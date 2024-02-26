@@ -104,7 +104,7 @@ pub enum AlpnProtocols {
     Http11,
 }
 
-pub struct HttpsSession {
+pub struct HttpsSession<'a> {
     answers: Rc<RefCell<HttpAnswers>>,
     configured_backend_timeout: Duration,
     configured_connect_timeout: Duration,
@@ -112,17 +112,17 @@ pub struct HttpsSession {
     frontend_token: Token,
     has_been_closed: bool,
     last_event: Instant,
-    listener: Rc<RefCell<HttpsListener>>,
+    listener: Rc<RefCell<HttpsListener<'a>>>,
     metrics: SessionMetrics,
     peer_address: Option<StdSocketAddr>,
     pool: Weak<RefCell<Pool>>,
-    proxy: Rc<RefCell<HttpsProxy>>,
+    proxy: Rc<RefCell<HttpsProxy<'a>>>,
     public_address: StdSocketAddr,
     state: HttpsStateMachine,
     sticky_name: String,
 }
 
-impl HttpsSession {
+impl<'a> HttpsSession<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         answers: Rc<RefCell<HttpAnswers>>,
@@ -140,7 +140,7 @@ impl HttpsSession {
         sticky_name: String,
         token: Token,
         wait_time: Duration,
-    ) -> HttpsSession {
+    ) -> HttpsSession<'a> {
         let peer_address = if expect_proxy {
             // Will be defined later once the expect proxy header has been received and parsed
             None
@@ -400,7 +400,7 @@ impl HttpsSession {
     }
 }
 
-impl ProxySession for HttpsSession {
+impl<'a> ProxySession for HttpsSession<'a> {
     fn close(&mut self) {
         if self.has_been_closed {
             return;
@@ -522,12 +522,12 @@ impl ProxySession for HttpsSession {
 pub type HostName = String;
 pub type PathBegin = String;
 
-pub struct HttpsListener {
+pub struct HttpsListener<'a> {
     active: bool,
     address: StdSocketAddr,
     answers: Rc<RefCell<HttpAnswers>>,
     config: HttpsListenerConfig,
-    fronts: Router,
+    fronts: Router<'a>,
     listener: Option<MioTcpListener>,
     resolver: Arc<MutexCertificateResolver>,
     rustls_details: Arc<RustlsServerConfig>,
@@ -535,7 +535,7 @@ pub struct HttpsListener {
     token: Token,
 }
 
-impl ListenerHandler for HttpsListener {
+impl<'a> ListenerHandler for HttpsListener<'a> {
     fn get_addr(&self) -> &StdSocketAddr {
         &self.address
     }
@@ -552,7 +552,7 @@ impl ListenerHandler for HttpsListener {
     }
 }
 
-impl L7ListenerHandler for HttpsListener {
+impl<'a> L7ListenerHandler for HttpsListener<'a> {
     fn get_sticky_name(&self) -> &str {
         &self.config.sticky_name
     }
@@ -609,11 +609,11 @@ impl L7ListenerHandler for HttpsListener {
     }
 }
 
-impl HttpsListener {
+impl<'a> HttpsListener<'a> {
     pub fn try_new(
         config: HttpsListenerConfig,
         token: Token,
-    ) -> Result<HttpsListener, ListenerError> {
+    ) -> Result<HttpsListener<'a>, ListenerError> {
         let resolver = Arc::new(MutexCertificateResolver::default());
 
         let server_config = Arc::new(Self::create_rustls_context(&config, resolver.to_owned())?);
@@ -767,8 +767,8 @@ impl HttpsListener {
     }
 }
 
-pub struct HttpsProxy {
-    listeners: HashMap<Token, Rc<RefCell<HttpsListener>>>,
+pub struct HttpsProxy<'a> {
+    listeners: HashMap<Token, Rc<RefCell<HttpsListener<'a>>>>,
     clusters: HashMap<ClusterId, Cluster>,
     backends: Rc<RefCell<BackendMap>>,
     pool: Rc<RefCell<Pool>>,
@@ -776,13 +776,13 @@ pub struct HttpsProxy {
     sessions: Rc<RefCell<SessionManager>>,
 }
 
-impl HttpsProxy {
+impl<'a> HttpsProxy<'a> {
     pub fn new(
         registry: Registry,
         sessions: Rc<RefCell<SessionManager>>,
         pool: Rc<RefCell<Pool>>,
         backends: Rc<RefCell<BackendMap>>,
-    ) -> HttpsProxy {
+    ) -> HttpsProxy<'a> {
         HttpsProxy {
             listeners: HashMap::new(),
             clusters: HashMap::new(),
@@ -1168,7 +1168,7 @@ impl HttpsProxy {
     }
 }
 
-impl ProxyConfiguration for HttpsProxy {
+impl<'a> ProxyConfiguration for HttpsProxy<'a> {
     fn accept(&mut self, token: ListenToken) -> Result<MioTcpStream, AcceptError> {
         match self.listeners.get(&Token(token.0)) {
             Some(listener) => listener.borrow_mut().accept(),
@@ -1356,7 +1356,7 @@ impl ProxyConfiguration for HttpsProxy {
         }
     }
 }
-impl L7Proxy for HttpsProxy {
+impl<'a> L7Proxy for HttpsProxy<'a> {
     fn kind(&self) -> ListenerType {
         ListenerType::Https
     }

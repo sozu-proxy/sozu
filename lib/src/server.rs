@@ -210,7 +210,7 @@ pub enum ServerError {
 ///
 /// Listeners and sessions are all stored in a slab structure to index them
 /// by a [Token], they all have to implement the [ProxySession] trait.
-pub struct Server {
+pub struct Server<'a> {
     accept_queue_timeout: Duration,
     accept_queue: VecDeque<(TcpStream, ListenToken, Protocol, Instant)>,
     accept_ready: HashSet<ListenToken>,
@@ -219,8 +219,8 @@ pub struct Server {
     channel: ProxyChannel,
     config_state: ConfigState,
     current_poll_errors: i32,
-    http: Rc<RefCell<http::HttpProxy>>,
-    https: Rc<RefCell<https::HttpsProxy>>,
+    http: Rc<RefCell<http::HttpProxy<'a>>>,
+    https: Rc<RefCell<https::HttpsProxy<'a>>>,
     last_sessions_len: usize,
     last_shutting_down_message: Option<Instant>,
     last_zombie_check: Instant,
@@ -238,7 +238,7 @@ pub struct Server {
     zombie_check_interval: Duration,
 }
 
-impl Server {
+impl<'a> Server<'a> {
     pub fn try_new_from_config(
         worker_to_main_channel: ProxyChannel,
         worker_to_main_scm: ScmSocket,

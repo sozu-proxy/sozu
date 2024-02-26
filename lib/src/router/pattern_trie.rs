@@ -2,7 +2,7 @@ use std::{collections::HashMap, fmt::Debug, iter, str};
 
 use regex::bytes::Regex;
 
-pub type Key = &[u8];
+pub type Key<'a> = &'a [u8];
 pub type KeyValue<K, V> = (K, V);
 
 #[derive(Debug, PartialEq, Eq)]
@@ -35,14 +35,14 @@ fn find_last_slash(input: &[u8]) -> Option<usize> {
 /// Leaves also store a value associated with the complete domain.
 /// For Sozu it is a list of (PathRule, MethodRule, ClusterId). See the Router strucure.
 #[derive(Debug)]
-pub struct TrieNode<V> {
-    key_value: Option<KeyValue<Key, V>>,
-    wildcard: Option<KeyValue<Key, V>>,
-    children: HashMap<Key, TrieNode<V>>,
-    regexps: Vec<(Regex, TrieNode<V>)>,
+pub struct TrieNode<'a, V> {
+    key_value: Option<KeyValue<Key<'a>, V>>,
+    wildcard: Option<KeyValue<Key<'a>, V>>,
+    children: HashMap<Key<'a>, TrieNode<'a, V>>,
+    regexps: Vec<(Regex, TrieNode<'a, V>)>,
 }
 
-impl<V: PartialEq> std::cmp::PartialEq for TrieNode<V> {
+impl<'a, V: PartialEq> std::cmp::PartialEq for TrieNode<'a, V> {
     fn eq(&self, other: &Self) -> bool {
         self.key_value == other.key_value
             && self.wildcard == other.wildcard
@@ -58,7 +58,7 @@ impl<V: PartialEq> std::cmp::PartialEq for TrieNode<V> {
     }
 }
 
-impl<V: Debug + Clone> TrieNode<V> {
+impl<'a, V: Debug + Clone> TrieNode<'a, V> {
     pub fn new(key: Key, value: V) -> TrieNode<V> {
         TrieNode {
             key_value: Some((key, value)),
@@ -77,7 +77,7 @@ impl<V: Debug + Clone> TrieNode<V> {
         }
     }
 
-    pub fn root() -> TrieNode<V> {
+    pub fn root() -> TrieNode<'a, V> {
         TrieNode {
             key_value: None,
             wildcard: None,

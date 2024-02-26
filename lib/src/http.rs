@@ -69,23 +69,23 @@ StateMachineBuilder! {
 /// HTTP Session to insert in the SessionManager
 ///
 /// 1 session <=> 1 HTTP connection (client to sozu)
-pub struct HttpSession {
+pub struct HttpSession<'a> {
     answers: Rc<RefCell<HttpAnswers>>,
     configured_backend_timeout: Duration,
     configured_connect_timeout: Duration,
     configured_frontend_timeout: Duration,
     frontend_token: Token,
     last_event: Instant,
-    listener: Rc<RefCell<HttpListener>>,
+    listener: Rc<RefCell<HttpListener<'a>>>,
     metrics: SessionMetrics,
     pool: Weak<RefCell<Pool>>,
-    proxy: Rc<RefCell<HttpProxy>>,
+    proxy: Rc<RefCell<HttpProxy<'a>>>,
     state: HttpStateMachine,
     sticky_name: String,
     has_been_closed: bool,
 }
 
-impl HttpSession {
+impl HttpSession<'_> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         answers: Rc<RefCell<HttpAnswers>>,
@@ -266,7 +266,7 @@ impl HttpSession {
     }
 }
 
-impl ProxySession for HttpSession {
+impl<'a> ProxySession for HttpSession<'a> {
     fn close(&mut self) {
         if self.has_been_closed {
             return;
@@ -383,18 +383,18 @@ impl ProxySession for HttpSession {
 
 pub type Hostname = String;
 
-pub struct HttpListener {
+pub struct HttpListener<'a> {
     active: bool,
     address: SocketAddr,
     answers: Rc<RefCell<HttpAnswers>>,
     config: HttpListenerConfig,
-    fronts: Router,
+    fronts: Router<'a>,
     listener: Option<TcpListener>,
     tags: BTreeMap<String, CachedTags>,
     token: Token,
 }
 
-impl ListenerHandler for HttpListener {
+impl<'a> ListenerHandler for HttpListener<'a> {
     fn get_addr(&self) -> &SocketAddr {
         &self.address
     }
@@ -411,7 +411,7 @@ impl ListenerHandler for HttpListener {
     }
 }
 
-impl L7ListenerHandler for HttpListener {
+impl<'a> L7ListenerHandler for HttpListener<'a> {
     fn get_sticky_name(&self) -> &str {
         &self.config.sticky_name
     }
@@ -474,22 +474,22 @@ impl L7ListenerHandler for HttpListener {
     }
 }
 
-pub struct HttpProxy {
+pub struct HttpProxy<'a> {
     backends: Rc<RefCell<BackendMap>>,
     clusters: HashMap<ClusterId, Cluster>,
-    listeners: HashMap<Token, Rc<RefCell<HttpListener>>>,
+    listeners: HashMap<Token, Rc<RefCell<HttpListener<'a>>>>,
     pool: Rc<RefCell<Pool>>,
     registry: Registry,
     sessions: Rc<RefCell<SessionManager>>,
 }
 
-impl HttpProxy {
+impl<'a> HttpProxy<'a> {
     pub fn new(
         registry: Registry,
         sessions: Rc<RefCell<SessionManager>>,
         pool: Rc<RefCell<Pool>>,
         backends: Rc<RefCell<BackendMap>>,
-    ) -> HttpProxy {
+    ) -> HttpProxy<'a> {
         HttpProxy {
             backends,
             clusters: HashMap::new(),
@@ -712,8 +712,11 @@ impl HttpProxy {
     }
 }
 
-impl HttpListener {
-    pub fn new(config: HttpListenerConfig, token: Token) -> Result<HttpListener, ListenerError> {
+impl<'a> HttpListener<'a> {
+    pub fn new(
+        config: HttpListenerConfig,
+        token: Token,
+    ) -> Result<HttpListener<'a>, ListenerError> {
         Ok(HttpListener {
             active: false,
             address: config.address.clone().into(),
@@ -789,7 +792,7 @@ impl HttpListener {
     }
 }
 
-impl ProxyConfiguration for HttpProxy {
+impl<'a> ProxyConfiguration for HttpProxy<'a> {
     fn notify(&mut self, request: WorkerRequest) -> WorkerResponse {
         let request_id = request.id.clone();
 
@@ -939,7 +942,7 @@ impl ProxyConfiguration for HttpProxy {
     }
 }
 
-impl L7Proxy for HttpProxy {
+impl<'a> L7Proxy for HttpProxy<'a> {
     fn kind(&self) -> ListenerType {
         ListenerType::Http
     }

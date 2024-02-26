@@ -32,20 +32,20 @@ pub enum RouterError {
     },
 }
 
-pub struct Router {
+pub struct Router<'a> {
     pre: Vec<(DomainRule, PathRule, MethodRule, Route)>,
-    pub tree: TrieNode<Vec<(PathRule, MethodRule, Route)>>,
+    pub tree: TrieNode<'a, Vec<(PathRule, MethodRule, Route)>>,
     post: Vec<(DomainRule, PathRule, MethodRule, Route)>,
 }
 
-impl Default for Router {
+impl Default for Router<'_> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Router {
-    pub fn new() -> Router {
+impl<'a> Router<'a> {
+    pub fn new() -> Router<'a> {
         Router {
             pre: Vec::new(),
             tree: TrieNode::root(),
