@@ -632,12 +632,8 @@ impl HttpsListener {
             active: false,
             fronts: Router::new(),
             answers: Rc::new(RefCell::new(
-                HttpAnswers::new(
-                    // &config.answer_404,
-                    // &config.answer_503,
-                    RawAnswers::default(),
-                )
-                .map_err(|(status, error)| ListenerError::TemplateParse(status, error))?,
+                HttpAnswers::new(&config.http_answers)
+                    .map_err(|(status, error)| ListenerError::TemplateParse(status, error))?,
             )),
             config,
             token,
@@ -1515,7 +1511,10 @@ mod tests {
 
     use std::sync::Arc;
 
-    use sozu_command::{config::ListenerBuilder, proto::command::SocketAddress};
+    use sozu_command::{
+        config::ListenerBuilder,
+        proto::command::{CustomHttpAnswers, SocketAddress},
+    };
 
     use crate::router::{trie::TrieNode, MethodRule, PathRule, Route, Router};
 
@@ -1597,12 +1596,7 @@ mod tests {
             rustls_details,
             resolver,
             answers: Rc::new(RefCell::new(
-                HttpAnswers::new(
-                    // "HTTP/1.1 404 Not Found\r\n\r\n",
-                    // "HTTP/1.1 503 Service Unavailable\r\n\r\n",
-                    RawAnswers::default(),
-                )
-                .unwrap(),
+                HttpAnswers::new(&CustomHttpAnswers::default()).unwrap(),
             )),
             config: default_config,
             token: Token(0),

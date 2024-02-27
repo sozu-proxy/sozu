@@ -117,8 +117,8 @@ message CountRequests {}
 message HttpListenerConfig {
     required SocketAddress address = 1;
     optional SocketAddress public_address = 2;
-    required string answer_404 = 3;
-    required string answer_503 = 4;
+    // required string answer_404 = 3;
+    // required string answer_503 = 4;
     required bool expect_proxy = 5 [default = false];
     required string sticky_name = 6;
     // client inactive time, in seconds
@@ -131,14 +131,15 @@ message HttpListenerConfig {
     required uint32 request_timeout = 10 [default = 10];
     // wether the listener is actively listening on its socket
     required bool active = 11 [default = false];
+    required CustomHttpAnswers http_answers = 12;
 }
 
 // details of an HTTPS listener
 message HttpsListenerConfig {
     required SocketAddress address = 1;
     optional SocketAddress public_address = 2;
-    required string answer_404 = 3;
-    required string answer_503 = 4;
+    // required string answer_404 = 3;
+    // required string answer_503 = 4;
     required bool expect_proxy = 5 [default = false];
     required string sticky_name = 6;
     // client inactive time, in seconds
@@ -164,6 +165,7 @@ message HttpsListenerConfig {
     // The tickets allow the client to resume a session. This protects the client
     // agains session tracking. Defaults to 4.
     required uint64 send_tls13_tickets = 20;
+    required CustomHttpAnswers http_answers = 21;
 }
 
 // details of an TCP listener
@@ -179,6 +181,31 @@ message TcpListenerConfig {
     required uint32 connect_timeout = 6 [default = 3];
     // wether the listener is actively listening on its socket
     required bool active = 7 [default = false];
+}
+
+// custom HTTP answers, useful for 404, 503 pages
+message CustomHttpAnswers {
+    // MovedPermanently
+    optional string answer_301 = 1;
+    // BadRequest
+    optional string answer_400 = 2;
+    // Unauthorized
+    optional string answer_401 = 3;
+    // NotFound
+    optional string answer_404 = 4;
+    // RequestTimeout
+    optional string answer_408 = 5;
+    // PayloadTooLarge
+    optional string answer_413 = 6;
+    // BadGateway
+    optional string answer_502 = 7;
+    // ServiceUnavailable
+    optional string answer_503 = 8;
+    // GatewayTimeout
+    optional string answer_504 = 9;
+    // InsufficientStorage
+    optional string answer_507 = 10;
+
 }
 
 message ActivateListener {

@@ -62,11 +62,11 @@ use crate::{
     logging::AccessLogFormat,
     proto::command::{
         request::RequestType, ActivateListener, AddBackend, AddCertificate, CertificateAndKey,
-        Cluster, HttpListenerConfig, HttpsListenerConfig, ListenerType, LoadBalancingAlgorithms,
-        LoadBalancingParams, LoadMetric, MetricsConfiguration, PathRule, ProtobufAccessLogFormat,
-        ProxyProtocolConfig, Request, RequestHttpFrontend, RequestTcpFrontend, RulePosition,
-        ServerConfig, ServerMetricsConfig, SocketAddress, TcpListenerConfig, TlsVersion,
-        WorkerRequest,
+        Cluster, CustomHttpAnswers, HttpListenerConfig, HttpsListenerConfig, ListenerType,
+        LoadBalancingAlgorithms, LoadBalancingParams, LoadMetric, MetricsConfiguration, PathRule,
+        ProtobufAccessLogFormat, ProxyProtocolConfig, Request, RequestHttpFrontend,
+        RequestTcpFrontend, RulePosition, ServerConfig, ServerMetricsConfig, SocketAddress,
+        TcpListenerConfig, TlsVersion, WorkerRequest,
     },
     ObjectKind,
 };
@@ -237,10 +237,16 @@ pub struct ListenerBuilder {
     pub address: SocketAddr,
     pub protocol: Option<ListenerProtocol>,
     pub public_address: Option<SocketAddr>,
-    /// path to the 404 html file
+    pub answer_301: Option<String>,
+    pub answer_400: Option<String>,
+    pub answer_401: Option<String>,
     pub answer_404: Option<String>,
-    /// path to the 503 html file
+    pub answer_408: Option<String>,
+    pub answer_413: Option<String>,
+    pub answer_502: Option<String>,
     pub answer_503: Option<String>,
+    pub answer_504: Option<String>,
+    pub answer_507: Option<String>,
     pub tls_versions: Option<Vec<TlsVersion>>,
     pub cipher_list: Option<Vec<String>>,
     pub cipher_suites: Option<Vec<String>>,
@@ -293,24 +299,32 @@ impl ListenerBuilder {
     fn new(address: SocketAddress, protocol: ListenerProtocol) -> ListenerBuilder {
         ListenerBuilder {
             address: address.into(),
-            protocol: Some(protocol),
-            sticky_name: DEFAULT_STICKY_NAME.to_string(),
-            public_address: None,
+            answer_301: None,
+            answer_401: None,
+            answer_400: None,
             answer_404: None,
+            answer_408: None,
+            answer_413: None,
+            answer_502: None,
             answer_503: None,
-            tls_versions: None,
+            answer_504: None,
+            answer_507: None,
+            back_timeout: None,
+            certificate_chain: None,
+            certificate: None,
             cipher_list: None,
             cipher_suites: None,
-            expect_proxy: None,
-            certificate: None,
-            certificate_chain: None,
-            key: None,
-            front_timeout: None,
-            back_timeout: None,
-            connect_timeout: None,
-            request_timeout: None,
             config: None,
+            connect_timeout: None,
+            expect_proxy: None,
+            front_timeout: None,
+            key: None,
+            protocol: Some(protocol),
+            public_address: None,
+            request_timeout: None,
             send_tls13_tickets: None,
+            sticky_name: DEFAULT_STICKY_NAME.to_string(),
+            tls_versions: None,
         }
     }
 
@@ -412,6 +426,23 @@ impl ListenerBuilder {
         self
     }
 
+    /// Get the custom HTTP answers from the file system using the provided paths
+    fn get_http_answers(&self) -> Result<CustomHttpAnswers, ConfigError> {
+        let http_answers = CustomHttpAnswers {
+            answer_301: read_http_answer_file(&self.answer_301)?,
+            answer_400: read_http_answer_file(&self.answer_400)?,
+            answer_401: read_http_answer_file(&self.answer_401)?,
+            answer_404: read_http_answer_file(&self.answer_404)?,
+            answer_408: read_http_answer_file(&self.answer_408)?,
+            answer_413: read_http_answer_file(&self.answer_413)?,
+            answer_502: read_http_answer_file(&self.answer_502)?,
+            answer_503: read_http_answer_file(&self.answer_503)?,
+            answer_504: read_http_answer_file(&self.answer_504)?,
+            answer_507: read_http_answer_file(&self.answer_507)?,
+        };
+        Ok(http_answers)
+    }
+
     /// Assign the timeouts of the config to this listener, only if timeouts did not exist
     fn assign_config_timeouts(&mut self, config: &Config) {
         self.front_timeout = Some(self.front_timeout.unwrap_or(config.front_timeout));
@@ -433,7 +464,7 @@ impl ListenerBuilder {
             self.assign_config_timeouts(config);
         }
 
-        let (answer_404, answer_503) = self.get_404_503_answers()?;
+        let http_answers = self.get_http_answers()?;
 
         let configuration = HttpListenerConfig {
             address: self.address.into(),
@@ -444,8 +475,7 @@ impl ListenerBuilder {
             back_timeout: self.back_timeout.unwrap_or(DEFAULT_BACK_TIMEOUT),
             connect_timeout: self.connect_timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT),
             request_timeout: self.request_timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT),
-            answer_404,
-            answer_503,
+            http_answers,
             ..Default::default()
         };
 
@@ -517,7 +547,7 @@ impl ListenerBuilder {
             .map(split_certificate_chain)
             .unwrap_or_default();
 
-        let (answer_404, answer_503) = self.get_404_503_answers()?;
+        let http_answers = self.get_http_answers()?;
 
         if let Some(config) = config {
             self.assign_config_timeouts(config);
@@ -537,8 +567,6 @@ impl ListenerBuilder {
             back_timeout: self.back_timeout.unwrap_or(DEFAULT_BACK_TIMEOUT),
             connect_timeout: self.connect_timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT),
             request_timeout: self.request_timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT),
-            answer_404,
-            answer_503,
             cipher_suites,
             signature_algorithms,
             groups_list,
@@ -546,6 +574,7 @@ impl ListenerBuilder {
             send_tls13_tickets: self
                 .send_tls13_tickets
                 .unwrap_or(DEFAULT_SEND_TLS_13_TICKETS),
+            http_answers,
         };
 
         Ok(https_listener_config)
@@ -575,36 +604,44 @@ impl ListenerBuilder {
         })
     }
 
+    /*
+    TODO: remove this, and remove default 404 and 503 from the assets, we should rely on the lib for defaults
     /// Get the 404 and 503 answers from the file system using the provided paths,
     /// if none, defaults to HTML files in the sozu assets
     fn get_404_503_answers(&self) -> Result<(String, String), ConfigError> {
         let answer_404 = match &self.answer_404 {
-            Some(a_404_path) => open_and_read_file(a_404_path)?,
+            Some(a_404_path) => read_file(a_404_path)?,
             None => String::from(include_str!("../assets/404.html")),
         };
 
         let answer_503 = match &self.answer_503 {
-            Some(a_503_path) => open_and_read_file(a_503_path)?,
+            Some(a_503_path) => read_file(a_503_path)?,
             None => String::from(include_str!("../assets/503.html")),
         };
         Ok((answer_404, answer_503))
     }
+    */
 }
 
-fn open_and_read_file(path: &str) -> Result<String, ConfigError> {
-    let mut content = String::new();
-    let mut file = File::open(path).map_err(|io_error| ConfigError::FileOpen {
-        path_to_open: path.to_owned(),
-        io_error,
-    })?;
+fn read_http_answer_file(path: &Option<String>) -> Result<Option<String>, ConfigError> {
+    match path {
+        Some(path) => {
+            let mut content = String::new();
+            let mut file = File::open(path).map_err(|io_error| ConfigError::FileOpen {
+                path_to_open: path.to_owned(),
+                io_error,
+            })?;
 
-    file.read_to_string(&mut content)
-        .map_err(|io_error| ConfigError::FileRead {
-            path_to_read: path.to_owned(),
-            io_error,
-        })?;
+            file.read_to_string(&mut content)
+                .map_err(|io_error| ConfigError::FileRead {
+                    path_to_read: path.to_owned(),
+                    io_error,
+                })?;
 
-    Ok(content)
+            Ok(Some(content))
+        }
+        None => Ok(None),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

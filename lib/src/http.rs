@@ -726,12 +726,8 @@ impl HttpListener {
             active: false,
             address: config.address.clone().into(),
             answers: Rc::new(RefCell::new(
-                HttpAnswers::new(
-                    // &config.answer_404,
-                    // &config.answer_503,
-                    RawAnswers::default(),
-                )
-                .map_err(|(status, error)| ListenerError::TemplateParse(status, error))?,
+                HttpAnswers::new(&config.http_answers)
+                    .map_err(|(status, error)| ListenerError::TemplateParse(status, error))?,
             )),
             config,
             fronts: Router::new(),
@@ -1057,7 +1053,7 @@ mod tests {
 
     use super::testing::start_http_worker;
     use super::*;
-    use sozu_command::proto::command::SocketAddress;
+    use sozu_command::proto::command::{CustomHttpAnswers, SocketAddress};
 
     use crate::sozu_command::{
         channel::Channel,
@@ -1473,12 +1469,7 @@ mod tests {
             address: address.into(),
             fronts,
             answers: Rc::new(RefCell::new(
-                HttpAnswers::new(
-                    // "HTTP/1.1 404 Not Found\r\n\r\n",
-                    // "HTTP/1.1 503 Service Unavailable\r\n\r\n",
-                    RawAnswers::default(),
-                )
-                .unwrap(),
+                HttpAnswers::new(&CustomHttpAnswers::default()).unwrap(),
             )),
             config: default_config,
             token: Token(0),
