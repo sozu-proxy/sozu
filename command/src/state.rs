@@ -1496,7 +1496,9 @@ mod tests {
     use rand::{seq::SliceRandom, thread_rng, Rng};
 
     use super::*;
-    use crate::proto::command::{LoadBalancingParams, RequestHttpFrontend, RulePosition};
+    use crate::proto::command::{
+        CustomHttpAnswers, LoadBalancingParams, RequestHttpFrontend, RulePosition,
+    };
 
     #[test]
     fn serialize() {
@@ -1998,6 +2000,10 @@ mod tests {
     #[test]
     fn listener_diff() {
         let mut state: ConfigState = Default::default();
+        let custom_http_answers = CustomHttpAnswers {
+            answer_404: Some("test".to_string()),
+            ..Default::default()
+        };
         state
             .dispatch(
                 &RequestType::AddTcpListener(TcpListenerConfig {
@@ -2061,7 +2067,7 @@ mod tests {
             .dispatch(
                 &RequestType::AddHttpListener(HttpListenerConfig {
                     address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
-                    answer_404: "test".to_string(),
+                    http_answers: custom_http_answers.clone(),
                     ..Default::default()
                 })
                 .into(),
@@ -2081,7 +2087,7 @@ mod tests {
             .dispatch(
                 &RequestType::AddHttpsListener(HttpsListenerConfig {
                     address: SocketAddress::new_v4(0, 0, 0, 0, 8443),
-                    answer_404: String::from("test"),
+                    http_answers: custom_http_answers.clone(),
                     ..Default::default()
                 })
                 .into(),
@@ -2123,7 +2129,7 @@ mod tests {
             .into(),
             RequestType::AddHttpListener(HttpListenerConfig {
                 address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
-                answer_404: String::from("test"),
+                http_answers: custom_http_answers.clone(),
                 ..Default::default()
             })
             .into(),
@@ -2140,7 +2146,7 @@ mod tests {
             .into(),
             RequestType::AddHttpsListener(HttpsListenerConfig {
                 address: SocketAddress::new_v4(0, 0, 0, 0, 8443),
-                answer_404: String::from("test"),
+                http_answers: custom_http_answers.clone(),
                 ..Default::default()
             })
             .into(),
