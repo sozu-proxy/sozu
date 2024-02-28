@@ -32,7 +32,7 @@ use crate::{
     pool::Pool,
     protocol::{
         http::{
-            answers::{HttpAnswers, RawAnswers},
+            answers::HttpAnswers,
             parser::{hostname_and_port, Method},
             ResponseStream,
         },

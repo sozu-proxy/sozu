@@ -117,8 +117,6 @@ message CountRequests {}
 message HttpListenerConfig {
     required SocketAddress address = 1;
     optional SocketAddress public_address = 2;
-    // required string answer_404 = 3;
-    // required string answer_503 = 4;
     required bool expect_proxy = 5 [default = false];
     required string sticky_name = 6;
     // client inactive time, in seconds
@@ -138,8 +136,6 @@ message HttpListenerConfig {
 message HttpsListenerConfig {
     required SocketAddress address = 1;
     optional SocketAddress public_address = 2;
-    // required string answer_404 = 3;
-    // required string answer_503 = 4;
     required bool expect_proxy = 5 [default = false];
     required string sticky_name = 6;
     // client inactive time, in seconds
