@@ -228,7 +228,6 @@ pub struct Server {
     max_poll_errors: i32, // TODO: make this configurable? this defaults to 10000 for now
     pub poll: Poll,
     poll_timeout: Option<Duration>, // TODO: make this configurable? this defaults to 1000 milliseconds for now
-    pool: Rc<RefCell<Pool>>,
     scm_listeners: Option<Listeners>,
     scm: ScmSocket,
     sessions: Rc<RefCell<SessionManager>>,
@@ -285,14 +284,6 @@ impl Server {
             })));
         }
 
-        let registry = event_loop
-            .registry()
-            .try_clone()
-            .map_err(ServerError::CloneRegistry)?;
-
-        let https =
-            https::HttpsProxy::new(registry, sessions.clone(), pool.clone(), backends.clone());
-
         Server::new(
             event_loop,
             worker_to_main_channel,
@@ -301,7 +292,7 @@ impl Server {
             pool,
             backends,
             None,
-            Some(https),
+            None,
             None,
             config,
             Some(initial_state),
@@ -378,7 +369,7 @@ impl Server {
                     .try_clone()
                     .map_err(ServerError::CloneRegistry)?;
 
-                tcp::TcpProxy::new(registry, sessions.clone(), backends.clone())
+                tcp::TcpProxy::new(registry, sessions.clone(), pool.clone(), backends.clone())
             }
         }));
 
@@ -400,7 +391,6 @@ impl Server {
             max_poll_errors: 10000,            // TODO: make it configurable?
             poll_timeout: Some(Duration::milliseconds(1000)), // TODO: make it configurable?
             poll,
-            pool,
             scm_listeners: None,
             scm,
             sessions,
@@ -1162,11 +1152,7 @@ impl Server {
         let entry = session_manager.slab.vacant_entry();
         let token = Token(entry.key());
 
-        match self
-            .tcp
-            .borrow_mut()
-            .add_listener(listener, self.pool.clone(), token)
-        {
+        match self.tcp.borrow_mut().add_listener(listener, token) {
             Ok(_token) => {
                 entry.insert(Rc::new(RefCell::new(ListenSession {
                     protocol: Protocol::TCPListen,
