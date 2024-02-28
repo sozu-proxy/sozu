@@ -26,12 +26,15 @@ pub fn http_request<S1: Into<String>, S2: Into<String>, S3: Into<String>, S4: In
 
 // the default value for the 404 error, as provided in the command lib,
 // used as default for listeners
-pub fn default_404_answer() -> String {
-    String::from(include_str!("../../../command/assets/404.html"))
+// TODO: make this return a fix 404 error to be compared to in the tests
+// TODO: rename this to fix_404_answer
+// same for 503
+pub fn immutable_404_answer() -> String {
+    String::from("HTTP/1.1 404 Not Found\r\nCache-Control: no-cache\r\nConnection: close\r\n")
 }
 
 // the default value for the 503 error, as provided in the command lib,
 // used as default for listeners
-pub fn default_503_answer() -> String {
-    String::from(include_str!("../../../command/assets/503.html"))
+pub fn fixed_503_answer() -> String {
+    String::from("HTTP/1.1 503 Service Unavailable\r\nCache-Control: no-cache\r\nConnection: close\r\n%Content-Length: %CONTENT_LENGTH\r\nSozu-Id: %SOZU_ID\r\n")
 }

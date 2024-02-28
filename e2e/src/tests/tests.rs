@@ -17,7 +17,7 @@ use sozu_command_lib::{
 };
 
 use crate::{
-    http_utils::{default_404_answer, default_503_answer, http_ok_response, http_request},
+    http_utils::{immutable_404_answer, fixed_503_answer, http_ok_response, http_request},
     mock::{
         aggregator::SimpleAggregator,
         async_backend::BackendHandle as AsyncBackend,
@@ -664,7 +664,7 @@ fn try_http_behaviors() -> State {
 
     let response = client.receive();
     println!("response: {response:?}");
-    assert_eq!(response, Some(default_404_answer()));
+    assert_eq!(response, Some(immutable_404_answer()));
     assert_eq!(client.receive(), None);
 
     worker.send_proxy_request_type(RequestType::AddHttpFrontend(RequestHttpFrontend {
@@ -679,7 +679,7 @@ fn try_http_behaviors() -> State {
 
     let response = client.receive();
     println!("response: {response:?}");
-    assert_eq!(response, Some(default_503_answer()));
+    assert_eq!(response, Some(fixed_503_answer()));
     assert_eq!(client.receive(), None);
 
     let back_address = create_local_address();
@@ -785,7 +785,7 @@ fn try_http_behaviors() -> State {
     let response = client.receive();
     println!("request: {request:?}");
     println!("response: {response:?}");
-    assert_eq!(response, Some(default_503_answer()));
+    assert_eq!(response, Some(fixed_503_answer()));
     assert_eq!(client.receive(), None);
 
     worker.send_proxy_request_type(RequestType::RemoveBackend(RemoveBackend {
