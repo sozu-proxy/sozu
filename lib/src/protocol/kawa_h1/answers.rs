@@ -84,11 +84,17 @@ impl fmt::Debug for Template {
 }
 
 impl Template {
+    /// sanitize the template: transform newlines \r (CR) to \r\n (CRLF)
     pub fn new(
         status: u16,
-        answer: Vec<u8>,
+        answer: String,
         variables: &[TemplateVariable],
     ) -> Result<Self, (u16, TemplateError)> {
+        let answer = answer
+            .replace("\r\n", "\n")
+            .replace("\n", "\r\n")
+            .into_bytes();
+
         Self::_new(status, answer, variables).map_err(|e| (status, e))
     }
 
@@ -309,21 +315,21 @@ pub struct HttpAnswers {
     pub cluster_custom_answers: HashMap<ClusterId, ClusterAnswers>,
 }
 
-fn default_301() -> Vec<u8> {
-    Vec::from(
-        &b"\
+fn default_301() -> String {
+    String::from(
+        "\
 HTTP/1.1 301 Moved Permanently\r
 Location: %REDIRECT_LOCATION\r
 Connection: close\r
 Content-Length: 0\r
 Sozu-Id: %SOZU_ID\r
-\r\n"[..],
+\r\n",
     )
 }
 
-fn default_400() -> Vec<u8> {
-    Vec::from(
-        &b"\
+fn default_400() -> String {
+    String::from(
+        "\
 HTTP/1.1 400 Bad Request\r
 Cache-Control: no-cache\r
 Connection: close\r
@@ -335,46 +341,46 @@ Sozu-Id: %SOZU_ID\r
 <pre>
 Kawa error: %DETAILS
 <pre>
-"[..],
+",
     )
 }
 
-fn default_401() -> Vec<u8> {
-    Vec::from(
-        &b"\
+fn default_401() -> String {
+    String::from(
+        "\
 HTTP/1.1 401 Unauthorized\r
 Cache-Control: no-cache\r
 Connection: close\r
 Sozu-Id: %SOZU_ID\r
-\r\n"[..],
+\r\n",
     )
 }
 
-fn default_404() -> Vec<u8> {
-    Vec::from(
-        &b"\
+fn default_404() -> String {
+    String::from(
+        "\
 HTTP/1.1 404 Not Found\r
 Cache-Control: no-cache\r
 Connection: close\r
 Sozu-Id: %SOZU_ID\r
-\r\n"[..],
+\r\n",
     )
 }
 
-fn default_408() -> Vec<u8> {
-    Vec::from(
-        &b"\
+fn default_408() -> String {
+    String::from(
+        "\
 HTTP/1.1 408 Request Timeout\r
 Cache-Control: no-cache\r
 Connection: close\r
 Sozu-Id: %SOZU_ID\r
-\r\n"[..],
+\r\n",
     )
 }
 
-fn default_413() -> Vec<u8> {
-    Vec::from(
-        &b"\
+fn default_413() -> String {
+    String::from(
+        "\
 HTTP/1.1 413 Payload Too Large\r
 Cache-Control: no-cache\r
 Connection: close\r
@@ -386,13 +392,13 @@ Sozu-Id: %SOZU_ID\r
 <pre>
 Kawa cursors: %DETAILS
 <pre>
-"[..],
+",
     )
 }
 
-fn default_502() -> Vec<u8> {
-    Vec::from(
-        &b"\
+fn default_502() -> String {
+    String::from(
+        "\
 HTTP/1.1 502 Bad Gateway\r
 Cache-Control: no-cache\r
 Connection: close\r
@@ -404,13 +410,13 @@ Sozu-Id: %SOZU_ID\r
 <pre>
 Kawa error: %DETAILS
 <pre>
-"[..],
+",
     )
 }
 
-fn default_503() -> Vec<u8> {
-    Vec::from(
-        &b"\
+fn default_503() -> String {
+    String::from(
+        "\
 HTTP/1.1 503 Service Unavailable\r
 Cache-Control: no-cache\r
 Connection: close\r
@@ -422,24 +428,24 @@ Sozu-Id: %SOZU_ID\r
 <pre>
 %DETAILS
 <pre>
-"[..],
+",
     )
 }
 
-fn default_504() -> Vec<u8> {
-    Vec::from(
-        &b"\
+fn default_504() -> String {
+    String::from(
+        "\
 HTTP/1.1 504 Gateway Timeout\r
 Cache-Control: no-cache\r
 Connection: close\r
 Sozu-Id: %SOZU_ID\r
-\r\n"[..],
+\r\n",
     )
 }
 
-fn default_507() -> Vec<u8> {
-    Vec::from(
-        &b"\
+fn default_507() -> String {
+    String::from(
+        "\
 HTTP/1.1 507 Insufficient Storage\r
 Cache-Control: no-cache\r
 Connection: close\r
@@ -451,7 +457,7 @@ Sozu-Id: %SOZU_ID\r
 <pre>
 Kawa cursors: %DETAILS
 <pre>
-"[..],
+",
     )
 }
 
@@ -481,60 +487,20 @@ impl HttpAnswers {
             valid_in_header: true,
             typ: ReplacementType::VariableOnce(0),
         };
-        let ans_301: Vec<u8> = conf
-            .answer_301
-            .clone()
-            .map(|a| a.into_bytes())
-            .unwrap_or(default_301());
-        let answer_400: Vec<u8> = conf
-            .answer_400
-            .clone()
-            .map(|a| a.into_bytes())
-            .unwrap_or(default_400());
-        let answer_401: Vec<u8> = conf
-            .answer_401
-            .clone()
-            .map(|a| a.into_bytes())
-            .unwrap_or(default_401());
-        let answer_404: Vec<u8> = conf
-            .answer_404
-            .clone()
-            .map(|a| a.into_bytes())
-            .unwrap_or(default_404());
-        let answer_408: Vec<u8> = conf
-            .answer_408
-            .clone()
-            .map(|a| a.into_bytes())
-            .unwrap_or(default_408());
-        let answer_413: Vec<u8> = conf
-            .answer_413
-            .clone()
-            .map(|a| a.into_bytes())
-            .unwrap_or(default_413());
-        let answer_502: Vec<u8> = conf
-            .answer_502
-            .clone()
-            .map(|a| a.into_bytes())
-            .unwrap_or(default_502());
-        let answer_503: Vec<u8> = conf
-            .answer_503
-            .clone()
-            .map(|a| a.into_bytes())
-            .unwrap_or(default_503());
-        let answer_504 = conf
-            .answer_504
-            .clone()
-            .map(|a| a.into_bytes())
-            .unwrap_or(default_504());
-        let answer_507: Vec<u8> = conf
-            .answer_507
-            .clone()
-            .map(|a| a.into_bytes())
-            .unwrap_or(default_507());
+        let answer_301 = conf.answer_301.clone().unwrap_or(default_301());
+        let answer_400 = conf.answer_400.clone().unwrap_or(default_400());
+        let answer_401 = conf.answer_401.clone().unwrap_or(default_401());
+        let answer_404 = conf.answer_404.clone().unwrap_or(default_404());
+        let answer_408 = conf.answer_408.clone().unwrap_or(default_408());
+        let answer_413 = conf.answer_413.clone().unwrap_or(default_413());
+        let answer_502 = conf.answer_502.clone().unwrap_or(default_502());
+        let answer_503 = conf.answer_503.clone().unwrap_or(default_503());
+        let answer_504 = conf.answer_504.clone().unwrap_or(default_504());
+        let answer_507 = conf.answer_507.clone().unwrap_or(default_507());
 
         Ok(HttpAnswers {
             listener_answers: ListenerAnswers {
-                answer_301: Template::new(301, ans_301, &[sozu_id, length, location])?,
+                answer_301: Template::new(301, answer_301, &[sozu_id, length, location])?,
                 answer_400: Template::new(400, answer_400, &[sozu_id, length, details])?,
                 answer_401: Template::new(401, answer_401, &[sozu_id, length])?,
                 answer_404: Template::new(404, answer_404, &[sozu_id, length])?,
@@ -549,13 +515,32 @@ impl HttpAnswers {
         })
     }
 
-    // TODO: rename to add_503_answer
     pub fn add_custom_answer(
         &mut self,
         cluster_id: &str,
         answer_503: String,
     ) -> Result<(), (u16, TemplateError)> {
-        let answer_503 = Template::new(503, answer_503.into(), &[])?;
+        // TODO: make those constants, or make a builder or something
+        let sozu_id = TemplateVariable {
+            name: "SOZU_ID",
+            valid_in_body: true,
+            valid_in_header: true,
+            typ: ReplacementType::Variable(0),
+        };
+        let length = TemplateVariable {
+            name: "CONTENT_LENGTH",
+            valid_in_body: false,
+            valid_in_header: true,
+            typ: ReplacementType::ContentLength,
+        };
+        let details = TemplateVariable {
+            name: "DETAILS",
+            valid_in_body: true,
+            valid_in_header: false,
+            typ: ReplacementType::VariableOnce(0),
+        };
+
+        let answer_503 = Template::new(503, answer_503, &[sozu_id, length, details])?;
         self.cluster_custom_answers
             .insert(cluster_id.to_string(), ClusterAnswers { answer_503 });
         Ok(())

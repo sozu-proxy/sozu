@@ -603,26 +603,9 @@ impl ListenerBuilder {
             active: false,
         })
     }
-
-    /*
-    TODO: remove this, and remove default 404 and 503 from the assets, we should rely on the lib for defaults
-    /// Get the 404 and 503 answers from the file system using the provided paths,
-    /// if none, defaults to HTML files in the sozu assets
-    fn get_404_503_answers(&self) -> Result<(String, String), ConfigError> {
-        let answer_404 = match &self.answer_404 {
-            Some(a_404_path) => read_file(a_404_path)?,
-            None => String::from(include_str!("../assets/404.html")),
-        };
-
-        let answer_503 = match &self.answer_503 {
-            Some(a_503_path) => read_file(a_503_path)?,
-            None => String::from(include_str!("../assets/503.html")),
-        };
-        Ok((answer_404, answer_503))
-    }
-    */
 }
 
+/// read a custom HTTP answer from a file
 fn read_http_answer_file(path: &Option<String>) -> Result<Option<String>, ConfigError> {
     match path {
         Some(path) => {
