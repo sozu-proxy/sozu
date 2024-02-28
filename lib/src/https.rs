@@ -54,7 +54,7 @@ use crate::{
     protocol::{
         h2::Http2,
         http::{
-            answers::{HttpAnswers, RawAnswers},
+            answers::HttpAnswers,
             parser::{hostname_and_port, Method},
             ResponseStream,
         },

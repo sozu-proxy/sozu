@@ -272,31 +272,9 @@ impl Template {
         }
     }
 }
-pub struct RawAnswers {
-    /// MovedPermanently
-    pub answer_301: Vec<u8>,
-    /// BadRequest
-    pub answer_400: Vec<u8>,
-    /// Unauthorized
-    pub answer_401: Vec<u8>,
-    /// NotFound
-    pub answer_404: Vec<u8>,
-    /// RequestTimeout
-    pub answer_408: Vec<u8>,
-    /// PayloadTooLarge
-    pub answer_413: Vec<u8>,
-    /// BadGateway
-    pub answer_502: Vec<u8>,
-    /// ServiceUnavailable
-    pub answer_503: Vec<u8>,
-    /// GatewayTimeout
-    pub answer_504: Vec<u8>,
-    /// InsufficientStorage
-    pub answer_507: Vec<u8>,
-}
 
-// TODO: rename for clarity. These are not default answers,
-pub struct DefaultAnswers {
+/// a set of templates for HTTP answers, meant for one listener to use
+pub struct ListenerAnswers {
     /// MovedPermanently
     pub answer_301: Template,
     /// BadRequest
@@ -319,16 +297,16 @@ pub struct DefaultAnswers {
     pub answer_507: Template,
 }
 
+/// templates for HTTP answers, set for one cluster
 #[allow(non_snake_case)]
-pub struct CustomAnswers {
+pub struct ClusterAnswers {
     /// ServiceUnavailable
     pub answer_503: Template,
 }
 
 pub struct HttpAnswers {
-    pub default: DefaultAnswers,
-    // TODO: rename to custom_503_answers, bring its type to HashMap<ClusterId, Template>
-    pub custom: HashMap<ClusterId, CustomAnswers>,
+    pub listener_answers: ListenerAnswers, // configurated answers
+    pub cluster_custom_answers: HashMap<ClusterId, ClusterAnswers>,
 }
 
 fn default_301() -> Vec<u8> {
@@ -543,7 +521,7 @@ impl HttpAnswers {
             .clone()
             .map(|a| a.into_bytes())
             .unwrap_or(default_503());
-        let answer_504: Vec<u8> = conf
+        let answer_504 = conf
             .answer_504
             .clone()
             .map(|a| a.into_bytes())
@@ -555,7 +533,7 @@ impl HttpAnswers {
             .unwrap_or(default_507());
 
         Ok(HttpAnswers {
-            default: DefaultAnswers {
+            listener_answers: ListenerAnswers {
                 answer_301: Template::new(301, ans_301, &[sozu_id, length, location])?,
                 answer_400: Template::new(400, answer_400, &[sozu_id, length, details])?,
                 answer_401: Template::new(401, answer_401, &[sozu_id, length])?,
@@ -567,7 +545,7 @@ impl HttpAnswers {
                 answer_504: Template::new(504, answer_504, &[sozu_id, length])?,
                 answer_507: Template::new(507, answer_507, &[sozu_id, length, details])?,
             },
-            custom: HashMap::new(),
+            cluster_custom_answers: HashMap::new(),
         })
     }
 
@@ -578,13 +556,13 @@ impl HttpAnswers {
         answer_503: String,
     ) -> Result<(), (u16, TemplateError)> {
         let answer_503 = Template::new(503, answer_503.into(), &[])?;
-        self.custom
-            .insert(cluster_id.to_string(), CustomAnswers { answer_503 });
+        self.cluster_custom_answers
+            .insert(cluster_id.to_string(), ClusterAnswers { answer_503 });
         Ok(())
     }
 
     pub fn remove_custom_answer(&mut self, cluster_id: &str) {
-        self.custom.remove(cluster_id);
+        self.cluster_custom_answers.remove(cluster_id);
     }
 
     pub fn get(
@@ -597,46 +575,46 @@ impl HttpAnswers {
         let template = match answer {
             DefaultAnswer::Answer301 { location } => {
                 variables_once = vec![location.into()];
-                &self.default.answer_301
+                &self.listener_answers.answer_301
             }
             DefaultAnswer::Answer400 { details } => {
                 variables_once = vec![details.into()];
-                &self.default.answer_400
+                &self.listener_answers.answer_400
             }
             DefaultAnswer::Answer401 {} => {
                 variables_once = vec![];
-                &self.default.answer_401
+                &self.listener_answers.answer_401
             }
             DefaultAnswer::Answer404 {} => {
                 variables_once = vec![];
-                &self.default.answer_404
+                &self.listener_answers.answer_404
             }
             DefaultAnswer::Answer408 {} => {
                 variables_once = vec![];
-                &self.default.answer_408
+                &self.listener_answers.answer_408
             }
             DefaultAnswer::Answer413 { details } => {
                 variables_once = vec![details.into()];
-                &self.default.answer_413
+                &self.listener_answers.answer_413
             }
             DefaultAnswer::Answer502 { details } => {
                 variables_once = vec![details.into()];
-                &self.default.answer_502
+                &self.listener_answers.answer_502
             }
             DefaultAnswer::Answer503 { details } => {
                 variables_once = vec![details.into()];
                 cluster_id
-                    .and_then(|id: &str| self.custom.get(id))
+                    .and_then(|id: &str| self.cluster_custom_answers.get(id))
                     .map(|c| &c.answer_503)
-                    .unwrap_or_else(|| &self.default.answer_503)
+                    .unwrap_or_else(|| &self.listener_answers.answer_503)
             }
             DefaultAnswer::Answer504 {} => {
                 variables_once = vec![];
-                &self.default.answer_504
+                &self.listener_answers.answer_504
             }
             DefaultAnswer::Answer507 { details } => {
                 variables_once = vec![details.into()];
-                &self.default.answer_507
+                &self.listener_answers.answer_507
             }
         };
         // kawa::debug_kawa(&template.kawa);
