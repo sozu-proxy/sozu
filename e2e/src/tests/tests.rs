@@ -9,15 +9,15 @@ use sozu_command_lib::{
     info,
     logging::setup_default_logging,
     proto::command::{
-        request::RequestType, ActivateListener, AddCertificate, CertificateAndKey, ListenerType,
-        RemoveBackend, RequestHttpFrontend, SocketAddress,
+        request::RequestType, ActivateListener, AddCertificate, CertificateAndKey, Cluster,
+        ListenerType, RemoveBackend, RequestHttpFrontend, SocketAddress,
     },
     scm_socket::Listeners,
     state::ConfigState,
 };
 
 use crate::{
-    http_utils::{immutable_404_answer, fixed_503_answer, http_ok_response, http_request},
+    http_utils::{http_ok_response, http_request, immutable_answer},
     mock::{
         aggregator::SimpleAggregator,
         async_backend::BackendHandle as AsyncBackend,
@@ -306,7 +306,6 @@ pub fn try_issue_810_panic(part2: bool) -> State {
     }));
     worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
         "cluster_0",
-        false,
     )));
     worker.send_proxy_request_type(RequestType::AddTcpFrontend(Worker::default_tcp_frontend(
         "cluster_0",
@@ -376,7 +375,6 @@ pub fn try_tls_endpoint() -> State {
 
     worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
         "cluster_0",
-        false,
     )));
 
     let hostname = "localhost".to_string();
@@ -640,11 +638,14 @@ fn try_http_behaviors() -> State {
     let (config, listeners, state) = Worker::empty_config();
     let mut worker = Worker::start_new_worker("BEHAVE-WORKER", config, &listeners, state);
 
-    worker.send_proxy_request_type(RequestType::AddHttpListener(
-        ListenerBuilder::new_http(front_address.into())
-            .to_http(None)
-            .unwrap(),
-    ));
+    let mut http_config = ListenerBuilder::new_http(front_address.into())
+        .to_http(None)
+        .unwrap();
+    http_config.http_answers.answer_400 = Some(immutable_answer(400));
+    http_config.http_answers.answer_404 = Some(immutable_answer(404));
+    http_config.http_answers.answer_502 = Some(immutable_answer(502));
+    http_config.http_answers.answer_503 = Some(immutable_answer(503));
+    worker.send_proxy_request_type(RequestType::AddHttpListener(http_config));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
         address: front_address.into(),
         proxy: ListenerType::Http.into(),
@@ -664,7 +665,7 @@ fn try_http_behaviors() -> State {
 
     let response = client.receive();
     println!("response: {response:?}");
-    assert_eq!(response, Some(immutable_404_answer()));
+    assert_eq!(response, Some(immutable_answer(404)));
     assert_eq!(client.receive(), None);
 
     worker.send_proxy_request_type(RequestType::AddHttpFrontend(RequestHttpFrontend {
@@ -679,7 +680,7 @@ fn try_http_behaviors() -> State {
 
     let response = client.receive();
     println!("response: {response:?}");
-    assert_eq!(response, Some(fixed_503_answer()));
+    assert_eq!(response, Some(immutable_answer(503)));
     assert_eq!(client.receive(), None);
 
     let back_address = create_local_address();
@@ -697,12 +698,9 @@ fn try_http_behaviors() -> State {
     client.connect();
     client.send();
 
-    let expected_response = String::from(
-        "HTTP/1.1 400 Bad Request\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
-    );
     let response = client.receive();
     println!("response: {response:?}");
-    assert_eq!(response, Some(expected_response));
+    assert_eq!(response, Some(immutable_answer(400)));
     assert_eq!(client.receive(), None);
 
     let mut backend = SyncBackend::new("backend", back_address, "TEST\r\n\r\n");
@@ -716,13 +714,10 @@ fn try_http_behaviors() -> State {
     let request = backend.receive(0);
     backend.send(0);
 
-    let expected_response = String::from(
-        "HTTP/1.1 502 Bad Gateway\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
-    );
     let response = client.receive();
     println!("request: {request:?}");
     println!("response: {response:?}");
-    assert_eq!(response, Some(expected_response));
+    assert_eq!(response, Some(immutable_answer(502)));
     assert_eq!(client.receive(), None);
 
     info!("expecting 200");
@@ -785,7 +780,7 @@ fn try_http_behaviors() -> State {
     let response = client.receive();
     println!("request: {request:?}");
     println!("response: {response:?}");
-    assert_eq!(response, Some(fixed_503_answer()));
+    assert_eq!(response, Some(immutable_answer(503)));
     assert_eq!(client.receive(), None);
 
     worker.send_proxy_request_type(RequestType::RemoveBackend(RemoveBackend {
@@ -936,6 +931,53 @@ fn try_http_behaviors() -> State {
     worker.wait_for_server_stop();
 
     info!("good bye");
+    State::Success
+}
+
+fn try_https_redirect() -> State {
+    let front_address: SocketAddr = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_config();
+    let mut worker = Worker::start_new_worker("BEHAVE-WORKER", config, &listeners, state);
+
+    let mut http_config = ListenerBuilder::new_http(front_address.into())
+        .to_http(None)
+        .unwrap();
+    let answer_301_prefix = "HTTP/1.1 301 Moved Permanently\r\nLocation: ";
+    http_config.http_answers.answer_301 =
+        Some(format!("{answer_301_prefix}%REDIRECT_LOCATION\r\n\r\n"));
+    worker.send_proxy_request_type(RequestType::AddHttpListener(http_config));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        address: front_address.into(),
+        proxy: ListenerType::Http.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request(
+        RequestType::AddCluster(Cluster {
+            https_redirect: true,
+            ..Worker::default_cluster("cluster_0")
+        })
+        .into(),
+    );
+    worker.send_proxy_request_type(RequestType::AddHttpFrontend(RequestHttpFrontend {
+        hostname: String::from("example.com"),
+        ..Worker::default_http_frontend("cluster_0", front_address)
+    }));
+
+    worker.read_to_last();
+
+    let mut client = Client::new(
+        "client",
+        front_address,
+        http_request("GET", "/redirected?true", "", "example.com"),
+    );
+
+    client.connect();
+    client.send();
+    let answer = client.receive();
+    let expected_answer = format!("{answer_301_prefix}https://example.com/redirected?true\r\n\r\n");
+    assert_eq!(answer, Some(expected_answer));
+
     State::Success
 }
 
@@ -1477,12 +1519,8 @@ fn try_wildcard() -> State {
         .into(),
     );
 
-    worker.send_proxy_request(
-        RequestType::AddCluster(Worker::default_cluster("cluster_0", false)).into(),
-    );
-    worker.send_proxy_request(
-        RequestType::AddCluster(Worker::default_cluster("cluster_1", false)).into(),
-    );
+    worker.send_proxy_request(RequestType::AddCluster(Worker::default_cluster("cluster_0")).into());
+    worker.send_proxy_request(RequestType::AddCluster(Worker::default_cluster("cluster_1")).into());
 
     worker.send_proxy_request(
         RequestType::AddHttpFrontend(RequestHttpFrontend {
@@ -1694,6 +1732,14 @@ fn test_tls_endpoint() {
 fn test_http_behaviors() {
     assert_eq!(
         repeat_until_error_or(10, "HTTP stack", try_http_behaviors),
+        State::Success
+    );
+}
+
+#[test]
+fn test_https_redirect() {
+    assert_eq!(
+        repeat_until_error_or(2, "HTTPS redirection", try_https_redirect),
         State::Success
     );
 }
