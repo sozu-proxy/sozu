@@ -1,0 +1,11 @@
+HTTP/1.1 503 Service Unavailable
+Cache-Control: no-cache
+Connection: close
+%Content-Length: %CONTENT_LENGTH
+Sozu-Id: %SOZU_ID
+
+<h1>MyCluster: 503 Service Unavailable</h1>
+<p>No server seems to be alive, could not redirect request %SOZU_ID.</p>
+<pre>
+%DETAILS
+<pre>
