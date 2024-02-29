@@ -69,7 +69,7 @@ pub struct Template {
     kawa: DefaultAnswerStream,
     body_replacements: Vec<Replacement>,
     header_replacements: Vec<Replacement>,
-    // Size of body without any variables
+    /// Size of body without any variables
     body_size: usize,
 }
 
@@ -85,24 +85,16 @@ impl fmt::Debug for Template {
 
 impl Template {
     /// sanitize the template: transform newlines \r (CR) to \r\n (CRLF)
-    pub fn new(
+    fn new(
         status: u16,
         answer: String,
         variables: &[TemplateVariable],
-    ) -> Result<Self, (u16, TemplateError)> {
+    ) -> Result<Self, TemplateError> {
         let answer = answer
             .replace("\r\n", "\n")
             .replace("\n", "\r\n")
             .into_bytes();
 
-        Self::_new(status, answer, variables).map_err(|e| (status, e))
-    }
-
-    fn _new(
-        status: u16,
-        answer: Vec<u8>,
-        variables: &[TemplateVariable],
-    ) -> Result<Self, TemplateError> {
         let len = answer.len();
         let mut kawa = Kawa::new(Kind::Response, Buffer::new(SharedBuffer(Rc::from(answer))));
         kawa.storage.end = len;
@@ -462,7 +454,7 @@ Kawa cursors: %DETAILS
 }
 
 impl HttpAnswers {
-    pub fn new(conf: &CustomHttpAnswers) -> Result<Self, (u16, TemplateError)> {
+    pub fn template(status: u16, answer: String) -> Result<Template, (u16, TemplateError)> {
         let sozu_id = TemplateVariable {
             name: "SOZU_ID",
             valid_in_body: true,
@@ -487,29 +479,35 @@ impl HttpAnswers {
             valid_in_header: true,
             typ: ReplacementType::VariableOnce(0),
         };
-        let answer_301 = conf.answer_301.clone().unwrap_or(default_301());
-        let answer_400 = conf.answer_400.clone().unwrap_or(default_400());
-        let answer_401 = conf.answer_401.clone().unwrap_or(default_401());
-        let answer_404 = conf.answer_404.clone().unwrap_or(default_404());
-        let answer_408 = conf.answer_408.clone().unwrap_or(default_408());
-        let answer_413 = conf.answer_413.clone().unwrap_or(default_413());
-        let answer_502 = conf.answer_502.clone().unwrap_or(default_502());
-        let answer_503 = conf.answer_503.clone().unwrap_or(default_503());
-        let answer_504 = conf.answer_504.clone().unwrap_or(default_504());
-        let answer_507 = conf.answer_507.clone().unwrap_or(default_507());
+        match status {
+            301 => Template::new(301, answer, &[sozu_id, length, location]),
+            400 => Template::new(400, answer, &[sozu_id, length, details]),
+            401 => Template::new(401, answer, &[sozu_id, length]),
+            404 => Template::new(404, answer, &[sozu_id, length]),
+            408 => Template::new(408, answer, &[sozu_id, length]),
+            413 => Template::new(413, answer, &[sozu_id, length, details]),
+            502 => Template::new(502, answer, &[sozu_id, length, details]),
+            503 => Template::new(503, answer, &[sozu_id, length, details]),
+            504 => Template::new(504, answer, &[sozu_id, length]),
+            507 => Template::new(507, answer, &[sozu_id, length, details]),
+            _ => Err(TemplateError::InvalidStatusCode(status)),
+        }
+        .map_err(|e| (status, e))
+    }
 
+    pub fn new(conf: &CustomHttpAnswers) -> Result<Self, (u16, TemplateError)> {
         Ok(HttpAnswers {
             listener_answers: ListenerAnswers {
-                answer_301: Template::new(301, answer_301, &[sozu_id, length, location])?,
-                answer_400: Template::new(400, answer_400, &[sozu_id, length, details])?,
-                answer_401: Template::new(401, answer_401, &[sozu_id, length])?,
-                answer_404: Template::new(404, answer_404, &[sozu_id, length])?,
-                answer_408: Template::new(408, answer_408, &[sozu_id, length])?,
-                answer_413: Template::new(413, answer_413, &[sozu_id, length, details])?,
-                answer_502: Template::new(502, answer_502, &[sozu_id, length, details])?,
-                answer_503: Template::new(503, answer_503, &[sozu_id, length, details])?,
-                answer_504: Template::new(504, answer_504, &[sozu_id, length])?,
-                answer_507: Template::new(507, answer_507, &[sozu_id, length, details])?,
+                answer_301: Self::template(301, conf.answer_301.clone().unwrap_or(default_301()))?,
+                answer_400: Self::template(400, conf.answer_400.clone().unwrap_or(default_400()))?,
+                answer_401: Self::template(401, conf.answer_401.clone().unwrap_or(default_401()))?,
+                answer_404: Self::template(404, conf.answer_404.clone().unwrap_or(default_404()))?,
+                answer_408: Self::template(408, conf.answer_408.clone().unwrap_or(default_408()))?,
+                answer_413: Self::template(413, conf.answer_413.clone().unwrap_or(default_413()))?,
+                answer_502: Self::template(502, conf.answer_502.clone().unwrap_or(default_502()))?,
+                answer_503: Self::template(503, conf.answer_503.clone().unwrap_or(default_503()))?,
+                answer_504: Self::template(504, conf.answer_504.clone().unwrap_or(default_504()))?,
+                answer_507: Self::template(507, conf.answer_507.clone().unwrap_or(default_507()))?,
             },
             cluster_custom_answers: HashMap::new(),
         })
@@ -520,27 +518,7 @@ impl HttpAnswers {
         cluster_id: &str,
         answer_503: String,
     ) -> Result<(), (u16, TemplateError)> {
-        // TODO: make those constants, or make a builder or something
-        let sozu_id = TemplateVariable {
-            name: "SOZU_ID",
-            valid_in_body: true,
-            valid_in_header: true,
-            typ: ReplacementType::Variable(0),
-        };
-        let length = TemplateVariable {
-            name: "CONTENT_LENGTH",
-            valid_in_body: false,
-            valid_in_header: true,
-            typ: ReplacementType::ContentLength,
-        };
-        let details = TemplateVariable {
-            name: "DETAILS",
-            valid_in_body: true,
-            valid_in_header: false,
-            typ: ReplacementType::VariableOnce(0),
-        };
-
-        let answer_503 = Template::new(503, answer_503, &[sozu_id, length, details])?;
+        let answer_503 = Self::template(503, answer_503)?;
         self.cluster_custom_answers
             .insert(cluster_id.to_string(), ClusterAnswers { answer_503 });
         Ok(())
