@@ -257,10 +257,10 @@ impl Worker {
         result
     }
 
-    pub fn default_cluster<S: Into<String>>(cluster_id: S, sticky_session: bool) -> Cluster {
+    pub fn default_cluster<S: Into<String>>(cluster_id: S) -> Cluster {
         Cluster {
             cluster_id: cluster_id.into(),
-            sticky_session,
+            sticky_session: false,
             https_redirect: false,
             ..Default::default()
         }

@@ -1168,8 +1168,8 @@ impl ConfigState {
     /// Gives details about a given cluster.
     /// Types like `HttpFrontend` are converted into protobuf ones, like `RequestHttpFrontend`
     pub fn cluster_state(&self, cluster_id: &str) -> Option<ClusterInformation> {
-        let configuration = self.clusters.get(cluster_id).cloned();
-        configuration.as_ref()?;
+        let configuration = self.clusters.get(cluster_id).cloned()?;
+        info!("{:#?}", configuration);
 
         let http_frontends: Vec<RequestHttpFrontend> = self
             .http_fronts
@@ -1204,7 +1204,7 @@ impl ConfigState {
             .collect();
 
         Some(ClusterInformation {
-            configuration,
+            configuration: Some(configuration),
             http_frontends,
             https_frontends,
             tcp_frontends,

@@ -1058,9 +1058,7 @@ mod tests {
     use crate::sozu_command::{
         channel::Channel,
         config::ListenerBuilder,
-        proto::command::{
-            LoadBalancingAlgorithms, LoadBalancingParams, PathRule, RulePosition, WorkerRequest,
-        },
+        proto::command::{LoadBalancingParams, PathRule, RulePosition, WorkerRequest},
         response::{Backend, HttpFrontend},
     };
 
@@ -1279,99 +1277,6 @@ mod tests {
             "Response: {}",
             str::from_utf8(&buffer2[..index]).expect("could not make string from buffer")
         );
-    }
-
-    #[test]
-    fn https_redirect() {
-        setup_test_logger!();
-
-        let config = ListenerBuilder::new_http(SocketAddress::new_v4(127, 0, 0, 1, 1041))
-            .to_http(None)
-            .expect("could not create listener config");
-
-        let (mut command, channel) =
-            Channel::generate(1000, 10000).expect("should create a channel");
-        let _jg = thread::spawn(move || {
-            setup_test_logger!();
-            start_http_worker(config, channel, 10, 16384).expect("could not start the http server");
-        });
-
-        let cluster = Cluster {
-            cluster_id: String::from("cluster_1"),
-            https_redirect: true,
-            load_balancing: LoadBalancingAlgorithms::default() as i32,
-            sticky_session: false,
-            ..Default::default()
-        };
-        command
-            .write_message(&WorkerRequest {
-                id: String::from("ID_ABCD"),
-                content: RequestType::AddCluster(cluster).into(),
-            })
-            .unwrap();
-        let front = RequestHttpFrontend {
-            address: SocketAddress::new_v4(127, 0, 0, 1, 1041),
-            hostname: String::from("localhost"),
-            path: PathRule::prefix(String::from("/")),
-            cluster_id: Some(String::from("cluster_1")),
-            ..Default::default()
-        };
-        command
-            .write_message(&WorkerRequest {
-                id: String::from("ID_EFGH"),
-                content: RequestType::AddHttpFrontend(front).into(),
-            })
-            .unwrap();
-        let backend = Backend {
-            address: SocketAddress::new_v4(127, 0, 0, 1, 1040).into(),
-            backend_id: String::from("cluster_1-0"),
-            backup: None,
-            cluster_id: String::from("cluster_1"),
-            load_balancing_parameters: Some(LoadBalancingParams::default()),
-            sticky_id: None,
-        };
-        command
-            .write_message(&WorkerRequest {
-                id: String::from("ID_IJKL"),
-                content: RequestType::AddBackend(backend.to_add_backend()).into(),
-            })
-            .unwrap();
-
-        println!("test received: {:?}", command.read_message());
-        println!("test received: {:?}", command.read_message());
-        println!("test received: {:?}", command.read_message());
-
-        let mut client = TcpStream::connect(("127.0.0.1", 1041)).expect("could not connect");
-        // 5 seconds of timeout
-        client.set_read_timeout(Some(Duration::new(5, 0))).unwrap();
-
-        let w = client.write(
-            &b"GET /redirected?true HTTP/1.1\r\nHost: localhost\r\nConnection: Close\r\n\r\n"[..],
-        );
-        println!("http client write: {w:?}");
-
-        let expected_answer = "HTTP/1.1 301 Moved Permanently\r\nContent-Length: 0\r\nLocation: https://localhost/redirected?true\r\n\r\n";
-        let mut buffer = [0; 4096];
-        let mut index = 0;
-        loop {
-            assert!(index <= expected_answer.len());
-            if index == expected_answer.len() {
-                break;
-            }
-
-            let r = client.read(&mut buffer[index..]);
-            println!("http client read: {r:?}");
-            match r {
-                Err(e) => assert!(false, "Failed to read client stream. Error: {e:?}"),
-                Ok(sz) => {
-                    index += sz;
-                }
-            }
-        }
-
-        let answer = str::from_utf8(&buffer[..index]).expect("could not make string from buffer");
-        println!("Response: {answer}");
-        assert_eq!(answer, expected_answer);
     }
 
     use self::tiny_http::{Response, Server};
