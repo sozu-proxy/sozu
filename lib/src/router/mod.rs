@@ -219,7 +219,7 @@ impl Router {
                 //FIXME: necessary ti build on stable rust (1.35), can be removed once 1.36 is there
                 let mut empty = true;
                 if let Some((_, ref mut paths)) =
-                    self.tree.domain_lookup_mut(hostname.as_bytes(), false)
+                    self.tree.lookup_mut(hostname.as_bytes(), false)
                 {
                     empty = false;
                     if !paths.iter().any(|(p, m, _)| p == path && m == method) {
@@ -229,7 +229,7 @@ impl Router {
                 }
 
                 if empty {
-                    self.tree.domain_insert(
+                    self.tree.insert(
                         hostname.into_bytes(),
                         vec![(path.to_owned(), method.to_owned(), cluster.to_owned())],
                     );
@@ -257,7 +257,7 @@ impl Router {
         match ::idna::domain_to_ascii(hostname) {
             Ok(hostname) => {
                 let should_delete = {
-                    let paths_opt = self.tree.domain_lookup_mut(hostname.as_bytes(), false);
+                    let paths_opt = self.tree.lookup_mut(hostname.as_bytes(), false);
 
                     if let Some((_, paths)) = paths_opt {
                         paths.retain(|(p, m, _)| p != path || m != method);
@@ -270,7 +270,7 @@ impl Router {
                 };
 
                 if should_delete {
-                    self.tree.domain_remove(&hostname.into_bytes());
+                    self.tree.remove(&hostname.into_bytes());
                 }
 
                 true

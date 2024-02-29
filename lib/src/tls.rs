@@ -217,7 +217,7 @@ impl CertificateResolver {
                 if let Some(fingerprints) = self.name_fingerprint_idx.get_mut(&name) {
                     fingerprints.remove(fingerprint);
 
-                    self.domains.domain_remove(&name.clone().into_bytes());
+                    self.domains.remove(&name.clone().into_bytes());
 
                     if let Some(fingerprint) = fingerprints.iter().next() {
                         self.domains
@@ -336,7 +336,7 @@ impl CertificateResolver {
         domain: &[u8],
         accept_wildcard: bool,
     ) -> Option<&KeyValue<Key, Fingerprint>> {
-        self.domains.domain_lookup(domain, accept_wildcard)
+        self.domains.lookup(domain, accept_wildcard)
     }
 }
 
@@ -364,7 +364,7 @@ impl ResolvesServerCert for MutexCertificateResolver {
         );
         if let Ok(ref mut resolver) = self.0.try_lock() {
             //resolver.domains.print();
-            if let Some((_, fingerprint)) = resolver.domains.domain_lookup(name.as_bytes(), true) {
+            if let Some((_, fingerprint)) = resolver.domains.lookup(name.as_bytes(), true) {
                 trace!(
                     "looking for certificate for {:?} with fingerprint {:?}",
                     name,

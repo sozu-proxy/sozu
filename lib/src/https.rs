@@ -1636,27 +1636,27 @@ mod tests {
     fn wildcard_certificate_names() {
         let mut trie = TrieNode::root();
 
-        trie.domain_insert("*.services.clever-cloud.com".as_bytes().to_vec(), 1u8);
-        trie.domain_insert("*.clever-cloud.com".as_bytes().to_vec(), 2u8);
-        trie.domain_insert("services.clever-cloud.com".as_bytes().to_vec(), 0u8);
-        trie.domain_insert(
+        trie.insert("*.services.clever-cloud.com".as_bytes().to_vec(), 1u8);
+        trie.insert("*.clever-cloud.com".as_bytes().to_vec(), 2u8);
+        trie.insert("services.clever-cloud.com".as_bytes().to_vec(), 0u8);
+        trie.insert(
             "abprefix.services.clever-cloud.com".as_bytes().to_vec(),
             3u8,
         );
-        trie.domain_insert(
+        trie.insert(
             "cdprefix.services.clever-cloud.com".as_bytes().to_vec(),
             4u8,
         );
 
-        let res = trie.domain_lookup(b"test.services.clever-cloud.com", true);
+        let res = trie.lookup(b"test.services.clever-cloud.com", true);
         println!("query result: {res:?}");
 
         assert_eq!(
-            trie.domain_lookup(b"pgstudio.services.clever-cloud.com", true),
+            trie.lookup(b"pgstudio.services.clever-cloud.com", true),
             Some(&("*.services.clever-cloud.com".as_bytes().to_vec(), 1u8))
         );
         assert_eq!(
-            trie.domain_lookup(b"test-prefix.services.clever-cloud.com", true),
+            trie.lookup(b"test-prefix.services.clever-cloud.com", true),
             Some(&("*.services.clever-cloud.com".as_bytes().to_vec(), 1u8))
         );
     }
@@ -1665,36 +1665,36 @@ mod tests {
     fn wildcard_with_subdomains() {
         let mut trie = TrieNode::root();
 
-        trie.domain_insert("*.test.example.com".as_bytes().to_vec(), 1u8);
-        trie.domain_insert("hello.sub.test.example.com".as_bytes().to_vec(), 2u8);
+        trie.insert("*.test.example.com".as_bytes().to_vec(), 1u8);
+        trie.insert("hello.sub.test.example.com".as_bytes().to_vec(), 2u8);
 
-        let res = trie.domain_lookup(b"sub.test.example.com", true);
+        let res = trie.lookup(b"sub.test.example.com", true);
         println!("query result: {res:?}");
 
         assert_eq!(
-            trie.domain_lookup(b"sub.test.example.com", true),
+            trie.lookup(b"sub.test.example.com", true),
             Some(&("*.test.example.com".as_bytes().to_vec(), 1u8))
         );
         assert_eq!(
-            trie.domain_lookup(b"hello.sub.test.example.com", true),
+            trie.lookup(b"hello.sub.test.example.com", true),
             Some(&("hello.sub.test.example.com".as_bytes().to_vec(), 2u8))
         );
 
         // now try in a different order
         let mut trie = TrieNode::root();
 
-        trie.domain_insert("hello.sub.test.example.com".as_bytes().to_vec(), 2u8);
-        trie.domain_insert("*.test.example.com".as_bytes().to_vec(), 1u8);
+        trie.insert("hello.sub.test.example.com".as_bytes().to_vec(), 2u8);
+        trie.insert("*.test.example.com".as_bytes().to_vec(), 1u8);
 
-        let res = trie.domain_lookup(b"sub.test.example.com", true);
+        let res = trie.lookup(b"sub.test.example.com", true);
         println!("query result: {res:?}");
 
         assert_eq!(
-            trie.domain_lookup(b"sub.test.example.com", true),
+            trie.lookup(b"sub.test.example.com", true),
             Some(&("*.test.example.com".as_bytes().to_vec(), 1u8))
         );
         assert_eq!(
-            trie.domain_lookup(b"hello.sub.test.example.com", true),
+            trie.lookup(b"hello.sub.test.example.com", true),
             Some(&("hello.sub.test.example.com".as_bytes().to_vec(), 2u8))
         );
     }

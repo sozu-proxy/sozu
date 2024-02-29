@@ -3,6 +3,7 @@ use std::{collections::HashMap, fmt::Debug, iter, str};
 use regex::bytes::Regex;
 
 pub type Key = Vec<u8>;
+pub type KeyRef<'a> = &'a [u8];
 pub type KeyValue<K, V> = (K, V);
 
 #[derive(Debug, PartialEq, Eq)]
@@ -18,12 +19,12 @@ pub enum RemoveResult {
     NotFound,
 }
 
-fn find_last_dot(input: &[u8]) -> Option<usize> {
+pub fn find_last_dot(input: &[u8]) -> Option<usize> {
     //println!("find_last_dot: input = {}", from_utf8(input).unwrap());
     (0..input.len()).rev().find(|&i| input[i] == b'.')
 }
 
-fn find_last_slash(input: &[u8]) -> Option<usize> {
+pub fn find_last_slash(input: &[u8]) -> Option<usize> {
     //println!("find_last_dot: input = {}", from_utf8(input).unwrap());
     (0..input.len()).rev().find(|&i| input[i] == b'/')
 }
@@ -107,14 +108,12 @@ impl<V: Debug + Clone> TrieNode<V> {
         insert_result
     }
 
-    pub fn insert_recursive(&mut self, partial_key: &[u8], key: &Key, value: V) -> InsertResult {
+    pub fn insert_recursive(&mut self, partial_key: KeyRef, key: KeyRef, value: V) -> InsertResult {
         //println!("insert_rec: key == {}", std::str::from_utf8(partial_key).unwrap());
         assert_ne!(partial_key, &b""[..]);
 
         if partial_key[partial_key.len() - 1] == b'/' {
-            let pos = find_last_slash(&partial_key[..partial_key.len() - 1]);
-
-            if let Some(pos) = pos {
+            if let Some(pos) = find_last_slash(&partial_key[..partial_key.len() - 1]) {
                 if pos > 0 && partial_key[pos - 1] != b'.' {
                     return InsertResult::Failed;
                 }
@@ -150,8 +149,7 @@ impl<V: Debug + Clone> TrieNode<V> {
             return InsertResult::Failed;
         }
 
-        let pos = find_last_dot(partial_key);
-        match pos {
+        match find_last_dot(partial_key) {
             None => {
                 if self.children.contains_key(partial_key) {
                     InsertResult::Existing
@@ -185,11 +183,11 @@ impl<V: Debug + Clone> TrieNode<V> {
         }
     }
 
-    pub fn remove(&mut self, key: &Key) -> RemoveResult {
+    pub fn remove(&mut self, key: KeyRef) -> RemoveResult {
         self.remove_recursive(key)
     }
 
-    pub fn remove_recursive(&mut self, partial_key: &[u8]) -> RemoveResult {
+    pub fn remove_recursive(&mut self, partial_key: KeyRef) -> RemoveResult {
         //println!("remove: key == {}", std::str::from_utf8(partial_key).unwrap());
 
         if partial_key.is_empty() {
@@ -211,9 +209,7 @@ impl<V: Debug + Clone> TrieNode<V> {
         }
 
         if partial_key[partial_key.len() - 1] == b'/' {
-            let pos = find_last_slash(&partial_key[..partial_key.len() - 1]);
-
-            if let Some(pos) = pos {
+            if let Some(pos) = find_last_slash(&partial_key[..partial_key.len() - 1]) {
                 if pos > 0 && partial_key[pos - 1] != b'.' {
                     return RemoveResult::NotFound;
                 }
@@ -242,8 +238,7 @@ impl<V: Debug + Clone> TrieNode<V> {
             return RemoveResult::NotFound;
         }
 
-        let pos = find_last_dot(partial_key);
-        let (prefix, suffix) = match pos {
+        let (prefix, suffix) = match find_last_dot(partial_key) {
             None => (&b""[..], partial_key),
             Some(pos) => (&partial_key[..pos], &partial_key[pos..]),
         };
@@ -263,15 +258,14 @@ impl<V: Debug + Clone> TrieNode<V> {
         }
     }
 
-    pub fn lookup(&self, partial_key: &[u8], accept_wildcard: bool) -> Option<&KeyValue<Key, V>> {
+    pub fn lookup(&self, partial_key: KeyRef, accept_wildcard: bool) -> Option<&KeyValue<Key, V>> {
         //println!("lookup: key == {}", std::str::from_utf8(partial_key).unwrap());
 
         if partial_key.is_empty() {
             return self.key_value.as_ref();
         }
 
-        let pos = find_last_dot(partial_key);
-        let (prefix, suffix) = match pos {
+        let (prefix, suffix) = match find_last_dot(partial_key) {
             None => (&b""[..], partial_key),
             Some(pos) => (&partial_key[..pos], &partial_key[pos..]),
         };
@@ -286,8 +280,6 @@ impl<V: Debug + Clone> TrieNode<V> {
                     //println!("no dot, wildcard applies");
                     self.wildcard.as_ref()
                 } else {
-                    //println!("there's still a subdomain, wildcard does not apply");
-
                     for (ref regexp, ref child) in self.regexps.iter() {
                         let suffix = if suffix[0] == b'.' {
                             &suffix[1..]
@@ -310,7 +302,7 @@ impl<V: Debug + Clone> TrieNode<V> {
 
     pub fn lookup_mut(
         &mut self,
-        partial_key: &[u8],
+        partial_key: KeyRef,
         accept_wildcard: bool,
     ) -> Option<&mut KeyValue<Key, V>> {
         //println!("lookup: key == {}", std::str::from_utf8(partial_key).unwrap());
@@ -324,9 +316,7 @@ impl<V: Debug + Clone> TrieNode<V> {
         }
 
         if partial_key[partial_key.len() - 1] == b'/' {
-            let pos = find_last_slash(&partial_key[..partial_key.len() - 1]);
-
-            if let Some(pos) = pos {
+            if let Some(pos) = find_last_slash(&partial_key[..partial_key.len() - 1]) {
                 if pos > 0 && partial_key[pos - 1] != b'.' {
                     return None;
                 }
@@ -343,8 +333,7 @@ impl<V: Debug + Clone> TrieNode<V> {
             return None;
         }
 
-        let pos = find_last_dot(partial_key);
-        let (prefix, suffix) = match pos {
+        let (prefix, suffix) = match find_last_dot(partial_key) {
             None => (&b""[..], partial_key),
             Some(pos) => (&partial_key[..pos], &partial_key[pos..]),
         };
@@ -385,7 +374,7 @@ impl<V: Debug + Clone> TrieNode<V> {
         self.print_recursive(b"", 0)
     }
 
-    pub fn print_recursive(&self, partial_key: &[u8], indent: u8) {
+    pub fn print_recursive(&self, partial_key: KeyRef, indent: u8) {
         let raw_prefix: Vec<u8> = iter::repeat(b' ').take(2 * indent as usize).collect();
         let prefix = str::from_utf8(&raw_prefix).unwrap();
 
@@ -410,26 +399,6 @@ impl<V: Debug + Clone> TrieNode<V> {
             //print!("{}{}:", prefix, regexp.as_str());
             child.print_recursive(regexp.as_str().as_bytes(), indent + 1);
         }
-    }
-
-    pub fn domain_insert(&mut self, key: Key, value: V) -> InsertResult {
-        self.insert(key, value)
-    }
-
-    pub fn domain_remove(&mut self, key: &Key) -> RemoveResult {
-        self.remove(key)
-    }
-
-    pub fn domain_lookup(&self, key: &[u8], accept_wildcard: bool) -> Option<&KeyValue<Key, V>> {
-        self.lookup(key, accept_wildcard)
-    }
-
-    pub fn domain_lookup_mut(
-        &mut self,
-        key: &[u8],
-        accept_wildcard: bool,
-    ) -> Option<&mut KeyValue<Key, V>> {
-        self.lookup_mut(key, accept_wildcard)
     }
 
     pub fn size(&self) -> usize {
@@ -473,24 +442,15 @@ mod tests {
         let mut root: TrieNode<u8> = TrieNode::root();
         root.print();
 
-        assert_eq!(
-            root.domain_insert(Vec::from(&b"abcd"[..]), 1),
-            InsertResult::Ok
-        );
+        assert_eq!(root.insert(Vec::from(&b"abcd"[..]), 1), InsertResult::Ok);
         root.print();
-        assert_eq!(
-            root.domain_insert(Vec::from(&b"abce"[..]), 2),
-            InsertResult::Ok
-        );
+        assert_eq!(root.insert(Vec::from(&b"abce"[..]), 2), InsertResult::Ok);
         root.print();
-        assert_eq!(
-            root.domain_insert(Vec::from(&b"abgh"[..]), 3),
-            InsertResult::Ok
-        );
+        assert_eq!(root.insert(Vec::from(&b"abgh"[..]), 3), InsertResult::Ok);
         root.print();
 
         assert_eq!(
-            root.domain_lookup(&b"abce"[..], true),
+            root.lookup(&b"abce"[..], true),
             Some(&(b"abce"[..].to_vec(), 2))
         );
         //assert!(false);
@@ -556,22 +516,19 @@ mod tests {
         );
         root.print();
         assert_eq!(
-            root.domain_lookup(&b"www.sozu.com".to_vec(), false),
+            root.lookup(&b"www.sozu.com".to_vec(), false),
             Some(&(b"www./.*/.com".to_vec(), 1))
         );
         assert_eq!(
-            root.domain_lookup(&b"www.doc.sozu.com".to_vec(), false),
+            root.lookup(&b"www.doc.sozu.com".to_vec(), false),
             Some(&(b"www.doc./.*/.com".to_vec(), 2))
         );
 
-        assert_eq!(
-            root.domain_remove(&b"www./.*/.com".to_vec()),
-            RemoveResult::Ok
-        );
+        assert_eq!(root.remove(&b"www./.*/.com".to_vec()), RemoveResult::Ok);
         root.print();
-        assert_eq!(root.domain_lookup(&b"www.sozu.com".to_vec(), false), None);
+        assert_eq!(root.lookup(&b"www.sozu.com".to_vec(), false), None);
         assert_eq!(
-            root.domain_lookup(&b"www.doc.sozu.com".to_vec(), false),
+            root.lookup(&b"www.doc.sozu.com".to_vec(), false),
             Some(&(b"www.doc./.*/.com".to_vec(), 2))
         );
     }
@@ -630,132 +587,123 @@ mod tests {
         root.print();
 
         assert_eq!(
-            root.domain_insert(Vec::from(&b"www.example.com"[..]), 1),
+            root.insert(Vec::from(&b"www.example.com"[..]), 1),
             InsertResult::Ok
         );
         root.print();
         assert_eq!(
-            root.domain_insert(Vec::from(&b"test.example.com"[..]), 2),
+            root.insert(Vec::from(&b"test.example.com"[..]), 2),
             InsertResult::Ok
         );
         root.print();
         assert_eq!(
-            root.domain_insert(Vec::from(&b"*.alldomains.org"[..]), 3),
+            root.insert(Vec::from(&b"*.alldomains.org"[..]), 3),
             InsertResult::Ok
         );
         root.print();
         assert_eq!(
-            root.domain_insert(Vec::from(&b"alldomains.org"[..]), 4),
+            root.insert(Vec::from(&b"alldomains.org"[..]), 4),
             InsertResult::Ok
         );
         assert_eq!(
-            root.domain_insert(Vec::from(&b"pouet.alldomains.org"[..]), 5),
-            InsertResult::Ok
-        );
-        root.print();
-        assert_eq!(
-            root.domain_insert(Vec::from(&b"hello.com"[..]), 6),
-            InsertResult::Ok
-        );
-        assert_eq!(
-            root.domain_insert(Vec::from(&b"*.hello.com"[..]), 7),
-            InsertResult::Ok
-        );
-        assert_eq!(
-            root.domain_insert(Vec::from(&b"images./cdn[0-9]+/.hello.com"[..]), 8),
+            root.insert(Vec::from(&b"pouet.alldomains.org"[..]), 5),
             InsertResult::Ok
         );
         root.print();
         assert_eq!(
-            root.domain_insert(Vec::from(&b"/test[0-9]+/.www.hello.com"[..]), 9),
+            root.insert(Vec::from(&b"hello.com"[..]), 6),
+            InsertResult::Ok
+        );
+        assert_eq!(
+            root.insert(Vec::from(&b"*.hello.com"[..]), 7),
+            InsertResult::Ok
+        );
+        assert_eq!(
+            root.insert(Vec::from(&b"images./cdn[0-9]+/.hello.com"[..]), 8),
+            InsertResult::Ok
+        );
+        root.print();
+        assert_eq!(
+            root.insert(Vec::from(&b"/test[0-9]+/.www.hello.com"[..]), 9),
             InsertResult::Ok
         );
         root.print();
 
-        assert_eq!(root.domain_lookup(&b"example.com"[..], true), None);
+        assert_eq!(root.lookup(&b"example.com"[..], true), None);
+        assert_eq!(root.lookup(&b"blah.test.example.com"[..], true), None);
         assert_eq!(
-            root.domain_lookup(&b"blah.test.example.com"[..], true),
-            None
-        );
-        assert_eq!(
-            root.domain_lookup(&b"www.example.com"[..], true),
+            root.lookup(&b"www.example.com"[..], true),
             Some(&(b"www.example.com"[..].to_vec(), 1))
         );
         assert_eq!(
-            root.domain_lookup(&b"alldomains.org"[..], true),
+            root.lookup(&b"alldomains.org"[..], true),
             Some(&(b"alldomains.org"[..].to_vec(), 4))
         );
         assert_eq!(
-            root.domain_lookup(&b"test.hello.com"[..], true),
+            root.lookup(&b"test.hello.com"[..], true),
             Some(&(b"*.hello.com"[..].to_vec(), 7))
         );
         assert_eq!(
-            root.domain_lookup(&b"images.cdn10.hello.com"[..], true),
+            root.lookup(&b"images.cdn10.hello.com"[..], true),
             Some(&(b"images./cdn[0-9]+/.hello.com"[..].to_vec(), 8))
         );
         assert_eq!(
-            root.domain_lookup(&b"test42.www.hello.com"[..], true),
+            root.lookup(&b"test42.www.hello.com"[..], true),
             Some(&(b"/test[0-9]+/.www.hello.com"[..].to_vec(), 9))
         );
         assert_eq!(
-            root.domain_lookup(&b"test.alldomains.org"[..], true),
+            root.lookup(&b"test.alldomains.org"[..], true),
             Some(&(b"*.alldomains.org"[..].to_vec(), 3))
         );
         assert_eq!(
-            root.domain_lookup(&b"hello.alldomains.org"[..], true),
+            root.lookup(&b"hello.alldomains.org"[..], true),
             Some(&(b"*.alldomains.org"[..].to_vec(), 3))
         );
         assert_eq!(
-            root.domain_lookup(&b"pouet.alldomains.org"[..], true),
+            root.lookup(&b"pouet.alldomains.org"[..], true),
             Some(&(b"pouet.alldomains.org"[..].to_vec(), 5))
         );
-        assert_eq!(
-            root.domain_lookup(&b"blah.test.alldomains.org"[..], true),
-            None
-        );
+        assert_eq!(root.lookup(&b"blah.test.alldomains.org"[..], true), None);
 
         assert_eq!(
-            root.domain_remove(&Vec::from(&b"alldomains.org"[..])),
+            root.remove(&Vec::from(&b"alldomains.org"[..])),
             RemoveResult::Ok
         );
         println!("after remove");
         root.print();
-        assert_eq!(root.domain_lookup(&b"alldomains.org"[..], true), None);
+        assert_eq!(root.lookup(&b"alldomains.org"[..], true), None);
         assert_eq!(
-            root.domain_lookup(&b"test.alldomains.org"[..], true),
+            root.lookup(&b"test.alldomains.org"[..], true),
             Some(&(b"*.alldomains.org"[..].to_vec(), 3))
         );
         assert_eq!(
-            root.domain_lookup(&b"hello.alldomains.org"[..], true),
+            root.lookup(&b"hello.alldomains.org"[..], true),
             Some(&(b"*.alldomains.org"[..].to_vec(), 3))
         );
         assert_eq!(
-            root.domain_lookup(&b"pouet.alldomains.org"[..], true),
+            root.lookup(&b"pouet.alldomains.org"[..], true),
             Some(&(b"pouet.alldomains.org"[..].to_vec(), 5))
         );
         assert_eq!(
-            root.domain_lookup(&b"test.hello.com"[..], true),
+            root.lookup(&b"test.hello.com"[..], true),
             Some(&(b"*.hello.com"[..].to_vec(), 7))
         );
-        assert_eq!(
-            root.domain_lookup(&b"blah.test.alldomains.org"[..], true),
-            None
-        );
+        assert_eq!(root.lookup(&b"blah.test.alldomains.org"[..], true), None);
     }
 
     #[test]
     fn wildcard() {
         let mut root: TrieNode<u8> = TrieNode::root();
         root.print();
-        root.domain_insert("*.clever-cloud.com".as_bytes().to_vec(), 2u8);
-        root.domain_insert("services.clever-cloud.com".as_bytes().to_vec(), 0u8);
-        root.domain_insert("*.services.clever-cloud.com".as_bytes().to_vec(), 1u8);
+        root.insert("*.clever-cloud.com".as_bytes().to_vec(), 2u8);
+        root.insert("services.clever-cloud.com".as_bytes().to_vec(), 0u8);
+        root.insert("*.services.clever-cloud.com".as_bytes().to_vec(), 1u8);
 
-        let res = root.domain_lookup(b"test.services.clever-cloud.com", true);
+        let res = root.lookup(b"test.services.clever-cloud.com", true);
         println!("query result: {res:?}");
 
         assert_eq!(
-            root.domain_lookup(b"pgstudio.services.clever-cloud.com", true),
+            root.lookup(b"pgstudio.services.clever-cloud.com", true),
             Some(&("*.services.clever-cloud.com".as_bytes().to_vec(), 1u8))
         );
     }
@@ -781,7 +729,7 @@ mod tests {
             }
 
             //println!("inserting key: '{}', value: '{}'", k, v);
-            //assert_eq!(root.domain_insert(Vec::from(k.as_bytes()), *v), InsertResult::Ok);
+            //assert_eq!(root.insert(Vec::from(k.as_bytes()), *v), InsertResult::Ok);
             assert_eq!(
                 root.insert(Vec::from(k.as_bytes()), *v),
                 InsertResult::Ok,
@@ -808,8 +756,8 @@ mod tests {
                 continue;
             }
 
-            //match root.domain_lookup(k.as_bytes()) {
-            match root.lookup(k.as_bytes(), false) {
+            //match root.lookup(k.as_bytes()) {
+            match root.lookup(k.as_bytes(), true) {
                 None => {
                     println!("did not find key '{k}'");
                     return false;
