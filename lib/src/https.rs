@@ -793,15 +793,19 @@ impl HttpsProxy {
         }
     }
 
-    pub fn add_listener(&mut self, config: HttpsListenerConfig, token: Token) -> Option<Token> {
+    pub fn add_listener(
+        &mut self,
+        config: HttpsListenerConfig,
+        token: Token,
+    ) -> Result<Token, ProxyError> {
         match self.listeners.entry(token) {
             Entry::Vacant(entry) => {
-                entry.insert(Rc::new(RefCell::new(
-                    HttpsListener::try_new(config, token).ok()?,
-                )));
-                Some(token)
+                let https_listener =
+                    HttpsListener::try_new(config, token).map_err(ProxyError::AddListener)?;
+                entry.insert(Rc::new(RefCell::new(https_listener)));
+                Ok(token)
             }
-            _ => None,
+            _ => Err(ProxyError::ListenerAlreadyPresent),
         }
     }
 
@@ -981,22 +985,24 @@ impl HttpsProxy {
             .collect()
     }
 
-    // TODO: return <Result, ProxyError>
     pub fn give_back_listener(
         &mut self,
         address: StdSocketAddr,
-    ) -> Option<(Token, MioTcpListener)> {
-        self.listeners
+    ) -> Result<(Token, MioTcpListener), ProxyError> {
+        let listener = self
+            .listeners
             .values()
             .find(|listener| listener.borrow().address == address)
-            .and_then(|listener| {
-                let mut owned = listener.borrow_mut();
+            .ok_or(ProxyError::NoListenerFound(address.clone()))?;
 
-                owned
-                    .listener
-                    .take()
-                    .map(|listener| (owned.token, listener))
-            })
+        let mut owned = listener.borrow_mut();
+
+        let taken_listener = owned
+            .listener
+            .take()
+            .ok_or(ProxyError::UnactivatedListener)?;
+
+        Ok((owned.token, taken_listener))
     }
 
     pub fn add_cluster(

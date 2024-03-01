@@ -674,8 +674,8 @@ impl Server {
                         info!("received ReturnListenSockets order");
                         match self.return_listen_sockets() {
                             Ok(_) => push_queue(WorkerResponse::ok(request.id.clone())),
-                            Err(error) => push_queue(WorkerResponse::error(
-                                request.id.clone(),
+                            Err(error) => push_queue(worker_response_error(
+                                request.id,
                                 format!("Could not send listeners on scm socket: {error:?}"),
                             )),
                         }
@@ -932,7 +932,7 @@ impl Server {
                             .into(),
                         )
                     } else {
-                        WorkerResponse::error(
+                        worker_response_error(
                             message.id.clone(),
                             "Could not find certificate for this fingerprint",
                         )
@@ -1019,7 +1019,7 @@ impl Server {
                     Ok(ListenerType::Http) => self.http.borrow_mut().notify(request.clone()),
                     Ok(ListenerType::Https) => self.https.borrow_mut().notify(request.clone()),
                     Ok(ListenerType::Tcp) => self.tcp.borrow_mut().notify(request.clone()),
-                    Err(_) => WorkerResponse::error(req_id, "Wrong variant ListenerType"),
+                    Err(_) => worker_response_error(req_id, "Wrong variant ListenerType"),
                 };
                 push_queue(response);
             }
@@ -1077,10 +1077,7 @@ impl Server {
         debug!("{} add http listener {:?}", req_id, listener);
 
         if self.sessions.borrow().at_capacity() {
-            return WorkerResponse::error(
-                req_id.to_string(),
-                "session list is full, cannot add a listener",
-            );
+            return worker_response_error(req_id, "session list is full, cannot add a listener");
         }
 
         let mut session_manager = self.sessions.borrow_mut();
@@ -1095,11 +1092,7 @@ impl Server {
                 self.base_sessions_count += 1;
                 WorkerResponse::ok(req_id)
             }
-            Err(e) => {
-                let error = format!("Couldn't add HTTP listener: {e}");
-                error!("{}", error);
-                WorkerResponse::error(req_id, error)
-            }
+            Err(e) => worker_response_error(req_id, format!("Could not add HTTP listener: {e}")),
         }
     }
 
@@ -1111,7 +1104,7 @@ impl Server {
         debug!("{} add https listener {:?}", req_id, listener);
 
         if self.sessions.borrow().at_capacity() {
-            return WorkerResponse::error(req_id, "session list is full, cannot add a listener");
+            return worker_response_error(req_id, "session list is full, cannot add a listener");
         }
 
         let mut session_manager = self.sessions.borrow_mut();
@@ -1123,17 +1116,14 @@ impl Server {
             .borrow_mut()
             .add_listener(listener.clone(), token)
         {
-            Some(_token) => {
+            Ok(_token) => {
                 entry.insert(Rc::new(RefCell::new(ListenSession {
                     protocol: Protocol::HTTPSListen,
                 })));
                 self.base_sessions_count += 1;
                 WorkerResponse::ok(req_id)
             }
-            None => {
-                error!("Couldn't add HTTPS listener");
-                WorkerResponse::error(req_id, "cannot add HTTPS listener")
-            }
+            Err(e) => worker_response_error(req_id, format!("Could not add HTTPS listener: {e}")),
         }
     }
 
@@ -1145,7 +1135,7 @@ impl Server {
         debug!("{} add tcp listener {:?}", req_id, listener);
 
         if self.sessions.borrow().at_capacity() {
-            return WorkerResponse::error(req_id, "session list is full, cannot add a listener");
+            return worker_response_error(req_id, "session list is full, cannot add a listener");
         }
 
         let mut session_manager = self.sessions.borrow_mut();
@@ -1160,11 +1150,7 @@ impl Server {
                 self.base_sessions_count += 1;
                 WorkerResponse::ok(req_id)
             }
-            Err(e) => {
-                let error = format!("Couldn't add TCP listener: {e}");
-                error!("{}", error);
-                WorkerResponse::error(req_id, error)
-            }
+            Err(e) => worker_response_error(req_id, format!("Could not add TCP listener: {e}")),
         }
     }
 
@@ -1194,10 +1180,10 @@ impl Server {
                         self.accept(ListenToken(token.0), Protocol::HTTPListen);
                         WorkerResponse::ok(req_id)
                     }
-                    Err(activate_error) => {
-                        error!("Could not activate HTTP listener: {}", activate_error);
-                        WorkerResponse::error(req_id, activate_error)
-                    }
+                    Err(activate_error) => worker_response_error(
+                        req_id,
+                        format!("Could not activate HTTP listener: {}", activate_error),
+                    ),
                 }
             }
             Ok(ListenerType::Https) => {
@@ -1216,10 +1202,10 @@ impl Server {
                         self.accept(ListenToken(token.0), Protocol::HTTPSListen);
                         WorkerResponse::ok(req_id)
                     }
-                    Err(activate_error) => {
-                        error!("Could not activate HTTPS listener: {}", activate_error);
-                        WorkerResponse::error(req_id, activate_error)
-                    }
+                    Err(activate_error) => worker_response_error(
+                        req_id,
+                        format!("Could not activate HTTPS listener: {}", activate_error),
+                    ),
                 }
             }
             Ok(ListenerType::Tcp) => {
@@ -1231,17 +1217,17 @@ impl Server {
 
                 let listener_token = self.tcp.borrow_mut().activate_listener(&address, listener);
                 match listener_token {
-                    Some(token) => {
+                    Ok(token) => {
                         self.accept(ListenToken(token.0), Protocol::TCPListen);
                         WorkerResponse::ok(req_id)
                     }
-                    None => {
-                        error!("Could not activate TCP listener");
-                        WorkerResponse::error(req_id, "cannot activate TCP listener")
-                    }
+                    Err(activate_error) => worker_response_error(
+                        req_id,
+                        format!("Could not activate TCP listener: {}", activate_error),
+                    ),
                 }
             }
-            Err(_) => WorkerResponse::error(req_id, "Wrong variant for ListenerType on request"),
+            Err(_) => worker_response_error(req_id, "Wrong variant for ListenerType on request"),
         }
     }
 
@@ -1261,12 +1247,14 @@ impl Server {
             Ok(ListenerType::Http) => {
                 let (token, mut listener) = match self.http.borrow_mut().give_back_listener(address)
                 {
-                    Some((token, listener)) => (token, listener),
-                    None => {
-                        let error =
-                            format!("Couldn't deactivate HTTP listener at address {address:?}");
-                        error!("{}", error);
-                        return WorkerResponse::error(req_id, error);
+                    Ok((token, listener)) => (token, listener),
+                    Err(e) => {
+                        return worker_response_error(
+                            req_id,
+                            format!(
+                                "Couldn't deactivate HTTP listener at address {address:?}: {e}"
+                            ),
+                        )
                     }
                 };
 
@@ -1304,16 +1292,13 @@ impl Server {
             Ok(ListenerType::Https) => {
                 let (token, mut listener) =
                     match self.https.borrow_mut().give_back_listener(address) {
-                        Some((token, listener)) => (token, listener),
-
-                        None => {
-                            let error = format!(
-                                "Couldn't deactivate HTTPS listener at address {:?}",
-                                address
-                            );
-                            error!("{}", error);
-                            return WorkerResponse::error(req_id, error);
-                        }
+                        Ok((token, listener)) => (token, listener),
+                        Err(e) => return worker_response_error(
+                            req_id,
+                            format!(
+                                "Couldn't deactivate HTTPS listener at address {address:?}: {e}",
+                            ),
+                        ),
                     };
                 if let Err(e) = self.poll.registry().deregister(&mut listener) {
                     error!(
@@ -1345,12 +1330,15 @@ impl Server {
             Ok(ListenerType::Tcp) => {
                 let (token, mut listener) = match self.tcp.borrow_mut().give_back_listener(address)
                 {
-                    Some((token, listener)) => (token, listener),
-                    None => {
-                        let error =
-                            format!("Couldn't deactivate TCP listener at address {:?}", address);
-                        error!("{}", error);
-                        return WorkerResponse::error(req_id, error);
+                    Ok((token, listener)) => (token, listener),
+                    Err(e) => {
+                        return worker_response_error(
+                            req_id,
+                            format!(
+                                "Could not deactivate TCP listener at address {:?}: {}",
+                                address, e
+                            ),
+                        )
                     }
                 };
 
@@ -1381,7 +1369,7 @@ impl Server {
                 }
                 WorkerResponse::ok(req_id)
             }
-            Err(_) => WorkerResponse::error(req_id, "Wrong variant for ListenerType on request"),
+            Err(_) => worker_response_error(req_id, "Wrong variant for ListenerType on request"),
         }
     }
 
@@ -1669,6 +1657,17 @@ impl Server {
             error!("Could not block channel: {}", e);
         }
     }
+}
+
+/// log the error together with the request id
+/// create a WorkerResponse
+fn worker_response_error<S: ToString, T: ToString>(request_id: S, error: T) -> WorkerResponse {
+    error!(
+        "error on request {}, {}",
+        request_id.to_string(),
+        error.to_string()
+    );
+    WorkerResponse::error(request_id, error)
 }
 
 pub struct ListenSession {
