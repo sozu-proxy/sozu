@@ -16,6 +16,9 @@ use crate::{
 /// before it is drop to avoid a double free.
 ///
 /// This trait works on &T and Option<&T> types
+///
+/// After performance review, it seems not any more efficient than calling `clone()`,
+/// probably because the cache of malloc is so well optimized these days.
 trait DuplicateOwnership {
     type Target;
     /// Don't forget to use std::mem::forget or ManuallyDrop over one of your owners
