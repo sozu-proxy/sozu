@@ -220,7 +220,10 @@ impl HttpSession {
         let back_token = match http.backend_token {
             Some(back_token) => back_token,
             None => {
-                warn!("Could not upgrade http request on cluster '{:?}' ({:?}) using backend '{:?}' into websocket for request '{}'", http.cluster_id, self.frontend_token, http.backend_id, http.context.id);
+                warn!(
+                    "Could not upgrade http request on cluster '{:?}' ({:?}) using backend '{:?}' into websocket for request '{}'",
+                    http.context.cluster_id, self.frontend_token, http.context.backend_id, http.context.id
+                );
                 return None;
             }
         };
@@ -239,12 +242,12 @@ impl HttpSession {
 
         let mut pipe = Pipe::new(
             backend_buffer,
-            http.backend_id,
+            http.context.backend_id,
             http.backend_socket,
             http.backend,
             Some(container_backend_timeout),
             Some(container_frontend_timeout),
-            http.cluster_id,
+            http.context.cluster_id,
             http.request_stream.storage.buffer,
             front_token,
             http.frontend_socket,
