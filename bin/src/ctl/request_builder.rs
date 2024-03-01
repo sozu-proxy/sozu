@@ -192,7 +192,7 @@ impl CommandManager {
                     }
 
                     let query_domain = QueryClusterByDomain {
-                        hostname: splitted.get(0).ok_or(CtlError::NeedClusterDomain)?.clone(),
+                        hostname: splitted.first().ok_or(CtlError::NeedClusterDomain)?.clone(),
                         path: splitted.get(1).cloned().map(|path| format!("/{path}")), // We add the / again because of the splitn removing it
                     };
 

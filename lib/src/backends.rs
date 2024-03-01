@@ -213,7 +213,7 @@ impl BackendMap {
     pub fn add_backend(&mut self, cluster_id: &str, backend: Backend) {
         self.backends
             .entry(cluster_id.to_string())
-            .or_insert_with(BackendList::new)
+            .or_default()
             .add_backend(backend);
     }
 
@@ -351,7 +351,7 @@ impl BackendMap {
     pub fn get_or_create_backend_list_for_cluster(&mut self, cluster_id: &str) -> &mut BackendList {
         self.backends
             .entry(cluster_id.to_string())
-            .or_insert_with(BackendList::new)
+            .or_default()
     }
 }
 

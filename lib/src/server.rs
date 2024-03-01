@@ -2,7 +2,6 @@
 use std::{
     cell::RefCell,
     collections::{HashSet, VecDeque},
-    convert::TryFrom,
     io::Error as IoError,
     os::unix::io::{AsRawFd, FromRawFd},
     rc::Rc,

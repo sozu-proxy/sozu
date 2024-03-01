@@ -57,8 +57,6 @@ use std::{
     path::PathBuf,
 };
 
-use toml;
-
 use crate::{
     certificate::split_certificate_chain,
     logging::AccessLogFormat,
@@ -517,7 +515,7 @@ impl ListenerBuilder {
                     .ok()
             })
             .map(split_certificate_chain)
-            .unwrap_or_else(Vec::new);
+            .unwrap_or_default();
 
         let (answer_404, answer_503) = self.get_404_503_answers()?;
 

@@ -10,7 +10,6 @@ use nix::{
     errno::Errno,
     fcntl::{fcntl, FcntlArg, FdFlag},
 };
-use thiserror;
 
 use sozu_command_lib::config::Config;
 use sozu_lib::metrics::{self, MetricError};

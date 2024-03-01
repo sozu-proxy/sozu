@@ -1,4 +1,4 @@
-use std::{cmp::Ordering, collections::BTreeMap, default::Default, fmt, net::SocketAddr};
+use std::{cmp::Ordering, collections::BTreeMap, fmt, net::SocketAddr};
 
 use crate::{
     proto::command::{

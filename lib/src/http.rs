@@ -517,7 +517,7 @@ impl HttpProxy {
     }
 
     pub fn get_listener(&self, token: &Token) -> Option<Rc<RefCell<HttpListener>>> {
-        self.listeners.get(token).map(Clone::clone)
+        self.listeners.get(token).cloned()
     }
 
     pub fn remove_listener(&mut self, remove: RemoveListener) -> Result<(), ProxyError> {
@@ -875,7 +875,7 @@ impl ProxyConfiguration for HttpProxy {
         let listener = self
             .listeners
             .get(&Token(listener_token.0))
-            .map(Clone::clone)
+            .cloned()
             .ok_or(AcceptError::IoError)?;
 
         if let Err(e) = frontend_sock.set_nodelay(true) {

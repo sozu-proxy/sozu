@@ -12,12 +12,11 @@ use std::{
 
 #[cfg(target_os = "macos")]
 use libc::c_char;
-use libc::{self, pid_t};
+use libc::pid_t;
 #[cfg(target_os = "freebsd")]
 use libc::{sysctl, CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, PATH_MAX};
 use mio::net::UnixStream;
 use nix::{
-    self,
     errno::Errno,
     unistd::{fork, ForkResult},
 };

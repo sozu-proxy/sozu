@@ -121,14 +121,13 @@ enum MetricMeta {
 pub struct LocalClusterMetrics {
     /// metric_name -> metric value
     cluster: BTreeMap<String, AggregatedMetric>,
-    ///
     backends: Vec<LocalBackendMetrics>,
 }
 
 impl LocalClusterMetrics {
     fn to_filtered_metrics(
         &self,
-        metric_names: &Vec<String>,
+        metric_names: &[String],
     ) -> Result<ClusterMetrics, MetricError> {
         let cluster = self
             .cluster
@@ -182,7 +181,7 @@ pub struct LocalBackendMetrics {
 impl LocalBackendMetrics {
     fn to_filtered_metrics(
         &self,
-        metric_names: &Vec<String>,
+        metric_names: &[String],
     ) -> Result<BackendMetrics, MetricError> {
         let filtered_backend_metrics = self
             .metrics
@@ -306,7 +305,7 @@ impl LocalDrain {
 
     pub fn dump_all_metrics(
         &mut self,
-        metric_names: &Vec<String>,
+        metric_names: &[String],
     ) -> Result<WorkerMetrics, MetricError> {
         Ok(WorkerMetrics {
             proxy: self.dump_proxy_metrics(metric_names),
@@ -316,7 +315,7 @@ impl LocalDrain {
 
     pub fn dump_proxy_metrics(
         &mut self,
-        metric_names: &Vec<String>,
+        metric_names: &[String],
     ) -> BTreeMap<String, FilteredMetrics> {
         self.proxy_metrics
             .iter()
@@ -333,7 +332,7 @@ impl LocalDrain {
 
     pub fn dump_cluster_metrics(
         &mut self,
-        metric_names: &Vec<String>,
+        metric_names: &[String],
     ) -> Result<BTreeMap<String, ClusterMetrics>, MetricError> {
         let mut cluster_data = BTreeMap::new();
 
@@ -348,7 +347,7 @@ impl LocalDrain {
     fn metrics_of_one_cluster(
         &self,
         cluster_id: &str,
-        metric_names: &Vec<String>,
+        metric_names: &[String],
     ) -> Result<ClusterMetrics, MetricError> {
         let aggregated = self
             .cluster_metrics
@@ -363,7 +362,7 @@ impl LocalDrain {
     fn metrics_of_one_backend(
         &self,
         backend_id: &str,
-        metric_names: &Vec<String>,
+        metric_names: &[String],
     ) -> Result<BackendMetrics, MetricError> {
         for cluster_metrics in self.cluster_metrics.values() {
             if let Some(backend_metrics) = cluster_metrics
@@ -383,8 +382,8 @@ impl LocalDrain {
 
     fn query_clusters(
         &mut self,
-        cluster_ids: &Vec<String>,
-        metric_names: &Vec<String>,
+        cluster_ids: &[String],
+        metric_names: &[String],
     ) -> Result<WorkerMetrics, MetricError> {
         debug!("Querying cluster with ids: {:?}", cluster_ids);
         let mut clusters: BTreeMap<String, ClusterMetrics> = BTreeMap::new();
@@ -405,8 +404,8 @@ impl LocalDrain {
 
     fn query_backends(
         &mut self,
-        backend_ids: &Vec<String>,
-        metric_names: &Vec<String>,
+        backend_ids: &[String],
+        metric_names: &[String],
     ) -> Result<WorkerMetrics, MetricError> {
         let mut clusters: BTreeMap<String, ClusterMetrics> = BTreeMap::new();
 

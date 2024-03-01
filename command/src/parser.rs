@@ -1,5 +1,4 @@
 use nom::{
-    self,
     bytes::streaming::is_not,
     character::complete::char,
     combinator::map_res,

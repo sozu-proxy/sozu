@@ -4,9 +4,7 @@
 //! [`CertifiedKey` format](https://docs.rs/rustls/latest/rustls/sign/struct.CertifiedKey.html),
 //! exposes them to the HTTPS listener for TLS handshakes.
 use std::{
-    borrow::ToOwned,
     collections::{HashMap, HashSet},
-    convert::From,
     fmt,
     io::BufReader,
     str::FromStr,
@@ -184,7 +182,7 @@ impl CertificateResolver {
 
             self.name_fingerprint_idx
                 .entry(new_name.to_owned())
-                .or_insert_with(HashSet::new)
+                .or_default()
                 .insert(cert_to_add.fingerprint.to_owned());
         }
 

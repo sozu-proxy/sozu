@@ -12,7 +12,6 @@ use crate::server::TIMER;
 
 // Conversion utilities
 mod convert {
-    use std::convert::TryFrom;
     use time::Duration;
 
     /// Convert a `Duration` to milliseconds, rounding up and saturating at

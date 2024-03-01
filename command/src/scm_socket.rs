@@ -264,7 +264,7 @@ impl Listeners {
     }
 }
 
-fn parse_addresses(addresses: &Vec<String>) -> Result<Vec<SocketAddr>, ScmSocketError> {
+fn parse_addresses(addresses: &[String]) -> Result<Vec<SocketAddr>, ScmSocketError> {
     let mut parsed_addresses = Vec::new();
     for address in addresses {
         parsed_addresses.push(address.parse::<SocketAddr>().map_err(|error| {

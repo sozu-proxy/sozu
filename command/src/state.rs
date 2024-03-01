@@ -6,7 +6,7 @@ use std::{
     fs::File,
     hash::{Hash, Hasher},
     io::Write,
-    iter::{repeat, FromIterator},
+    iter::repeat,
     net::SocketAddr,
 };
 
@@ -382,7 +382,7 @@ impl ConfigState {
         let entry = self
             .certificates
             .entry(add.address.clone().into())
-            .or_insert_with(HashMap::new);
+            .or_default();
 
         let mut add = add.clone();
         add.certificate
@@ -464,7 +464,7 @@ impl ConfigState {
         let tcp_frontends = self
             .tcp_fronts
             .entry(front.cluster_id.clone())
-            .or_insert_with(Vec::new);
+            .or_default();
 
         let tcp_frontend = TcpFrontend {
             cluster_id: front.cluster_id.clone(),
@@ -514,7 +514,7 @@ impl ConfigState {
         let backends = self
             .backends
             .entry(backend.cluster_id.clone())
-            .or_insert_with(Vec::new);
+            .or_default();
 
         // we might be modifying the sticky id or load balancing parameters
         backends.retain(|b| b.backend_id != backend.backend_id || b.address != backend.address);

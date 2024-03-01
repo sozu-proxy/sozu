@@ -13,8 +13,6 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use poule;
-
 static BUFFER_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 pub struct Pool {

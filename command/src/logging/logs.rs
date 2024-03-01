@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    cmp::{self, Ord},
+    cmp,
     env,
     fmt::Arguments,
     fs::{File, OpenOptions},
@@ -11,7 +11,6 @@ use std::{
     str::FromStr,
 };
 
-use libc;
 use mio::net::UnixDatagram;
 use prost::{encoding::encoded_len_varint, Message};
 use rand::{distributions::Alphanumeric, thread_rng, Rng};
