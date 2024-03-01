@@ -147,7 +147,7 @@ impl TryFrom<&AddCertificate> for CertifiedKeyWrapper {
 #[derive(Default, Debug)]
 pub struct CertificateResolver {
     /// all fingerprints of all
-    pub domains: TrieNode<Fingerprint>,
+    pub domains: TrieNode<false, Fingerprint>,
     /// a map of fingerprint -> stored_certificate
     certificates: HashMap<Fingerprint, CertifiedKeyWrapper>,
     /// map of domain_name -> all fingerprints linked to this domain name

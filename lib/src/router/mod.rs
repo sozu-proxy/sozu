@@ -1,4 +1,3 @@
-pub mod pattern_trie;
 pub mod trie;
 
 use std::str::from_utf8;
@@ -12,7 +11,7 @@ use sozu_command::{
     state::ClusterId,
 };
 
-use crate::{protocol::http::parser::Method, router::pattern_trie::TrieNode};
+use crate::{protocol::http::parser::Method, router::trie::TrieNode};
 
 #[derive(thiserror::Error, Debug, PartialEq)]
 pub enum RouterError {
@@ -34,7 +33,7 @@ pub enum RouterError {
 
 pub struct Router {
     pre: Vec<(DomainRule, PathRule, MethodRule, Route)>,
-    pub tree: TrieNode<Vec<(PathRule, MethodRule, Route)>>,
+    pub tree: TrieNode<true, Vec<(PathRule, MethodRule, Route)>>,
     post: Vec<(DomainRule, PathRule, MethodRule, Route)>,
 }
 
@@ -218,9 +217,7 @@ impl Router {
             Ok(hostname) => {
                 //FIXME: necessary ti build on stable rust (1.35), can be removed once 1.36 is there
                 let mut empty = true;
-                if let Some((_, ref mut paths)) =
-                    self.tree.lookup_mut(hostname.as_bytes(), false)
-                {
+                if let Some((_, ref mut paths)) = self.tree.lookup_mut(hostname.as_bytes(), false) {
                     empty = false;
                     if !paths.iter().any(|(p, m, _)| p == path && m == method) {
                         paths.push((path.to_owned(), method.to_owned(), cluster.to_owned()));

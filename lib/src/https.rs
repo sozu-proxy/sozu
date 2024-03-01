@@ -1634,7 +1634,7 @@ mod tests {
 
     #[test]
     fn wildcard_certificate_names() {
-        let mut trie = TrieNode::root();
+        let mut trie = TrieNode::<false, _>::root();
 
         trie.insert("*.services.clever-cloud.com".as_bytes().to_vec(), 1u8);
         trie.insert("*.clever-cloud.com".as_bytes().to_vec(), 2u8);
@@ -1663,7 +1663,7 @@ mod tests {
 
     #[test]
     fn wildcard_with_subdomains() {
-        let mut trie = TrieNode::root();
+        let mut trie = TrieNode::<false, _>::root();
 
         trie.insert("*.test.example.com".as_bytes().to_vec(), 1u8);
         trie.insert("hello.sub.test.example.com".as_bytes().to_vec(), 2u8);
@@ -1681,7 +1681,7 @@ mod tests {
         );
 
         // now try in a different order
-        let mut trie = TrieNode::root();
+        let mut trie = TrieNode::<false, _>::root();
 
         trie.insert("hello.sub.test.example.com".as_bytes().to_vec(), 2u8);
         trie.insert("*.test.example.com".as_bytes().to_vec(), 1u8);
