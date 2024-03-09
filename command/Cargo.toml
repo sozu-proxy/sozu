@@ -33,7 +33,7 @@ log = "^0.4.20"
 time = "^0.3.31"
 toml = "^0.8.8"
 memchr = "^2.7.1"
-mio = { version = "^0.8.10", features = ["os-poll", "net"] }
+mio = { version = "^0.8.11", features = ["os-poll", "net"] }
 nix = { version = "^0.27.1", features = ["socket", "uio"] }
 nom = "^7.1.3"
 prost = "^0.12.3"
