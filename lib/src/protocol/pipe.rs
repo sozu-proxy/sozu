@@ -10,14 +10,12 @@ use sozu_command::{
 use crate::{
     backends::Backend,
     pool::Checkout,
-    protocol::SessionState,
+    protocol::{http::parser::Method, SessionState},
     socket::{stats::socket_rtt, SocketHandler, SocketResult, TransportProtocol},
     sozu_command::ready::Ready,
     timer::TimeoutContainer,
     L7Proxy, ListenerHandler, Protocol, Readiness, SessionMetrics, SessionResult, StateResult,
 };
-
-use super::http::parser::Method;
 
 #[derive(PartialEq, Eq)]
 pub enum SessionStatus {

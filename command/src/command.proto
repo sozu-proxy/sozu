@@ -751,7 +751,7 @@ message HttpEndpoint {
     optional string authority = 2;
     optional string path = 3;
     // warning: this should be a u16 but protobuf only has uint32.
-    // Make sure the value never exceeds u16 bounds.
+    // Make sure the value never exceeds u16 bounds.
     optional uint32 status = 4;
     optional string reason = 5;
 }

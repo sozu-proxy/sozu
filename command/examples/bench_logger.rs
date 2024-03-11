@@ -2,12 +2,13 @@
 //! You can change the number of logs, log target, log filter and if they are colored with env
 //! variables.
 
+#[macro_use]
+extern crate sozu_command_lib;
+
 use std::time::Instant;
 
 use rand::{rngs::StdRng, Rng, RngCore, SeedableRng};
 
-#[macro_use]
-extern crate sozu_command_lib;
 use sozu_command_lib::logging::setup_logging;
 
 struct LogLine {

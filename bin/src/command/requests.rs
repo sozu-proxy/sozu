@@ -220,12 +220,12 @@ fn set_logging_level(server: &mut Server, client: &mut ClientSession, logging_fi
     let (directives, errors) = logging::parse_logging_spec(&logging_filter);
     if !errors.is_empty() {
         client.finish_failure(format!(
-            "Error parsing logging filter:\n  {}",
+            "Error parsing logging filter:\n- {}",
             errors
                 .iter()
                 .map(logging::LogSpecParseError::to_string)
                 .collect::<Vec<String>>()
-                .join("\n  ")
+                .join("\n- ")
         ));
         return;
     }
