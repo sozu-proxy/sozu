@@ -13,7 +13,7 @@ use sozu::server::Server;
 use sozu_command::{
     channel::Channel,
     config::{ConfigBuilder, FileConfig},
-    logging::setup_logging,
+    logging::setup_default_logging,
     proto::command::{
         request::RequestType, AddBackend, Cluster, HardStop, LoadBalancingParams, PathRule,
         Request, RequestHttpFrontend, RequestTcpFrontend, ReturnListenSockets, RulePosition,
@@ -133,7 +133,7 @@ impl Worker {
         println!("Setting up logging");
 
         let server_job = thread::spawn(move || {
-            setup_logging("stdout", None, "error", &thread_name);
+            setup_default_logging(false, "error", &thread_name);
             let mut server = Server::try_new_from_config(
                 cmd_worker_to_main,
                 thread_scm_worker_to_main,

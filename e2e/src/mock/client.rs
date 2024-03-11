@@ -36,8 +36,8 @@ impl Client {
         }
     }
 
-    /// Establish a TCP connection with its address,
-    /// register the yielded TCP stream, apply timeouts
+    /// Establish a TCP connection with its address,
+    /// register the yielded TCP stream, apply timeouts
     pub fn connect(&mut self) {
         let stream = TcpStream::connect(self.address).expect("could not connect");
         stream

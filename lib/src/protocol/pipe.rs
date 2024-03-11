@@ -2,13 +2,15 @@ use std::{cell::RefCell, net::SocketAddr, rc::Rc};
 
 use mio::{net::TcpStream, Token};
 use rusty_ulid::Ulid;
-use sozu_command::config::MAX_LOOP_ITERATIONS;
+use sozu_command::{
+    config::MAX_LOOP_ITERATIONS,
+    logging::{EndpointRecord, LogContext},
+};
 
 use crate::{
     backends::Backend,
-    logs::{Endpoint, LogContext, RequestRecord},
     pool::Checkout,
-    protocol::SessionState,
+    protocol::{http::parser::Method, SessionState},
     socket::{stats::socket_rtt, SocketHandler, SocketResult, TransportProtocol},
     sozu_command::ready::Ready,
     timer::TimeoutContainer,
@@ -27,6 +29,18 @@ enum ConnectionStatus {
     ReadOpen,
     WriteOpen,
     Closed,
+}
+
+/// matches sozu_command_lib::logging::access_logs::EndpointRecords
+pub enum WebSocketContext {
+    Http {
+        method: Option<Method>,
+        authority: Option<String>,
+        path: Option<String>,
+        status: Option<u16>,
+        reason: Option<String>,
+    },
+    Tcp,
 }
 
 pub struct Pipe<Front: SocketHandler, L: ListenerHandler> {
@@ -49,7 +63,7 @@ pub struct Pipe<Front: SocketHandler, L: ListenerHandler> {
     protocol: Protocol,
     request_id: Ulid,
     session_address: Option<SocketAddr>,
-    websocket_context: Option<String>,
+    websocket_context: WebSocketContext,
 }
 
 impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
@@ -75,7 +89,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         protocol: Protocol,
         request_id: Ulid,
         session_address: Option<SocketAddr>,
-        websocket_context: Option<String>,
+        websocket_context: WebSocketContext,
     ) -> Pipe<Front, L> {
         let frontend_status = ConnectionStatus::Normal;
         let backend_status = if backend_socket.is_none() {
@@ -196,28 +210,32 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         }
     }
 
-    pub fn log_request(&self, metrics: &SessionMetrics, message: Option<&str>) {
+    pub fn log_request(&self, metrics: &SessionMetrics, error: bool, message: Option<&str>) {
         let listener = self.listener.borrow();
-        RequestRecord {
-            error: message,
-            context: self.log_context(),
+        let context = self.log_context();
+        let endpoint = self.log_endpoint();
+        metrics.register_end_of_session(&context);
+        log_access!(
+            error,
+            message: message,
+            context,
             session_address: self.get_session_address(),
             backend_address: self.get_backend_address(),
             protocol: self.protocol_string(),
-            endpoint: Endpoint::Tcp {
-                context: self.websocket_context.as_deref(),
-            },
-            tags: listener.get_concatenated_tags(&listener.get_addr().to_string()),
+            endpoint,
+            tags: listener.get_tags(&listener.get_addr().to_string()),
             client_rtt: socket_rtt(self.front_socket()),
             server_rtt: self.backend_socket.as_ref().and_then(socket_rtt),
-            metrics,
-            user_agent: None,
-        }
-        .log();
+            service_time: metrics.service_time(),
+            response_time: metrics.response_time(),
+            bytes_in: metrics.bin,
+            bytes_out: metrics.bout,
+            user_agent: None
+        );
     }
 
     pub fn log_request_success(&self, metrics: &SessionMetrics) {
-        self.log_request(metrics, None);
+        self.log_request(metrics, false, None);
     }
 
     pub fn log_request_error(&self, metrics: &SessionMetrics, message: &str) {
@@ -228,7 +246,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             message
         );
         self.print_state(self.protocol_string());
-        self.log_request(metrics, Some(message));
+        self.log_request(metrics, true, Some(message));
     }
 
     pub fn check_connections(&self) -> bool {
@@ -613,6 +631,25 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             request_id: self.request_id,
             cluster_id: self.cluster_id.as_deref(),
             backend_id: self.backend_id.as_deref(),
+        }
+    }
+
+    fn log_endpoint(&self) -> EndpointRecord {
+        match &self.websocket_context {
+            WebSocketContext::Http {
+                method,
+                authority,
+                path,
+                status,
+                reason,
+            } => EndpointRecord::Http {
+                method: method.as_deref(),
+                authority: authority.as_deref(),
+                path: path.as_deref(),
+                status: status.to_owned(),
+                reason: reason.as_deref(),
+            },
+            WebSocketContext::Tcp => EndpointRecord::Tcp,
         }
     }
 }

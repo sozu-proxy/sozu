@@ -1,7 +1,6 @@
 use std::{sync::Arc, time::SystemTime};
 
 use hyper::{
-    self,
     client::{connect::dns::GaiResolver, HttpConnector, ResponseFuture},
     StatusCode,
 };

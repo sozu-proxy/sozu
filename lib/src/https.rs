@@ -37,7 +37,6 @@ use time::{Duration, Instant};
 use sozu_command::{
     certificate::Fingerprint,
     config::DEFAULT_CIPHER_SUITES,
-    logging,
     proto::command::{
         request::RequestType, response_content::ContentType, AddCertificate, CertificateSummary,
         CertificatesByAddress, Cluster, HttpsListenerConfig, ListOfCertificatesByAddress,
@@ -372,7 +371,7 @@ impl HttpsSession {
             Protocol::HTTP,
             http.context.id,
             http.context.session_address,
-            Some(ws_context),
+            ws_context,
         );
 
         pipe.frontend_readiness.event = http.frontend_readiness.event;
@@ -871,17 +870,6 @@ impl HttpsProxy {
         Ok(())
     }
 
-    pub fn logging(
-        &mut self,
-        logging_filter: String,
-    ) -> Result<Option<ResponseContent>, ProxyError> {
-        logging::LOGGER.with(|l| {
-            let directives = logging::parse_logging_spec(&logging_filter);
-            l.borrow_mut().set_directives(directives);
-        });
-        Ok(None)
-    }
-
     pub fn query_all_certificates(&mut self) -> Result<Option<ResponseContent>, ProxyError> {
         let certificates = self
             .listeners
@@ -1321,13 +1309,6 @@ impl ProxyConfiguration for HttpsProxy {
             RequestType::Status(_) => {
                 debug!("{} status", request_id);
                 Ok(None)
-            }
-            RequestType::Logging(logging_filter) => {
-                debug!(
-                    "{} changing logging filter to {}",
-                    request_id, logging_filter
-                );
-                self.logging(logging_filter)
             }
             RequestType::QueryCertificatesFromWorkers(filters) => {
                 if let Some(domain) = filters.domain {

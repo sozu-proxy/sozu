@@ -14,7 +14,7 @@ worker only seems ideal:
 worker_count = 1
 ```
 
-The HTTP and HTTPS listeners should be identical.
+The HTTP and HTTPS listeners should be identical.
 Chose a TLS version and a cipher list for the HTTPS listener, and stick to it.
 
 ```toml

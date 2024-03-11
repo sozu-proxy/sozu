@@ -87,3 +87,29 @@ pub enum ObjectKind {
     TcpListener,
     TcpFrontend,
 }
+
+pub trait AsString {
+    fn as_string_or(&self, default: &'static str) -> String;
+}
+
+impl<T: ToString> AsString for Option<T> {
+    fn as_string_or(&self, default: &'static str) -> String {
+        match self {
+            None => default.to_string(),
+            Some(t) => t.to_string(),
+        }
+    }
+}
+
+pub trait AsStr {
+    fn as_str_or(&self, default: &'static str) -> &str;
+}
+
+impl<T: AsRef<str>> AsStr for Option<T> {
+    fn as_str_or(&self, default: &'static str) -> &str {
+        match self {
+            None => default,
+            Some(s) => s.as_ref(),
+        }
+    }
+}

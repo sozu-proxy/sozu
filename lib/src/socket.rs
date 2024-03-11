@@ -633,6 +633,9 @@ pub mod stats {
         let info = socket_info(fd);
         assert!(info.is_some());
         println!("{:#?}", info);
-        println!("rtt: {}", crate::logs::LogDuration(socket_rtt(&sock)));
+        println!(
+            "rtt: {}",
+            sozu_command::logging::LogDuration(socket_rtt(&sock))
+        );
     }
 }

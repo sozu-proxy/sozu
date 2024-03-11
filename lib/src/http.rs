@@ -17,7 +17,7 @@ use rusty_ulid::Ulid;
 use time::{Duration, Instant};
 
 use sozu_command::{
-    logging,
+    logging::CachedTags,
     proto::command::{
         request::RequestType, Cluster, HttpListenerConfig, ListenerType, RemoveListener,
         RequestHttpFrontend, WorkerRequest, WorkerResponse,
@@ -42,7 +42,7 @@ use crate::{
     server::{ListenToken, SessionManager},
     socket::server_bind,
     timer::TimeoutContainer,
-    AcceptError, CachedTags, FrontendFromRequestError, L7ListenerHandler, L7Proxy, ListenerError,
+    AcceptError, FrontendFromRequestError, L7ListenerHandler, L7Proxy, ListenerError,
     ListenerHandler, Protocol, ProxyConfiguration, ProxyError, ProxySession, SessionIsToBeClosed,
     SessionMetrics, SessionResult, StateMachineBuilder, StateResult,
 };
@@ -245,7 +245,7 @@ impl HttpSession {
             Protocol::HTTP,
             http.context.id,
             http.context.session_address,
-            Some(ws_context),
+            ws_context,
         );
 
         pipe.frontend_readiness.event = http.frontend_readiness.event;
@@ -517,7 +517,7 @@ impl HttpProxy {
     }
 
     pub fn get_listener(&self, token: &Token) -> Option<Rc<RefCell<HttpListener>>> {
-        self.listeners.get(token).map(Clone::clone)
+        self.listeners.get(token).cloned()
     }
 
     pub fn remove_listener(&mut self, remove: RemoveListener) -> Result<(), ProxyError> {
@@ -708,14 +708,6 @@ impl HttpProxy {
 
         Ok(())
     }
-
-    pub fn logging(&mut self, logging_filter: String) -> Result<(), ProxyError> {
-        logging::LOGGER.with(|l| {
-            let directives = logging::parse_logging_spec(&logging_filter);
-            l.borrow_mut().set_directives(directives);
-        });
-        Ok(())
-    }
 }
 
 impl HttpListener {
@@ -844,13 +836,6 @@ impl ProxyConfiguration for HttpProxy {
                 debug!("{} status", request_id);
                 Ok(())
             }
-            Some(RequestType::Logging(logging_filter)) => {
-                debug!(
-                    "{} changing logging filter to {}",
-                    request_id, logging_filter
-                );
-                self.logging(logging_filter)
-            }
             other_command => {
                 debug!(
                     "{} unsupported message for HTTP proxy, ignoring: {:?}",
@@ -890,7 +875,7 @@ impl ProxyConfiguration for HttpProxy {
         let listener = self
             .listeners
             .get(&Token(listener_token.0))
-            .map(Clone::clone)
+            .cloned()
             .ok_or(AcceptError::IoError)?;
 
         if let Err(e) = frontend_sock.set_nodelay(true) {

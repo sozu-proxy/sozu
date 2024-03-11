@@ -3,12 +3,14 @@ use std::{cell::RefCell, rc::Rc};
 use mio::{net::TcpStream, *};
 use nom::{Err, HexDisplay};
 use rusty_ulid::Ulid;
-use sozu_command::config::MAX_LOOP_ITERATIONS;
+use sozu_command::{config::MAX_LOOP_ITERATIONS, logging::LogContext};
 
 use crate::{
-    logs::LogContext,
     pool::Checkout,
-    protocol::{pipe::Pipe, SessionResult, SessionState},
+    protocol::{
+        pipe::{Pipe, WebSocketContext},
+        SessionResult, SessionState,
+    },
     socket::{SocketHandler, SocketResult},
     sozu_command::ready::Ready,
     tcp::TcpListener,
@@ -183,7 +185,7 @@ impl<Front: SocketHandler> ExpectProxyProtocol<Front> {
             Protocol::TCP,
             self.request_id,
             addr,
-            None,
+            WebSocketContext::Tcp,
         );
 
         pipe.frontend_readiness.event = self.frontend_readiness.event;

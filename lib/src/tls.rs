@@ -4,10 +4,8 @@
 //! [`CertifiedKey` format](https://docs.rs/rustls/latest/rustls/sign/struct.CertifiedKey.html),
 //! exposes them to the HTTPS listener for TLS handshakes.
 use std::{
-    borrow::ToOwned,
     collections::{HashMap, HashSet},
-    convert::From,
-    fmt::Debug,
+    fmt,
     io::BufReader,
     str::FromStr,
     sync::{Arc, Mutex},
@@ -184,7 +182,7 @@ impl CertificateResolver {
 
             self.name_fingerprint_idx
                 .entry(new_name.to_owned())
-                .or_insert_with(HashSet::new)
+                .or_default()
                 .insert(cert_to_add.fingerprint.to_owned());
         }
 
@@ -390,7 +388,7 @@ impl ResolvesServerCert for MutexCertificateResolver {
     }
 }
 
-impl Debug for MutexCertificateResolver {
+impl fmt::Debug for MutexCertificateResolver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("MutexWrappedCertificateResolver")
     }

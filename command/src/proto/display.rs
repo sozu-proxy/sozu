@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    fmt::{Display, Formatter},
+    fmt::{self, Display, Formatter},
     net::SocketAddr,
 };
 
@@ -8,21 +8,24 @@ use prettytable::{cell, row, Row, Table};
 use time::format_description;
 use x509_parser::time::ASN1Time;
 
-use crate::proto::{
-    command::{
-        filtered_metrics, request::RequestType, response_content::ContentType, AggregatedMetrics,
-        AvailableMetrics, CertificateAndKey, CertificateSummary, CertificatesWithFingerprints,
-        ClusterMetrics, FilteredMetrics, ListOfCertificatesByAddress, ListedFrontends,
-        ListenersList, QueryCertificatesFilters, RequestCounts, Response, ResponseContent,
-        ResponseStatus, RunState, TlsVersion, WorkerInfos, WorkerMetrics, WorkerResponses,
+use crate::{
+    proto::{
+        command::{
+            filtered_metrics, protobuf_endpoint, request::RequestType,
+            response_content::ContentType, AggregatedMetrics, AvailableMetrics, CertificateAndKey,
+            CertificateSummary, CertificatesWithFingerprints, ClusterMetrics, FilteredMetrics,
+            HttpEndpoint, ListOfCertificatesByAddress, ListedFrontends, ListenersList,
+            ProtobufEndpoint, QueryCertificatesFilters, RequestCounts, Response, ResponseContent,
+            ResponseStatus, RunState, SocketAddress, TlsVersion, WorkerInfos, WorkerMetrics,
+            WorkerResponses,
+        },
+        DisplayError,
     },
-    DisplayError,
+    AsString,
 };
 
-use super::command::SocketAddress;
-
 impl Display for CertificateAndKey {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let versions = self.versions.iter().fold(String::new(), |acc, tls_v| {
             acc + " "
                 + match TlsVersion::try_from(*tls_v) {
@@ -40,13 +43,13 @@ impl Display for CertificateAndKey {
 }
 
 impl Display for CertificateSummary {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(f, "{}:\t{}", self.fingerprint, self.domain)
     }
 }
 
 impl Display for QueryCertificatesFilters {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         if let Some(d) = self.domain.clone() {
             write!(f, "domain:{}", d)
         } else if let Some(fp) = self.fingerprint.clone() {
@@ -945,7 +948,32 @@ fn create_cluster_table(headers: Vec<&str>, data: &BTreeMap<String, ResponseCont
 }
 
 impl Display for SocketAddress {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(f, "{}", SocketAddr::from(self.clone()))
+    }
+}
+
+impl Display for ProtobufEndpoint {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        match &self.inner {
+            Some(protobuf_endpoint::Inner::Http(HttpEndpoint {
+                method,
+                authority,
+                path,
+                status,
+                ..
+            })) => write!(
+                f,
+                "{} {} {} -> {}",
+                authority.as_string_or("-"),
+                method.as_string_or("-"),
+                path.as_string_or("-"),
+                status.as_string_or("-"),
+            ),
+            Some(protobuf_endpoint::Inner::Tcp(_)) => {
+                write!(f, "-")
+            }
+            None => Ok(()),
+        }
     }
 }

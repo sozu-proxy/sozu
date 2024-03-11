@@ -1,15 +1,14 @@
-#![allow(unused_variables, unused_must_use)]
+#![allow(unused_must_use)]
 extern crate sozu_lib;
 #[macro_use]
 extern crate sozu_command_lib;
-extern crate time;
 
 use std::thread;
 
 use anyhow::Context;
 use sozu_command_lib::{
     channel::Channel,
-    logging::setup_logging,
+    logging::setup_default_logging,
     proto::command::{
         request::RequestType, AddBackend, LoadBalancingParams, RequestTcpFrontend, SocketAddress,
         TcpListenerConfig, WorkerRequest,
@@ -17,7 +16,7 @@ use sozu_command_lib::{
 };
 
 fn main() -> anyhow::Result<()> {
-    setup_logging("stdout", None, "info", "EXAMPLE");
+    setup_default_logging(true, "info", "EXAMPLE");
 
     info!("starting up");
 
@@ -25,14 +24,13 @@ fn main() -> anyhow::Result<()> {
         Channel::generate(1000, 10000).with_context(|| "should create a channel")?;
 
     let jg = thread::spawn(move || {
-        let max_listeners = 500;
         let max_buffers = 500;
         let buffer_size = 16384;
         let listener = TcpListenerConfig {
             address: SocketAddress::new_v4(127, 0, 0, 1, 8080),
             ..Default::default()
         };
-        setup_logging("stdout", None, "debug", "TCP");
+        setup_default_logging(true, "debug", "TCP");
         sozu_lib::tcp::testing::start_tcp_worker(listener, max_buffers, buffer_size, channel);
     });
 

@@ -8,6 +8,7 @@ use std::{
 };
 
 use prost::{DecodeError, Message};
+use rusty_ulid::Ulid;
 
 use crate::{
     proto::{
@@ -66,16 +67,19 @@ impl Request {
             | RequestType::RemoveBackend(_)
             | RequestType::SoftStop(_)
             | RequestType::HardStop(_)
-            | RequestType::Status(_)
-            | RequestType::QueryClusterById(_)
-            | RequestType::QueryClustersByDomain(_)
-            | RequestType::QueryClustersHashes(_)
-            | RequestType::QueryMetrics(_)
-            | RequestType::Logging(_) => {
+            | RequestType::Status(_) => {
                 proxy_destination.to_http_proxy = true;
                 proxy_destination.to_https_proxy = true;
                 proxy_destination.to_tcp_proxy = true;
             }
+
+            // handled at worker level prior to this call
+            RequestType::ConfigureMetrics(_)
+            | RequestType::QueryMetrics(_)
+            | RequestType::Logging(_)
+            | RequestType::QueryClustersHashes(_)
+            | RequestType::QueryClusterById(_)
+            | RequestType::QueryClustersByDomain(_) => {}
 
             // the Add***Listener and other Listener orders will be handled separately
             // by the notify_proxys function, so we don't give them destinations
@@ -85,7 +89,6 @@ impl Request {
             | RequestType::RemoveListener(_)
             | RequestType::ActivateListener(_)
             | RequestType::DeactivateListener(_)
-            | RequestType::ConfigureMetrics(_)
             | RequestType::ReturnListenSockets(_) => {}
 
             // These won't ever reach a worker anyway
@@ -281,5 +284,25 @@ impl From<u128> for Uint128 {
         let low = value as u64;
         let high = (value >> 64) as u64;
         Uint128 { low, high }
+    }
+}
+
+impl From<i128> for Uint128 {
+    fn from(value: i128) -> Self {
+        Uint128::from(value as u128)
+    }
+}
+
+impl From<Ulid> for Uint128 {
+    fn from(value: Ulid) -> Self {
+        let (low, high) = value.into();
+        Uint128 { low, high }
+    }
+}
+
+impl From<Uint128> for Ulid {
+    fn from(value: Uint128) -> Self {
+        let Uint128 { low, high } = value;
+        Ulid::from((low, high))
     }
 }

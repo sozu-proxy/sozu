@@ -14,13 +14,18 @@ use mio::{
 use rusty_ulid::Ulid;
 use time::{Duration, Instant};
 
-use sozu_command::{config::MAX_LOOP_ITERATIONS, proto::command::request::RequestType, ObjectKind};
+use sozu_command::{
+    config::MAX_LOOP_ITERATIONS,
+    logging::{EndpointRecord, LogContext},
+    proto::command::request::RequestType,
+    ObjectKind,
+};
 
 use crate::{
     backends::{Backend, BackendMap},
-    logs::{Endpoint, LogContext, RequestRecord},
     pool::{Checkout, Pool},
     protocol::{
+        pipe::WebSocketContext,
         proxy_protocol::{
             expect::ExpectProxyProtocol, relay::RelayProxyProtocol, send::SendProxyProtocol,
         },
@@ -30,7 +35,6 @@ use crate::{
     server::{push_event, ListenToken, SessionManager, CONN_RETRIES, TIMER},
     socket::{server_bind, stats::socket_rtt},
     sozu_command::{
-        logging,
         proto::command::{
             Event, EventKind, ProxyProtocolConfig, RequestTcpFrontend, TcpListenerConfig,
             WorkerRequest, WorkerResponse,
@@ -156,7 +160,7 @@ impl TcpSession {
                     Protocol::TCP,
                     request_id,
                     frontend_address,
-                    None,
+                    WebSocketContext::Tcp,
                 );
                 pipe.set_cluster_id(cluster_id.clone());
                 TcpStateMachine::Pipe(pipe)
@@ -191,20 +195,24 @@ impl TcpSession {
 
     fn log_request(&self) {
         let listener = self.listener.borrow();
-        RequestRecord {
-            error: None,
-            context: self.log_context(),
+        let context = self.log_context();
+        self.metrics.register_end_of_session(&context);
+        info_access!(
+            message: None,
+            context,
             session_address: self.frontend_address,
             backend_address: None,
             protocol: "TCP",
-            endpoint: Endpoint::Tcp { context: None },
-            tags: listener.get_concatenated_tags(&listener.get_addr().to_string()),
+            endpoint: EndpointRecord::Tcp,
+            tags: listener.get_tags(&listener.get_addr().to_string()),
             client_rtt: socket_rtt(self.state.front_socket()),
             server_rtt: None,
-            metrics: &self.metrics,
             user_agent: None,
-        }
-        .log();
+            service_time: self.metrics.service_time(),
+            response_time: self.metrics.response_time(),
+            bytes_in: self.metrics.bin,
+            bytes_out: self.metrics.bout
+        );
     }
 
     fn front_hup(&mut self) -> SessionResult {
@@ -1025,10 +1033,7 @@ impl ListenerHandler for TcpListener {
 }
 
 impl TcpListener {
-    fn new(
-        config: TcpListenerConfig,
-        token: Token,
-    ) -> Result<TcpListener, ListenerError> {
+    fn new(config: TcpListenerConfig, token: Token) -> Result<TcpListener, ListenerError> {
         Ok(TcpListener {
             cluster_id: None,
             listener: None,
@@ -1184,7 +1189,10 @@ impl TcpProxy {
 
         let mut owned = listener.borrow_mut();
 
-        let taken_listener = owned.listener.take().ok_or(ProxyError::UnactivatedListener)?;
+        let taken_listener = owned
+            .listener
+            .take()
+            .ok_or(ProxyError::UnactivatedListener)?;
 
         Ok((owned.token, taken_listener))
     }
@@ -1271,17 +1279,6 @@ impl ProxyConfiguration for TcpProxy {
             }
             RequestType::Status(_) => {
                 info!("{} status", message.id);
-                WorkerResponse::ok(message.id)
-            }
-            RequestType::Logging(logging_filter) => {
-                info!(
-                    "{} changing logging filter to {}",
-                    message.id, logging_filter
-                );
-                logging::LOGGER.with(|l| {
-                    let directives = logging::parse_logging_spec(&logging_filter);
-                    l.borrow_mut().set_directives(directives);
-                });
                 WorkerResponse::ok(message.id)
             }
             RequestType::AddCluster(cluster) => {

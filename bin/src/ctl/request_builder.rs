@@ -18,8 +18,8 @@ use sozu_command_lib::{
 
 use crate::{
     cli::{
-        BackendCmd, ClusterCmd, HttpFrontendCmd, HttpListenerCmd, HttpsListenerCmd, LoggingLevel,
-        MetricsCmd, TcpFrontendCmd, TcpListenerCmd,
+        BackendCmd, ClusterCmd, HttpFrontendCmd, HttpListenerCmd, HttpsListenerCmd, MetricsCmd,
+        TcpFrontendCmd, TcpListenerCmd,
     },
     ctl::CommandManager,
 };
@@ -192,7 +192,7 @@ impl CommandManager {
                     }
 
                     let query_domain = QueryClusterByDomain {
-                        hostname: splitted.get(0).ok_or(CtlError::NeedClusterDomain)?.clone(),
+                        hostname: splitted.first().ok_or(CtlError::NeedClusterDomain)?.clone(),
                         path: splitted.get(1).cloned().map(|path| format!("/{path}")), // We add the / again because of the splitn removing it
                     };
 
@@ -484,8 +484,8 @@ impl CommandManager {
         )
     }
 
-    pub fn logging_filter(&mut self, filter: &LoggingLevel) -> Result<(), CtlError> {
-        self.send_request(RequestType::Logging(filter.to_string().to_lowercase()).into())
+    pub fn logging_filter(&mut self, filter: String) -> Result<(), CtlError> {
+        self.send_request(RequestType::Logging(filter).into())
     }
 
     pub fn add_certificate(

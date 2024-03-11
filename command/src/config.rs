@@ -49,7 +49,7 @@
 //! 3. if a variable has not been set in the TOML file, it will be set to a default defined here
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    env,
+    env, fmt,
     fs::{create_dir_all, metadata, File},
     io::{ErrorKind, Read},
     net::SocketAddr,
@@ -57,16 +57,16 @@ use std::{
     path::PathBuf,
 };
 
-use toml;
-
 use crate::{
     certificate::split_certificate_chain,
+    logging::AccessLogFormat,
     proto::command::{
         request::RequestType, ActivateListener, AddBackend, AddCertificate, CertificateAndKey,
         Cluster, HttpListenerConfig, HttpsListenerConfig, ListenerType, LoadBalancingAlgorithms,
-        LoadBalancingParams, LoadMetric, MetricsConfiguration, PathRule, ProxyProtocolConfig,
-        Request, RequestHttpFrontend, RequestTcpFrontend, RulePosition, ServerConfig,
-        ServerMetricsConfig, SocketAddress, TcpListenerConfig, TlsVersion, WorkerRequest,
+        LoadBalancingParams, LoadMetric, MetricsConfiguration, PathRule, ProtobufAccessLogFormat,
+        ProxyProtocolConfig, Request, RequestHttpFrontend, RequestTcpFrontend, RulePosition,
+        ServerConfig, ServerMetricsConfig, SocketAddress, TcpListenerConfig, TlsVersion,
+        WorkerRequest,
     },
     ObjectKind,
 };
@@ -515,7 +515,7 @@ impl ListenerBuilder {
                     .ok()
             })
             .map(split_certificate_chain)
-            .unwrap_or_else(Vec::new);
+            .unwrap_or_default();
 
         let (answer_404, answer_503) = self.get_404_503_answers()?;
 
@@ -1089,7 +1089,13 @@ pub struct FileConfig {
     pub log_level: Option<String>,
     pub log_target: Option<String>,
     #[serde(default)]
-    pub log_access_target: Option<String>,
+    pub log_colored: bool,
+    #[serde(default)]
+    pub access_logs_target: Option<String>,
+    #[serde(default)]
+    pub access_logs_format: Option<AccessLogFormat>,
+    #[serde(default)]
+    pub access_logs_colored: Option<bool>,
     pub worker_count: Option<u16>,
     pub worker_automatic_restart: Option<bool>,
     pub metrics: Option<MetricsConfig>,
@@ -1200,7 +1206,9 @@ impl ConfigBuilder {
             ctl_command_timeout: file_config.ctl_command_timeout.unwrap_or(1_000),
             front_timeout: file_config.front_timeout.unwrap_or(DEFAULT_FRONT_TIMEOUT),
             handle_process_affinity: file_config.handle_process_affinity.unwrap_or(false),
-            log_access_target: file_config.log_access_target.clone(),
+            access_logs_target: file_config.access_logs_target.clone(),
+            access_logs_format: file_config.access_logs_format.clone(),
+            access_logs_colored: file_config.access_logs_colored,
             log_level: file_config
                 .log_level
                 .clone()
@@ -1209,6 +1217,7 @@ impl ConfigBuilder {
                 .log_target
                 .clone()
                 .unwrap_or_else(|| String::from("stdout")),
+            log_colored: file_config.log_colored,
             max_buffers: file_config.max_buffers.unwrap_or(DEFAULT_MAX_BUFFERS),
             max_command_buffer_size: file_config
                 .max_command_buffer_size
@@ -1430,7 +1439,7 @@ impl ConfigBuilder {
 /// Sōzu configuration, populated with clusters and listeners.
 ///
 /// This struct is used on startup to generate `WorkerRequest`s
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Default, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Default, Deserialize)]
 pub struct Config {
     pub config_path: String,
     pub command_socket: String,
@@ -1445,8 +1454,11 @@ pub struct Config {
     pub automatic_state_save: bool,
     pub log_level: String,
     pub log_target: String,
+    pub log_colored: bool,
     #[serde(default)]
-    pub log_access_target: Option<String>,
+    pub access_logs_target: Option<String>,
+    pub access_logs_format: Option<AccessLogFormat>,
+    pub access_logs_colored: Option<bool>,
     pub worker_count: u16,
     pub worker_automatic_restart: bool,
     pub metrics: Option<MetricsConfig>,
@@ -1739,6 +1751,42 @@ impl Config {
     }
 }
 
+impl fmt::Debug for Config {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Config")
+            .field("config_path", &self.config_path)
+            .field("command_socket", &self.command_socket)
+            .field("command_buffer_size", &self.command_buffer_size)
+            .field("max_command_buffer_size", &self.max_command_buffer_size)
+            .field("max_connections", &self.max_connections)
+            .field("min_buffers", &self.min_buffers)
+            .field("max_buffers", &self.max_buffers)
+            .field("buffer_size", &self.buffer_size)
+            .field("saved_state", &self.saved_state)
+            .field("automatic_state_save", &self.automatic_state_save)
+            .field("log_level", &self.log_level)
+            .field("log_target", &self.log_target)
+            .field("access_logs_target", &self.access_logs_target)
+            .field("access_logs_format", &self.access_logs_format)
+            .field("worker_count", &self.worker_count)
+            .field("worker_automatic_restart", &self.worker_automatic_restart)
+            .field("metrics", &self.metrics)
+            .field("disable_cluster_metrics", &self.disable_cluster_metrics)
+            .field("handle_process_affinity", &self.handle_process_affinity)
+            .field("ctl_command_timeout", &self.ctl_command_timeout)
+            .field("pid_file_path", &self.pid_file_path)
+            .field("activate_listeners", &self.activate_listeners)
+            .field("front_timeout", &self.front_timeout)
+            .field("back_timeout", &self.back_timeout)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("zombie_check_interval", &self.zombie_check_interval)
+            .field("accept_queue_timeout", &self.accept_queue_timeout)
+            .field("request_timeout", &self.request_timeout)
+            .field("worker_timeout", &self.worker_timeout)
+            .finish()
+    }
+}
+
 fn display_toml_error(file: &str, error: &toml::de::Error) {
     println!("error parsing the configuration file '{file}': {error}");
     if let Some(Range { start, end }) = error.span() {
@@ -1773,10 +1821,12 @@ impl From<&Config> for ServerConfig {
             buffer_size: config.buffer_size,
             log_level: config.log_level.clone(),
             log_target: config.log_target.clone(),
-            log_access_target: config.log_access_target.clone(),
+            access_logs_target: config.access_logs_target.clone(),
             command_buffer_size: config.command_buffer_size,
             max_command_buffer_size: config.max_command_buffer_size,
             metrics,
+            access_log_format: ProtobufAccessLogFormat::from(&config.access_logs_format) as i32,
+            log_colored: config.log_colored,
         }
     }
 }

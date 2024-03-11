@@ -2,7 +2,6 @@ use std::{
     cmp::min,
     fmt::Debug,
     io::{self, ErrorKind, Read, Write},
-    iter::Iterator,
     marker::PhantomData,
     os::unix::{
         io::{AsRawFd, FromRawFd, IntoRawFd, RawFd},

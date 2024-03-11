@@ -1,6 +1,7 @@
 use std::{
     cmp::min,
     fmt::{self, Write},
+    ops::Deref,
     str::from_utf8_unchecked,
 };
 
@@ -64,19 +65,33 @@ impl Method {
     }
 }
 
+impl AsRef<str> for Method {
+    fn as_ref(&self) -> &str {
+        match self {
+            Self::Get => "GET",
+            Self::Post => "POST",
+            Self::Head => "HEAD",
+            Self::Options => "OPTIONS",
+            Self::Put => "PUT",
+            Self::Delete => "DELETE",
+            Self::Trace => "TRACE",
+            Self::Connect => "CONNECT",
+            Self::Custom(custom) => custom,
+        }
+    }
+}
+
+impl Deref for Method {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_ref()
+    }
+}
+
 impl fmt::Display for Method {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Method::Get => write!(f, "GET"),
-            Method::Post => write!(f, "POST"),
-            Method::Head => write!(f, "HEAD"),
-            Method::Options => write!(f, "OPTIONS"),
-            Method::Put => write!(f, "PUT"),
-            Method::Delete => write!(f, "DELETE"),
-            Method::Trace => write!(f, "TRACE"),
-            Method::Connect => write!(f, "CONNECT"),
-            Method::Custom(s) => write!(f, "{s}"),
-        }
+        write!(f, "{}", self.as_ref())
     }
 }
 

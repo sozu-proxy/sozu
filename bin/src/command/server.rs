@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    fmt::Debug,
+    fmt::{self, Debug},
     io::Error as IoError,
     ops::{Deref, DerefMut},
     os::fd::{AsRawFd, FromRawFd},
@@ -223,8 +223,8 @@ impl CommandHub {
         let channel = Channel::new(stream, 4096, u64::MAX);
         let id = self.next_client_id();
         let session = ClientSession::new(channel, id, token);
-        info!("register new client: {}", id);
-        debug!("new client: {:?}", session);
+        info!("Register new client: {}", id);
+        debug!("{:#?}", session);
         self.clients.insert(token, session);
     }
 
@@ -295,7 +295,7 @@ impl CommandHub {
     /// - manage timeouts of tasks
     pub fn run(&mut self) {
         let mut events = Events::with_capacity(100);
-        debug!("running the command hub: {:?}", self);
+        debug!("running the command hub: {:#?}", self);
 
         loop {
             let run_state = self.run_state;
@@ -400,7 +400,8 @@ impl CommandHub {
                                     server.handle_client_request(client, request);
                                 }
                                 ClientResult::CloseSession => {
-                                    info!("Closing client {:#?}", client);
+                                    info!("Closing client {}", client.id);
+                                    debug!("{:#?}", client);
                                     self.event_subscribers.remove(&token);
                                     self.clients.remove(&token);
                                 }
@@ -511,7 +512,6 @@ pub enum ServerState {
 /// - scatter to workers
 /// - gather worker responses
 /// - trigger a finishing function when all responses are gathered
-#[derive(Debug)]
 pub struct Server {
     pub config: Config,
     /// Sōzu clients that subscribed to events
@@ -855,5 +855,25 @@ impl Server {
             next_task_id: self.next_task_id,
             next_worker_id: self.next_worker_id,
         }
+    }
+}
+
+impl Debug for Server {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Server")
+            .field("config", &self.config)
+            .field("event_subscribers", &self.event_subscribers)
+            .field("executable_path", &self.executable_path)
+            .field("in_flight", &self.in_flight)
+            .field("next_client_id", &self.next_client_id)
+            .field("next_session_id", &self.next_session_id)
+            .field("next_task_id", &self.next_task_id)
+            .field("next_worker_id", &self.next_worker_id)
+            .field("poll", &self.poll)
+            .field("queued_tasks", &self.queued_tasks)
+            .field("run_state", &self.run_state)
+            .field("unix_listener", &self.unix_listener)
+            .field("workers", &self.workers)
+            .finish()
     }
 }

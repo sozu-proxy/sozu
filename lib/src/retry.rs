@@ -1,6 +1,6 @@
 use std::{cmp, fmt::Debug, time};
 
-use rand::{self, Rng};
+use rand::Rng;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum RetryAction {

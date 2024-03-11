@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap},
+    env,
     fs::File,
     io::{ErrorKind, Read},
 };
@@ -216,17 +217,28 @@ fn save_state(server: &mut Server, client: &mut ClientSession, path: &str) {
 /// change logging level on the main process, and on all workers
 fn set_logging_level(server: &mut Server, client: &mut ClientSession, logging_filter: String) {
     debug!("Changing main process log level to {}", logging_filter);
-    logging::LOGGER.with(|l| {
-        let directives = logging::parse_logging_spec(&logging_filter);
-        l.borrow_mut().set_directives(directives);
+    let (directives, errors) = logging::parse_logging_spec(&logging_filter);
+    if !errors.is_empty() {
+        client.finish_failure(format!(
+            "Error parsing logging filter:\n- {}",
+            errors
+                .iter()
+                .map(logging::LogSpecParseError::to_string)
+                .collect::<Vec<String>>()
+                .join("\n- ")
+        ));
+        return;
+    }
+    logging::LOGGER.with(|logger| {
+        logger.borrow_mut().set_directives(directives);
     });
 
     // also change / set the content of RUST_LOG so future workers / main thread
     // will have the new logging filter value
-    ::std::env::set_var("RUST_LOG", &logging_filter);
+    env::set_var("RUST_LOG", &logging_filter);
     debug!(
         "Logging level now: {}",
-        ::std::env::var("RUST_LOG").unwrap_or("could get RUST_LOG from env".to_string())
+        env::var("RUST_LOG").unwrap_or("could get RUST_LOG from env".to_string())
     );
 
     worker_request(server, client, RequestType::Logging(logging_filter));

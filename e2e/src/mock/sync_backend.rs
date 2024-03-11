@@ -42,13 +42,13 @@ impl Backend {
         }
     }
 
-    /// Binds itself to its address, stores the yielded TCP listener
+    /// Binds itself to its address, stores the yielded TCP listener
     pub fn connect(&mut self) {
         let listener = TcpListener::bind(self.address).expect("could not bind");
         let timeout = Duration::from_millis(100);
         let timeout = libc::timeval {
             tv_sec: 0,
-            tv_usec: timeout.subsec_micros().try_into().unwrap(),
+            tv_usec: timeout.subsec_micros().into(),
         };
         let listener = unsafe {
             let fd = listener.into_raw_fd();

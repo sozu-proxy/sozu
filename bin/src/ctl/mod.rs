@@ -126,7 +126,7 @@ impl CommandManager {
                 } => self.get_metrics(list, refresh, names, clusters, backends, no_clusters),
                 _ => self.configure_metrics(cmd),
             },
-            SubCmd::Logging { level } => self.logging_filter(&level),
+            SubCmd::Logging { filter } => self.logging_filter(filter),
             SubCmd::State { cmd } => match cmd {
                 StateCmd::Save { file } => self.save_state(file),
                 StateCmd::Load { file } => self.load_state(file),

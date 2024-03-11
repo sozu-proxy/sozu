@@ -13,13 +13,13 @@ use mio::{net::TcpStream, Interest, Token};
 use rusty_ulid::Ulid;
 use sozu_command::{
     config::MAX_LOOP_ITERATIONS,
+    logging::EndpointRecord,
     proto::command::{Event, EventKind, ListenerType},
 };
 use time::{Duration, Instant};
 
 use crate::{
     backends::{Backend, BackendError},
-    logs::{Endpoint, LogContext, RequestRecord},
     pool::{Checkout, Pool},
     protocol::{
         http::{editor::HttpContext, parser::Method},
@@ -29,12 +29,14 @@ use crate::{
     router::Route,
     server::{push_event, CONN_RETRIES},
     socket::{stats::socket_rtt, SocketHandler, SocketResult, TransportProtocol},
-    sozu_command::ready::Ready,
+    sozu_command::{logging::LogContext, ready::Ready},
     timer::TimeoutContainer,
     AcceptError, BackendConnectAction, BackendConnectionError, BackendConnectionStatus,
     L7ListenerHandler, L7Proxy, ListenerHandler, Protocol, ProxySession, Readiness,
     RetrieveClusterError, SessionIsToBeClosed, SessionMetrics, SessionResult, StateResult,
 };
+
+use super::pipe::WebSocketContext;
 
 /// Generic Http representation using the Kawa crate using the Checkout of Sozu as buffer
 type GenericHttpStream = kawa::Kawa<Checkout>;
@@ -763,6 +765,20 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         }
     }
 
+    fn log_endpoint(&self) -> EndpointRecord {
+        let status = match self.status {
+            SessionStatus::Normal => self.context.status,
+            SessionStatus::DefaultAnswer(answers, ..) => Some(answers.into()),
+        };
+        EndpointRecord::Http {
+            method: self.context.method.as_deref(),
+            authority: self.context.authority.as_deref(),
+            path: self.context.path.as_deref(),
+            reason: self.context.reason.as_deref(),
+            status,
+        }
+    }
+
     pub fn get_session_address(&self) -> Option<SocketAddr> {
         self.context
             .session_address
@@ -798,64 +814,57 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
     }
 
     /// Format the context of the websocket into a loggable String
-    pub fn websocket_context(&self) -> String {
-        format!(
-            "{}",
-            Endpoint::Http {
-                method: self.context.method.as_ref(),
-                authority: self.context.authority.as_deref(),
-                path: self.context.path.as_deref(),
-                status: self.context.status,
-                reason: self.context.reason.as_deref(),
-            }
-        )
+    pub fn websocket_context(&self) -> WebSocketContext {
+        WebSocketContext::Http {
+            method: self.context.method.clone(),
+            authority: self.context.authority.clone(),
+            path: self.context.path.clone(),
+            reason: self.context.reason.clone(),
+            status: self.context.status,
+        }
     }
 
-    pub fn log_request(&mut self, metrics: &SessionMetrics, message: Option<&str>) {
+    pub fn log_request(&self, metrics: &SessionMetrics, error: bool, message: Option<&str>) {
         let listener = self.listener.borrow();
         let tags = self.context.authority.as_ref().and_then(|host| {
             let hostname = match host.split_once(':') {
                 None => host,
                 Some((hostname, _)) => hostname,
             };
-            listener.get_concatenated_tags(hostname)
+            listener.get_tags(hostname)
         });
-        let status = match self.status {
-            SessionStatus::Normal => self.context.status,
-            SessionStatus::DefaultAnswer(answers, ..) => Some(answers.into()),
-        };
 
-        let user_agent = self.context.user_agent.take();
-        RequestRecord {
-            error: message,
-            context: self.log_context(),
+        let context = self.log_context();
+        metrics.register_end_of_session(&context);
+
+        log_access! {
+            error,
+            message: message,
+            context,
             session_address: self.get_session_address(),
             backend_address: self.get_backend_address(),
             protocol: self.protocol_string(),
-            endpoint: Endpoint::Http {
-                method: self.context.method.as_ref(),
-                authority: self.context.authority.as_deref(),
-                path: self.context.path.as_deref(),
-                status,
-                reason: self.context.reason.as_deref(),
-            },
+            endpoint: self.log_endpoint(),
             tags,
             client_rtt: socket_rtt(self.front_socket()),
             server_rtt: self.backend_socket.as_ref().and_then(socket_rtt),
-            metrics,
-            user_agent,
-        }
-        .log();
+            service_time: metrics.service_time(),
+            response_time: metrics.response_time(),
+            bytes_in: metrics.bin,
+            bytes_out: metrics.bout,
+            user_agent: self.context.user_agent.as_deref(),
+        };
     }
 
     pub fn log_request_success(&mut self, metrics: &SessionMetrics) {
         save_http_status_metric(self.context.status, self.log_context());
-        self.log_request(metrics, None);
+        self.log_request(metrics, false, None);
     }
-    pub fn log_default_answer_success(&mut self, metrics: &SessionMetrics) {
-        self.log_request(metrics, None);
+
+    pub fn log_default_answer_success(&self, metrics: &SessionMetrics) {
+        self.log_request(metrics, false, None);
     }
-    pub fn log_request_error(&mut self, metrics: &mut SessionMetrics, message: &str) {
+    pub fn log_request_error(&self, metrics: &mut SessionMetrics, message: &str) {
         incr!("http.errors");
         error!(
             "{} Could not process request properly got: {}",
@@ -863,7 +872,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             message
         );
         self.print_state(self.protocol_string());
-        self.log_request(metrics, Some(message));
+        self.log_request(metrics, true, Some(message));
     }
 
     pub fn set_answer(&mut self, answer: DefaultAnswerStatus, buf: Option<Rc<Vec<u8>>>) {
@@ -1573,6 +1582,9 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         }
 
         if self.frontend_readiness.event.is_hup() {
+            if !self.request_stream.is_initial() {
+                self.log_request_error(metrics, "Client disconnected abruptly");
+            }
             return SessionResult::Close;
         }
 

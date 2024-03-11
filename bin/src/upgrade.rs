@@ -7,7 +7,7 @@ use std::{
     process::Command,
 };
 
-use libc::{self, pid_t};
+use libc::pid_t;
 use mio::net::UnixStream;
 use nix::{
     errno::Errno,
