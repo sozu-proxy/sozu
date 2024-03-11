@@ -1579,18 +1579,21 @@ mod tests {
         let address = SocketAddress::new_v4(127, 0, 0, 1, 1032);
         let resolver = Arc::new(MutexCertificateResolver::default());
 
-        let server_config = RustlsServerConfig::builder_with_protocol_versions(&[
-            &rustls::version::TLS12,
-            &rustls::version::TLS13,
-        ])
-        .with_no_client_auth()
-        .with_cert_resolver(resolver.clone());
+        let crypto_provider = Arc::new(ring::default_provider());
+
+        let server_config = RustlsServerConfig::builder_with_provider(crypto_provider)
+            .with_protocol_versions(&[&rustls::version::TLS12, &rustls::version::TLS13])
+            .expect("could not create rustls config server")
+            .with_no_client_auth()
+            .with_cert_resolver(resolver.clone());
 
         let rustls_details = Arc::new(server_config);
 
         let default_config = ListenerBuilder::new_https(address.clone())
             .to_tls(None)
             .expect("Could not create default HTTPS listener config");
+
+        println!("it doesn't even matter");
 
         let listener = HttpsListener {
             listener: None,
