@@ -1,5 +1,6 @@
 [workspace]
 members = ["lib", "command", "bin", "e2e"]
+resolver = "2" # consistent with rust edition 2021, see https://doc.rust-lang.org/cargo/reference/resolver.html#features
 
 [profile.release]
 lto = true

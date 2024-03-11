@@ -15,7 +15,7 @@ authors = [
 ]
 categories = ["network-programming"]
 edition = "2021"
-rust-version = "1.70.0"
+rust-version = "1.74.0"
 include = ["README.md", "Cargo.toml", "src/**/*"]
 
 [dependencies]
@@ -24,7 +24,7 @@ jemallocator = { version = "^0.5.4", optional = true }
 libc = "^0.2.152"
 log = "^0.4.20"
 mio = { version = "^0.8.10", features = ["os-poll", "net"] }
-nix = { version = "^0.27.1", features = ["signal", "fs"] }
+nix = { version = "^0.28.0", features = ["signal", "fs"] }
 nom = "^7.1.3"
 paw = "^1.0.0"
 serde = { version = "^1.0.195", features = ["derive"] }
