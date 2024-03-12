@@ -611,11 +611,11 @@ fn print_cluster_infos(worker_responses: &WorkerResponses) -> Result<(), Display
 
     let worker_ids: HashSet<&String> = worker_responses.map.keys().collect();
 
-    let mut cluster_infos = HashMap::new();
-    let mut http_frontends = HashMap::new();
-    let mut https_frontends = HashMap::new();
-    let mut tcp_frontends = HashMap::new();
-    let mut backends = HashMap::new();
+    let mut cluster_infos = BTreeMap::new();
+    let mut http_frontends = BTreeMap::new();
+    let mut https_frontends = BTreeMap::new();
+    let mut tcp_frontends = BTreeMap::new();
+    let mut backends = BTreeMap::new();
 
     for (worker_id, response_content) in worker_responses.map.iter() {
         if let Some(ContentType::Clusters(clusters)) = &response_content.content_type {
