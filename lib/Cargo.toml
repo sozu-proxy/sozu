@@ -28,28 +28,28 @@ include = [
 ]
 
 [dependencies]
-anyhow = "^1.0.79"
+anyhow = "^1.0.81"
 cookie-factory = "^0.3.2"
 hdrhistogram = "^7.5.4"
 hex = "^0.4.3"
 hpack = "^0.3.0"
 idna = "^0.5.0"
-kawa = { version = "^0.6.4", default-features = false }
-libc = "^0.2.152"
+kawa = { version = "^0.6.5", default-features = false }
+libc = "^0.2.153"
 memchr = "^2.7.1"
 mio = { version = "^0.8.11", features = ["os-poll", "os-ext", "net"] }
 nom = { version = "^7.1.3", default-features = true, features = ["std"] }
 poule = "^0.3.2"
 rand = "^0.8.5"
 regex = "^1.10.3"
-rustls = { version = "^0.23.1", features = ["ring"] }
-rustls-pemfile = "^2.0.0"
+rustls = { version = "^0.23.2", features = ["ring"] }
+rustls-pemfile = "^2.1.1"
 rusty_ulid = "^2.0.0"
 sha2 = "^0.10.8"
 slab = "^0.4.9"
-socket2 = { version = "^0.5.5", features = ["all"] }
-thiserror = "^1.0.56"
-time = "^0.3.31"
+socket2 = { version = "^0.5.6", features = ["all"] }
+thiserror = "^1.0.58"
+time = "^0.3.34"
 once_cell = "1.19.0"
 sozu-command-lib = { path = "../command", version = "^0.15.19" }
 
