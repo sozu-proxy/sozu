@@ -22,7 +22,9 @@ use crate::{
 #[derive(thiserror::Error, Debug)]
 pub enum CertificateError {
     #[error("Could not parse PEM certificate from bytes: {0}")]
-    InvalidCertificate(String),
+    ParsePEMCertificate(String),
+    #[error("Could not parse X509 certificate from bytes: {0}")]
+    ParseX509Certificate(String),
     #[error("failed to parse tls version '{0}'")]
     InvalidTlsVersion(String),
     #[error("failed to parse fingerprint, {0}")]
@@ -40,14 +42,14 @@ pub enum CertificateError {
 /// (a.k.a [`Pem`])
 pub fn parse_pem(certificate: &[u8]) -> Result<Pem, CertificateError> {
     let (_, pem) = parse_x509_pem(certificate)
-        .map_err(|err| CertificateError::InvalidCertificate(err.to_string()))?;
+        .map_err(|err| CertificateError::ParsePEMCertificate(err.to_string()))?;
 
     Ok(pem)
 }
 
 pub fn parse_x509(pem_bytes: &[u8]) -> Result<X509Certificate, CertificateError> {
     parse_x509_certificate(pem_bytes)
-        .map_err(|nom_e| CertificateError::InvalidCertificate(nom_e.to_string()))
+        .map_err(|nom_e| CertificateError::ParseX509Certificate(nom_e.to_string()))
         .map(|t| t.1)
 }
 
@@ -174,10 +176,9 @@ pub fn calculate_fingerprint_from_der(certificate: &[u8]) -> Vec<u8> {
 
 /// Compute fingerprint from a certificate that is encoded in pem format
 pub fn calculate_fingerprint(certificate: &[u8]) -> Result<Vec<u8>, CertificateError> {
-    let parsed_certificate = parse_pem(certificate)
-        .map_err(|parse_error| CertificateError::InvalidCertificate(parse_error.to_string()))?;
-
-    Ok(calculate_fingerprint_from_der(&parsed_certificate.contents))
+    let parsed_certificate = parse_pem(certificate)?;
+    let fingerprint = calculate_fingerprint_from_der(&parsed_certificate.contents);
+    Ok(fingerprint)
 }
 
 pub fn split_certificate_chain(mut chain: String) -> Vec<String> {
