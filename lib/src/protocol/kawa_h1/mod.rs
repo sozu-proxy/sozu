@@ -222,10 +222,8 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
     /// Reset the connection in case of keep-alive to be ready for the next request
     pub fn reset(&mut self) {
         trace!("==============reset");
-        self.context.keep_alive_frontend = true;
-        self.context.keep_alive_backend = true;
-        self.context.sticky_session_found = None;
         self.context.id = Ulid::generate();
+        self.context.reset();
 
         self.request_stream.clear();
         self.response_stream.clear();
@@ -239,8 +237,9 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
         // reset the front timeout and cancel the back timeout while we are
         // waiting for a new request
-        self.container_frontend_timeout.reset();
         self.container_backend_timeout.cancel();
+        self.container_frontend_timeout
+            .set_duration(self.configured_frontend_timeout);
         self.frontend_readiness.interest = Ready::READABLE | Ready::HUP | Ready::ERROR;
         self.backend_readiness.interest = Ready::HUP | Ready::ERROR;
 
@@ -528,7 +527,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             return match (
                 self.context.keep_alive_frontend,
                 self.context.keep_alive_backend,
-                response_length_known
+                response_length_known,
             ) {
                 (true, true, true) => {
                     debug!("{} keep alive front/back", self.log_context());
@@ -636,6 +635,12 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             );
             self.print_state(self.protocol_string());
         }
+        // In case both the response happens while the request is not tagged as "terminated",
+        // we place the timeout responsibility on the backend.
+        // This can happen when:
+        // - kawa fails to detect a properly terminated request (e.g. a GET request with no body and no length)
+        // - the response can start before the end of the request (e.g. stream processing like compression)
+        self.container_frontend_timeout.cancel();
 
         if let SessionStatus::DefaultAnswer(_, _, _) = self.status {
             error!(
@@ -1761,15 +1766,20 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> SessionState 
         if self.frontend_token == token {
             self.container_frontend_timeout.triggered();
             return match self.timeout_status() {
+                // we do not have a complete answer
                 TimeoutStatus::Request => {
                     self.set_answer(DefaultAnswerStatus::Answer408, None);
                     self.writable(metrics)
                 }
+                // we have a complete answer but the response did not start
                 TimeoutStatus::WaitingForResponse => {
-                    self.set_answer(DefaultAnswerStatus::Answer504, None);
+                    self.set_answer(DefaultAnswerStatus::Answer408, None);
                     self.writable(metrics)
                 }
-                TimeoutStatus::Response => StateResult::CloseSession,
+                // we have a complete answer and the start of a response, but the request was not tagged as terminated
+                // for now we place responsibility of timeout on the backend in those cases, so we ignore this
+                TimeoutStatus::Response => StateResult::Continue,
+                // timeout in keep-alive, simply close the connection
                 TimeoutStatus::WaitingForNewRequest => StateResult::CloseSession,
             };
         }
@@ -1796,6 +1806,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> SessionState 
                     );
                     StateResult::CloseSession
                 }
+                // in keep-alive, we place responsibility of timeout on the frontend, so we ignore this
                 TimeoutStatus::WaitingForNewRequest => StateResult::Continue,
             };
         }

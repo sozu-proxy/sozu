@@ -95,6 +95,10 @@ impl HttpContext {
                 .map(ToOwned::to_owned);
         }
 
+        if self.method == Some(Method::Get) && request.body_size == kawa::BodySize::Empty {
+            request.parsing_phase = kawa::ParsingPhase::Terminated;
+        }
+
         let public_ip = self.public_address.ip();
         let public_port = self.public_address.port();
         let proto = match self.protocol {
@@ -336,5 +340,17 @@ impl HttpContext {
             key: kawa::Store::Static(b"Sozu-Id"),
             val: kawa::Store::from_string(self.id.to_string()),
         }));
+    }
+
+    pub fn reset(&mut self) {
+        self.keep_alive_backend = true;
+        self.keep_alive_frontend = true;
+        self.sticky_session_found = None;
+        self.method = None;
+        self.authority = None;
+        self.path = None;
+        self.status = None;
+        self.reason = None;
+        self.user_agent = None;
     }
 }
