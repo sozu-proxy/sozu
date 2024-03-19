@@ -14,5 +14,5 @@ rustls = { version = "^0.21.10", features = ["dangerous_configuration"] }
 time = "^0.3.31"
 tokio = { version = "1.35.1", features = ["net", "rt-multi-thread"] }
 
-sozu-command-lib = { path = "../command", version = "^0.15.19" }
-sozu-lib = { path = "../lib", version = "^0.15.19" }
+sozu-command-lib = { path = "../command", version = "^1.0.0-rc.1" }
+sozu-lib = { path = "../lib", version = "^1.0.0-rc.1" }
