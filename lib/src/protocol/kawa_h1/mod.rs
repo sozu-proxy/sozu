@@ -635,12 +635,6 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             );
             self.print_state(self.protocol_string());
         }
-        // In case both the response happens while the request is not tagged as "terminated",
-        // we place the timeout responsibility on the backend.
-        // This can happen when:
-        // - kawa fails to detect a properly terminated request (e.g. a GET request with no body and no length)
-        // - the response can start before the end of the request (e.g. stream processing like compression)
-        self.container_frontend_timeout.cancel();
 
         if let SessionStatus::DefaultAnswer(_, _, _) = self.status {
             error!(
@@ -686,6 +680,14 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             // if self.kawa_response.storage.is_full() {
             //     self.backend_readiness.interest.remove(Ready::READABLE);
             // }
+
+            // In case the response starts while the request is not tagged as "terminated",
+            // we place the timeout responsibility on the backend.
+            // This can happen when:
+            // - the request is malformed and doesn't have length information
+            // - kawa fails to detect a properly terminated request (e.g. a GET request with no body and no length)
+            // - the response can start before the end of the request (e.g. stream processing like compression)
+            self.container_frontend_timeout.cancel();
         } else {
             self.backend_readiness.event.remove(Ready::READABLE);
         }
