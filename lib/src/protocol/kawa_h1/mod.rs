@@ -1,4 +1,5 @@
 pub mod answers;
+pub mod diagnostics;
 pub mod editor;
 pub mod parser;
 
@@ -22,7 +23,12 @@ use crate::{
     backends::{Backend, BackendError},
     pool::{Checkout, Pool},
     protocol::{
-        http::{answers::DefaultAnswerStream, editor::HttpContext, parser::Method},
+        http::{
+            answers::DefaultAnswerStream,
+            diagnostics::{diagnostic_400_502, diagnostic_413_507},
+            editor::HttpContext,
+            parser::Method,
+        },
         pipe::WebSocketContext,
         SessionState,
     },
@@ -51,16 +57,40 @@ impl kawa::AsBuffer for Checkout {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DefaultAnswer {
-    Answer301 { location: String },
-    Answer400 { details: String },
+    Answer301 {
+        location: String,
+    },
+    Answer400 {
+        message: String,
+        phase: kawa::ParsingPhaseMarker,
+        details: String,
+    },
     Answer401 {},
     Answer404 {},
-    Answer408 {},
-    Answer413 { details: String },
-    Answer502 { details: String },
-    Answer503 { details: String },
-    Answer504 {},
-    Answer507 { details: String },
+    Answer408 {
+        duration: String,
+    },
+    Answer413 {
+        message: String,
+        phase: kawa::ParsingPhaseMarker,
+        capacity: usize,
+    },
+    Answer502 {
+        message: String,
+        phase: kawa::ParsingPhaseMarker,
+        details: String,
+    },
+    Answer503 {
+        message: String,
+    },
+    Answer504 {
+        duration: String,
+    },
+    Answer507 {
+        phase: kawa::ParsingPhaseMarker,
+        message: String,
+        capacity: usize,
+    },
 }
 
 impl From<&DefaultAnswer> for u16 {
@@ -297,9 +327,10 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 self.backend_readiness.interest.insert(Ready::WRITABLE);
             } else {
                 // client has filled its buffer and we can't empty it
-                let s = &self.request_stream.storage;
                 self.set_answer(DefaultAnswer::Answer413 {
-                    details: format!("{} {} {}", s.start, s.head, s.end),
+                    capacity: self.request_stream.storage.capacity(),
+                    phase: self.request_stream.parsing_phase.marker(),
+                    message: diagnostic_413_507(self.request_stream.parsing_phase),
                 });
             }
             return StateResult::Continue;
@@ -400,8 +431,11 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 self.log_request_error(metrics, "Parsing error on the request");
                 return StateResult::CloseSession;
             } else {
+                let (message, details) = diagnostic_400_502(marker, kind, &self.request_stream);
                 self.set_answer(DefaultAnswer::Answer400 {
-                    details: format!("{marker:?}: {kind:?}"),
+                    phase: marker,
+                    details,
+                    message,
                 });
                 return StateResult::Continue;
             }
@@ -707,10 +741,13 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 self.frontend_readiness.interest.insert(Ready::WRITABLE);
             } else {
                 // server has filled its buffer and we can't empty it
-                let s = &response_stream.storage;
-                let (start, head, end) = (s.start, s.head, s.end);
+                let capacity = response_stream.storage.capacity();
+                let phase = response_stream.parsing_phase.marker();
+                let message = diagnostic_413_507(response_stream.parsing_phase);
                 self.set_answer(DefaultAnswer::Answer507 {
-                    details: format!("{start} {head} {end}"),
+                    capacity,
+                    phase,
+                    message,
                 });
             }
             return SessionResult::Continue;
@@ -719,7 +756,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         let (size, socket_state) = backend_socket.socket_read(response_stream.storage.space());
         debug!(
             "{}\tBACK  [{}<-{:?}]: read {} bytes",
-            "ctx", // FIXME: self.context.log_context(),
+            self.context.log_context(),
             self.frontend_token.0,
             self.backend_token,
             size
@@ -793,8 +830,11 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             if response_stream.consumed {
                 return SessionResult::Close;
             } else {
+                let (message, details) = diagnostic_400_502(marker, kind, &self.request_stream);
                 self.set_answer(DefaultAnswer::Answer502 {
-                    details: format!("{marker:?}: {kind:?}"),
+                    phase: marker,
+                    details,
+                    message,
                 });
                 return SessionResult::Continue;
             }
@@ -975,8 +1015,10 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
         let mut kawa = self.answers.borrow().get(
             answer,
-            self.context.cluster_id.as_deref(),
             self.context.id.to_string(),
+            self.context.cluster_id.as_deref(),
+            self.context.backend_id.as_deref(),
+            self.get_route(),
         );
         kawa.prepare(&mut kawa::h1::BlockConverter);
         self.context.status = Some(status);
@@ -1111,7 +1153,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 self.context.log_context()
             );
             self.set_answer(DefaultAnswer::Answer503 {
-                details: format!(
+                message: format!(
                     "Max connection attempt reached: {}",
                     self.connection_attempts
                 ),
@@ -1159,6 +1201,19 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         Ok((given_authority, given_path, given_method))
     }
 
+    pub fn get_route(&self) -> String {
+        if let Some(method) = &self.context.method {
+            if let Some(authority) = &self.context.authority {
+                if let Some(path) = &self.context.path {
+                    return format!("{method} {authority}{path}");
+                }
+                return format!("{method} {authority}");
+            }
+            return format!("{method}");
+        }
+        return format!("");
+    }
+
     fn cluster_id_from_request(
         &mut self,
         proxy: Rc<RefCell<dyn L7Proxy>>,
@@ -1167,7 +1222,9 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             Ok(tuple) => tuple,
             Err(cluster_error) => {
                 self.set_answer(DefaultAnswer::Answer400 {
-                    details: "...".into(),
+                    phase: self.request_stream.parsing_phase.marker(),
+                    details: cluster_error.to_string(),
+                    message: "Could not extract the route after connection started, this should not happen.".into(),
                 });
                 return Err(cluster_error);
             }
@@ -1230,7 +1287,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 // some backend errors are actually retryable
                 // TODO: maybe retry or return a different default answer
                 self.set_answer(DefaultAnswer::Answer503 {
-                    details: format!("{backend_error}"),
+                    message: backend_error.to_string(),
                 });
                 BackendConnectionError::Backend(backend_error)
             })?;
@@ -1538,7 +1595,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                     self.frontend_token
                 );
                 self.set_answer(DefaultAnswer::Answer503 {
-                    details: "Backend closed after consuming part of the request".into(),
+                    message: "Backend closed after consuming part of the request".into(),
                 });
                 self.backend_readiness.interest = Ready::EMPTY;
                 StateResult::Continue
@@ -1786,14 +1843,18 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> SessionState 
             return match self.timeout_status() {
                 // we do not have a complete answer
                 TimeoutStatus::Request => {
-                    self.set_answer(DefaultAnswer::Answer408 {});
+                    self.set_answer(DefaultAnswer::Answer408 {
+                        duration: self.container_frontend_timeout.duration().to_string(),
+                    });
                     self.writable(metrics)
                 }
                 // we have a complete answer but the response did not start
                 TimeoutStatus::WaitingForResponse => {
                     // this case is ambiguous, as it is the frontend timeout that triggers while we were waiting for response
                     // the timeout responsibility should have switched before
-                    self.set_answer(DefaultAnswer::Answer504 {});
+                    self.set_answer(DefaultAnswer::Answer504 {
+                        duration: self.container_backend_timeout.duration().to_string(),
+                    });
                     self.writable(metrics)
                 }
                 // we have a complete answer and the start of a response, but the request was not tagged as terminated
@@ -1812,11 +1873,15 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> SessionState 
                     error!(
                         "got backend timeout while waiting for a request, this should not happen"
                     );
-                    self.set_answer(DefaultAnswer::Answer504 {});
+                    self.set_answer(DefaultAnswer::Answer504 {
+                        duration: self.container_backend_timeout.duration().to_string(),
+                    });
                     self.writable(metrics)
                 }
                 TimeoutStatus::WaitingForResponse => {
-                    self.set_answer(DefaultAnswer::Answer504 {});
+                    self.set_answer(DefaultAnswer::Answer504 {
+                        duration: self.container_backend_timeout.duration().to_string(),
+                    });
                     self.writable(metrics)
                 }
                 TimeoutStatus::Response => {

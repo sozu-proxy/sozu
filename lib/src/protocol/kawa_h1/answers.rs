@@ -1,7 +1,7 @@
 use crate::{protocol::http::DefaultAnswer, sozu_command::state::ClusterId};
 use kawa::{
     h1::NoCallbacks, AsBuffer, Block, BodySize, Buffer, Chunk, Kawa, Kind, Pair, ParsingPhase,
-    StatusLine, Store,
+    ParsingPhaseMarker, StatusLine, Store,
 };
 use sozu_command::proto::command::CustomHttpAnswers;
 use std::{
@@ -90,6 +90,28 @@ impl Template {
         answer: String,
         variables: &[TemplateVariable],
     ) -> Result<Self, TemplateError> {
+        let mut i = 0;
+        let mut j = 0;
+        let variables = variables
+            .iter()
+            .map(|v| match v.typ {
+                ReplacementType::Variable(_) => {
+                    i += 1;
+                    TemplateVariable {
+                        typ: ReplacementType::Variable(i - 1),
+                        ..*v
+                    }
+                }
+                ReplacementType::VariableOnce(_) => {
+                    j += 1;
+                    TemplateVariable {
+                        typ: ReplacementType::VariableOnce(j - 1),
+                        ..*v
+                    }
+                }
+                ReplacementType::ContentLength => *v,
+            })
+            .collect::<Vec<_>>();
         let answer = answer
             .replace("\r\n", "\n")
             .replace("\n", "\r\n")
@@ -125,7 +147,7 @@ impl Template {
                     let val_data = val.data(buf);
                     let key_data = key.data(buf);
                     if let Some(b'%') = val_data.first() {
-                        for variable in variables {
+                        for variable in &variables {
                             if &val_data[1..] == variable.name.as_bytes() {
                                 if !variable.valid_in_header {
                                     return Err(TemplateError::NotAllowedInHeader(variable.name));
@@ -164,7 +186,7 @@ impl Template {
                     let mut i = 0;
                     while i < data.len() {
                         if data[i] == b'%' {
-                            for variable in variables {
+                            for variable in &variables {
                                 if data[i + 1..].starts_with(variable.name.as_bytes()) {
                                     if !variable.valid_in_body {
                                         return Err(TemplateError::NotAllowedInBody(variable.name));
@@ -219,7 +241,7 @@ impl Template {
         })
     }
 
-    fn fill(&self, variables: &[&[u8]], variables_once: &mut [Vec<u8>]) -> DefaultAnswerStream {
+    fn fill(&self, variables: &[Vec<u8>], variables_once: &mut [Vec<u8>]) -> DefaultAnswerStream {
         let mut blocks = self.kawa.blocks.clone();
         let mut body_size = self.body_size;
         for replacement in &self.body_replacements {
@@ -245,7 +267,7 @@ impl Template {
             if let Block::Header(pair) = &mut blocks[replacement.block_index] {
                 match replacement.typ {
                     ReplacementType::Variable(var_index) => {
-                        pair.val = Store::from_slice(variables[var_index]);
+                        pair.val = Store::from_slice(&variables[var_index]);
                     }
                     ReplacementType::VariableOnce(var_index) => {
                         let variable = std::mem::take(&mut variables_once[var_index]);
@@ -307,6 +329,19 @@ pub struct HttpAnswers {
     pub cluster_custom_answers: HashMap<ClusterId, ClusterAnswers>,
 }
 
+// const HEADERS: &str = "Connection: close\r
+// Content-Length: 0\r
+// Sozu-Id: %REQUEST_ID\r
+// \r";
+// const STYLE: &str = "<style>
+// pre {
+//   background: #EEE;
+//   padding: 10px;
+//   border: 1px solid #AAA;
+//   border-radius: 5px;
+// }
+// </style>";
+// const FOOTER: &str = "<footer>This is an automatic answer by Sozu.</footer>";
 fn default_301() -> String {
     String::from(
         "\
@@ -314,7 +349,7 @@ HTTP/1.1 301 Moved Permanently\r
 Location: %REDIRECT_LOCATION\r
 Connection: close\r
 Content-Length: 0\r
-Sozu-Id: %SOZU_ID\r
+Sozu-Id: %REQUEST_ID\r
 \r\n",
     )
 }
@@ -326,14 +361,21 @@ HTTP/1.1 400 Bad Request\r
 Cache-Control: no-cache\r
 Connection: close\r
 %Content-Length: %CONTENT_LENGTH\r
-Sozu-Id: %SOZU_ID\r
+Sozu-Id: %REQUEST_ID\r
 \r
-<h1>Sozu automatic 400 answer</h1>
-<p>Request %SOZU_ID could not be parsed.</p>
+<style>pre{background:#EEE;padding:10px;border:1px solid #AAA;border-radius: 5px;}</style>
+<h1>400 Bad Request</h1>
 <pre>
-Kawa error: %DETAILS
-<pre>
-",
+{
+    \"route\": \"%ROUTE\",
+    \"request_id\": \"%REQUEST_ID\",
+}
+</pre>
+<p>Request could not be parsed. Parser stopped at phase: %PHASE.</p>
+<p>Diagnostic: %MESSAGE</p>
+<p>Further details:</p>
+<pre>%DETAILS</pre>
+<footer>This is an automatic answer by Sozu.</footer>",
     )
 }
 
@@ -343,8 +385,17 @@ fn default_401() -> String {
 HTTP/1.1 401 Unauthorized\r
 Cache-Control: no-cache\r
 Connection: close\r
-Sozu-Id: %SOZU_ID\r
-\r\n",
+Sozu-Id: %REQUEST_ID\r
+\r
+<style>pre{background:#EEE;padding:10px;border:1px solid #AAA;border-radius: 5px;}</style>
+<h1>401 Unauthorized</h1>
+<pre>
+{
+    \"route\": \"%ROUTE\",
+    \"request_id\": \"%REQUEST_ID\",
+}
+</pre>
+<footer>This is an automatic answer by Sozu.</footer>",
     )
 }
 
@@ -354,8 +405,17 @@ fn default_404() -> String {
 HTTP/1.1 404 Not Found\r
 Cache-Control: no-cache\r
 Connection: close\r
-Sozu-Id: %SOZU_ID\r
-\r\n",
+Sozu-Id: %REQUEST_ID\r
+\r
+<style>pre{background:#EEE;padding:10px;border:1px solid #AAA;border-radius: 5px;}</style>
+<h1>404 Not Found</h1>
+<pre>
+{
+    \"route\": \"%ROUTE\",
+    \"request_id\": \"%REQUEST_ID\",
+}
+</pre>
+<footer>This is an automatic answer by Sozu.</footer>",
     )
 }
 
@@ -365,8 +425,18 @@ fn default_408() -> String {
 HTTP/1.1 408 Request Timeout\r
 Cache-Control: no-cache\r
 Connection: close\r
-Sozu-Id: %SOZU_ID\r
-\r\n",
+Sozu-Id: %REQUEST_ID\r
+\r
+<style>pre{background:#EEE;padding:10px;border:1px solid #AAA;border-radius: 5px;}</style>
+<h1>408 Request Timeout</h1>
+<pre>
+{
+    \"route\": \"%ROUTE\",
+    \"request_id\": \"%REQUEST_ID\",
+}
+</pre>
+<p>Request timed out after %DURATION.</p>
+<footer>This is an automatic answer by Sozu.</footer>",
     )
 }
 
@@ -377,14 +447,19 @@ HTTP/1.1 413 Payload Too Large\r
 Cache-Control: no-cache\r
 Connection: close\r
 %Content-Length: %CONTENT_LENGTH\r
-Sozu-Id: %SOZU_ID\r
+Sozu-Id: %REQUEST_ID\r
 \r
-<h1>Sozu automatic 413 answer</h1>
-<p>Request %SOZU_ID failed because all its headers could not be contained at once</p>
+<style>pre{background:#EEE;padding:10px;border:1px solid #AAA;border-radius: 5px;}</style>
+<h1>413 Payload Too Large</h1>
 <pre>
-Kawa cursors: %DETAILS
-<pre>
-",
+{
+    \"route\": \"%ROUTE\",
+    \"request_id\": \"%REQUEST_ID\",
+}
+</pre>
+<p>Request needed more than %CAPACITY bytes to fit. Parser stopped at phase: %PHASE.</p>
+<p>Diagnostic: %MESSAGE</p>
+<footer>This is an automatic answer by Sozu.</footer>",
     )
 }
 
@@ -395,14 +470,23 @@ HTTP/1.1 502 Bad Gateway\r
 Cache-Control: no-cache\r
 Connection: close\r
 %Content-Length: %CONTENT_LENGTH\r
-Sozu-Id: %SOZU_ID\r
+Sozu-Id: %REQUEST_ID\r
 \r
-<h1>Sozu automatic 502 answer</h1>
-<p>Response to %SOZU_ID could not be parsed.</p>
+<style>pre{background:#EEE;padding:10px;border:1px solid #AAA;border-radius: 5px;}</style>
+<h1>502 Bad Gateway</h1>
 <pre>
-Kawa error: %DETAILS
-<pre>
-",
+{
+    \"route\": \"%ROUTE\",
+    \"request_id\": \"%REQUEST_ID\",
+    \"cluster_id\": \"%CLUSTER_ID\",
+    \"backend_id\": \"%BACKEND_ID\",
+}
+</pre>
+<p>Response could not be parsed. Parser stopped at phase: %PHASE.</p>
+<p>Diagnostic: %MESSAGE</p>
+<p>Further details:</p>
+<pre>%DETAILS</pre>
+<footer>This is an automatic answer by Sozu.</footer>",
     )
 }
 
@@ -413,14 +497,20 @@ HTTP/1.1 503 Service Unavailable\r
 Cache-Control: no-cache\r
 Connection: close\r
 %Content-Length: %CONTENT_LENGTH\r
-Sozu-Id: %SOZU_ID\r
+Sozu-Id: %REQUEST_ID\r
 \r
-<h1>Sozu automatic 503 answer</h1>
-<p>Could not find an available backend for request %SOZU_ID.</p>
+<style>pre{background:#EEE;padding:10px;border:1px solid #AAA;border-radius: 5px;}</style>
+<h1>503 Service Unavailable</h1>
 <pre>
-%DETAILS
-<pre>
-",
+{
+    \"route\": \"%ROUTE\",
+    \"request_id\": \"%REQUEST_ID\",
+    \"cluster_id\": \"%CLUSTER_ID\",
+    \"backend_id\": \"%BACKEND_ID\",
+}
+</pre>
+<p>Diagnostic: %MESSAGE</p>
+<footer>This is an automatic answer by Sozu.</footer>",
     )
 }
 
@@ -430,8 +520,20 @@ fn default_504() -> String {
 HTTP/1.1 504 Gateway Timeout\r
 Cache-Control: no-cache\r
 Connection: close\r
-Sozu-Id: %SOZU_ID\r
-\r\n",
+Sozu-Id: %REQUEST_ID\r
+\r
+<style>pre{background:#EEE;padding:10px;border:1px solid #AAA;border-radius: 5px;}</style>
+<h1>504 Gateway Timeout</h1>
+<pre>
+{
+    \"route\": \"%ROUTE\",
+    \"request_id\": \"%REQUEST_ID\",
+    \"cluster_id\": \"%CLUSTER_ID\",
+    \"backend_id\": \"%BACKEND_ID\",
+}
+</pre>
+<p>Response timed out after %DURATION.</p>
+<footer>This is an automatic answer by Sozu.</footer>",
     )
 }
 
@@ -442,30 +544,102 @@ HTTP/1.1 507 Insufficient Storage\r
 Cache-Control: no-cache\r
 Connection: close\r
 %Content-Length: %CONTENT_LENGTH\r
-Sozu-Id: %SOZU_ID\r
+Sozu-Id: %REQUEST_ID\r
 \r
-<h1>Sozu automatic 507 answer</h1>
-<p>Response to %SOZU_ID failed because all its headers could not be contained at once.</p>
+<style>pre{background:#EEE;padding:10px;border:1px solid #AAA;border-radius: 5px;}</style>
+<h1>507 Insufficient Storage</h1>
 <pre>
-Kawa cursors: %DETAILS
-<pre>
-",
+{
+    \"route\": \"%ROUTE\",
+    \"request_id\": \"%REQUEST_ID\",
+    \"cluster_id\": \"%CLUSTER_ID\",
+    \"backend_id\": \"%BACKEND_ID\",
+}
+</pre>
+<p>Response needed more than %CAPACITY bytes to fit. Parser stopped at phase: %PHASE.</p>
+<p>Diagnostic: %MESSAGE/p>
+<footer>This is an automatic answer by Sozu.</footer>",
     )
 }
 
+fn phase_to_vec(phase: ParsingPhaseMarker) -> Vec<u8> {
+    match phase {
+        ParsingPhaseMarker::StatusLine => "StatusLine",
+        ParsingPhaseMarker::Headers => "Headers",
+        ParsingPhaseMarker::Cookies => "Cookies",
+        ParsingPhaseMarker::Body => "Body",
+        ParsingPhaseMarker::Chunks => "Chunks",
+        ParsingPhaseMarker::Trailers => "Trailers",
+        ParsingPhaseMarker::Terminated => "Terminated",
+        ParsingPhaseMarker::Error => "Error",
+    }
+    .into()
+}
+
 impl HttpAnswers {
+    #[rustfmt::skip]
     pub fn template(status: u16, answer: String) -> Result<Template, (u16, TemplateError)> {
-        let sozu_id = TemplateVariable {
-            name: "SOZU_ID",
-            valid_in_body: true,
-            valid_in_header: true,
-            typ: ReplacementType::Variable(0),
-        };
         let length = TemplateVariable {
             name: "CONTENT_LENGTH",
             valid_in_body: false,
             valid_in_header: true,
             typ: ReplacementType::ContentLength,
+        };
+
+        let route = TemplateVariable {
+            name: "ROUTE",
+            valid_in_body: true,
+            valid_in_header: true,
+            typ: ReplacementType::Variable(0),
+        };
+        let request_id = TemplateVariable {
+            name: "REQUEST_ID",
+            valid_in_body: true,
+            valid_in_header: true,
+            typ: ReplacementType::Variable(0),
+        };
+        let cluster_id = TemplateVariable {
+            name: "CLUSTER_ID",
+            valid_in_body: true,
+            valid_in_header: true,
+            typ: ReplacementType::Variable(0),
+        };
+        let backend_id = TemplateVariable {
+            name: "BACKEND_ID",
+            valid_in_body: true,
+            valid_in_header: true,
+            typ: ReplacementType::Variable(0),
+        };
+        let duration = TemplateVariable {
+            name: "DURATION",
+            valid_in_body: true,
+            valid_in_header: true,
+            typ: ReplacementType::Variable(0),
+        };
+        let capacity = TemplateVariable {
+            name: "CAPACITY",
+            valid_in_body: true,
+            valid_in_header: true,
+            typ: ReplacementType::Variable(0),
+        };
+        let phase = TemplateVariable {
+            name: "PHASE",
+            valid_in_body: true,
+            valid_in_header: true,
+            typ: ReplacementType::Variable(0),
+        };
+
+        let location = TemplateVariable {
+            name: "REDIRECT_LOCATION",
+            valid_in_body: false,
+            valid_in_header: true,
+            typ: ReplacementType::VariableOnce(0),
+        };
+        let message = TemplateVariable {
+            name: "MESSAGE",
+            valid_in_body: true,
+            valid_in_header: false,
+            typ: ReplacementType::VariableOnce(0),
         };
         let details = TemplateVariable {
             name: "DETAILS",
@@ -473,23 +647,58 @@ impl HttpAnswers {
             valid_in_header: false,
             typ: ReplacementType::VariableOnce(0),
         };
-        let location = TemplateVariable {
-            name: "REDIRECT_LOCATION",
-            valid_in_body: false,
-            valid_in_header: true,
-            typ: ReplacementType::VariableOnce(0),
-        };
+
         match status {
-            301 => Template::new(301, answer, &[sozu_id, length, location]),
-            400 => Template::new(400, answer, &[sozu_id, length, details]),
-            401 => Template::new(401, answer, &[sozu_id, length]),
-            404 => Template::new(404, answer, &[sozu_id, length]),
-            408 => Template::new(408, answer, &[sozu_id, length]),
-            413 => Template::new(413, answer, &[sozu_id, length, details]),
-            502 => Template::new(502, answer, &[sozu_id, length, details]),
-            503 => Template::new(503, answer, &[sozu_id, length, details]),
-            504 => Template::new(504, answer, &[sozu_id, length]),
-            507 => Template::new(507, answer, &[sozu_id, length, details]),
+            301 => Template::new(
+                301,
+                answer,
+                &[length, route, request_id, location]
+            ),
+            400 => Template::new(
+                400,
+                answer,
+                &[length, route, request_id, message, phase, details],
+            ),
+            401 => Template::new(
+                401,
+                answer,
+                &[length, route, request_id]
+            ),
+            404 => Template::new(
+                404,
+                answer,
+                &[length, route, request_id]
+            ),
+            408 => Template::new(
+                408,
+                answer,
+                &[length, route, request_id, duration]
+            ),
+            413 => Template::new(
+                413,
+                answer,
+                &[length, route, request_id, capacity, message, phase],
+            ),
+            502 => Template::new(
+                502,
+                answer,
+                &[length, route, request_id, cluster_id, backend_id, message, phase, details],
+            ),
+            503 => Template::new(
+                503,
+                answer,
+                &[length, route, request_id, cluster_id, backend_id, message],
+            ),
+            504 => Template::new(
+                504,
+                answer,
+                &[length, route, request_id, cluster_id, backend_id, duration],
+            ),
+            507 => Template::new(
+                507,
+                answer,
+                &[length, route, request_id, cluster_id, backend_id, capacity, message, phase],
+            ),
             _ => Err(TemplateError::InvalidStatusCode(status)),
         }
         .map_err(|e| (status, e))
@@ -531,57 +740,115 @@ impl HttpAnswers {
     pub fn get(
         &self,
         answer: DefaultAnswer,
-        cluster_id: Option<&str>,
         request_id: String,
+        cluster_id: Option<&str>,
+        backend_id: Option<&str>,
+        route: String,
     ) -> DefaultAnswerStream {
+        let variables: Vec<Vec<u8>>;
         let mut variables_once: Vec<Vec<u8>>;
         let template = match answer {
             DefaultAnswer::Answer301 { location } => {
+                variables = vec![route.into(), request_id.into()];
                 variables_once = vec![location.into()];
                 &self.listener_answers.answer_301
             }
-            DefaultAnswer::Answer400 { details } => {
-                variables_once = vec![details.into()];
+            DefaultAnswer::Answer400 {
+                message,
+                phase,
+                details,
+            } => {
+                variables = vec![route.into(), request_id.into(), phase_to_vec(phase)];
+                variables_once = vec![message.into(), details.into()];
                 &self.listener_answers.answer_400
             }
             DefaultAnswer::Answer401 {} => {
+                variables = vec![route.into(), request_id.into()];
                 variables_once = vec![];
                 &self.listener_answers.answer_401
             }
             DefaultAnswer::Answer404 {} => {
+                variables = vec![route.into(), request_id.into()];
                 variables_once = vec![];
                 &self.listener_answers.answer_404
             }
-            DefaultAnswer::Answer408 {} => {
+            DefaultAnswer::Answer408 { duration } => {
+                variables = vec![route.into(), request_id.into(), duration.to_string().into()];
                 variables_once = vec![];
                 &self.listener_answers.answer_408
             }
-            DefaultAnswer::Answer413 { details } => {
-                variables_once = vec![details.into()];
+            DefaultAnswer::Answer413 {
+                message,
+                phase,
+                capacity,
+            } => {
+                variables = vec![
+                    route.into(),
+                    request_id.into(),
+                    capacity.to_string().into(),
+                    phase_to_vec(phase),
+                ];
+                variables_once = vec![message.into()];
                 &self.listener_answers.answer_413
             }
-            DefaultAnswer::Answer502 { details } => {
-                variables_once = vec![details.into()];
+            DefaultAnswer::Answer502 {
+                message,
+                phase,
+                details,
+            } => {
+                variables = vec![
+                    route.into(),
+                    request_id.into(),
+                    cluster_id.unwrap_or_default().into(),
+                    backend_id.unwrap_or_default().into(),
+                    phase_to_vec(phase),
+                ];
+                variables_once = vec![message.into(), details.into()];
                 &self.listener_answers.answer_502
             }
-            DefaultAnswer::Answer503 { details } => {
-                variables_once = vec![details.into()];
+            DefaultAnswer::Answer503 { message } => {
+                variables = vec![
+                    route.into(),
+                    request_id.into(),
+                    cluster_id.unwrap_or_default().into(),
+                    backend_id.unwrap_or_default().into(),
+                ];
+                variables_once = vec![message.into()];
                 cluster_id
                     .and_then(|id: &str| self.cluster_custom_answers.get(id))
                     .map(|c| &c.answer_503)
                     .unwrap_or_else(|| &self.listener_answers.answer_503)
             }
-            DefaultAnswer::Answer504 {} => {
+            DefaultAnswer::Answer504 { duration } => {
+                variables = vec![
+                    route.into(),
+                    request_id.into(),
+                    cluster_id.unwrap_or_default().into(),
+                    backend_id.unwrap_or_default().into(),
+                    duration.to_string().into(),
+                ];
                 variables_once = vec![];
                 &self.listener_answers.answer_504
             }
-            DefaultAnswer::Answer507 { details } => {
-                variables_once = vec![details.into()];
+            DefaultAnswer::Answer507 {
+                phase,
+                message,
+                capacity,
+            } => {
+                variables = vec![
+                    route.into(),
+                    request_id.into(),
+                    cluster_id.unwrap_or_default().into(),
+                    backend_id.unwrap_or_default().into(),
+                    capacity.to_string().into(),
+                    phase_to_vec(phase),
+                ];
+                variables_once = vec![message.into()];
                 &self.listener_answers.answer_507
             }
         };
         // kawa::debug_kawa(&template.kawa);
         // println!("{template:#?}");
-        template.fill(&[request_id.as_bytes()], &mut variables_once)
+        template.fill(&variables, &mut variables_once)
     }
 }
