@@ -127,6 +127,7 @@ pub struct Http<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> {
     /// so Http can't be borrowed again to be used in callbacks. HttContext is an independant
     /// subsection of Http that can be mutably borrowed for parser callbacks.
     pub context: HttpContext,
+    backend_backpressure: bool,
 }
 
 impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L> {
@@ -215,6 +216,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 reason: None,
                 user_agent: None,
             },
+            backend_backpressure: false,
         })
     }
 
@@ -452,6 +454,11 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             count!("bytes_out", size as i64);
             metrics.bout += size;
             self.backend_readiness.interest.insert(Ready::READABLE);
+            if self.backend_backpressure {
+                warn!("RELEASING BACKEND BACKPRESSURE");
+                self.backend_backpressure = false;
+                self.backend_readiness.event.insert(Ready::READABLE);
+            }
         } else {
             self.frontend_readiness.event.remove(Ready::WRITABLE);
         }
@@ -679,6 +686,9 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             //     self.backend_readiness.interest.remove(Ready::READABLE);
             // }
         } else {
+            if socket_state == SocketResult::Continue {
+                self.backend_backpressure = true;
+            }
             self.backend_readiness.event.remove(Ready::READABLE);
         }
 
@@ -1734,6 +1744,10 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> SessionState 
     fn close(&mut self, proxy: Rc<RefCell<dyn L7Proxy>>, metrics: &mut SessionMetrics) {
         self.close_backend(proxy, metrics);
 
+        warn!(
+            "{:?} -> ({:?}, {})",
+            self.frontend_readiness, self.backend_readiness, self.backend_backpressure
+        );
         //if the state was initial, the connection was already reset
         if !self.request_stream.is_initial() {
             gauge_add!("http.active_requests", -1);
