@@ -127,6 +127,7 @@ pub struct Http<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> {
     /// so Http can't be borrowed again to be used in callbacks. HttContext is an independant
     /// subsection of Http that can be mutably borrowed for parser callbacks.
     pub context: HttpContext,
+    backend_backpressure: bool,
 }
 
 impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L> {
@@ -215,6 +216,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 reason: None,
                 user_agent: None,
             },
+            backend_backpressure: false,
         })
     }
 
@@ -433,11 +435,10 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         self.response_stream.prepare(&mut kawa::h1::BlockConverter);
 
         let bufs = self.response_stream.as_io_slice();
-        if bufs.is_empty() {
+        if bufs.is_empty() && !self.frontend_socket.socket_wants_write() {
             self.frontend_readiness.interest.remove(Ready::WRITABLE);
             return StateResult::Continue;
         }
-
         let (size, socket_state) = self.frontend_socket.socket_write_vectored(&bufs);
         debug!(
             "{}\tFRONT [{}<-{:?}]: wrote {} bytes",
@@ -452,8 +453,10 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             count!("bytes_out", size as i64);
             metrics.bout += size;
             self.backend_readiness.interest.insert(Ready::READABLE);
-        } else {
-            self.frontend_readiness.event.remove(Ready::WRITABLE);
+            if self.backend_backpressure {
+                self.backend_backpressure = false;
+                self.backend_readiness.event.insert(Ready::READABLE);
+            }
         }
 
         match socket_state {
@@ -473,6 +476,10 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 self.frontend_readiness.event.remove(Ready::WRITABLE);
             }
             SocketResult::Continue => {}
+        }
+
+        if self.frontend_socket.socket_wants_write() {
+            return StateResult::Continue;
         }
 
         if self.response_stream.is_terminated() && self.response_stream.is_completed() {
@@ -679,6 +686,9 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             //     self.backend_readiness.interest.remove(Ready::READABLE);
             // }
         } else {
+            if socket_state == SocketResult::Continue {
+                self.backend_backpressure = true;
+            }
             self.backend_readiness.event.remove(Ready::READABLE);
         }
 
