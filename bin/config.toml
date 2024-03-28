@@ -191,6 +191,7 @@ address = "0.0.0.0:8443"
 
 # answer_404 = "../lib/assets/404.html"
 # answer_503 = "../lib/assets/503.html"
+answer_502 = "./502.html"
 # sticky_name = "SOZUBALANCEID"
 
 # Configures the client socket to receive a PROXY protocol header

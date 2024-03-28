@@ -348,7 +348,7 @@ use std::{
 use backends::BackendError;
 use hex::FromHexError;
 use mio::{net::TcpStream, Interest, Token};
-use protocol::http::parser::Method;
+use protocol::http::{answers::TemplateError, parser::Method};
 use router::RouterError;
 use socket::ServerBindError;
 use time::{Duration, Instant};
@@ -624,6 +624,8 @@ pub enum ListenerError {
     Resolver(CertificateResolverError),
     #[error("failed to parse pem, {0}")]
     PemParse(String),
+    #[error("failed to parse template {0}: {1}")]
+    TemplateParse(u16, TemplateError),
     #[error("failed to build rustls context, {0}")]
     BuildRustls(String),
     #[error("could not activate listener with address {address:?}: {error}")]
@@ -655,6 +657,8 @@ pub enum ProxyError {
     ListenerAlreadyPresent,
     #[error("could not add listener: {0}")]
     AddListener(ListenerError),
+    #[error("could not add cluster: {0}")]
+    AddCluster(ListenerError),
     #[error("failed to activate listener with address {address:?}: {listener_error}")]
     ListenerActivation {
         address: SocketAddr,

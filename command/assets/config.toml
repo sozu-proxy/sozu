@@ -12,13 +12,12 @@ buffer_size = 16384
 [[listeners]]
 address = "0.0.0.0:80"
 protocol = "http"
-answer_404 = "./assets/404.html"
 #expect_proxy = true
 
 [[listeners]]
 address = "0.0.0.0:443"
 protocol = "https"
-answer_404 = "./assets/404.html"
+answer_404 = "./assets/custom_404.html"
 tls_versions = ["TLS_V12"]
 
 [[listeners]]
@@ -29,6 +28,7 @@ expect_proxy = true
 [clusters]
 [clusters.MyCluster]
 protocol = "http"
+answer_503 = "./assets/custom_503.html"
 #sticky_session = false
 #https_redirect = false
 frontends = [

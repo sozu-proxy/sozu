@@ -8,7 +8,9 @@ use std::{
 
 use sozu_command_lib::{
     config::ListenerBuilder,
-    proto::command::{request::RequestType, ActivateListener, ListenerType, Request, ServerConfig},
+    proto::command::{
+        request::RequestType, ActivateListener, Cluster, ListenerType, Request, ServerConfig,
+    },
     scm_socket::Listeners,
     state::ConfigState,
 };
@@ -70,10 +72,10 @@ pub fn setup_test<S: Into<String>>(
         })),
     });
     worker.send_proxy_request(Request {
-        request_type: Some(RequestType::AddCluster(Worker::default_cluster(
-            "cluster_0",
-            should_stick,
-        ))),
+        request_type: Some(RequestType::AddCluster(Cluster {
+            sticky_session: should_stick,
+            ..Worker::default_cluster("cluster_0")
+        })),
     });
     worker.send_proxy_request(Request {
         request_type: Some(RequestType::AddHttpFrontend(Worker::default_http_frontend(
