@@ -433,7 +433,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         self.response_stream.prepare(&mut kawa::h1::BlockConverter);
 
         let bufs = self.response_stream.as_io_slice();
-        if bufs.is_empty() {
+        if bufs.is_empty() && !self.frontend_socket.socket_wants_write() {
             self.frontend_readiness.interest.remove(Ready::WRITABLE);
             return StateResult::Continue;
         }
@@ -452,8 +452,6 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             count!("bytes_out", size as i64);
             metrics.bout += size;
             self.backend_readiness.interest.insert(Ready::READABLE);
-        } else {
-            self.frontend_readiness.event.remove(Ready::WRITABLE);
         }
 
         match socket_state {
@@ -473,6 +471,10 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 self.frontend_readiness.event.remove(Ready::WRITABLE);
             }
             SocketResult::Continue => {}
+        }
+
+        if self.frontend_socket.socket_wants_write() {
+            return StateResult::Continue;
         }
 
         if self.response_stream.is_terminated() && self.response_stream.is_completed() {
