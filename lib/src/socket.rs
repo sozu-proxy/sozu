@@ -48,8 +48,9 @@ pub enum TransportProtocol {
 pub trait SocketHandler {
     fn socket_read(&mut self, buf: &mut [u8]) -> (usize, SocketResult);
     fn socket_write(&mut self, buf: &[u8]) -> (usize, SocketResult);
-    fn socket_write_vectored(&mut self, _buf: &[std::io::IoSlice]) -> (usize, SocketResult) {
-        unimplemented!()
+    fn socket_write_vectored(&mut self, _buf: &[std::io::IoSlice]) -> (usize, SocketResult);
+    fn socket_wants_write(&self) -> bool {
+        false
     }
     fn socket_ref(&self) -> &TcpStream;
     fn socket_mut(&mut self) -> &mut TcpStream;
@@ -183,7 +184,7 @@ impl SocketHandler for FrontRustls {
             counter += 1;
             if counter > MAX_LOOP_ITERATIONS {
                 error!("MAX_LOOP_ITERATION reached in FrontRustls::socket_read");
-                incr!("socket.read.infinite_loop.error");
+                incr!("rustls.read.infinite_loop.error");
             }
 
             if size == buf.len() {
@@ -232,7 +233,6 @@ impl SocketHandler for FrontRustls {
                     Ok(0) => break,
                     Ok(sz) => {
                         size += sz;
-                        can_read = true;
                     }
                     Err(e) => match e.kind() {
                         ErrorKind::WouldBlock => {
@@ -276,7 +276,7 @@ impl SocketHandler for FrontRustls {
             counter += 1;
             if counter > MAX_LOOP_ITERATIONS {
                 error!("MAX_LOOP_ITERATION reached in FrontRustls::socket_write");
-                incr!("socket.write.infinite_loop.error");
+                incr!("rustls.write.infinite_loop.error");
             }
             if buffered_size == buf.len() {
                 break;
@@ -392,11 +392,10 @@ impl SocketHandler for FrontRustls {
             counter += 1;
             if counter > MAX_LOOP_ITERATIONS {
                 error!("MAX_LOOP_ITERATION reached in FrontRustls::socket_write_vectored");
-                incr!("socket.write.infinite_loop.error");
+                incr!("rustls.write.infinite_loop.error");
             }
             match self.session.write_tls(&mut self.stream) {
                 Ok(0) => {
-                    //can_write = false;
                     break;
                 }
                 Ok(_sz) => {}
@@ -431,6 +430,10 @@ impl SocketHandler for FrontRustls {
         } else {
             (buffered_size, SocketResult::Continue)
         }
+    }
+
+    fn socket_wants_write(&self) -> bool {
+        self.session.wants_write()
     }
 
     fn socket_ref(&self) -> &TcpStream {

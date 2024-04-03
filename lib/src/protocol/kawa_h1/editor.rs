@@ -95,9 +95,9 @@ impl HttpContext {
                 .map(ToOwned::to_owned);
         }
 
-        if self.method == Some(Method::Get) && request.body_size == kawa::BodySize::Empty {
-            request.parsing_phase = kawa::ParsingPhase::Terminated;
-        }
+        // if self.method == Some(Method::Get) && request.body_size == kawa::BodySize::Empty {
+        //     request.parsing_phase = kawa::ParsingPhase::Terminated;
+        // }
 
         let public_ip = self.public_address.ip();
         let public_port = self.public_address.port();
