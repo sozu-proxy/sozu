@@ -1377,7 +1377,7 @@ mod tests {
             address: address.into(),
             fronts,
             answers: Rc::new(RefCell::new(
-                HttpAnswers::new(&CustomHttpAnswers::default()).unwrap(),
+                HttpAnswers::new(&Some(CustomHttpAnswers::default())).unwrap(),
             )),
             config: default_config,
             token: Token(0),

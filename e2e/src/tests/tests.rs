@@ -10,7 +10,7 @@ use sozu_command_lib::{
     logging::setup_default_logging,
     proto::command::{
         request::RequestType, ActivateListener, AddCertificate, CertificateAndKey, Cluster,
-        ListenerType, RemoveBackend, RequestHttpFrontend, SocketAddress,
+        CustomHttpAnswers, ListenerType, RemoveBackend, RequestHttpFrontend, SocketAddress,
     },
     scm_socket::Listeners,
     state::ConfigState,
@@ -641,10 +641,15 @@ fn try_http_behaviors() -> State {
     let mut http_config = ListenerBuilder::new_http(front_address.into())
         .to_http(None)
         .unwrap();
-    http_config.http_answers.answer_400 = Some(immutable_answer(400));
-    http_config.http_answers.answer_404 = Some(immutable_answer(404));
-    http_config.http_answers.answer_502 = Some(immutable_answer(502));
-    http_config.http_answers.answer_503 = Some(immutable_answer(503));
+    let http_answers = CustomHttpAnswers {
+        answer_400: Some(immutable_answer(400)),
+        answer_404: Some(immutable_answer(404)),
+        answer_502: Some(immutable_answer(502)),
+        answer_503: Some(immutable_answer(503)),
+        ..Default::default()
+    };
+    http_config.http_answers = Some(http_answers);
+
     worker.send_proxy_request_type(RequestType::AddHttpListener(http_config));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
         address: front_address.into(),
@@ -944,8 +949,13 @@ fn try_https_redirect() -> State {
         .to_http(None)
         .unwrap();
     let answer_301_prefix = "HTTP/1.1 301 Moved Permanently\r\nLocation: ";
-    http_config.http_answers.answer_301 =
-        Some(format!("{answer_301_prefix}%REDIRECT_LOCATION\r\n\r\n"));
+
+    let http_answers = CustomHttpAnswers {
+        answer_301: Some(format!("{answer_301_prefix}%REDIRECT_LOCATION\r\n\r\n")),
+        ..Default::default()
+    };
+    http_config.http_answers = Some(http_answers);
+
     worker.send_proxy_request_type(RequestType::AddHttpListener(http_config));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
         address: front_address.into(),

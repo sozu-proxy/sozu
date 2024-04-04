@@ -461,10 +461,7 @@ impl ConfigState {
     }
 
     fn add_tcp_frontend(&mut self, front: &RequestTcpFrontend) -> Result<(), StateError> {
-        let tcp_frontends = self
-            .tcp_fronts
-            .entry(front.cluster_id.clone())
-            .or_default();
+        let tcp_frontends = self.tcp_fronts.entry(front.cluster_id.clone()).or_default();
 
         let tcp_frontend = TcpFrontend {
             cluster_id: front.cluster_id.clone(),
@@ -511,10 +508,7 @@ impl ConfigState {
             load_balancing_parameters: add_backend.load_balancing_parameters.clone(),
             backup: add_backend.backup,
         };
-        let backends = self
-            .backends
-            .entry(backend.cluster_id.clone())
-            .or_default();
+        let backends = self.backends.entry(backend.cluster_id.clone()).or_default();
 
         // we might be modifying the sticky id or load balancing parameters
         backends.retain(|b| b.backend_id != backend.backend_id || b.address != backend.address);
@@ -2000,10 +1994,10 @@ mod tests {
     #[test]
     fn listener_diff() {
         let mut state: ConfigState = Default::default();
-        let custom_http_answers = CustomHttpAnswers {
+        let custom_http_answers = Some(CustomHttpAnswers {
             answer_404: Some("test".to_string()),
             ..Default::default()
-        };
+        });
         state
             .dispatch(
                 &RequestType::AddTcpListener(TcpListenerConfig {

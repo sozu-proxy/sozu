@@ -125,10 +125,7 @@ pub struct LocalClusterMetrics {
 }
 
 impl LocalClusterMetrics {
-    fn to_filtered_metrics(
-        &self,
-        metric_names: &[String],
-    ) -> Result<ClusterMetrics, MetricError> {
+    fn to_filtered_metrics(&self, metric_names: &[String]) -> Result<ClusterMetrics, MetricError> {
         let cluster = self
             .cluster
             .iter()
@@ -179,10 +176,7 @@ pub struct LocalBackendMetrics {
 }
 
 impl LocalBackendMetrics {
-    fn to_filtered_metrics(
-        &self,
-        metric_names: &[String],
-    ) -> Result<BackendMetrics, MetricError> {
+    fn to_filtered_metrics(&self, metric_names: &[String]) -> Result<BackendMetrics, MetricError> {
         let filtered_backend_metrics = self
             .metrics
             .iter()

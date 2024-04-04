@@ -1599,7 +1599,7 @@ mod tests {
             rustls_details,
             resolver,
             answers: Rc::new(RefCell::new(
-                HttpAnswers::new(&CustomHttpAnswers::default()).unwrap(),
+                HttpAnswers::new(&Some(CustomHttpAnswers::default())).unwrap(),
             )),
             config: default_config,
             token: Token(0),

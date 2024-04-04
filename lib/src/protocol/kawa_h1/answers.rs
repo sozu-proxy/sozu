@@ -704,19 +704,69 @@ impl HttpAnswers {
         .map_err(|e| (status, e))
     }
 
-    pub fn new(conf: &CustomHttpAnswers) -> Result<Self, (u16, TemplateError)> {
+    pub fn new(conf: &Option<CustomHttpAnswers>) -> Result<Self, (u16, TemplateError)> {
         Ok(HttpAnswers {
             listener_answers: ListenerAnswers {
-                answer_301: Self::template(301, conf.answer_301.clone().unwrap_or(default_301()))?,
-                answer_400: Self::template(400, conf.answer_400.clone().unwrap_or(default_400()))?,
-                answer_401: Self::template(401, conf.answer_401.clone().unwrap_or(default_401()))?,
-                answer_404: Self::template(404, conf.answer_404.clone().unwrap_or(default_404()))?,
-                answer_408: Self::template(408, conf.answer_408.clone().unwrap_or(default_408()))?,
-                answer_413: Self::template(413, conf.answer_413.clone().unwrap_or(default_413()))?,
-                answer_502: Self::template(502, conf.answer_502.clone().unwrap_or(default_502()))?,
-                answer_503: Self::template(503, conf.answer_503.clone().unwrap_or(default_503()))?,
-                answer_504: Self::template(504, conf.answer_504.clone().unwrap_or(default_504()))?,
-                answer_507: Self::template(507, conf.answer_507.clone().unwrap_or(default_507()))?,
+                answer_301: Self::template(
+                    301,
+                    conf.as_ref()
+                        .and_then(|c| c.answer_301.clone())
+                        .unwrap_or(default_301()),
+                )?,
+                answer_400: Self::template(
+                    400,
+                    conf.as_ref()
+                        .and_then(|c| c.answer_400.clone())
+                        .unwrap_or(default_400()),
+                )?,
+                answer_401: Self::template(
+                    401,
+                    conf.as_ref()
+                        .and_then(|c| c.answer_401.clone())
+                        .unwrap_or(default_401()),
+                )?,
+                answer_404: Self::template(
+                    404,
+                    conf.as_ref()
+                        .and_then(|c| c.answer_404.clone())
+                        .unwrap_or(default_404()),
+                )?,
+                answer_408: Self::template(
+                    408,
+                    conf.as_ref()
+                        .and_then(|c| c.answer_408.clone())
+                        .unwrap_or(default_408()),
+                )?,
+                answer_413: Self::template(
+                    413,
+                    conf.as_ref()
+                        .and_then(|c| c.answer_413.clone())
+                        .unwrap_or(default_413()),
+                )?,
+                answer_502: Self::template(
+                    502,
+                    conf.as_ref()
+                        .and_then(|c| c.answer_502.clone())
+                        .unwrap_or(default_502()),
+                )?,
+                answer_503: Self::template(
+                    503,
+                    conf.as_ref()
+                        .and_then(|c| c.answer_503.clone())
+                        .unwrap_or(default_503()),
+                )?,
+                answer_504: Self::template(
+                    504,
+                    conf.as_ref()
+                        .and_then(|c| c.answer_504.clone())
+                        .unwrap_or(default_504()),
+                )?,
+                answer_507: Self::template(
+                    507,
+                    conf.as_ref()
+                        .and_then(|c| c.answer_507.clone())
+                        .unwrap_or(default_507()),
+                )?,
             },
             cluster_custom_answers: HashMap::new(),
         })

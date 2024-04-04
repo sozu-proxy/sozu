@@ -1,7 +1,6 @@
 use std::{
     cell::RefCell,
-    cmp,
-    env,
+    cmp, env,
     fmt::Arguments,
     fs::{File, OpenOptions},
     io::{stdout, Error as IoError, ErrorKind as IoErrorKind, Stdout, Write},

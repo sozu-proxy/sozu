@@ -923,7 +923,7 @@ impl Display for HttpListenerConfig {
         table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
         table.add_row(row!["socket address", format!("{:?}", self.address)]);
         table.add_row(row!["public address", format!("{:?}", self.public_address),]);
-        for http_answer_row in self.http_answers.to_rows() {
+        for http_answer_row in CustomHttpAnswers::to_rows(&self.http_answers) {
             table.add_row(http_answer_row);
         }
         table.add_row(row!["expect proxy", self.expect_proxy]);
@@ -948,7 +948,7 @@ impl Display for HttpsListenerConfig {
 
         table.add_row(row!["socket address", format!("{:?}", self.address)]);
         table.add_row(row!["public address", format!("{:?}", self.public_address)]);
-        for http_answer_row in self.http_answers.to_rows() {
+        for http_answer_row in CustomHttpAnswers::to_rows(&self.http_answers) {
             table.add_row(http_answer_row);
         }
         table.add_row(row!["versions", tls_versions]);
@@ -972,34 +972,36 @@ impl Display for HttpsListenerConfig {
 }
 
 impl CustomHttpAnswers {
-    fn to_rows(&self) -> Vec<Row> {
+    fn to_rows(option: &Option<Self>) -> Vec<Row> {
         let mut rows = Vec::new();
-        if let Some(a) = &self.answer_301 {
-            rows.push(row!("301", a));
-        }
-        if let Some(a) = &self.answer_400 {
-            rows.push(row!("400", a));
-        }
-        if let Some(a) = &self.answer_404 {
-            rows.push(row!("404", a));
-        }
-        if let Some(a) = &self.answer_408 {
-            rows.push(row!("408", a));
-        }
-        if let Some(a) = &self.answer_413 {
-            rows.push(row!("413", a));
-        }
-        if let Some(a) = &self.answer_502 {
-            rows.push(row!("502", a));
-        }
-        if let Some(a) = &self.answer_503 {
-            rows.push(row!("503", a));
-        }
-        if let Some(a) = &self.answer_504 {
-            rows.push(row!("504", a));
-        }
-        if let Some(a) = &self.answer_507 {
-            rows.push(row!("507", a));
+        if let Some(answers) = option {
+            if let Some(a) = &answers.answer_301 {
+                rows.push(row!("301", a));
+            }
+            if let Some(a) = &answers.answer_400 {
+                rows.push(row!("400", a));
+            }
+            if let Some(a) = &answers.answer_404 {
+                rows.push(row!("404", a));
+            }
+            if let Some(a) = &answers.answer_408 {
+                rows.push(row!("408", a));
+            }
+            if let Some(a) = &answers.answer_413 {
+                rows.push(row!("413", a));
+            }
+            if let Some(a) = &answers.answer_502 {
+                rows.push(row!("502", a));
+            }
+            if let Some(a) = &answers.answer_503 {
+                rows.push(row!("503", a));
+            }
+            if let Some(a) = &answers.answer_504 {
+                rows.push(row!("504", a));
+            }
+            if let Some(a) = &answers.answer_507 {
+                rows.push(row!("507", a));
+            }
         }
         rows
     }

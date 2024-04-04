@@ -427,7 +427,7 @@ impl ListenerBuilder {
     }
 
     /// Get the custom HTTP answers from the file system using the provided paths
-    fn get_http_answers(&self) -> Result<CustomHttpAnswers, ConfigError> {
+    fn get_http_answers(&self) -> Result<Option<CustomHttpAnswers>, ConfigError> {
         let http_answers = CustomHttpAnswers {
             answer_301: read_http_answer_file(&self.answer_301)?,
             answer_400: read_http_answer_file(&self.answer_400)?,
@@ -440,7 +440,7 @@ impl ListenerBuilder {
             answer_504: read_http_answer_file(&self.answer_504)?,
             answer_507: read_http_answer_file(&self.answer_507)?,
         };
-        Ok(http_answers)
+        Ok(Some(http_answers))
     }
 
     /// Assign the timeouts of the config to this listener, only if timeouts did not exist
