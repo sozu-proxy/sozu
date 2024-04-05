@@ -81,13 +81,65 @@ address = "0.0.0.0:8080"
 
 #### Options specific to HTTP and HTTPS listeners
 
-```toml
-# path to custom 404 and 503 answers
-# a 404 response is sent when sozu does not know about the requested domain or path
-# a 503 response is sent if there are no backend servers available
-answer_404 = "../lib/assets/404.html"
-answer_503 = "../lib/assets/503.html"
+Since version 1.0.0, Sōzu allows custom HTTP answers defined for HTTP and HTTPS listeners.
 
+These answers are customizable:
+
+  - 301 Moved Permanently
+  - 400 Bad Request
+  - 401 Unauthorized
+  - 404 Not Found
+  - 408 Request Timeout
+  - 413 Payload Too Large
+  - 502 Bad Gateway
+  - 503 Service Unavailable
+  - 504 Gateway Timeout
+  - 507 Insufficient Storage
+
+These answers are to be provided in plain text files of whichever extension (we recommend `.http`
+for clarity) and may look like this:
+
+```html
+HTTP/1.1 404 Not Found
+Cache-Control: no-cache
+Connection: close
+Sozu-Id: %REQUEST_ID
+
+<style>pre{background:#EEE;padding:10px;border:1px solid #AAA;border-radius: 5px;}</style>
+<h1>404 Not Found</h1>
+
+<p>insert your custom text here, in fact, all HTML is changeable, including the CSS.</p>
+
+<pre>
+{
+    \"route\": \"%ROUTE\",
+    \"request_id\": \"%REQUEST_ID\",
+}
+</pre>
+<footer>This is an automatic answer by Sozu.</footer>",
+```
+
+There are a number of available template variables, like `REQUEST_ID` or `CLUSTER_ID`, that will be replaced
+by the proxying logic when producing the error.
+
+To create your own custom HTTP answers, we highly suggest you first copy the default answers present
+in `lib/src/protocol/kawa_h1/answers.rs`, and then change them to your liking. Feel free to remove the
+`\r` newlines of the default strings for clarity.
+Sōzu will parse your file and replace whatever newline symbol(s) you use.
+
+Then, for each listener, provide the absolute paths of each custom answer.
+
+```toml
+# a 404 response is sent when sozu does not know about the requested domain or path
+answer_404 = "/path/to/my-404-answer.http"
+# a 503 response is sent if there are no backend servers available
+answer_503 = "/path/to/my-503-answer.http"
+# answer_507 = ...
+```
+
+If a frontend has a `sticky_session`, the sticky name is defined at the listener level.
+
+```toml
 # defines the sticky session cookie's name, if `sticky_session` is activated format
 # a cluster. Defaults to "SOZUBALANCEID"
 sticky_name = "SOZUBALANCEID"
