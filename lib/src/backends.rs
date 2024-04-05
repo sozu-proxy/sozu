@@ -349,9 +349,7 @@ impl BackendMap {
     }
 
     pub fn get_or_create_backend_list_for_cluster(&mut self, cluster_id: &str) -> &mut BackendList {
-        self.backends
-            .entry(cluster_id.to_string())
-            .or_default()
+        self.backends.entry(cluster_id.to_string()).or_default()
     }
 }
 

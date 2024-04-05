@@ -461,10 +461,7 @@ impl ConfigState {
     }
 
     fn add_tcp_frontend(&mut self, front: &RequestTcpFrontend) -> Result<(), StateError> {
-        let tcp_frontends = self
-            .tcp_fronts
-            .entry(front.cluster_id.clone())
-            .or_default();
+        let tcp_frontends = self.tcp_fronts.entry(front.cluster_id.clone()).or_default();
 
         let tcp_frontend = TcpFrontend {
             cluster_id: front.cluster_id.clone(),
@@ -511,10 +508,7 @@ impl ConfigState {
             load_balancing_parameters: add_backend.load_balancing_parameters.clone(),
             backup: add_backend.backup,
         };
-        let backends = self
-            .backends
-            .entry(backend.cluster_id.clone())
-            .or_default();
+        let backends = self.backends.entry(backend.cluster_id.clone()).or_default();
 
         // we might be modifying the sticky id or load balancing parameters
         backends.retain(|b| b.backend_id != backend.backend_id || b.address != backend.address);
@@ -1168,8 +1162,8 @@ impl ConfigState {
     /// Gives details about a given cluster.
     /// Types like `HttpFrontend` are converted into protobuf ones, like `RequestHttpFrontend`
     pub fn cluster_state(&self, cluster_id: &str) -> Option<ClusterInformation> {
-        let configuration = self.clusters.get(cluster_id).cloned();
-        configuration.as_ref()?;
+        let configuration = self.clusters.get(cluster_id).cloned()?;
+        info!("{:#?}", configuration);
 
         let http_frontends: Vec<RequestHttpFrontend> = self
             .http_fronts
@@ -1204,7 +1198,7 @@ impl ConfigState {
             .collect();
 
         Some(ClusterInformation {
-            configuration,
+            configuration: Some(configuration),
             http_frontends,
             https_frontends,
             tcp_frontends,
@@ -1496,7 +1490,9 @@ mod tests {
     use rand::{seq::SliceRandom, thread_rng, Rng};
 
     use super::*;
-    use crate::proto::command::{LoadBalancingParams, RequestHttpFrontend, RulePosition};
+    use crate::proto::command::{
+        CustomHttpAnswers, LoadBalancingParams, RequestHttpFrontend, RulePosition,
+    };
 
     #[test]
     fn serialize() {
@@ -1998,6 +1994,10 @@ mod tests {
     #[test]
     fn listener_diff() {
         let mut state: ConfigState = Default::default();
+        let custom_http_answers = Some(CustomHttpAnswers {
+            answer_404: Some("test".to_string()),
+            ..Default::default()
+        });
         state
             .dispatch(
                 &RequestType::AddTcpListener(TcpListenerConfig {
@@ -2061,7 +2061,7 @@ mod tests {
             .dispatch(
                 &RequestType::AddHttpListener(HttpListenerConfig {
                     address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
-                    answer_404: "test".to_string(),
+                    http_answers: custom_http_answers.clone(),
                     ..Default::default()
                 })
                 .into(),
@@ -2081,7 +2081,7 @@ mod tests {
             .dispatch(
                 &RequestType::AddHttpsListener(HttpsListenerConfig {
                     address: SocketAddress::new_v4(0, 0, 0, 0, 8443),
-                    answer_404: String::from("test"),
+                    http_answers: custom_http_answers.clone(),
                     ..Default::default()
                 })
                 .into(),
@@ -2123,7 +2123,7 @@ mod tests {
             .into(),
             RequestType::AddHttpListener(HttpListenerConfig {
                 address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
-                answer_404: String::from("test"),
+                http_answers: custom_http_answers.clone(),
                 ..Default::default()
             })
             .into(),
@@ -2140,7 +2140,7 @@ mod tests {
             .into(),
             RequestType::AddHttpsListener(HttpsListenerConfig {
                 address: SocketAddress::new_v4(0, 0, 0, 0, 8443),
-                answer_404: String::from("test"),
+                http_answers: custom_http_answers.clone(),
                 ..Default::default()
             })
             .into(),

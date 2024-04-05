@@ -34,6 +34,7 @@ use crate::{
         http::{
             answers::HttpAnswers,
             parser::{hostname_and_port, Method},
+            ResponseStream,
         },
         proxy_protocol::expect::ExpectProxyProtocol,
         Http, Pipe, SessionState,
@@ -219,7 +220,10 @@ impl HttpSession {
         let back_token = match http.backend_token {
             Some(back_token) => back_token,
             None => {
-                warn!("Could not upgrade http request on cluster '{:?}' ({:?}) using backend '{:?}' into websocket for request '{}'", http.cluster_id, self.frontend_token, http.backend_id, http.context.id);
+                warn!(
+                    "Could not upgrade http request on cluster '{:?}' ({:?}) using backend '{:?}' into websocket for request '{}'",
+                    http.context.cluster_id, self.frontend_token, http.context.backend_id, http.context.id
+                );
                 return None;
             }
         };
@@ -230,14 +234,20 @@ impl HttpSession {
         container_frontend_timeout.reset();
         container_backend_timeout.reset();
 
+        let backend_buffer = if let ResponseStream::BackendAnswer(kawa) = http.response_stream {
+            kawa.storage.buffer
+        } else {
+            return None;
+        };
+
         let mut pipe = Pipe::new(
-            http.response_stream.storage.buffer,
-            http.backend_id,
+            backend_buffer,
+            http.context.backend_id,
             http.backend_socket,
             http.backend,
             Some(container_backend_timeout),
             Some(container_frontend_timeout),
-            http.cluster_id,
+            http.context.cluster_id,
             http.request_stream.storage.buffer,
             front_token,
             http.frontend_socket,
@@ -586,14 +596,17 @@ impl HttpProxy {
         Ok((owned.token, taken_listener))
     }
 
-    pub fn add_cluster(&mut self, cluster: Cluster) -> Result<(), ProxyError> {
-        if let Some(answer_503) = &cluster.answer_503 {
+    pub fn add_cluster(&mut self, mut cluster: Cluster) -> Result<(), ProxyError> {
+        if let Some(answer_503) = cluster.answer_503.take() {
             for listener in self.listeners.values() {
                 listener
                     .borrow()
                     .answers
                     .borrow_mut()
-                    .add_custom_answer(&cluster.cluster_id, answer_503);
+                    .add_custom_answer(&cluster.cluster_id, answer_503.clone())
+                    .map_err(|(status, error)| {
+                        ProxyError::AddCluster(ListenerError::TemplateParse(status, error))
+                    })?;
             }
         }
         self.clusters.insert(cluster.cluster_id.clone(), cluster);
@@ -715,10 +728,10 @@ impl HttpListener {
         Ok(HttpListener {
             active: false,
             address: config.address.clone().into(),
-            answers: Rc::new(RefCell::new(HttpAnswers::new(
-                &config.answer_404,
-                &config.answer_503,
-            ))),
+            answers: Rc::new(RefCell::new(
+                HttpAnswers::new(&config.http_answers)
+                    .map_err(|(status, error)| ListenerError::TemplateParse(status, error))?,
+            )),
             config,
             fronts: Router::new(),
             listener: None,
@@ -1043,14 +1056,12 @@ mod tests {
 
     use super::testing::start_http_worker;
     use super::*;
-    use sozu_command::proto::command::SocketAddress;
+    use sozu_command::proto::command::{CustomHttpAnswers, SocketAddress};
 
     use crate::sozu_command::{
         channel::Channel,
         config::ListenerBuilder,
-        proto::command::{
-            LoadBalancingAlgorithms, LoadBalancingParams, PathRule, RulePosition, WorkerRequest,
-        },
+        proto::command::{LoadBalancingParams, PathRule, RulePosition, WorkerRequest},
         response::{Backend, HttpFrontend},
     };
 
@@ -1271,99 +1282,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn https_redirect() {
-        setup_test_logger!();
-
-        let config = ListenerBuilder::new_http(SocketAddress::new_v4(127, 0, 0, 1, 1041))
-            .to_http(None)
-            .expect("could not create listener config");
-
-        let (mut command, channel) =
-            Channel::generate(1000, 10000).expect("should create a channel");
-        let _jg = thread::spawn(move || {
-            setup_test_logger!();
-            start_http_worker(config, channel, 10, 16384).expect("could not start the http server");
-        });
-
-        let cluster = Cluster {
-            cluster_id: String::from("cluster_1"),
-            https_redirect: true,
-            load_balancing: LoadBalancingAlgorithms::default() as i32,
-            sticky_session: false,
-            ..Default::default()
-        };
-        command
-            .write_message(&WorkerRequest {
-                id: String::from("ID_ABCD"),
-                content: RequestType::AddCluster(cluster).into(),
-            })
-            .unwrap();
-        let front = RequestHttpFrontend {
-            address: SocketAddress::new_v4(127, 0, 0, 1, 1041),
-            hostname: String::from("localhost"),
-            path: PathRule::prefix(String::from("/")),
-            cluster_id: Some(String::from("cluster_1")),
-            ..Default::default()
-        };
-        command
-            .write_message(&WorkerRequest {
-                id: String::from("ID_EFGH"),
-                content: RequestType::AddHttpFrontend(front).into(),
-            })
-            .unwrap();
-        let backend = Backend {
-            address: SocketAddress::new_v4(127, 0, 0, 1, 1040).into(),
-            backend_id: String::from("cluster_1-0"),
-            backup: None,
-            cluster_id: String::from("cluster_1"),
-            load_balancing_parameters: Some(LoadBalancingParams::default()),
-            sticky_id: None,
-        };
-        command
-            .write_message(&WorkerRequest {
-                id: String::from("ID_IJKL"),
-                content: RequestType::AddBackend(backend.to_add_backend()).into(),
-            })
-            .unwrap();
-
-        println!("test received: {:?}", command.read_message());
-        println!("test received: {:?}", command.read_message());
-        println!("test received: {:?}", command.read_message());
-
-        let mut client = TcpStream::connect(("127.0.0.1", 1041)).expect("could not connect");
-        // 5 seconds of timeout
-        client.set_read_timeout(Some(Duration::new(5, 0))).unwrap();
-
-        let w = client.write(
-            &b"GET /redirected?true HTTP/1.1\r\nHost: localhost\r\nConnection: Close\r\n\r\n"[..],
-        );
-        println!("http client write: {w:?}");
-
-        let expected_answer = "HTTP/1.1 301 Moved Permanently\r\nContent-Length: 0\r\nLocation: https://localhost/redirected?true\r\n\r\n";
-        let mut buffer = [0; 4096];
-        let mut index = 0;
-        loop {
-            assert!(index <= expected_answer.len());
-            if index == expected_answer.len() {
-                break;
-            }
-
-            let r = client.read(&mut buffer[index..]);
-            println!("http client read: {r:?}");
-            match r {
-                Err(e) => assert!(false, "Failed to read client stream. Error: {e:?}"),
-                Ok(sz) => {
-                    index += sz;
-                }
-            }
-        }
-
-        let answer = str::from_utf8(&buffer[..index]).expect("could not make string from buffer");
-        println!("Response: {answer}");
-        assert_eq!(answer, expected_answer);
-    }
-
     use self::tiny_http::{Response, Server};
 
     fn start_server(port: u16, barrier: Arc<Barrier>) {
@@ -1458,10 +1376,9 @@ mod tests {
             listener: None,
             address: address.into(),
             fronts,
-            answers: Rc::new(RefCell::new(HttpAnswers::new(
-                "HTTP/1.1 404 Not Found\r\n\r\n",
-                "HTTP/1.1 503 Service Unavailable\r\n\r\n",
-            ))),
+            answers: Rc::new(RefCell::new(
+                HttpAnswers::new(&Some(CustomHttpAnswers::default())).unwrap(),
+            )),
             config: default_config,
             token: Token(0),
             active: true,

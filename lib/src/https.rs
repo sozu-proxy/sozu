@@ -56,6 +56,7 @@ use crate::{
         http::{
             answers::HttpAnswers,
             parser::{hostname_and_port, Method},
+            ResponseStream,
         },
         proxy_protocol::expect::ExpectProxyProtocol,
         rustls::TlsHandshake,
@@ -345,7 +346,10 @@ impl HttpsSession {
         let back_token = match http.backend_token {
             Some(back_token) => back_token,
             None => {
-                warn!("Could not upgrade https request on cluster '{:?}' ({:?}) using backend '{:?}' into secure websocket for request '{}'", http.cluster_id, self.frontend_token, http.backend_id, http.context.id);
+                warn!(
+                    "Could not upgrade https request on cluster '{:?}' ({:?}) using backend '{:?}' into secure websocket for request '{}'",
+                    http.context.cluster_id, self.frontend_token, http.context.backend_id, http.context.id
+                );
                 return None;
             }
         };
@@ -356,14 +360,20 @@ impl HttpsSession {
         container_frontend_timeout.reset();
         container_backend_timeout.reset();
 
+        let backend_buffer = if let ResponseStream::BackendAnswer(kawa) = http.response_stream {
+            kawa.storage.buffer
+        } else {
+            return None;
+        };
+
         let mut pipe = Pipe::new(
-            http.response_stream.storage.buffer,
-            http.backend_id,
+            backend_buffer,
+            http.context.backend_id,
             http.backend_socket,
             http.backend,
             Some(container_backend_timeout),
             Some(container_frontend_timeout),
-            http.cluster_id,
+            http.context.cluster_id,
             http.request_stream.storage.buffer,
             front_token,
             http.frontend_socket,
@@ -624,10 +634,10 @@ impl HttpsListener {
             rustls_details: server_config,
             active: false,
             fronts: Router::new(),
-            answers: Rc::new(RefCell::new(HttpAnswers::new(
-                &config.answer_404,
-                &config.answer_503,
-            ))),
+            answers: Rc::new(RefCell::new(
+                HttpAnswers::new(&config.http_answers)
+                    .map_err(|(status, error)| ListenerError::TemplateParse(status, error))?,
+            )),
             config,
             token,
             tags: BTreeMap::new(),
@@ -1003,7 +1013,10 @@ impl HttpsProxy {
                     .borrow()
                     .answers
                     .borrow_mut()
-                    .add_custom_answer(&cluster.cluster_id, &answer_503);
+                    .add_custom_answer(&cluster.cluster_id, answer_503.clone())
+                    .map_err(|(status, error)| {
+                        ProxyError::AddCluster(ListenerError::TemplateParse(status, error))
+                    })?;
             }
         }
         self.clusters.insert(cluster.cluster_id.clone(), cluster);
@@ -1501,7 +1514,10 @@ mod tests {
 
     use std::sync::Arc;
 
-    use sozu_command::{config::ListenerBuilder, proto::command::SocketAddress};
+    use sozu_command::{
+        config::ListenerBuilder,
+        proto::command::{CustomHttpAnswers, SocketAddress},
+    };
 
     use crate::router::{trie::TrieNode, MethodRule, PathRule, Route, Router};
 
@@ -1582,10 +1598,9 @@ mod tests {
             fronts,
             rustls_details,
             resolver,
-            answers: Rc::new(RefCell::new(HttpAnswers::new(
-                "HTTP/1.1 404 Not Found\r\n\r\n",
-                "HTTP/1.1 503 Service Unavailable\r\n\r\n",
-            ))),
+            answers: Rc::new(RefCell::new(
+                HttpAnswers::new(&Some(CustomHttpAnswers::default())).unwrap(),
+            )),
             config: default_config,
             token: Token(0),
             active: true,

@@ -11,6 +11,8 @@ use crate::{
     Protocol,
 };
 
+use sozu_command_lib::logging::LogContext;
+
 /// This is the container used to store and use information about the session from within a Kawa parser callback
 #[derive(Debug)]
 pub struct HttpContext {
@@ -40,6 +42,8 @@ pub struct HttpContext {
     pub closing: bool,
     /// the value of the custom header, named "Sozu-Id", that Kawa should write (request and response)
     pub id: Ulid,
+    pub backend_id: Option<String>,
+    pub cluster_id: Option<String>,
     /// the value of the protocol Kawa should write in the Forwarded headers of the request
     pub protocol: Protocol,
     /// the value of the public address Kawa should write in the Forwarded headers of the request
@@ -352,5 +356,13 @@ impl HttpContext {
         self.status = None;
         self.reason = None;
         self.user_agent = None;
+    }
+
+    pub fn log_context(&self) -> LogContext {
+        LogContext {
+            request_id: self.id,
+            cluster_id: self.cluster_id.as_deref(),
+            backend_id: self.backend_id.as_deref(),
+        }
     }
 }
