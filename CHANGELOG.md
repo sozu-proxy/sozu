@@ -4,6 +4,50 @@
 
 See milestone [`v1.1.0`](https://github.com/sozu-proxy/sozu/projects/3?card_filter_query=milestone%3Av1.1.0)
 
+## 1.0.0-rc.2 - 2024-04-05
+
+> This changelog is the second release candidate before the version `1.0.0`, it includes a __breaking change__ on the protocol buffer and configuration around definition of custom response when Sōzu answers instead of backends defined in cluster.
+
+### 🌟 Features
+
+- We have introduce a way to define custom http response for a wide range of status code, see [`3f0bfa1`](https://github.com/sozu-proxy/sozu/commit/3f0bfa12a7fc83ba1487d85ea012e29a83af8aa5), [`4923153`](https://github.com/sozu-proxy/sozu/commit/4923153bc76343fa6d135f4e99b60381f2b96cb5), [`b9df0c1`](https://github.com/sozu-proxy/sozu/commit/b9df0c1dc4659c2deb25433e3f36dc46998680fa), [`ee2430f`](https://github.com/sozu-proxy/sozu/commit/ee2430f9c85ee846314ebb09b8cc981267ba427b), [`3030944`](https://github.com/sozu-proxy/sozu/commit/30309447ddd246f9bd3c061ce7b544f7fa40559f), [`6023216`](https://github.com/sozu-proxy/sozu/commit/60232166716b656a3f68a5f68326ef3768f763ad), [`55242ba`](https://github.com/sozu-proxy/sozu/commit/55242bab7a9a881b3cc5bd3e8b8f569f0ac34a17), [`55242ba`](https://github.com/sozu-proxy/sozu/commit/55242bab7a9a881b3cc5bd3e8b8f569f0ac34a17), [`8faa16c`](https://github.com/sozu-proxy/sozu/commit/8faa16c999cf47f2c9260c87d6e8b17deca8a269), [`a5058c2`](https://github.com/sozu-proxy/sozu/commit/a5058c2981c9bed99e714a98b325320473b9a011), [`fb6aad9`](https://github.com/sozu-proxy/sozu/commit/fb6aad93a74b17960af2ed91bb2f4a527594bdf9) and [`a2236d1`](https://github.com/sozu-proxy/sozu/commit/a2236d11e20a33aeaaf4863d6c6b0a32167dab21).
+- We also fix a bug that could occur on some streaming https requests with tcp-keepalive when going through multiple Sōzu which does not flush correctly the ending chunk of data when calling `rustls::write_vectored`, see [`d83f399`](https://github.com/sozu-proxy/sozu/commit/d83f3997953f889a75d3300b10a55021d23f768d).
+- We also change how works timeout on frontends as it is now closed by the backend, once we have received a first chunk of data, see [`6114e17`](https://github.com/sozu-proxy/sozu/commit/6114e17b53aec8740e608c6ddf4e1c17a779b052).
+
+### Changelog
+
+#### 🌟 Features
+
+- [ [`3f0bfa1`](https://github.com/sozu-proxy/sozu/commit/3f0bfa12a7fc83ba1487d85ea012e29a83af8aa5) ] Dynamic automatic answers system [`Eloi DEMOLIS`] (`2024-04-05`)
+- [ [`4923153`](https://github.com/sozu-proxy/sozu/commit/4923153bc76343fa6d135f4e99b60381f2b96cb5) ] Unify template creation [`Eloi DEMOLIS`] (`2024-04-05`)
+- [ [`b9df0c1`](https://github.com/sozu-proxy/sozu/commit/b9df0c1dc4659c2deb25433e3f36dc46998680fa) ] add example 404 and 508 errors [`Emmanuel Bosquet`] (`2024-04-05`)
+- [ [`ee2430f`](https://github.com/sozu-proxy/sozu/commit/ee2430f9c85ee846314ebb09b8cc981267ba427b) ] make Http[s]ListenerConfig::http_answers optional [`Emmanuel Bosquet`] (`2024-04-05`)
+- [ [`3030944`](https://github.com/sozu-proxy/sozu/commit/30309447ddd246f9bd3c061ce7b544f7fa40559f) ] Minor changes [`Eloi DEMOLIS`] (`2024-04-05`)
+- [ [`6023216`](https://github.com/sozu-proxy/sozu/commit/60232166716b656a3f68a5f68326ef3768f763ad) ] create protobuf type CustomHttpAnswers [`Emmanuel Bosquet`] (`2024-04-05`)
+- [ [`55242ba`](https://github.com/sozu-proxy/sozu/commit/55242bab7a9a881b3cc5bd3e8b8f569f0ac34a17) ] rename types [`Emmanuel Bosquet`] (`2024-04-05`)
+- [ [`8faa16c`](https://github.com/sozu-proxy/sozu/commit/8faa16c999cf47f2c9260c87d6e8b17deca8a269) ] Restore context in logs by moving the fields in HttpContext [`Eloi DEMOLIS`] (`2024-04-05`)
+- [ [`a5058c2`](https://github.com/sozu-proxy/sozu/commit/a5058c2981c9bed99e714a98b325320473b9a011) ] remove 404 and 503 files [`Emmanuel Bosquet`] (`2024-04-05`)
+- [ [`fb6aad9`](https://github.com/sozu-proxy/sozu/commit/fb6aad93a74b17960af2ed91bb2f4a527594bdf9) ] Move test_https_redirect to e2e, use immutable automatic answers for e2e [`Eloi DEMOLIS`] (`2024-04-05`)
+- [ [`a2236d1`](https://github.com/sozu-proxy/sozu/commit/a2236d11e20a33aeaaf4863d6c6b0a32167dab21) ] More template variables [`Eloi DEMOLIS`] (`2024-04-05`)
+
+#### ➕ Added
+
+- [ [`90ee05c`](https://github.com/sozu-proxy/sozu/commit/90ee05c2f347a0ccb90d65e2cbae5c5e8a2192b6) ] benchmark info logs in the CI [`Emmanuel Bosquet`] (`2024-03-15`)
+
+### ✍️ Changed
+
+- [ [`6114e17`](https://github.com/sozu-proxy/sozu/commit/6114e17b53aec8740e608c6ddf4e1c17a779b052) ] Move timeout responsibility from front to back only when first bytes are received from the back [`Eloi DEMOLIS`] (`2024-03-20`)
+
+#### ⛑️ Fixed
+
+- [ [`d83f399`](https://github.com/sozu-proxy/sozu/commit/d83f3997953f889a75d3300b10a55021d23f768d) ] Expose internal rustls buffers to ensure they are flushed [`Eloi DEMOLIS`] (`2024-04-03`)
+
+### 🥹 Contributors
+* @keksoj
+* @Wonshtrum
+
+**Full Changelog**: https://github.com/sozu-proxy/sozu/compare/1.0.0.-rc.1..1.0.0-rc.2
+
 ## 1.0.0-rc.1 - 2024-03-19
 
 > This changelog is the first release candidate before the version `1.0.0`, its goal is to allow to migrate smoothly other crates as the `sozu-client` to be compatible with the protobuf-everywhere part and to be able to make tests on production at Clever-Cloud by doing some A/B testing.
