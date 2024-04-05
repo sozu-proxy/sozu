@@ -34,7 +34,7 @@ hdrhistogram = "^7.5.4"
 hex = "^0.4.3"
 hpack = "^0.3.0"
 idna = "^0.5.0"
-kawa = { version = "^0.6.5", default-features = false }
+kawa = { version = "^0.6.6", default-features = false }
 libc = "^0.2.153"
 memchr = "^2.7.1"
 mio = { version = "^0.8.11", features = ["os-poll", "os-ext", "net"] }

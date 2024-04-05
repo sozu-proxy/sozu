@@ -13,11 +13,11 @@ use crate::{
         command::{
             filtered_metrics, protobuf_endpoint, request::RequestType,
             response_content::ContentType, AggregatedMetrics, AvailableMetrics, CertificateAndKey,
-            CertificateSummary, CertificatesWithFingerprints, ClusterMetrics, FilteredMetrics,
-            HttpEndpoint, ListOfCertificatesByAddress, ListedFrontends, ListenersList,
-            ProtobufEndpoint, QueryCertificatesFilters, RequestCounts, Response, ResponseContent,
-            ResponseStatus, RunState, SocketAddress, TlsVersion, WorkerInfos, WorkerMetrics,
-            WorkerResponses,
+            CertificateSummary, CertificatesWithFingerprints, ClusterMetrics, CustomHttpAnswers,
+            FilteredMetrics, HttpEndpoint, HttpListenerConfig, HttpsListenerConfig,
+            ListOfCertificatesByAddress, ListedFrontends, ListenersList, ProtobufEndpoint,
+            QueryCertificatesFilters, RequestCounts, Response, ResponseContent, ResponseStatus,
+            RunState, SocketAddress, TlsVersion, WorkerInfos, WorkerMetrics, WorkerResponses,
         },
         DisplayError,
     },
@@ -489,74 +489,13 @@ pub fn print_listeners(listeners_list: &ListenersList) -> Result<(), DisplayErro
     println!("\nHTTP LISTENERS\n================");
 
     for (_, http_listener) in listeners_list.http_listeners.iter() {
-        let mut table = Table::new();
-        table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
-        table.add_row(row![
-            "socket address",
-            format!("{:?}", http_listener.address)
-        ]);
-        table.add_row(row![
-            "public address",
-            format!("{:?}", http_listener.public_address),
-        ]);
-        table.add_row(row!["404", http_listener.answer_404]);
-        table.add_row(row!["503", http_listener.answer_503]);
-        table.add_row(row!["expect proxy", http_listener.expect_proxy]);
-        table.add_row(row!["sticky name", http_listener.sticky_name]);
-        table.add_row(row!["front timeout", http_listener.front_timeout]);
-        table.add_row(row!["back timeout", http_listener.back_timeout]);
-        table.add_row(row!["connect timeout", http_listener.connect_timeout]);
-        table.add_row(row!["request timeout", http_listener.request_timeout]);
-        table.add_row(row!["activated", http_listener.active]);
-        table.printstd();
+        println!("{}", http_listener);
     }
 
     println!("\nHTTPS LISTENERS\n================");
 
     for (_, https_listener) in listeners_list.https_listeners.iter() {
-        let mut table = Table::new();
-        table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
-        let mut tls_versions = String::new();
-        for tls_version in https_listener.versions.iter() {
-            tls_versions.push_str(&format!("{tls_version:?}\n"));
-        }
-
-        table.add_row(row![
-            "socket address",
-            format!("{:?}", https_listener.address)
-        ]);
-        table.add_row(row![
-            "public address",
-            format!("{:?}", https_listener.public_address)
-        ]);
-        table.add_row(row!["404", https_listener.answer_404,]);
-        table.add_row(row!["503", https_listener.answer_503,]);
-        table.add_row(row!["versions", tls_versions]);
-        table.add_row(row![
-            "cipher list",
-            list_string_vec(&https_listener.cipher_list),
-        ]);
-        table.add_row(row![
-            "cipher suites",
-            list_string_vec(&https_listener.cipher_suites),
-        ]);
-        table.add_row(row![
-            "signature algorithms",
-            list_string_vec(&https_listener.signature_algorithms),
-        ]);
-        table.add_row(row![
-            "groups list",
-            list_string_vec(&https_listener.groups_list),
-        ]);
-        table.add_row(row!["key", format!("{:?}", https_listener.key),]);
-        table.add_row(row!["expect proxy", https_listener.expect_proxy,]);
-        table.add_row(row!["sticky name", https_listener.sticky_name,]);
-        table.add_row(row!["front timeout", https_listener.front_timeout,]);
-        table.add_row(row!["back timeout", https_listener.back_timeout,]);
-        table.add_row(row!["connect timeout", https_listener.connect_timeout,]);
-        table.add_row(row!["request timeout", https_listener.request_timeout,]);
-        table.add_row(row!["activated", https_listener.active]);
-        table.printstd();
+        println!("{}", https_listener);
     }
 
     println!("\nTCP LISTENERS\n================");
@@ -975,5 +914,95 @@ impl Display for ProtobufEndpoint {
             }
             None => Ok(()),
         }
+    }
+}
+
+impl Display for HttpListenerConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let mut table = Table::new();
+        table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
+        table.add_row(row!["socket address", format!("{:?}", self.address)]);
+        table.add_row(row!["public address", format!("{:?}", self.public_address),]);
+        for http_answer_row in CustomHttpAnswers::to_rows(&self.http_answers) {
+            table.add_row(http_answer_row);
+        }
+        table.add_row(row!["expect proxy", self.expect_proxy]);
+        table.add_row(row!["sticky name", self.sticky_name]);
+        table.add_row(row!["front timeout", self.front_timeout]);
+        table.add_row(row!["back timeout", self.back_timeout]);
+        table.add_row(row!["connect timeout", self.connect_timeout]);
+        table.add_row(row!["request timeout", self.request_timeout]);
+        table.add_row(row!["activated", self.active]);
+        write!(f, "{}", table)
+    }
+}
+
+impl Display for HttpsListenerConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let mut table = Table::new();
+        table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
+        let mut tls_versions = String::new();
+        for tls_version in self.versions.iter() {
+            tls_versions.push_str(&format!("{tls_version:?}\n"));
+        }
+
+        table.add_row(row!["socket address", format!("{:?}", self.address)]);
+        table.add_row(row!["public address", format!("{:?}", self.public_address)]);
+        for http_answer_row in CustomHttpAnswers::to_rows(&self.http_answers) {
+            table.add_row(http_answer_row);
+        }
+        table.add_row(row!["versions", tls_versions]);
+        table.add_row(row!["cipher list", list_string_vec(&self.cipher_list),]);
+        table.add_row(row!["cipher suites", list_string_vec(&self.cipher_suites),]);
+        table.add_row(row![
+            "signature algorithms",
+            list_string_vec(&self.signature_algorithms),
+        ]);
+        table.add_row(row!["groups list", list_string_vec(&self.groups_list),]);
+        table.add_row(row!["key", format!("{:?}", self.key),]);
+        table.add_row(row!["expect proxy", self.expect_proxy]);
+        table.add_row(row!["sticky name", self.sticky_name]);
+        table.add_row(row!["front timeout", self.front_timeout]);
+        table.add_row(row!["back timeout", self.back_timeout]);
+        table.add_row(row!["connect timeout", self.connect_timeout]);
+        table.add_row(row!["request timeout", self.request_timeout]);
+        table.add_row(row!["activated", self.active]);
+        write!(f, "{}", table)
+    }
+}
+
+impl CustomHttpAnswers {
+    fn to_rows(option: &Option<Self>) -> Vec<Row> {
+        let mut rows = Vec::new();
+        if let Some(answers) = option {
+            if let Some(a) = &answers.answer_301 {
+                rows.push(row!("301", a));
+            }
+            if let Some(a) = &answers.answer_400 {
+                rows.push(row!("400", a));
+            }
+            if let Some(a) = &answers.answer_404 {
+                rows.push(row!("404", a));
+            }
+            if let Some(a) = &answers.answer_408 {
+                rows.push(row!("408", a));
+            }
+            if let Some(a) = &answers.answer_413 {
+                rows.push(row!("413", a));
+            }
+            if let Some(a) = &answers.answer_502 {
+                rows.push(row!("502", a));
+            }
+            if let Some(a) = &answers.answer_503 {
+                rows.push(row!("503", a));
+            }
+            if let Some(a) = &answers.answer_504 {
+                rows.push(row!("504", a));
+            }
+            if let Some(a) = &answers.answer_507 {
+                rows.push(row!("507", a));
+            }
+        }
+        rows
     }
 }
