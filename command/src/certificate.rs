@@ -47,6 +47,7 @@ pub fn parse_pem(certificate: &[u8]) -> Result<Pem, CertificateError> {
     Ok(pem)
 }
 
+/// parse x509 certificate from PEM bytes
 pub fn parse_x509(pem_bytes: &[u8]) -> Result<X509Certificate, CertificateError> {
     parse_x509_certificate(pem_bytes)
         .map_err(|nom_e| CertificateError::ParseX509Certificate(nom_e.to_string()))
@@ -56,7 +57,7 @@ pub fn parse_x509(pem_bytes: &[u8]) -> Result<X509Certificate, CertificateError>
 // -----------------------------------------------------------------------------
 // get_cn_and_san_attributes
 
-/// Retrieve from the pem (as bytes) the common name (a.k.a `CN`) and the
+/// Retrieve from the x509 the common name (a.k.a `CN`) and the
 /// subject alternate names (a.k.a `SAN`)
 pub fn get_cn_and_san_attributes(x509: &X509Certificate) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
