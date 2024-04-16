@@ -4,6 +4,146 @@
 
 See milestone [`v1.1.0`](https://github.com/sozu-proxy/sozu/projects/3?card_filter_query=milestone%3Av1.1.0)
 
+## 1.0.0 - 2024-04-16
+
+> This is the first release of Sōzu which is a huge steps since the beginning of the project.
+> We would like to thanks every people involved in the development of Sōzu.
+> The next steps is to implements h2(c) on top of kawa with a rework of session to be able to use http 1.x clients with h2 backends and h2 clients with h2 backends, h2 clients with http 1.x backends.
+
+### 🌟 Features
+
+- This release is the first one that use `protobuf-everywhere`. It means that we are moving out from the old exchange model for sockets (which are data exchanges between main process and workers processes and also main process and control plane process) that use Rust structures that we serialize into json to structures described in protobuf that generate Rust source code and then communicate with binary format. Besides, this work also have some nice side-effects on fork when creating new workers (due to a self-healing or at start) which allow to reduce the time to configure a worker by around 50%. It also introduces a new way to emit access logs in a binary way, see [ [`dfacdb7`](https://github.com/sozu-proxy/sozu/commit/dfacdb7adfaf20876fbccf0b5a21230adc74ec03) ], [ [`a6ffebe`](https://github.com/sozu-proxy/sozu/commit/a6ffebe627c4647336e4a4cff700b85235dc6bcd) ], [ [`fb11245`](https://github.com/sozu-proxy/sozu/commit/fb11245d87a0716b0cee7c3ecc5909dc799b0be6) ], [ [`6daf43c`](https://github.com/sozu-proxy/sozu/commit/6daf43c64d8185c5a691bb638274a85f260cfa46) ], [ [`8e81a02`](https://github.com/sozu-proxy/sozu/commit/8e81a02875441709579d1825fa9fe7cdd061a608) ], [ [`24a941b`](https://github.com/sozu-proxy/sozu/commit/24a941b6a79dbdf0e56a91d9d02c823afd101975) ], [ [`6d160b4`](https://github.com/sozu-proxy/sozu/commit/6d160b40d2f4a7027b99f860b7ec1a79366625a3) ], [ [`e382a1c`](https://github.com/sozu-proxy/sozu/commit/e382a1c2ab5f7d7560b609dbf2c7bde6963c8866) ], [ [`4f2d760`](https://github.com/sozu-proxy/sozu/commit/4f2d76042b9a8a7f0f3ef536f0ff298315d47888) ], [ [`6d43eb1`](https://github.com/sozu-proxy/sozu/commit/6d43eb18b44093790a5d4202b02da38748a634b6) ] and [ [`5852c6b`](https://github.com/sozu-proxy/sozu/commit/5852c6b1a9778d4a79af947907bea3dcb8e6c9f6) ].
+- We have reworked emitted logs and access logs format, if you are tools that parse them, you have to take a look at the new one. Besides, it will be easier to parse. Furthermore, we have added color on logs to improve readability, see [ [`0885863`](https://github.com/sozu-proxy/sozu/commit/088586314e2234d8b83613afdeec5542ce5b7d27) ], [ [`d3eeddc`](https://github.com/sozu-proxy/sozu/commit/d3eeddc4060f73da37b1bd8257ca9562e63e0cec) ], [ [`3bb3997`](https://github.com/sozu-proxy/sozu/commit/3bb399705bb2a8db6ef81f41236618cc00627b40) ] and [ [`5f55561`](https://github.com/sozu-proxy/sozu/commit/5f55561ce702083dbdd783456f88caa67dd8db4a) ].
+- We have bump the minimum Rust supported version to `v1.74.0`, see [ [`2c4363d`](https://github.com/sozu-proxy/sozu/commit/2c4363d088376e775e3af7d98113b0e70c6bcca2) ], [ [`96f5329`](https://github.com/sozu-proxy/sozu/commit/96f5329335410ac8a14bb84b2a3120a63f91e557) ] and [ [`e6bcfe0`](https://github.com/sozu-proxy/sozu/commit/e6bcfe033975a6aa4696a08bd0591d55ff41e63f) ].
+- We have introduce a way to define custom http response for a wide range of status code, see [`3f0bfa1`](https://github.com/sozu-proxy/sozu/commit/3f0bfa12a7fc83ba1487d85ea012e29a83af8aa5), [`4923153`](https://github.com/sozu-proxy/sozu/commit/4923153bc76343fa6d135f4e99b60381f2b96cb5), [`b9df0c1`](https://github.com/sozu-proxy/sozu/commit/b9df0c1dc4659c2deb25433e3f36dc46998680fa), [`ee2430f`](https://github.com/sozu-proxy/sozu/commit/ee2430f9c85ee846314ebb09b8cc981267ba427b), [`3030944`](https://github.com/sozu-proxy/sozu/commit/30309447ddd246f9bd3c061ce7b544f7fa40559f), [`6023216`](https://github.com/sozu-proxy/sozu/commit/60232166716b656a3f68a5f68326ef3768f763ad), [`55242ba`](https://github.com/sozu-proxy/sozu/commit/55242bab7a9a881b3cc5bd3e8b8f569f0ac34a17), [`55242ba`](https://github.com/sozu-proxy/sozu/commit/55242bab7a9a881b3cc5bd3e8b8f569f0ac34a17), [`8faa16c`](https://github.com/sozu-proxy/sozu/commit/8faa16c999cf47f2c9260c87d6e8b17deca8a269), [`a5058c2`](https://github.com/sozu-proxy/sozu/commit/a5058c2981c9bed99e714a98b325320473b9a011), [`fb6aad9`](https://github.com/sozu-proxy/sozu/commit/fb6aad93a74b17960af2ed91bb2f4a527594bdf9) and [`a2236d1`](https://github.com/sozu-proxy/sozu/commit/a2236d11e20a33aeaaf4863d6c6b0a32167dab21).
+- We also fix a bug that could occur on some streaming https requests with tcp-keepalive when going through multiple Sōzu which does not flush correctly the ending chunk of data when calling `rustls::write_vectored`, see [`d83f399`](https://github.com/sozu-proxy/sozu/commit/d83f3997953f889a75d3300b10a55021d23f768d).
+- We also change how works timeout on frontends as it is now closed by the backend, once we have received a first chunk of data, see [`6114e17`](https://github.com/sozu-proxy/sozu/commit/6114e17b53aec8740e608c6ddf4e1c17a779b052).
+
+### 🚀 Performance
+
+- Thanks to the work achieved on Rustls ([v0.23.0](https://github.com/rustls/rustls/releases/tag/v%2F0.23.0)) with the help of maintainers (a huge thanks to them ❤️), we have gain between 10% and 20% performance on https requests depending of the workload, see [ [`7fa680d`](https://github.com/sozu-proxy/sozu/commit/7fa680d8d346031ec50d7bcf40f51e3101cd7cec) ].
+
+### ⛑️ Fixed
+
+- We have fixed a bug that occurs during http request when doing streaming and tcp keep-alive which prevent to send the close-delimiter on response, see [ [`59c0615`](https://github.com/sozu-proxy/sozu/commit/59c06158ad86d664f4e2900b777dc6cfa8fad2f0) ].
+- We have fix a few bugs on certificate replacement and improve the resolution of certificates, see [ [`6aa45b9`](https://github.com/sozu-proxy/sozu/commit/6aa45b9bd4ef8cadca308712d82f136e3747b7d5) ].
+- We have fix a bug that involved timeout on frontend sockets which did not take the given value, see [ [`d20e759`](https://github.com/sozu-proxy/sozu/commit/d20e759a7e66527d35110e11f7651a5cfee86161) ].
+
+### ✍️ Changed
+
+- We have work on errors to have a better context when something happens, see [ [`ba8b51a`](https://github.com/sozu-proxy/sozu/commit/ba8b51aa0d6e2e631ec4c2e648ad3fdce67569fa) ], [ [`629551f`](https://github.com/sozu-proxy/sozu/commit/629551fdf17b943d91acc7543db391eb2ccdd8d3) ] and [ [`1c90c04`](https://github.com/sozu-proxy/sozu/commit/1c90c0496f315981606f5fae8945ad930369cb50) ].
+
+### 📚 Documentation
+
+- We have added some documentation about logs and access logs, see [ [`d44b227`](https://github.com/sozu-proxy/sozu/commit/d44b227036c26fa1a70883bfd1682262a02ae39e) ] and [ [`7241c0e`](https://github.com/sozu-proxy/sozu/commit/7241c0ee6bfa72e53e3317f6b3d13f27de863452) ].
+- We have reworked or improved examples, see [ [`31bc55e`](https://github.com/sozu-proxy/sozu/commit/31bc55e2456f5bfe16d3d7de797d25676107755c) ] and [ [`95624e6`](https://github.com/sozu-proxy/sozu/commit/95624e6c91e548d2e87ea6df6341d0bc25cff630) ].
+- We have added some documentation of using Sōzu with firewalld (thanks @obreidenich), see [ [`4cba552`](https://github.com/sozu-proxy/sozu/commit/4cba552b5d0b3ecead7553fd55bd7febc53ce9d1) ].
+- We have setup a github continuous integration to provides and document a way to benchmark Sōzu (values on the ci are not reliable), see [ [`8df9ba5`](https://github.com/sozu-proxy/sozu/commit/8df9ba5618574cc3fd73865e2d5e739557db1bd5) ].
+
+### Changelog
+
+#### 🚀 Performance
+
+- [ [`7fa680d`](https://github.com/sozu-proxy/sozu/commit/7fa680d8d346031ec50d7bcf40f51e3101cd7cec) ] update dependencies, notably rustls [`Emmanuel Bosquet`] (`2024-03-11`)
+
+#### 🌟 Features
+
+- [ [`3f0bfa1`](https://github.com/sozu-proxy/sozu/commit/3f0bfa12a7fc83ba1487d85ea012e29a83af8aa5) ] Dynamic automatic answers system [`Eloi DEMOLIS`] (`2024-04-05`)
+- [ [`4923153`](https://github.com/sozu-proxy/sozu/commit/4923153bc76343fa6d135f4e99b60381f2b96cb5) ] Unify template creation [`Eloi DEMOLIS`] (`2024-04-05`)
+- [ [`b9df0c1`](https://github.com/sozu-proxy/sozu/commit/b9df0c1dc4659c2deb25433e3f36dc46998680fa) ] add example 404 and 508 errors [`Emmanuel Bosquet`] (`2024-04-05`)
+- [ [`ee2430f`](https://github.com/sozu-proxy/sozu/commit/ee2430f9c85ee846314ebb09b8cc981267ba427b) ] make Http[s]ListenerConfig::http_answers optional [`Emmanuel Bosquet`] (`2024-04-05`)
+- [ [`3030944`](https://github.com/sozu-proxy/sozu/commit/30309447ddd246f9bd3c061ce7b544f7fa40559f) ] Minor changes [`Eloi DEMOLIS`] (`2024-04-05`)
+- [ [`6023216`](https://github.com/sozu-proxy/sozu/commit/60232166716b656a3f68a5f68326ef3768f763ad) ] create protobuf type CustomHttpAnswers [`Emmanuel Bosquet`] (`2024-04-05`)
+- [ [`55242ba`](https://github.com/sozu-proxy/sozu/commit/55242bab7a9a881b3cc5bd3e8b8f569f0ac34a17) ] rename types [`Emmanuel Bosquet`] (`2024-04-05`)
+- [ [`8faa16c`](https://github.com/sozu-proxy/sozu/commit/8faa16c999cf47f2c9260c87d6e8b17deca8a269) ] Restore context in logs by moving the fields in HttpContext [`Eloi DEMOLIS`] (`2024-04-05`)
+- [ [`a5058c2`](https://github.com/sozu-proxy/sozu/commit/a5058c2981c9bed99e714a98b325320473b9a011) ] remove 404 and 503 files [`Emmanuel Bosquet`] (`2024-04-05`)
+- [ [`fb6aad9`](https://github.com/sozu-proxy/sozu/commit/fb6aad93a74b17960af2ed91bb2f4a527594bdf9) ] Move test_https_redirect to e2e, use immutable automatic answers for e2e [`Eloi DEMOLIS`] (`2024-04-05`)
+- [ [`a2236d1`](https://github.com/sozu-proxy/sozu/commit/a2236d11e20a33aeaaf4863d6c6b0a32167dab21) ] More template variables [`Eloi DEMOLIS`] (`2024-04-05`)
+
+#### ➕ Added
+
+- [ [`90ee05c`](https://github.com/sozu-proxy/sozu/commit/90ee05c2f347a0ccb90d65e2cbae5c5e8a2192b6) ] benchmark info logs in the CI [`Emmanuel Bosquet`] (`2024-03-15`)
+- [ [`a6fde1e`](https://github.com/sozu-proxy/sozu/commit/a6fde1eb44f958b095a6fb8c1208854ab6d8c85f) ] distinct PEM and X509 variants for CertificateError [`Emmanuel Bosquet`] (`2024-03-15`)
+- [ [`e793ec6`](https://github.com/sozu-proxy/sozu/commit/e793ec6667ae83d8be302d549751637315bef0fd) ] Edit access logs ASCII format, put logs-cache under feature [`Eloi DEMOLIS`] (`2024-03-11`)
+- [ [`85e2653`](https://github.com/sozu-proxy/sozu/commit/85e26535a4ec4eafe8c64f186b2f40014b5b1f4e) ] implement From<Uint128> for Ulid [`Emmanuel Bosquet`] (`2024-03-11`)
+- [ [`756b78b`](https://github.com/sozu-proxy/sozu/commit/756b78bc9c13684b4acb15caf14044f0ad90e623) ] create type WebSocketContext [`Emmanuel Bosquet`] (`2024-03-11`)
+- [ [`0885863`](https://github.com/sozu-proxy/sozu/commit/088586314e2234d8b83613afdeec5542ce5b7d27) ] Logger refactor: better structured logs and colored logs [`Eloi DEMOLIS`] (`2024-03-11`)
+- [ [`dfacdb7`](https://github.com/sozu-proxy/sozu/commit/dfacdb7adfaf20876fbccf0b5a21230adc74ec03) ] protobuf access logs [`Emmanuel Bosquet`] (`2024-03-11`)
+- [ [`7c25133`](https://github.com/sozu-proxy/sozu/commit/7c25133e66541b221b151bcbf8f4d7efc87e945e) ] create helper function server::worker_response_error [`Emmanuel Bosquet`] (`2024-02-23`)
+- [ [`a6ffebe`](https://github.com/sozu-proxy/sozu/commit/a6ffebe627c4647336e4a4cff700b85235dc6bcd) ] binary and delimited serialization of prost messages in channels [`Emmanuel Bosquet`] (`2024-02-02`)
+- [ [`62f3db3`](https://github.com/sozu-proxy/sozu/commit/62f3db34ca9d8e209ce9444ab890e1847f3ef093) ] add fields and defaults to ServerConfig [`Emmanuel Bosquet`] (`2024-02-02`)
+- [ [`fb11245`](https://github.com/sozu-proxy/sozu/commit/fb11245d87a0716b0cee7c3ecc5909dc799b0be6) ] create protobuf type SocketAddress, use everywhere [`Emmanuel Bosquet`] (`2024-02-02`)
+- [ [`f9ac920`](https://github.com/sozu-proxy/sozu/commit/f9ac9207df5edf4bad4e6c1392e829a3e1e080ed) ] add size to ChannelError::BufferFull [`Emmanuel Bosquet`] (`2024-02-02`)
+
+#### ➖ Removed
+
+- [ [`c677b10`](https://github.com/sozu-proxy/sozu/commit/c677b102a0694db998ebc3ebf485aeb2d869dc71) ] remove duplicate code of HttpsProxy creation [`Emmanuel Bosquet`] (`2024-02-26`)
+- [ [`39af839`](https://github.com/sozu-proxy/sozu/commit/39af83929154820687bc9c87fc25fc6fa7747b5d) ] remove useless Serde error in channel module [`Emmanuel Bosquet`] (`2024-02-02`)
+
+### ✍️ Changed
+
+- [ [`6114e17`](https://github.com/sozu-proxy/sozu/commit/6114e17b53aec8740e608c6ddf4e1c17a779b052) ] Move timeout responsibility from front to back only when first bytes are received from the back [`Eloi DEMOLIS`] (`2024-03-20`)
+- [ [`0d7f7d6`](https://github.com/sozu-proxy/sozu/commit/0d7f7d634d964976dfae2f29d737498a6d0d6a7d) ] Release v1.0.0-rc.1 [`Florentin Dubois`] (`2024-03-19`)
+- [ [`bcef3b8`](https://github.com/sozu-proxy/sozu/commit/bcef3b84328333acb0ef9bb936245328bca60c62) ] chore: update dependencies [`Florentin Dubois`] (`2024-03-14`)
+- [ [`a806fb6`](https://github.com/sozu-proxy/sozu/commit/a806fb6699aff7662e85d1a8f586d65c149bc3f4) ] sort cluster information alphabetically when displaying [`Emmanuel Bosquet`] (`2024-03-12`)
+- [ [`6daf43c`](https://github.com/sozu-proxy/sozu/commit/6daf43c64d8185c5a691bb638274a85f260cfa46) ] write two empty bytes after each protobuf access log [`Emmanuel Bosquet`] (`2024-03-11`)
+- [ [`8e81a02`](https://github.com/sozu-proxy/sozu/commit/8e81a02875441709579d1825fa9fe7cdd061a608) ] rename ProtobufAccessLog::error to 'message' [`Emmanuel Bosquet`] (`2024-03-11`)
+- [ [`b6ca85b`](https://github.com/sozu-proxy/sozu/commit/b6ca85b03be0d53bd98f98436866bbe44cbc04ff) ] apply clippy suggestions for nightly [`Emmanuel Bosquet`] (`2024-03-11`)
+- [ [`618bed0`](https://github.com/sozu-proxy/sozu/commit/618bed03e7f7f8535d1fe6ad93a4b1acd30f9404) ] apply review: cosmetic changes [`Emmanuel Bosquet`] (`2024-03-11`)
+- [ [`182b291`](https://github.com/sozu-proxy/sozu/commit/182b291b347964a02c07e14d7886164e0322fc4e) ] Use error_access in lib, add log_access to make it easier [`Eloi DEMOLIS`] (`2024-03-11`)
+- [ [`5f55561`](https://github.com/sozu-proxy/sozu/commit/5f55561ce702083dbdd783456f88caa67dd8db4a) ] rename log_access_* variables to access_logs_* [`Emmanuel Bosquet`] (`2024-03-11`)
+- [ [`d3eeddc`](https://github.com/sozu-proxy/sozu/commit/d3eeddc4060f73da37b1bd8257ca9562e63e0cec) ] Small changes mainly relative to logging [`Eloi DEMOLIS`] (`2024-03-11`)
+- [ [`3bb3997`](https://github.com/sozu-proxy/sozu/commit/3bb399705bb2a8db6ef81f41236618cc00627b40) ] Move all logging primitives in their own module [`Eloi DEMOLIS`] (`2024-03-11`)
+- [ [`e6bcfe0`](https://github.com/sozu-proxy/sozu/commit/e6bcfe033975a6aa4696a08bd0591d55ff41e63f) ] set dependency resolver to 2 [`Emmanuel Bosquet`] (`2024-03-11`)
+- [ [`96f5329`](https://github.com/sozu-proxy/sozu/commit/96f5329335410ac8a14bb84b2a3120a63f91e557) ] set rust-version to 1.74.0, update Cargo.lock [`Emmanuel Bosquet`] (`2024-03-11`)
+- [ [`2c4363d`](https://github.com/sozu-proxy/sozu/commit/2c4363d088376e775e3af7d98113b0e70c6bcca2) ] bump rust-toolchain to 1.74.0 [`Emmanuel Bosquet`] (`2024-03-11`)
+- [ [`c6ee01b`](https://github.com/sozu-proxy/sozu/commit/c6ee01b2a606558bf064688affb8f4f9fb79cd63) ] move TCP pool from TcpListener to TcpProxy [`Emmanuel Bosquet`] (`2024-02-26`)
+- [ [`1c90c04`](https://github.com/sozu-proxy/sozu/commit/1c90c0496f315981606f5fae8945ad930369cb50) ] propagate errors in HttpProxy and HttpsProxy [`Emmanuel Bosquet`] (`2024-02-23`)
+- [ [`629551f`](https://github.com/sozu-proxy/sozu/commit/629551fdf17b943d91acc7543db391eb2ccdd8d3) ] propagate errors in TcpProxy [`Emmanuel Bosquet`] (`2024-02-23`)
+- [ [`ba8b51a`](https://github.com/sozu-proxy/sozu/commit/ba8b51aa0d6e2e631ec4c2e648ad3fdce67569fa) ] HttpsProxy::add_listener returns Result [`Emmanuel Bosquet`] (`2024-02-23`)
+- [ [`630b1a7`](https://github.com/sozu-proxy/sozu/commit/630b1a70b20018f8e876307ea6f3872dc4e3c13c) ] define buffer sizes in u64 [`Emmanuel Bosquet`] (`2024-02-02`)
+- [ [`24a941b`](https://github.com/sozu-proxy/sozu/commit/24a941b6a79dbdf0e56a91d9d02c823afd101975) ] pass ServerConfig to new worker [`Emmanuel Bosquet`] (`2024-02-02`)
+- [ [`6d160b4`](https://github.com/sozu-proxy/sozu/commit/6d160b40d2f4a7027b99f860b7ec1a79366625a3) ] move ServerConfig to sozu_command_lib::config [`Emmanuel Bosquet`] (`2024-02-02`)
+- [ [`f0ecc54`](https://github.com/sozu-proxy/sozu/commit/f0ecc54451649d4190f34cb8c9dd674321aec2bb) ] rewrite CommandServer with MIO [`Eloi DEMOLIS`] (`2024-01-30`)
+- [ [`e382a1c`](https://github.com/sozu-proxy/sozu/commit/e382a1c2ab5f7d7560b609dbf2c7bde6963c8866) ] translate WorkerRequest and WorkerResponse to protobuf [`Emmanuel Bosquet`] (`2024-02-02`)
+- [ [`4f2d760`](https://github.com/sozu-proxy/sozu/commit/4f2d76042b9a8a7f0f3ef536f0ff298315d47888) ] translate ServerConfig in protobuf [`Emmanuel Bosquet`] (`2024-02-02`)
+- [ [`6d43eb1`](https://github.com/sozu-proxy/sozu/commit/6d43eb18b44093790a5d4202b02da38748a634b6) ] SCM sockets transmit listeners in binary format [`Emmanuel Bosquet`] (`2024-02-02`)
+- [ [`5852c6b`](https://github.com/sozu-proxy/sozu/commit/5852c6b1a9778d4a79af947907bea3dcb8e6c9f6) ] pass initial state to workers in protobuf [`Emmanuel Bosquet`] (`2024-02-02`)
+- [ [`cc0a221`](https://github.com/sozu-proxy/sozu/commit/cc0a2214401763862e72d9539cb31e90faf18112) ] apply clippy suggestions, remove unwraps [`Emmanuel Bosquet`] (`2024-02-02`)
+- [ [`a3fe0d3`](https://github.com/sozu-proxy/sozu/commit/a3fe0d37025fbe29a51f8db126158176564e44a7) ] chore: update dependencies [`Florentin Dubois`] (`2024-04-16`)
+- [ [`8d89733`](https://github.com/sozu-proxy/sozu/commit/8d89733d9a06b9cb4b0327524fbe44ea69a199bf) ] chore: update configuration file [`Florentin Dubois`] (`2024-04-16`)
+
+#### ⛑️ Fixed
+
+- [ [`d83f399`](https://github.com/sozu-proxy/sozu/commit/d83f3997953f889a75d3300b10a55021d23f768d) ] Expose internal rustls buffers to ensure they are flushed [`Eloi DEMOLIS`] (`2024-04-03`)
+- [ [`d20e759`](https://github.com/sozu-proxy/sozu/commit/d20e759a7e66527d35110e11f7651a5cfee86161) ] Fix some timeout edge cases [`Eloi DEMOLIS`] (`2024-03-18`)
+- [ [`284068d`](https- [ [`a6fde1e`](https://github.com/sozu-proxy/sozu/commit/a6fde1eb44f958b095a6fb8c1208854ab6d8c85f) ] distinct PEM and X509 variants for CertificateError [`Emmanuel Bosquet`] (`2024-03-15`)
+- [ [`e793ec6`](https://github.com/sozu-proxy/sozu/commit/e793ec6667ae83d8be302d549751637315bef0fd) ] Edit access logs ASCII format, put logs-cache under feature [`Eloi DEMOLIS`] (`2024-03-11`)
+- [ [`85e2653`](https://github.com/sozu-proxy/sozu/commit/85e26535a4ec4eafe8c64f186b2f40014b5b1f4e) ] implement From<Uint128> for Ulid [`Emmanuel Bosquet`] (`2024-03-11`)
+- [ [`756b78b`](https://github.com/sozu-proxy/sozu/commit/756b78bc9c13684b4acb15caf14044f0ad90e623) ] create type WebSocketContext [`Emmanuel Bosquet`] (`2024-03-11`)
+- [ [`0885863`](https://github.com/sozu-proxy/sozu/commit/088586314e2234d8b83613afdeec5542ce5b7d27) ] Logger refactor: better structured logs and colored logs [`Eloi DEMOLIS`] (`2024-03-11`)
+- [ [`dfacdb7`](https://github.com/sozu-proxy/sozu/commit/dfacdb7adfaf20876fbccf0b5a21230adc74ec03) ] protobuf access logs [`Emmanuel Bosquet`] (`2024-03-11`)
+- [ [`7c25133`](https://github.com/sozu-proxy/sozu/commit/7c25133e66541b221b151bcbf8f4d7efc87e945e) ] create helper function server::worker_response_error [`Emmanuel Bosquet`] (`2024-02-23`)
+- [ [`a6ffebe`](https://github.com/sozu-proxy/sozu/commit/a6ffebe627c4647336e4a4cff700b85235dc6bcd) ] binary and delimited serialization of prost messages in channels [`Emmanuel Bosquet`] (`2024-02-02`)
+- [ [`62f3db3`](https://github.com/sozu-proxy/sozu/commit/62f3db34ca9d8e209ce9444ab890e1847f3ef093) ] add fields and defaults to ServerConfig [`Emmanuel Bosquet`] (`2024-02-02`)
+- [ [`fb11245`](https://github.com/sozu-proxy/sozu/commit/fb11245d87a0716b0cee7c3ecc5909dc799b0be6) ] create protobuf type SocketAddress, use everywhere [`Emmanuel Bosquet`] (`2024-02-02`)
+- [ [`f9ac920`](https://github.com/sozu-proxy/sozu/commit/f9ac9207df5edf4bad4e6c1392e829a3e1e080ed) ] add size to ChannelError::BufferFull [`Emmanuel Bosquet`] (`2024-02-02`)
+- [ [`d44b227`](https://github.com/sozu-proxy/sozu/commit/d44b227036c26fa1a70883bfd1682262a02ae39e) ] document the logs-cache feature flag [`Emmanuel Bosquet`] (`2024-03-11`)
+- [ [`7241c0e`](https://github.com/sozu-proxy/sozu/commit/7241c0ee6bfa72e53e3317f6b3d13f27de863452) ] document the DuplicateOwnership trait [`Emmanuel Bosquet`] (`2024-03-11`)
+- [ [`31bc55e`](https://github.com/sozu-proxy/sozu/commit/31bc55e2456f5bfe16d3d7de797d25676107755c) ] Add example in command lib to benchmark the logger [`Emmanuel Bosquet`] (`2024-03-11`)
+- [ [`4cba552`](https://github.com/sozu-proxy/sozu/commit/4cba552b5d0b3ecead7553fd55bd7febc53ce9d1) ] A small, descriptive extension to include firewalld. Avoiding a search for those not using iptables. [`obreidenich`] (`2024-02-21`)
+- [ [`8df9ba5`](https://github.com/sozu-proxy/sozu/commit/8df9ba5618574cc3fd73865e2d5e739557db1bd5) ] CI: Adding a benchmark framework [`Guillaume Assier`] (`2024-02-07`)
+- [ [`95624e6`](https://github.com/sozu-proxy/sozu/commit/95624e6c91e548d2e87ea6df6341d0bc25cff630) ] Refactor HTTP, HTTPS and TCP example code [`Eloi DEMOLIS`] (`2024-02-02`)
+
+### 🥹 Contributors
+* @obreidenich made their first contribution in https://github.com/sozu-proxy/sozu/pull/1079
+* @rex4539 made their first contribution in https://github.com/sozu-proxy/sozu/pull/1090
+* @keksoj
+* @FlorentinDUBOIS
+* @Wonshtrum
+
+**Full Changelog**: https://github.com/sozu-proxy/sozu/compare/0.15.19..1.0.0
+
 ## 1.0.0-rc.2 - 2024-04-05
 
 > This changelog is the second release candidate before the version `1.0.0`, it includes a __breaking change__ on the protocol buffer and configuration around definition of custom response when Sōzu answers instead of backends defined in cluster.
