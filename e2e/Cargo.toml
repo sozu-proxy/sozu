@@ -1,6 +1,6 @@
 [package]
 name = "sozu-e2e"
-version = "0.15.19"
+version = "1.0.0"
 rust-version = "1.74.0"
 edition = "2021"
 
@@ -15,4 +15,4 @@ time = "^0.3.36"
 tokio = { version = "1.37.0", features = ["net", "rt-multi-thread"] }
 
 sozu-command-lib = { path = "../command", version = "^1.0.0-rc.2" }
-sozu-lib = { path = "../lib", version = "^1.0.0-rc.2" }
+sozu-lib = { path = "../lib", version = "^1.0.0" }
