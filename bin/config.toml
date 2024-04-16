@@ -202,8 +202,27 @@ address = "0.0.0.0:8443"
 # this option is incompatible with expect_proxy
 # public_address = "1.2.3.4:80"
 
-# custom HTTP answers can be added here, see example config above
+# For details about custom HTTP answers, see `doc/configure.md`,
+# and for defaults, check out `/lib/src/protocol/kawa_h1/answers.rs`
+# a 401 response is sent when a frontend has a Deny rule
+# answer_401 = "/absolute/path/to/custom_401.http"
+# a 404 response is sent when sozu does not know about the requested domain or path
+# answer_404 = "/absolute/path/to/custom_404.http"
+# a 408 response is sent when a frontend has a Deny rule (unusual)
+# answer_408 = "/absolute/path/to/custom_408.http"
+# a 413 response is sent when a request was too large
+# answer_413 = "/absolute/path/to/custom_413.http"
+# a 502 response means the response sent by a backend could not be parsed by Sōzu
+# answer_502 = "/absolute/path/to/custom_502.http"
+# a 503 response is sent if there are no backend servers available
+# answer_503 = "/absolute/path/to/custom_503.http"
+# a 504 response means the backend timed out
+# answer_504 = "/absolute/path/to/custom_504.http"
+# a 507 response occurs when the response sent by a backend is too big
+# answer_507 = "/absolute/path/to/custom_507.http"
 
+# defines the sticky session cookie's name, if `sticky_session` is activated for
+# a cluster. Defaults to "SOZUBALANCEID"
 # sticky_name = "SOZUBALANCEID"
 
 # Configures the client socket to receive a PROXY protocol header
