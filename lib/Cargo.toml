@@ -28,22 +28,22 @@ include = [
 ]
 
 [dependencies]
-anyhow = "^1.0.81"
-cookie-factory = "^0.3.2"
+anyhow = "^1.0.82"
+cookie-factory = "^0.3.3"
 hdrhistogram = "^7.5.4"
 hex = "^0.4.3"
 hpack = "^0.3.0"
 idna = "^0.5.0"
 kawa = { version = "^0.6.6", default-features = false }
 libc = "^0.2.153"
-memchr = "^2.7.1"
+memchr = "^2.7.2"
 mio = { version = "^0.8.11", features = ["os-poll", "os-ext", "net"] }
 nom = { version = "^7.1.3", default-features = true, features = ["std"] }
 poule = "^0.3.2"
 rand = "^0.8.5"
-regex = "^1.10.3"
-rustls = { version = "^0.23.2", features = ["ring"] }
-rustls-pemfile = "^2.1.1"
+regex = "^1.10.4"
+rustls = { version = "^0.23.4", features = ["ring"] }
+rustls-pemfile = "^2.1.2"
 rusty_ulid = "^2.0.0"
 sha2 = "^0.10.8"
 slab = "^0.4.9"
