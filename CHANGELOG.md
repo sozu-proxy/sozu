@@ -115,9 +115,10 @@ See milestone [`v1.1.0`](https://github.com/sozu-proxy/sozu/projects/3?card_filt
 
 #### ⛑️ Fixed
 
-- [ [`d83f399`](https://github.com/sozu-proxy/sozu/commit/d83f3997953f889a75d3300b10a55021d23f768d) ] Expose internal rustls buffers to ensure they are flushed [`Eloi DEMOLIS`] (`2024-04-03`)
 - [ [`d20e759`](https://github.com/sozu-proxy/sozu/commit/d20e759a7e66527d35110e11f7651a5cfee86161) ] Fix some timeout edge cases [`Eloi DEMOLIS`] (`2024-03-18`)
-- [ [`284068d`](https- [ [`a6fde1e`](https://github.com/sozu-proxy/sozu/commit/a6fde1eb44f958b095a6fb8c1208854ab6d8c85f) ] distinct PEM and X509 variants for CertificateError [`Emmanuel Bosquet`] (`2024-03-15`)
+- [ [`284068d`](https://github.com/sozu-proxy/sozu/commit/284068d73be3624cbe225b06af60278f9a0a72f0) ] fix: fix RUSTSEC-2024-0019 [`Dimitris Apostolou`] (`2024-03-09`)
+- [ [`59c0615`](https://github.com/sozu-proxy/sozu/commit/59c06158ad86d664f4e2900b777dc6cfa8fad2f0) ] Fix close propagation on close-delimited responses with front keep-alive [`Eloi DEMOLIS`] (`2024-02-20`)
+- [ [`6aa45b9`](https://github.com/sozu-proxy/sozu/commit/6aa45b9bd4ef8cadca308712d82f136e3747b7d5) ] fix and rewrite  CertificateResolver [`Emmanuel Bosquet`] (`2024-02-14`)
 - [ [`e793ec6`](https://github.com/sozu-proxy/sozu/commit/e793ec6667ae83d8be302d549751637315bef0fd) ] Edit access logs ASCII format, put logs-cache under feature [`Eloi DEMOLIS`] (`2024-03-11`)
 - [ [`85e2653`](https://github.com/sozu-proxy/sozu/commit/85e26535a4ec4eafe8c64f186b2f40014b5b1f4e) ] implement From<Uint128> for Ulid [`Emmanuel Bosquet`] (`2024-03-11`)
 - [ [`756b78b`](https://github.com/sozu-proxy/sozu/commit/756b78bc9c13684b4acb15caf14044f0ad90e623) ] create type WebSocketContext [`Emmanuel Bosquet`] (`2024-03-11`)
