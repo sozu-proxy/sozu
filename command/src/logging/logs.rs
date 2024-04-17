@@ -12,12 +12,12 @@ use std::{
 
 use mio::net::UnixDatagram;
 use prost::{encoding::encoded_len_varint, Message};
-use rand::{distributions::Alphanumeric, thread_rng, Rng};
 
 use crate::{
-    config::Config,
+    config::{Config, DEFAULT_LOG_TARGET},
     logging::{LogDuration, LogError, LogMessage, RequestRecord},
     proto::command::ProtobufAccessLogFormat,
+    writer::MultiLineWriter,
     AsString,
 };
 
@@ -58,9 +58,13 @@ impl From<&Option<AccessLogFormat>> for ProtobufAccessLogFormat {
 pub struct InnerLogger {
     directives: Vec<LogDirective>,
     backend: LoggerBackend,
+    /// inherited from the config's `log_target`, used to revive the backend
+    log_target: String,
     pub colored: bool,
     /// target of the access logs
     access_backend: Option<LoggerBackend>,
+    /// used to revive the backend for access logs
+    access_logs_target: Option<String>,
     /// how to format the access logs
     access_format: AccessLogFormat,
     access_colored: bool,
@@ -97,8 +101,10 @@ impl Default for Logger {
                     level: LogLevelFilter::Error,
                 }],
                 backend: LoggerBackend::Stdout(stdout()),
+                log_target: DEFAULT_LOG_TARGET.to_string(),
                 colored: false,
                 access_backend: None,
+                access_logs_target: None,
                 access_format: AccessLogFormat::Ascii,
                 access_colored: false,
                 buffer: LoggerBuffer(Vec::with_capacity(4096)),
@@ -118,12 +124,20 @@ impl Logger {
     pub fn init(
         tag: String,
         spec: &str,
-        backend: LoggerBackend,
+        log_target: &str,
         colored: bool,
-        access_backend: Option<LoggerBackend>,
+        access_logs_target: Option<&str>,
         access_format: Option<AccessLogFormat>,
         access_colored: Option<bool>,
     ) {
+        println!("setting log target to {log_target}");
+        let backend = target_or_default(log_target);
+
+        println!("setting target of access logs to {access_logs_target:?}");
+        let access_backend = access_logs_target.map(|target| {
+            target_to_backend(target).expect("could not setup logger for access logs")
+        });
+
         let (directives, _errors) = parse_logging_spec(spec);
         LOGGER.with(|logger| {
             let mut logger = logger.borrow_mut();
@@ -140,7 +154,9 @@ impl Logger {
                     _ => false,
                 };
                 logger.backend = backend;
+                logger.log_target = log_target.to_owned();
                 logger.access_backend = access_backend;
+                logger.access_logs_target = access_logs_target.map(ToOwned::to_owned);
                 logger.access_format = access_format.unwrap_or(AccessLogFormat::Ascii);
                 logger.tag = tag;
                 logger.pid = unsafe { libc::getpid() };
@@ -287,6 +303,11 @@ impl InnerLogger {
 
         if let Err(e) = io_result {
             println!("Could not write access log to {}: {e:?}", backend.as_ref());
+            println!(
+                "trying to revive the backend of access logs to {:?}, or defaulting to {}",
+                self.access_logs_target, self.log_target
+            );
+            backend.revive(self.access_logs_target.as_ref().unwrap_or(&self.log_target));
         }
     }
 
@@ -319,6 +340,17 @@ pub enum LoggerBackend {
     Udp(UdpSocket, SocketAddr),
     Tcp(TcpStream),
     File(crate::writer::MultiLineWriter<File>),
+}
+
+impl LoggerBackend {
+    fn revive(&mut self, log_target: &str) {
+        match target_to_backend(log_target) {
+            Ok(backend) => *self = backend,
+            Err(err) => {
+                eprintln!("could not revive logger backend: {err}");
+            }
+        }
+    }
 }
 
 #[repr(usize)]
@@ -598,18 +630,14 @@ pub fn setup_logging(
     log_level: &str,
     tag: &str,
 ) {
-    let backend = target_or_default(log_target);
-
-    let access_backend = access_logs_target.map(target_or_default);
-
     let log_level = env::var("RUST_LOG").unwrap_or(log_level.to_string());
 
     Logger::init(
         tag.to_string(),
         &log_level,
-        backend,
+        log_target,
         log_colored,
-        access_backend,
+        access_logs_target,
         access_logs_format,
         access_logs_colored,
     );
@@ -620,7 +648,7 @@ fn target_or_default(target: &str) -> LoggerBackend {
     match target_to_backend(target) {
         Ok(backend) => return backend,
         Err(target_error) => {
-            println!("{target_error}, defaulting to stdout");
+            eprintln!("{target_error}, defaulting to stdout");
             LoggerBackend::Stdout(stdout())
         }
     }
@@ -632,38 +660,28 @@ pub fn target_to_backend(target: &str) -> Result<LoggerBackend, LogError> {
     }
 
     if let Some(addr) = target.strip_prefix("udp://") {
-        let mut address = addr
-            .to_socket_addrs()
-            .map_err(|e| LogError::InvalidLogTarget(target.to_owned(), e.to_string()))?;
+        let address = addr
+            .parse::<SocketAddr>()
+            .map_err(|e| LogError::InvalidSocketAddress(target.to_owned(), e))?;
 
-        let socket = UdpSocket::bind(("0.0.0.0", 0)).unwrap();
-        return Ok(LoggerBackend::Udp(socket, address.next().unwrap()));
+        let socket = UdpSocket::bind(("0.0.0.0", 0)).map_err(LogError::UdpBind)?;
+
+        return Ok(LoggerBackend::Udp(socket, address));
     }
 
     if let Some(addr) = target.strip_prefix("tcp://") {
-        let mut address = addr
-            .to_socket_addrs()
-            .map_err(|e| LogError::InvalidLogTarget(target.to_owned(), e.to_string()))?;
-
-        let tcp_stream = TcpStream::connect(address.next().unwrap())
-            .map_err(|e| LogError::TcpConnect(target.to_owned(), e))?;
+        let tcp_stream =
+            TcpStream::connect(addr).map_err(|e| LogError::TcpConnect(target.to_owned(), e))?;
 
         return Ok(LoggerBackend::Tcp(tcp_stream));
     }
 
     if let Some(addr) = target.strip_prefix("unix://") {
-        let path = Path::new(addr);
-        let mut dir = env::temp_dir();
-        let s: String = thread_rng()
-            .sample_iter(&Alphanumeric)
-            .take(12)
-            .map(|c| c as char)
-            .collect();
-        dir.push(s);
-        let socket = UnixDatagram::bind(dir).unwrap();
+        let socket = UnixDatagram::unbound().map_err(LogError::CreateUnixSocket)?;
+
         socket
-            .connect(path)
-            .map_err(|e| LogError::InvalidLogTarget(target.to_owned(), e.to_string()))?;
+            .connect(addr)
+            .map_err(|e| LogError::ConnectToUnixSocket(target.to_owned(), e))?;
 
         return Ok(LoggerBackend::Unix(socket));
     }
@@ -674,15 +692,14 @@ pub fn target_to_backend(target: &str) -> Result<LoggerBackend, LogError> {
             .create(true)
             .append(true)
             .open(path)
-            .map_err(|e| LogError::InvalidLogTarget(target.to_owned(), e.to_string()))?;
+            .map_err(|e| LogError::OpenFile(target.to_owned(), e))?;
 
-        let writer = crate::writer::MultiLineWriter::new(file);
-        return Ok(LoggerBackend::File(writer));
+        return Ok(LoggerBackend::File(MultiLineWriter::new(file)));
     }
 
     Err(LogError::InvalidLogTarget(
         target.to_owned(),
-        "Log target is not parseable".to_string(),
+        "Log target is not parseable",
     ))
 }
 
@@ -986,10 +1003,10 @@ impl log::Log for CompatLogger {
 #[macro_export]
 macro_rules! setup_test_logger {
     () => {
-        $crate::logging::Logger::init(
+        let _ = $crate::logging::Logger::init(
             module_path!().to_string(),
             "error",
-            $crate::logging::LoggerBackend::Stdout(::std::io::stdout()),
+            sozu_command_lib::config::DEFAULT_LOG_TARGET,
             false,
             None,
             None,
