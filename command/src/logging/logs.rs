@@ -16,7 +16,7 @@ use rand::{distributions::Alphanumeric, thread_rng, Rng};
 
 use crate::{
     config::Config,
-    logging::{LogDuration, LogMessage, RequestRecord},
+    logging::{LogDuration, LogError, LogMessage, RequestRecord},
     proto::command::ProtobufAccessLogFormat,
     AsString,
 };
@@ -598,12 +598,15 @@ pub fn setup_logging(
     log_level: &str,
     tag: &str,
 ) {
-    let backend = target_to_backend(log_target);
-    let access_backend = access_logs_target.map(target_to_backend);
+    let backend = target_or_default(log_target);
+
+    let access_backend = access_logs_target.map(target_or_default);
+
+    let log_level = env::var("RUST_LOG").unwrap_or(log_level.to_string());
 
     Logger::init(
         tag.to_string(),
-        env::var("RUST_LOG").as_deref().unwrap_or(log_level),
+        &log_level,
         backend,
         log_colored,
         access_backend,
@@ -612,60 +615,75 @@ pub fn setup_logging(
     );
 }
 
-pub fn target_to_backend(target: &str) -> LoggerBackend {
-    if target == "stdout" {
-        LoggerBackend::Stdout(stdout())
-    } else if let Some(addr) = target.strip_prefix("udp://") {
-        match addr.to_socket_addrs() {
-            Err(e) => {
-                println!("invalid log target configuration ({e:?}): {target}");
-                LoggerBackend::Stdout(stdout())
-            }
-            Ok(mut addrs) => {
-                let socket = UdpSocket::bind(("0.0.0.0", 0)).unwrap();
-                LoggerBackend::Udp(socket, addrs.next().unwrap())
-            }
-        }
-    } else if let Some(addr) = target.strip_prefix("tcp://") {
-        match addr.to_socket_addrs() {
-            Err(e) => {
-                println!("invalid log target configuration ({e:?}): {target}");
-                LoggerBackend::Stdout(stdout())
-            }
-            Ok(mut addrs) => LoggerBackend::Tcp(TcpStream::connect(addrs.next().unwrap()).unwrap()),
-        }
-    } else if let Some(addr) = target.strip_prefix("unix://") {
-        let path = Path::new(addr);
-        if !path.exists() {
-            println!("invalid log target configuration: {addr} is not a file");
+/// defaults to stdout if the log target is unparseable
+fn target_or_default(target: &str) -> LoggerBackend {
+    match target_to_backend(target) {
+        Ok(backend) => return backend,
+        Err(target_error) => {
+            println!("{target_error}, defaulting to stdout");
             LoggerBackend::Stdout(stdout())
-        } else {
-            let mut dir = env::temp_dir();
-            let s: String = thread_rng()
-                .sample_iter(&Alphanumeric)
-                .take(12)
-                .map(|c| c as char)
-                .collect();
-            dir.push(s);
-            let socket = UnixDatagram::bind(dir).unwrap();
-            socket.connect(path).unwrap();
-            LoggerBackend::Unix(socket)
         }
-    } else if let Some(addr) = target.strip_prefix("file://") {
-        let path = Path::new(addr);
-        match OpenOptions::new().create(true).append(true).open(path) {
-            Ok(file) => LoggerBackend::File(crate::writer::MultiLineWriter::new(file)),
-            Err(e) => {
-                println!(
-                    "invalid log target configuration: could not open file at {addr} (error: {e:?})"
-                );
-                LoggerBackend::Stdout(stdout())
-            }
-        }
-    } else {
-        println!("invalid log target configuration: {target}");
-        LoggerBackend::Stdout(stdout())
     }
+}
+
+pub fn target_to_backend(target: &str) -> Result<LoggerBackend, LogError> {
+    if target == "stdout" {
+        return Ok(LoggerBackend::Stdout(stdout()));
+    }
+
+    if let Some(addr) = target.strip_prefix("udp://") {
+        let mut address = addr
+            .to_socket_addrs()
+            .map_err(|e| LogError::InvalidLogTarget(target.to_owned(), e.to_string()))?;
+
+        let socket = UdpSocket::bind(("0.0.0.0", 0)).unwrap();
+        return Ok(LoggerBackend::Udp(socket, address.next().unwrap()));
+    }
+
+    if let Some(addr) = target.strip_prefix("tcp://") {
+        let mut address = addr
+            .to_socket_addrs()
+            .map_err(|e| LogError::InvalidLogTarget(target.to_owned(), e.to_string()))?;
+
+        let tcp_stream = TcpStream::connect(address.next().unwrap())
+            .map_err(|e| LogError::TcpConnect(target.to_owned(), e))?;
+
+        return Ok(LoggerBackend::Tcp(tcp_stream));
+    }
+
+    if let Some(addr) = target.strip_prefix("unix://") {
+        let path = Path::new(addr);
+        let mut dir = env::temp_dir();
+        let s: String = thread_rng()
+            .sample_iter(&Alphanumeric)
+            .take(12)
+            .map(|c| c as char)
+            .collect();
+        dir.push(s);
+        let socket = UnixDatagram::bind(dir).unwrap();
+        socket
+            .connect(path)
+            .map_err(|e| LogError::InvalidLogTarget(target.to_owned(), e.to_string()))?;
+
+        return Ok(LoggerBackend::Unix(socket));
+    }
+
+    if let Some(addr) = target.strip_prefix("file://") {
+        let path = Path::new(addr);
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(|e| LogError::InvalidLogTarget(target.to_owned(), e.to_string()))?;
+
+        let writer = crate::writer::MultiLineWriter::new(file);
+        return Ok(LoggerBackend::File(writer));
+    }
+
+    Err(LogError::InvalidLogTarget(
+        target.to_owned(),
+        "Log target is not parseable".to_string(),
+    ))
 }
 
 #[macro_export]
