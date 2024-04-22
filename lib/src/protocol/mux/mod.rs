@@ -1,7 +1,7 @@
 use std::{
     cell::RefCell,
     collections::HashMap,
-    io::{ErrorKind, Write},
+    io::ErrorKind,
     net::{Shutdown, SocketAddr},
     rc::{Rc, Weak},
     time::Duration,
@@ -42,7 +42,7 @@ use self::h2::Prioriser;
 macro_rules! println_ {
     ($($t:expr),*) => {
         // print!("{}:{} ", file!(), line!());
-        println!($($t),*)
+        // println!($($t),*)
         // $(let _ = &$t;)*
     };
 }
@@ -942,7 +942,7 @@ impl<Front: SocketHandler + std::fmt::Debug> SessionState for Mux<Front> {
                 let mut dead_backends = Vec::new();
                 for (token, backend) in self.router.backends.iter_mut() {
                     let readiness = backend.readiness_mut();
-                    println!("{token:?} -> {readiness:?}");
+                    // println!("{token:?} -> {readiness:?}");
                     let dead = readiness.filter_interest().is_hup()
                         || readiness.filter_interest().is_error();
                     if dead {
@@ -1011,7 +1011,7 @@ impl<Front: SocketHandler + std::fmt::Debug> SessionState for Mux<Front> {
                         if !proxy_borrow.remove_session(*token) {
                             error!("session {:?} was already removed!", token);
                         } else {
-                            println!("SUCCESS: session {token:?} was removed!");
+                            // println!("SUCCESS: session {token:?} was removed!");
                         }
                     }
                     println_!("FRONTEND: {:#?}", self.frontend);
@@ -1257,7 +1257,7 @@ impl<Front: SocketHandler + std::fmt::Debug> SessionState for Mux<Front> {
             if !proxy_borrow.remove_session(*token) {
                 error!("session {:?} was already removed!", token);
             } else {
-                println!("SUCCESS: session {token:?} was removed!");
+                // println!("SUCCESS: session {token:?} was removed!");
             }
         }
         // let s = match &mut self.frontend {
