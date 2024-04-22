@@ -49,7 +49,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             return MuxResult::Continue;
         }
 
-        let was_initial = kawa.is_initial();
+        let was_main_phase = kawa.is_main_phase();
         kawa::h1::parse(kawa, parts.context);
         debug_kawa(kawa);
         if kawa.is_error() {
@@ -80,7 +80,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             }
             match self.position {
                 Position::Server => {
-                    if was_initial {
+                    if !was_main_phase {
                         self.requests += 1;
                         println_!("REQUESTS: {}", self.requests);
                         stream.state = StreamState::Link
@@ -153,9 +153,9 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                     let old_state = std::mem::replace(&mut stream.state, StreamState::Unlinked);
                     if stream.context.keep_alive_frontend {
                         self.timeout_container.reset();
-                        println!("{old_state:?} {:?}", self.readiness);
+                        // println!("{old_state:?} {:?}", self.readiness);
                         if let StreamState::Linked(token) = old_state {
-                            println!("{:?}", endpoint.readiness(token));
+                            // println!("{:?}", endpoint.readiness(token));
                             endpoint.end_stream(token, self.stream, context);
                         }
                         self.readiness.interest.insert(Ready::READABLE);
