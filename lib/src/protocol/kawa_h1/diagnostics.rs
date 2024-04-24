@@ -16,11 +16,7 @@ fn hex_dump(buffer: &[u8], window: usize, start: usize, end: usize) -> String {
         for c in slice {
             let _ = write!(result, " {c:02x}");
         }
-        result.push_str(
-            &std::iter::repeat(' ')
-                .take((window + start - end) * 3 + 4)
-                .collect::<String>(),
-        );
+        result.push_str(&" ".repeat((window + start - end) * 3 + 4));
         result.push_str(&String::from_utf8_lossy(slice).escape_debug().to_string());
     } else {
         let slice1 = &buffer[start..start + window - 1];
@@ -112,10 +108,11 @@ Invalid:
 pub fn diagnostic_413_507(parsing_phase: ParsingPhase) -> String {
     match parsing_phase {
         kawa::ParsingPhase::StatusLine => {
-            format!("Request line is too long. Note that an URL should not exceed 2083 characters.")
+            "Request line is too long. Note that an URL should not exceed 2083 characters."
+                .to_string()
         }
         kawa::ParsingPhase::Headers | kawa::ParsingPhase::Cookies { .. } => {
-            format!("Headers are too long. All headers should fit in a single buffer.")
+            "Headers are too long. All headers should fit in a single buffer.".to_string()
         }
         phase => format!("Unexpected parsing phase: {phase:?}"),
     }

@@ -606,7 +606,7 @@ impl Server {
         }
     }
 
-    fn reset_loop_time_and_get_timeout(&mut self) -> Option<std::time::Duration> {
+    fn reset_loop_time_and_get_timeout(&mut self) -> Option<Duration> {
         let now = Instant::now();
         time!("event_loop_time", (now - self.loop_start).as_millis());
 
@@ -632,7 +632,7 @@ impl Server {
         };
 
         self.loop_start = now;
-        timeout.and_then(|t| std::time::Duration::try_from(t).ok())
+        timeout
     }
 
     /// Returns true if hardstop

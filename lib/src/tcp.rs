@@ -1064,7 +1064,7 @@ impl TcpListener {
 
         registry
             .register(&mut listener, self.token, Interest::READABLE)
-            .map_err(|io_err| ProxyError::RegisterListener(io_err))?;
+            .map_err(ProxyError::RegisterListener)?;
 
         self.listener = Some(listener);
         self.active = true;

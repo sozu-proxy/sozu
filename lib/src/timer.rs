@@ -3,7 +3,9 @@
 //! code imported from mio-extras
 //! License: MIT or Apache 2.0
 use std::{
-    cmp, iter,
+    cmp,
+    fmt::Display,
+    iter,
     time::{Duration, Instant},
     u64, usize,
 };
@@ -146,11 +148,6 @@ impl TimeoutContainer {
         self.duration
     }
 
-    /// format timeout duration
-    pub fn duration_fmt(&self) -> String {
-        format!("{:?}", self.duration)
-    }
-
     pub fn cancel(&mut self) -> bool {
         match self.timeout.take() {
             None => {
@@ -187,10 +184,16 @@ impl TimeoutContainer {
     }
 }
 
+impl Display for TimeoutContainer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.duration)
+    }
+}
+
 impl std::ops::Drop for TimeoutContainer {
     fn drop(&mut self) {
         if self.cancel() {
-            debug!("Cancel a dangling timeout that haven't be handled in session lifecycle, token ({:?}), duration {}", self.token, self.duration_fmt());
+            debug!("Cancel a dangling timeout that haven't be handled in session lifecycle, token ({:?}), duration {}", self.token, self);
         }
     }
 }
@@ -475,9 +478,8 @@ impl<T> Timer<T> {
     }
 
     pub fn next_poll_date(&self) -> Option<Instant> {
-        self.next_tick().map(|tick| {
-            self.start + Duration::from_millis(self.tick_ms.saturating_mul(tick) as u64)
-        })
+        self.next_tick()
+            .map(|tick| self.start + Duration::from_millis(self.tick_ms.saturating_mul(tick)))
     }
 
     fn slot_for(&self, tick: Tick) -> usize {

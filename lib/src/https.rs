@@ -987,7 +987,7 @@ impl HttpsProxy {
             .listeners
             .values()
             .find(|listener| listener.borrow().address == address)
-            .ok_or(ProxyError::NoListenerFound(address.clone()))?;
+            .ok_or(ProxyError::NoListenerFound(address))?;
 
         let mut owned = listener.borrow_mut();
 

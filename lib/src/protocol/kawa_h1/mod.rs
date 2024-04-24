@@ -1212,7 +1212,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             }
             return format!("{method}");
         }
-        return format!("");
+        String::new()
     }
 
     fn cluster_id_from_request(
@@ -1845,7 +1845,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> SessionState 
                 // we do not have a complete answer
                 TimeoutStatus::Request => {
                     self.set_answer(DefaultAnswer::Answer408 {
-                        duration: self.container_frontend_timeout.duration_fmt(),
+                        duration: self.container_frontend_timeout.to_string(),
                     });
                     self.writable(metrics)
                 }
@@ -1854,7 +1854,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> SessionState 
                     // this case is ambiguous, as it is the frontend timeout that triggers while we were waiting for response
                     // the timeout responsibility should have switched before
                     self.set_answer(DefaultAnswer::Answer504 {
-                        duration: self.container_backend_timeout.duration_fmt(),
+                        duration: self.container_backend_timeout.to_string(),
                     });
                     self.writable(metrics)
                 }
@@ -1875,13 +1875,13 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> SessionState 
                         "got backend timeout while waiting for a request, this should not happen"
                     );
                     self.set_answer(DefaultAnswer::Answer504 {
-                        duration: self.container_backend_timeout.duration_fmt(),
+                        duration: self.container_backend_timeout.to_string(),
                     });
                     self.writable(metrics)
                 }
                 TimeoutStatus::WaitingForResponse => {
                     self.set_answer(DefaultAnswer::Answer504 {
-                        duration: self.container_backend_timeout.duration_fmt(),
+                        duration: self.container_backend_timeout.to_string(),
                     });
                     self.writable(metrics)
                 }
