@@ -343,6 +343,7 @@ use std::{
     net::SocketAddr,
     rc::Rc,
     str,
+    time::{Duration, Instant},
 };
 
 use backends::BackendError;
@@ -351,7 +352,6 @@ use mio::{net::TcpStream, Interest, Token};
 use protocol::http::{answers::TemplateError, parser::Method};
 use router::RouterError;
 use socket::ServerBindError;
-use time::{Duration, Instant};
 use tls::CertificateResolverError;
 
 use sozu_command::{
@@ -945,8 +945,8 @@ impl SessionMetrics {
     pub fn new(wait_time: Option<Duration>) -> SessionMetrics {
         SessionMetrics {
             start: Some(Instant::now()),
-            service_time: Duration::seconds(0),
-            wait_time: wait_time.unwrap_or_else(|| Duration::seconds(0)),
+            service_time: Duration::from_secs(0),
+            wait_time: wait_time.unwrap_or_else(|| Duration::from_secs(0)),
             bin: 0,
             bout: 0,
             service_start: None,
@@ -962,8 +962,8 @@ impl SessionMetrics {
 
     pub fn reset(&mut self) {
         self.start = None;
-        self.service_time = Duration::seconds(0);
-        self.wait_time = Duration::seconds(0);
+        self.service_time = Duration::from_secs(0);
+        self.wait_time = Duration::from_secs(0);
         self.bin = 0;
         self.bout = 0;
         self.service_start = None;
@@ -1009,7 +1009,7 @@ impl SessionMetrics {
     pub fn response_time(&self) -> Duration {
         match self.start {
             Some(start) => Instant::now() - start,
-            None => Duration::seconds(0),
+            None => Duration::from_secs(0),
         }
     }
 
@@ -1045,26 +1045,18 @@ impl SessionMetrics {
         let service_time = self.service_time();
 
         if let Some(cluster_id) = context.cluster_id {
-            time!(
-                "response_time",
-                cluster_id,
-                response_time.whole_milliseconds()
-            );
-            time!(
-                "service_time",
-                cluster_id,
-                service_time.whole_milliseconds()
-            );
+            time!("response_time", cluster_id, response_time.as_millis());
+            time!("service_time", cluster_id, service_time.as_millis());
         }
-        time!("response_time", response_time.whole_milliseconds());
-        time!("service_time", service_time.whole_milliseconds());
+        time!("response_time", response_time.as_millis());
+        time!("service_time", service_time.as_millis());
 
         if let Some(backend_id) = self.backend_id.as_ref() {
             if let Some(backend_response_time) = self.backend_response_time() {
                 record_backend_metrics!(
                     context.cluster_id.as_str_or("-"),
                     backend_id,
-                    backend_response_time.whole_milliseconds(),
+                    backend_response_time.as_millis(),
                     self.backend_connection_time(),
                     self.backend_bin,
                     self.backend_bout
@@ -1121,7 +1113,7 @@ impl PeakEWMA {
             self.rtt = rtt;
         } else {
             // new_rtt = old_rtt * e^(-elapsed/decay) + observed_rtt * (1 - e^(-elapsed/decay))
-            let weight = (-1.0 * dur.whole_nanoseconds() as f64 / self.decay).exp();
+            let weight = (-1.0 * dur.as_nanos() as f64 / self.decay).exp();
             self.rtt = self.rtt * weight + rtt * (1.0 - weight);
         }
 

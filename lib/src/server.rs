@@ -5,6 +5,7 @@ use std::{
     io::Error as IoError,
     os::unix::io::{AsRawFd, FromRawFd},
     rc::Rc,
+    time::{Duration, Instant},
 };
 
 use mio::{
@@ -12,7 +13,6 @@ use mio::{
     Events, Interest, Poll, Token,
 };
 use slab::Slab;
-use time::{Duration, Instant};
 
 use sozu_command::{
     channel::Channel,
@@ -374,7 +374,9 @@ impl Server {
         }));
 
         let mut server = Server {
-            accept_queue_timeout: Duration::seconds(i64::from(server_config.accept_queue_timeout)),
+            accept_queue_timeout: Duration::from_secs(u64::from(
+                server_config.accept_queue_timeout,
+            )),
             accept_queue: VecDeque::new(),
             accept_ready: HashSet::new(),
             backends,
@@ -389,7 +391,7 @@ impl Server {
             last_zombie_check: Instant::now(), // to be reset on server run
             loop_start: Instant::now(),        // to be reset on server run
             max_poll_errors: 10000,            // TODO: make it configurable?
-            poll_timeout: Some(Duration::milliseconds(1000)), // TODO: make it configurable?
+            poll_timeout: Some(Duration::from_millis(1000)), // TODO: make it configurable?
             poll,
             scm_listeners: None,
             scm,
@@ -397,7 +399,7 @@ impl Server {
             should_poll_at: None,
             shutting_down: None,
             tcp,
-            zombie_check_interval: Duration::seconds(i64::from(
+            zombie_check_interval: Duration::from_secs(u64::from(
                 server_config.zombie_check_interval,
             )),
         };
@@ -491,10 +493,7 @@ impl Server {
             }
 
             let after_epoll = Instant::now();
-            time!(
-                "epoll_time",
-                (after_epoll - self.loop_start).whole_milliseconds()
-            );
+            time!("epoll_time", (after_epoll - self.loop_start).as_millis());
             self.loop_start = after_epoll;
 
             self.send_queue();
@@ -609,10 +608,7 @@ impl Server {
 
     fn reset_loop_time_and_get_timeout(&mut self) -> Option<std::time::Duration> {
         let now = Instant::now();
-        time!(
-            "event_loop_time",
-            (now - self.loop_start).whole_milliseconds()
-        );
+        time!("event_loop_time", (now - self.loop_start).as_millis());
 
         let timeout = match self.should_poll_at.as_ref() {
             None => self.poll_timeout,
@@ -787,7 +783,7 @@ impl Server {
         if new_sessions_count < sessions_count {
             let now = Instant::now();
             if let Some(last) = self.last_shutting_down_message {
-                if (now - last) > Duration::seconds(5) {
+                if (now - last) > Duration::from_secs(5) {
                     info!(
                         "closed {} sessions, {} sessions left, base_sessions_count = {}",
                         sessions_count - new_sessions_count,
@@ -1538,7 +1534,7 @@ impl Server {
     pub fn create_sessions(&mut self) {
         while let Some((sock, token, protocol, timestamp)) = self.accept_queue.pop_back() {
             let wait_time = Instant::now() - timestamp;
-            time!("accept_queue.wait_time", wait_time.whole_milliseconds());
+            time!("accept_queue.wait_time", wait_time.as_millis());
             if wait_time > self.accept_queue_timeout {
                 incr!("accept_queue.timeout");
                 continue;

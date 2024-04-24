@@ -8,6 +8,7 @@ use std::{
     io::ErrorKind,
     net::{Shutdown, SocketAddr},
     rc::{Rc, Weak},
+    time::{Duration, Instant},
 };
 
 use mio::{net::TcpStream, Interest, Token};
@@ -17,7 +18,7 @@ use sozu_command::{
     logging::EndpointRecord,
     proto::command::{Event, EventKind, ListenerType},
 };
-use time::{Duration, Instant};
+// use time::{Duration, Instant};
 
 use crate::{
     backends::{Backend, BackendError},
@@ -1052,7 +1053,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             Some(stop_instant) => {
                 let now = Instant::now();
                 let dur = now - *stop_instant;
-                if dur > Duration::seconds(1) {
+                if dur > Duration::from_secs(1) {
                     return self.test_backend_socket();
                 }
             }
@@ -1844,7 +1845,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> SessionState 
                 // we do not have a complete answer
                 TimeoutStatus::Request => {
                     self.set_answer(DefaultAnswer::Answer408 {
-                        duration: self.container_frontend_timeout.duration().to_string(),
+                        duration: self.container_frontend_timeout.duration_fmt(),
                     });
                     self.writable(metrics)
                 }
@@ -1853,7 +1854,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> SessionState 
                     // this case is ambiguous, as it is the frontend timeout that triggers while we were waiting for response
                     // the timeout responsibility should have switched before
                     self.set_answer(DefaultAnswer::Answer504 {
-                        duration: self.container_backend_timeout.duration().to_string(),
+                        duration: self.container_backend_timeout.duration_fmt(),
                     });
                     self.writable(metrics)
                 }
@@ -1874,13 +1875,13 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> SessionState 
                         "got backend timeout while waiting for a request, this should not happen"
                     );
                     self.set_answer(DefaultAnswer::Answer504 {
-                        duration: self.container_backend_timeout.duration().to_string(),
+                        duration: self.container_backend_timeout.duration_fmt(),
                     });
                     self.writable(metrics)
                 }
                 TimeoutStatus::WaitingForResponse => {
                     self.set_answer(DefaultAnswer::Answer504 {
-                        duration: self.container_backend_timeout.duration().to_string(),
+                        duration: self.container_backend_timeout.duration_fmt(),
                     });
                     self.writable(metrics)
                 }

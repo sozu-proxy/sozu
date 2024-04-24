@@ -1,10 +1,9 @@
 pub mod pattern_trie;
 pub mod trie;
 
-use std::str::from_utf8;
+use std::{str::from_utf8, time::Instant};
 
 use regex::bytes::Regex;
-use time::Instant;
 
 use sozu_command::{
     proto::command::{PathRule as CommandPathRule, PathRuleKind, RulePosition},
@@ -441,7 +440,7 @@ impl DomainRule {
                 let start = Instant::now();
                 let is_a_match = r.is_match(hostname);
                 let now = Instant::now();
-                time!("regex_matching_time", (now - start).whole_milliseconds());
+                time!("regex_matching_time", (now - start).as_millis());
                 is_a_match
             }
         }
@@ -521,7 +520,7 @@ impl PathRule {
                 let start = Instant::now();
                 let is_a_match = regex.is_match(path);
                 let now = Instant::now();
-                time!("regex_matching_time", (now - start).whole_milliseconds());
+                time!("regex_matching_time", (now - start).as_millis());
 
                 if is_a_match {
                     PathRuleResult::Regex

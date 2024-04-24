@@ -1007,6 +1007,7 @@ pub struct Rfc3339Time {
     pub inner: ::time::OffsetDateTime,
 }
 
+/// yields (Rfc3339Time, unix_epoch)
 pub fn now() -> (Rfc3339Time, i128) {
     let t = time::OffsetDateTime::now_utc();
     (

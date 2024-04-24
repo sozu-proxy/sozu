@@ -7,6 +7,7 @@ use std::{
     rc::{Rc, Weak},
     str::{from_utf8, from_utf8_unchecked},
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use mio::{
@@ -32,7 +33,6 @@ use rustls::{
     SupportedCipherSuite,
 };
 use rusty_ulid::Ulid;
-use time::{Duration, Instant};
 
 use sozu_command::{
     certificate::Fingerprint,
@@ -607,11 +607,7 @@ impl L7ListenerHandler for HttpsListener {
         let now = Instant::now();
 
         if let Route::ClusterId(cluster) = &route {
-            time!(
-                "frontend_matching_time",
-                cluster,
-                (now - start).whole_milliseconds()
-            );
+            time!("frontend_matching_time", cluster, (now - start).as_millis());
         }
 
         Ok(route)
@@ -1232,10 +1228,10 @@ impl ProxyConfiguration for HttpsProxy {
 
         let session = Rc::new(RefCell::new(HttpsSession::new(
             owned.answers.clone(),
-            Duration::seconds(owned.config.back_timeout as i64),
-            Duration::seconds(owned.config.connect_timeout as i64),
-            Duration::seconds(owned.config.front_timeout as i64),
-            Duration::seconds(owned.config.request_timeout as i64),
+            Duration::from_secs(owned.config.back_timeout as u64),
+            Duration::from_secs(owned.config.connect_timeout as u64),
+            Duration::from_secs(owned.config.front_timeout as u64),
+            Duration::from_secs(owned.config.request_timeout as u64),
             owned.config.expect_proxy,
             listener.clone(),
             Rc::downgrade(&self.pool),

@@ -310,9 +310,8 @@ mod expect_test {
         net::{IpAddr, Ipv4Addr, SocketAddr},
         sync::{Arc, Barrier},
         thread::{self, JoinHandle},
+        time::Duration,
     };
-
-    use time::Duration;
 
     use crate::protocol::proxy_protocol::header::*;
 
@@ -349,7 +348,7 @@ mod expect_test {
         }
 
         let mut session_metrics = SessionMetrics::new(None);
-        let container_frontend_timeout = TimeoutContainer::new(Duration::seconds(10), Token(0));
+        let container_frontend_timeout = TimeoutContainer::new(Duration::from_secs(10), Token(0));
         let mut expect_pp = ExpectProxyProtocol::new(
             container_frontend_timeout,
             session_stream,

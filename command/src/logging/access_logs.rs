@@ -1,7 +1,6 @@
-use std::{collections::BTreeMap, mem::ManuallyDrop, net::SocketAddr};
+use std::{collections::BTreeMap, mem::ManuallyDrop, net::SocketAddr, time::Duration};
 
 use rusty_ulid::Ulid;
-use time::Duration;
 
 use crate::{
     logging::{LogLevel, Rfc3339Time},
@@ -160,7 +159,7 @@ impl RequestRecord<'_> {
                 backend_id: self.context.backend_id.duplicate(),
                 bytes_in: self.bytes_in as u64,
                 bytes_out: self.bytes_out as u64,
-                client_rtt: self.client_rtt.map(|t| t.whole_microseconds() as u64),
+                client_rtt: self.client_rtt.map(|t| t.as_micros() as u64),
                 cluster_id: self.context.cluster_id.duplicate(),
                 endpoint: ProtobufEndpoint {
                     inner: Some(endpoint),
@@ -168,9 +167,9 @@ impl RequestRecord<'_> {
                 message: self.message.duplicate(),
                 protocol: self.protocol.duplicate(),
                 request_id: self.context.request_id.into(),
-                response_time: self.response_time.whole_microseconds() as u64,
-                server_rtt: self.server_rtt.map(|t| t.whole_microseconds() as u64),
-                service_time: self.service_time.whole_microseconds() as u64,
+                response_time: self.response_time.as_micros() as u64,
+                server_rtt: self.server_rtt.map(|t| t.as_micros() as u64),
+                service_time: self.service_time.as_micros() as u64,
                 session_address: self.session_address.map(Into::into),
                 tags: self
                     .tags
