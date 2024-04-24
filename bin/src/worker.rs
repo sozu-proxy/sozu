@@ -22,7 +22,7 @@ use tempfile::tempfile;
 use sozu_command_lib::{
     channel::{Channel, ChannelError},
     config::Config,
-    logging::{setup_logging, AccessLogFormat},
+    logging::{setup_logging, AccessLogFormat, LogError},
     proto::command::{ServerConfig, WorkerRequest, WorkerResponse},
     ready::Ready,
     request::{read_initial_state_from_file, RequestError},
@@ -74,6 +74,8 @@ pub enum WorkerError {
         state: String,
         channel_err: ChannelError,
     },
+    #[error("could not setup the logger: {0}")]
+    SetupLogging(LogError),
 }
 
 /// called within a worker process, this starts the actual proxy
@@ -117,7 +119,8 @@ pub fn begin_worker_process(
         Some(worker_config.log_colored),
         &worker_config.log_level,
         &worker_id,
-    );
+    )
+    .map_err(WorkerError::SetupLogging)?;
 
     trace!(
         "Creating worker {} with config: {:#?}",

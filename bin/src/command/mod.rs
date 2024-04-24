@@ -11,7 +11,7 @@ use mio::net::UnixListener;
 
 use sozu_command_lib::{
     config::{Config, ConfigError},
-    logging::setup_logging_with_config,
+    logging::{setup_logging_with_config, LogError},
 };
 
 use crate::{
@@ -52,6 +52,8 @@ pub enum StartError {
     SetPermissions(IoError),
     #[error("could not launch new worker: {0}")]
     LaunchWorker(ServerError),
+    #[error("could not setup the logger: {0}")]
+    SetupLogging(LogError),
 }
 
 pub fn begin_main_process(args: &Args) -> Result<(), StartError> {
@@ -59,7 +61,7 @@ pub fn begin_main_process(args: &Args) -> Result<(), StartError> {
 
     let config = Config::load_from_path(config_file_path).map_err(StartError::LoadConfig)?;
 
-    setup_logging_with_config(&config, "MAIN");
+    setup_logging_with_config(&config, "MAIN").map_err(StartError::SetupLogging)?;
     info!("Starting up");
     setup_metrics(&config).map_err(StartError::SetupMetrics)?;
     write_pid_file(&config).map_err(StartError::WritePidFile)?;

@@ -53,7 +53,9 @@ fn main() {
     eprintln!(
         "n={n}, pre_generate={pre_generate}, target={target}, colored={colored}, filter={filter}"
     );
-    setup_logging(&target, colored, None, None, None, &filter, "WRK-01");
+    if let Err(e) = setup_logging(&target, colored, None, None, None, &filter, "WRK-01") {
+        println!("could not setup logging: {}", e);
+    }
 
     let mut pre_generated_log_iterator;
     let mut log_iterator = std::iter::repeat(())

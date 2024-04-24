@@ -162,7 +162,11 @@ impl CommandManager {
             let config = self.config.clone();
 
             upgrade_jobs.push(std::thread::spawn(move || {
-                setup_logging_with_config(&config, &format!("UPGRADE-WRK-{}", worker.id));
+                if let Err(e) =
+                    setup_logging_with_config(&config, &format!("UPGRADE-WRK-{}", worker.id))
+                {
+                    error!("Could not setup logging: {}", e);
+                }
 
                 info!("creating channel to upgrade worker {}", worker.id);
                 let channel = match create_channel(&config) {

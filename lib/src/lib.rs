@@ -226,7 +226,7 @@
 //! };
 //!
 //! fn main() -> anyhow::Result<()> {
-//!     setup_default_logging(true, "info", "EXAMPLE");
+//!     setup_default_logging(true, "info", "EXAMPLE").with_context(|| "could not setup logging")?;
 //!
 //!     info!("starting up");
 //!

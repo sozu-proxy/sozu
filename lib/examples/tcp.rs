@@ -16,7 +16,7 @@ use sozu_command_lib::{
 };
 
 fn main() -> anyhow::Result<()> {
-    setup_default_logging(true, "info", "EXAMPLE");
+    setup_default_logging(true, "info", "EXAMPLE").with_context(|| "could not setup logging")?;
 
     info!("starting up");
 
@@ -30,7 +30,9 @@ fn main() -> anyhow::Result<()> {
             address: SocketAddress::new_v4(127, 0, 0, 1, 8080),
             ..Default::default()
         };
-        setup_default_logging(true, "debug", "TCP");
+        if let Err(e) = setup_default_logging(true, "debug", "TCP") {
+            println!("could not setup logging: {e}");
+        }
         sozu_lib::tcp::testing::start_tcp_worker(listener, max_buffers, buffer_size, channel);
     });
 

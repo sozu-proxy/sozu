@@ -172,6 +172,7 @@ pub const MAX_LOOP_ITERATIONS: usize = 100000;
 /// with little influence on performance. Defaults to 4.
 pub const DEFAULT_SEND_TLS_13_TICKETS: u64 = 4;
 
+/// for both logs and access logs
 pub const DEFAULT_LOG_TARGET: &str = "stdout";
 
 #[derive(Debug)]

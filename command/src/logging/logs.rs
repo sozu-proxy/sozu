@@ -4,7 +4,7 @@ use std::{
     fmt::Arguments,
     fs::{File, OpenOptions},
     io::{stdout, Error as IoError, ErrorKind as IoErrorKind, Stdout, Write},
-    net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket},
+    net::{SocketAddr, TcpStream, UdpSocket},
     ops::{Deref, DerefMut},
     path::Path,
     str::FromStr,
@@ -129,14 +129,12 @@ impl Logger {
         access_logs_target: Option<&str>,
         access_format: Option<AccessLogFormat>,
         access_colored: Option<bool>,
-    ) {
+    ) -> Result<(), LogError> {
         println!("setting log target to {log_target}");
         let backend = target_or_default(log_target);
 
         println!("setting target of access logs to {access_logs_target:?}");
-        let access_backend = access_logs_target.map(|target| {
-            target_to_backend(target).expect("could not setup logger for access logs")
-        });
+        let access_backend = access_logs_target.map(target_to_backend).transpose()?;
 
         let (directives, _errors) = parse_logging_spec(spec);
         LOGGER.with(|logger| {
@@ -168,6 +166,7 @@ impl Logger {
                 log::set_max_level(log::LevelFilter::Info);
             }
         });
+        Ok(())
     }
 
     pub fn set_directives(&mut self, directives: Vec<LogDirective>) {
@@ -600,12 +599,16 @@ pub fn parse_logging_spec(spec: &str) -> (Vec<LogDirective>, Vec<LogSpecParseErr
 }
 
 /// start the logger with all logs and access logs on stdout
-pub fn setup_default_logging(log_colored: bool, log_level: &str, tag: &str) {
+pub fn setup_default_logging(
+    log_colored: bool,
+    log_level: &str,
+    tag: &str,
+) -> Result<(), LogError> {
     setup_logging("stdout", log_colored, None, None, None, log_level, tag)
 }
 
 /// start the logger from config (takes RUST_LOG into account)
-pub fn setup_logging_with_config(config: &Config, tag: &str) {
+pub fn setup_logging_with_config(config: &Config, tag: &str) -> Result<(), LogError> {
     setup_logging(
         &config.log_target,
         config.log_colored,
@@ -629,7 +632,7 @@ pub fn setup_logging(
     access_logs_colored: Option<bool>,
     log_level: &str,
     tag: &str,
-) {
+) -> Result<(), LogError> {
     let log_level = env::var("RUST_LOG").unwrap_or(log_level.to_string());
 
     Logger::init(
@@ -640,13 +643,13 @@ pub fn setup_logging(
         access_logs_target,
         access_logs_format,
         access_logs_colored,
-    );
+    )
 }
 
 /// defaults to stdout if the log target is unparseable
 fn target_or_default(target: &str) -> LoggerBackend {
     match target_to_backend(target) {
-        Ok(backend) => return backend,
+        Ok(backend) => backend,
         Err(target_error) => {
             eprintln!("{target_error}, defaulting to stdout");
             LoggerBackend::Stdout(stdout())
