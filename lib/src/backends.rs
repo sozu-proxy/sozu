@@ -1,7 +1,6 @@
-use std::{cell::RefCell, collections::HashMap, net::SocketAddr, rc::Rc};
+use std::{cell::RefCell, collections::HashMap, net::SocketAddr, rc::Rc, time::Duration};
 
 use mio::net::TcpStream;
-use time::Duration;
 
 use sozu_command::{
     proto::command::{Event, EventKind, LoadBalancingAlgorithms, LoadBalancingParams, LoadMetric},
@@ -130,7 +129,7 @@ impl Backend {
     }
 
     pub fn set_connection_time(&mut self, dur: Duration) {
-        self.connection_time.observe(dur.whole_nanoseconds() as f64);
+        self.connection_time.observe(dur.as_nanos() as f64);
     }
 
     pub fn peak_ewma_connection(&mut self) -> f64 {

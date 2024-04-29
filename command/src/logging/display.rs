@@ -77,19 +77,19 @@ impl fmt::Display for LogDuration {
         match self.0 {
             None => write!(f, "-"),
             Some(duration) => {
-                let secs = duration.whole_seconds();
+                let secs = duration.as_secs();
                 if secs >= 10 {
                     return write!(f, "{secs}s");
                 }
 
-                let ms = duration.whole_milliseconds();
+                let ms = duration.as_millis();
                 if ms < 10 {
-                    let us = duration.whole_microseconds();
+                    let us = duration.as_millis();
                     if us >= 10 {
                         return write!(f, "{us}μs");
                     }
 
-                    let ns = duration.whole_nanoseconds();
+                    let ns = duration.as_nanos();
                     return write!(f, "{ns}ns");
                 }
 

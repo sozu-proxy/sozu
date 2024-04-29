@@ -114,7 +114,7 @@ impl Template {
             .collect::<Vec<_>>();
         let answer = answer
             .replace("\r\n", "\n")
-            .replace("\n", "\r\n")
+            .replace('\n', "\r\n")
             .into_bytes();
 
         let len = answer.len();

@@ -1688,7 +1688,6 @@ dependencies = [
  "tempfile",
  "termion",
  "thiserror",
- "time",
 ]
 
 [[package]]

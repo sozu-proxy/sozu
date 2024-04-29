@@ -496,14 +496,13 @@ pub fn server_bind(addr: SocketAddr) -> Result<TcpListener, ServerBindError> {
 
 /// Socket statistics
 pub mod stats {
-    use std::os::fd::AsRawFd;
-    use time::Duration;
+    use std::{os::fd::AsRawFd, time::Duration};
 
     use internal::{TcpInfo, OPT_LEVEL, OPT_NAME};
 
     /// Round trip time for a TCP socket
     pub fn socket_rtt<A: AsRawFd>(socket: &A) -> Option<Duration> {
-        socket_info(socket.as_raw_fd()).map(|info| Duration::microseconds(info.rtt() as i64))
+        socket_info(socket.as_raw_fd()).map(|info| Duration::from_micros(info.rtt() as u64))
     }
 
     #[cfg(unix)]

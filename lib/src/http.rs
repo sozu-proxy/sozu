@@ -6,6 +6,7 @@ use std::{
     os::unix::io::AsRawFd,
     rc::{Rc, Weak},
     str::from_utf8_unchecked,
+    time::{Duration, Instant},
 };
 
 use mio::{
@@ -14,7 +15,6 @@ use mio::{
     Interest, Registry, Token,
 };
 use rusty_ulid::Ulid;
-use time::{Duration, Instant};
 
 use sozu_command::{
     logging::CachedTags,
@@ -473,11 +473,7 @@ impl L7ListenerHandler for HttpListener {
         let now = Instant::now();
 
         if let Route::ClusterId(cluster) = &route {
-            time!(
-                "frontend_matching_time",
-                cluster,
-                (now - start).whole_milliseconds()
-            );
+            time!("frontend_matching_time", cluster, (now - start).as_millis());
         }
 
         Ok(route)
@@ -584,7 +580,7 @@ impl HttpProxy {
             .listeners
             .values()
             .find(|listener| listener.borrow().address == address)
-            .ok_or(ProxyError::NoListenerFound(address.clone()))?;
+            .ok_or(ProxyError::NoListenerFound(address))?;
 
         let mut owned = listener.borrow_mut();
 
@@ -921,10 +917,10 @@ impl ProxyConfiguration for HttpProxy {
 
         let session = HttpSession::new(
             owned.answers.clone(),
-            Duration::seconds(owned.config.back_timeout as i64),
-            Duration::seconds(owned.config.connect_timeout as i64),
-            Duration::seconds(owned.config.front_timeout as i64),
-            Duration::seconds(owned.config.request_timeout as i64),
+            Duration::from_secs(owned.config.back_timeout as u64),
+            Duration::from_secs(owned.config.connect_timeout as u64),
+            Duration::from_secs(owned.config.front_timeout as u64),
+            Duration::from_secs(owned.config.request_timeout as u64),
             owned.config.expect_proxy,
             listener.clone(),
             Rc::downgrade(&self.pool),

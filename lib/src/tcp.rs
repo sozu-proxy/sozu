@@ -5,6 +5,7 @@ use std::{
     net::{Shutdown, SocketAddr},
     os::unix::io::AsRawFd,
     rc::Rc,
+    time::{Duration, Instant},
 };
 
 use mio::{
@@ -12,7 +13,6 @@ use mio::{
     Registry, Token,
 };
 use rusty_ulid::Ulid;
-use time::{Duration, Instant};
 
 use sozu_command::{
     config::MAX_LOOP_ITERATIONS,
@@ -815,7 +815,7 @@ impl TcpSession {
         }
 
         let connect_timeout_duration =
-            Duration::seconds(self.listener.borrow().config.connect_timeout as i64);
+            Duration::from_secs(self.listener.borrow().config.connect_timeout as u64);
         self.container_backend_timeout
             .set_duration(connect_timeout_duration);
         self.container_backend_timeout.set(back_token);
@@ -1064,7 +1064,7 @@ impl TcpListener {
 
         registry
             .register(&mut listener, self.token, Interest::READABLE)
-            .map_err(|io_err| ProxyError::RegisterListener(io_err))?;
+            .map_err(ProxyError::RegisterListener)?;
 
         self.listener = Some(listener);
         self.active = true;
@@ -1408,8 +1408,8 @@ impl ProxyConfiguration for TcpProxy {
             back_buffer,
             None,
             owned.cluster_id.clone(),
-            Duration::seconds(owned.config.back_timeout as i64),
-            Duration::seconds(owned.config.front_timeout as i64),
+            Duration::from_secs(owned.config.back_timeout as u64),
+            Duration::from_secs(owned.config.front_timeout as u64),
             front_buffer,
             frontend_token,
             listener.clone(),
