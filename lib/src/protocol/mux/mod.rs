@@ -41,8 +41,8 @@ use self::h2::Prioriser;
 #[macro_export]
 macro_rules! println_ {
     ($($t:expr),*) => {
-        // print!("{}:{} ", file!(), line!());
-        // println!($($t),*)
+        print!("{}:{} ", file!(), line!());
+        println!($($t),*)
         // $(let _ = &$t;)*
     };
 }
@@ -1260,26 +1260,27 @@ impl<Front: SocketHandler + std::fmt::Debug> SessionState for Mux<Front> {
                 // println!("SUCCESS: session {token:?} was removed!");
             }
         }
-        // let s = match &mut self.frontend {
-        //     Connection::H1(c) => &mut c.socket,
-        //     Connection::H2(c) => &mut c.socket,
-        // };
-        // let mut b = [0; 1024];
-        // let (size, status) = s.socket_read(&mut b);
-        // println_!("{size} {status:?} {:?}", &b[..size]);
-        // for stream in &mut self.context.streams {
-        //     for kawa in [&mut stream.front, &mut stream.back] {
-        //         debug_kawa(kawa);
-        //         kawa.prepare(&mut kawa::h1::BlockConverter);
-        //         let out = kawa.as_io_slice();
-        //         let mut writer = std::io::BufWriter::new(Vec::new());
-        //         let amount = writer.write_vectored(&out).unwrap();
-        //         println_!(
-        //             "amount: {amount}\n{}",
-        //             String::from_utf8_lossy(writer.buffer())
-        //         );
-        //     }
-        // }
+        use std::io::Write;
+        let s = match &mut self.frontend {
+            Connection::H1(c) => &mut c.socket,
+            Connection::H2(c) => &mut c.socket,
+        };
+        let mut b = [0; 1024];
+        let (size, status) = s.socket_read(&mut b);
+        println_!("{size} {status:?} {:?}", &b[..size]);
+        for stream in &mut self.context.streams {
+            for kawa in [&mut stream.front, &mut stream.back] {
+                debug_kawa(kawa);
+                kawa.prepare(&mut kawa::h1::BlockConverter);
+                let out = kawa.as_io_slice();
+                let mut writer = std::io::BufWriter::new(Vec::new());
+                let amount = writer.write_vectored(&out).unwrap();
+                println_!(
+                    "amount: {amount}\n{}",
+                    String::from_utf8_lossy(writer.buffer())
+                );
+            }
+        }
     }
 
     fn shutting_down(&mut self) -> SessionIsToBeClosed {
