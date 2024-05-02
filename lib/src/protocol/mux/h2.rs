@@ -59,7 +59,7 @@ impl Default for H2Settings {
     fn default() -> Self {
         Self {
             settings_header_table_size: 4096,
-            settings_enable_push: true,
+            settings_enable_push: false,
             settings_max_concurrent_streams: 100,
             settings_initial_window_size: (1 << 16) - 1,
             settings_max_frame_size: 1 << 14,

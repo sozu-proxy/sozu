@@ -26,10 +26,14 @@ pub fn http_request<S1: Into<String>, S2: Into<String>, S3: Into<String>, S4: In
 
 pub fn immutable_answer(status: u16) -> String {
     match status {
-        400 => String::from("HTTP/1.1 400 Bad Request\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"),
-        404 => String::from("HTTP/1.1 404 Not Found\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"),
-        502 => String::from("HTTP/1.1 502 Bad Gateway\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"),
-        503 => String::from("HTTP/1.1 503 Service Unavailable\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"),
+        // 400 => String::from("HTTP/1.1 400 Bad Request\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"),
+        400 => String::from("HTTP/1.1 400 Sozu Default Answer\r\nCache-Control: no-cache\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"),
+        // 404 => String::from("HTTP/1.1 404 Not Found\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"),
+        404 => String::from("HTTP/1.1 404 Sozu Default Answer\r\nCache-Control: no-cache\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"),
+        // 502 => String::from("HTTP/1.1 502 Bad Gateway\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"),
+        502 => String::from("HTTP/1.1 502 Sozu Default Answer\r\nCache-Control: no-cache\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"),
+        // 503 => String::from("HTTP/1.1 503 Service Unavailable\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"),
+        503 => String::from("HTTP/1.1 503 Sozu Default Answer\r\nCache-Control: no-cache\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"),
         _ => unimplemented!()
     }
 }
