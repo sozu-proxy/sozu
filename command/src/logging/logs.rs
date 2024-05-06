@@ -56,7 +56,6 @@ impl From<&Option<AccessLogFormat>> for ProtobufAccessLogFormat {
 }
 
 pub struct InnerLogger {
-    version: u8,
     directives: Vec<LogDirective>,
     backend: LoggerBackend,
     pub colored: bool,
@@ -93,7 +92,6 @@ impl Default for Logger {
     fn default() -> Self {
         Self {
             inner: InnerLogger {
-                version: 1, // all call site start with a version of 0
                 directives: vec![LogDirective {
                     name: None,
                     level: LogLevelFilter::Error,
@@ -157,10 +155,6 @@ impl Logger {
     }
 
     pub fn set_directives(&mut self, directives: Vec<LogDirective>) {
-        self.version += 1;
-        if self.version >= LOG_LINE_ENABLED {
-            self.version = 0;
-        }
         self.directives = directives;
     }
 
@@ -305,16 +299,6 @@ impl InnerLogger {
             }
         }
         false
-    }
-
-    pub fn cached_enabled(&self, call_site_state: &mut LogLineCachedState, meta: Metadata) -> bool {
-        if call_site_state.version() == self.version {
-            call_site_state.enabled()
-        } else {
-            let enabled = self.enabled(meta);
-            call_site_state.set(self.version, enabled);
-            enabled
-        }
     }
 
     fn compat_enabled(&self, meta: &log::Metadata) -> bool {
@@ -789,23 +773,10 @@ impl LogLineCachedState {
 macro_rules! _log_enabled {
     ($logger:expr, $lvl:expr) => {{
         let logger = $logger.borrow_mut();
-        let enable = if cfg!(feature = "logs-cache") {
-            static mut LOG_LINE_CACHED_STATE: $crate::logging::LogLineCachedState =
-                $crate::logging::LogLineCachedState::new();
-            logger.cached_enabled(
-                unsafe { &mut LOG_LINE_CACHED_STATE },
-                $crate::logging::Metadata {
-                    level: $lvl,
-                    target: module_path!(),
-                },
-            )
-        } else {
-            logger.enabled($crate::logging::Metadata {
-                level: $lvl,
-                target: module_path!(),
-            })
-        };
-        if !enable {
+        if !logger.enabled($crate::logging::Metadata {
+            level: $lvl,
+            target: module_path!(),
+        }) {
             return;
         }
         logger
