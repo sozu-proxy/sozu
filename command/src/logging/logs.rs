@@ -232,7 +232,7 @@ impl InnerLogger {
     /// write an access log to the proper logging target
     ///
     /// Protobuf access logs are written with a prost length delimiter before, and 2 empty bytes after
-    pub fn log_access(&mut self, log: RequestRecord) {
+    pub fn log_access(&mut self, log: RequestRecord) -> bool {
         let backend = self.access_backend.as_mut().unwrap_or(&mut self.backend);
 
         let io_result = match self.access_format {
@@ -254,7 +254,7 @@ impl InnerLogger {
                     match backend {
                         LoggerBackend::Stdout(stdout) => {
                             let _ = stdout.write(bytes);
-                            return;
+                            return true;
                         }
                         LoggerBackend::Tcp(socket) => socket.write(bytes),
                         LoggerBackend::File(file) => file.write(bytes),
@@ -307,6 +307,9 @@ impl InnerLogger {
                 self.access_logs_target, self.log_target
             );
             backend.revive(self.access_logs_target.as_ref().unwrap_or(&self.log_target));
+            false
+        } else {
+            true
         }
     }
 
@@ -852,16 +855,26 @@ macro_rules! _log {
 #[macro_export]
 macro_rules! _log_access {
     ($lvl:expr, $($request_record_fields:tt)*) => {{
-        $crate::logging::LOGGER.with(|logger| {
-            let mut logger = $crate::_log_enabled!(logger, $lvl);
-            let (pid, tag, inner) = logger.split();
-            let (now, precise_time) = $crate::logging::now();
+         $crate::logging::LOGGER.with(|logger| {
+            let success = {
+                let mut logger = $crate::_log_enabled!(logger, $lvl);
+                let (pid, tag, inner) = logger.split();
+                let (now, precise_time) = $crate::logging::now();
 
-            inner.log_access(
-                $crate::_structured_access_log!([$crate::logging::RequestRecord]
-                pid, tag, now, precise_time, level: $lvl, $($request_record_fields)*
-            ));
-        })
+                inner.log_access(
+                    $crate::_structured_access_log!(
+                        [$crate::logging::RequestRecord]
+                        pid, tag, now, precise_time, level: $lvl, $($request_record_fields)*
+                    )
+                )
+            }; // logger dropped here
+
+            if !success {
+                // recording this metric may borrow the logger, so we have
+                // to perform this action after the block above
+                incr!("unsent-access-logs");
+            }
+        });
     }};
 }
 
