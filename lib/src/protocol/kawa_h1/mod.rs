@@ -930,6 +930,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
         log_access! {
             error,
+            on_failure: { incr!("unsent-access-logs") },
             message: message,
             context,
             session_address: self.get_session_address(),

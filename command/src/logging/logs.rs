@@ -854,7 +854,7 @@ macro_rules! _log {
 
 #[macro_export]
 macro_rules! _log_access {
-    ($lvl:expr, $($request_record_fields:tt)*) => {{
+    ($lvl:expr, $on_failure:block, $($request_record_fields:tt)*) => {{
          $crate::logging::LOGGER.with(|logger| {
             let success = {
                 let mut logger = $crate::_log_enabled!(logger, $lvl);
@@ -872,7 +872,7 @@ macro_rules! _log_access {
             if !success {
                 // recording this metric may borrow the logger, so we have
                 // to perform this action after the block above
-                incr!("unsent-access-logs");
+                $on_failure
             }
         });
     }};
@@ -890,29 +890,29 @@ macro_rules! _structured_access_log {
 #[macro_export]
 /// dynamically chose between info_access and error_access
 macro_rules! log_access {
-    ($error:expr, $($request_record_fields:tt)*) => {
+    ($error:expr, on_failure: $on_failure:block, $($request_record_fields:tt)*) => {
         let lvl = if $error {
             $crate::logging::LogLevel::Error
         } else {
             $crate::logging::LogLevel::Info
         };
-        _log_access!(lvl, $($request_record_fields)*);
+        _log_access!(lvl, $on_failure, $($request_record_fields)*);
     };
 }
 
 /// log a failure concerning an HTTP or TCP request
 #[macro_export]
 macro_rules! error_access {
-    ($($request_record_fields:tt)*) => {
-        $crate::_log_access!($crate::logging::LogLevel::Error, $($request_record_fields)*);
+    (on_failure: $on_failure:block, $($request_record_fields:tt)*) => {
+        $crate::_log_access!($crate::logging::LogLevel::Error, $on_failure, $($request_record_fields)*);
     };
 }
 
 /// log the success of an HTTP or TCP request
 #[macro_export]
 macro_rules! info_access {
-    ($($request_record_fields:tt)*) => {
-        $crate::_log_access!($crate::logging::LogLevel::Info, $($request_record_fields)*);
+    (on_failure: $on_failure:block, $($request_record_fields:tt)*) => {
+        $crate::_log_access!($crate::logging::LogLevel::Info, $on_failure, $($request_record_fields)*);
     };
 }
 
