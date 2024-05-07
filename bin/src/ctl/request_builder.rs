@@ -251,7 +251,6 @@ impl CommandManager {
                         Some(tags) => tags,
                         None => BTreeMap::new(),
                     },
-                    h2: h2.unwrap_or(false),
                 })
                 .into(),
             ),
@@ -301,7 +300,6 @@ impl CommandManager {
                         Some(tags) => tags,
                         None => BTreeMap::new(),
                     },
-                    h2: h2.unwrap_or(false),
                 })
                 .into(),
             ),

@@ -1219,7 +1219,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         };
 
         let cluster_id = match route {
-            Route::Cluster { id, .. } => id,
+            Route::Cluster(id) => id,
             Route::Deny => {
                 self.set_answer(DefaultAnswer::Answer401 {});
                 return Err(RetrieveClusterError::UnauthorizedRoute);
