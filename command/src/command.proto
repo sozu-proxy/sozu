@@ -248,7 +248,6 @@ message RequestHttpFrontend {
     required RulePosition position = 6 [default = TREE];
     // custom tags to identify the frontend in the access logs
     map<string, string> tags = 7;
-    required bool h2 = 8;
 }
 
 message RequestTcpFrontend {
@@ -383,6 +382,7 @@ message Cluster {
     required LoadBalancingAlgorithms load_balancing = 5 [default = ROUND_ROBIN];
     optional string answer_503 = 6;
     optional LoadMetric load_metric = 7;
+    required bool http2 = 8;
 }
 
 enum LoadBalancingAlgorithms {

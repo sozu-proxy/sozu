@@ -184,13 +184,13 @@ impl<Front: SocketHandler> Connection<Front> {
         timeout_container: TimeoutContainer,
     ) -> Connection<Front> {
         Connection::H1(ConnectionH1 {
+            socket: front_stream,
             position: Position::Server,
             readiness: Readiness {
                 interest: Ready::READABLE | Ready::HUP | Ready::ERROR,
                 event: Ready::EMPTY,
             },
             requests: 0,
-            socket: front_stream,
             stream: 0,
             timeout_container,
         })
@@ -667,16 +667,22 @@ impl Router {
         stream.attempts += 1;
 
         let stream_context = &mut stream.context;
-        let (cluster_id, h2) = self
+        let cluster_id = self
             .route_from_request(stream_context, proxy.clone())
             .map_err(BackendConnectionError::RetrieveClusterError)?;
 
-        let (frontend_should_stick, frontend_should_redirect_https) = proxy
+        let (frontend_should_stick, frontend_should_redirect_https, h2) = proxy
             .borrow()
             .clusters()
             .get(&cluster_id)
-            .map(|cluster| (cluster.sticky_session, cluster.https_redirect))
-            .unwrap_or((false, false));
+            .map(|cluster| {
+                (
+                    cluster.sticky_session,
+                    cluster.https_redirect,
+                    cluster.http2,
+                )
+            })
+            .unwrap_or((false, false, false));
 
         if frontend_should_redirect_https && matches!(proxy.borrow().kind(), ListenerType::Http) {
             return Err(BackendConnectionError::RetrieveClusterError(
@@ -790,7 +796,7 @@ impl Router {
         &mut self,
         context: &mut HttpContext,
         _proxy: Rc<RefCell<dyn L7Proxy>>,
-    ) -> Result<(String, bool), RetrieveClusterError> {
+    ) -> Result<String, RetrieveClusterError> {
         let (host, uri, method) = match context.extract_route() {
             Ok(tuple) => tuple,
             Err(cluster_error) => {
@@ -815,7 +821,7 @@ impl Router {
         };
 
         let cluster_id = match route {
-            Route::Cluster { id, h2 } => (id, h2),
+            Route::Cluster(id) => id,
             Route::Deny => {
                 println!("Route::Deny");
                 // self.set_answer(DefaultAnswerStatus::Answer401, None);
