@@ -684,7 +684,6 @@ pub struct FileClusterFrontendConfig {
     #[serde(default = "default_rule_position")]
     pub position: RulePosition,
     pub tags: Option<BTreeMap<String, String>>,
-    pub h2: Option<bool>,
 }
 
 impl FileClusterFrontendConfig {
@@ -770,7 +769,6 @@ impl FileClusterFrontendConfig {
             path,
             method: self.method.clone(),
             tags: self.tags.clone(),
-            h2: self.h2.unwrap_or(false),
         })
     }
 }
@@ -787,6 +785,7 @@ pub enum ListenerProtocol {
 #[serde(deny_unknown_fields, rename_all = "lowercase")]
 pub enum FileClusterProtocolConfig {
     Http,
+    Http2,
     Tcp,
 }
 
@@ -876,7 +875,7 @@ impl FileClusterConfig {
                     load_metric: self.load_metric,
                 }))
             }
-            FileClusterProtocolConfig::Http => {
+            FileClusterProtocolConfig::Http | FileClusterProtocolConfig::Http2 => {
                 let mut frontends = Vec::new();
                 for frontend in self.frontends {
                     let http_frontend = frontend.to_http_front(cluster_id)?;
@@ -894,6 +893,7 @@ impl FileClusterConfig {
 
                 Ok(ClusterConfig::Http(HttpClusterConfig {
                     cluster_id: cluster_id.to_string(),
+                    http2: self.protocol == FileClusterProtocolConfig::Http2,
                     frontends,
                     backends: self.backends,
                     sticky_session: self.sticky_session.unwrap_or(false),
@@ -922,7 +922,6 @@ pub struct HttpFrontendConfig {
     #[serde(default)]
     pub position: RulePosition,
     pub tags: Option<BTreeMap<String, String>>,
-    pub h2: bool,
 }
 
 impl HttpFrontendConfig {
@@ -959,7 +958,6 @@ impl HttpFrontendConfig {
                     path: self.path.clone(),
                     method: self.method.clone(),
                     position: self.position.into(),
-                    h2: self.h2,
                     tags,
                 })
                 .into(),
@@ -974,7 +972,6 @@ impl HttpFrontendConfig {
                     path: self.path.clone(),
                     method: self.method.clone(),
                     position: self.position.into(),
-                    h2: self.h2,
                     tags,
                 })
                 .into(),
@@ -989,6 +986,7 @@ impl HttpFrontendConfig {
 #[serde(deny_unknown_fields)]
 pub struct HttpClusterConfig {
     pub cluster_id: String,
+    pub http2: bool,
     pub frontends: Vec<HttpFrontendConfig>,
     pub backends: Vec<BackendConfig>,
     pub sticky_session: bool,
@@ -1004,6 +1002,7 @@ impl HttpClusterConfig {
             cluster_id: self.cluster_id.clone(),
             sticky_session: self.sticky_session,
             https_redirect: self.https_redirect,
+            http2: self.http2,
             proxy_protocol: None,
             load_balancing: self.load_balancing as i32,
             answer_503: self.answer_503.clone(),
@@ -1063,6 +1062,7 @@ impl TcpClusterConfig {
             cluster_id: self.cluster_id.clone(),
             sticky_session: false,
             https_redirect: false,
+            http2: false,
             proxy_protocol: self.proxy_protocol.map(|s| s as i32),
             load_balancing: self.load_balancing as i32,
             load_metric: self.load_metric.map(|s| s as i32),

@@ -520,7 +520,7 @@ impl L7ListenerHandler for HttpListener {
 
         let now = Instant::now();
 
-        if let Route::Cluster { id: cluster, .. } = &route {
+        if let Route::Cluster(cluster) = &route {
             time!("frontend_matching_time", cluster, (now - start).as_millis());
         }
 
@@ -1374,7 +1374,6 @@ mod tests {
                 position: RulePosition::Tree,
                 cluster_id: Some(cluster_id1),
                 tags: None,
-                h2: false,
             })
             .expect("Could not add http frontend");
         fronts
@@ -1386,7 +1385,6 @@ mod tests {
                 position: RulePosition::Tree,
                 cluster_id: Some(cluster_id2),
                 tags: None,
-                h2: false,
             })
             .expect("Could not add http frontend");
         fronts
@@ -1398,7 +1396,6 @@ mod tests {
                 position: RulePosition::Tree,
                 cluster_id: Some(cluster_id3),
                 tags: None,
-                h2: false,
             })
             .expect("Could not add http frontend");
         fronts
@@ -1410,7 +1407,6 @@ mod tests {
                 position: RulePosition::Tree,
                 cluster_id: Some("cluster_1".to_owned()),
                 tags: None,
-                h2: false,
             })
             .expect("Could not add http frontend");
 
@@ -1440,31 +1436,19 @@ mod tests {
         let frontend5 = listener.frontend_from_request("domain", "/", &Method::Get);
         assert_eq!(
             frontend1.expect("should find frontend"),
-            Route::Cluster {
-                id: "cluster_1".to_string(),
-                h2: false
-            }
+            Route::Cluster("cluster_1".to_string())
         );
         assert_eq!(
             frontend2.expect("should find frontend"),
-            Route::Cluster {
-                id: "cluster_1".to_string(),
-                h2: false
-            }
+            Route::Cluster("cluster_1".to_string())
         );
         assert_eq!(
             frontend3.expect("should find frontend"),
-            Route::Cluster {
-                id: "cluster_2".to_string(),
-                h2: false
-            }
+            Route::Cluster("cluster_2".to_string())
         );
         assert_eq!(
             frontend4.expect("should find frontend"),
-            Route::Cluster {
-                id: "cluster_3".to_string(),
-                h2: false
-            }
+            Route::Cluster("cluster_3".to_string())
         );
         assert!(frontend5.is_err());
     }
