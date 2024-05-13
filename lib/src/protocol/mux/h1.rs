@@ -9,7 +9,7 @@ use crate::{
     },
     socket::SocketHandler,
     timer::TimeoutContainer,
-    Readiness,
+    L7ListenerHandler, ListenerHandler, Readiness,
 };
 
 pub struct ConnectionH1<Front: SocketHandler> {
@@ -34,9 +34,10 @@ impl<Front: SocketHandler> std::fmt::Debug for ConnectionH1<Front> {
 }
 
 impl<Front: SocketHandler> ConnectionH1<Front> {
-    pub fn readable<E>(&mut self, context: &mut Context, mut endpoint: E) -> MuxResult
+    pub fn readable<E, L>(&mut self, context: &mut Context<L>, mut endpoint: E) -> MuxResult
     where
         E: Endpoint,
+        L: ListenerHandler + L7ListenerHandler,
     {
         println_!("======= MUX H1 READABLE {:?}", self.position);
         self.timeout_container.reset();
@@ -55,7 +56,9 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         if kawa.is_error() {
             match self.position {
                 Position::Client(_) => {
-                    let StreamState::Linked(token) = stream.state else { unreachable!() };
+                    let StreamState::Linked(token) = stream.state else {
+                        unreachable!()
+                    };
                     let global_stream_id = self.stream;
                     self.readiness.interest.remove(Ready::ALL);
                     self.end_stream(global_stream_id, context);
@@ -92,9 +95,10 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         MuxResult::Continue
     }
 
-    pub fn writable<E>(&mut self, context: &mut Context, mut endpoint: E) -> MuxResult
+    pub fn writable<E, L>(&mut self, context: &mut Context<L>, mut endpoint: E) -> MuxResult
     where
         E: Endpoint,
+        L: ListenerHandler + L7ListenerHandler,
     {
         println_!("======= MUX H1 WRITABLE {:?}", self.position);
         self.timeout_container.reset();
@@ -150,6 +154,8 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                         }
                         _ => {}
                     }
+                    // ACCESS LOG
+                    stream.generate_access_log(false, Some(String::from("H1")), context.listener.clone());
                     let old_state = std::mem::replace(&mut stream.state, StreamState::Unlinked);
                     if stream.context.keep_alive_frontend {
                         self.timeout_container.reset();
@@ -186,9 +192,10 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         }
     }
 
-    pub fn close<E>(&mut self, context: &mut Context, mut endpoint: E)
+    pub fn close<E, L>(&mut self, context: &mut Context<L>, mut endpoint: E)
     where
         E: Endpoint,
+        L: ListenerHandler + L7ListenerHandler,
     {
         match self.position {
             Position::Client(BackendStatus::KeepAlive(_))
@@ -201,11 +208,16 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             Position::Server => unreachable!(),
         }
         // reconnection is handled by the server
-        let StreamState::Linked(token) = context.streams[self.stream].state else {unreachable!()};
+        let StreamState::Linked(token) = context.streams[self.stream].state else {
+            unreachable!()
+        };
         endpoint.end_stream(token, self.stream, context)
     }
 
-    pub fn end_stream(&mut self, stream: GlobalStreamId, context: &mut Context) {
+    pub fn end_stream<L>(&mut self, stream: GlobalStreamId, context: &mut Context<L>)
+    where
+        L: ListenerHandler + L7ListenerHandler,
+    {
         assert_eq!(stream, self.stream);
         let stream = &mut context.streams[stream];
         let stream_context = &mut stream.context;
@@ -250,7 +262,10 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         }
     }
 
-    pub fn start_stream(&mut self, stream: GlobalStreamId, context: &mut Context) {
+    pub fn start_stream<L>(&mut self, stream: GlobalStreamId, context: &mut Context<L>)
+    where
+        L: ListenerHandler + L7ListenerHandler,
+    {
         println_!("start H1 stream {stream} {:?}", self.readiness);
         self.readiness.interest.insert(Ready::ALL);
         self.stream = stream;

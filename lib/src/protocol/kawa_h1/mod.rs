@@ -30,7 +30,6 @@ use crate::{
             editor::HttpContext,
             parser::Method,
         },
-        pipe::WebSocketContext,
         SessionState,
     },
     retry::RetryPolicy,
@@ -237,8 +236,9 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             )),
             context: HttpContext {
                 id: request_id,
-                backend_id: None,
                 cluster_id: None,
+                backend_id: None,
+                backend_address: None,
 
                 closing: false,
                 keep_alive_backend: true,
@@ -1094,7 +1094,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
     /// WARNING: this function removes the backend entry in the session manager
     /// IF the backend_token is set, so that entry can be reused for new backend.
     /// I don't think this is a good idea, but it is a quick fix
-    fn close_backend(&mut self, proxy: Rc<RefCell<dyn L7Proxy>>, metrics: &mut SessionMetrics) {
+    fn close_backend<P: L7Proxy>(&mut self, proxy: Rc<RefCell<P>>, metrics: &mut SessionMetrics) {
         self.container_backend_timeout.cancel();
         debug!(
             "{}\tPROXY [{}->{}] CLOSED BACKEND",
@@ -1189,9 +1189,9 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         true
     }
 
-    fn cluster_id_from_request(
+    fn cluster_id_from_request<P: L7Proxy>(
         &mut self,
-        proxy: Rc<RefCell<dyn L7Proxy>>,
+        proxy: Rc<RefCell<P>>,
     ) -> Result<String, RetrieveClusterError> {
         let (host, uri, method) = match self.context.extract_route() {
             Ok(tuple) => tuple,
@@ -1244,11 +1244,11 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         Ok(cluster_id)
     }
 
-    pub fn backend_from_request(
+    pub fn backend_from_request<P: L7Proxy>(
         &mut self,
         cluster_id: &str,
         frontend_should_stick: bool,
-        proxy: Rc<RefCell<dyn L7Proxy>>,
+        proxy: Rc<RefCell<P>>,
         metrics: &mut SessionMetrics,
     ) -> Result<TcpStream, BackendConnectionError> {
         let (backend, conn) = self
@@ -1269,7 +1269,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
         if frontend_should_stick {
             // update sticky name in case it changed I guess?
-            self.context.sticky_name = self.listener.borrow().get_sticky_name().to_string();
+            self.context.sticky_name = self.listener.borrow().sticky_name().to_string();
 
             self.context.sticky_session = Some(
                 backend
@@ -1288,12 +1288,12 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         Ok(conn)
     }
 
-    fn get_backend_for_sticky_session(
+    fn get_backend_for_sticky_session<P: L7Proxy>(
         &self,
         frontend_should_stick: bool,
         sticky_session: Option<&str>,
         cluster_id: &str,
-        proxy: Rc<RefCell<dyn L7Proxy>>,
+        proxy: Rc<RefCell<P>>,
     ) -> Result<(Rc<RefCell<Backend>>, TcpStream), BackendError> {
         match (frontend_should_stick, sticky_session) {
             (true, Some(sticky_session)) => proxy
@@ -1309,10 +1309,10 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         }
     }
 
-    fn connect_to_backend(
+    fn connect_to_backend<P: L7Proxy>(
         &mut self,
         session_rc: Rc<RefCell<dyn ProxySession>>,
-        proxy: Rc<RefCell<dyn L7Proxy>>,
+        proxy: Rc<RefCell<P>>,
         metrics: &mut SessionMetrics,
     ) -> Result<BackendConnectAction, BackendConnectionError> {
         let old_cluster_id = self.context.cluster_id.clone();
@@ -1609,10 +1609,10 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
     ///   - write request to back
     ///   - read response on back
     ///   - write response to front
-    fn ready_inner(
+    fn ready_inner<P: L7Proxy>(
         &mut self,
         session: Rc<RefCell<dyn crate::ProxySession>>,
-        proxy: Rc<RefCell<dyn L7Proxy>>,
+        proxy: Rc<RefCell<P>>,
         metrics: &mut SessionMetrics,
     ) -> SessionResult {
         let mut counter = 0;
@@ -1816,10 +1816,10 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 }
 
 impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> SessionState for Http<Front, L> {
-    fn ready(
+    fn ready<P: L7Proxy>(
         &mut self,
         session: Rc<RefCell<dyn crate::ProxySession>>,
-        proxy: Rc<RefCell<dyn L7Proxy>>,
+        proxy: Rc<RefCell<P>>,
         metrics: &mut SessionMetrics,
     ) -> SessionResult {
         let session_result = self.ready_inner(session, proxy, metrics);
@@ -1850,7 +1850,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> SessionState 
         }
     }
 
-    fn close(&mut self, proxy: Rc<RefCell<dyn L7Proxy>>, metrics: &mut SessionMetrics) {
+    fn close<P: L7Proxy>(&mut self, proxy: Rc<RefCell<P>>, metrics: &mut SessionMetrics) {
         self.close_backend(proxy, metrics);
 
         //if the state was initial, the connection was already reset

@@ -9,7 +9,7 @@ use std::{
 
 use mio::{net::TcpStream, Interest, Token};
 use rusty_ulid::Ulid;
-use sozu_command::{proto::command::ListenerType, ready::Ready};
+use sozu_command::{logging::EndpointRecord, proto::command::ListenerType, ready::Ready};
 
 mod converter;
 mod h1;
@@ -20,23 +20,24 @@ mod serializer;
 
 use crate::{
     backends::{Backend, BackendError},
+    http::HttpListener,
+    https::HttpsListener,
     pool::{Checkout, Pool},
     protocol::{
         http::editor::HttpContext,
-        mux::h2::{H2Settings, H2State, H2StreamId},
+        mux::h2::{H2Settings, H2State, H2StreamId, Prioriser},
         SessionState,
     },
     router::Route,
     server::CONN_RETRIES,
-    socket::{SocketHandler, SocketResult},
+    socket::{FrontRustls, SocketHandler, SocketResult},
     timer::TimeoutContainer,
-    BackendConnectionError, L7ListenerHandler, L7Proxy, ProxySession, Readiness,
-    RetrieveClusterError, SessionIsToBeClosed, SessionMetrics, SessionResult, StateResult,
+    BackendConnectionError, L7ListenerHandler, L7Proxy, ListenerHandler, Protocol, ProxySession,
+    Readiness, RetrieveClusterError, SessionIsToBeClosed, SessionMetrics, SessionResult,
+    StateResult,
 };
 
 pub use crate::protocol::mux::{h1::ConnectionH1, h2::ConnectionH2};
-
-use self::h2::Prioriser;
 
 #[macro_export]
 macro_rules! println_ {
@@ -54,6 +55,8 @@ fn debug_kawa(_kawa: &GenericHttpStream) {
 type GenericHttpStream = kawa::Kawa<Checkout>;
 type StreamId = u32;
 type GlobalStreamId = usize;
+pub type MuxClear = Mux<TcpStream, HttpListener>;
+pub type MuxTls = Mux<FrontRustls, HttpsListener>;
 
 pub fn fill_default_301_answer<T: kawa::AsBuffer>(kawa: &mut kawa::Kawa<T>, host: &str, uri: &str) {
     kawa.detached.status_line = kawa::StatusLine::Response {
@@ -117,6 +120,7 @@ fn set_default_answer(stream: &mut Stream, readiness: &mut Readiness, code: u16)
     } else {
         fill_default_answer(kawa, code);
     }
+    stream.context.status = Some(code);
     stream.state = StreamState::Unlinked;
     readiness.interest.insert(Ready::WRITABLE);
 }
@@ -165,11 +169,21 @@ pub trait Endpoint {
     /// If end_stream is called on a server it means the stream was BROKEN, the client was most likely disconnected or encountered an error
     /// it is for the server to decide if the stream can be retried or an error should be sent. It should be GUARANTEED that all bytes from
     /// the backend were read. However it is almost certain that all bytes were not already sent to the client.
-    fn end_stream(&mut self, token: Token, stream: GlobalStreamId, context: &mut Context);
+    fn end_stream<L: ListenerHandler + L7ListenerHandler>(
+        &mut self,
+        token: Token,
+        stream: GlobalStreamId,
+        context: &mut Context<L>,
+    );
     /// If start_stream is called on a client it means the stream should be attached to this endpoint,
     /// the stream might be recovering from a disconnection, in any case at this point its response MUST be empty.
     /// If the start_stream is called on a H2 server it means the stream is a server push and its request MUST be empty.
-    fn start_stream(&mut self, token: Token, stream: GlobalStreamId, context: &mut Context);
+    fn start_stream<L: ListenerHandler + L7ListenerHandler>(
+        &mut self,
+        token: Token,
+        stream: GlobalStreamId,
+        context: &mut Context<L>,
+    );
 }
 
 #[derive(Debug)]
@@ -323,18 +337,21 @@ impl<Front: SocketHandler> Connection<Front> {
             Connection::H2(c) => c.force_disconnect(),
         }
     }
-    fn readable<E>(&mut self, context: &mut Context, endpoint: E) -> MuxResult
+
+    fn readable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
     where
         E: Endpoint,
+        L: ListenerHandler + L7ListenerHandler,
     {
         match self {
             Connection::H1(c) => c.readable(context, endpoint),
             Connection::H2(c) => c.readable(context, endpoint),
         }
     }
-    fn writable<E>(&mut self, context: &mut Context, endpoint: E) -> MuxResult
+    fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
     where
         E: Endpoint,
+        L: ListenerHandler + L7ListenerHandler,
     {
         match self {
             Connection::H1(c) => c.writable(context, endpoint),
@@ -342,9 +359,10 @@ impl<Front: SocketHandler> Connection<Front> {
         }
     }
 
-    fn close<E>(&mut self, context: &mut Context, endpoint: E)
+    fn close<E, L>(&mut self, context: &mut Context<L>, endpoint: E)
     where
         E: Endpoint,
+        L: ListenerHandler + L7ListenerHandler,
     {
         match self {
             Connection::H1(c) => c.close(context, endpoint),
@@ -352,14 +370,20 @@ impl<Front: SocketHandler> Connection<Front> {
         }
     }
 
-    fn end_stream(&mut self, stream: GlobalStreamId, context: &mut Context) {
+    fn end_stream<L>(&mut self, stream: GlobalStreamId, context: &mut Context<L>)
+    where
+        L: ListenerHandler + L7ListenerHandler,
+    {
         match self {
             Connection::H1(c) => c.end_stream(stream, context),
             Connection::H2(c) => c.end_stream(stream, context),
         }
     }
 
-    fn start_stream(&mut self, stream: GlobalStreamId, context: &mut Context) {
+    fn start_stream<L>(&mut self, stream: GlobalStreamId, context: &mut Context<L>)
+    where
+        L: ListenerHandler + L7ListenerHandler,
+    {
         match self {
             Connection::H1(c) => c.start_stream(stream, context),
             Connection::H2(c) => c.start_stream(stream, context),
@@ -380,13 +404,19 @@ impl<'a, Front: SocketHandler> Endpoint for EndpointServer<'a, Front> {
         self.0.readiness_mut()
     }
 
-    fn end_stream(&mut self, token: Token, stream: GlobalStreamId, context: &mut Context) {
+    fn end_stream<L>(&mut self, token: Token, stream: GlobalStreamId, context: &mut Context<L>)
+    where
+        L: ListenerHandler + L7ListenerHandler,
+    {
         // this may be used to forward H2<->H2 RstStream
         // or to handle backend hup
         self.0.end_stream(stream, context);
     }
 
-    fn start_stream(&mut self, token: Token, stream: GlobalStreamId, context: &mut Context) {
+    fn start_stream<L>(&mut self, token: Token, stream: GlobalStreamId, context: &mut Context<L>)
+    where
+        L: ListenerHandler + L7ListenerHandler,
+    {
         // this may be used to forward H2<->H2 PushPromise
         todo!()
     }
@@ -399,7 +429,10 @@ impl<'a> Endpoint for EndpointClient<'a> {
         self.0.backends.get_mut(&token).unwrap().readiness_mut()
     }
 
-    fn end_stream(&mut self, token: Token, stream: GlobalStreamId, context: &mut Context) {
+    fn end_stream<L>(&mut self, token: Token, stream: GlobalStreamId, context: &mut Context<L>)
+    where
+        L: ListenerHandler + L7ListenerHandler,
+    {
         self.0
             .backends
             .get_mut(&token)
@@ -407,7 +440,10 @@ impl<'a> Endpoint for EndpointClient<'a> {
             .end_stream(stream, context);
     }
 
-    fn start_stream(&mut self, token: Token, stream: GlobalStreamId, context: &mut Context) {
+    fn start_stream<L>(&mut self, token: Token, stream: GlobalStreamId, context: &mut Context<L>)
+    where
+        L: ListenerHandler + L7ListenerHandler,
+    {
         self.0
             .backends
             .get_mut(&token)
@@ -522,31 +558,8 @@ pub struct StreamParts<'a> {
     pub context: &'a mut HttpContext,
 }
 
-fn temporary_http_context(request_id: Ulid) -> HttpContext {
-    HttpContext {
-        backend_id: None,
-        cluster_id: None,
-        keep_alive_backend: true,
-        keep_alive_frontend: true,
-        sticky_session_found: None,
-        method: None,
-        authority: None,
-        path: None,
-        status: None,
-        reason: None,
-        user_agent: None,
-        closing: false,
-        id: request_id,
-        protocol: crate::Protocol::HTTPS,
-        public_address: "0.0.0.0:80".parse().unwrap(),
-        session_address: None,
-        sticky_name: "SOZUBALANCEID".to_owned(),
-        sticky_session: None,
-    }
-}
-
 impl Stream {
-    pub fn new(pool: Weak<RefCell<Pool>>, request_id: Ulid, window: u32) -> Option<Self> {
+    pub fn new(pool: Weak<RefCell<Pool>>, context: HttpContext, window: u32) -> Option<Self> {
         let (front_buffer, back_buffer) = match pool.upgrade() {
             Some(pool) => {
                 let mut pool = pool.borrow_mut();
@@ -563,7 +576,7 @@ impl Stream {
             window: window as i32,
             front: GenericHttpStream::new(kawa::Kind::Request, kawa::Buffer::new(front_buffer)),
             back: GenericHttpStream::new(kawa::Kind::Response, kawa::Buffer::new(back_buffer)),
-            context: temporary_http_context(request_id),
+            context,
         })
     }
     pub fn split(&mut self, position: &Position) -> StreamParts<'_> {
@@ -592,22 +605,90 @@ impl Stream {
             Position::Server => &mut self.back,
         }
     }
+    pub fn generate_access_log<L>(
+        &mut self,
+        error: bool,
+        message: Option<String>,
+        listener: Rc<RefCell<L>>,
+    ) where
+        L: ListenerHandler + L7ListenerHandler,
+    {
+        let protocol = match self.context.protocol {
+            Protocol::HTTP => "http",
+            Protocol::HTTPS => "https",
+            _ => unreachable!(),
+        };
+
+        let endpoint = EndpointRecord::Http {
+            method: self.context.method.as_deref(),
+            authority: self.context.authority.as_deref(),
+            path: self.context.path.as_deref(),
+            reason: self.context.reason.as_deref(),
+            status: self.context.status,
+        };
+
+        let listener = listener.borrow();
+        let tags = self.context.authority.as_deref().and_then(|host| {
+            let hostname = match host.split_once(':') {
+                None => host,
+                Some((hostname, _)) => hostname,
+            };
+            listener.get_tags(hostname)
+        });
+
+        log_access! {
+            error,
+            on_failure: { incr!("unsent-access-logs") },
+            message: message.as_deref(),
+            context: self.context.log_context(),
+            session_address: self.context.session_address,
+            backend_address: self.context.backend_address,
+            protocol,
+            endpoint,
+            tags,
+            client_rtt: None, //socket_rtt(self.front_socket()),
+            server_rtt: None, //self.backend_socket.as_ref().and_then(socket_rtt),
+            service_time: Duration::from_micros(0), //metrics.service_time(),
+            response_time: Some(Duration::from_micros(0)), //metrics.response_time(),
+            request_time: Duration::from_micros(0), // metrics.request_time(),
+            bytes_in: 0, //metrics.bin,
+            bytes_out: 0, //metrics.bout,
+            user_agent: self.context.user_agent.as_deref(),
+        };
+    }
 }
 
-pub struct Context {
+pub struct Context<L: ListenerHandler + L7ListenerHandler> {
     pub streams: Vec<Stream>,
     pub pool: Weak<RefCell<Pool>>,
+    pub listener: Rc<RefCell<L>>,
 }
 
-impl Context {
+impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
+    pub fn new(pool: Weak<RefCell<Pool>>, listener: Rc<RefCell<L>>) -> Self {
+        Self {
+            streams: Vec::new(),
+            pool,
+            listener,
+        }
+    }
+
     pub fn create_stream(&mut self, request_id: Ulid, window: u32) -> Option<GlobalStreamId> {
+        let listener = self.listener.borrow();
+        let http_context = HttpContext::new(
+            request_id,
+            listener.protocol(),
+            listener.public_address(),
+            None, // TODO: how???
+            listener.sticky_name().to_string(),
+        );
         for (stream_id, stream) in self.streams.iter_mut().enumerate() {
             if stream.state == StreamState::Recycle {
                 println_!("Reuse stream: {stream_id}");
                 stream.state = StreamState::Idle;
                 stream.attempts = 0;
                 stream.window = window as i32;
-                stream.context = temporary_http_context(request_id);
+                stream.context = http_context;
                 stream.back.clear();
                 stream.back.storage.clear();
                 stream.front.clear();
@@ -616,15 +697,8 @@ impl Context {
             }
         }
         self.streams
-            .push(Stream::new(self.pool.clone(), request_id, window)?);
+            .push(Stream::new(self.pool.clone(), http_context, window)?);
         Some(self.streams.len() - 1)
-    }
-
-    pub fn new(pool: Weak<RefCell<Pool>>) -> Context {
-        Self {
-            streams: Vec::new(),
-            pool,
-        }
     }
 }
 
@@ -632,29 +706,23 @@ pub struct Router {
     pub backends: HashMap<Token, Connection<TcpStream>>,
     pub configured_backend_timeout: Duration,
     pub configured_connect_timeout: Duration,
-    pub listener: Rc<RefCell<dyn L7ListenerHandler>>,
 }
 
 impl Router {
-    pub fn new(
-        configured_backend_timeout: Duration,
-        configured_connect_timeout: Duration,
-        listener: Rc<RefCell<dyn L7ListenerHandler>>,
-    ) -> Self {
+    pub fn new(configured_backend_timeout: Duration, configured_connect_timeout: Duration) -> Self {
         Self {
             backends: HashMap::new(),
             configured_backend_timeout,
             configured_connect_timeout,
-            listener,
         }
     }
 
-    fn connect(
+    fn connect<L: ListenerHandler + L7ListenerHandler, P: L7Proxy>(
         &mut self,
         stream_id: GlobalStreamId,
-        context: &mut Context,
+        context: &mut Context<L>,
         session: Rc<RefCell<dyn ProxySession>>,
-        proxy: Rc<RefCell<dyn L7Proxy>>,
+        proxy: Rc<RefCell<P>>,
         metrics: &mut SessionMetrics,
     ) -> Result<(), BackendConnectionError> {
         let stream = &mut context.streams[stream_id];
@@ -662,14 +730,17 @@ impl Router {
         // with concurrent connections on a single endpoint
         assert!(matches!(stream.state, StreamState::Link));
         if stream.attempts >= CONN_RETRIES {
-            return Err(BackendConnectionError::MaxConnectionRetries(None));
+            return Err(BackendConnectionError::MaxConnectionRetries(
+                stream.context.cluster_id.clone(),
+            ));
         }
         stream.attempts += 1;
 
         let stream_context = &mut stream.context;
         let cluster_id = self
-            .route_from_request(stream_context, proxy.clone())
+            .route_from_request(stream_context, &context.listener)
             .map_err(BackendConnectionError::RetrieveClusterError)?;
+        stream_context.cluster_id = Some(cluster_id.clone());
 
         let (frontend_should_stick, frontend_should_redirect_https, h2) = proxy
             .borrow()
@@ -690,6 +761,19 @@ impl Router {
             ));
         }
 
+        /*
+        Current h2 connecting strategy:
+        - look at every backend connection
+        - reuse the first connected backend that belongs to the same cluster
+        - or, reuse the last connecting backend that belonds to the same cluster
+        - if no backend is to reuse, ask the router for a socket to the "next in line" backend for that cluster
+
+        We may want to change to:
+        - ask the router the name of the "next in line" backend for that cluster
+        - if we already have a backend connected to this name, reuse it
+        - if not, create a new socket to it
+         */
+
         let mut reuse_token = None;
         // let mut priority = 0;
         let mut reuse_connecting = true;
@@ -699,22 +783,22 @@ impl Router {
                     unreachable!("Backend connection behaves like a server")
                 }
                 (_, _, Position::Client(BackendStatus::Disconnecting)) => {}
+                (true, false, Position::Client(BackendStatus::Connecting(_))) => {}
 
-                (true, _, Position::Client(BackendStatus::Connected(old_cluster_id))) => {
-                    if *old_cluster_id == cluster_id {
+                (true, _, Position::Client(BackendStatus::Connected(other_cluster_id))) => {
+                    if *other_cluster_id == cluster_id {
                         reuse_token = Some(*token);
                         reuse_connecting = false;
                         break;
                     }
                 }
-                (true, true, Position::Client(BackendStatus::Connecting(old_cluster_id))) => {
-                    if *old_cluster_id == cluster_id {
+                (true, true, Position::Client(BackendStatus::Connecting(other_cluster_id))) => {
+                    if *other_cluster_id == cluster_id {
                         reuse_token = Some(*token)
                     }
                 }
-                (true, false, Position::Client(BackendStatus::Connecting(_))) => {}
-                (true, _, Position::Client(BackendStatus::KeepAlive(old_cluster_id))) => {
-                    if *old_cluster_id == cluster_id {
+                (true, _, Position::Client(BackendStatus::KeepAlive(other_cluster_id))) => {
+                    if *other_cluster_id == cluster_id {
                         unreachable!("ConnectionH2 behaves like H1")
                     }
                 }
@@ -742,6 +826,7 @@ impl Router {
                 frontend_should_stick,
                 stream_context,
                 proxy.clone(),
+                &context.listener,
                 metrics,
             )?;
 
@@ -792,10 +877,10 @@ impl Router {
         Ok(())
     }
 
-    fn route_from_request(
+    fn route_from_request<L: ListenerHandler + L7ListenerHandler>(
         &mut self,
         context: &mut HttpContext,
-        _proxy: Rc<RefCell<dyn L7Proxy>>,
+        listener: &Rc<RefCell<L>>,
     ) -> Result<String, RetrieveClusterError> {
         let (host, uri, method) = match context.extract_route() {
             Ok(tuple) => tuple,
@@ -806,10 +891,7 @@ impl Router {
             }
         };
 
-        let route_result = self
-            .listener
-            .borrow()
-            .frontend_from_request(host, uri, method);
+        let route_result = listener.borrow().frontend_from_request(host, uri, method);
 
         let route = match route_result {
             Ok(route) => route,
@@ -832,12 +914,13 @@ impl Router {
         Ok(cluster_id)
     }
 
-    pub fn backend_from_request(
+    pub fn backend_from_request<L: ListenerHandler + L7ListenerHandler, P: L7Proxy>(
         &mut self,
         cluster_id: &str,
         frontend_should_stick: bool,
         context: &mut HttpContext,
-        proxy: Rc<RefCell<dyn L7Proxy>>,
+        proxy: Rc<RefCell<P>>,
+        listener: &Rc<RefCell<L>>,
         _metrics: &mut SessionMetrics,
     ) -> Result<TcpStream, BackendConnectionError> {
         let (backend, conn) = self
@@ -855,7 +938,7 @@ impl Router {
 
         if frontend_should_stick {
             // update sticky name in case it changed I guess?
-            context.sticky_name = self.listener.borrow().get_sticky_name().to_string();
+            context.sticky_name = listener.borrow().sticky_name().to_string();
 
             context.sticky_session = Some(
                 backend
@@ -870,16 +953,18 @@ impl Router {
         // metrics.backend_start();
         // self.set_backend_id(backend.borrow().backend_id.clone());
         // self.backend = Some(backend);
+        context.backend_id = Some(backend.borrow().backend_id.clone());
+        context.backend_address = Some(backend.borrow().address);
 
         Ok(conn)
     }
 
-    fn get_backend_for_sticky_session(
+    fn get_backend_for_sticky_session<P: L7Proxy>(
         &self,
         cluster_id: &str,
         frontend_should_stick: bool,
         sticky_session: Option<&str>,
-        proxy: Rc<RefCell<dyn L7Proxy>>,
+        proxy: Rc<RefCell<P>>,
     ) -> Result<(Rc<RefCell<Backend>>, TcpStream), BackendError> {
         match (frontend_should_stick, sticky_session) {
             (true, Some(sticky_session)) => proxy
@@ -896,7 +981,7 @@ impl Router {
     }
 }
 
-pub struct Mux<Front: SocketHandler> {
+pub struct Mux<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> {
     pub configured_frontend_timeout: Duration,
     pub frontend_token: Token,
     pub frontend: Connection<Front>,
@@ -904,20 +989,22 @@ pub struct Mux<Front: SocketHandler> {
     pub public_address: SocketAddr,
     pub peer_address: Option<SocketAddr>,
     pub sticky_name: String,
-    pub context: Context,
+    pub context: Context<L>,
 }
 
-impl<Front: SocketHandler> Mux<Front> {
+impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Mux<Front, L> {
     pub fn front_socket(&self) -> &TcpStream {
         self.frontend.socket()
     }
 }
 
-impl<Front: SocketHandler + std::fmt::Debug> SessionState for Mux<Front> {
-    fn ready(
+impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHandler> SessionState
+    for Mux<Front, L>
+{
+    fn ready<P: L7Proxy>(
         &mut self,
         session: Rc<RefCell<dyn ProxySession>>,
-        proxy: Rc<RefCell<dyn L7Proxy>>,
+        proxy: Rc<RefCell<P>>,
         metrics: &mut SessionMetrics,
     ) -> SessionResult {
         let mut counter = 0;
@@ -1174,7 +1261,7 @@ impl<Front: SocketHandler + std::fmt::Debug> SessionState for Mux<Front> {
                 let stream = &mut self.context.streams[stream_id];
                 if let StreamState::Linked(back_token) = stream.state {
                     if token == back_token {
-                        // This stream is linked to the backend that timedout.
+                        // This stream is linked to the backend that timedout
                         if stream.back.is_terminated() || stream.back.is_error() {
                             println!(
                                 "Stream terminated or in error, do nothing, just wait a bit more"
@@ -1183,7 +1270,7 @@ impl<Front: SocketHandler + std::fmt::Debug> SessionState for Mux<Front> {
                             if !stream.back.is_completed() {
                                 should_close = false;
                             }
-                        } else if stream.back.is_initial() {
+                        } else if !stream.back.consumed {
                             // The response has not started yet
                             println!("Stream still waiting for response, send 504");
                             set_default_answer(stream, front_readiness, 504);
@@ -1194,10 +1281,13 @@ impl<Front: SocketHandler + std::fmt::Debug> SessionState for Mux<Front> {
                             should_write = true;
                         }
                         backend.end_stream(stream_id, &mut self.context);
-                        backend.force_disconnect();
+                        // backend.force_disconnect();
                     }
                 }
             }
+        } else {
+            // Session received a timeout for an unknown token, ignore it
+            return StateResult::Continue;
         }
         if should_write {
             return match self
@@ -1244,7 +1334,7 @@ impl<Front: SocketHandler + std::fmt::Debug> SessionState for Mux<Front> {
         }
     }
 
-    fn close(&mut self, proxy: Rc<RefCell<dyn L7Proxy>>, _metrics: &mut SessionMetrics) {
+    fn close<P: L7Proxy>(&mut self, proxy: Rc<RefCell<P>>, _metrics: &mut SessionMetrics) {
         println_!("FRONTEND: {:#?}", self.frontend);
         println_!("BACKENDS: {:#?}", self.router.backends);
 
@@ -1273,7 +1363,7 @@ impl<Front: SocketHandler + std::fmt::Debug> SessionState for Mux<Front> {
         };
         let mut b = [0; 1024];
         let (size, status) = s.socket_read(&mut b);
-        println_!("{size} {status:?} {:?}", &b[..size]);
+        println_!("socket: {size} {status:?} {:?}", &b[..size]);
         for stream in &mut self.context.streams {
             for kawa in [&mut stream.front, &mut stream.back] {
                 debug_kawa(kawa);

@@ -221,7 +221,7 @@ impl TcpSession {
             backend_address: None,
             protocol: "TCP",
             endpoint: EndpointRecord::Tcp,
-            tags: listener.get_tags(&listener.get_addr().to_string()),
+            tags: listener.get_tags(&listener.address().to_string()),
             client_rtt: socket_rtt(self.state.front_socket()),
             server_rtt: None,
             user_agent: None,
@@ -1098,8 +1098,20 @@ pub struct TcpListener {
 }
 
 impl ListenerHandler for TcpListener {
-    fn get_addr(&self) -> &SocketAddr {
+    fn protocol(&self) -> Protocol {
+        Protocol::TCP
+    }
+
+    fn address(&self) -> &SocketAddr {
         &self.address
+    }
+
+    fn public_address(&self) -> SocketAddr {
+        self.config
+            .public_address
+            .as_ref()
+            .map(|addr| addr.clone().into())
+            .unwrap_or(self.address.clone())
     }
 
     fn get_tags(&self, key: &str) -> Option<&CachedTags> {
