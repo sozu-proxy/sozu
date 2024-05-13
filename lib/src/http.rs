@@ -83,7 +83,6 @@ pub struct HttpSession {
     pool: Weak<RefCell<Pool>>,
     proxy: Rc<RefCell<HttpProxy>>,
     state: HttpStateMachine,
-    sticky_name: String,
     has_been_closed: bool,
 }
 
@@ -101,7 +100,6 @@ impl HttpSession {
         proxy: Rc<RefCell<HttpProxy>>,
         public_address: SocketAddr,
         sock: TcpStream,
-        sticky_name: String,
         token: Token,
         wait_time: Duration,
     ) -> Result<Self, AcceptError> {
@@ -124,7 +122,12 @@ impl HttpSession {
 
             let frontend = mux::Connection::new_h1_server(sock, container_frontend_timeout);
             let router = mux::Router::new(configured_backend_timeout, configured_connect_timeout);
-            let mut context = mux::Context::new(pool.clone(), listener.clone());
+            let mut context = mux::Context::new(
+                pool.clone(),
+                listener.clone(),
+                session_address,
+                public_address,
+            );
             context
                 .create_stream(request_id, 1 << 16)
                 .ok_or(AcceptError::BufferCapacityReached)?;
@@ -133,9 +136,6 @@ impl HttpSession {
                 frontend_token: token,
                 frontend,
                 router,
-                public_address,
-                peer_address: session_address,
-                sticky_name: sticky_name.clone(),
                 context,
             })
             // HttpStateMachine::Http(Http::new(
@@ -170,7 +170,6 @@ impl HttpSession {
             pool,
             proxy,
             state,
-            sticky_name,
         })
     }
 
@@ -213,16 +212,18 @@ impl HttpSession {
                     self.configured_backend_timeout,
                     self.configured_connect_timeout,
                 );
-                let mut context = mux::Context::new(self.pool.clone(), self.listener.clone());
+                let mut context = mux::Context::new(
+                    self.pool.clone(),
+                    self.listener.clone(),
+                    Some(session_address),
+                    public_address,
+                );
                 context.create_stream(expect.request_id, 1 << 16)?;
                 let mut mux = Mux {
                     configured_frontend_timeout: self.configured_frontend_timeout,
                     frontend_token: self.frontend_token,
                     frontend,
                     router,
-                    public_address,
-                    peer_address: Some(session_address),
-                    sticky_name: self.sticky_name.clone(),
                     context,
                 };
                 mux.frontend.readiness_mut().event = expect.frontend_readiness.event;
@@ -981,7 +982,6 @@ impl ProxyConfiguration for HttpProxy {
             proxy,
             public_address,
             frontend_sock,
-            owned.config.sticky_name.clone(),
             session_token,
             wait_time,
         )?;

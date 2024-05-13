@@ -291,7 +291,12 @@ impl HttpsSession {
             self.configured_backend_timeout,
             self.configured_connect_timeout,
         );
-        let mut context = mux::Context::new(self.pool.clone(), self.listener.clone());
+        let mut context = mux::Context::new(
+            self.pool.clone(),
+            self.listener.clone(),
+            self.peer_address,
+            self.public_address,
+        );
         let mut frontend = match alpn {
             AlpnProtocol::Http11 => {
                 context.create_stream(handshake.request_id, 1 << 16)?;
@@ -312,9 +317,6 @@ impl HttpsSession {
             frontend,
             context,
             router,
-            public_address: self.public_address,
-            peer_address: self.peer_address,
-            sticky_name: self.sticky_name.clone(),
         }))
     }
 

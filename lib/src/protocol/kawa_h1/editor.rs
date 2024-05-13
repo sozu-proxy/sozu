@@ -74,16 +74,16 @@ impl HttpContext {
     pub fn new(
         id: Ulid,
         protocol: Protocol,
+        sticky_name: String,
         public_address: SocketAddr,
         session_address: Option<SocketAddr>,
-        sticky_name: String,
     ) -> Self {
         Self {
             id,
             protocol,
+            sticky_name,
             public_address,
             session_address,
-            sticky_name,
 
             cluster_id: None,
             backend_id: None,
