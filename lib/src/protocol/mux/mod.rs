@@ -662,14 +662,23 @@ pub struct Context<L: ListenerHandler + L7ListenerHandler> {
     pub streams: Vec<Stream>,
     pub pool: Weak<RefCell<Pool>>,
     pub listener: Rc<RefCell<L>>,
+    pub session_address: Option<SocketAddr>,
+    pub public_address: SocketAddr,
 }
 
 impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
-    pub fn new(pool: Weak<RefCell<Pool>>, listener: Rc<RefCell<L>>) -> Self {
+    pub fn new(
+        pool: Weak<RefCell<Pool>>,
+        listener: Rc<RefCell<L>>,
+        session_address: Option<SocketAddr>,
+        public_address: SocketAddr,
+    ) -> Self {
         Self {
             streams: Vec::new(),
             pool,
             listener,
+            session_address,
+            public_address,
         }
     }
 
@@ -678,9 +687,9 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
         let http_context = HttpContext::new(
             request_id,
             listener.protocol(),
-            listener.public_address(),
-            None, // TODO: how???
             listener.sticky_name().to_string(),
+            self.public_address,
+            self.session_address,
         );
         for (stream_id, stream) in self.streams.iter_mut().enumerate() {
             if stream.state == StreamState::Recycle {
@@ -986,9 +995,6 @@ pub struct Mux<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> {
     pub frontend_token: Token,
     pub frontend: Connection<Front>,
     pub router: Router,
-    pub public_address: SocketAddr,
-    pub peer_address: Option<SocketAddr>,
-    pub sticky_name: String,
     pub context: Context<L>,
 }
 
