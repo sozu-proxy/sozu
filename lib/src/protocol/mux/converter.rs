@@ -17,7 +17,7 @@ pub struct H2BlockConverter<'a> {
 }
 
 impl<'a, T: AsBuffer> BlockConverter<T> for H2BlockConverter<'a> {
-    fn call(&mut self, block: Block, kawa: &mut Kawa<T>) {
+    fn call(&mut self, block: Block, kawa: &mut Kawa<T>) -> bool {
         let buffer = kawa.storage.buffer();
         match block {
             Block::StatusLine => match kawa.detached.status_line.pop() {
@@ -49,7 +49,7 @@ impl<'a, T: AsBuffer> BlockConverter<T> for H2BlockConverter<'a> {
             },
             Block::Cookies => {
                 if kawa.detached.jar.is_empty() {
-                    return;
+                    return true;
                 }
                 for cookie in kawa
                     .detached
@@ -83,7 +83,7 @@ impl<'a, T: AsBuffer> BlockConverter<T> for H2BlockConverter<'a> {
                         || compare_no_case(key, b"upgrade")
                     {
                         println!("Elided H2 header: {}", unsafe { from_utf8_unchecked(key) });
-                        return;
+                        return true;
                     }
                 }
                 self.encoder
@@ -164,6 +164,7 @@ impl<'a, T: AsBuffer> BlockConverter<T> for H2BlockConverter<'a> {
                 }
             }
         }
+        true
     }
     fn finalize(&mut self, _kawa: &mut Kawa<T>) {
         assert!(self.out.is_empty());

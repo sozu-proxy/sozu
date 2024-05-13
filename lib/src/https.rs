@@ -56,9 +56,8 @@ use crate::{
         http::{
             answers::HttpAnswers,
             parser::{hostname_and_port, Method},
-            ResponseStream,
         },
-        mux::{self, Mux},
+        mux::{self, Mux, MuxTls},
         proxy_protocol::expect::ExpectProxyProtocol,
         rustls::TlsHandshake,
         Pipe, SessionState,
@@ -91,7 +90,7 @@ StateMachineBuilder! {
     enum HttpsStateMachine impl SessionState {
         Expect(ExpectProxyProtocol<MioTcpStream>, ServerConnection),
         Handshake(TlsHandshake),
-        Mux(Mux<FrontRustls>),
+        Mux(MuxTls),
         // Http(Http<FrontRustls, HttpsListener>),
         WebSocket(Pipe<FrontRustls, HttpsListener>),
         // Http2(Http2<FrontRustls>) -> todo!("H2"),
@@ -291,9 +290,8 @@ impl HttpsSession {
         let router = mux::Router::new(
             self.configured_backend_timeout,
             self.configured_connect_timeout,
-            self.listener.clone(),
         );
-        let mut context = mux::Context::new(self.pool.clone());
+        let mut context = mux::Context::new(self.pool.clone(), self.listener.clone());
         let mut frontend = match alpn {
             AlpnProtocol::Http11 => {
                 context.create_stream(handshake.request_id, 1 << 16)?;
@@ -320,7 +318,7 @@ impl HttpsSession {
         }))
     }
 
-    fn upgrade_mux(&self, mut mux: Mux<FrontRustls>) -> Option<HttpsStateMachine> {
+    fn upgrade_mux(&self, mut mux: MuxTls) -> Option<HttpsStateMachine> {
         debug!("mux switching to wss");
         let stream = mux.context.streams.pop().unwrap();
 
@@ -546,8 +544,20 @@ pub struct HttpsListener {
 }
 
 impl ListenerHandler for HttpsListener {
-    fn get_addr(&self) -> &StdSocketAddr {
+    fn protocol(&self) -> Protocol {
+        Protocol::HTTPS
+    }
+
+    fn address(&self) -> &StdSocketAddr {
         &self.address
+    }
+
+    fn public_address(&self) -> StdSocketAddr {
+        self.config
+            .public_address
+            .as_ref()
+            .map(|addr| addr.clone().into())
+            .unwrap_or(self.address.clone())
     }
 
     fn get_tags(&self, key: &str) -> Option<&CachedTags> {
@@ -563,11 +573,11 @@ impl ListenerHandler for HttpsListener {
 }
 
 impl L7ListenerHandler for HttpsListener {
-    fn get_sticky_name(&self) -> &str {
+    fn sticky_name(&self) -> &str {
         &self.config.sticky_name
     }
 
-    fn get_connect_timeout(&self) -> u32 {
+    fn connect_timeout(&self) -> u32 {
         self.config.connect_timeout
     }
 

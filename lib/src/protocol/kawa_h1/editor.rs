@@ -45,8 +45,9 @@ pub struct HttpContext {
     pub closing: bool,
     /// the value of the custom header, named "Sozu-Id", that Kawa should write (request and response)
     pub id: Ulid,
-    pub backend_id: Option<String>,
     pub cluster_id: Option<String>,
+    pub backend_id: Option<String>,
+    pub backend_address: Option<SocketAddr>,
     /// the value of the protocol Kawa should write in the Forwarded headers of the request
     pub protocol: Protocol,
     /// the value of the public address Kawa should write in the Forwarded headers of the request
@@ -70,6 +71,36 @@ impl kawa::h1::ParserCallbacks<Checkout> for HttpContext {
 }
 
 impl HttpContext {
+    pub fn new(
+        id: Ulid,
+        protocol: Protocol,
+        public_address: SocketAddr,
+        session_address: Option<SocketAddr>,
+        sticky_name: String,
+    ) -> Self {
+        Self {
+            id,
+            protocol,
+            public_address,
+            session_address,
+            sticky_name,
+
+            cluster_id: None,
+            backend_id: None,
+            backend_address: None,
+            keep_alive_backend: true,
+            keep_alive_frontend: true,
+            sticky_session_found: None,
+            method: None,
+            authority: None,
+            path: None,
+            status: None,
+            reason: None,
+            user_agent: None,
+            closing: false,
+            sticky_session: None,
+        }
+    }
     /// Callback for request:
     ///
     /// - edit headers (connection, forwarded, sticky cookie, sozu-id)

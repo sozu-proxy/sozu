@@ -34,9 +34,8 @@ use crate::{
         http::{
             answers::HttpAnswers,
             parser::{hostname_and_port, Method},
-            ResponseStream,
         },
-        mux::{self, Mux},
+        mux::{self, Mux, MuxClear},
         proxy_protocol::expect::ExpectProxyProtocol,
         Pipe, SessionState,
     },
@@ -64,7 +63,7 @@ StateMachineBuilder! {
     enum HttpStateMachine impl SessionState {
         Expect(ExpectProxyProtocol<TcpStream>),
         // Http(Http<TcpStream, HttpListener>),
-        Mux(Mux<TcpStream>),
+        Mux(MuxClear),
         WebSocket(Pipe<TcpStream, HttpListener>),
     }
 }
@@ -124,12 +123,8 @@ impl HttpSession {
             let session_address = sock.peer_addr().ok();
 
             let frontend = mux::Connection::new_h1_server(sock, container_frontend_timeout);
-            let router = mux::Router::new(
-                configured_backend_timeout,
-                configured_connect_timeout,
-                listener.clone(),
-            );
-            let mut context = mux::Context::new(pool.clone());
+            let router = mux::Router::new(configured_backend_timeout, configured_connect_timeout);
+            let mut context = mux::Context::new(pool.clone(), listener.clone());
             context
                 .create_stream(request_id, 1 << 16)
                 .ok_or(AcceptError::BufferCapacityReached)?;
@@ -217,9 +212,8 @@ impl HttpSession {
                 let router = mux::Router::new(
                     self.configured_backend_timeout,
                     self.configured_connect_timeout,
-                    self.listener.clone(),
                 );
-                let mut context = mux::Context::new(self.pool.clone());
+                let mut context = mux::Context::new(self.pool.clone(), self.listener.clone());
                 context.create_stream(expect.request_id, 1 << 16)?;
                 let mut mux = Mux {
                     configured_frontend_timeout: self.configured_frontend_timeout,
@@ -241,7 +235,7 @@ impl HttpSession {
         }
     }
 
-    fn upgrade_mux(&mut self, mut mux: Mux<TcpStream>) -> Option<HttpStateMachine> {
+    fn upgrade_mux(&mut self, mut mux: MuxClear) -> Option<HttpStateMachine> {
         debug!("mux switching to ws");
         let stream = mux.context.streams.pop().unwrap();
 
@@ -453,8 +447,20 @@ pub struct HttpListener {
 }
 
 impl ListenerHandler for HttpListener {
-    fn get_addr(&self) -> &SocketAddr {
+    fn protocol(&self) -> Protocol {
+        Protocol::HTTP
+    }
+
+    fn address(&self) -> &SocketAddr {
         &self.address
+    }
+
+    fn public_address(&self) -> SocketAddr {
+        self.config
+            .public_address
+            .as_ref()
+            .map(|addr| addr.clone().into())
+            .unwrap_or(self.address.clone())
     }
 
     fn get_tags(&self, key: &str) -> Option<&CachedTags> {
@@ -470,11 +476,11 @@ impl ListenerHandler for HttpListener {
 }
 
 impl L7ListenerHandler for HttpListener {
-    fn get_sticky_name(&self) -> &str {
+    fn sticky_name(&self) -> &str {
         &self.config.sticky_name
     }
 
-    fn get_connect_timeout(&self) -> u32 {
+    fn connect_timeout(&self) -> u32 {
         self.config.connect_timeout
     }
 
