@@ -14,7 +14,7 @@ use crate::{
     },
     socket::SocketHandler,
     timer::TimeoutContainer,
-    Readiness,
+    L7ListenerHandler, ListenerHandler, Readiness,
 };
 
 #[inline(always)]
@@ -123,9 +123,10 @@ pub enum H2StreamId {
 }
 
 impl<Front: SocketHandler> ConnectionH2<Front> {
-    pub fn readable<E>(&mut self, context: &mut Context, endpoint: E) -> MuxResult
+    pub fn readable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
     where
         E: Endpoint,
+        L: ListenerHandler + L7ListenerHandler,
     {
         println_!("======= MUX H2 READABLE {:?}", self.position);
         self.timeout_container.reset();
@@ -321,9 +322,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         MuxResult::Continue
     }
 
-    pub fn writable<E>(&mut self, context: &mut Context, mut endpoint: E) -> MuxResult
+    pub fn writable<E, L>(&mut self, context: &mut Context<L>, mut endpoint: E) -> MuxResult
     where
         E: Endpoint,
+        L: ListenerHandler + L7ListenerHandler,
     {
         println_!("======= MUX H2 WRITABLE {:?}", self.position);
         self.timeout_container.reset();
@@ -408,6 +410,12 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                             Position::Server => {
                                 // mark stream as reusable
                                 println_!("Recycle stream: {global_stream_id}");
+                                // ACCESS LOG
+                                stream.generate_access_log(
+                                    false,
+                                    Some(String::from("H2::SplitFrame")),
+                                    context.listener.clone(),
+                                );
                                 let state =
                                     std::mem::replace(&mut stream.state, StreamState::Recycle);
                                 if let StreamState::Linked(token) = state {
@@ -453,6 +461,12 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                             Position::Server => {
                                 // mark stream as reusable
                                 println_!("Recycle stream: {global_stream_id}");
+                                // ACCESS LOG
+                                stream.generate_access_log(
+                                    false,
+                                    Some(String::from("H2::WholeFrame")),
+                                    context.listener.clone(),
+                                );
                                 let state =
                                     std::mem::replace(&mut stream.state, StreamState::Recycle);
                                 if let StreamState::Linked(token) = state {
@@ -497,11 +511,14 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         }
     }
 
-    pub fn create_stream(
+    pub fn create_stream<L>(
         &mut self,
         stream_id: StreamId,
-        context: &mut Context,
-    ) -> Option<GlobalStreamId> {
+        context: &mut Context<L>,
+    ) -> Option<GlobalStreamId>
+    where
+        L: ListenerHandler + L7ListenerHandler,
+    {
         let global_stream_id = context.create_stream(
             Ulid::generate(),
             self.peer_settings.settings_initial_window_size,
@@ -521,9 +538,15 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         }
     }
 
-    fn handle_frame<E>(&mut self, frame: Frame, context: &mut Context, mut endpoint: E) -> MuxResult
+    fn handle_frame<E, L>(
+        &mut self,
+        frame: Frame,
+        context: &mut Context<L>,
+        mut endpoint: E,
+    ) -> MuxResult
     where
         E: Endpoint,
+        L: ListenerHandler + L7ListenerHandler,
     {
         println_!("{frame:#?}");
         match frame {
@@ -618,6 +641,15 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     match self.position {
                         Position::Client(_) => {}
                         Position::Server => {
+                            // This is a special case, normally, all stream are terminated by the server
+                            // when the last byte of the response is written. Here, the reset is requested
+                            // on the server endpoint and immediately terminates, shortcutting the other path
+                            // ACCESS LOG
+                            stream.generate_access_log(
+                                true,
+                                Some(String::from("H2::ResetFrame")),
+                                context.listener.clone(),
+                            );
                             stream.state = StreamState::Recycle;
                         }
                     }
@@ -700,9 +732,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         }
     }
 
-    pub fn close<E>(&mut self, context: &mut Context, mut endpoint: E)
+    pub fn close<E, L>(&mut self, context: &mut Context<L>, mut endpoint: E)
     where
         E: Endpoint,
+        L: ListenerHandler + L7ListenerHandler,
     {
         match self.position {
             Position::Client(BackendStatus::Connected(_))
@@ -714,12 +747,17 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // reconnection is handled by the server for each stream separately
         for global_stream_id in self.streams.values() {
             println_!("end stream: {global_stream_id}");
-            let StreamState::Linked(token) = context.streams[*global_stream_id].state else { unreachable!() };
+            let StreamState::Linked(token) = context.streams[*global_stream_id].state else {
+                unreachable!()
+            };
             endpoint.end_stream(token, *global_stream_id, context)
         }
     }
 
-    pub fn end_stream(&mut self, stream: GlobalStreamId, context: &mut Context) {
+    pub fn end_stream<L>(&mut self, stream: GlobalStreamId, context: &mut Context<L>)
+    where
+        L: ListenerHandler + L7ListenerHandler,
+    {
         let stream_context = &mut context.streams[stream].context;
         println_!("end H2 stream {stream}: {stream_context:#?}");
         match self.position {
@@ -764,7 +802,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         }
     }
 
-    pub fn start_stream(&mut self, stream: GlobalStreamId, context: &mut Context) {
+    pub fn start_stream<L>(&mut self, stream: GlobalStreamId, context: &mut Context<L>)
+    where
+        L: ListenerHandler + L7ListenerHandler,
+    {
         println_!("start new H2 stream {stream} {:?}", self.readiness);
         let stream_id = self.new_stream_id();
         self.streams.insert(stream_id, stream);

@@ -245,7 +245,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             backend_address: self.get_backend_address(),
             protocol: self.protocol_string(),
             endpoint,
-            tags: listener.get_tags(&listener.get_addr().to_string()),
+            tags: listener.get_tags(&listener.address().to_string()),
             client_rtt: socket_rtt(self.front_socket()),
             server_rtt: self.backend_socket.as_ref().and_then(socket_rtt),
             service_time: metrics.service_time(),
@@ -658,10 +658,10 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
 }
 
 impl<Front: SocketHandler, L: ListenerHandler> SessionState for Pipe<Front, L> {
-    fn ready(
+    fn ready<P: L7Proxy>(
         &mut self,
         _session: Rc<RefCell<dyn crate::ProxySession>>,
-        _proxy: Rc<RefCell<dyn crate::L7Proxy>>,
+        _proxy: Rc<RefCell<P>>,
         metrics: &mut SessionMetrics,
     ) -> SessionResult {
         let mut counter = 0;
@@ -791,7 +791,7 @@ impl<Front: SocketHandler, L: ListenerHandler> SessionState for Pipe<Front, L> {
         self.container_backend_timeout.as_mut().map(|t| t.cancel());
     }
 
-    fn close(&mut self, _proxy: Rc<RefCell<dyn L7Proxy>>, _metrics: &mut SessionMetrics) {
+    fn close<P: L7Proxy>(&mut self, _proxy: Rc<RefCell<P>>, _metrics: &mut SessionMetrics) {
         if let Some(backend) = self.backend.as_mut() {
             let mut backend = backend.borrow_mut();
             backend.active_requests = backend.active_requests.saturating_sub(1);

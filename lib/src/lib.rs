@@ -466,8 +466,8 @@ macro_rules! StateMachineBuilder {
         }
 
         macro_rules! _fn_impl {
-            ($function:ident(&$d($mut:ident)?, self $d(,$arg_name:ident: $arg_type:ty)*) $d(-> $ret:ty)? $d(| $marker:tt => $fail:expr)?) => {
-                fn $function(&$d($mut)? self $d(,$arg_name: $arg_type)*) $d(-> $ret)? {
+            ($function:ident$d([$d($bounds:tt)*])?(&$d($mut:ident)?, self $d(,$arg_name:ident: $arg_type:ty)*) $d(-> $ret:ty)? $d(| $marker:tt => $fail:expr)?) => {
+                fn $function$d(<$d($bounds)*>)?(&$d($mut)? self $d(,$arg_name: $arg_type)*) $d(-> $ret)? {
                     match self {
                         $($state_name::$variant_name(_state, ..) => $crate::fallback!({$($override)?} _state.$function($d($arg_name),*)),)+
                         $state_name::FailedUpgrade($crate::fallback!({$d($marker)?} _)) => $crate::fallback!({$d($fail)?} unreachable!())
@@ -503,28 +503,32 @@ macro_rules! StateMachineBuilder {
         $crate::branch!{
             if $($trait)? == SessionState {
                 impl SessionState for $state_name {
-                    _fn_impl!{ready(&mut, self, session: Rc<RefCell<dyn ProxySession>>, proxy: Rc<RefCell<dyn L7Proxy>>, metrics: &mut SessionMetrics) -> SessionResult}
+                    _fn_impl!{ready[P: L7Proxy](&mut, self, session: Rc<RefCell<dyn ProxySession>>, proxy: Rc<RefCell<P>>, metrics: &mut SessionMetrics) -> SessionResult}
                     _fn_impl!{update_readiness(&mut, self, token: Token, events: Ready)}
                     _fn_impl!{timeout(&mut, self, token: Token, metrics: &mut SessionMetrics) -> StateResult}
                     _fn_impl!{cancel_timeouts(&mut, self)}
                     _fn_impl!{print_state(&, self, context: &str) | marker => error!("{} Session(FailedUpgrade({:?}))", context, marker)}
-                    _fn_impl!{close(&mut, self, proxy: Rc<RefCell<dyn L7Proxy>>, metrics: &mut SessionMetrics) | _ => {}}
+                    _fn_impl!{close[P: L7Proxy](&mut, self, proxy: Rc<RefCell<P>>, metrics: &mut SessionMetrics) | _ => {}}
                     _fn_impl!{shutting_down(&mut, self) -> SessionIsToBeClosed | _ => true}
                 }
             } else {}
         }
     };
-    ($($tt:tt)+) => {
-        StateMachineBuilder!{($) $($tt)+}
+    ($(#[$($state_macros:tt)*])* enum $($tt:tt)+) => {
+        StateMachineBuilder!{($) $(#[$($state_macros)*])* enum $($tt)+}
     }
 }
 
 pub trait ListenerHandler {
-    fn get_addr(&self) -> &SocketAddr;
+    fn protocol(&self) -> Protocol;
+
+    fn address(&self) -> &SocketAddr;
+
+    fn public_address(&self) -> SocketAddr;
 
     fn get_tags(&self, key: &str) -> Option<&CachedTags>;
 
-    fn get_concatenated_tags(&self, key: &str) -> Option<&str> {
+    fn concatenated_tags(&self, key: &str) -> Option<&str> {
         self.get_tags(key).map(|tags| tags.concatenated.as_str())
     }
 
@@ -542,9 +546,9 @@ pub enum FrontendFromRequestError {
 }
 
 pub trait L7ListenerHandler {
-    fn get_sticky_name(&self) -> &str;
+    fn sticky_name(&self) -> &str;
 
-    fn get_connect_timeout(&self) -> u32;
+    fn connect_timeout(&self) -> u32;
 
     /// retrieve a frontend by parsing a request's hostname, uri and method
     fn frontend_from_request(
