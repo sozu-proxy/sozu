@@ -3,7 +3,7 @@ use std::convert::From;
 use kawa::repr::Slice;
 use nom::{
     bytes::complete::{tag, take},
-    combinator::{complete, map, map_opt},
+    combinator::{complete, map},
     error::{ErrorKind, ParseError},
     multi::many0,
     number::complete::{be_u16, be_u24, be_u32, be_u8},
@@ -69,15 +69,16 @@ pub fn error_code_to_str(error_code: u32) -> &'static str {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct Error<'a> {
+pub struct ParserError<'a> {
     pub input: &'a [u8],
-    pub error: InnerError,
+    pub kind: ParserErrorKind,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum InnerError {
+pub enum ParserErrorKind {
     Nom(ErrorKind),
     H2(H2Error),
+    UnknownFrame(u32),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -98,39 +99,39 @@ pub enum H2Error {
     HTTP11Required,
 }
 
-impl<'a> Error<'a> {
-    pub fn new(input: &'a [u8], error: InnerError) -> Error<'a> {
-        Error { input, error }
+impl<'a> ParserError<'a> {
+    pub fn new(input: &'a [u8], error: ParserErrorKind) -> ParserError<'a> {
+        ParserError { input, kind: error }
     }
-    pub fn new_h2(input: &'a [u8], error: H2Error) -> Error<'a> {
-        Error {
+    pub fn new_h2(input: &'a [u8], error: H2Error) -> ParserError<'a> {
+        ParserError {
             input,
-            error: InnerError::H2(error),
+            kind: ParserErrorKind::H2(error),
         }
     }
 }
 
-impl<'a> ParseError<&'a [u8]> for Error<'a> {
+impl<'a> ParseError<&'a [u8]> for ParserError<'a> {
     fn from_error_kind(input: &'a [u8], kind: ErrorKind) -> Self {
-        Error {
+        ParserError {
             input,
-            error: InnerError::Nom(kind),
+            kind: ParserErrorKind::Nom(kind),
         }
     }
 
     fn append(input: &'a [u8], kind: ErrorKind, other: Self) -> Self {
-        Error {
+        ParserError {
             input,
-            error: InnerError::Nom(kind),
+            kind: ParserErrorKind::Nom(kind),
         }
     }
 }
 
-impl<'a> From<(&'a [u8], ErrorKind)> for Error<'a> {
+impl<'a> From<(&'a [u8], ErrorKind)> for ParserError<'a> {
     fn from((input, kind): (&'a [u8], ErrorKind)) -> Self {
-        Error {
+        ParserError {
             input,
-            error: InnerError::Nom(kind),
+            kind: ParserErrorKind::Nom(kind),
         }
     }
 }
@@ -155,11 +156,40 @@ pub fn preface(i: &[u8]) -> IResult<&[u8], &[u8]> {
 );
   */
 
-pub fn frame_header(input: &[u8]) -> IResult<&[u8], FrameHeader, Error> {
+pub fn frame_header(input: &[u8], max_frame_size: u32) -> IResult<&[u8], FrameHeader, ParserError> {
     let (i, payload_len) = be_u24(input)?;
-    let (i, frame_type) = map_opt(be_u8, convert_frame_type)(i)?;
+    if payload_len > max_frame_size {
+        return Err(Err::Failure(ParserError::new_h2(
+            i,
+            H2Error::FrameSizeError,
+        )));
+    }
+
+    let (i, t) = be_u8(i)?;
+    let Some(frame_type) = convert_frame_type(t) else {
+        return Err(Err::Failure(ParserError::new(
+            i,
+            ParserErrorKind::UnknownFrame(payload_len),
+        )));
+    };
     let (i, flags) = be_u8(i)?;
     let (i, stream_id) = be_u32(i)?;
+    let stream_id = stream_id & 0x7FFFFFFF;
+
+    let valid_stream_id = match frame_type {
+        FrameType::Data
+        | FrameType::Headers
+        | FrameType::Priority
+        | FrameType::RstStream
+        | FrameType::PushPromise
+        | FrameType::Continuation => stream_id != 0,
+        FrameType::Settings | FrameType::Ping | FrameType::GoAway => stream_id == 0,
+        FrameType::WindowUpdate => true,
+    };
+    if !valid_stream_id {
+        println!("invalid stream_id: {stream_id}");
+        return Err(Err::Failure(ParserError::new_h2(i, H2Error::ProtocolError)));
+    }
 
     Ok((
         i,
@@ -234,39 +264,25 @@ impl Frame {
 pub fn frame_body<'a>(
     i: &'a [u8],
     header: &FrameHeader,
-    max_frame_size: u32,
-) -> IResult<&'a [u8], Frame, Error<'a>> {
-    if header.payload_len > max_frame_size {
-        return Err(Err::Failure(Error::new_h2(i, H2Error::FrameSizeError)));
-    }
-
-    let valid_stream_id = match header.frame_type {
-        FrameType::Data
-        | FrameType::Headers
-        | FrameType::Priority
-        | FrameType::RstStream
-        | FrameType::PushPromise
-        | FrameType::Continuation => header.stream_id != 0,
-        FrameType::Settings | FrameType::Ping | FrameType::GoAway => header.stream_id == 0,
-        FrameType::WindowUpdate => true,
-    };
-
-    if !valid_stream_id {
-        return Err(Err::Failure(Error::new_h2(i, H2Error::ProtocolError)));
-    }
-
+) -> IResult<&'a [u8], Frame, ParserError<'a>> {
     let f = match header.frame_type {
         FrameType::Data => data_frame(i, header)?,
         FrameType::Headers => headers_frame(i, header)?,
         FrameType::Priority => {
             if header.payload_len != 5 {
-                return Err(Err::Failure(Error::new_h2(i, H2Error::FrameSizeError)));
+                return Err(Err::Failure(ParserError::new_h2(
+                    i,
+                    H2Error::FrameSizeError,
+                )));
             }
             priority_frame(i, header)?
         }
         FrameType::RstStream => {
             if header.payload_len != 4 {
-                return Err(Err::Failure(Error::new_h2(i, H2Error::FrameSizeError)));
+                return Err(Err::Failure(ParserError::new_h2(
+                    i,
+                    H2Error::FrameSizeError,
+                )));
             }
             rst_stream_frame(i, header)?
         }
@@ -274,20 +290,29 @@ pub fn frame_body<'a>(
         FrameType::Continuation => continuation_frame(i, header)?,
         FrameType::Settings => {
             if header.payload_len % 6 != 0 {
-                return Err(Err::Failure(Error::new_h2(i, H2Error::FrameSizeError)));
+                return Err(Err::Failure(ParserError::new_h2(
+                    i,
+                    H2Error::FrameSizeError,
+                )));
             }
             settings_frame(i, header)?
         }
         FrameType::Ping => {
             if header.payload_len != 8 {
-                return Err(Err::Failure(Error::new_h2(i, H2Error::FrameSizeError)));
+                return Err(Err::Failure(ParserError::new_h2(
+                    i,
+                    H2Error::FrameSizeError,
+                )));
             }
             ping_frame(i, header)?
         }
         FrameType::GoAway => goaway_frame(i, header)?,
         FrameType::WindowUpdate => {
             if header.payload_len != 4 {
-                return Err(Err::Failure(Error::new_h2(i, H2Error::FrameSizeError)));
+                return Err(Err::Failure(ParserError::new_h2(
+                    i,
+                    H2Error::FrameSizeError,
+                )));
             }
             window_update_frame(i, header)?
         }
@@ -306,8 +331,9 @@ pub struct Data {
 pub fn data_frame<'a>(
     input: &'a [u8],
     header: &FrameHeader,
-) -> IResult<&'a [u8], Frame, Error<'a>> {
+) -> IResult<&'a [u8], Frame, ParserError<'a>> {
     let (remaining, i) = take(header.payload_len)(input)?;
+    println!("{i:?}");
 
     let (i, pad_length) = if header.flags & 0x8 != 0 {
         let (i, pad_length) = be_u8(i)?;
@@ -317,7 +343,10 @@ pub fn data_frame<'a>(
     };
 
     if pad_length.is_some() && i.len() <= pad_length.unwrap() as usize {
-        return Err(Err::Failure(Error::new_h2(input, H2Error::ProtocolError)));
+        return Err(Err::Failure(ParserError::new_h2(
+            input,
+            H2Error::ProtocolError,
+        )));
     }
 
     let (_, payload) = take(i.len() - pad_length.unwrap_or(0) as usize)(i)?;
@@ -335,13 +364,11 @@ pub fn data_frame<'a>(
 #[derive(Clone, Debug)]
 pub struct Headers {
     pub stream_id: u32,
-    pub stream_dependency: Option<StreamDependency>,
-    pub weight: Option<u8>,
+    pub priority: Option<PriorityPart>,
     pub header_block_fragment: Slice,
     // pub header_block_fragment: &'a [u8],
     pub end_stream: bool,
     pub end_headers: bool,
-    pub priority: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -350,7 +377,7 @@ pub struct StreamDependency {
     pub stream_id: u32,
 }
 
-fn stream_dependency(i: &[u8]) -> IResult<&[u8], StreamDependency, Error<'_>> {
+fn stream_dependency(i: &[u8]) -> IResult<&[u8], StreamDependency, ParserError<'_>> {
     let (i, stream) = map(be_u32, |i| StreamDependency {
         exclusive: i & 0x8000 != 0,
         stream_id: i & 0x7FFFFFFF,
@@ -361,7 +388,7 @@ fn stream_dependency(i: &[u8]) -> IResult<&[u8], StreamDependency, Error<'_>> {
 pub fn headers_frame<'a>(
     input: &'a [u8],
     header: &FrameHeader,
-) -> IResult<&'a [u8], Frame, Error<'a>> {
+) -> IResult<&'a [u8], Frame, ParserError<'a>> {
     let (remaining, i) = take(header.payload_len)(input)?;
 
     let (i, pad_length) = if header.flags & 0x8 != 0 {
@@ -371,16 +398,25 @@ pub fn headers_frame<'a>(
         (i, None)
     };
 
-    let (i, stream_dependency, weight) = if header.flags & 0x20 != 0 {
+    let (i, priority) = if header.flags & 0x20 != 0 {
         let (i, stream_dependency) = stream_dependency(i)?;
         let (i, weight) = be_u8(i)?;
-        (i, Some(stream_dependency), Some(weight))
+        (
+            i,
+            Some(PriorityPart::Rfc7540 {
+                stream_dependency,
+                weight,
+            }),
+        )
     } else {
-        (i, None, None)
+        (i, None)
     };
 
     if pad_length.is_some() && i.len() <= pad_length.unwrap() as usize {
-        return Err(Err::Failure(Error::new_h2(input, H2Error::ProtocolError)));
+        return Err(Err::Failure(ParserError::new_h2(
+            input,
+            H2Error::ProtocolError,
+        )));
     }
 
     let (_, header_block_fragment) = take(i.len() - pad_length.unwrap_or(0) as usize)(i)?;
@@ -389,35 +425,46 @@ pub fn headers_frame<'a>(
         remaining,
         Frame::Headers(Headers {
             stream_id: header.stream_id,
-            stream_dependency,
-            weight,
+            priority,
             header_block_fragment: Slice::new(input, header_block_fragment),
             end_stream: header.flags & 0x1 != 0,
             end_headers: header.flags & 0x4 != 0,
-            priority: header.flags & 0x20 != 0,
         }),
     ))
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub enum PriorityPart {
+    Rfc7540 {
+        stream_dependency: StreamDependency,
+        weight: u8,
+    },
+    Rfc9218 {
+        urgency: u8, // should be between 0 and 7 inclusive
+        incremental: bool,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct Priority {
     pub stream_id: u32,
-    pub stream_dependency: StreamDependency,
-    pub weight: u8,
+    pub inner: PriorityPart,
 }
 
 pub fn priority_frame<'a>(
     input: &'a [u8],
     header: &FrameHeader,
-) -> IResult<&'a [u8], Frame, Error<'a>> {
+) -> IResult<&'a [u8], Frame, ParserError<'a>> {
     let (i, stream_dependency) = stream_dependency(input)?;
     let (i, weight) = be_u8(i)?;
     Ok((
         i,
         Frame::Priority(Priority {
-            stream_dependency,
             stream_id: header.stream_id,
-            weight,
+            inner: PriorityPart::Rfc7540 {
+                stream_dependency,
+                weight,
+            },
         }),
     ))
 }
@@ -431,7 +478,7 @@ pub struct RstStream {
 pub fn rst_stream_frame<'a>(
     input: &'a [u8],
     header: &FrameHeader,
-) -> IResult<&'a [u8], Frame, Error<'a>> {
+) -> IResult<&'a [u8], Frame, ParserError<'a>> {
     let (i, error_code) = be_u32(input)?;
     Ok((
         i,
@@ -457,7 +504,7 @@ pub struct Setting {
 pub fn settings_frame<'a>(
     input: &'a [u8],
     header: &FrameHeader,
-) -> IResult<&'a [u8], Frame, Error<'a>> {
+) -> IResult<&'a [u8], Frame, ParserError<'a>> {
     let (i, data) = take(header.payload_len)(input)?;
 
     let (_, settings) = many0(map(
@@ -485,7 +532,7 @@ pub struct PushPromise {
 pub fn push_promise_frame<'a>(
     input: &'a [u8],
     header: &FrameHeader,
-) -> IResult<&'a [u8], Frame, Error<'a>> {
+) -> IResult<&'a [u8], Frame, ParserError<'a>> {
     let (remaining, i) = take(header.payload_len)(input)?;
 
     let (i, pad_length) = if header.flags & 0x8 != 0 {
@@ -496,7 +543,10 @@ pub fn push_promise_frame<'a>(
     };
 
     if pad_length.is_some() && i.len() <= pad_length.unwrap() as usize {
-        return Err(Err::Failure(Error::new_h2(input, H2Error::ProtocolError)));
+        return Err(Err::Failure(ParserError::new_h2(
+            input,
+            H2Error::ProtocolError,
+        )));
     }
 
     let (i, promised_stream_id) = be_u32(i)?;
@@ -521,7 +571,7 @@ pub struct Ping {
 pub fn ping_frame<'a>(
     input: &'a [u8],
     _header: &FrameHeader,
-) -> IResult<&'a [u8], Frame, Error<'a>> {
+) -> IResult<&'a [u8], Frame, ParserError<'a>> {
     let (i, data) = take(8usize)(input)?;
 
     let mut p = Ping { payload: [0; 8] };
@@ -540,7 +590,7 @@ pub struct GoAway {
 pub fn goaway_frame<'a>(
     input: &'a [u8],
     header: &FrameHeader,
-) -> IResult<&'a [u8], Frame, Error<'a>> {
+) -> IResult<&'a [u8], Frame, ParserError<'a>> {
     let (remaining, i) = take(header.payload_len)(input)?;
     let (i, last_stream_id) = be_u32(i)?;
     let (additional_debug_data, error_code) = be_u32(i)?;
@@ -563,13 +613,16 @@ pub struct WindowUpdate {
 pub fn window_update_frame<'a>(
     input: &'a [u8],
     header: &FrameHeader,
-) -> IResult<&'a [u8], Frame, Error<'a>> {
+) -> IResult<&'a [u8], Frame, ParserError<'a>> {
     let (i, increment) = be_u32(input)?;
     let increment = increment & 0x7FFFFFFF;
 
     //FIXME: if stream id is 0, trat it as connection error?
     if increment == 0 {
-        return Err(Err::Failure(Error::new_h2(input, H2Error::ProtocolError)));
+        return Err(Err::Failure(ParserError::new_h2(
+            input,
+            H2Error::ProtocolError,
+        )));
     }
 
     Ok((
@@ -591,7 +644,7 @@ pub struct Continuation {
 pub fn continuation_frame<'a>(
     input: &'a [u8],
     header: &FrameHeader,
-) -> IResult<&'a [u8], Frame, Error<'a>> {
+) -> IResult<&'a [u8], Frame, ParserError<'a>> {
     let (i, header_block_fragment) = take(header.payload_len)(input)?;
     Ok((
         i,

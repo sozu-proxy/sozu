@@ -7,7 +7,10 @@ use crate::{
     println_,
     protocol::mux::{
         converter, debug_kawa, forcefully_terminate_answer,
-        parser::{self, error_code_to_str, Frame, FrameHeader, FrameType, H2Error, Headers},
+        parser::{
+            self, error_code_to_str, Frame, FrameHeader, FrameType, H2Error, Headers, ParserError,
+            ParserErrorKind,
+        },
         pkawa, serializer, set_default_answer, update_readiness_after_read,
         update_readiness_after_write, BackendStatus, Context, Endpoint, GenericHttpStream,
         GlobalStreamId, MuxResult, Position, StreamId, StreamState,
@@ -18,10 +21,14 @@ use crate::{
 };
 
 #[inline(always)]
-fn error_nom_to_h2(error: nom::Err<parser::Error>) -> H2Error {
+fn error_nom_to_h2(error: nom::Err<parser::ParserError>) -> H2Error {
     match error {
-        nom::Err::Error(parser::Error {
-            error: parser::InnerError::H2(e),
+        nom::Err::Error(parser::ParserError {
+            kind: parser::ParserErrorKind::H2(e),
+            ..
+        }) => return e,
+        nom::Err::Failure(parser::ParserError {
+            kind: parser::ParserErrorKind::H2(e),
             ..
         }) => return e,
         _ => return H2Error::ProtocolError,
@@ -39,6 +46,7 @@ pub enum H2State {
     ContinuationFrame(Headers),
     GoAway,
     Error,
+    Discard,
 }
 
 #[derive(Debug)]
@@ -76,8 +84,8 @@ impl Prioriser {
     pub fn new() -> Self {
         Self {}
     }
-    pub fn push_priority(&mut self, priority: parser::Priority) {
-        println!("DEPRECATED: {priority:?}");
+    pub fn push_priority(&mut self, stream_id: StreamId, priority: parser::PriorityPart) {
+        println!("PRIORITY REQUEST FOR {stream_id}: {priority:?}");
     }
 }
 
@@ -96,7 +104,7 @@ pub struct ConnectionH2<Front: SocketHandler> {
     pub state: H2State,
     pub streams: HashMap<StreamId, GlobalStreamId>,
     pub timeout_container: TimeoutContainer,
-    pub window: u32,
+    pub window: i32,
     pub zero: GenericHttpStream,
 }
 impl<Front: SocketHandler> std::fmt::Debug for ConnectionH2<Front> {
@@ -116,7 +124,7 @@ impl<Front: SocketHandler> std::fmt::Debug for ConnectionH2<Front> {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum H2StreamId {
     Zero,
     Other(StreamId, GlobalStreamId),
@@ -139,6 +147,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             };
             println_!("{:?}({stream_id:?}, {amount})", self.state);
             if amount > 0 {
+                if amount > kawa.storage.available_space() {
+                    self.readiness.interest.remove(Ready::READABLE);
+                    return MuxResult::Continue;
+                }
                 let (size, status) = self.socket.socket_read(&mut kawa.storage.space()[..amount]);
                 kawa.storage.fill(size);
                 if update_readiness_after_read(size, status, &mut self.readiness) {
@@ -148,6 +160,25 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         self.expect_read = None;
                     } else {
                         self.expect_read = Some((stream_id, amount - size));
+                        match (&self.state, &self.position) {
+                            (H2State::ClientPreface, Position::Server) => {
+                                let i = kawa.storage.data();
+                                if !b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".starts_with(i) {
+                                    println_!("EARLY INVALID PREFACE: {i:?}");
+                                    return self.force_disconnect();
+                                }
+                            }
+                            // (
+                            //     H2State::Frame(FrameHeader {
+                            //         payload_len,
+                            //         frame_type: FrameType::Data,
+                            //         flags,
+                            //         stream_id,
+                            //     }),
+                            //     _,
+                            // ) => {}
+                            _ => {}
+                        }
                         return MuxResult::Continue;
                     }
                 }
@@ -165,16 +196,23 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             | (H2State::ServerSettings, Position::Server)
             | (H2State::ClientPreface, Position::Client(_))
             | (H2State::ClientSettings, Position::Client(_)) => unreachable!(
-                "Unexpected combination: (Writable, {:?}, {:?})",
+                "Unexpected combination: (Readable, {:?}, {:?})",
                 self.state, self.position
             ),
+            (H2State::Discard, _) => {
+                let i = kawa.storage.data();
+                println_!("DISCARDING: {i:?}");
+                kawa.storage.clear();
+                self.state = H2State::Header;
+                self.expect_read = Some((H2StreamId::Zero, 9));
+            }
             (H2State::ClientPreface, Position::Server) => {
                 let i = kawa.storage.data();
                 let i = match parser::preface(i) {
                     Ok((i, _)) => i,
                     Err(_) => return self.force_disconnect(),
                 };
-                match parser::frame_header(i) {
+                match parser::frame_header(i, self.local_settings.settings_max_frame_size) {
                     Ok((
                         _,
                         FrameHeader {
@@ -223,7 +261,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             }
             (H2State::ServerSettings, Position::Client(_)) => {
                 let i = kawa.storage.data();
-                match parser::frame_header(i) {
+                match parser::frame_header(i, self.local_settings.settings_max_frame_size) {
                     Ok((
                         _,
                         header @ FrameHeader {
@@ -243,74 +281,120 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             (H2State::Header, _) => {
                 let i = kawa.storage.data();
                 println_!("  header: {i:?}");
-                match parser::frame_header(i) {
+                match parser::frame_header(i, self.local_settings.settings_max_frame_size) {
                     Ok((_, header)) => {
                         println_!("{header:#?}");
                         kawa.storage.clear();
                         let stream_id = header.stream_id;
-                        let stream_id =
-                            if stream_id == 0 || header.frame_type == FrameType::RstStream {
-                                H2StreamId::Zero
+                        let read_stream = if stream_id == 0 {
+                            H2StreamId::Zero
+                        } else if let Some(global_stream_id) = self.streams.get(&stream_id) {
+                            let stream = &context.streams[*global_stream_id];
+                            println_!(
+                                "REQUESTING EXISTING STREAM {stream_id}: {}/{:?}",
+                                stream.received_end_of_stream,
+                                stream.state
+                            );
+                            if stream.received_end_of_stream || !stream.state.is_open() {
+                                return self.goaway(H2Error::StreamClosed);
+                            }
+                            if header.frame_type == FrameType::Data {
+                                H2StreamId::Other(stream_id, *global_stream_id)
                             } else {
-                                let global_stream_id =
-                                    if let Some(global_stream_id) = self.streams.get(&stream_id) {
-                                        *global_stream_id
-                                    } else {
-                                        match self.create_stream(stream_id, context) {
-                                            Some(global_stream_id) => global_stream_id,
-                                            None => return self.goaway(H2Error::InternalError),
-                                        }
-                                    };
-                                if header.frame_type == FrameType::Data {
-                                    H2StreamId::Other(stream_id, global_stream_id)
-                                } else {
-                                    H2StreamId::Zero
+                                H2StreamId::Zero
+                            }
+                        } else {
+                            if header.frame_type == FrameType::Headers
+                                && self.position.is_server()
+                                && stream_id % 2 == 1
+                                && stream_id >= self.last_stream_id
+                            {
+                                if context.streams.len()
+                                    >= self.local_settings.settings_max_concurrent_streams as usize
+                                {
+                                    return self.goaway(H2Error::RefusedStream);
                                 }
-                            };
+                                match self.create_stream(stream_id, context) {
+                                    Some(_) => {}
+                                    None => return self.goaway(H2Error::InternalError),
+                                }
+                            } else if header.frame_type != FrameType::Priority {
+                                println_!(
+                                    "ONLY HEADERS AND PRIORITY CAN BE RECEIVED ON IDLE/CLOSED STREAMS"
+                                );
+                                return self.goaway(H2Error::ProtocolError);
+                            }
+                            H2StreamId::Zero
+                        };
                         println_!("{} {stream_id:?} {:#?}", header.stream_id, self.streams);
-                        self.expect_read = Some((stream_id, header.payload_len as usize));
+                        self.expect_read = Some((read_stream, header.payload_len as usize));
                         self.state = H2State::Frame(header);
                     }
-                    Err(_) => return self.goaway(H2Error::ProtocolError),
+                    Err(nom::Err::Failure(ParserError {
+                        kind: ParserErrorKind::UnknownFrame(skip),
+                        ..
+                    })) => {
+                        self.expect_read = Some((H2StreamId::Zero, skip as usize));
+                        self.state = H2State::Discard;
+                    }
+                    Err(error) => {
+                        let error = error_nom_to_h2(error);
+                        return self.goaway(error);
+                    }
                 };
             }
             (H2State::ContinuationHeader(headers), _) => {
-                let i = kawa.storage.data();
+                let i = kawa.storage.unparsed_data();
                 println_!("  continuation header: {i:?}");
-                match parser::frame_header(i) {
-                    Ok((_, header)) => {
-                        println_!("{header:#?}");
+                match parser::frame_header(i, self.local_settings.settings_max_frame_size) {
+                    Ok((
+                        _,
+                        FrameHeader {
+                            payload_len,
+                            frame_type: FrameType::Continuation,
+                            flags,
+                            stream_id,
+                        },
+                    )) => {
+                        // println_!("{header:#?}");
                         kawa.storage.end -= 9;
-                        let stream_id = header.stream_id;
                         assert_eq!(stream_id, headers.stream_id);
-                        self.expect_read = Some((H2StreamId::Zero, header.payload_len as usize));
+                        self.expect_read = Some((H2StreamId::Zero, payload_len as usize));
                         let mut headers = headers.clone();
-                        headers.end_headers = header.flags & 0x4 != 0;
-                        headers.header_block_fragment.len += header.payload_len;
+                        headers.end_headers = flags & 0x4 != 0;
+                        headers.header_block_fragment.len += payload_len;
                         self.state = H2State::ContinuationFrame(headers);
                     }
-                    Err(_) => return self.goaway(H2Error::ProtocolError),
+                    Err(error) => {
+                        let error = error_nom_to_h2(error);
+                        return self.goaway(error);
+                    }
+                    _ => return self.goaway(H2Error::ProtocolError),
                 };
             }
             (H2State::Frame(header), _) => {
-                let i = kawa.storage.data();
+                let i = kawa.storage.unparsed_data();
                 println_!("  data: {i:?}");
-                let frame = match parser::frame_body(
-                    i,
-                    header,
-                    self.local_settings.settings_max_frame_size,
-                ) {
+                let frame = match parser::frame_body(i, header) {
                     Ok((_, frame)) => frame,
-                    Err(e) => panic!("stream error: {:?}", error_nom_to_h2(e)),
+                    Err(error) => {
+                        let error = error_nom_to_h2(error);
+                        return self.goaway(error);
+                    }
                 };
                 if let H2StreamId::Zero = stream_id {
-                    kawa.storage.clear();
+                    if header.frame_type == FrameType::Headers {
+                        kawa.storage.head = kawa.storage.end;
+                    } else {
+                        kawa.storage.end = kawa.storage.head;
+                    }
                 }
                 self.state = H2State::Header;
                 self.expect_read = Some((H2StreamId::Zero, 9));
                 return self.handle_frame(frame, context, endpoint);
             }
             (H2State::ContinuationFrame(headers), _) => {
+                kawa.storage.head = kawa.storage.end;
                 let i = kawa.storage.data();
                 println_!("  data: {i:?}");
                 let headers = headers.clone();
@@ -346,10 +430,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         }
         match (&self.state, &self.position) {
             (H2State::Error, _)
+            | (H2State::Discard, _)
             | (H2State::ClientPreface, Position::Server)
             | (H2State::ClientSettings, Position::Server)
             | (H2State::ServerSettings, Position::Client(_)) => unreachable!(
-                "Unexpected combination: (Readable, {:?}, {:?})",
+                "Unexpected combination: (Writable, {:?}, {:?})",
                 self.state, self.position
             ),
             (H2State::GoAway, _) => self.force_disconnect(),
@@ -392,13 +477,22 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             | (H2State::ContinuationHeader(_), _) => {
                 let mut dead_streams = Vec::new();
 
-                if let Some(H2StreamId::Other(stream_id, global_stream_id)) = self.expect_write {
+                if let Some(write_stream @ H2StreamId::Other(stream_id, global_stream_id)) =
+                    self.expect_write
+                {
                     let stream = &mut context.streams[global_stream_id];
                     let kawa = stream.wbuffer(&self.position);
                     while !kawa.out.is_empty() {
                         let bufs = kawa.as_io_slice();
                         let (size, status) = self.socket.socket_write_vectored(&bufs);
                         kawa.consume(size);
+                        if let Some((read_stream, amount)) = self.expect_read {
+                            if write_stream == read_stream
+                                && kawa.storage.available_space() >= amount
+                            {
+                                self.readiness.interest.insert(Ready::READABLE);
+                            }
+                        }
                         if update_readiness_after_write(size, status, &mut self.readiness) {
                             return MuxResult::Continue;
                         }
@@ -455,6 +549,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                             break 'outer;
                         }
                     }
+                    self.expect_write = None;
                     if (kawa.is_terminated() || kawa.is_error()) && kawa.is_completed() {
                         match self.position {
                             Position::Client(_) => {}
@@ -493,8 +588,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     pub fn goaway(&mut self, error: H2Error) -> MuxResult {
         self.state = H2State::Error;
         self.expect_read = None;
-        self.expect_write = Some(H2StreamId::Zero);
         let kawa = &mut self.zero;
+        kawa.storage.clear();
 
         match serializer::gen_goaway(kawa.storage.space(), self.last_stream_id, error) {
             Ok((_, size)) => {
@@ -523,9 +618,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             Ulid::generate(),
             self.peer_settings.settings_initial_window_size,
         )?;
-        if stream_id > self.last_stream_id {
-            self.last_stream_id = stream_id & !1;
-        }
+        self.last_stream_id = (stream_id + 2) & !1;
         self.streams.insert(stream_id, global_stream_id);
         Some(global_stream_id)
     }
@@ -533,8 +626,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     pub fn new_stream_id(&mut self) -> StreamId {
         self.last_stream_id += 2;
         match self.position {
-            Position::Client(_) => self.last_stream_id + 1,
-            Position::Server => self.last_stream_id,
+            Position::Client(_) => self.last_stream_id - 1,
+            Position::Server => self.last_stream_id - 2,
         }
     }
 
@@ -571,6 +664,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         end_stream: true,
                     }));
                     kawa.parsing_phase = kawa::ParsingPhase::Terminated;
+                    stream.received_end_of_stream = true;
                 }
                 if let StreamState::Linked(token) = stream.state {
                     endpoint
@@ -581,24 +675,34 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             }
             Frame::Headers(headers) => {
                 if !headers.end_headers {
+                    // self.zero.storage.head = self.zero.storage.end;
+                    println!("FRAGMENT: {:?}", self.zero.storage.data());
                     self.state = H2State::ContinuationHeader(headers);
                     return MuxResult::Continue;
                 }
                 // can this fail?
-                let global_stream_id = *self.streams.get(&headers.stream_id).unwrap();
+                let stream_id = headers.stream_id;
+                let global_stream_id = *self.streams.get(&stream_id).unwrap();
                 let kawa = &mut self.zero;
                 let buffer = headers.header_block_fragment.data(kawa.storage.buffer());
                 let stream = &mut context.streams[global_stream_id];
                 let parts = &mut stream.split(&self.position);
                 let was_initial = parts.rbuffer.is_initial();
                 pkawa::handle_header(
+                    &mut self.decoder,
+                    &mut self.prioriser,
+                    stream_id,
                     parts.rbuffer,
                     buffer,
                     headers.end_stream,
-                    &mut self.decoder,
                     parts.context,
                 );
+                kawa.storage.clear();
+                if parts.rbuffer.is_error() {
+                    return self.goaway(H2Error::CompressionError);
+                }
                 debug_kawa(parts.rbuffer);
+                stream.received_end_of_stream |= headers.end_stream;
                 if let StreamState::Linked(token) = stream.state {
                     endpoint
                         .readiness_mut(token)
@@ -625,7 +729,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     return self.goaway(H2Error::ProtocolError);
                 }
             },
-            Frame::Priority(priority) => self.prioriser.push_priority(priority),
+            Frame::Priority(priority) => self
+                .prioriser
+                .push_priority(priority.stream_id, priority.inner),
             Frame::RstStream(rst_stream) => {
                 println_!(
                     "RstStream({} -> {})",
@@ -704,15 +810,22 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     goaway.error_code,
                     error_code_to_str(goaway.error_code)
                 );
-                return self.goaway(H2Error::NoError);
+                // return self.goaway(H2Error::NoError);
             }
             Frame::WindowUpdate(update) => {
-                if update.stream_id == 0 {
-                    self.window += update.increment;
+                let window = if update.stream_id == 0 {
+                    &mut self.window
                 } else {
                     if let Some(global_stream_id) = self.streams.get(&update.stream_id) {
-                        context.streams[*global_stream_id].window += update.increment as i32;
+                        &mut context.streams[*global_stream_id].window
+                    } else {
+                        unreachable!()
                     }
+                };
+                if update.increment as i32 > i32::MAX - *window {
+                    return self.goaway(H2Error::FlowControlError);
+                } else {
+                    *window += update.increment as i32;
                 }
             }
             Frame::Continuation(_) => unreachable!(),
