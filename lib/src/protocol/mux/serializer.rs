@@ -13,7 +13,7 @@ use super::{
 
 pub const H2_PRI: &str = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 pub const SETTINGS_ACKNOWLEDGEMENT: [u8; 9] = [0, 0, 0, 4, 1, 0, 0, 0, 0];
-pub const PING_ACKNOWLEDGEMENT_HEADER: [u8; 9] = [0, 0, 0, 6, 1, 0, 0, 0, 0];
+pub const PING_ACKNOWLEDGEMENT_HEADER: [u8; 9] = [0, 0, 8, 6, 1, 0, 0, 0, 0];
 
 pub fn gen_frame_header<'a, 'b>(
     buf: &'a mut [u8],
@@ -68,7 +68,7 @@ pub fn gen_settings<'a>(
     gen_frame_header(
         buf,
         &FrameHeader {
-            payload_len: 6 * 6,
+            payload_len: 6 * 8,
             frame_type: FrameType::Settings,
             flags: 0,
             stream_id: 0,
@@ -89,6 +89,10 @@ pub fn gen_settings<'a>(
                 be_u32(settings.settings_max_frame_size),
                 be_u16(6),
                 be_u32(settings.settings_max_header_list_size),
+                be_u16(8),
+                be_u32(settings.settings_enable_connect_protocol as u32),
+                be_u16(9),
+                be_u32(settings.settings_no_rfc7540_priorities as u32),
             )),
             buf,
         )
@@ -123,7 +127,7 @@ pub fn gen_goaway<'a>(
     gen_frame_header(
         buf,
         &FrameHeader {
-            payload_len: 4,
+            payload_len: 8,
             frame_type: FrameType::GoAway,
             flags: 0,
             stream_id: 0,

@@ -147,6 +147,21 @@ pub enum Position {
     Server,
 }
 
+impl Position {
+    fn is_server(&self) -> bool {
+        match self {
+            Position::Client(_) => false,
+            Position::Server => true,
+        }
+    }
+    fn is_client(&self) -> bool {
+        match self {
+            Position::Client(_) => true,
+            Position::Server => false,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum BackendStatus {
     Connecting(String),
@@ -419,6 +434,7 @@ impl<'a, Front: SocketHandler> Endpoint for EndpointServer<'a, Front> {
     {
         // this may be used to forward H2<->H2 PushPromise
         todo!()
+        // self.0.start_stream(stream, context);
     }
 }
 impl<'a> Endpoint for EndpointClient<'a> {
@@ -540,11 +556,21 @@ pub enum StreamState {
     Recycle,
 }
 
+impl StreamState {
+    fn is_open(&self) -> bool {
+        match self {
+            StreamState::Idle | StreamState::Recycle => false,
+            _ => true,
+        }
+    }
+}
+
 pub struct Stream {
     // pub request_id: Ulid,
     pub window: i32,
     pub attempts: u8,
     pub state: StreamState,
+    pub received_end_of_stream: bool,
     pub front: GenericHttpStream,
     pub back: GenericHttpStream,
     pub context: HttpContext,
@@ -574,6 +600,7 @@ impl Stream {
             state: StreamState::Idle,
             attempts: 0,
             window: window as i32,
+            received_end_of_stream: false,
             front: GenericHttpStream::new(kawa::Kind::Request, kawa::Buffer::new(front_buffer)),
             back: GenericHttpStream::new(kawa::Kind::Response, kawa::Buffer::new(back_buffer)),
             context,
@@ -1188,6 +1215,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
 
                                 BE::Backend(_) => {}
                                 BE::RetrieveClusterError(_) => unreachable!(),
+                                // TCP specific error
                                 BE::NotFound(_) => unreachable!(),
                             }
                         }
@@ -1203,6 +1231,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
     }
 
     fn update_readiness(&mut self, token: Token, events: Ready) {
+        println!("EVENTS: {events:?} on {token:?}");
         if token == self.frontend_token {
             self.frontend.readiness_mut().event |= events;
         } else if let Some(c) = self.router.backends.get_mut(&token) {
@@ -1362,7 +1391,6 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 // println!("SUCCESS: session {token:?} was removed!");
             }
         }
-        use std::io::Write;
         let s = match &mut self.frontend {
             Connection::H1(c) => &mut c.socket,
             Connection::H2(c) => &mut c.socket,
@@ -1372,15 +1400,15 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         println_!("socket: {size} {status:?} {:?}", &b[..size]);
         for stream in &mut self.context.streams {
             for kawa in [&mut stream.front, &mut stream.back] {
-                debug_kawa(kawa);
-                kawa.prepare(&mut kawa::h1::BlockConverter);
-                let out = kawa.as_io_slice();
-                let mut writer = std::io::BufWriter::new(Vec::new());
-                let amount = writer.write_vectored(&out).unwrap();
-                println_!(
-                    "amount: {amount}\n{}",
-                    String::from_utf8_lossy(writer.buffer())
-                );
+                kawa::debug_kawa(kawa);
+                // kawa.prepare(&mut kawa::h1::BlockConverter);
+                // let out = kawa.as_io_slice();
+                // let mut writer = std::io::BufWriter::new(Vec::new());
+                // let amount = writer.write_vectored(&out).unwrap();
+                // println_!(
+                //     "amount: {amount}\n{}",
+                //     String::from_utf8_lossy(writer.buffer())
+                // );
             }
         }
     }
