@@ -68,6 +68,26 @@ pub fn error_code_to_str(error_code: u32) -> &'static str {
     }
 }
 
+pub fn str_to_error_code(str: &str) -> H2Error {
+    match str {
+        "NO_ERROR" => H2Error::NoError,
+        "PROTOCOL_ERROR" => H2Error::ProtocolError,
+        "INTERNAL_ERROR" => H2Error::InternalError,
+        "FLOW_CONTROL_ERROR" => H2Error::FlowControlError,
+        "SETTINGS_TIMEOUT" => H2Error::SettingsTimeout,
+        "STREAM_CLOSED" => H2Error::StreamClosed,
+        "FRAME_SIZE_ERROR" => H2Error::FrameSizeError,
+        "REFUSED_STREAM" => H2Error::RefusedStream,
+        "CANCEL" => H2Error::Cancel,
+        "COMPRESSION_ERROR" => H2Error::CompressionError,
+        "CONNECT_ERROR" => H2Error::ConnectError,
+        "ENHANCE_YOUR_CALM" => H2Error::EnhanceYourCalm,
+        "INADEQUATE_SECURITY" => H2Error::InadequateSecurity,
+        "HTTP_1_1_REQUIRED" => H2Error::HTTP11Required,
+        _ => H2Error::InternalError,
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ParserError<'a> {
     pub input: &'a [u8],
@@ -566,15 +586,19 @@ pub fn push_promise_frame<'a>(
 #[derive(Clone, Debug, PartialEq)]
 pub struct Ping {
     pub payload: [u8; 8],
+    pub ack: bool,
 }
 
 pub fn ping_frame<'a>(
     input: &'a [u8],
-    _header: &FrameHeader,
+    header: &FrameHeader,
 ) -> IResult<&'a [u8], Frame, ParserError<'a>> {
     let (i, data) = take(8usize)(input)?;
 
-    let mut p = Ping { payload: [0; 8] };
+    let mut p = Ping {
+        payload: [0; 8],
+        ack: header.flags & 1 != 0,
+    };
     p.payload[..8].copy_from_slice(&data[..8]);
 
     Ok((i, Frame::Ping(p)))

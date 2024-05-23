@@ -37,7 +37,11 @@ use crate::{
     StateResult,
 };
 
-pub use crate::protocol::mux::{h1::ConnectionH1, h2::ConnectionH2};
+pub use crate::protocol::mux::{
+    h1::ConnectionH1,
+    h2::ConnectionH2,
+    parser::{error_code_to_str, H2Error},
+};
 
 #[macro_export]
 macro_rules! println_ {
@@ -127,15 +131,18 @@ fn set_default_answer(stream: &mut Stream, readiness: &mut Readiness, code: u16)
 
 /// Forcefully terminates a kawa message by setting the "end_stream" flag and setting the parsing_phase to Error.
 /// An H2 converter will produce an RstStream frame.
-fn forcefully_terminate_answer(stream: &mut Stream, readiness: &mut Readiness) {
+fn forcefully_terminate_answer(stream: &mut Stream, readiness: &mut Readiness, error: H2Error) {
     let kawa = &mut stream.back;
-    kawa.push_block(kawa::Block::Flags(kawa::Flags {
-        end_body: false,
-        end_chunk: false,
-        end_header: false,
-        end_stream: true,
-    }));
-    kawa.parsing_phase.error("Termination".into());
+    kawa.out.clear();
+    kawa.blocks.clear();
+    // kawa.push_block(kawa::Block::Flags(kawa::Flags {
+    //     end_body: false,
+    //     end_chunk: false,
+    //     end_header: false,
+    //     end_stream: true,
+    // }));
+    kawa.parsing_phase
+        .error(error_code_to_str(error as u32).into());
     debug_kawa(kawa);
     stream.state = StreamState::Unlinked;
     readiness.interest.insert(Ready::WRITABLE);
@@ -1312,7 +1319,11 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                             should_write = true;
                         } else {
                             println!("Stream waiting for end of response, forcefully terminate it");
-                            forcefully_terminate_answer(stream, front_readiness);
+                            forcefully_terminate_answer(
+                                stream,
+                                front_readiness,
+                                H2Error::InternalError,
+                            );
                             should_write = true;
                         }
                         backend.end_stream(stream_id, &mut self.context);

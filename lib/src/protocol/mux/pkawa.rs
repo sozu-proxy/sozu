@@ -1,4 +1,4 @@
-use std::{io::Write, str::from_utf8_unchecked};
+use std::{io::Write, str::from_utf8};
 
 use kawa::{
     h1::ParserCallbacks, repr::Slice, Block, BodySize, Flags, Kind, Pair, ParsingPhase, StatusLine,
@@ -9,9 +9,27 @@ use crate::{
     pool::Checkout,
     protocol::{
         http::parser::compare_no_case,
-        mux::{h2::Prioriser, parser::PriorityPart, GenericHttpStream, StreamId},
+        mux::{
+            h2::Prioriser,
+            parser::{H2Error, PriorityPart},
+            GenericHttpStream, StreamId,
+        },
     },
 };
+
+trait AdHocStore {
+    fn len(&self) -> usize;
+}
+impl AdHocStore for Store {
+    fn len(&self) -> usize {
+        match self {
+            Store::Empty => 0,
+            Store::Slice(slice) | Store::Detached(slice) => slice.len(),
+            Store::Static(s) => s.len(),
+            Store::Alloc(a, i) => a.len() - *i as usize,
+        }
+    }
+}
 
 pub fn handle_header<C>(
     decoder: &mut hpack::Decoder,
@@ -21,7 +39,8 @@ pub fn handle_header<C>(
     input: &[u8],
     end_stream: bool,
     callbacks: &mut C,
-) where
+) -> Result<(), (H2Error, bool)>
+where
     C: ParserCallbacks<Checkout>,
 {
     if !kawa.is_initial() {
@@ -34,6 +53,8 @@ pub fn handle_header<C>(
             let mut authority = Store::Empty;
             let mut path = Store::Empty;
             let mut scheme = Store::Empty;
+            let mut invalid_headers = false;
+            let mut regular_headers = false;
             let decode_status = decoder.decode_with_cb(input, |k, v| {
                 let start = kawa.storage.end as u32;
                 kawa.storage.write_all(&v).unwrap();
@@ -45,28 +66,49 @@ pub fn handle_header<C>(
                 });
 
                 if compare_no_case(&k, b":method") {
+                    if !method.is_empty() || regular_headers {
+                        invalid_headers = true;
+                    }
                     method = val;
                 } else if compare_no_case(&k, b":scheme") {
+                    if !scheme.is_empty() || regular_headers {
+                        invalid_headers = true;
+                    }
                     scheme = val;
                 } else if compare_no_case(&k, b":path") {
+                    if !path.is_empty() || regular_headers {
+                        invalid_headers = true;
+                    }
                     path = val;
                 } else if compare_no_case(&k, b":authority") {
+                    if !authority.is_empty() || regular_headers {
+                        invalid_headers = true;
+                    }
                     authority = val;
+                } else if k.starts_with(b":") {
+                    invalid_headers = true;
                 } else if compare_no_case(&k, b"cookie---") {
+                    regular_headers = true;
                     todo!("cookies should be split in pairs");
-                } else if compare_no_case(&k, b"priority") {
-                    todo!("decode priority");
-                    prioriser.push_priority(
-                        stream_id,
-                        PriorityPart::Rfc9218 {
-                            urgency: todo!(),
-                            incremental: todo!(),
-                        },
-                    )
                 } else {
+                    regular_headers = true;
                     if compare_no_case(&k, b"content-length") {
-                        let length = unsafe { from_utf8_unchecked(&v).parse::<usize>().unwrap() };
-                        kawa.body_size = BodySize::Length(length);
+                        if let Some(length) =
+                            from_utf8(&v).ok().and_then(|v| v.parse::<usize>().ok())
+                        {
+                            kawa.body_size = BodySize::Length(length);
+                        } else {
+                            invalid_headers = true;
+                        }
+                    } else if compare_no_case(&k, b"priority") {
+                        todo!("decode priority");
+                        prioriser.push_priority(
+                            stream_id,
+                            PriorityPart::Rfc9218 {
+                                urgency: todo!(),
+                                incremental: todo!(),
+                            },
+                        );
                     }
                     kawa.storage.write_all(&k).unwrap();
                     let key = Store::Slice(Slice {
@@ -78,11 +120,16 @@ pub fn handle_header<C>(
             });
             if let Err(error) = decode_status {
                 println!("INVALID FRAGMENT: {error:?}");
-                kawa.parsing_phase.error("Invalid header fragment".into());
+                return Err((H2Error::CompressionError, true));
             }
-            if method.is_empty() || authority.is_empty() || path.is_empty() {
-                println!("MISSING PSEUDO HEADERS");
-                kawa.parsing_phase.error("Missing pseudo headers".into());
+            if invalid_headers
+                || method.len() == 0
+                || authority.len() == 0
+                || path.len() == 0
+                || scheme.len() == 0
+            {
+                println!("INVALID HEADERS");
+                return Err((H2Error::ProtocolError, false));
             }
             // uri is only used by H1 statusline, in most cases it only consists of the path
             // a better algorithm should be used though
@@ -107,6 +154,8 @@ pub fn handle_header<C>(
         Kind::Response => {
             let mut code = 0;
             let mut status = Store::Empty;
+            let mut invalid_headers = false;
+            let mut regular_headers = false;
             let decode_status = decoder.decode_with_cb(input, |k, v| {
                 let start = kawa.storage.end as u32;
                 kawa.storage.write_all(&v).unwrap();
@@ -118,9 +167,21 @@ pub fn handle_header<C>(
                 });
 
                 if compare_no_case(&k, b":status") {
+                    if !status.is_empty() || regular_headers {
+                        invalid_headers = true;
+                    }
                     status = val;
-                    code = unsafe { from_utf8_unchecked(&v).parse::<u16>().ok().unwrap() }
+                    if let Some(parsed_code) =
+                        from_utf8(&v).ok().and_then(|v| v.parse::<u16>().ok())
+                    {
+                        code = parsed_code;
+                    } else {
+                        invalid_headers = true;
+                    }
+                } else if k.starts_with(b":") {
+                    invalid_headers = true;
                 } else {
+                    regular_headers = true;
                     kawa.storage.write_all(&k).unwrap();
                     let key = Store::Slice(Slice {
                         start: start + len_val,
@@ -131,11 +192,11 @@ pub fn handle_header<C>(
             });
             if let Err(error) = decode_status {
                 println!("INVALID FRAGMENT: {error:?}");
-                kawa.parsing_phase.error("Invalid header fragment".into());
+                return Err((H2Error::CompressionError, true));
             }
-            if status.is_empty() {
-                println!("MISSING PSEUDO HEADERS");
-                kawa.parsing_phase.error("Missing pseudo headers".into());
+            if invalid_headers || status.len() == 0 {
+                println!("INVALID HEADERS");
+                return Err((H2Error::ProtocolError, false));
             }
             StatusLine::Response {
                 version: Version::V20,
@@ -153,9 +214,6 @@ pub fn handle_header<C>(
         kawa.storage.start, kawa.storage.head, kawa.storage.end
     );
 
-    if kawa.is_error() {
-        return;
-    }
     callbacks.on_headers(kawa);
 
     if end_stream {
@@ -176,7 +234,7 @@ pub fn handle_header<C>(
     }));
 
     if kawa.parsing_phase == ParsingPhase::Terminated {
-        return;
+        return Ok(());
     }
 
     kawa.parsing_phase = match kawa.body_size {
@@ -185,6 +243,7 @@ pub fn handle_header<C>(
         BodySize::Length(_) => ParsingPhase::Body,
         BodySize::Empty => ParsingPhase::Chunks { first: true },
     };
+    Ok(())
 }
 
 pub fn handle_trailer(
@@ -192,32 +251,38 @@ pub fn handle_trailer(
     input: &[u8],
     end_stream: bool,
     decoder: &mut hpack::Decoder,
-) {
-    decoder
-        .decode_with_cb(input, |k, v| {
-            let start = kawa.storage.end as u32;
-            kawa.storage.write_all(&k).unwrap();
-            kawa.storage.write_all(&v).unwrap();
-            let len_key = k.len() as u32;
-            let len_val = v.len() as u32;
-            let key = Store::Slice(Slice {
-                start,
-                len: len_key,
-            });
-            let val = Store::Slice(Slice {
-                start: start + len_key,
-                len: len_val,
-            });
-            kawa.push_block(Block::Header(Pair { key, val }));
-        })
-        .unwrap();
+) -> Result<(), (H2Error, bool)> {
+    if !end_stream {
+        return Err((H2Error::ProtocolError, false));
+    }
+    let decode_status = decoder.decode_with_cb(input, |k, v| {
+        let start = kawa.storage.end as u32;
+        kawa.storage.write_all(&k).unwrap();
+        kawa.storage.write_all(&v).unwrap();
+        let len_key = k.len() as u32;
+        let len_val = v.len() as u32;
+        let key = Store::Slice(Slice {
+            start,
+            len: len_key,
+        });
+        let val = Store::Slice(Slice {
+            start: start + len_key,
+            len: len_val,
+        });
+        kawa.push_block(Block::Header(Pair { key, val }));
+    });
 
-    // assert!(end_stream);
+    if let Err(error) = decode_status {
+        println!("INVALID FRAGMENT: {error:?}");
+        return Err((H2Error::CompressionError, true));
+    }
+
     kawa.push_block(Block::Flags(Flags {
-        end_body: end_stream,
+        end_body: false,
         end_chunk: false,
         end_header: true,
-        end_stream,
+        end_stream: true,
     }));
     kawa.parsing_phase = ParsingPhase::Terminated;
+    Ok(())
 }
