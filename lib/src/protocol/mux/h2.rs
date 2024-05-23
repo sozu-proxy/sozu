@@ -9,7 +9,7 @@ use crate::{
         converter, debug_kawa, forcefully_terminate_answer,
         parser::{
             self, error_code_to_str, Frame, FrameHeader, FrameType, H2Error, Headers, ParserError,
-            ParserErrorKind,
+            ParserErrorKind, StreamDependency, WindowUpdate,
         },
         pkawa, serializer, set_default_answer, update_readiness_after_read,
         update_readiness_after_write, BackendStatus, Context, Endpoint, GenericHttpStream,
@@ -84,8 +84,25 @@ impl Prioriser {
     pub fn new() -> Self {
         Self {}
     }
-    pub fn push_priority(&mut self, stream_id: StreamId, priority: parser::PriorityPart) {
-        println!("PRIORITY REQUEST FOR {stream_id}: {priority:?}");
+    pub fn push_priority(&mut self, stream_id: StreamId, priority: parser::PriorityPart) -> bool {
+        println_!("PRIORITY REQUEST FOR {stream_id}: {priority:?}");
+        match priority {
+            parser::PriorityPart::Rfc7540 {
+                stream_dependency,
+                weight,
+            } => {
+                if stream_dependency.stream_id == stream_id {
+                    println_!("STREAM CAN'T DEPEND ON ITSELF");
+                    true
+                } else {
+                    false
+                }
+            }
+            parser::PriorityPart::Rfc9218 {
+                urgency,
+                incremental,
+            } => false,
+        }
     }
 }
 
@@ -289,13 +306,18 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         let read_stream = if stream_id == 0 {
                             H2StreamId::Zero
                         } else if let Some(global_stream_id) = self.streams.get(&stream_id) {
+                            let allowed_on_half_closed = header.frame_type
+                                == FrameType::WindowUpdate
+                                || header.frame_type == FrameType::Priority;
                             let stream = &context.streams[*global_stream_id];
                             println_!(
                                 "REQUESTING EXISTING STREAM {stream_id}: {}/{:?}",
                                 stream.received_end_of_stream,
                                 stream.state
                             );
-                            if stream.received_end_of_stream || !stream.state.is_open() {
+                            if !allowed_on_half_closed
+                                && (stream.received_end_of_stream || !stream.state.is_open())
+                            {
                                 return self.goaway(H2Error::StreamClosed);
                             }
                             if header.frame_type == FrameType::Data {
@@ -318,7 +340,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                                     Some(_) => {}
                                     None => return self.goaway(H2Error::InternalError),
                                 }
-                            } else if header.frame_type != FrameType::Priority {
+                            } else if header.frame_type != FrameType::Priority
+                                && header.frame_type != FrameType::WindowUpdate
+                            {
                                 println_!(
                                     "ONLY HEADERS AND PRIORITY CAN BE RECEIVED ON IDLE/CLOSED STREAMS"
                                 );
@@ -555,7 +579,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                             Position::Client(_) => {}
                             Position::Server => {
                                 // mark stream as reusable
-                                println_!("Recycle stream: {global_stream_id}");
+                                println_!("Recycle1 stream: {global_stream_id}");
                                 // ACCESS LOG
                                 stream.generate_access_log(
                                     false,
@@ -683,12 +707,25 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 // can this fail?
                 let stream_id = headers.stream_id;
                 let global_stream_id = *self.streams.get(&stream_id).unwrap();
+
+                if let Some(priority) = &headers.priority {
+                    if self.prioriser.push_priority(stream_id, priority.clone()) {
+                        self.reset_stream(
+                            global_stream_id,
+                            context,
+                            endpoint,
+                            H2Error::ProtocolError,
+                        );
+                        return MuxResult::Continue;
+                    }
+                }
+
                 let kawa = &mut self.zero;
                 let buffer = headers.header_block_fragment.data(kawa.storage.buffer());
                 let stream = &mut context.streams[global_stream_id];
                 let parts = &mut stream.split(&self.position);
                 let was_initial = parts.rbuffer.is_initial();
-                pkawa::handle_header(
+                let status = pkawa::handle_header(
                     &mut self.decoder,
                     &mut self.prioriser,
                     stream_id,
@@ -698,8 +735,12 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     parts.context,
                 );
                 kawa.storage.clear();
-                if parts.rbuffer.is_error() {
-                    return self.goaway(H2Error::CompressionError);
+                if let Err((error, global)) = status {
+                    if global {
+                        return self.goaway(error);
+                    } else {
+                        return self.reset_stream(global_stream_id, context, endpoint, error);
+                    }
                 }
                 debug_kawa(parts.rbuffer);
                 stream.received_end_of_stream |= headers.end_stream;
@@ -729,9 +770,23 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     return self.goaway(H2Error::ProtocolError);
                 }
             },
-            Frame::Priority(priority) => self
-                .prioriser
-                .push_priority(priority.stream_id, priority.inner),
+            Frame::Priority(priority) => {
+                if self
+                    .prioriser
+                    .push_priority(priority.stream_id, priority.inner)
+                {
+                    if let Some(global_stream_id) = self.streams.get(&priority.stream_id) {
+                        return self.reset_stream(
+                            *global_stream_id,
+                            context,
+                            endpoint,
+                            H2Error::ProtocolError,
+                        );
+                    } else {
+                        return self.goaway(H2Error::ProtocolError);
+                    }
+                }
+            }
             Frame::RstStream(rst_stream) => {
                 println_!(
                     "RstStream({} -> {})",
@@ -766,18 +821,23 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     return MuxResult::Continue;
                 }
                 for setting in settings.settings {
+                    let v = setting.value;
+                    let mut is_error = false;
                     #[rustfmt::skip]
                     let _ = match setting.identifier {
-                        1 => self.peer_settings.settings_header_table_size = setting.value,
-                        2 => self.peer_settings.settings_enable_push = setting.value == 1,
-                        3 => self.peer_settings.settings_max_concurrent_streams = setting.value,
-                        4 => self.peer_settings.settings_initial_window_size = setting.value,
-                        5 => self.peer_settings.settings_max_frame_size = setting.value,
-                        6 => self.peer_settings.settings_max_header_list_size = setting.value,
-                        8 => self.peer_settings.settings_enable_connect_protocol = setting.value == 1,
-                        9 => self.peer_settings.settings_no_rfc7540_priorities = setting.value == 1,
+                        1 => { self.peer_settings.settings_header_table_size = v },
+                        2 => { self.peer_settings.settings_enable_push = v == 1;                is_error |= v > 1 },
+                        3 => { self.peer_settings.settings_max_concurrent_streams = v },
+                        4 => { self.peer_settings.settings_initial_window_size = v;             is_error |= v >= 1<<31 },
+                        5 => { self.peer_settings.settings_max_frame_size = v;                  is_error |= v >= 1<<24 || v < 1<<14 },
+                        6 => { self.peer_settings.settings_max_header_list_size = v },
+                        8 => { self.peer_settings.settings_enable_connect_protocol = v == 1;    is_error |= v > 1 },
+                        9 => { self.peer_settings.settings_no_rfc7540_priorities = v == 1;      is_error |= v > 1 },
                         other => println!("unknown setting_id: {other}, we MUST ignore this"),
                     };
+                    if is_error {
+                        return self.goaway(H2Error::ProtocolError);
+                    }
                 }
                 println_!("{:#?}", self.peer_settings);
 
@@ -792,6 +852,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 self.expect_write = Some(H2StreamId::Zero);
             }
             Frame::Ping(ping) => {
+                if ping.ack {
+                    return MuxResult::Continue;
+                }
                 let kawa = &mut self.zero;
                 match serializer::gen_ping_acknolegment(kawa.storage.space(), &ping.payload) {
                     Ok((_, size)) => kawa.storage.fill(size),
@@ -812,21 +875,36 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 );
                 // return self.goaway(H2Error::NoError);
             }
-            Frame::WindowUpdate(update) => {
-                let window = if update.stream_id == 0 {
-                    &mut self.window
-                } else {
-                    if let Some(global_stream_id) = self.streams.get(&update.stream_id) {
-                        &mut context.streams[*global_stream_id].window
+            Frame::WindowUpdate(WindowUpdate {
+                stream_id,
+                increment,
+            }) => {
+                let increment = increment as i32;
+                if stream_id == 0 {
+                    if increment > i32::MAX - self.window {
+                        return self.goaway(H2Error::FlowControlError);
                     } else {
-                        unreachable!()
+                        self.window += increment;
+                    }
+                } else {
+                    if let Some(global_stream_id) = self.streams.get(&stream_id) {
+                        let stream = &mut context.streams[*global_stream_id];
+                        if increment > i32::MAX - stream.window {
+                            return self.reset_stream(
+                                *global_stream_id,
+                                context,
+                                endpoint,
+                                H2Error::FlowControlError,
+                            );
+                        } else {
+                            stream.window += increment;
+                        }
+                    } else {
+                        println_!(
+                            "Ignoring window update on closed stream {stream_id}: {increment}"
+                        );
                     }
                 };
-                if update.increment as i32 > i32::MAX - *window {
-                    return self.goaway(H2Error::FlowControlError);
-                } else {
-                    *window += update.increment as i32;
-                }
             }
             Frame::Continuation(_) => unreachable!(),
         }
@@ -867,6 +945,27 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         }
     }
 
+    pub fn reset_stream<E, L>(
+        &mut self,
+        stream_id: GlobalStreamId,
+        context: &mut Context<L>,
+        mut endpoint: E,
+        error: H2Error,
+    ) -> MuxResult
+    where
+        E: Endpoint,
+        L: ListenerHandler + L7ListenerHandler,
+    {
+        let stream = &mut context.streams[stream_id];
+        println_!("reset H2 stream {stream_id}: {:#?}", stream.context);
+        let old_state = std::mem::replace(&mut stream.state, StreamState::Unlinked);
+        forcefully_terminate_answer(stream, &mut self.readiness, error);
+        if let StreamState::Linked(token) = old_state {
+            endpoint.end_stream(token, stream_id, context);
+        }
+        MuxResult::Continue
+    }
+
     pub fn end_stream<L>(&mut self, stream: GlobalStreamId, context: &mut Context<L>)
     where
         L: ListenerHandler + L7ListenerHandler,
@@ -878,6 +977,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 for (stream_id, global_stream_id) in &self.streams {
                     if *global_stream_id == stream {
                         let id = *stream_id;
+                        // if the stream is not in a closed state we should probably send an
+                        // RST_STREAM frame here. We also need to handle frames coming from
+                        // the backend on this stream after it was closed
                         self.streams.remove(&id);
                         return;
                     }
@@ -893,7 +995,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         // if the answer is not terminated we send an RstStream to properly clean the stream
                         // if it is terminated, we finish the transfer, the backend is not necessary anymore
                         if !stream.back.is_terminated() {
-                            forcefully_terminate_answer(stream, &mut self.readiness);
+                            forcefully_terminate_answer(
+                                stream,
+                                &mut self.readiness,
+                                H2Error::InternalError,
+                            );
                         } else {
                             stream.state = StreamState::Unlinked;
                             self.readiness.interest.insert(Ready::WRITABLE);

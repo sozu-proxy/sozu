@@ -1,13 +1,17 @@
 use std::str::from_utf8_unchecked;
 
-use kawa::{AsBuffer, Block, BlockConverter, Chunk, Flags, Kawa, Pair, StatusLine, Store};
+use kawa::{
+    AsBuffer, Block, BlockConverter, Chunk, Flags, Kawa, Pair, ParsingErrorKind, ParsingPhase,
+    StatusLine, Store,
+};
 
-use crate::protocol::http::parser::compare_no_case;
-
-use super::{
-    parser::{FrameHeader, FrameType, H2Error},
-    serializer::{gen_frame_header, gen_rst_stream},
-    StreamId,
+use crate::protocol::{
+    http::parser::compare_no_case,
+    mux::{
+        parser::{str_to_error_code, FrameHeader, FrameType, H2Error},
+        serializer::{gen_frame_header, gen_rst_stream},
+        StreamId,
+    },
 };
 
 pub struct H2BlockConverter<'a> {
@@ -17,6 +21,26 @@ pub struct H2BlockConverter<'a> {
 }
 
 impl<'a, T: AsBuffer> BlockConverter<T> for H2BlockConverter<'a> {
+    fn initialize(&mut self, kawa: &mut Kawa<T>) {
+        // This is very ugly... we may add a h2 variant in kawa::ParsingErrorKind
+        match kawa.parsing_phase {
+            ParsingPhase::Error {
+                kind: ParsingErrorKind::Processing { message },
+                ..
+            } => {
+                let error = str_to_error_code(message);
+                let mut frame = [0; 13];
+                gen_rst_stream(&mut frame, self.stream_id, error).unwrap();
+                kawa.push_out(Store::from_slice(&frame));
+            }
+            ParsingPhase::Error { .. } => {
+                let mut frame = [0; 13];
+                gen_rst_stream(&mut frame, self.stream_id, H2Error::InternalError).unwrap();
+                kawa.push_out(Store::from_slice(&frame));
+            }
+            _ => {}
+        }
+    }
     fn call(&mut self, block: Block, kawa: &mut Kawa<T>) -> bool {
         let buffer = kawa.storage.buffer();
         match block {
@@ -140,24 +164,18 @@ impl<'a, T: AsBuffer> BlockConverter<T> for H2BlockConverter<'a> {
                     kawa.push_out(Store::from_slice(&header));
                     kawa.push_out(Store::Alloc(payload.into_boxed_slice(), 0));
                 } else if end_stream {
-                    if kawa.is_error() {
-                        let mut frame = [0; 13];
-                        gen_rst_stream(&mut frame, self.stream_id, H2Error::InternalError).unwrap();
-                        kawa.push_out(Store::from_slice(&frame));
-                    } else {
-                        let mut header = [0; 9];
-                        gen_frame_header(
-                            &mut header,
-                            &FrameHeader {
-                                payload_len: 0,
-                                frame_type: FrameType::Data,
-                                flags: 1,
-                                stream_id: self.stream_id,
-                            },
-                        )
-                        .unwrap();
-                        kawa.push_out(Store::from_slice(&header));
-                    }
+                    let mut header = [0; 9];
+                    gen_frame_header(
+                        &mut header,
+                        &FrameHeader {
+                            payload_len: 0,
+                            frame_type: FrameType::Data,
+                            flags: 1,
+                            stream_id: self.stream_id,
+                        },
+                    )
+                    .unwrap();
+                    kawa.push_out(Store::from_slice(&header));
                 }
                 if end_header || end_stream {
                     kawa.push_delimiter()

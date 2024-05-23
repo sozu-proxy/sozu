@@ -3,9 +3,7 @@ use sozu_command::ready::Ready;
 use crate::{
     println_,
     protocol::mux::{
-        debug_kawa, forcefully_terminate_answer, set_default_answer, update_readiness_after_read,
-        update_readiness_after_write, BackendStatus, Context, Endpoint, GlobalStreamId, MuxResult,
-        Position, StreamState,
+        debug_kawa, forcefully_terminate_answer, parser::H2Error, set_default_answer, update_readiness_after_read, update_readiness_after_write, BackendStatus, Context, Endpoint, GlobalStreamId, MuxResult, Position, StreamState
     },
     socket::SocketHandler,
     timer::TimeoutContainer,
@@ -226,6 +224,9 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             Position::Client(BackendStatus::Connected(cluster_id))
             | Position::Client(BackendStatus::Connecting(cluster_id)) => {
                 self.stream = usize::MAX;
+                // keep alive should probably be used only if the http context is fully reset
+                // in case end_stream occurs due to an error the connection state is probably
+                // unrecoverable and should be terminated
                 if stream_context.keep_alive_backend {
                     self.position =
                         Position::Client(BackendStatus::KeepAlive(std::mem::take(cluster_id)))
@@ -241,7 +242,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                     // if the answer is not terminated we send an RstStream to properly clean the stream
                     // if it is terminated, we finish the transfer, the backend is not necessary anymore
                     if !stream.back.is_terminated() {
-                        forcefully_terminate_answer(stream, &mut self.readiness);
+                        forcefully_terminate_answer(stream, &mut self.readiness, H2Error::InternalError);
                     } else {
                         stream.state = StreamState::Unlinked;
                         self.readiness.interest.insert(Ready::WRITABLE);
