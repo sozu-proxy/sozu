@@ -6,7 +6,7 @@ use cookie_factory::{
     GenError,
 };
 
-use super::{
+use crate::protocol::mux::{
     h2::H2Settings,
     parser::{FrameHeader, FrameType, H2Error},
 };
