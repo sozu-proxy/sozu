@@ -1701,7 +1701,7 @@ dependencies = [
 
 [[package]]
 name = "sozu"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "clap",
  "jemallocator",
@@ -1724,7 +1724,7 @@ dependencies = [
 
 [[package]]
 name = "sozu-command-lib"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "hex",
  "libc",
@@ -1752,7 +1752,7 @@ dependencies = [
 
 [[package]]
 name = "sozu-e2e"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "futures",
  "hyper",
@@ -1768,7 +1768,7 @@ dependencies = [
 
 [[package]]
 name = "sozu-lib"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "cookie-factory",
