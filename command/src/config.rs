@@ -919,7 +919,11 @@ impl HttpFrontendConfig {
                         certificate: self.certificate.clone().unwrap(),
                         certificate_chain: self.certificate_chain.clone().unwrap_or_default(),
                         versions: self.tls_versions.iter().map(|v| *v as i32).collect(),
-                        names: vec![self.hostname.clone()],
+                        // This field is used to override the certificate subject and san, we should not set it when
+                        // loading the configuration, as we may provide a wildcard certificate for a specific domain.
+                        // As a result, we will reject legit traffic for others domains as the certificate resolver will
+                        // not load twice the same certificate and then do not register the certificate for others domains.
+                        names: vec![],
                     },
                     expired_at: None,
                 })
