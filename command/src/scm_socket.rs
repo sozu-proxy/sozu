@@ -196,6 +196,7 @@ impl ScmSocket {
         let mut fd_count = 0;
         let received_fds = msg
             .cmsgs()
+            .map_err(|error| ScmSocketError::Receive(error.to_string()))?
             .filter_map(|cmsg| {
                 if let socket::ControlMessageOwned::ScmRights(s) = cmsg {
                     Some(s)
