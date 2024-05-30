@@ -17,20 +17,6 @@ use crate::{
     },
 };
 
-trait AdHocStore {
-    fn len(&self) -> usize;
-}
-impl AdHocStore for Store {
-    fn len(&self) -> usize {
-        match self {
-            Store::Empty => 0,
-            Store::Slice(slice) | Store::Detached(slice) => slice.len(),
-            Store::Static(s) => s.len(),
-            Store::Alloc(a, i) => a.len() - *i as usize,
-        }
-    }
-}
-
 pub fn handle_header<C>(
     decoder: &mut hpack::Decoder,
     prioriser: &mut Prioriser,
