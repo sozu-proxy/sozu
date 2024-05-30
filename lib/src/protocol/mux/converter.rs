@@ -15,6 +15,7 @@ use crate::protocol::{
 };
 
 pub struct H2BlockConverter<'a> {
+    pub window: i32,
     pub stream_id: StreamId,
     pub encoder: &'a mut hpack::Encoder<'static>,
     pub out: Vec<u8>,
@@ -122,12 +123,21 @@ impl<'a, T: AsBuffer> BlockConverter<T> for H2BlockConverter<'a> {
             }
             Block::Chunk(Chunk { data }) => {
                 let mut header = [0; 9];
-                let payload_len = match &data {
-                    Store::Empty => 0,
-                    Store::Detached(s) | Store::Slice(s) => s.len,
-                    Store::Static(s) => s.len() as u32,
-                    Store::Alloc(a, i) => a.len() as u32 - i,
+                let payload_len = data.len();
+                let (data, payload_len, can_continue) = if self.window >= payload_len as i32 {
+                    // the window is wide enought to send the entire chunk
+                    (data, payload_len as u32, true)
+                } else if self.window > 0 {
+                    // we split the chunk to fit in the window
+                    let (before, after) = data.split(self.window as usize);
+                    kawa.blocks.push_front(Block::Chunk(Chunk { data: after }));
+                    (before, self.window as u32, false)
+                } else {
+                    // the window can't take any more bytes, return the chunk to the blocks
+                    kawa.blocks.push_front(Block::Chunk(Chunk { data }));
+                    return false;
                 };
+                self.window -= payload_len as i32;
                 gen_frame_header(
                     &mut header,
                     &FrameHeader {
@@ -140,7 +150,8 @@ impl<'a, T: AsBuffer> BlockConverter<T> for H2BlockConverter<'a> {
                 .unwrap();
                 kawa.push_out(Store::from_slice(&header));
                 kawa.push_out(data);
-                kawa.push_delimiter()
+                kawa.push_delimiter();
+                return can_continue;
             }
             Block::Flags(Flags {
                 end_header,

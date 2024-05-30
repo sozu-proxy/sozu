@@ -275,7 +275,7 @@ impl<Front: SocketHandler> Connection<Front> {
             state: H2State::ClientPreface,
             streams: HashMap::new(),
             timeout_container,
-            window: 1 << 16,
+            window: (1 << 16) - 1,
             zero: kawa::Kawa::new(kawa::Kind::Request, kawa::Buffer::new(buffer)),
         }))
     }
@@ -306,7 +306,7 @@ impl<Front: SocketHandler> Connection<Front> {
             state: H2State::ClientPreface,
             streams: HashMap::new(),
             timeout_container,
-            window: 1 << 16,
+            window: (1 << 16) - 1,
             zero: kawa::Kawa::new(kawa::Kind::Request, kawa::Buffer::new(buffer)),
         }))
     }
@@ -586,6 +586,7 @@ pub struct Stream {
 /// This struct allows to mutably borrow the read and write buffers (dependant on the position)
 /// as well as the context of a Stream at the same time
 pub struct StreamParts<'a> {
+    pub window: &'a mut i32,
     pub rbuffer: &'a mut GenericHttpStream,
     pub wbuffer: &'a mut GenericHttpStream,
     pub context: &'a mut HttpContext,
@@ -616,11 +617,13 @@ impl Stream {
     pub fn split(&mut self, position: &Position) -> StreamParts<'_> {
         match position {
             Position::Client(_) => StreamParts {
+                window: &mut self.window,
                 rbuffer: &mut self.back,
                 wbuffer: &mut self.front,
                 context: &mut self.context,
             },
             Position::Server => StreamParts {
+                window: &mut self.window,
                 rbuffer: &mut self.front,
                 wbuffer: &mut self.back,
                 context: &mut self.context,
