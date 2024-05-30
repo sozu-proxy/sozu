@@ -33,7 +33,7 @@ cookie-factory = "^0.3.3"
 hdrhistogram = "^7.5.4"
 hex = "^0.4.3"
 hpack = "^0.3.0"
-idna = "^1.0.2"
+idna = "^1.0.3"
 kawa = { version = "^0.6.7", default-features = false }
 libc = "^0.2.159"
 memchr = "^2.7.4"

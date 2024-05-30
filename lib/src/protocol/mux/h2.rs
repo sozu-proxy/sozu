@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{cmp::min, collections::HashMap};
 
 use rusty_ulid::Ulid;
 use sozu_command::ready::Ready;
@@ -9,7 +9,7 @@ use crate::{
         converter, debug_kawa, forcefully_terminate_answer,
         parser::{
             self, error_code_to_str, Frame, FrameHeader, FrameType, H2Error, Headers, ParserError,
-            ParserErrorKind, StreamDependency, WindowUpdate,
+            ParserErrorKind, WindowUpdate,
         },
         pkawa, serializer, set_default_answer, update_readiness_after_read,
         update_readiness_after_write, BackendStatus, Context, Endpoint, GenericHttpStream,
@@ -127,13 +127,13 @@ pub struct ConnectionH2<Front: SocketHandler> {
 impl<Front: SocketHandler> std::fmt::Debug for ConnectionH2<Front> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConnectionH2")
-            .field("expect", &self.expect_read)
             .field("position", &self.position)
+            .field("state", &self.state)
+            .field("expect", &self.expect_read)
             .field("readiness", &self.readiness)
             .field("local_settings", &self.local_settings)
             .field("peer_settings", &self.peer_settings)
             .field("socket", &self.socket.socket_ref())
-            .field("state", &self.state)
             .field("streams", &self.streams)
             .field("zero", &self.zero.storage.meter(20))
             .field("window", &self.window)
@@ -185,15 +185,6 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                                     return self.force_disconnect();
                                 }
                             }
-                            // (
-                            //     H2State::Frame(FrameHeader {
-                            //         payload_len,
-                            //         frame_type: FrameType::Data,
-                            //         flags,
-                            //         stream_id,
-                            //     }),
-                            //     _,
-                            // ) => {}
                             _ => {}
                         }
                         return MuxResult::Continue;
@@ -340,9 +331,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                                     Some(_) => {}
                                     None => return self.goaway(H2Error::InternalError),
                                 }
-                            } else if header.frame_type != FrameType::Priority
-                                && header.frame_type != FrameType::WindowUpdate
-                            {
+                            } else if header.frame_type != FrameType::Priority {
                                 println_!(
                                     "ONLY HEADERS AND PRIORITY CAN BE RECEIVED ON IDLE/CLOSED STREAMS"
                                 );
@@ -546,6 +535,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 }
 
                 let mut converter = converter::H2BlockConverter {
+                    window: 0,
                     stream_id: 0,
                     encoder: &mut self.encoder,
                     out: Vec::new(),
@@ -557,10 +547,16 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 'outer: for stream_id in priorities {
                     let global_stream_id = *self.streams.get(stream_id).unwrap();
                     let stream = &mut context.streams[global_stream_id];
-                    let kawa = stream.wbuffer(&self.position);
+                    let parts = stream.split(&self.position);
+                    let kawa = parts.wbuffer;
                     if kawa.is_main_phase() || kawa.is_error() {
+                        let window = min(*parts.window, self.window);
+                        converter.window = window;
                         converter.stream_id = *stream_id;
                         kawa.prepare(&mut converter);
+                        let consumed = window - converter.window;
+                        *parts.window -= consumed;
+                        self.window -= consumed;
                         debug_kawa(kawa);
                     }
                     while !kawa.out.is_empty() {
@@ -828,7 +824,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         1 => { self.peer_settings.settings_header_table_size = v },
                         2 => { self.peer_settings.settings_enable_push = v == 1;                is_error |= v > 1 },
                         3 => { self.peer_settings.settings_max_concurrent_streams = v },
-                        4 => { self.peer_settings.settings_initial_window_size = v;             is_error |= v >= 1<<31 },
+                        4 => { is_error |= self.update_initial_window_size(v, context) },
                         5 => { self.peer_settings.settings_max_frame_size = v;                  is_error |= v >= 1<<24 || v < 1<<14 },
                         6 => { self.peer_settings.settings_max_header_list_size = v },
                         8 => { self.peer_settings.settings_enable_connect_protocol = v == 1;    is_error |= v > 1 },
@@ -881,23 +877,29 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             }) => {
                 let increment = increment as i32;
                 if stream_id == 0 {
-                    if increment > i32::MAX - self.window {
-                        return self.goaway(H2Error::FlowControlError);
+                    if let Some(window) = self.window.checked_add(increment) {
+                        if self.window <= 0 && window > 0 {
+                            self.readiness.interest.insert(Ready::WRITABLE);
+                        }
+                        self.window = window;
                     } else {
-                        self.window += increment;
+                        return self.goaway(H2Error::FlowControlError);
                     }
                 } else {
                     if let Some(global_stream_id) = self.streams.get(&stream_id) {
                         let stream = &mut context.streams[*global_stream_id];
-                        if increment > i32::MAX - stream.window {
+                        if let Some(window) = stream.window.checked_add(increment) {
+                            if stream.window <= 0 && window > 0 {
+                                self.readiness.interest.insert(Ready::WRITABLE);
+                            }
+                            stream.window = window;
+                        } else {
                             return self.reset_stream(
                                 *global_stream_id,
                                 context,
                                 endpoint,
                                 H2Error::FlowControlError,
                             );
-                        } else {
-                            stream.window += increment;
                         }
                     } else {
                         println_!(
@@ -909,6 +911,36 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             Frame::Continuation(_) => unreachable!(),
         }
         MuxResult::Continue
+    }
+
+    fn update_initial_window_size<L>(&mut self, value: u32, context: &mut Context<L>) -> bool
+    where
+        L: ListenerHandler + L7ListenerHandler,
+    {
+        if value >= 1 << 31 {
+            return true;
+        }
+        let delta = value as i32 - self.peer_settings.settings_initial_window_size as i32;
+        println!(
+            "INITIAL_WINDOW_SIZE: {} -> {} => {}",
+            self.peer_settings.settings_initial_window_size, value, delta
+        );
+        let mut open_window = false;
+        for (i, stream) in context.streams.iter_mut().enumerate() {
+            println!(
+                " - stream_{i}: {} -> {}",
+                stream.window,
+                stream.window + delta
+            );
+            open_window |= stream.window <= 0 && stream.window + delta > 0;
+            stream.window += delta;
+        }
+        println_!("UPDATE INIT WINDOW: {open_window} {:?}", self.readiness);
+        if open_window {
+            self.readiness.interest.insert(Ready::WRITABLE);
+        }
+        self.peer_settings.settings_initial_window_size = value;
+        false
     }
 
     pub fn force_disconnect(&mut self) -> MuxResult {
