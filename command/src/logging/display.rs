@@ -84,7 +84,7 @@ impl fmt::Display for LogDuration {
 
                 let ms = duration.as_millis();
                 if ms < 10 {
-                    let us = duration.as_millis();
+                    let us = duration.as_micros();
                     if us >= 10 {
                         return write!(f, "{us}μs");
                     }

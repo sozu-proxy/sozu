@@ -513,8 +513,6 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         }
 
         if response_stream.is_terminated() && response_stream.is_completed() {
-            metrics.reset();
-
             if self.context.closing {
                 debug!(
                     "{} closing proxy, no keep alive",
@@ -574,11 +572,13 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             ) {
                 (true, true, true) => {
                     debug!("{} keep alive front/back", self.context.log_context());
+                    metrics.reset();
                     self.reset();
                     StateResult::Continue
                 }
                 (true, false, true) => {
                     debug!("{} keep alive front", self.context.log_context());
+                    metrics.reset();
                     self.reset();
                     StateResult::CloseBackend
                 }
