@@ -365,7 +365,7 @@ mod test_v2 {
         let dst_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)), 4200);
 
         let header = HeaderV2::new(Command::Proxy, src_addr, dst_addr);
-        let expected = vec![
+        let expected = [
             0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54,
             0x0A, // MAGIC header
             0x21, // Version 2 and command PROXY
@@ -376,7 +376,7 @@ mod test_v2 {
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x01, // destination address
             0x1F, 0x90, // source port
-            0x10, 0x68, // destination port
+            0x10, 0x68,
         ];
 
         assert_eq!(&expected[..], &header.into_bytes()[..]);

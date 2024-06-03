@@ -860,7 +860,13 @@ impl Display for Readiness {
         display_ready(r, self.event);
         display_ready(mixed, self.interest & self.event);
 
-        write!(f, "I({:?})&R({:?})=M({:?})", String::from_utf8_lossy(i), String::from_utf8_lossy(r), String::from_utf8_lossy(mixed))
+        write!(
+            f,
+            "I({:?})&R({:?})=M({:?})",
+            String::from_utf8_lossy(i),
+            String::from_utf8_lossy(r),
+            String::from_utf8_lossy(mixed)
+        )
     }
 }
 

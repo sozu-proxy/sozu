@@ -246,6 +246,6 @@ mod test {
         backends.remove(1);
 
         let backend2 = roundrobin.next_available_backend(&mut backends);
-        assert_eq!(backend2.as_ref(), backends.get(0));
+        assert_eq!(backend2.as_ref(), backends.first());
     }
 }

@@ -610,7 +610,7 @@ mod tests {
             local_drain
                 .metrics_of_one_backend(
                     "test-backend-1",
-                    &["connections_per_backend".to_string()].to_vec(),
+                    ["connections_per_backend".to_string()].as_ref(),
                 )
                 .expect("could not query metrics for this backend")
         )
@@ -645,7 +645,7 @@ mod tests {
         };
 
         let returned_cluster_metrics = local_drain
-            .metrics_of_one_cluster("test-cluster", &["http_errors".to_string()].to_vec())
+            .metrics_of_one_cluster("test-cluster", ["http_errors".to_string()].as_ref())
             .expect("could not query metrics for this cluster");
 
         assert_eq!(expected_cluster_metrics, returned_cluster_metrics);
