@@ -4,6 +4,56 @@
 
 See milestone [`v1.1.0`](https://github.com/sozu-proxy/sozu/projects/3?card_filter_query=milestone%3Av1.1.0)
 
+## 1.0.2 - 2024-06-03
+
+> This changelog entry contains changes from the version `1.0.1` and `1.0.2`
+
+### 🌟 Features
+
+- We format logs from session using the same pattern to harmonize them in the console and to provide more information to debug, see [`9b1827f`](https://github.com/sozu-proxy/sozu/commit/9b1827f9b464c5fc21eb764b2076f6ed7f3e7b94) ].
+
+### 📚 Documentation
+
+- We have updated the readme to correct and be more accurate on the advantages section of using Sōzu, see [`ed5f4ef`](https://github.com/sozu-proxy/sozu/commit/ed5f4ef7f1f9b580ea4e1a5e19361ca723091f4a).
+- We have added the changelog entries in CHANGELOG.md, see [`d965e6a`](https://github.com/sozu-proxy/sozu/commit/d965e6a00484c4054baac561a79688d4ad10c15e) and [`5ce5c5a`](https://github.com/sozu-proxy/sozu/commit/5ce5c5ac0060bff8333920eb8ad45fb8d7e00407).
+
+### ⛑️ Fixed
+
+- We have fixed a few bugs that occurred in production, see [`1bf28a2`](https://github.com/sozu-proxy/sozu/commit/1bf28a2c350850b1dfeced9132201ff847bf1fba), [`a1dfe01`](https://github.com/sozu-proxy/sozu/commit/a1dfe0164a70ff0b772163bf834863a3d1ab0ea6) and [`de0da04`](https://github.com/sozu-proxy/sozu/commit/de0da04dd98245213ce470657fe5d604cf283136).
+
+### Changelog
+
+#### 🌟 Features
+
+- [ [`9b1827f`](https://github.com/sozu-proxy/sozu/commit/9b1827f9b464c5fc21eb764b2076f6ed7f3e7b94) ] feat: implements a common way to print session log of a request [`Florentin Dubois`] (`2024-06-03`)
+
+#### 📚 Documentation
+
+- [ [`ed5f4ef`](https://github.com/sozu-proxy/sozu/commit/ed5f4ef7f1f9b580ea4e1a5e19361ca723091f4a) ] README: correct details on the advantages of sozu [`Emmanuel Bosquet`] (`2024-05-17`)
+- [ [`d965e6a`](https://github.com/sozu-proxy/sozu/commit/d965e6a00484c4054baac561a79688d4ad10c15e) ] doc(changelog): add entry for release 1.0.0 [`Florentin Dubois`] (`2024-04-16`)
+- [ [`5ce5c5a`](https://github.com/sozu-proxy/sozu/commit/5ce5c5ac0060bff8333920eb8ad45fb8d7e00407) ] doc(changelog): update typos [`Florentin Dubois`] (`2024-04-16`)
+- [ [`2e66285`](https://github.com/sozu-proxy/sozu/commit/2e662856e86aea51dffae2964e0f84b5a0e58f5c) ] correct comments in sozu_command_lib::certificate [`Emmanuel Bosquet`] (`2024-05-17`)
+
+#### ✍️ Changed
+
+- [ [`f84cdeb`](https://github.com/sozu-proxy/sozu/commit/f84cdeb7dbf9e8506fb24e446bf78e2932e0bc1a) ] use std::time instead of crate time [`Emmanuel Bosquet`] (`2024-04-24`)
+- [ [`3816cbf`](https://github.com/sozu-proxy/sozu/commit/3816cbf4e03093b82e2cd871ddaf58b9104252c2) ] apply clippy suggestions [`Emmanuel Bosquet`] (`2024-04-29`)
+- [ [`8f46dad`](https://github.com/sozu-proxy/sozu/commit/8f46daddc5e1470b8293a5d32d8914b0474f0499) ] chore: update dependencies [`Florentin Dubois`] (`2024-05-29`)
+- [ [`b05fced`](https://github.com/sozu-proxy/sozu/commit/b05fceddd13ca1a5627dade0bbdd745016e388d6) ] chore: apply cargo clippy [`Florentin Dubois`] (`2024-06-03`)
+
+#### ⛑️ Fixed
+
+- [ [`de0da04`](https://github.com/sozu-proxy/sozu/commit/de0da04dd98245213ce470657fe5d604cf283136) ] fix(command): do not override subject and san of certificate when loading configuration from file [`Florentin Dubois`] (`2024-05-29`)
+- [ [`a1dfe01`](https://github.com/sozu-proxy/sozu/commit/a1dfe0164a70ff0b772163bf834863a3d1ab0ea6) ] fix(kawa_h1): give response stream instead of request stream [`Florentin Dubois`] (`2024-06-03`)
+- [ [`1bf28a2`](https://github.com/sozu-proxy/sozu/commit/1bf28a2c350850b1dfeced9132201ff847bf1fba) ] Fix access logs metrics [`Eloi DEMOLIS`] (`2024-06-03`)
+
+### 🥹 Contributors
+* @keksoj
+* @FlorentinDUBOIS
+* @Wonshtrum
+
+**Full Changelog**: https://github.com/sozu-proxy/sozu/compare/1.0.0..1.0.2
+
 ## 1.0.0 - 2024-04-16
 
 > This is the first release of Sōzu which is a huge steps since the beginning of the project.
