@@ -1364,10 +1364,12 @@ impl ConfigBuilder {
                                         })
                                     {
                                         //println!("using listener certificate for {:}", frontend.address);
-                                        frontend.certificate = https_listener.certificate.clone();
+                                        frontend
+                                            .certificate
+                                            .clone_from(&https_listener.certificate);
                                         frontend.certificate_chain =
                                             Some(https_listener.certificate_chain.clone());
-                                        frontend.key = https_listener.key.clone();
+                                        frontend.key.clone_from(&https_listener.key);
                                     }
                                     if frontend.certificate.is_none() {
                                         debug!("known addresses: {:#?}", self.known_addresses);

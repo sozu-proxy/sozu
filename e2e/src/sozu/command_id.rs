@@ -17,7 +17,7 @@ impl CommandID {
 
     pub fn next(&mut self) -> String {
         let id = format!("{}{}", self.prefix, self.id);
-        self.last = id.to_owned();
+        id.clone_into(&mut self.last);
         self.id += 1;
         id
     }

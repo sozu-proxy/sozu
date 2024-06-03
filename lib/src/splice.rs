@@ -95,13 +95,12 @@ pub fn splice_out(pipe: Pipe, stream: &dyn AsRawFd) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use libc::c_int;
+
     use std::{
-        io::{Error, Read, Write},
+        io::{Read, Write},
         net::SocketAddr,
         net::{TcpListener, TcpStream},
-        os::unix::io::{AsRawFd, FromRawFd},
-        ptr, str,
+        str,
         str::FromStr,
         sync::{Arc, Barrier},
         thread,
@@ -119,7 +118,7 @@ mod tests {
         barrier.wait();
 
         let mut res = [0; 128];
-        let mut sz = stream
+        let sz = stream
             .read(&mut res[..])
             .expect("could not read from stream");
         println!("stream received {:?}", str::from_utf8(&res[..sz]));
@@ -168,7 +167,7 @@ mod tests {
             id: u8,
             barrier: &Arc<Barrier>,
         ) {
-            let mut buf = [0; 128];
+            let buf = [0; 128];
             let response = b" END";
             unsafe {
                 if let (Some(pipe_in), Some(pipe_out)) = (create_pipe(), create_pipe()) {
@@ -191,7 +190,7 @@ mod tests {
                         let addr: SocketAddr =
                             FromStr::from_str("127.0.0.1:4242").expect("could not parse address");
                         let mut backend =
-                            TcpStream::connect(&addr).expect("could not create tcp stream");
+                            TcpStream::connect(addr).expect("could not create tcp stream");
                         println!("got a new client: {}", count);
                         handle_client(&mut stream, &mut backend, count, &barrier)
                     }

@@ -92,7 +92,7 @@ pub fn setup_test<S: Into<String>>(
             RequestType::AddBackend(Worker::default_backend(
                 "cluster_0",
                 format!("cluster_0-{i}"),
-                back_address.into(),
+                back_address,
                 if should_stick {
                     Some(format!("sticky_cluster_0-{i}"))
                 } else {

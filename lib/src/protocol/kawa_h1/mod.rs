@@ -1684,7 +1684,11 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 let connection_result =
                     self.connect_to_backend(session.clone(), proxy.clone(), metrics);
                 if let Err(err) = &connection_result {
-                    error!("{} Error connecting to backend: {}", log_context!(self), err);
+                    error!(
+                        "{} Error connecting to backend: {}",
+                        log_context!(self),
+                        err
+                    );
                 }
 
                 if let Some(session_result) = handle_connection_result(connection_result) {
@@ -1743,7 +1747,11 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                         let connection_result =
                             self.connect_to_backend(session.clone(), proxy.clone(), metrics);
                         if let Err(err) = &connection_result {
-                            error!("{} Error connecting to backend: {}", log_context!(self), err);
+                            error!(
+                                "{} Error connecting to backend: {}",
+                                log_context!(self),
+                                err
+                            );
                         }
 
                         if let Some(session_result) = handle_connection_result(connection_result) {

@@ -47,7 +47,7 @@ pub const CONN_RETRIES: u8 = 3;
 pub type ProxyChannel = Channel<WorkerResponse, WorkerRequest>;
 
 thread_local! {
-  pub static QUEUE: RefCell<VecDeque<WorkerResponse>> = RefCell::new(VecDeque::new());
+  pub static QUEUE: RefCell<VecDeque<WorkerResponse>> = const { RefCell::new(VecDeque::new()) };
 }
 
 thread_local! {

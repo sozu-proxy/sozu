@@ -405,8 +405,9 @@ impl BackendList {
             // keeping connection retry state
             Some(old_backend) => {
                 let mut b = old_backend.borrow_mut();
-                b.sticky_id = backend.sticky_id.clone();
-                b.load_balancing_parameters = backend.load_balancing_parameters.clone();
+                b.sticky_id.clone_from(&backend.sticky_id);
+                b.load_balancing_parameters
+                    .clone_from(&backend.load_balancing_parameters);
                 b.backup = backend.backup;
             }
         }

@@ -362,13 +362,13 @@ pub fn try_tls_endpoint() -> State {
     let mut worker = Worker::start_new_worker("TLS-ENDPOINT", config, &listeners, state);
 
     worker.send_proxy_request_type(RequestType::AddHttpsListener(
-        ListenerBuilder::new_https(front_address.clone().into())
+        ListenerBuilder::new_https(front_address.clone())
             .to_tls(None)
             .unwrap(),
     ));
 
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
-        address: front_address.clone().into(),
+        address: front_address.clone(),
         proxy: ListenerType::Https.into(),
         from_scm: false,
     }));
@@ -391,7 +391,7 @@ pub fn try_tls_endpoint() -> State {
         names: vec![],
     };
     let add_certificate = AddCertificate {
-        address: front_address.into(),
+        address: front_address,
         certificate: certificate_and_key,
         expired_at: None,
     };
@@ -1062,7 +1062,7 @@ pub fn try_blue_geen() -> State {
     worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
         "cluster_0",
         "cluster_0-0",
-        primary_address.into(),
+        primary_address,
         None,
     )));
     worker.read_to_last();
@@ -1081,7 +1081,7 @@ pub fn try_blue_geen() -> State {
     worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
         "cluster_0",
         "cluster_0-1",
-        secondary_address.into(),
+        secondary_address,
         None,
     )));
     worker.read_to_last();
@@ -1138,7 +1138,7 @@ pub fn try_keep_alive() -> State {
 
     let mut backend = backends.pop().unwrap();
     let mut client = Client::new(
-        format!("client"),
+        "client".to_string(),
         front_address,
         "GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
     );
@@ -1220,7 +1220,7 @@ pub fn try_stick() -> State {
     let mut backend2 = backends.pop().unwrap();
     let mut backend1 = backends.pop().unwrap();
     let mut client = Client::new(
-        format!("client"),
+        "client".to_string(),
         front_address,
         "GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nCookie: foo=bar\r\n\r\n",
     );
@@ -1423,7 +1423,7 @@ pub fn try_head() -> State {
     let mut client = Client::new(
         "client",
         front_address,
-        http_request("HEAD", "/api", format!("ping"), "localhost"),
+        http_request("HEAD", "/api", "ping".to_string(), "localhost"),
     );
 
     client.connect();
@@ -1559,13 +1559,13 @@ fn try_wildcard() -> State {
     let mut backend0 = SyncBackend::new(
         "BACKEND_0",
         back_address,
-        http_ok_response(format!("pong0")),
+        http_ok_response("pong0".to_string()),
     );
 
     let mut client = Client::new(
         "client",
         front_address,
-        http_request("POST", "/api", format!("ping"), "www.sozu.io"),
+        http_request("POST", "/api", "ping".to_string(), "www.sozu.io"),
     );
 
     backend0.connect();
@@ -1604,7 +1604,7 @@ fn try_wildcard() -> State {
     let mut backend1 = SyncBackend::new(
         "BACKEND_1",
         back_address,
-        http_ok_response(format!("pong1")),
+        http_ok_response("pong1".to_string()),
     );
 
     worker.read_to_last();

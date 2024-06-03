@@ -764,6 +764,12 @@ macro_rules! _prompt_log {
 pub struct LogLineCachedState(u8);
 const LOG_LINE_ENABLED: u8 = 1 << 7;
 
+impl Default for LogLineCachedState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LogLineCachedState {
     pub const fn new() -> Self {
         Self(0)

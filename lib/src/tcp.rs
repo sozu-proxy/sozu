@@ -594,7 +594,11 @@ impl TcpSession {
                 self.close_backend();
                 let connection_result = self.connect_to_backend(session.clone());
                 if let Err(err) = &connection_result {
-                    error!("{} Error connecting to backend: {}", log_context!(self), err);
+                    error!(
+                        "{} Error connecting to backend: {}",
+                        log_context!(self),
+                        err
+                    );
                 }
 
                 if let Some(state_result) = handle_connection_result(connection_result) {
@@ -609,7 +613,11 @@ impl TcpSession {
         } else if back_connected == BackendConnectionStatus::NotConnected {
             let connection_result = self.connect_to_backend(session.clone());
             if let Err(err) = &connection_result {
-                error!("{} Error connecting to backend: {}", log_context!(self), err);
+                error!(
+                    "{} Error connecting to backend: {}",
+                    log_context!(self),
+                    err
+                );
             }
 
             if let Some(state_result) = handle_connection_result(connection_result) {
@@ -1256,7 +1264,7 @@ impl TcpProxy {
             .listeners
             .values()
             .find(|listener| listener.borrow().address == address)
-            .ok_or(ProxyError::NoListenerFound(address.clone()))?;
+            .ok_or(ProxyError::NoListenerFound(address))?;
 
         let mut owned = listener.borrow_mut();
 

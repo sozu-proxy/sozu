@@ -2195,13 +2195,13 @@ mod tests {
             certificates_found_by_fingerprint
         );
 
-        assert!(certificates_found_by_fingerprint.len() >= 1);
+        assert!(!certificates_found_by_fingerprint.is_empty());
 
         let certificate_found_by_domain_name = state.get_certificates(QueryCertificatesFilters {
             domain: Some("lolcatho.st".to_string()),
             fingerprint: None,
         });
 
-        assert!(certificate_found_by_domain_name.len() >= 1);
+        assert!(!certificate_found_by_domain_name.is_empty());
     }
 }

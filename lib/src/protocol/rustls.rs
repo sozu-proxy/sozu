@@ -17,8 +17,15 @@ macro_rules! log_context {
         format!(
             "RUSTLS\t{}\tSession(sni={:?}, source={:?}, frontend={}, readiness={})\t >>>",
             $self.log_context(),
-            $self.session.server_name().map(|addr| addr.to_string()).unwrap_or_else(|| "<none>".to_string()),
-            $self.peer_address.map(|addr| addr.to_string()).unwrap_or_else(|| "<none>".to_string()),
+            $self
+                .session
+                .server_name()
+                .map(|addr| addr.to_string())
+                .unwrap_or_else(|| "<none>".to_string()),
+            $self
+                .peer_address
+                .map(|addr| addr.to_string())
+                .unwrap_or_else(|| "<none>".to_string()),
             $self.frontend_token.0,
             $self.frontend_readiness
         )
