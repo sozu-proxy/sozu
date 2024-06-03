@@ -4,11 +4,14 @@
 
 ## Why use Sōzu?
 
-- **Hot configurable:** Sozu can receive configuration changes at runtime through secure unix sockets without having to reload.
-- **Upgrades without restarting:** Sozu is always-up, meaning it upgrades itself *while still processing requests*.
-- **Handles SSL:** Sozu handles SSL, so your backend servers can focus on what they do best.
-- **Protects your network:** Sozu protect backends by shielding them behind the reverse proxy, limiting direct network access. Sozu uses Rust, a language primed for memory safety. And even if a worker is exploited, sozu workers are sandboxed.
-- **Optimize performance:** Sozu can expose your web service over the Internet with HTTP/2 protocol even if your backend only supports HTTP/1.*. Your Web apps benefit from connection multiplexing using transparent HTTP/2 streams. 
+- **Hot configurable:** Sōzu can receive configuration changes at runtime, through secure unix sockets, without having to reload.
+- **Upgrades without restarting:** Sōzu is always-up, meaning it upgrades itself *while still processing requests*.
+- **Handles SSL:** Sōzu works as a TLS endpoint, so your backend servers can focus on what they do best.
+- **Protects your network:** Sōzu protect backends by shielding them behind the reverse proxy, limiting direct network access. Sōzu uses Rust, a language primed for memory safety. And even if a worker is exploited, Sōzu workers are sandboxed.
+- **Optimize performance:** Sōzu makes the most of Rust's capacity to avoid useless copying and memory usage.
+   Two key dependencies have been optimized in this way:
+   - [Kawa](https://github.com/CleverCloud/kawa) is a generic HTTP representation library that parses and translates HTTP messages with zero copy
+   - [Rustls](https://github.com/rustls/rustls) is a TLS library that encrypts/decrypts TLS traffic with as little intermediate memory usage as it gets
 
 To get started check out our [documentation](./doc/README.md) !
 
@@ -20,7 +23,7 @@ To get started check out our [documentation](./doc/README.md) !
 
 ## License
 
-Sozu itself is covered by the GNU Affero General Public License (AGPL) version 3.0 and above. Traffic going through Sozu doesn't consider Clients and Servers as "covered work" hence don't have to be placed under the same license. A "covered work" in the Licence terms, will consider a service using Sozu's code, methods or specific algorithms. This service can be a self managed software or an online service. The "covered work" will not consider a specific control plane you could have develop to control or use Sozu. In simple terms, Sozu is a Free and Open Source software you can use for both infrastructure and business but in case of a business based on Sozu (e.g. a Load Balancer product), you should either give back your contributions to the project, or contact Clever Cloud for a specific Business Agreement.
+Sōzu itself is covered by the GNU Affero General Public License (AGPL) version 3.0 and above. Traffic going through Sōzu doesn't consider Clients and Servers as "covered work" hence don't have to be placed under the same license. A "covered work" in the Licence terms, will consider a service using Sōzu's code, methods or specific algorithms. This service can be a self managed software or an online service. The "covered work" will not consider a specific control plane you could have develop to control or use Sōzu. In simple terms, Sōzu is a Free and Open Source software you can use for both infrastructure and business but in case of a business based on Sōzu (e.g. a Load Balancer product), you should either give back your contributions to the project, or contact Clever Cloud for a specific Business Agreement.
 
 ### sozu-lib, sozu
 
