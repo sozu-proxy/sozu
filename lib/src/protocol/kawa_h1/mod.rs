@@ -831,7 +831,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             if response_stream.consumed {
                 return SessionResult::Close;
             } else {
-                let (message, details) = diagnostic_400_502(marker, kind, &self.request_stream);
+                let (message, details) = diagnostic_400_502(marker, kind, response_stream);
                 self.set_answer(DefaultAnswer::Answer502 {
                     phase: marker,
                     details,
