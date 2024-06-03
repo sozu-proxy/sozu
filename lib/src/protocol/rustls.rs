@@ -10,6 +10,21 @@ use crate::{
     SessionResult, StateResult,
 };
 
+/// This macro is defined uniquely in this module to help the tracking of tls
+/// issues inside Sōzu
+macro_rules! log_context {
+    ($self:expr) => {
+        format!(
+            "RUSTLS\t{}\tSession(sni={:?}, source={:?}, frontend={}, readiness={})\t >>>",
+            $self.log_context(),
+            $self.session.server_name().map(|addr| addr.to_string()).unwrap_or_else(|| "<none>".to_string()),
+            $self.peer_address.map(|addr| addr.to_string()).unwrap_or_else(|| "<none>".to_string()),
+            $self.frontend_token.0,
+            $self.frontend_readiness
+        )
+    };
+}
+
 pub enum TlsState {
     Initial,
     Handshake,
@@ -65,7 +80,7 @@ impl TlsHandshake {
 
                 match self.session.read_tls(&mut self.stream) {
                     Ok(0) => {
-                        error!("connection closed during handshake");
+                        error!("{} Connection closed during handshake", log_context!(self));
                         return SessionResult::Close;
                     }
                     Ok(_) => {}
@@ -76,9 +91,8 @@ impl TlsHandshake {
                         }
                         _ => {
                             error!(
-                                "Session(sni={:?}, source={:?}) could not perform handshake: {:?}",
-                                self.session.server_name(),
-                                self.peer_address,
+                                "{} Could not perform handshake: {:?}",
+                                log_context!(self),
                                 e
                             );
                             return SessionResult::Close;
@@ -88,9 +102,8 @@ impl TlsHandshake {
 
                 if let Err(e) = self.session.process_new_packets() {
                     error!(
-                        "Session(sni={:?}, source={:?}) could not perform handshake: {:?}",
-                        self.session.server_name(),
-                        self.peer_address,
+                        "{} Could not perform handshake: {:?}",
+                        log_context!(self),
                         e
                     );
                     return SessionResult::Close;
@@ -113,7 +126,7 @@ impl TlsHandshake {
         if self.session.is_handshaking() {
             SessionResult::Continue
         } else {
-            // handshake might be finished but we still have something to send
+            // handshake might be finished, but we still have something to send
             if self.session.wants_write() {
                 SessionResult::Continue
             } else {
@@ -143,9 +156,8 @@ impl TlsHandshake {
                         }
                         _ => {
                             error!(
-                                "Session(sni={:?}, source={:?}) could not perform handshake: {:?}",
-                                self.session.server_name(),
-                                self.peer_address,
+                                "{} Could not perform handshake: {:?}",
+                                log_context!(self),
                                 e
                             );
                             return SessionResult::Close;
@@ -155,9 +167,8 @@ impl TlsHandshake {
 
                 if let Err(e) = self.session.process_new_packets() {
                     error!(
-                        "Session(sni={:?}, source={:?}) could not perform handshake: {:?}",
-                        self.session.server_name(),
-                        self.peer_address,
+                        "{} Could not perform handshake: {:?}",
+                        log_context!(self),
                         e
                     );
                     return SessionResult::Close;
@@ -218,13 +229,7 @@ impl SessionState for TlsHandshake {
         while counter < MAX_LOOP_ITERATIONS {
             let frontend_interest = self.frontend_readiness.filter_interest();
 
-            trace!(
-                "PROXY\t{} {:?} {:?} -> None",
-                self.log_context(),
-                self.frontend_token,
-                self.frontend_readiness
-            );
-
+            trace!("{} Interest({:?})", log_context!(self), frontend_interest);
             if frontend_interest.is_empty() {
                 break;
             }
@@ -244,12 +249,8 @@ impl SessionState for TlsHandshake {
             }
 
             if frontend_interest.is_error() {
-                error!(
-                    "PROXY session {:?} front error, disconnecting",
-                    self.frontend_token
-                );
+                error!("{} Front socket error, disconnecting", log_context!(self));
                 self.frontend_readiness.interest = Ready::EMPTY;
-
                 return SessionResult::Close;
             }
 
@@ -258,11 +259,11 @@ impl SessionState for TlsHandshake {
 
         if counter >= MAX_LOOP_ITERATIONS {
             error!(
-                "PROXY\thandling session {:?} went through {} iterations, there's a probable infinite loop bug, closing the connection",
-                self.frontend_token, MAX_LOOP_ITERATIONS
+                "{}\tHandling session went through {} iterations, there's a probable infinite loop bug, closing the connection",
+                 log_context!(self), MAX_LOOP_ITERATIONS
             );
-            incr!("http.infinite_loop.error");
 
+            incr!("http.infinite_loop.error");
             self.print_state("HTTPS");
 
             return SessionResult::Close;
@@ -285,7 +286,8 @@ impl SessionState for TlsHandshake {
         }
 
         error!(
-            "Expect state: got timeout for an invalid token: {:?}",
+            "{}, Expect state: got timeout for an invalid token: {:?}",
+            log_context!(self),
             token
         );
         StateResult::CloseSession

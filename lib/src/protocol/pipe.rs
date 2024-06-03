@@ -17,6 +17,22 @@ use crate::{
     L7Proxy, ListenerHandler, Protocol, Readiness, SessionMetrics, SessionResult, StateResult,
 };
 
+/// This macro is defined uniquely in this module to help the tracking of pipelining
+/// issues inside Sōzu
+macro_rules! log_context {
+    ($self:expr) => {
+        format!(
+            "PIPE\t{}\tSession(address={}, frontend={}, readiness={}, backend={}, readiness={})\t >>>",
+            $self.log_context(),
+            $self.session_address.map(|addr| addr.to_string()).unwrap_or_else(|| "<none>".to_string()),
+            $self.frontend_token.0,
+            $self.frontend_readiness,
+            $self.backend_token.map(|token| token.0.to_string()).unwrap_or_else(|| "<none>".to_string()),
+            $self.backend_readiness,
+        )
+    };
+}
+
 #[derive(PartialEq, Eq)]
 pub enum SessionStatus {
     Normal,
@@ -159,13 +175,16 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
     fn reset_timeouts(&mut self) {
         if let Some(t) = self.container_frontend_timeout.as_mut() {
             if !t.reset() {
-                error!("{} could not reset front timeout (pipe)", self.request_id);
+                error!(
+                    "{} Could not reset front timeout (pipe)",
+                    log_context!(self)
+                );
             }
         }
 
         if let Some(t) = self.container_backend_timeout.as_mut() {
             if !t.reset() {
-                error!("{} could not reset back timeout (pipe)", self.request_id);
+                error!("{} Could not reset back timeout (pipe)", log_context!(self));
             }
         }
     }
@@ -242,7 +261,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         incr!("pipe.errors");
         error!(
             "{} Could not process request properly got: {}",
-            self.log_context(),
+            log_context!(self),
             message
         );
         self.print_state(self.protocol_string());
@@ -311,7 +330,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         if self.backend_buffer.available_data() == 0 {
             if self.backend_readiness.event.is_readable() {
                 self.backend_readiness.interest.insert(Ready::READABLE);
-                error!("Pipe::back_hup: backend connection closed but the kernel still holds some data. readiness: {:?} -> {:?}", self.frontend_readiness, self.backend_readiness);
+                error!("{} Pipe::back_hup: backend connection closed but the kernel still holds some data.", log_context!(self));
                 SessionResult::Continue
             } else {
                 self.log_request_success(metrics);
@@ -338,12 +357,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         }
 
         let (sz, res) = self.frontend.socket_read(self.frontend_buffer.space());
-        debug!(
-            "{}\tFRONT [{:?}]: read {} bytes",
-            self.log_context(),
-            self.frontend_token,
-            sz
-        );
+        debug!("{} Read {} bytes", log_context!(self), sz);
 
         if sz > 0 {
             //FIXME: replace with copy()
@@ -400,7 +414,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
 
     // Forward content to session
     pub fn writable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
-        trace!("pipe writable");
+        trace!("{} Pipe writable", log_context!(self));
         if self.backend_buffer.available_data() == 0 {
             self.backend_readiness.interest.insert(Ready::READABLE);
             self.frontend_readiness.interest.remove(Ready::WRITABLE);
@@ -448,10 +462,8 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         }
 
         debug!(
-            "{}\tFRONT [{}<-{:?}]: wrote {} bytes of {}",
-            self.log_context(),
-            self.frontend_token.0,
-            self.backend_token,
+            "{} Wrote {} bytes of {}",
+            log_context!(self),
             sz,
             self.backend_buffer.available_data()
         );
@@ -527,10 +539,8 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         }
 
         debug!(
-            "{}\tBACK [{:?}->{}]: wrote {} bytes of {}",
-            self.log_context(),
-            self.backend_token,
-            self.frontend_token.0,
+            "{} Wrote {} bytes of {}",
+            log_context!(self),
             sz,
             output_size
         );
@@ -560,7 +570,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
     pub fn backend_readable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
         self.reset_timeouts();
 
-        trace!("pipe back_readable");
+        trace!("{} Pipe back_readable", log_context!(self));
         if self.backend_buffer.available_space() == 0 {
             self.backend_readiness.interest.remove(Ready::READABLE);
             return SessionResult::Continue;
@@ -570,13 +580,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             let (size, remaining) = backend.socket_read(self.backend_buffer.space());
             self.backend_buffer.fill(size);
 
-            debug!(
-                "{}\tBACK  [{}<-{:?}]: read {} bytes",
-                self.log_context(),
-                self.frontend_token.0,
-                self.backend_token,
-                size
-            );
+            debug!("{} Read {} bytes", log_context!(self), size);
 
             if remaining != SocketResult::Continue || size == 0 {
                 self.backend_readiness.event.remove(Ready::READABLE);
@@ -667,19 +671,16 @@ impl<Front: SocketHandler, L: ListenerHandler> SessionState for Pipe<Front, L> {
             return SessionResult::Close;
         }
 
-        let token = self.frontend_token;
         while counter < MAX_LOOP_ITERATIONS {
             let frontend_interest = self.frontend_readiness.filter_interest();
             let backend_interest = self.backend_readiness.filter_interest();
 
             trace!(
-                "PROXY\t{} {:?} {:?} -> {:?}",
-                self.log_context(),
-                token,
-                self.frontend_readiness,
-                self.backend_readiness
+                "{} Frontend interest({:?}), backend interest({:?})",
+                log_context!(self),
+                frontend_interest,
+                backend_interest
             );
-
             if frontend_interest.is_empty() && backend_interest.is_empty() {
                 break;
             }
@@ -717,8 +718,8 @@ impl<Front: SocketHandler, L: ListenerHandler> SessionState for Pipe<Front, L> {
 
             if frontend_interest.is_error() {
                 error!(
-                    "PROXY session {:?} front error, disconnecting",
-                    self.frontend_token
+                    "{} Frontend socket error, disconnecting",
+                    log_context!(self)
                 );
 
                 self.frontend_readiness.interest = Ready::EMPTY;
@@ -731,10 +732,7 @@ impl<Front: SocketHandler, L: ListenerHandler> SessionState for Pipe<Front, L> {
                 self.frontend_readiness.interest = Ready::EMPTY;
                 self.backend_readiness.interest = Ready::EMPTY;
 
-                error!(
-                    "PROXY session {:?} back error, disconnecting",
-                    self.frontend_token
-                );
+                error!("{} Backend socket error, disconnecting", log_context!(self));
                 return SessionResult::Close;
             }
 
@@ -743,11 +741,11 @@ impl<Front: SocketHandler, L: ListenerHandler> SessionState for Pipe<Front, L> {
 
         if counter >= MAX_LOOP_ITERATIONS {
             error!(
-                "PROXY\thandling session {:?} went through {} iterations, there's a probable infinite loop bug, closing the connection",
-                self.frontend_token, MAX_LOOP_ITERATIONS
+                "{}\tHandling session went through {} iterations, there's a probable infinite loop bug, closing the connection",
+                log_context!(self), MAX_LOOP_ITERATIONS
             );
-            incr!("http.infinite_loop.error");
 
+            incr!("http.infinite_loop.error");
             self.print_state(self.protocol_string());
 
             return SessionResult::Close;
@@ -767,7 +765,7 @@ impl<Front: SocketHandler, L: ListenerHandler> SessionState for Pipe<Front, L> {
     fn timeout(&mut self, token: Token, metrics: &mut SessionMetrics) -> StateResult {
         //info!("got timeout for token: {:?}", token);
         if self.frontend_token == token {
-            self.log_request_error(metrics, "front socket timeout");
+            self.log_request_error(metrics, "frontend socket timeout");
             if let Some(timeout) = self.container_frontend_timeout.as_mut() {
                 timeout.triggered()
             }
@@ -780,11 +778,11 @@ impl<Front: SocketHandler, L: ListenerHandler> SessionState for Pipe<Front, L> {
                 timeout.triggered()
             }
 
-            self.log_request_error(metrics, "back socket timeout");
+            self.log_request_error(metrics, "backend socket timeout");
             return StateResult::CloseSession;
         }
 
-        error!("got timeout for an invalid token");
+        error!("{} Got timeout for an invalid token", log_context!(self));
         self.log_request_error(metrics, "invalid token timeout");
         StateResult::CloseSession
     }
@@ -804,11 +802,12 @@ impl<Front: SocketHandler, L: ListenerHandler> SessionState for Pipe<Front, L> {
     fn print_state(&self, context: &str) {
         error!(
             "\
-{} Session(Pipe)
+{} {} Session(Pipe)
 \tFrontend:
 \t\ttoken: {:?}\treadiness: {:?}
 \tBackend:
 \t\ttoken: {:?}\treadiness: {:?}",
+            log_context!(self),
             context,
             self.frontend_token,
             self.frontend_readiness,

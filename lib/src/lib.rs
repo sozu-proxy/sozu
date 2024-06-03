@@ -339,7 +339,7 @@ pub mod https;
 use std::{
     cell::RefCell,
     collections::{BTreeMap, HashMap},
-    fmt,
+    fmt::{self, Display, Formatter},
     net::SocketAddr,
     rc::Rc,
     str,
@@ -848,6 +848,20 @@ pub struct Readiness {
     pub event: Ready,
     /// the readiness we wish to attain
     pub interest: Ready,
+}
+
+impl Display for Readiness {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        let i = &mut [b'-'; 4];
+        let r = &mut [b'-'; 4];
+        let mixed = &mut [b'-'; 4];
+
+        display_ready(i, self.interest);
+        display_ready(r, self.event);
+        display_ready(mixed, self.interest & self.event);
+
+        write!(f, "I({:?})&R({:?})=M({:?})", String::from_utf8_lossy(i), String::from_utf8_lossy(r), String::from_utf8_lossy(mixed))
+    }
 }
 
 impl Default for Readiness {
