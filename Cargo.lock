@@ -1249,9 +1249,9 @@ dependencies = [
 
 [[package]]
 name = "proc-macro2"
-version = "1.0.84"
+version = "1.0.85"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec96c6a92621310b51366f1e28d05ef11489516e93be030060e5fc12024a49d6"
+checksum = "22244ce15aa966053a896d1accb3a6e68469b97c7f33f284b99f0d576879fc23"
 dependencies = [
  "unicode-ident",
 ]
@@ -1486,9 +1486,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.8"
+version = "0.23.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "79adb16721f56eb2d843e67676896a61ce7a0fa622dc18d3e372477a029d2740"
+checksum = "a218f0f6d05669de4eabfb24f31ce802035c952429d037507b4a4a39f0e60c5b"
 dependencies = [
  "aws-lc-rs",
  "log 0.4.21",
@@ -1701,7 +1701,7 @@ dependencies = [
 
 [[package]]
 name = "sozu"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "clap",
  "jemallocator",
@@ -1724,7 +1724,7 @@ dependencies = [
 
 [[package]]
 name = "sozu-command-lib"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "hex",
  "libc",
@@ -1768,7 +1768,7 @@ dependencies = [
 
 [[package]]
 name = "sozu-lib"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "cookie-factory",
@@ -1786,7 +1786,7 @@ dependencies = [
  "quickcheck",
  "rand",
  "regex",
- "rustls 0.23.8",
+ "rustls 0.23.9",
  "rustls-pemfile",
  "rusty_ulid",
  "serial_test",
@@ -1965,9 +1965,9 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokio"
-version = "1.37.0"
+version = "1.38.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1adbebffeca75fcfd058afa480fb6c0b81e165a0323f9c9d39c9697e37c46787"
+checksum = "ba4f4a02a7a80d6f274636f0aa95c7e383b912d41fe721a31f29e29698585a4a"
 dependencies = [
  "backtrace",
  "libc",
