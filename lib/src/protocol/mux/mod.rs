@@ -1,15 +1,20 @@
 use std::{
     cell::RefCell,
     collections::HashMap,
+    fmt::Debug,
     io::ErrorKind,
     net::{Shutdown, SocketAddr},
     rc::{Rc, Weak},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use mio::{net::TcpStream, Interest, Token};
 use rusty_ulid::Ulid;
-use sozu_command::{logging::EndpointRecord, proto::command::ListenerType, ready::Ready};
+use sozu_command::{
+    logging::EndpointRecord,
+    proto::command::{Event, EventKind, ListenerType},
+    ready::Ready,
+};
 
 mod converter;
 mod h1;
@@ -28,8 +33,9 @@ use crate::{
         mux::h2::{H2Settings, H2State, H2StreamId, Prioriser},
         SessionState,
     },
+    retry::RetryPolicy,
     router::Route,
-    server::CONN_RETRIES,
+    server::{push_event, CONN_RETRIES},
     socket::{FrontRustls, SocketHandler, SocketResult},
     timer::TimeoutContainer,
     BackendConnectionError, L7ListenerHandler, L7Proxy, ListenerHandler, Protocol, ProxySession,
@@ -148,22 +154,34 @@ fn forcefully_terminate_answer(stream: &mut Stream, readiness: &mut Readiness, e
     readiness.interest.insert(Ready::WRITABLE);
 }
 
-#[derive(Debug)]
 pub enum Position {
-    Client(BackendStatus),
+    Client(String, Rc<RefCell<Backend>>, BackendStatus),
     Server,
+}
+
+impl Debug for Position {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Client(cluster_id, _, status) => f
+                .debug_tuple("Client")
+                .field(cluster_id)
+                .field(status)
+                .finish(),
+            Self::Server => write!(f, "Server"),
+        }
+    }
 }
 
 impl Position {
     fn is_server(&self) -> bool {
         match self {
-            Position::Client(_) => false,
+            Position::Client(..) => false,
             Position::Server => true,
         }
     }
     fn is_client(&self) -> bool {
         match self {
-            Position::Client(_) => true,
+            Position::Client(..) => true,
             Position::Server => false,
         }
     }
@@ -171,9 +189,9 @@ impl Position {
 
 #[derive(Debug)]
 pub enum BackendStatus {
-    Connecting(String),
-    Connected(String),
-    KeepAlive(String),
+    Connecting(Instant),
+    Connected,
+    KeepAlive,
     Disconnecting,
 }
 
@@ -234,11 +252,16 @@ impl<Front: SocketHandler> Connection<Front> {
     pub fn new_h1_client(
         front_stream: Front,
         cluster_id: String,
+        backend: Rc<RefCell<Backend>>,
         timeout_container: TimeoutContainer,
     ) -> Connection<Front> {
         Connection::H1(ConnectionH1 {
             socket: front_stream,
-            position: Position::Client(BackendStatus::Connecting(cluster_id)),
+            position: Position::Client(
+                cluster_id,
+                backend,
+                BackendStatus::Connecting(Instant::now()),
+            ),
             readiness: Readiness {
                 interest: Ready::WRITABLE | Ready::READABLE | Ready::HUP | Ready::ERROR,
                 event: Ready::EMPTY,
@@ -282,6 +305,7 @@ impl<Front: SocketHandler> Connection<Front> {
     pub fn new_h2_client(
         front_stream: Front,
         cluster_id: String,
+        backend: Rc<RefCell<Backend>>,
         pool: Weak<RefCell<Pool>>,
         timeout_container: TimeoutContainer,
     ) -> Option<Connection<Front>> {
@@ -296,7 +320,11 @@ impl<Front: SocketHandler> Connection<Front> {
             last_stream_id: 0,
             local_settings: H2Settings::default(),
             peer_settings: H2Settings::default(),
-            position: Position::Client(BackendStatus::Connecting(cluster_id)),
+            position: Position::Client(
+                cluster_id,
+                backend,
+                BackendStatus::Connecting(Instant::now()),
+            ),
             prioriser: Prioriser::new(),
             readiness: Readiness {
                 interest: Ready::WRITABLE | Ready::HUP | Ready::ERROR,
@@ -386,6 +414,21 @@ impl<Front: SocketHandler> Connection<Front> {
         E: Endpoint,
         L: ListenerHandler + L7ListenerHandler,
     {
+        match self.position() {
+            Position::Client(cluster_id, backend, _) => {
+                let mut backend_borrow = backend.borrow_mut();
+                backend_borrow.dec_connections();
+                gauge_add!("backend.connections", -1);
+                gauge_add!(
+                    "connections_per_backend",
+                    -1,
+                    Some(cluster_id),
+                    Some(&backend_borrow.backend_id)
+                );
+                println_!("--------------- CONNECTION CLOSE: {backend_borrow:#?}");
+            }
+            Position::Server => todo!(),
+        }
         match self {
             Connection::H1(c) => c.close(context, endpoint),
             Connection::H2(c) => c.close(context, endpoint),
@@ -396,6 +439,14 @@ impl<Front: SocketHandler> Connection<Front> {
     where
         L: ListenerHandler + L7ListenerHandler,
     {
+        match self.position() {
+            Position::Client(_, backend, BackendStatus::Connected) => {
+                let mut backend_borrow = backend.borrow_mut();
+                backend_borrow.active_requests = backend_borrow.active_requests.saturating_sub(1);
+                println_!("--------------- CONNECTION END STREAM: {backend_borrow:#?}");
+            }
+            _ => {}
+        }
         match self {
             Connection::H1(c) => c.end_stream(stream, context),
             Connection::H2(c) => c.end_stream(stream, context),
@@ -406,6 +457,14 @@ impl<Front: SocketHandler> Connection<Front> {
     where
         L: ListenerHandler + L7ListenerHandler,
     {
+        match self.position() {
+            Position::Client(_, backend, BackendStatus::Connected) => {
+                let mut backend_borrow = backend.borrow_mut();
+                backend_borrow.active_requests += 1;
+                println_!("--------------- CONNECTION START STREAM: {backend_borrow:#?}");
+            }
+            _ => {}
+        }
         match self {
             Connection::H1(c) => c.start_stream(stream, context),
             Connection::H2(c) => c.start_stream(stream, context),
@@ -581,15 +640,17 @@ pub struct Stream {
     pub front: GenericHttpStream,
     pub back: GenericHttpStream,
     pub context: HttpContext,
+    pub metrics: SessionMetrics,
 }
 
 /// This struct allows to mutably borrow the read and write buffers (dependant on the position)
-/// as well as the context of a Stream at the same time
+/// as well as the context and metrics of a Stream at the same time
 pub struct StreamParts<'a> {
     pub window: &'a mut i32,
     pub rbuffer: &'a mut GenericHttpStream,
     pub wbuffer: &'a mut GenericHttpStream,
     pub context: &'a mut HttpContext,
+    pub metrics: &'a mut SessionMetrics,
 }
 
 impl Stream {
@@ -612,34 +673,25 @@ impl Stream {
             front: GenericHttpStream::new(kawa::Kind::Request, kawa::Buffer::new(front_buffer)),
             back: GenericHttpStream::new(kawa::Kind::Response, kawa::Buffer::new(back_buffer)),
             context,
+            metrics: SessionMetrics::new(None), // FIXME
         })
     }
     pub fn split(&mut self, position: &Position) -> StreamParts<'_> {
         match position {
-            Position::Client(_) => StreamParts {
+            Position::Client(..) => StreamParts {
                 window: &mut self.window,
                 rbuffer: &mut self.back,
                 wbuffer: &mut self.front,
                 context: &mut self.context,
+                metrics: &mut self.metrics,
             },
             Position::Server => StreamParts {
                 window: &mut self.window,
                 rbuffer: &mut self.front,
                 wbuffer: &mut self.back,
                 context: &mut self.context,
+                metrics: &mut self.metrics,
             },
-        }
-    }
-    pub fn rbuffer(&mut self, position: &Position) -> &mut GenericHttpStream {
-        match position {
-            Position::Client(_) => &mut self.back,
-            Position::Server => &mut self.front,
-        }
-    }
-    pub fn wbuffer(&mut self, position: &Position) -> &mut GenericHttpStream {
-        match position {
-            Position::Client(_) => &mut self.front,
-            Position::Server => &mut self.back,
         }
     }
     pub fn generate_access_log<L>(
@@ -650,6 +702,7 @@ impl Stream {
     ) where
         L: ListenerHandler + L7ListenerHandler,
     {
+        gauge_add!("http.active_requests", -1);
         let protocol = match self.context.protocol {
             Protocol::HTTP => "http",
             Protocol::HTTPS => "https",
@@ -685,11 +738,11 @@ impl Stream {
             tags,
             client_rtt: None, //socket_rtt(self.front_socket()),
             server_rtt: None, //self.backend_socket.as_ref().and_then(socket_rtt),
-            service_time: Duration::from_micros(0), //metrics.service_time(),
-            response_time: Some(Duration::from_micros(0)), //metrics.response_time(),
-            request_time: Duration::from_micros(0), // metrics.request_time(),
-            bytes_in: 0, //metrics.bin,
-            bytes_out: 0, //metrics.bout,
+            service_time: self.metrics.service_time(),
+            response_time: self.metrics.backend_response_time(),
+            request_time: self.metrics.request_time(),
+            bytes_in: self.metrics.bin,
+            bytes_out: self.metrics.bout,
             user_agent: self.context.user_agent.as_deref(),
         };
     }
@@ -769,7 +822,6 @@ impl Router {
         context: &mut Context<L>,
         session: Rc<RefCell<dyn ProxySession>>,
         proxy: Rc<RefCell<P>>,
-        metrics: &mut SessionMetrics,
     ) -> Result<(), BackendConnectionError> {
         let stream = &mut context.streams[stream_id];
         // when reused, a stream should be detached from its old connection, if not we could end
@@ -828,28 +880,32 @@ impl Router {
                 (_, _, Position::Server) => {
                     unreachable!("Backend connection behaves like a server")
                 }
-                (_, _, Position::Client(BackendStatus::Disconnecting)) => {}
-                (true, false, Position::Client(BackendStatus::Connecting(_))) => {}
+                (_, _, Position::Client(_, _, BackendStatus::Disconnecting)) => {}
+                (true, false, Position::Client(_, _, BackendStatus::Connecting(_))) => {}
 
-                (true, _, Position::Client(BackendStatus::Connected(other_cluster_id))) => {
+                (true, _, Position::Client(other_cluster_id, _, BackendStatus::Connected)) => {
                     if *other_cluster_id == cluster_id {
                         reuse_token = Some(*token);
                         reuse_connecting = false;
                         break;
                     }
                 }
-                (true, true, Position::Client(BackendStatus::Connecting(other_cluster_id))) => {
+                (
+                    true,
+                    true,
+                    Position::Client(other_cluster_id, _, BackendStatus::Connecting(_)),
+                ) => {
                     if *other_cluster_id == cluster_id {
                         reuse_token = Some(*token)
                     }
                 }
-                (true, _, Position::Client(BackendStatus::KeepAlive(other_cluster_id))) => {
+                (true, _, Position::Client(other_cluster_id, _, BackendStatus::KeepAlive)) => {
                     if *other_cluster_id == cluster_id {
                         unreachable!("ConnectionH2 behaves like H1")
                     }
                 }
 
-                (false, _, Position::Client(BackendStatus::KeepAlive(old_cluster_id))) => {
+                (false, _, Position::Client(old_cluster_id, _, BackendStatus::KeepAlive)) => {
                     if *old_cluster_id == cluster_id {
                         reuse_token = Some(*token);
                         reuse_connecting = false;
@@ -857,24 +913,33 @@ impl Router {
                     }
                 }
                 // can't bundle H1 streams together
-                (false, _, Position::Client(BackendStatus::Connected(_)))
-                | (false, _, Position::Client(BackendStatus::Connecting(_))) => {}
+                (false, _, Position::Client(_, _, BackendStatus::Connected))
+                | (false, _, Position::Client(_, _, BackendStatus::Connecting(_))) => {}
             }
         }
         println_!("connect: {cluster_id} (stick={frontend_should_stick}, h2={h2}) -> (reuse={reuse_token:?})");
 
         let token = if let Some(token) = reuse_token {
             println_!("reused backend: {:#?}", self.backends.get(&token).unwrap());
+            stream.metrics.backend_start();
+            stream.metrics.backend_connected();
             token
         } else {
-            let mut socket = self.backend_from_request(
+            let (mut socket, backend) = self.backend_from_request(
                 &cluster_id,
                 frontend_should_stick,
                 stream_context,
                 proxy.clone(),
                 &context.listener,
-                metrics,
             )?;
+            stream.metrics.backend_start();
+            gauge_add!("backend.connections", 1);
+            gauge_add!(
+                "connections_per_backend",
+                1,
+                Some(&cluster_id),
+                Some(&backend.borrow().backend_id)
+            );
 
             if let Err(e) = socket.set_nodelay(true) {
                 error!(
@@ -882,8 +947,6 @@ impl Router {
                     socket, e
                 );
             }
-            // self.backend_readiness.interest = Ready::WRITABLE | Ready::HUP | Ready::ERROR;
-            // self.backend_connection_status = BackendConnectionStatus::Connecting(Instant::now());
 
             let token = proxy.borrow().add_session(session);
 
@@ -900,6 +963,7 @@ impl Router {
                 match Connection::new_h2_client(
                     socket,
                     cluster_id,
+                    backend,
                     context.pool.clone(),
                     timeout_container,
                 ) {
@@ -907,7 +971,7 @@ impl Router {
                     None => return Err(BackendConnectionError::MaxBuffers),
                 }
             } else {
-                Connection::new_h1_client(socket, cluster_id, timeout_container)
+                Connection::new_h1_client(socket, cluster_id, backend, timeout_container)
             };
             self.backends.insert(token, connection);
             token
@@ -967,8 +1031,7 @@ impl Router {
         context: &mut HttpContext,
         proxy: Rc<RefCell<P>>,
         listener: &Rc<RefCell<L>>,
-        _metrics: &mut SessionMetrics,
-    ) -> Result<TcpStream, BackendConnectionError> {
+    ) -> Result<(TcpStream, Rc<RefCell<Backend>>), BackendConnectionError> {
         let (backend, conn) = self
             .get_backend_for_sticky_session(
                 cluster_id,
@@ -995,14 +1058,10 @@ impl Router {
             );
         }
 
-        // metrics.backend_id = Some(backend.borrow().backend_id.clone());
-        // metrics.backend_start();
-        // self.set_backend_id(backend.borrow().backend_id.clone());
-        // self.backend = Some(backend);
         context.backend_id = Some(backend.borrow().backend_id.clone());
         context.backend_address = Some(backend.borrow().address);
 
-        Ok(conn)
+        Ok((conn, backend))
     }
 
     fn get_backend_for_sticky_session<P: L7Proxy>(
@@ -1076,8 +1135,8 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 let mut all_backends_readiness_are_empty = true;
                 let context = &mut self.context;
                 let mut dead_backends = Vec::new();
-                for (token, backend) in self.router.backends.iter_mut() {
-                    let readiness = backend.readiness_mut();
+                for (token, client) in self.router.backends.iter_mut() {
+                    let readiness = client.readiness_mut();
                     // println!("{token:?} -> {readiness:?}");
                     let dead = readiness.filter_interest().is_hup()
                         || readiness.filter_interest().is_error();
@@ -1086,50 +1145,139 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                         readiness.event.remove(Ready::WRITABLE);
                     }
 
-                    if backend.readiness().filter_interest().is_writable() {
-                        let position = backend.position_mut();
+                    if client.readiness().filter_interest().is_writable() {
+                        let position = client.position_mut();
                         match position {
-                            Position::Client(BackendStatus::Connecting(cluster_id)) => {
-                                *position = Position::Client(BackendStatus::Connected(
+                            Position::Client(
+                                cluster_id,
+                                backend,
+                                BackendStatus::Connecting(start),
+                            ) => {
+                                let mut backend_borrow = backend.borrow_mut();
+                                if backend_borrow.retry_policy.is_down() {
+                                    info!(
+                                        "backend server {} at {} is up",
+                                        backend_borrow.backend_id, backend_borrow.address
+                                    );
+                                    incr!(
+                                        "backend.up",
+                                        Some(cluster_id),
+                                        Some(&backend_borrow.backend_id)
+                                    );
+                                    push_event(Event {
+                                        kind: EventKind::BackendUp as i32,
+                                        backend_id: Some(backend_borrow.backend_id.to_owned()),
+                                        address: Some(backend_borrow.address.into()),
+                                        cluster_id: Some(cluster_id.to_owned()),
+                                    });
+                                }
+
+                                //successful connection, reset failure counter
+                                backend_borrow.failures = 0;
+                                backend_borrow.set_connection_time(start.elapsed());
+                                backend_borrow.retry_policy.succeed();
+
+                                for stream in &mut context.streams {
+                                    match stream.state {
+                                        StreamState::Linked(back_token) if back_token == *token => {
+                                            stream.metrics.backend_connected();
+                                            backend_borrow.active_requests += 1;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                println_!(
+                                    "--------------- CONNECTION SUCCESS: {backend_borrow:#?}"
+                                );
+                                drop(backend_borrow);
+                                *position = Position::Client(
                                     std::mem::take(cluster_id),
-                                ));
-                                backend
+                                    backend.clone(),
+                                    BackendStatus::Connected,
+                                );
+                                client
                                     .timeout_container()
                                     .set_duration(self.router.configured_backend_timeout);
                             }
-                            _ => {}
+                            Position::Client(..) => {}
+                            Position::Server => unreachable!(),
                         }
-                        match backend.writable(context, EndpointServer(&mut self.frontend)) {
+                        match client.writable(context, EndpointServer(&mut self.frontend)) {
                             MuxResult::Continue => {}
                             MuxResult::Upgrade => unreachable!(), // only frontend can upgrade
                             MuxResult::CloseSession => return SessionResult::Close,
                         }
                     }
 
-                    if backend.readiness().filter_interest().is_readable() {
-                        match backend.readable(context, EndpointServer(&mut self.frontend)) {
+                    if client.readiness().filter_interest().is_readable() {
+                        match client.readable(context, EndpointServer(&mut self.frontend)) {
                             MuxResult::Continue => {}
                             MuxResult::Upgrade => unreachable!(), // only frontend can upgrade
                             MuxResult::CloseSession => return SessionResult::Close,
                         }
                     }
 
-                    if dead && !backend.readiness().filter_interest().is_readable() {
-                        println_!("Closing {:#?}", backend);
-                        backend.close(context, EndpointServer(&mut self.frontend));
+                    if dead && !client.readiness().filter_interest().is_readable() {
+                        println_!("Closing {:#?}", client);
+                        match client.position() {
+                            Position::Client(cluster_id, backend, BackendStatus::Connecting(_)) => {
+                                let mut backend_borrow = backend.borrow_mut();
+                                backend_borrow.failures += 1;
+
+                                let already_unavailable = backend_borrow.retry_policy.is_down();
+                                backend_borrow.retry_policy.fail();
+                                incr!(
+                                    "backend.connections.error",
+                                    Some(cluster_id),
+                                    Some(&backend_borrow.backend_id)
+                                );
+                                if !already_unavailable && backend_borrow.retry_policy.is_down() {
+                                    error!(
+                                        "backend server {} at {} is down",
+                                        backend_borrow.backend_id, backend_borrow.address
+                                    );
+                                    incr!(
+                                        "backend.down",
+                                        Some(cluster_id),
+                                        Some(&backend_borrow.backend_id)
+                                    );
+                                    push_event(Event {
+                                        kind: EventKind::BackendDown as i32,
+                                        backend_id: Some(backend_borrow.backend_id.to_owned()),
+                                        address: Some(backend_borrow.address.into()),
+                                        cluster_id: Some(cluster_id.to_owned()),
+                                    });
+                                }
+                                println_!("--------------- CONNECTION FAIL: {backend_borrow:#?}");
+                            }
+                            Position::Client(_, backend, _) => {
+                                let mut backend_borrow = backend.borrow_mut();
+                                for stream in &mut context.streams {
+                                    match stream.state {
+                                        StreamState::Linked(back_token) if back_token == *token => {
+                                            backend_borrow.active_requests =
+                                                backend_borrow.active_requests.saturating_sub(1);
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            Position::Server => unreachable!(),
+                        }
+                        client.close(context, EndpointServer(&mut self.frontend));
                         dead_backends.push(*token);
                     }
 
-                    if !backend.readiness().filter_interest().is_empty() {
+                    if !client.readiness().filter_interest().is_empty() {
                         all_backends_readiness_are_empty = false;
                     }
                 }
                 if !dead_backends.is_empty() {
                     for token in &dead_backends {
                         let proxy_borrow = proxy.borrow();
-                        if let Some(mut backend) = self.router.backends.remove(token) {
-                            backend.timeout_container().cancel();
-                            let socket = backend.socket_mut();
+                        if let Some(mut client) = self.router.backends.remove(token) {
+                            client.timeout_container().cancel();
+                            let socket = client.socket_mut();
                             if let Err(e) = proxy_borrow.deregister_socket(socket) {
                                 error!("error deregistering back socket({:?}): {:?}", socket, e);
                             }
@@ -1190,13 +1338,10 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                         .set_duration(self.configured_frontend_timeout);
                     let front_readiness = self.frontend.readiness_mut();
                     dirty = true;
-                    match self.router.connect(
-                        stream_id,
-                        context,
-                        session.clone(),
-                        proxy.clone(),
-                        metrics,
-                    ) {
+                    match self
+                        .router
+                        .connect(stream_id, context, session.clone(), proxy.clone())
+                    {
                         Ok(_) => {}
                         Err(error) => {
                             println_!("Connection error: {error}");
@@ -1387,10 +1532,10 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         println_!("FRONTEND: {:#?}", self.frontend);
         println_!("BACKENDS: {:#?}", self.router.backends);
 
-        for (token, backend) in &mut self.router.backends {
+        for (token, client) in &mut self.router.backends {
             let proxy_borrow = proxy.borrow();
-            backend.timeout_container().cancel();
-            let socket = backend.socket_mut();
+            client.timeout_container().cancel();
+            let socket = client.socket_mut();
             if let Err(e) = proxy_borrow.deregister_socket(socket) {
                 error!("error deregistering back socket({:?}): {:?}", socket, e);
             }
@@ -1403,6 +1548,31 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 error!("session {:?} was already removed!", token);
             } else {
                 // println!("SUCCESS: session {token:?} was removed!");
+            }
+
+            match client.position() {
+                Position::Client(cluster_id, backend, _) => {
+                    let mut backend_borrow = backend.borrow_mut();
+                    backend_borrow.dec_connections();
+                    gauge_add!("backend.connections", -1);
+                    gauge_add!(
+                        "connections_per_backend",
+                        -1,
+                        Some(cluster_id),
+                        Some(&backend_borrow.backend_id)
+                    );
+                    for stream in &mut self.context.streams {
+                        match stream.state {
+                            StreamState::Linked(back_token) if back_token == *token => {
+                                backend_borrow.active_requests =
+                                    backend_borrow.active_requests.saturating_sub(1);
+                            }
+                            _ => {}
+                        }
+                    }
+                    println_!("--------------- CONNECTION(SESSION) CLOSED: {backend_borrow:#?}");
+                }
+                Position::Server => unreachable!(),
             }
         }
         let s = match &mut self.frontend {

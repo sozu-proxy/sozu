@@ -152,7 +152,7 @@ impl Response {
 }
 
 impl ResponseContent {
-    fn display(&self, json: bool) -> Result<(), DisplayError> {
+    pub fn display(&self, json: bool) -> Result<(), DisplayError> {
         let content_type = match &self.content_type {
             Some(content_type) => content_type,
             None => return Ok(println!("No content")),
