@@ -583,7 +583,7 @@ pub enum BackendConnectAction {
 pub enum BackendConnectionError {
     #[error("Not found: {0:?}")]
     NotFound(ObjectKind),
-    #[error("Too many connections on cluster {0:?}")]
+    #[error("Too many failed attemps on cluster {0:?}")]
     MaxConnectionRetries(Option<String>),
     #[error("the sessions slab has reached maximum capacity")]
     MaxSessionsMemory,

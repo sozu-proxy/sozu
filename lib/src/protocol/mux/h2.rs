@@ -159,7 +159,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             let kawa = match stream_id {
                 H2StreamId::Zero => &mut self.zero,
                 H2StreamId::Other(stream_id, global_stream_id) => {
-                    context.streams[global_stream_id].rbuffer(&self.position)
+                    context.streams[global_stream_id]
+                        .split(&self.position)
+                        .rbuffer
                 }
             };
             println_!("{:?}({stream_id:?}, {amount})", self.state);
@@ -170,6 +172,14 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 }
                 let (size, status) = self.socket.socket_read(&mut kawa.storage.space()[..amount]);
                 kawa.storage.fill(size);
+                match self.position {
+                    Position::Client(..) => {
+                        count!("back_bytes_in", size as i64);
+                    }
+                    Position::Server => {
+                        count!("bytes_in", size as i64);
+                    }
+                }
                 if update_readiness_after_read(size, status, &mut self.readiness) {
                     return MuxResult::Continue;
                 } else {
@@ -202,8 +212,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             (H2State::Error, _)
             | (H2State::GoAway, _)
             | (H2State::ServerSettings, Position::Server)
-            | (H2State::ClientPreface, Position::Client(_))
-            | (H2State::ClientSettings, Position::Client(_)) => unreachable!(
+            | (H2State::ClientPreface, Position::Client(..))
+            | (H2State::ClientSettings, Position::Client(..)) => unreachable!(
                 "Unexpected combination: (Readable, {:?}, {:?})",
                 self.state, self.position
             ),
@@ -267,7 +277,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 self.expect_write = Some(H2StreamId::Zero);
                 return self.handle_frame(settings, context, endpoint);
             }
-            (H2State::ServerSettings, Position::Client(_)) => {
+            (H2State::ServerSettings, Position::Client(..)) => {
                 let i = kawa.storage.data();
                 match parser::frame_header(i, self.local_settings.settings_max_frame_size) {
                     Ok((
@@ -432,6 +442,14 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             while !kawa.storage.is_empty() {
                 let (size, status) = self.socket.socket_write(kawa.storage.data());
                 kawa.storage.consume(size);
+                match self.position {
+                    Position::Client(..) => {
+                        count!("back_bytes_out", size as i64);
+                    }
+                    Position::Server => {
+                        count!("bytes_out", size as i64);
+                    }
+                }
                 if update_readiness_after_write(size, status, &mut self.readiness) {
                     return MuxResult::Continue;
                 }
@@ -446,12 +464,12 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             | (H2State::Discard, _)
             | (H2State::ClientPreface, Position::Server)
             | (H2State::ClientSettings, Position::Server)
-            | (H2State::ServerSettings, Position::Client(_)) => unreachable!(
+            | (H2State::ServerSettings, Position::Client(..)) => unreachable!(
                 "Unexpected combination: (Writable, {:?}, {:?})",
                 self.state, self.position
             ),
             (H2State::GoAway, _) => self.force_disconnect(),
-            (H2State::ClientPreface, Position::Client(_)) => {
+            (H2State::ClientPreface, Position::Client(..)) => {
                 println_!("Preparing preface and settings");
                 let pri = serializer::H2_PRI.as_bytes();
                 let kawa = &mut self.zero;
@@ -470,7 +488,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 self.expect_write = Some(H2StreamId::Zero);
                 MuxResult::Continue
             }
-            (H2State::ClientSettings, Position::Client(_)) => {
+            (H2State::ClientSettings, Position::Client(..)) => {
                 println_!("Sent preface and settings");
                 self.state = H2State::ServerSettings;
                 self.readiness.interest.remove(Ready::WRITABLE);
@@ -494,11 +512,22 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     self.expect_write
                 {
                     let stream = &mut context.streams[global_stream_id];
-                    let kawa = stream.wbuffer(&self.position);
+                    let parts = stream.split(&self.position);
+                    let kawa = parts.wbuffer;
                     while !kawa.out.is_empty() {
                         let bufs = kawa.as_io_slice();
                         let (size, status) = self.socket.socket_write_vectored(&bufs);
                         kawa.consume(size);
+                        match self.position {
+                            Position::Client(..) => {
+                                count!("back_bytes_out", size as i64);
+                                parts.metrics.backend_bout += size;
+                            }
+                            Position::Server => {
+                                count!("bytes_out", size as i64);
+                                parts.metrics.bout += size;
+                            }
+                        }
                         if let Some((read_stream, amount)) = self.expect_read {
                             if write_stream == read_stream
                                 && kawa.storage.available_space() >= amount
@@ -513,7 +542,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     self.expect_write = None;
                     if (kawa.is_terminated() || kawa.is_error()) && kawa.is_completed() {
                         match self.position {
-                            Position::Client(_) => {}
+                            Position::Client(..) => {}
                             Position::Server => {
                                 // mark stream as reusable
                                 println_!("Recycle stream: {global_stream_id}");
@@ -563,6 +592,16 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         let bufs = kawa.as_io_slice();
                         let (size, status) = self.socket.socket_write_vectored(&bufs);
                         kawa.consume(size);
+                        match self.position {
+                            Position::Client(..) => {
+                                count!("back_bytes_out", size as i64);
+                                parts.metrics.backend_bout += size;
+                            }
+                            Position::Server => {
+                                count!("bytes_out", size as i64);
+                                parts.metrics.bout += size;
+                            }
+                        }
                         if update_readiness_after_write(size, status, &mut self.readiness) {
                             self.expect_write =
                                 Some(H2StreamId::Other(*stream_id, global_stream_id));
@@ -572,7 +611,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     self.expect_write = None;
                     if (kawa.is_terminated() || kawa.is_error()) && kawa.is_completed() {
                         match self.position {
-                            Position::Client(_) => {}
+                            Position::Client(..) => {}
                             Position::Server => {
                                 // mark stream as reusable
                                 println_!("Recycle1 stream: {global_stream_id}");
@@ -646,7 +685,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     pub fn new_stream_id(&mut self) -> StreamId {
         self.last_stream_id += 2;
         match self.position {
-            Position::Client(_) => self.last_stream_id - 1,
+            Position::Client(..) => self.last_stream_id - 1,
             Position::Server => self.last_stream_id - 2,
         }
     }
@@ -670,7 +709,12 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     None => panic!("stream error"),
                 };
                 let stream = &mut context.streams[global_stream_id];
-                let kawa = stream.rbuffer(&self.position);
+                let parts = stream.split(&self.position);
+                let kawa = parts.rbuffer;
+                match self.position {
+                    Position::Client(..) => parts.metrics.backend_bin += slice.len(),
+                    Position::Server => parts.metrics.bin += slice.len(),
+                }
                 slice.start += kawa.storage.head as u32;
                 kawa.storage.head += slice.len();
                 kawa.push_block(kawa::Block::Chunk(kawa::Chunk {
@@ -720,6 +764,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 let buffer = headers.header_block_fragment.data(kawa.storage.buffer());
                 let stream = &mut context.streams[global_stream_id];
                 let parts = &mut stream.split(&self.position);
+                match self.position {
+                    Position::Client(..) => parts.metrics.backend_bin += buffer.len(),
+                    Position::Server => parts.metrics.bin += buffer.len(),
+                }
                 let was_initial = parts.rbuffer.is_initial();
                 let status = pkawa::handle_header(
                     &mut self.decoder,
@@ -746,15 +794,14 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         .interest
                         .insert(Ready::WRITABLE)
                 }
-                if was_initial {
-                    match self.position {
-                        Position::Server => stream.state = StreamState::Link,
-                        Position::Client(_) => {}
-                    };
+                // was_initial prevents trailers from triggering connection
+                if was_initial && self.position.is_server() {
+                    gauge_add!("http.active_requests", 1);
+                    stream.state = StreamState::Link;
                 }
             }
             Frame::PushPromise(push_promise) => match self.position {
-                Position::Client(_) => {
+                Position::Client(..) => {
                     if self.local_settings.settings_enable_push {
                         todo!("forward the push")
                     } else {
@@ -796,7 +843,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     }
                     let stream = &mut context.streams[stream_id];
                     match self.position {
-                        Position::Client(_) => {}
+                        Position::Client(..) => {}
                         Position::Server => {
                             // This is a special case, normally, all stream are terminated by the server
                             // when the last byte of the response is written. Here, the reset is requested
@@ -945,9 +992,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
 
     pub fn force_disconnect(&mut self) -> MuxResult {
         self.state = H2State::Error;
-        match self.position {
-            Position::Client(_) => {
-                self.position = Position::Client(BackendStatus::Disconnecting);
+        match &mut self.position {
+            Position::Client(_, _, status) => {
+                *status = BackendStatus::Disconnecting;
                 self.readiness.event = Ready::HUP;
                 MuxResult::Continue
             }
@@ -961,10 +1008,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         L: ListenerHandler + L7ListenerHandler,
     {
         match self.position {
-            Position::Client(BackendStatus::Connected(_))
-            | Position::Client(BackendStatus::Connecting(_))
-            | Position::Client(BackendStatus::Disconnecting) => {}
-            Position::Client(BackendStatus::KeepAlive(_)) => unreachable!(),
+            Position::Client(_, _, BackendStatus::KeepAlive) => unreachable!(),
+            Position::Client(..) => {}
             Position::Server => unreachable!(),
         }
         // reconnection is handled by the server for each stream separately
@@ -1005,7 +1050,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         let stream_context = &mut context.streams[stream].context;
         println_!("end H2 stream {stream}: {stream_context:#?}");
         match self.position {
-            Position::Client(_) => {
+            Position::Client(..) => {
                 for (stream_id, global_stream_id) in &self.streams {
                     if *global_stream_id == stream {
                         let id = *stream_id;
