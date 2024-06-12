@@ -259,15 +259,16 @@ impl HttpSession {
             return None;
         };
         let backend = mux.router.backends.remove(&back_token).unwrap();
-        let (cluster_id, backend_readiness, backend_socket, mut container_backend_timeout) =
+        let (cluster_id, backend, backend_readiness, backend_socket, mut container_backend_timeout) =
             match backend {
                 mux::Connection::H1(mux::ConnectionH1 {
-                    position: mux::Position::Client(mux::BackendStatus::Connected(cluster_id)),
+                    position:
+                        mux::Position::Client(cluster_id, backend, mux::BackendStatus::Connected),
                     readiness,
                     socket,
                     timeout_container,
                     ..
-                }) => (cluster_id, readiness, socket, timeout_container),
+                }) => (cluster_id, backend, readiness, socket, timeout_container),
                 mux::Connection::H1(_) => {
                     error!("The backend disconnected just after upgrade, abort");
                     return None;
@@ -283,11 +284,12 @@ impl HttpSession {
         container_frontend_timeout.reset();
         container_backend_timeout.reset();
 
+        let backend_id = backend.borrow().backend_id.clone();
         let mut pipe = Pipe::new(
             stream.back.storage.buffer,
-            None,
+            Some(backend_id),
             Some(backend_socket),
-            None,
+            Some(backend),
             Some(container_backend_timeout),
             Some(container_frontend_timeout),
             Some(cluster_id),
@@ -307,7 +309,6 @@ impl HttpSession {
 
         gauge_add!("protocol.http", -1);
         gauge_add!("protocol.ws", 1);
-        gauge_add!("http.active_requests", -1);
         gauge_add!("websocket.active_requests", 1);
         Some(HttpStateMachine::WebSocket(pipe))
     }

@@ -297,7 +297,8 @@ impl BackendMap {
         })?;
         self.available = true;
 
-        Ok((next_backend.clone(), tcp_stream))
+        drop(borrowed_backend);
+        Ok((next_backend, tcp_stream))
     }
 
     pub fn backend_from_sticky_session(
