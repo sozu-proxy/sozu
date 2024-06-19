@@ -112,7 +112,10 @@ pub struct RequestRecord<'a> {
     pub server_rtt: Option<Duration>,
     pub user_agent: Option<&'a str>,
     pub service_time: Duration,
-    pub response_time: Duration,
+    /// time from connecting to the backend until the end of the response
+    pub response_time: Option<Duration>,
+    /// time between first byte of the request and last byte of the response
+    pub request_time: Duration,
     pub bytes_in: usize,
     pub bytes_out: usize,
 
@@ -167,7 +170,7 @@ impl RequestRecord<'_> {
                 message: self.message.duplicate(),
                 protocol: self.protocol.duplicate(),
                 request_id: self.context.request_id.into(),
-                response_time: self.response_time.as_micros() as u64,
+                response_time: self.response_time.map(|t| t.as_micros() as u64),
                 server_rtt: self.server_rtt.map(|t| t.as_micros() as u64),
                 service_time: self.service_time.as_micros() as u64,
                 session_address: self.session_address.map(Into::into),
@@ -178,6 +181,7 @@ impl RequestRecord<'_> {
                 user_agent: self.user_agent.duplicate(),
                 tag: self.tag.duplicate(),
                 time: self.precise_time.into(),
+                request_time: Some(self.request_time.as_micros() as u64),
             })
         }
     }
