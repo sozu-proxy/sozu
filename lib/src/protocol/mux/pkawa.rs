@@ -33,6 +33,21 @@ where
         return handle_trailer(kawa, input, end_stream, decoder);
     }
     kawa.push_block(Block::StatusLine);
+    // kawa.detached.status_line = match kawa.kind {
+    //     Kind::Request => StatusLine::Request {
+    //         version: Version::V20,
+    //         method: Store::Static(b"GET"),
+    //         uri: Store::Static(b"/"),
+    //         authority: Store::Static(b"lolcatho.st:8443"),
+    //         path: Store::Static(b"/"),
+    //     },
+    //     Kind::Response => StatusLine::Response {
+    //         version: Version::V20,
+    //         code: 200,
+    //         status: Store::Static(b"200"),
+    //         reason: Store::Static(b"FromH2"),
+    //     },
+    // };
     kawa.detached.status_line = match kawa.kind {
         Kind::Request => {
             let mut method = Store::Empty;
@@ -87,12 +102,15 @@ where
                             invalid_headers = true;
                         }
                     } else if compare_no_case(&k, b"priority") {
-                        todo!("decode priority");
+                        // todo!("decode priority");
+                        warn!("DECODE PRIORITY: {}", unsafe {
+                            std::str::from_utf8_unchecked(v.as_ref())
+                        });
                         prioriser.push_priority(
                             stream_id,
                             PriorityPart::Rfc9218 {
-                                urgency: todo!(),
-                                incremental: todo!(),
+                                urgency: 0,
+                                incremental: false,
                             },
                         );
                     }
@@ -105,7 +123,7 @@ where
                 }
             });
             if let Err(error) = decode_status {
-                println!("INVALID FRAGMENT: {error:?}");
+                error!("INVALID FRAGMENT: {:?}", error);
                 return Err((H2Error::CompressionError, true));
             }
             if invalid_headers
@@ -114,7 +132,7 @@ where
                 || path.len() == 0
                 || scheme.len() == 0
             {
-                println!("INVALID HEADERS");
+                error!("INVALID HEADERS");
                 return Err((H2Error::ProtocolError, false));
             }
             // uri is only used by H1 statusline, in most cases it only consists of the path
@@ -177,11 +195,11 @@ where
                 }
             });
             if let Err(error) = decode_status {
-                println!("INVALID FRAGMENT: {error:?}");
+                error!("INVALID FRAGMENT: {:?}", error);
                 return Err((H2Error::CompressionError, true));
             }
             if invalid_headers || status.len() == 0 {
-                println!("INVALID HEADERS");
+                error!("INVALID HEADERS");
                 return Err((H2Error::ProtocolError, false));
             }
             StatusLine::Response {
@@ -195,7 +213,7 @@ where
 
     // everything has been parsed
     kawa.storage.head = kawa.storage.end;
-    println!(
+    debug!(
         "index: {}/{}/{}",
         kawa.storage.start, kawa.storage.head, kawa.storage.end
     );
