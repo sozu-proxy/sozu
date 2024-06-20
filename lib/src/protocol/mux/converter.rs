@@ -150,7 +150,7 @@ impl<'a, T: AsBuffer> BlockConverter<T> for H2BlockConverter<'a> {
                 .unwrap();
                 kawa.push_out(Store::from_slice(&header));
                 kawa.push_out(data);
-                kawa.push_delimiter();
+                // kawa.push_delimiter();
                 return can_continue;
             }
             Block::Flags(Flags {
@@ -189,7 +189,7 @@ impl<'a, T: AsBuffer> BlockConverter<T> for H2BlockConverter<'a> {
                     kawa.push_out(Store::from_slice(&header));
                 }
                 if end_header || end_stream {
-                    kawa.push_delimiter()
+                    // kawa.push_delimiter()
                 }
             }
         }

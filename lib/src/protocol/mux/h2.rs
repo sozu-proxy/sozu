@@ -92,7 +92,7 @@ impl Prioriser {
                 weight,
             } => {
                 if stream_dependency.stream_id == stream_id {
-                    println_!("STREAM CAN'T DEPEND ON ITSELF");
+                    error!("STREAM CAN'T DEPEND ON ITSELF");
                     true
                 } else {
                     false
@@ -148,6 +148,10 @@ pub enum H2StreamId {
 }
 
 impl<Front: SocketHandler> ConnectionH2<Front> {
+    fn expect_header(&mut self) {
+        self.state = H2State::Header;
+        self.expect_read = Some((H2StreamId::Zero, 9));
+    }
     pub fn readable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
     where
         E: Endpoint,
@@ -221,8 +225,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 let i = kawa.storage.data();
                 println_!("DISCARDING: {i:?}");
                 kawa.storage.clear();
-                self.state = H2State::Header;
-                self.expect_read = Some((H2StreamId::Zero, 9));
+                self.expect_header();
             }
             (H2State::ClientPreface, Position::Server) => {
                 let i = kawa.storage.data();
@@ -267,8 +270,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 let kawa = &mut self.zero;
                 match serializer::gen_settings(kawa.storage.space(), &self.local_settings) {
                     Ok((_, size)) => kawa.storage.fill(size),
-                    Err(e) => {
-                        println!("could not serialize SettingsFrame: {e:?}");
+                    Err(error) => {
+                        error!("Could not serialize SettingsFrame: {:?}", error);
                         return self.force_disconnect();
                     }
                 };
@@ -309,7 +312,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         } else if let Some(global_stream_id) = self.streams.get(&stream_id) {
                             let allowed_on_half_closed = header.frame_type
                                 == FrameType::WindowUpdate
-                                || header.frame_type == FrameType::Priority;
+                                || header.frame_type == FrameType::Priority
+                                || header.frame_type == FrameType::RstStream;
                             let stream = &context.streams[*global_stream_id];
                             println_!(
                                 "REQUESTING EXISTING STREAM {stream_id}: {}/{:?}",
@@ -319,6 +323,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                             if !allowed_on_half_closed
                                 && (stream.received_end_of_stream || !stream.state.is_open())
                             {
+                                error!(
+                                    "CANNOT RECEIVE {:?} ON THIS STREAM {:?}",
+                                    header.frame_type, stream.state
+                                );
                                 return self.goaway(H2Error::StreamClosed);
                             }
                             if header.frame_type == FrameType::Data {
@@ -332,19 +340,43 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                                 && stream_id % 2 == 1
                                 && stream_id >= self.last_stream_id
                             {
-                                if context.streams.len()
+                                if context.active_len()
                                     >= self.local_settings.settings_max_concurrent_streams as usize
                                 {
+                                    error!(
+                                        "MAX CONCURRENT STREAMS: {} {} {}",
+                                        self.local_settings.settings_max_concurrent_streams,
+                                        context.active_len(),
+                                        context.streams.len()
+                                    );
                                     return self.goaway(H2Error::RefusedStream);
                                 }
                                 match self.create_stream(stream_id, context) {
                                     Some(_) => {}
-                                    None => return self.goaway(H2Error::InternalError),
+                                    None => {
+                                        error!("COULD NOT CREATE NEW STREAM");
+                                        return self.goaway(H2Error::InternalError);
+                                    }
                                 }
                             } else if header.frame_type != FrameType::Priority {
-                                println_!(
-                                    "ONLY HEADERS AND PRIORITY CAN BE RECEIVED ON IDLE/CLOSED STREAMS"
+                                error!(
+                                    "CANNOT RECEIVE {:?} FRAME ON IDLE/CLOSED STREAMS",
+                                    header.frame_type
                                 );
+                                if header.frame_type == FrameType::Data
+                                    && header.payload_len == 0
+                                    && header.flags == 1
+                                {
+                                    error!(
+                                        "SKIPPED DATA: {} {} {} {}",
+                                        stream_id,
+                                        self.last_stream_id,
+                                        header.flags,
+                                        header.payload_len
+                                    );
+                                    self.expect_header();
+                                    return MuxResult::Continue;
+                                }
                                 return self.goaway(H2Error::ProtocolError);
                             }
                             H2StreamId::Zero
@@ -362,6 +394,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     }
                     Err(error) => {
                         let error = error_nom_to_h2(error);
+                        error!("COULD NOT PARSE FRAME HEADER");
                         return self.goaway(error);
                     }
                 };
@@ -390,9 +423,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     }
                     Err(error) => {
                         let error = error_nom_to_h2(error);
+                        error!("COULD NOT PARSE CONTINUATION HEADER");
                         return self.goaway(error);
                     }
-                    _ => return self.goaway(H2Error::ProtocolError),
+                    other => {
+                        error!("UNEXPECTED {:?} WHILE PARSING CONTINUATION HEADER", other);
+                        return self.goaway(H2Error::ProtocolError);
+                    }
                 };
             }
             (H2State::Frame(header), _) => {
@@ -402,6 +439,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     Ok((_, frame)) => frame,
                     Err(error) => {
                         let error = error_nom_to_h2(error);
+                        error!("COULD NOT PARSE FRAME BODY");
                         return self.goaway(error);
                     }
                 };
@@ -412,8 +450,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         kawa.storage.end = kawa.storage.head;
                     }
                 }
-                self.state = H2State::Header;
-                self.expect_read = Some((H2StreamId::Zero, 9));
+                self.expect_header();
                 return self.handle_frame(frame, context, endpoint);
             }
             (H2State::ContinuationFrame(headers), _) => {
@@ -421,8 +458,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 let i = kawa.storage.data();
                 println_!("  data: {i:?}");
                 let headers = headers.clone();
-                self.state = H2State::Header;
-                self.expect_read = Some((H2StreamId::Zero, 9));
+                self.expect_header();
                 return self.handle_frame(Frame::Headers(headers), context, endpoint);
             }
         }
@@ -478,8 +514,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 kawa.storage.fill(pri.len());
                 match serializer::gen_settings(kawa.storage.space(), &self.local_settings) {
                     Ok((_, size)) => kawa.storage.fill(size),
-                    Err(e) => {
-                        println!("could not serialize SettingsFrame: {e:?}");
+                    Err(error) => {
+                        error!("Could not serialize SettingsFrame: {:?}", error);
                         return self.force_disconnect();
                     }
                 };
@@ -491,14 +527,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             (H2State::ClientSettings, Position::Client(..)) => {
                 println_!("Sent preface and settings");
                 self.state = H2State::ServerSettings;
-                self.readiness.interest.remove(Ready::WRITABLE);
                 self.expect_read = Some((H2StreamId::Zero, 9));
+                self.readiness.interest.remove(Ready::WRITABLE);
                 MuxResult::Continue
             }
             (H2State::ServerSettings, Position::Server) => {
-                self.state = H2State::Header;
+                self.expect_header();
                 self.readiness.interest.remove(Ready::WRITABLE);
-                self.expect_read = Some((H2StreamId::Zero, 9));
                 MuxResult::Continue
             }
             // Proxying states
@@ -649,6 +684,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         self.expect_read = None;
         let kawa = &mut self.zero;
         kawa.storage.clear();
+        error!("//////////////GOAWAY: {:?}", error);
 
         match serializer::gen_goaway(kawa.storage.space(), self.last_stream_id, error) {
             Ok((_, size)) => {
@@ -658,8 +694,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 self.readiness.interest = Ready::WRITABLE | Ready::HUP | Ready::ERROR;
                 MuxResult::Continue
             }
-            Err(e) => {
-                println!("could not serialize GoAwayFrame: {e:?}");
+            Err(error) => {
+                error!("Could not serialize GoAwayFrame: {:?}", error);
                 self.force_disconnect()
             }
         }
@@ -704,10 +740,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         match frame {
             Frame::Data(data) => {
                 let mut slice = data.payload;
-                let global_stream_id = match self.streams.get(&data.stream_id) {
-                    Some(global_stream_id) => *global_stream_id,
-                    None => panic!("stream error"),
-                };
+                // can this fail?
+                let global_stream_id = *self.streams.get(&data.stream_id).unwrap();
                 let stream = &mut context.streams[global_stream_id];
                 let parts = stream.split(&self.position);
                 let kawa = parts.rbuffer;
@@ -739,8 +773,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             }
             Frame::Headers(headers) => {
                 if !headers.end_headers {
-                    // self.zero.storage.head = self.zero.storage.end;
-                    println!("FRAGMENT: {:?}", self.zero.storage.data());
+                    debug!("FRAGMENT: {:?}", self.zero.storage.data());
                     self.state = H2State::ContinuationHeader(headers);
                     return MuxResult::Continue;
                 }
@@ -781,6 +814,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 kawa.storage.clear();
                 if let Err((error, global)) = status {
                     if global {
+                        error!("GOT GLOBAL ERROR WHILE PROCESSING HEADERS");
                         return self.goaway(error);
                     } else {
                         return self.reset_stream(global_stream_id, context, endpoint, error);
@@ -805,11 +839,12 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     if self.local_settings.settings_enable_push {
                         todo!("forward the push")
                     } else {
+                        error!("DID NOT ALLOW PUSH");
                         return self.goaway(H2Error::ProtocolError);
                     }
                 }
                 Position::Server => {
-                    println_!("A client should not push promises");
+                    error!("INVALID PUSH FROM CLIENT");
                     return self.goaway(H2Error::ProtocolError);
                 }
             },
@@ -826,6 +861,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                             H2Error::ProtocolError,
                         );
                     } else {
+                        error!("INVALID PRIORITY RECEIVED ON INVALID STREAM");
                         return self.goaway(H2Error::ProtocolError);
                     }
                 }
@@ -876,9 +912,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         6 => { self.peer_settings.settings_max_header_list_size = v },
                         8 => { self.peer_settings.settings_enable_connect_protocol = v == 1;    is_error |= v > 1 },
                         9 => { self.peer_settings.settings_no_rfc7540_priorities = v == 1;      is_error |= v > 1 },
-                        other => println!("unknown setting_id: {other}, we MUST ignore this"),
+                        other => warn!("Unknown setting_id: {}, we MUST ignore this", other),
                     };
                     if is_error {
+                        error!("INVALID SETTING");
                         return self.goaway(H2Error::ProtocolError);
                     }
                 }
@@ -901,8 +938,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 let kawa = &mut self.zero;
                 match serializer::gen_ping_acknolegment(kawa.storage.space(), &ping.payload) {
                     Ok((_, size)) => kawa.storage.fill(size),
-                    Err(e) => {
-                        println!("could not serialize PingFrame: {e:?}");
+                    Err(error) => {
+                        error!("Could not serialize PingFrame: {:?}", error);
                         return self.force_disconnect();
                     }
                 };
@@ -930,6 +967,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         }
                         self.window = window;
                     } else {
+                        error!("INVALID WINDOW INCREMENT");
                         return self.goaway(H2Error::FlowControlError);
                     }
                 } else {
@@ -968,21 +1006,15 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             return true;
         }
         let delta = value as i32 - self.peer_settings.settings_initial_window_size as i32;
-        println!(
-            "INITIAL_WINDOW_SIZE: {} -> {} => {}",
-            self.peer_settings.settings_initial_window_size, value, delta
-        );
         let mut open_window = false;
         for (i, stream) in context.streams.iter_mut().enumerate() {
-            println!(
-                " - stream_{i}: {} -> {}",
-                stream.window,
-                stream.window + delta
-            );
             open_window |= stream.window <= 0 && stream.window + delta > 0;
             stream.window += delta;
         }
-        println_!("UPDATE INIT WINDOW: {open_window} {:?}", self.readiness);
+        println_!(
+            "UPDATE INIT WINDOW: {delta} {open_window} {:?}",
+            self.readiness
+        );
         if open_window {
             self.readiness.interest.insert(Ready::WRITABLE);
         }
@@ -1090,7 +1122,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     }
                     (false, false) => {
                         // we do not have an answer, but the request is untouched so we can retry
-                        println!("H2 RECONNECT");
+                        debug!("H2 RECONNECT");
                         stream.state = StreamState::Link
                     }
                 }
