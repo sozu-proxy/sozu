@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use sozu_command::ready::Ready;
 
 use crate::{
@@ -42,6 +44,9 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         println_!("======= MUX H1 READABLE {:?}", self.position);
         self.timeout_container.reset();
         let stream = &mut context.streams[self.stream];
+        if stream.metrics.start.is_none() {
+            stream.metrics.start = Some(Instant::now());
+        }
         let parts = stream.split(&self.position);
         let kawa = parts.rbuffer;
         let (size, status) = self.socket.socket_read(kawa.storage.space());
@@ -144,11 +149,11 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                     let kawa = &mut stream.back;
                     match kawa.detached.status_line {
                         kawa::StatusLine::Response { code: 101, .. } => {
-                            println!("============== HANDLE UPGRADE!");
+                            debug!("============== HANDLE UPGRADE!");
                             return MuxResult::Upgrade;
                         }
                         kawa::StatusLine::Response { code: 100, .. } => {
-                            println!("============== HANDLE CONTINUE!");
+                            debug!("============== HANDLE CONTINUE!");
                             // after a 100 continue, we expect the client to continue with its request
                             self.timeout_container.reset();
                             self.readiness.interest.insert(Ready::READABLE);
@@ -156,7 +161,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                             return MuxResult::Continue;
                         }
                         kawa::StatusLine::Response { code: 103, .. } => {
-                            println!("============== HANDLE EARLY HINT!");
+                            debug!("============== HANDLE EARLY HINT!");
                             if let StreamState::Linked(token) = stream.state {
                                 // after a 103 early hints, we expect the backend to send its response
                                 endpoint
@@ -181,9 +186,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                     let old_state = std::mem::replace(&mut stream.state, StreamState::Unlinked);
                     if stream.context.keep_alive_frontend {
                         self.timeout_container.reset();
-                        // println!("{old_state:?} {:?}", self.readiness);
                         if let StreamState::Linked(token) = old_state {
-                            // println!("{:?}", endpoint.readiness(token));
                             endpoint.end_stream(token, self.stream, context);
                         }
                         self.readiness.interest.insert(Ready::READABLE);
@@ -285,7 +288,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                 }
                 (false, false) => {
                     // we do not have an answer, but the request is untouched so we can retry
-                    println!("H1 RECONNECT");
+                    debug!("H1 RECONNECT");
                     stream.state = StreamState::Link;
                 }
                 (false, true) => unreachable!(),

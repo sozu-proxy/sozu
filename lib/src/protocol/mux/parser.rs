@@ -207,7 +207,7 @@ pub fn frame_header(input: &[u8], max_frame_size: u32) -> IResult<&[u8], FrameHe
         FrameType::WindowUpdate => true,
     };
     if !valid_stream_id {
-        println!("invalid stream_id: {stream_id}");
+        error!("invalid stream_id: {}", stream_id);
         return Err(Err::Failure(ParserError::new_h2(i, H2Error::ProtocolError)));
     }
 
@@ -223,7 +223,7 @@ pub fn frame_header(input: &[u8], max_frame_size: u32) -> IResult<&[u8], FrameHe
 }
 
 fn convert_frame_type(t: u8) -> Option<FrameType> {
-    info!("got frame type: {}", t);
+    debug!("got frame type: {}", t);
     match t {
         0 => Some(FrameType::Data),
         1 => Some(FrameType::Headers),
@@ -353,7 +353,6 @@ pub fn data_frame<'a>(
     header: &FrameHeader,
 ) -> IResult<&'a [u8], Frame, ParserError<'a>> {
     let (remaining, i) = take(header.payload_len)(input)?;
-    println!("{i:?}");
 
     let (i, pad_length) = if header.flags & 0x8 != 0 {
         let (i, pad_length) = be_u8(i)?;

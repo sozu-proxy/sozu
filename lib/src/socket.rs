@@ -193,6 +193,31 @@ impl SocketHandler for FrontRustls {
                 incr!("rustls.read.infinite_loop.error");
             }
 
+            while !self.session.wants_read() {
+                match self.session.reader().read(&mut buf[size..]) {
+                    Ok(0) => break,
+                    Ok(sz) => {
+                        size += sz;
+                    }
+                    Err(e) => match e.kind() {
+                        ErrorKind::WouldBlock => {
+                            break;
+                        }
+                        ErrorKind::ConnectionReset
+                        | ErrorKind::ConnectionAborted
+                        | ErrorKind::BrokenPipe => {
+                            is_closed = true;
+                            break;
+                        }
+                        _ => {
+                            error!("could not read data from TLS stream: {:?}", e);
+                            is_error = true;
+                            break;
+                        }
+                    },
+                }
+            }
+
             if size == buf.len() {
                 break;
             }
@@ -232,31 +257,6 @@ impl SocketHandler for FrontRustls {
                 error!("could not process read TLS packets: {:?}", e);
                 is_error = true;
                 break;
-            }
-
-            while !self.session.wants_read() {
-                match self.session.reader().read(&mut buf[size..]) {
-                    Ok(0) => break,
-                    Ok(sz) => {
-                        size += sz;
-                    }
-                    Err(e) => match e.kind() {
-                        ErrorKind::WouldBlock => {
-                            break;
-                        }
-                        ErrorKind::ConnectionReset
-                        | ErrorKind::ConnectionAborted
-                        | ErrorKind::BrokenPipe => {
-                            is_closed = true;
-                            break;
-                        }
-                        _ => {
-                            error!("could not read data from TLS stream: {:?}", e);
-                            is_error = true;
-                            break;
-                        }
-                    },
-                }
             }
         }
 
