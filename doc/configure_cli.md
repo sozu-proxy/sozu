@@ -94,3 +94,14 @@ sozu --config /etc/sozu/config.toml state load --file state.json
 ```
 
 You should be able to request your cluster like before the shutdown.
+
+### Monitor status of backends with events
+
+This CLI command:
+
+```bash
+sozu --config /path/to/config.toml events
+```
+
+listens to events sent by Sōzu workers whenever a backend is down, up again,
+or when no backend is available.

@@ -14,10 +14,11 @@ use crate::{
             filtered_metrics, protobuf_endpoint, request::RequestType,
             response_content::ContentType, AggregatedMetrics, AvailableMetrics, CertificateAndKey,
             CertificateSummary, CertificatesWithFingerprints, ClusterMetrics, CustomHttpAnswers,
-            FilteredMetrics, HttpEndpoint, HttpListenerConfig, HttpsListenerConfig,
-            ListOfCertificatesByAddress, ListedFrontends, ListenersList, ProtobufEndpoint,
-            QueryCertificatesFilters, RequestCounts, Response, ResponseContent, ResponseStatus,
-            RunState, SocketAddress, TlsVersion, WorkerInfos, WorkerMetrics, WorkerResponses,
+            Event, EventKind, FilteredMetrics, HttpEndpoint, HttpListenerConfig,
+            HttpsListenerConfig, ListOfCertificatesByAddress, ListedFrontends, ListenersList,
+            ProtobufEndpoint, QueryCertificatesFilters, RequestCounts, Response, ResponseContent,
+            ResponseStatus, RunState, SocketAddress, TlsVersion, WorkerInfos, WorkerMetrics,
+            WorkerResponses,
         },
         DisplayError,
     },
@@ -1004,5 +1005,28 @@ impl CustomHttpAnswers {
             }
         }
         rows
+    }
+}
+
+impl Display for Event {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let kind = match self.kind() {
+            EventKind::BackendDown => "backend down",
+            EventKind::BackendUp => "backend up",
+            EventKind::NoAvailableBackends => "no available backends",
+            EventKind::RemovedBackendHasNoConnections => "removed backend has no connections",
+        };
+        let address = match &self.address {
+            Some(a) => a.to_string(),
+            None => String::new(),
+        };
+        write!(
+            f,
+            "{}, backend={}, cluster={}, address={}",
+            kind,
+            self.backend_id(),
+            self.cluster_id(),
+            address,
+        )
     }
 }
