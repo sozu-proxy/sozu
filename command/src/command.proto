@@ -522,6 +522,7 @@ message ClusterInformation {
     repeated AddBackend backends = 5;
 }
 
+// an event produced by a worker to notify about backends status
 message Event {
     required EventKind kind = 1;
     optional string cluster_id = 2;

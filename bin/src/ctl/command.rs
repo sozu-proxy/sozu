@@ -46,6 +46,12 @@ impl CommandManager {
                     if !self.json {
                         debug!("Processing: {}", response.message);
                     }
+                    if let Some(ResponseContent {
+                        content_type: Some(ContentType::Event(event)),
+                    }) = response.content
+                    {
+                        info!("{}, {}", response.message, event);
+                    }
                 }
                 ResponseStatus::Failure => return Err(CtlError::Failure(response.message)),
                 ResponseStatus::Ok => return Ok(response),
