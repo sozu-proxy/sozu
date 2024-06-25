@@ -1005,9 +1005,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a4a650543ca06a924e8b371db273b2756685faae30f8487da1b56505a8f78b0c"
 dependencies = [
  "libc",
- "log 0.4.21",
  "wasi",
  "windows-sys 0.48.0",
+]
+
+[[package]]
+name = "mio"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4929e1f84c5e54c3ec6141cd5d8b5a5c055f031f80cf78f2072920173cb4d880"
+dependencies = [
+ "hermit-abi",
+ "libc",
+ "log 0.4.21",
+ "wasi",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1707,7 +1719,7 @@ dependencies = [
  "jemallocator",
  "libc",
  "log 0.4.21",
- "mio",
+ "mio 1.0.0",
  "nix",
  "nom",
  "num_cpus",
@@ -1730,7 +1742,7 @@ dependencies = [
  "libc",
  "log 0.4.21",
  "memchr",
- "mio",
+ "mio 1.0.0",
  "nix",
  "nom",
  "pool",
@@ -1758,7 +1770,7 @@ dependencies = [
  "hyper",
  "hyper-rustls",
  "libc",
- "mio",
+ "mio 1.0.0",
  "rustls 0.21.12",
  "sozu-command-lib",
  "sozu-lib",
@@ -1779,7 +1791,7 @@ dependencies = [
  "kawa",
  "libc",
  "memchr",
- "mio",
+ "mio 1.0.0",
  "nom",
  "once_cell",
  "poule",
@@ -1971,7 +1983,7 @@ checksum = "ba4f4a02a7a80d6f274636f0aa95c7e383b912d41fe721a31f29e29698585a4a"
 dependencies = [
  "backtrace",
  "libc",
- "mio",
+ "mio 0.8.11",
  "num_cpus",
  "pin-project-lite",
  "socket2",
