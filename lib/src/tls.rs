@@ -3,8 +3,10 @@
 //! Persists certificates in the Rustls
 //! [`CertifiedKey` format](https://docs.rs/rustls/latest/rustls/sign/struct.CertifiedKey.html),
 //! exposes them to the HTTPS listener for TLS handshakes.
+#[cfg(test)]
+use std::collections::HashSet;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     fmt,
     io::BufReader,
     str::FromStr,
@@ -142,14 +144,21 @@ impl TryFrom<&AddCertificate> for CertifiedKeyWrapper {
 }
 
 /// Parses and stores TLS certificates, makes them available to Rustls for TLS handshakes
+///
+/// the `domains` TrieNode is an addressing system to resolve a certificate
+/// for a given domain name.
+/// Certificates are stored in a hashmap that may contain unreachable certificates if
+/// no domain name points to it.
 #[derive(Default, Debug)]
 pub struct CertificateResolver {
-    /// all fingerprints of all
+    /// routing one domain name to one certificate for fast resolving
     pub domains: TrieNode<Fingerprint>,
-    /// a map of fingerprint -> stored_certificate
+    /// a storage map: fingerprint -> stored_certificate
     certificates: HashMap<Fingerprint, CertifiedKeyWrapper>,
-    /// map of domain_name -> all fingerprints linked to this domain name
-    name_fingerprint_idx: HashMap<String, HashSet<Fingerprint>>,
+    /// maps each domain name to several compatible certificates, sorted by expiration date
+    /// map of domain_name -> all fingerprints (and expiration) linked to this domain name
+    //  the vector of (fingerprint, expiration) is sorted by expiration
+    name_fingerprint_idx: HashMap<String, Vec<(Fingerprint, i64)>>,
 }
 
 impl CertificateResolver {
@@ -158,50 +167,54 @@ impl CertificateResolver {
         self.certificates.get(fingerprint).map(ToOwned::to_owned)
     }
 
-    /// persist a certificate, after ensuring validity, and checking if it can replace another certificate
+    /// persist a certificate, after ensuring validity, and checking if it can replace another certificate.
+    /// return the certificate fingerprint regardless of having inserted it or not
     pub fn add_certificate(
         &mut self,
         add: &AddCertificate,
     ) -> Result<Fingerprint, CertificateResolverError> {
         let cert_to_add = CertifiedKeyWrapper::try_from(add)?;
 
-        let (should_insert, outdated_certs) = self.should_insert(&cert_to_add)?;
+        trace!("Certificate Resolver: adding certificate {:?}", cert_to_add);
 
-        if !should_insert {
-            // if we do not need to insert the fingerprint just return the fingerprint
+        if self.certificates.contains_key(&cert_to_add.fingerprint) {
             return Ok(cert_to_add.fingerprint);
         }
 
         for new_name in &cert_to_add.names {
-            self.domains.remove(&new_name.to_owned().into_bytes());
+            let fingerprints_for_this_name = self
+                .name_fingerprint_idx
+                .entry(new_name.to_owned())
+                .or_default();
 
+            fingerprints_for_this_name
+                .push((cert_to_add.fingerprint.clone(), cert_to_add.expiration));
+
+            // sort expiration ascending (longest-lived to the right)
+            fingerprints_for_this_name.sort_by_key(|t| t.1);
+
+            let longest_lived_cert = match fingerprints_for_this_name.last() {
+                Some(cert) => cert,
+                None => {
+                    error!("no fingerprint for this name, this should not happen");
+                    continue;
+                }
+            };
+
+            // update the longest lived certificate in the TriNode
+            self.domains.remove(&new_name.to_owned().into_bytes());
             self.domains.insert(
                 new_name.to_owned().into_bytes(),
-                cert_to_add.fingerprint.to_owned(),
+                longest_lived_cert.0.to_owned(),
             );
-
-            self.name_fingerprint_idx
-                .entry(new_name.to_owned())
-                .or_default()
-                .insert(cert_to_add.fingerprint.to_owned());
-        }
-
-        for name in &cert_to_add.names {
-            if let Some(fingerprints) = self.name_fingerprint_idx.get_mut(name) {
-                for outdated in &outdated_certs {
-                    fingerprints.remove(outdated);
-                }
-            }
-        }
-
-        for outdated in &outdated_certs {
-            self.certificates.remove(outdated);
         }
 
         self.certificates
             .insert(cert_to_add.fingerprint.to_owned(), cert_to_add.clone());
 
-        Ok(cert_to_add.fingerprint.to_owned())
+        trace!("{:#?}", self);
+
+        Ok(cert_to_add.fingerprint)
     }
 
     /// Delete a certificate from the resolver. May fail if there is no alternative for
@@ -212,20 +225,26 @@ impl CertificateResolver {
     ) -> Result<(), CertificateResolverError> {
         if let Some(certificate_to_remove) = self.get_certificate(fingerprint) {
             for name in certificate_to_remove.names {
-                if let Some(fingerprints) = self.name_fingerprint_idx.get_mut(&name) {
-                    fingerprints.remove(fingerprint);
+                self.domains.domain_remove(&name.clone().into_bytes());
 
-                    self.domains.domain_remove(&name.clone().into_bytes());
+                if let Some(fingerprints_and_exp) = self.name_fingerprint_idx.get_mut(&name) {
+                    // remove fingerprints from the index for this name
+                    *fingerprints_and_exp = fingerprints_and_exp
+                        .drain(..)
+                        .filter(|t| &t.0 != fingerprint)
+                        .collect();
 
-                    if let Some(fingerprint) = fingerprints.iter().next() {
+                    // if present, reinsert the longest lived certificate in the TrieNode
+                    if let Some(longest_lived_cert) = fingerprints_and_exp.last() {
                         self.domains
-                            .insert(name.into_bytes(), fingerprint.to_owned());
+                            .insert(name.into_bytes(), longest_lived_cert.0.to_owned());
                     }
                 }
             }
 
             self.certificates.remove(fingerprint);
         }
+        trace!("{:#?}", self);
 
         Ok(())
     }
@@ -262,7 +281,7 @@ impl CertificateResolver {
         for name in names {
             if let Some(fprints) = self.name_fingerprint_idx.get(name) {
                 fprints.iter().for_each(|fingerprint| {
-                    fingerprints.insert(fingerprint.to_owned());
+                    fingerprints.insert(fingerprint.to_owned().0);
                 });
             }
         }
@@ -270,7 +289,8 @@ impl CertificateResolver {
         Ok(fingerprints)
     }
 
-    /// return the hashset of subjects that the certificate is able to handle
+    /// return the hashset of subjects that the certificate is able to handle.
+    /// the certificate must be already persisted for this check
     #[cfg(test)]
     fn certificate_names(
         &self,
@@ -280,53 +300,6 @@ impl CertificateResolver {
             return Ok(cert.names.iter().cloned().collect());
         }
         Ok(HashSet::new())
-    }
-
-    /// check the certificate expiration and related certificates,
-    /// return a list of outdated certificates that should be removed
-    fn should_insert(
-        &self,
-        candidate_cert: &CertifiedKeyWrapper,
-    ) -> Result<(bool, Vec<Fingerprint>), CertificateResolverError> {
-        let mut should_insert = false;
-
-        let mut related_certificates = HashSet::new();
-
-        for name in &candidate_cert.names {
-            match self.name_fingerprint_idx.get(name) {
-                None => should_insert = true,
-                Some(fingerprints) if fingerprints.is_empty() => should_insert = true,
-                Some(fingerprints) => related_certificates.extend(fingerprints),
-            }
-        }
-
-        let mut outdated_certificates = Vec::new();
-
-        for fingerprint in related_certificates {
-            let related_certificate = match self.certificates.get(fingerprint) {
-                Some(cert) => cert,
-                None => {
-                    error!("certificates and fingerprint hashmaps are desynchronized");
-                    continue;
-                }
-            };
-
-            if related_certificate.expiration > candidate_cert.expiration {
-                continue;
-            }
-
-            for name in &related_certificate.names {
-                if !candidate_cert.names.contains(name) {
-                    continue;
-                }
-            }
-
-            should_insert = true;
-
-            outdated_certificates.push(fingerprint.clone());
-        }
-
-        Ok((should_insert, outdated_certificates))
     }
 
     pub fn domain_lookup(
@@ -407,7 +380,7 @@ mod tests {
 
     use super::CertificateResolver;
 
-    use rand::{seq::SliceRandom, thread_rng};
+    // use rand::{seq::SliceRandom, thread_rng};
     use sozu_command::proto::command::{AddCertificate, CertificateAndKey, SocketAddress};
 
     #[test]
@@ -432,15 +405,21 @@ mod tests {
             return Err("failed to retrieve certificate".into());
         }
 
+        // get the names to try and retrieve the certificate AFTER it is supposed to be removed
+        let names = resolver.certificate_names(&fingerprint)?;
+
         if let Err(err) = resolver.remove_certificate(&fingerprint) {
-            return Err(format!("the certificate must not been removed, {err}").into());
+            return Err(format!("the certificate was not removed, {err}").into());
         }
 
-        let names = resolver.certificate_names(&fingerprint)?;
-        if !resolver.find_certificates_by_names(&names)?.is_empty()
-            && resolver.get_certificate(&fingerprint).is_some()
-        {
-            return Err("We have retrieve the certificate that should be deleted".into());
+        if resolver.get_certificate(&fingerprint).is_some() {
+            return Err("We have retrieved the certificate that should be deleted".into());
+        }
+
+        if !resolver.find_certificates_by_names(&names)?.is_empty() {
+            return Err(
+                "The certificate should be deleted but one of its names is in the index".into(),
+            );
         }
 
         Ok(())
@@ -490,93 +469,98 @@ mod tests {
     }
 
     #[test]
-    fn properly_replace_outdated_cert() -> Result<(), Box<dyn Error + Send + Sync>> {
+    fn keep_resolving_with_wildcard() -> Result<(), Box<dyn Error + Send + Sync>> {
         let address = SocketAddress::new_v4(127, 0, 0, 1, 8080);
         let mut resolver = CertificateResolver::default();
 
-        let first_certificate = CertificateAndKey {
-            certificate: String::from(include_str!("../assets/tests/certificate-1y.pem")),
+        // ---------------------------------------------------------------------
+        // load the wildcard certificate,  expiring in 3 years
+        let wildcard_example_org = CertificateAndKey {
+            certificate: String::from(include_str!("../assets/tests/certificate-3.pem")),
             key: String::from(include_str!("../assets/tests/key.pem")),
-            names: vec!["localhost".into()],
             ..Default::default()
         };
-        let first = resolver.add_certificate(&AddCertificate {
+
+        let wildcard_example_org_fingerprint = resolver.add_certificate(&AddCertificate {
             address: address.clone(),
-            certificate: first_certificate,
-            expired_at: None,
+            certificate: wildcard_example_org,
+            expired_at: Some(
+                (SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?
+                    + Duration::from_secs(1 * 365 * 24 * 3600))
+                .as_secs() as i64,
+            ),
         })?;
-        if resolver.get_certificate(&first).is_none() {
-            return Err("failed to retrieve first certificate".into());
-        }
-        match resolver.domain_lookup("localhost".as_bytes(), true) {
-            Some((_, fingerprint)) if fingerprint == &first => {}
-            Some((domain, fingerprint)) => {
-                return Err(format!(
-                    "failed to lookup first inserted certificate. domain: {:?}, fingerprint: {}",
-                    domain, fingerprint
-                )
-                .into())
-            }
-            _ => return Err("failed to lookup first inserted certificate".into()),
+
+        if resolver
+            .get_certificate(&wildcard_example_org_fingerprint)
+            .is_none()
+        {
+            return Err("could not load the 2-year-valid certificate".into());
         }
 
-        let second_certificate = CertificateAndKey {
-            certificate: String::from(include_str!("../assets/tests/certificate-2y.pem")),
+        // ---------------------------------------------------------------------
+        // try loading the ordinary certificate, expiring in 2 years
+        // this one has two names: example.org and www.example.org
+        let www_example_org = CertificateAndKey {
+            certificate: String::from(include_str!("../assets/tests/certificate-2.pem")),
             key: String::from(include_str!("../assets/tests/key.pem")),
-            names: vec!["localhost".into(), "lolcatho.st".into()],
             ..Default::default()
         };
-        let second = resolver.add_certificate(&AddCertificate {
+
+        let www_example_org_fingerprint = resolver.add_certificate(&AddCertificate {
             address,
-            certificate: second_certificate,
-            expired_at: None,
+            certificate: www_example_org,
+            expired_at: Some(
+                (SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?
+                    + Duration::from_secs(2 * 365 * 24 * 3600))
+                .as_secs() as i64,
+            ),
+            ..Default::default()
         })?;
 
-        if resolver.get_certificate(&second).is_none() {
-            return Err("failed to retrieve second certificate".into());
-        }
+        let www_example_org = resolver
+            .domain_lookup("www.example.org".as_bytes(), true)
+            .expect("there should be a www.example.org cert");
+        assert_eq!(www_example_org.1, www_example_org_fingerprint);
 
-        match resolver.domain_lookup("localhost".as_bytes(), true) {
-            Some((_, fingerprint)) if fingerprint == &second => {}
-            Some((domain, fingerprint)) => {
-                return Err(format!(
-                    "failed to lookup second inserted certificate. domain: {:?}, fingerprint: {}",
-                    domain, fingerprint
-                )
-                .into())
-            }
-            _ => return Err("the former certificate has not been overriden by the new one".into()),
-        }
+        let test_example_org = resolver
+            .domain_lookup("test.example.org".as_bytes(), true)
+            .expect("there should be a test.example.org cert");
+        assert_eq!(test_example_org.1, wildcard_example_org_fingerprint);
+
+        let example_org = resolver
+            .domain_lookup("example.org".as_bytes(), true)
+            .expect("there should be a example.org cert");
+        assert_eq!(example_org.1, www_example_org_fingerprint);
+
+        // check that when removing the www.example.org certificate
+        // the resolver falls back on the wildcard
+        resolver
+            .remove_certificate(&www_example_org_fingerprint)
+            .expect("should be able to remove the 2-year certificate");
+
+        let should_be_wildcard_fingerprint = resolver
+            .domain_lookup("www.example.org".as_bytes(), true)
+            .expect("there should be a www.example.org cert");
+        assert_eq!(
+            should_be_wildcard_fingerprint.1,
+            wildcard_example_org_fingerprint
+        );
+
+        assert!(resolver
+            .domain_lookup("example.org".as_bytes(), true)
+            .is_none());
 
         Ok(())
     }
 
     #[test]
-    fn replacement() -> Result<(), Box<dyn Error + Send + Sync>> {
+    fn resolve_the_longer_lived_cert() -> Result<(), Box<dyn Error + Send + Sync>> {
         let address = SocketAddress::new_v4(127, 0, 0, 1, 8080);
         let mut resolver = CertificateResolver::default();
 
         // ---------------------------------------------------------------------
-        // load first certificate
-        let certificate_and_key_1y = CertificateAndKey {
-            certificate: String::from(include_str!("../assets/tests/certificate-1y.pem")),
-            key: String::from(include_str!("../assets/tests/key-1y.pem")),
-            ..Default::default()
-        };
-
-        let fingerprint_1y = resolver.add_certificate(&AddCertificate {
-            address: address.clone(),
-            certificate: certificate_and_key_1y,
-            expired_at: None,
-        })?;
-        let names_1y = resolver.certificate_names(&fingerprint_1y)?;
-
-        if resolver.get_certificate(&fingerprint_1y).is_none() {
-            return Err("failed to retrieve certificate".into());
-        }
-
-        // ---------------------------------------------------------------------
-        // load second certificate
+        // load the 2-year valid certificate
         let certificate_and_key_2y = CertificateAndKey {
             certificate: String::from(include_str!("../assets/tests/certificate-2y.pem")),
             key: String::from(include_str!("../assets/tests/key-2y.pem")),
@@ -584,33 +568,47 @@ mod tests {
         };
 
         let fingerprint_2y = resolver.add_certificate(&AddCertificate {
-            address,
+            address: address.clone(),
             certificate: certificate_and_key_2y,
             expired_at: None,
         })?;
 
         if resolver.get_certificate(&fingerprint_2y).is_none() {
-            return Err("failed to retrieve certificate".into());
+            return Err("could not load the 2-year-valid certificate".into());
         }
 
         // ---------------------------------------------------------------------
-        // Check if the fist certificate has been successfully replaced
-        if resolver.get_certificate(&fingerprint_1y).is_some() {
-            return Err("certificate must be replaced by the 2y expiration one".into());
-        }
+        // try loading the 1-year valid certificate
+        let certificate_and_key_1y = CertificateAndKey {
+            certificate: String::from(include_str!("../assets/tests/certificate-1y.pem")),
+            key: String::from(include_str!("../assets/tests/key-1y.pem")),
+            ..Default::default()
+        };
 
-        if resolver.get_certificate(&fingerprint_2y).is_none() {
-            return Err("certificate must be added instead of the 1y expiration one".into());
-        }
+        let fingerprint_1y = resolver.add_certificate(&AddCertificate {
+            address,
+            certificate: certificate_and_key_1y,
+            ..Default::default()
+        })?;
 
-        let fingerprints = resolver.find_certificates_by_names(&names_1y)?;
-        if fingerprints.get(&fingerprint_1y).is_some() {
-            return Err("index must not reference the 1y expiration certificate".into());
-        }
+        let localhost_cert = resolver
+            .domain_lookup("localhost".as_bytes(), true)
+            .expect("there should be a localhost cert");
 
-        if fingerprints.get(&fingerprint_2y).is_none() {
-            return Err("index have to reference the 2y expiration certificate".into());
-        }
+        assert_eq!(localhost_cert.1, fingerprint_2y);
+
+        // check that when removing the longer-lived certificate,
+        // the resolver falls back on the shorter-lived one
+
+        resolver
+            .remove_certificate(&fingerprint_2y)
+            .expect("should be able to remove the 2-year certificate");
+
+        let localhost_cert = resolver
+            .domain_lookup("localhost".as_bytes(), true)
+            .expect("there should be a localhost cert");
+
+        assert_eq!(localhost_cert.1, fingerprint_1y);
 
         Ok(())
     }
@@ -628,7 +626,7 @@ mod tests {
             ..Default::default()
         };
 
-        let fingerprint_1y = resolver.add_certificate(&AddCertificate {
+        let fingerprint_1y_overriden = resolver.add_certificate(&AddCertificate {
             address: address.clone(),
             certificate: certificate_and_key_1y,
             expired_at: Some(
@@ -637,9 +635,11 @@ mod tests {
                 .as_secs() as i64,
             ),
         })?;
-        let names_1y = resolver.certificate_names(&fingerprint_1y)?;
 
-        if resolver.get_certificate(&fingerprint_1y).is_none() {
+        if resolver
+            .get_certificate(&fingerprint_1y_overriden)
+            .is_none()
+        {
             return Err("failed to retrieve certificate".into());
         }
 
@@ -657,118 +657,24 @@ mod tests {
             expired_at: None,
         })?;
 
-        if resolver.get_certificate(&fingerprint_2y).is_some() {
-            return Err("certificate should not be loaded".into());
-        }
+        let localhost_cert = resolver
+            .domain_lookup("localhost".as_bytes(), true)
+            .expect("there should be a localhost cert");
 
-        // ---------------------------------------------------------------------
-        // Check if the fist certificate has been successfully not replaced
-        if resolver.get_certificate(&fingerprint_1y).is_none() {
-            return Err("certificate must not be replaced by the 2y expiration one".into());
-        }
+        assert_eq!(localhost_cert.1, fingerprint_1y_overriden);
 
-        if resolver.get_certificate(&fingerprint_2y).is_some() {
-            return Err("certificate must not be added instead of the 1y expiration one".into());
-        }
+        // check that when removing the overriden certificate,
+        // the resolver falls back on the other one
 
-        let fingerprints = resolver.find_certificates_by_names(&names_1y)?;
-        if fingerprints.get(&fingerprint_1y).is_none() {
-            return Err("index must reference the 1y expiration certificate".into());
-        }
+        resolver
+            .remove_certificate(&fingerprint_1y_overriden)
+            .expect("should be able to remove the 1-year (3-year-overriden) certificate");
 
-        if fingerprints.get(&fingerprint_2y).is_some() {
-            return Err("index must not reference the 2y expiration certificate".into());
-        }
+        let localhost_cert = resolver
+            .domain_lookup("localhost".as_bytes(), true)
+            .expect("there should be a localhost cert");
 
-        Ok(())
-    }
-
-    #[test]
-    fn random() -> Result<(), Box<dyn Error + Send + Sync>> {
-        // ---------------------------------------------------------------------
-        // load certificates
-        let mut certificates = vec![
-            CertificateAndKey {
-                certificate: include_str!("../assets/tests/certificate-1.pem").to_string(),
-                key: include_str!("../assets/tests/key.pem").to_string(),
-                ..Default::default()
-            },
-            CertificateAndKey {
-                certificate: include_str!("../assets/tests/certificate-2.pem").to_string(),
-                key: include_str!("../assets/tests/key.pem").to_string(),
-                ..Default::default()
-            },
-            CertificateAndKey {
-                certificate: include_str!("../assets/tests/certificate-3.pem").to_string(),
-                key: include_str!("../assets/tests/key.pem").to_string(),
-                ..Default::default()
-            },
-            CertificateAndKey {
-                certificate: include_str!("../assets/tests/certificate-4.pem").to_string(),
-                key: include_str!("../assets/tests/key.pem").to_string(),
-                ..Default::default()
-            },
-            CertificateAndKey {
-                certificate: include_str!("../assets/tests/certificate-5.pem").to_string(),
-                key: include_str!("../assets/tests/key.pem").to_string(),
-                ..Default::default()
-            },
-            CertificateAndKey {
-                certificate: include_str!("../assets/tests/certificate-6.pem").to_string(),
-                key: include_str!("../assets/tests/key.pem").to_string(),
-                ..Default::default()
-            },
-        ];
-
-        let mut fingerprints = vec![];
-
-        // randomize entries
-        certificates.shuffle(&mut thread_rng());
-
-        // ---------------------------------------------------------------------
-        // load certificates in resolver
-        let address = SocketAddress::new_v4(127, 0, 0, 1, 8080);
-        let mut resolver = CertificateResolver::default();
-
-        for certificate in &certificates {
-            fingerprints.push(resolver.add_certificate(&AddCertificate {
-                address: address.clone(),
-                certificate: certificate.to_owned(),
-                expired_at: None,
-            })?);
-        }
-
-        let mut names = HashSet::new();
-        names.insert("example.org".to_string());
-
-        let fprints = resolver.find_certificates_by_names(&names)?;
-        if 1 != fprints.len() && !fprints.contains(&fingerprints[1]) {
-            return Err("domain 'example.org' resolve to the wrong certificate".into());
-        }
-
-        let mut names = HashSet::new();
-        names.insert("*.example.org".to_string());
-
-        let fprints = resolver.find_certificates_by_names(&names)?;
-        if 1 != fprints.len() && !fprints.contains(&fingerprints[2]) {
-            return Err("domain '*.example.org' resolve to the wrong certificate".into());
-        }
-
-        let mut names = HashSet::new();
-        names.insert("clever-cloud.com".to_string());
-
-        let fprints = resolver.find_certificates_by_names(&names)?;
-        if 1 != fprints.len() && !fprints.contains(&fingerprints[4]) {
-            return Err("domain 'clever-cloud.com' resolve to the wrong certificate".into());
-        }
-
-        let mut names = HashSet::new();
-        names.insert("*.clever-cloud.com".to_string());
-
-        let fprints = resolver.find_certificates_by_names(&names)?;
-        if 1 != fprints.len() && !fprints.contains(&fingerprints[5]) {
-            return Err("domain '*.clever-cloud.com' resolve to the wrong certificate".into());
-        }
+        assert_eq!(localhost_cert.1, fingerprint_2y);
 
         Ok(())
     }
