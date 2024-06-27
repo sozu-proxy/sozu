@@ -245,6 +245,13 @@ pub fn print_metrics(aggregated_metrics: &AggregatedMetrics) -> Result<(), Displ
         println!("\nWorker {worker_id}\n=========");
         print_worker_metrics(worker_metrics)?;
     }
+
+    // clusters
+    if !aggregated_metrics.clusters.is_empty() {
+        println!("\nClusters\n=======");
+        print_cluster_metrics(&aggregated_metrics.clusters);
+    }
+
     Ok(())
 }
 

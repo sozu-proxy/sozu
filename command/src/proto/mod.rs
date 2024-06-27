@@ -1,3 +1,6 @@
+use std::collections::BTreeMap;
+
+use command::{filtered_metrics::Inner, AggregatedMetrics, ClusterMetrics, FilteredMetrics};
 use prost::DecodeError;
 
 /// Contains all types received by and sent from Sōzu
@@ -34,6 +37,100 @@ impl From<command::request::RequestType> for command::Request {
     fn from(value: command::request::RequestType) -> Self {
         Self {
             request_type: Some(value),
+        }
+    }
+}
+
+impl AggregatedMetrics {
+    /// Merge cluster metrics that were received from several workers
+    ///
+    /// Each workers serves the same clusters and gathers metrics on them,
+    /// which means we have to reduce each metric from N instances to 1.
+    pub fn merge_cluster_metrics(&mut self) {
+        for (_worker_id, worker_metrics) in &mut self.workers {
+            // avoid copying the cluster metrics by taking them
+            let clusters = std::mem::take(&mut worker_metrics.clusters);
+
+            for (cluster_id, mut cluster_metrics) in clusters {
+                for (metric_name, new_value) in cluster_metrics.cluster {
+                    if !new_value.is_mergeable() {
+                        continue;
+                    }
+                    self.clusters
+                        .entry(cluster_id.to_owned())
+                        .and_modify(|cluster| {
+                            cluster
+                                .cluster
+                                .entry(metric_name.clone())
+                                .and_modify(|old_value| old_value.merge(&new_value))
+                                .or_insert(new_value.clone());
+                        })
+                        .or_insert(ClusterMetrics {
+                            cluster: BTreeMap::from([(metric_name, new_value)]),
+                            backends: Vec::new(),
+                        });
+                }
+
+                for backend in cluster_metrics.backends.drain(..) {
+                    for (metric_name, new_value) in &backend.metrics {
+                        if !new_value.is_mergeable() {
+                            continue;
+                        }
+                        self.clusters
+                            .entry(cluster_id.to_owned())
+                            .and_modify(|cluster| {
+                                let found_backend = cluster
+                                    .backends
+                                    .iter_mut()
+                                    .find(|present| present.backend_id == backend.backend_id);
+
+                                let Some(existing_backend) = found_backend else {
+                                    cluster.backends.push(backend.clone());
+                                    return;
+                                };
+
+                                let _ = existing_backend
+                                    .metrics
+                                    .entry(metric_name.clone())
+                                    .and_modify(|old_value| old_value.merge(&new_value))
+                                    .or_insert(new_value.to_owned());
+                            })
+                            .or_insert(ClusterMetrics {
+                                cluster: BTreeMap::new(),
+                                backends: vec![backend.clone()],
+                            });
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl FilteredMetrics {
+    pub fn merge(&mut self, right: &Self) {
+        match (&self.inner, &right.inner) {
+            (Some(Inner::Gauge(a)), Some(Inner::Gauge(b))) => {
+                *self = Self {
+                    inner: Some(Inner::Gauge(a + b)),
+                };
+            }
+            (Some(Inner::Count(a)), Some(Inner::Count(b))) => {
+                *self = Self {
+                    inner: Some(Inner::Count(a + b)),
+                };
+            }
+            _ => {}
+        }
+    }
+
+    fn is_mergeable(&self) -> bool {
+        match &self.inner {
+            Some(Inner::Gauge(_)) | Some(Inner::Count(_)) => true,
+            // Inner::Time and Inner::Timeserie are never used in Sōzu
+            Some(Inner::Time(_))
+            | Some(Inner::Percentiles(_))
+            | Some(Inner::TimeSerie(_))
+            | None => false,
         }
     }
 }

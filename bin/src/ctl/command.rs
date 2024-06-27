@@ -85,6 +85,7 @@ impl CommandManager {
         cluster_ids: Vec<String>,
         backend_ids: Vec<String>,
         no_clusters: bool,
+        workers: bool,
     ) -> Result<(), CtlError> {
         let request: Request = RequestType::QueryMetrics(QueryMetricsOptions {
             list,
@@ -92,6 +93,7 @@ impl CommandManager {
             backend_ids,
             metric_names,
             no_clusters,
+            workers,
         })
         .into();
 
