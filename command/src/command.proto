@@ -578,12 +578,18 @@ message AvailableMetrics {
 
 // Aggregated metrics of main process & workers
 message AggregatedMetrics {
+    // metrics about the main process.
     // metric_name -> metric_value
     map<string, FilteredMetrics> main = 1;
+    // details of worker metrics, with clusters and backends.
     // worker_id -> worker_metrics
     map<string, WorkerMetrics> workers = 2;
+    // if present, contains metrics of clusters and their backends, merged across all workers.
     // cluster_id -> cluster_metrics
     map<string, ClusterMetrics> clusters = 3;
+    // if present, proxying metrics, merged accross all workers.
+    // metric_name -> metric_value
+    map<string, FilteredMetrics> proxying = 4;
 }
 
 // All metrics of a worker: proxy and clusters

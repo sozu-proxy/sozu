@@ -231,7 +231,7 @@ pub enum MetricsCmd {
         #[clap(
             short = 'w',
             long = "workers",
-            help = "display metrics of each worker, without flattening by cluster id (takes more space)"
+            help = "display metrics of each worker, without merging by metric name or cluster id (takes more space)"
         )]
         workers: bool,
     },

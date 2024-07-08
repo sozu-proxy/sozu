@@ -42,16 +42,27 @@ impl From<command::request::RequestType> for command::Request {
 }
 
 impl AggregatedMetrics {
-    /// Merge cluster metrics that were received from several workers
+    /// Merge metrics that were received from several workers
     ///
-    /// Each workers serves the same clusters and gathers metrics on them,
-    /// which means we have to reduce each metric from N instances to 1.
-    pub fn merge_cluster_metrics(&mut self) {
-        for (_worker_id, worker_metrics) in &mut self.workers {
-            // avoid copying the cluster metrics by taking them
-            let clusters = std::mem::take(&mut worker_metrics.clusters);
+    /// Each worker gather the same kind of metrics,
+    /// for its own proxying logic, and for the same clusters with their backends.
+    /// This means we have to reduce each metric from N instances to 1.
+    pub fn merge_metrics(&mut self) {
+        // avoid copying the worker metrics, by taking them
+        let workers = std::mem::take(&mut self.workers);
 
-            for (cluster_id, mut cluster_metrics) in clusters {
+        for (_worker_id, worker) in workers {
+            for (metric_name, new_value) in worker.proxy {
+                if !new_value.is_mergeable() {
+                    continue;
+                }
+                self.proxying
+                    .entry(metric_name)
+                    .and_modify(|old_value| old_value.merge(&new_value))
+                    .or_insert(new_value);
+            }
+
+            for (cluster_id, mut cluster_metrics) in worker.clusters {
                 for (metric_name, new_value) in cluster_metrics.cluster {
                     if !new_value.is_mergeable() {
                         continue;

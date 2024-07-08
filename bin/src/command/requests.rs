@@ -583,10 +583,11 @@ impl GatheringTask for QueryMetricsTask {
             main: main_metrics,
             clusters: BTreeMap::new(),
             workers: workers_metrics,
+            proxying: BTreeMap::new(),
         };
 
         if !self.options.workers && server.workers.len() > 1 {
-            aggregated_metrics.merge_cluster_metrics();
+            aggregated_metrics.merge_metrics();
         }
 
         client.finish_ok_with_content(

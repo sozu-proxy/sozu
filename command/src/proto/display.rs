@@ -240,10 +240,17 @@ pub fn print_metrics(aggregated_metrics: &AggregatedMetrics) -> Result<(), Displ
     println!("\nMAIN PROCESS\n============");
     print_proxy_metrics(&aggregated_metrics.main);
 
+    if aggregated_metrics.proxying.len() != 0 {
+        println!("\nPROXYING\n============");
+        print_proxy_metrics(&aggregated_metrics.proxying);
+    }
+
     // workers
-    for (worker_id, worker_metrics) in aggregated_metrics.workers.iter() {
-        println!("\nWorker {worker_id}\n=========");
-        print_worker_metrics(worker_metrics)?;
+    for (worker_id, worker) in aggregated_metrics.workers.iter() {
+        if worker.clusters.len() != 0 && worker.proxy.len() != 0 {
+            println!("\nWorker {worker_id}\n=========");
+            print_worker_metrics(worker)?;
+        }
     }
 
     // clusters
