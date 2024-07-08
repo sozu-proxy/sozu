@@ -269,9 +269,24 @@ fn print_cluster_metrics(cluster_metrics: &BTreeMap<String, ClusterMetrics>) {
         print_gauges_and_counts(&filtered);
         print_percentiles(&filtered);
 
-        for backend_metrics in cluster_metrics_data.backends.iter() {
-            println!("\n{cluster_id}/{}\n--------", backend_metrics.backend_id);
-            let filtered = filter_metrics(&backend_metrics.metrics);
+        // backend_id -> (metric_name -> value )
+        let mut backend_metric_acc: HashMap<String, BTreeMap<String, FilteredMetrics>> =
+            HashMap::new();
+
+        for backend in &cluster_metrics_data.backends {
+            for (metric_name, value) in &backend.metrics {
+                backend_metric_acc
+                    .entry(backend.backend_id.clone())
+                    .and_modify(|map| {
+                        map.insert(metric_name.clone(), value.clone());
+                    })
+                    .or_insert(BTreeMap::from([(metric_name.clone(), value.clone())]));
+            }
+        }
+
+        for (backend_id, metrics) in backend_metric_acc {
+            println!("\n{cluster_id}/{backend_id}\n--------");
+            let filtered = filter_metrics(&metrics);
             print_gauges_and_counts(&filtered);
             print_percentiles(&filtered);
         }
