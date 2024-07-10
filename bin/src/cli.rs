@@ -228,6 +228,12 @@ pub enum MetricsCmd {
             help = "get only the metrics of main process and workers (no cluster metrics)"
         )]
         no_clusters: bool,
+        #[clap(
+            short = 'w',
+            long = "workers",
+            help = "display metrics of each worker, without merging by metric name or cluster id (takes more space)"
+        )]
+        workers: bool,
     },
 }
 

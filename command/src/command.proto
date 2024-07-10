@@ -441,6 +441,8 @@ message QueryMetricsOptions {
     repeated string metric_names = 4;
     // query only worker and main process metrics (no cluster metrics)
     required bool no_clusters = 5;
+    // display metrics of each worker, without flattening (takes more space)
+    required bool workers = 6;
 }
 
 // options to configure metrics collection
@@ -576,8 +578,18 @@ message AvailableMetrics {
 
 // Aggregated metrics of main process & workers
 message AggregatedMetrics {
+    // metrics about the main process.
+    // metric_name -> metric_value
     map<string, FilteredMetrics> main = 1;
+    // details of worker metrics, with clusters and backends.
+    // worker_id -> worker_metrics
     map<string, WorkerMetrics> workers = 2;
+    // if present, contains metrics of clusters and their backends, merged across all workers.
+    // cluster_id -> cluster_metrics
+    map<string, ClusterMetrics> clusters = 3;
+    // if present, proxying metrics, merged accross all workers.
+    // metric_name -> metric_value
+    map<string, FilteredMetrics> proxying = 4;
 }
 
 // All metrics of a worker: proxy and clusters
@@ -593,7 +605,7 @@ message WorkerMetrics {
 message ClusterMetrics {
     // metric name -> metric value
     map<string, FilteredMetrics> cluster = 1;
-    // backend_id -> (metric name-> metric value)
+    // list of backends with their metrics
     repeated BackendMetrics backends = 2;
 }
 
@@ -604,8 +616,11 @@ message BackendMetrics {
 
 message FilteredMetrics {
     oneof inner {
+        // increases or decrease depending on the state
         uint64 gauge = 1;
+        // increases only
         int64 count = 2;
+        // milliseconds
         uint64 time = 3;
         Percentiles percentiles = 4;
         FilteredTimeSerie time_serie = 5;

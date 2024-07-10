@@ -253,6 +253,7 @@ impl LocalDrain {
             backend_ids,
             list,
             no_clusters,
+            workers: _workers,
         } = options;
 
         if *list {

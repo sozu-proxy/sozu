@@ -532,7 +532,7 @@ impl GatheringTask for QueryMetricsTask {
 
     fn on_finish(
         self: Box<Self>,
-        _server: &mut Server,
+        server: &mut Server,
         client: &mut OptionalClient,
         _timed_out: bool,
     ) {
@@ -579,12 +579,19 @@ impl GatheringTask for QueryMetricsTask {
             )
             .collect();
 
+        let mut aggregated_metrics = AggregatedMetrics {
+            main: main_metrics,
+            clusters: BTreeMap::new(),
+            workers: workers_metrics,
+            proxying: BTreeMap::new(),
+        };
+
+        if !self.options.workers && server.workers.len() > 1 {
+            aggregated_metrics.merge_metrics();
+        }
+
         client.finish_ok_with_content(
-            ContentType::Metrics(AggregatedMetrics {
-                main: main_metrics,
-                workers: workers_metrics,
-            })
-            .into(),
+            ContentType::Metrics(aggregated_metrics).into(),
             "Successfully aggregated all metrics",
         );
     }
