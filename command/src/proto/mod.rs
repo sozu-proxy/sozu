@@ -1,6 +1,9 @@
 use std::collections::BTreeMap;
 
-use command::{filtered_metrics::Inner, AggregatedMetrics, ClusterMetrics, FilteredMetrics};
+use command::{
+    filtered_metrics::Inner, AggregatedMetrics, BackendMetrics, Bucket, FilteredHistogram,
+    FilteredMetrics,
+};
 use prost::DecodeError;
 
 /// Contains all types received by and sent from Sōzu
@@ -53,63 +56,50 @@ impl AggregatedMetrics {
 
         for (_worker_id, worker) in workers {
             for (metric_name, new_value) in worker.proxy {
-                if !new_value.is_mergeable() {
-                    continue;
+                if new_value.is_mergeable() {
+                    self.proxying
+                        .entry(metric_name)
+                        .and_modify(|old_value| old_value.merge(&new_value))
+                        .or_insert(new_value);
                 }
-                self.proxying
-                    .entry(metric_name)
-                    .and_modify(|old_value| old_value.merge(&new_value))
-                    .or_insert(new_value);
             }
 
             for (cluster_id, mut cluster_metrics) in worker.clusters {
                 for (metric_name, new_value) in cluster_metrics.cluster {
-                    if !new_value.is_mergeable() {
-                        continue;
+                    if new_value.is_mergeable() {
+                        let cluster = self.clusters.entry(cluster_id.to_owned()).or_default();
+
+                        cluster
+                            .cluster
+                            .entry(metric_name)
+                            .and_modify(|old_value| old_value.merge(&new_value))
+                            .or_insert(new_value);
                     }
-                    self.clusters
-                        .entry(cluster_id.to_owned())
-                        .and_modify(|cluster| {
-                            cluster
-                                .cluster
-                                .entry(metric_name.clone())
-                                .and_modify(|old_value| old_value.merge(&new_value))
-                                .or_insert(new_value.clone());
-                        })
-                        .or_insert(ClusterMetrics {
-                            cluster: BTreeMap::from([(metric_name, new_value)]),
-                            backends: Vec::new(),
-                        });
                 }
 
                 for backend in cluster_metrics.backends.drain(..) {
-                    for (metric_name, new_value) in &backend.metrics {
-                        if !new_value.is_mergeable() {
-                            continue;
-                        }
-                        self.clusters
-                            .entry(cluster_id.to_owned())
-                            .and_modify(|cluster| {
-                                let found_backend = cluster
-                                    .backends
-                                    .iter_mut()
-                                    .find(|present| present.backend_id == backend.backend_id);
+                    for (metric_name, new_value) in backend.metrics {
+                        if new_value.is_mergeable() {
+                            let cluster = self.clusters.entry(cluster_id.to_owned()).or_default();
 
-                                let Some(existing_backend) = found_backend else {
-                                    cluster.backends.push(backend.clone());
-                                    return;
-                                };
+                            let found_backend = cluster
+                                .backends
+                                .iter_mut()
+                                .find(|present| &present.backend_id == &backend.backend_id);
 
+                            if let Some(existing_backend) = found_backend {
                                 let _ = existing_backend
                                     .metrics
-                                    .entry(metric_name.clone())
+                                    .entry(metric_name)
                                     .and_modify(|old_value| old_value.merge(&new_value))
-                                    .or_insert(new_value.to_owned());
-                            })
-                            .or_insert(ClusterMetrics {
-                                cluster: BTreeMap::new(),
-                                backends: vec![backend.clone()],
-                            });
+                                    .or_insert(new_value);
+                            } else {
+                                cluster.backends.push(BackendMetrics {
+                                    backend_id: backend.backend_id.clone(),
+                                    metrics: BTreeMap::from([(metric_name, new_value)]),
+                                });
+                            };
+                        }
                     }
                 }
             }
@@ -130,13 +120,39 @@ impl FilteredMetrics {
                     inner: Some(Inner::Count(a + b)),
                 };
             }
+            (Some(Inner::Histogram(a)), Some(Inner::Histogram(b))) => {
+                let longest_len = a.buckets.len().max(b.buckets.len());
+
+                let buckets = (0..longest_len)
+                    .map(|i| Bucket {
+                        le: (1 << i) - 1, // the bucket less-or-equal limits are normalized: 0, 1, 3, 7, 15, ...
+                        count: a
+                            .buckets
+                            .get(i)
+                            .and_then(|buck| Some(buck.count))
+                            .unwrap_or(0)
+                            + b.buckets
+                                .get(i)
+                                .and_then(|buck| Some(buck.count))
+                                .unwrap_or(0),
+                    })
+                    .collect();
+
+                *self = Self {
+                    inner: Some(Inner::Histogram(FilteredHistogram {
+                        count: a.count + b.count,
+                        sum: a.sum + b.sum,
+                        buckets,
+                    })),
+                };
+            }
             _ => {}
         }
     }
 
     fn is_mergeable(&self) -> bool {
         match &self.inner {
-            Some(Inner::Gauge(_)) | Some(Inner::Count(_)) => true,
+            Some(Inner::Gauge(_)) | Some(Inner::Count(_)) | Some(Inner::Histogram(_)) => true,
             // Inner::Time and Inner::Timeserie are never used in Sōzu
             Some(Inner::Time(_))
             | Some(Inner::Percentiles(_))

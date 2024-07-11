@@ -614,6 +614,7 @@ message BackendMetrics {
     map<string, FilteredMetrics> metrics = 2;
 }
 
+// A metric, in a "filtered" format, which means: sendable to outside programs.
 message FilteredMetrics {
     oneof inner {
         // increases or decrease depending on the state
@@ -624,6 +625,7 @@ message FilteredMetrics {
         uint64 time = 3;
         Percentiles percentiles = 4;
         FilteredTimeSerie time_serie = 5;
+        FilteredHistogram histogram = 6;
     }
 }
 
@@ -632,7 +634,6 @@ message FilteredTimeSerie {
     repeated uint32 last_minute = 2;
     repeated uint32 last_hour = 3;
 }
-
 
 message Percentiles {
     required uint64 samples = 1;
@@ -644,6 +645,20 @@ message Percentiles {
     required uint64 p_99_999 = 7;
     required uint64 p_100 = 8;
     required uint64 sum = 9;
+}
+
+// a histogram meant to be translated to prometheus
+message FilteredHistogram {
+    required uint64 sum = 1;
+    required uint64 count = 2;
+    repeated Bucket buckets = 3;
+}
+
+// a prometheus histogram bucket
+message Bucket {
+    required uint64 count = 1;
+    // upper range of the bucket (le = less or equal)
+    required uint64 le = 2;
 }
 
 message RequestCounts {

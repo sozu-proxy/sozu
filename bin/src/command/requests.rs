@@ -555,6 +555,11 @@ impl GatheringTask for QueryMetricsTask {
                     summed_cluster_metrics.append(&mut listed_cluster_metrics.clone());
                 }
             }
+            summed_proxy_metrics.sort();
+            summed_cluster_metrics.sort();
+            summed_proxy_metrics.dedup();
+            summed_cluster_metrics.dedup();
+
             return client.finish_ok_with_content(
                 ContentType::AvailableMetrics(AvailableMetrics {
                     proxy_metrics: summed_proxy_metrics,
