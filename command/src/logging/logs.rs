@@ -130,10 +130,10 @@ impl Logger {
         access_format: Option<AccessLogFormat>,
         access_colored: Option<bool>,
     ) -> Result<(), LogError> {
-        println!("setting log target to {log_target}");
+        println!("Logs will be sent to {log_target}");
         let backend = target_or_default(log_target);
 
-        println!("setting target of access logs to {access_logs_target:?}");
+        println!("Access logs will be sent to {access_logs_target:?}");
         let access_backend = access_logs_target.map(target_to_backend).transpose()?;
 
         let (directives, _errors) = parse_logging_spec(spec);
@@ -303,10 +303,13 @@ impl InnerLogger {
         if let Err(e) = io_result {
             println!("Could not write access log to {}: {e:?}", backend.as_ref());
             println!(
-                "trying to revive the backend of access logs to {:?}, or defaulting to {}",
+                "Trying to revive the backend of access logs to {:?}, or defaulting to {}",
                 self.access_logs_target, self.log_target
             );
-            backend.revive(self.access_logs_target.as_ref().unwrap_or(&self.log_target));
+            let log_target = self.access_logs_target.as_ref().unwrap_or(&self.log_target);
+            if let Err(err) = backend.revive(log_target) {
+                eprintln!("could not revive logger backend: {err}");
+            }
             false
         } else {
             true
@@ -345,13 +348,9 @@ pub enum LoggerBackend {
 }
 
 impl LoggerBackend {
-    fn revive(&mut self, log_target: &str) {
-        match target_to_backend(log_target) {
-            Ok(backend) => *self = backend,
-            Err(err) => {
-                eprintln!("could not revive logger backend: {err}");
-            }
-        }
+    fn revive(&mut self, log_target: &str) -> Result<(), LogError> {
+        *self = target_to_backend(log_target)?;
+        Ok(())
     }
 }
 
@@ -636,11 +635,9 @@ pub fn setup_logging(
     log_level: &str,
     tag: &str,
 ) -> Result<(), LogError> {
-    let log_level = env::var("RUST_LOG").unwrap_or(log_level.to_string());
-
     Logger::init(
         tag.to_string(),
-        &log_level,
+        env::var("RUST_LOG").as_deref().unwrap_or(log_level),
         log_target,
         log_colored,
         access_logs_target,
