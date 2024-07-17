@@ -4,6 +4,66 @@
 
 See milestone [`v1.1.0`](https://github.com/sozu-proxy/sozu/projects/3?card_filter_query=milestone%3Av1.1.0)
 
+## 1.0.3 - 2024-07-17
+
+> This changelog entry contains changes from the version `1.0.1` and `1.0.2`
+
+### 🌟 Features
+
+- Metrics are now merged accross workers, to have proxying metrics, and cluster metrics, cumulated. This is avoidable in the CLI with the `--workers` flag. See [`6b4b96b`](https://github.com/sozu-proxy/sozu/commit/6b4b96b3e7e9171c2da546450894b0b4361b658d), [`5deac5d`](https://github.com/sozu-proxy/sozu/commit/5deac5d1fbf66a68c61a669c350a0cc0c9147d60)
+- Time metrics are now converted to prometheus-compatible histograms, cumulated accross workers as explained above. See [`64b558e`](https://github.com/sozu-proxy/sozu/commit/64b558eb4e104bff345f51c641a4bbd7593ea35e)
+- Additional metrics, "unsent-access-logs", see [`ec56678`](https://github.com/sozu-proxy/sozu/commit/ec5667869774becff16ed5a0c9f2581c6aac04c7) and "request_time", see [`57923de`](https://github.com/sozu-proxy/sozu/commit/57923de5e88276a9fcd2d3a678bf9ef13ccf08b8)
+- backend events are displayed in the CLI, see [`97c9f30`](https://github.com/sozu-proxy/sozu/commit/97c9f3021c9191ae9d3b132a3c55241f1e611b52)
+- Sōzu reconnects with the access log target (for instance, a UNIX socket) if the connection is lost. See [`18d6649`](https://github.com/sozu-proxy/sozu/commit/18d66498af5d4ac7e976e6e2954bd81a0d0620e2)
+
+### ⛑️ Fixed
+
+- The behaviour of certificate resolver has been entirely reworked to mitigate certificate conflicts, and prevent deleting certificates accidently, see [`8b3462d`](https://github.com/sozu-proxy/sozu/commit/8b3462daae3989e612877b19e33f5179e59061fc)
+
+### Changelog
+
+#### 🌟 Features
+
+- [ [`97c9f30`](https://github.com/sozu-proxy/sozu/commit/97c9f3021c9191ae9d3b132a3c55241f1e611b52) ] display events in the CLI, document the use [`Emmanuel Bosquet`] (`2024-06-25`)
+- [ [`6b4b96b`](https://github.com/sozu-proxy/sozu/commit/6b4b96b3e7e9171c2da546450894b0b4361b658d) ] merge proxying metrics accross workers [`Emmanuel Bosquet`] (`2024-07-09`)
+- [ [`5deac5d`](https://github.com/sozu-proxy/sozu/commit/5deac5d1fbf66a68c61a669c350a0cc0c9147d60) ] merge cluster metrics across workers [`Emmanuel Bosquet`] (`2024-07-09`)
+- [ [`64b558e`](https://github.com/sozu-proxy/sozu/commit/64b558eb4e104bff345f51c641a4bbd7593ea35e) ] metrics: return histograms for time metrics [`Emmanuel Bosquet`] (`2024-07-11`)
+- [ [`ec56678`](https://github.com/sozu-proxy/sozu/commit/ec5667869774becff16ed5a0c9f2581c6aac04c7) ] add count metric "unsent-access-logs" [`Emmanuel Bosquet`] (`2024-07-11`)
+- [ [`18d6649`](https://github.com/sozu-proxy/sozu/commit/18d66498af5d4ac7e976e6e2954bd81a0d0620e2) ] revive backend of access logs when it fails [`Emmanuel Bosquet`] (`2024-07-11`)
+- [ [`57923de`](https://github.com/sozu-proxy/sozu/commit/57923de5e88276a9fcd2d3a678bf9ef13ccf08b8) ] add request_time metric to access logs, BREAKING [`Emmanuel Bosquet`] (`2024-07-11`)
+
+#### 📚 Documentation
+
+- [ [`e2204ae`](https://github.com/sozu-proxy/sozu/commit/e2204ae2dfffc5c33ab7a4cba0859f179c82afc6) ] doc: add @llenotre to codeowners [`Florentin DUBOIS`] (`2024-07-08`)
+
+#### ⛑️ Fixed
+
+- [ [`8b3462d`](https://github.com/sozu-proxy/sozu/commit/8b3462daae3989e612877b19e33f5179e59061fc) ] resolve longer-lived certificates [`Emmanuel Bosquet`] (`2024-06-21`)
+- [ [`67802bf`](https://github.com/sozu-proxy/sozu/commit/67802bf7266c146e51880f3c8027b9b02ad3203b) ] CertificateResolver: add two unit tests, and suggestions [`Emmanuel Bosquet`] (`2024-06-21`)
+- [ [`7a107c6`](https://github.com/sozu-proxy/sozu/commit/7a107c6f4671b54f0d91e6b0d692f2d70e719733) ] better display of backend metrics [`Emmanuel Bosquet`] (`2024-07-08`)
+- [ [`15ac8eb`](https://github.com/sozu-proxy/sozu/commit/15ac8eb9591e64a663d2f5d717d93378ff0b6aac) ] fix AggregatedMetrics::merge_metrics [`Emmanuel Bosquet`] (`2024-07-11`)
+- [ [`9f765c1`](https://github.com/sozu-proxy/sozu/commit/9f765c172e7bbc6fd4511ac2f5dc09303da6f3de) ] command::logging::logs apply review [`Emmanuel Bosquet`] (`2024-07-17`)
+
+#### ✍️ Changed
+
+- [ [`e6626c4`](https://github.com/sozu-proxy/sozu/commit/e6626c444d6d3ea61cfd7fb2ceaee98e1f391843) ] remove the logs-cache feature [`Emmanuel Bosquet`] (`2024-05-06`)
+- [ [`9e889ce`](https://github.com/sozu-proxy/sozu/commit/9e889ce3f589f2d5ba2532c676bc5df297f0eef8) ] bump mio to 1.0.0 [`Emmanuel Bosquet`] (`2024-06-21`)
+- [ [`b74888c`](https://github.com/sozu-proxy/sozu/commit/b74888c19d75d518de32a464f9b990251e6387e3) ] Move unsent-access-logs metric increment out of sozu_command_lib [`Eloi DEMOLIS`] (`2024-07-11`)
+- [ [`dd54bea`](https://github.com/sozu-proxy/sozu/commit/dd54bea333cd83928d5ade16c347924820574dc0) ] propagate logging setup errors [`Emmanuel Bosquet`] (`2024-07-11`)
+
+
+#### ➕ Added
+
+- [ [`f30d0b1`](https://github.com/sozu-proxy/sozu/commit/f30d0b10bf184e39c786de775f660a86e7f7ee29) ] create command::logging::LogError [`Emmanuel Bosquet`] (`2024-07-11`)
+
+### 🥹 Contributors
+
+* @keksoj
+* @FlorentinDUBOIS
+* @Wonshtrum
+* @llenotre
+
+
 ## 1.0.2 - 2024-06-03
 
 > This changelog entry contains changes from the version `1.0.1` and `1.0.2`
