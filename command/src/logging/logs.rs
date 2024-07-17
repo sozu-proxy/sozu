@@ -276,13 +276,14 @@ impl InnerLogger {
                     log.tag,
                 ],
                 standard: {
-                    formats: ["{} {} {} {}/{}/{}/{} {} {} [{}] {} {}{}\n"],
+                    formats: ["{} {} {} {}/{}/{}/{}/{} {} {} [{}] {} {}{}\n"],
                     args: [
                         log.context,
                         log.session_address.as_string_or("-"),
                         log.backend_address.as_string_or("-"),
-                        LogDuration(Some(log.response_time)),
+                        LogDuration(Some(log.request_time)),
                         LogDuration(Some(log.service_time)),
+                        LogDuration(log.response_time),
                         LogDuration(log.client_rtt),
                         LogDuration(log.server_rtt),
                         log.bytes_in,
@@ -294,7 +295,7 @@ impl InnerLogger {
                     ]
                 },
                 colored: {
-                    formats: ["\x1b[;1m{}\x1b[m {} {} {}/{}/{}/{} {} {} \x1b[2m[{}] \x1b[;1m{} {:#}\x1b[m{}\n"],
+                    formats: ["\x1b[;1m{}\x1b[m {} {} {}/{}/{}/{}/{} {} {} \x1b[2m[{}] \x1b[;1m{} {:#}\x1b[m{}\n"],
                     args: @,
                 }
             },

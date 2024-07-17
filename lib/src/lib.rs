@@ -1026,7 +1026,8 @@ impl SessionMetrics {
         }
     }
 
-    pub fn response_time(&self) -> Duration {
+    /// time elapsed since the beginning of the session
+    pub fn request_time(&self) -> Duration {
         match self.start {
             Some(start) => Instant::now() - start,
             None => Duration::from_secs(0),
@@ -1061,14 +1062,14 @@ impl SessionMetrics {
     }
 
     pub fn register_end_of_session(&self, context: &LogContext) {
-        let response_time = self.response_time();
+        let request_time = self.request_time();
         let service_time = self.service_time();
 
         if let Some(cluster_id) = context.cluster_id {
-            time!("response_time", cluster_id, response_time.as_millis());
+            time!("request_time", cluster_id, request_time.as_millis());
             time!("service_time", cluster_id, service_time.as_millis());
         }
-        time!("response_time", response_time.as_millis());
+        time!("request_time", request_time.as_millis());
         time!("service_time", service_time.as_millis());
 
         if let Some(backend_id) = self.backend_id.as_ref() {

@@ -226,7 +226,8 @@ impl TcpSession {
             server_rtt: None,
             user_agent: None,
             service_time: self.metrics.service_time(),
-            response_time: self.metrics.response_time(),
+            response_time: self.metrics.backend_response_time(),
+            request_time: self.metrics.request_time(),
             bytes_in: self.metrics.bin,
             bytes_out: self.metrics.bout
         );

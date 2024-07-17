@@ -775,8 +775,6 @@ message ProtobufAccessLog {
     optional uint64 client_rtt = 9;
     // round trip time for the backend (microseconds)
     optional uint64 server_rtt = 10;
-    // time for the backend to respond (microseconds)
-    required uint64 response_time = 12;
     // time spent on a session (microseconds)
     required uint64 service_time = 13;
     // number of bytes received from the client
@@ -791,6 +789,12 @@ message ProtobufAccessLog {
     required string tag = 18;
     // POSIX timestamp, nanoseconds
     required Uint128 time = 19;
+    // Entire time between first byte received and last byte of the response.
+    // If a request ends abruptly before the last byte is transmitted,
+    // the `request_time` produced is the time elapsed since the first byte received.
+    optional uint64 request_time = 20;
+    // time for the backend to respond (microseconds)
+    optional uint64 response_time = 21;
 }
 
 message ProtobufEndpoint {

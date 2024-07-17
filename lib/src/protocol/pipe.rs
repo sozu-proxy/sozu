@@ -247,7 +247,8 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             client_rtt: socket_rtt(self.front_socket()),
             server_rtt: self.backend_socket.as_ref().and_then(socket_rtt),
             service_time: metrics.service_time(),
-            response_time: metrics.response_time(),
+            response_time: metrics.backend_response_time(),
+            request_time: metrics.request_time(),
             bytes_in: metrics.bin,
             bytes_out: metrics.bout,
             user_agent: None
