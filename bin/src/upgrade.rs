@@ -18,7 +18,7 @@ use tempfile::tempfile;
 
 use sozu_command_lib::{
     channel::{Channel, ChannelError},
-    logging::setup_logging_with_config,
+    logging::{setup_logging_with_config, LogError},
 };
 
 use crate::{
@@ -69,6 +69,8 @@ pub enum UpgradeError {
     CreateHub(HubError),
     #[error("could not enable cloexec after upgrade: {0}")]
     EnableCloexec(ServerError),
+    #[error("could not setup the logger: {0}")]
+    SetupLogging(LogError),
 }
 
 /// unix-forks the main process
@@ -180,7 +182,7 @@ pub fn begin_new_main_process(
 
     println!("Setting up logging");
 
-    setup_logging_with_config(&config, "MAIN");
+    setup_logging_with_config(&config, "MAIN").map_err(UpgradeError::SetupLogging)?;
     util::setup_metrics(&config).map_err(UpgradeError::SetupMetrics)?;
 
     let mut command_hub =

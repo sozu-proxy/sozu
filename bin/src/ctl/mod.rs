@@ -7,7 +7,7 @@ use sozu_command_lib::{
     certificate::CertificateError,
     channel::{Channel, ChannelError},
     config::{Config, ConfigError},
-    logging::setup_logging_with_config,
+    logging::{setup_logging_with_config, LogError},
     proto::{
         command::{Request, Response},
         DisplayError,
@@ -53,6 +53,8 @@ pub enum CtlError {
     NeedClusterDomain,
     #[error("wrong response from Sōzu: {0:?}")]
     WrongResponse(Response),
+    #[error("could not setup the logger: {0}")]
+    SetupLogging(LogError),
 }
 
 pub struct CommandManager {
@@ -70,7 +72,7 @@ pub fn ctl(args: cli::Args) -> Result<(), CtlError> {
 
     // prevent logging for json responses for a clean output
     if !args.json {
-        setup_logging_with_config(&config, "CTL");
+        setup_logging_with_config(&config, "CTL").map_err(CtlError::SetupLogging)?;
     }
 
     // If the command is `config check` then exit because if we are here, the configuration is valid

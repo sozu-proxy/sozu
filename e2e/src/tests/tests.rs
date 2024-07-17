@@ -629,7 +629,9 @@ pub fn try_hard_or_soft_stop(soft: bool) -> State {
 }
 
 fn try_http_behaviors() -> State {
-    setup_default_logging(false, "debug", "BEHAVE-OUT");
+    if let Err(e) = setup_default_logging(false, "debug", "BEHAVE-OUT") {
+        println!("could not setup default logging: {e}");
+    }
 
     info!("starting up");
 
@@ -1121,7 +1123,9 @@ pub fn try_blue_geen() -> State {
 }
 
 pub fn try_keep_alive() -> State {
-    setup_default_logging(false, "debug", "KA-OUT");
+    if let Err(e) = setup_default_logging(false, "debug", "KA-OUT") {
+        println!("could not setup default logging: {e}");
+    }
 
     let front_address = create_local_address();
 
