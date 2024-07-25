@@ -238,6 +238,7 @@ impl CommandManager {
                 method,
                 cluster_id: route,
                 tags,
+                h2,
             } => self.send_request(
                 RequestType::AddHttpFrontend(RequestHttpFrontend {
                     cluster_id: route.into(),
@@ -286,6 +287,7 @@ impl CommandManager {
                 method,
                 cluster_id: route,
                 tags,
+                h2,
             } => self.send_request(
                 RequestType::AddHttpsFrontend(RequestHttpFrontend {
                     cluster_id: route.into(),

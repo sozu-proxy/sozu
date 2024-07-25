@@ -15,7 +15,7 @@ use crate::{
     sozu_command::ready::Ready,
     tcp::TcpListener,
     timer::TimeoutContainer,
-    Protocol, Readiness, SessionMetrics, StateResult,
+    L7Proxy, Protocol, Readiness, SessionMetrics, StateResult,
 };
 
 use super::{header::ProxyAddr, parser::parse_v2_header};
@@ -204,13 +204,20 @@ impl<Front: SocketHandler> ExpectProxyProtocol<Front> {
             backend_id: None,
         }
     }
+
+    fn print_state(&self, context: &str) {
+        error!(
+            "{} Session(Expect)\n\tFrontend:\n\t\ttoken: {:?}\treadiness: {:?}",
+            context, self.frontend_token, self.frontend_readiness
+        );
+    }
 }
 
 impl<Front: SocketHandler> SessionState for ExpectProxyProtocol<Front> {
-    fn ready(
+    fn ready<P: L7Proxy>(
         &mut self,
         _session: Rc<RefCell<dyn crate::ProxySession>>,
-        _proxy: Rc<RefCell<dyn crate::L7Proxy>>,
+        _proxy: Rc<RefCell<P>>,
         metrics: &mut SessionMetrics,
     ) -> SessionResult {
         let mut counter = 0;
@@ -292,10 +299,7 @@ impl<Front: SocketHandler> SessionState for ExpectProxyProtocol<Front> {
     }
 
     fn print_state(&self, context: &str) {
-        error!(
-            "{} Session(Expect)\n\tFrontend:\n\t\ttoken: {:?}\treadiness: {:?}",
-            context, self.frontend_token, self.frontend_readiness
-        );
+        self.print_state(context)
     }
 }
 

@@ -7,8 +7,11 @@ use rusty_ulid::Ulid;
 
 use crate::{
     pool::Checkout,
-    protocol::http::{parser::compare_no_case, GenericHttpStream, Method},
-    Protocol,
+    protocol::{
+        http::{parser::compare_no_case, GenericHttpStream, Method},
+        pipe::WebSocketContext,
+    },
+    Protocol, RetrieveClusterError,
 };
 
 use sozu_command_lib::logging::LogContext;
@@ -38,12 +41,13 @@ pub struct HttpContext {
     pub user_agent: Option<String>,
 
     // ========== Read only
-    /// signals wether Kawa should write a "Connection" header with a "close" value (request and response)
+    /// signals whether Kawa should write a "Connection" header with a "close" value (request and response)
     pub closing: bool,
     /// the value of the custom header, named "Sozu-Id", that Kawa should write (request and response)
     pub id: Ulid,
-    pub backend_id: Option<String>,
     pub cluster_id: Option<String>,
+    pub backend_id: Option<String>,
+    pub backend_address: Option<SocketAddr>,
     /// the value of the protocol Kawa should write in the Forwarded headers of the request
     pub protocol: Protocol,
     /// the value of the public address Kawa should write in the Forwarded headers of the request
@@ -67,6 +71,36 @@ impl kawa::h1::ParserCallbacks<Checkout> for HttpContext {
 }
 
 impl HttpContext {
+    pub fn new(
+        id: Ulid,
+        protocol: Protocol,
+        sticky_name: String,
+        public_address: SocketAddr,
+        session_address: Option<SocketAddr>,
+    ) -> Self {
+        Self {
+            id,
+            protocol,
+            sticky_name,
+            public_address,
+            session_address,
+
+            cluster_id: None,
+            backend_id: None,
+            backend_address: None,
+            keep_alive_backend: true,
+            keep_alive_frontend: true,
+            sticky_session_found: None,
+            method: None,
+            authority: None,
+            path: None,
+            status: None,
+            reason: None,
+            user_agent: None,
+            closing: false,
+            sticky_session: None,
+        }
+    }
     /// Callback for request:
     ///
     /// - edit headers (connection, forwarded, sticky cookie, sozu-id)
@@ -356,6 +390,7 @@ impl HttpContext {
         self.status = None;
         self.reason = None;
         self.user_agent = None;
+        self.id = Ulid::generate();
     }
 
     pub fn log_context(&self) -> LogContext {
@@ -363,6 +398,41 @@ impl HttpContext {
             request_id: self.id,
             cluster_id: self.cluster_id.as_deref(),
             backend_id: self.backend_id.as_deref(),
+        }
+    }
+
+    // -> host, path, method
+    pub fn extract_route(&self) -> Result<(&str, &str, &Method), RetrieveClusterError> {
+        let given_method = self.method.as_ref().ok_or(RetrieveClusterError::NoMethod)?;
+        let given_authority = self
+            .authority
+            .as_deref()
+            .ok_or(RetrieveClusterError::NoHost)?;
+        let given_path = self.path.as_deref().ok_or(RetrieveClusterError::NoPath)?;
+
+        Ok((given_authority, given_path, given_method))
+    }
+
+    pub fn get_route(&self) -> String {
+        if let Some(method) = &self.method {
+            if let Some(authority) = &self.authority {
+                if let Some(path) = &self.path {
+                    return format!("{method} {authority}{path}");
+                }
+                return format!("{method} {authority}");
+            }
+            return format!("{method}");
+        }
+        String::new()
+    }
+
+    pub fn websocket_context(&self) -> WebSocketContext {
+        WebSocketContext::Http {
+            method: self.method.clone(),
+            authority: self.authority.clone(),
+            path: self.path.clone(),
+            reason: self.reason.clone(),
+            status: self.status,
         }
     }
 }
