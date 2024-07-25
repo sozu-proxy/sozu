@@ -36,7 +36,7 @@ memchr = "^2.7.2"
 mio = { version = "^1.0.0", features = ["os-poll", "net"] }
 nix = { version = "^0.29.0", features = ["socket", "uio"] }
 nom = "^7.1.3"
-prost = "^0.12.6"
+prost = "^0.13.1"
 rand = "^0.8.5"
 rusty_ulid = "^2.0.0"
 serde = { version = "^1.0.203", features = ["derive"] }
@@ -58,4 +58,4 @@ logs-trace = []
 travis-ci = { repository = "sozu-proxy/sozu" }
 
 [build-dependencies]
-prost-build = { version = "^0.12.6" }
+prost-build = { version = "^0.13.1" }

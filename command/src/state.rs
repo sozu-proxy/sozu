@@ -10,7 +10,7 @@ use std::{
     net::SocketAddr,
 };
 
-use prost::{DecodeError, Message};
+use prost::{Message, UnknownEnumValue};
 
 use crate::{
     certificate::{calculate_fingerprint, CertificateError, Fingerprint},
@@ -44,8 +44,8 @@ pub enum StateError {
     NotFound { kind: ObjectKind, id: String },
     #[error("{kind:?} '{id}' already exists")]
     Exists { kind: ObjectKind, id: String },
-    #[error("Wrong request: {0}")]
-    WrongRequest(String),
+    #[error("Wrong field value: {0}")]
+    WrongFieldValue(UnknownEnumValue),
     #[error("Could not add certificate: {0}")]
     AddCertificate(CertificateError),
     #[error("Could not remove certificate: {0}")]
@@ -58,12 +58,6 @@ pub enum StateError {
     FrontendConversion { frontend: String, error: String },
     #[error("Could not write state to file: {0}")]
     FileError(std::io::Error),
-}
-
-impl From<DecodeError> for StateError {
-    fn from(decode_error: DecodeError) -> Self {
-        Self::WrongRequest(format!("Wrong field value: {decode_error}"))
-    }
 }
 
 /// The `ConfigState` represents the state of Sōzu's business, which is to forward traffic
@@ -223,7 +217,7 @@ impl ConfigState {
     }
 
     fn remove_listener(&mut self, remove: &RemoveListener) -> Result<(), StateError> {
-        match ListenerType::try_from(remove.proxy)? {
+        match ListenerType::try_from(remove.proxy).map_err(StateError::WrongFieldValue)? {
             ListenerType::Http => self.remove_http_listener(&remove.address.clone().into()),
             ListenerType::Https => self.remove_https_listener(&remove.address.clone().into()),
             ListenerType::Tcp => self.remove_tcp_listener(&remove.address.clone().into()),
@@ -252,7 +246,7 @@ impl ConfigState {
     }
 
     fn activate_listener(&mut self, activate: &ActivateListener) -> Result<(), StateError> {
-        match ListenerType::try_from(activate.proxy)? {
+        match ListenerType::try_from(activate.proxy).map_err(StateError::WrongFieldValue)? {
             ListenerType::Http => self
                 .http_listeners
                 .get_mut(&activate.address.clone().into())
@@ -281,7 +275,7 @@ impl ConfigState {
     }
 
     fn deactivate_listener(&mut self, deactivate: &DeactivateListener) -> Result<(), StateError> {
-        match ListenerType::try_from(deactivate.proxy)? {
+        match ListenerType::try_from(deactivate.proxy).map_err(StateError::WrongFieldValue)? {
             ListenerType::Http => self
                 .http_listeners
                 .get_mut(&deactivate.address.clone().into())

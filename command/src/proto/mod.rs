@@ -4,7 +4,7 @@ use command::{
     filtered_metrics::Inner, AggregatedMetrics, BackendMetrics, Bucket, FilteredHistogram,
     FilteredMetrics,
 };
-use prost::DecodeError;
+use prost::UnknownEnumValue;
 
 /// Contains all types received by and sent from Sōzu
 pub mod command;
@@ -23,7 +23,7 @@ pub enum DisplayError {
     #[error("Could not format the datetime to ISO 8601")]
     DateTime,
     #[error("unrecognized protobuf variant: {0}")]
-    DecodeError(DecodeError),
+    DecodeError(UnknownEnumValue),
 }
 
 // Simple helper to build ResponseContent from ContentType
