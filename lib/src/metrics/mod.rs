@@ -265,15 +265,6 @@ impl Subscriber for Aggregator {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MetricLine {
-    label: &'static str,
-    cluster_id: Option<String>,
-    backend_id: Option<String>,
-    /// in milliseconds
-    duration: usize,
-}
-
 pub struct MetricSocket {
     pub addr: SocketAddr,
     pub socket: UdpSocket,

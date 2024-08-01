@@ -76,13 +76,6 @@ use crate::{
 // const SERVER_PROTOS: &[&str] = &["http/1.1", "h2"];
 const SERVER_PROTOS: &[&str] = &["http/1.1"];
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TlsCluster {
-    cluster_id: String,
-    hostname: String,
-    path_begin: String,
-}
-
 StateMachineBuilder! {
     /// The various Stages of an HTTPS connection:
     ///

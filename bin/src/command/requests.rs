@@ -258,7 +258,6 @@ fn subscribe_client_to_events(server: &mut Server, client: &mut ClientSession) {
 #[derive(Debug)]
 pub struct QueryClustersTask {
     pub client_token: Token,
-    pub request_type: RequestType,
     pub gatherer: DefaultGatherer,
     main_process_response: Option<ResponseContent>,
 }
@@ -276,7 +275,6 @@ pub fn query_clusters(
             client_token: client.token,
             gatherer: DefaultGatherer::default(),
             main_process_response: server.query_main(request_content.clone()),
-            request_type: request_content,
         }),
         Timeout::Default,
         None,

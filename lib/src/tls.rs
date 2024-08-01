@@ -10,10 +10,9 @@ use std::{
     fmt,
     io::BufReader,
     str::FromStr,
-    sync::{Arc, Mutex},
+    sync::{Arc, LazyLock, Mutex},
 };
 
-use once_cell::sync::Lazy;
 use rustls::{
     crypto::ring::sign::any_supported_type,
     pki_types::{CertificateDer, PrivateKeyDer},
@@ -33,7 +32,7 @@ use crate::router::trie::{Key, KeyValue, TrieNode};
 // -----------------------------------------------------------------------------
 // Default ParsedCertificateAndKey
 
-static DEFAULT_CERTIFICATE: Lazy<Option<Arc<CertifiedKey>>> = Lazy::new(|| {
+static DEFAULT_CERTIFICATE: LazyLock<Option<Arc<CertifiedKey>>> = LazyLock::new(|| {
     let add = AddCertificate {
         certificate: CertificateAndKey {
             certificate: include_str!("../assets/certificate.pem").to_string(),
