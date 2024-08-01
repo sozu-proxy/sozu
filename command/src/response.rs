@@ -217,11 +217,6 @@ impl fmt::Display for RunState {
     }
 }
 
-#[derive(Serialize)]
-struct StatePath {
-    path: String,
-}
-
 pub type MessageId = String;
 
 impl WorkerResponse {
