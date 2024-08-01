@@ -121,6 +121,9 @@ impl Server {
                 })
                 .into(),
             ),
+            RequestType::ListFrontends(filters) => {
+                Some(ContentType::FrontendList(self.state.list_frontends(filters)).into())
+            }
             _ => None,
         }
     }

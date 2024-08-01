@@ -180,7 +180,10 @@ pub enum SubCmd {
         #[clap(subcommand)]
         cmd: ConfigCmd,
     },
-    #[clap(name = "events", about = "receive sozu events about the status of backends")]
+    #[clap(
+        name = "events",
+        about = "receive sozu events about the status of backends"
+    )]
     Events,
 }
 
