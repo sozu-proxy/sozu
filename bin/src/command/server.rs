@@ -447,14 +447,15 @@ impl CommandHub {
         }
 
         let Some(task_id) = self.in_flight.get(&response.id).copied() else {
-            error!("Got a response for an unknown task: {}", response);
+            // this will appear on startup, when requesting status. It is inconsequential.
+            warn!("Got a response for an unknown task: {}", response);
             return;
         };
 
         let task = match self.tasks.get_mut(&task_id) {
             Some(task) => task,
             None => {
-                error!("Got a response for an unknown task");
+                warn!("Got a response for an unknown task");
                 return;
             }
         };
