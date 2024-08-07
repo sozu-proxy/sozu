@@ -1375,8 +1375,8 @@ impl ConfigBuilder {
                                         frontend.key.clone_from(&https_listener.key);
                                     }
                                     if frontend.certificate.is_none() {
-                                        debug!("known addresses: {:#?}", self.known_addresses);
-                                        debug!("frontend: {:#?}", frontend);
+                                        debug!("known addresses: {:?}", self.known_addresses);
+                                        debug!("frontend: {:?}", frontend);
                                         return Err(ConfigError::WrongFrontendProtocol(
                                             ListenerProtocol::Https,
                                         ));

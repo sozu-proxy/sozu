@@ -224,7 +224,7 @@ impl CommandHub {
         let id = self.next_client_id();
         let session = ClientSession::new(channel, id, token);
         info!("Register new client: {}", id);
-        debug!("{:#?}", session);
+        debug!("registering client {:?}", session);
         self.clients.insert(token, session);
     }
 
@@ -295,7 +295,7 @@ impl CommandHub {
     /// - manage timeouts of tasks
     pub fn run(&mut self) {
         let mut events = Events::with_capacity(100);
-        debug!("running the command hub: {:#?}", self);
+        debug!("running the command hub: {:?}", self);
 
         loop {
             let run_state = self.run_state;
@@ -401,7 +401,7 @@ impl CommandHub {
                                 }
                                 ClientResult::CloseSession => {
                                     info!("Closing client {}", client.id);
-                                    debug!("{:#?}", client);
+                                    debug!("closing client {:?}", client);
                                     self.event_subscribers.remove(&token);
                                     self.clients.remove(&token);
                                 }
@@ -447,14 +447,15 @@ impl CommandHub {
         }
 
         let Some(task_id) = self.in_flight.get(&response.id).copied() else {
-            error!("Got a response for an unknown task: {}", response);
+            // this will appear on startup, when requesting status. It is inconsequential.
+            warn!("Got a response for an unknown task: {}", response);
             return;
         };
 
         let task = match self.tasks.get_mut(&task_id) {
             Some(task) => task,
             None => {
-                error!("Got a response for an unknown task");
+                warn!("Got a response for an unknown task");
                 return;
             }
         };
