@@ -123,18 +123,20 @@ impl FilteredMetrics {
             (Some(Inner::Histogram(a)), Some(Inner::Histogram(b))) => {
                 let longest_len = a.buckets.len().max(b.buckets.len());
 
+                let mut a_count = 0;
+                let mut b_count = 0;
                 let buckets = (0..longest_len)
-                    .map(|i| Bucket {
-                        le: (1 << i) - 1, // the bucket less-or-equal limits are normalized: 0, 1, 3, 7, 15, ...
-                        count: a
-                            .buckets
-                            .get(i)
-                            .and_then(|buck| Some(buck.count))
-                            .unwrap_or(0)
-                            + b.buckets
-                                .get(i)
-                                .and_then(|buck| Some(buck.count))
-                                .unwrap_or(0),
+                    .map(|i| {
+                        if let Some(a_bucket) = a.buckets.get(i) {
+                            a_count = a_bucket.count;
+                        }
+                        if let Some(b_bucket) = b.buckets.get(i) {
+                            b_count = b_bucket.count;
+                        }
+                        Bucket {
+                            le: (1 << i) - 1, // the bucket less-or-equal limits are normalized: 0, 1, 3, 7, 15, ...
+                            count: a_count + b_count,
+                        }
                     })
                     .collect();
 
@@ -159,5 +161,97 @@ impl FilteredMetrics {
             | Some(Inner::TimeSerie(_))
             | None => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::command::{filtered_metrics::Inner, Bucket, FilteredHistogram, FilteredMetrics};
+
+    #[test]
+    fn merge_counts_and_gauges() {
+        let mut gauge_a = FilteredMetrics {
+            inner: Some(Inner::Gauge(4)),
+        };
+        let gauge_b = FilteredMetrics {
+            inner: Some(Inner::Gauge(4)),
+        };
+
+        gauge_a.merge(&gauge_b);
+
+        assert_eq!(
+            gauge_a,
+            FilteredMetrics {
+                inner: Some(Inner::Gauge(8)),
+            }
+        );
+
+        let mut count_a = FilteredMetrics {
+            inner: Some(Inner::Count(3)),
+        };
+        let count_b = FilteredMetrics {
+            inner: Some(Inner::Count(3)),
+        };
+
+        count_a.merge(&count_b);
+
+        assert_eq!(
+            count_a,
+            FilteredMetrics {
+                inner: Some(Inner::Count(6)),
+            }
+        );
+    }
+
+    #[test]
+    fn merge_histograms() {
+        let mut histogram_a = FilteredMetrics {
+            inner: Some(Inner::Histogram(FilteredHistogram {
+                sum: 95,
+                count: 30,
+                buckets: vec![
+                    Bucket { le: 0, count: 1 },
+                    Bucket { le: 1, count: 2 },
+                    Bucket { le: 3, count: 10 },
+                    Bucket { le: 7, count: 25 },
+                    Bucket { le: 15, count: 27 },
+                    Bucket { le: 31, count: 30 },
+                ],
+            })),
+        };
+
+        let histogram_b = FilteredMetrics {
+            inner: Some(Inner::Histogram(FilteredHistogram {
+                sum: 82,
+                count: 40,
+                buckets: vec![
+                    Bucket { le: 0, count: 0 },
+                    Bucket { le: 1, count: 0 },
+                    Bucket { le: 3, count: 12 },
+                    Bucket { le: 7, count: 30 },
+                    Bucket { le: 15, count: 40 },
+                    // note: there is no bucket for "le: 31"
+                ],
+            })),
+        };
+
+        histogram_a.merge(&histogram_b);
+
+        let merged_histogram = FilteredMetrics {
+            inner: Some(Inner::Histogram(FilteredHistogram {
+                sum: 177,
+                count: 70,
+                buckets: vec![
+                    Bucket { le: 0, count: 1 },
+                    Bucket { le: 1, count: 2 },
+                    Bucket { le: 3, count: 22 },
+                    Bucket { le: 7, count: 55 },
+                    Bucket { le: 15, count: 67 },
+                    Bucket { le: 31, count: 70 }, // note: the total count of histogram b is added, even though histogram b has no bucket
+                ],
+            })),
+        };
+
+        assert_eq!(histogram_a, merged_histogram);
     }
 }
