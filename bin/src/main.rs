@@ -71,10 +71,18 @@ enum MainError {
     BeginNewMain(UpgradeError),
     #[error("{0}")]
     Cli(CtlError),
+    #[error("paw io error: {0}")]
+    Io(std::io::Error),
+}
+
+impl From<std::io::Error> for MainError {
+    fn from(value: std::io::Error) -> Self {
+        Self::Io(value)
+    }
 }
 
 #[paw::main]
-fn main(args: Args) {
+fn main(args: Args) -> Result<(), MainError> {
     register_panic_hook();
 
     let result = match args.cmd {
@@ -119,10 +127,11 @@ fn main(args: Args) {
         }
         _ => ctl::ctl(args).map_err(MainError::Cli),
     };
-    match result {
-        Ok(_) => {}
-        Err(main_error) => println!("{}", main_error),
+
+    if let Err(main_error) = &result {
+        eprintln!("\n{main_error}\n");
     }
+    result
 }
 
 /// Set workers process affinity, see man sched_setaffinity
