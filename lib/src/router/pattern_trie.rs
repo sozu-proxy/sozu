@@ -34,7 +34,7 @@ fn find_last_slash(input: &[u8]) -> Option<usize> {
 /// A leaf node (leftmost label) can be a wildcard, a regex pattern or a plain string.
 /// Leaves also store a value associated with the complete domain.
 /// For Sozu it is a list of (PathRule, MethodRule, ClusterId). See the Router strucure.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct TrieNode<V> {
     key_value: Option<KeyValue<Key, V>>,
     wildcard: Option<KeyValue<Key, V>>,

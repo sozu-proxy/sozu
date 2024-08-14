@@ -1,5 +1,4 @@
 pub mod pattern_trie;
-pub mod trie;
 
 use std::{str::from_utf8, time::Instant};
 
