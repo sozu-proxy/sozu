@@ -1508,7 +1508,7 @@ mod tests {
         proto::command::{CustomHttpAnswers, SocketAddress},
     };
 
-    use crate::router::{trie::TrieNode, MethodRule, PathRule, Route, Router};
+    use crate::router::{pattern_trie::TrieNode, MethodRule, PathRule, Route, Router};
 
     /*
     #[test]

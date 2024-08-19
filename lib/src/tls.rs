@@ -27,7 +27,7 @@ use sozu_command::{
     proto::command::{AddCertificate, CertificateAndKey, ReplaceCertificate, SocketAddress},
 };
 
-use crate::router::trie::{Key, KeyValue, TrieNode};
+use crate::router::pattern_trie::{Key, KeyValue, TrieNode};
 
 // -----------------------------------------------------------------------------
 // Default ParsedCertificateAndKey

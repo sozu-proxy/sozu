@@ -108,7 +108,7 @@ impl FromStr for TlsVersion {
 
 //FIXME: make fixed size depending on hash algorithm
 /// A TLS certificates, encoded in bytes
-#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct Fingerprint(pub Vec<u8>);
 
 impl FromStr for Fingerprint {
