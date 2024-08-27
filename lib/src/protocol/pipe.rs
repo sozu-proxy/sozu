@@ -513,6 +513,8 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
                 if self.frontend_buffer.available_data() == 0 {
                     self.frontend_readiness.interest.insert(Ready::READABLE);
                     self.backend_readiness.interest.remove(Ready::WRITABLE);
+                    count!("back_bytes_out", sz as i64);
+                    metrics.backend_bout += sz;
                     return SessionResult::Continue;
                 }
 
@@ -531,6 +533,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             }
         }
 
+        count!("back_bytes_out", sz as i64);
         metrics.backend_bout += sz;
 
         if !self.check_connections() {
