@@ -287,9 +287,7 @@ impl SocketHandler for FrontRustls {
             }
 
             match self.session.writer().write(&buf[buffered_size..]) {
-                Ok(0) => {
-                    break;
-                }
+                Ok(0) => {} // zero byte written means that the Rustls buffers are full, we will try to write on the socket and try again
                 Ok(sz) => {
                     buffered_size += sz;
                 }
@@ -363,7 +361,7 @@ impl SocketHandler for FrontRustls {
         let mut is_closed = false;
 
         match self.session.writer().write_vectored(bufs) {
-            Ok(0) => {}
+            Ok(0) => {} // zero byte written means that the Rustls buffers are full, we will try to write on the socket and try again
             Ok(sz) => {
                 buffered_size += sz;
             }
