@@ -270,54 +270,45 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         self.log_request(metrics, true, Some(message));
     }
 
+    /// Wether the session should be kept open, depending on endpoints status
+    /// and buffer usage (both in memory and in kernel)
     pub fn check_connections(&self) -> bool {
+        let request_is_inflight = self.frontend_buffer.available_data() > 0
+            || self.frontend_readiness.event.is_readable();
+        let response_is_inflight =
+            self.backend_buffer.available_data() > 0 || self.backend_readiness.event.is_readable();
         match (self.frontend_status, self.backend_status) {
-            //(ConnectionStatus::Normal, ConnectionStatus::Normal) => true,
-            //(ConnectionStatus::Normal, ConnectionStatus::ReadOpen) => true,
+            (ConnectionStatus::Normal, ConnectionStatus::Normal) => true,
+            (ConnectionStatus::Normal, ConnectionStatus::ReadOpen) => true,
             (ConnectionStatus::Normal, ConnectionStatus::WriteOpen) => {
                 // technically we should keep it open, but we'll assume that if the front
                 // is not readable and there is no in flight data front -> back or back -> front,
                 // we'll close the session, otherwise it interacts badly with HTTP connections
                 // with Connection: close header and no Content-length
-                self.frontend_readiness.event.is_readable()
-                    || self.frontend_buffer.available_data() > 0
-                    || self.backend_buffer.available_data() > 0
+                request_is_inflight || response_is_inflight
             }
-            (ConnectionStatus::Normal, ConnectionStatus::Closed) => {
-                self.backend_buffer.available_data() > 0
-            }
+            (ConnectionStatus::Normal, ConnectionStatus::Closed) => response_is_inflight,
 
             (ConnectionStatus::WriteOpen, ConnectionStatus::Normal) => {
                 // technically we should keep it open, but we'll assume that if the back
                 // is not readable and there is no in flight data back -> front or front -> back, we'll close the session
-                self.backend_readiness.event.is_readable()
-                    || self.backend_buffer.available_data() > 0
-                    || self.frontend_buffer.available_data() > 0
+                request_is_inflight || response_is_inflight
             }
-            //(ConnectionStatus::WriteOpen, ConnectionStatus::ReadOpen) => true,
+            (ConnectionStatus::WriteOpen, ConnectionStatus::ReadOpen) => true,
             (ConnectionStatus::WriteOpen, ConnectionStatus::WriteOpen) => {
-                self.frontend_buffer.available_data() > 0
-                    || self.backend_buffer.available_data() > 0
+                request_is_inflight || response_is_inflight
             }
-            (ConnectionStatus::WriteOpen, ConnectionStatus::Closed) => {
-                self.backend_buffer.available_data() > 0
-            }
+            (ConnectionStatus::WriteOpen, ConnectionStatus::Closed) => response_is_inflight,
 
-            //(ConnectionStatus::ReadOpen, ConnectionStatus::Normal) => true,
+            (ConnectionStatus::ReadOpen, ConnectionStatus::Normal) => true,
             (ConnectionStatus::ReadOpen, ConnectionStatus::ReadOpen) => false,
-            //(ConnectionStatus::ReadOpen, ConnectionStatus::WriteOpen) => true,
+            (ConnectionStatus::ReadOpen, ConnectionStatus::WriteOpen) => true,
             (ConnectionStatus::ReadOpen, ConnectionStatus::Closed) => false,
 
-            (ConnectionStatus::Closed, ConnectionStatus::Normal) => {
-                self.frontend_buffer.available_data() > 0
-            }
+            (ConnectionStatus::Closed, ConnectionStatus::Normal) => request_is_inflight,
             (ConnectionStatus::Closed, ConnectionStatus::ReadOpen) => false,
-            (ConnectionStatus::Closed, ConnectionStatus::WriteOpen) => {
-                self.frontend_buffer.available_data() > 0
-            }
+            (ConnectionStatus::Closed, ConnectionStatus::WriteOpen) => request_is_inflight,
             (ConnectionStatus::Closed, ConnectionStatus::Closed) => false,
-
-            _ => true,
         }
     }
 
@@ -332,13 +323,14 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         if self.backend_buffer.available_data() == 0 {
             if self.backend_readiness.event.is_readable() {
                 self.backend_readiness.interest.insert(Ready::READABLE);
-                error!("{} Pipe::back_hup: backend connection closed but the kernel still holds some data.", log_context!(self));
+                debug!("{} Pipe::backend_hup: backend connection closed, keeping alive due to inflight data in kernel.", log_context!(self));
                 SessionResult::Continue
             } else {
                 self.log_request_success(metrics);
                 SessionResult::Close
             }
         } else {
+            debug!("{} Pipe::backend_hup: backend connection closed, keeping alive due to inflight data in buffers.", log_context!(self));
             self.frontend_readiness.interest.insert(Ready::WRITABLE);
             if self.backend_readiness.event.is_readable() {
                 self.backend_readiness.interest.insert(Ready::READABLE);
@@ -575,7 +567,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
     pub fn backend_readable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
         self.reset_timeouts();
 
-        trace!("{} Pipe back_readable", log_context!(self));
+        trace!("{} Pipe backend_readable", log_context!(self));
         if self.backend_buffer.available_space() == 0 {
             self.backend_readiness.interest.remove(Ready::READABLE);
             return SessionResult::Continue;
