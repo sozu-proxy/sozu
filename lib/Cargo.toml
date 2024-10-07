@@ -34,7 +34,6 @@ hdrhistogram = "^7.5.4"
 hex = "^0.4.3"
 hpack = "^0.3.0"
 idna = "^1.0.2"
-kawa = { version = "^0.6.6", default-features = false }
 libc = "^0.2.155"
 memchr = "^2.7.2"
 mio = { version = "^1.0.0", features = ["os-poll", "os-ext", "net"] }
@@ -59,13 +58,18 @@ serial_test = "^3.1.1"
 tiny_http = "^0.12.0"
 
 [features]
-default = ["simd"]
+default = []
 logs-debug = []
 logs-trace = []
-simd = ["kawa/simd"]
 splice = []
 tolerant-http1-parser = ["kawa/tolerant-parsing"]
 unstable = []
+
+[target.'cfg(not(target_feature = "sse4.2"))'.dependencies]
+kawa = { version = "^0.6.6" }
+
+[target.'cfg(target_feature = "sse4.2")'.dependencies]
+kawa = { version = "^0.6.6", default-features = false }
 
 [badges]
 travis-ci = { repository = "sozu-proxy/sozu" }
