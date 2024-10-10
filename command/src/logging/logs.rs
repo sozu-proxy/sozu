@@ -572,13 +572,16 @@ pub fn parse_logging_spec(spec: &str) -> (Vec<LogDirective>, Vec<LogSpecParseErr
                         // treat that as a global fallback
                         match part0.parse() {
                             Ok(num) => (num, None),
-                            Err(_) => (LogLevelFilter::max(), Some(part0)),
+                            Err(_) => {
+                                errors.push(LogSpecParseError::InvalidLogLevel(s.to_string()));
+                                (LogLevelFilter::max(), None)
+                            }
                         }
                     }
                     (Some(part0), Some(""), None) => (LogLevelFilter::max(), Some(part0)),
                     (Some(part0), Some(part1), None) => match part1.parse() {
                         Ok(num) => (num, Some(part0)),
-                        _ => {
+                        Err(_) => {
                             errors.push(LogSpecParseError::InvalidLogLevel(s.to_string()));
                             continue;
                         }
@@ -945,7 +948,7 @@ macro_rules! debug {
         #[cfg(any(debug_assertions, feature = "logs-debug", feature = "logs-trace"))]
         $crate::_log!($crate::logging::LogLevel::Debug, concat!("{}\t", $format), module_path!() $(, $args)*);
         #[cfg(not(any(debug_assertions, feature = "logs-trace")))]
-        {$( let _ = $args; )*}
+        if false {$( let _ = $args; )*}
     }};
 }
 
@@ -956,7 +959,7 @@ macro_rules! trace {
         #[cfg(any(debug_assertions, feature = "logs-trace"))]
         $crate::_log!($crate::logging::LogLevel::Trace, concat!("{}\t", $format), module_path!() $(, $args)*);
         #[cfg(not(any(debug_assertions, feature = "logs-trace")))]
-        {$( let _ = $args; )*}
+        if false {$( let _ = $args; )*}
     }};
 }
 
