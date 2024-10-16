@@ -90,17 +90,40 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             self.readiness.interest.remove(Ready::READABLE);
         }
         if kawa.is_main_phase() {
+            if !was_main_phase && self.position.is_server() {
+                if parts.context.method.is_none()
+                    || parts.context.authority.is_none()
+                    || parts.context.path.is_none()
+                {
+                    if let kawa::StatusLine::Request {
+                        version: kawa::Version::V10,
+                        ..
+                    } = kawa.detached.status_line
+                    {
+                        error!(
+                            "Unexpected malformed request: HTTP/1.0 from {:?} with {:?} {:?} {:?}",
+                            parts.context.session_address,
+                            parts.context.method,
+                            parts.context.authority,
+                            parts.context.path
+                        );
+                    } else {
+                        error!("Unexpected malformed request");
+                        kawa::debug_kawa(kawa);
+                    }
+                    set_default_answer(stream, &mut self.readiness, 400);
+                    return MuxResult::Continue;
+                }
+                self.requests += 1;
+                println_!("REQUESTS: {}", self.requests);
+                gauge_add!("http.active_requests", 1);
+                stream.state = StreamState::Link
+            }
             if let StreamState::Linked(token) = stream.state {
                 endpoint
                     .readiness_mut(token)
                     .interest
                     .insert(Ready::WRITABLE)
-            }
-            if !was_main_phase && self.position.is_server() {
-                self.requests += 1;
-                println_!("REQUESTS: {}", self.requests);
-                gauge_add!("http.active_requests", 1);
-                stream.state = StreamState::Link
             }
         };
         MuxResult::Continue
@@ -150,6 +173,11 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                     match kawa.detached.status_line {
                         kawa::StatusLine::Response { code: 101, .. } => {
                             debug!("============== HANDLE UPGRADE!");
+                            stream.generate_access_log(
+                                false,
+                                Some(String::from("H1::Upgrade")),
+                                context.listener.clone(),
+                            );
                             return MuxResult::Upgrade;
                         }
                         kawa::StatusLine::Response { code: 100, .. } => {
@@ -158,6 +186,11 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                             self.timeout_container.reset();
                             self.readiness.interest.insert(Ready::READABLE);
                             kawa.clear();
+                            stream.generate_access_log(
+                                false,
+                                Some(String::from("H1::Continue")),
+                                context.listener.clone(),
+                            );
                             return MuxResult::Continue;
                         }
                         kawa::StatusLine::Response { code: 103, .. } => {
@@ -169,14 +202,24 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                                     .interest
                                     .insert(Ready::READABLE);
                                 kawa.clear();
+                                stream.generate_access_log(
+                                    false,
+                                    Some(String::from("H1::EarlyHint+Error")),
+                                    context.listener.clone(),
+                                );
                                 return MuxResult::Continue;
                             } else {
+                                stream.generate_access_log(
+                                    false,
+                                    Some(String::from("H1::EarlyHint")),
+                                    context.listener.clone(),
+                                );
                                 return MuxResult::CloseSession;
                             }
                         }
                         _ => {}
                     }
-                    // ACCESS LOG
+                    incr!("http.e2e.http11");
                     stream.generate_access_log(
                         false,
                         Some(String::from("H1")),

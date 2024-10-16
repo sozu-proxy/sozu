@@ -139,7 +139,7 @@ impl<'a> ParseError<&'a [u8]> for ParserError<'a> {
         }
     }
 
-    fn append(input: &'a [u8], kind: ErrorKind, other: Self) -> Self {
+    fn append(input: &'a [u8], kind: ErrorKind, _other: Self) -> Self {
         ParserError {
             input,
             kind: ParserErrorKind::Nom(kind),

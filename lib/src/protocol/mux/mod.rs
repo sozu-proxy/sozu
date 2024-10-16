@@ -120,17 +120,39 @@ pub fn terminate_default_answer<T: kawa::AsBuffer>(kawa: &mut kawa::Kawa<T>, clo
 
 /// Replace the content of the kawa message with a default Sozu answer for a given status code
 fn set_default_answer(stream: &mut Stream, readiness: &mut Readiness, code: u16) {
+    let context = &mut stream.context;
     let kawa = &mut stream.back;
     kawa.clear();
     kawa.storage.clear();
+    let key = match code {
+        301 => "http.301.redirection",
+        400 => "http.400.errors",
+        401 => "http.401.errors",
+        404 => "http.404.errors",
+        408 => "http.408.errors",
+        413 => "http.413.errors",
+        502 => "http.502.errors",
+        503 => "http.503.errors",
+        504 => "http.504.errors",
+        507 => "http.507.errors",
+        _ => "http.other.errors",
+    };
+    // if context.cluster_id.is_some() {
+    //     incr!(key);
+    // }
+    incr!(
+        key,
+        context.cluster_id.as_deref(),
+        context.backend_id.as_deref()
+    );
     if code == 301 {
-        let host = stream.context.authority.as_deref().unwrap();
-        let uri = stream.context.path.as_deref().unwrap();
+        let host = context.authority.as_deref().unwrap();
+        let uri = context.path.as_deref().unwrap();
         fill_default_301_answer(kawa, host, uri);
     } else {
         fill_default_answer(kawa, code);
     }
-    stream.context.status = Some(code);
+    context.status = Some(code);
     stream.state = StreamState::Unlinked;
     readiness.interest.insert(Ready::WRITABLE);
 }
@@ -172,6 +194,7 @@ impl Debug for Position {
     }
 }
 
+#[allow(dead_code)]
 impl Position {
     fn is_server(&self) -> bool {
         match self {
@@ -289,7 +312,7 @@ impl<Front: SocketHandler> Connection<Front> {
             local_settings: H2Settings::default(),
             peer_settings: H2Settings::default(),
             position: Position::Server,
-            prioriser: Prioriser::new(),
+            prioriser: Prioriser::default(),
             readiness: Readiness {
                 interest: Ready::READABLE | Ready::HUP | Ready::ERROR,
                 event: Ready::EMPTY,
@@ -325,7 +348,7 @@ impl<Front: SocketHandler> Connection<Front> {
                 backend,
                 BackendStatus::Connecting(Instant::now()),
             ),
-            prioriser: Prioriser::new(),
+            prioriser: Prioriser::default(),
             readiness: Readiness {
                 interest: Ready::WRITABLE | Ready::HUP | Ready::ERROR,
                 event: Ready::EMPTY,
@@ -439,13 +462,10 @@ impl<Front: SocketHandler> Connection<Front> {
     where
         L: ListenerHandler + L7ListenerHandler,
     {
-        match self.position() {
-            Position::Client(_, backend, BackendStatus::Connected) => {
-                let mut backend_borrow = backend.borrow_mut();
-                backend_borrow.active_requests = backend_borrow.active_requests.saturating_sub(1);
-                println_!("--------------- CONNECTION END STREAM: {backend_borrow:#?}");
-            }
-            _ => {}
+        if let Position::Client(_, backend, BackendStatus::Connected) = self.position() {
+            let mut backend_borrow = backend.borrow_mut();
+            backend_borrow.active_requests = backend_borrow.active_requests.saturating_sub(1);
+            println_!("--------------- CONNECTION END STREAM: {backend_borrow:#?}");
         }
         match self {
             Connection::H1(c) => c.end_stream(stream, context),
@@ -457,13 +477,10 @@ impl<Front: SocketHandler> Connection<Front> {
     where
         L: ListenerHandler + L7ListenerHandler,
     {
-        match self.position() {
-            Position::Client(_, backend, BackendStatus::Connected) => {
-                let mut backend_borrow = backend.borrow_mut();
-                backend_borrow.active_requests += 1;
-                println_!("--------------- CONNECTION START STREAM: {backend_borrow:#?}");
-            }
-            _ => {}
+        if let Position::Client(_, backend, BackendStatus::Connected) = self.position() {
+            let mut backend_borrow = backend.borrow_mut();
+            backend_borrow.active_requests += 1;
+            println_!("--------------- CONNECTION START STREAM: {backend_borrow:#?}");
         }
         match self {
             Connection::H1(c) => c.start_stream(stream, context),
@@ -485,7 +502,7 @@ impl<'a, Front: SocketHandler> Endpoint for EndpointServer<'a, Front> {
         self.0.readiness_mut()
     }
 
-    fn end_stream<L>(&mut self, token: Token, stream: GlobalStreamId, context: &mut Context<L>)
+    fn end_stream<L>(&mut self, _token: Token, stream: GlobalStreamId, context: &mut Context<L>)
     where
         L: ListenerHandler + L7ListenerHandler,
     {
@@ -702,23 +719,46 @@ impl Stream {
     ) where
         L: ListenerHandler + L7ListenerHandler,
     {
+        let context = &self.context;
         gauge_add!("http.active_requests", -1);
-        let protocol = match self.context.protocol {
+        let protocol = match context.protocol {
             Protocol::HTTP => "http",
             Protocol::HTTPS => "https",
             _ => unreachable!(),
         };
 
+        // Save the HTTP status code of the backend response
+        let key = if let Some(status) = context.status {
+            match status {
+                100..=199 => "http.status.1xx",
+                200..=299 => "http.status.2xx",
+                300..=399 => "http.status.3xx",
+                400..=499 => "http.status.4xx",
+                500..=599 => "http.status.5xx",
+                _ => "http.status.other",
+            }
+        } else {
+            "http.status.none"
+        };
+        // if context.cluster_id.is_some() {
+        //     incr!(key);
+        // }
+        incr!(
+            key,
+            context.cluster_id.as_deref(),
+            context.backend_id.as_deref()
+        );
+
         let endpoint = EndpointRecord::Http {
-            method: self.context.method.as_deref(),
-            authority: self.context.authority.as_deref(),
-            path: self.context.path.as_deref(),
-            reason: self.context.reason.as_deref(),
-            status: self.context.status,
+            method: context.method.as_deref(),
+            authority: context.authority.as_deref(),
+            path: context.path.as_deref(),
+            reason: context.reason.as_deref(),
+            status: context.status,
         };
 
         let listener = listener.borrow();
-        let tags = self.context.authority.as_deref().and_then(|host| {
+        let tags = context.authority.as_deref().and_then(|host| {
             let hostname = match host.split_once(':') {
                 None => host,
                 Some((hostname, _)) => hostname,
@@ -730,9 +770,9 @@ impl Stream {
             error,
             on_failure: { incr!("unsent-access-logs") },
             message: message.as_deref(),
-            context: self.context.log_context(),
-            session_address: self.context.session_address,
-            backend_address: self.context.backend_address,
+            context: context.log_context(),
+            session_address: context.session_address,
+            backend_address: context.backend_address,
             protocol,
             endpoint,
             tags,
@@ -743,7 +783,7 @@ impl Stream {
             request_time: self.metrics.request_time(),
             bytes_in: self.metrics.bin,
             bytes_out: self.metrics.bout,
-            user_agent: self.context.user_agent.as_deref(),
+            user_agent: context.user_agent.as_deref(),
         };
     }
 }
@@ -1007,6 +1047,10 @@ impl Router {
             Err(cluster_error) => {
                 // we are past kawa parsing if it succeeded this can't fail
                 // if the request was malformed it was caught by kawa and we sent a 400
+                error!(
+                    "Malformed request in connect (should be caught at parsing) {:?}",
+                    context
+                );
                 unreachable!("{cluster_error}");
             }
         };
@@ -1117,7 +1161,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         &mut self,
         session: Rc<RefCell<dyn ProxySession>>,
         proxy: Rc<RefCell<P>>,
-        metrics: &mut SessionMetrics,
+        _metrics: &mut SessionMetrics,
     ) -> SessionResult {
         let mut counter = 0;
         let max_loop_iterations = 100000;
@@ -1127,7 +1171,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         }
 
         let start = std::time::Instant::now();
-        println_!("{start:?}");
+        println_!("{:?}", start);
         loop {
             loop {
                 let context = &mut self.context;
@@ -1538,7 +1582,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
     }
 
     fn close<P: L7Proxy>(&mut self, proxy: Rc<RefCell<P>>, _metrics: &mut SessionMetrics) {
-        println!("MUX CLOSE");
+        debug!("MUX CLOSE");
         println_!("FRONTEND: {:#?}", self.frontend);
         println_!("BACKENDS: {:#?}", self.router.backends);
 
@@ -1583,7 +1627,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 Position::Server => unreachable!(),
             }
         }
-        return;
+        /*
         let s = match &mut self.frontend {
             Connection::H1(c) => &mut c.socket,
             Connection::H2(c) => &mut c.socket,
@@ -1594,16 +1638,17 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         for stream in &mut self.context.streams {
             for kawa in [&mut stream.front, &mut stream.back] {
                 kawa::debug_kawa(kawa);
-                // kawa.prepare(&mut kawa::h1::BlockConverter);
-                // let out = kawa.as_io_slice();
-                // let mut writer = std::io::BufWriter::new(Vec::new());
-                // let amount = writer.write_vectored(&out).unwrap();
-                // println_!(
-                //     "amount: {amount}\n{}",
-                //     String::from_utf8_lossy(writer.buffer())
-                // );
+                kawa.prepare(&mut kawa::h1::BlockConverter);
+                let out = kawa.as_io_slice();
+                let mut writer = std::io::BufWriter::new(Vec::new());
+                let amount = writer.write_vectored(&out).unwrap();
+                println_!(
+                    "amount: {amount}\n{}",
+                    String::from_utf8_lossy(writer.buffer())
+                );
             }
         }
+        */
     }
 
     fn shutting_down(&mut self) -> SessionIsToBeClosed {

@@ -218,7 +218,10 @@ impl HttpSession {
                     Some(session_address),
                     public_address,
                 );
-                context.create_stream(expect.request_id, 1 << 16)?;
+                if context.create_stream(expect.request_id, 1 << 16).is_none() {
+                    error!("HTTP expect upgrade failed: could not create stream");
+                    return None;
+                }
                 let mut mux = Mux {
                     configured_frontend_timeout: self.configured_frontend_timeout,
                     frontend_token: self.frontend_token,
@@ -232,7 +235,13 @@ impl HttpSession {
                 gauge_add!("protocol.http", 1);
                 Some(HttpStateMachine::Mux(mux))
             }
-            _ => None,
+            _ => {
+                warn!(
+                    "HTTP expect upgrade failed: bad header {:?}",
+                    expect.addresses
+                );
+                None
+            }
         }
     }
 

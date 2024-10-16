@@ -15,9 +15,9 @@ pub const H2_PRI: &str = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 pub const SETTINGS_ACKNOWLEDGEMENT: [u8; 9] = [0, 0, 0, 4, 1, 0, 0, 0, 0];
 pub const PING_ACKNOWLEDGEMENT_HEADER: [u8; 9] = [0, 0, 8, 6, 1, 0, 0, 0, 0];
 
-pub fn gen_frame_header<'a, 'b>(
+pub fn gen_frame_header<'a>(
     buf: &'a mut [u8],
-    frame: &'b FrameHeader,
+    frame: &FrameHeader,
 ) -> Result<(&'a mut [u8], usize), GenError> {
     let serializer = tuple((
         be_u24(frame.payload_len),
@@ -100,11 +100,11 @@ pub fn gen_settings<'a>(
     })
 }
 
-pub fn gen_rst_stream<'a>(
-    buf: &'a mut [u8],
+pub fn gen_rst_stream(
+    buf: &mut [u8],
     stream_id: u32,
     error_code: H2Error,
-) -> Result<(&'a mut [u8], usize), GenError> {
+) -> Result<(&mut [u8], usize), GenError> {
     gen_frame_header(
         buf,
         &FrameHeader {
@@ -119,11 +119,11 @@ pub fn gen_rst_stream<'a>(
     })
 }
 
-pub fn gen_goaway<'a>(
-    buf: &'a mut [u8],
+pub fn gen_goaway(
+    buf: &mut [u8],
     last_stream_id: u32,
     error_code: H2Error,
-) -> Result<(&'a mut [u8], usize), GenError> {
+) -> Result<(&mut [u8], usize), GenError> {
     gen_frame_header(
         buf,
         &FrameHeader {

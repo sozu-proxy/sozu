@@ -150,6 +150,7 @@ impl CommandManager {
                 send_proxy,
                 expect_proxy,
                 load_balancing_policy,
+                h2,
             } => {
                 let proxy_protocol = match (send_proxy, expect_proxy) {
                     (true, true) => Some(ProxyProtocolConfig::RelayHeader),
@@ -164,7 +165,9 @@ impl CommandManager {
                         https_redirect,
                         proxy_protocol: proxy_protocol.map(|pp| pp as i32),
                         load_balancing: load_balancing_policy as i32,
-                        ..Default::default()
+                        http2: h2,
+                        load_metric: None,
+                        answer_503: None,
                     })
                     .into(),
                 )
@@ -238,7 +241,6 @@ impl CommandManager {
                 method,
                 cluster_id: route,
                 tags,
-                h2,
             } => self.send_request(
                 RequestType::AddHttpFrontend(RequestHttpFrontend {
                     cluster_id: route.into(),
@@ -287,7 +289,6 @@ impl CommandManager {
                 method,
                 cluster_id: route,
                 tags,
-                h2,
             } => self.send_request(
                 RequestType::AddHttpsFrontend(RequestHttpFrontend {
                     cluster_id: route.into(),
