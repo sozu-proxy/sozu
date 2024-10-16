@@ -26,12 +26,12 @@ fn error_nom_to_h2(error: nom::Err<parser::ParserError>) -> H2Error {
         nom::Err::Error(parser::ParserError {
             kind: parser::ParserErrorKind::H2(e),
             ..
-        }) => return e,
+        }) => e,
         nom::Err::Failure(parser::ParserError {
             kind: parser::ParserErrorKind::H2(e),
             ..
-        }) => return e,
-        _ => return H2Error::ProtocolError,
+        }) => e,
+        _ => H2Error::ProtocolError,
     }
 }
 
@@ -78,12 +78,10 @@ impl Default for H2Settings {
     }
 }
 
+#[derive(Default)]
 pub struct Prioriser {}
 
 impl Prioriser {
-    pub fn new() -> Self {
-        Self {}
-    }
     pub fn push_priority(&mut self, stream_id: StreamId, priority: parser::PriorityPart) -> bool {
         println_!("PRIORITY REQUEST FOR {stream_id}: {priority:?}");
         match priority {
@@ -162,7 +160,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         let (stream_id, kawa) = if let Some((stream_id, amount)) = self.expect_read {
             let kawa = match stream_id {
                 H2StreamId::Zero => &mut self.zero,
-                H2StreamId::Other(stream_id, global_stream_id) => {
+                H2StreamId::Other(_, global_stream_id) => {
                     context.streams[global_stream_id]
                         .split(&self.position)
                         .rbuffer
@@ -186,23 +184,21 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 }
                 if update_readiness_after_read(size, status, &mut self.readiness) {
                     return MuxResult::Continue;
+                } else if size == amount {
+                    self.expect_read = None;
                 } else {
-                    if size == amount {
-                        self.expect_read = None;
-                    } else {
-                        self.expect_read = Some((stream_id, amount - size));
-                        match (&self.state, &self.position) {
-                            (H2State::ClientPreface, Position::Server) => {
-                                let i = kawa.storage.data();
-                                if !b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".starts_with(i) {
-                                    println_!("EARLY INVALID PREFACE: {i:?}");
-                                    return self.force_disconnect();
-                                }
+                    self.expect_read = Some((stream_id, amount - size));
+                    match (&self.state, &self.position) {
+                        (H2State::ClientPreface, Position::Server) => {
+                            let i = kawa.storage.data();
+                            if !b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".starts_with(i) {
+                                println_!("EARLY INVALID PREFACE: {i:?}");
+                                return self.force_disconnect();
                             }
-                            _ => {}
                         }
-                        return MuxResult::Continue;
+                        _ => {}
                     }
+                    return MuxResult::Continue;
                 }
             } else {
                 self.expect_read = None;
@@ -359,24 +355,24 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                                     }
                                 }
                             } else if header.frame_type != FrameType::Priority {
-                                error!(
-                                    "CANNOT RECEIVE {:?} FRAME ON IDLE/CLOSED STREAMS",
-                                    header.frame_type
-                                );
                                 if header.frame_type == FrameType::Data
                                     && header.payload_len == 0
                                     && header.flags == 1
                                 {
-                                    error!(
-                                        "SKIPPED DATA: {} {} {} {}",
-                                        stream_id,
-                                        self.last_stream_id,
-                                        header.flags,
-                                        header.payload_len
-                                    );
+                                    // error!(
+                                    //     "SKIPPED DATA: {} {} {} {}",
+                                    //     stream_id,
+                                    //     self.last_stream_id,
+                                    //     header.flags,
+                                    //     header.payload_len
+                                    // );
                                     self.expect_header();
                                     return MuxResult::Continue;
                                 }
+                                error!(
+                                    "CANNOT RECEIVE {:?} FRAME ON IDLE/CLOSED STREAMS",
+                                    header.frame_type
+                                );
                                 return self.goaway(H2Error::ProtocolError);
                             }
                             H2StreamId::Zero
@@ -456,7 +452,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             (H2State::ContinuationFrame(headers), _) => {
                 kawa.storage.head = kawa.storage.end;
                 let i = kawa.storage.data();
-                println_!("  data: {i:?}");
+                println_!("  data: {:?}", i);
                 let headers = headers.clone();
                 self.expect_header();
                 return self.handle_frame(Frame::Headers(headers), context, endpoint);
@@ -581,7 +577,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                             Position::Server => {
                                 // mark stream as reusable
                                 println_!("Recycle stream: {global_stream_id}");
-                                // ACCESS LOG
+                                incr!("http.e2e.h2");
                                 stream.generate_access_log(
                                     false,
                                     Some(String::from("H2::SplitFrame")),
@@ -648,9 +644,12 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         match self.position {
                             Position::Client(..) => {}
                             Position::Server => {
+                                // Handle 1xx, this code should probably be merged with the h2 SplitFrame case and h1 nominal case
+                                // to avoid code duplication
+
                                 // mark stream as reusable
                                 println_!("Recycle1 stream: {global_stream_id}");
-                                // ACCESS LOG
+                                incr!("http.e2e.h2");
                                 stream.generate_access_log(
                                     false,
                                     Some(String::from("H2::WholeFrame")),
@@ -834,7 +833,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     stream.state = StreamState::Link;
                 }
             }
-            Frame::PushPromise(push_promise) => match self.position {
+            Frame::PushPromise(_push_promise) => match self.position {
                 Position::Client(..) => {
                     if self.local_settings.settings_enable_push {
                         todo!("forward the push")
@@ -884,7 +883,6 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                             // This is a special case, normally, all stream are terminated by the server
                             // when the last byte of the response is written. Here, the reset is requested
                             // on the server endpoint and immediately terminates, shortcutting the other path
-                            // ACCESS LOG
                             stream.generate_access_log(
                                 true,
                                 Some(String::from("H2::ResetFrame")),
@@ -903,7 +901,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     let v = setting.value;
                     let mut is_error = false;
                     #[rustfmt::skip]
-                    let _ = match setting.identifier {
+                    match setting.identifier {
                         1 => { self.peer_settings.settings_header_table_size = v },
                         2 => { self.peer_settings.settings_enable_push = v == 1;                is_error |= v > 1 },
                         3 => { self.peer_settings.settings_max_concurrent_streams = v },
@@ -970,27 +968,23 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         error!("INVALID WINDOW INCREMENT");
                         return self.goaway(H2Error::FlowControlError);
                     }
-                } else {
-                    if let Some(global_stream_id) = self.streams.get(&stream_id) {
-                        let stream = &mut context.streams[*global_stream_id];
-                        if let Some(window) = stream.window.checked_add(increment) {
-                            if stream.window <= 0 && window > 0 {
-                                self.readiness.interest.insert(Ready::WRITABLE);
-                            }
-                            stream.window = window;
-                        } else {
-                            return self.reset_stream(
-                                *global_stream_id,
-                                context,
-                                endpoint,
-                                H2Error::FlowControlError,
-                            );
+                } else if let Some(global_stream_id) = self.streams.get(&stream_id) {
+                    let stream = &mut context.streams[*global_stream_id];
+                    if let Some(window) = stream.window.checked_add(increment) {
+                        if stream.window <= 0 && window > 0 {
+                            self.readiness.interest.insert(Ready::WRITABLE);
                         }
+                        stream.window = window;
                     } else {
-                        println_!(
-                            "Ignoring window update on closed stream {stream_id}: {increment}"
+                        return self.reset_stream(
+                            *global_stream_id,
+                            context,
+                            endpoint,
+                            H2Error::FlowControlError,
                         );
                     }
+                } else {
+                    println_!("Ignoring window update on closed stream {stream_id}: {increment}");
                 };
             }
             Frame::Continuation(_) => unreachable!(),
@@ -1007,7 +1001,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         }
         let delta = value as i32 - self.peer_settings.settings_initial_window_size as i32;
         let mut open_window = false;
-        for (i, stream) in context.streams.iter_mut().enumerate() {
+        for stream in context.streams.iter_mut() {
             open_window |= stream.window <= 0 && stream.window + delta > 0;
             stream.window += delta;
         }
@@ -1080,7 +1074,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         L: ListenerHandler + L7ListenerHandler,
     {
         let stream_context = &mut context.streams[stream].context;
-        println_!("end H2 stream {stream}: {stream_context:#?}");
+        println_!("end H2 stream {}: {:#?}", stream, stream_context);
         match self.position {
             Position::Client(..) => {
                 for (stream_id, global_stream_id) in &self.streams {

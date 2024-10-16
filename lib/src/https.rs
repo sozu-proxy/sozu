@@ -248,7 +248,10 @@ impl HttpsSession {
         if !expect.container_frontend_timeout.cancel() {
             error!("failed to cancel request timeout on expect upgrade phase for 'expect proxy protocol with AF_UNSPEC address'");
         }
-
+        warn!(
+            "HTTP expect upgrade failed: bad header {:?}",
+            expect.addresses
+        );
         None
     }
 
@@ -299,14 +302,18 @@ impl HttpsSession {
         );
         let mut frontend = match alpn {
             AlpnProtocol::Http11 => {
+                incr!("http.alpn.http11");
                 context.create_stream(handshake.request_id, 1 << 16)?;
                 mux::Connection::new_h1_server(front_stream, handshake.container_frontend_timeout)
             }
-            AlpnProtocol::H2 => mux::Connection::new_h2_server(
-                front_stream,
-                self.pool.clone(),
-                handshake.container_frontend_timeout,
-            )?,
+            AlpnProtocol::H2 => {
+                incr!("http.alpn.h2");
+                mux::Connection::new_h2_server(
+                    front_stream,
+                    self.pool.clone(),
+                    handshake.container_frontend_timeout,
+                )?
+            }
         };
         frontend.readiness_mut().event = handshake.frontend_readiness.event;
 
