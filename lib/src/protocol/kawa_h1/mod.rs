@@ -81,7 +81,9 @@ pub enum DefaultAnswer {
     Answer400 {
         message: String,
         phase: kawa::ParsingPhaseMarker,
-        details: String,
+        successfully_parsed: String,
+        partially_parsed: String,
+        invalid: String,
     },
     Answer401 {},
     Answer404 {},
@@ -96,7 +98,9 @@ pub enum DefaultAnswer {
     Answer502 {
         message: String,
         phase: kawa::ParsingPhaseMarker,
-        details: String,
+        successfully_parsed: String,
+        partially_parsed: String,
+        invalid: String,
     },
     Answer503 {
         message: String,
@@ -445,11 +449,14 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 self.log_request_error(metrics, "Parsing error on the request");
                 return StateResult::CloseSession;
             } else {
-                let (message, details) = diagnostic_400_502(marker, kind, &self.request_stream);
+                let (message, successfully_parsed, partially_parsed, invalid) =
+                    diagnostic_400_502(marker, kind, &self.request_stream);
                 self.set_answer(DefaultAnswer::Answer400 {
-                    phase: marker,
-                    details,
                     message,
+                    phase: marker,
+                    successfully_parsed,
+                    partially_parsed,
+                    invalid,
                 });
                 return StateResult::Continue;
             }
@@ -837,11 +844,14 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             if response_stream.consumed {
                 return SessionResult::Close;
             } else {
-                let (message, details) = diagnostic_400_502(marker, kind, response_stream);
+                let (message, successfully_parsed, partially_parsed, invalid) =
+                    diagnostic_400_502(marker, kind, response_stream);
                 self.set_answer(DefaultAnswer::Answer502 {
-                    phase: marker,
-                    details,
                     message,
+                    phase: marker,
+                    successfully_parsed,
+                    partially_parsed,
+                    invalid,
                 });
                 return SessionResult::Continue;
             }
@@ -1243,9 +1253,11 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             Ok(tuple) => tuple,
             Err(cluster_error) => {
                 self.set_answer(DefaultAnswer::Answer400 {
-                    phase: self.request_stream.parsing_phase.marker(),
-                    details: cluster_error.to_string(),
                     message: "Could not extract the route after connection started, this should not happen.".into(),
+                    phase: self.request_stream.parsing_phase.marker(),
+                    successfully_parsed: "null".into(),
+                    partially_parsed: "null".into(),
+                    invalid: "null".into(),
                 });
                 return Err(cluster_error);
             }
