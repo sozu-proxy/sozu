@@ -7,7 +7,6 @@ use std::{
     fmt::Display,
     iter,
     time::{Duration, Instant},
-    u64, usize,
 };
 
 use mio::Token;

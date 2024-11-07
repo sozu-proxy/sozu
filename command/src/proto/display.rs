@@ -976,7 +976,7 @@ fn create_cluster_table(headers: Vec<&str>, data: &BTreeMap<String, ResponseCont
 
 impl Display for SocketAddress {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", SocketAddr::from(self.clone()))
+        write!(f, "{}", SocketAddr::from(*self))
     }
 }
 

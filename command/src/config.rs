@@ -908,10 +908,7 @@ impl HttpFrontendConfig {
     pub fn generate_requests(&self, cluster_id: &str) -> Vec<Request> {
         let mut v = Vec::new();
 
-        let tags = match self.tags.clone() {
-            Some(tags) => tags,
-            None => BTreeMap::new(),
-        };
+        let tags = self.tags.clone().unwrap_or_default();
 
         if self.key.is_some() && self.certificate.is_some() {
             v.push(
@@ -1586,7 +1583,7 @@ impl Config {
         for listener in &self.tcp_listeners {
             v.push(WorkerRequest {
                 id: format!("CONFIG-{count}"),
-                content: RequestType::AddTcpListener(listener.clone()).into(),
+                content: RequestType::AddTcpListener(*listener).into(),
             });
             count += 1;
         }
@@ -1607,7 +1604,7 @@ impl Config {
                 v.push(WorkerRequest {
                     id: format!("CONFIG-{count}"),
                     content: RequestType::ActivateListener(ActivateListener {
-                        address: listener.address.clone(),
+                        address: listener.address,
                         proxy: ListenerType::Http.into(),
                         from_scm: false,
                     })
@@ -1620,7 +1617,7 @@ impl Config {
                 v.push(WorkerRequest {
                     id: format!("CONFIG-{count}"),
                     content: RequestType::ActivateListener(ActivateListener {
-                        address: listener.address.clone(),
+                        address: listener.address,
                         proxy: ListenerType::Https.into(),
                         from_scm: false,
                     })
@@ -1633,7 +1630,7 @@ impl Config {
                 v.push(WorkerRequest {
                     id: format!("CONFIG-{count}"),
                     content: RequestType::ActivateListener(ActivateListener {
-                        address: listener.address.clone(),
+                        address: listener.address,
                         proxy: ListenerType::Tcp.into(),
                         from_scm: false,
                     })

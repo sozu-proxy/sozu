@@ -383,7 +383,7 @@ impl BackendList {
                 &backend.backend_id,
                 backend.address,
                 backend.sticky_id.clone(),
-                backend.load_balancing_parameters.clone(),
+                backend.load_balancing_parameters,
                 backend.backup,
             );
             list.add_backend(backend);

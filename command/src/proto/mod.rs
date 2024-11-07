@@ -85,7 +85,7 @@ impl AggregatedMetrics {
                             let found_backend = cluster
                                 .backends
                                 .iter_mut()
-                                .find(|present| &present.backend_id == &backend.backend_id);
+                                .find(|present| present.backend_id == backend.backend_id);
 
                             if let Some(existing_backend) = found_backend {
                                 let _ = existing_backend

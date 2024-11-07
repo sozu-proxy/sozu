@@ -1120,7 +1120,7 @@ impl TcpListener {
             cluster_id: None,
             listener: None,
             token,
-            address: config.address.clone().into(),
+            address: config.address.into(),
             config,
             active: false,
             tags: BTreeMap::new(),
@@ -1139,7 +1139,7 @@ impl TcpListener {
         let mut listener = match tcp_listener {
             Some(listener) => listener,
             None => {
-                let address = self.config.address.clone().into();
+                let address = self.config.address.into();
                 server_bind(address).map_err(|e| ProxyError::BindToSocket(address, e))?
             }
         };
@@ -1377,7 +1377,7 @@ impl ProxyConfiguration for TcpProxy {
                 WorkerResponse::ok(message.id)
             }
             RequestType::RemoveListener(remove) => {
-                if !self.remove_listener(remove.address.clone().into()) {
+                if !self.remove_listener(remove.address.into()) {
                     WorkerResponse::error(
                         message.id,
                         format!("no TCP listener to remove at address {:?}", remove.address),
@@ -1518,7 +1518,7 @@ pub mod testing {
         buffer_size: usize,
         channel: ProxyChannel,
     ) -> anyhow::Result<()> {
-        let address = config.address.clone().into();
+        let address = config.address.into();
 
         let ServerParts {
             event_loop,

@@ -84,10 +84,12 @@ pub struct Pipe<Front: SocketHandler, L: ListenerHandler> {
 
 impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
     /// Instantiate a new Pipe SessionState with:
+    ///
     /// - frontend_interest: READABLE | WRITABLE | HUP | ERROR
     /// - frontend_event: EMPTY
     /// - backend_interest: READABLE | WRITABLE | HUP | ERROR
     /// - backend_event: EMPTY
+    ///
     /// Remember to set the events from the previous State!
     #[allow(clippy::too_many_arguments)]
     pub fn new(
