@@ -341,7 +341,7 @@ pub struct HttpAnswers {
 //   border-radius: 5px;
 // }
 // </style>";
-// const FOOTER: &str = "<footer>This is an automatic answer by Sozu.</footer>";
+// const FOOTER: &str = "<footer>This is an automatic answer by Sōzu.</footer>";
 fn default_301() -> String {
     String::from(
         "\
@@ -363,19 +363,43 @@ Connection: close\r
 %Content-Length: %CONTENT_LENGTH\r
 Sozu-Id: %REQUEST_ID\r
 \r
+<html><head><meta charset='utf-8'><head><body>
 <style>pre{background:#EEE;padding:10px;border:1px solid #AAA;border-radius: 5px;}</style>
 <h1>400 Bad Request</h1>
 <pre>
 {
+    \"status_code\": 400,
     \"route\": \"%ROUTE\",
     \"request_id\": \"%REQUEST_ID\",
+    \"parsing_phase\": \"%PHASE\",
+    \"successfully_parsed\": %SUCCESSFULLY_PARSED,
+    \"partially_parsed\": %PARTIALLY_PARSED,
+    \"invalid\": %INVALID
 }
 </pre>
-<p>Request could not be parsed. Parser stopped at phase: %PHASE.</p>
-<p>Diagnostic: %MESSAGE</p>
-<p>Further details:</p>
-<pre>%DETAILS</pre>
-<footer>This is an automatic answer by Sozu.</footer>",
+<p>Request could not be parsed. %MESSAGE</p>
+<div id=details hidden=true>
+<p>While parsing %PHASE, this was reported as invalid:</p>
+<pre>
+<span id=p1 style='background:rgba(0,255,0,0.2)'></span><span id=p2 style='background:rgba(255,255,0,0.2)'></span><span id=p3 style='background:rgba(255,0,0,0.2)'></span>
+</pre>
+</div>
+<script>
+function display(id, chunks) {
+    let [start, end] = chunks.split(' … ');
+    let dec = new TextDecoder('utf8');
+    let decode = chunk => dec.decode(new Uint8Array(chunk.split(' ').filter(e => e).map(e => parseInt(e, 16))));
+    document.getElementById(id).innerText = JSON.stringify(end ? `${decode(start)} […] ${decode(end)}` : `${decode(start)}`).slice(1,-1);
+}
+let p1 = %SUCCESSFULLY_PARSED;
+let p2 = %PARTIALLY_PARSED;
+let p3 = %INVALID;
+if (p1 !== null) {
+    document.getElementById('details').hidden=false;
+    display('p1', p1);display('p2', p2);display('p3', p3);
+}
+</script>
+<footer>This is an automatic answer by Sōzu.</footer></body></html>",
     )
 }
 
@@ -387,15 +411,17 @@ Cache-Control: no-cache\r
 Connection: close\r
 Sozu-Id: %REQUEST_ID\r
 \r
+<html><head><meta charset='utf-8'><head><body>
 <style>pre{background:#EEE;padding:10px;border:1px solid #AAA;border-radius: 5px;}</style>
 <h1>401 Unauthorized</h1>
 <pre>
 {
+    \"status_code\": 401,
     \"route\": \"%ROUTE\",
-    \"request_id\": \"%REQUEST_ID\",
+    \"request_id\": \"%REQUEST_ID\"
 }
 </pre>
-<footer>This is an automatic answer by Sozu.</footer>",
+<footer>This is an automatic answer by Sōzu.</footer></body></html>",
     )
 }
 
@@ -407,15 +433,17 @@ Cache-Control: no-cache\r
 Connection: close\r
 Sozu-Id: %REQUEST_ID\r
 \r
+<html><head><meta charset='utf-8'><head><body>
 <style>pre{background:#EEE;padding:10px;border:1px solid #AAA;border-radius: 5px;}</style>
 <h1>404 Not Found</h1>
 <pre>
 {
+    \"status_code\": 404,
     \"route\": \"%ROUTE\",
-    \"request_id\": \"%REQUEST_ID\",
+    \"request_id\": \"%REQUEST_ID\"
 }
 </pre>
-<footer>This is an automatic answer by Sozu.</footer>",
+<footer>This is an automatic answer by Sōzu.</footer></body></html>",
     )
 }
 
@@ -427,16 +455,18 @@ Cache-Control: no-cache\r
 Connection: close\r
 Sozu-Id: %REQUEST_ID\r
 \r
+<html><head><meta charset='utf-8'><head><body>
 <style>pre{background:#EEE;padding:10px;border:1px solid #AAA;border-radius: 5px;}</style>
 <h1>408 Request Timeout</h1>
 <pre>
 {
+    \"status_code\": 408,
     \"route\": \"%ROUTE\",
-    \"request_id\": \"%REQUEST_ID\",
+    \"request_id\": \"%REQUEST_ID\"
 }
 </pre>
 <p>Request timed out after %DURATION.</p>
-<footer>This is an automatic answer by Sozu.</footer>",
+<footer>This is an automatic answer by Sōzu.</footer></body></html>",
     )
 }
 
@@ -449,17 +479,18 @@ Connection: close\r
 %Content-Length: %CONTENT_LENGTH\r
 Sozu-Id: %REQUEST_ID\r
 \r
+<html><head><meta charset='utf-8'><head><body>
 <style>pre{background:#EEE;padding:10px;border:1px solid #AAA;border-radius: 5px;}</style>
 <h1>413 Payload Too Large</h1>
 <pre>
 {
+    \"status_code\": 413,
     \"route\": \"%ROUTE\",
-    \"request_id\": \"%REQUEST_ID\",
+    \"request_id\": \"%REQUEST_ID\"
 }
 </pre>
-<p>Request needed more than %CAPACITY bytes to fit. Parser stopped at phase: %PHASE.</p>
-<p>Diagnostic: %MESSAGE</p>
-<footer>This is an automatic answer by Sozu.</footer>",
+<p>Request needed more than %CAPACITY bytes to fit. Parser stopped at phase: %PHASE. %MESSAGE</p>
+<footer>This is an automatic answer by Sōzu.</footer></body></html>",
     )
 }
 
@@ -472,21 +503,45 @@ Connection: close\r
 %Content-Length: %CONTENT_LENGTH\r
 Sozu-Id: %REQUEST_ID\r
 \r
+<html><head><meta charset='utf-8'><head><body>
 <style>pre{background:#EEE;padding:10px;border:1px solid #AAA;border-radius: 5px;}</style>
 <h1>502 Bad Gateway</h1>
 <pre>
 {
+    \"status_code\": 502,
     \"route\": \"%ROUTE\",
     \"request_id\": \"%REQUEST_ID\",
     \"cluster_id\": \"%CLUSTER_ID\",
     \"backend_id\": \"%BACKEND_ID\",
+    \"parsing_phase\": \"%PHASE\",
+    \"successfully_parsed\": \"%SUCCESSFULLY_PARSED\",
+    \"partially_parsed\": \"%PARTIALLY_PARSED\",
+    \"invalid\": \"%INVALID\"
 }
 </pre>
-<p>Response could not be parsed. Parser stopped at phase: %PHASE.</p>
-<p>Diagnostic: %MESSAGE</p>
-<p>Further details:</p>
-<pre>%DETAILS</pre>
-<footer>This is an automatic answer by Sozu.</footer>",
+<p>Response could not be parsed. %MESSAGE</p>
+<div id=details hidden=true>
+<p>While parsing %PHASE, this was reported as invalid:</p>
+<pre>
+<span id=p1 style='background:rgba(0,255,0,0.2)'></span><span id=p2 style='background:rgba(255,255,0,0.2)'></span><span id=p3 style='background:rgba(255,0,0,0.2)'></span>
+</pre>
+</div>
+<script>
+function display(id, chunks) {
+    let [start, end] = chunks.split(' … ');
+    let dec = new TextDecoder('utf8');
+    let decode = chunk => dec.decode(new Uint8Array(chunk.split(' ').filter(e => e).map(e => parseInt(e, 16))));
+    document.getElementById(id).innerText = JSON.stringify(end ? `${decode(start)} […] ${decode(end)}` : `${decode(start)}`).slice(1,-1);
+}
+let p1 = %SUCCESSFULLY_PARSED;
+let p2 = %PARTIALLY_PARSED;
+let p3 = %INVALID;
+if (p1 !== null) {
+    document.getElementById('details').hidden=false;
+    display('p1', p1);display('p2', p2);display('p3', p3);
+}
+</script>
+<footer>This is an automatic answer by Sōzu.</footer></body></html>",
     )
 }
 
@@ -499,18 +554,20 @@ Connection: close\r
 %Content-Length: %CONTENT_LENGTH\r
 Sozu-Id: %REQUEST_ID\r
 \r
+<html><head><meta charset='utf-8'><head><body>
 <style>pre{background:#EEE;padding:10px;border:1px solid #AAA;border-radius: 5px;}</style>
 <h1>503 Service Unavailable</h1>
 <pre>
 {
+    \"status_code\": 503,
     \"route\": \"%ROUTE\",
     \"request_id\": \"%REQUEST_ID\",
     \"cluster_id\": \"%CLUSTER_ID\",
-    \"backend_id\": \"%BACKEND_ID\",
+    \"backend_id\": \"%BACKEND_ID\"
 }
 </pre>
-<p>Diagnostic: %MESSAGE</p>
-<footer>This is an automatic answer by Sozu.</footer>",
+<p>%MESSAGE</p>
+<footer>This is an automatic answer by Sōzu.</footer></body></html>",
     )
 }
 
@@ -522,18 +579,20 @@ Cache-Control: no-cache\r
 Connection: close\r
 Sozu-Id: %REQUEST_ID\r
 \r
+<html><head><meta charset='utf-8'><head><body>
 <style>pre{background:#EEE;padding:10px;border:1px solid #AAA;border-radius: 5px;}</style>
 <h1>504 Gateway Timeout</h1>
 <pre>
 {
+    \"status_code\": 504,
     \"route\": \"%ROUTE\",
     \"request_id\": \"%REQUEST_ID\",
     \"cluster_id\": \"%CLUSTER_ID\",
-    \"backend_id\": \"%BACKEND_ID\",
+    \"backend_id\": \"%BACKEND_ID\"
 }
 </pre>
 <p>Response timed out after %DURATION.</p>
-<footer>This is an automatic answer by Sozu.</footer>",
+<footer>This is an automatic answer by Sōzu.</footer></body></html>",
     )
 }
 
@@ -546,19 +605,20 @@ Connection: close\r
 %Content-Length: %CONTENT_LENGTH\r
 Sozu-Id: %REQUEST_ID\r
 \r
+<html><head><meta charset='utf-8'><head><body>
 <style>pre{background:#EEE;padding:10px;border:1px solid #AAA;border-radius: 5px;}</style>
 <h1>507 Insufficient Storage</h1>
 <pre>
 {
+    \"status_code\": 507,
     \"route\": \"%ROUTE\",
     \"request_id\": \"%REQUEST_ID\",
     \"cluster_id\": \"%CLUSTER_ID\",
-    \"backend_id\": \"%BACKEND_ID\",
+    \"backend_id\": \"%BACKEND_ID\"
 }
 </pre>
-<p>Response needed more than %CAPACITY bytes to fit. Parser stopped at phase: %PHASE.</p>
-<p>Diagnostic: %MESSAGE/p>
-<footer>This is an automatic answer by Sozu.</footer>",
+<p>Response needed more than %CAPACITY bytes to fit. Parser stopped at phase: %PHASE. %MESSAGE/p>
+<footer>This is an automatic answer by Sōzu.</footer></body></html>",
     )
 }
 
@@ -641,11 +701,23 @@ impl HttpAnswers {
             valid_in_header: false,
             typ: ReplacementType::VariableOnce(0),
         };
-        let details = TemplateVariable {
-            name: "DETAILS",
+        let successfully_parsed = TemplateVariable {
+            name: "SUCCESSFULLY_PARSED",
             valid_in_body: true,
             valid_in_header: false,
-            typ: ReplacementType::VariableOnce(0),
+            typ: ReplacementType::Variable(0),
+        };
+        let partially_parsed = TemplateVariable {
+            name: "PARTIALLY_PARSED",
+            valid_in_body: true,
+            valid_in_header: false,
+            typ: ReplacementType::Variable(0),
+        };
+        let invalid = TemplateVariable {
+            name: "INVALID",
+            valid_in_body: true,
+            valid_in_header: false,
+            typ: ReplacementType::Variable(0),
         };
 
         match status {
@@ -657,7 +729,7 @@ impl HttpAnswers {
             400 => Template::new(
                 400,
                 answer,
-                &[length, route, request_id, message, phase, details],
+                &[length, route, request_id, message, phase, successfully_parsed, partially_parsed, invalid],
             ),
             401 => Template::new(
                 401,
@@ -682,7 +754,7 @@ impl HttpAnswers {
             502 => Template::new(
                 502,
                 answer,
-                &[length, route, request_id, cluster_id, backend_id, message, phase, details],
+                &[length, route, request_id, cluster_id, backend_id, message, phase, successfully_parsed, partially_parsed, invalid],
             ),
             503 => Template::new(
                 503,
@@ -806,10 +878,19 @@ impl HttpAnswers {
             DefaultAnswer::Answer400 {
                 message,
                 phase,
-                details,
+                successfully_parsed,
+                partially_parsed,
+                invalid,
             } => {
-                variables = vec![route.into(), request_id.into(), phase_to_vec(phase)];
-                variables_once = vec![message.into(), details.into()];
+                variables = vec![
+                    route.into(),
+                    request_id.into(),
+                    phase_to_vec(phase),
+                    successfully_parsed.into(),
+                    partially_parsed.into(),
+                    invalid.into(),
+                ];
+                variables_once = vec![message.into()];
                 &self.listener_answers.answer_400
             }
             DefaultAnswer::Answer401 {} => {
@@ -844,7 +925,9 @@ impl HttpAnswers {
             DefaultAnswer::Answer502 {
                 message,
                 phase,
-                details,
+                successfully_parsed,
+                partially_parsed,
+                invalid,
             } => {
                 variables = vec![
                     route.into(),
@@ -852,8 +935,11 @@ impl HttpAnswers {
                     cluster_id.unwrap_or_default().into(),
                     backend_id.unwrap_or_default().into(),
                     phase_to_vec(phase),
+                    successfully_parsed.into(),
+                    partially_parsed.into(),
+                    invalid.into(),
                 ];
-                variables_once = vec![message.into(), details.into()];
+                variables_once = vec![message.into()];
                 &self.listener_answers.answer_502
             }
             DefaultAnswer::Answer503 { message } => {
