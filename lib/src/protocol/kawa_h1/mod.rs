@@ -177,10 +177,12 @@ pub struct Http<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> {
 
 impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L> {
     /// Instantiate a new HTTP SessionState with:
+    ///
     /// - frontend_interest: READABLE | HUP | ERROR
     /// - frontend_event: EMPTY
     /// - backend_interest: EMPTY
     /// - backend_event: EMPTY
+    ///
     /// Remember to set the events from the previous State!
     #[allow(clippy::too_many_arguments)]
     pub fn new(

@@ -618,7 +618,7 @@ impl HttpsListener {
 
         Ok(HttpsListener {
             listener: None,
-            address: config.address.clone().into(),
+            address: config.address.into(),
             resolver,
             rustls_details: server_config,
             active: false,
@@ -641,7 +641,7 @@ impl HttpsListener {
         if self.active {
             return Ok(self.token);
         }
-        let address: StdSocketAddr = self.config.address.clone().into();
+        let address: StdSocketAddr = self.config.address.into();
 
         let mut listener = match tcp_listener {
             Some(tcp_listener) => tcp_listener,
@@ -1082,7 +1082,7 @@ impl HttpsProxy {
         &mut self,
         add_certificate: AddCertificate,
     ) -> Result<Option<ResponseContent>, ProxyError> {
-        let address = add_certificate.address.clone().into();
+        let address = add_certificate.address.into();
 
         let listener = self
             .listeners
@@ -1141,7 +1141,7 @@ impl HttpsProxy {
         &mut self,
         replace_certificate: ReplaceCertificate,
     ) -> Result<Option<ResponseContent>, ProxyError> {
-        let address = replace_certificate.address.clone().into();
+        let address = replace_certificate.address.into();
 
         let listener = self
             .listeners
@@ -1214,9 +1214,9 @@ impl ProxyConfiguration for HttpsProxy {
                 AcceptError::RegisterError
             })?;
 
-        let public_address: StdSocketAddr = match owned.config.public_address.clone() {
+        let public_address: StdSocketAddr = match owned.config.public_address {
             Some(pub_addr) => pub_addr.into(),
-            None => owned.config.address.clone().into(),
+            None => owned.config.address.into(),
         };
 
         let session = Rc::new(RefCell::new(HttpsSession::new(
@@ -1443,7 +1443,7 @@ pub mod testing {
         max_buffers: usize,
         buffer_size: usize,
     ) -> anyhow::Result<()> {
-        let address = config.address.clone().into();
+        let address = config.address.into();
 
         let ServerParts {
             event_loop,

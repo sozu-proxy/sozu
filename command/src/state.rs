@@ -175,7 +175,7 @@ impl ConfigState {
     }
 
     fn add_http_listener(&mut self, listener: &HttpListenerConfig) -> Result<(), StateError> {
-        let address: SocketAddr = listener.address.clone().into();
+        let address: SocketAddr = listener.address.into();
         match self.http_listeners.entry(address) {
             BTreeMapEntry::Vacant(vacant_entry) => vacant_entry.insert(listener.clone()),
             BTreeMapEntry::Occupied(_) => {
@@ -189,7 +189,7 @@ impl ConfigState {
     }
 
     fn add_https_listener(&mut self, listener: &HttpsListenerConfig) -> Result<(), StateError> {
-        let address: SocketAddr = listener.address.clone().into();
+        let address: SocketAddr = listener.address.into();
         match self.https_listeners.entry(address) {
             BTreeMapEntry::Vacant(vacant_entry) => vacant_entry.insert(listener.clone()),
             BTreeMapEntry::Occupied(_) => {
@@ -203,9 +203,9 @@ impl ConfigState {
     }
 
     fn add_tcp_listener(&mut self, listener: &TcpListenerConfig) -> Result<(), StateError> {
-        let address: SocketAddr = listener.address.clone().into();
+        let address: SocketAddr = listener.address.into();
         match self.tcp_listeners.entry(address) {
-            BTreeMapEntry::Vacant(vacant_entry) => vacant_entry.insert(listener.clone()),
+            BTreeMapEntry::Vacant(vacant_entry) => vacant_entry.insert(*listener),
             BTreeMapEntry::Occupied(_) => {
                 return Err(StateError::Exists {
                     kind: ObjectKind::TcpListener,
@@ -218,9 +218,9 @@ impl ConfigState {
 
     fn remove_listener(&mut self, remove: &RemoveListener) -> Result<(), StateError> {
         match ListenerType::try_from(remove.proxy).map_err(StateError::WrongFieldValue)? {
-            ListenerType::Http => self.remove_http_listener(&remove.address.clone().into()),
-            ListenerType::Https => self.remove_https_listener(&remove.address.clone().into()),
-            ListenerType::Tcp => self.remove_tcp_listener(&remove.address.clone().into()),
+            ListenerType::Http => self.remove_http_listener(&remove.address.into()),
+            ListenerType::Https => self.remove_https_listener(&remove.address.into()),
+            ListenerType::Tcp => self.remove_tcp_listener(&remove.address.into()),
         }
     }
 
@@ -249,7 +249,7 @@ impl ConfigState {
         match ListenerType::try_from(activate.proxy).map_err(StateError::WrongFieldValue)? {
             ListenerType::Http => self
                 .http_listeners
-                .get_mut(&activate.address.clone().into())
+                .get_mut(&activate.address.into())
                 .map(|listener| listener.active = true)
                 .ok_or(StateError::NotFound {
                     kind: ObjectKind::HttpListener,
@@ -257,7 +257,7 @@ impl ConfigState {
                 }),
             ListenerType::Https => self
                 .https_listeners
-                .get_mut(&activate.address.clone().into())
+                .get_mut(&activate.address.into())
                 .map(|listener| listener.active = true)
                 .ok_or(StateError::NotFound {
                     kind: ObjectKind::HttpsListener,
@@ -265,7 +265,7 @@ impl ConfigState {
                 }),
             ListenerType::Tcp => self
                 .tcp_listeners
-                .get_mut(&activate.address.clone().into())
+                .get_mut(&activate.address.into())
                 .map(|listener| listener.active = true)
                 .ok_or(StateError::NotFound {
                     kind: ObjectKind::TcpListener,
@@ -278,7 +278,7 @@ impl ConfigState {
         match ListenerType::try_from(deactivate.proxy).map_err(StateError::WrongFieldValue)? {
             ListenerType::Http => self
                 .http_listeners
-                .get_mut(&deactivate.address.clone().into())
+                .get_mut(&deactivate.address.into())
                 .map(|listener| listener.active = false)
                 .ok_or(StateError::NotFound {
                     kind: ObjectKind::HttpListener,
@@ -286,7 +286,7 @@ impl ConfigState {
                 }),
             ListenerType::Https => self
                 .https_listeners
-                .get_mut(&deactivate.address.clone().into())
+                .get_mut(&deactivate.address.into())
                 .map(|listener| listener.active = false)
                 .ok_or(StateError::NotFound {
                     kind: ObjectKind::HttpsListener,
@@ -294,7 +294,7 @@ impl ConfigState {
                 }),
             ListenerType::Tcp => self
                 .tcp_listeners
-                .get_mut(&deactivate.address.clone().into())
+                .get_mut(&deactivate.address.into())
                 .map(|listener| listener.active = false)
                 .ok_or(StateError::NotFound {
                     kind: ObjectKind::TcpListener,
@@ -373,10 +373,7 @@ impl ConfigState {
             .fingerprint()
             .map_err(StateError::AddCertificate)?;
 
-        let entry = self
-            .certificates
-            .entry(add.address.clone().into())
-            .or_default();
+        let entry = self.certificates.entry(add.address.into()).or_default();
 
         let mut add = add.clone();
         add.certificate
@@ -401,7 +398,7 @@ impl ConfigState {
                 .map_err(|decode_error| StateError::RemoveCertificate(decode_error.to_string()))?,
         );
 
-        if let Some(index) = self.certificates.get_mut(&remove.address.clone().into()) {
+        if let Some(index) = self.certificates.get_mut(&remove.address.into()) {
             index.remove(&fingerprint);
         }
 
@@ -413,7 +410,7 @@ impl ConfigState {
     /// - insert the new certificate with the new fingerprint as key
     /// - check that the new entry is present in the certificates hashmap
     fn replace_certificate(&mut self, replace: &ReplaceCertificate) -> Result<(), StateError> {
-        let replace_address = replace.address.clone().into();
+        let replace_address = replace.address.into();
         let old_fingerprint = Fingerprint(
             hex::decode(&replace.old_fingerprint)
                 .map_err(|decode_error| StateError::RemoveCertificate(decode_error.to_string()))?,
@@ -459,7 +456,7 @@ impl ConfigState {
 
         let tcp_frontend = TcpFrontend {
             cluster_id: front.cluster_id.clone(),
-            address: front.address.clone().into(),
+            address: front.address.into(),
             tags: front.tags.clone(),
         };
         if tcp_frontends.contains(&tcp_frontend) {
@@ -486,7 +483,7 @@ impl ConfigState {
                 })?;
 
         let len = tcp_frontends.len();
-        tcp_frontends.retain(|front| front.address != front_to_remove.address.clone().into());
+        tcp_frontends.retain(|front| front.address != front_to_remove.address.into());
         if tcp_frontends.len() == len {
             return Err(StateError::NoChange);
         }
@@ -495,11 +492,11 @@ impl ConfigState {
 
     fn add_backend(&mut self, add_backend: &AddBackend) -> Result<(), StateError> {
         let backend = Backend {
-            address: add_backend.address.clone().into(),
+            address: add_backend.address.into(),
             cluster_id: add_backend.cluster_id.clone(),
             backend_id: add_backend.backend_id.clone(),
             sticky_id: add_backend.sticky_id.clone(),
-            load_balancing_parameters: add_backend.load_balancing_parameters.clone(),
+            load_balancing_parameters: add_backend.load_balancing_parameters,
             backup: add_backend.backup,
         };
         let backends = self.backends.entry(backend.cluster_id.clone()).or_default();
@@ -522,7 +519,7 @@ impl ConfigState {
                 })?;
 
         let len = backend_list.len();
-        let remove_address = backend.address.clone().into();
+        let remove_address = backend.address.into();
         backend_list.retain(|b| b.backend_id != backend.backend_id || b.address != remove_address);
         backend_list.sort();
         if backend_list.len() == len {
@@ -540,7 +537,7 @@ impl ConfigState {
             if listener.active {
                 v.push(
                     RequestType::ActivateListener(ActivateListener {
-                        address: listener.address.clone(),
+                        address: listener.address,
                         proxy: ListenerType::Http.into(),
                         from_scm: false,
                     })
@@ -554,7 +551,7 @@ impl ConfigState {
             if listener.active {
                 v.push(
                     RequestType::ActivateListener(ActivateListener {
-                        address: listener.address.clone(),
+                        address: listener.address,
                         proxy: ListenerType::Https.into(),
                         from_scm: false,
                     })
@@ -564,11 +561,11 @@ impl ConfigState {
         }
 
         for listener in self.tcp_listeners.values() {
-            v.push(RequestType::AddTcpListener(listener.clone()).into());
+            v.push(RequestType::AddTcpListener(*listener).into());
             if listener.active {
                 v.push(
                     RequestType::ActivateListener(ActivateListener {
-                        address: listener.address.clone(),
+                        address: listener.address,
                         proxy: ListenerType::Tcp.into(),
                         from_scm: false,
                     })
@@ -710,7 +707,7 @@ impl ConfigState {
         }
 
         for address in added_tcp_listeners.clone() {
-            v.push(RequestType::AddTcpListener(other.tcp_listeners[*address].clone()).into());
+            v.push(RequestType::AddTcpListener(other.tcp_listeners[*address]).into());
 
             if other.tcp_listeners[*address].active {
                 v.push(
@@ -809,7 +806,7 @@ impl ConfigState {
                     .into(),
                 );
                 // any added listener should be unactive
-                let mut listener_to_add = their_listener.clone();
+                let mut listener_to_add = *their_listener;
                 listener_to_add.active = false;
                 v.push(RequestType::AddTcpListener(listener_to_add).into());
             }
@@ -1102,7 +1099,7 @@ impl ConfigState {
             if listener.active {
                 v.push(
                     RequestType::ActivateListener(ActivateListener {
-                        address: listener.address.clone(),
+                        address: listener.address,
                         proxy: ListenerType::Tcp.into(),
                         from_scm: false,
                     })
@@ -1316,7 +1313,7 @@ impl ConfigState {
             tcp_listeners: self
                 .tcp_listeners
                 .iter()
-                .map(|(addr, listener)| (addr.to_string(), listener.clone()))
+                .map(|(addr, listener)| (addr.to_string(), *listener))
                 .collect(),
         }
     }

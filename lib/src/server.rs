@@ -1064,9 +1064,9 @@ impl Server {
     fn add_backend(&mut self, req_id: &str, add_backend: &AddBackend) -> WorkerResponse {
         let new_backend = Backend::new(
             &add_backend.backend_id,
-            add_backend.address.clone().into(),
+            add_backend.address.into(),
             add_backend.sticky_id.clone(),
-            add_backend.load_balancing_parameters.clone(),
+            add_backend.load_balancing_parameters,
             add_backend.backup,
         );
         self.backends
@@ -1077,7 +1077,7 @@ impl Server {
     }
 
     fn remove_backend(&mut self, req_id: &str, backend: &RemoveBackend) -> WorkerResponse {
-        let address = backend.address.clone().into();
+        let address = backend.address.into();
         self.backends
             .borrow_mut()
             .remove_backend(&backend.cluster_id, &address);
@@ -1180,7 +1180,7 @@ impl Server {
             req_id, activate.proxy, activate
         );
 
-        let address: std::net::SocketAddr = activate.address.clone().into();
+        let address: std::net::SocketAddr = activate.address.into();
 
         match ListenerType::try_from(activate.proxy) {
             Ok(ListenerType::Http) => {
@@ -1257,7 +1257,7 @@ impl Server {
             req_id, deactivate.proxy, deactivate
         );
 
-        let address: std::net::SocketAddr = deactivate.address.clone().into();
+        let address: std::net::SocketAddr = deactivate.address.into();
 
         match ListenerType::try_from(deactivate.proxy) {
             Ok(ListenerType::Http) => {
