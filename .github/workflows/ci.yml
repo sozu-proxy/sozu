@@ -115,7 +115,7 @@ jobs:
             echo tag=$var >> ${GITHUB_OUTPUT}
           else
             echo arch=linux/amd64 >> ${GITHUB_OUTPUT}
-            echo tag=$var >> ${GITHUB_OUTPUT}
+            echo tag=dev >> ${GITHUB_OUTPUT}
           fi
       - uses: docker/build-push-action@v6
         with:
