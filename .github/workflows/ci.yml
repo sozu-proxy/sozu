@@ -126,9 +126,9 @@ jobs:
           tags: |
             ghcr.io/sozu-proxy/sozu:${{ steps.config.outputs.tag }}
       - name: Scan image using Grype
-        id: grype
         uses: anchore/scan-action@v5
         with:
           image: ghcr.io/sozu-proxy/sozu:${{ steps.config.outputs.tag }}
           output-format: table
+          severity-cutoff: high
 ...

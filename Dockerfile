@@ -38,9 +38,9 @@ RUN mkdir -p /var/lib/sozu
 
 # Install runtime dependencies
 RUN apk update && apk add --no-cache \
-  llvm-libunwind \
-  libgcc \
-  ca-certificates
+    llvm-libunwind \
+    libgcc \
+    ca-certificates
 
 # Copy the built binary from the builder stage
 COPY --from=builder /usr/src/sozu/target/release/sozu /usr/local/bin/sozu
