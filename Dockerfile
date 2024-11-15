@@ -4,6 +4,7 @@ FROM alpine:$ALPINE_VERSION AS builder
 
 RUN apk update && apk add --no-cache --virtual .build-dependencies \
   cargo \
+  cmake \
   build-base \
   file \
   libgcc \
