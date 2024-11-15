@@ -1,6 +1,6 @@
 ARG ALPINE_VERSION=edge
 
-FROM alpine:$ALPINE_VERSION as builder
+FROM alpine:$ALPINE_VERSION AS builder
 
 RUN apk update && apk add --no-cache --virtual .build-dependencies \
   cargo \
@@ -21,7 +21,7 @@ WORKDIR /usr/src/sozu
 RUN cargo vendor --locked
 RUN cargo build --release --frozen
 
-FROM alpine:$ALPINE_VERSION as bin
+FROM alpine:$ALPINE_VERSION AS bin
 
 EXPOSE 80
 EXPOSE 443
@@ -38,8 +38,6 @@ RUN apk update && apk add --no-cache \
 
 COPY --from=builder /usr/src/sozu/target/release/sozu /usr/local/bin/sozu
 COPY os-build/config.toml /etc/sozu/config.toml
-COPY lib/assets/404.html /etc/sozu/html/404.html
-COPY lib/assets/503.html /etc/sozu/html/503.html
 
 ENTRYPOINT ["/usr/local/bin/sozu"]
 CMD ["start", "-c", "/etc/sozu/config.toml"]
