@@ -32,7 +32,7 @@ use crate::{
         Pipe,
     },
     retry::RetryPolicy,
-    server::{push_event, ListenToken, SessionManager, CONN_RETRIES, TIMER},
+    server::{push_event, ListenToken, SessionManager, CONN_RETRIES},
     socket::{server_bind, stats::socket_rtt},
     sozu_command::{
         proto::command::{
@@ -84,6 +84,7 @@ pub struct TcpSession {
     backend_token: Option<Token>,
     backend: Option<Rc<RefCell<Backend>>>,
     cluster_id: Option<String>,
+    configured_backend_timeout: Duration,
     connection_attempt: u8,
     container_backend_timeout: TimeoutContainer,
     container_frontend_timeout: TimeoutContainer,
@@ -106,6 +107,7 @@ impl TcpSession {
         backend_id: Option<String>,
         cluster_id: Option<String>,
         configured_backend_timeout: Duration,
+        configured_connect_timeout: Duration,
         configured_frontend_timeout: Duration,
         frontend_buffer: Checkout,
         frontend_token: Token,
@@ -123,7 +125,7 @@ impl TcpSession {
 
         let container_frontend_timeout =
             TimeoutContainer::new(configured_frontend_timeout, frontend_token);
-        let container_backend_timeout = TimeoutContainer::new_empty(configured_backend_timeout);
+        let container_backend_timeout = TimeoutContainer::new_empty(configured_connect_timeout);
 
         let state = match proxy_protocol {
             Some(ProxyProtocolConfig::RelayHeader) => {
@@ -193,6 +195,7 @@ impl TcpSession {
             backend_token: None,
             backend: None,
             cluster_id,
+            configured_backend_timeout,
             connection_attempt: 0,
             container_backend_timeout,
             container_frontend_timeout,
@@ -264,11 +267,18 @@ impl TcpSession {
     fn readable(&mut self) -> SessionResult {
         if !self.container_frontend_timeout.reset() {
             error!(
-                "{} Could not reset frontend socket timeout",
+                "{} Could not reset frontend timeout on readable",
                 log_context!(self)
             );
         }
-
+        if self.backend_connected == BackendConnectionStatus::Connected
+            && !self.container_backend_timeout.reset()
+        {
+            error!(
+                "{} Could not reset backend timeout on readable",
+                log_context!(self)
+            );
+        }
         match &mut self.state {
             TcpStateMachine::Pipe(pipe) => pipe.readable(&mut self.metrics),
             TcpStateMachine::RelayProxyProtocol(pp) => pp.readable(&mut self.metrics),
@@ -286,8 +296,17 @@ impl TcpSession {
     }
 
     fn back_readable(&mut self) -> SessionResult {
+        if !self.container_frontend_timeout.reset() {
+            error!(
+                "{} Could not reset frontend timeout on back_readable",
+                log_context!(self)
+            );
+        }
         if !self.container_backend_timeout.reset() {
-            error!("{} Could not reset backend timeout", log_context!(self));
+            error!(
+                "{} Could not reset backend timeout on back_readable",
+                log_context!(self)
+            );
         }
 
         match &mut self.state {
@@ -478,6 +497,13 @@ impl TcpSession {
                 self.cluster_id.as_deref(),
                 self.metrics.backend_id.as_deref()
             );
+
+            // the back timeout was of connect_timeout duration before,
+            // now that we're connected, move to backend_timeout duration
+            self.container_backend_timeout
+                .set_duration(self.configured_backend_timeout);
+            self.container_frontend_timeout.reset();
+
             if let TcpStateMachine::SendProxyProtocol(spp) = &mut self.state {
                 spp.set_back_connected(BackendConnectionStatus::Connected);
             }
@@ -555,10 +581,6 @@ impl TcpSession {
         }
     }
 
-    fn reset_connection_attempt(&mut self) {
-        self.connection_attempt = 0;
-    }
-
     pub fn test_back_socket(&mut self) -> SessionIsToBeClosed {
         match self.back_socket_mut() {
             Some(ref mut s) => {
@@ -607,9 +629,7 @@ impl TcpSession {
                     return state_result;
                 }
             } else if self.back_readiness().unwrap().event != Ready::EMPTY {
-                self.reset_connection_attempt();
-                let back_token = self.backend_token.unwrap();
-                self.container_backend_timeout.set(back_token);
+                self.connection_attempt = 0;
                 self.set_back_connected(BackendConnectionStatus::Connected);
             }
         } else if back_connected == BackendConnectionStatus::NotConnected {
@@ -845,18 +865,6 @@ impl TcpSession {
             .backend_from_cluster_id(&cluster_id)
             .map_err(BackendConnectionError::Backend)?;
 
-        /*
-        this was the old error matching for backend_from_cluster_id.
-        panic! is called in case of mio::net::MioTcpStream::connect() error
-        Do we really want to panic ?
-        Err(ConnectionError::NoBackendAvailable(c_id)) => {
-            Err(ConnectionError::NoBackendAvailable(c_id))
-        }
-        Err(e) => {
-            panic!("tcp connect_to_backend: unexpected error: {:?}", e);
-        }
-        */
-
         if let Err(e) = stream.set_nodelay(true) {
             error!(
                 "{} Error setting nodelay on back socket({:?}): {:?}",
@@ -889,10 +897,6 @@ impl TcpSession {
             );
         }
 
-        let connect_timeout_duration =
-            Duration::from_secs(self.listener.borrow().config.connect_timeout as u64);
-        self.container_backend_timeout
-            .set_duration(connect_timeout_duration);
         self.container_backend_timeout.set(back_token);
 
         self.set_back_token(back_token);
@@ -974,14 +978,11 @@ impl ProxySession for TcpSession {
 
     fn timeout(&mut self, token: Token) -> SessionIsToBeClosed {
         if self.frontend_token == token {
-            let dur = Instant::now() - self.last_event;
-            let front_timeout = self.container_frontend_timeout.duration();
-            if dur < front_timeout {
-                TIMER.with(|timer| {
-                    timer.borrow_mut().set_timeout(front_timeout - dur, token);
-                });
-                return false;
-            }
+            self.container_frontend_timeout.triggered();
+            return true;
+        }
+        if self.backend_token == Some(token) {
+            self.container_backend_timeout.triggered();
             return true;
         }
         // invalid token, obsolete timeout triggered
@@ -1490,6 +1491,7 @@ impl ProxyConfiguration for TcpProxy {
             None,
             owned.cluster_id.clone(),
             Duration::from_secs(owned.config.back_timeout as u64),
+            Duration::from_secs(owned.config.connect_timeout as u64),
             Duration::from_secs(owned.config.front_timeout as u64),
             front_buffer,
             frontend_token,
