@@ -46,7 +46,7 @@ trailer = "^0.1.2"
 prettytable-rs = { version = "^0.10.0", default-features = false }
 pool = "^0.1.4"
 poule = "^0.3.2"
-thiserror = "^1.0.64"
+thiserror = "^2.0.3"
 x509-parser = "^0.16.0"
 
 [features]

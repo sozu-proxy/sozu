@@ -48,7 +48,7 @@ rusty_ulid = "^2.0.0"
 sha2 = "^0.10.8"
 slab = "^0.4.9"
 socket2 = { version = "^0.5.7", features = ["all"] }
-thiserror = "^1.0.64"
+thiserror = "^2.0.3"
 time = "^0.3.36"
 
 sozu-command-lib = { path = "../command", version = "^1.0.5" }
