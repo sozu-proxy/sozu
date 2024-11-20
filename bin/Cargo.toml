@@ -32,7 +32,7 @@ serde_json = "^1.0.128"
 prost = "^0.13.3"
 tempfile = "^3.13.0"
 termion = "^4.0.3"
-thiserror = "^1.0.64"
+thiserror = "^2.0.3"
 
 sozu-command-lib = { path = "../command", version = "^1.0.5" }
 sozu-lib = { path = "../lib", version = "^1.0.5" }
