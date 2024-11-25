@@ -52,6 +52,7 @@ pub trait SocketHandler {
     fn socket_wants_write(&self) -> bool {
         false
     }
+    fn socket_close(&mut self) {}
     fn socket_ref(&self) -> &TcpStream;
     fn socket_mut(&mut self) -> &mut TcpStream;
     fn protocol(&self) -> TransportProtocol;
@@ -428,6 +429,10 @@ impl SocketHandler for FrontRustls {
         } else {
             (buffered_size, SocketResult::Continue)
         }
+    }
+
+    fn socket_close(&mut self) {
+        self.session.send_close_notify();
     }
 
     fn socket_wants_write(&self) -> bool {
