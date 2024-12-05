@@ -435,6 +435,9 @@ impl ProxySession for HttpsSession {
         }
 
         self.state.cancel_timeouts();
+        // defer backend closing to the state
+        // in case of https it should also send a close notify on the client before the socket is closed below
+        self.state.close(self.proxy.clone(), &mut self.metrics);
 
         let front_socket = self.state.front_socket();
         if let Err(e) = front_socket.shutdown(Shutdown::Both) {
@@ -458,8 +461,6 @@ impl ProxySession for HttpsSession {
         }
         proxy.remove_session(self.frontend_token);
 
-        // defer backend closing to the state
-        self.state.close(self.proxy.clone(), &mut self.metrics);
         self.has_been_closed = true;
     }
 

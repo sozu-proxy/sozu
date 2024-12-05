@@ -492,7 +492,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         let bufs = response_stream.as_io_slice();
         if bufs.is_empty() && !self.frontend_socket.socket_wants_write() {
             self.frontend_readiness.interest.remove(Ready::WRITABLE);
-            return StateResult::Continue;
+            // do not shortcut, response might have been terminated without anything more to send
         }
 
         let (size, socket_state) = self.frontend_socket.socket_write_vectored(&bufs);
@@ -532,6 +532,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         if response_stream.is_terminated() && response_stream.is_completed() {
             if self.context.closing {
                 debug!("{} closing proxy, no keep alive", log_context!(self));
+                self.log_request_success(metrics);
                 return StateResult::CloseSession;
             }
 
@@ -1623,15 +1624,10 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
                 response_stream.parsing_phase = kawa::ParsingPhase::Terminated;
 
-                // check if there is anything left to write
-                if response_stream.is_completed() {
-                    // we have to close the session now, because writable would short-cut
-                    self.log_request_success(metrics);
-                    StateResult::CloseSession
-                } else {
-                    // writable() will be called again and finish the session properly
-                    StateResult::CloseBackend
-                }
+                // writable() will be called again and finish the session properly
+                // for this reason, writable must not short cut
+                self.frontend_readiness.interest.insert(Ready::WRITABLE);
+                StateResult::Continue
             }
             // probably backend hup between keep alive request, change backend
             (true, true) => {
@@ -1912,6 +1908,8 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> SessionState 
 
     fn close(&mut self, proxy: Rc<RefCell<dyn L7Proxy>>, metrics: &mut SessionMetrics) {
         self.close_backend(proxy, metrics);
+        self.frontend_socket.socket_close();
+        let _ = self.frontend_socket.socket_write_vectored(&[]);
 
         //if the state was initial, the connection was already reset
         if !self.request_stream.is_initial() {
