@@ -350,13 +350,13 @@ use backends::BackendError;
 use hex::FromHexError;
 use mio::{net::TcpStream, Interest, Token};
 use protocol::http::{answers::TemplateError, parser::Method};
-use router::RouterError;
+use router::{RouteResult, RouterError};
 use socket::ServerBindError;
 use tls::CertificateResolverError;
 
 use sozu_command::{
     logging::{CachedTags, LogContext},
-    proto::command::{Cluster, ListenerType, RequestHttpFrontend, WorkerRequest, WorkerResponse},
+    proto::command::{Cluster, ListenerType, RedirectPolicy, RequestHttpFrontend, WorkerRequest, WorkerResponse},
     ready::Ready,
     state::ClusterId,
     AsStr, ObjectKind,
@@ -554,7 +554,7 @@ pub trait L7ListenerHandler {
         host: &str,
         uri: &str,
         method: &Method,
-    ) -> Result<Route, FrontendFromRequestError>;
+    ) -> Result<RouteResult, FrontendFromRequestError>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -602,6 +602,8 @@ pub enum RetrieveClusterError {
     NoPath,
     #[error("unauthorized route")]
     UnauthorizedRoute,
+    #[error("redirected {0:?}")]
+    Redirected(RedirectPolicy),
     #[error("{0}")]
     RetrieveFrontend(FrontendFromRequestError),
 }

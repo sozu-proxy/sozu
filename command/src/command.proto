@@ -237,6 +237,20 @@ message ListenersList {
     map<string, TcpListenerConfig> tcp_listeners = 3;
 }
 
+enum RedirectPolicy {
+    FORWARD = 0;
+    FORCE_HTTPS = 1;
+    TEMPORARY = 2;
+    PERMANENT = 3;
+    UNAUTHORIZED = 4;
+}
+
+enum RedirectScheme {
+    USE_SAME = 0;
+    USE_HTTP = 1;
+    USE_HTTPS = 2;
+}
+
 // An HTTP or HTTPS frontend, as order to, or received from, Sōzu
 message RequestHttpFrontend {
     optional string cluster_id = 1;
@@ -247,6 +261,10 @@ message RequestHttpFrontend {
     required RulePosition position = 6 [default = TREE];
     // custom tags to identify the frontend in the access logs
     map<string, string> tags = 7;
+    optional RedirectPolicy redirect = 8;
+    optional RedirectScheme redirect_scheme = 9;
+    optional string host_rewrite = 10;
+    optional string path_rewrite = 11;
 }
 
 message RequestTcpFrontend {

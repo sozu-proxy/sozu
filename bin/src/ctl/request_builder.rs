@@ -250,6 +250,10 @@ impl CommandManager {
                         Some(tags) => tags,
                         None => BTreeMap::new(),
                     },
+                    redirect: todo!(),
+                    redirect_scheme: todo!(),
+                    host_rewrite: todo!(),
+                    path_rewrite: todo!(),
                 })
                 .into(),
             ),
@@ -298,6 +302,10 @@ impl CommandManager {
                         Some(tags) => tags,
                         None => BTreeMap::new(),
                     },
+                    redirect: todo!(),
+                    redirect_scheme: todo!(),
+                    host_rewrite: todo!(),
+                    path_rewrite: todo!(),
                 })
                 .into(),
             ),

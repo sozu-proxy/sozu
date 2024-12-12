@@ -64,9 +64,9 @@ use crate::{
         request::RequestType, ActivateListener, AddBackend, AddCertificate, CertificateAndKey,
         Cluster, CustomHttpAnswers, HttpListenerConfig, HttpsListenerConfig, ListenerType,
         LoadBalancingAlgorithms, LoadBalancingParams, LoadMetric, MetricsConfiguration, PathRule,
-        ProtobufAccessLogFormat, ProxyProtocolConfig, Request, RequestHttpFrontend,
-        RequestTcpFrontend, RulePosition, ServerConfig, ServerMetricsConfig, SocketAddress,
-        TcpListenerConfig, TlsVersion, WorkerRequest,
+        ProtobufAccessLogFormat, ProxyProtocolConfig, RedirectPolicy, RedirectScheme, Request,
+        RequestHttpFrontend, RequestTcpFrontend, RulePosition, ServerConfig, ServerMetricsConfig,
+        SocketAddress, TcpListenerConfig, TlsVersion, WorkerRequest,
     },
     ObjectKind,
 };
@@ -667,6 +667,10 @@ pub struct FileClusterFrontendConfig {
     #[serde(default)]
     pub position: RulePosition,
     pub tags: Option<BTreeMap<String, String>>,
+    pub redirect: Option<RedirectPolicy>,
+    pub redirect_scheme: Option<RedirectScheme>,
+    pub host_rewrite: Option<String>,
+    pub path_rewrite: Option<String>,
 }
 
 impl FileClusterFrontendConfig {
@@ -752,6 +756,10 @@ impl FileClusterFrontendConfig {
             path,
             method: self.method.clone(),
             tags: self.tags.clone(),
+            redirect: self.redirect,
+            redirect_scheme: self.redirect_scheme,
+            host_rewrite: self.host_rewrite.clone(),
+            path_rewrite: self.path_rewrite.clone(),
         })
     }
 }
@@ -902,6 +910,10 @@ pub struct HttpFrontendConfig {
     #[serde(default)]
     pub position: RulePosition,
     pub tags: Option<BTreeMap<String, String>>,
+    pub redirect: Option<RedirectPolicy>,
+    pub redirect_scheme: Option<RedirectScheme>,
+    pub host_rewrite: Option<String>,
+    pub path_rewrite: Option<String>,
 }
 
 impl HttpFrontendConfig {
@@ -939,6 +951,10 @@ impl HttpFrontendConfig {
                     method: self.method.clone(),
                     position: self.position.into(),
                     tags,
+                    redirect: self.redirect.map(Into::into),
+                    redirect_scheme: self.redirect_scheme.map(Into::into),
+                    host_rewrite: self.host_rewrite.clone(),
+                    path_rewrite: self.path_rewrite.clone(),
                 })
                 .into(),
             );
@@ -953,6 +969,10 @@ impl HttpFrontendConfig {
                     method: self.method.clone(),
                     position: self.position.into(),
                     tags,
+                    redirect: self.redirect.map(Into::into),
+                    redirect_scheme: self.redirect_scheme.map(Into::into),
+                    host_rewrite: self.host_rewrite.clone(),
+                    path_rewrite: self.path_rewrite.clone(),
                 })
                 .into(),
             );

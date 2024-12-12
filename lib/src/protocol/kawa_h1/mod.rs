@@ -16,7 +16,7 @@ use rusty_ulid::Ulid;
 use sozu_command::{
     config::MAX_LOOP_ITERATIONS,
     logging::EndpointRecord,
-    proto::command::{Event, EventKind, ListenerType},
+    proto::command::{Event, EventKind, ListenerType, RedirectPolicy, RedirectScheme},
 };
 // use time::{Duration, Instant};
 
@@ -34,7 +34,7 @@ use crate::{
         SessionState,
     },
     retry::RetryPolicy,
-    router::Route,
+    router::{Route, RouteResult},
     server::{push_event, CONN_RETRIES},
     socket::{stats::socket_rtt, SocketHandler, SocketResult, TransportProtocol},
     sozu_command::{logging::LogContext, ready::Ready},
@@ -1279,30 +1279,54 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             }
         };
 
-        let cluster_id = match route {
-            Route::ClusterId(cluster_id) => cluster_id,
-            Route::Deny => {
+        match route {
+            RouteResult::Deny
+            | RouteResult::Cluster {
+                redirect: RedirectPolicy::Unauthorized,
+                ..
+            } => {
                 self.set_answer(DefaultAnswer::Answer401 {});
-                return Err(RetrieveClusterError::UnauthorizedRoute);
+                Err(RetrieveClusterError::UnauthorizedRoute)
             }
-        };
-
-        let frontend_should_redirect_https = matches!(proxy.borrow().kind(), ListenerType::Http)
-            && proxy
-                .borrow()
-                .clusters()
-                .get(&cluster_id)
-                .map(|cluster| cluster.https_redirect)
-                .unwrap_or(false);
-
-        if frontend_should_redirect_https {
-            self.set_answer(DefaultAnswer::Answer301 {
-                location: format!("https://{host}{uri}"),
-            });
-            return Err(RetrieveClusterError::UnauthorizedRoute);
+            RouteResult::Cluster {
+                cluster_id,
+                redirect,
+                redirect_scheme,
+                rewritten_host,
+                rewritten_path,
+            } => {
+                let host = rewritten_host.as_deref().unwrap_or(host);
+                let path = rewritten_path.as_deref().unwrap_or(uri);
+                let is_https = matches!(proxy.borrow().kind(), ListenerType::Https);
+                match (redirect, is_https) {
+                    (RedirectPolicy::Forward, _) | (RedirectPolicy::ForceHttps, true) => {
+                        Ok(cluster_id)
+                    }
+                    (RedirectPolicy::ForceHttps, false) => {
+                        self.set_answer(DefaultAnswer::Answer301 {
+                            location: format!("https://{host}{path}"),
+                        });
+                        Err(RetrieveClusterError::Redirected(redirect))
+                    }
+                    (RedirectPolicy::Permanent, _) => {
+                        let proto = match (redirect_scheme, is_https) {
+                            (RedirectScheme::UseHttp, _) | (RedirectScheme::UseSame, false) => {
+                                "http"
+                            }
+                            (RedirectScheme::UseHttps, _) | (RedirectScheme::UseSame, true) => {
+                                "https"
+                            }
+                        };
+                        self.set_answer(DefaultAnswer::Answer301 {
+                            location: format!("{proto}://{host}{path}"),
+                        });
+                        Err(RetrieveClusterError::Redirected(redirect))
+                    }
+                    (RedirectPolicy::Temporary, _) => todo!(),
+                    (RedirectPolicy::Unauthorized, _) => unreachable!(),
+                }
+            }
         }
-
-        Ok(cluster_id)
     }
 
     pub fn backend_from_request(

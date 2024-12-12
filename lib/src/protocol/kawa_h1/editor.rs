@@ -117,7 +117,7 @@ impl HttpContext {
             let key = cookie.key.data(buf);
             if key == self.sticky_name.as_bytes() {
                 let val = cookie.val.data(buf);
-                self.sticky_session_found = from_utf8(val).ok().map(|val| val.to_string());
+                self.sticky_session_found = from_utf8(val).ok().map(ToOwned::to_owned);
                 cookie.elide();
             }
         }

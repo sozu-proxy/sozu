@@ -1,11 +1,19 @@
 pub mod pattern_trie;
 
-use std::{str::from_utf8, time::Instant};
+use std::{
+    fmt::Write,
+    str::{from_utf8, from_utf8_unchecked},
+    time::Instant,
+};
 
+use nom::AsChar;
+use pattern_trie::{TrieMatches, TrieSubMatch};
 use regex::bytes::Regex;
 
 use sozu_command::{
-    proto::command::{PathRule as CommandPathRule, PathRuleKind, RulePosition},
+    proto::command::{
+        PathRule as CommandPathRule, PathRuleKind, RedirectPolicy, RedirectScheme, RulePosition,
+    },
     response::HttpFrontend,
     state::ClusterId,
 };
@@ -16,8 +24,12 @@ use crate::{protocol::http::parser::Method, router::pattern_trie::TrieNode};
 pub enum RouterError {
     #[error("Could not parse rule from frontend path {0:?}")]
     InvalidPathRule(String),
-    #[error("parsing hostname {hostname} failed")]
-    InvalidDomain { hostname: String },
+    #[error("Could not parse hostname {0:?}")]
+    InvalidDomain(String),
+    #[error("Could not parse host rewrite {0:?}")]
+    InvalidHostRewrite(String),
+    #[error("Could not parse path rewrite {0:?}")]
+    InvalidPathRewrite(String),
     #[error("Could not add route {0}")]
     AddRoute(String),
     #[error("Could not remove route {0}")]
@@ -51,35 +63,46 @@ impl Router {
         }
     }
 
-    pub fn lookup(
-        &self,
-        hostname: &str,
-        path: &str,
-        method: &Method,
-    ) -> Result<Route, RouterError> {
+    pub fn lookup<'a, 'b>(
+        &'a self,
+        hostname: &'b str,
+        path: &'b str,
+        method: &'b Method,
+    ) -> Result<RouteResult, RouterError> {
         let hostname_b = hostname.as_bytes();
         let path_b = path.as_bytes();
-        for (domain_rule, path_rule, method_rule, cluster_id) in &self.pre {
+        for (domain_rule, path_rule, method_rule, route) in &self.pre {
             if domain_rule.matches(hostname_b)
                 && path_rule.matches(path_b) != PathRuleResult::None
                 && method_rule.matches(method) != MethodRuleResult::None
             {
-                return Ok(cluster_id.clone());
+                return Ok(RouteResult::new_no_trie(
+                    hostname_b,
+                    domain_rule,
+                    path_b,
+                    path_rule,
+                    route,
+                ));
             }
         }
 
-        if let Some((_, path_rules)) = self.tree.lookup(hostname_b, true) {
+        let trie_path = Vec::with_capacity(16);
+        if let Some(((_, rules), trie_path)) = self.tree.lookup(hostname_b, true, trie_path) {
             let mut prefix_length = 0;
-            let mut route = None;
+            let mut frontend = None;
 
-            for (rule, method_rule, cluster_id) in path_rules {
-                match rule.matches(path_b) {
+            for (path_rule, method_rule, route) in rules {
+                match path_rule.matches(path_b) {
                     PathRuleResult::Regex | PathRuleResult::Equals => {
                         match method_rule.matches(method) {
-                            MethodRuleResult::Equals => return Ok(cluster_id.clone()),
+                            MethodRuleResult::Equals => {
+                                return Ok(RouteResult::new_with_trie(
+                                    trie_path, path_b, path_rule, route,
+                                ))
+                            }
                             MethodRuleResult::All => {
                                 prefix_length = path_b.len();
-                                route = Some(cluster_id);
+                                frontend = Some((path_rule, route));
                             }
                             MethodRuleResult::None => {}
                         }
@@ -90,11 +113,11 @@ impl Router {
                                 // FIXME: the rule order will be important here
                                 MethodRuleResult::Equals => {
                                     prefix_length = size;
-                                    route = Some(cluster_id);
+                                    frontend = Some((path_rule, route));
                                 }
                                 MethodRuleResult::All => {
                                     prefix_length = size;
-                                    route = Some(cluster_id);
+                                    frontend = Some((path_rule, route));
                                 }
                                 MethodRuleResult::None => {}
                             }
@@ -104,17 +127,25 @@ impl Router {
                 }
             }
 
-            if let Some(cluster_id) = route {
-                return Ok(cluster_id.clone());
+            if let Some((path_rule, route)) = frontend {
+                return Ok(RouteResult::new_with_trie(
+                    trie_path, path_b, path_rule, route,
+                ));
             }
         }
 
-        for (domain_rule, path_rule, method_rule, cluster_id) in self.post.iter() {
+        for (domain_rule, path_rule, method_rule, route) in self.post.iter() {
             if domain_rule.matches(hostname_b)
                 && path_rule.matches(path_b) != PathRuleResult::None
                 && method_rule.matches(method) != MethodRuleResult::None
             {
-                return Ok(cluster_id.clone());
+                return Ok(RouteResult::new_no_trie(
+                    hostname_b,
+                    domain_rule,
+                    path_b,
+                    path_rule,
+                    route,
+                ));
             }
         }
 
@@ -126,34 +157,34 @@ impl Router {
     }
 
     pub fn add_http_front(&mut self, front: &HttpFrontend) -> Result<(), RouterError> {
+        let domain_rule = front
+            .hostname
+            .parse::<DomainRule>()
+            .map_err(|_| RouterError::InvalidDomain(front.hostname.clone()))?;
+
         let path_rule = PathRule::from_config(front.path.clone())
             .ok_or(RouterError::InvalidPathRule(front.path.to_string()))?;
 
         let method_rule = MethodRule::new(front.method.clone());
 
         let route = match &front.cluster_id {
-            Some(cluster_id) => Route::ClusterId(cluster_id.clone()),
+            Some(cluster_id) => Route::new(
+                cluster_id.clone(),
+                &domain_rule,
+                &path_rule,
+                front.redirect,
+                front.redirect_scheme,
+                front.host_rewrite.clone(),
+                front.path_rewrite.clone(),
+            )?,
             None => Route::Deny,
         };
+        println!("ROUTE:{route:#?}");
 
         let success = match front.position {
-            RulePosition::Pre => {
-                let domain = front.hostname.parse::<DomainRule>().map_err(|_| {
-                    RouterError::InvalidDomain {
-                        hostname: front.hostname.clone(),
-                    }
-                })?;
-
-                self.add_pre_rule(&domain, &path_rule, &method_rule, &route)
-            }
+            RulePosition::Pre => self.add_pre_rule(&domain_rule, &path_rule, &method_rule, &route),
             RulePosition::Post => {
-                let domain = front.hostname.parse::<DomainRule>().map_err(|_| {
-                    RouterError::InvalidDomain {
-                        hostname: front.hostname.clone(),
-                    }
-                })?;
-
-                self.add_post_rule(&domain, &path_rule, &method_rule, &route)
+                self.add_post_rule(&domain_rule, &path_rule, &method_rule, &route)
             }
             RulePosition::Tree => {
                 self.add_tree_rule(front.hostname.as_bytes(), &path_rule, &method_rule, &route)
@@ -173,22 +204,20 @@ impl Router {
 
         let remove_success = match front.position {
             RulePosition::Pre => {
-                let domain = front.hostname.parse::<DomainRule>().map_err(|_| {
-                    RouterError::InvalidDomain {
-                        hostname: front.hostname.clone(),
-                    }
-                })?;
+                let domain_rule = front
+                    .hostname
+                    .parse::<DomainRule>()
+                    .map_err(|_| RouterError::InvalidDomain(front.hostname.clone()))?;
 
-                self.remove_pre_rule(&domain, &path_rule, &method_rule)
+                self.remove_pre_rule(&domain_rule, &path_rule, &method_rule)
             }
             RulePosition::Post => {
-                let domain = front.hostname.parse::<DomainRule>().map_err(|_| {
-                    RouterError::InvalidDomain {
-                        hostname: front.hostname.clone(),
-                    }
-                })?;
+                let domain_rule = front
+                    .hostname
+                    .parse::<DomainRule>()
+                    .map_err(|_| RouterError::InvalidDomain(front.hostname.clone()))?;
 
-                self.remove_post_rule(&domain, &path_rule, &method_rule)
+                self.remove_post_rule(&domain_rule, &path_rule, &method_rule)
             }
             RulePosition::Tree => {
                 self.remove_tree_rule(front.hostname.as_bytes(), &path_rule, &method_rule)
@@ -367,7 +396,7 @@ impl Router {
 #[derive(Clone, Debug)]
 pub enum DomainRule {
     Any,
-    Exact(String),
+    Equals(String),
     Wildcard(String),
     Regex(Regex),
 }
@@ -388,6 +417,7 @@ fn convert_regex_domain_rule(hostname: &str) -> Option<String> {
                     }
                     index = i + 1;
                     found = true;
+                    break;
                 }
             }
 
@@ -434,7 +464,7 @@ impl DomainRule {
                 hostname.ends_with(s[1..].as_bytes())
                     && !&hostname[..len_without_suffix].contains(&b'.')
             }
-            DomainRule::Exact(s) => s.as_bytes() == hostname,
+            DomainRule::Equals(s) => s.as_bytes() == hostname,
             DomainRule::Regex(r) => {
                 let start = Instant::now();
                 let is_a_match = r.is_match(hostname);
@@ -451,7 +481,7 @@ impl std::cmp::PartialEq for DomainRule {
         match (self, other) {
             (DomainRule::Any, DomainRule::Any) => true,
             (DomainRule::Wildcard(s1), DomainRule::Wildcard(s2)) => s1 == s2,
-            (DomainRule::Exact(s1), DomainRule::Exact(s2)) => s1 == s2,
+            (DomainRule::Equals(s1), DomainRule::Equals(s2)) => s1 == s2,
             (DomainRule::Regex(r1), DomainRule::Regex(r2)) => r1.as_str() == r2.as_str(),
             _ => false,
         }
@@ -483,7 +513,7 @@ impl std::str::FromStr for DomainRule {
             }
         } else {
             match ::idna::domain_to_ascii(s) {
-                Ok(r) => DomainRule::Exact(r),
+                Ok(r) => DomainRule::Equals(r),
                 Err(_) => return Err(()),
             }
         })
@@ -590,13 +620,339 @@ impl MethodRule {
     }
 }
 
+#[derive(Debug, Clone)]
+enum RewritePart {
+    String(String),
+    Host(usize),
+    Path(usize),
+}
+impl RewritePart {
+    pub fn string(s: &str) -> Self {
+        Self::String(String::from(s))
+    }
+    pub fn bytes(b: &[u8]) -> Self {
+        Self::String(unsafe { String::from_utf8_unchecked(b.to_vec()) })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RewriteParts(Vec<RewritePart>);
+impl RewriteParts {
+    pub fn new(
+        pattern: &str,
+        index_max_host: usize,
+        index_max_path: usize,
+        used_index_host: &mut usize,
+        used_index_path: &mut usize,
+    ) -> Option<Self> {
+        let mut result = Vec::new();
+        let mut i = 0;
+        let pattern = pattern.as_bytes();
+        while i < pattern.len() {
+            if pattern[i] == b'$' {
+                let is_host = if pattern[i..].starts_with(b"$HOST[") {
+                    i += 6;
+                    true
+                } else if pattern[i..].starts_with(b"$PATH[") {
+                    i += 6;
+                    false
+                } else {
+                    return None;
+                };
+                let mut index = 0;
+                while i < pattern.len() && pattern[i].is_dec_digit() {
+                    index = index * 10 + (pattern[i] - b'0') as usize;
+                    i += 1;
+                }
+                if i >= pattern.len() || pattern[i] != b']' {
+                    return None;
+                }
+                if is_host && index > *used_index_host {
+                    if index >= index_max_host {
+                        return None;
+                    }
+                    *used_index_host = index;
+                    result.push(RewritePart::Host(index));
+                } else if index > *used_index_path {
+                    if index >= index_max_path {
+                        return None;
+                    }
+                    *used_index_path = index;
+                    result.push(RewritePart::Path(index));
+                }
+                i += 1;
+            } else {
+                let start = i;
+                while i < pattern.len() && pattern[i] != b'$' {
+                    i += 1;
+                }
+                result.push(RewritePart::bytes(&pattern[start..i]));
+            }
+        }
+        Some(Self(result))
+    }
+    pub fn run(&self, host_captures: &Vec<&str>, path_captures: &Vec<&str>) -> String {
+        let mut cap = 0;
+        for part in &self.0 {
+            cap += match part {
+                RewritePart::String(s) => s.len(),
+                RewritePart::Host(i) => unsafe { host_captures.get_unchecked(*i).len() },
+                RewritePart::Path(i) => unsafe { path_captures.get_unchecked(*i).len() },
+            };
+        }
+        let mut result = String::with_capacity(cap);
+        for part in &self.0 {
+            match part {
+                RewritePart::String(s) => result.write_str(s),
+                RewritePart::Host(i) => {
+                    result.write_str(unsafe { host_captures.get_unchecked(*i) })
+                }
+                RewritePart::Path(i) => {
+                    result.write_str(unsafe { path_captures.get_unchecked(*i) })
+                }
+            };
+        }
+        result
+    }
+}
+
 /// The cluster to which the traffic will be redirected
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone)]
 pub enum Route {
     /// send a 401 default answer
     Deny,
     /// the cluster to which the frontend belongs
-    ClusterId(ClusterId),
+    Cluster {
+        cluster_id: ClusterId,
+        redirect: RedirectPolicy,
+        redirect_scheme: RedirectScheme,
+        capture_cap_host: usize,
+        capture_cap_path: usize,
+        rewrite_host: Option<RewriteParts>,
+        rewrite_path: Option<RewriteParts>,
+    },
+}
+
+impl Route {
+    pub fn new(
+        cluster_id: ClusterId,
+        domain_rule: &DomainRule,
+        path_rule: &PathRule,
+        redirect: RedirectPolicy,
+        redirect_scheme: RedirectScheme,
+        rewrite_host: Option<String>,
+        rewrite_path: Option<String>,
+    ) -> Result<Self, RouterError> {
+        let mut capture_cap_host = match domain_rule {
+            DomainRule::Any => 2,
+            DomainRule::Equals(_) => 1,
+            DomainRule::Wildcard(_) => 2,
+            DomainRule::Regex(regex) => regex.captures_len(),
+        };
+        let mut capture_cap_path = match path_rule {
+            PathRule::Prefix(_) => 2,
+            PathRule::Equals(_) => 1,
+            PathRule::Regex(regex) => regex.captures_len(),
+        };
+        let mut used_capture_host = 0;
+        let mut used_capture_path = 0;
+        let rewrite_host = if let Some(p) = rewrite_host {
+            Some(
+                RewriteParts::new(
+                    &p,
+                    capture_cap_host,
+                    capture_cap_path,
+                    &mut used_capture_host,
+                    &mut used_capture_path,
+                )
+                .ok_or(RouterError::InvalidHostRewrite(p))?,
+            )
+        } else {
+            None
+        };
+        let rewrite_path = if let Some(p) = rewrite_path {
+            Some(
+                RewriteParts::new(
+                    &p,
+                    capture_cap_host,
+                    capture_cap_path,
+                    &mut used_capture_host,
+                    &mut used_capture_path,
+                )
+                .ok_or(RouterError::InvalidPathRewrite(p))?,
+            )
+        } else {
+            None
+        };
+        if used_capture_host == 0 {
+            capture_cap_host = 0;
+        }
+        if used_capture_path == 0 {
+            capture_cap_path = 0;
+        }
+        Ok(Self::Cluster {
+            cluster_id,
+            redirect,
+            redirect_scheme,
+            capture_cap_host,
+            capture_cap_path,
+            rewrite_host,
+            rewrite_path,
+        })
+    }
+
+    #[cfg(test)]
+    pub fn simple(cluster_id: ClusterId) -> Self {
+        Self::Cluster {
+            cluster_id,
+            redirect: RedirectPolicy::Forward,
+            redirect_scheme: RedirectScheme::UseSame,
+            capture_cap_host: 0,
+            capture_cap_path: 0,
+            rewrite_host: None,
+            rewrite_path: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RouteResult {
+    Deny,
+    Cluster {
+        cluster_id: ClusterId,
+        redirect: RedirectPolicy,
+        redirect_scheme: RedirectScheme,
+        rewritten_host: Option<String>,
+        rewritten_path: Option<String>,
+    },
+}
+
+impl RouteResult {
+    fn new<'a>(
+        captures_host: Vec<&'a str>,
+        path: &'a [u8],
+        path_rule: &PathRule,
+        route: &Route,
+    ) -> Self {
+        match route {
+            Route::Deny => Self::Deny,
+            Route::Cluster {
+                cluster_id,
+                redirect,
+                redirect_scheme,
+                capture_cap_path,
+                rewrite_host,
+                rewrite_path,
+                ..
+            } => {
+                let mut captures_path = Vec::with_capacity(*capture_cap_path);
+                if *capture_cap_path > 0 {
+                    match path_rule {
+                        PathRule::Prefix(prefix) => captures_path
+                            .push(unsafe { from_utf8_unchecked(&path[prefix.len()..]) }),
+                        PathRule::Regex(regex) => captures_path.extend(
+                            regex
+                                .captures(&path)
+                                .unwrap()
+                                .iter()
+                                .map(|c| unsafe { from_utf8_unchecked(c.unwrap().as_bytes()) }),
+                        ),
+                        _ => {}
+                    }
+                }
+                println!("========HOST_CAPTURES: {captures_host:?}");
+                println!("========PATH_CAPTURES: {captures_path:?}");
+                Self::Cluster {
+                    cluster_id: cluster_id.clone(),
+                    redirect: *redirect,
+                    redirect_scheme: *redirect_scheme,
+                    rewritten_host: rewrite_host
+                        .as_ref()
+                        .map(|rewrite| rewrite.run(&captures_host, &captures_path)),
+                    rewritten_path: rewrite_path
+                        .as_ref()
+                        .map(|rewrite| rewrite.run(&captures_host, &captures_path)),
+                }
+            }
+        }
+    }
+    fn new_no_trie<'a>(
+        domain: &'a [u8],
+        domain_rule: &DomainRule,
+        path: &'a [u8],
+        path_rule: &PathRule,
+        route: &Route,
+    ) -> Self {
+        match route {
+            Route::Deny => Self::Deny,
+            Route::Cluster {
+                capture_cap_host, ..
+            } => {
+                let mut captures_host = Vec::with_capacity(*capture_cap_host);
+                if *capture_cap_host > 0 {
+                    match domain_rule {
+                        DomainRule::Wildcard(suffix) => captures_host.push(unsafe {
+                            from_utf8_unchecked(&domain[..domain.len() - suffix.len()])
+                        }),
+                        DomainRule::Regex(regex) => captures_host.extend(
+                            regex
+                                .captures(&domain)
+                                .unwrap()
+                                .iter()
+                                .skip(1)
+                                .map(|c| unsafe { from_utf8_unchecked(c.unwrap().as_bytes()) }),
+                        ),
+                        _ => {}
+                    }
+                }
+                Self::new(captures_host, path, path_rule, route)
+            }
+        }
+    }
+    fn new_with_trie<'a>(
+        domain_submatches: TrieMatches<'_, 'a>,
+        path: &'a [u8],
+        path_rule: &PathRule,
+        route: &Route,
+    ) -> Self {
+        match route {
+            Route::Deny => Self::Deny,
+            Route::Cluster {
+                capture_cap_host, ..
+            } => {
+                let mut captures_host = Vec::with_capacity(*capture_cap_host);
+                if *capture_cap_host > 0 {
+                    for submatch in domain_submatches {
+                        match submatch {
+                            TrieSubMatch::Wildcard(part) => {
+                                captures_host.push(unsafe { from_utf8_unchecked(part) })
+                            }
+                            TrieSubMatch::Regexp(part, regex) => captures_host.extend(
+                                regex
+                                    .captures(&part)
+                                    .unwrap()
+                                    .iter()
+                                    .skip(1)
+                                    .map(|c| unsafe { from_utf8_unchecked(c.unwrap().as_bytes()) }),
+                            ),
+                        }
+                    }
+                }
+                Self::new(captures_host, path, path_rule, route)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub fn simple(cluster_id: ClusterId) -> Self {
+        Self::Cluster {
+            cluster_id,
+            redirect: RedirectPolicy::Forward,
+            redirect_scheme: RedirectScheme::UseSame,
+            rewritten_host: None,
+            rewritten_path: None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -643,7 +999,7 @@ mod tests {
         assert_eq!("*".parse::<DomainRule>().unwrap(), DomainRule::Any);
         assert_eq!(
             "www.example.com".parse::<DomainRule>().unwrap(),
-            DomainRule::Exact("www.example.com".to_string())
+            DomainRule::Equals("www.example.com".to_string())
         );
         assert_eq!(
             "*.example.com".parse::<DomainRule>().unwrap(),
@@ -660,7 +1016,7 @@ mod tests {
     fn match_domain_rule() {
         assert!(DomainRule::Any.matches("www.example.com".as_bytes()));
         assert!(
-            DomainRule::Exact("www.example.com".to_string()).matches("www.example.com".as_bytes())
+            DomainRule::Equals("www.example.com".to_string()).matches("www.example.com".as_bytes())
         );
         assert!(
             DomainRule::Wildcard("*.example.com".to_string()).matches("www.example.com".as_bytes())
@@ -715,27 +1071,27 @@ mod tests {
             b"*.sozu.io",
             &PathRule::Prefix("".to_string()),
             &MethodRule::new(Some("GET".to_string())),
-            &Route::ClusterId("base".to_string())
+            &Route::simple("base".to_string())
         ));
         println!("{:#?}", router.tree);
         assert_eq!(
             router.lookup("www.sozu.io", "/api", &Method::Get),
-            Ok(Route::ClusterId("base".to_string()))
+            Ok(RouteResult::simple("base".to_string()))
         );
         assert!(router.add_tree_rule(
             b"*.sozu.io",
             &PathRule::Prefix("/api".to_string()),
             &MethodRule::new(Some("GET".to_string())),
-            &Route::ClusterId("api".to_string())
+            &Route::simple("api".to_string())
         ));
         println!("{:#?}", router.tree);
         assert_eq!(
             router.lookup("www.sozu.io", "/ap", &Method::Get),
-            Ok(Route::ClusterId("base".to_string()))
+            Ok(RouteResult::simple("base".to_string()))
         );
         assert_eq!(
             router.lookup("www.sozu.io", "/api", &Method::Get),
-            Ok(Route::ClusterId("api".to_string()))
+            Ok(RouteResult::simple("api".to_string()))
         );
     }
 
@@ -754,27 +1110,27 @@ mod tests {
             b"*.sozu.io",
             &PathRule::Prefix("".to_string()),
             &MethodRule::new(Some("GET".to_string())),
-            &Route::ClusterId("base".to_string())
+            &Route::simple("base".to_string())
         ));
         println!("{:#?}", router.tree);
         assert_eq!(
             router.lookup("www.sozu.io", "/api", &Method::Get),
-            Ok(Route::ClusterId("base".to_string()))
+            Ok(RouteResult::simple("base".to_string()))
         );
         assert!(router.add_tree_rule(
             b"api.sozu.io",
             &PathRule::Prefix("".to_string()),
             &MethodRule::new(Some("GET".to_string())),
-            &Route::ClusterId("api".to_string())
+            &Route::simple("api".to_string())
         ));
         println!("{:#?}", router.tree);
         assert_eq!(
             router.lookup("www.sozu.io", "/api", &Method::Get),
-            Ok(Route::ClusterId("base".to_string()))
+            Ok(RouteResult::simple("base".to_string()))
         );
         assert_eq!(
             router.lookup("api.sozu.io", "/api", &Method::Get),
-            Ok(Route::ClusterId("api".to_string()))
+            Ok(RouteResult::simple("api".to_string()))
         );
     }
 
@@ -786,23 +1142,23 @@ mod tests {
             b"www./.*/.io",
             &PathRule::Prefix("".to_string()),
             &MethodRule::new(Some("GET".to_string())),
-            &Route::ClusterId("base".to_string())
+            &Route::simple("base".to_string())
         ));
         println!("{:#?}", router.tree);
         assert!(router.add_tree_rule(
             b"www.doc./.*/.io",
             &PathRule::Prefix("".to_string()),
             &MethodRule::new(Some("GET".to_string())),
-            &Route::ClusterId("doc".to_string())
+            &Route::simple("doc".to_string())
         ));
         println!("{:#?}", router.tree);
         assert_eq!(
             router.lookup("www.sozu.io", "/", &Method::Get),
-            Ok(Route::ClusterId("base".to_string()))
+            Ok(RouteResult::simple("base".to_string()))
         );
         assert_eq!(
             router.lookup("www.doc.sozu.io", "/", &Method::Get),
-            Ok(Route::ClusterId("doc".to_string()))
+            Ok(RouteResult::simple("doc".to_string()))
         );
         assert!(router.remove_tree_rule(
             b"www./.*/.io",
@@ -813,7 +1169,7 @@ mod tests {
         assert!(router.lookup("www.sozu.io", "/", &Method::Get).is_err());
         assert_eq!(
             router.lookup("www.doc.sozu.io", "/", &Method::Get),
-            Ok(Route::ClusterId("doc".to_string()))
+            Ok(RouteResult::simple("doc".to_string()))
         );
     }
 
@@ -825,30 +1181,30 @@ mod tests {
             &"*".parse::<DomainRule>().unwrap(),
             &PathRule::Prefix("/.well-known/acme-challenge".to_string()),
             &MethodRule::new(Some("GET".to_string())),
-            &Route::ClusterId("acme".to_string())
+            &Route::simple("acme".to_string())
         ));
         assert!(router.add_tree_rule(
             "www.example.com".as_bytes(),
             &PathRule::Prefix("/".to_string()),
             &MethodRule::new(Some("GET".to_string())),
-            &Route::ClusterId("example".to_string())
+            &Route::simple("example".to_string())
         ));
         assert!(router.add_tree_rule(
             "*.test.example.com".as_bytes(),
             &PathRule::Regex(Regex::new("/hello[A-Z]+/").unwrap()),
             &MethodRule::new(Some("GET".to_string())),
-            &Route::ClusterId("examplewildcard".to_string())
+            &Route::simple("examplewildcard".to_string())
         ));
         assert!(router.add_tree_rule(
             "/test[0-9]/.example.com".as_bytes(),
             &PathRule::Prefix("/".to_string()),
             &MethodRule::new(Some("GET".to_string())),
-            &Route::ClusterId("exampleregex".to_string())
+            &Route::simple("exampleregex".to_string())
         ));
 
         assert_eq!(
             router.lookup("www.example.com", "/helloA", &Method::new(&b"GET"[..])),
-            Ok(Route::ClusterId("example".to_string()))
+            Ok(RouteResult::simple("example".to_string()))
         );
         assert_eq!(
             router.lookup(
@@ -856,7 +1212,7 @@ mod tests {
                 "/.well-known/acme-challenge",
                 &Method::new(&b"GET"[..])
             ),
-            Ok(Route::ClusterId("acme".to_string()))
+            Ok(RouteResult::simple("acme".to_string()))
         );
         assert!(router
             .lookup("www.test.example.com", "/", &Method::new(&b"GET"[..]))
@@ -867,11 +1223,11 @@ mod tests {
                 "/helloAB/",
                 &Method::new(&b"GET"[..])
             ),
-            Ok(Route::ClusterId("examplewildcard".to_string()))
+            Ok(RouteResult::simple("examplewildcard".to_string()))
         );
         assert_eq!(
             router.lookup("test1.example.com", "/helloAB/", &Method::new(&b"GET"[..])),
-            Ok(Route::ClusterId("exampleregex".to_string()))
+            Ok(RouteResult::simple("exampleregex".to_string()))
         );
     }
 }
