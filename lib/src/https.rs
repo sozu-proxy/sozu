@@ -62,7 +62,7 @@ use crate::{
         rustls::TlsHandshake,
         Http, Pipe, SessionState,
     },
-    router::{Route, RouteResult, Router},
+    router::{RouteDirection, RouteResult, Router},
     server::{ListenToken, SessionManager},
     socket::{server_bind, FrontRustls},
     timer::TimeoutContainer,
@@ -600,7 +600,11 @@ impl L7ListenerHandler for HttpsListener {
 
         let now = Instant::now();
 
-        if let RouteResult::Cluster { cluster_id, .. } = &route {
+        if let RouteResult::Flow {
+            direction: RouteDirection::Forward(cluster_id),
+            ..
+        } = &route
+        {
             time!(
                 "frontend_matching_time",
                 cluster_id,

@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fmt::Debug, hash::Hash, iter, str};
+use std::{collections::HashMap, fmt::Debug, iter, str};
 
 use regex::bytes::Regex;
 

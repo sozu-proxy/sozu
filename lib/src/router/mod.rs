@@ -97,7 +97,7 @@ impl Router {
                         match method_rule.matches(method) {
                             MethodRuleResult::Equals => {
                                 return Ok(RouteResult::new_with_trie(
-                                    trie_path, path_b, path_rule, route,
+                                    hostname_b, trie_path, path_b, path_rule, route,
                                 ))
                             }
                             MethodRuleResult::All => {
@@ -129,7 +129,7 @@ impl Router {
 
             if let Some((path_rule, route)) = frontend {
                 return Ok(RouteResult::new_with_trie(
-                    trie_path, path_b, path_rule, route,
+                    hostname_b, trie_path, path_b, path_rule, route,
                 ));
             }
         }
@@ -167,18 +167,15 @@ impl Router {
 
         let method_rule = MethodRule::new(front.method.clone());
 
-        let route = match &front.cluster_id {
-            Some(cluster_id) => Route::new(
-                cluster_id.clone(),
-                &domain_rule,
-                &path_rule,
-                front.redirect,
-                front.redirect_scheme,
-                front.host_rewrite.clone(),
-                front.path_rewrite.clone(),
-            )?,
-            None => Route::Deny,
-        };
+        let route = Route::new(
+            front.cluster_id.clone(),
+            &domain_rule,
+            &path_rule,
+            front.redirect,
+            front.redirect_scheme,
+            front.rewrite_host.clone(),
+            front.rewrite_path.clone(),
+        )?;
         println!("ROUTE:{route:#?}");
 
         let success = match front.position {
@@ -667,17 +664,21 @@ impl RewriteParts {
                 if i >= pattern.len() || pattern[i] != b']' {
                     return None;
                 }
-                if is_host && index > *used_index_host {
+                if is_host {
                     if index >= index_max_host {
                         return None;
                     }
-                    *used_index_host = index;
+                    if index >= *used_index_host {
+                        *used_index_host = index + 1;
+                    }
                     result.push(RewritePart::Host(index));
-                } else if index > *used_index_path {
+                } else {
                     if index >= index_max_path {
                         return None;
                     }
-                    *used_index_path = index;
+                    if index >= *used_index_path {
+                        *used_index_path = index + 1;
+                    }
                     result.push(RewritePart::Path(index));
                 }
                 i += 1;
@@ -702,7 +703,7 @@ impl RewriteParts {
         }
         let mut result = String::with_capacity(cap);
         for part in &self.0 {
-            match part {
+            let _ = match part {
                 RewritePart::String(s) => result.write_str(s),
                 RewritePart::Host(i) => {
                     result.write_str(unsafe { host_captures.get_unchecked(*i) })
@@ -716,26 +717,30 @@ impl RewriteParts {
     }
 }
 
-/// The cluster to which the traffic will be redirected
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RouteDirection {
+    Forward(ClusterId),
+    Temporary(RedirectScheme),
+    Permanent(RedirectScheme),
+}
+
+/// What to do with the traffic
 #[derive(Debug, Clone)]
 pub enum Route {
-    /// send a 401 default answer
     Deny,
-    /// the cluster to which the frontend belongs
-    Cluster {
-        cluster_id: ClusterId,
-        redirect: RedirectPolicy,
-        redirect_scheme: RedirectScheme,
+    Flow {
+        direction: RouteDirection,
         capture_cap_host: usize,
         capture_cap_path: usize,
         rewrite_host: Option<RewriteParts>,
         rewrite_path: Option<RewriteParts>,
+        // rewrite_port?
     },
 }
 
 impl Route {
     pub fn new(
-        cluster_id: ClusterId,
+        cluster_id: Option<ClusterId>,
         domain_rule: &DomainRule,
         path_rule: &PathRule,
         redirect: RedirectPolicy,
@@ -743,15 +748,21 @@ impl Route {
         rewrite_host: Option<String>,
         rewrite_path: Option<String>,
     ) -> Result<Self, RouterError> {
+        let flow = match (cluster_id, redirect) {
+            (Some(cluster_id), RedirectPolicy::Forward) => RouteDirection::Forward(cluster_id),
+            (_, RedirectPolicy::Temporary) => RouteDirection::Temporary(redirect_scheme),
+            (_, RedirectPolicy::Permanent) => RouteDirection::Permanent(redirect_scheme),
+            _ => return Ok(Route::Deny),
+        };
         let mut capture_cap_host = match domain_rule {
-            DomainRule::Any => 2,
+            DomainRule::Any => 1,
             DomainRule::Equals(_) => 1,
             DomainRule::Wildcard(_) => 2,
             DomainRule::Regex(regex) => regex.captures_len(),
         };
         let mut capture_cap_path = match path_rule {
-            PathRule::Prefix(_) => 2,
             PathRule::Equals(_) => 1,
+            PathRule::Prefix(_) => 2,
             PathRule::Regex(regex) => regex.captures_len(),
         };
         let mut used_capture_host = 0;
@@ -790,10 +801,8 @@ impl Route {
         if used_capture_path == 0 {
             capture_cap_path = 0;
         }
-        Ok(Self::Cluster {
-            cluster_id,
-            redirect,
-            redirect_scheme,
+        Ok(Route::Flow {
+            direction: flow,
             capture_cap_host,
             capture_cap_path,
             rewrite_host,
@@ -803,10 +812,8 @@ impl Route {
 
     #[cfg(test)]
     pub fn simple(cluster_id: ClusterId) -> Self {
-        Self::Cluster {
-            cluster_id,
-            redirect: RedirectPolicy::Forward,
-            redirect_scheme: RedirectScheme::UseSame,
+        Self::Flow {
+            direction: RouteDirection::Forward(cluster_id),
             capture_cap_host: 0,
             capture_cap_path: 0,
             rewrite_host: None,
@@ -818,12 +825,11 @@ impl Route {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RouteResult {
     Deny,
-    Cluster {
-        cluster_id: ClusterId,
-        redirect: RedirectPolicy,
-        redirect_scheme: RedirectScheme,
+    Flow {
+        direction: RouteDirection,
         rewritten_host: Option<String>,
         rewritten_path: Option<String>,
+        // rewritten_port?
     },
 }
 
@@ -836,10 +842,8 @@ impl RouteResult {
     ) -> Self {
         match route {
             Route::Deny => Self::Deny,
-            Route::Cluster {
-                cluster_id,
-                redirect,
-                redirect_scheme,
+            Route::Flow {
+                direction: flow,
                 capture_cap_path,
                 rewrite_host,
                 rewrite_path,
@@ -847,6 +851,7 @@ impl RouteResult {
             } => {
                 let mut captures_path = Vec::with_capacity(*capture_cap_path);
                 if *capture_cap_path > 0 {
+                    captures_path.push(unsafe { from_utf8_unchecked(path) });
                     match path_rule {
                         PathRule::Prefix(prefix) => captures_path
                             .push(unsafe { from_utf8_unchecked(&path[prefix.len()..]) }),
@@ -862,10 +867,8 @@ impl RouteResult {
                 }
                 println!("========HOST_CAPTURES: {captures_host:?}");
                 println!("========PATH_CAPTURES: {captures_path:?}");
-                Self::Cluster {
-                    cluster_id: cluster_id.clone(),
-                    redirect: *redirect,
-                    redirect_scheme: *redirect_scheme,
+                Self::Flow {
+                    direction: flow.clone(),
                     rewritten_host: rewrite_host
                         .as_ref()
                         .map(|rewrite| rewrite.run(&captures_host, &captures_path)),
@@ -885,11 +888,12 @@ impl RouteResult {
     ) -> Self {
         match route {
             Route::Deny => Self::Deny,
-            Route::Cluster {
+            Route::Flow {
                 capture_cap_host, ..
             } => {
                 let mut captures_host = Vec::with_capacity(*capture_cap_host);
                 if *capture_cap_host > 0 {
+                    captures_host.push(unsafe { from_utf8_unchecked(domain) });
                     match domain_rule {
                         DomainRule::Wildcard(suffix) => captures_host.push(unsafe {
                             from_utf8_unchecked(&domain[..domain.len() - suffix.len()])
@@ -910,6 +914,7 @@ impl RouteResult {
         }
     }
     fn new_with_trie<'a>(
+        domain: &'a [u8],
         domain_submatches: TrieMatches<'_, 'a>,
         path: &'a [u8],
         path_rule: &PathRule,
@@ -917,11 +922,12 @@ impl RouteResult {
     ) -> Self {
         match route {
             Route::Deny => Self::Deny,
-            Route::Cluster {
+            Route::Flow {
                 capture_cap_host, ..
             } => {
                 let mut captures_host = Vec::with_capacity(*capture_cap_host);
                 if *capture_cap_host > 0 {
+                    captures_host.push(unsafe { from_utf8_unchecked(domain) });
                     for submatch in domain_submatches {
                         match submatch {
                             TrieSubMatch::Wildcard(part) => {
@@ -945,10 +951,8 @@ impl RouteResult {
 
     #[cfg(test)]
     pub fn simple(cluster_id: ClusterId) -> Self {
-        Self::Cluster {
-            cluster_id,
-            redirect: RedirectPolicy::Forward,
-            redirect_scheme: RedirectScheme::UseSame,
+        Self::Flow {
+            direction: RouteDirection::Forward(cluster_id),
             rewritten_host: None,
             rewritten_path: None,
         }

@@ -263,8 +263,8 @@ message RequestHttpFrontend {
     map<string, string> tags = 7;
     optional RedirectPolicy redirect = 8;
     optional RedirectScheme redirect_scheme = 9;
-    optional string host_rewrite = 10;
-    optional string path_rewrite = 11;
+    optional string rewrite_host = 10;
+    optional string rewrite_path = 11;
 }
 
 message RequestTcpFrontend {

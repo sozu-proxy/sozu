@@ -356,13 +356,13 @@ use tls::CertificateResolverError;
 
 use sozu_command::{
     logging::{CachedTags, LogContext},
-    proto::command::{Cluster, ListenerType, RedirectPolicy, RequestHttpFrontend, WorkerRequest, WorkerResponse},
+    proto::command::{Cluster, ListenerType, RequestHttpFrontend, WorkerRequest, WorkerResponse},
     ready::Ready,
     state::ClusterId,
     AsStr, ObjectKind,
 };
 
-use crate::{backends::BackendMap, router::Route};
+use crate::backends::BackendMap;
 
 /// Anything that can be registered in mio (subscribe to kernel events)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -602,8 +602,8 @@ pub enum RetrieveClusterError {
     NoPath,
     #[error("unauthorized route")]
     UnauthorizedRoute,
-    #[error("redirected {0:?}")]
-    Redirected(RedirectPolicy),
+    #[error("redirected")]
+    Redirected,
     #[error("{0}")]
     RetrieveFrontend(FrontendFromRequestError),
 }

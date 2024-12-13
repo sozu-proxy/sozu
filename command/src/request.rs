@@ -169,8 +169,8 @@ impl RequestHttpFrontend {
             path: self.path,
             method: self.method,
             tags: Some(self.tags),
-            host_rewrite: self.host_rewrite,
-            path_rewrite: self.path_rewrite,
+            rewrite_host: self.rewrite_host,
+            rewrite_path: self.rewrite_path,
         })
     }
 }

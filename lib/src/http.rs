@@ -39,7 +39,7 @@ use crate::{
         proxy_protocol::expect::ExpectProxyProtocol,
         Http, Pipe, SessionState,
     },
-    router::{Route, RouteResult, Router},
+    router::{RouteDirection, RouteResult, Router},
     server::{ListenToken, SessionManager},
     socket::server_bind,
     timer::TimeoutContainer,
@@ -472,7 +472,11 @@ impl L7ListenerHandler for HttpListener {
 
         let now = Instant::now();
 
-        if let RouteResult::Cluster { cluster_id, .. } = &route {
+        if let RouteResult::Flow {
+            direction: RouteDirection::Forward(cluster_id),
+            ..
+        } = &route
+        {
             time!(
                 "frontend_matching_time",
                 cluster_id,
@@ -1056,7 +1060,9 @@ mod tests {
 
     use super::testing::start_http_worker;
     use super::*;
-    use sozu_command::proto::command::{CustomHttpAnswers, RedirectPolicy, RedirectScheme, SocketAddress};
+    use sozu_command::proto::command::{
+        CustomHttpAnswers, RedirectPolicy, RedirectScheme, SocketAddress,
+    };
 
     use crate::sozu_command::{
         channel::Channel,
@@ -1331,8 +1337,8 @@ mod tests {
                 cluster_id: Some(cluster_id1),
                 redirect: RedirectPolicy::Forward,
                 redirect_scheme: RedirectScheme::UseSame,
-                host_rewrite: None,
-                path_rewrite: None,
+                rewrite_host: None,
+                rewrite_path: None,
                 tags: None,
             })
             .expect("Could not add http frontend");
@@ -1346,8 +1352,8 @@ mod tests {
                 cluster_id: Some(cluster_id2),
                 redirect: RedirectPolicy::Forward,
                 redirect_scheme: RedirectScheme::UseSame,
-                host_rewrite: None,
-                path_rewrite: None,
+                rewrite_host: None,
+                rewrite_path: None,
                 tags: None,
             })
             .expect("Could not add http frontend");
@@ -1361,8 +1367,8 @@ mod tests {
                 cluster_id: Some(cluster_id3),
                 redirect: RedirectPolicy::Forward,
                 redirect_scheme: RedirectScheme::UseSame,
-                host_rewrite: None,
-                path_rewrite: None,
+                rewrite_host: None,
+                rewrite_path: None,
                 tags: None,
             })
             .expect("Could not add http frontend");
@@ -1376,8 +1382,8 @@ mod tests {
                 cluster_id: Some("cluster_1".to_owned()),
                 redirect: RedirectPolicy::Forward,
                 redirect_scheme: RedirectScheme::UseSame,
-                host_rewrite: None,
-                path_rewrite: None,
+                rewrite_host: None,
+                rewrite_path: None,
                 tags: None,
             })
             .expect("Could not add http frontend");

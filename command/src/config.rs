@@ -669,8 +669,8 @@ pub struct FileClusterFrontendConfig {
     pub tags: Option<BTreeMap<String, String>>,
     pub redirect: Option<RedirectPolicy>,
     pub redirect_scheme: Option<RedirectScheme>,
-    pub host_rewrite: Option<String>,
-    pub path_rewrite: Option<String>,
+    pub rewrite_host: Option<String>,
+    pub rewrite_path: Option<String>,
 }
 
 impl FileClusterFrontendConfig {
@@ -758,8 +758,8 @@ impl FileClusterFrontendConfig {
             tags: self.tags.clone(),
             redirect: self.redirect,
             redirect_scheme: self.redirect_scheme,
-            host_rewrite: self.host_rewrite.clone(),
-            path_rewrite: self.path_rewrite.clone(),
+            rewrite_host: self.rewrite_host.clone(),
+            rewrite_path: self.rewrite_path.clone(),
         })
     }
 }
@@ -912,8 +912,8 @@ pub struct HttpFrontendConfig {
     pub tags: Option<BTreeMap<String, String>>,
     pub redirect: Option<RedirectPolicy>,
     pub redirect_scheme: Option<RedirectScheme>,
-    pub host_rewrite: Option<String>,
-    pub path_rewrite: Option<String>,
+    pub rewrite_host: Option<String>,
+    pub rewrite_path: Option<String>,
 }
 
 impl HttpFrontendConfig {
@@ -953,8 +953,8 @@ impl HttpFrontendConfig {
                     tags,
                     redirect: self.redirect.map(Into::into),
                     redirect_scheme: self.redirect_scheme.map(Into::into),
-                    host_rewrite: self.host_rewrite.clone(),
-                    path_rewrite: self.path_rewrite.clone(),
+                    rewrite_host: self.rewrite_host.clone(),
+                    rewrite_path: self.rewrite_path.clone(),
                 })
                 .into(),
             );
@@ -971,8 +971,8 @@ impl HttpFrontendConfig {
                     tags,
                     redirect: self.redirect.map(Into::into),
                     redirect_scheme: self.redirect_scheme.map(Into::into),
-                    host_rewrite: self.host_rewrite.clone(),
-                    path_rewrite: self.path_rewrite.clone(),
+                    rewrite_host: self.rewrite_host.clone(),
+                    rewrite_path: self.rewrite_path.clone(),
                 })
                 .into(),
             );
