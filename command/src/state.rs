@@ -1482,7 +1482,8 @@ mod tests {
 
     use super::*;
     use crate::proto::command::{
-        CustomHttpAnswers, LoadBalancingParams, RequestHttpFrontend, RulePosition,
+        CustomHttpAnswers, LoadBalancingParams, RedirectPolicy, RedirectScheme,
+        RequestHttpFrontend, RulePosition,
     };
 
     #[test]
@@ -1724,6 +1725,8 @@ mod tests {
                 hostname: String::from("test.local"),
                 path: PathRule::prefix(String::from("/abc")),
                 address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
+                redirect: Some(RedirectPolicy::Forward.into()),
+                redirect_scheme: Some(RedirectScheme::UseSame.into()),
                 ..Default::default()
             })
             .into(),

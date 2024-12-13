@@ -1252,7 +1252,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         &mut self,
         proxy: Rc<RefCell<dyn L7Proxy>>,
     ) -> Result<String, RetrieveClusterError> {
-        let (host, uri, method) = match self.extract_route() {
+        let (host, path, method) = match self.extract_route() {
             Ok(tuple) => tuple,
             Err(cluster_error) => {
                 self.set_answer(DefaultAnswer::Answer400 {
@@ -1269,7 +1269,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         let route_result = self
             .listener
             .borrow()
-            .frontend_from_request(host, uri, method);
+            .frontend_from_request(host, path, method);
 
         let route = match route_result {
             Ok(route) => route,
@@ -1289,9 +1289,24 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 rewritten_host,
                 rewritten_path,
             } => {
-                let host = rewritten_host.as_deref().unwrap_or(host);
-                let path = rewritten_path.as_deref().unwrap_or(uri);
                 let is_https = matches!(proxy.borrow().kind(), ListenerType::Https);
+                if let RouteDirection::Forward(cluster_id) = &flow {
+                    if !is_https
+                        && proxy
+                            .borrow()
+                            .clusters()
+                            .get(cluster_id)
+                            .map(|cluster| cluster.https_redirect)
+                            .unwrap_or(false)
+                    {
+                        self.set_answer(DefaultAnswer::Answer301 {
+                            location: format!("https://{host}{path}"),
+                        });
+                        return Err(RetrieveClusterError::Redirected);
+                    }
+                }
+                let host = rewritten_host.as_deref().unwrap_or(host);
+                let path = rewritten_path.as_deref().unwrap_or(path);
                 match flow {
                     RouteDirection::Forward(cluster_id) => Ok(cluster_id),
                     RouteDirection::Permanent(redirect_scheme) => {
