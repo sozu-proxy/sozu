@@ -175,6 +175,7 @@ impl Router {
             front.redirect_scheme,
             front.rewrite_host.clone(),
             front.rewrite_path.clone(),
+            front.rewrite_port,
         )?;
         println!("ROUTE:{route:#?}");
 
@@ -734,7 +735,7 @@ pub enum Route {
         capture_cap_path: usize,
         rewrite_host: Option<RewriteParts>,
         rewrite_path: Option<RewriteParts>,
-        // rewrite_port?
+        rewrite_port: Option<u16>,
     },
 }
 
@@ -747,6 +748,7 @@ impl Route {
         redirect_scheme: RedirectScheme,
         rewrite_host: Option<String>,
         rewrite_path: Option<String>,
+        rewrite_port: Option<u16>,
     ) -> Result<Self, RouterError> {
         let flow = match (cluster_id, redirect) {
             (Some(cluster_id), RedirectPolicy::Forward) => RouteDirection::Forward(cluster_id),
@@ -807,6 +809,7 @@ impl Route {
             capture_cap_path,
             rewrite_host,
             rewrite_path,
+            rewrite_port,
         })
     }
 
@@ -818,6 +821,7 @@ impl Route {
             capture_cap_path: 0,
             rewrite_host: None,
             rewrite_path: None,
+            rewrite_port: None,
         }
     }
 }
@@ -829,7 +833,7 @@ pub enum RouteResult {
         direction: RouteDirection,
         rewritten_host: Option<String>,
         rewritten_path: Option<String>,
-        // rewritten_port?
+        rewritten_port: Option<u16>,
     },
 }
 
@@ -847,6 +851,7 @@ impl RouteResult {
                 capture_cap_path,
                 rewrite_host,
                 rewrite_path,
+                rewrite_port,
                 ..
             } => {
                 let mut captures_path = Vec::with_capacity(*capture_cap_path);
@@ -875,6 +880,7 @@ impl RouteResult {
                     rewritten_path: rewrite_path
                         .as_ref()
                         .map(|rewrite| rewrite.run(&captures_host, &captures_path)),
+                    rewritten_port: *rewrite_port,
                 }
             }
         }
@@ -955,6 +961,7 @@ impl RouteResult {
             direction: RouteDirection::Forward(cluster_id),
             rewritten_host: None,
             rewritten_path: None,
+            rewritten_port: None,
         }
     }
 }

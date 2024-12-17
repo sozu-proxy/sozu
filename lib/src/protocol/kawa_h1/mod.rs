@@ -8,10 +8,12 @@ use std::{
     io::ErrorKind,
     net::{Shutdown, SocketAddr},
     rc::{Rc, Weak},
+    str::from_utf8_unchecked,
     time::{Duration, Instant},
 };
 
 use mio::{net::TcpStream, Interest, Token};
+use parser::hostname_and_port;
 use rusty_ulid::Ulid;
 use sozu_command::{
     config::MAX_LOOP_ITERATIONS,
@@ -40,8 +42,9 @@ use crate::{
     sozu_command::{logging::LogContext, ready::Ready},
     timer::TimeoutContainer,
     AcceptError, BackendConnectAction, BackendConnectionError, BackendConnectionStatus,
-    L7ListenerHandler, L7Proxy, ListenerHandler, Protocol, ProxySession, Readiness,
-    RetrieveClusterError, SessionIsToBeClosed, SessionMetrics, SessionResult, StateResult,
+    FrontendFromRequestError, L7ListenerHandler, L7Proxy, ListenerHandler, Protocol, ProxySession,
+    Readiness, RetrieveClusterError, SessionIsToBeClosed, SessionMetrics, SessionResult,
+    StateResult,
 };
 
 /// This macro is defined uniquely in this module to help the tracking of kawa h1
@@ -1257,7 +1260,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             Err(cluster_error) => {
                 self.set_answer(DefaultAnswer::Answer400 {
                     message: "Could not extract the route after connection started, this should not happen.".into(),
-                    phase: self.request_stream.parsing_phase.marker(),
+                    phase: kawa::ParsingPhaseMarker::StatusLine,
                     successfully_parsed: "null".into(),
                     partially_parsed: "null".into(),
                     invalid: "null".into(),
@@ -1266,6 +1269,38 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             }
         };
 
+        let (host, port) = match hostname_and_port(host.as_bytes()) {
+            Ok((b"", (hostname, port))) => (unsafe { from_utf8_unchecked(hostname) }, port),
+            Ok(_) => {
+                let host = host.to_owned();
+                self.set_answer(DefaultAnswer::Answer400 {
+                    message: "Invalid characters after hostname, this should not happen.".into(),
+                    phase: kawa::ParsingPhaseMarker::StatusLine,
+                    successfully_parsed: "null".into(),
+                    partially_parsed: "null".into(),
+                    invalid: "null".into(),
+                });
+                return Err(RetrieveClusterError::RetrieveFrontend(
+                    FrontendFromRequestError::InvalidCharsAfterHost(host),
+                ));
+            }
+            Err(parse_error) => {
+                let host = host.to_owned();
+                let error = parse_error.to_string();
+                self.set_answer(DefaultAnswer::Answer400 {
+                    message: "Could not parse port from hostname, this should not happen.".into(),
+                    phase: kawa::ParsingPhaseMarker::StatusLine,
+                    successfully_parsed: "null".into(),
+                    partially_parsed: "null".into(),
+                    invalid: "null".into(),
+                });
+                return Err(RetrieveClusterError::RetrieveFrontend(
+                    FrontendFromRequestError::HostParse { host, error },
+                ));
+            }
+        };
+
+        let start = Instant::now();
         let route_result = self
             .listener
             .borrow()
@@ -1288,25 +1323,43 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 direction: flow,
                 rewritten_host,
                 rewritten_path,
+                rewritten_port,
             } => {
                 let is_https = matches!(proxy.borrow().kind(), ListenerType::Https);
                 if let RouteDirection::Forward(cluster_id) = &flow {
-                    if !is_https
-                        && proxy
-                            .borrow()
-                            .clusters()
-                            .get(cluster_id)
-                            .map(|cluster| cluster.https_redirect)
-                            .unwrap_or(false)
-                    {
+                    time!(
+                        "frontend_matching_time",
+                        cluster_id,
+                        start.elapsed().as_millis()
+                    );
+                    let (https_redirect, https_redirect_port, authentication) = proxy
+                        .borrow()
+                        .clusters()
+                        .get(cluster_id)
+                        .map(|cluster| (cluster.https_redirect, Some(8443), None::<()>))
+                        .unwrap_or((false, None, None));
+                    if !is_https && https_redirect {
+                        let port =
+                            https_redirect_port.map_or(String::new(), |port| format!(":{port}"));
                         self.set_answer(DefaultAnswer::Answer301 {
-                            location: format!("https://{host}{path}"),
+                            location: format!("https://{host}{port}{path}"),
                         });
                         return Err(RetrieveClusterError::Redirected);
+                    }
+                    if let Some(authentication) = authentication {
+                        return Err(RetrieveClusterError::UnauthorizedRoute);
                     }
                 }
                 let host = rewritten_host.as_deref().unwrap_or(host);
                 let path = rewritten_path.as_deref().unwrap_or(path);
+                let port = rewritten_port.map_or_else(
+                    || {
+                        port.map_or(String::new(), |port| {
+                            format!(":{}", unsafe { from_utf8_unchecked(port) })
+                        })
+                    },
+                    |port| format!(":{port}"),
+                );
                 match flow {
                     RouteDirection::Forward(cluster_id) => Ok(cluster_id),
                     RouteDirection::Permanent(redirect_scheme) => {
@@ -1319,7 +1372,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                             }
                         };
                         self.set_answer(DefaultAnswer::Answer301 {
-                            location: format!("{proto}://{host}{path}"),
+                            location: format!("{proto}://{host}{port}{path}"),
                         });
                         Err(RetrieveClusterError::Redirected)
                     }

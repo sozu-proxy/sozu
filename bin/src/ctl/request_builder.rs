@@ -254,6 +254,7 @@ impl CommandManager {
                     redirect_scheme: todo!(),
                     rewrite_host: todo!(),
                     rewrite_path: todo!(),
+                    rewrite_port: todo!(),
                 })
                 .into(),
             ),
@@ -306,6 +307,7 @@ impl CommandManager {
                     redirect_scheme: todo!(),
                     rewrite_host: todo!(),
                     rewrite_path: todo!(),
+                    rewrite_port: todo!(),
                 })
                 .into(),
             ),

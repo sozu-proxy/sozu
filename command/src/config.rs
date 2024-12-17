@@ -671,6 +671,7 @@ pub struct FileClusterFrontendConfig {
     pub redirect_scheme: Option<RedirectScheme>,
     pub rewrite_host: Option<String>,
     pub rewrite_path: Option<String>,
+    pub rewrite_port: Option<u16>,
 }
 
 impl FileClusterFrontendConfig {
@@ -760,6 +761,7 @@ impl FileClusterFrontendConfig {
             redirect_scheme: self.redirect_scheme,
             rewrite_host: self.rewrite_host.clone(),
             rewrite_path: self.rewrite_path.clone(),
+            rewrite_port: self.rewrite_port.clone(),
         })
     }
 }
@@ -914,6 +916,7 @@ pub struct HttpFrontendConfig {
     pub redirect_scheme: Option<RedirectScheme>,
     pub rewrite_host: Option<String>,
     pub rewrite_path: Option<String>,
+    pub rewrite_port: Option<u16>,
 }
 
 impl HttpFrontendConfig {
@@ -955,6 +958,7 @@ impl HttpFrontendConfig {
                     redirect_scheme: self.redirect_scheme.map(Into::into),
                     rewrite_host: self.rewrite_host.clone(),
                     rewrite_path: self.rewrite_path.clone(),
+                    rewrite_port: self.rewrite_port.map(|x| x as u32),
                 })
                 .into(),
             );
@@ -973,6 +977,7 @@ impl HttpFrontendConfig {
                     redirect_scheme: self.redirect_scheme.map(Into::into),
                     rewrite_host: self.rewrite_host.clone(),
                     rewrite_path: self.rewrite_path.clone(),
+                    rewrite_port: self.rewrite_port.map(|x| x as u32),
                 })
                 .into(),
             );

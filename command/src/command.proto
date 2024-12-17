@@ -265,6 +265,7 @@ message RequestHttpFrontend {
     optional RedirectScheme redirect_scheme = 9;
     optional string rewrite_host = 10;
     optional string rewrite_path = 11;
+    optional uint32 rewrite_port = 12;
 }
 
 message RequestTcpFrontend {

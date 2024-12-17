@@ -171,6 +171,7 @@ impl RequestHttpFrontend {
             tags: Some(self.tags),
             rewrite_host: self.rewrite_host,
             rewrite_path: self.rewrite_path,
+            rewrite_port: self.rewrite_port.map(|x| x as u16),
         })
     }
 }

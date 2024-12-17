@@ -44,6 +44,8 @@ pub struct HttpFrontend {
     pub rewrite_host: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rewrite_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rewrite_port: Option<u16>,
     pub tags: Option<BTreeMap<String, String>>,
 }
 
@@ -61,6 +63,7 @@ impl From<HttpFrontend> for RequestHttpFrontend {
             redirect_scheme: Some(val.redirect_scheme.into()),
             rewrite_host: val.rewrite_host,
             rewrite_path: val.rewrite_path,
+            rewrite_port: val.rewrite_port.map(|x| x as u32),
         }
     }
 }

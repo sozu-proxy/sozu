@@ -430,61 +430,16 @@ impl L7ListenerHandler for HttpListener {
         self.config.connect_timeout
     }
 
-    // redundant, already called once in extract_route
     fn frontend_from_request(
         &self,
         host: &str,
-        uri: &str,
+        path: &str,
         method: &Method,
     ) -> Result<RouteResult, FrontendFromRequestError> {
-        let start = Instant::now();
-        let (remaining_input, (hostname, _)) = match hostname_and_port(host.as_bytes()) {
-            Ok(tuple) => tuple,
-            Err(parse_error) => {
-                // parse_error contains a slice of given_host, which should NOT escape this scope
-                return Err(FrontendFromRequestError::HostParse {
-                    host: host.to_owned(),
-                    error: parse_error.to_string(),
-                });
-            }
-        };
-        if remaining_input != &b""[..] {
-            return Err(FrontendFromRequestError::InvalidCharsAfterHost(
-                host.to_owned(),
-            ));
-        }
-
-        /*if port == Some(&b"80"[..]) {
-        // it is alright to call from_utf8_unchecked,
-        // we already verified that there are only ascii
-        // chars in there
-          unsafe { from_utf8_unchecked(hostname) }
-        } else {
-          host
-        }
-        */
-        let host = unsafe { from_utf8_unchecked(hostname) };
-
-        let route = self.fronts.lookup(host, uri, method).map_err(|e| {
+        self.fronts.lookup(host, path, method).map_err(|e| {
             incr!("http.failed_backend_matching");
             FrontendFromRequestError::NoClusterFound(e)
-        })?;
-
-        let now = Instant::now();
-
-        if let RouteResult::Flow {
-            direction: RouteDirection::Forward(cluster_id),
-            ..
-        } = &route
-        {
-            time!(
-                "frontend_matching_time",
-                cluster_id,
-                (now - start).as_millis()
-            );
-        }
-
-        Ok(route)
+        })
     }
 }
 
@@ -1339,6 +1294,7 @@ mod tests {
                 redirect_scheme: RedirectScheme::UseSame,
                 rewrite_host: None,
                 rewrite_path: None,
+                rewrite_port: None,
                 tags: None,
             })
             .expect("Could not add http frontend");
@@ -1354,6 +1310,7 @@ mod tests {
                 redirect_scheme: RedirectScheme::UseSame,
                 rewrite_host: None,
                 rewrite_path: None,
+                rewrite_port: None,
                 tags: None,
             })
             .expect("Could not add http frontend");
@@ -1369,6 +1326,7 @@ mod tests {
                 redirect_scheme: RedirectScheme::UseSame,
                 rewrite_host: None,
                 rewrite_path: None,
+                rewrite_port: None,
                 tags: None,
             })
             .expect("Could not add http frontend");
@@ -1384,6 +1342,7 @@ mod tests {
                 redirect_scheme: RedirectScheme::UseSame,
                 rewrite_host: None,
                 rewrite_path: None,
+                rewrite_port: None,
                 tags: None,
             })
             .expect("Could not add http frontend");
