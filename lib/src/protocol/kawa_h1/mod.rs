@@ -78,6 +78,10 @@ impl kawa::AsBuffer for Checkout {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DefaultAnswer {
+    AnswerCustom {
+        name: String,
+        location: String,
+    },
     Answer301 {
         location: String,
     },
@@ -116,23 +120,6 @@ pub enum DefaultAnswer {
         message: String,
         capacity: usize,
     },
-}
-
-impl From<&DefaultAnswer> for u16 {
-    fn from(answer: &DefaultAnswer) -> u16 {
-        match answer {
-            DefaultAnswer::Answer301 { .. } => 301,
-            DefaultAnswer::Answer400 { .. } => 400,
-            DefaultAnswer::Answer401 { .. } => 401,
-            DefaultAnswer::Answer404 { .. } => 404,
-            DefaultAnswer::Answer408 { .. } => 408,
-            DefaultAnswer::Answer413 { .. } => 413,
-            DefaultAnswer::Answer502 { .. } => 502,
-            DefaultAnswer::Answer503 { .. } => 503,
-            DefaultAnswer::Answer504 { .. } => 504,
-            DefaultAnswer::Answer507 { .. } => 507,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -985,66 +972,68 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
     }
 
     pub fn set_answer(&mut self, answer: DefaultAnswer) {
-        let status = u16::from(&answer);
+        match answer {
+            DefaultAnswer::AnswerCustom { .. } => incr!(
+                "http.custom_asnwers",
+                self.context.cluster_id.as_deref(),
+                self.context.backend_id.as_deref()
+            ),
+            DefaultAnswer::Answer301 { .. } => incr!(
+                "http.301.redirection",
+                self.context.cluster_id.as_deref(),
+                self.context.backend_id.as_deref()
+            ),
+            DefaultAnswer::Answer400 { .. } => incr!("http.400.errors"),
+            DefaultAnswer::Answer401 { .. } => incr!(
+                "http.401.errors",
+                self.context.cluster_id.as_deref(),
+                self.context.backend_id.as_deref()
+            ),
+            DefaultAnswer::Answer404 { .. } => incr!("http.404.errors"),
+            DefaultAnswer::Answer408 { .. } => incr!(
+                "http.408.errors",
+                self.context.cluster_id.as_deref(),
+                self.context.backend_id.as_deref()
+            ),
+            DefaultAnswer::Answer413 { .. } => incr!(
+                "http.413.errors",
+                self.context.cluster_id.as_deref(),
+                self.context.backend_id.as_deref()
+            ),
+            DefaultAnswer::Answer502 { .. } => incr!(
+                "http.502.errors",
+                self.context.cluster_id.as_deref(),
+                self.context.backend_id.as_deref()
+            ),
+            DefaultAnswer::Answer503 { .. } => incr!(
+                "http.503.errors",
+                self.context.cluster_id.as_deref(),
+                self.context.backend_id.as_deref()
+            ),
+            DefaultAnswer::Answer504 { .. } => incr!(
+                "http.504.errors",
+                self.context.cluster_id.as_deref(),
+                self.context.backend_id.as_deref()
+            ),
+            DefaultAnswer::Answer507 { .. } => incr!(
+                "http.507.errors",
+                self.context.cluster_id.as_deref(),
+                self.context.backend_id.as_deref()
+            ),
+        }
+        let (status, mut kawa) = self.answers.borrow().get(
+            answer,
+            self.context.id.to_string(), // TODO: this feels wrong
+            self.context.cluster_id.as_deref(),
+            self.context.backend_id.as_deref(),
+            self.get_route(),
+        );
         if let ResponseStream::DefaultAnswer(old_status, ..) = self.response_stream {
             error!(
                 "already set the default answer to {}, trying to set to {}",
                 old_status, status
             );
-        } else {
-            match answer {
-                DefaultAnswer::Answer301 { .. } => incr!(
-                    "http.301.redirection",
-                    self.context.cluster_id.as_deref(),
-                    self.context.backend_id.as_deref()
-                ),
-                DefaultAnswer::Answer400 { .. } => incr!("http.400.errors"),
-                DefaultAnswer::Answer401 { .. } => incr!(
-                    "http.401.errors",
-                    self.context.cluster_id.as_deref(),
-                    self.context.backend_id.as_deref()
-                ),
-                DefaultAnswer::Answer404 { .. } => incr!("http.404.errors"),
-                DefaultAnswer::Answer408 { .. } => incr!(
-                    "http.408.errors",
-                    self.context.cluster_id.as_deref(),
-                    self.context.backend_id.as_deref()
-                ),
-                DefaultAnswer::Answer413 { .. } => incr!(
-                    "http.413.errors",
-                    self.context.cluster_id.as_deref(),
-                    self.context.backend_id.as_deref()
-                ),
-                DefaultAnswer::Answer502 { .. } => incr!(
-                    "http.502.errors",
-                    self.context.cluster_id.as_deref(),
-                    self.context.backend_id.as_deref()
-                ),
-                DefaultAnswer::Answer503 { .. } => incr!(
-                    "http.503.errors",
-                    self.context.cluster_id.as_deref(),
-                    self.context.backend_id.as_deref()
-                ),
-                DefaultAnswer::Answer504 { .. } => incr!(
-                    "http.504.errors",
-                    self.context.cluster_id.as_deref(),
-                    self.context.backend_id.as_deref()
-                ),
-                DefaultAnswer::Answer507 { .. } => incr!(
-                    "http.507.errors",
-                    self.context.cluster_id.as_deref(),
-                    self.context.backend_id.as_deref()
-                ),
-            };
-        }
-
-        let mut kawa = self.answers.borrow().get(
-            answer,
-            self.context.id.to_string(),
-            self.context.cluster_id.as_deref(),
-            self.context.backend_id.as_deref(),
-            self.get_route(),
-        );
+        };
         kawa.prepare(&mut kawa::h1::BlockConverter);
         self.context.status = Some(status);
         self.context.reason = None;
@@ -1383,6 +1372,13 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                         Err(RetrieveClusterError::Redirected)
                     }
                     RouteDirection::Temporary(_) => todo!(),
+                    RouteDirection::Template(cluster_id, name) => {
+                        let location = format!("{host}{port}{path}");
+                        // TODO: this feels wrong
+                        self.context.cluster_id = cluster_id;
+                        self.set_answer(DefaultAnswer::AnswerCustom { name, location });
+                        Err(RetrieveClusterError::Redirected)
+                    }
                 }
             }
         }
@@ -1464,6 +1460,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
         self.check_circuit_breaker()?;
 
+        // TODO: in case of default answer, should we ensure the backend is closed?
         let cluster_id = self
             .cluster_id_from_request(proxy.clone())
             .map_err(BackendConnectionError::RetrieveClusterError)?;

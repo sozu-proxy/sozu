@@ -106,7 +106,6 @@
 //!     sticky_session: false,
 //!     https_redirect: false,
 //!     load_balancing: LoadBalancingAlgorithms::RoundRobin as i32,
-//!     answer_503: Some("A custom forbidden message".to_string()),
 //!     ..Default::default()
 //! };
 //! ```
@@ -249,7 +248,6 @@
 //!         sticky_session: false,
 //!         https_redirect: false,
 //!         load_balancing: LoadBalancingAlgorithms::RoundRobin as i32,
-//!         answer_503: Some("A custom forbidden message".to_string()),
 //!         ..Default::default()
 //!     };
 //!
@@ -626,8 +624,8 @@ pub enum ListenerError {
     Resolver(CertificateResolverError),
     #[error("failed to parse pem, {0}")]
     PemParse(String),
-    #[error("failed to parse template {0}: {1}")]
-    TemplateParse(u16, TemplateError),
+    #[error("failed to parse template {0:?}: {1}")]
+    TemplateParse(String, TemplateError),
     #[error("failed to build rustls context, {0}")]
     BuildRustls(String),
     #[error("could not activate listener with address {address:?}: {error}")]

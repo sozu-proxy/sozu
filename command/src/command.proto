@@ -129,7 +129,7 @@ message HttpListenerConfig {
     required uint32 request_timeout = 10 [default = 10];
     // wether the listener is actively listening on its socket
     required bool active = 11 [default = false];
-    optional CustomHttpAnswers http_answers = 12;
+    map<string, string> answers = 13;
 }
 
 // details of an HTTPS listener
@@ -161,7 +161,7 @@ message HttpsListenerConfig {
     // The tickets allow the client to resume a session. This protects the client
     // agains session tracking. Defaults to 4.
     required uint64 send_tls13_tickets = 20;
-    optional CustomHttpAnswers http_answers = 21;
+    map<string, string> answers = 22;
 }
 
 // details of an TCP listener
@@ -177,31 +177,6 @@ message TcpListenerConfig {
     required uint32 connect_timeout = 6 [default = 3];
     // wether the listener is actively listening on its socket
     required bool active = 7 [default = false];
-}
-
-// custom HTTP answers, useful for 404, 503 pages
-message CustomHttpAnswers {
-    // MovedPermanently
-    optional string answer_301 = 1;
-    // BadRequest
-    optional string answer_400 = 2;
-    // Unauthorized
-    optional string answer_401 = 3;
-    // NotFound
-    optional string answer_404 = 4;
-    // RequestTimeout
-    optional string answer_408 = 5;
-    // PayloadTooLarge
-    optional string answer_413 = 6;
-    // BadGateway
-    optional string answer_502 = 7;
-    // ServiceUnavailable
-    optional string answer_503 = 8;
-    // GatewayTimeout
-    optional string answer_504 = 9;
-    // InsufficientStorage
-    optional string answer_507 = 10;
-
 }
 
 message ActivateListener {
@@ -239,10 +214,9 @@ message ListenersList {
 
 enum RedirectPolicy {
     FORWARD = 0;
-    FORCE_HTTPS = 1;
-    TEMPORARY = 2;
-    PERMANENT = 3;
-    UNAUTHORIZED = 4;
+    TEMPORARY = 1;
+    PERMANENT = 2;
+    UNAUTHORIZED = 3;
 }
 
 enum RedirectScheme {
@@ -263,9 +237,10 @@ message RequestHttpFrontend {
     map<string, string> tags = 7;
     optional RedirectPolicy redirect = 8;
     optional RedirectScheme redirect_scheme = 9;
-    optional string rewrite_host = 10;
-    optional string rewrite_path = 11;
-    optional uint32 rewrite_port = 12;
+    optional string redirect_template = 10;
+    optional string rewrite_host = 11;
+    optional string rewrite_path = 12;
+    optional uint32 rewrite_port = 13;
 }
 
 message RequestTcpFrontend {
@@ -393,9 +368,9 @@ message Cluster {
     required bool https_redirect = 3;
     optional ProxyProtocolConfig proxy_protocol = 4;
     required LoadBalancingAlgorithms load_balancing = 5 [default = ROUND_ROBIN];
-    optional string answer_503 = 6;
     optional LoadMetric load_metric = 7;
     optional uint32 https_redirect_port = 8;
+    map<string, string> answers = 9;
 }
 
 enum LoadBalancingAlgorithms {

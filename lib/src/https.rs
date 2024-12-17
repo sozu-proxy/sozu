@@ -593,10 +593,9 @@ impl HttpsListener {
             rustls_details: server_config,
             active: false,
             fronts: Router::new(),
-            answers: Rc::new(RefCell::new(
-                HttpAnswers::new(&config.http_answers)
-                    .map_err(|(status, error)| ListenerError::TemplateParse(status, error))?,
-            )),
+            answers: Rc::new(RefCell::new(HttpAnswers::new(&config.answers).map_err(
+                |(status, error)| ListenerError::TemplateParse(status, error),
+            )?)),
             config,
             token,
             tags: BTreeMap::new(),
@@ -966,18 +965,19 @@ impl HttpsProxy {
         &mut self,
         mut cluster: Cluster,
     ) -> Result<Option<ResponseContent>, ProxyError> {
-        if let Some(answer_503) = cluster.answer_503.take() {
+        if !cluster.answers.is_empty() {
             for listener in self.listeners.values() {
                 listener
                     .borrow()
                     .answers
                     .borrow_mut()
-                    .add_custom_answer(&cluster.cluster_id, answer_503.clone())
-                    .map_err(|(status, error)| {
-                        ProxyError::AddCluster(ListenerError::TemplateParse(status, error))
+                    .add_cluster_answers(&cluster.cluster_id, &cluster.answers)
+                    .map_err(|(name, error)| {
+                        ProxyError::AddCluster(ListenerError::TemplateParse(name, error))
                     })?;
             }
         }
+        cluster.answers.clear();
         self.clusters.insert(cluster.cluster_id.clone(), cluster);
         Ok(None)
     }
@@ -992,7 +992,7 @@ impl HttpsProxy {
                 .borrow()
                 .answers
                 .borrow_mut()
-                .remove_custom_answer(cluster_id);
+                .remove_cluster_answers(cluster_id);
         }
 
         Ok(None)
@@ -1473,10 +1473,7 @@ mod tests {
 
     use std::sync::Arc;
 
-    use sozu_command::{
-        config::ListenerBuilder,
-        proto::command::{CustomHttpAnswers, SocketAddress},
-    };
+    use sozu_command::{config::ListenerBuilder, proto::command::SocketAddress};
 
     use crate::router::{pattern_trie::TrieNode, MethodRule, PathRule, Route, Router};
 
@@ -1557,9 +1554,7 @@ mod tests {
             fronts,
             rustls_details,
             resolver,
-            answers: Rc::new(RefCell::new(
-                HttpAnswers::new(&Some(CustomHttpAnswers::default())).unwrap(),
-            )),
+            answers: Rc::new(RefCell::new(HttpAnswers::new(&BTreeMap::new()).unwrap())),
             config: default_config,
             token: Token(0),
             active: true,

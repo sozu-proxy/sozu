@@ -2,6 +2,7 @@ use std::{
     cell::RefCell,
     collections::{hash_map::Entry, BTreeMap, HashMap},
     io::ErrorKind,
+    mem,
     net::{Shutdown, SocketAddr},
     os::unix::io::AsRawFd,
     rc::{Rc, Weak},
@@ -556,18 +557,19 @@ impl HttpProxy {
     }
 
     pub fn add_cluster(&mut self, mut cluster: Cluster) -> Result<(), ProxyError> {
-        if let Some(answer_503) = cluster.answer_503.take() {
+        if !cluster.answers.is_empty() {
             for listener in self.listeners.values() {
                 listener
                     .borrow()
                     .answers
                     .borrow_mut()
-                    .add_custom_answer(&cluster.cluster_id, answer_503.clone())
-                    .map_err(|(status, error)| {
-                        ProxyError::AddCluster(ListenerError::TemplateParse(status, error))
+                    .add_cluster_answers(&cluster.cluster_id, &cluster.answers)
+                    .map_err(|(name, error)| {
+                        ProxyError::AddCluster(ListenerError::TemplateParse(name, error))
                     })?;
             }
         }
+        cluster.answers.clear();
         self.clusters.insert(cluster.cluster_id.clone(), cluster);
         Ok(())
     }
@@ -580,7 +582,7 @@ impl HttpProxy {
                 .borrow()
                 .answers
                 .borrow_mut()
-                .remove_custom_answer(cluster_id);
+                .remove_cluster_answers(cluster_id);
         }
         Ok(())
     }
@@ -688,8 +690,8 @@ impl HttpListener {
             active: false,
             address: config.address.into(),
             answers: Rc::new(RefCell::new(
-                HttpAnswers::new(&config.http_answers)
-                    .map_err(|(status, error)| ListenerError::TemplateParse(status, error))?,
+                HttpAnswers::new(&config.answers)
+                    .map_err(|(name, error)| ListenerError::TemplateParse(name, error))?,
             )),
             config,
             fronts: Router::new(),
@@ -1015,9 +1017,7 @@ mod tests {
 
     use super::testing::start_http_worker;
     use super::*;
-    use sozu_command::proto::command::{
-        CustomHttpAnswers, RedirectPolicy, RedirectScheme, SocketAddress,
-    };
+    use sozu_command::proto::command::{RedirectPolicy, RedirectScheme, SocketAddress};
 
     use crate::sozu_command::{
         channel::Channel,
@@ -1292,6 +1292,7 @@ mod tests {
                 cluster_id: Some(cluster_id1),
                 redirect: RedirectPolicy::Forward,
                 redirect_scheme: RedirectScheme::UseSame,
+                redirect_template: None,
                 rewrite_host: None,
                 rewrite_path: None,
                 rewrite_port: None,
@@ -1308,6 +1309,7 @@ mod tests {
                 cluster_id: Some(cluster_id2),
                 redirect: RedirectPolicy::Forward,
                 redirect_scheme: RedirectScheme::UseSame,
+                redirect_template: None,
                 rewrite_host: None,
                 rewrite_path: None,
                 rewrite_port: None,
@@ -1324,6 +1326,7 @@ mod tests {
                 cluster_id: Some(cluster_id3),
                 redirect: RedirectPolicy::Forward,
                 redirect_scheme: RedirectScheme::UseSame,
+                redirect_template: None,
                 rewrite_host: None,
                 rewrite_path: None,
                 rewrite_port: None,
@@ -1340,6 +1343,7 @@ mod tests {
                 cluster_id: Some("cluster_1".to_owned()),
                 redirect: RedirectPolicy::Forward,
                 redirect_scheme: RedirectScheme::UseSame,
+                redirect_template: None,
                 rewrite_host: None,
                 rewrite_path: None,
                 rewrite_port: None,
@@ -1357,9 +1361,7 @@ mod tests {
             listener: None,
             address: address.into(),
             fronts,
-            answers: Rc::new(RefCell::new(
-                HttpAnswers::new(&Some(CustomHttpAnswers::default())).unwrap(),
-            )),
+            answers: Rc::new(RefCell::new(HttpAnswers::new(&BTreeMap::new()).unwrap())),
             config: default_config,
             token: Token(0),
             active: true,

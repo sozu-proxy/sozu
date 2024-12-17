@@ -13,12 +13,11 @@ use crate::{
         command::{
             filtered_metrics, protobuf_endpoint, request::RequestType,
             response_content::ContentType, AggregatedMetrics, AvailableMetrics, CertificateAndKey,
-            CertificateSummary, CertificatesWithFingerprints, ClusterMetrics, CustomHttpAnswers,
-            Event, EventKind, FilteredMetrics, HttpEndpoint, HttpListenerConfig,
-            HttpsListenerConfig, ListOfCertificatesByAddress, ListedFrontends, ListenersList,
-            ProtobufEndpoint, QueryCertificatesFilters, RequestCounts, Response, ResponseContent,
-            ResponseStatus, RunState, SocketAddress, TlsVersion, WorkerInfos, WorkerMetrics,
-            WorkerResponses,
+            CertificateSummary, CertificatesWithFingerprints, ClusterMetrics, Event, EventKind,
+            FilteredMetrics, HttpEndpoint, HttpListenerConfig, HttpsListenerConfig,
+            ListOfCertificatesByAddress, ListedFrontends, ListenersList, ProtobufEndpoint,
+            QueryCertificatesFilters, RequestCounts, Response, ResponseContent, ResponseStatus,
+            RunState, SocketAddress, TlsVersion, WorkerInfos, WorkerMetrics, WorkerResponses,
         },
         DisplayError,
     },
@@ -1011,8 +1010,8 @@ impl Display for HttpListenerConfig {
         table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
         table.add_row(row!["socket address", format!("{:?}", self.address)]);
         table.add_row(row!["public address", format!("{:?}", self.public_address),]);
-        for http_answer_row in CustomHttpAnswers::to_rows(&self.http_answers) {
-            table.add_row(http_answer_row);
+        for (name, content) in &self.answers {
+            table.add_row(row![format!("answer({name})"), content]);
         }
         table.add_row(row!["expect proxy", self.expect_proxy]);
         table.add_row(row!["sticky name", self.sticky_name]);
@@ -1036,8 +1035,8 @@ impl Display for HttpsListenerConfig {
 
         table.add_row(row!["socket address", format!("{:?}", self.address)]);
         table.add_row(row!["public address", format!("{:?}", self.public_address)]);
-        for http_answer_row in CustomHttpAnswers::to_rows(&self.http_answers) {
-            table.add_row(http_answer_row);
+        for (name, content) in &self.answers {
+            table.add_row(row![format!("answer({name})"), content]);
         }
         table.add_row(row!["versions", tls_versions]);
         table.add_row(row!["cipher list", list_string_vec(&self.cipher_list),]);
@@ -1056,42 +1055,6 @@ impl Display for HttpsListenerConfig {
         table.add_row(row!["request timeout", self.request_timeout]);
         table.add_row(row!["activated", self.active]);
         write!(f, "{}", table)
-    }
-}
-
-impl CustomHttpAnswers {
-    fn to_rows(option: &Option<Self>) -> Vec<Row> {
-        let mut rows = Vec::new();
-        if let Some(answers) = option {
-            if let Some(a) = &answers.answer_301 {
-                rows.push(row!("301", a));
-            }
-            if let Some(a) = &answers.answer_400 {
-                rows.push(row!("400", a));
-            }
-            if let Some(a) = &answers.answer_404 {
-                rows.push(row!("404", a));
-            }
-            if let Some(a) = &answers.answer_408 {
-                rows.push(row!("408", a));
-            }
-            if let Some(a) = &answers.answer_413 {
-                rows.push(row!("413", a));
-            }
-            if let Some(a) = &answers.answer_502 {
-                rows.push(row!("502", a));
-            }
-            if let Some(a) = &answers.answer_503 {
-                rows.push(row!("503", a));
-            }
-            if let Some(a) = &answers.answer_504 {
-                rows.push(row!("504", a));
-            }
-            if let Some(a) = &answers.answer_507 {
-                rows.push(row!("507", a));
-            }
-        }
-        rows
     }
 }
 

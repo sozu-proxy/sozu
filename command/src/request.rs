@@ -163,15 +163,16 @@ impl RequestHttpFrontend {
             position: self.position(),
             redirect: self.redirect(),
             redirect_scheme: self.redirect_scheme(),
+            redirect_template: self.redirect_template,
+            rewrite_host: self.rewrite_host,
+            rewrite_path: self.rewrite_path,
+            rewrite_port: self.rewrite_port.map(|x| x as u16),
             address: self.address.into(),
             cluster_id: self.cluster_id,
             hostname: self.hostname,
             path: self.path,
             method: self.method,
             tags: Some(self.tags),
-            rewrite_host: self.rewrite_host,
-            rewrite_path: self.rewrite_path,
-            rewrite_port: self.rewrite_port.map(|x| x as u16),
         })
     }
 }

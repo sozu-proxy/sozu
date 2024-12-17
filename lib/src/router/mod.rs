@@ -173,6 +173,7 @@ impl Router {
             &path_rule,
             front.redirect,
             front.redirect_scheme,
+            front.redirect_template.clone(),
             front.rewrite_host.clone(),
             front.rewrite_path.clone(),
             front.rewrite_port,
@@ -723,6 +724,7 @@ pub enum RouteDirection {
     Forward(ClusterId),
     Temporary(RedirectScheme),
     Permanent(RedirectScheme),
+    Template(Option<ClusterId>, String),
 }
 
 /// What to do with the traffic
@@ -746,14 +748,18 @@ impl Route {
         path_rule: &PathRule,
         redirect: RedirectPolicy,
         redirect_scheme: RedirectScheme,
+        redirect_template: Option<String>,
         rewrite_host: Option<String>,
         rewrite_path: Option<String>,
         rewrite_port: Option<u16>,
     ) -> Result<Self, RouterError> {
-        let flow = match (cluster_id, redirect) {
-            (Some(cluster_id), RedirectPolicy::Forward) => RouteDirection::Forward(cluster_id),
-            (_, RedirectPolicy::Temporary) => RouteDirection::Temporary(redirect_scheme),
-            (_, RedirectPolicy::Permanent) => RouteDirection::Permanent(redirect_scheme),
+        let flow = match (cluster_id, redirect, redirect_template) {
+            (cluster_id, RedirectPolicy::Forward, Some(template)) => {
+                RouteDirection::Template(cluster_id, template)
+            }
+            (Some(cluster_id), RedirectPolicy::Forward, _) => RouteDirection::Forward(cluster_id),
+            (_, RedirectPolicy::Temporary, _) => RouteDirection::Temporary(redirect_scheme),
+            (_, RedirectPolicy::Permanent, _) => RouteDirection::Permanent(redirect_scheme),
             _ => return Ok(Route::Deny),
         };
         let mut capture_cap_host = match domain_rule {

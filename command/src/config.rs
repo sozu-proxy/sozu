@@ -51,7 +51,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     env, fmt,
     fs::{create_dir_all, metadata, File},
-    io::{ErrorKind, Read},
+    io::ErrorKind,
     net::SocketAddr,
     ops::Range,
     path::PathBuf,
@@ -62,11 +62,11 @@ use crate::{
     logging::AccessLogFormat,
     proto::command::{
         request::RequestType, ActivateListener, AddBackend, AddCertificate, CertificateAndKey,
-        Cluster, CustomHttpAnswers, HttpListenerConfig, HttpsListenerConfig, ListenerType,
-        LoadBalancingAlgorithms, LoadBalancingParams, LoadMetric, MetricsConfiguration, PathRule,
-        ProtobufAccessLogFormat, ProxyProtocolConfig, RedirectPolicy, RedirectScheme, Request,
-        RequestHttpFrontend, RequestTcpFrontend, RulePosition, ServerConfig, ServerMetricsConfig,
-        SocketAddress, TcpListenerConfig, TlsVersion, WorkerRequest,
+        Cluster, HttpListenerConfig, HttpsListenerConfig, ListenerType, LoadBalancingAlgorithms,
+        LoadBalancingParams, LoadMetric, MetricsConfiguration, PathRule, ProtobufAccessLogFormat,
+        ProxyProtocolConfig, RedirectPolicy, RedirectScheme, Request, RequestHttpFrontend,
+        RequestTcpFrontend, RulePosition, ServerConfig, ServerMetricsConfig, SocketAddress,
+        TcpListenerConfig, TlsVersion, WorkerRequest,
     },
     ObjectKind,
 };
@@ -240,16 +240,7 @@ pub struct ListenerBuilder {
     pub address: SocketAddr,
     pub protocol: Option<ListenerProtocol>,
     pub public_address: Option<SocketAddr>,
-    pub answer_301: Option<String>,
-    pub answer_400: Option<String>,
-    pub answer_401: Option<String>,
-    pub answer_404: Option<String>,
-    pub answer_408: Option<String>,
-    pub answer_413: Option<String>,
-    pub answer_502: Option<String>,
-    pub answer_503: Option<String>,
-    pub answer_504: Option<String>,
-    pub answer_507: Option<String>,
+    pub answers: Option<BTreeMap<String, String>>,
     pub tls_versions: Option<Vec<TlsVersion>>,
     pub cipher_list: Option<Vec<String>>,
     pub cipher_suites: Option<Vec<String>>,
@@ -279,6 +270,26 @@ pub fn default_sticky_name() -> String {
     DEFAULT_STICKY_NAME.to_string()
 }
 
+pub fn load_answers(
+    answers: Option<&BTreeMap<String, String>>,
+) -> Result<BTreeMap<String, String>, ConfigError> {
+    if let Some(answers) = answers {
+        answers
+            .iter()
+            .map(|(name, path)| match Config::load_file(path) {
+                Ok(content) => Ok((name.to_owned(), content)),
+                Err(e) => Err((name.to_owned(), path, e)),
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()
+            .map_err(|(name, path, e)| {
+                error!("cannot load answer {:?} at path {:?}: {:?}", name, path, e);
+                e
+            })
+    } else {
+        Ok(BTreeMap::new())
+    }
+}
+
 impl ListenerBuilder {
     /// starts building an HTTP Listener with config values for timeouts,
     /// or defaults if no config is provided
@@ -302,16 +313,7 @@ impl ListenerBuilder {
     fn new(address: SocketAddress, protocol: ListenerProtocol) -> ListenerBuilder {
         ListenerBuilder {
             address: address.into(),
-            answer_301: None,
-            answer_401: None,
-            answer_400: None,
-            answer_404: None,
-            answer_408: None,
-            answer_413: None,
-            answer_502: None,
-            answer_503: None,
-            answer_504: None,
-            answer_507: None,
+            answers: None,
             back_timeout: None,
             certificate_chain: None,
             certificate: None,
@@ -338,23 +340,22 @@ impl ListenerBuilder {
         self
     }
 
-    pub fn with_answer_404_path<S>(&mut self, answer_404_path: Option<S>) -> &mut Self
+    pub fn with_answer<S>(&mut self, name: S, path: Option<String>) -> &mut Self
     where
         S: ToString,
     {
-        if let Some(path) = answer_404_path {
-            self.answer_404 = Some(path.to_string());
+        if let Some(path) = path {
+            self.answers
+                .get_or_insert_with(BTreeMap::new)
+                .insert(name.to_string(), path);
         }
         self
     }
 
-    pub fn with_answer_503_path<S>(&mut self, answer_503_path: Option<S>) -> &mut Self
-    where
-        S: ToString,
-    {
-        if let Some(path) = answer_503_path {
-            self.answer_503 = Some(path.to_string());
-        }
+    pub fn with_answers(&mut self, mut answers: BTreeMap<String, String>) -> &mut Self {
+        self.answers
+            .get_or_insert_with(BTreeMap::new)
+            .append(&mut answers);
         self
     }
 
@@ -429,23 +430,6 @@ impl ListenerBuilder {
         self
     }
 
-    /// Get the custom HTTP answers from the file system using the provided paths
-    fn get_http_answers(&self) -> Result<Option<CustomHttpAnswers>, ConfigError> {
-        let http_answers = CustomHttpAnswers {
-            answer_301: read_http_answer_file(&self.answer_301)?,
-            answer_400: read_http_answer_file(&self.answer_400)?,
-            answer_401: read_http_answer_file(&self.answer_401)?,
-            answer_404: read_http_answer_file(&self.answer_404)?,
-            answer_408: read_http_answer_file(&self.answer_408)?,
-            answer_413: read_http_answer_file(&self.answer_413)?,
-            answer_502: read_http_answer_file(&self.answer_502)?,
-            answer_503: read_http_answer_file(&self.answer_503)?,
-            answer_504: read_http_answer_file(&self.answer_504)?,
-            answer_507: read_http_answer_file(&self.answer_507)?,
-        };
-        Ok(Some(http_answers))
-    }
-
     /// Assign the timeouts of the config to this listener, only if timeouts did not exist
     fn assign_config_timeouts(&mut self, config: &Config) {
         self.front_timeout = Some(self.front_timeout.unwrap_or(config.front_timeout));
@@ -467,8 +451,6 @@ impl ListenerBuilder {
             self.assign_config_timeouts(config);
         }
 
-        let http_answers = self.get_http_answers()?;
-
         let configuration = HttpListenerConfig {
             address: self.address.into(),
             public_address: self.public_address.map(|a| a.into()),
@@ -478,7 +460,7 @@ impl ListenerBuilder {
             back_timeout: self.back_timeout.unwrap_or(DEFAULT_BACK_TIMEOUT),
             connect_timeout: self.connect_timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT),
             request_timeout: self.request_timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT),
-            http_answers,
+            answers: load_answers(self.answers.as_ref())?,
             ..Default::default()
         };
 
@@ -550,8 +532,6 @@ impl ListenerBuilder {
             .map(split_certificate_chain)
             .unwrap_or_default();
 
-        let http_answers = self.get_http_answers()?;
-
         if let Some(config) = config {
             self.assign_config_timeouts(config);
         }
@@ -577,7 +557,7 @@ impl ListenerBuilder {
             send_tls13_tickets: self
                 .send_tls13_tickets
                 .unwrap_or(DEFAULT_SEND_TLS_13_TICKETS),
-            http_answers,
+            answers: load_answers(self.answers.as_ref())?,
         };
 
         Ok(https_listener_config)
@@ -605,28 +585,6 @@ impl ListenerBuilder {
             connect_timeout: self.connect_timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT),
             active: false,
         })
-    }
-}
-
-/// read a custom HTTP answer from a file
-fn read_http_answer_file(path: &Option<String>) -> Result<Option<String>, ConfigError> {
-    match path {
-        Some(path) => {
-            let mut content = String::new();
-            let mut file = File::open(path).map_err(|io_error| ConfigError::FileOpen {
-                path_to_open: path.to_owned(),
-                io_error,
-            })?;
-
-            file.read_to_string(&mut content)
-                .map_err(|io_error| ConfigError::FileRead {
-                    path_to_read: path.to_owned(),
-                    io_error,
-                })?;
-
-            Ok(Some(content))
-        }
-        None => Ok(None),
     }
 }
 
@@ -669,6 +627,7 @@ pub struct FileClusterFrontendConfig {
     pub tags: Option<BTreeMap<String, String>>,
     pub redirect: Option<RedirectPolicy>,
     pub redirect_scheme: Option<RedirectScheme>,
+    pub redirect_template: Option<String>,
     pub rewrite_host: Option<String>,
     pub rewrite_path: Option<String>,
     pub rewrite_port: Option<u16>,
@@ -759,6 +718,7 @@ impl FileClusterFrontendConfig {
             tags: self.tags.clone(),
             redirect: self.redirect,
             redirect_scheme: self.redirect_scheme,
+            redirect_template: self.redirect_template.clone(),
             rewrite_host: self.rewrite_host.clone(),
             rewrite_path: self.rewrite_path.clone(),
             rewrite_port: self.rewrite_port.clone(),
@@ -781,7 +741,7 @@ pub enum FileClusterProtocolConfig {
     Tcp,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileClusterConfig {
     pub frontends: Vec<FileClusterFrontendConfig>,
@@ -794,9 +754,10 @@ pub struct FileClusterConfig {
     pub send_proxy: Option<bool>,
     #[serde(default)]
     pub load_balancing: LoadBalancingAlgorithms,
-    pub answer_503: Option<String>,
     #[serde(default)]
     pub load_metric: Option<LoadMetric>,
+    #[serde(default)]
+    pub answers: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -874,15 +835,6 @@ impl FileClusterConfig {
                     frontends.push(http_frontend);
                 }
 
-                let answer_503 = self.answer_503.as_ref().and_then(|path| {
-                    Config::load_file(path)
-                        .map_err(|e| {
-                            error!("cannot load 503 error page at path '{}': {:?}", path, e);
-                            e
-                        })
-                        .ok()
-                });
-
                 Ok(ClusterConfig::Http(HttpClusterConfig {
                     cluster_id: cluster_id.to_string(),
                     frontends,
@@ -892,7 +844,7 @@ impl FileClusterConfig {
                     https_redirect_port: self.https_redirect_port,
                     load_balancing: self.load_balancing,
                     load_metric: self.load_metric,
-                    answer_503,
+                    answers: load_answers(self.answers.as_ref())?,
                 }))
             }
         }
@@ -916,6 +868,7 @@ pub struct HttpFrontendConfig {
     pub tags: Option<BTreeMap<String, String>>,
     pub redirect: Option<RedirectPolicy>,
     pub redirect_scheme: Option<RedirectScheme>,
+    pub redirect_template: Option<String>,
     pub rewrite_host: Option<String>,
     pub rewrite_path: Option<String>,
     pub rewrite_port: Option<u16>,
@@ -958,6 +911,7 @@ impl HttpFrontendConfig {
                     tags,
                     redirect: self.redirect.map(Into::into),
                     redirect_scheme: self.redirect_scheme.map(Into::into),
+                    redirect_template: self.redirect_template.clone(),
                     rewrite_host: self.rewrite_host.clone(),
                     rewrite_path: self.rewrite_path.clone(),
                     rewrite_port: self.rewrite_port.map(|x| x as u32),
@@ -977,6 +931,7 @@ impl HttpFrontendConfig {
                     tags,
                     redirect: self.redirect.map(Into::into),
                     redirect_scheme: self.redirect_scheme.map(Into::into),
+                    redirect_template: self.redirect_template.clone(),
                     rewrite_host: self.rewrite_host.clone(),
                     rewrite_path: self.rewrite_path.clone(),
                     rewrite_port: self.rewrite_port.map(|x| x as u32),
@@ -989,7 +944,7 @@ impl HttpFrontendConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HttpClusterConfig {
     pub cluster_id: String,
@@ -1000,7 +955,7 @@ pub struct HttpClusterConfig {
     pub https_redirect_port: Option<u16>,
     pub load_balancing: LoadBalancingAlgorithms,
     pub load_metric: Option<LoadMetric>,
-    pub answer_503: Option<String>,
+    pub answers: BTreeMap<String, String>,
 }
 
 impl HttpClusterConfig {
@@ -1012,8 +967,8 @@ impl HttpClusterConfig {
             https_redirect_port: self.https_redirect_port.map(|s| s as u32),
             proxy_protocol: None,
             load_balancing: self.load_balancing as i32,
-            answer_503: self.answer_503.clone(),
             load_metric: self.load_metric.map(|s| s as i32),
+            answers: self.answers.clone(),
         })
         .into()];
 
@@ -1073,7 +1028,7 @@ impl TcpClusterConfig {
             proxy_protocol: self.proxy_protocol.map(|s| s as i32),
             load_balancing: self.load_balancing as i32,
             load_metric: self.load_metric.map(|s| s as i32),
-            answer_503: None,
+            answers: Default::default(),
         })
         .into()];
 
@@ -1112,7 +1067,7 @@ impl TcpClusterConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClusterConfig {
     Http(HttpClusterConfig),
     Tcp(TcpClusterConfig),
@@ -1898,7 +1853,7 @@ mod tests {
             SocketAddress::new_v4(127, 0, 0, 1, 8080),
             ListenerProtocol::Http,
         )
-        .with_answer_404_path(Some("404.html"))
+        .with_answer(404, Some("404.html".to_string()))
         .to_owned();
         println!("http: {:?}", to_string(&http));
 
@@ -1906,7 +1861,7 @@ mod tests {
             SocketAddress::new_v4(127, 0, 0, 1, 8443),
             ListenerProtocol::Https,
         )
-        .with_answer_404_path(Some("404.html"))
+        .with_answer(404, Some("404.html".to_string()))
         .to_owned();
         println!("https: {:?}", to_string(&https));
 
