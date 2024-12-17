@@ -1336,11 +1336,17 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                         .borrow()
                         .clusters()
                         .get(cluster_id)
-                        .map(|cluster| (cluster.https_redirect, Some(8443), None::<()>))
+                        .map(|cluster| {
+                            (
+                                cluster.https_redirect,
+                                cluster.https_redirect_port,
+                                None::<()>,
+                            )
+                        })
                         .unwrap_or((false, None, None));
                     if !is_https && https_redirect {
-                        let port =
-                            https_redirect_port.map_or(String::new(), |port| format!(":{port}"));
+                        let port = https_redirect_port
+                            .map_or(String::new(), |port| format!(":{}", port as u16));
                         self.set_answer(DefaultAnswer::Answer301 {
                             location: format!("https://{host}{port}{path}"),
                         });
