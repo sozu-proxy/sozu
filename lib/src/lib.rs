@@ -106,7 +106,6 @@
 //!     sticky_session: false,
 //!     https_redirect: false,
 //!     load_balancing: LoadBalancingAlgorithms::RoundRobin as i32,
-//!     answer_503: Some("A custom forbidden message".to_string()),
 //!     ..Default::default()
 //! };
 //! ```
@@ -249,7 +248,6 @@
 //!         sticky_session: false,
 //!         https_redirect: false,
 //!         load_balancing: LoadBalancingAlgorithms::RoundRobin as i32,
-//!         answer_503: Some("A custom forbidden message".to_string()),
 //!         ..Default::default()
 //!     };
 //!
@@ -350,7 +348,7 @@ use backends::BackendError;
 use hex::FromHexError;
 use mio::{net::TcpStream, Interest, Token};
 use protocol::http::{answers::TemplateError, parser::Method};
-use router::RouterError;
+use router::{RouteResult, RouterError};
 use socket::ServerBindError;
 use tls::CertificateResolverError;
 
@@ -362,7 +360,7 @@ use sozu_command::{
     AsStr, ObjectKind,
 };
 
-use crate::{backends::BackendMap, router::Route};
+use crate::backends::BackendMap;
 
 /// Anything that can be registered in mio (subscribe to kernel events)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -554,7 +552,7 @@ pub trait L7ListenerHandler {
         host: &str,
         uri: &str,
         method: &Method,
-    ) -> Result<Route, FrontendFromRequestError>;
+    ) -> Result<RouteResult, FrontendFromRequestError>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -602,6 +600,8 @@ pub enum RetrieveClusterError {
     NoPath,
     #[error("unauthorized route")]
     UnauthorizedRoute,
+    #[error("redirected")]
+    Redirected,
     #[error("{0}")]
     RetrieveFrontend(FrontendFromRequestError),
 }
@@ -624,8 +624,8 @@ pub enum ListenerError {
     Resolver(CertificateResolverError),
     #[error("failed to parse pem, {0}")]
     PemParse(String),
-    #[error("failed to parse template {0}: {1}")]
-    TemplateParse(u16, TemplateError),
+    #[error("failed to parse template {0:?}: {1}")]
+    TemplateParse(String, TemplateError),
     #[error("failed to build rustls context, {0}")]
     BuildRustls(String),
     #[error("could not activate listener with address {address:?}: {error}")]

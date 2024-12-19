@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     net::SocketAddr,
     thread,
     time::{Duration, Instant},
@@ -10,7 +11,7 @@ use sozu_command_lib::{
     logging::setup_default_logging,
     proto::command::{
         request::RequestType, ActivateListener, AddCertificate, CertificateAndKey, Cluster,
-        CustomHttpAnswers, ListenerType, RemoveBackend, RequestHttpFrontend, SocketAddress,
+        ListenerType, RemoveBackend, RequestHttpFrontend, SocketAddress,
     },
     scm_socket::Listeners,
     state::ConfigState,
@@ -643,14 +644,12 @@ fn try_http_behaviors() -> State {
     let mut http_config = ListenerBuilder::new_http(front_address.into())
         .to_http(None)
         .unwrap();
-    let http_answers = CustomHttpAnswers {
-        answer_400: Some(immutable_answer(400)),
-        answer_404: Some(immutable_answer(404)),
-        answer_502: Some(immutable_answer(502)),
-        answer_503: Some(immutable_answer(503)),
-        ..Default::default()
-    };
-    http_config.http_answers = Some(http_answers);
+    http_config.answers = BTreeMap::from([
+        ("400".to_string(), immutable_answer(400)),
+        ("404".to_string(), immutable_answer(404)),
+        ("502".to_string(), immutable_answer(502)),
+        ("503".to_string(), immutable_answer(503)),
+    ]);
 
     worker.send_proxy_request_type(RequestType::AddHttpListener(http_config));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
@@ -951,12 +950,10 @@ fn try_https_redirect() -> State {
         .to_http(None)
         .unwrap();
     let answer_301_prefix = "HTTP/1.1 301 Moved Permanently\r\nLocation: ";
-
-    let http_answers = CustomHttpAnswers {
-        answer_301: Some(format!("{answer_301_prefix}%REDIRECT_LOCATION\r\n\r\n")),
-        ..Default::default()
-    };
-    http_config.http_answers = Some(http_answers);
+    http_config.answers = BTreeMap::from([(
+        "301".to_string(),
+        format!("{answer_301_prefix}%REDIRECT_LOCATION\r\n\r\n"),
+    )]);
 
     worker.send_proxy_request_type(RequestType::AddHttpListener(http_config));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {

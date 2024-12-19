@@ -5,7 +5,7 @@ use std::{
     net::{Shutdown, SocketAddr as StdSocketAddr},
     os::unix::io::AsRawFd,
     rc::{Rc, Weak},
-    str::{from_utf8, from_utf8_unchecked},
+    str::from_utf8,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -53,16 +53,12 @@ use crate::{
     pool::Pool,
     protocol::{
         h2::Http2,
-        http::{
-            answers::HttpAnswers,
-            parser::{hostname_and_port, Method},
-            ResponseStream,
-        },
+        http::{answers::HttpAnswers, parser::Method, ResponseStream},
         proxy_protocol::expect::ExpectProxyProtocol,
         rustls::TlsHandshake,
         Http, Pipe, SessionState,
     },
-    router::{Route, Router},
+    router::{RouteResult, Router},
     server::{ListenToken, SessionManager},
     socket::{server_bind, FrontRustls},
     timer::TimeoutContainer,
@@ -567,44 +563,13 @@ impl L7ListenerHandler for HttpsListener {
     fn frontend_from_request(
         &self,
         host: &str,
-        uri: &str,
+        path: &str,
         method: &Method,
-    ) -> Result<Route, FrontendFromRequestError> {
-        let start = Instant::now();
-        let (remaining_input, (hostname, _)) = match hostname_and_port(host.as_bytes()) {
-            Ok(tuple) => tuple,
-            Err(parse_error) => {
-                // parse_error contains a slice of given_host, which should NOT escape this scope
-                return Err(FrontendFromRequestError::HostParse {
-                    host: host.to_owned(),
-                    error: parse_error.to_string(),
-                });
-            }
-        };
-
-        if remaining_input != &b""[..] {
-            return Err(FrontendFromRequestError::InvalidCharsAfterHost(
-                host.to_owned(),
-            ));
-        }
-
-        // it is alright to call from_utf8_unchecked,
-        // we already verified that there are only ascii
-        // chars in there
-        let host = unsafe { from_utf8_unchecked(hostname) };
-
-        let route = self.fronts.lookup(host, uri, method).map_err(|e| {
+    ) -> Result<RouteResult, FrontendFromRequestError> {
+        self.fronts.lookup(host, path, method).map_err(|e| {
             incr!("http.failed_backend_matching");
             FrontendFromRequestError::NoClusterFound(e)
-        })?;
-
-        let now = Instant::now();
-
-        if let Route::ClusterId(cluster) = &route {
-            time!("frontend_matching_time", cluster, (now - start).as_millis());
-        }
-
-        Ok(route)
+        })
     }
 }
 
@@ -624,10 +589,9 @@ impl HttpsListener {
             rustls_details: server_config,
             active: false,
             fronts: Router::new(),
-            answers: Rc::new(RefCell::new(
-                HttpAnswers::new(&config.http_answers)
-                    .map_err(|(status, error)| ListenerError::TemplateParse(status, error))?,
-            )),
+            answers: Rc::new(RefCell::new(HttpAnswers::new(&config.answers).map_err(
+                |(status, error)| ListenerError::TemplateParse(status, error),
+            )?)),
             config,
             token,
             tags: BTreeMap::new(),
@@ -997,18 +961,19 @@ impl HttpsProxy {
         &mut self,
         mut cluster: Cluster,
     ) -> Result<Option<ResponseContent>, ProxyError> {
-        if let Some(answer_503) = cluster.answer_503.take() {
+        if !cluster.answers.is_empty() {
             for listener in self.listeners.values() {
                 listener
                     .borrow()
                     .answers
                     .borrow_mut()
-                    .add_custom_answer(&cluster.cluster_id, answer_503.clone())
-                    .map_err(|(status, error)| {
-                        ProxyError::AddCluster(ListenerError::TemplateParse(status, error))
+                    .add_cluster_answers(&cluster.cluster_id, &cluster.answers)
+                    .map_err(|(name, error)| {
+                        ProxyError::AddCluster(ListenerError::TemplateParse(name, error))
                     })?;
             }
         }
+        cluster.answers.clear();
         self.clusters.insert(cluster.cluster_id.clone(), cluster);
         Ok(None)
     }
@@ -1023,7 +988,7 @@ impl HttpsProxy {
                 .borrow()
                 .answers
                 .borrow_mut()
-                .remove_custom_answer(cluster_id);
+                .remove_cluster_answers(cluster_id);
         }
 
         Ok(None)
@@ -1504,10 +1469,7 @@ mod tests {
 
     use std::sync::Arc;
 
-    use sozu_command::{
-        config::ListenerBuilder,
-        proto::command::{CustomHttpAnswers, SocketAddress},
-    };
+    use sozu_command::{config::ListenerBuilder, proto::command::SocketAddress};
 
     use crate::router::{pattern_trie::TrieNode, MethodRule, PathRule, Route, Router};
 
@@ -1542,25 +1504,25 @@ mod tests {
             "lolcatho.st".as_bytes(),
             &PathRule::Prefix(uri1),
             &MethodRule::new(None),
-            &Route::ClusterId(cluster_id1.clone())
+            &Route::simple(cluster_id1.clone())
         ));
         assert!(fronts.add_tree_rule(
             "lolcatho.st".as_bytes(),
             &PathRule::Prefix(uri2),
             &MethodRule::new(None),
-            &Route::ClusterId(cluster_id2)
+            &Route::simple(cluster_id2)
         ));
         assert!(fronts.add_tree_rule(
             "lolcatho.st".as_bytes(),
             &PathRule::Prefix(uri3),
             &MethodRule::new(None),
-            &Route::ClusterId(cluster_id3)
+            &Route::simple(cluster_id3)
         ));
         assert!(fronts.add_tree_rule(
             "other.domain".as_bytes(),
             &PathRule::Prefix("test".to_string()),
             &MethodRule::new(None),
-            &Route::ClusterId(cluster_id1)
+            &Route::simple(cluster_id1)
         ));
 
         let address = SocketAddress::new_v4(127, 0, 0, 1, 1032);
@@ -1588,9 +1550,7 @@ mod tests {
             fronts,
             rustls_details,
             resolver,
-            answers: Rc::new(RefCell::new(
-                HttpAnswers::new(&Some(CustomHttpAnswers::default())).unwrap(),
-            )),
+            answers: Rc::new(RefCell::new(HttpAnswers::new(&BTreeMap::new()).unwrap())),
             config: default_config,
             token: Token(0),
             active: true,
@@ -1601,25 +1561,25 @@ mod tests {
         let frontend1 = listener.frontend_from_request("lolcatho.st", "/", &Method::Get);
         assert_eq!(
             frontend1.expect("should find a frontend"),
-            Route::ClusterId("cluster_1".to_string())
+            RouteResult::simple("cluster_1".to_string())
         );
         println!("TEST {}", line!());
         let frontend2 = listener.frontend_from_request("lolcatho.st", "/test", &Method::Get);
         assert_eq!(
             frontend2.expect("should find a frontend"),
-            Route::ClusterId("cluster_1".to_string())
+            RouteResult::simple("cluster_1".to_string())
         );
         println!("TEST {}", line!());
         let frontend3 = listener.frontend_from_request("lolcatho.st", "/yolo/test", &Method::Get);
         assert_eq!(
             frontend3.expect("should find a frontend"),
-            Route::ClusterId("cluster_2".to_string())
+            RouteResult::simple("cluster_2".to_string())
         );
         println!("TEST {}", line!());
         let frontend4 = listener.frontend_from_request("lolcatho.st", "/yolo/swag", &Method::Get);
         assert_eq!(
             frontend4.expect("should find a frontend"),
-            Route::ClusterId("cluster_3".to_string())
+            RouteResult::simple("cluster_3".to_string())
         );
         println!("TEST {}", line!());
         let frontend5 = listener.frontend_from_request("domain", "/", &Method::Get);
