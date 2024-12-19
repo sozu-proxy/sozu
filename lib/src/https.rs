@@ -5,7 +5,7 @@ use std::{
     net::{Shutdown, SocketAddr as StdSocketAddr},
     os::unix::io::AsRawFd,
     rc::{Rc, Weak},
-    str::{from_utf8, from_utf8_unchecked},
+    str::from_utf8,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -53,16 +53,12 @@ use crate::{
     pool::Pool,
     protocol::{
         h2::Http2,
-        http::{
-            answers::HttpAnswers,
-            parser::{hostname_and_port, Method},
-            ResponseStream,
-        },
+        http::{answers::HttpAnswers, parser::Method, ResponseStream},
         proxy_protocol::expect::ExpectProxyProtocol,
         rustls::TlsHandshake,
         Http, Pipe, SessionState,
     },
-    router::{RouteDirection, RouteResult, Router},
+    router::{RouteResult, Router},
     server::{ListenToken, SessionManager},
     socket::{server_bind, FrontRustls},
     timer::TimeoutContainer,

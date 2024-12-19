@@ -719,26 +719,19 @@ impl RewriteParts {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RouteDirection {
-    Forward(ClusterId),
-    Temporary(RedirectScheme),
-    Permanent(RedirectScheme),
-    Template(Option<ClusterId>, String),
-}
-
 /// What to do with the traffic
+/// TODO: tags should be moved here
 #[derive(Debug, Clone)]
-pub enum Route {
-    Deny,
-    Flow {
-        direction: RouteDirection,
-        capture_cap_host: usize,
-        capture_cap_path: usize,
-        rewrite_host: Option<RewriteParts>,
-        rewrite_path: Option<RewriteParts>,
-        rewrite_port: Option<u16>,
-    },
+pub struct Route {
+    cluster_id: Option<ClusterId>,
+    redirect: RedirectPolicy,
+    redirect_scheme: RedirectScheme,
+    redirect_template: Option<String>,
+    capture_cap_host: usize,
+    capture_cap_path: usize,
+    rewrite_host: Option<RewriteParts>,
+    rewrite_path: Option<RewriteParts>,
+    rewrite_port: Option<u16>,
 }
 
 impl Route {
@@ -753,14 +746,21 @@ impl Route {
         rewrite_path: Option<String>,
         rewrite_port: Option<u16>,
     ) -> Result<Self, RouterError> {
-        let flow = match (cluster_id, redirect, redirect_template) {
-            (cluster_id, RedirectPolicy::Forward, Some(template)) => {
-                RouteDirection::Template(cluster_id, template)
+        match (&cluster_id, redirect, &redirect_template) {
+            (None, RedirectPolicy::Forward, None) | (_, RedirectPolicy::Unauthorized, _) => {
+                return Ok(Self {
+                    cluster_id,
+                    redirect: RedirectPolicy::Unauthorized,
+                    redirect_scheme,
+                    redirect_template: None,
+                    capture_cap_host: 0,
+                    capture_cap_path: 0,
+                    rewrite_host: None,
+                    rewrite_path: None,
+                    rewrite_port: None,
+                })
             }
-            (Some(cluster_id), RedirectPolicy::Forward, _) => RouteDirection::Forward(cluster_id),
-            (_, RedirectPolicy::Temporary, _) => RouteDirection::Temporary(redirect_scheme),
-            (_, RedirectPolicy::Permanent, _) => RouteDirection::Permanent(redirect_scheme),
-            _ => return Ok(Route::Deny),
+            _ => {}
         };
         let mut capture_cap_host = match domain_rule {
             DomainRule::Any => 1,
@@ -809,8 +809,11 @@ impl Route {
         if used_capture_path == 0 {
             capture_cap_path = 0;
         }
-        Ok(Route::Flow {
-            direction: flow,
+        Ok(Route {
+            cluster_id,
+            redirect,
+            redirect_scheme,
+            redirect_template,
             capture_cap_host,
             capture_cap_path,
             rewrite_host,
@@ -821,8 +824,11 @@ impl Route {
 
     #[cfg(test)]
     pub fn simple(cluster_id: ClusterId) -> Self {
-        Self::Flow {
-            direction: RouteDirection::Forward(cluster_id),
+        Self {
+            cluster_id: Some(cluster_id),
+            redirect: RedirectPolicy::Forward,
+            redirect_scheme: RedirectScheme::UseSame,
+            redirect_template: None,
             capture_cap_host: 0,
             capture_cap_path: 0,
             rewrite_host: None,
@@ -833,62 +839,76 @@ impl Route {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RouteResult {
-    Deny,
-    Flow {
-        direction: RouteDirection,
-        rewritten_host: Option<String>,
-        rewritten_path: Option<String>,
-        rewritten_port: Option<u16>,
-    },
+pub struct RouteResult {
+    pub cluster_id: Option<ClusterId>,
+    pub redirect: RedirectPolicy,
+    pub redirect_scheme: RedirectScheme,
+    pub redirect_template: Option<String>,
+    pub rewritten_host: Option<String>,
+    pub rewritten_path: Option<String>,
+    pub rewritten_port: Option<u16>,
 }
 
 impl RouteResult {
+    fn deny(cluster_id: &Option<ClusterId>) -> Self {
+        Self {
+            cluster_id: cluster_id.clone(),
+            redirect: RedirectPolicy::Unauthorized,
+            redirect_scheme: RedirectScheme::UseSame,
+            redirect_template: None,
+            rewritten_host: None,
+            rewritten_path: None,
+            rewritten_port: None,
+        }
+    }
     fn new<'a>(
         captures_host: Vec<&'a str>,
         path: &'a [u8],
         path_rule: &PathRule,
         route: &Route,
     ) -> Self {
-        match route {
-            Route::Deny => Self::Deny,
-            Route::Flow {
-                direction: flow,
-                capture_cap_path,
-                rewrite_host,
-                rewrite_path,
-                rewrite_port,
-                ..
-            } => {
-                let mut captures_path = Vec::with_capacity(*capture_cap_path);
-                if *capture_cap_path > 0 {
-                    captures_path.push(unsafe { from_utf8_unchecked(path) });
-                    match path_rule {
-                        PathRule::Prefix(prefix) => captures_path
-                            .push(unsafe { from_utf8_unchecked(&path[prefix.len()..]) }),
-                        PathRule::Regex(regex) => captures_path.extend(
-                            regex
-                                .captures(&path)
-                                .unwrap()
-                                .iter()
-                                .map(|c| unsafe { from_utf8_unchecked(c.unwrap().as_bytes()) }),
-                        ),
-                        _ => {}
-                    }
+        let Route {
+            cluster_id,
+            redirect,
+            redirect_scheme,
+            redirect_template,
+            capture_cap_path,
+            rewrite_host,
+            rewrite_path,
+            rewrite_port,
+            ..
+        } = route;
+        let mut captures_path = Vec::with_capacity(*capture_cap_path);
+        if *capture_cap_path > 0 {
+            captures_path.push(unsafe { from_utf8_unchecked(path) });
+            match path_rule {
+                PathRule::Prefix(prefix) => {
+                    captures_path.push(unsafe { from_utf8_unchecked(&path[prefix.len()..]) })
                 }
-                println!("========HOST_CAPTURES: {captures_host:?}");
-                println!("========PATH_CAPTURES: {captures_path:?}");
-                Self::Flow {
-                    direction: flow.clone(),
-                    rewritten_host: rewrite_host
-                        .as_ref()
-                        .map(|rewrite| rewrite.run(&captures_host, &captures_path)),
-                    rewritten_path: rewrite_path
-                        .as_ref()
-                        .map(|rewrite| rewrite.run(&captures_host, &captures_path)),
-                    rewritten_port: *rewrite_port,
-                }
+                PathRule::Regex(regex) => captures_path.extend(
+                    regex
+                        .captures(&path)
+                        .unwrap()
+                        .iter()
+                        .map(|c| unsafe { from_utf8_unchecked(c.unwrap().as_bytes()) }),
+                ),
+                _ => {}
             }
+        }
+        println!("========HOST_CAPTURES: {captures_host:?}");
+        println!("========PATH_CAPTURES: {captures_path:?}");
+        Self {
+            cluster_id: cluster_id.clone(),
+            redirect: *redirect,
+            redirect_scheme: *redirect_scheme,
+            redirect_template: redirect_template.clone(),
+            rewritten_host: rewrite_host
+                .as_ref()
+                .map(|rewrite| rewrite.run(&captures_host, &captures_path)),
+            rewritten_path: rewrite_path
+                .as_ref()
+                .map(|rewrite| rewrite.run(&captures_host, &captures_path)),
+            rewritten_port: *rewrite_port,
         }
     }
     fn new_no_trie<'a>(
@@ -898,32 +918,33 @@ impl RouteResult {
         path_rule: &PathRule,
         route: &Route,
     ) -> Self {
-        match route {
-            Route::Deny => Self::Deny,
-            Route::Flow {
-                capture_cap_host, ..
-            } => {
-                let mut captures_host = Vec::with_capacity(*capture_cap_host);
-                if *capture_cap_host > 0 {
-                    captures_host.push(unsafe { from_utf8_unchecked(domain) });
-                    match domain_rule {
-                        DomainRule::Wildcard(suffix) => captures_host.push(unsafe {
-                            from_utf8_unchecked(&domain[..domain.len() - suffix.len()])
-                        }),
-                        DomainRule::Regex(regex) => captures_host.extend(
-                            regex
-                                .captures(&domain)
-                                .unwrap()
-                                .iter()
-                                .skip(1)
-                                .map(|c| unsafe { from_utf8_unchecked(c.unwrap().as_bytes()) }),
-                        ),
-                        _ => {}
-                    }
-                }
-                Self::new(captures_host, path, path_rule, route)
+        let Route {
+            cluster_id,
+            redirect,
+            capture_cap_host,
+            ..
+        } = route;
+        if *redirect == RedirectPolicy::Unauthorized {
+            return Self::deny(cluster_id);
+        }
+        let mut captures_host = Vec::with_capacity(*capture_cap_host);
+        if *capture_cap_host > 0 {
+            captures_host.push(unsafe { from_utf8_unchecked(domain) });
+            match domain_rule {
+                DomainRule::Wildcard(suffix) => captures_host
+                    .push(unsafe { from_utf8_unchecked(&domain[..domain.len() - suffix.len()]) }),
+                DomainRule::Regex(regex) => captures_host.extend(
+                    regex
+                        .captures(&domain)
+                        .unwrap()
+                        .iter()
+                        .skip(1)
+                        .map(|c| unsafe { from_utf8_unchecked(c.unwrap().as_bytes()) }),
+                ),
+                _ => {}
             }
         }
+        Self::new(captures_host, path, path_rule, route)
     }
     fn new_with_trie<'a>(
         domain: &'a [u8],
@@ -932,39 +953,44 @@ impl RouteResult {
         path_rule: &PathRule,
         route: &Route,
     ) -> Self {
-        match route {
-            Route::Deny => Self::Deny,
-            Route::Flow {
-                capture_cap_host, ..
-            } => {
-                let mut captures_host = Vec::with_capacity(*capture_cap_host);
-                if *capture_cap_host > 0 {
-                    captures_host.push(unsafe { from_utf8_unchecked(domain) });
-                    for submatch in domain_submatches {
-                        match submatch {
-                            TrieSubMatch::Wildcard(part) => {
-                                captures_host.push(unsafe { from_utf8_unchecked(part) })
-                            }
-                            TrieSubMatch::Regexp(part, regex) => captures_host.extend(
-                                regex
-                                    .captures(&part)
-                                    .unwrap()
-                                    .iter()
-                                    .skip(1)
-                                    .map(|c| unsafe { from_utf8_unchecked(c.unwrap().as_bytes()) }),
-                            ),
-                        }
+        let Route {
+            cluster_id,
+            redirect,
+            capture_cap_host,
+            ..
+        } = route;
+        if *redirect == RedirectPolicy::Unauthorized {
+            return Self::deny(cluster_id);
+        }
+        let mut captures_host = Vec::with_capacity(*capture_cap_host);
+        if *capture_cap_host > 0 {
+            captures_host.push(unsafe { from_utf8_unchecked(domain) });
+            for submatch in domain_submatches {
+                match submatch {
+                    TrieSubMatch::Wildcard(part) => {
+                        captures_host.push(unsafe { from_utf8_unchecked(part) })
                     }
+                    TrieSubMatch::Regexp(part, regex) => captures_host.extend(
+                        regex
+                            .captures(&part)
+                            .unwrap()
+                            .iter()
+                            .skip(1)
+                            .map(|c| unsafe { from_utf8_unchecked(c.unwrap().as_bytes()) }),
+                    ),
                 }
-                Self::new(captures_host, path, path_rule, route)
             }
         }
+        Self::new(captures_host, path, path_rule, route)
     }
 
     #[cfg(test)]
     pub fn simple(cluster_id: ClusterId) -> Self {
-        Self::Flow {
-            direction: RouteDirection::Forward(cluster_id),
+        Self {
+            cluster_id: Some(cluster_id),
+            redirect: RedirectPolicy::Forward,
+            redirect_scheme: RedirectScheme::UseSame,
+            redirect_template: None,
             rewritten_host: None,
             rewritten_path: None,
             rewritten_port: None,

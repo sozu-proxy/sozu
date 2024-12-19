@@ -2,11 +2,9 @@ use std::{
     cell::RefCell,
     collections::{hash_map::Entry, BTreeMap, HashMap},
     io::ErrorKind,
-    mem,
     net::{Shutdown, SocketAddr},
     os::unix::io::AsRawFd,
     rc::{Rc, Weak},
-    str::from_utf8_unchecked,
     time::{Duration, Instant},
 };
 
@@ -32,15 +30,11 @@ use crate::{
     backends::BackendMap,
     pool::Pool,
     protocol::{
-        http::{
-            answers::HttpAnswers,
-            parser::{hostname_and_port, Method},
-            ResponseStream,
-        },
+        http::{answers::HttpAnswers, parser::Method, ResponseStream},
         proxy_protocol::expect::ExpectProxyProtocol,
         Http, Pipe, SessionState,
     },
-    router::{RouteDirection, RouteResult, Router},
+    router::{RouteResult, Router},
     server::{ListenToken, SessionManager},
     socket::server_bind,
     timer::TimeoutContainer,
