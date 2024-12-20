@@ -1284,6 +1284,7 @@ mod tests {
                 path: PathRule::prefix(uri1),
                 position: RulePosition::Tree,
                 cluster_id: Some(cluster_id1),
+                required_auth: false,
                 redirect: RedirectPolicy::Forward,
                 redirect_scheme: RedirectScheme::UseSame,
                 redirect_template: None,
@@ -1301,6 +1302,7 @@ mod tests {
                 path: PathRule::prefix(uri2),
                 position: RulePosition::Tree,
                 cluster_id: Some(cluster_id2),
+                required_auth: false,
                 redirect: RedirectPolicy::Forward,
                 redirect_scheme: RedirectScheme::UseSame,
                 redirect_template: None,
@@ -1318,6 +1320,7 @@ mod tests {
                 path: PathRule::prefix(uri3),
                 position: RulePosition::Tree,
                 cluster_id: Some(cluster_id3),
+                required_auth: false,
                 redirect: RedirectPolicy::Forward,
                 redirect_scheme: RedirectScheme::UseSame,
                 redirect_template: None,
@@ -1335,6 +1338,7 @@ mod tests {
                 path: PathRule::prefix("/test".to_owned()),
                 position: RulePosition::Tree,
                 cluster_id: Some("cluster_1".to_owned()),
+                required_auth: false,
                 redirect: RedirectPolicy::Forward,
                 redirect_scheme: RedirectScheme::UseSame,
                 redirect_template: None,
@@ -1369,19 +1373,19 @@ mod tests {
         let frontend5 = listener.frontend_from_request("domain", "/", &Method::Get);
         assert_eq!(
             frontend1.expect("should find frontend"),
-            RouteResult::simple("cluster_1".to_string())
+            RouteResult::forward("cluster_1".to_string())
         );
         assert_eq!(
             frontend2.expect("should find frontend"),
-            RouteResult::simple("cluster_1".to_string())
+            RouteResult::forward("cluster_1".to_string())
         );
         assert_eq!(
             frontend3.expect("should find frontend"),
-            RouteResult::simple("cluster_2".to_string())
+            RouteResult::forward("cluster_2".to_string())
         );
         assert_eq!(
             frontend4.expect("should find frontend"),
-            RouteResult::simple("cluster_3".to_string())
+            RouteResult::forward("cluster_3".to_string())
         );
         assert!(frontend5.is_err());
     }

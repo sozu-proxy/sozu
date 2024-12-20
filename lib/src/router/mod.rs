@@ -171,6 +171,7 @@ impl Router {
             front.cluster_id.clone(),
             &domain_rule,
             &path_rule,
+            front.required_auth,
             front.redirect,
             front.redirect_scheme,
             front.redirect_template.clone(),
@@ -724,6 +725,7 @@ impl RewriteParts {
 #[derive(Debug, Clone)]
 pub struct Route {
     cluster_id: Option<ClusterId>,
+    required_auth: bool,
     redirect: RedirectPolicy,
     redirect_scheme: RedirectScheme,
     redirect_template: Option<String>,
@@ -739,6 +741,7 @@ impl Route {
         cluster_id: Option<ClusterId>,
         domain_rule: &DomainRule,
         path_rule: &PathRule,
+        required_auth: bool,
         redirect: RedirectPolicy,
         redirect_scheme: RedirectScheme,
         redirect_template: Option<String>,
@@ -746,22 +749,39 @@ impl Route {
         rewrite_path: Option<String>,
         rewrite_port: Option<u16>,
     ) -> Result<Self, RouterError> {
-        match (&cluster_id, redirect, &redirect_template) {
-            (None, RedirectPolicy::Forward, None) | (_, RedirectPolicy::Unauthorized, _) => {
-                return Ok(Self {
-                    cluster_id,
-                    redirect: RedirectPolicy::Unauthorized,
-                    redirect_scheme,
-                    redirect_template: None,
-                    capture_cap_host: 0,
-                    capture_cap_path: 0,
-                    rewrite_host: None,
-                    rewrite_path: None,
-                    rewrite_port: None,
-                })
+        let deny = match (&cluster_id, redirect, &redirect_template, required_auth) {
+            (_, RedirectPolicy::Unauthorized, _, false) => true,
+            (_, RedirectPolicy::Unauthorized, _, true) => {
+                warn!("Frontend[cluster: {:?}, domain: {:?}, path: {:?}, redirect: {:?}]: unauthorized frontends ignore auth", cluster_id, domain_rule, path_rule, redirect);
+                true
             }
-            _ => {}
+            (None, RedirectPolicy::Forward, None, _) => {
+                warn!("Frontend[domain: {:?}, path: {:?}]: forward on clusterless frontends are unauthorized", domain_rule, path_rule);
+                true
+            }
+            (None, _, _, true) => {
+                warn!(
+                    "Frontend[domain: {:?}, path: {:?}]: clusterless frontends ignore auth",
+                    domain_rule, path_rule
+                );
+                true
+            }
+            _ => false,
         };
+        if deny {
+            return Ok(Self {
+                cluster_id,
+                required_auth,
+                redirect: RedirectPolicy::Unauthorized,
+                redirect_scheme,
+                redirect_template: None,
+                capture_cap_host: 0,
+                capture_cap_path: 0,
+                rewrite_host: None,
+                rewrite_path: None,
+                rewrite_port: None,
+            });
+        }
         let mut capture_cap_host = match domain_rule {
             DomainRule::Any => 1,
             DomainRule::Equals(_) => 1,
@@ -811,6 +831,7 @@ impl Route {
         }
         Ok(Route {
             cluster_id,
+            required_auth,
             redirect,
             redirect_scheme,
             redirect_template,
@@ -823,9 +844,10 @@ impl Route {
     }
 
     #[cfg(test)]
-    pub fn simple(cluster_id: ClusterId) -> Self {
+    pub fn forward(cluster_id: ClusterId) -> Self {
         Self {
             cluster_id: Some(cluster_id),
+            required_auth: false,
             redirect: RedirectPolicy::Forward,
             redirect_scheme: RedirectScheme::UseSame,
             redirect_template: None,
@@ -841,6 +863,7 @@ impl Route {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteResult {
     pub cluster_id: Option<ClusterId>,
+    pub required_auth: bool,
     pub redirect: RedirectPolicy,
     pub redirect_scheme: RedirectScheme,
     pub redirect_template: Option<String>,
@@ -853,6 +876,7 @@ impl RouteResult {
     fn deny(cluster_id: &Option<ClusterId>) -> Self {
         Self {
             cluster_id: cluster_id.clone(),
+            required_auth: false,
             redirect: RedirectPolicy::Unauthorized,
             redirect_scheme: RedirectScheme::UseSame,
             redirect_template: None,
@@ -861,6 +885,21 @@ impl RouteResult {
             rewritten_port: None,
         }
     }
+
+    #[cfg(test)]
+    pub fn forward(cluster_id: ClusterId) -> Self {
+        Self {
+            cluster_id: Some(cluster_id),
+            required_auth: false,
+            redirect: RedirectPolicy::Forward,
+            redirect_scheme: RedirectScheme::UseSame,
+            redirect_template: None,
+            rewritten_host: None,
+            rewritten_path: None,
+            rewritten_port: None,
+        }
+    }
+
     fn new<'a>(
         captures_host: Vec<&'a str>,
         path: &'a [u8],
@@ -869,6 +908,7 @@ impl RouteResult {
     ) -> Self {
         let Route {
             cluster_id,
+            required_auth,
             redirect,
             redirect_scheme,
             redirect_template,
@@ -899,6 +939,7 @@ impl RouteResult {
         println!("========PATH_CAPTURES: {captures_path:?}");
         Self {
             cluster_id: cluster_id.clone(),
+            required_auth: *required_auth,
             redirect: *redirect,
             redirect_scheme: *redirect_scheme,
             redirect_template: redirect_template.clone(),
@@ -982,19 +1023,6 @@ impl RouteResult {
             }
         }
         Self::new(captures_host, path, path_rule, route)
-    }
-
-    #[cfg(test)]
-    pub fn simple(cluster_id: ClusterId) -> Self {
-        Self {
-            cluster_id: Some(cluster_id),
-            redirect: RedirectPolicy::Forward,
-            redirect_scheme: RedirectScheme::UseSame,
-            redirect_template: None,
-            rewritten_host: None,
-            rewritten_path: None,
-            rewritten_port: None,
-        }
     }
 }
 
@@ -1114,27 +1142,27 @@ mod tests {
             b"*.sozu.io",
             &PathRule::Prefix("".to_string()),
             &MethodRule::new(Some("GET".to_string())),
-            &Route::simple("base".to_string())
+            &Route::forward("base".to_string())
         ));
         println!("{:#?}", router.tree);
         assert_eq!(
             router.lookup("www.sozu.io", "/api", &Method::Get),
-            Ok(RouteResult::simple("base".to_string()))
+            Ok(RouteResult::forward("base".to_string()))
         );
         assert!(router.add_tree_rule(
             b"*.sozu.io",
             &PathRule::Prefix("/api".to_string()),
             &MethodRule::new(Some("GET".to_string())),
-            &Route::simple("api".to_string())
+            &Route::forward("api".to_string())
         ));
         println!("{:#?}", router.tree);
         assert_eq!(
             router.lookup("www.sozu.io", "/ap", &Method::Get),
-            Ok(RouteResult::simple("base".to_string()))
+            Ok(RouteResult::forward("base".to_string()))
         );
         assert_eq!(
             router.lookup("www.sozu.io", "/api", &Method::Get),
-            Ok(RouteResult::simple("api".to_string()))
+            Ok(RouteResult::forward("api".to_string()))
         );
     }
 
@@ -1153,27 +1181,27 @@ mod tests {
             b"*.sozu.io",
             &PathRule::Prefix("".to_string()),
             &MethodRule::new(Some("GET".to_string())),
-            &Route::simple("base".to_string())
+            &Route::forward("base".to_string())
         ));
         println!("{:#?}", router.tree);
         assert_eq!(
             router.lookup("www.sozu.io", "/api", &Method::Get),
-            Ok(RouteResult::simple("base".to_string()))
+            Ok(RouteResult::forward("base".to_string()))
         );
         assert!(router.add_tree_rule(
             b"api.sozu.io",
             &PathRule::Prefix("".to_string()),
             &MethodRule::new(Some("GET".to_string())),
-            &Route::simple("api".to_string())
+            &Route::forward("api".to_string())
         ));
         println!("{:#?}", router.tree);
         assert_eq!(
             router.lookup("www.sozu.io", "/api", &Method::Get),
-            Ok(RouteResult::simple("base".to_string()))
+            Ok(RouteResult::forward("base".to_string()))
         );
         assert_eq!(
             router.lookup("api.sozu.io", "/api", &Method::Get),
-            Ok(RouteResult::simple("api".to_string()))
+            Ok(RouteResult::forward("api".to_string()))
         );
     }
 
@@ -1185,23 +1213,23 @@ mod tests {
             b"www./.*/.io",
             &PathRule::Prefix("".to_string()),
             &MethodRule::new(Some("GET".to_string())),
-            &Route::simple("base".to_string())
+            &Route::forward("base".to_string())
         ));
         println!("{:#?}", router.tree);
         assert!(router.add_tree_rule(
             b"www.doc./.*/.io",
             &PathRule::Prefix("".to_string()),
             &MethodRule::new(Some("GET".to_string())),
-            &Route::simple("doc".to_string())
+            &Route::forward("doc".to_string())
         ));
         println!("{:#?}", router.tree);
         assert_eq!(
             router.lookup("www.sozu.io", "/", &Method::Get),
-            Ok(RouteResult::simple("base".to_string()))
+            Ok(RouteResult::forward("base".to_string()))
         );
         assert_eq!(
             router.lookup("www.doc.sozu.io", "/", &Method::Get),
-            Ok(RouteResult::simple("doc".to_string()))
+            Ok(RouteResult::forward("doc".to_string()))
         );
         assert!(router.remove_tree_rule(
             b"www./.*/.io",
@@ -1212,7 +1240,7 @@ mod tests {
         assert!(router.lookup("www.sozu.io", "/", &Method::Get).is_err());
         assert_eq!(
             router.lookup("www.doc.sozu.io", "/", &Method::Get),
-            Ok(RouteResult::simple("doc".to_string()))
+            Ok(RouteResult::forward("doc".to_string()))
         );
     }
 
@@ -1224,30 +1252,30 @@ mod tests {
             &"*".parse::<DomainRule>().unwrap(),
             &PathRule::Prefix("/.well-known/acme-challenge".to_string()),
             &MethodRule::new(Some("GET".to_string())),
-            &Route::simple("acme".to_string())
+            &Route::forward("acme".to_string())
         ));
         assert!(router.add_tree_rule(
             "www.example.com".as_bytes(),
             &PathRule::Prefix("/".to_string()),
             &MethodRule::new(Some("GET".to_string())),
-            &Route::simple("example".to_string())
+            &Route::forward("example".to_string())
         ));
         assert!(router.add_tree_rule(
             "*.test.example.com".as_bytes(),
             &PathRule::Regex(Regex::new("/hello[A-Z]+/").unwrap()),
             &MethodRule::new(Some("GET".to_string())),
-            &Route::simple("examplewildcard".to_string())
+            &Route::forward("examplewildcard".to_string())
         ));
         assert!(router.add_tree_rule(
             "/test[0-9]/.example.com".as_bytes(),
             &PathRule::Prefix("/".to_string()),
             &MethodRule::new(Some("GET".to_string())),
-            &Route::simple("exampleregex".to_string())
+            &Route::forward("exampleregex".to_string())
         ));
 
         assert_eq!(
             router.lookup("www.example.com", "/helloA", &Method::new(&b"GET"[..])),
-            Ok(RouteResult::simple("example".to_string()))
+            Ok(RouteResult::forward("example".to_string()))
         );
         assert_eq!(
             router.lookup(
@@ -1255,7 +1283,7 @@ mod tests {
                 "/.well-known/acme-challenge",
                 &Method::new(&b"GET"[..])
             ),
-            Ok(RouteResult::simple("acme".to_string()))
+            Ok(RouteResult::forward("acme".to_string()))
         );
         assert!(router
             .lookup("www.test.example.com", "/", &Method::new(&b"GET"[..]))
@@ -1266,11 +1294,11 @@ mod tests {
                 "/helloAB/",
                 &Method::new(&b"GET"[..])
             ),
-            Ok(RouteResult::simple("examplewildcard".to_string()))
+            Ok(RouteResult::forward("examplewildcard".to_string()))
         );
         assert_eq!(
             router.lookup("test1.example.com", "/helloAB/", &Method::new(&b"GET"[..])),
-            Ok(RouteResult::simple("exampleregex".to_string()))
+            Ok(RouteResult::forward("exampleregex".to_string()))
         );
     }
 }

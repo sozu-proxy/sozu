@@ -1,4 +1,5 @@
 use std::{
+    hash::{DefaultHasher, Hash, Hasher},
     net::{IpAddr, SocketAddr},
     str::{from_utf8, from_utf8_unchecked},
 };
@@ -24,7 +25,7 @@ pub struct HttpContext {
     /// the value of the sticky session cookie in the request
     pub sticky_session_found: Option<String>,
     /// position of the last authentication header, only valid until prepare is called
-    pub authentication_found: Option<usize>,
+    pub authentication_found: Option<u64>,
     // ---------- Status Line
     /// the value of the method in the request line
     pub method: Option<Method>,
@@ -137,7 +138,7 @@ impl HttpContext {
         let mut has_x_port = false;
         let mut has_x_proto = false;
         let mut has_connection = false;
-        for (i, block) in request.blocks.iter_mut().enumerate() {
+        for block in &mut request.blocks {
             match block {
                 kawa::Block::Header(header) if !header.is_elided() => {
                     let key = header.key.data(buf);
@@ -185,7 +186,11 @@ impl HttpContext {
                             .and_then(|data| from_utf8(data).ok())
                             .map(ToOwned::to_owned);
                     } else if compare_no_case(key, b"Proxy-Authenticate") {
-                        self.authentication_found = Some(i);
+                        self.authentication_found = header.val.data_opt(buf).map(|auth| {
+                            let mut h = DefaultHasher::new();
+                            auth.hash(&mut h);
+                            h.finish()
+                        });
                     }
                 }
                 _ => {}

@@ -20,7 +20,6 @@ use sozu_command::{
     logging::EndpointRecord,
     proto::command::{Event, EventKind, ListenerType, RedirectPolicy, RedirectScheme},
 };
-// use time::{Duration, Instant};
 
 use crate::{
     backends::{Backend, BackendError},
@@ -116,8 +115,8 @@ pub enum DefaultAnswer {
         duration: String,
     },
     Answer507 {
-        phase: kawa::ParsingPhaseMarker,
         message: String,
+        phase: kawa::ParsingPhaseMarker,
         capacity: usize,
     },
 }
@@ -1024,8 +1023,8 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         }
         let (status, mut kawa) = self.answers.borrow().get(
             answer,
-            self.context.id.to_string(), // TODO: this feels wrong
-            self.context.cluster_id.as_deref(),
+            self.context.id.to_string(),
+            self.context.cluster_id.as_deref(), // TODO: this feels wrong
             self.context.backend_id.as_deref(),
             self.get_route(),
         );
@@ -1298,6 +1297,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
         let RouteResult {
             cluster_id,
+            required_auth,
             redirect,
             redirect_scheme,
             redirect_template,
@@ -1336,52 +1336,72 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             (RedirectScheme::UseHttps, _) | (RedirectScheme::UseSame, true) => "https",
         };
 
-        match (cluster_id, redirect, redirect_template) {
-            (_, RedirectPolicy::Unauthorized, _) | (None, RedirectPolicy::Forward, None) => {
-                self.set_answer(DefaultAnswer::Answer401 {});
-                return Err(RetrieveClusterError::UnauthorizedRoute);
-            }
-            (_, RedirectPolicy::Permanent, _) => {
-                self.set_answer(DefaultAnswer::Answer301 {
-                    location: format!("{proto}://{host}{port}{path}"),
-                });
+        let (authorized, https_redirect, https_redirect_port) =
+            match (&cluster_id, redirect, &redirect_template, required_auth) {
+                // unauthorized frontends
+                (_, RedirectPolicy::Unauthorized, _, _) => (false, false, None),
+                // forward frontends with no target (no cluster nor template)
+                (None, RedirectPolicy::Forward, None, _) => (false, false, None),
+                // clusterless frontend with auth (unsupported)
+                (None, _, _, true) => (false, false, None),
+                // clusterless frontends
+                (None, _, _, false) => (true, false, None),
+                // "attached" frontends
+                (Some(cluster_id), _, _, _) => {
+                    proxy.borrow().clusters().get(cluster_id).map_or(
+                        (false, false, None), // cluster not found, consider unauthorized
+                        |cluster| {
+                            let authorized =
+                                match (required_auth, self.context.authentication_found) {
+                                    // auth not required
+                                    (false, _) => true,
+                                    // no auth found
+                                    (true, None) => false,
+                                    // validation
+                                    (true, Some(hash)) => {
+                                        println!("{hash:?}");
+                                        cluster.authorized_hashes.contains(&hash)
+                                    }
+                                };
+                            (
+                                authorized,
+                                cluster.https_redirect,
+                                cluster.https_redirect_port,
+                            )
+                        },
+                    )
+                }
+            };
+
+        match (cluster_id, redirect, redirect_template, authorized) {
+            (cluster_id, RedirectPolicy::Permanent, _, true) => {
+                let location = format!("{proto}://{host}{port}{path}");
+                self.context.cluster_id = cluster_id;
+                self.set_answer(DefaultAnswer::Answer301 { location });
                 Err(RetrieveClusterError::Redirected)
             }
-            (_, RedirectPolicy::Temporary, _) => todo!(),
-            (cluster_id, RedirectPolicy::Forward, Some(name)) => {
+            (cluster_id, RedirectPolicy::Forward, Some(name), true) => {
                 let location = format!("{proto}://{host}{port}{path}");
-                // TODO: this feels wrong
                 self.context.cluster_id = cluster_id;
                 self.set_answer(DefaultAnswer::AnswerCustom { name, location });
                 Err(RetrieveClusterError::Redirected)
             }
-            (Some(cluster_id), RedirectPolicy::Forward, None) => {
-                let (https_redirect, https_redirect_port, authentication) = proxy
-                    .borrow()
-                    .clusters()
-                    .get(&cluster_id)
-                    .map(|cluster| {
-                        (
-                            cluster.https_redirect,
-                            cluster.https_redirect_port,
-                            None::<()>,
-                        )
-                    })
-                    .unwrap_or((false, None, None));
+            (Some(cluster_id), RedirectPolicy::Forward, None, true) => {
                 if !is_https && https_redirect {
                     let port = rewritten_port
                         .or_else(|| https_redirect_port.map(|port| port as u16))
                         .map_or(String::new(), |port| format!(":{port}"));
-                    self.set_answer(DefaultAnswer::Answer301 {
-                        location: format!("https://{host}{port}{path}"),
-                    });
+                    let location = format!("https://{host}{port}{path}");
+                    self.context.cluster_id = Some(cluster_id);
+                    self.set_answer(DefaultAnswer::Answer301 { location });
                     return Err(RetrieveClusterError::Redirected);
                 }
-                if let Some(authentication) = authentication {
-                    self.set_answer(DefaultAnswer::Answer401 {});
-                    return Err(RetrieveClusterError::UnauthorizedRoute);
-                }
-                return Ok(cluster_id);
+                Ok(cluster_id)
+            }
+            (cluster_id, ..) => {
+                self.context.cluster_id = cluster_id;
+                self.set_answer(DefaultAnswer::Answer401 {});
+                Err(RetrieveClusterError::UnauthorizedRoute)
             }
         }
     }

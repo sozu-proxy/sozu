@@ -214,9 +214,8 @@ message ListenersList {
 
 enum RedirectPolicy {
     FORWARD = 0;
-    TEMPORARY = 1;
-    PERMANENT = 2;
-    UNAUTHORIZED = 3;
+    PERMANENT = 1;
+    UNAUTHORIZED = 2;
 }
 
 enum RedirectScheme {
@@ -236,11 +235,12 @@ message RequestHttpFrontend {
     // custom tags to identify the frontend in the access logs
     map<string, string> tags = 7;
     optional RedirectPolicy redirect = 8;
-    optional RedirectScheme redirect_scheme = 9;
-    optional string redirect_template = 10;
-    optional string rewrite_host = 11;
-    optional string rewrite_path = 12;
-    optional uint32 rewrite_port = 13;
+    optional bool required_auth = 9;
+    optional RedirectScheme redirect_scheme = 10;
+    optional string redirect_template = 11;
+    optional string rewrite_host = 12;
+    optional string rewrite_path = 13;
+    optional uint32 rewrite_port = 14;
 }
 
 message RequestTcpFrontend {
@@ -371,6 +371,7 @@ message Cluster {
     optional LoadMetric load_metric = 7;
     optional uint32 https_redirect_port = 8;
     map<string, string> answers = 9;
+    repeated uint64 authorized_hashes = 10;
 }
 
 enum LoadBalancingAlgorithms {

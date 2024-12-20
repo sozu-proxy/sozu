@@ -161,6 +161,7 @@ impl RequestHttpFrontend {
     pub fn to_frontend(self) -> Result<HttpFrontend, RequestError> {
         Ok(HttpFrontend {
             position: self.position(),
+            required_auth: self.required_auth.unwrap_or(false),
             redirect: self.redirect(),
             redirect_scheme: self.redirect_scheme(),
             redirect_template: self.redirect_template,

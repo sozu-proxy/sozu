@@ -39,6 +39,7 @@ pub struct HttpFrontend {
     #[serde(default)]
     pub position: RulePosition,
     pub tags: Option<BTreeMap<String, String>>,
+    pub required_auth: bool,
     pub redirect: RedirectPolicy,
     pub redirect_scheme: RedirectScheme,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -61,6 +62,7 @@ impl From<HttpFrontend> for RequestHttpFrontend {
             method: val.method,
             position: val.position.into(),
             tags: val.tags.unwrap_or_default(),
+            required_auth: Some(val.required_auth),
             redirect: Some(val.redirect.into()),
             redirect_scheme: Some(val.redirect_scheme.into()),
             redirect_template: val.redirect_template,

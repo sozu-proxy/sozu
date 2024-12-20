@@ -625,6 +625,7 @@ pub struct FileClusterFrontendConfig {
     #[serde(default)]
     pub position: RulePosition,
     pub tags: Option<BTreeMap<String, String>>,
+    pub required_auth: Option<bool>,
     pub redirect: Option<RedirectPolicy>,
     pub redirect_scheme: Option<RedirectScheme>,
     pub redirect_template: Option<String>,
@@ -716,6 +717,7 @@ impl FileClusterFrontendConfig {
             path,
             method: self.method.clone(),
             tags: self.tags.clone(),
+            required_auth: self.required_auth.unwrap_or(false),
             redirect: self.redirect,
             redirect_scheme: self.redirect_scheme,
             redirect_template: self.redirect_template.clone(),
@@ -758,6 +760,8 @@ pub struct FileClusterConfig {
     pub load_metric: Option<LoadMetric>,
     #[serde(default)]
     pub answers: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    pub authorized_hashes: Vec<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -845,6 +849,7 @@ impl FileClusterConfig {
                     load_balancing: self.load_balancing,
                     load_metric: self.load_metric,
                     answers: load_answers(self.answers.as_ref())?,
+                    authorized_hashes: self.authorized_hashes,
                 }))
             }
         }
@@ -866,6 +871,7 @@ pub struct HttpFrontendConfig {
     #[serde(default)]
     pub position: RulePosition,
     pub tags: Option<BTreeMap<String, String>>,
+    pub required_auth: bool,
     pub redirect: Option<RedirectPolicy>,
     pub redirect_scheme: Option<RedirectScheme>,
     pub redirect_template: Option<String>,
@@ -909,6 +915,7 @@ impl HttpFrontendConfig {
                     method: self.method.clone(),
                     position: self.position.into(),
                     tags,
+                    required_auth: Some(self.required_auth),
                     redirect: self.redirect.map(Into::into),
                     redirect_scheme: self.redirect_scheme.map(Into::into),
                     redirect_template: self.redirect_template.clone(),
@@ -929,6 +936,7 @@ impl HttpFrontendConfig {
                     method: self.method.clone(),
                     position: self.position.into(),
                     tags,
+                    required_auth: Some(self.required_auth),
                     redirect: self.redirect.map(Into::into),
                     redirect_scheme: self.redirect_scheme.map(Into::into),
                     redirect_template: self.redirect_template.clone(),
@@ -956,6 +964,7 @@ pub struct HttpClusterConfig {
     pub load_balancing: LoadBalancingAlgorithms,
     pub load_metric: Option<LoadMetric>,
     pub answers: BTreeMap<String, String>,
+    pub authorized_hashes: Vec<u64>,
 }
 
 impl HttpClusterConfig {
@@ -969,6 +978,7 @@ impl HttpClusterConfig {
             load_balancing: self.load_balancing as i32,
             load_metric: self.load_metric.map(|s| s as i32),
             answers: self.answers.clone(),
+            authorized_hashes: self.authorized_hashes.clone(),
         })
         .into()];
 
@@ -1029,6 +1039,7 @@ impl TcpClusterConfig {
             load_balancing: self.load_balancing as i32,
             load_metric: self.load_metric.map(|s| s as i32),
             answers: Default::default(),
+            authorized_hashes: Default::default(),
         })
         .into()];
 
