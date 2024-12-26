@@ -18,7 +18,8 @@ RUN apk add --no-cache llvm-libunwind \
 COPY . /usr/src/sozu
 WORKDIR /usr/src/sozu
 
-RUN cargo vendor --locked
+RUN mkdir .cargo
+RUN cargo vendor --locked >.cargo/config.toml
 RUN cargo build --release --frozen
 
 FROM alpine:$ALPINE_VERSION as bin
@@ -38,8 +39,6 @@ RUN apk update && apk add --no-cache \
 
 COPY --from=builder /usr/src/sozu/target/release/sozu /usr/local/bin/sozu
 COPY os-build/config.toml /etc/sozu/config.toml
-COPY lib/assets/404.html /etc/sozu/html/404.html
-COPY lib/assets/503.html /etc/sozu/html/503.html
 
 ENTRYPOINT ["/usr/local/bin/sozu"]
 CMD ["start", "-c", "/etc/sozu/config.toml"]
