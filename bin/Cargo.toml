@@ -18,6 +18,14 @@ edition = "2021"
 rust-version = "1.80.0"
 include = ["README.md", "Cargo.toml", "src/**/*"]
 
+[lib]
+name = "sozu"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sozu"
+path = "src/main.rs"
+
 [dependencies]
 clap = { version = "^4.5.20", features = ["derive"] }
 jemallocator = { version = "^0.5.4", optional = true }

@@ -84,25 +84,27 @@ pub fn ctl(args: cli::Args) -> Result<(), CtlError> {
         std::process::exit(0);
     }
 
-    let channel = create_channel(&config)?;
-
     let timeout = Duration::from_millis(args.timeout.unwrap_or(config.ctl_command_timeout));
     if !args.json {
         debug!("applying timeout {:?}", timeout);
     }
 
-    let mut command_manager = CommandManager {
-        channel,
-        timeout,
-        config,
-        json: args.json,
-    };
+    let mut command_manager = CommandManager::new(config, timeout, args.json)?;
 
     command_manager.handle_command(args.cmd)
 }
 
 impl CommandManager {
-    fn handle_command(&mut self, command: SubCmd) -> Result<(), CtlError> {
+    pub fn new(config: Config, timeout: Duration, json: bool) -> Result<Self, CtlError> {
+        Ok(Self {
+            channel: create_channel(&config)?,
+            timeout,
+            config,
+            json,
+        })
+    }
+
+    pub fn handle_command(&mut self, command: SubCmd) -> Result<(), CtlError> {
         debug!("Executing command {:?}", command);
         match command {
             SubCmd::Shutdown { hard } => {
