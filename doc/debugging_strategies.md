@@ -10,9 +10,9 @@ It is useful to gather information on the configuration state in a production sy
 Here are some commands you can use to take a snapshot of the current state:
 
 ```bash
-sozu -c /etc/config.toml status > "sozu-status-$(date -Iseconds).txt"
-sozu -c /etc/config.toml query metrics > "sozu-metrics-$(date -Iseconds).txt"
-sozu -c /etc/config.toml query clusters > "sozu-applications-$(date -Iseconds).txt"
+sozu -c /etc/config.toml status"
+sozu -c /etc/config.toml metrics get"
+sozu -c /etc/config.toml clusters list"
 sozu -c /etc/config.toml state save -f "sozu-state-$(date -Iseconds).txt"
 ```
 
@@ -232,13 +232,13 @@ Normal traffic (`sozu.http.requests`) drops while 404 (`sozu.http.404.errors`) a
 Check the configuration state with;
 
 ```bash
-sozu -c /etc/config.toml query clusters
+sozu -c /etc/config.toml clusters list
 ```
 
 And, for the complete configuration for a specific cluster id:
 
 ```bash
-sozu -c /etc/config.toml query clusters -i cluster_id
+sozu -c /etc/config.toml clusters list -i cluster_id
 ```
 
 ### Backend server unavailable
