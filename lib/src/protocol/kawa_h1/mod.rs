@@ -8,17 +8,18 @@ use std::{
     io::ErrorKind,
     net::{Shutdown, SocketAddr},
     rc::{Rc, Weak},
+    str::from_utf8_unchecked,
     time::{Duration, Instant},
 };
 
 use mio::{net::TcpStream, Interest, Token};
+use parser::hostname_and_port;
 use rusty_ulid::Ulid;
 use sozu_command::{
     config::MAX_LOOP_ITERATIONS,
     logging::EndpointRecord,
-    proto::command::{Event, EventKind, ListenerType},
+    proto::command::{Event, EventKind, ListenerType, RedirectPolicy, RedirectScheme},
 };
-// use time::{Duration, Instant};
 
 use crate::{
     backends::{Backend, BackendError},
@@ -34,14 +35,15 @@ use crate::{
         SessionState,
     },
     retry::RetryPolicy,
-    router::Route,
+    router::RouteResult,
     server::{push_event, CONN_RETRIES},
     socket::{stats::socket_rtt, SocketHandler, SocketResult, TransportProtocol},
     sozu_command::{logging::LogContext, ready::Ready},
     timer::TimeoutContainer,
     AcceptError, BackendConnectAction, BackendConnectionError, BackendConnectionStatus,
-    L7ListenerHandler, L7Proxy, ListenerHandler, Protocol, ProxySession, Readiness,
-    RetrieveClusterError, SessionIsToBeClosed, SessionMetrics, SessionResult, StateResult,
+    FrontendFromRequestError, L7ListenerHandler, L7Proxy, ListenerHandler, Protocol, ProxySession,
+    Readiness, RetrieveClusterError, SessionIsToBeClosed, SessionMetrics, SessionResult,
+    StateResult,
 };
 
 /// This macro is defined uniquely in this module to help the tracking of kawa h1
@@ -75,6 +77,10 @@ impl kawa::AsBuffer for Checkout {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DefaultAnswer {
+    AnswerCustom {
+        name: String,
+        location: String,
+    },
     Answer301 {
         location: String,
     },
@@ -109,27 +115,10 @@ pub enum DefaultAnswer {
         duration: String,
     },
     Answer507 {
-        phase: kawa::ParsingPhaseMarker,
         message: String,
+        phase: kawa::ParsingPhaseMarker,
         capacity: usize,
     },
-}
-
-impl From<&DefaultAnswer> for u16 {
-    fn from(answer: &DefaultAnswer) -> u16 {
-        match answer {
-            DefaultAnswer::Answer301 { .. } => 301,
-            DefaultAnswer::Answer400 { .. } => 400,
-            DefaultAnswer::Answer401 { .. } => 401,
-            DefaultAnswer::Answer404 { .. } => 404,
-            DefaultAnswer::Answer408 { .. } => 408,
-            DefaultAnswer::Answer413 { .. } => 413,
-            DefaultAnswer::Answer502 { .. } => 502,
-            DefaultAnswer::Answer503 { .. } => 503,
-            DefaultAnswer::Answer504 { .. } => 504,
-            DefaultAnswer::Answer507 { .. } => 507,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -255,6 +244,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 sticky_name,
                 sticky_session: None,
                 sticky_session_found: None,
+                authentication_found: None,
 
                 method: None,
                 authority: None,
@@ -982,66 +972,68 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
     }
 
     pub fn set_answer(&mut self, answer: DefaultAnswer) {
-        let status = u16::from(&answer);
+        match answer {
+            DefaultAnswer::AnswerCustom { .. } => incr!(
+                "http.custom_asnwers",
+                self.context.cluster_id.as_deref(),
+                self.context.backend_id.as_deref()
+            ),
+            DefaultAnswer::Answer301 { .. } => incr!(
+                "http.301.redirection",
+                self.context.cluster_id.as_deref(),
+                self.context.backend_id.as_deref()
+            ),
+            DefaultAnswer::Answer400 { .. } => incr!("http.400.errors"),
+            DefaultAnswer::Answer401 { .. } => incr!(
+                "http.401.errors",
+                self.context.cluster_id.as_deref(),
+                self.context.backend_id.as_deref()
+            ),
+            DefaultAnswer::Answer404 { .. } => incr!("http.404.errors"),
+            DefaultAnswer::Answer408 { .. } => incr!(
+                "http.408.errors",
+                self.context.cluster_id.as_deref(),
+                self.context.backend_id.as_deref()
+            ),
+            DefaultAnswer::Answer413 { .. } => incr!(
+                "http.413.errors",
+                self.context.cluster_id.as_deref(),
+                self.context.backend_id.as_deref()
+            ),
+            DefaultAnswer::Answer502 { .. } => incr!(
+                "http.502.errors",
+                self.context.cluster_id.as_deref(),
+                self.context.backend_id.as_deref()
+            ),
+            DefaultAnswer::Answer503 { .. } => incr!(
+                "http.503.errors",
+                self.context.cluster_id.as_deref(),
+                self.context.backend_id.as_deref()
+            ),
+            DefaultAnswer::Answer504 { .. } => incr!(
+                "http.504.errors",
+                self.context.cluster_id.as_deref(),
+                self.context.backend_id.as_deref()
+            ),
+            DefaultAnswer::Answer507 { .. } => incr!(
+                "http.507.errors",
+                self.context.cluster_id.as_deref(),
+                self.context.backend_id.as_deref()
+            ),
+        }
+        let (status, mut kawa) = self.answers.borrow().get(
+            answer,
+            self.context.id.to_string(),
+            self.context.cluster_id.as_deref(), // TODO: this feels wrong
+            self.context.backend_id.as_deref(),
+            self.get_route(),
+        );
         if let ResponseStream::DefaultAnswer(old_status, ..) = self.response_stream {
             error!(
                 "already set the default answer to {}, trying to set to {}",
                 old_status, status
             );
-        } else {
-            match answer {
-                DefaultAnswer::Answer301 { .. } => incr!(
-                    "http.301.redirection",
-                    self.context.cluster_id.as_deref(),
-                    self.context.backend_id.as_deref()
-                ),
-                DefaultAnswer::Answer400 { .. } => incr!("http.400.errors"),
-                DefaultAnswer::Answer401 { .. } => incr!(
-                    "http.401.errors",
-                    self.context.cluster_id.as_deref(),
-                    self.context.backend_id.as_deref()
-                ),
-                DefaultAnswer::Answer404 { .. } => incr!("http.404.errors"),
-                DefaultAnswer::Answer408 { .. } => incr!(
-                    "http.408.errors",
-                    self.context.cluster_id.as_deref(),
-                    self.context.backend_id.as_deref()
-                ),
-                DefaultAnswer::Answer413 { .. } => incr!(
-                    "http.413.errors",
-                    self.context.cluster_id.as_deref(),
-                    self.context.backend_id.as_deref()
-                ),
-                DefaultAnswer::Answer502 { .. } => incr!(
-                    "http.502.errors",
-                    self.context.cluster_id.as_deref(),
-                    self.context.backend_id.as_deref()
-                ),
-                DefaultAnswer::Answer503 { .. } => incr!(
-                    "http.503.errors",
-                    self.context.cluster_id.as_deref(),
-                    self.context.backend_id.as_deref()
-                ),
-                DefaultAnswer::Answer504 { .. } => incr!(
-                    "http.504.errors",
-                    self.context.cluster_id.as_deref(),
-                    self.context.backend_id.as_deref()
-                ),
-                DefaultAnswer::Answer507 { .. } => incr!(
-                    "http.507.errors",
-                    self.context.cluster_id.as_deref(),
-                    self.context.backend_id.as_deref()
-                ),
-            };
-        }
-
-        let mut kawa = self.answers.borrow().get(
-            answer,
-            self.context.id.to_string(),
-            self.context.cluster_id.as_deref(),
-            self.context.backend_id.as_deref(),
-            self.get_route(),
-        );
+        };
         kawa.prepare(&mut kawa::h1::BlockConverter);
         self.context.status = Some(status);
         self.context.reason = None;
@@ -1252,12 +1244,12 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         &mut self,
         proxy: Rc<RefCell<dyn L7Proxy>>,
     ) -> Result<String, RetrieveClusterError> {
-        let (host, uri, method) = match self.extract_route() {
+        let (host, path, method) = match self.extract_route() {
             Ok(tuple) => tuple,
             Err(cluster_error) => {
                 self.set_answer(DefaultAnswer::Answer400 {
                     message: "Could not extract the route after connection started, this should not happen.".into(),
-                    phase: self.request_stream.parsing_phase.marker(),
+                    phase: kawa::ParsingPhaseMarker::StatusLine,
                     successfully_parsed: "null".into(),
                     partially_parsed: "null".into(),
                     invalid: "null".into(),
@@ -1266,12 +1258,53 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             }
         };
 
+        let (host, port) = match hostname_and_port(host.as_bytes()) {
+            Ok((b"", (hostname, port))) => (unsafe { from_utf8_unchecked(hostname) }, port),
+            Ok(_) => {
+                let host = host.to_owned();
+                self.set_answer(DefaultAnswer::Answer400 {
+                    message: "Invalid characters after hostname, this should not happen.".into(),
+                    phase: kawa::ParsingPhaseMarker::StatusLine,
+                    successfully_parsed: "null".into(),
+                    partially_parsed: "null".into(),
+                    invalid: "null".into(),
+                });
+                return Err(RetrieveClusterError::RetrieveFrontend(
+                    FrontendFromRequestError::InvalidCharsAfterHost(host),
+                ));
+            }
+            Err(parse_error) => {
+                let host = host.to_owned();
+                let error = parse_error.to_string();
+                self.set_answer(DefaultAnswer::Answer400 {
+                    message: "Could not parse port from hostname, this should not happen.".into(),
+                    phase: kawa::ParsingPhaseMarker::StatusLine,
+                    successfully_parsed: "null".into(),
+                    partially_parsed: "null".into(),
+                    invalid: "null".into(),
+                });
+                return Err(RetrieveClusterError::RetrieveFrontend(
+                    FrontendFromRequestError::HostParse { host, error },
+                ));
+            }
+        };
+
+        let start = Instant::now();
         let route_result = self
             .listener
             .borrow()
-            .frontend_from_request(host, uri, method);
+            .frontend_from_request(host, path, method);
 
-        let route = match route_result {
+        let RouteResult {
+            cluster_id,
+            required_auth,
+            redirect,
+            redirect_scheme,
+            redirect_template,
+            rewritten_host,
+            rewritten_path,
+            rewritten_port,
+        } = match route_result {
             Ok(route) => route,
             Err(frontend_error) => {
                 self.set_answer(DefaultAnswer::Answer404 {});
@@ -1279,30 +1312,98 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             }
         };
 
-        let cluster_id = match route {
-            Route::ClusterId(cluster_id) => cluster_id,
-            Route::Deny => {
-                self.set_answer(DefaultAnswer::Answer401 {});
-                return Err(RetrieveClusterError::UnauthorizedRoute);
-            }
-        };
-
-        let frontend_should_redirect_https = matches!(proxy.borrow().kind(), ListenerType::Http)
-            && proxy
-                .borrow()
-                .clusters()
-                .get(&cluster_id)
-                .map(|cluster| cluster.https_redirect)
-                .unwrap_or(false);
-
-        if frontend_should_redirect_https {
-            self.set_answer(DefaultAnswer::Answer301 {
-                location: format!("https://{host}{uri}"),
-            });
-            return Err(RetrieveClusterError::UnauthorizedRoute);
+        if let Some(cluster_id) = &cluster_id {
+            time!(
+                "frontend_matching_time",
+                cluster_id,
+                start.elapsed().as_millis()
+            );
         }
 
-        Ok(cluster_id)
+        let host = rewritten_host.as_deref().unwrap_or(host);
+        let path = rewritten_path.as_deref().unwrap_or(path);
+        let port = rewritten_port.map_or_else(
+            || {
+                port.map_or(String::new(), |port| {
+                    format!(":{}", unsafe { from_utf8_unchecked(port) })
+                })
+            },
+            |port| format!(":{port}"),
+        );
+        let is_https = matches!(proxy.borrow().kind(), ListenerType::Https);
+        let proto = match (redirect_scheme, is_https) {
+            (RedirectScheme::UseHttp, _) | (RedirectScheme::UseSame, false) => "http",
+            (RedirectScheme::UseHttps, _) | (RedirectScheme::UseSame, true) => "https",
+        };
+
+        let (authorized, https_redirect, https_redirect_port) =
+            match (&cluster_id, redirect, &redirect_template, required_auth) {
+                // unauthorized frontends
+                (_, RedirectPolicy::Unauthorized, _, _) => (false, false, None),
+                // forward frontends with no target (no cluster nor template)
+                (None, RedirectPolicy::Forward, None, _) => (false, false, None),
+                // clusterless frontend with auth (unsupported)
+                (None, _, _, true) => (false, false, None),
+                // clusterless frontends
+                (None, _, _, false) => (true, false, None),
+                // "attached" frontends
+                (Some(cluster_id), _, _, _) => {
+                    proxy.borrow().clusters().get(cluster_id).map_or(
+                        (false, false, None), // cluster not found, consider unauthorized
+                        |cluster| {
+                            let authorized =
+                                match (required_auth, self.context.authentication_found) {
+                                    // auth not required
+                                    (false, _) => true,
+                                    // no auth found
+                                    (true, None) => false,
+                                    // validation
+                                    (true, Some(hash)) => {
+                                        println!("{hash:?}");
+                                        cluster.authorized_hashes.contains(&hash)
+                                    }
+                                };
+                            (
+                                authorized,
+                                cluster.https_redirect,
+                                cluster.https_redirect_port,
+                            )
+                        },
+                    )
+                }
+            };
+
+        match (cluster_id, redirect, redirect_template, authorized) {
+            (cluster_id, RedirectPolicy::Permanent, _, true) => {
+                let location = format!("{proto}://{host}{port}{path}");
+                self.context.cluster_id = cluster_id;
+                self.set_answer(DefaultAnswer::Answer301 { location });
+                Err(RetrieveClusterError::Redirected)
+            }
+            (cluster_id, RedirectPolicy::Forward, Some(name), true) => {
+                let location = format!("{proto}://{host}{port}{path}");
+                self.context.cluster_id = cluster_id;
+                self.set_answer(DefaultAnswer::AnswerCustom { name, location });
+                Err(RetrieveClusterError::Redirected)
+            }
+            (Some(cluster_id), RedirectPolicy::Forward, None, true) => {
+                if !is_https && https_redirect {
+                    let port = rewritten_port
+                        .or_else(|| https_redirect_port.map(|port| port as u16))
+                        .map_or(String::new(), |port| format!(":{port}"));
+                    let location = format!("https://{host}{port}{path}");
+                    self.context.cluster_id = Some(cluster_id);
+                    self.set_answer(DefaultAnswer::Answer301 { location });
+                    return Err(RetrieveClusterError::Redirected);
+                }
+                Ok(cluster_id)
+            }
+            (cluster_id, ..) => {
+                self.context.cluster_id = cluster_id;
+                self.set_answer(DefaultAnswer::Answer401 {});
+                Err(RetrieveClusterError::UnauthorizedRoute)
+            }
+        }
     }
 
     pub fn backend_from_request(
@@ -1381,6 +1482,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
         self.check_circuit_breaker()?;
 
+        // TODO: in case of default answer, should we ensure the backend is closed?
         let cluster_id = self
             .cluster_id_from_request(proxy.clone())
             .map_err(BackendConnectionError::RetrieveClusterError)?;
@@ -1591,7 +1693,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         }
     }
 
-    pub fn backend_hup(&mut self, metrics: &mut SessionMetrics) -> StateResult {
+    pub fn backend_hup(&mut self, _metrics: &mut SessionMetrics) -> StateResult {
         let response_stream = match &mut self.response_stream {
             ResponseStream::BackendAnswer(response_stream) => response_stream,
             _ => return StateResult::CloseBackend,

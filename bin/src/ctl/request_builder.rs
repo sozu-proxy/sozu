@@ -250,6 +250,13 @@ impl CommandManager {
                         Some(tags) => tags,
                         None => BTreeMap::new(),
                     },
+                    required_auth: todo!(),
+                    redirect: todo!(),
+                    redirect_scheme: todo!(),
+                    redirect_template: todo!(),
+                    rewrite_host: todo!(),
+                    rewrite_path: todo!(),
+                    rewrite_port: todo!(),
                 })
                 .into(),
             ),
@@ -298,6 +305,13 @@ impl CommandManager {
                         Some(tags) => tags,
                         None => BTreeMap::new(),
                     },
+                    required_auth: todo!(),
+                    redirect: todo!(),
+                    redirect_scheme: todo!(),
+                    redirect_template: todo!(),
+                    rewrite_host: todo!(),
+                    rewrite_path: todo!(),
+                    rewrite_port: todo!(),
                 })
                 .into(),
             ),
@@ -341,8 +355,8 @@ impl CommandManager {
             } => {
                 let https_listener = ListenerBuilder::new_https(address.into())
                     .with_public_address(public_address)
-                    .with_answer_404_path(answer_404)
-                    .with_answer_503_path(answer_503)
+                    .with_answer("404", answer_404)
+                    .with_answer("503", answer_503)
                     .with_tls_versions(tls_versions)
                     .with_cipher_list(cipher_list)
                     .with_expect_proxy(expect_proxy)
@@ -384,8 +398,8 @@ impl CommandManager {
             } => {
                 let http_listener = ListenerBuilder::new_http(address.into())
                     .with_public_address(public_address)
-                    .with_answer_404_path(answer_404)
-                    .with_answer_503_path(answer_503)
+                    .with_answer("404", answer_404)
+                    .with_answer("503", answer_503)
                     .with_expect_proxy(expect_proxy)
                     .with_sticky_name(sticky_name)
                     .with_front_timeout(front_timeout)

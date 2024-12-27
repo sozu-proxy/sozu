@@ -1,4 +1,5 @@
 use std::{
+    hash::{DefaultHasher, Hash, Hasher},
     net::{IpAddr, SocketAddr},
     str::{from_utf8, from_utf8_unchecked},
 };
@@ -23,6 +24,8 @@ pub struct HttpContext {
     pub keep_alive_frontend: bool,
     /// the value of the sticky session cookie in the request
     pub sticky_session_found: Option<String>,
+    /// position of the last authentication header, only valid until prepare is called
+    pub authentication_found: Option<u64>,
     // ---------- Status Line
     /// the value of the method in the request line
     pub method: Option<Method>,
@@ -117,7 +120,7 @@ impl HttpContext {
             let key = cookie.key.data(buf);
             if key == self.sticky_name.as_bytes() {
                 let val = cookie.val.data(buf);
-                self.sticky_session_found = from_utf8(val).ok().map(|val| val.to_string());
+                self.sticky_session_found = from_utf8(val).ok().map(ToOwned::to_owned);
                 cookie.elide();
             }
         }
@@ -182,6 +185,12 @@ impl HttpContext {
                             .data_opt(buf)
                             .and_then(|data| from_utf8(data).ok())
                             .map(ToOwned::to_owned);
+                    } else if compare_no_case(key, b"Proxy-Authenticate") {
+                        self.authentication_found = header.val.data_opt(buf).map(|auth| {
+                            let mut h = DefaultHasher::new();
+                            auth.hash(&mut h);
+                            h.finish()
+                        });
                     }
                 }
                 _ => {}

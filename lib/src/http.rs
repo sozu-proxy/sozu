@@ -5,7 +5,6 @@ use std::{
     net::{Shutdown, SocketAddr},
     os::unix::io::AsRawFd,
     rc::{Rc, Weak},
-    str::from_utf8_unchecked,
     time::{Duration, Instant},
 };
 
@@ -31,15 +30,11 @@ use crate::{
     backends::BackendMap,
     pool::Pool,
     protocol::{
-        http::{
-            answers::HttpAnswers,
-            parser::{hostname_and_port, Method},
-            ResponseStream,
-        },
+        http::{answers::HttpAnswers, parser::Method, ResponseStream},
         proxy_protocol::expect::ExpectProxyProtocol,
         Http, Pipe, SessionState,
     },
-    router::{Route, Router},
+    router::{RouteResult, Router},
     server::{ListenToken, SessionManager},
     socket::server_bind,
     timer::TimeoutContainer,
@@ -430,53 +425,16 @@ impl L7ListenerHandler for HttpListener {
         self.config.connect_timeout
     }
 
-    // redundant, already called once in extract_route
     fn frontend_from_request(
         &self,
         host: &str,
-        uri: &str,
+        path: &str,
         method: &Method,
-    ) -> Result<Route, FrontendFromRequestError> {
-        let start = Instant::now();
-        let (remaining_input, (hostname, _)) = match hostname_and_port(host.as_bytes()) {
-            Ok(tuple) => tuple,
-            Err(parse_error) => {
-                // parse_error contains a slice of given_host, which should NOT escape this scope
-                return Err(FrontendFromRequestError::HostParse {
-                    host: host.to_owned(),
-                    error: parse_error.to_string(),
-                });
-            }
-        };
-        if remaining_input != &b""[..] {
-            return Err(FrontendFromRequestError::InvalidCharsAfterHost(
-                host.to_owned(),
-            ));
-        }
-
-        /*if port == Some(&b"80"[..]) {
-        // it is alright to call from_utf8_unchecked,
-        // we already verified that there are only ascii
-        // chars in there
-          unsafe { from_utf8_unchecked(hostname) }
-        } else {
-          host
-        }
-        */
-        let host = unsafe { from_utf8_unchecked(hostname) };
-
-        let route = self.fronts.lookup(host, uri, method).map_err(|e| {
+    ) -> Result<RouteResult, FrontendFromRequestError> {
+        self.fronts.lookup(host, path, method).map_err(|e| {
             incr!("http.failed_backend_matching");
             FrontendFromRequestError::NoClusterFound(e)
-        })?;
-
-        let now = Instant::now();
-
-        if let Route::ClusterId(cluster) = &route {
-            time!("frontend_matching_time", cluster, (now - start).as_millis());
-        }
-
-        Ok(route)
+        })
     }
 }
 
@@ -593,18 +551,19 @@ impl HttpProxy {
     }
 
     pub fn add_cluster(&mut self, mut cluster: Cluster) -> Result<(), ProxyError> {
-        if let Some(answer_503) = cluster.answer_503.take() {
+        if !cluster.answers.is_empty() {
             for listener in self.listeners.values() {
                 listener
                     .borrow()
                     .answers
                     .borrow_mut()
-                    .add_custom_answer(&cluster.cluster_id, answer_503.clone())
-                    .map_err(|(status, error)| {
-                        ProxyError::AddCluster(ListenerError::TemplateParse(status, error))
+                    .add_cluster_answers(&cluster.cluster_id, &cluster.answers)
+                    .map_err(|(name, error)| {
+                        ProxyError::AddCluster(ListenerError::TemplateParse(name, error))
                     })?;
             }
         }
+        cluster.answers.clear();
         self.clusters.insert(cluster.cluster_id.clone(), cluster);
         Ok(())
     }
@@ -617,7 +576,7 @@ impl HttpProxy {
                 .borrow()
                 .answers
                 .borrow_mut()
-                .remove_custom_answer(cluster_id);
+                .remove_cluster_answers(cluster_id);
         }
         Ok(())
     }
@@ -725,8 +684,8 @@ impl HttpListener {
             active: false,
             address: config.address.into(),
             answers: Rc::new(RefCell::new(
-                HttpAnswers::new(&config.http_answers)
-                    .map_err(|(status, error)| ListenerError::TemplateParse(status, error))?,
+                HttpAnswers::new(&config.answers)
+                    .map_err(|(name, error)| ListenerError::TemplateParse(name, error))?,
             )),
             config,
             fronts: Router::new(),
@@ -1052,7 +1011,7 @@ mod tests {
 
     use super::testing::start_http_worker;
     use super::*;
-    use sozu_command::proto::command::{CustomHttpAnswers, SocketAddress};
+    use sozu_command::proto::command::{RedirectPolicy, RedirectScheme, SocketAddress};
 
     use crate::sozu_command::{
         channel::Channel,
@@ -1325,6 +1284,13 @@ mod tests {
                 path: PathRule::prefix(uri1),
                 position: RulePosition::Tree,
                 cluster_id: Some(cluster_id1),
+                required_auth: false,
+                redirect: RedirectPolicy::Forward,
+                redirect_scheme: RedirectScheme::UseSame,
+                redirect_template: None,
+                rewrite_host: None,
+                rewrite_path: None,
+                rewrite_port: None,
                 tags: None,
             })
             .expect("Could not add http frontend");
@@ -1336,6 +1302,13 @@ mod tests {
                 path: PathRule::prefix(uri2),
                 position: RulePosition::Tree,
                 cluster_id: Some(cluster_id2),
+                required_auth: false,
+                redirect: RedirectPolicy::Forward,
+                redirect_scheme: RedirectScheme::UseSame,
+                redirect_template: None,
+                rewrite_host: None,
+                rewrite_path: None,
+                rewrite_port: None,
                 tags: None,
             })
             .expect("Could not add http frontend");
@@ -1347,6 +1320,13 @@ mod tests {
                 path: PathRule::prefix(uri3),
                 position: RulePosition::Tree,
                 cluster_id: Some(cluster_id3),
+                required_auth: false,
+                redirect: RedirectPolicy::Forward,
+                redirect_scheme: RedirectScheme::UseSame,
+                redirect_template: None,
+                rewrite_host: None,
+                rewrite_path: None,
+                rewrite_port: None,
                 tags: None,
             })
             .expect("Could not add http frontend");
@@ -1358,6 +1338,13 @@ mod tests {
                 path: PathRule::prefix("/test".to_owned()),
                 position: RulePosition::Tree,
                 cluster_id: Some("cluster_1".to_owned()),
+                required_auth: false,
+                redirect: RedirectPolicy::Forward,
+                redirect_scheme: RedirectScheme::UseSame,
+                redirect_template: None,
+                rewrite_host: None,
+                rewrite_path: None,
+                rewrite_port: None,
                 tags: None,
             })
             .expect("Could not add http frontend");
@@ -1372,9 +1359,7 @@ mod tests {
             listener: None,
             address: address.into(),
             fronts,
-            answers: Rc::new(RefCell::new(
-                HttpAnswers::new(&Some(CustomHttpAnswers::default())).unwrap(),
-            )),
+            answers: Rc::new(RefCell::new(HttpAnswers::new(&BTreeMap::new()).unwrap())),
             config: default_config,
             token: Token(0),
             active: true,
@@ -1388,19 +1373,19 @@ mod tests {
         let frontend5 = listener.frontend_from_request("domain", "/", &Method::Get);
         assert_eq!(
             frontend1.expect("should find frontend"),
-            Route::ClusterId("cluster_1".to_string())
+            RouteResult::forward("cluster_1".to_string())
         );
         assert_eq!(
             frontend2.expect("should find frontend"),
-            Route::ClusterId("cluster_1".to_string())
+            RouteResult::forward("cluster_1".to_string())
         );
         assert_eq!(
             frontend3.expect("should find frontend"),
-            Route::ClusterId("cluster_2".to_string())
+            RouteResult::forward("cluster_2".to_string())
         );
         assert_eq!(
             frontend4.expect("should find frontend"),
-            Route::ClusterId("cluster_3".to_string())
+            RouteResult::forward("cluster_3".to_string())
         );
         assert!(frontend5.is_err());
     }
