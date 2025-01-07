@@ -4,6 +4,92 @@
 
 See milestone [`v1.1.0`](https://github.com/sozu-proxy/sozu/projects/3?card_filter_query=milestone%3Av1.1.0)
 
+## 1.0.6 - 2024-12-05
+
+### 🌟 Features
+
+- We add new variables to inject on 400 and 502 errors, see [`07c7ec0`](https://github.com/sozu-proxy/sozu/commit/07c7ec0c6f27b4b423372612bed09e1ad12ac0b7).
+
+### ⛑️ Fixed
+
+- We fix the reset of the timeout on tcp backend connection, see [`9c432f3`](https://github.com/sozu-proxy/sozu/commit/9c432f3b3b25b10dbe51040b140b7477ba4dba6c).
+- We properly executre the close negociation on tls connection when the connection is ending by Sōzu, see [`2b19805`](https://github.com/sozu-proxy/sozu/commit/2b19805ef7a61b6e94be5f662f126632451902b5).
+
+### Changelog
+
+#### 🌟 Features
+
+- [ [`07c7ec0`](https://github.com/sozu-proxy/sozu/commit/07c7ec0c6f27b4b423372612bed09e1ad12ac0b7) ] Refine granularity of 400 and 502 error diagnostics [`Eloi DEMOLIS`] (`2024-11-07`)
+
+#### ⛑️ Fixed
+
+- [ [`9c432f3`](https://github.com/sozu-proxy/sozu/commit/9c432f3b3b25b10dbe51040b140b7477ba4dba6c) ] Fix TCP back timeout errors on reset [`Eloi DEMOLIS`] (`2024-11-19`)
+- [ [`2b19805`](https://github.com/sozu-proxy/sozu/commit/2b19805ef7a61b6e94be5f662f126632451902b5) ] Fix TLS close initiated by Sozu, solution is not ideal [`Eloi DEMOLIS`] (`2024-11-25`)
+
+#### ✍️ Changed
+
+- [ [`8162e99`](https://github.com/sozu-proxy/sozu/commit/8162e99c2e984cb616b6a9f9ec3cbf2fa69e2e86) ] apply clippy suggestions [`Emmanuel Bosquet`] (`2024-11-07`)
+- [ [`863dc9b`](https://github.com/sozu-proxy/sozu/commit/863dc9bfcf644d74fcf8f8d21679a23c49883710) ] bump dependencies for 1.0.6 [`Emmanuel Bosquet`] (`2024-11-20`)
+
+### 🥹 Contributors
+
+- @keksoj
+- @FlorentinDUBOIS
+- @Wonshtrum
+
+**Full Changelog**: https://github.com/sozu-proxy/sozu/compare/1.0.5...1.0.6
+
+## 1.0.5 - 2024-11-14
+
+> This changelog entry contains change from the version `1.0.3` to `1.0.5`
+
+### 🚀 Performance
+
+- We have found that compiling Sōzu without `logs-trace` and `logs-debug` flags lead to a 30% less performance. In fact with flags, the rust compiler is able to track the format! macro to the write_fmt method which allow him to write on stdout without allocating memory which is not the case without and the dead code eliminator is not able to correctly do its works. The compiler without the flags is required to perform the memory allocation that lead to the 30% less performance, see [`57b8d66`](https://github.com/sozu-proxy/sozu/commit/57b8d6620ce212b12a2cef3c16fa81430dce8110).
+
+### ⛑️ Fixed
+
+- We fixed a corner case that may appear during the exchange of payload between Sozu, the kernel and the http client when the payload is fully transfered from the backend and sozu, but still in the kernel waiting for the client to acknowledge previous frame, see [`1e6b38d`](https://github.com/sozu-proxy/sozu/commit/1e6b38d6a795e317ed8d80b0e047a36c1bb40740).
+
+### Changelog
+
+#### 🚀 Performance
+
+- [ [`57b8d66`](https://github.com/sozu-proxy/sozu/commit/57b8d6620ce212b12a2cef3c16fa81430dce8110) ] Elide allocation and formating of opt-out logs [`Eloi DEMOLIS`] (`2024-10-10`)
+
+#### ✍️ Changed
+
+- [ [`1ad059c`](https://github.com/sozu-proxy/sozu/commit/1ad059c4372f26fbe2291093291bf81173a41205) ] bump prost and prost-build to 0.13.1 [`Emmanuel Bosquet`] (`2024-07-25`)
+- [ [`c6aad5e`](https://github.com/sozu-proxy/sozu/commit/c6aad5ecbcd1188dca912e07f384358e1204dfd2) ] chore: update dependencies [`Florentin Dubois`] (`2024-10-14`)
+- [ [`d45227e`](https://github.com/sozu-proxy/sozu/commit/d45227e67bb8d3e572eb912d4da2b804714d0f2a) ] change log level of "unknown task" from error to warn [`Emmanuel Bosquet`] (`2024-08-07`)
+- [ [`daa5c02`](https://github.com/sozu-proxy/sozu/commit/daa5c02424d37e867d16c76913f274352538cba1) ] change multiline info and debug statements to inline [`Emmanuel Bosquet`] (`2024-08-07`)
+- [ [`0849163`](https://github.com/sozu-proxy/sozu/commit/084916353deb4668879212ea60e53f9c14ade6f8) ] function main returns exit status [`Emmanuel Bosquet`] (`2024-08-09`)
+- [ [`2c85009`](https://github.com/sozu-proxy/sozu/commit/2c85009b7d82d080239556139b60722cfd735724) ] add ListFrontends to main process [`Emmanuel Bosquet`] (`2024-08-01`)
+- [ [`e48b26d`](https://github.com/sozu-proxy/sozu/commit/e48b26d6269d3e63fa5fcf4aac24fe0b46e0c369) ] bump rust-toolchain to 1.80.0 [`Emmanuel Bosquet`] (`2024-08-01`)
+
+#### ➖ Removed
+
+- [ [`2ed27e9`](https://github.com/sozu-proxy/sozu/commit/2ed27e939a8efa65a4267a7485a9e28764749aa0) ] remove sozu_lib::router::trie and replace use with pattern_trie [`Emmanuel Bosquet`] (`2024-08-14`)
+
+#### ⛑️ Fixed
+
+- [ [`202c0cb`](https://github.com/sozu-proxy/sozu/commit/202c0cb44cf014c3440bf5ab668ba71ef81f50f2) ] fix merging of histograms [`Emmanuel Bosquet`] (`2024-08-09`)
+- [ [`44f76c3`](https://github.com/sozu-proxy/sozu/commit/44f76c31b6e1c14b8fce43434f86e510fd1829df) ] Fix worker softlock by allowing writing on socket when Rustls buffers are full [`Eloi DEMOLIS`] (`2024-08-27`)
+- [ [`1e6b38d`](https://github.com/sozu-proxy/sozu/commit/1e6b38d6a795e317ed8d80b0e047a36c1bb40740) ] Fix Pipe::check_connections: take kernel inflight data into account, to prevent early closing of TCP connections with no more backend [`Eloi DEMOLIS`] (`2024-10-04`)
+- [ [`5ab35c2`](https://github.com/sozu-proxy/sozu/commit/5ab35c2d346b0387a75840bdb568238cddb29ebd) ] Properly track the backend bytes out metric in Pipe [`Eloi DEMOLIS`] (`2024-08-27`)
+
+#### 📚 Documentation
+
+- [ [`1a611cb`](https://github.com/sozu-proxy/sozu/commit/1a611cb9daef06dbf825d56f2951a4d4660faa8f) ] doc(changelog): add 1.0.3 entry [`Emmanuel Bosquet`] (`2024-07-17`)
+
+### 🥹 Contributors
+
+- @keksoj
+- @FlorentinDUBOIS
+- @Wonshtrum
+
+**Full Changelog**: https://github.com/sozu-proxy/sozu/compare/1.0.3...1.0.5
+
 ## 1.0.3 - 2024-07-17
 
 > This changelog entry contains changes from the version `1.0.1` and `1.0.2`
@@ -51,18 +137,16 @@ See milestone [`v1.1.0`](https://github.com/sozu-proxy/sozu/projects/3?card_filt
 - [ [`b74888c`](https://github.com/sozu-proxy/sozu/commit/b74888c19d75d518de32a464f9b990251e6387e3) ] Move unsent-access-logs metric increment out of sozu_command_lib [`Eloi DEMOLIS`] (`2024-07-11`)
 - [ [`dd54bea`](https://github.com/sozu-proxy/sozu/commit/dd54bea333cd83928d5ade16c347924820574dc0) ] propagate logging setup errors [`Emmanuel Bosquet`] (`2024-07-11`)
 
-
 #### ➕ Added
 
 - [ [`f30d0b1`](https://github.com/sozu-proxy/sozu/commit/f30d0b10bf184e39c786de775f660a86e7f7ee29) ] create command::logging::LogError [`Emmanuel Bosquet`] (`2024-07-11`)
 
 ### 🥹 Contributors
 
-* @keksoj
-* @FlorentinDUBOIS
-* @Wonshtrum
-* @llenotre
-
+- @keksoj
+- @FlorentinDUBOIS
+- @Wonshtrum
+- @llenotre
 
 ## 1.0.2 - 2024-06-03
 
@@ -108,9 +192,10 @@ See milestone [`v1.1.0`](https://github.com/sozu-proxy/sozu/projects/3?card_filt
 - [ [`1bf28a2`](https://github.com/sozu-proxy/sozu/commit/1bf28a2c350850b1dfeced9132201ff847bf1fba) ] Fix access logs metrics [`Eloi DEMOLIS`] (`2024-06-03`)
 
 ### 🥹 Contributors
-* @keksoj
-* @FlorentinDUBOIS
-* @Wonshtrum
+
+- @keksoj
+- @FlorentinDUBOIS
+- @Wonshtrum
 
 **Full Changelog**: https://github.com/sozu-proxy/sozu/compare/1.0.0..1.0.2
 
@@ -201,7 +286,7 @@ See milestone [`v1.1.0`](https://github.com/sozu-proxy/sozu/projects/3?card_filt
 - [ [`b6ca85b`](https://github.com/sozu-proxy/sozu/commit/b6ca85b03be0d53bd98f98436866bbe44cbc04ff) ] apply clippy suggestions for nightly [`Emmanuel Bosquet`] (`2024-03-11`)
 - [ [`618bed0`](https://github.com/sozu-proxy/sozu/commit/618bed03e7f7f8535d1fe6ad93a4b1acd30f9404) ] apply review: cosmetic changes [`Emmanuel Bosquet`] (`2024-03-11`)
 - [ [`182b291`](https://github.com/sozu-proxy/sozu/commit/182b291b347964a02c07e14d7886164e0322fc4e) ] Use error_access in lib, add log_access to make it easier [`Eloi DEMOLIS`] (`2024-03-11`)
-- [ [`5f55561`](https://github.com/sozu-proxy/sozu/commit/5f55561ce702083dbdd783456f88caa67dd8db4a) ] rename log_access_* variables to access_logs_* [`Emmanuel Bosquet`] (`2024-03-11`)
+- [ [`5f55561`](https://github.com/sozu-proxy/sozu/commit/5f55561ce702083dbdd783456f88caa67dd8db4a) ] rename log*access*_ variables to access*logs*_ [`Emmanuel Bosquet`] (`2024-03-11`)
 - [ [`d3eeddc`](https://github.com/sozu-proxy/sozu/commit/d3eeddc4060f73da37b1bd8257ca9562e63e0cec) ] Small changes mainly relative to logging [`Eloi DEMOLIS`] (`2024-03-11`)
 - [ [`3bb3997`](https://github.com/sozu-proxy/sozu/commit/3bb399705bb2a8db6ef81f41236618cc00627b40) ] Move all logging primitives in their own module [`Eloi DEMOLIS`] (`2024-03-11`)
 - [ [`e6bcfe0`](https://github.com/sozu-proxy/sozu/commit/e6bcfe033975a6aa4696a08bd0591d55ff41e63f) ] set dependency resolver to 2 [`Emmanuel Bosquet`] (`2024-03-11`)
@@ -228,7 +313,7 @@ See milestone [`v1.1.0`](https://github.com/sozu-proxy/sozu/projects/3?card_filt
 - [ [`d20e759`](https://github.com/sozu-proxy/sozu/commit/d20e759a7e66527d35110e11f7651a5cfee86161) ] Fix some timeout edge cases [`Eloi DEMOLIS`] (`2024-03-18`)
 - [ [`284068d`](https://github.com/sozu-proxy/sozu/commit/284068d73be3624cbe225b06af60278f9a0a72f0) ] fix: fix RUSTSEC-2024-0019 [`Dimitris Apostolou`] (`2024-03-09`)
 - [ [`59c0615`](https://github.com/sozu-proxy/sozu/commit/59c06158ad86d664f4e2900b777dc6cfa8fad2f0) ] Fix close propagation on close-delimited responses with front keep-alive [`Eloi DEMOLIS`] (`2024-02-20`)
-- [ [`6aa45b9`](https://github.com/sozu-proxy/sozu/commit/6aa45b9bd4ef8cadca308712d82f136e3747b7d5) ] fix and rewrite  CertificateResolver [`Emmanuel Bosquet`] (`2024-02-14`)
+- [ [`6aa45b9`](https://github.com/sozu-proxy/sozu/commit/6aa45b9bd4ef8cadca308712d82f136e3747b7d5) ] fix and rewrite CertificateResolver [`Emmanuel Bosquet`] (`2024-02-14`)
 - [ [`e793ec6`](https://github.com/sozu-proxy/sozu/commit/e793ec6667ae83d8be302d549751637315bef0fd) ] Edit access logs ASCII format, put logs-cache under feature [`Eloi DEMOLIS`] (`2024-03-11`)
 - [ [`85e2653`](https://github.com/sozu-proxy/sozu/commit/85e26535a4ec4eafe8c64f186b2f40014b5b1f4e) ] implement From<Uint128> for Ulid [`Emmanuel Bosquet`] (`2024-03-11`)
 - [ [`756b78b`](https://github.com/sozu-proxy/sozu/commit/756b78bc9c13684b4acb15caf14044f0ad90e623) ] create type WebSocketContext [`Emmanuel Bosquet`] (`2024-03-11`)
@@ -247,17 +332,18 @@ See milestone [`v1.1.0`](https://github.com/sozu-proxy/sozu/projects/3?card_filt
 - [ [`95624e6`](https://github.com/sozu-proxy/sozu/commit/95624e6c91e548d2e87ea6df6341d0bc25cff630) ] Refactor HTTP, HTTPS and TCP example code [`Eloi DEMOLIS`] (`2024-02-02`)
 
 ### 🥹 Contributors
-* @obreidenich made their first contribution in https://github.com/sozu-proxy/sozu/pull/1079
-* @rex4539 made their first contribution in https://github.com/sozu-proxy/sozu/pull/1090
-* @keksoj
-* @FlorentinDUBOIS
-* @Wonshtrum
+
+- @obreidenich made their first contribution in https://github.com/sozu-proxy/sozu/pull/1079
+- @rex4539 made their first contribution in https://github.com/sozu-proxy/sozu/pull/1090
+- @keksoj
+- @FlorentinDUBOIS
+- @Wonshtrum
 
 **Full Changelog**: https://github.com/sozu-proxy/sozu/compare/0.15.19..1.0.0
 
 ## 1.0.0-rc.2 - 2024-04-05
 
-> This changelog is the second release candidate before the version `1.0.0`, it includes a __breaking change__ on the protocol buffer and configuration around definition of custom response when Sōzu answers instead of backends defined in cluster.
+> This changelog is the second release candidate before the version `1.0.0`, it includes a **breaking change** on the protocol buffer and configuration around definition of custom response when Sōzu answers instead of backends defined in cluster.
 
 ### 🌟 Features
 
@@ -294,8 +380,9 @@ See milestone [`v1.1.0`](https://github.com/sozu-proxy/sozu/projects/3?card_filt
 - [ [`d83f399`](https://github.com/sozu-proxy/sozu/commit/d83f3997953f889a75d3300b10a55021d23f768d) ] Expose internal rustls buffers to ensure they are flushed [`Eloi DEMOLIS`] (`2024-04-03`)
 
 ### 🥹 Contributors
-* @keksoj
-* @Wonshtrum
+
+- @keksoj
+- @Wonshtrum
 
 **Full Changelog**: https://github.com/sozu-proxy/sozu/compare/1.0.0.-rc.1..1.0.0-rc.2
 
@@ -341,7 +428,7 @@ See milestone [`v1.1.0`](https://github.com/sozu-proxy/sozu/projects/3?card_filt
 - [ [`d20e759`](https://github.com/sozu-proxy/sozu/commit/d20e759a7e66527d35110e11f7651a5cfee86161) ] Fix some timeout edge cases [`Eloi DEMOLIS`] (`2024-03-18`)
 - [ [`284068d`](https://github.com/sozu-proxy/sozu/commit/284068d73be3624cbe225b06af60278f9a0a72f0) ] fix: fix RUSTSEC-2024-0019 [`Dimitris Apostolou`] (`2024-03-09`)
 - [ [`59c0615`](https://github.com/sozu-proxy/sozu/commit/59c06158ad86d664f4e2900b777dc6cfa8fad2f0) ] Fix close propagation on close-delimited responses with front keep-alive [`Eloi DEMOLIS`] (`2024-02-20`)
-- [ [`6aa45b9`](https://github.com/sozu-proxy/sozu/commit/6aa45b9bd4ef8cadca308712d82f136e3747b7d5) ] fix and rewrite  CertificateResolver [`Emmanuel Bosquet`] (`2024-02-14`)
+- [ [`6aa45b9`](https://github.com/sozu-proxy/sozu/commit/6aa45b9bd4ef8cadca308712d82f136e3747b7d5) ] fix and rewrite CertificateResolver [`Emmanuel Bosquet`] (`2024-02-14`)
 
 #### 📚 Documentation
 
@@ -376,7 +463,7 @@ See milestone [`v1.1.0`](https://github.com/sozu-proxy/sozu/projects/3?card_filt
 - [ [`b6ca85b`](https://github.com/sozu-proxy/sozu/commit/b6ca85b03be0d53bd98f98436866bbe44cbc04ff) ] apply clippy suggestions for nightly [`Emmanuel Bosquet`] (`2024-03-11`)
 - [ [`618bed0`](https://github.com/sozu-proxy/sozu/commit/618bed03e7f7f8535d1fe6ad93a4b1acd30f9404) ] apply review: cosmetic changes [`Emmanuel Bosquet`] (`2024-03-11`)
 - [ [`182b291`](https://github.com/sozu-proxy/sozu/commit/182b291b347964a02c07e14d7886164e0322fc4e) ] Use error_access in lib, add log_access to make it easier [`Eloi DEMOLIS`] (`2024-03-11`)
-- [ [`5f55561`](https://github.com/sozu-proxy/sozu/commit/5f55561ce702083dbdd783456f88caa67dd8db4a) ] rename log_access_* variables to access_logs_* [`Emmanuel Bosquet`] (`2024-03-11`)
+- [ [`5f55561`](https://github.com/sozu-proxy/sozu/commit/5f55561ce702083dbdd783456f88caa67dd8db4a) ] rename log*access*_ variables to access*logs*_ [`Emmanuel Bosquet`] (`2024-03-11`)
 - [ [`d3eeddc`](https://github.com/sozu-proxy/sozu/commit/d3eeddc4060f73da37b1bd8257ca9562e63e0cec) ] Small changes mainly relative to logging [`Eloi DEMOLIS`] (`2024-03-11`)
 - [ [`3bb3997`](https://github.com/sozu-proxy/sozu/commit/3bb399705bb2a8db6ef81f41236618cc00627b40) ] Move all logging primitives in their own module [`Eloi DEMOLIS`] (`2024-03-11`)
 - [ [`e6bcfe0`](https://github.com/sozu-proxy/sozu/commit/e6bcfe033975a6aa4696a08bd0591d55ff41e63f) ] set dependency resolver to 2 [`Emmanuel Bosquet`] (`2024-03-11`)
@@ -402,11 +489,12 @@ See milestone [`v1.1.0`](https://github.com/sozu-proxy/sozu/projects/3?card_filt
 - [ [`39af839`](https://github.com/sozu-proxy/sozu/commit/39af83929154820687bc9c87fc25fc6fa7747b5d) ] remove useless Serde error in channel module [`Emmanuel Bosquet`] (`2024-02-02`)
 
 ### 🥹 Contributors
-* @obreidenich made their first contribution in https://github.com/sozu-proxy/sozu/pull/1079
-* @rex4539 made their first contribution in https://github.com/sozu-proxy/sozu/pull/1090
-* @keksoj
-* @FlorentinDUBOIS
-* @Wonshtrum
+
+- @obreidenich made their first contribution in https://github.com/sozu-proxy/sozu/pull/1079
+- @rex4539 made their first contribution in https://github.com/sozu-proxy/sozu/pull/1090
+- @keksoj
+- @FlorentinDUBOIS
+- @Wonshtrum
 
 **Full Changelog**: https://github.com/sozu-proxy/sozu/compare/0.15.19..1.0.0-rc.1
 
@@ -467,9 +555,10 @@ See milestone [`v1.1.0`](https://github.com/sozu-proxy/sozu/projects/3?card_filt
 - [ [`730f0c3`](https://github.com/sozu-proxy/sozu/commit/730f0c329917a1da9a09d0dfcbc3799e9a2288d5) ] Adjust logging level [`Eloi DEMOLIS`] (`2023-11-23`)
 
 ### 🥹 Contributors
-* @keksoj
-* @FlorentinDUBOIS
-* @Wonshtrum
+
+- @keksoj
+- @FlorentinDUBOIS
+- @Wonshtrum
 
 **Full Changelog**: https://github.com/sozu-proxy/sozu/compare/0.15.15...0.15.19
 
@@ -488,7 +577,7 @@ See milestone [`v1.1.0`](https://github.com/sozu-proxy/sozu/projects/3?card_filt
 #### 🚀 Performance
 
 - [ [`8364454`](https://github.com/sozu-proxy/sozu/commit/8364454da2ac4df3ea8fae517f619431ac0c068e) ] Use rustls::Writer::write_vectored to reduce writev syscalls [`Eloi DEMOLIS`] (`2023-11-08`)
-- [ [`92a277c`](https://github.com/sozu-proxy/sozu/commit/92a277c79fa0d319a0f8ad1f192d62b72ffd52a1) ] store certificates in parsed form in  CertificateResolver [`Eloi DEMOLIS`] (`2023-11-14`)
+- [ [`92a277c`](https://github.com/sozu-proxy/sozu/commit/92a277c79fa0d319a0f8ad1f192d62b72ffd52a1) ] store certificates in parsed form in CertificateResolver [`Eloi DEMOLIS`] (`2023-11-14`)
 
 #### ⛑️ Fixed
 
@@ -507,9 +596,10 @@ See milestone [`v1.1.0`](https://github.com/sozu-proxy/sozu/projects/3?card_filt
 - [ [`e754a15`](https://github.com/sozu-proxy/sozu/commit/e754a159dc9abf34285c2f33970e6ecbee765e6e) ] document benchmarking technique [`Emmanuel Bosquet`] (`2023-11-10`)
 
 ### 🥹 Contributors
-* @keksoj
-* @FlorentinDUBOIS
-* @Wonshtrum
+
+- @keksoj
+- @FlorentinDUBOIS
+- @Wonshtrum
 
 **Full Changelog**: https://github.com/sozu-proxy/sozu/compare/0.15.13...0.15.15
 
@@ -559,9 +649,10 @@ See milestone [`v1.1.0`](https://github.com/sozu-proxy/sozu/projects/3?card_filt
 - [ [`9301048`](https://github.com/sozu-proxy/sozu/commit/9301048af9ec64517bf06a7d2f38181fbf1eeae8) ] doc(changelog): add 0.15.6 entry [`Florentin Dubois`] (`2023-10-11`)
 
 ### 🥹 Contributors
-* @keksoj
-* @FlorentinDUBOIS
-* @Wonshtrum
+
+- @keksoj
+- @FlorentinDUBOIS
+- @Wonshtrum
 
 **Full Changelog**: https://github.com/sozu-proxy/sozu/compare/0.15.6...0.15.13
 
@@ -586,8 +677,9 @@ See milestone [`v1.1.0`](https://github.com/sozu-proxy/sozu/projects/3?card_filt
 - [ [`6de9cf5`](https://github.com/sozu-proxy/sozu/commit/6de9cf541368fca3d874b14df7e068a856d4d183) ] chore: update dependencies [`Florentin Dubois`] (`2023-09-21`)
 
 ### 🥹 Contributors
-* @FlorentinDUBOIS
-* @Wonshtrum
+
+- @FlorentinDUBOIS
+- @Wonshtrum
 
 **Full Changelog**: https://github.com/sozu-proxy/sozu/compare/0.15.5...0.15.6
 
@@ -606,7 +698,8 @@ We fix a bug that can occurs with pki using T.61 charset, see [`a5412b9`](https:
 - [ [`6de9cf5`](https://github.com/sozu-proxy/sozu/commit/6de9cf541368fca3d874b14df7e068a856d4d183) ] chore: update dependencies [`Florentin Dubois`] (`2023-09-21`)
 
 ### 🥹 Contributors
-* @FlorentinDUBOIS
+
+- @FlorentinDUBOIS
 
 **Full Changelog**: https://github.com/sozu-proxy/sozu/compare/0.15.4...0.15.5
 
@@ -663,9 +756,10 @@ We fix a bug that can occurs with pki using T.61 charset, see [`a5412b9`](https:
 - [ [`bd5703a`](https://github.com/sozu-proxy/sozu/commit/bd5703ae313a8ab270eba4b1ebe3d9ad911b2793) ] fix doc link to systemd unit file [`Emmanuel Bosquet`] (`2023-08-24`)
 
 ### 🥹 Contributors
-* @keksoj
-* @Wonshtrum
-* @FlorentinDUBOIS
+
+- @keksoj
+- @Wonshtrum
+- @FlorentinDUBOIS
 
 **Full Changelog**: https://github.com/sozu-proxy/sozu/compare/0.15.3...0.15.4
 
@@ -742,10 +836,11 @@ We fix a bug that can occurs with pki using T.61 charset, see [`a5412b9`](https:
 - [ [`0b0fbcb`](https://github.com/sozu-proxy/sozu/commit/0b0fbcbd34b7d00893d8feaea4205e5250d5bbe2) ] doc: add documentation on tls-related functions [`Florentin Dubois`] (`2023-08-04`)
 
 ### 🥹 Contributors
-* @keksoj
-* @hcaumeil
-* @Wonshtrum
-* @FlorentinDUBOIS
+
+- @keksoj
+- @hcaumeil
+- @Wonshtrum
+- @FlorentinDUBOIS
 
 **Full Changelog**: https://github.com/sozu-proxy/sozu/compare/0.15.2...0.15.3
 
@@ -768,8 +863,9 @@ We fix a bug that can occurs with pki using T.61 charset, see [`a5412b9`](https:
 - [ [`c6446e1`](https://github.com/sozu-proxy/sozu/commit/c6446e17e77b2bb603c6933066da40964f1d0c38) ] chore: add changelog entry for release v0.15.1 [`Florentin Dubois`] (`2023-07-11`)
 
 ### 🥹 Contributors
-* @Wonshtrum
-* @FlorentinDUBOIS
+
+- @Wonshtrum
+- @FlorentinDUBOIS
 
 **Full Changelog**: https://github.com/sozu-proxy/sozu/compare/0.15.1...0.15.2
 
@@ -811,9 +907,10 @@ We fix a bug that can occurs with pki using T.61 charset, see [`a5412b9`](https:
 - [ [`97034bd`](https://github.com/sozu-proxy/sozu/commit/97034bd671cd71145f7988d43bb0aacaf42e8a48) ] fix: update `start_tcp_worker` to use `TCPListen` variant of `Protocol` enum [`Florentin Dubois`] (`2023-07-11`)
 
 ### 🥹 Contributors
-* @Wonshtrum
-* @Keksoj
-* @FlorentinDUBOIS
+
+- @Wonshtrum
+- @Keksoj
+- @FlorentinDUBOIS
 
 **Full Changelog**: https://github.com/sozu-proxy/sozu/compare/0.15.0...0.15.1
 
@@ -918,9 +1015,10 @@ We fix a bug that can occurs with pki using T.61 charset, see [`a5412b9`](https:
 - [ [`09b0bf0`](https://github.com/sozu-proxy/sozu/commit/09b0bf02a5fcfe240bf0c00114da2a42e789f51a) ] chore: decrease logging verbosity [`Florentin Dubois`] (`2023-06-22`)
 
 ### 🥹 Contributors
-* @Wonshtrum
-* @Keksoj
-* @FlorentinDUBOIS
+
+- @Wonshtrum
+- @Keksoj
+- @FlorentinDUBOIS
 
 **Full Changelog**: https://github.com/sozu-proxy/sozu/compare/0.14.3...0.15.0
 
@@ -1152,14 +1250,15 @@ We fix a bug that can occurs with pki using T.61 charset, see [`a5412b9`](https:
 - [ [`fbad528`](https://github.com/sozu-proxy/sozu/commit/fbad528ff72113072c98ffad24213917a7b9644e) ] Update return for get_executable_path (freebsd) [`3boll`] (`2023-03-01`)
 
 ### 🥹 Contributors
-* @alkavan made their first contribution in https://github.com/sozu-proxy/sozu/pull/693
-* @kianmeng made their first contribution in https://github.com/sozu-proxy/sozu/pull/830
-* @pims made their first contribution in https://github.com/sozu-proxy/sozu/pull/868
-* @Sykursen made their first contribution in https://github.com/sozu-proxy/sozu/pull/893
-* @jmingov made their first contribution in https://github.com/sozu-proxy/sozu/pull/894
-* @Wonshtrum
-* @Keksoj
-* @FlorentinDUBOIS
+
+- @alkavan made their first contribution in https://github.com/sozu-proxy/sozu/pull/693
+- @kianmeng made their first contribution in https://github.com/sozu-proxy/sozu/pull/830
+- @pims made their first contribution in https://github.com/sozu-proxy/sozu/pull/868
+- @Sykursen made their first contribution in https://github.com/sozu-proxy/sozu/pull/893
+- @jmingov made their first contribution in https://github.com/sozu-proxy/sozu/pull/894
+- @Wonshtrum
+- @Keksoj
+- @FlorentinDUBOIS
 
 **Full Changelog**: https://github.com/sozu-proxy/sozu/compare/0.14.2...0.14.3
 
@@ -1249,11 +1348,12 @@ We remove the support of `OpenSSL` in favor of `RusTLS`, so the tls provider con
 - [ [`2624a43`](https://github.com/sozu-proxy/sozu/commit/2624a430c5d1c02e257a3bf9ddb545f46e29c8fd) ] Fix Sessions close: [`Eloi DEMOLIS`] (`2022-12-02`)
 
 ### 🥹 Contributors
-* @alkavan made their first contribution in https://github.com/sozu-proxy/sozu/pull/693
-* @kianmeng made their first contribution in https://github.com/sozu-proxy/sozu/pull/830
-* @Wonshtrum
-* @Keksoj
-* @FlorentinDUBOIS
+
+- @alkavan made their first contribution in https://github.com/sozu-proxy/sozu/pull/693
+- @kianmeng made their first contribution in https://github.com/sozu-proxy/sozu/pull/830
+- @Wonshtrum
+- @Keksoj
+- @FlorentinDUBOIS
 
 **Full Changelog**: https://github.com/sozu-proxy/sozu/compare/v0.14.1...0.14.2
 
@@ -1284,9 +1384,10 @@ We remove the support of `OpenSSL` in favor of `RusTLS`, so the tls provider con
 - [ [`0e3fffe`](https://github.com/sozu-proxy/sozu/commit/0e3fffeefe2a201c85255eda25b2b85babd65252) ] Fix a blocking clippy suggestion [`Florentin Dubois`] (`2022-10-13`)
 
 ### 🥹 Contributors
-* @Wonshtrum
-* @Keksoj
-* @FlorentinDUBOIS
+
+- @Wonshtrum
+- @Keksoj
+- @FlorentinDUBOIS
 
 **Full Changelog**: https://github.com/sozu-proxy/sozu/compare/v0.14.0...0.14.1
 
@@ -1295,11 +1396,11 @@ We remove the support of `OpenSSL` in favor of `RusTLS`, so the tls provider con
 ### 🌟 Features
 
 - 🚀 A new HTTP/1 router, see [`5b58b91`](https://github.com/sozu-proxy/sozu/commit/5b58b91f14b1f98299911b5a3bac4cd0c11a39d2), [`016d89c`](https://github.com/sozu-proxy/sozu/commit/016d89ca72e309499d388464b211aa501e0cf135), [`a9dd46e`](https://github.com/sozu-proxy/sozu/commit/a9dd46e95d9c691e5266e5d476469829e4e1c93a), [`043b928`](https://github.com/sozu-proxy/sozu/commit/043b928e73cf36c11f4a750165bd61ad4284f812), [`c8504d4`](https://github.com/sozu-proxy/sozu/commit/c8504d4d9dab6053b31462c8fa14f1fe32a37e5a), [`5dc5c00`](https://github.com/sozu-proxy/sozu/commit/5dc5c0058192457f540b7614029c4d7279f9dc5b), [`c5b9bfa`](https://github.com/sozu-proxy/sozu/commit/c5b9bfa9d6702e0bc09c92f70f7fe5ed150c92e8), [`f96d1ac`](https://github.com/sozu-proxy/sozu/commit/f96d1ac7a632ee318bb2398b9c891d11eb8058cc), [`af38431`](https://github.com/sozu-proxy/sozu/commit/af38431236243c3183d5b1d75c483e33b8e07c81)
-- 🤩 Bootstrap HTTP/2 work, see [`f247ce3`](https://github.com/sozu-proxy/sozu/commit/f247ce3783b912084a330bdf43d861c9c748dfed), [`65d5043`](https://github.com/sozu-proxy/sozu/commit/65d5043f8629744c166994d7e4c71d78983eccf9), [`6da9038`](https://github.com/sozu-proxy/sozu/commit/6da9038355f6c27060ef89a87e6110a33ba9a995), 
+- 🤩 Bootstrap HTTP/2 work, see [`f247ce3`](https://github.com/sozu-proxy/sozu/commit/f247ce3783b912084a330bdf43d861c9c748dfed), [`65d5043`](https://github.com/sozu-proxy/sozu/commit/65d5043f8629744c166994d7e4c71d78983eccf9), [`6da9038`](https://github.com/sozu-proxy/sozu/commit/6da9038355f6c27060ef89a87e6110a33ba9a995),
 - 1️⃣ One command line to rules them all, see [`8555e44`](https://github.com/sozu-proxy/sozu/commit/8555e44987fe3b0939403c24482fb65cbac93bb1)
 - ✨ Improve metrics, see [`b7fa649`](https://github.com/sozu-proxy/sozu/commit/b7fa649a5778a498bf096a03b33274fbdf783557), [`8ffca7f`](https://github.com/sozu-proxy/sozu/commit/8ffca7f7e3e812a9bdacd3a08ba19ea564a2d740), [`9e6bd1d`](https://github.com/sozu-proxy/sozu/commit/9e6bd1df2dce563c831fcc71d51d7d0980128aec), [`7515a7e`](https://github.com/sozu-proxy/sozu/commit/7515a7e9d40e17090a9d6d63a23e5a75f3669b55), [`809a481`](https://github.com/sozu-proxy/sozu/commit/809a48130f5408e008d85c04f50a154b9ec5174e), [`67b98d0`](https://github.com/sozu-proxy/sozu/commit/67b98d0dca4814a3476e71b48f5e44db3a2e3c66), [`086fdca`](https://github.com/sozu-proxy/sozu/commit/086fdca72a5d244f44f78b778bd4c20545a4a872), [`3b956fb`](https://github.com/sozu-proxy/sozu/commit/3b956fb15993316de9432762f1704e9ea3cff1cf), [`5691fb9`](https://github.com/sozu-proxy/sozu/commit/5691fb9161182aeb6cd8dd391f54494725ae6881), [`effc0a9`](https://github.com/sozu-proxy/sozu/commit/effc0a91c96f0cd52d1586a3c5c6788271c2a9f9), [`829ad4b`](https://github.com/sozu-proxy/sozu/commit/829ad4b6ad4e294ad4957d7201208384c4676bfa), [`3de4cb7`](https://github.com/sozu-proxy/sozu/commit/3de4cb7981525077524f71a6d2b316abe0ec33b4), [`6dd7f2f`](https://github.com/sozu-proxy/sozu/commit/6dd7f2fddabc668e5f8cf7aeeaf76c8550021316), [`5427107`](https://github.com/sozu-proxy/sozu/commit/54271078eed9220217cfaad73d6344e807f3d1f1), [`c271481`](https://github.com/sozu-proxy/sozu/commit/c2714818685f899bc9883620c67f7f51794aac45), [`7af7a98`](https://github.com/sozu-proxy/sozu/commit/7af7a98a98c918aca5ebfd59ee8fcf190c2f6723), [`d0f853a`](https://github.com/sozu-proxy/sozu/commit/d0f853a6fd4fab9f016f7d4e3ce752ec1908762f), [`aa1176a`](https://github.com/sozu-proxy/sozu/commit/aa1176ac6735187c15154507e55b9e818f542a7c), [`1c2c87a`](https://github.com/sozu-proxy/sozu/commit/1c2c87a9f4001f50163c7ff9c6d558d51d9da0aa), [`5309acb`](https://github.com/sozu-proxy/sozu/commit/5309acb7b385d7ba341eefda110abf7e6d44cf50), [`751c2e8`](https://github.com/sozu-proxy/sozu/commit/751c2e8deaff0e7b92d5963159006e071cc13e98), [`daacf30`](https://github.com/sozu-proxy/sozu/commit/daacf30c735853c41de0e6c1636ebb6ffd02d3d6), [`4f6a47f`](https://github.com/sozu-proxy/sozu/commit/4f6a47fb79c95fc9ca200822956846609213b01f), [`985afc0`](https://github.com/sozu-proxy/sozu/commit/985afc0e3f8ad5fcd0a041d331c903b8760dce06), [`3418b6f`](https://github.com/sozu-proxy/sozu/commit/3418b6f7847c7ca9c9c928c74a77da28b94e0d7f), [`f2d07eb`](https://github.com/sozu-proxy/sozu/commit/f2d07ebd3e32d75e830e86f024a872f7917cf3cf), [`ab34222`](https://github.com/sozu-proxy/sozu/commit/ab342224840a9b3b12edb7cccf06d5f7ec76c80a), [`aaf2224`](https://github.com/sozu-proxy/sozu/commit/aaf2224ed5f9aec4bceee116e6a5626271d9613c), [`f1dec19`](https://github.com/sozu-proxy/sozu/commit/f1dec19515ef286e9d617b45b46a05a75f6a16b3), [`67445c4`](https://github.com/sozu-proxy/sozu/commit/67445c4531b1cbf2316d30d4650a9448e076db7d), [`ae8d9c1`](https://github.com/sozu-proxy/sozu/commit/ae8d9c14e77a9d1e416f90396e01389f567a1066), [`b0844e3`](https://github.com/sozu-proxy/sozu/commit/b0844e37e7ac5f4046e5d592d7d92eaad4d6ffac), [`9eb2c01`](https://github.com/sozu-proxy/sozu/commit/9eb2c016713b69f3a09f0df78f21d363c2bd4f2f), [`e774cff`](https://github.com/sozu-proxy/sozu/commit/e774cff0208bfcb7f862bbfcc2fdc2163fd14a5d), [`81f24c4`](https://github.com/sozu-proxy/sozu/commit/81f24c4a9311d42238abb645c8ffcd763bd3cb48), [`c02b130`](https://github.com/sozu-proxy/sozu/commit/c02b130f45a925fcf316cd5540aeb49e320fd935), [`ce2c764`](https://github.com/sozu-proxy/sozu/commit/ce2c764101fc16d5eb5c6837c5cb6c9cee06999f)
 - 🙈 Return a HTTP 503 status code when we reach too many connection, see [`a82a83f`](https://github.com/sozu-proxy/sozu/commit/a82a83f68d6929d6f69b1b355a66581efbffb1f8)
-- Unified TLS certificate lifecycle and management, see [`a7952a1`](https://github.com/sozu-proxy/sozu/commit/a7952a10ea7e8e536148d1385026e9f2b28b7a7f), [`bbd4f5f`](https://github.com/sozu-proxy/sozu/commit/bbd4f5fd5af401c8c4d6d20db717297a54037d9b), [`7276e17`](https://github.com/sozu-proxy/sozu/commit/7276e17d27eaf9a70b5da5aff80050ecbfc3ab89) 
+- Unified TLS certificate lifecycle and management, see [`a7952a1`](https://github.com/sozu-proxy/sozu/commit/a7952a10ea7e8e536148d1385026e9f2b28b7a7f), [`bbd4f5f`](https://github.com/sozu-proxy/sozu/commit/bbd4f5fd5af401c8c4d6d20db717297a54037d9b), [`7276e17`](https://github.com/sozu-proxy/sozu/commit/7276e17d27eaf9a70b5da5aff80050ecbfc3ab89)
 - 1️⃣ Set event-based command handling, see [`5f62687`](https://github.com/sozu-proxy/sozu/commit/5f626872f9305b92ec7f9302cdc24785b49d012f), [`3c7ab65`](https://github.com/sozu-proxy/sozu/commit/3c7ab654e3282f8163530cfbbfae3114930593a5), [`d322bc2`](https://github.com/sozu-proxy/sozu/commit/d322bc2e6228e00a2960ea7d2f6f953a50d02249), [`33b6e11`](https://github.com/sozu-proxy/sozu/commit/33b6e11744c256419325427f40a1d625a7588f54), [`5bbde99`](https://github.com/sozu-proxy/sozu/commit/5bbde99bca1e31fe13ac6b78dffbacc05c5d73fe), [`3c24088`](https://github.com/sozu-proxy/sozu/commit/3c24088a2a5670876ef31850db13c6995dc2c73b)
 - 💪 Allow to set custom tags on logs, see [`115b9b1`](https://github.com/sozu-proxy/sozu/commit/115b9b1eee9fc94ceedd1e016eda8c2f588155cb), [`a9959ba`](https://github.com/sozu-proxy/sozu/commit/a9959ba34dbe07130170f40204035a1bf14f97ac)
 
@@ -1527,7 +1628,7 @@ Between the `v0.13.6` and `v0.14.0` structures present in the `command` folder h
 - [ [`7b213e5`](https://github.com/sozu-proxy/sozu/commit/7b213e5338507b4292f4a15452ba4235c1a76dbf) ] trickle up errors if no metric for a backend or cluster [`Emmanuel Bosquet`] (`2022-08-23`)
 - [ [`c44db1f`](https://github.com/sozu-proxy/sozu/commit/c44db1f9e62a914facebea743c94f0e3c43b79ba) ] Documenting comments and minor refactor [`Eloi DEMOLIS`] (`2022-08-31`)
 - [ [`9b19aae`](https://github.com/sozu-proxy/sozu/commit/9b19aae8abd8b56e42a2b8dc1fcce86416116db1) ] Renamed RequestLine and StatusLine and their raw versions [`Eloi DEMOLIS`] (`2022-08-31`)
-- [ [`8f2f1c0`](https://github.com/sozu-proxy/sozu/commit/8f2f1c08a6c1d45b8d669d63768584d6a6056de5) ] comments in bin imports, functions and struct fields,  refactoring [`Emmanuel Bosquet`] (`2022-09-02`)
+- [ [`8f2f1c0`](https://github.com/sozu-proxy/sozu/commit/8f2f1c08a6c1d45b8d669d63768584d6a6056de5) ] comments in bin imports, functions and struct fields, refactoring [`Emmanuel Bosquet`] (`2022-09-02`)
 - [ [`1a22d09`](https://github.com/sozu-proxy/sozu/commit/1a22d09f7be892cf6c3d5f9cdf8f38585284292d) ] proper error management on receive_listeners method of scm sockets [`Emmanuel Bosquet`] (`2022-09-02`)
 - [ [`a30eb4e`](https://github.com/sozu-proxy/sozu/commit/a30eb4ee4401d8ee6c65f8786c44a8b5b04978ac) ] variable renaming, documenting comments, light refactoring [`Emmanuel Bosquet`] (`2022-09-02`)
 - [ [`0955dcd`](https://github.com/sozu-proxy/sozu/commit/0955dcd97c6115484095c3f31be7ab39fe51676b) ] rename fields to better detailed names [`Emmanuel Bosquet`] (`2022-09-02`)
@@ -1594,16 +1695,16 @@ Between the `v0.13.6` and `v0.14.0` structures present in the `command` folder h
 - [ [`f423a3e`](https://github.com/sozu-proxy/sozu/commit/f423a3e16e1a4dac613eaa3eea3fc08ea3e11c7c) ] Update parser of header value to trim linear white space [`Florentin Dubois`] (`2022-07-13`)
 
 ### 🥹 Contributors
-* @arnolem made their first contribution in https://github.com/sozu-proxy/sozu/pull/727
-* @av-elier made their first contribution in https://github.com/sozu-proxy/sozu/pull/746
-* @sjames made their first contribution in https://github.com/sozu-proxy/sozu/pull/757
-* @DeLaBatth made their first contribution in https://github.com/sozu-proxy/sozu/pull/754
-* @LupusMichaelis made their first contribution in https://github.com/sozu-proxy/sozu/pull/755
-* @Wonshtrum made their first contribution in https://github.com/sozu-proxy/sozu/pull/797
-* @Geal
-* @Keksoj
-* @FlorentinDUBOIS
 
+- @arnolem made their first contribution in https://github.com/sozu-proxy/sozu/pull/727
+- @av-elier made their first contribution in https://github.com/sozu-proxy/sozu/pull/746
+- @sjames made their first contribution in https://github.com/sozu-proxy/sozu/pull/757
+- @DeLaBatth made their first contribution in https://github.com/sozu-proxy/sozu/pull/754
+- @LupusMichaelis made their first contribution in https://github.com/sozu-proxy/sozu/pull/755
+- @Wonshtrum made their first contribution in https://github.com/sozu-proxy/sozu/pull/797
+- @Geal
+- @Keksoj
+- @FlorentinDUBOIS
 
 **Full Changelog**: https://github.com/sozu-proxy/sozu/compare/0.13.6...v0.14.0
 
@@ -1630,7 +1731,7 @@ debug release
 
 ### Fixed
 
-- pass the app id from HTTP protocol to Pipe protocol when in  websocket
+- pass the app id from HTTP protocol to Pipe protocol when in websocket
 
 ## 0.11.14 - 2019-07-18
 
@@ -1655,7 +1756,7 @@ debug release
 - add logs-debug and logs-trace options to sozuctl to fix build on Exherbo
 
 ## 0.11.11 - 2019-07-09
- 
+
 ### Added
 
 - send 408 or 504 HTTP errors in case of timeouts
@@ -1750,6 +1851,7 @@ debug release
 ## 0.11 - 2018-11-15
 
 breaking changes:
+
 - the `public_address` field for listeners is now an `Option<SocketAddr>`, so it's configuration file format is `IP:port` instead of just an IP address
 - the `AddHttpsFront` message does not use a certificate fingerprint anymore, so HTTPS frontends do not depend on certificate anymore
 
@@ -1813,7 +1915,6 @@ breaking change: modules have been moved around in sozu-lib
 - openssl cipher configuration
 - circuit breaker
 
-
 ## 0.8.0 - 2018-08-21
 
 - metrics writing fixes
@@ -1839,7 +1940,6 @@ breaking change: modules have been moved around in sozu-lib
 - option to send metrics in InfluxDB's tagged format
 - PID file
 
-
 ## 0.5.0 - 2018-01-29
 
 - TCP proxy refactoring
@@ -1847,7 +1947,6 @@ breaking change: modules have been moved around in sozu-lib
 - HTTP -> HTTPS redirection
 - documentation
 - ReplaceCertifacte message
-
 
 ## 0.4.0 - 2017-11-29
 
@@ -1867,7 +1966,6 @@ breaking change: modules have been moved around in sozu-lib
 - load balancing algorithms
 - retry policy algorithms
 
-
 ### Added
 
 ### Changed
@@ -1884,6 +1982,7 @@ breaking change: modules have been moved around in sozu-lib
 ## 0.1.0 - 2017-04-04
 
 Started implementation:
+
 - TCP proxy
 - HTTP proxy
 - HTTPS proxy with SNI
