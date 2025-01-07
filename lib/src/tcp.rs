@@ -495,7 +495,7 @@ impl TcpSession {
                 "connections_per_backend",
                 1,
                 self.cluster_id.as_deref(),
-                self.metrics.backend_id.as_deref()
+                self.backend_id.as_deref()
             );
 
             // the back timeout was of connect_timeout duration before,
@@ -515,7 +515,7 @@ impl TcpSession {
                     incr!(
                         "backend.up",
                         self.cluster_id.as_deref(),
-                        self.metrics.backend_id.as_deref()
+                        self.backend_id.as_deref()
                     );
                     info!(
                         "backend server {} at {} is up",
@@ -558,7 +558,7 @@ impl TcpSession {
             incr!(
                 "backend.connections.error",
                 self.cluster_id.as_deref(),
-                self.metrics.backend_id.as_deref()
+                self.backend_id.as_deref()
             );
             if !already_unavailable && backend.retry_policy.is_down() {
                 error!(
@@ -568,7 +568,7 @@ impl TcpSession {
                 incr!(
                     "backend.down",
                     self.cluster_id.as_deref(),
-                    self.metrics.backend_id.as_deref()
+                    self.backend_id.as_deref()
                 );
 
                 push_event(Event {
@@ -822,7 +822,7 @@ impl TcpSession {
                 "connections_per_backend",
                 -1,
                 self.cluster_id.as_deref(),
-                self.metrics.backend_id.as_deref()
+                self.backend_id.as_deref()
             );
         }
 
@@ -902,7 +902,7 @@ impl TcpSession {
         self.set_back_token(back_token);
         self.set_back_socket(stream);
 
-        self.metrics.backend_id = Some(backend.borrow().backend_id.clone());
+        // self.metrics.backend_id = Some(backend.borrow().backend_id.clone());
         self.metrics.backend_start();
         self.set_backend_id(backend.borrow().backend_id.clone());
 

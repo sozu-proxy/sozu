@@ -645,10 +645,10 @@ fn try_http_behaviors() -> State {
         .to_http(None)
         .unwrap();
     http_config.answers = BTreeMap::from([
-        ("400".to_string(), immutable_answer(400)),
-        ("404".to_string(), immutable_answer(404)),
-        ("502".to_string(), immutable_answer(502)),
-        ("503".to_string(), immutable_answer(503)),
+        ("400".to_string(), immutable_answer(400, false)),
+        ("404".to_string(), immutable_answer(404, false)),
+        ("502".to_string(), immutable_answer(502, false)),
+        ("503".to_string(), immutable_answer(503, false)),
     ]);
 
     worker.send_proxy_request_type(RequestType::AddHttpListener(http_config));
@@ -671,7 +671,7 @@ fn try_http_behaviors() -> State {
 
     let response = client.receive();
     println!("response: {response:?}");
-    assert_eq!(response, Some(immutable_answer(404)));
+    assert_eq!(response, Some(immutable_answer(404, true)));
     assert_eq!(client.receive(), None);
 
     worker.send_proxy_request_type(RequestType::AddHttpFrontend(RequestHttpFrontend {
@@ -686,7 +686,7 @@ fn try_http_behaviors() -> State {
 
     let response = client.receive();
     println!("response: {response:?}");
-    assert_eq!(response, Some(immutable_answer(503)));
+    assert_eq!(response, Some(immutable_answer(503, true)));
     assert_eq!(client.receive(), None);
 
     let back_address = create_local_address();
@@ -706,7 +706,7 @@ fn try_http_behaviors() -> State {
 
     let response = client.receive();
     println!("response: {response:?}");
-    assert_eq!(response, Some(immutable_answer(400)));
+    assert_eq!(response, Some(immutable_answer(400, true)));
     assert_eq!(client.receive(), None);
 
     let mut backend = SyncBackend::new("backend", back_address, "TEST\r\n\r\n");
@@ -723,7 +723,7 @@ fn try_http_behaviors() -> State {
     let response = client.receive();
     println!("request: {request:?}");
     println!("response: {response:?}");
-    assert_eq!(response, Some(immutable_answer(502)));
+    assert_eq!(response, Some(immutable_answer(502, true)));
     assert_eq!(client.receive(), None);
 
     info!("expecting 200");
@@ -786,7 +786,7 @@ fn try_http_behaviors() -> State {
     let response = client.receive();
     println!("request: {request:?}");
     println!("response: {response:?}");
-    assert_eq!(response, Some(immutable_answer(503)));
+    assert_eq!(response, Some(immutable_answer(503, true)));
     assert_eq!(client.receive(), None);
 
     worker.send_proxy_request_type(RequestType::RemoveBackend(RemoveBackend {
@@ -984,7 +984,7 @@ fn try_https_redirect() -> State {
     client.connect();
     client.send();
     let answer = client.receive();
-    let expected_answer = format!("{answer_301_prefix}https://example.com/redirected?true\r\n\r\n");
+    let expected_answer = format!("{answer_301_prefix}https://example.com/redirected?true\r\nContent-Length: 0\r\n\r\n");
     assert_eq!(answer, Some(expected_answer));
 
     State::Success

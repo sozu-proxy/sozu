@@ -1,7 +1,7 @@
 use crate::{protocol::http::DefaultAnswer, sozu_command::state::ClusterId};
 use kawa::{
-    h1::NoCallbacks, AsBuffer, Block, BodySize, Buffer, Chunk, Kawa, Kind, Pair, ParsingPhase,
-    ParsingPhaseMarker, StatusLine, Store,
+    h1::NoCallbacks, AsBuffer, Block, BodySize, Buffer, Chunk, Flags, Kawa, Kind, Pair,
+    ParsingPhase, ParsingPhaseMarker, StatusLine, Store,
 };
 use nom::AsBytes;
 use std::{
@@ -10,6 +10,8 @@ use std::{
     rc::Rc,
     str::from_utf8_unchecked,
 };
+
+use super::parser::compare_no_case;
 
 #[derive(Clone)]
 pub struct SharedBuffer(Rc<[u8]>);
@@ -34,6 +36,8 @@ pub enum TemplateError {
     InvalidTemplate(ParsingPhase),
     #[error("unexpected status code: {0}")]
     InvalidStatusCode(u16),
+    #[error("unexpected size info: {0:?}")]
+    InvalidSizeInfo(BodySize),
     #[error("streaming is not supported in templates")]
     UnsupportedStreaming,
     #[error("template variable {0} is not allowed in headers")]
@@ -68,6 +72,7 @@ pub struct Replacement {
 // TODO: rename for clarity, for instance HttpAnswerTemplate
 pub struct Template {
     status: u16,
+    keep_alive: bool,
     kawa: DefaultAnswerStream,
     body_replacements: Vec<Replacement>,
     header_replacements: Vec<Replacement>,
@@ -126,6 +131,9 @@ impl Template {
         if !kawa.is_main_phase() {
             return Err(TemplateError::InvalidTemplate(kawa.parsing_phase));
         }
+        if kawa.body_size != BodySize::Empty {
+            return Err(TemplateError::InvalidSizeInfo(kawa.body_size));
+        }
         let status = if let StatusLine::Response { code, .. } = &kawa.detached.status_line {
             if let Some(expected_code) = status {
                 if expected_code != *code {
@@ -141,16 +149,35 @@ impl Template {
         let mut header_replacements = Vec::new();
         let mut body_replacements = Vec::new();
         let mut body_size = 0;
+        let mut keep_alive = true;
         let mut used_once = Vec::new();
         for mut block in kawa.blocks.into_iter() {
             match &mut block {
                 Block::ChunkHeader(_) => return Err(TemplateError::UnsupportedStreaming),
+                Block::Flags(Flags {
+                    end_header: true, ..
+                }) => {
+                    header_replacements.push(Replacement {
+                        block_index: blocks.len(),
+                        typ: ReplacementType::ContentLength,
+                    });
+                    blocks.push_back(Block::Header(Pair {
+                        key: Store::Static(b"Content-Length"),
+                        val: Store::Static(b"PLACEHOLDER"),
+                    }));
+                    blocks.push_back(block);
+                }
                 Block::StatusLine | Block::Cookies | Block::Flags(_) => {
                     blocks.push_back(block);
                 }
                 Block::Header(Pair { key, val }) => {
                     let val_data = val.data(buf);
                     let key_data = key.data(buf);
+                    if compare_no_case(key_data, b"connection")
+                        && compare_no_case(val_data, b"close")
+                    {
+                        keep_alive = false;
+                    }
                     if let Some(b'%') = val_data.first() {
                         for variable in &variables {
                             if &val_data[1..] == variable.name.as_bytes() {
@@ -168,11 +195,7 @@ impl Template {
                                         }
                                         used_once.push(var_index);
                                     }
-                                    ReplacementType::ContentLength => {
-                                        if let Some(b'%') = key_data.first() {
-                                            *key = Store::new_slice(buf, &key_data[1..]);
-                                        }
-                                    }
+                                    ReplacementType::ContentLength => {}
                                 }
                                 header_replacements.push(Replacement {
                                     block_index: blocks.len(),
@@ -240,6 +263,7 @@ impl Template {
         kawa.blocks = blocks;
         Ok(Self {
             status,
+            keep_alive,
             kawa,
             body_replacements,
             header_replacements,
@@ -306,7 +330,6 @@ pub struct HttpAnswers {
 }
 
 // const HEADERS: &str = "Connection: close\r
-// Content-Length: 0\r
 // Sozu-Id: %REQUEST_ID\r
 // \r";
 // const STYLE: &str = "<style>
@@ -324,7 +347,6 @@ fn fallback() -> String {
 HTTP/1.1 404 Not Found\r
 Cache-Control: no-cache\r
 Connection: close\r
-%Content-Length: %CONTENT_LENGTH\r
 Sozu-Id: %REQUEST_ID\r
 \r
 <html><head><meta charset='utf-8'><head><body>
@@ -350,7 +372,6 @@ fn default_301() -> String {
 HTTP/1.1 301 Moved Permanently\r
 Location: %REDIRECT_LOCATION\r
 Connection: close\r
-Content-Length: 0\r
 Sozu-Id: %REQUEST_ID\r
 \r\n",
     )
@@ -362,7 +383,6 @@ fn default_400() -> String {
 HTTP/1.1 400 Bad Request\r
 Cache-Control: no-cache\r
 Connection: close\r
-%Content-Length: %CONTENT_LENGTH\r
 Sozu-Id: %REQUEST_ID\r
 \r
 <html><head><meta charset='utf-8'><head><body>
@@ -411,7 +431,6 @@ fn default_401() -> String {
 HTTP/1.1 401 Unauthorized\r
 Cache-Control: no-cache\r
 Connection: close\r
-%Content-Length: %CONTENT_LENGTH\r
 Sozu-Id: %REQUEST_ID\r
 \r
 <html><head><meta charset='utf-8'><head><body>
@@ -433,8 +452,6 @@ fn default_404() -> String {
         "\
 HTTP/1.1 404 Not Found\r
 Cache-Control: no-cache\r
-Connection: close\r
-%Content-Length: %CONTENT_LENGTH\r
 Sozu-Id: %REQUEST_ID\r
 \r
 <html><head><meta charset='utf-8'><head><body>
@@ -457,7 +474,6 @@ fn default_408() -> String {
 HTTP/1.1 408 Request Timeout\r
 Cache-Control: no-cache\r
 Connection: close\r
-%Content-Length: %CONTENT_LENGTH\r
 Sozu-Id: %REQUEST_ID\r
 \r
 <html><head><meta charset='utf-8'><head><body>
@@ -481,7 +497,6 @@ fn default_413() -> String {
 HTTP/1.1 413 Payload Too Large\r
 Cache-Control: no-cache\r
 Connection: close\r
-%Content-Length: %CONTENT_LENGTH\r
 Sozu-Id: %REQUEST_ID\r
 \r
 <html><head><meta charset='utf-8'><head><body>
@@ -505,7 +520,6 @@ fn default_502() -> String {
 HTTP/1.1 502 Bad Gateway\r
 Cache-Control: no-cache\r
 Connection: close\r
-%Content-Length: %CONTENT_LENGTH\r
 Sozu-Id: %REQUEST_ID\r
 \r
 <html><head><meta charset='utf-8'><head><body>
@@ -556,7 +570,6 @@ fn default_503() -> String {
 HTTP/1.1 503 Service Unavailable\r
 Cache-Control: no-cache\r
 Connection: close\r
-%Content-Length: %CONTENT_LENGTH\r
 Sozu-Id: %REQUEST_ID\r
 \r
 <html><head><meta charset='utf-8'><head><body>
@@ -582,7 +595,6 @@ fn default_504() -> String {
 HTTP/1.1 504 Gateway Timeout\r
 Cache-Control: no-cache\r
 Connection: close\r
-%Content-Length: %CONTENT_LENGTH\r
 Sozu-Id: %REQUEST_ID\r
 \r
 <html><head><meta charset='utf-8'><head><body>
@@ -608,7 +620,6 @@ fn default_507() -> String {
 HTTP/1.1 507 Insufficient Storage\r
 Cache-Control: no-cache\r
 Connection: close\r
-%Content-Length: %CONTENT_LENGTH\r
 Sozu-Id: %REQUEST_ID\r
 \r
 <html><head><meta charset='utf-8'><head><body>
@@ -645,13 +656,6 @@ fn phase_to_vec(phase: ParsingPhaseMarker) -> Vec<u8> {
 impl HttpAnswers {
     #[rustfmt::skip]
     pub fn template(name: &str, answer: &str) -> Result<Template, (String, TemplateError)> {
-        let length = TemplateVariable {
-            name: "CONTENT_LENGTH",
-            valid_in_body: false,
-            valid_in_header: true,
-            typ: ReplacementType::ContentLength,
-        };
-
         let route = TemplateVariable {
             name: "ROUTE",
             valid_in_body: true,
@@ -736,57 +740,57 @@ impl HttpAnswers {
             "301" => Template::new(
                 Some(301),
                 answer,
-                &[length, route, request_id, location]
+                &[route, request_id, location]
             ),
             "400" => Template::new(
                 Some(400),
                 answer,
-                &[length, route, request_id, message, phase, successfully_parsed, partially_parsed, invalid],
+                &[route, request_id, message, phase, successfully_parsed, partially_parsed, invalid],
             ),
             "401" => Template::new(
                 Some(401),
                 answer,
-                &[length, route, request_id]
+                &[route, request_id]
             ),
             "404" => Template::new(
                 Some(404),
                 answer,
-                &[length, route, request_id]
+                &[route, request_id]
             ),
             "408" => Template::new(
                 Some(408),
                 answer,
-                &[length, route, request_id, duration]
+                &[route, request_id, duration]
             ),
             "413" => Template::new(
                 Some(413),
                 answer,
-                &[length, route, request_id, capacity, message, phase],
+                &[route, request_id, capacity, message, phase],
             ),
             "502" => Template::new(
                 Some(502),
                 answer,
-                &[length, route, request_id, cluster_id, backend_id, message, phase, successfully_parsed, partially_parsed, invalid],
+                &[route, request_id, cluster_id, backend_id, message, phase, successfully_parsed, partially_parsed, invalid],
             ),
             "503" => Template::new(
                 Some(503),
                 answer,
-                &[length, route, request_id, cluster_id, backend_id, message],
+                &[route, request_id, cluster_id, backend_id, message],
             ),
             "504" => Template::new(
                 Some(504),
                 answer,
-                &[length, route, request_id, cluster_id, backend_id, duration],
+                &[route, request_id, cluster_id, backend_id, duration],
             ),
             "507" => Template::new(
                 Some(507),
                 answer,
-                &[length, route, request_id, cluster_id, backend_id, capacity, message, phase],
+                &[route, request_id, cluster_id, backend_id, capacity, message, phase],
             ),
             _ => Template::new(
                 None,
                 answer,
-                &[length, route, request_id, cluster_id, location, template_name]
+                &[route, request_id, cluster_id, location, template_name]
             )
         }
         .map_err(|e| (name.to_owned(), e))
@@ -852,7 +856,7 @@ impl HttpAnswers {
         cluster_id: Option<&str>,
         backend_id: Option<&str>,
         route: String,
-    ) -> (u16, DefaultAnswerStream) {
+    ) -> (u16, bool, DefaultAnswerStream) {
         let variables: Vec<Vec<u8>>;
         let mut variables_once: Vec<Vec<u8>>;
         let name = match answer {
@@ -987,6 +991,7 @@ impl HttpAnswers {
             .unwrap_or(&self.fallback);
         (
             template.status,
+            template.keep_alive,
             template.fill(&variables, &mut variables_once),
         )
     }

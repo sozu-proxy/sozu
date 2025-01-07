@@ -953,7 +953,6 @@ pub struct SessionMetrics {
     pub service_start: Option<Instant>,
     pub wait_start: Instant,
 
-    pub backend_id: Option<String>,
     pub backend_start: Option<Instant>,
     pub backend_connected: Option<Instant>,
     pub backend_stop: Option<Instant>,
@@ -971,7 +970,6 @@ impl SessionMetrics {
             bout: 0,
             service_start: None,
             wait_start: Instant::now(),
-            backend_id: None,
             backend_start: None,
             backend_connected: None,
             backend_stop: None,
@@ -1072,7 +1070,7 @@ impl SessionMetrics {
         time!("request_time", request_time.as_millis());
         time!("service_time", service_time.as_millis());
 
-        if let Some(backend_id) = self.backend_id.as_ref() {
+        if let Some(backend_id) = context.backend_id {
             if let Some(backend_response_time) = self.backend_response_time() {
                 record_backend_metrics!(
                     context.cluster_id.as_str_or("-"),

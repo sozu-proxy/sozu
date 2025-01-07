@@ -1724,6 +1724,7 @@ mod tests {
                 hostname: String::from("test.local"),
                 path: PathRule::prefix(String::from("/abc")),
                 address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
+                required_auth: Some(false),
                 redirect: Some(RedirectPolicy::Forward.into()),
                 redirect_scheme: Some(RedirectScheme::UseSame.into()),
                 ..Default::default()

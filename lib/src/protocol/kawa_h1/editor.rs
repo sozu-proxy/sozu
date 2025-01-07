@@ -365,6 +365,8 @@ impl HttpContext {
         self.status = None;
         self.reason = None;
         self.user_agent = None;
+        self.cluster_id = None;
+        self.backend_id = None;
     }
 
     pub fn log_context(&self) -> LogContext {

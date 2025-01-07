@@ -209,11 +209,14 @@ impl HttpSession {
         }
     }
 
-    fn upgrade_http(&mut self, http: Http<TcpStream, HttpListener>) -> Option<HttpStateMachine> {
+    fn upgrade_http(
+        &mut self,
+        mut http: Http<TcpStream, HttpListener>,
+    ) -> Option<HttpStateMachine> {
         debug!("http switching to ws");
-        let front_token = self.frontend_token;
-        let back_token = match http.backend_token {
-            Some(back_token) => back_token,
+        let frontend_token = self.frontend_token;
+        let origin = match http.origin.take() {
+            Some(origin) => origin,
             None => {
                 warn!(
                     "Could not upgrade http request on cluster '{:?}' ({:?}) using backend '{:?}' into websocket for request '{}'",
@@ -223,7 +226,7 @@ impl HttpSession {
             }
         };
 
-        let ws_context = http.websocket_context();
+        let websocket_context = http.websocket_context();
         let mut container_frontend_timeout = http.container_frontend_timeout;
         let mut container_backend_timeout = http.container_backend_timeout;
         container_frontend_timeout.reset();
@@ -237,25 +240,25 @@ impl HttpSession {
 
         let mut pipe = Pipe::new(
             backend_buffer,
-            http.context.backend_id,
-            http.backend_socket,
-            http.backend,
+            Some(origin.backend_id),
+            Some(origin.socket),
+            Some(origin.backend),
             Some(container_backend_timeout),
             Some(container_frontend_timeout),
             http.context.cluster_id,
             http.request_stream.storage.buffer,
-            front_token,
+            frontend_token,
             http.frontend_socket,
             self.listener.clone(),
             Protocol::HTTP,
             http.context.id,
             http.context.session_address,
-            ws_context,
+            websocket_context,
         );
 
         pipe.frontend_readiness.event = http.frontend_readiness.event;
         pipe.backend_readiness.event = http.backend_readiness.event;
-        pipe.set_back_token(back_token);
+        pipe.set_back_token(origin.token);
 
         gauge_add!("protocol.http", -1);
         gauge_add!("protocol.ws", 1);

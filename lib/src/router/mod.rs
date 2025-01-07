@@ -179,7 +179,6 @@ impl Router {
             front.rewrite_path.clone(),
             front.rewrite_port,
         )?;
-        println!("ROUTE:{route:#?}");
 
         let success = match front.position {
             RulePosition::Pre => self.add_pre_rule(&domain_rule, &path_rule, &method_rule, &route),
@@ -935,8 +934,8 @@ impl RouteResult {
                 _ => {}
             }
         }
-        println!("========HOST_CAPTURES: {captures_host:?}");
-        println!("========PATH_CAPTURES: {captures_path:?}");
+        // println!("========HOST_CAPTURES: {captures_host:?}");
+        // println!("========PATH_CAPTURES: {captures_path:?}");
         Self {
             cluster_id: cluster_id.clone(),
             required_auth: *required_auth,
