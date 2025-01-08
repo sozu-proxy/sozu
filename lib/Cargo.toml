@@ -65,13 +65,16 @@ serial_test = "^3.1.1"
 tiny_http = "^0.12.0"
 
 [features]
-default = ["simd"]
+default = []
 logs-debug = []
 logs-trace = []
 simd = ["kawa/simd"]
 splice = []
 tolerant-http1-parser = ["kawa/tolerant-parsing"]
 unstable = []
+
+[target.'cfg(target_arch = "x86_64")'.features]
+default = ["simd"]
 
 [badges]
 travis-ci = { repository = "sozu-proxy/sozu" }

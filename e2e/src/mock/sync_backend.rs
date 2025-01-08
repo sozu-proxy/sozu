@@ -48,7 +48,7 @@ impl Backend {
         let timeout = Duration::from_millis(100);
         let timeout = libc::timeval {
             tv_sec: 0,
-            tv_usec: timeout.subsec_micros().into(),
+            tv_usec: timeout.subsec_micros().try_into().unwrap_or(0),
         };
         let listener = unsafe {
             let fd = listener.into_raw_fd();
