@@ -75,7 +75,6 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                         unreachable!()
                     };
                     let global_stream_id = self.stream;
-                    self.readiness.interest.remove(Ready::ALL);
                     self.end_stream(global_stream_id, context);
                     endpoint.end_stream(token, global_stream_id, context);
                 }
@@ -293,14 +292,16 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         match &mut self.position {
             Position::Client(_, _, BackendStatus::Connecting(_)) => {
                 self.stream = usize::MAX;
+                self.readiness.interest.remove(Ready::ALL);
                 self.force_disconnect();
             }
             Position::Client(_, _, status @ BackendStatus::Connected) => {
                 self.stream = usize::MAX;
+                self.readiness.interest.remove(Ready::ALL);
                 // keep alive should probably be used only if the http context is fully reset
                 // in case end_stream occurs due to an error the connection state is probably
                 // unrecoverable and should be terminated
-                if stream_context.keep_alive_backend {
+                if stream_context.keep_alive_backend && stream.back.is_terminated() {
                     *status = BackendStatus::KeepAlive;
                 } else {
                     self.force_disconnect();
