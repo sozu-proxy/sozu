@@ -9,7 +9,7 @@ use rusty_ulid::Ulid;
 use crate::{
     pool::Checkout,
     protocol::http::{parser::compare_no_case, GenericHttpStream, Method},
-    Protocol,
+    Protocol, RetrieveClusterError,
 };
 
 use sozu_command_lib::logging::LogContext;
@@ -24,8 +24,10 @@ pub struct HttpContext {
     pub keep_alive_frontend: bool,
     /// the value of the sticky session cookie in the request
     pub sticky_session_found: Option<String>,
-    /// position of the last authentication header, only valid until prepare is called
+    /// hashed value of the last authentication header
     pub authentication_found: Option<u64>,
+    /// position of the last header (the "Sozu-Id"), only valid until prepare is called
+    pub last_header: Option<usize>,
     // ---------- Status Line
     /// the value of the method in the request line
     pub method: Option<Method>,
@@ -284,6 +286,7 @@ impl HttpContext {
             }));
         }
 
+        self.last_header = Some(request.blocks.len());
         // Create a custom "Sozu-Id" header
         request.push_block(kawa::Block::Header(kawa::Pair {
             key: kawa::Store::Static(b"Sozu-Id"),
@@ -375,5 +378,17 @@ impl HttpContext {
             cluster_id: self.cluster_id.as_deref(),
             backend_id: self.backend_id.as_deref(),
         }
+    }
+
+    // -> host, path, method
+    pub fn extract_route(&self) -> Result<(&str, &str, &Method), RetrieveClusterError> {
+        let given_method = self.method.as_ref().ok_or(RetrieveClusterError::NoMethod)?;
+        let given_authority = self
+            .authority
+            .as_deref()
+            .ok_or(RetrieveClusterError::NoHost)?;
+        let given_path = self.path.as_deref().ok_or(RetrieveClusterError::NoPath)?;
+
+        Ok((given_authority, given_path, given_method))
     }
 }

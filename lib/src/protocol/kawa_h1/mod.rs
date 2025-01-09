@@ -260,6 +260,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 sticky_session: None,
                 sticky_session_found: None,
                 authentication_found: None,
+                last_header: None,
 
                 method: None,
                 authority: None,
@@ -1192,27 +1193,6 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         true
     }
 
-    // -> host, path, method
-    pub fn extract_route(&self) -> Result<(&str, &str, &Method), RetrieveClusterError> {
-        let given_method = self
-            .context
-            .method
-            .as_ref()
-            .ok_or(RetrieveClusterError::NoMethod)?;
-        let given_authority = self
-            .context
-            .authority
-            .as_deref()
-            .ok_or(RetrieveClusterError::NoHost)?;
-        let given_path = self
-            .context
-            .path
-            .as_deref()
-            .ok_or(RetrieveClusterError::NoPath)?;
-
-        Ok((given_authority, given_path, given_method))
-    }
-
     pub fn get_route(&self) -> String {
         if let Some(method) = &self.context.method {
             if let Some(authority) = &self.context.authority {
@@ -1230,7 +1210,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         &mut self,
         proxy: Rc<RefCell<dyn L7Proxy>>,
     ) -> Result<String, RetrieveClusterError> {
-        let (host, path, method) = match self.extract_route() {
+        let (host, path, method) = match self.context.extract_route() {
             Ok(tuple) => tuple,
             Err(cluster_error) => {
                 self.set_answer(DefaultAnswer::Answer400 {
@@ -1304,6 +1284,28 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 cluster_id,
                 start.elapsed().as_millis()
             );
+        }
+
+        match &mut self.request_stream.detached.status_line {
+            kawa::StatusLine::Request { authority, uri, .. } => {
+                let buf = self.request_stream.storage.mut_buffer();
+                if let Some(new) = &rewritten_host {
+                    authority.modify(buf, new.as_bytes());
+                    if let Some(position) = self.context.last_header {
+                        self.request_stream.blocks.insert(
+                            position,
+                            kawa::Block::Header(kawa::Pair {
+                                key: kawa::Store::Static(b"X-Forwarded-Host"),
+                                val: kawa::Store::from_slice(host.as_bytes()),
+                            }),
+                        );
+                    }
+                }
+                if let Some(new) = &rewritten_path {
+                    uri.modify(buf, new.as_bytes());
+                }
+            }
+            _ => unreachable!(),
         }
 
         let host = rewritten_host.as_deref().unwrap_or(host);
@@ -1459,6 +1461,10 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
     ) -> Result<BackendConnectAction, BackendConnectionError> {
         self.check_circuit_breaker()?;
 
+        // TODO: this is called on every connect attempt, not just the first
+        // cluster_id is determined from the triplet (method, authority, path)
+        // which doesn't ever change for a request
+        // this is wasteful and potentially dangerous with the rewrite logic
         let cluster_id = self
             .cluster_id_from_request(proxy.clone())
             .map_err(BackendConnectionError::RetrieveClusterError)?;

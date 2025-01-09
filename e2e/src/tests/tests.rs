@@ -984,7 +984,9 @@ fn try_https_redirect() -> State {
     client.connect();
     client.send();
     let answer = client.receive();
-    let expected_answer = format!("{answer_301_prefix}https://example.com/redirected?true\r\nContent-Length: 0\r\n\r\n");
+    let expected_answer = format!(
+        "{answer_301_prefix}https://example.com/redirected?true\r\nContent-Length: 0\r\n\r\n"
+    );
     assert_eq!(answer, Some(expected_answer));
 
     State::Success
