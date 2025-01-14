@@ -1461,23 +1461,27 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
     ) -> Result<BackendConnectAction, BackendConnectionError> {
         self.check_circuit_breaker()?;
 
-        // TODO: this is called on every connect attempt, not just the first
-        // cluster_id is determined from the triplet (method, authority, path)
-        // which doesn't ever change for a request
-        // this is wasteful and potentially dangerous with the rewrite logic
-        let cluster_id = self
-            .cluster_id_from_request(proxy.clone())
-            .map_err(BackendConnectionError::RetrieveClusterError)?;
-
-        trace!(
-            "{} {:?} Connect_to_backend: {:?}",
-            log_context!(self),
-            self.origin,
-            cluster_id,
-        );
+        let cluster_id = if self.connection_attempts == 0 {
+            // cluster_id is determined from the triplet (method, authority, path)
+            // which doesn't ever change for a request
+            // WARNING: cluster_id_from_request is NOT idempotent, but connect_to_backend SHOULD be
+            self
+                .cluster_id_from_request(proxy.clone())
+                .map_err(BackendConnectionError::RetrieveClusterError)?
+        } else if let Some(cluster_id) = self.context.cluster_id.take() {
+            cluster_id
+        } else {
+            unreachable!();
+        };
 
         // update response cluster producer
         self.context.cluster_id = Some(cluster_id.clone());
+
+        trace!(
+            "{} Connect_to_backend: {:?}",
+            log_context!(self),
+            cluster_id,
+        );
 
         // check if we can reuse the backend connection
         if let Some(origin) = &self.origin {

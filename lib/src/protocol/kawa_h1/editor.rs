@@ -83,6 +83,14 @@ impl HttpContext {
     ///   - sticky cookie
     ///   - user-agent
     fn on_request_headers(&mut self, request: &mut GenericHttpStream) {
+        if request.body_size == kawa::BodySize::Empty {
+            request.parsing_phase = kawa::ParsingPhase::Terminated;
+            request.push_block(kawa::Block::Header(kawa::Pair {
+                key: kawa::Store::Static(b"Content-Length"),
+                val: kawa::Store::Static(b"0"),
+            }));
+        };
+
         let buf = &mut request.storage.mut_buffer();
 
         // Captures the request line
@@ -103,10 +111,6 @@ impl HttpContext {
                 .and_then(|data| from_utf8(data).ok())
                 .map(ToOwned::to_owned);
         }
-
-        // if self.method == Some(Method::Get) && request.body_size == kawa::BodySize::Empty {
-        //     request.parsing_phase = kawa::ParsingPhase::Terminated;
-        // }
 
         let public_ip = self.public_address.ip();
         let public_port = self.public_address.port();
