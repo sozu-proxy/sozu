@@ -739,8 +739,12 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         match frame {
             Frame::Data(data) => {
                 let mut slice = data.payload;
-                // can this fail?
-                let global_stream_id = *self.streams.get(&data.stream_id).unwrap();
+                // can this fail? yes
+                let Some(global_stream_id) = self.streams.get(&data.stream_id).copied() else {
+                    error!("Handling Data frame with no attached stream {:#?}", self);
+                    incr!("h2.data_no_stream.error");
+                    return self.force_disconnect();
+                };
                 let stream = &mut context.streams[global_stream_id];
                 let parts = stream.split(&self.position);
                 let kawa = parts.rbuffer;
@@ -778,7 +782,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 }
                 // can this fail?
                 let stream_id = headers.stream_id;
-                let global_stream_id = *self.streams.get(&stream_id).unwrap();
+                let Some(global_stream_id) = self.streams.get(&stream_id).copied() else {
+                    error!("Handling Headers frame with no attached stream {:#?}", self);
+                    incr!("h2.headers_no_stream.error");
+                    return self.force_disconnect();
+                };
 
                 if let Some(priority) = &headers.priority {
                     if self.prioriser.push_priority(stream_id, priority.clone()) {

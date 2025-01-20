@@ -1,5 +1,3 @@
-use std::str::from_utf8_unchecked;
-
 use kawa::{
     AsBuffer, Block, BlockConverter, Chunk, Flags, Kawa, Pair, ParsingErrorKind, ParsingPhase,
     StatusLine, Store,
@@ -107,7 +105,6 @@ impl<'a, T: AsBuffer> BlockConverter<T> for H2BlockConverter<'a> {
                         || compare_no_case(key, b"transfer-encoding")
                         || compare_no_case(key, b"upgrade")
                     {
-                        println!("Elided H2 header: {}", unsafe { from_utf8_unchecked(key) });
                         return true;
                     }
                 }

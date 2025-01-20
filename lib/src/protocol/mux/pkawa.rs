@@ -103,9 +103,6 @@ where
                         }
                     } else if compare_no_case(&k, b"priority") {
                         // todo!("decode priority");
-                        warn!("DECODE PRIORITY: {}", unsafe {
-                            std::str::from_utf8_unchecked(v.as_ref())
-                        });
                         prioriser.push_priority(
                             stream_id,
                             PriorityPart::Rfc9218 {
