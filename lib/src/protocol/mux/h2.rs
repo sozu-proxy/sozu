@@ -595,6 +595,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 }
 
                 let mut converter = converter::H2BlockConverter {
+                    max_frame_size: self.peer_settings.settings_max_frame_size as usize,
                     window: 0,
                     stream_id: 0,
                     encoder: &mut self.encoder,
