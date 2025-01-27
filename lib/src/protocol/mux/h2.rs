@@ -745,13 +745,16 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         println_!("{frame:#?}");
         match frame {
             Frame::Data(data) => {
-                let mut slice = data.payload;
                 // can this fail? yes
                 let Some(global_stream_id) = self.streams.get(&data.stream_id).copied() else {
-                    error!("Handling Data frame with no attached stream {:#?}", self);
+                    error!(
+                        "Handling Data frame with no attached stream: {:?} | {:?} | {:?} | {:?}",
+                        data, context.streams, self, endpoint,
+                    );
                     incr!("h2.data_no_stream.error");
                     return self.force_disconnect();
                 };
+                let mut slice = data.payload;
                 let stream = &mut context.streams[global_stream_id];
                 let parts = stream.split(&self.position);
                 let kawa = parts.rbuffer;

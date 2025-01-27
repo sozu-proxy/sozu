@@ -225,7 +225,7 @@ pub enum MuxResult {
     CloseSession,
 }
 
-pub trait Endpoint {
+pub trait Endpoint: Debug {
     fn readiness(&self, token: Token) -> &Readiness;
     fn readiness_mut(&mut self, token: Token) -> &mut Readiness;
     /// If end_stream is called on a client it means the stream has PROPERLY finished,
@@ -490,12 +490,14 @@ impl<Front: SocketHandler> Connection<Front> {
     }
 }
 
+#[derive(Debug)]
 struct EndpointServer<'a, Front: SocketHandler>(&'a mut Connection<Front>);
+#[derive(Debug)]
 struct EndpointClient<'a>(&'a mut Router);
 
 // note: EndpointServer are used by client Connection, they do not know the frontend Token
 // they will use the Stream's Token which is their backend token
-impl<'a, Front: SocketHandler> Endpoint for EndpointServer<'a, Front> {
+impl<'a, Front: SocketHandler + Debug> Endpoint for EndpointServer<'a, Front> {
     fn readiness(&self, _token: Token) -> &Readiness {
         self.0.readiness()
     }
@@ -659,6 +661,38 @@ pub struct Stream {
     pub back: GenericHttpStream,
     pub context: HttpContext,
     pub metrics: SessionMetrics,
+}
+
+struct KawaSummary<'a>(&'a GenericHttpStream);
+impl Debug for KawaSummary<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Kawa")
+            .field("kind", &self.0.kind)
+            .field("parsing_phase", &self.0.parsing_phase)
+            .field("body_size", &self.0.body_size)
+            .field("consumed", &self.0.consumed)
+            .field("expects", &self.0.expects)
+            .field("blocks", &self.0.blocks.len())
+            .field("out", &self.0.out.len())
+            .field("storage_start", &self.0.storage.start)
+            .field("storage_head", &self.0.storage.head)
+            .field("storage_end", &self.0.storage.end)
+            .finish()
+    }
+}
+impl Debug for Stream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Stream")
+            .field("window", &self.window)
+            .field("attempts", &self.attempts)
+            .field("state", &self.state)
+            .field("received_end_of_stream", &self.received_end_of_stream)
+            .field("front", &KawaSummary(&self.front))
+            .field("back", &KawaSummary(&self.back))
+            .field("context", &self.context)
+            .field("metrics", &self.metrics)
+            .finish()
+    }
 }
 
 /// This struct allows to mutably borrow the read and write buffers (dependant on the position)
@@ -852,6 +886,7 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
     }
 }
 
+#[derive(Debug)]
 pub struct Router {
     pub backends: HashMap<Token, Connection<TcpStream>>,
     pub configured_backend_timeout: Duration,
@@ -1587,7 +1622,8 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         println_!("FRONTEND: {:#?}", self.frontend);
         println_!("BACKENDS: {:#?}", self.router.backends);
 
-        self.frontend.close(&mut self.context, EndpointClient(&mut self.router));
+        self.frontend
+            .close(&mut self.context, EndpointClient(&mut self.router));
 
         for (token, client) in &mut self.router.backends {
             let proxy_borrow = proxy.borrow();
