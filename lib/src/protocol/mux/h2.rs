@@ -605,6 +605,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 priorities.sort();
 
                 println_!("PRIORITIES: {priorities:?}");
+                let mut socket_write = false;
                 'outer: for stream_id in priorities {
                     let global_stream_id = *self.streams.get(stream_id).unwrap();
                     let stream = &mut context.streams[global_stream_id];
@@ -621,6 +622,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         debug_kawa(kawa);
                     }
                     while !kawa.out.is_empty() {
+                        socket_write = true;
                         let bufs = kawa.as_io_slice();
                         let (size, status) = self.socket.socket_write_vectored(&bufs);
                         kawa.consume(size);
@@ -670,7 +672,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     self.streams.remove(&stream_id).unwrap();
                 }
 
-                if self.expect_write.is_none() {
+                if self.socket.socket_wants_write() {
+                    if !socket_write {
+                        self.socket.socket_write(&[]);
+                    }
+                } else if self.expect_write.is_none() {
                     // We wrote everything
                     self.readiness.interest.remove(Ready::WRITABLE);
                 }
@@ -1045,7 +1051,12 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         match self.position {
             Position::Client(_, _, BackendStatus::KeepAlive) => unreachable!(),
             Position::Client(..) => {}
-            Position::Server => unreachable!(),
+            Position::Server => {
+                println_!("H2 SENDING CLOSE NOTIFY");
+                self.socket.socket_close();
+                let _ = self.socket.socket_write_vectored(&[]);
+                return;
+            }
         }
         // reconnection is handled by the server for each stream separately
         for global_stream_id in self.streams.values() {

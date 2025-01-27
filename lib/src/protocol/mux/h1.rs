@@ -141,7 +141,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         kawa.prepare(&mut kawa::h1::BlockConverter);
         debug_kawa(kawa);
         let bufs = kawa.as_io_slice();
-        if bufs.is_empty() {
+        if bufs.is_empty() && !self.socket.socket_wants_write() {
             self.readiness.interest.remove(Ready::WRITABLE);
             return MuxResult::Continue;
         }
@@ -157,7 +157,9 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                 parts.metrics.bout += size;
             }
         }
-        if update_readiness_after_write(size, status, &mut self.readiness) {
+        if update_readiness_after_write(size, status, &mut self.readiness)
+            || self.socket.socket_wants_write()
+        {
             return MuxResult::Continue;
         }
 
@@ -272,7 +274,12 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             }
             Position::Client(_, _, BackendStatus::Connecting(_))
             | Position::Client(_, _, BackendStatus::Connected) => {}
-            Position::Server => unreachable!(),
+            Position::Server => {
+                println_!("H1 SENDING CLOSE NOTIFY");
+                self.socket.socket_close();
+                let _ = self.socket.socket_write_vectored(&[]);
+                return;
+            }
         }
         // reconnection is handled by the server
         let StreamState::Linked(token) = context.streams[self.stream].state else {

@@ -151,6 +151,7 @@ fn set_default_answer(stream: &mut Stream, readiness: &mut Readiness, code: u16)
         fill_default_301_answer(kawa, host, uri);
     } else {
         fill_default_answer(kawa, code);
+        context.keep_alive_frontend = false;
     }
     context.status = Some(code);
     stream.state = StreamState::Unlinked;
@@ -450,7 +451,7 @@ impl<Front: SocketHandler> Connection<Front> {
                 );
                 println_!("--------------- CONNECTION CLOSE: {backend_borrow:#?}");
             }
-            Position::Server => todo!(),
+            Position::Server => {}
         }
         match self {
             Connection::H1(c) => c.close(context, endpoint),
@@ -1585,6 +1586,8 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         debug!("MUX CLOSE");
         println_!("FRONTEND: {:#?}", self.frontend);
         println_!("BACKENDS: {:#?}", self.router.backends);
+
+        self.frontend.close(&mut self.context, EndpointClient(&mut self.router));
 
         for (token, client) in &mut self.router.backends {
             let proxy_borrow = proxy.borrow();
