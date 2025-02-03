@@ -53,6 +53,7 @@ pub struct TemplateVariable {
     name: &'static str,
     valid_in_body: bool,
     valid_in_header: bool,
+    or_elide_header: bool,
     typ: ReplacementType,
 }
 
@@ -66,6 +67,7 @@ pub enum ReplacementType {
 #[derive(Clone, Copy, Debug)]
 pub struct Replacement {
     block_index: usize,
+    or_elide_header: bool,
     typ: ReplacementType,
 }
 
@@ -159,6 +161,7 @@ impl Template {
                 }) => {
                     header_replacements.push(Replacement {
                         block_index: blocks.len(),
+                        or_elide_header: false,
                         typ: ReplacementType::ContentLength,
                     });
                     blocks.push_back(Block::Header(Pair {
@@ -199,6 +202,7 @@ impl Template {
                                 }
                                 header_replacements.push(Replacement {
                                     block_index: blocks.len(),
+                                    or_elide_header: variable.or_elide_header,
                                     typ: variable.typ,
                                 });
                                 break;
@@ -241,6 +245,7 @@ impl Template {
                                     }
                                     body_replacements.push(Replacement {
                                         block_index: blocks.len(),
+                                        or_elide_header: false,
                                         typ: variable.typ,
                                     });
                                     blocks.push_back(Block::Chunk(Chunk {
@@ -306,6 +311,10 @@ impl Template {
                     ReplacementType::ContentLength => {
                         pair.val = Store::from_string(body_size.to_string())
                     }
+                }
+                if pair.val.len() == 0 && replacement.or_elide_header {
+                    pair.elide();
+                    continue;
                 }
             }
         }
@@ -429,6 +438,7 @@ fn default_401() -> String {
     String::from(
         "\
 HTTP/1.1 401 Unauthorized\r
+WWW-Authenticate: %WWW_AUTHENTICATE\r
 Cache-Control: no-cache\r
 Connection: close\r
 Sozu-Id: %REQUEST_ID\r
@@ -660,42 +670,49 @@ impl HttpAnswers {
             name: "ROUTE",
             valid_in_body: true,
             valid_in_header: true,
+            or_elide_header: false,
             typ: ReplacementType::Variable(0),
         };
         let request_id = TemplateVariable {
             name: "REQUEST_ID",
             valid_in_body: true,
             valid_in_header: true,
+            or_elide_header: false,
             typ: ReplacementType::Variable(0),
         };
         let cluster_id = TemplateVariable {
             name: "CLUSTER_ID",
             valid_in_body: true,
             valid_in_header: true,
+            or_elide_header: false,
             typ: ReplacementType::Variable(0),
         };
         let backend_id = TemplateVariable {
             name: "BACKEND_ID",
             valid_in_body: true,
             valid_in_header: true,
+            or_elide_header: false,
             typ: ReplacementType::Variable(0),
         };
         let duration = TemplateVariable {
             name: "DURATION",
             valid_in_body: true,
             valid_in_header: true,
+            or_elide_header: false,
             typ: ReplacementType::Variable(0),
         };
         let capacity = TemplateVariable {
             name: "CAPACITY",
             valid_in_body: true,
             valid_in_header: true,
+            or_elide_header: false,
             typ: ReplacementType::Variable(0),
         };
         let phase = TemplateVariable {
             name: "PHASE",
             valid_in_body: true,
             valid_in_header: true,
+            or_elide_header: false,
             typ: ReplacementType::Variable(0),
         };
 
@@ -703,36 +720,49 @@ impl HttpAnswers {
             name: "REDIRECT_LOCATION",
             valid_in_body: true,
             valid_in_header: true,
+            or_elide_header: false,
+            typ: ReplacementType::VariableOnce(0),
+        };
+        let www_authenticate = TemplateVariable {
+            name: "WWW_AUTHENTICATE",
+            valid_in_body: false,
+            valid_in_header: true,
+            or_elide_header: true,
             typ: ReplacementType::VariableOnce(0),
         };
         let message = TemplateVariable {
             name: "MESSAGE",
             valid_in_body: true,
             valid_in_header: false,
+            or_elide_header: false,
             typ: ReplacementType::VariableOnce(0),
         };
         let successfully_parsed = TemplateVariable {
             name: "SUCCESSFULLY_PARSED",
             valid_in_body: true,
             valid_in_header: false,
+            or_elide_header: false,
             typ: ReplacementType::Variable(0),
         };
         let partially_parsed = TemplateVariable {
             name: "PARTIALLY_PARSED",
             valid_in_body: true,
             valid_in_header: false,
+            or_elide_header: false,
             typ: ReplacementType::Variable(0),
         };
         let invalid = TemplateVariable {
             name: "INVALID",
             valid_in_body: true,
             valid_in_header: false,
+            or_elide_header: false,
             typ: ReplacementType::Variable(0),
         };
         let template_name = TemplateVariable {
             name: "TEMPLATE_NAME",
             valid_in_body: true,
             valid_in_header: true,
+            or_elide_header: false,
             typ: ReplacementType::Variable(0),
         };
 
@@ -750,7 +780,7 @@ impl HttpAnswers {
             "401" => Template::new(
                 Some(401),
                 answer,
-                &[route, request_id]
+                &[route, request_id, www_authenticate]
             ),
             "404" => Template::new(
                 Some(404),
@@ -883,9 +913,9 @@ impl HttpAnswers {
                 variables_once = vec![message.into()];
                 "400"
             }
-            DefaultAnswer::Answer401 {} => {
+            DefaultAnswer::Answer401 { www_authenticate } => {
                 variables = vec![route.into(), request_id.into()];
-                variables_once = vec![];
+                variables_once = vec![www_authenticate.map(Into::into).unwrap_or_default()];
                 "401"
             }
             DefaultAnswer::Answer404 {} => {

@@ -1241,7 +1241,7 @@ pub fn try_stick() -> State {
     backend1.send(0);
     let response = client.receive();
     println!("response: {response:?}");
-    assert!(request.unwrap().starts_with("GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nCookie: foo=bar\r\nX-Forwarded-For:"));
+    assert!(request.unwrap().starts_with("GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nCookie: foo=bar\r\nContent-Length: 0\r\nX-Forwarded-For:"));
     assert!(response.unwrap().starts_with("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nSet-Cookie: SOZUBALANCEID=sticky_cluster_0-0; Path=/\r\nSozu-Id:"));
 
     // invalid sticky_session
@@ -1254,7 +1254,7 @@ pub fn try_stick() -> State {
     backend2.send(0);
     let response = client.receive();
     println!("response: {response:?}");
-    assert!(request.unwrap().starts_with("GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nCookie: foo=bar\r\nX-Forwarded-For:"));
+    assert!(request.unwrap().starts_with("GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nCookie: foo=bar\r\nContent-Length: 0\r\nX-Forwarded-For:"));
     assert!(response.unwrap().starts_with("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nSet-Cookie: SOZUBALANCEID=sticky_cluster_0-1; Path=/\r\nSozu-Id:"));
 
     // good sticky_session (force use backend2, round-robin would have chosen backend1)
@@ -1267,7 +1267,7 @@ pub fn try_stick() -> State {
     backend2.send(0);
     let response = client.receive();
     println!("response: {response:?}");
-    assert!(request.unwrap().starts_with("GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nCookie: foo=bar\r\nX-Forwarded-For:"));
+    assert!(request.unwrap().starts_with("GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nCookie: foo=bar\r\nContent-Length: 0\r\nX-Forwarded-For:"));
     assert!(response
         .unwrap()
         .starts_with("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nSozu-Id:"));

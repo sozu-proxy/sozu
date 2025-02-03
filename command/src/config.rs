@@ -210,13 +210,15 @@ pub enum ConfigError {
     },
     #[error("Invalid '{0}' field for a TCP frontend")]
     InvalidFrontendConfig(String),
-    #[error("invalid path {0:?}")]
+    #[error("Invalid path {0:?}")]
     InvalidPath(PathBuf),
-    #[error("listening address {0:?} is already used in the configuration")]
+    #[error("Invalid Sha256 hash '{0}'")]
+    InvalidHash(String),
+    #[error("Listening address {0:?} is already used in the configuration")]
     ListenerAddressAlreadyInUse(SocketAddr),
-    #[error("missing {0:?}")]
+    #[error("Missing {0:?}")]
     Missing(MissingKind),
-    #[error("could not get parent directory for file {0}")]
+    #[error("Could not get parent directory for file {0}")]
     NoFileParent(String),
     #[error("Could not get the path of the saved state")]
     SaveStatePath(String),
@@ -761,7 +763,9 @@ pub struct FileClusterConfig {
     #[serde(default)]
     pub answers: Option<BTreeMap<String, String>>,
     #[serde(default)]
-    pub authorized_hashes: Vec<u64>,
+    pub authorized_hashes: Vec<String>,
+    #[serde(default)]
+    pub www_authenticate: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -838,6 +842,17 @@ impl FileClusterConfig {
                     let http_frontend = frontend.to_http_front(cluster_id)?;
                     frontends.push(http_frontend);
                 }
+                self.authorized_hashes
+                    .iter()
+                    .map(|hash| {
+                        hex::decode(&hash)
+                            .map_err(|_| ConfigError::InvalidHash(hash.clone()))
+                            .and_then(|v| {
+                                v.try_into()
+                                    .map_err(|_| ConfigError::InvalidHash(hash.clone()))
+                            })
+                    })
+                    .collect::<Result<Vec<[u8; 32]>, ConfigError>>()?;
 
                 Ok(ClusterConfig::Http(HttpClusterConfig {
                     cluster_id: cluster_id.to_string(),
@@ -850,6 +865,7 @@ impl FileClusterConfig {
                     load_metric: self.load_metric,
                     answers: load_answers(self.answers.as_ref())?,
                     authorized_hashes: self.authorized_hashes,
+                    www_authenticate: self.www_authenticate,
                 }))
             }
         }
@@ -964,7 +980,8 @@ pub struct HttpClusterConfig {
     pub load_balancing: LoadBalancingAlgorithms,
     pub load_metric: Option<LoadMetric>,
     pub answers: BTreeMap<String, String>,
-    pub authorized_hashes: Vec<u64>,
+    pub authorized_hashes: Vec<String>,
+    pub www_authenticate: Option<String>,
 }
 
 impl HttpClusterConfig {
@@ -979,6 +996,7 @@ impl HttpClusterConfig {
             load_metric: self.load_metric.map(|s| s as i32),
             answers: self.answers.clone(),
             authorized_hashes: self.authorized_hashes.clone(),
+            www_authenticate: self.www_authenticate.clone(),
         })
         .into()];
 
@@ -1040,6 +1058,7 @@ impl TcpClusterConfig {
             load_metric: self.load_metric.map(|s| s as i32),
             answers: Default::default(),
             authorized_hashes: Default::default(),
+            www_authenticate: None,
         })
         .into()];
 

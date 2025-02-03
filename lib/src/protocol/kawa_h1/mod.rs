@@ -91,7 +91,9 @@ pub enum DefaultAnswer {
         partially_parsed: String,
         invalid: String,
     },
-    Answer401 {},
+    Answer401 {
+        www_authenticate: Option<String>,
+    },
     Answer404 {},
     Answer408 {
         duration: String,
@@ -259,7 +261,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 sticky_name,
                 sticky_session: None,
                 sticky_session_found: None,
-                authentication_found: None,
+                authorization_found: None,
                 last_header: None,
 
                 method: None,
@@ -1324,23 +1326,23 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             (RedirectScheme::UseHttps, _) | (RedirectScheme::UseSame, true) => "https",
         };
 
-        let (authorized, https_redirect, https_redirect_port) =
+        let (authorized, www_authenticate, https_redirect, https_redirect_port) =
             match (&cluster_id, redirect, &redirect_template, required_auth) {
                 // unauthorized frontends
-                (_, RedirectPolicy::Unauthorized, _, _) => (false, false, None),
+                (_, RedirectPolicy::Unauthorized, _, _) => (false, None, false, None),
                 // forward frontends with no target (no cluster nor template)
-                (None, RedirectPolicy::Forward, None, _) => (false, false, None),
+                (None, RedirectPolicy::Forward, None, _) => (false, None, false, None),
                 // clusterless frontend with auth (unsupported)
-                (None, _, _, true) => (false, false, None),
+                (None, _, _, true) => (false, None, false, None),
                 // clusterless frontends
-                (None, _, _, false) => (true, false, None),
+                (None, _, _, false) => (true, None, false, None),
                 // "attached" frontends
                 (Some(cluster_id), _, _, _) => {
                     proxy.borrow().clusters().get(cluster_id).map_or(
-                        (true, false, None), // cluster not found, consider authorized?
+                        (true, None, false, None), // cluster not found, consider authorized?
                         |cluster| {
                             let authorized =
-                                match (required_auth, self.context.authentication_found) {
+                                match (required_auth, &self.context.authorization_found) {
                                     // auth not required
                                     (false, _) => true,
                                     // no auth found
@@ -1348,11 +1350,12 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                                     // validation
                                     (true, Some(hash)) => {
                                         println!("{hash:?}");
-                                        cluster.authorized_hashes.contains(&hash)
+                                        cluster.authorized_hashes.contains(hash)
                                     }
                                 };
                             (
                                 authorized,
+                                cluster.www_authenticate.clone(),
                                 cluster.https_redirect,
                                 cluster.https_redirect_port,
                             )
@@ -1388,7 +1391,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             }
             (cluster_id, ..) => {
                 self.context.cluster_id = cluster_id;
-                self.set_answer(DefaultAnswer::Answer401 {});
+                self.set_answer(DefaultAnswer::Answer401 { www_authenticate });
                 Err(RetrieveClusterError::UnauthorizedRoute)
             }
         }
@@ -1465,8 +1468,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             // cluster_id is determined from the triplet (method, authority, path)
             // which doesn't ever change for a request
             // WARNING: cluster_id_from_request is NOT idempotent, but connect_to_backend SHOULD be
-            self
-                .cluster_id_from_request(proxy.clone())
+            self.cluster_id_from_request(proxy.clone())
                 .map_err(BackendConnectionError::RetrieveClusterError)?
         } else if let Some(cluster_id) = self.context.cluster_id.take() {
             cluster_id

@@ -5,6 +5,7 @@ use std::{
 };
 
 use rusty_ulid::Ulid;
+use sha2::{Digest, Sha256};
 
 use crate::{
     pool::Checkout,
@@ -24,8 +25,8 @@ pub struct HttpContext {
     pub keep_alive_frontend: bool,
     /// the value of the sticky session cookie in the request
     pub sticky_session_found: Option<String>,
-    /// hashed value of the last authentication header
-    pub authentication_found: Option<u64>,
+    /// hashed value of the last authorization header
+    pub authorization_found: Option<String>,
     /// position of the last header (the "Sozu-Id"), only valid until prepare is called
     pub last_header: Option<usize>,
     // ---------- Status Line
@@ -139,11 +140,14 @@ impl HttpContext {
         // - store X-Forwarded-For
         // - store Forwarded
         // - store User-Agent
+        // - compute sha256 of Authorization
         let mut x_for = None;
         let mut forwarded = None;
         let mut has_x_port = false;
         let mut has_x_proto = false;
         let mut has_connection = false;
+
+        let mut auth = None;
         for block in &mut request.blocks {
             match block {
                 kawa::Block::Header(header) if !header.is_elided() => {
@@ -191,17 +195,17 @@ impl HttpContext {
                             .data_opt(buf)
                             .and_then(|data| from_utf8(data).ok())
                             .map(ToOwned::to_owned);
-                    } else if compare_no_case(key, b"Proxy-Authenticate") {
-                        self.authentication_found = header.val.data_opt(buf).map(|auth| {
-                            let mut h = DefaultHasher::new();
-                            auth.hash(&mut h);
-                            h.finish()
-                        });
+                    } else if compare_no_case(key, b"Authorization") {
+                        auth = Some(header);
                     }
                 }
                 _ => {}
             }
         }
+
+        self.authorization_found = auth
+            .and_then(|header| header.val.data_opt(buf))
+            .map(|auth| hex::encode(Sha256::digest(auth)));
 
         // If session_address is set:
         // - append its ip address to the list of "X-Forwarded-For" if it was found, creates it if not

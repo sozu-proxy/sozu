@@ -371,7 +371,8 @@ message Cluster {
     optional LoadMetric load_metric = 7;
     optional uint32 https_redirect_port = 8;
     map<string, string> answers = 9;
-    repeated uint64 authorized_hashes = 10;
+    repeated string authorized_hashes = 10;
+    optional string www_authenticate = 11;
 }
 
 enum LoadBalancingAlgorithms {
