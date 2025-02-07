@@ -1,7 +1,8 @@
 pub mod pattern_trie;
 
 use std::{
-    fmt::Write,
+    fmt::{Debug, Write},
+    rc::Rc,
     str::{from_utf8, from_utf8_unchecked},
     time::Instant,
 };
@@ -12,7 +13,8 @@ use regex::bytes::Regex;
 
 use sozu_command::{
     proto::command::{
-        PathRule as CommandPathRule, PathRuleKind, RedirectPolicy, RedirectScheme, RulePosition,
+        Header, PathRule as CommandPathRule, PathRuleKind, Position, RedirectPolicy,
+        RedirectScheme, RulePosition,
     },
     response::HttpFrontend,
     state::ClusterId,
@@ -178,6 +180,7 @@ impl Router {
             front.rewrite_host.clone(),
             front.rewrite_path.clone(),
             front.rewrite_port,
+            &front.headers,
         )?;
 
         let success = match front.position {
@@ -719,6 +722,22 @@ impl RewriteParts {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct HeaderEdit {
+    pub key: Rc<[u8]>,
+    pub val: Rc<[u8]>,
+}
+
+impl Debug for HeaderEdit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!(
+            "({:?}, {:?})",
+            String::from_utf8_lossy(&self.key),
+            String::from_utf8_lossy(&self.val)
+        ))
+    }
+}
+
 /// What to do with the traffic
 /// TODO: tags should be moved here
 #[derive(Debug, Clone)]
@@ -733,6 +752,8 @@ pub struct Route {
     rewrite_host: Option<RewriteParts>,
     rewrite_path: Option<RewriteParts>,
     rewrite_port: Option<u16>,
+    headers_request: Rc<[HeaderEdit]>,
+    headers_response: Rc<[HeaderEdit]>,
 }
 
 impl Route {
@@ -747,6 +768,7 @@ impl Route {
         rewrite_host: Option<String>,
         rewrite_path: Option<String>,
         rewrite_port: Option<u16>,
+        headers: &[Header],
     ) -> Result<Self, RouterError> {
         let deny = match (&cluster_id, redirect, &redirect_template, required_auth) {
             (_, RedirectPolicy::Unauthorized, _, false) => true,
@@ -779,6 +801,8 @@ impl Route {
                 rewrite_host: None,
                 rewrite_path: None,
                 rewrite_port: None,
+                headers_request: Rc::new([]),
+                headers_response: Rc::new([]),
             });
         }
         let mut capture_cap_host = match domain_rule {
@@ -828,6 +852,21 @@ impl Route {
         if used_capture_path == 0 {
             capture_cap_path = 0;
         }
+        let mut headers_request = Vec::new();
+        let mut headers_response = Vec::new();
+        for header in headers {
+            if header.position() == Position::Frontend {
+                headers_request.push(HeaderEdit {
+                    key: header.key.clone().into_bytes().into(),
+                    val: header.val.clone().into_bytes().into(),
+                });
+            } else {
+                headers_response.push(HeaderEdit {
+                    key: header.key.clone().into_bytes().into(),
+                    val: header.val.clone().into_bytes().into(),
+                });
+            }
+        }
         Ok(Route {
             cluster_id,
             required_auth,
@@ -839,6 +878,8 @@ impl Route {
             rewrite_host,
             rewrite_path,
             rewrite_port,
+            headers_request: headers_request.into(),
+            headers_response: headers_response.into(),
         })
     }
 
@@ -855,6 +896,8 @@ impl Route {
             rewrite_host: None,
             rewrite_path: None,
             rewrite_port: None,
+            headers_request: Rc::new([]),
+            headers_response: Rc::new([]),
         }
     }
 }
@@ -869,6 +912,8 @@ pub struct RouteResult {
     pub rewritten_host: Option<String>,
     pub rewritten_path: Option<String>,
     pub rewritten_port: Option<u16>,
+    pub headers_request: Rc<[HeaderEdit]>,
+    pub headers_response: Rc<[HeaderEdit]>,
 }
 
 impl RouteResult {
@@ -882,6 +927,8 @@ impl RouteResult {
             rewritten_host: None,
             rewritten_path: None,
             rewritten_port: None,
+            headers_request: Rc::new([]),
+            headers_response: Rc::new([]),
         }
     }
 
@@ -896,6 +943,8 @@ impl RouteResult {
             rewritten_host: None,
             rewritten_path: None,
             rewritten_port: None,
+            headers_request: Rc::new([]),
+            headers_response: Rc::new([]),
         }
     }
 
@@ -915,6 +964,8 @@ impl RouteResult {
             rewrite_host,
             rewrite_path,
             rewrite_port,
+            headers_request,
+            headers_response,
             ..
         } = route;
         let mut captures_path = Vec::with_capacity(*capture_cap_path);
@@ -949,6 +1000,8 @@ impl RouteResult {
                 .as_ref()
                 .map(|rewrite| rewrite.run(&captures_host, &captures_path)),
             rewritten_port: *rewrite_port,
+            headers_request: headers_request.clone(),
+            headers_response: headers_response.clone(),
         }
     }
     fn new_no_trie<'a>(

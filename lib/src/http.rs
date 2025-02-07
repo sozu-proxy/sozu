@@ -1294,6 +1294,7 @@ mod tests {
                 rewrite_host: None,
                 rewrite_path: None,
                 rewrite_port: None,
+                headers: vec![],
                 tags: None,
             })
             .expect("Could not add http frontend");
@@ -1312,6 +1313,7 @@ mod tests {
                 rewrite_host: None,
                 rewrite_path: None,
                 rewrite_port: None,
+                headers: vec![],
                 tags: None,
             })
             .expect("Could not add http frontend");
@@ -1330,6 +1332,7 @@ mod tests {
                 rewrite_host: None,
                 rewrite_path: None,
                 rewrite_port: None,
+                headers: vec![],
                 tags: None,
             })
             .expect("Could not add http frontend");
@@ -1348,6 +1351,7 @@ mod tests {
                 rewrite_host: None,
                 rewrite_path: None,
                 rewrite_port: None,
+                headers: vec![],
                 tags: None,
             })
             .expect("Could not add http frontend");

@@ -62,11 +62,11 @@ use crate::{
     logging::AccessLogFormat,
     proto::command::{
         request::RequestType, ActivateListener, AddBackend, AddCertificate, CertificateAndKey,
-        Cluster, HttpListenerConfig, HttpsListenerConfig, ListenerType, LoadBalancingAlgorithms,
-        LoadBalancingParams, LoadMetric, MetricsConfiguration, PathRule, ProtobufAccessLogFormat,
-        ProxyProtocolConfig, RedirectPolicy, RedirectScheme, Request, RequestHttpFrontend,
-        RequestTcpFrontend, RulePosition, ServerConfig, ServerMetricsConfig, SocketAddress,
-        TcpListenerConfig, TlsVersion, WorkerRequest,
+        Cluster, Header, HttpListenerConfig, HttpsListenerConfig, ListenerType,
+        LoadBalancingAlgorithms, LoadBalancingParams, LoadMetric, MetricsConfiguration, PathRule,
+        ProtobufAccessLogFormat, ProxyProtocolConfig, RedirectPolicy, RedirectScheme, Request,
+        RequestHttpFrontend, RequestTcpFrontend, RulePosition, ServerConfig, ServerMetricsConfig,
+        SocketAddress, TcpListenerConfig, TlsVersion, WorkerRequest,
     },
     ObjectKind,
 };
@@ -634,6 +634,8 @@ pub struct FileClusterFrontendConfig {
     pub rewrite_host: Option<String>,
     pub rewrite_path: Option<String>,
     pub rewrite_port: Option<u16>,
+    #[serde(default)]
+    pub headers: Vec<Header>,
 }
 
 impl FileClusterFrontendConfig {
@@ -726,6 +728,7 @@ impl FileClusterFrontendConfig {
             rewrite_host: self.rewrite_host.clone(),
             rewrite_path: self.rewrite_path.clone(),
             rewrite_port: self.rewrite_port.clone(),
+            headers: self.headers.clone(),
         })
     }
 }
@@ -894,6 +897,7 @@ pub struct HttpFrontendConfig {
     pub rewrite_host: Option<String>,
     pub rewrite_path: Option<String>,
     pub rewrite_port: Option<u16>,
+    pub headers: Vec<Header>,
 }
 
 impl HttpFrontendConfig {
@@ -938,6 +942,7 @@ impl HttpFrontendConfig {
                     rewrite_host: self.rewrite_host.clone(),
                     rewrite_path: self.rewrite_path.clone(),
                     rewrite_port: self.rewrite_port.map(|x| x as u32),
+                    headers: self.headers.clone(),
                 })
                 .into(),
             );
@@ -959,6 +964,7 @@ impl HttpFrontendConfig {
                     rewrite_host: self.rewrite_host.clone(),
                     rewrite_path: self.rewrite_path.clone(),
                     rewrite_port: self.rewrite_port.map(|x| x as u32),
+                    headers: self.headers.clone(),
                 })
                 .into(),
             );

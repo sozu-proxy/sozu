@@ -1,6 +1,6 @@
 use std::{
-    hash::{DefaultHasher, Hash, Hasher},
     net::{IpAddr, SocketAddr},
+    rc::Rc,
     str::{from_utf8, from_utf8_unchecked},
 };
 
@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use crate::{
     pool::Checkout,
     protocol::http::{parser::compare_no_case, GenericHttpStream, Method},
+    router::HeaderEdit,
     Protocol, RetrieveClusterError,
 };
 
@@ -27,7 +28,7 @@ pub struct HttpContext {
     pub sticky_session_found: Option<String>,
     /// hashed value of the last authorization header
     pub authorization_found: Option<String>,
-    /// position of the last header (the "Sozu-Id"), only valid until prepare is called
+    /// position of the last header of the request (the "Sozu-Id"), only valid until prepare is called
     pub last_header: Option<usize>,
     // ---------- Status Line
     /// the value of the method in the request line
@@ -61,6 +62,8 @@ pub struct HttpContext {
     /// the sticky session that should be used
     /// used to create a "Set-Cookie" header in the response in case it differs from sticky_session_found
     pub sticky_session: Option<String>,
+    /// Headers to add to response
+    pub headers_response: Rc<[HeaderEdit]>,
 }
 
 impl kawa::h1::ParserCallbacks<Checkout> for HttpContext {
@@ -246,6 +249,8 @@ impl HttpContext {
                 header.val = kawa::Store::from_string(new_value);
             }
 
+            request.blocks.reserve(8);
+
             if !has_x_for {
                 request.push_block(kawa::Block::Header(kawa::Pair {
                     key: kawa::Store::Static(b"X-Forwarded-For"),
@@ -345,6 +350,8 @@ impl HttpContext {
             }
         }
 
+        response.blocks.reserve(2 + self.headers_response.len());
+
         // If the sticky_session is set and differs from the one found in the request
         // create a "Set-Cookie" header to update the sticky_name value
         if let Some(sticky_session) = &self.sticky_session {
@@ -358,6 +365,8 @@ impl HttpContext {
                 }));
             }
         }
+
+        apply_header_edits(response, self.headers_response.clone());
 
         // Create a custom "Sozu-Id" header
         response.push_block(kawa::Block::Header(kawa::Pair {
@@ -378,6 +387,7 @@ impl HttpContext {
         self.user_agent = None;
         self.cluster_id = None;
         self.backend_id = None;
+        self.headers_response = Rc::new([]);
     }
 
     pub fn log_context(&self) -> LogContext {
@@ -398,5 +408,14 @@ impl HttpContext {
         let given_path = self.path.as_deref().ok_or(RetrieveClusterError::NoPath)?;
 
         Ok((given_authority, given_path, given_method))
+    }
+}
+
+pub fn apply_header_edits(kawa: &mut GenericHttpStream, headers: Rc<[HeaderEdit]>) {
+    for header in &*headers {
+        kawa.push_block(kawa::Block::Header(kawa::Pair {
+            key: kawa::Store::Shared(header.key.clone(), 0),
+            val: kawa::Store::Shared(header.val.clone(), 0),
+        }));
     }
 }

@@ -241,6 +241,18 @@ message RequestHttpFrontend {
     optional string rewrite_host = 12;
     optional string rewrite_path = 13;
     optional uint32 rewrite_port = 14;
+    repeated Header headers = 15;
+}
+
+enum Position {
+    FRONTEND = 1;
+    BACKEND = 2;
+}
+
+message Header {
+    required Position position = 1;
+    required string key = 2;
+    required string val = 3;
 }
 
 message RequestTcpFrontend {

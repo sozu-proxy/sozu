@@ -1,10 +1,15 @@
-use std::{cmp::Ordering, collections::BTreeMap, fmt, net::SocketAddr};
+use std::{
+    cmp::Ordering,
+    collections::BTreeMap,
+    fmt::{self, Debug},
+    net::SocketAddr,
+};
 
 use crate::{
     proto::command::{
-        AddBackend, FilteredTimeSerie, LoadBalancingParams, PathRule, PathRuleKind, RedirectPolicy,
-        RedirectScheme, RequestHttpFrontend, RequestTcpFrontend, Response, ResponseContent,
-        ResponseStatus, RulePosition, RunState, WorkerResponse,
+        AddBackend, FilteredTimeSerie, Header, LoadBalancingParams, PathRule, PathRuleKind,
+        RedirectPolicy, RedirectScheme, RequestHttpFrontend, RequestTcpFrontend, Response,
+        ResponseContent, ResponseStatus, RulePosition, RunState, WorkerResponse,
     },
     state::ClusterId,
 };
@@ -50,6 +55,7 @@ pub struct HttpFrontend {
     pub rewrite_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rewrite_port: Option<u16>,
+    pub headers: Vec<Header>,
 }
 
 impl From<HttpFrontend> for RequestHttpFrontend {
@@ -69,6 +75,7 @@ impl From<HttpFrontend> for RequestHttpFrontend {
             rewrite_host: val.rewrite_host,
             rewrite_path: val.rewrite_path,
             rewrite_port: val.rewrite_port.map(|x| x as u32),
+            headers: val.headers,
         }
     }
 }

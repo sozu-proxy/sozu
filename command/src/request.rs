@@ -174,6 +174,7 @@ impl RequestHttpFrontend {
             path: self.path,
             method: self.method,
             tags: Some(self.tags),
+            headers: self.headers,
         })
     }
 }

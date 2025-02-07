@@ -13,6 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use editor::apply_header_edits;
 use mio::{net::TcpStream, Interest, Token};
 use parser::hostname_and_port;
 use rusty_ulid::Ulid;
@@ -263,6 +264,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 sticky_session_found: None,
                 authorization_found: None,
                 last_header: None,
+                headers_response: Rc::new([]),
 
                 method: None,
                 authority: None,
@@ -1272,6 +1274,8 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             rewritten_host,
             rewritten_path,
             rewritten_port,
+            headers_request,
+            headers_response,
         } = match route_result {
             Ok(route) => route,
             Err(frontend_error) => {
@@ -1288,20 +1292,23 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             );
         }
 
+        let body = if let Some(position) = self.context.last_header {
+            self.request_stream.blocks.split_off(position)
+        } else {
+            unreachable!();
+        };
+
         match &mut self.request_stream.detached.status_line {
             kawa::StatusLine::Request { authority, uri, .. } => {
                 let buf = self.request_stream.storage.mut_buffer();
                 if let Some(new) = &rewritten_host {
                     authority.modify(buf, new.as_bytes());
-                    if let Some(position) = self.context.last_header {
-                        self.request_stream.blocks.insert(
-                            position,
-                            kawa::Block::Header(kawa::Pair {
-                                key: kawa::Store::Static(b"X-Forwarded-Host"),
-                                val: kawa::Store::from_slice(host.as_bytes()),
-                            }),
-                        );
-                    }
+                    self.request_stream
+                        .blocks
+                        .push_back(kawa::Block::Header(kawa::Pair {
+                            key: kawa::Store::Static(b"X-Forwarded-Host"),
+                            val: kawa::Store::from_slice(host.as_bytes()),
+                        }));
                 }
                 if let Some(new) = &rewritten_path {
                     uri.modify(buf, new.as_bytes());
@@ -1387,6 +1394,12 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                     self.set_answer(DefaultAnswer::Answer301 { location });
                     return Err(RetrieveClusterError::Redirected);
                 }
+                warn!("{:?}", body);
+                warn!("{:?}", headers_request);
+                warn!("{:?}", headers_response);
+                apply_header_edits(&mut self.request_stream, headers_request);
+                self.request_stream.blocks.extend(body);
+                self.context.headers_response = headers_response;
                 Ok(cluster_id)
             }
             (cluster_id, ..) => {
