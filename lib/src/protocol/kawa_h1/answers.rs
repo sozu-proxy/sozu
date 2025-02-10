@@ -1007,9 +1007,7 @@ impl HttpAnswers {
                     name.into(),
                 ];
                 variables_once = vec![location.into()];
-                // custom_name_owner = name;
-                // &custom_name_owner
-                unsafe { &from_utf8_unchecked(variables[3].as_bytes()) }
+                unsafe { from_utf8_unchecked(variables[3].as_bytes()) }
             }
         };
         // kawa::debug_kawa(&template.kawa);

@@ -624,7 +624,7 @@ pub struct FileClusterFrontendConfig {
     pub certificate_chain: Option<String>,
     #[serde(default)]
     pub tls_versions: Vec<TlsVersion>,
-    #[serde(default)]
+    #[serde(default = "default_rule_position")]
     pub position: RulePosition,
     pub tags: Option<BTreeMap<String, String>>,
     pub required_auth: Option<bool>,
@@ -727,7 +727,7 @@ impl FileClusterFrontendConfig {
             redirect_template: self.redirect_template.clone(),
             rewrite_host: self.rewrite_host.clone(),
             rewrite_path: self.rewrite_path.clone(),
-            rewrite_port: self.rewrite_port.clone(),
+            rewrite_port: self.rewrite_port,
             headers: self.headers.clone(),
         })
     }
@@ -848,7 +848,7 @@ impl FileClusterConfig {
                 self.authorized_hashes
                     .iter()
                     .map(|hash| {
-                        hex::decode(&hash)
+                        hex::decode(hash)
                             .map_err(|_| ConfigError::InvalidHash(hash.clone()))
                             .and_then(|v| {
                                 v.try_into()
@@ -887,7 +887,7 @@ pub struct HttpFrontendConfig {
     pub certificate_chain: Option<Vec<String>>,
     #[serde(default)]
     pub tls_versions: Vec<TlsVersion>,
-    #[serde(default)]
+    #[serde(default = "default_rule_position")]
     pub position: RulePosition,
     pub tags: Option<BTreeMap<String, String>>,
     pub required_auth: bool,
@@ -898,6 +898,10 @@ pub struct HttpFrontendConfig {
     pub rewrite_path: Option<String>,
     pub rewrite_port: Option<u16>,
     pub headers: Vec<Header>,
+}
+
+fn default_rule_position() -> RulePosition {
+    RulePosition::Tree
 }
 
 impl HttpFrontendConfig {

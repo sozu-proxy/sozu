@@ -1394,9 +1394,6 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                     self.set_answer(DefaultAnswer::Answer301 { location });
                     return Err(RetrieveClusterError::Redirected);
                 }
-                warn!("{:?}", body);
-                warn!("{:?}", headers_request);
-                warn!("{:?}", headers_response);
                 apply_header_edits(&mut self.request_stream, headers_request);
                 self.request_stream.blocks.extend(body);
                 self.context.headers_response = headers_response;

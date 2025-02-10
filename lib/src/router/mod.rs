@@ -65,11 +65,11 @@ impl Router {
         }
     }
 
-    pub fn lookup<'a, 'b>(
-        &'a self,
-        hostname: &'b str,
-        path: &'b str,
-        method: &'b Method,
+    pub fn lookup<'a>(
+        &self,
+        hostname: &'a str,
+        path: &'a str,
+        method: &'a Method,
     ) -> Result<RouteResult, RouterError> {
         let hostname_b = hostname.as_bytes();
         let path_b = path.as_bytes();
@@ -529,7 +529,7 @@ pub enum PathRule {
     Equals(String),
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PathRuleResult {
     Regex,
     Prefix(usize),
@@ -697,7 +697,7 @@ impl RewriteParts {
         }
         Some(Self(result))
     }
-    pub fn run(&self, host_captures: &Vec<&str>, path_captures: &Vec<&str>) -> String {
+    pub fn run(&self, host_captures: &[&str], path_captures: &[&str]) -> String {
         let mut cap = 0;
         for part in &self.0 {
             cap += match part {
@@ -977,7 +977,7 @@ impl RouteResult {
                 }
                 PathRule::Regex(regex) => captures_path.extend(
                     regex
-                        .captures(&path)
+                        .captures(path)
                         .unwrap()
                         .iter()
                         .map(|c| unsafe { from_utf8_unchecked(c.unwrap().as_bytes()) }),
@@ -1028,7 +1028,7 @@ impl RouteResult {
                     .push(unsafe { from_utf8_unchecked(&domain[..domain.len() - suffix.len()]) }),
                 DomainRule::Regex(regex) => captures_host.extend(
                     regex
-                        .captures(&domain)
+                        .captures(domain)
                         .unwrap()
                         .iter()
                         .skip(1)
@@ -1065,7 +1065,7 @@ impl RouteResult {
                     }
                     TrieSubMatch::Regexp(part, regex) => captures_host.extend(
                         regex
-                            .captures(&part)
+                            .captures(part)
                             .unwrap()
                             .iter()
                             .skip(1)
