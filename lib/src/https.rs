@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::{hash_map::Entry, BTreeMap, HashMap},
+    collections::{hash_map::Entry, HashMap},
     io::ErrorKind,
     net::{Shutdown, SocketAddr as StdSocketAddr},
     os::unix::io::AsRawFd,
@@ -64,9 +64,9 @@ use crate::{
     timer::TimeoutContainer,
     tls::MutexCertificateResolver,
     util::UnwrapLog,
-    AcceptError, CachedTags, FrontendFromRequestError, L7ListenerHandler, L7Proxy, ListenerError,
-    ListenerHandler, Protocol, ProxyConfiguration, ProxyError, ProxySession, SessionIsToBeClosed,
-    SessionMetrics, SessionResult, StateMachineBuilder, StateResult,
+    AcceptError, FrontendFromRequestError, L7ListenerHandler, L7Proxy, ListenerError, Protocol,
+    ProxyConfiguration, ProxyError, ProxySession, SessionIsToBeClosed, SessionMetrics,
+    SessionResult, StateMachineBuilder, StateResult,
 };
 
 // const SERVER_PROTOS: &[&str] = &["http/1.1", "h2"];
@@ -83,7 +83,7 @@ StateMachineBuilder! {
         Expect(ExpectProxyProtocol<MioTcpStream>, ServerConnection),
         Handshake(TlsHandshake),
         Http(Http<FrontRustls, HttpsListener>),
-        WebSocket(Pipe<FrontRustls, HttpsListener>),
+        WebSocket(Pipe<FrontRustls>),
         Http2(Http2<FrontRustls>) -> todo!("H2"),
     }
 }
@@ -369,11 +369,11 @@ impl HttpsSession {
             http.request_stream.storage.buffer,
             front_token,
             http.frontend_socket,
-            self.listener.clone(),
             Protocol::HTTPS,
             http.context.id,
             http.context.session_address,
             websocket_context,
+            http.context.tags,
         );
 
         pipe.frontend_readiness.event = http.frontend_readiness.event;
@@ -391,10 +391,7 @@ impl HttpsSession {
         todo!()
     }
 
-    fn upgrade_websocket(
-        &self,
-        wss: Pipe<FrontRustls, HttpsListener>,
-    ) -> Option<HttpsStateMachine> {
+    fn upgrade_websocket(&self, wss: Pipe<FrontRustls>) -> Option<HttpsStateMachine> {
         // what do we do here?
         error!("Upgrade called on WSS, this should not happen");
         Some(HttpsStateMachine::WebSocket(wss))
@@ -533,25 +530,7 @@ pub struct HttpsListener {
     listener: Option<MioTcpListener>,
     resolver: Arc<MutexCertificateResolver>,
     rustls_details: Arc<RustlsServerConfig>,
-    tags: BTreeMap<String, CachedTags>,
     token: Token,
-}
-
-impl ListenerHandler for HttpsListener {
-    fn get_addr(&self) -> &StdSocketAddr {
-        &self.address
-    }
-
-    fn get_tags(&self, key: &str) -> Option<&CachedTags> {
-        self.tags.get(key)
-    }
-
-    fn set_tags(&mut self, key: String, tags: Option<BTreeMap<String, String>>) {
-        match tags {
-            Some(tags) => self.tags.insert(key, CachedTags::new(tags)),
-            None => self.tags.remove(&key),
-        };
-    }
 }
 
 impl L7ListenerHandler for HttpsListener {
@@ -597,7 +576,6 @@ impl HttpsListener {
             )?)),
             config,
             token,
-            tags: BTreeMap::new(),
         })
     }
 
@@ -1015,7 +993,6 @@ impl HttpsProxy {
             .ok_or(ProxyError::NoListenerFound(front.address))?
             .borrow_mut();
 
-        listener.set_tags(front.hostname.to_owned(), front.tags.to_owned());
         listener
             .add_https_front(front)
             .map_err(ProxyError::AddFrontend)?;
@@ -1040,7 +1017,6 @@ impl HttpsProxy {
             .ok_or(ProxyError::NoListenerFound(front.address))?
             .borrow_mut();
 
-        listener.set_tags(front.hostname.to_owned(), None);
         listener
             .remove_https_front(front)
             .map_err(ProxyError::RemoveFrontend)?;
@@ -1470,11 +1446,11 @@ pub mod testing {
 mod tests {
     use super::*;
 
-    use std::sync::Arc;
+    use std::{collections::BTreeMap, sync::Arc};
 
     use sozu_command::{config::ListenerBuilder, proto::command::SocketAddress};
 
-    use crate::router::{pattern_trie::TrieNode, MethodRule, PathRule, Route, Router};
+    use crate::router::{pattern_trie::TrieNode, Frontend, MethodRule, PathRule, Router};
 
     /*
     #[test]
@@ -1507,25 +1483,25 @@ mod tests {
             "lolcatho.st".as_bytes(),
             &PathRule::Prefix(uri1),
             &MethodRule::new(None),
-            &Route::forward(cluster_id1.clone())
+            &Frontend::forward(cluster_id1.clone())
         ));
         assert!(fronts.add_tree_rule(
             "lolcatho.st".as_bytes(),
             &PathRule::Prefix(uri2),
             &MethodRule::new(None),
-            &Route::forward(cluster_id2)
+            &Frontend::forward(cluster_id2)
         ));
         assert!(fronts.add_tree_rule(
             "lolcatho.st".as_bytes(),
             &PathRule::Prefix(uri3),
             &MethodRule::new(None),
-            &Route::forward(cluster_id3)
+            &Frontend::forward(cluster_id3)
         ));
         assert!(fronts.add_tree_rule(
             "other.domain".as_bytes(),
             &PathRule::Prefix("test".to_string()),
             &MethodRule::new(None),
-            &Route::forward(cluster_id1)
+            &Frontend::forward(cluster_id1)
         ));
 
         let address = SocketAddress::new_v4(127, 0, 0, 1, 1032);
@@ -1557,32 +1533,31 @@ mod tests {
             config: default_config,
             token: Token(0),
             active: true,
-            tags: BTreeMap::new(),
         };
 
         println!("TEST {}", line!());
         let frontend1 = listener.frontend_from_request("lolcatho.st", "/", &Method::Get);
         assert_eq!(
-            frontend1.expect("should find a frontend"),
-            RouteResult::forward("cluster_1".to_string())
+            frontend1.expect("should find a frontend").cluster_id,
+            Some("cluster_1".to_string())
         );
         println!("TEST {}", line!());
         let frontend2 = listener.frontend_from_request("lolcatho.st", "/test", &Method::Get);
         assert_eq!(
-            frontend2.expect("should find a frontend"),
-            RouteResult::forward("cluster_1".to_string())
+            frontend2.expect("should find a frontend").cluster_id,
+            Some("cluster_1".to_string())
         );
         println!("TEST {}", line!());
         let frontend3 = listener.frontend_from_request("lolcatho.st", "/yolo/test", &Method::Get);
         assert_eq!(
-            frontend3.expect("should find a frontend"),
-            RouteResult::forward("cluster_2".to_string())
+            frontend3.expect("should find a frontend").cluster_id,
+            Some("cluster_2".to_string())
         );
         println!("TEST {}", line!());
         let frontend4 = listener.frontend_from_request("lolcatho.st", "/yolo/swag", &Method::Get);
         assert_eq!(
-            frontend4.expect("should find a frontend"),
-            RouteResult::forward("cluster_3".to_string())
+            frontend4.expect("should find a frontend").cluster_id,
+            Some("cluster_3".to_string())
         );
         println!("TEST {}", line!());
         let frontend5 = listener.frontend_from_request("domain", "/", &Method::Get);

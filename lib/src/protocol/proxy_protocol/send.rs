@@ -1,11 +1,11 @@
 use std::{
-    cell::RefCell,
     io::{ErrorKind, Write},
     rc::Rc,
 };
 
 use mio::{net::TcpStream, Token};
 use rusty_ulid::Ulid;
+use sozu_command::logging::CachedTags;
 
 use crate::{
     pool::Checkout,
@@ -15,7 +15,6 @@ use crate::{
     },
     socket::SocketHandler,
     sozu_command::ready::Ready,
-    tcp::TcpListener,
     BackendConnectionStatus, Protocol, Readiness, SessionMetrics, SessionResult,
 };
 
@@ -156,8 +155,8 @@ impl<Front: SocketHandler> SendProxyProtocol<Front> {
         mut self,
         front_buf: Checkout,
         back_buf: Checkout,
-        listener: Rc<RefCell<TcpListener>>,
-    ) -> Pipe<Front, TcpListener> {
+        tags: Option<Rc<CachedTags>>,
+    ) -> Pipe<Front> {
         let backend_socket = self.backend.take().unwrap();
         let addr = self.front_socket().peer_addr().ok();
 
@@ -172,11 +171,11 @@ impl<Front: SocketHandler> SendProxyProtocol<Front> {
             front_buf,
             self.frontend_token,
             self.frontend,
-            listener,
             Protocol::TCP,
             self.request_id,
             addr,
             WebSocketContext::Tcp,
+            tags,
         );
 
         pipe.frontend_readiness = self.frontend_readiness;

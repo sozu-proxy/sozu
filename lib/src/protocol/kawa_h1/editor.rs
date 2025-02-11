@@ -6,6 +6,7 @@ use std::{
 
 use rusty_ulid::Ulid;
 use sha2::{Digest, Sha256};
+use sozu_command::logging::CachedTags;
 
 use crate::{
     pool::Checkout,
@@ -15,6 +16,13 @@ use crate::{
 };
 
 use sozu_command_lib::logging::LogContext;
+
+#[derive(Debug)]
+pub struct HttpRoute {
+    pub method: Option<Method>,
+    pub authority: Option<String>,
+    pub path: Option<String>,
+}
 
 /// This is the container used to store and use information about the session from within a Kawa parser callback
 #[derive(Debug)]
@@ -30,16 +38,9 @@ pub struct HttpContext {
     pub authorization_found: Option<String>,
     /// position of the last header of the request (the "Sozu-Id"), only valid until prepare is called
     pub last_header: Option<usize>,
-    // ---------- Status Line
-    /// the value of the method in the request line
-    pub method: Option<Method>,
-    /// the value of the authority of the request (in the request line of "Host" header)
-    pub authority: Option<String>,
-    /// the value of the path in the request line
-    pub path: Option<String>,
-    /// the value of the status code in the response line
+    // ---------- Route
+    pub route: HttpRoute,
     pub status: Option<u16>,
-    /// the value of the reason in the response line
     pub reason: Option<String>,
     // ---------- Additional optional data
     pub user_agent: Option<String>,
@@ -64,6 +65,8 @@ pub struct HttpContext {
     pub sticky_session: Option<String>,
     /// Headers to add to response
     pub headers_response: Rc<[HeaderEdit]>,
+    /// tags of the contacted frontend
+    pub tags: Option<Rc<CachedTags>>,
 }
 
 impl kawa::h1::ParserCallbacks<Checkout> for HttpContext {
@@ -105,12 +108,12 @@ impl HttpContext {
             ..
         } = &request.detached.status_line
         {
-            self.method = method.data_opt(buf).map(Method::new);
-            self.authority = authority
+            self.route.method = method.data_opt(buf).map(Method::new);
+            self.route.authority = authority
                 .data_opt(buf)
                 .and_then(|data| from_utf8(data).ok())
                 .map(ToOwned::to_owned);
-            self.path = path
+            self.route.path = path
                 .data_opt(buf)
                 .and_then(|data| from_utf8(data).ok())
                 .map(ToOwned::to_owned);
@@ -172,7 +175,7 @@ impl HttpContext {
                             incr!("http.trusting.x_proto.diff");
                             debug!(
                                 "Trusting X-Forwarded-Proto for {:?} even though {:?} != {}",
-                                self.authority, val, proto
+                                self.route.authority, val, proto
                             );
                         }
                     } else if compare_no_case(key, b"X-Forwarded-Port") {
@@ -185,7 +188,7 @@ impl HttpContext {
                             incr!("http.trusting.x_port.diff");
                             debug!(
                                 "Trusting X-Forwarded-Port for {:?} even though {:?} != {}",
-                                self.authority, val, expected
+                                self.route.authority, val, expected
                             );
                         }
                     } else if compare_no_case(key, b"X-Forwarded-For") {
@@ -326,7 +329,7 @@ impl HttpContext {
                 .map(ToOwned::to_owned);
         }
 
-        if self.method == Some(Method::Head) {
+        if self.route.method == Some(Method::Head) {
             response.parsing_phase = kawa::ParsingPhase::Terminated;
         }
 
@@ -379,9 +382,9 @@ impl HttpContext {
         self.keep_alive_backend = true;
         self.keep_alive_frontend = true;
         self.sticky_session_found = None;
-        self.method = None;
-        self.authority = None;
-        self.path = None;
+        self.route.method = None;
+        self.route.authority = None;
+        self.route.path = None;
         self.status = None;
         self.reason = None;
         self.user_agent = None;
@@ -397,9 +400,11 @@ impl HttpContext {
             backend_id: self.backend_id.as_deref(),
         }
     }
+}
 
+impl HttpRoute {
     // -> host, path, method
-    pub fn extract_route(&self) -> Result<(&str, &str, &Method), RetrieveClusterError> {
+    pub fn extract(&self) -> Result<(&str, &str, &Method), RetrieveClusterError> {
         let given_method = self.method.as_ref().ok_or(RetrieveClusterError::NoMethod)?;
         let given_authority = self
             .authority

@@ -3,7 +3,10 @@ use std::{cell::RefCell, rc::Rc};
 use mio::{net::TcpStream, *};
 use nom::{Err, HexDisplay};
 use rusty_ulid::Ulid;
-use sozu_command::{config::MAX_LOOP_ITERATIONS, logging::LogContext};
+use sozu_command::{
+    config::MAX_LOOP_ITERATIONS,
+    logging::{CachedTags, LogContext},
+};
 
 use crate::{
     pool::Checkout,
@@ -13,7 +16,6 @@ use crate::{
     },
     socket::{SocketHandler, SocketResult},
     sozu_command::ready::Ready,
-    tcp::TcpListener,
     timer::TimeoutContainer,
     Protocol, Readiness, SessionMetrics, StateResult,
 };
@@ -166,8 +168,8 @@ impl<Front: SocketHandler> ExpectProxyProtocol<Front> {
         back_buf: Checkout,
         backend_socket: Option<TcpStream>,
         backend_token: Option<Token>,
-        listener: Rc<RefCell<TcpListener>>,
-    ) -> Pipe<Front, TcpListener> {
+        tags: Option<Rc<CachedTags>>,
+    ) -> Pipe<Front> {
         let addr = self.front_socket().peer_addr().ok();
 
         let mut pipe = Pipe::new(
@@ -181,11 +183,11 @@ impl<Front: SocketHandler> ExpectProxyProtocol<Front> {
             front_buf,
             self.frontend_token,
             self.frontend,
-            listener,
             Protocol::TCP,
             self.request_id,
             addr,
             WebSocketContext::Tcp,
+            tags,
         );
 
         pipe.frontend_readiness.event = self.frontend_readiness.event;

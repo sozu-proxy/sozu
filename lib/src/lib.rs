@@ -519,16 +519,10 @@ macro_rules! StateMachineBuilder {
     }
 }
 
-pub trait ListenerHandler {
-    fn get_addr(&self) -> &SocketAddr;
+pub trait L4ListenerHandler {
+    fn get_tags(&self) -> Option<&CachedTags>;
 
-    fn get_tags(&self, key: &str) -> Option<&CachedTags>;
-
-    fn get_concatenated_tags(&self, key: &str) -> Option<&str> {
-        self.get_tags(key).map(|tags| tags.concatenated.as_str())
-    }
-
-    fn set_tags(&mut self, key: String, tags: Option<BTreeMap<String, String>>);
+    fn set_tags(&mut self, tags: Option<BTreeMap<String, String>>);
 }
 
 #[derive(thiserror::Error, Debug)]

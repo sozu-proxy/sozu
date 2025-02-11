@@ -1,8 +1,9 @@
-use std::{cell::RefCell, io::Write, rc::Rc};
+use std::{io::Write, rc::Rc};
 
 use mio::{net::TcpStream, Token};
 use nom::{Err, Offset};
 use rusty_ulid::Ulid;
+use sozu_command::logging::CachedTags;
 
 use crate::{
     pool::Checkout,
@@ -12,7 +13,6 @@ use crate::{
     },
     socket::{SocketHandler, SocketResult},
     sozu_command::ready::Ready,
-    tcp::TcpListener,
     Protocol, Readiness, SessionMetrics, SessionResult,
 };
 
@@ -172,11 +172,7 @@ impl<Front: SocketHandler> RelayProxyProtocol<Front> {
         self.backend_token = Some(token);
     }
 
-    pub fn into_pipe(
-        mut self,
-        back_buf: Checkout,
-        listener: Rc<RefCell<TcpListener>>,
-    ) -> Pipe<Front, TcpListener> {
+    pub fn into_pipe(mut self, back_buf: Checkout, tags: Option<Rc<CachedTags>>) -> Pipe<Front> {
         let backend_socket = self.backend.take().unwrap();
         let addr = self.front_socket().peer_addr().ok();
 
@@ -191,11 +187,11 @@ impl<Front: SocketHandler> RelayProxyProtocol<Front> {
             self.frontend_buffer,
             self.frontend_token,
             self.frontend,
-            listener,
             Protocol::TCP,
             self.request_id,
             addr,
             WebSocketContext::Tcp,
+            tags,
         );
 
         pipe.frontend_readiness.event = self.frontend_readiness.event;

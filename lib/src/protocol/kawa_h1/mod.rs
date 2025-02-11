@@ -13,7 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use editor::apply_header_edits;
+use editor::{apply_header_edits, HttpRoute};
 use mio::{net::TcpStream, Interest, Token};
 use parser::hostname_and_port;
 use rusty_ulid::Ulid;
@@ -43,8 +43,8 @@ use crate::{
     sozu_command::{logging::LogContext, ready::Ready},
     timer::TimeoutContainer,
     AcceptError, BackendConnectAction, BackendConnectionError, FrontendFromRequestError,
-    L7ListenerHandler, L7Proxy, ListenerHandler, Protocol, ProxySession, Readiness,
-    RetrieveClusterError, SessionIsToBeClosed, SessionMetrics, SessionResult, StateResult,
+    L7ListenerHandler, L7Proxy, Protocol, ProxySession, Readiness, RetrieveClusterError,
+    SessionIsToBeClosed, SessionMetrics, SessionResult, StateResult,
 };
 
 /// This macro is defined uniquely in this module to help the tracking of kawa h1
@@ -156,7 +156,7 @@ impl Origin {
 }
 
 /// Http will be contained in State which itself is contained by Session
-pub struct Http<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> {
+pub struct Http<Front: SocketHandler, L: L7ListenerHandler> {
     answers: Rc<RefCell<answers::HttpAnswers>>,
     /// The last origin server we tried to communicate with.
     /// It may be connected or connecting. It may be the server serving the current response,
@@ -185,7 +185,7 @@ pub struct Http<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> {
     pub context: HttpContext,
 }
 
-impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L> {
+impl<Front: SocketHandler, L: L7ListenerHandler> Http<Front, L> {
     /// Instantiate a new HTTP SessionState with:
     ///
     /// - frontend_interest: READABLE | HUP | ERROR
@@ -265,10 +265,13 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 authorization_found: None,
                 last_header: None,
                 headers_response: Rc::new([]),
+                tags: None,
 
-                method: None,
-                authority: None,
-                path: None,
+                route: HttpRoute {
+                    method: None,
+                    authority: None,
+                    path: None,
+                },
                 status: None,
                 reason: None,
                 user_agent: None,
@@ -890,12 +893,12 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
     }
 }
 
-impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L> {
+impl<Front: SocketHandler, L: L7ListenerHandler> Http<Front, L> {
     fn log_endpoint(&self) -> EndpointRecord {
         EndpointRecord::Http {
-            method: self.context.method.as_deref(),
-            authority: self.context.authority.as_deref(),
-            path: self.context.path.as_deref(),
+            method: self.context.route.method.as_deref(),
+            authority: self.context.route.authority.as_deref(),
+            path: self.context.route.path.as_deref(),
             reason: self.context.reason.as_deref(),
             status: self.context.status,
         }
@@ -933,24 +936,15 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
     /// Format the context of the websocket into a loggable String
     pub fn websocket_context(&self) -> WebSocketContext {
         WebSocketContext::Http {
-            method: self.context.method.clone(),
-            authority: self.context.authority.clone(),
-            path: self.context.path.clone(),
+            method: self.context.route.method.clone(),
+            authority: self.context.route.authority.clone(),
+            path: self.context.route.path.clone(),
             reason: self.context.reason.clone(),
             status: self.context.status,
         }
     }
 
     pub fn log_request(&self, metrics: &SessionMetrics, error: bool, message: Option<&str>) {
-        let listener = self.listener.borrow();
-        let tags = self.context.authority.as_ref().and_then(|host| {
-            let hostname = match host.split_once(':') {
-                None => host,
-                Some((hostname, _)) => hostname,
-            };
-            listener.get_tags(hostname)
-        });
-
         let context = self.context.log_context();
         metrics.register_end_of_session(&context);
 
@@ -963,7 +957,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             backend_address: self.get_backend_address(),
             protocol: self.protocol_string(),
             endpoint: self.log_endpoint(),
-            tags,
+            tags: self.context.tags.as_deref(),
             client_rtt: socket_rtt(self.front_socket()),
             server_rtt: self.origin.as_ref().and_then(|origin| socket_rtt(&origin.socket)),
             service_time: metrics.service_time(),
@@ -1198,9 +1192,9 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
     }
 
     pub fn get_route(&self) -> String {
-        if let Some(method) = &self.context.method {
-            if let Some(authority) = &self.context.authority {
-                if let Some(path) = &self.context.path {
+        if let Some(method) = &self.context.route.method {
+            if let Some(authority) = &self.context.route.authority {
+                if let Some(path) = &self.context.route.path {
                     return format!("{method} {authority}{path}");
                 }
                 return format!("{method} {authority}");
@@ -1214,7 +1208,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         &mut self,
         proxy: Rc<RefCell<dyn L7Proxy>>,
     ) -> Result<String, RetrieveClusterError> {
-        let (host, path, method) = match self.context.extract_route() {
+        let (host, path, method) = match self.context.route.extract() {
             Ok(tuple) => tuple,
             Err(cluster_error) => {
                 self.set_answer(DefaultAnswer::Answer400 {
@@ -1276,6 +1270,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             rewritten_port,
             headers_request,
             headers_response,
+            tags,
         } = match route_result {
             Ok(route) => route,
             Err(frontend_error) => {
@@ -1283,8 +1278,12 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 return Err(RetrieveClusterError::RetrieveFrontend(frontend_error));
             }
         };
+        self.context.cluster_id = cluster_id;
+        self.context.headers_response = headers_response;
+        self.context.tags = tags;
+        let cluster_id = &self.context.cluster_id;
 
-        if let Some(cluster_id) = &cluster_id {
+        if let Some(cluster_id) = cluster_id {
             time!(
                 "frontend_matching_time",
                 cluster_id,
@@ -1372,15 +1371,13 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             };
 
         match (cluster_id, redirect, redirect_template, authorized) {
-            (cluster_id, RedirectPolicy::Permanent, _, true) => {
+            (_, RedirectPolicy::Permanent, _, true) => {
                 let location = format!("{proto}://{host}{port}{path}");
-                self.context.cluster_id = cluster_id;
                 self.set_answer(DefaultAnswer::Answer301 { location });
                 Err(RetrieveClusterError::Redirected)
             }
-            (cluster_id, RedirectPolicy::Forward, Some(name), true) => {
+            (_, RedirectPolicy::Forward, Some(name), true) => {
                 let location = format!("{proto}://{host}{port}{path}");
-                self.context.cluster_id = cluster_id;
                 self.set_answer(DefaultAnswer::AnswerCustom { name, location });
                 Err(RetrieveClusterError::Redirected)
             }
@@ -1390,17 +1387,14 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                         .or_else(|| https_redirect_port.map(|port| port as u16))
                         .map_or(String::new(), |port| format!(":{port}"));
                     let location = format!("https://{host}{port}{path}");
-                    self.context.cluster_id = Some(cluster_id);
                     self.set_answer(DefaultAnswer::Answer301 { location });
                     return Err(RetrieveClusterError::Redirected);
                 }
                 apply_header_edits(&mut self.request_stream, headers_request);
                 self.request_stream.blocks.extend(body);
-                self.context.headers_response = headers_response;
-                Ok(cluster_id)
+                Ok(cluster_id.clone())
             }
-            (cluster_id, ..) => {
-                self.context.cluster_id = cluster_id;
+            _ => {
                 self.set_answer(DefaultAnswer::Answer401 { www_authenticate });
                 Err(RetrieveClusterError::UnauthorizedRoute)
             }
@@ -1956,7 +1950,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
     }
 }
 
-impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> SessionState for Http<Front, L> {
+impl<Front: SocketHandler, L: L7ListenerHandler> SessionState for Http<Front, L> {
     fn ready(
         &mut self,
         session: Rc<RefCell<dyn crate::ProxySession>>,
