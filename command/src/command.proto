@@ -244,13 +244,14 @@ message RequestHttpFrontend {
     repeated Header headers = 15;
 }
 
-enum Position {
-    FRONTEND = 1;
-    BACKEND = 2;
+enum HeaderPosition {
+    REQUEST = 1;
+    RESPONSE = 2;
+    BOTH = 3;
 }
 
 message Header {
-    required Position position = 1;
+    required HeaderPosition position = 1;
     required string key = 2;
     required string val = 3;
 }

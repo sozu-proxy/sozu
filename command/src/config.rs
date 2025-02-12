@@ -62,7 +62,7 @@ use crate::{
     logging::AccessLogFormat,
     proto::command::{
         request::RequestType, ActivateListener, AddBackend, AddCertificate, CertificateAndKey,
-        Cluster, Header, HttpListenerConfig, HttpsListenerConfig, ListenerType,
+        Cluster, Header, HeaderPosition, HttpListenerConfig, HttpsListenerConfig, ListenerType,
         LoadBalancingAlgorithms, LoadBalancingParams, LoadMetric, MetricsConfiguration, PathRule,
         ProtobufAccessLogFormat, ProxyProtocolConfig, RedirectPolicy, RedirectScheme, Request,
         RequestHttpFrontend, RequestTcpFrontend, RulePosition, ServerConfig, ServerMetricsConfig,
@@ -611,6 +611,14 @@ pub enum PathRuleType {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct HeaderConfig {
+    position: HeaderPosition,
+    key: String,
+    val: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FileClusterFrontendConfig {
     pub address: SocketAddr,
     pub hostname: Option<String>,
@@ -635,7 +643,7 @@ pub struct FileClusterFrontendConfig {
     pub rewrite_path: Option<String>,
     pub rewrite_port: Option<u16>,
     #[serde(default)]
-    pub headers: Vec<Header>,
+    pub headers: Vec<HeaderConfig>,
 }
 
 impl FileClusterFrontendConfig {
@@ -897,7 +905,7 @@ pub struct HttpFrontendConfig {
     pub rewrite_host: Option<String>,
     pub rewrite_path: Option<String>,
     pub rewrite_port: Option<u16>,
-    pub headers: Vec<Header>,
+    pub headers: Vec<HeaderConfig>,
 }
 
 fn default_rule_position() -> RulePosition {
@@ -909,6 +917,16 @@ impl HttpFrontendConfig {
         let mut v = Vec::new();
 
         let tags = self.tags.clone().unwrap_or_default();
+        let headers = self
+            .headers
+            .iter()
+            .cloned()
+            .map(|h| Header {
+                position: h.position.into(),
+                key: h.key,
+                val: h.val,
+            })
+            .collect();
 
         if self.key.is_some() && self.certificate.is_some() {
             v.push(
@@ -946,7 +964,7 @@ impl HttpFrontendConfig {
                     rewrite_host: self.rewrite_host.clone(),
                     rewrite_path: self.rewrite_path.clone(),
                     rewrite_port: self.rewrite_port.map(|x| x as u32),
-                    headers: self.headers.clone(),
+                    headers,
                 })
                 .into(),
             );
@@ -968,7 +986,7 @@ impl HttpFrontendConfig {
                     rewrite_host: self.rewrite_host.clone(),
                     rewrite_path: self.rewrite_path.clone(),
                     rewrite_port: self.rewrite_port.map(|x| x as u32),
-                    headers: self.headers.clone(),
+                    headers,
                 })
                 .into(),
             );

@@ -14,7 +14,7 @@ use regex::bytes::Regex;
 use sozu_command::{
     logging::CachedTags,
     proto::command::{
-        PathRule as CommandPathRule, PathRuleKind, Position, RedirectPolicy, RedirectScheme,
+        HeaderPosition, PathRule as CommandPathRule, PathRuleKind, RedirectPolicy, RedirectScheme,
         RulePosition,
     },
     response::HttpFrontend,
@@ -852,16 +852,17 @@ impl Frontend {
         let mut headers_request = Vec::new();
         let mut headers_response = Vec::new();
         for header in headers {
-            if header.position() == Position::Frontend {
-                headers_request.push(HeaderEdit {
-                    key: header.key.clone().into_bytes().into(),
-                    val: header.val.clone().into_bytes().into(),
-                });
-            } else {
-                headers_response.push(HeaderEdit {
-                    key: header.key.clone().into_bytes().into(),
-                    val: header.val.clone().into_bytes().into(),
-                });
+            let edit = HeaderEdit {
+                key: header.key.clone().into_bytes().into(),
+                val: header.val.clone().into_bytes().into(),
+            };
+            match header.position() {
+                HeaderPosition::Request => headers_request.push(edit),
+                HeaderPosition::Response => headers_response.push(edit),
+                HeaderPosition::Both => {
+                    headers_request.push(edit.clone());
+                    headers_response.push(edit);
+                }
             }
         }
         Ok(Frontend {

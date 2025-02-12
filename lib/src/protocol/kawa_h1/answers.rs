@@ -543,9 +543,9 @@ Sozu-Id: %REQUEST_ID\r
     \"cluster_id\": \"%CLUSTER_ID\",
     \"backend_id\": \"%BACKEND_ID\",
     \"parsing_phase\": \"%PHASE\",
-    \"successfully_parsed\": \"%SUCCESSFULLY_PARSED\",
-    \"partially_parsed\": \"%PARTIALLY_PARSED\",
-    \"invalid\": \"%INVALID\"
+    \"successfully_parsed\": %SUCCESSFULLY_PARSED,
+    \"partially_parsed\": %PARTIALLY_PARSED,
+    \"invalid\": %INVALID
 }
 </pre>
 <p>Response could not be parsed. %MESSAGE</p>
