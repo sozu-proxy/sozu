@@ -1,11 +1,11 @@
 use std::{
     cell::RefCell,
-    collections::{hash_map::Entry, BTreeMap, HashMap},
+    collections::{hash_map::Entry, HashMap},
     io::ErrorKind,
     net::{Shutdown, SocketAddr as StdSocketAddr},
     os::unix::io::AsRawFd,
     rc::{Rc, Weak},
-    str::{from_utf8, from_utf8_unchecked},
+    str::from_utf8,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -53,24 +53,20 @@ use crate::{
     pool::Pool,
     protocol::{
         h2::Http2,
-        http::{
-            answers::HttpAnswers,
-            parser::{hostname_and_port, Method},
-            ResponseStream,
-        },
+        http::{answers::HttpAnswers, parser::Method, ResponseStream},
         proxy_protocol::expect::ExpectProxyProtocol,
         rustls::TlsHandshake,
         Http, Pipe, SessionState,
     },
-    router::{Route, Router},
+    router::{RouteResult, Router},
     server::{ListenToken, SessionManager},
     socket::{server_bind, FrontRustls},
     timer::TimeoutContainer,
     tls::MutexCertificateResolver,
     util::UnwrapLog,
-    AcceptError, CachedTags, FrontendFromRequestError, L7ListenerHandler, L7Proxy, ListenerError,
-    ListenerHandler, Protocol, ProxyConfiguration, ProxyError, ProxySession, SessionIsToBeClosed,
-    SessionMetrics, SessionResult, StateMachineBuilder, StateResult,
+    AcceptError, FrontendFromRequestError, L7ListenerHandler, L7Proxy, ListenerError, Protocol,
+    ProxyConfiguration, ProxyError, ProxySession, SessionIsToBeClosed, SessionMetrics,
+    SessionResult, StateMachineBuilder, StateResult,
 };
 
 // const SERVER_PROTOS: &[&str] = &["http/1.1", "h2"];
@@ -87,7 +83,7 @@ StateMachineBuilder! {
         Expect(ExpectProxyProtocol<MioTcpStream>, ServerConnection),
         Handshake(TlsHandshake),
         Http(Http<FrontRustls, HttpsListener>),
-        WebSocket(Pipe<FrontRustls, HttpsListener>),
+        WebSocket(Pipe<FrontRustls>),
         Http2(Http2<FrontRustls>) -> todo!("H2"),
     }
 }
@@ -333,11 +329,14 @@ impl HttpsSession {
         }
     }
 
-    fn upgrade_http(&self, http: Http<FrontRustls, HttpsListener>) -> Option<HttpsStateMachine> {
+    fn upgrade_http(
+        &self,
+        mut http: Http<FrontRustls, HttpsListener>,
+    ) -> Option<HttpsStateMachine> {
         debug!("https switching to wss");
         let front_token = self.frontend_token;
-        let back_token = match http.backend_token {
-            Some(back_token) => back_token,
+        let origin = match http.origin.take() {
+            Some(origin) => origin,
             None => {
                 warn!(
                     "Could not upgrade https request on cluster '{:?}' ({:?}) using backend '{:?}' into secure websocket for request '{}'",
@@ -347,7 +346,7 @@ impl HttpsSession {
             }
         };
 
-        let ws_context = http.websocket_context();
+        let websocket_context = http.websocket_context();
         let mut container_frontend_timeout = http.container_frontend_timeout;
         let mut container_backend_timeout = http.container_backend_timeout;
         container_frontend_timeout.reset();
@@ -361,25 +360,25 @@ impl HttpsSession {
 
         let mut pipe = Pipe::new(
             backend_buffer,
-            http.context.backend_id,
-            http.backend_socket,
-            http.backend,
+            Some(origin.backend_id),
+            Some(origin.socket),
+            Some(origin.backend),
             Some(container_backend_timeout),
             Some(container_frontend_timeout),
             http.context.cluster_id,
             http.request_stream.storage.buffer,
             front_token,
             http.frontend_socket,
-            self.listener.clone(),
-            Protocol::HTTP,
+            Protocol::HTTPS,
             http.context.id,
             http.context.session_address,
-            ws_context,
+            websocket_context,
+            http.context.tags,
         );
 
         pipe.frontend_readiness.event = http.frontend_readiness.event;
         pipe.backend_readiness.event = http.backend_readiness.event;
-        pipe.set_back_token(back_token);
+        pipe.set_back_token(origin.token);
 
         gauge_add!("protocol.https", -1);
         gauge_add!("protocol.wss", 1);
@@ -392,10 +391,7 @@ impl HttpsSession {
         todo!()
     }
 
-    fn upgrade_websocket(
-        &self,
-        wss: Pipe<FrontRustls, HttpsListener>,
-    ) -> Option<HttpsStateMachine> {
+    fn upgrade_websocket(&self, wss: Pipe<FrontRustls>) -> Option<HttpsStateMachine> {
         // what do we do here?
         error!("Upgrade called on WSS, this should not happen");
         Some(HttpsStateMachine::WebSocket(wss))
@@ -534,25 +530,7 @@ pub struct HttpsListener {
     listener: Option<MioTcpListener>,
     resolver: Arc<MutexCertificateResolver>,
     rustls_details: Arc<RustlsServerConfig>,
-    tags: BTreeMap<String, CachedTags>,
     token: Token,
-}
-
-impl ListenerHandler for HttpsListener {
-    fn get_addr(&self) -> &StdSocketAddr {
-        &self.address
-    }
-
-    fn get_tags(&self, key: &str) -> Option<&CachedTags> {
-        self.tags.get(key)
-    }
-
-    fn set_tags(&mut self, key: String, tags: Option<BTreeMap<String, String>>) {
-        match tags {
-            Some(tags) => self.tags.insert(key, CachedTags::new(tags)),
-            None => self.tags.remove(&key),
-        };
-    }
 }
 
 impl L7ListenerHandler for HttpsListener {
@@ -567,44 +545,13 @@ impl L7ListenerHandler for HttpsListener {
     fn frontend_from_request(
         &self,
         host: &str,
-        uri: &str,
+        path: &str,
         method: &Method,
-    ) -> Result<Route, FrontendFromRequestError> {
-        let start = Instant::now();
-        let (remaining_input, (hostname, _)) = match hostname_and_port(host.as_bytes()) {
-            Ok(tuple) => tuple,
-            Err(parse_error) => {
-                // parse_error contains a slice of given_host, which should NOT escape this scope
-                return Err(FrontendFromRequestError::HostParse {
-                    host: host.to_owned(),
-                    error: parse_error.to_string(),
-                });
-            }
-        };
-
-        if remaining_input != &b""[..] {
-            return Err(FrontendFromRequestError::InvalidCharsAfterHost(
-                host.to_owned(),
-            ));
-        }
-
-        // it is alright to call from_utf8_unchecked,
-        // we already verified that there are only ascii
-        // chars in there
-        let host = unsafe { from_utf8_unchecked(hostname) };
-
-        let route = self.fronts.lookup(host, uri, method).map_err(|e| {
+    ) -> Result<RouteResult, FrontendFromRequestError> {
+        self.fronts.lookup(host, path, method).map_err(|e| {
             incr!("http.failed_backend_matching");
             FrontendFromRequestError::NoClusterFound(e)
-        })?;
-
-        let now = Instant::now();
-
-        if let Route::ClusterId(cluster) = &route {
-            time!("frontend_matching_time", cluster, (now - start).as_millis());
-        }
-
-        Ok(route)
+        })
     }
 }
 
@@ -624,13 +571,11 @@ impl HttpsListener {
             rustls_details: server_config,
             active: false,
             fronts: Router::new(),
-            answers: Rc::new(RefCell::new(
-                HttpAnswers::new(&config.http_answers)
-                    .map_err(|(status, error)| ListenerError::TemplateParse(status, error))?,
-            )),
+            answers: Rc::new(RefCell::new(HttpAnswers::new(&config.answers).map_err(
+                |(status, error)| ListenerError::TemplateParse(status, error),
+            )?)),
             config,
             token,
-            tags: BTreeMap::new(),
         })
     }
 
@@ -997,18 +942,19 @@ impl HttpsProxy {
         &mut self,
         mut cluster: Cluster,
     ) -> Result<Option<ResponseContent>, ProxyError> {
-        if let Some(answer_503) = cluster.answer_503.take() {
+        if !cluster.answers.is_empty() {
             for listener in self.listeners.values() {
                 listener
                     .borrow()
                     .answers
                     .borrow_mut()
-                    .add_custom_answer(&cluster.cluster_id, answer_503.clone())
-                    .map_err(|(status, error)| {
-                        ProxyError::AddCluster(ListenerError::TemplateParse(status, error))
+                    .add_cluster_answers(&cluster.cluster_id, &cluster.answers)
+                    .map_err(|(name, error)| {
+                        ProxyError::AddCluster(ListenerError::TemplateParse(name, error))
                     })?;
             }
         }
+        cluster.answers.clear();
         self.clusters.insert(cluster.cluster_id.clone(), cluster);
         Ok(None)
     }
@@ -1023,7 +969,7 @@ impl HttpsProxy {
                 .borrow()
                 .answers
                 .borrow_mut()
-                .remove_custom_answer(cluster_id);
+                .remove_cluster_answers(cluster_id);
         }
 
         Ok(None)
@@ -1047,7 +993,6 @@ impl HttpsProxy {
             .ok_or(ProxyError::NoListenerFound(front.address))?
             .borrow_mut();
 
-        listener.set_tags(front.hostname.to_owned(), front.tags.to_owned());
         listener
             .add_https_front(front)
             .map_err(ProxyError::AddFrontend)?;
@@ -1072,7 +1017,6 @@ impl HttpsProxy {
             .ok_or(ProxyError::NoListenerFound(front.address))?
             .borrow_mut();
 
-        listener.set_tags(front.hostname.to_owned(), None);
         listener
             .remove_https_front(front)
             .map_err(ProxyError::RemoveFrontend)?;
@@ -1502,14 +1446,11 @@ pub mod testing {
 mod tests {
     use super::*;
 
-    use std::sync::Arc;
+    use std::{collections::BTreeMap, sync::Arc};
 
-    use sozu_command::{
-        config::ListenerBuilder,
-        proto::command::{CustomHttpAnswers, SocketAddress},
-    };
+    use sozu_command::{config::ListenerBuilder, proto::command::SocketAddress};
 
-    use crate::router::{pattern_trie::TrieNode, MethodRule, PathRule, Route, Router};
+    use crate::router::{pattern_trie::TrieNode, Frontend, MethodRule, PathRule, Router};
 
     /*
     #[test]
@@ -1542,25 +1483,25 @@ mod tests {
             "lolcatho.st".as_bytes(),
             &PathRule::Prefix(uri1),
             &MethodRule::new(None),
-            &Route::ClusterId(cluster_id1.clone())
+            &Frontend::forward(cluster_id1.clone())
         ));
         assert!(fronts.add_tree_rule(
             "lolcatho.st".as_bytes(),
             &PathRule::Prefix(uri2),
             &MethodRule::new(None),
-            &Route::ClusterId(cluster_id2)
+            &Frontend::forward(cluster_id2)
         ));
         assert!(fronts.add_tree_rule(
             "lolcatho.st".as_bytes(),
             &PathRule::Prefix(uri3),
             &MethodRule::new(None),
-            &Route::ClusterId(cluster_id3)
+            &Frontend::forward(cluster_id3)
         ));
         assert!(fronts.add_tree_rule(
             "other.domain".as_bytes(),
             &PathRule::Prefix("test".to_string()),
             &MethodRule::new(None),
-            &Route::ClusterId(cluster_id1)
+            &Frontend::forward(cluster_id1)
         ));
 
         let address = SocketAddress::new_v4(127, 0, 0, 1, 1032);
@@ -1588,38 +1529,35 @@ mod tests {
             fronts,
             rustls_details,
             resolver,
-            answers: Rc::new(RefCell::new(
-                HttpAnswers::new(&Some(CustomHttpAnswers::default())).unwrap(),
-            )),
+            answers: Rc::new(RefCell::new(HttpAnswers::new(&BTreeMap::new()).unwrap())),
             config: default_config,
             token: Token(0),
             active: true,
-            tags: BTreeMap::new(),
         };
 
         println!("TEST {}", line!());
         let frontend1 = listener.frontend_from_request("lolcatho.st", "/", &Method::Get);
         assert_eq!(
-            frontend1.expect("should find a frontend"),
-            Route::ClusterId("cluster_1".to_string())
+            frontend1.expect("should find a frontend").cluster_id,
+            Some("cluster_1".to_string())
         );
         println!("TEST {}", line!());
         let frontend2 = listener.frontend_from_request("lolcatho.st", "/test", &Method::Get);
         assert_eq!(
-            frontend2.expect("should find a frontend"),
-            Route::ClusterId("cluster_1".to_string())
+            frontend2.expect("should find a frontend").cluster_id,
+            Some("cluster_1".to_string())
         );
         println!("TEST {}", line!());
         let frontend3 = listener.frontend_from_request("lolcatho.st", "/yolo/test", &Method::Get);
         assert_eq!(
-            frontend3.expect("should find a frontend"),
-            Route::ClusterId("cluster_2".to_string())
+            frontend3.expect("should find a frontend").cluster_id,
+            Some("cluster_2".to_string())
         );
         println!("TEST {}", line!());
         let frontend4 = listener.frontend_from_request("lolcatho.st", "/yolo/swag", &Method::Get);
         assert_eq!(
-            frontend4.expect("should find a frontend"),
-            Route::ClusterId("cluster_3".to_string())
+            frontend4.expect("should find a frontend").cluster_id,
+            Some("cluster_3".to_string())
         );
         println!("TEST {}", line!());
         let frontend5 = listener.frontend_from_request("domain", "/", &Method::Get);

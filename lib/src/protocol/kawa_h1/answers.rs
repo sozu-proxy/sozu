@@ -1,14 +1,17 @@
 use crate::{protocol::http::DefaultAnswer, sozu_command::state::ClusterId};
 use kawa::{
-    h1::NoCallbacks, AsBuffer, Block, BodySize, Buffer, Chunk, Kawa, Kind, Pair, ParsingPhase,
-    ParsingPhaseMarker, StatusLine, Store,
+    h1::NoCallbacks, AsBuffer, Block, BodySize, Buffer, Chunk, Flags, Kawa, Kind, Pair,
+    ParsingPhase, ParsingPhaseMarker, StatusLine, Store,
 };
-use sozu_command::proto::command::CustomHttpAnswers;
+use nom::AsBytes;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     fmt,
     rc::Rc,
+    str::from_utf8_unchecked,
 };
+
+use super::parser::compare_no_case;
 
 #[derive(Clone)]
 pub struct SharedBuffer(Rc<[u8]>);
@@ -33,6 +36,8 @@ pub enum TemplateError {
     InvalidTemplate(ParsingPhase),
     #[error("unexpected status code: {0}")]
     InvalidStatusCode(u16),
+    #[error("unexpected size info: {0:?}")]
+    InvalidSizeInfo(BodySize),
     #[error("streaming is not supported in templates")]
     UnsupportedStreaming,
     #[error("template variable {0} is not allowed in headers")]
@@ -48,6 +53,7 @@ pub struct TemplateVariable {
     name: &'static str,
     valid_in_body: bool,
     valid_in_header: bool,
+    or_elide_header: bool,
     typ: ReplacementType,
 }
 
@@ -61,11 +67,14 @@ pub enum ReplacementType {
 #[derive(Clone, Copy, Debug)]
 pub struct Replacement {
     block_index: usize,
+    or_elide_header: bool,
     typ: ReplacementType,
 }
 
 // TODO: rename for clarity, for instance HttpAnswerTemplate
 pub struct Template {
+    status: u16,
+    keep_alive: bool,
     kawa: DefaultAnswerStream,
     body_replacements: Vec<Replacement>,
     header_replacements: Vec<Replacement>,
@@ -86,8 +95,8 @@ impl fmt::Debug for Template {
 impl Template {
     /// sanitize the template: transform newlines \r (CR) to \r\n (CRLF)
     fn new(
-        status: u16,
-        answer: String,
+        status: Option<u16>,
+        answer: &str,
         variables: &[TemplateVariable],
     ) -> Result<Self, TemplateError> {
         let mut i = 0;
@@ -124,28 +133,54 @@ impl Template {
         if !kawa.is_main_phase() {
             return Err(TemplateError::InvalidTemplate(kawa.parsing_phase));
         }
-        if let StatusLine::Response { code, .. } = kawa.detached.status_line {
-            if code != status {
-                return Err(TemplateError::InvalidStatusCode(code));
+        if kawa.body_size != BodySize::Empty {
+            return Err(TemplateError::InvalidSizeInfo(kawa.body_size));
+        }
+        let status = if let StatusLine::Response { code, .. } = &kawa.detached.status_line {
+            if let Some(expected_code) = status {
+                if expected_code != *code {
+                    return Err(TemplateError::InvalidStatusCode(*code));
+                }
             }
+            *code
         } else {
             return Err(TemplateError::InvalidType);
-        }
+        };
         let buf = kawa.storage.buffer();
         let mut blocks = VecDeque::new();
         let mut header_replacements = Vec::new();
         let mut body_replacements = Vec::new();
         let mut body_size = 0;
+        let mut keep_alive = true;
         let mut used_once = Vec::new();
         for mut block in kawa.blocks.into_iter() {
             match &mut block {
                 Block::ChunkHeader(_) => return Err(TemplateError::UnsupportedStreaming),
+                Block::Flags(Flags {
+                    end_header: true, ..
+                }) => {
+                    header_replacements.push(Replacement {
+                        block_index: blocks.len(),
+                        or_elide_header: false,
+                        typ: ReplacementType::ContentLength,
+                    });
+                    blocks.push_back(Block::Header(Pair {
+                        key: Store::Static(b"Content-Length"),
+                        val: Store::Static(b"PLACEHOLDER"),
+                    }));
+                    blocks.push_back(block);
+                }
                 Block::StatusLine | Block::Cookies | Block::Flags(_) => {
                     blocks.push_back(block);
                 }
                 Block::Header(Pair { key, val }) => {
                     let val_data = val.data(buf);
                     let key_data = key.data(buf);
+                    if compare_no_case(key_data, b"connection")
+                        && compare_no_case(val_data, b"close")
+                    {
+                        keep_alive = false;
+                    }
                     if let Some(b'%') = val_data.first() {
                         for variable in &variables {
                             if &val_data[1..] == variable.name.as_bytes() {
@@ -163,14 +198,11 @@ impl Template {
                                         }
                                         used_once.push(var_index);
                                     }
-                                    ReplacementType::ContentLength => {
-                                        if let Some(b'%') = key_data.first() {
-                                            *key = Store::new_slice(buf, &key_data[1..]);
-                                        }
-                                    }
+                                    ReplacementType::ContentLength => {}
                                 }
                                 header_replacements.push(Replacement {
                                     block_index: blocks.len(),
+                                    or_elide_header: variable.or_elide_header,
                                     typ: variable.typ,
                                 });
                                 break;
@@ -213,6 +245,7 @@ impl Template {
                                     }
                                     body_replacements.push(Replacement {
                                         block_index: blocks.len(),
+                                        or_elide_header: false,
                                         typ: variable.typ,
                                     });
                                     blocks.push_back(Block::Chunk(Chunk {
@@ -234,6 +267,8 @@ impl Template {
         }
         kawa.blocks = blocks;
         Ok(Self {
+            status,
+            keep_alive,
             kawa,
             body_replacements,
             header_replacements,
@@ -277,6 +312,10 @@ impl Template {
                         pair.val = Store::from_string(body_size.to_string())
                     }
                 }
+                if pair.val.len() == 0 && replacement.or_elide_header {
+                    pair.elide();
+                    continue;
+                }
             }
         }
         Kawa {
@@ -293,44 +332,13 @@ impl Template {
     }
 }
 
-/// a set of templates for HTTP answers, meant for one listener to use
-pub struct ListenerAnswers {
-    /// MovedPermanently
-    pub answer_301: Template,
-    /// BadRequest
-    pub answer_400: Template,
-    /// Unauthorized
-    pub answer_401: Template,
-    /// NotFound
-    pub answer_404: Template,
-    /// RequestTimeout
-    pub answer_408: Template,
-    /// PayloadTooLarge
-    pub answer_413: Template,
-    /// BadGateway
-    pub answer_502: Template,
-    /// ServiceUnavailable
-    pub answer_503: Template,
-    /// GatewayTimeout
-    pub answer_504: Template,
-    /// InsufficientStorage
-    pub answer_507: Template,
-}
-
-/// templates for HTTP answers, set for one cluster
-#[allow(non_snake_case)]
-pub struct ClusterAnswers {
-    /// ServiceUnavailable
-    pub answer_503: Template,
-}
-
 pub struct HttpAnswers {
-    pub listener_answers: ListenerAnswers, // configurated answers
-    pub cluster_custom_answers: HashMap<ClusterId, ClusterAnswers>,
+    pub cluster_answers: HashMap<ClusterId, BTreeMap<String, Template>>,
+    pub listener_answers: BTreeMap<String, Template>,
+    pub fallback: Template,
 }
 
 // const HEADERS: &str = "Connection: close\r
-// Content-Length: 0\r
 // Sozu-Id: %REQUEST_ID\r
 // \r";
 // const STYLE: &str = "<style>
@@ -342,13 +350,37 @@ pub struct HttpAnswers {
 // }
 // </style>";
 // const FOOTER: &str = "<footer>This is an automatic answer by Sōzu.</footer>";
+fn fallback() -> String {
+    String::from(
+        "\
+HTTP/1.1 404 Not Found\r
+Cache-Control: no-cache\r
+Connection: close\r
+Sozu-Id: %REQUEST_ID\r
+\r
+<html><head><meta charset='utf-8'><head><body>
+<style>pre{background:#EEE;padding:10px;border:1px solid #AAA;border-radius: 5px;}</style>
+<h1>404 Not Found</h1>
+<pre>
+{
+    \"status_code\": 404,
+    \"route\": \"%ROUTE\",
+    \"rewritten_url\": \"%REDIRECT_LOCATION\",
+    \"request_id\": \"%REQUEST_ID\"
+    \"cluster_id\": \"%CLUSTER_ID\",
+}
+</pre>
+<h1>A frontend requested template \"%TEMPLATE_NAME\" that couldn't be found</h1>
+<footer>This is an automatic answer by Sōzu.</footer></body></html>",
+    )
+}
+
 fn default_301() -> String {
     String::from(
         "\
 HTTP/1.1 301 Moved Permanently\r
 Location: %REDIRECT_LOCATION\r
 Connection: close\r
-Content-Length: 0\r
 Sozu-Id: %REQUEST_ID\r
 \r\n",
     )
@@ -360,7 +392,6 @@ fn default_400() -> String {
 HTTP/1.1 400 Bad Request\r
 Cache-Control: no-cache\r
 Connection: close\r
-%Content-Length: %CONTENT_LENGTH\r
 Sozu-Id: %REQUEST_ID\r
 \r
 <html><head><meta charset='utf-8'><head><body>
@@ -407,6 +438,7 @@ fn default_401() -> String {
     String::from(
         "\
 HTTP/1.1 401 Unauthorized\r
+WWW-Authenticate: %WWW_AUTHENTICATE\r
 Cache-Control: no-cache\r
 Connection: close\r
 Sozu-Id: %REQUEST_ID\r
@@ -430,7 +462,6 @@ fn default_404() -> String {
         "\
 HTTP/1.1 404 Not Found\r
 Cache-Control: no-cache\r
-Connection: close\r
 Sozu-Id: %REQUEST_ID\r
 \r
 <html><head><meta charset='utf-8'><head><body>
@@ -476,7 +507,6 @@ fn default_413() -> String {
 HTTP/1.1 413 Payload Too Large\r
 Cache-Control: no-cache\r
 Connection: close\r
-%Content-Length: %CONTENT_LENGTH\r
 Sozu-Id: %REQUEST_ID\r
 \r
 <html><head><meta charset='utf-8'><head><body>
@@ -500,7 +530,6 @@ fn default_502() -> String {
 HTTP/1.1 502 Bad Gateway\r
 Cache-Control: no-cache\r
 Connection: close\r
-%Content-Length: %CONTENT_LENGTH\r
 Sozu-Id: %REQUEST_ID\r
 \r
 <html><head><meta charset='utf-8'><head><body>
@@ -514,9 +543,9 @@ Sozu-Id: %REQUEST_ID\r
     \"cluster_id\": \"%CLUSTER_ID\",
     \"backend_id\": \"%BACKEND_ID\",
     \"parsing_phase\": \"%PHASE\",
-    \"successfully_parsed\": \"%SUCCESSFULLY_PARSED\",
-    \"partially_parsed\": \"%PARTIALLY_PARSED\",
-    \"invalid\": \"%INVALID\"
+    \"successfully_parsed\": %SUCCESSFULLY_PARSED,
+    \"partially_parsed\": %PARTIALLY_PARSED,
+    \"invalid\": %INVALID
 }
 </pre>
 <p>Response could not be parsed. %MESSAGE</p>
@@ -551,7 +580,6 @@ fn default_503() -> String {
 HTTP/1.1 503 Service Unavailable\r
 Cache-Control: no-cache\r
 Connection: close\r
-%Content-Length: %CONTENT_LENGTH\r
 Sozu-Id: %REQUEST_ID\r
 \r
 <html><head><meta charset='utf-8'><head><body>
@@ -602,7 +630,6 @@ fn default_507() -> String {
 HTTP/1.1 507 Insufficient Storage\r
 Cache-Control: no-cache\r
 Connection: close\r
-%Content-Length: %CONTENT_LENGTH\r
 Sozu-Id: %REQUEST_ID\r
 \r
 <html><head><meta charset='utf-8'><head><body>
@@ -638,225 +665,218 @@ fn phase_to_vec(phase: ParsingPhaseMarker) -> Vec<u8> {
 
 impl HttpAnswers {
     #[rustfmt::skip]
-    pub fn template(status: u16, answer: String) -> Result<Template, (u16, TemplateError)> {
-        let length = TemplateVariable {
-            name: "CONTENT_LENGTH",
-            valid_in_body: false,
-            valid_in_header: true,
-            typ: ReplacementType::ContentLength,
-        };
-
+    pub fn template(name: &str, answer: &str) -> Result<Template, (String, TemplateError)> {
         let route = TemplateVariable {
             name: "ROUTE",
             valid_in_body: true,
             valid_in_header: true,
+            or_elide_header: false,
             typ: ReplacementType::Variable(0),
         };
         let request_id = TemplateVariable {
             name: "REQUEST_ID",
             valid_in_body: true,
             valid_in_header: true,
+            or_elide_header: false,
             typ: ReplacementType::Variable(0),
         };
         let cluster_id = TemplateVariable {
             name: "CLUSTER_ID",
             valid_in_body: true,
             valid_in_header: true,
+            or_elide_header: false,
             typ: ReplacementType::Variable(0),
         };
         let backend_id = TemplateVariable {
             name: "BACKEND_ID",
             valid_in_body: true,
             valid_in_header: true,
+            or_elide_header: false,
             typ: ReplacementType::Variable(0),
         };
         let duration = TemplateVariable {
             name: "DURATION",
             valid_in_body: true,
             valid_in_header: true,
+            or_elide_header: false,
             typ: ReplacementType::Variable(0),
         };
         let capacity = TemplateVariable {
             name: "CAPACITY",
             valid_in_body: true,
             valid_in_header: true,
+            or_elide_header: false,
             typ: ReplacementType::Variable(0),
         };
         let phase = TemplateVariable {
             name: "PHASE",
             valid_in_body: true,
             valid_in_header: true,
+            or_elide_header: false,
             typ: ReplacementType::Variable(0),
         };
 
         let location = TemplateVariable {
             name: "REDIRECT_LOCATION",
+            valid_in_body: true,
+            valid_in_header: true,
+            or_elide_header: false,
+            typ: ReplacementType::VariableOnce(0),
+        };
+        let www_authenticate = TemplateVariable {
+            name: "WWW_AUTHENTICATE",
             valid_in_body: false,
             valid_in_header: true,
+            or_elide_header: true,
             typ: ReplacementType::VariableOnce(0),
         };
         let message = TemplateVariable {
             name: "MESSAGE",
             valid_in_body: true,
             valid_in_header: false,
+            or_elide_header: false,
             typ: ReplacementType::VariableOnce(0),
         };
         let successfully_parsed = TemplateVariable {
             name: "SUCCESSFULLY_PARSED",
             valid_in_body: true,
             valid_in_header: false,
+            or_elide_header: false,
             typ: ReplacementType::Variable(0),
         };
         let partially_parsed = TemplateVariable {
             name: "PARTIALLY_PARSED",
             valid_in_body: true,
             valid_in_header: false,
+            or_elide_header: false,
             typ: ReplacementType::Variable(0),
         };
         let invalid = TemplateVariable {
             name: "INVALID",
             valid_in_body: true,
             valid_in_header: false,
+            or_elide_header: false,
+            typ: ReplacementType::Variable(0),
+        };
+        let template_name = TemplateVariable {
+            name: "TEMPLATE_NAME",
+            valid_in_body: true,
+            valid_in_header: true,
+            or_elide_header: false,
             typ: ReplacementType::Variable(0),
         };
 
-        match status {
-            301 => Template::new(
-                301,
+        match name {
+            "301" => Template::new(
+                Some(301),
                 answer,
-                &[length, route, request_id, location]
+                &[route, request_id, location]
             ),
-            400 => Template::new(
-                400,
+            "400" => Template::new(
+                Some(400),
                 answer,
-                &[length, route, request_id, message, phase, successfully_parsed, partially_parsed, invalid],
+                &[route, request_id, message, phase, successfully_parsed, partially_parsed, invalid],
             ),
-            401 => Template::new(
-                401,
+            "401" => Template::new(
+                Some(401),
                 answer,
-                &[length, route, request_id]
+                &[route, request_id, www_authenticate]
             ),
-            404 => Template::new(
-                404,
+            "404" => Template::new(
+                Some(404),
                 answer,
-                &[length, route, request_id]
+                &[route, request_id]
             ),
-            408 => Template::new(
-                408,
+            "408" => Template::new(
+                Some(408),
                 answer,
-                &[length, route, request_id, duration]
+                &[route, request_id, duration]
             ),
-            413 => Template::new(
-                413,
+            "413" => Template::new(
+                Some(413),
                 answer,
-                &[length, route, request_id, capacity, message, phase],
+                &[route, request_id, capacity, message, phase],
             ),
-            502 => Template::new(
-                502,
+            "502" => Template::new(
+                Some(502),
                 answer,
-                &[length, route, request_id, cluster_id, backend_id, message, phase, successfully_parsed, partially_parsed, invalid],
+                &[route, request_id, cluster_id, backend_id, message, phase, successfully_parsed, partially_parsed, invalid],
             ),
-            503 => Template::new(
-                503,
+            "503" => Template::new(
+                Some(503),
                 answer,
-                &[length, route, request_id, cluster_id, backend_id, message],
+                &[route, request_id, cluster_id, backend_id, message],
             ),
-            504 => Template::new(
-                504,
+            "504" => Template::new(
+                Some(504),
                 answer,
-                &[length, route, request_id, cluster_id, backend_id, duration],
+                &[route, request_id, cluster_id, backend_id, duration],
             ),
-            507 => Template::new(
-                507,
+            "507" => Template::new(
+                Some(507),
                 answer,
-                &[length, route, request_id, cluster_id, backend_id, capacity, message, phase],
+                &[route, request_id, cluster_id, backend_id, capacity, message, phase],
             ),
-            _ => Err(TemplateError::InvalidStatusCode(status)),
+            _ => Template::new(
+                None,
+                answer,
+                &[route, request_id, cluster_id, location, template_name]
+            )
         }
-        .map_err(|e| (status, e))
+        .map_err(|e| (name.to_owned(), e))
     }
 
-    pub fn new(conf: &Option<CustomHttpAnswers>) -> Result<Self, (u16, TemplateError)> {
+    pub fn templates(
+        answers: &BTreeMap<String, String>,
+    ) -> Result<BTreeMap<String, Template>, (String, TemplateError)> {
+        answers
+            .iter()
+            .map(|(name, answer)| {
+                Self::template(name, answer).map(|template| (name.clone(), template))
+            })
+            .collect::<Result<_, _>>()
+    }
+
+    pub fn new(answers: &BTreeMap<String, String>) -> Result<Self, (String, TemplateError)> {
+        let mut listener_answers = Self::templates(answers)?;
+        let expected_defaults: &[(&str, fn() -> String)] = &[
+            ("301", default_301),
+            ("400", default_400),
+            ("401", default_401),
+            ("404", default_404),
+            ("408", default_408),
+            ("413", default_413),
+            ("502", default_502),
+            ("503", default_503),
+            ("504", default_504),
+            ("507", default_507),
+        ];
+        for (name, default) in expected_defaults {
+            listener_answers
+                .entry(name.to_string())
+                .or_insert_with(|| Self::template(name, &default()).unwrap());
+        }
         Ok(HttpAnswers {
-            listener_answers: ListenerAnswers {
-                answer_301: Self::template(
-                    301,
-                    conf.as_ref()
-                        .and_then(|c| c.answer_301.clone())
-                        .unwrap_or(default_301()),
-                )?,
-                answer_400: Self::template(
-                    400,
-                    conf.as_ref()
-                        .and_then(|c| c.answer_400.clone())
-                        .unwrap_or(default_400()),
-                )?,
-                answer_401: Self::template(
-                    401,
-                    conf.as_ref()
-                        .and_then(|c| c.answer_401.clone())
-                        .unwrap_or(default_401()),
-                )?,
-                answer_404: Self::template(
-                    404,
-                    conf.as_ref()
-                        .and_then(|c| c.answer_404.clone())
-                        .unwrap_or(default_404()),
-                )?,
-                answer_408: Self::template(
-                    408,
-                    conf.as_ref()
-                        .and_then(|c| c.answer_408.clone())
-                        .unwrap_or(default_408()),
-                )?,
-                answer_413: Self::template(
-                    413,
-                    conf.as_ref()
-                        .and_then(|c| c.answer_413.clone())
-                        .unwrap_or(default_413()),
-                )?,
-                answer_502: Self::template(
-                    502,
-                    conf.as_ref()
-                        .and_then(|c| c.answer_502.clone())
-                        .unwrap_or(default_502()),
-                )?,
-                answer_503: Self::template(
-                    503,
-                    conf.as_ref()
-                        .and_then(|c| c.answer_503.clone())
-                        .unwrap_or(default_503()),
-                )?,
-                answer_504: Self::template(
-                    504,
-                    conf.as_ref()
-                        .and_then(|c| c.answer_504.clone())
-                        .unwrap_or(default_504()),
-                )?,
-                answer_507: Self::template(
-                    507,
-                    conf.as_ref()
-                        .and_then(|c| c.answer_507.clone())
-                        .unwrap_or(default_507()),
-                )?,
-            },
-            cluster_custom_answers: HashMap::new(),
+            fallback: Self::template("", &fallback()).unwrap(),
+            listener_answers,
+            cluster_answers: HashMap::new(),
         })
     }
 
-    pub fn add_custom_answer(
+    pub fn add_cluster_answers(
         &mut self,
         cluster_id: &str,
-        answer_503: String,
-    ) -> Result<(), (u16, TemplateError)> {
-        let answer_503 = Self::template(503, answer_503)?;
-        self.cluster_custom_answers
-            .insert(cluster_id.to_string(), ClusterAnswers { answer_503 });
+        answers: &BTreeMap<String, String>,
+    ) -> Result<(), (String, TemplateError)> {
+        self.cluster_answers
+            .entry(cluster_id.to_owned())
+            .or_default()
+            .append(&mut Self::templates(answers)?);
         Ok(())
     }
 
-    pub fn remove_custom_answer(&mut self, cluster_id: &str) {
-        self.cluster_custom_answers.remove(cluster_id);
+    pub fn remove_cluster_answers(&mut self, cluster_id: &str) {
+        self.cluster_answers.remove(cluster_id);
     }
 
     pub fn get(
@@ -866,14 +886,14 @@ impl HttpAnswers {
         cluster_id: Option<&str>,
         backend_id: Option<&str>,
         route: String,
-    ) -> DefaultAnswerStream {
+    ) -> (u16, bool, DefaultAnswerStream) {
         let variables: Vec<Vec<u8>>;
         let mut variables_once: Vec<Vec<u8>>;
-        let template = match answer {
+        let name = match answer {
             DefaultAnswer::Answer301 { location } => {
                 variables = vec![route.into(), request_id.into()];
                 variables_once = vec![location.into()];
-                &self.listener_answers.answer_301
+                "301"
             }
             DefaultAnswer::Answer400 {
                 message,
@@ -891,22 +911,22 @@ impl HttpAnswers {
                     invalid.into(),
                 ];
                 variables_once = vec![message.into()];
-                &self.listener_answers.answer_400
+                "400"
             }
-            DefaultAnswer::Answer401 {} => {
+            DefaultAnswer::Answer401 { www_authenticate } => {
                 variables = vec![route.into(), request_id.into()];
-                variables_once = vec![];
-                &self.listener_answers.answer_401
+                variables_once = vec![www_authenticate.map(Into::into).unwrap_or_default()];
+                "401"
             }
             DefaultAnswer::Answer404 {} => {
                 variables = vec![route.into(), request_id.into()];
                 variables_once = vec![];
-                &self.listener_answers.answer_404
+                "404"
             }
             DefaultAnswer::Answer408 { duration } => {
                 variables = vec![route.into(), request_id.into(), duration.to_string().into()];
                 variables_once = vec![];
-                &self.listener_answers.answer_408
+                "408"
             }
             DefaultAnswer::Answer413 {
                 message,
@@ -920,7 +940,7 @@ impl HttpAnswers {
                     phase_to_vec(phase),
                 ];
                 variables_once = vec![message.into()];
-                &self.listener_answers.answer_413
+                "413"
             }
             DefaultAnswer::Answer502 {
                 message,
@@ -940,7 +960,7 @@ impl HttpAnswers {
                     invalid.into(),
                 ];
                 variables_once = vec![message.into()];
-                &self.listener_answers.answer_502
+                "502"
             }
             DefaultAnswer::Answer503 { message } => {
                 variables = vec![
@@ -950,10 +970,7 @@ impl HttpAnswers {
                     backend_id.unwrap_or_default().into(),
                 ];
                 variables_once = vec![message.into()];
-                cluster_id
-                    .and_then(|id: &str| self.cluster_custom_answers.get(id))
-                    .map(|c| &c.answer_503)
-                    .unwrap_or_else(|| &self.listener_answers.answer_503)
+                "503"
             }
             DefaultAnswer::Answer504 { duration } => {
                 variables = vec![
@@ -964,7 +981,7 @@ impl HttpAnswers {
                     duration.to_string().into(),
                 ];
                 variables_once = vec![];
-                &self.listener_answers.answer_504
+                "504"
             }
             DefaultAnswer::Answer507 {
                 phase,
@@ -980,11 +997,30 @@ impl HttpAnswers {
                     phase_to_vec(phase),
                 ];
                 variables_once = vec![message.into()];
-                &self.listener_answers.answer_507
+                "507"
+            }
+            DefaultAnswer::AnswerCustom { name, location, .. } => {
+                variables = vec![
+                    route.into(),
+                    request_id.into(),
+                    cluster_id.unwrap_or_default().into(),
+                    name.into(),
+                ];
+                variables_once = vec![location.into()];
+                unsafe { from_utf8_unchecked(variables[3].as_bytes()) }
             }
         };
         // kawa::debug_kawa(&template.kawa);
         // println!("{template:#?}");
-        template.fill(&variables, &mut variables_once)
+        let template = cluster_id
+            .and_then(|id| self.cluster_answers.get(id))
+            .and_then(|answers| answers.get(name))
+            .or_else(|| self.listener_answers.get(name))
+            .unwrap_or(&self.fallback);
+        (
+            template.status,
+            template.keep_alive,
+            template.fill(&variables, &mut variables_once),
+        )
     }
 }

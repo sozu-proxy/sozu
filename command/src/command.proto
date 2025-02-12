@@ -129,7 +129,7 @@ message HttpListenerConfig {
     required uint32 request_timeout = 10 [default = 10];
     // wether the listener is actively listening on its socket
     required bool active = 11 [default = false];
-    optional CustomHttpAnswers http_answers = 12;
+    map<string, string> answers = 13;
 }
 
 // details of an HTTPS listener
@@ -161,7 +161,7 @@ message HttpsListenerConfig {
     // The tickets allow the client to resume a session. This protects the client
     // agains session tracking. Defaults to 4.
     required uint64 send_tls13_tickets = 20;
-    optional CustomHttpAnswers http_answers = 21;
+    map<string, string> answers = 22;
 }
 
 // details of an TCP listener
@@ -177,31 +177,6 @@ message TcpListenerConfig {
     required uint32 connect_timeout = 6 [default = 3];
     // wether the listener is actively listening on its socket
     required bool active = 7 [default = false];
-}
-
-// custom HTTP answers, useful for 404, 503 pages
-message CustomHttpAnswers {
-    // MovedPermanently
-    optional string answer_301 = 1;
-    // BadRequest
-    optional string answer_400 = 2;
-    // Unauthorized
-    optional string answer_401 = 3;
-    // NotFound
-    optional string answer_404 = 4;
-    // RequestTimeout
-    optional string answer_408 = 5;
-    // PayloadTooLarge
-    optional string answer_413 = 6;
-    // BadGateway
-    optional string answer_502 = 7;
-    // ServiceUnavailable
-    optional string answer_503 = 8;
-    // GatewayTimeout
-    optional string answer_504 = 9;
-    // InsufficientStorage
-    optional string answer_507 = 10;
-
 }
 
 message ActivateListener {
@@ -237,6 +212,18 @@ message ListenersList {
     map<string, TcpListenerConfig> tcp_listeners = 3;
 }
 
+enum RedirectPolicy {
+    FORWARD = 0;
+    PERMANENT = 1;
+    UNAUTHORIZED = 2;
+}
+
+enum RedirectScheme {
+    USE_SAME = 0;
+    USE_HTTP = 1;
+    USE_HTTPS = 2;
+}
+
 // An HTTP or HTTPS frontend, as order to, or received from, Sōzu
 message RequestHttpFrontend {
     optional string cluster_id = 1;
@@ -247,6 +234,26 @@ message RequestHttpFrontend {
     required RulePosition position = 6 [default = TREE];
     // custom tags to identify the frontend in the access logs
     map<string, string> tags = 7;
+    optional RedirectPolicy redirect = 8;
+    optional bool required_auth = 9;
+    optional RedirectScheme redirect_scheme = 10;
+    optional string redirect_template = 11;
+    optional string rewrite_host = 12;
+    optional string rewrite_path = 13;
+    optional uint32 rewrite_port = 14;
+    repeated Header headers = 15;
+}
+
+enum HeaderPosition {
+    REQUEST = 1;
+    RESPONSE = 2;
+    BOTH = 3;
+}
+
+message Header {
+    required HeaderPosition position = 1;
+    required string key = 2;
+    required string val = 3;
 }
 
 message RequestTcpFrontend {
@@ -374,8 +381,11 @@ message Cluster {
     required bool https_redirect = 3;
     optional ProxyProtocolConfig proxy_protocol = 4;
     required LoadBalancingAlgorithms load_balancing = 5 [default = ROUND_ROBIN];
-    optional string answer_503 = 6;
     optional LoadMetric load_metric = 7;
+    optional uint32 https_redirect_port = 8;
+    map<string, string> answers = 9;
+    repeated string authorized_hashes = 10;
+    optional string www_authenticate = 11;
 }
 
 enum LoadBalancingAlgorithms {

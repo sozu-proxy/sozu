@@ -44,7 +44,7 @@ use crate::{
     },
     timer::TimeoutContainer,
     AcceptError, BackendConnectAction, BackendConnectionError, BackendConnectionStatus, CachedTags,
-    ListenerError, ListenerHandler, Protocol, ProxyConfiguration, ProxyError, ProxySession,
+    L4ListenerHandler, ListenerError, Protocol, ProxyConfiguration, ProxyError, ProxySession,
     Readiness, SessionIsToBeClosed, SessionMetrics, SessionResult, StateMachineBuilder,
 };
 
@@ -54,7 +54,7 @@ StateMachineBuilder! {
     /// 1. optional (ExpectProxyProtocol | SendProxyProtocol | RelayProxyProtocol)
     /// 2. Pipe
     enum TcpStateMachine {
-        Pipe(Pipe<MioTcpStream, TcpListener>),
+        Pipe(Pipe<MioTcpStream>),
         SendProxyProtocol(SendProxyProtocol<MioTcpStream>),
         RelayProxyProtocol(RelayProxyProtocol<MioTcpStream>),
         ExpectProxyProtocol(ExpectProxyProtocol<MioTcpStream>),
@@ -91,13 +91,14 @@ pub struct TcpSession {
     frontend_address: Option<SocketAddr>,
     frontend_buffer: Option<Checkout>,
     frontend_token: Token,
-    has_been_closed: SessionIsToBeClosed,
+    has_been_closed: bool,
     last_event: Instant,
     listener: Rc<RefCell<TcpListener>>,
     metrics: SessionMetrics,
     proxy: Rc<RefCell<TcpProxy>>,
     request_id: Ulid,
     state: TcpStateMachine,
+    tags: Option<Rc<CachedTags>>,
 }
 
 impl TcpSession {
@@ -126,6 +127,8 @@ impl TcpSession {
         let container_frontend_timeout =
             TimeoutContainer::new(configured_frontend_timeout, frontend_token);
         let container_backend_timeout = TimeoutContainer::new_empty(configured_connect_timeout);
+
+        let tags = listener.borrow().tags.clone();
 
         let state = match proxy_protocol {
             Some(ProxyProtocolConfig::RelayHeader) => {
@@ -174,11 +177,11 @@ impl TcpSession {
                     frontend_buffer,
                     frontend_token,
                     socket,
-                    listener.clone(),
                     Protocol::TCP,
                     request_id,
                     frontend_address,
                     WebSocketContext::Tcp,
+                    tags.clone(),
                 );
                 pipe.set_cluster_id(cluster_id.clone());
                 TcpStateMachine::Pipe(pipe)
@@ -209,11 +212,11 @@ impl TcpSession {
             proxy,
             request_id,
             state,
+            tags,
         }
     }
 
     fn log_request(&self) {
-        let listener = self.listener.borrow();
         let context = self.log_context();
         self.metrics.register_end_of_session(&context);
         info_access!(
@@ -224,7 +227,7 @@ impl TcpSession {
             backend_address: None,
             protocol: "TCP",
             endpoint: EndpointRecord::Tcp,
-            tags: listener.get_tags(&listener.get_addr().to_string()),
+            tags: self.tags.as_deref(),
             client_rtt: socket_rtt(self.state.front_socket()),
             server_rtt: None,
             user_agent: None,
@@ -364,7 +367,7 @@ impl TcpSession {
             let mut pipe = send_proxy_protocol.into_pipe(
                 self.frontend_buffer.take().unwrap(),
                 self.backend_buffer.take().unwrap(),
-                self.listener.clone(),
+                self.tags.clone(),
             );
 
             pipe.set_cluster_id(self.cluster_id.clone());
@@ -382,8 +385,7 @@ impl TcpSession {
 
     fn upgrade_relay(&mut self, rpp: RelayProxyProtocol<MioTcpStream>) -> Option<TcpStateMachine> {
         if self.backend_buffer.is_some() {
-            let mut pipe =
-                rpp.into_pipe(self.backend_buffer.take().unwrap(), self.listener.clone());
+            let mut pipe = rpp.into_pipe(self.backend_buffer.take().unwrap(), self.tags.clone());
             pipe.set_cluster_id(self.cluster_id.clone());
             gauge_add!("protocol.proxy.relay", -1);
             gauge_add!("protocol.tcp", 1);
@@ -407,7 +409,7 @@ impl TcpSession {
                 self.backend_buffer.take().unwrap(),
                 None,
                 None,
-                self.listener.clone(),
+                self.tags.clone(),
             );
 
             pipe.set_cluster_id(self.cluster_id.clone());
@@ -495,7 +497,7 @@ impl TcpSession {
                 "connections_per_backend",
                 1,
                 self.cluster_id.as_deref(),
-                self.metrics.backend_id.as_deref()
+                self.backend_id.as_deref()
             );
 
             // the back timeout was of connect_timeout duration before,
@@ -515,7 +517,7 @@ impl TcpSession {
                     incr!(
                         "backend.up",
                         self.cluster_id.as_deref(),
-                        self.metrics.backend_id.as_deref()
+                        self.backend_id.as_deref()
                     );
                     info!(
                         "backend server {} at {} is up",
@@ -558,7 +560,7 @@ impl TcpSession {
             incr!(
                 "backend.connections.error",
                 self.cluster_id.as_deref(),
-                self.metrics.backend_id.as_deref()
+                self.backend_id.as_deref()
             );
             if !already_unavailable && backend.retry_policy.is_down() {
                 error!(
@@ -568,7 +570,7 @@ impl TcpSession {
                 incr!(
                     "backend.down",
                     self.cluster_id.as_deref(),
-                    self.metrics.backend_id.as_deref()
+                    self.backend_id.as_deref()
                 );
 
                 push_event(Event {
@@ -822,7 +824,7 @@ impl TcpSession {
                 "connections_per_backend",
                 -1,
                 self.cluster_id.as_deref(),
-                self.metrics.backend_id.as_deref()
+                self.backend_id.as_deref()
             );
         }
 
@@ -902,7 +904,7 @@ impl TcpSession {
         self.set_back_token(back_token);
         self.set_back_socket(stream);
 
-        self.metrics.backend_id = Some(backend.borrow().backend_id.clone());
+        // self.metrics.backend_id = Some(backend.borrow().backend_id.clone());
         self.metrics.backend_start();
         self.set_backend_id(backend.borrow().backend_id.clone());
 
@@ -1089,29 +1091,22 @@ impl ProxySession for TcpSession {
 }
 
 pub struct TcpListener {
-    active: SessionIsToBeClosed,
+    active: bool,
     address: SocketAddr,
     cluster_id: Option<String>,
     config: TcpListenerConfig,
     listener: Option<MioTcpListener>,
-    tags: BTreeMap<String, CachedTags>,
+    pub tags: Option<Rc<CachedTags>>,
     token: Token,
 }
 
-impl ListenerHandler for TcpListener {
-    fn get_addr(&self) -> &SocketAddr {
-        &self.address
+impl L4ListenerHandler for TcpListener {
+    fn get_tags(&self) -> Option<&CachedTags> {
+        self.tags.as_deref()
     }
 
-    fn get_tags(&self, key: &str) -> Option<&CachedTags> {
-        self.tags.get(key)
-    }
-
-    fn set_tags(&mut self, key: String, tags: Option<BTreeMap<String, String>>) {
-        match tags {
-            Some(tags) => self.tags.insert(key, CachedTags::new(tags)),
-            None => self.tags.remove(&key),
-        };
+    fn set_tags(&mut self, tags: Option<BTreeMap<String, String>>) {
+        self.tags = tags.map(|tags| Rc::new(CachedTags::new(tags)))
     }
 }
 
@@ -1124,7 +1119,7 @@ impl TcpListener {
             address: config.address.into(),
             config,
             active: false,
-            tags: BTreeMap::new(),
+            tags: None,
         })
     }
 
@@ -1224,7 +1219,7 @@ impl TcpProxy {
         }
     }
 
-    pub fn remove_listener(&mut self, address: SocketAddr) -> SessionIsToBeClosed {
+    pub fn remove_listener(&mut self, address: SocketAddr) -> bool {
         let len = self.listeners.len();
 
         self.listeners.retain(|_, l| l.borrow().address != address);
@@ -1291,7 +1286,7 @@ impl TcpProxy {
 
         self.fronts
             .insert(front.cluster_id.to_string(), listener.token);
-        listener.set_tags(address.to_string(), Some(front.tags));
+        listener.set_tags(Some(front.tags));
         listener.cluster_id = Some(front.cluster_id);
         Ok(())
     }
@@ -1308,7 +1303,7 @@ impl TcpProxy {
             None => return Err(ProxyError::NoListenerFound(address)),
         };
 
-        listener.set_tags(address.to_string(), None);
+        listener.set_tags(None);
         if let Some(cluster_id) = listener.cluster_id.take() {
             self.fronts.remove(&cluster_id);
         }

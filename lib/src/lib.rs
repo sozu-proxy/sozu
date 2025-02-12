@@ -106,7 +106,6 @@
 //!     sticky_session: false,
 //!     https_redirect: false,
 //!     load_balancing: LoadBalancingAlgorithms::RoundRobin as i32,
-//!     answer_503: Some("A custom forbidden message".to_string()),
 //!     ..Default::default()
 //! };
 //! ```
@@ -249,7 +248,6 @@
 //!         sticky_session: false,
 //!         https_redirect: false,
 //!         load_balancing: LoadBalancingAlgorithms::RoundRobin as i32,
-//!         answer_503: Some("A custom forbidden message".to_string()),
 //!         ..Default::default()
 //!     };
 //!
@@ -350,7 +348,7 @@ use backends::BackendError;
 use hex::FromHexError;
 use mio::{net::TcpStream, Interest, Token};
 use protocol::http::{answers::TemplateError, parser::Method};
-use router::RouterError;
+use router::{RouteResult, RouterError};
 use socket::ServerBindError;
 use tls::CertificateResolverError;
 
@@ -362,7 +360,7 @@ use sozu_command::{
     AsStr, ObjectKind,
 };
 
-use crate::{backends::BackendMap, router::Route};
+use crate::backends::BackendMap;
 
 /// Anything that can be registered in mio (subscribe to kernel events)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -521,16 +519,10 @@ macro_rules! StateMachineBuilder {
     }
 }
 
-pub trait ListenerHandler {
-    fn get_addr(&self) -> &SocketAddr;
+pub trait L4ListenerHandler {
+    fn get_tags(&self) -> Option<&CachedTags>;
 
-    fn get_tags(&self, key: &str) -> Option<&CachedTags>;
-
-    fn get_concatenated_tags(&self, key: &str) -> Option<&str> {
-        self.get_tags(key).map(|tags| tags.concatenated.as_str())
-    }
-
-    fn set_tags(&mut self, key: String, tags: Option<BTreeMap<String, String>>);
+    fn set_tags(&mut self, tags: Option<BTreeMap<String, String>>);
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -554,7 +546,7 @@ pub trait L7ListenerHandler {
         host: &str,
         uri: &str,
         method: &Method,
-    ) -> Result<Route, FrontendFromRequestError>;
+    ) -> Result<RouteResult, FrontendFromRequestError>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -602,6 +594,8 @@ pub enum RetrieveClusterError {
     NoPath,
     #[error("unauthorized route")]
     UnauthorizedRoute,
+    #[error("redirected")]
+    Redirected,
     #[error("{0}")]
     RetrieveFrontend(FrontendFromRequestError),
 }
@@ -624,8 +618,8 @@ pub enum ListenerError {
     Resolver(CertificateResolverError),
     #[error("failed to parse pem, {0}")]
     PemParse(String),
-    #[error("failed to parse template {0}: {1}")]
-    TemplateParse(u16, TemplateError),
+    #[error("failed to parse template {0:?}: {1}")]
+    TemplateParse(String, TemplateError),
     #[error("failed to build rustls context, {0}")]
     BuildRustls(String),
     #[error("could not activate listener with address {address:?}: {error}")]
@@ -953,7 +947,6 @@ pub struct SessionMetrics {
     pub service_start: Option<Instant>,
     pub wait_start: Instant,
 
-    pub backend_id: Option<String>,
     pub backend_start: Option<Instant>,
     pub backend_connected: Option<Instant>,
     pub backend_stop: Option<Instant>,
@@ -971,7 +964,6 @@ impl SessionMetrics {
             bout: 0,
             service_start: None,
             wait_start: Instant::now(),
-            backend_id: None,
             backend_start: None,
             backend_connected: None,
             backend_stop: None,
@@ -1072,7 +1064,7 @@ impl SessionMetrics {
         time!("request_time", request_time.as_millis());
         time!("service_time", service_time.as_millis());
 
-        if let Some(backend_id) = self.backend_id.as_ref() {
+        if let Some(backend_id) = context.backend_id {
             if let Some(backend_response_time) = self.backend_response_time() {
                 record_backend_metrics!(
                     context.cluster_id.as_str_or("-"),

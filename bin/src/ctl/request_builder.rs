@@ -76,11 +76,7 @@ impl CommandManager {
 
     pub fn reload_configuration(&mut self, path: Option<String>) -> Result<(), CtlError> {
         debug!("Reloading configuration…");
-        let path = match path {
-            Some(p) => p,
-            None => String::new(),
-        };
-        self.send_request(RequestType::ReloadConfiguration(path).into())
+        self.send_request(RequestType::ReloadConfiguration(path.unwrap_or_default()).into())
     }
 
     pub fn list_frontends(
@@ -246,10 +242,15 @@ impl CommandManager {
                     path: PathRule::from_cli_options(path_prefix, path_regex, path_equals),
                     method: method.map(String::from),
                     position: RulePosition::Tree.into(),
-                    tags: match tags {
-                        Some(tags) => tags,
-                        None => BTreeMap::new(),
-                    },
+                    tags: tags.unwrap_or_default(),
+                    required_auth: todo!(),
+                    redirect: todo!(),
+                    redirect_scheme: todo!(),
+                    redirect_template: todo!(),
+                    rewrite_host: todo!(),
+                    rewrite_path: todo!(),
+                    rewrite_port: todo!(),
+                    headers: todo!(),
                 })
                 .into(),
             ),
@@ -294,10 +295,15 @@ impl CommandManager {
                     path: PathRule::from_cli_options(path_prefix, path_regex, path_equals),
                     method: method.map(String::from),
                     position: RulePosition::Tree.into(),
-                    tags: match tags {
-                        Some(tags) => tags,
-                        None => BTreeMap::new(),
-                    },
+                    tags: tags.unwrap_or_default(),
+                    required_auth: todo!(),
+                    redirect: todo!(),
+                    redirect_scheme: todo!(),
+                    redirect_template: todo!(),
+                    rewrite_host: todo!(),
+                    rewrite_path: todo!(),
+                    rewrite_port: todo!(),
+                    headers: todo!(),
                 })
                 .into(),
             ),
@@ -341,8 +347,8 @@ impl CommandManager {
             } => {
                 let https_listener = ListenerBuilder::new_https(address.into())
                     .with_public_address(public_address)
-                    .with_answer_404_path(answer_404)
-                    .with_answer_503_path(answer_503)
+                    .with_answer("404", answer_404)
+                    .with_answer("503", answer_503)
                     .with_tls_versions(tls_versions)
                     .with_cipher_list(cipher_list)
                     .with_expect_proxy(expect_proxy)
@@ -384,8 +390,8 @@ impl CommandManager {
             } => {
                 let http_listener = ListenerBuilder::new_http(address.into())
                     .with_public_address(public_address)
-                    .with_answer_404_path(answer_404)
-                    .with_answer_503_path(answer_503)
+                    .with_answer("404", answer_404)
+                    .with_answer("503", answer_503)
                     .with_expect_proxy(expect_proxy)
                     .with_sticky_name(sticky_name)
                     .with_front_timeout(front_timeout)

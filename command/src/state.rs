@@ -1482,7 +1482,7 @@ mod tests {
 
     use super::*;
     use crate::proto::command::{
-        CustomHttpAnswers, LoadBalancingParams, RequestHttpFrontend, RulePosition,
+        LoadBalancingParams, RedirectPolicy, RedirectScheme, RequestHttpFrontend, RulePosition,
     };
 
     #[test]
@@ -1724,6 +1724,9 @@ mod tests {
                 hostname: String::from("test.local"),
                 path: PathRule::prefix(String::from("/abc")),
                 address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
+                required_auth: Some(false),
+                redirect: Some(RedirectPolicy::Forward.into()),
+                redirect_scheme: Some(RedirectScheme::UseSame.into()),
                 ..Default::default()
             })
             .into(),
@@ -1985,10 +1988,7 @@ mod tests {
     #[test]
     fn listener_diff() {
         let mut state: ConfigState = Default::default();
-        let custom_http_answers = Some(CustomHttpAnswers {
-            answer_404: Some("test".to_string()),
-            ..Default::default()
-        });
+        let answers = BTreeMap::from([("404".to_string(), "test".to_string())]);
         state
             .dispatch(
                 &RequestType::AddTcpListener(TcpListenerConfig {
@@ -2052,7 +2052,7 @@ mod tests {
             .dispatch(
                 &RequestType::AddHttpListener(HttpListenerConfig {
                     address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
-                    http_answers: custom_http_answers.clone(),
+                    answers: answers.clone(),
                     ..Default::default()
                 })
                 .into(),
@@ -2072,7 +2072,7 @@ mod tests {
             .dispatch(
                 &RequestType::AddHttpsListener(HttpsListenerConfig {
                     address: SocketAddress::new_v4(0, 0, 0, 0, 8443),
-                    http_answers: custom_http_answers.clone(),
+                    answers: answers.clone(),
                     ..Default::default()
                 })
                 .into(),
@@ -2114,7 +2114,7 @@ mod tests {
             .into(),
             RequestType::AddHttpListener(HttpListenerConfig {
                 address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
-                http_answers: custom_http_answers.clone(),
+                answers: answers.clone(),
                 ..Default::default()
             })
             .into(),
@@ -2131,7 +2131,7 @@ mod tests {
             .into(),
             RequestType::AddHttpsListener(HttpsListenerConfig {
                 address: SocketAddress::new_v4(0, 0, 0, 0, 8443),
-                http_answers: custom_http_answers.clone(),
+                answers: answers.clone(),
                 ..Default::default()
             })
             .into(),

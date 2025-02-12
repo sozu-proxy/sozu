@@ -4,7 +4,7 @@ use mio::{net::TcpStream, Token};
 use rusty_ulid::Ulid;
 use sozu_command::{
     config::MAX_LOOP_ITERATIONS,
-    logging::{EndpointRecord, LogContext},
+    logging::{CachedTags, EndpointRecord, LogContext},
 };
 
 use crate::{
@@ -14,7 +14,7 @@ use crate::{
     socket::{stats::socket_rtt, SocketHandler, SocketResult, TransportProtocol},
     sozu_command::ready::Ready,
     timer::TimeoutContainer,
-    L7Proxy, ListenerHandler, Protocol, Readiness, SessionMetrics, SessionResult, StateResult,
+    L7Proxy, Protocol, Readiness, SessionMetrics, SessionResult, StateResult,
 };
 
 /// This macro is defined uniquely in this module to help the tracking of pipelining
@@ -59,7 +59,7 @@ pub enum WebSocketContext {
     Tcp,
 }
 
-pub struct Pipe<Front: SocketHandler, L: ListenerHandler> {
+pub struct Pipe<Front: SocketHandler> {
     backend_buffer: Checkout,
     backend_id: Option<String>,
     pub backend_readiness: Readiness,
@@ -75,14 +75,14 @@ pub struct Pipe<Front: SocketHandler, L: ListenerHandler> {
     frontend_status: ConnectionStatus,
     frontend_token: Token,
     frontend: Front,
-    listener: Rc<RefCell<L>>,
     protocol: Protocol,
     request_id: Ulid,
     session_address: Option<SocketAddr>,
+    tags: Option<Rc<CachedTags>>,
     websocket_context: WebSocketContext,
 }
 
-impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
+impl<Front: SocketHandler> Pipe<Front> {
     /// Instantiate a new Pipe SessionState with:
     ///
     /// - frontend_interest: READABLE | WRITABLE | HUP | ERROR
@@ -103,12 +103,12 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         frontend_buffer: Checkout,
         frontend_token: Token,
         frontend: Front,
-        listener: Rc<RefCell<L>>,
         protocol: Protocol,
         request_id: Ulid,
         session_address: Option<SocketAddr>,
         websocket_context: WebSocketContext,
-    ) -> Pipe<Front, L> {
+        tags: Option<Rc<CachedTags>>,
+    ) -> Pipe<Front> {
         let frontend_status = ConnectionStatus::Normal;
         let backend_status = if backend_socket.is_none() {
             ConnectionStatus::Closed
@@ -138,10 +138,10 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             frontend_status,
             frontend_token,
             frontend,
-            listener,
             protocol,
             request_id,
             session_address,
+            tags,
             websocket_context,
         };
 
@@ -232,7 +232,6 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
     }
 
     pub fn log_request(&self, metrics: &SessionMetrics, error: bool, message: Option<&str>) {
-        let listener = self.listener.borrow();
         let context = self.log_context();
         let endpoint = self.log_endpoint();
         metrics.register_end_of_session(&context);
@@ -245,7 +244,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             backend_address: self.get_backend_address(),
             protocol: self.protocol_string(),
             endpoint,
-            tags: listener.get_tags(&listener.get_addr().to_string()),
+            tags: self.tags.as_deref(),
             client_rtt: socket_rtt(self.front_socket()),
             server_rtt: self.backend_socket.as_ref().and_then(socket_rtt),
             service_time: metrics.service_time(),
@@ -657,7 +656,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
     }
 }
 
-impl<Front: SocketHandler, L: ListenerHandler> SessionState for Pipe<Front, L> {
+impl<Front: SocketHandler> SessionState for Pipe<Front> {
     fn ready(
         &mut self,
         _session: Rc<RefCell<dyn crate::ProxySession>>,

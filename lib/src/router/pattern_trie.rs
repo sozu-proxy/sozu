@@ -4,6 +4,12 @@ use regex::bytes::Regex;
 
 pub type Key = Vec<u8>;
 pub type KeyValue<K, V> = (K, V);
+pub type TrieMatches<'a, 'b> = Vec<TrieSubMatch<'b, 'a>>;
+
+pub enum TrieSubMatch<'a, 'b> {
+    Wildcard(&'a [u8]),
+    Regexp(&'a [u8], &'b Regex),
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum InsertResult {
@@ -263,11 +269,16 @@ impl<V: Debug + Clone> TrieNode<V> {
         }
     }
 
-    pub fn lookup(&self, partial_key: &[u8], accept_wildcard: bool) -> Option<&KeyValue<Key, V>> {
+    pub fn lookup<'a, 'b>(
+        &'a self,
+        partial_key: &'b [u8],
+        accept_wildcard: bool,
+        mut path: TrieMatches<'a, 'b>,
+    ) -> Option<(&'a KeyValue<Key, V>, TrieMatches<'a, 'b>)> {
         //println!("lookup: key == {}", std::str::from_utf8(partial_key).unwrap());
 
         if partial_key.is_empty() {
-            return self.key_value.as_ref();
+            return self.key_value.as_ref().map(|kv| (kv, path));
         }
 
         let pos = find_last_dot(partial_key);
@@ -278,27 +289,29 @@ impl<V: Debug + Clone> TrieNode<V> {
         //println!("lookup: prefix|suffix: {} | {}", std::str::from_utf8(prefix).unwrap(), std::str::from_utf8(suffix).unwrap());
 
         match self.children.get(suffix) {
-            Some(child) => child.lookup(prefix, accept_wildcard),
+            Some(child) => child.lookup(prefix, accept_wildcard, path),
             None => {
                 //println!("no child found, testing wildcard and regexps");
 
                 if prefix.is_empty() && self.wildcard.is_some() && accept_wildcard {
                     //println!("no dot, wildcard applies");
-                    self.wildcard.as_ref()
+                    path.insert(0, TrieSubMatch::Wildcard(suffix));
+                    self.wildcard.as_ref().map(|kv| (kv, path))
                 } else {
                     //println!("there's still a subdomain, wildcard does not apply");
 
-                    for (ref regexp, ref child) in self.regexps.iter() {
-                        let suffix = if suffix[0] == b'.' {
-                            &suffix[1..]
-                        } else {
-                            suffix
-                        };
+                    // let suffix = if suffix[0] == b'.' {
+                    //     &suffix[1..]
+                    // } else {
+                    //     suffix
+                    // };
+                    for (regexp, child) in &self.regexps {
                         //println!("testing regexp: {} on suffix {}", r.as_str(), str::from_utf8(s).unwrap());
 
                         if regexp.is_match(suffix) {
                             //println!("matched");
-                            return child.lookup(prefix, accept_wildcard);
+                            path.insert(0, TrieSubMatch::Regexp(suffix, regexp));
+                            return child.lookup(prefix, accept_wildcard, path);
                         }
                     }
 
@@ -421,7 +434,8 @@ impl<V: Debug + Clone> TrieNode<V> {
     }
 
     pub fn domain_lookup(&self, key: &[u8], accept_wildcard: bool) -> Option<&KeyValue<Key, V>> {
-        self.lookup(key, accept_wildcard)
+        let path = Vec::new();
+        self.lookup(key, accept_wildcard, path).map(|(kv, _)| kv)
     }
 
     pub fn domain_lookup_mut(
@@ -809,7 +823,7 @@ mod tests {
             }
 
             //match root.domain_lookup(k.as_bytes()) {
-            match root.lookup(k.as_bytes(), false) {
+            match root.domain_lookup(k.as_bytes(), false) {
                 None => {
                     println!("did not find key '{k}'");
                     return false;

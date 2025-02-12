@@ -1,17 +1,28 @@
 use std::{
     net::{IpAddr, SocketAddr},
+    rc::Rc,
     str::{from_utf8, from_utf8_unchecked},
 };
 
 use rusty_ulid::Ulid;
+use sha2::{Digest, Sha256};
+use sozu_command::logging::CachedTags;
 
 use crate::{
     pool::Checkout,
     protocol::http::{parser::compare_no_case, GenericHttpStream, Method},
-    Protocol,
+    router::HeaderEdit,
+    Protocol, RetrieveClusterError,
 };
 
 use sozu_command_lib::logging::LogContext;
+
+#[derive(Debug)]
+pub struct HttpRoute {
+    pub method: Option<Method>,
+    pub authority: Option<String>,
+    pub path: Option<String>,
+}
 
 /// This is the container used to store and use information about the session from within a Kawa parser callback
 #[derive(Debug)]
@@ -23,16 +34,13 @@ pub struct HttpContext {
     pub keep_alive_frontend: bool,
     /// the value of the sticky session cookie in the request
     pub sticky_session_found: Option<String>,
-    // ---------- Status Line
-    /// the value of the method in the request line
-    pub method: Option<Method>,
-    /// the value of the authority of the request (in the request line of "Host" header)
-    pub authority: Option<String>,
-    /// the value of the path in the request line
-    pub path: Option<String>,
-    /// the value of the status code in the response line
+    /// hashed value of the last authorization header
+    pub authorization_found: Option<String>,
+    /// position of the last header of the request (the "Sozu-Id"), only valid until prepare is called
+    pub last_header: Option<usize>,
+    // ---------- Route
+    pub route: HttpRoute,
     pub status: Option<u16>,
-    /// the value of the reason in the response line
     pub reason: Option<String>,
     // ---------- Additional optional data
     pub user_agent: Option<String>,
@@ -55,6 +63,10 @@ pub struct HttpContext {
     /// the sticky session that should be used
     /// used to create a "Set-Cookie" header in the response in case it differs from sticky_session_found
     pub sticky_session: Option<String>,
+    /// Headers to add to response
+    pub headers_response: Rc<[HeaderEdit]>,
+    /// tags of the contacted frontend
+    pub tags: Option<Rc<CachedTags>>,
 }
 
 impl kawa::h1::ParserCallbacks<Checkout> for HttpContext {
@@ -78,6 +90,14 @@ impl HttpContext {
     ///   - sticky cookie
     ///   - user-agent
     fn on_request_headers(&mut self, request: &mut GenericHttpStream) {
+        if request.body_size == kawa::BodySize::Empty {
+            request.parsing_phase = kawa::ParsingPhase::Terminated;
+            request.push_block(kawa::Block::Header(kawa::Pair {
+                key: kawa::Store::Static(b"Content-Length"),
+                val: kawa::Store::Static(b"0"),
+            }));
+        };
+
         let buf = &mut request.storage.mut_buffer();
 
         // Captures the request line
@@ -88,20 +108,16 @@ impl HttpContext {
             ..
         } = &request.detached.status_line
         {
-            self.method = method.data_opt(buf).map(Method::new);
-            self.authority = authority
+            self.route.method = method.data_opt(buf).map(Method::new);
+            self.route.authority = authority
                 .data_opt(buf)
                 .and_then(|data| from_utf8(data).ok())
                 .map(ToOwned::to_owned);
-            self.path = path
+            self.route.path = path
                 .data_opt(buf)
                 .and_then(|data| from_utf8(data).ok())
                 .map(ToOwned::to_owned);
         }
-
-        // if self.method == Some(Method::Get) && request.body_size == kawa::BodySize::Empty {
-        //     request.parsing_phase = kawa::ParsingPhase::Terminated;
-        // }
 
         let public_ip = self.public_address.ip();
         let public_port = self.public_address.port();
@@ -117,7 +133,7 @@ impl HttpContext {
             let key = cookie.key.data(buf);
             if key == self.sticky_name.as_bytes() {
                 let val = cookie.val.data(buf);
-                self.sticky_session_found = from_utf8(val).ok().map(|val| val.to_string());
+                self.sticky_session_found = from_utf8(val).ok().map(ToOwned::to_owned);
                 cookie.elide();
             }
         }
@@ -130,11 +146,14 @@ impl HttpContext {
         // - store X-Forwarded-For
         // - store Forwarded
         // - store User-Agent
+        // - compute sha256 of Authorization
         let mut x_for = None;
         let mut forwarded = None;
         let mut has_x_port = false;
         let mut has_x_proto = false;
         let mut has_connection = false;
+
+        let mut auth = None;
         for block in &mut request.blocks {
             match block {
                 kawa::Block::Header(header) if !header.is_elided() => {
@@ -156,7 +175,7 @@ impl HttpContext {
                             incr!("http.trusting.x_proto.diff");
                             debug!(
                                 "Trusting X-Forwarded-Proto for {:?} even though {:?} != {}",
-                                self.authority, val, proto
+                                self.route.authority, val, proto
                             );
                         }
                     } else if compare_no_case(key, b"X-Forwarded-Port") {
@@ -169,7 +188,7 @@ impl HttpContext {
                             incr!("http.trusting.x_port.diff");
                             debug!(
                                 "Trusting X-Forwarded-Port for {:?} even though {:?} != {}",
-                                self.authority, val, expected
+                                self.route.authority, val, expected
                             );
                         }
                     } else if compare_no_case(key, b"X-Forwarded-For") {
@@ -182,11 +201,17 @@ impl HttpContext {
                             .data_opt(buf)
                             .and_then(|data| from_utf8(data).ok())
                             .map(ToOwned::to_owned);
+                    } else if compare_no_case(key, b"Authorization") {
+                        auth = Some(header);
                     }
                 }
                 _ => {}
             }
         }
+
+        self.authorization_found = auth
+            .and_then(|header| header.val.data_opt(buf))
+            .map(|auth| hex::encode(Sha256::digest(auth)));
 
         // If session_address is set:
         // - append its ip address to the list of "X-Forwarded-For" if it was found, creates it if not
@@ -226,6 +251,8 @@ impl HttpContext {
                 };
                 header.val = kawa::Store::from_string(new_value);
             }
+
+            request.blocks.reserve(8);
 
             if !has_x_for {
                 request.push_block(kawa::Block::Header(kawa::Pair {
@@ -275,6 +302,7 @@ impl HttpContext {
             }));
         }
 
+        self.last_header = Some(request.blocks.len());
         // Create a custom "Sozu-Id" header
         request.push_block(kawa::Block::Header(kawa::Pair {
             key: kawa::Store::Static(b"Sozu-Id"),
@@ -301,7 +329,7 @@ impl HttpContext {
                 .map(ToOwned::to_owned);
         }
 
-        if self.method == Some(Method::Head) {
+        if self.route.method == Some(Method::Head) {
             response.parsing_phase = kawa::ParsingPhase::Terminated;
         }
 
@@ -325,6 +353,8 @@ impl HttpContext {
             }
         }
 
+        response.blocks.reserve(2 + self.headers_response.len());
+
         // If the sticky_session is set and differs from the one found in the request
         // create a "Set-Cookie" header to update the sticky_name value
         if let Some(sticky_session) = &self.sticky_session {
@@ -339,6 +369,8 @@ impl HttpContext {
             }
         }
 
+        apply_header_edits(response, self.headers_response.clone());
+
         // Create a custom "Sozu-Id" header
         response.push_block(kawa::Block::Header(kawa::Pair {
             key: kawa::Store::Static(b"Sozu-Id"),
@@ -350,12 +382,15 @@ impl HttpContext {
         self.keep_alive_backend = true;
         self.keep_alive_frontend = true;
         self.sticky_session_found = None;
-        self.method = None;
-        self.authority = None;
-        self.path = None;
+        self.route.method = None;
+        self.route.authority = None;
+        self.route.path = None;
         self.status = None;
         self.reason = None;
         self.user_agent = None;
+        self.cluster_id = None;
+        self.backend_id = None;
+        self.headers_response = Rc::new([]);
     }
 
     pub fn log_context(&self) -> LogContext {
@@ -364,5 +399,28 @@ impl HttpContext {
             cluster_id: self.cluster_id.as_deref(),
             backend_id: self.backend_id.as_deref(),
         }
+    }
+}
+
+impl HttpRoute {
+    // -> host, path, method
+    pub fn extract(&self) -> Result<(&str, &str, &Method), RetrieveClusterError> {
+        let given_method = self.method.as_ref().ok_or(RetrieveClusterError::NoMethod)?;
+        let given_authority = self
+            .authority
+            .as_deref()
+            .ok_or(RetrieveClusterError::NoHost)?;
+        let given_path = self.path.as_deref().ok_or(RetrieveClusterError::NoPath)?;
+
+        Ok((given_authority, given_path, given_method))
+    }
+}
+
+pub fn apply_header_edits(kawa: &mut GenericHttpStream, headers: Rc<[HeaderEdit]>) {
+    for header in &*headers {
+        kawa.push_block(kawa::Block::Header(kawa::Pair {
+            key: kawa::Store::Shared(header.key.clone(), 0),
+            val: kawa::Store::Shared(header.val.clone(), 0),
+        }));
     }
 }

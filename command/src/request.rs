@@ -14,8 +14,7 @@ use crate::{
     proto::{
         command::{
             ip_address, request::RequestType, InitialState, IpAddress, LoadBalancingAlgorithms,
-            PathRuleKind, Request, RequestHttpFrontend, RulePosition, SocketAddress, Uint128,
-            WorkerRequest,
+            PathRuleKind, Request, RequestHttpFrontend, SocketAddress, Uint128, WorkerRequest,
         },
         display::format_request_type,
     },
@@ -161,18 +160,21 @@ impl RequestHttpFrontend {
     /// convert a requested frontend to a usable one by parsing its address
     pub fn to_frontend(self) -> Result<HttpFrontend, RequestError> {
         Ok(HttpFrontend {
+            position: self.position(),
+            required_auth: self.required_auth.unwrap_or(false),
+            redirect: self.redirect(),
+            redirect_scheme: self.redirect_scheme(),
+            redirect_template: self.redirect_template,
+            rewrite_host: self.rewrite_host,
+            rewrite_path: self.rewrite_path,
+            rewrite_port: self.rewrite_port.map(|x| x as u16),
             address: self.address.into(),
             cluster_id: self.cluster_id,
             hostname: self.hostname,
             path: self.path,
             method: self.method,
-            position: RulePosition::try_from(self.position).map_err(|_| {
-                RequestError::InvalidValue {
-                    name: "position".to_string(),
-                    value: self.position,
-                }
-            })?,
             tags: Some(self.tags),
+            headers: self.headers,
         })
     }
 }
