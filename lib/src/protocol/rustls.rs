@@ -6,7 +6,7 @@ use rusty_ulid::Ulid;
 use sozu_command::{config::MAX_LOOP_ITERATIONS, logging::LogContext};
 
 use crate::{
-    protocol::SessionState, timer::TimeoutContainer, Readiness, Ready, SessionMetrics,
+    protocol::SessionState, timer::TimeoutContainer, L7Proxy, Readiness, Ready, SessionMetrics,
     SessionResult, StateResult,
 };
 
@@ -223,10 +223,10 @@ impl TlsHandshake {
 }
 
 impl SessionState for TlsHandshake {
-    fn ready(
+    fn ready<P: L7Proxy>(
         &mut self,
         _session: Rc<RefCell<dyn crate::ProxySession>>,
-        _proxy: Rc<RefCell<dyn crate::L7Proxy>>,
+        _proxy: Rc<RefCell<P>>,
         _metrics: &mut SessionMetrics,
     ) -> SessionResult {
         let mut counter = 0;

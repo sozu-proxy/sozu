@@ -173,6 +173,12 @@ pub struct FrontRustls {
     pub session: ServerConnection,
 }
 
+impl std::fmt::Debug for FrontRustls {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FrontRustls")
+    }
+}
+
 impl SocketHandler for FrontRustls {
     fn socket_read(&mut self, buf: &mut [u8]) -> (usize, SocketResult) {
         let mut size = 0usize;
@@ -188,11 +194,36 @@ impl SocketHandler for FrontRustls {
                 incr!("rustls.read.infinite_loop.error");
             }
 
+            while !self.session.wants_read() {
+                match self.session.reader().read(&mut buf[size..]) {
+                    Ok(0) => break,
+                    Ok(sz) => {
+                        size += sz;
+                    }
+                    Err(e) => match e.kind() {
+                        ErrorKind::WouldBlock => {
+                            break;
+                        }
+                        ErrorKind::ConnectionReset
+                        | ErrorKind::ConnectionAborted
+                        | ErrorKind::BrokenPipe => {
+                            is_closed = true;
+                            break;
+                        }
+                        _ => {
+                            error!("could not read data from TLS stream: {:?}", e);
+                            is_error = true;
+                            break;
+                        }
+                    },
+                }
+            }
+
             if size == buf.len() {
                 break;
             }
 
-            if !can_read | is_error | is_closed {
+            if !can_read || is_error || is_closed {
                 break;
             }
 
@@ -228,39 +259,14 @@ impl SocketHandler for FrontRustls {
                 is_error = true;
                 break;
             }
-
-            while !self.session.wants_read() {
-                match self.session.reader().read(&mut buf[size..]) {
-                    Ok(0) => break,
-                    Ok(sz) => {
-                        size += sz;
-                    }
-                    Err(e) => match e.kind() {
-                        ErrorKind::WouldBlock => {
-                            break;
-                        }
-                        ErrorKind::ConnectionReset
-                        | ErrorKind::ConnectionAborted
-                        | ErrorKind::BrokenPipe => {
-                            is_closed = true;
-                            break;
-                        }
-                        _ => {
-                            error!("could not read data from TLS stream: {:?}", e);
-                            is_error = true;
-                            break;
-                        }
-                    },
-                }
-            }
         }
 
         if is_error {
             (size, SocketResult::Error)
         } else if is_closed {
             (size, SocketResult::Closed)
-        } else if !can_read {
-            (size, SocketResult::WouldBlock)
+        // } else if !can_read {
+        //     (size, SocketResult::WouldBlock)
         } else {
             (size, SocketResult::Continue)
         }

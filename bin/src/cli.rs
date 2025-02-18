@@ -299,6 +299,11 @@ pub enum ClusterCmd {
             help = "Configures the load balancing policy. Possible values are 'roundrobin', 'random' or 'leastconnections'"
         )]
         load_balancing_policy: LoadBalancingAlgorithms,
+        #[clap(
+            long = "http2",
+            help = "the backends of this cluster use http2 prio-knowledge"
+        )]
+        h2: bool,
     },
 }
 

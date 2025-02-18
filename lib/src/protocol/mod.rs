@@ -1,5 +1,6 @@
 pub mod h2;
 pub mod kawa_h1;
+pub mod mux;
 pub mod pipe;
 pub mod proxy_protocol;
 pub mod rustls;
@@ -23,17 +24,17 @@ pub trait SessionState {
     /// if a session received an event or can still execute, the event loop will
     /// call this method. Its result indicates if it can still execute or if the
     /// session can be closed
-    fn ready(
+    fn ready<P: L7Proxy>(
         &mut self,
         session: Rc<RefCell<dyn ProxySession>>,
-        proxy: Rc<RefCell<dyn L7Proxy>>,
+        proxy: Rc<RefCell<P>>,
         metrics: &mut SessionMetrics,
     ) -> SessionResult;
     /// if the event loop got an event for a token associated with the session,
     /// it will call this method
     fn update_readiness(&mut self, token: Token, events: Ready);
     /// close the state
-    fn close(&mut self, _proxy: Rc<RefCell<dyn L7Proxy>>, _metrics: &mut SessionMetrics) {}
+    fn close<P: L7Proxy>(&mut self, _proxy: Rc<RefCell<P>>, _metrics: &mut SessionMetrics) {}
     /// if a timeout associated with the session triggers, the event loop will
     /// call this method with the timeout's token
     fn timeout(&mut self, token: Token, metrics: &mut SessionMetrics) -> StateResult;

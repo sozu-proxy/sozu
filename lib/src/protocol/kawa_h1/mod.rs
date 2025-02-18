@@ -30,7 +30,6 @@ use crate::{
             editor::HttpContext,
             parser::Method,
         },
-        pipe::WebSocketContext,
         SessionState,
     },
     retry::RetryPolicy,
@@ -243,8 +242,9 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             )),
             context: HttpContext {
                 id: request_id,
-                backend_id: None,
                 cluster_id: None,
+                backend_id: None,
+                backend_address: None,
 
                 closing: false,
                 keep_alive_backend: true,
@@ -274,7 +274,6 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             _ => return,
         };
 
-        self.context.id = Ulid::generate();
         self.context.reset();
 
         self.request_stream.clear();
@@ -917,17 +916,6 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         }
     }
 
-    /// Format the context of the websocket into a loggable String
-    pub fn websocket_context(&self) -> WebSocketContext {
-        WebSocketContext::Http {
-            method: self.context.method.clone(),
-            authority: self.context.authority.clone(),
-            path: self.context.path.clone(),
-            reason: self.context.reason.clone(),
-            status: self.context.status,
-        }
-    }
-
     pub fn log_request(&self, metrics: &SessionMetrics, error: bool, message: Option<&str>) {
         let listener = self.listener.borrow();
         let tags = self.context.authority.as_ref().and_then(|host| {
@@ -1040,7 +1028,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             self.context.id.to_string(),
             self.context.cluster_id.as_deref(),
             self.context.backend_id.as_deref(),
-            self.get_route(),
+            self.context.get_route(),
         );
         kawa.prepare(&mut kawa::h1::BlockConverter);
         self.context.status = Some(status);
@@ -1119,7 +1107,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
     /// WARNING: this function removes the backend entry in the session manager
     /// IF the backend_token is set, so that entry can be reused for new backend.
     /// I don't think this is a good idea, but it is a quick fix
-    fn close_backend(&mut self, proxy: Rc<RefCell<dyn L7Proxy>>, metrics: &mut SessionMetrics) {
+    fn close_backend<P: L7Proxy>(&mut self, proxy: Rc<RefCell<P>>, metrics: &mut SessionMetrics) {
         self.container_backend_timeout.cancel();
         debug!(
             "{}\tPROXY [{}->{}] CLOSED BACKEND",
@@ -1214,45 +1202,11 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         true
     }
 
-    // -> host, path, method
-    pub fn extract_route(&self) -> Result<(&str, &str, &Method), RetrieveClusterError> {
-        let given_method = self
-            .context
-            .method
-            .as_ref()
-            .ok_or(RetrieveClusterError::NoMethod)?;
-        let given_authority = self
-            .context
-            .authority
-            .as_deref()
-            .ok_or(RetrieveClusterError::NoHost)?;
-        let given_path = self
-            .context
-            .path
-            .as_deref()
-            .ok_or(RetrieveClusterError::NoPath)?;
-
-        Ok((given_authority, given_path, given_method))
-    }
-
-    pub fn get_route(&self) -> String {
-        if let Some(method) = &self.context.method {
-            if let Some(authority) = &self.context.authority {
-                if let Some(path) = &self.context.path {
-                    return format!("{method} {authority}{path}");
-                }
-                return format!("{method} {authority}");
-            }
-            return format!("{method}");
-        }
-        String::new()
-    }
-
-    fn cluster_id_from_request(
+    fn cluster_id_from_request<P: L7Proxy>(
         &mut self,
-        proxy: Rc<RefCell<dyn L7Proxy>>,
+        proxy: Rc<RefCell<P>>,
     ) -> Result<String, RetrieveClusterError> {
-        let (host, uri, method) = match self.extract_route() {
+        let (host, uri, method) = match self.context.extract_route() {
             Ok(tuple) => tuple,
             Err(cluster_error) => {
                 self.set_answer(DefaultAnswer::Answer400 {
@@ -1280,7 +1234,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         };
 
         let cluster_id = match route {
-            Route::ClusterId(cluster_id) => cluster_id,
+            Route::Cluster(id) => id,
             Route::Deny => {
                 self.set_answer(DefaultAnswer::Answer401 {});
                 return Err(RetrieveClusterError::UnauthorizedRoute);
@@ -1305,11 +1259,11 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         Ok(cluster_id)
     }
 
-    pub fn backend_from_request(
+    pub fn backend_from_request<P: L7Proxy>(
         &mut self,
         cluster_id: &str,
         frontend_should_stick: bool,
-        proxy: Rc<RefCell<dyn L7Proxy>>,
+        proxy: Rc<RefCell<P>>,
         metrics: &mut SessionMetrics,
     ) -> Result<TcpStream, BackendConnectionError> {
         let (backend, conn) = self
@@ -1330,7 +1284,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
         if frontend_should_stick {
             // update sticky name in case it changed I guess?
-            self.context.sticky_name = self.listener.borrow().get_sticky_name().to_string();
+            self.context.sticky_name = self.listener.borrow().sticky_name().to_string();
 
             self.context.sticky_session = Some(
                 backend
@@ -1349,12 +1303,12 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         Ok(conn)
     }
 
-    fn get_backend_for_sticky_session(
+    fn get_backend_for_sticky_session<P: L7Proxy>(
         &self,
         frontend_should_stick: bool,
         sticky_session: Option<&str>,
         cluster_id: &str,
-        proxy: Rc<RefCell<dyn L7Proxy>>,
+        proxy: Rc<RefCell<P>>,
     ) -> Result<(Rc<RefCell<Backend>>, TcpStream), BackendError> {
         match (frontend_should_stick, sticky_session) {
             (true, Some(sticky_session)) => proxy
@@ -1370,10 +1324,10 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         }
     }
 
-    fn connect_to_backend(
+    fn connect_to_backend<P: L7Proxy>(
         &mut self,
         session_rc: Rc<RefCell<dyn ProxySession>>,
-        proxy: Rc<RefCell<dyn L7Proxy>>,
+        proxy: Rc<RefCell<P>>,
         metrics: &mut SessionMetrics,
     ) -> Result<BackendConnectAction, BackendConnectionError> {
         let old_cluster_id = self.context.cluster_id.clone();
@@ -1665,10 +1619,10 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
     ///   - write request to back
     ///   - read response on back
     ///   - write response to front
-    fn ready_inner(
+    fn ready_inner<P: L7Proxy>(
         &mut self,
         session: Rc<RefCell<dyn crate::ProxySession>>,
-        proxy: Rc<RefCell<dyn L7Proxy>>,
+        proxy: Rc<RefCell<P>>,
         metrics: &mut SessionMetrics,
     ) -> SessionResult {
         let mut counter = 0;
@@ -1872,10 +1826,10 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 }
 
 impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> SessionState for Http<Front, L> {
-    fn ready(
+    fn ready<P: L7Proxy>(
         &mut self,
         session: Rc<RefCell<dyn crate::ProxySession>>,
-        proxy: Rc<RefCell<dyn L7Proxy>>,
+        proxy: Rc<RefCell<P>>,
         metrics: &mut SessionMetrics,
     ) -> SessionResult {
         let session_result = self.ready_inner(session, proxy, metrics);
@@ -1906,7 +1860,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> SessionState 
         }
     }
 
-    fn close(&mut self, proxy: Rc<RefCell<dyn L7Proxy>>, metrics: &mut SessionMetrics) {
+    fn close<P: L7Proxy>(&mut self, proxy: Rc<RefCell<P>>, metrics: &mut SessionMetrics) {
         self.close_backend(proxy, metrics);
         self.frontend_socket.socket_close();
         let _ = self.frontend_socket.socket_write_vectored(&[]);
