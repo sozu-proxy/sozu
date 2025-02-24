@@ -5,14 +5,14 @@ rust-version = "1.80.0"
 edition = "2021"
 
 [dependencies]
-futures = "^0.3.31"
-hyper = { version = "^0.14.28", features = ["client", "http1"] }
-hyper-rustls = { version = "^0.24.2", default-features = false, features = ["webpki-tokio", "http1", "tls12", "logging"] }
-libc = "^0.2.159"
-mio = "^1.0.2"
+futures = { workspace = true }
+hyper = { workspace = true, features = ["client", "http1"] }
+hyper-rustls = { workspace = true, features = ["webpki-tokio", "http1", "tls12", "logging"] }
+libc = { workspace = true }
+mio = { workspace = true }
 rustls = { version = "^0.21.10", features = ["dangerous_configuration"] }
-time = "^0.3.36"
-tokio = { version = "1.40.0", features = ["net", "rt-multi-thread"] }
+time = { workspace = true }
+tokio = { workspace = true, features = ["net", "rt-multi-thread"] }
 
-sozu-command-lib = { path = "../command", version = "^1.0.6" }
-sozu-lib = { path = "../lib", version = "^1.0.6" }
+sozu-command-lib = { workspace = true }
+sozu-lib = { workspace = true }
