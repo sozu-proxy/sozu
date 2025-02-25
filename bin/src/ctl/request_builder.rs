@@ -30,7 +30,13 @@ impl CommandManager {
     pub fn save_state(&mut self, path: String) -> Result<(), CtlError> {
         debug!("Saving the state to file {}", path);
 
-        self.send_request(RequestType::SaveState(path).into())
+        let current_directory =
+            std::env::current_dir().map_err(|err| CtlError::ResolvePath(path.to_owned(), err))?;
+
+        let absolute_path = current_directory.join(&path);
+        self.send_request(
+            RequestType::SaveState(String::from(absolute_path.to_string_lossy())).into(),
+        )
     }
 
     pub fn load_state(&mut self, path: String) -> Result<(), CtlError> {
