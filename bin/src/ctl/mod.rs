@@ -55,6 +55,8 @@ pub enum CtlError {
     WrongResponse(Response),
     #[error("could not setup the logger: {0}")]
     SetupLogging(LogError),
+    #[error("could not resolve path for {0} : {1}")]
+    ResolvePath(String, std::io::Error),
 }
 
 pub struct CommandManager {

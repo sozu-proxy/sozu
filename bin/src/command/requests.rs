@@ -3,6 +3,7 @@ use std::{
     env,
     fs::File,
     io::{ErrorKind, Read},
+    path::PathBuf,
 };
 
 use mio::Token;
@@ -198,18 +199,35 @@ fn list_listeners(server: &mut Server, client: &mut ClientSession) {
 }
 
 fn save_state(server: &mut Server, client: &mut ClientSession, path: &str) {
-    debug!("saving state to file {}", path);
-    let mut file = match File::create(path) {
+    let mut path = PathBuf::from(path);
+    if path.is_relative() {
+        match std::env::current_dir() {
+            Ok(cwd) => path = cwd.join(path),
+            Err(error) => {
+                client.finish_failure(format!("Cannot get Sōzu working directory: {error}",));
+                return;
+            }
+        }
+    }
+
+    debug!("saving state to file {}", &path.display());
+    let mut file = match File::create(&path) {
         Ok(file) => file,
         Err(error) => {
-            client.finish_failure(format!("Cannot create file at path {path}: {error}"));
+            client.finish_failure(format!(
+                "Cannot create file at path {}: {error}",
+                path.display()
+            ));
             return;
         }
     };
 
     match server.state.write_requests_to_file(&mut file) {
         Ok(counter) => {
-            client.finish_ok(format!("Saved {counter} config messages to {path}"));
+            client.finish_ok(format!(
+                "Saved {counter} config messages to {}",
+                &path.display()
+            ));
         }
         Err(error) => {
             client.finish_failure(format!("Failed writing state to file: {error}"));
