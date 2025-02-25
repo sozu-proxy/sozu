@@ -19,7 +19,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.18'
+          go-version: '1.22'
           check-latest: false
 
       - name: Build bombardier
