@@ -7,7 +7,7 @@ use crate::{
     protocol::mux::{
         debug_kawa, forcefully_terminate_answer, parser::H2Error, set_default_answer,
         update_readiness_after_read, update_readiness_after_write, BackendStatus, Context,
-        Endpoint, GlobalStreamId, MuxResult, Position, StreamState,
+        DebugEvent, Endpoint, GlobalStreamId, MuxResult, Position, StreamState,
     },
     socket::SocketHandler,
     timer::TimeoutContainer,
@@ -50,6 +50,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         let parts = stream.split(&self.position);
         let kawa = parts.rbuffer;
         let (size, status) = self.socket.socket_read(kawa.storage.space());
+        context.debug.push(DebugEvent::I2(0, size));
         kawa.storage.fill(size);
         match self.position {
             Position::Client(..) => {
@@ -146,6 +147,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             return MuxResult::Continue;
         }
         let (size, status) = self.socket.socket_write_vectored(&bufs);
+        context.debug.push(DebugEvent::I2(1, size));
         kawa.consume(size);
         match self.position {
             Position::Client(..) => {
@@ -223,7 +225,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                     incr!("http.e2e.http11");
                     stream.generate_access_log(
                         false,
-                        Some(String::from("H1")),
+                        Some(String::from("H1::Continue")),
                         context.listener.clone(),
                     );
                     stream.metrics.reset();
@@ -273,7 +275,9 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                 return;
             }
             Position::Client(_, _, BackendStatus::Connecting(_))
-            | Position::Client(_, _, BackendStatus::Connected) => {}
+            | Position::Client(_, _, BackendStatus::Connected) => {
+                warn!("BACKEND CLOSING FOR: {:?} {}", self.position, self.stream);
+            }
             Position::Server => {
                 println_!("H1 SENDING CLOSE NOTIFY");
                 self.socket.socket_close();
@@ -321,7 +325,11 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                     // we have a "forwardable" answer from the back
                     // if the answer is not terminated we send an RstStream to properly clean the stream
                     // if it is terminated, we finish the transfer, the backend is not necessary anymore
-                    if !stream.back.is_terminated() {
+                    if !stream.context.keep_alive_backend {
+                        warn!("CLOSE DELIMITED");
+                        // TODO why not force_disconnect?
+                        self.readiness.event = Ready::HUP;
+                    } else if !stream.back.is_terminated() {
                         forcefully_terminate_answer(
                             stream,
                             &mut self.readiness,

@@ -164,7 +164,7 @@ impl<'a, T: AsBuffer> BlockConverter<T> for H2BlockConverter<'a> {
                 end_stream,
                 ..
             }) => {
-                if end_header {
+                let sent_end_stream = if end_header {
                     let payload = std::mem::take(&mut self.out);
                     let mut header = [0; 9];
                     let chunks = payload.chunks(self.max_frame_size);
@@ -198,7 +198,11 @@ impl<'a, T: AsBuffer> BlockConverter<T> for H2BlockConverter<'a> {
                         kawa.push_out(Store::from_slice(&header));
                         kawa.push_out(Store::from_slice(chunk));
                     }
-                } else if end_stream {
+                    n_chunks > 0
+                } else {
+                    false
+                };
+                if end_stream && !sent_end_stream {
                     let mut header = [0; 9];
                     gen_frame_header(
                         &mut header,
@@ -211,9 +215,6 @@ impl<'a, T: AsBuffer> BlockConverter<T> for H2BlockConverter<'a> {
                     )
                     .unwrap();
                     kawa.push_out(Store::from_slice(&header));
-                }
-                if end_header || end_stream {
-                    // kawa.push_delimiter()
                 }
             }
         }

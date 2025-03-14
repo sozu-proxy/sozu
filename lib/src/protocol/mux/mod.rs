@@ -8,6 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use kawa::ParsingPhase;
 use mio::{net::TcpStream, Interest, Token};
 use rusty_ulid::Ulid;
 use sozu_command::{
@@ -219,6 +220,7 @@ pub enum BackendStatus {
     Disconnecting,
 }
 
+#[derive(Debug, Clone, Copy)]
 pub enum MuxResult {
     Continue,
     Upgrade,
@@ -823,12 +825,39 @@ impl Stream {
     }
 }
 
+// trait DebugHistory {
+//     fn push(&mut self, event: DebugEvent);
+//     fn set_interesting(&mut self, val: bool);
+// }
+pub struct DebugHistory {
+    pub events: Vec<DebugEvent>,
+    pub is_interesting: bool,
+}
+impl DebugHistory {
+    pub fn new() -> Self {
+        Self {
+            events: Vec::new(),
+            is_interesting: false,
+        }
+    }
+    pub fn push(&mut self, event: DebugEvent) {
+        //self.events.push(event);
+    }
+    pub fn set_interesting(&mut self, val: bool) {
+        //self.is_interesting = val;
+    }
+    pub fn is_interesting(&mut self) -> bool {
+        self.is_interesting
+    }
+}
+
 pub struct Context<L: ListenerHandler + L7ListenerHandler> {
     pub streams: Vec<Stream>,
     pub pool: Weak<RefCell<Pool>>,
     pub listener: Rc<RefCell<L>>,
     pub session_address: Option<SocketAddr>,
     pub public_address: SocketAddr,
+    pub debug: DebugHistory,
 }
 
 impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
@@ -844,6 +873,7 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
             listener,
             session_address,
             public_address,
+            debug: DebugHistory::new(),
         }
     }
 
@@ -913,6 +943,9 @@ impl Router {
         // when reused, a stream should be detached from its old connection, if not we could end
         // with concurrent connections on a single endpoint
         assert!(matches!(stream.state, StreamState::Link));
+        context
+            .debug
+            .push(DebugEvent::Str(stream.context.get_route()));
         if stream.attempts >= CONN_RETRIES {
             return Err(BackendConnectionError::MaxConnectionRetries(
                 stream.context.cluster_id.clone(),
@@ -1190,6 +1223,27 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Mux<Front, L>
     }
 }
 
+#[derive(Debug)]
+pub enum DebugEvent {
+    EV(Token, Ready),
+    R(usize),
+    L1,
+    L2(i32),
+    SR(Token, MuxResult, Readiness),
+    SW(Token, MuxResult, Readiness),
+    CW(Token, MuxResult, Readiness),
+    CR(Token, MuxResult, Readiness),
+    CC(usize, StreamState),
+    CCS(Token, String),
+    CCF(usize, BackendConnectionError),
+    CH(Token, Readiness),
+    S(u32, usize, ParsingPhase, usize, usize),
+    Str(String),
+    I1(usize),
+    I2(usize, usize),
+    I3(usize, usize, usize),
+}
+
 impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHandler> SessionState
     for Mux<Front, L>
 {
@@ -1206,16 +1260,29 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             return SessionResult::Close;
         }
 
-        let start = std::time::Instant::now();
+        let start = Instant::now();
+        self.context.debug.push(DebugEvent::R(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as usize,
+        ));
         println_!("{:?}", start);
         loop {
+            self.context.debug.push(DebugEvent::L1);
             loop {
                 let context = &mut self.context;
+                context.debug.push(DebugEvent::L2(counter));
                 if self.frontend.readiness().filter_interest().is_readable() {
-                    match self
+                    let res = self
                         .frontend
-                        .readable(context, EndpointClient(&mut self.router))
-                    {
+                        .readable(context, EndpointClient(&mut self.router));
+                    context.debug.push(DebugEvent::SR(
+                        self.frontend_token,
+                        res,
+                        self.frontend.readiness().clone(),
+                    ));
+                    match res {
                         MuxResult::Continue => {}
                         MuxResult::CloseSession => return SessionResult::Close,
                         MuxResult::Upgrade => return SessionResult::Upgrade,
@@ -1242,6 +1309,10 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                 backend,
                                 BackendStatus::Connecting(start),
                             ) => {
+                                context
+                                    .debug
+                                    .push(DebugEvent::CCS(*token, cluster_id.clone()));
+
                                 let mut backend_borrow = backend.borrow_mut();
                                 if backend_borrow.retry_policy.is_down() {
                                     info!(
@@ -1291,7 +1362,11 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                             Position::Client(..) => {}
                             Position::Server => unreachable!(),
                         }
-                        match client.writable(context, EndpointServer(&mut self.frontend)) {
+                        let res = client.writable(context, EndpointServer(&mut self.frontend));
+                        context
+                            .debug
+                            .push(DebugEvent::CW(*token, res, client.readiness().clone()));
+                        match res {
                             MuxResult::Continue => {}
                             MuxResult::Upgrade => unreachable!(), // only frontend can upgrade
                             MuxResult::CloseSession => return SessionResult::Close,
@@ -1299,7 +1374,11 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                     }
 
                     if client.readiness().filter_interest().is_readable() {
-                        match client.readable(context, EndpointServer(&mut self.frontend)) {
+                        let res = client.readable(context, EndpointServer(&mut self.frontend));
+                        context
+                            .debug
+                            .push(DebugEvent::CR(*token, res, client.readiness().clone()));
+                        match res {
                             MuxResult::Continue => {}
                             MuxResult::Upgrade => unreachable!(), // only frontend can upgrade
                             MuxResult::CloseSession => return SessionResult::Close,
@@ -1307,6 +1386,9 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                     }
 
                     if dead && !client.readiness().filter_interest().is_readable() {
+                        context
+                            .debug
+                            .push(DebugEvent::CH(*token, client.readiness().clone()));
                         println_!("Closing {:#?}", client);
                         match client.position() {
                             Position::Client(cluster_id, backend, BackendStatus::Connecting(_)) => {
@@ -1391,10 +1473,15 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
 
                 let context = &mut self.context;
                 if self.frontend.readiness().filter_interest().is_writable() {
-                    match self
+                    let res = self
                         .frontend
-                        .writable(context, EndpointClient(&mut self.router))
-                    {
+                        .writable(context, EndpointClient(&mut self.router));
+                    context.debug.push(DebugEvent::SW(
+                        self.frontend_token,
+                        res,
+                        self.frontend.readiness().clone(),
+                    ));
+                    match res {
                         MuxResult::Continue => {}
                         MuxResult::CloseSession => return SessionResult::Close,
                         MuxResult::Upgrade => return SessionResult::Upgrade,
@@ -1429,7 +1516,10 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                         .router
                         .connect(stream_id, context, session.clone(), proxy.clone())
                     {
-                        Ok(_) => {}
+                        Ok(_) => {
+                            let state = context.streams[stream_id].state.clone();
+                            context.debug.push(DebugEvent::CC(stream_id, state));
+                        }
                         Err(error) => {
                             println_!("Connection error: {error}");
                             let stream = &mut context.streams[stream_id];
@@ -1460,6 +1550,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                 // TCP specific error
                                 BE::NotFound(_) => unreachable!(),
                             }
+                            context.debug.push(DebugEvent::CCF(stream_id, error));
                         }
                     }
                 }
@@ -1474,6 +1565,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
 
     fn update_readiness(&mut self, token: Token, events: Ready) {
         println_!("EVENTS: {events:?} on {token:?}");
+        self.context.debug.push(DebugEvent::EV(token, events));
         if token == self.frontend_token {
             self.frontend.readiness_mut().event |= events;
         } else if let Some(c) = self.router.backends.get_mut(&token) {
@@ -1618,6 +1710,9 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
     }
 
     fn close<P: L7Proxy>(&mut self, proxy: Rc<RefCell<P>>, _metrics: &mut SessionMetrics) {
+        if self.context.debug.is_interesting() {
+            warn!("{:?}", self.context.debug.events);
+        }
         debug!("MUX CLOSE");
         println_!("FRONTEND: {:#?}", self.frontend);
         println_!("BACKENDS: {:#?}", self.router.backends);

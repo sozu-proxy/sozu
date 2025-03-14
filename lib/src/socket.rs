@@ -265,8 +265,8 @@ impl SocketHandler for FrontRustls {
             (size, SocketResult::Error)
         } else if is_closed {
             (size, SocketResult::Closed)
-        // } else if !can_read {
-        //     (size, SocketResult::WouldBlock)
+        } else if !can_read {
+            (size, SocketResult::WouldBlock)
         } else {
             (size, SocketResult::Continue)
         }

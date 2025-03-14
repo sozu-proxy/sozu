@@ -12,8 +12,8 @@ use crate::{
             ParserErrorKind, WindowUpdate,
         },
         pkawa, serializer, set_default_answer, update_readiness_after_read,
-        update_readiness_after_write, BackendStatus, Context, Endpoint, GenericHttpStream,
-        GlobalStreamId, MuxResult, Position, StreamId, StreamState,
+        update_readiness_after_write, BackendStatus, Context, DebugEvent, Endpoint,
+        GenericHttpStream, GlobalStreamId, MuxResult, Position, StreamId, StreamState,
     },
     socket::SocketHandler,
     timer::TimeoutContainer,
@@ -158,13 +158,14 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         println_!("======= MUX H2 READABLE {:?}", self.position);
         self.timeout_container.reset();
         let (stream_id, kawa) = if let Some((stream_id, amount)) = self.expect_read {
-            let kawa = match stream_id {
-                H2StreamId::Zero => &mut self.zero,
-                H2StreamId::Other(_, global_stream_id) => {
+            let (kawa, did) = match stream_id {
+                H2StreamId::Zero => (&mut self.zero, usize::MAX),
+                H2StreamId::Other(_, global_stream_id) => (
                     context.streams[global_stream_id]
                         .split(&self.position)
-                        .rbuffer
-                }
+                        .rbuffer,
+                    global_stream_id,
+                ),
             };
             println_!("{:?}({stream_id:?}, {amount})", self.state);
             if amount > 0 {
@@ -173,6 +174,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     return MuxResult::Continue;
                 }
                 let (size, status) = self.socket.socket_read(&mut kawa.storage.space()[..amount]);
+                context.debug.push(DebugEvent::I3(0, did, size));
                 kawa.storage.fill(size);
                 match self.position {
                     Position::Client(..) => {
@@ -473,6 +475,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             println_!("{:?}", kawa.storage.data());
             while !kawa.storage.is_empty() {
                 let (size, status) = self.socket.socket_write(kawa.storage.data());
+                context.debug.push(DebugEvent::I2(1, size));
                 kawa.storage.consume(size);
                 match self.position {
                     Position::Client(..) => {
@@ -543,11 +546,15 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     self.expect_write
                 {
                     let stream = &mut context.streams[global_stream_id];
+                    let stream_state = stream.state;
                     let parts = stream.split(&self.position);
                     let kawa = parts.wbuffer;
                     while !kawa.out.is_empty() {
                         let bufs = kawa.as_io_slice();
                         let (size, status) = self.socket.socket_write_vectored(&bufs);
+                        context
+                            .debug
+                            .push(DebugEvent::I3(2, global_stream_id, size));
                         kawa.consume(size);
                         match self.position {
                             Position::Client(..) => {
@@ -576,6 +583,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                             Position::Client(..) => {}
                             Position::Server => {
                                 // mark stream as reusable
+                                context.debug.push(DebugEvent::I2(4, global_stream_id));
                                 println_!("Recycle stream: {global_stream_id}");
                                 incr!("http.e2e.h2");
                                 stream.generate_access_log(
@@ -621,10 +629,20 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         self.window -= consumed;
                         debug_kawa(kawa);
                     }
+                    context.debug.push(DebugEvent::S(
+                        *stream_id,
+                        global_stream_id,
+                        kawa.parsing_phase,
+                        kawa.blocks.len(),
+                        kawa.out.len(),
+                    ));
                     while !kawa.out.is_empty() {
                         socket_write = true;
                         let bufs = kawa.as_io_slice();
                         let (size, status) = self.socket.socket_write_vectored(&bufs);
+                        context
+                            .debug
+                            .push(DebugEvent::I3(3, global_stream_id, size));
                         kawa.consume(size);
                         match self.position {
                             Position::Client(..) => {
@@ -651,6 +669,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                                 // to avoid code duplication
 
                                 // mark stream as reusable
+                                context.debug.push(DebugEvent::I2(5, global_stream_id));
+                                if context.debug.is_interesting() {
+                                    warn!("{:?}", context.debug.events);
+                                    context.debug.set_interesting(false);
+                                }
                                 println_!("Recycle1 stream: {global_stream_id}");
                                 incr!("http.e2e.h2");
                                 stream.generate_access_log(
@@ -678,6 +701,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     }
                 } else if self.expect_write.is_none() {
                     // We wrote everything
+                    context.debug.push(DebugEvent::Str(format!(
+                        "Wrote everything: {:?}",
+                        self.streams
+                    )));
                     self.readiness.interest.remove(Ready::WRITABLE);
                 }
                 MuxResult::Continue
@@ -745,14 +772,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         println_!("{frame:#?}");
         match frame {
             Frame::Data(data) => {
-                // can this fail? yes
                 let Some(global_stream_id) = self.streams.get(&data.stream_id).copied() else {
-                    error!(
-                        "Handling Data frame with no attached stream: {:?} | {:?} | {:?} | {:?}",
-                        data, context.streams, self, endpoint,
-                    );
-                    incr!("h2.data_no_stream.error");
-                    return self.force_disconnect();
+                    // the stream was terminated while data was expected,
+                    // probably due to automatic answer for invalid/unauthorized access
+                    // ignore this frame
+                    return MuxResult::Continue;
                 };
                 let mut slice = data.payload;
                 let stream = &mut context.streams[global_stream_id];
@@ -1092,16 +1116,16 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         MuxResult::Continue
     }
 
-    pub fn end_stream<L>(&mut self, stream: GlobalStreamId, context: &mut Context<L>)
+    pub fn end_stream<L>(&mut self, stream_gid: GlobalStreamId, context: &mut Context<L>)
     where
         L: ListenerHandler + L7ListenerHandler,
     {
-        let stream_context = &mut context.streams[stream].context;
-        println_!("end H2 stream {}: {:#?}", stream, stream_context);
+        let stream_context = &mut context.streams[stream_gid].context;
+        println_!("end H2 stream {}: {:#?}", stream_gid, stream_context);
         match self.position {
             Position::Client(..) => {
                 for (stream_id, global_stream_id) in &self.streams {
-                    if *global_stream_id == stream {
+                    if *global_stream_id == stream_gid {
                         let id = *stream_id;
                         // if the stream is not in a closed state we should probably send an
                         // RST_STREAM frame here. We also need to handle frames coming from
@@ -1113,7 +1137,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 unreachable!()
             }
             Position::Server => {
-                let stream = &mut context.streams[stream];
+                let stream = &mut context.streams[stream_gid];
                 match (stream.front.consumed, stream.back.is_main_phase()) {
                     (_, true) => {
                         // front might not have been consumed (in case of PushPromise)
@@ -1121,25 +1145,40 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         // if the answer is not terminated we send an RstStream to properly clean the stream
                         // if it is terminated, we finish the transfer, the backend is not necessary anymore
                         if !stream.back.is_terminated() {
+                            context
+                                .debug
+                                .push(DebugEvent::Str(format!("Close unterminated {stream_gid}")));
+                            warn!("CLOSING H2 UNTERMINATED STREAM {} {:?}", stream_gid, stream);
                             forcefully_terminate_answer(
                                 stream,
                                 &mut self.readiness,
                                 H2Error::InternalError,
                             );
                         } else {
+                            context
+                                .debug
+                                .push(DebugEvent::Str(format!("Close terminated {stream_gid}")));
+                            warn!("CLOSING H2 TERMINATED STREAM {} {:?}", stream_gid, stream);
                             stream.state = StreamState::Unlinked;
                             self.readiness.interest.insert(Ready::WRITABLE);
                         }
+                        context.debug.set_interesting(true);
                     }
                     (true, false) => {
                         // we do not have an answer, but the request has already been partially consumed
                         // so we can't retry, send a 502 bad gateway instead
                         // note: it might be possible to send a RstStream with an adequate error code
+                        context.debug.push(DebugEvent::Str(format!(
+                            "Can't retry, send 502 on {stream_gid}"
+                        )));
                         set_default_answer(stream, &mut self.readiness, 502);
                     }
                     (false, false) => {
                         // we do not have an answer, but the request is untouched so we can retry
                         debug!("H2 RECONNECT");
+                        context
+                            .debug
+                            .push(DebugEvent::Str(format!("Retry {stream_gid}")));
                         stream.state = StreamState::Link
                     }
                 }

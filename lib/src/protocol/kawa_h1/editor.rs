@@ -112,6 +112,14 @@ impl HttpContext {
     ///   - sticky cookie
     ///   - user-agent
     fn on_request_headers(&mut self, request: &mut GenericHttpStream) {
+        if request.body_size == kawa::BodySize::Empty {
+            request.parsing_phase = kawa::ParsingPhase::Terminated;
+            // request.push_block(kawa::Block::Header(kawa::Pair {
+            //     key: kawa::Store::Static(b"Content-Length"),
+            //     val: kawa::Store::Static(b"0"),
+            // }));
+        };
+
         let buf = &mut request.storage.mut_buffer();
 
         // Captures the request line
@@ -173,7 +181,9 @@ impl HttpContext {
             match block {
                 kawa::Block::Header(header) if !header.is_elided() => {
                     let key = header.key.data(buf);
-                    if compare_no_case(key, b"connection") {
+                    if compare_no_case(key, b"te") {
+                        header.elide();
+                    } else if compare_no_case(key, b"connection") {
                         has_connection = true;
                         if self.closing {
                             header.val = kawa::Store::Static(b"close");
