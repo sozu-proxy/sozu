@@ -29,6 +29,7 @@ include = [
 
 [dependencies]
 anyhow = "^1.0.89"
+base64 = "0.22.1"
 cookie-factory = "^0.3.3"
 hdrhistogram = "^7.5.4"
 hex = "^0.4.3"

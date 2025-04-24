@@ -853,17 +853,17 @@ impl FileClusterConfig {
                     let http_frontend = frontend.to_http_front(cluster_id)?;
                     frontends.push(http_frontend);
                 }
-                self.authorized_hashes
-                    .iter()
-                    .map(|hash| {
-                        hex::decode(hash)
-                            .map_err(|_| ConfigError::InvalidHash(hash.clone()))
-                            .and_then(|v| {
-                                v.try_into()
-                                    .map_err(|_| ConfigError::InvalidHash(hash.clone()))
-                            })
-                    })
-                    .collect::<Result<Vec<[u8; 32]>, ConfigError>>()?;
+                // self.authorized_hashes
+                //     .iter()
+                //     .map(|hash| {
+                //         hex::decode(hash)
+                //             .map_err(|_| ConfigError::InvalidHash(hash.clone()))
+                //             .and_then(|v| {
+                //                 v.try_into()
+                //                     .map_err(|_| ConfigError::InvalidHash(hash.clone()))
+                //             })
+                //     })
+                //     .collect::<Result<Vec<[u8; 32]>, ConfigError>>()?;
 
                 Ok(ClusterConfig::Http(HttpClusterConfig {
                     cluster_id: cluster_id.to_string(),

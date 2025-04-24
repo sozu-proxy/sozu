@@ -4,6 +4,7 @@ use std::{
     str::{from_utf8, from_utf8_unchecked},
 };
 
+use base64::Engine;
 use rusty_ulid::Ulid;
 use sha2::{Digest, Sha256};
 use sozu_command::logging::CachedTags;
@@ -209,9 +210,20 @@ impl HttpContext {
             }
         }
 
-        self.authorization_found = auth
-            .and_then(|header| header.val.data_opt(buf))
-            .map(|auth| hex::encode(Sha256::digest(auth)));
+        self.authorization_found =
+            auth.and_then(|header| header.val.data_opt(buf))
+                .and_then(|auth| {
+                    let (kind, token) = auth.trim_ascii_start().split_at("Basic ".len());
+                    compare_no_case(kind, b"Basic ").then_some(())?;
+                    let token = base64::prelude::BASE64_STANDARD.decode(token).ok()?;
+                    let (name, pwd) = token
+                        .iter()
+                        .position(|c| *c == b':')
+                        .map(|i| token.split_at(i+1))?;
+                    let mut auth = String::from_utf8(name.to_vec()).ok()?;
+                    auth.push_str(&hex::encode(Sha256::digest(pwd)));
+                    Some(auth)
+                });
 
         // If session_address is set:
         // - append its ip address to the list of "X-Forwarded-For" if it was found, creates it if not
