@@ -204,24 +204,16 @@ impl HttpContext {
             }
             if let Some(header) = &mut forwarded {
                 let value = unsafe { from_utf8_unchecked(header.val.data(buf)) };
-                let new_value = match (peer_ip, public_ip) {
-                    (IpAddr::V4(_), IpAddr::V4(_)) => {
-                        format!("{value}, proto={proto};for={peer_ip}:{peer_port};by={public_ip}")
-                    }
-                    (IpAddr::V4(_), IpAddr::V6(_)) => {
-                        format!(
-                            "{value}, proto={proto};for={peer_ip}:{peer_port};by=\"{public_ip}\""
-                        )
-                    }
-                    (IpAddr::V6(_), IpAddr::V4(_)) => {
+                let new_value = match public_ip {
+                    IpAddr::V4(_) => {
                         format!(
                             "{value}, proto={proto};for=\"{peer_ip}:{peer_port}\";by={public_ip}"
                         )
                     }
-                    (IpAddr::V6(_), IpAddr::V6(_)) => {
+                    IpAddr::V6(_) => {
                         format!(
-                        "{value}, proto={proto};for=\"{peer_ip}:{peer_port}\";by=\"{public_ip}\""
-                    )
+                            "{value}, proto={proto};for=\"{peer_ip}:{peer_port}\";by=\"{public_ip}\""
+                        )
                     }
                 };
                 header.val = kawa::Store::from_string(new_value);
@@ -234,17 +226,11 @@ impl HttpContext {
                 }));
             }
             if !has_forwarded {
-                let value = match (peer_ip, public_ip) {
-                    (IpAddr::V4(_), IpAddr::V4(_)) => {
-                        format!("proto={proto};for={peer_ip}:{peer_port};by={public_ip}")
-                    }
-                    (IpAddr::V4(_), IpAddr::V6(_)) => {
-                        format!("proto={proto};for={peer_ip}:{peer_port};by=\"{public_ip}\"")
-                    }
-                    (IpAddr::V6(_), IpAddr::V4(_)) => {
+                let value = match public_ip {
+                    IpAddr::V4(_) => {
                         format!("proto={proto};for=\"{peer_ip}:{peer_port}\";by={public_ip}")
                     }
-                    (IpAddr::V6(_), IpAddr::V6(_)) => {
+                    IpAddr::V6(_) => {
                         format!("proto={proto};for=\"{peer_ip}:{peer_port}\";by=\"{public_ip}\"")
                     }
                 };
