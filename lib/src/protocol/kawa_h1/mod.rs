@@ -241,28 +241,13 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 kawa::Kind::Response,
                 kawa::Buffer::new(back_buffer),
             )),
-            context: HttpContext {
-                id: request_id,
-                backend_id: None,
-                cluster_id: None,
-
-                closing: false,
-                keep_alive_backend: true,
-                keep_alive_frontend: true,
+            context: HttpContext::new(
+                request_id,
                 protocol,
                 public_address,
                 session_address,
                 sticky_name,
-                sticky_session: None,
-                sticky_session_found: None,
-
-                method: None,
-                authority: None,
-                path: None,
-                status: None,
-                reason: None,
-                user_agent: None,
-            },
+            ),
         })
     }
 
