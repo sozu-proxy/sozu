@@ -4,12 +4,11 @@ use crate::{
     Protocol,
 };
 use rusty_ulid::Ulid;
+use sozu_command_lib::logging::LogContext;
 use std::{
     net::{IpAddr, SocketAddr},
     str::{from_utf8, from_utf8_unchecked},
 };
-
-use sozu_command_lib::logging::LogContext;
 
 #[cfg(feature = "opentelemetry")]
 fn parse_ot_id<const N: usize>(val: &kawa::Store, buf: &[u8]) -> Option<[u8; N]> {
@@ -55,11 +54,7 @@ pub struct HttpContext {
     pub user_agent: Option<String>,
 
     #[cfg(feature = "opentelemetry")]
-    pub ot_trace_id: [u8; 32],
-    #[cfg(feature = "opentelemetry")]
-    pub ot_span_id: [u8; 16],
-    #[cfg(feature = "opentelemetry")]
-    pub ot_parent_span_id: [u8; 16],
+    pub otel: Option<sozu_command::logging::OpenTelemetry>,
 
     // ========== Read only
     /// signals wether Kawa should write a "Connection" header with a "close" value (request and response)
@@ -122,11 +117,7 @@ impl HttpContext {
             user_agent: None,
 
             #[cfg(feature = "opentelemetry")]
-            ot_trace_id: [0; 32],
-            #[cfg(feature = "opentelemetry")]
-            ot_span_id: [0; 16],
-            #[cfg(feature = "opentelemetry")]
-            ot_parent_span_id: [0; 16],
+            otel: Default::default(),
         }
     }
 
@@ -252,8 +243,14 @@ impl HttpContext {
                     } else {
                         #[cfg(feature = "opentelemetry")]
                         if compare_no_case(key, b"ot-tracer-traceid") {
+                            if let Some(hdr) = ot_trace_id {
+                                hdr.elide();
+                            }
                             ot_trace_id = Some(header);
                         } else if compare_no_case(key, b"ot-tracer-spanid") {
+                            if let Some(hdr) = ot_span_id {
+                                hdr.elide();
+                            }
                             ot_span_id = Some(header);
                         }
                     }
@@ -263,26 +260,24 @@ impl HttpContext {
         }
 
         #[cfg(feature = "opentelemetry")]
-        let (has_trace_id, has_span_id) = {
-            // Handle traceid
-            self.ot_trace_id = ot_trace_id
+        let (otel, has_trace_id, has_span_id) = {
+            let mut otel = sozu_command_lib::logging::OpenTelemetry::default();
+            otel.trace_id = ot_trace_id
                 .as_ref()
                 .and_then(|hdr| parse_ot_id(&hdr.val, buf))
                 .unwrap_or_else(|| random_id());
-            // Handle spanid
-            self.ot_span_id = random_id();
-            // Modify header if present
-            if let Some(id) = &mut ot_span_id {
-                // Swap spanid for the generated one
-                id.val.modify(buf, self.ot_span_id.as_slice());
-            }
-            // Handle parent spanid
-            self.ot_parent_span_id = ot_span_id
+            otel.span_id = random_id();
+            otel.parent_span_id = ot_span_id
                 .as_ref()
-                .and_then(|id| parse_ot_id::<16>(&id.val, buf))
-                .unwrap_or_else(|| random_id());
-            // Insert new headers later to avoid borrow issues
-            (ot_trace_id.is_some(), ot_span_id.is_some())
+                .and_then(|id| parse_ot_id::<16>(&id.val, buf));
+            // Modify header if present
+            if let Some(id) = &mut ot_trace_id {
+                id.val.modify(buf, otel.trace_id.as_slice());
+            }
+            if let Some(id) = &mut ot_span_id {
+                id.val.modify(buf, otel.span_id.as_slice());
+            }
+            (otel, ot_trace_id.is_some(), ot_span_id.is_some())
         };
 
         // If session_address is set:
@@ -343,15 +338,16 @@ impl HttpContext {
             if !has_trace_id {
                 request.push_block(kawa::Block::Header(kawa::Pair {
                     key: kawa::Store::Static(b"ot-tracer-traceid"),
-                    val: kawa::Store::from_slice(self.ot_trace_id.as_slice()),
+                    val: kawa::Store::from_slice(otel.trace_id.as_slice()),
                 }));
             }
             if !has_span_id {
                 request.push_block(kawa::Block::Header(kawa::Pair {
                     key: kawa::Store::Static(b"ot-tracer-spanid"),
-                    val: kawa::Store::from_slice(self.ot_span_id.as_slice()),
+                    val: kawa::Store::from_slice(otel.span_id.as_slice()),
                 }));
             }
+            self.otel = Some(otel);
         }
 
         if !has_x_port {

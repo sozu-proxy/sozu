@@ -1,7 +1,8 @@
-use std::{collections::BTreeMap, mem::ManuallyDrop, net::SocketAddr, time::Duration};
-
 use rusty_ulid::Ulid;
+use std::fmt::Formatter;
+use std::{collections::BTreeMap, fmt, mem::ManuallyDrop, net::SocketAddr, time::Duration};
 
+use crate::proto::command::OpenTelemetry as ProtobufOpenTelemetry;
 use crate::{
     logging::{LogLevel, Rfc3339Time},
     proto::command::{
@@ -98,6 +99,26 @@ pub struct FullTags<'a> {
     pub user_agent: Option<&'a str>,
 }
 
+#[derive(Default)]
+pub struct OpenTelemetry {
+    pub trace_id: [u8; 32],
+    pub span_id: [u8; 16],
+    pub parent_span_id: Option<[u8; 16]>,
+}
+
+impl fmt::Debug for OpenTelemetry {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let trace_id = unsafe { std::str::from_utf8_unchecked(&self.trace_id) };
+        let span_id = unsafe { std::str::from_utf8_unchecked(&self.span_id) };
+        let parent_span_id = self
+            .parent_span_id
+            .as_ref()
+            .map(|id| unsafe { std::str::from_utf8_unchecked(id) })
+            .unwrap_or("-");
+        write!(f, "{trace_id} {span_id} {parent_span_id}")
+    }
+}
+
 /// Intermediate representation of an access log agnostic of the final format.
 /// Every field is a reference to avoid capturing ownership (as a logger should).
 pub struct RequestRecord<'a> {
@@ -118,6 +139,7 @@ pub struct RequestRecord<'a> {
     pub request_time: Duration,
     pub bytes_in: usize,
     pub bytes_out: usize,
+    pub otel: Option<&'a OpenTelemetry>,
 
     // added by the logger itself
     pub pid: i32,
@@ -182,6 +204,14 @@ impl RequestRecord<'_> {
                 tag: self.tag.duplicate(),
                 time: self.precise_time.into(),
                 request_time: Some(self.request_time.as_micros() as u64),
+                otel: self.otel.map(|otel| ProtobufOpenTelemetry {
+                    trace_id: std::str::from_utf8_unchecked(&otel.trace_id).duplicate(),
+                    span_id: std::str::from_utf8_unchecked(&otel.span_id).duplicate(),
+                    parent_span_id: otel
+                        .parent_span_id
+                        .as_ref()
+                        .map(|id| std::str::from_utf8_unchecked(id).duplicate()),
+                }),
             })
         }
     }

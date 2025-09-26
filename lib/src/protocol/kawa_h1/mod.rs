@@ -929,7 +929,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         log_access! {
             error,
             on_failure: { incr!("unsent-access-logs") },
-            message: message,
+            message,
             context,
             session_address: self.get_session_address(),
             backend_address: self.get_backend_address(),
@@ -944,6 +944,10 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             bytes_in: metrics.bin,
             bytes_out: metrics.bout,
             user_agent: self.context.user_agent.as_deref(),
+            #[cfg(feature = "opentelemetry")]
+            otel: self.context.otel.as_ref(),
+            #[cfg(not(feature = "opentelemetry"))]
+            otel: None,
         };
     }
 
