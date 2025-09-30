@@ -1197,6 +1197,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         metrics.backend_id = self.backend.as_ref().map(|i| i.borrow().backend_id.clone());
 
         metrics.backend_start();
+        metrics.backend_connected();
         if let Some(b) = self.backend.as_mut() {
             b.borrow_mut().active_requests += 1;
         }
