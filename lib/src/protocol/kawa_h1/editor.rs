@@ -11,9 +11,32 @@ use std::{
 };
 
 #[cfg(feature = "opentelemetry")]
-fn parse_ot_id<const N: usize>(val: &kawa::Store, buf: &[u8]) -> Option<[u8; N]> {
-    let trace_id: Option<[u8; N]> = val.data(buf).try_into().ok();
-    trace_id.filter(|trace_id| trace_id.iter().all(|c| c.is_ascii_hexdigit()))
+fn parse_traceparent(val: &kawa::Store, buf: &[u8]) -> Option<([u8; 32], [u8; 16])> {
+    let val = val.data(buf);
+    let (version, val) = parse_hex::<2>(val)?;
+    if version.as_slice() != b"00" {
+        return None;
+    }
+    let val = skip_separator(val)?;
+    let (trace_id, val) = parse_hex::<32>(val)?;
+    let val = skip_separator(val)?;
+    let (parent_id, val) = parse_hex::<16>(val)?;
+    let val = skip_separator(val)?;
+    let (_, val) = parse_hex::<2>(val)?;
+    val.is_empty().then_some((trace_id, parent_id))
+}
+
+#[cfg(feature = "opentelemetry")]
+fn parse_hex<const N: usize>(buf: &[u8]) -> Option<([u8; N], &[u8])> {
+    let val: [u8; N] = buf.get(..N)?.try_into().unwrap();
+    val.iter()
+        .all(|c| c.is_ascii_hexdigit())
+        .then_some((val, &buf[N..]))
+}
+
+#[cfg(feature = "opentelemetry")]
+fn skip_separator(buf: &[u8]) -> Option<&[u8]> {
+    buf.first().filter(|b| **b == b'-').map(|_| &buf[1..])
 }
 
 #[cfg(feature = "opentelemetry")]
@@ -26,6 +49,17 @@ fn random_id<const N: usize>() -> [u8; N] {
         let n = rng.gen_range(0..CHARSET.len());
         CHARSET[n]
     });
+    buf
+}
+
+#[cfg(feature = "opentelemetry")]
+fn build_traceparent(trace_id: &[u8; 32], parent_id: &[u8; 16]) -> [u8; 55] {
+    let mut buf = [0; 55];
+    buf[..3].copy_from_slice(b"00-");
+    buf[3..35].copy_from_slice(trace_id);
+    buf[35] = b'-';
+    buf[36..52].copy_from_slice(parent_id);
+    buf[52..55].copy_from_slice(b"-01");
     buf
 }
 
@@ -190,9 +224,9 @@ impl HttpContext {
         let mut has_x_proto = false;
         let mut has_connection = false;
         #[cfg(feature = "opentelemetry")]
-        let mut ot_trace_id = None;
+        let mut traceparent: Option<&mut kawa::Pair> = None;
         #[cfg(feature = "opentelemetry")]
-        let mut ot_span_id = None;
+        let mut tracestate: Option<&mut kawa::Pair> = None;
         for block in &mut request.blocks {
             match block {
                 kawa::Block::Header(header) if !header.is_elided() => {
@@ -242,16 +276,16 @@ impl HttpContext {
                             .map(ToOwned::to_owned);
                     } else {
                         #[cfg(feature = "opentelemetry")]
-                        if compare_no_case(key, b"ot-tracer-traceid") {
-                            if let Some(hdr) = ot_trace_id {
+                        if compare_no_case(key, b"traceparent") {
+                            if let Some(hdr) = traceparent {
                                 hdr.elide();
                             }
-                            ot_trace_id = Some(header);
-                        } else if compare_no_case(key, b"ot-tracer-spanid") {
-                            if let Some(hdr) = ot_span_id {
+                            traceparent = Some(header);
+                        } else if compare_no_case(key, b"tracestate") {
+                            if let Some(hdr) = tracestate {
                                 hdr.elide();
                             }
-                            ot_span_id = Some(header);
+                            tracestate = Some(header);
                         }
                     }
                 }
@@ -260,24 +294,26 @@ impl HttpContext {
         }
 
         #[cfg(feature = "opentelemetry")]
-        let (otel, has_trace_id, has_span_id) = {
+        let (otel, has_traceparent) = {
             let mut otel = sozu_command_lib::logging::OpenTelemetry::default();
-            otel.trace_id = ot_trace_id
+            let tp = traceparent
                 .as_ref()
-                .and_then(|hdr| parse_ot_id(&hdr.val, buf))
-                .unwrap_or_else(|| random_id());
+                .and_then(|hdr| parse_traceparent(&hdr.val, buf))
+                .map(|(trace_id, parent_id)| (trace_id, Some(parent_id)));
+            // Remove tracestate if no traceparent is present
+            if let (None, Some(tracestate)) = (tp, tracestate) {
+                tracestate.elide();
+            }
+            let (trace_id, parent_id) = tp.unwrap_or_else(|| (random_id(), None));
+            otel.trace_id = trace_id;
+            otel.parent_span_id = parent_id;
             otel.span_id = random_id();
-            otel.parent_span_id = ot_span_id
-                .as_ref()
-                .and_then(|id| parse_ot_id::<16>(&id.val, buf));
             // Modify header if present
-            if let Some(id) = &mut ot_trace_id {
-                id.val.modify(buf, otel.trace_id.as_slice());
+            if let Some(id) = &mut traceparent {
+                let new_val = build_traceparent(&otel.trace_id, &otel.span_id);
+                id.val.modify(buf, &new_val);
             }
-            if let Some(id) = &mut ot_span_id {
-                id.val.modify(buf, otel.span_id.as_slice());
-            }
-            (otel, ot_trace_id.is_some(), ot_span_id.is_some())
+            (otel, traceparent.is_some())
         };
 
         // If session_address is set:
@@ -335,16 +371,11 @@ impl HttpContext {
 
         #[cfg(feature = "opentelemetry")]
         {
-            if !has_trace_id {
+            if !has_traceparent {
+                let val = build_traceparent(&otel.trace_id, &otel.span_id);
                 request.push_block(kawa::Block::Header(kawa::Pair {
-                    key: kawa::Store::Static(b"ot-tracer-traceid"),
-                    val: kawa::Store::from_slice(otel.trace_id.as_slice()),
-                }));
-            }
-            if !has_span_id {
-                request.push_block(kawa::Block::Header(kawa::Pair {
-                    key: kawa::Store::Static(b"ot-tracer-spanid"),
-                    val: kawa::Store::from_slice(otel.span_id.as_slice()),
+                    key: kawa::Store::Static(b"traceparent"),
+                    val: kawa::Store::from_slice(&val),
                 }));
             }
             self.otel = Some(otel);
