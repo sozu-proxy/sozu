@@ -132,7 +132,8 @@ impl<V: Debug + Clone> TrieNode<V> {
                         }
                     }
 
-                    if let Ok(r) = Regex::new(s) {
+                    let s = format!("\\A{s}\\z");
+                    if let Ok(r) = Regex::new(&s) {
                         if pos > 0 {
                             let mut node = TrieNode::root();
                             let pos = pos - 1;
@@ -300,11 +301,11 @@ impl<V: Debug + Clone> TrieNode<V> {
                 } else {
                     //println!("there's still a subdomain, wildcard does not apply");
 
-                    // let suffix = if suffix[0] == b'.' {
-                    //     &suffix[1..]
-                    // } else {
-                    //     suffix
-                    // };
+                    let suffix = if suffix[0] == b'.' {
+                        &suffix[1..]
+                    } else {
+                        suffix
+                    };
                     for (regexp, child) in &self.regexps {
                         //println!("testing regexp: {} on suffix {}", r.as_str(), str::from_utf8(s).unwrap());
 
@@ -374,12 +375,12 @@ impl<V: Debug + Clone> TrieNode<V> {
                 } else {
                     //println!("there's still a subdomain, wildcard does not apply");
 
-                    for (ref regexp, ref mut child) in self.regexps.iter_mut() {
-                        let suffix = if suffix[0] == b'.' {
-                            &suffix[1..]
-                        } else {
-                            suffix
-                        };
+                    let suffix = if suffix[0] == b'.' {
+                        &suffix[1..]
+                    } else {
+                        suffix
+                    };
+                    for (regexp, child) in &mut self.regexps {
                         //println!("testing regexp: {} on suffix {}", r.as_str(), str::from_utf8(s).unwrap());
 
                         if regexp.is_match(suffix) {

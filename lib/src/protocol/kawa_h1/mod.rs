@@ -1318,14 +1318,6 @@ impl<Front: SocketHandler, L: L7ListenerHandler> Http<Front, L> {
 
         let host = rewritten_host.as_deref().unwrap_or(host);
         let path = rewritten_path.as_deref().unwrap_or(path);
-        let port = rewritten_port.map_or_else(
-            || {
-                port.map_or(String::new(), |port| {
-                    format!(":{}", unsafe { from_utf8_unchecked(port) })
-                })
-            },
-            |port| format!(":{port}"),
-        );
         let is_https = matches!(proxy.borrow().kind(), ListenerType::Https);
         let proto = match (redirect_scheme, is_https) {
             (RedirectScheme::UseHttp, _) | (RedirectScheme::UseSame, false) => "http",
@@ -1370,6 +1362,18 @@ impl<Front: SocketHandler, L: L7ListenerHandler> Http<Front, L> {
                 }
             };
 
+        let port = match (
+            port,
+            rewritten_port,
+            https_redirect_port,
+            !is_https && https_redirect,
+        ) {
+            (_, Some(port), _, _) => format!(":{port}"),
+            (_, _, Some(port), true) => format!(":{port}"),
+            (Some(port), _, _, _) => format!(":{}", unsafe { from_utf8_unchecked(port) }),
+            _ => String::new(),
+        };
+
         match (cluster_id, redirect, redirect_template, authorized) {
             (_, RedirectPolicy::Permanent, _, true) => {
                 let location = format!("{proto}://{host}{port}{path}");
@@ -1383,9 +1387,6 @@ impl<Front: SocketHandler, L: L7ListenerHandler> Http<Front, L> {
             }
             (Some(cluster_id), RedirectPolicy::Forward, None, true) => {
                 if !is_https && https_redirect {
-                    let port = rewritten_port
-                        .or_else(|| https_redirect_port.map(|port| port as u16))
-                        .map_or(String::new(), |port| format!(":{port}"));
                     let location = format!("https://{host}{port}{path}");
                     self.set_answer(DefaultAnswer::Answer301 { location });
                     return Err(RetrieveClusterError::Redirected);

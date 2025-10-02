@@ -1,0 +1,37 @@
+log_target = "stdout"
+log_colored = true
+worker_count = 1
+
+[[listeners]]
+protocol = "http"
+address = "0.0.0.0:8080"
+#answers = { "404" = "default_404.html", "503" = "default_503.html", "custom_200" = "default_200.html" }
+
+[clusters.MyCluster]
+protocol = "http"
+answers = { "custom_200" = "../lib/assets/mycluster_200.html" }
+https_redirect = true
+https_redirect_port = 8443
+
+backends = []
+
+[[clusters.MyCluster.frontends]]
+address = "0.0.0.0:8080"
+hostname = "/cdn([0-9]*)/.foo./(.*)/.com"
+path = "\\A/client/id_([0-9]*)/(.*)"
+path_type = "REGEX"
+redirect_scheme = "USE_HTTPS"
+redirect_template = "custom_200"
+rewrite_host = "client_$PATH[1].bar.$HOST[2].com"
+rewrite_path = "/$PATH[2]?cdn=$HOST[1]"
+rewrite_port = 8442
+
+[[clusters.MyCluster.frontends]]
+address = "0.0.0.0:8080"
+hostname = "localhost"
+path = "\\A/download(/(.*))?\\z"
+path_type = "REGEX"
+redirect_scheme = "USE_HTTPS"
+redirect_template = "custom_200"
+rewrite_path = "/rewritten/$PATH[2]"
+

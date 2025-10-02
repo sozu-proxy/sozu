@@ -393,7 +393,7 @@ pub enum DomainRule {
 }
 
 fn convert_regex_domain_rule(hostname: &str) -> Option<String> {
-    let mut result = String::new();
+    let mut result = String::from("\\A");
 
     let s = hostname.as_bytes();
     let mut index = 0;
@@ -436,6 +436,7 @@ fn convert_regex_domain_rule(hostname: &str) -> Option<String> {
         }
 
         if index == s.len() {
+            result.push_str("\\z");
             return Some(result);
         } else if s[index] == b'.' {
             result.push_str("\\.");
@@ -962,13 +963,12 @@ impl RouteResult {
                 PathRule::Prefix(prefix) => {
                     captures_path.push(unsafe { from_utf8_unchecked(&path[prefix.len()..]) })
                 }
-                PathRule::Regex(regex) => captures_path.extend(
-                    regex
-                        .captures(path)
-                        .unwrap()
-                        .iter()
-                        .map(|c| unsafe { from_utf8_unchecked(c.unwrap().as_bytes()) }),
-                ),
+                PathRule::Regex(regex) => {
+                    captures_path.extend(regex.captures(path).unwrap().iter().skip(1).map(|c| {
+                        c.map(|c| unsafe { from_utf8_unchecked(c.as_bytes()) })
+                            .unwrap_or("")
+                    }))
+                }
                 _ => {}
             }
         }
