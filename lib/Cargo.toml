@@ -60,13 +60,16 @@ serial_test = { workspace = true }
 tiny_http = { workspace = true }
 
 [features]
-default = ["simd"]
+default = []
 logs-debug = []
 logs-trace = []
 opentelemetry = []
 simd = ["kawa/simd"]
 splice = []
 tolerant-http1-parser = ["kawa/tolerant-parsing"]
+
+[target.'cfg(target_arch = "x86_64")'.features]
+default = ["simd"]
 
 [badges]
 travis-ci = { repository = "sozu-proxy/sozu" }
