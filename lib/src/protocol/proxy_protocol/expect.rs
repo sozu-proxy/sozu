@@ -197,7 +197,7 @@ impl<Front: SocketHandler> ExpectProxyProtocol<Front> {
         pipe
     }
 
-    pub fn log_context(&self) -> LogContext {
+    pub fn log_context(&self) -> LogContext<'_> {
         LogContext {
             request_id: self.request_id,
             cluster_id: None,

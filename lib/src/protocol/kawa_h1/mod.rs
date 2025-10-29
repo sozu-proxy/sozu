@@ -873,7 +873,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 }
 
 impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L> {
-    fn log_endpoint(&self) -> EndpointRecord {
+    fn log_endpoint(&self) -> EndpointRecord<'_> {
         EndpointRecord::Http {
             method: self.context.method.as_deref(),
             authority: self.context.authority.as_deref(),
@@ -1591,7 +1591,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         }
     }
 
-    pub fn backend_hup(&mut self, metrics: &mut SessionMetrics) -> StateResult {
+    pub fn backend_hup(&mut self, _metrics: &mut SessionMetrics) -> StateResult {
         let response_stream = match &mut self.response_stream {
             ResponseStream::BackendAnswer(response_stream) => response_stream,
             _ => return StateResult::CloseBackend,

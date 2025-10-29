@@ -1,9 +1,9 @@
 use std::{cell::RefCell, fmt::Debug, rc::Rc};
 
 use rand::{
-    distributions::{Distribution, WeightedIndex},
-    seq::SliceRandom,
-    thread_rng, Rng,
+    distr::{weighted::WeightedIndex, Distribution},
+    prelude::IndexedRandom,
+    rng, Rng,
 };
 
 use crate::{backends::Backend, sozu_command::proto::command::LoadMetric};
@@ -54,7 +54,7 @@ impl LoadBalancingAlgorithm for Random {
         &mut self,
         backends: &mut Vec<Rc<RefCell<Backend>>>,
     ) -> Option<Rc<RefCell<Backend>>> {
-        let mut rng = thread_rng();
+        let mut rng = rng();
         let weights: Vec<i32> = backends
             .iter()
             .map(|b| {
@@ -162,7 +162,7 @@ impl LoadBalancingAlgorithm for PowerOfTwo {
             // should not happen, but let's be exhaustive
             (None, Some((_, b))) => Some(b.clone()),
             (Some((_, b1)), Some((_, b2))) => {
-                if thread_rng().gen_bool(0.5) {
+                if rng().random_bool(0.5) {
                     Some(b1.clone())
                 } else {
                     Some(b2.clone())

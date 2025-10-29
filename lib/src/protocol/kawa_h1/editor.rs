@@ -344,7 +344,7 @@ impl HttpContext {
         self.user_agent = None;
     }
 
-    pub fn log_context(&self) -> LogContext {
+    pub fn log_context(&self) -> LogContext<'_> {
         LogContext {
             request_id: self.id,
             cluster_id: self.cluster_id.as_deref(),

@@ -256,7 +256,7 @@ impl TcpSession {
         }
     }
 
-    fn log_context(&self) -> LogContext {
+    fn log_context(&self) -> LogContext<'_> {
         LogContext {
             request_id: self.request_id,
             cluster_id: self.cluster_id.as_deref(),

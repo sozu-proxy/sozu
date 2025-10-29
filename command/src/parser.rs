@@ -54,7 +54,7 @@ where
     })
 }
 
-pub fn parse_several_requests<'a, T>(input: &'a [u8]) -> IResult<&[u8], Vec<T>>
+pub fn parse_several_requests<'a, T>(input: &'a [u8]) -> IResult<&'a [u8], Vec<T>>
 where
     T: serde::de::Deserialize<'a>,
 {
