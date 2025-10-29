@@ -2,7 +2,10 @@ use std::{
     ffi::OsString,
     fs::{read_link, File},
     io::{Error as IoError, Write},
-    os::unix::io::RawFd,
+    os::{
+        fd::{FromRawFd, OwnedFd},
+        unix::io::RawFd,
+    },
     path::PathBuf,
 };
 
@@ -52,28 +55,36 @@ pub enum UtilError {
 /// so we need to remove the flag on the client, otherwise
 /// it won't be accessible
 pub fn enable_close_on_exec(fd: RawFd) -> Result<i32, UtilError> {
-    let file_descriptor =
-        fcntl(fd, FcntlArg::F_GETFD).map_err(|err_no| UtilError::GetFlags(fd, err_no))?;
+    let file_descriptor = fcntl(unsafe { OwnedFd::from_raw_fd(fd) }, FcntlArg::F_GETFD)
+        .map_err(|err_no| UtilError::GetFlags(fd, err_no))?;
 
     let mut new_flags = FdFlag::from_bits(file_descriptor).ok_or(UtilError::ConvertFlags(fd))?;
 
     new_flags.insert(FdFlag::FD_CLOEXEC);
 
-    fcntl(fd, FcntlArg::F_SETFD(new_flags)).map_err(|err_no| UtilError::SetFlags(fd, err_no))
+    fcntl(
+        unsafe { OwnedFd::from_raw_fd(fd) },
+        FcntlArg::F_SETFD(new_flags),
+    )
+    .map_err(|err_no| UtilError::SetFlags(fd, err_no))
 }
 
 /// FD_CLOEXEC is set by default on every fd in Rust standard lib,
 /// so we need to remove the flag on the client, otherwise
 /// it won't be accessible
 pub fn disable_close_on_exec(fd: RawFd) -> Result<i32, UtilError> {
-    let old_flags =
-        fcntl(fd, FcntlArg::F_GETFD).map_err(|err_no| UtilError::GetFlags(fd, err_no))?;
+    let old_flags = fcntl(unsafe { OwnedFd::from_raw_fd(fd) }, FcntlArg::F_GETFD)
+        .map_err(|err_no| UtilError::GetFlags(fd, err_no))?;
 
     let mut new_flags = FdFlag::from_bits(old_flags).ok_or(UtilError::ConvertFlags(fd))?;
 
     new_flags.remove(FdFlag::FD_CLOEXEC);
 
-    fcntl(fd, FcntlArg::F_SETFD(new_flags)).map_err(|err_no| UtilError::SetFlags(fd, err_no))
+    fcntl(
+        unsafe { OwnedFd::from_raw_fd(fd) },
+        FcntlArg::F_SETFD(new_flags),
+    )
+    .map_err(|err_no| UtilError::SetFlags(fd, err_no))
 }
 
 pub fn setup_metrics(config: &Config) -> Result<(), UtilError> {
