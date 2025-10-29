@@ -16,7 +16,7 @@ authors = [
 ]
 categories = ["network-programming"]
 edition = "2021"
-rust-version = "1.80.0"
+rust-version = "1.82.0"
 include = [
   "./README.md",
   "Cargo.toml",
@@ -42,12 +42,7 @@ nom = { workspace = true, features = ["std"] }
 poule = { workspace = true }
 rand = { workspace = true }
 regex = { workspace = true }
-rustls = { version = "^0.23.14", default-features = false, features = [
-  "ring",
-  "logging",
-  "std",
-  "tls12",
-] }
+rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 rusty_ulid = { workspace = true }
 sha2 = { workspace = true }

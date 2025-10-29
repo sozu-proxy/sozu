@@ -21,7 +21,7 @@ struct LogLine {
 #[allow(dead_code)]
 fn random_string(rng: &mut StdRng) -> String {
     (0..10)
-        .map(|_| rng.sample(rand::distributions::Alphanumeric) as char)
+        .map(|_| rng.sample(rand::distr::Alphanumeric) as char)
         .collect()
 }
 

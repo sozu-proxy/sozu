@@ -629,7 +629,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         SessionResult::Continue
     }
 
-    pub fn log_context(&self) -> LogContext {
+    pub fn log_context(&self) -> LogContext<'_> {
         LogContext {
             request_id: self.request_id,
             cluster_id: self.cluster_id.as_deref(),
@@ -637,7 +637,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         }
     }
 
-    fn log_endpoint(&self) -> EndpointRecord {
+    fn log_endpoint(&self) -> EndpointRecord<'_> {
         match &self.websocket_context {
             WebSocketContext::Http {
                 method,

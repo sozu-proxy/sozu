@@ -1478,7 +1478,7 @@ impl<
 
 #[cfg(test)]
 mod tests {
-    use rand::{seq::SliceRandom, thread_rng, Rng};
+    use rand::{rng, seq::SliceRandom, Rng};
 
     use super::*;
     use crate::proto::command::{
@@ -1962,10 +1962,10 @@ mod tests {
                     .expect("Could not execute request");
             }
 
-            let mut rng = thread_rng();
+            let mut rng = rng();
             let mut indexes = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
             indexes.shuffle(&mut rng);
-            let random_count = rng.gen_range(1..indexes.len());
+            let random_count = rng.random_range(1..indexes.len());
             let random_indexes: Vec<i32> = indexes.into_iter().take(random_count).collect();
 
             for j in random_indexes {

@@ -3,10 +3,6 @@ extern crate sozu_lib as sozu;
 #[macro_use]
 extern crate sozu_command_lib;
 
-#[cfg(feature = "jemallocator")]
-#[global_allocator]
-static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
-
 /// the arguments to the sozu command line
 pub mod cli;
 /// Receives orders from the CLI, transmits to workers

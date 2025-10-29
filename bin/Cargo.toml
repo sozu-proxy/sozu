@@ -15,7 +15,7 @@ authors = [
 ]
 categories = ["network-programming"]
 edition = "2021"
-rust-version = "1.80.0"
+rust-version = "1.82.0"
 include = ["README.md", "Cargo.toml", "src/**/*"]
 
 [lib]
@@ -46,7 +46,7 @@ sozu-command-lib = { workspace = true }
 sozu-lib = { workspace = true }
 
 [target.'cfg(target_os="linux")'.dependencies]
-num_cpus = "^1.16.0"
+num_cpus = "^1.17.0"
 
 [features]
 default = ["jemallocator"]

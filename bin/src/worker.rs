@@ -76,6 +76,8 @@ pub enum WorkerError {
     },
     #[error("could not setup the logger: {0}")]
     SetupLogging(LogError),
+    #[error("could not spawn child process: {0}")]
+    SpawnChild(std::io::Error),
 }
 
 /// called within a worker process, this starts the actual proxy
@@ -285,7 +287,7 @@ pub fn fork_main_into_worker(
         }
         ForkResult::Child => {
             trace!("child({}):\twill spawn a child", unsafe { libc::getpid() });
-            Command::new(executable_path)
+            let err = Command::new(executable_path)
                 .arg("worker")
                 .arg("--id")
                 .arg(worker_id)
@@ -301,7 +303,8 @@ pub fn fork_main_into_worker(
                 .arg(config.max_command_buffer_size.to_string())
                 .exec();
 
-            unreachable!();
+            error!("Failed to spawn child process: {}", err);
+            Err(WorkerError::SpawnChild(err))
         }
     }
 }

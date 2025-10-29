@@ -128,7 +128,7 @@ pub struct RequestRecord<'a> {
 }
 
 impl RequestRecord<'_> {
-    pub fn full_tags(&self) -> FullTags {
+    pub fn full_tags(&self) -> FullTags<'_> {
         FullTags {
             concatenated: self.tags.as_ref().map(|t| t.concatenated.as_str()),
             user_agent: self.user_agent,

@@ -48,7 +48,7 @@ pub fn parse_pem(certificate: &[u8]) -> Result<Pem, CertificateError> {
 }
 
 /// parse x509 certificate from PEM bytes
-pub fn parse_x509(pem_bytes: &[u8]) -> Result<X509Certificate, CertificateError> {
+pub fn parse_x509(pem_bytes: &[u8]) -> Result<X509Certificate<'_>, CertificateError> {
     parse_x509_certificate(pem_bytes)
         .map_err(|nom_e| CertificateError::ParseX509Certificate(nom_e.to_string()))
         .map(|t| t.1)

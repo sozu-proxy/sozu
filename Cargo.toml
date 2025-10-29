@@ -3,52 +3,58 @@ members = ["lib", "command", "bin", "e2e"]
 resolver = "2" # consistent with rust edition 2021, see https://doc.rust-lang.org/cargo/reference/resolver.html#features
 
 [workspace.dependencies]
-anyhow = "1.0.89"
-clap = "4.5.20"
-cookie-factory = "0.3.3"
-futures = "0.3.31"
-hdrhistogram = "7.5.4"
-hex = "0.4.3"
-hpack = "0.3.0"
-hyper = "0.14.28"
-hyper-rustls = { version = "0.24.2", default-features = false }
-idna = "1.0.2"
-jemallocator = "0.5.4"
-kawa = { version = "0.6.7", default-features = false }
-libc = "0.2.159"
-log = "0.4.22"
-memchr = "2.7.4"
-mio = "1.0.2"
-nix = "0.29.0"
-nom = "7.1.3"
-paw = "1.0.0"
-pool = "0.1.4"
-poule = "0.3.2"
-prettytable-rs = { version = "0.10.0", default-features = false }
-prost = "0.13.3"
-prost-build = "0.13.3"
-quickcheck = "1.0.3"
-rand = "0.8.5"
-regex = "1.11.0"
-rustls-pemfile = "2.2.0"
-rusty_ulid = "2.0.0"
-serde = "1.0.210"
-serde_json = "1.0.128"
-serial_test = "3.1.1"
-sha2 = "0.10.8"
-slab = "0.4.9"
-socket2 = "0.5.7"
-sozu-command-lib = { version = "1.0.6", path = "command" }
-sozu-lib = { version = "1.0.6", path = "lib" }
-tempfile = "3.13.0"
-termion = "4.0.3"
-thiserror = "2.0.3"
-time = "0.3.36"
-tiny_http = "0.12.0"
-tokio = "1.40.0"
-toml = "0.8.19"
-trailer = "0.1.2"
-x509-parser = "0.16.0"
+anyhow = "^1.0.100"
+clap = "^4.5.51"
+cookie-factory = "^0.3.3"
+futures = "^0.3.31"
+hdrhistogram = "^7.5.4"
+hex = "^0.4.3"
+hpack = "^0.3.0"
+hyper = "^0.14.28"
+hyper-rustls = { version = "^0.24.2", default-features = false }
+idna = "^1.1.0"
+jemallocator = "^0.5.4"
+kawa = { version = "^0.6.8", default-features = false }
+libc = "^0.2.177"
+log = "^0.4.28"
+memchr = "^2.7.6"
+mio = "^1.1.0"
+nix = "0.30.1"
+nom = "^7.1.3"
+paw = "^1.0.0"
+pool = "^0.1.4"
+poule = "^0.3.2"
+prettytable-rs = { version = "^0.10.0", default-features = false }
+prost = "^0.14.1"
+prost-build = "^0.14.1"
+quickcheck = "^1.0.3"
+rand = "^0.9.2"
+regex = "^1.12.2"
+rustls-pemfile = "^2.2.0"
+rustls = { version = "^0.23.34", default-features = false, features = [
+  "ring",
+  "logging",
+  "std",
+  "tls12",
+] }
+rusty_ulid = "^2.0.0"
+serde = "^1.0.228"
+serde_json = "^1.0.145"
+serial_test = "^3.2.0"
+sha2 = "^0.10.8"
+slab = "^0.4.11"
+socket2 = "^0.6.0"
+sozu-command-lib = { version = "^1.0.6", path = "command" }
+sozu-lib = { version = "^1.0.6", path = "lib" }
+tempfile = "^3.23.0"
+termion = "^4.0.5"
+thiserror = "^2.0.17"
+time = "^0.3.44"
+tiny_http = "^0.12.0"
+tokio = "^1.47.1"
+toml = "^0.9.8"
+trailer = "^0.1.2"
+x509-parser = "^0.18.0"
 
 [profile.release]
 lto = true

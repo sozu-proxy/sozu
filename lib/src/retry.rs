@@ -69,8 +69,8 @@ impl RetryPolicy for ExponentialBackoffPolicy {
         let wait = if max_secs == 1 {
             1
         } else {
-            let mut rng = rand::thread_rng();
-            rng.gen_range(1..max_secs)
+            let mut rng = rand::rng();
+            rng.random_range(1..max_secs)
         };
 
         self.wait = time::Duration::from_secs(wait);
