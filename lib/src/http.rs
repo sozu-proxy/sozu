@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::{hash_map::Entry, BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, hash_map::Entry},
     io::ErrorKind,
     net::{Shutdown, SocketAddr},
     os::unix::io::AsRawFd,
@@ -10,17 +10,16 @@ use std::{
 };
 
 use mio::{
+    Interest, Registry, Token,
     net::{TcpListener as MioTcpListener, TcpStream},
     unix::SourceFd,
-    Interest, Registry, Token,
 };
 use rusty_ulid::Ulid;
-
 use sozu_command::{
     logging::CachedTags,
     proto::command::{
-        request::RequestType, Cluster, HttpListenerConfig, ListenerType, RemoveListener,
-        RequestHttpFrontend, WorkerRequest, WorkerResponse,
+        Cluster, HttpListenerConfig, ListenerType, RemoveListener, RequestHttpFrontend,
+        WorkerRequest, WorkerResponse, request::RequestType,
     },
     ready::Ready,
     response::HttpFrontend,
@@ -28,24 +27,24 @@ use sozu_command::{
 };
 
 use crate::{
+    AcceptError, FrontendFromRequestError, L7ListenerHandler, L7Proxy, ListenerError,
+    ListenerHandler, Protocol, ProxyConfiguration, ProxyError, ProxySession, SessionIsToBeClosed,
+    SessionMetrics, SessionResult, StateMachineBuilder, StateResult,
     backends::BackendMap,
     pool::Pool,
     protocol::{
+        Http, Pipe, SessionState,
         http::{
-            answers::HttpAnswers,
-            parser::{hostname_and_port, Method},
             ResponseStream,
+            answers::HttpAnswers,
+            parser::{Method, hostname_and_port},
         },
         proxy_protocol::expect::ExpectProxyProtocol,
-        Http, Pipe, SessionState,
     },
     router::{Route, Router},
     server::{ListenToken, SessionManager},
     socket::server_bind,
     timer::TimeoutContainer,
-    AcceptError, FrontendFromRequestError, L7ListenerHandler, L7Proxy, ListenerError,
-    ListenerHandler, Protocol, ProxyConfiguration, ProxyError, ProxySession, SessionIsToBeClosed,
-    SessionMetrics, SessionResult, StateMachineBuilder, StateResult,
 };
 
 #[derive(PartialEq, Eq)]
@@ -222,7 +221,10 @@ impl HttpSession {
             None => {
                 warn!(
                     "Could not upgrade http request on cluster '{:?}' ({:?}) using backend '{:?}' into websocket for request '{}'",
-                    http.context.cluster_id, self.frontend_token, http.context.backend_id, http.context.id
+                    http.context.cluster_id,
+                    self.frontend_token,
+                    http.context.backend_id,
+                    http.context.id
                 );
                 return None;
             }
@@ -1050,17 +1052,6 @@ pub mod testing {
 mod tests {
     extern crate tiny_http;
 
-    use super::testing::start_http_worker;
-    use super::*;
-    use sozu_command::proto::command::{CustomHttpAnswers, SocketAddress};
-
-    use crate::sozu_command::{
-        channel::Channel,
-        config::ListenerBuilder,
-        proto::command::{LoadBalancingParams, PathRule, RulePosition, WorkerRequest},
-        response::{Backend, HttpFrontend},
-    };
-
     use std::{
         io::{Read, Write},
         net::TcpStream,
@@ -1068,6 +1059,16 @@ mod tests {
         sync::{Arc, Barrier},
         thread,
         time::Duration,
+    };
+
+    use sozu_command::proto::command::{CustomHttpAnswers, SocketAddress};
+
+    use super::{testing::start_http_worker, *};
+    use crate::sozu_command::{
+        channel::Channel,
+        config::ListenerBuilder,
+        proto::command::{LoadBalancingParams, PathRule, RulePosition, WorkerRequest},
+        response::{Backend, HttpFrontend},
     };
 
     /*

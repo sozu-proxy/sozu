@@ -8,7 +8,7 @@ use x509_parser::{
     extensions::{GeneralName, ParsedExtension},
     oid_registry::{OID_X509_COMMON_NAME, OID_X509_EXT_SUBJECT_ALT_NAME},
     parse_x509_certificate,
-    pem::{parse_x509_pem, Pem},
+    pem::{Pem, parse_x509_pem},
 };
 
 use crate::{

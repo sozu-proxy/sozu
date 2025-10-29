@@ -22,7 +22,7 @@ use rustls::{
 use sha2::{Digest, Sha256};
 use sozu_command::{
     certificate::{
-        get_cn_and_san_attributes, parse_pem, parse_x509, CertificateError, Fingerprint,
+        CertificateError, Fingerprint, get_cn_and_san_attributes, parse_pem, parse_x509,
     },
     proto::command::{AddCertificate, CertificateAndKey, ReplaceCertificate, SocketAddress},
 };
@@ -329,16 +329,14 @@ impl ResolvesServerCert for MutexCertificateResolver {
         let name: &str = server_name.unwrap();
         trace!(
             "trying to resolve name: {:?} for signature scheme: {:?}",
-            name,
-            sigschemes
+            name, sigschemes
         );
         if let Ok(ref mut resolver) = self.0.try_lock() {
             //resolver.domains.print();
             if let Some((_, fingerprint)) = resolver.domains.domain_lookup(name.as_bytes(), true) {
                 trace!(
                     "looking for certificate for {:?} with fingerprint {:?}",
-                    name,
-                    fingerprint
+                    name, fingerprint
                 );
 
                 let cert = resolver
@@ -377,10 +375,10 @@ mod tests {
         time::{Duration, SystemTime},
     };
 
-    use super::CertificateResolver;
-
     // use rand::{seq::SliceRandom, thread_rng};
     use sozu_command::proto::command::{AddCertificate, CertificateAndKey, SocketAddress};
+
+    use super::CertificateResolver;
 
     #[test]
     fn lifecycle() -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -546,9 +544,11 @@ mod tests {
             wildcard_example_org_fingerprint
         );
 
-        assert!(resolver
-            .domain_lookup("example.org".as_bytes(), true)
-            .is_none());
+        assert!(
+            resolver
+                .domain_lookup("example.org".as_bytes(), true)
+                .is_none()
+        );
 
         Ok(())
     }

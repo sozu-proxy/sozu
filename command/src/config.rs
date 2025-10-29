@@ -50,7 +50,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     env, fmt,
-    fs::{create_dir_all, metadata, File},
+    fs::{File, create_dir_all, metadata},
     io::{ErrorKind, Read},
     net::SocketAddr,
     ops::Range,
@@ -58,17 +58,17 @@ use std::{
 };
 
 use crate::{
+    ObjectKind,
     certificate::split_certificate_chain,
     logging::AccessLogFormat,
     proto::command::{
-        request::RequestType, ActivateListener, AddBackend, AddCertificate, CertificateAndKey,
-        Cluster, CustomHttpAnswers, HttpListenerConfig, HttpsListenerConfig, ListenerType,
+        ActivateListener, AddBackend, AddCertificate, CertificateAndKey, Cluster,
+        CustomHttpAnswers, HttpListenerConfig, HttpsListenerConfig, ListenerType,
         LoadBalancingAlgorithms, LoadBalancingParams, LoadMetric, MetricsConfiguration, PathRule,
         ProtobufAccessLogFormat, ProxyProtocolConfig, Request, RequestHttpFrontend,
         RequestTcpFrontend, RulePosition, ServerConfig, ServerMetricsConfig, SocketAddress,
-        TcpListenerConfig, TlsVersion, WorkerRequest,
+        TcpListenerConfig, TlsVersion, WorkerRequest, request::RequestType,
     },
-    ObjectKind,
 };
 
 /// provides all supported cipher suites exported by Rustls TLS
@@ -202,7 +202,9 @@ pub enum ConfigError {
         path_to_read: String,
         io_error: std::io::Error,
     },
-    #[error("the field {kind:?} of {object:?} with id or address {id} is incompatible with the rest of the options")]
+    #[error(
+        "the field {kind:?} of {object:?} with id or address {id} is incompatible with the rest of the options"
+    )]
     Incompatible {
         kind: IncompatibilityKind,
         object: ObjectKind,
@@ -705,7 +707,7 @@ impl FileClusterFrontendConfig {
             None => {
                 return Err(ConfigError::Missing(MissingKind::Field(
                     "hostname".to_string(),
-                )))
+                )));
             }
         };
 
@@ -817,7 +819,7 @@ impl FileClusterConfig {
                                     object: ObjectKind::Cluster,
                                     id: cluster_id.to_owned(),
                                     kind: IncompatibilityKind::ProxyProtocol,
-                                })
+                                });
                             }
                             None => has_expect_proxy = Some(true),
                         }
@@ -829,7 +831,7 @@ impl FileClusterConfig {
                                     object: ObjectKind::Cluster,
                                     id: cluster_id.to_owned(),
                                     kind: IncompatibilityKind::ProxyProtocol,
-                                })
+                                });
                             }
                             None => has_expect_proxy = Some(false),
                         }
@@ -977,16 +979,18 @@ pub struct HttpClusterConfig {
 
 impl HttpClusterConfig {
     pub fn generate_requests(&self) -> Result<Vec<Request>, ConfigError> {
-        let mut v = vec![RequestType::AddCluster(Cluster {
-            cluster_id: self.cluster_id.clone(),
-            sticky_session: self.sticky_session,
-            https_redirect: self.https_redirect,
-            proxy_protocol: None,
-            load_balancing: self.load_balancing as i32,
-            answer_503: self.answer_503.clone(),
-            load_metric: self.load_metric.map(|s| s as i32),
-        })
-        .into()];
+        let mut v = vec![
+            RequestType::AddCluster(Cluster {
+                cluster_id: self.cluster_id.clone(),
+                sticky_session: self.sticky_session,
+                https_redirect: self.https_redirect,
+                proxy_protocol: None,
+                load_balancing: self.load_balancing as i32,
+                answer_503: self.answer_503.clone(),
+                load_metric: self.load_metric.map(|s| s as i32),
+            })
+            .into(),
+        ];
 
         for frontend in &self.frontends {
             let mut orders = frontend.generate_requests(&self.cluster_id);
@@ -1036,16 +1040,18 @@ pub struct TcpClusterConfig {
 
 impl TcpClusterConfig {
     pub fn generate_requests(&self) -> Result<Vec<Request>, ConfigError> {
-        let mut v = vec![RequestType::AddCluster(Cluster {
-            cluster_id: self.cluster_id.clone(),
-            sticky_session: false,
-            https_redirect: false,
-            proxy_protocol: self.proxy_protocol.map(|s| s as i32),
-            load_balancing: self.load_balancing as i32,
-            load_metric: self.load_metric.map(|s| s as i32),
-            answer_503: None,
-        })
-        .into()];
+        let mut v = vec![
+            RequestType::AddCluster(Cluster {
+                cluster_id: self.cluster_id.clone(),
+                sticky_session: false,
+                https_redirect: false,
+                proxy_protocol: self.proxy_protocol.map(|s| s as i32),
+                load_balancing: self.load_balancing as i32,
+                load_metric: self.load_metric.map(|s| s as i32),
+                answer_503: None,
+            })
+            .into(),
+        ];
 
         for frontend in &self.frontends {
             v.push(
@@ -1859,8 +1865,9 @@ impl From<&Config> for ServerConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use toml::to_string;
+
+    use super::*;
 
     #[test]
     fn serialize() {

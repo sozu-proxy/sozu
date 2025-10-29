@@ -4,28 +4,27 @@ use std::{
     net::SocketAddr,
 };
 
-use prettytable::{cell, row, Row, Table};
+use prettytable::{Row, Table, cell, row};
 use time::format_description;
 use x509_parser::time::ASN1Time;
 
-use crate::{
-    proto::{
-        command::{
-            filtered_metrics, protobuf_endpoint, request::RequestType,
-            response_content::ContentType, AggregatedMetrics, AvailableMetrics, CertificateAndKey,
-            CertificateSummary, CertificatesWithFingerprints, ClusterMetrics, CustomHttpAnswers,
-            Event, EventKind, FilteredMetrics, HttpEndpoint, HttpListenerConfig,
-            HttpsListenerConfig, ListOfCertificatesByAddress, ListedFrontends, ListenersList,
-            ProtobufEndpoint, QueryCertificatesFilters, RequestCounts, Response, ResponseContent,
-            ResponseStatus, RunState, SocketAddress, TlsVersion, WorkerInfos, WorkerMetrics,
-            WorkerResponses,
-        },
-        DisplayError,
-    },
-    AsString,
-};
-
 use super::command::FilteredHistogram;
+use crate::{
+    AsString,
+    proto::{
+        DisplayError,
+        command::{
+            AggregatedMetrics, AvailableMetrics, CertificateAndKey, CertificateSummary,
+            CertificatesWithFingerprints, ClusterMetrics, CustomHttpAnswers, Event, EventKind,
+            FilteredMetrics, HttpEndpoint, HttpListenerConfig, HttpsListenerConfig,
+            ListOfCertificatesByAddress, ListedFrontends, ListenersList, ProtobufEndpoint,
+            QueryCertificatesFilters, RequestCounts, Response, ResponseContent, ResponseStatus,
+            RunState, SocketAddress, TlsVersion, WorkerInfos, WorkerMetrics, WorkerResponses,
+            filtered_metrics, protobuf_endpoint, request::RequestType,
+            response_content::ContentType,
+        },
+    },
+};
 
 impl Display for CertificateAndKey {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
@@ -39,7 +38,10 @@ impl Display for CertificateAndKey {
         write!(
             f,
             "\tcertificate: {}\n\tcertificate_chain: {:?}\n\tkey: {}\n\tTLS versions: {}\n\tnames: {:?}",
-            self.certificate, self.certificate_chain, self.key, versions,
+            self.certificate,
+            self.certificate_chain,
+            self.key,
+            versions,
             concatenate_vector(&self.names)
         )
     }
@@ -133,7 +135,7 @@ impl Response {
             ResponseStatus::Processing => {
                 return Err(DisplayError::WrongResponseType(
                     "ResponseStatus::Processing".to_string(),
-                ))
+                ));
             }
         }
 
@@ -684,21 +686,27 @@ fn print_cluster_infos(worker_responses: &WorkerResponses) -> Result<(), Display
 
     for (cluster_info, workers_the_cluster_is_present_on) in cluster_infos.iter() {
         let mut row = Vec::new();
-        row.push(cell!(cluster_info
-            .configuration
-            .as_ref()
-            .map(|conf| conf.cluster_id.to_owned())
-            .unwrap_or_else(|| String::from("None"))));
-        row.push(cell!(cluster_info
-            .configuration
-            .as_ref()
-            .map(|conf| conf.sticky_session)
-            .unwrap_or_else(|| false)));
-        row.push(cell!(cluster_info
-            .configuration
-            .as_ref()
-            .map(|conf| conf.https_redirect)
-            .unwrap_or_else(|| false)));
+        row.push(cell!(
+            cluster_info
+                .configuration
+                .as_ref()
+                .map(|conf| conf.cluster_id.to_owned())
+                .unwrap_or_else(|| String::from("None"))
+        ));
+        row.push(cell!(
+            cluster_info
+                .configuration
+                .as_ref()
+                .map(|conf| conf.sticky_session)
+                .unwrap_or_else(|| false)
+        ));
+        row.push(cell!(
+            cluster_info
+                .configuration
+                .as_ref()
+                .map(|conf| conf.https_redirect)
+                .unwrap_or_else(|| false)
+        ));
 
         for worker in workers_the_cluster_is_present_on {
             if worker_ids.contains(worker) {
@@ -785,10 +793,11 @@ fn print_cluster_infos(worker_responses: &WorkerResponses) -> Result<(), Display
         let mut row = vec![
             cell!(key.backend_id),
             cell!(format!("{}", key.address)),
-            cell!(key
-                .backup
-                .map(|b| if b { "X" } else { "" })
-                .unwrap_or_else(|| "")),
+            cell!(
+                key.backup
+                    .map(|b| if b { "X" } else { "" })
+                    .unwrap_or_else(|| "")
+            ),
         ];
 
         for val in values {

@@ -29,11 +29,10 @@ use std::{
 };
 
 use hdrhistogram::Histogram;
-
 use sozu_command::proto::command::{
-    filtered_metrics, response_content::ContentType, AvailableMetrics, BackendMetrics, Bucket,
-    ClusterMetrics, FilteredHistogram, FilteredMetrics, MetricsConfiguration, Percentiles,
-    QueryMetricsOptions, ResponseContent, WorkerMetrics,
+    AvailableMetrics, BackendMetrics, Bucket, ClusterMetrics, FilteredHistogram, FilteredMetrics,
+    MetricsConfiguration, Percentiles, QueryMetricsOptions, ResponseContent, WorkerMetrics,
+    filtered_metrics, response_content::ContentType,
 };
 
 use crate::metrics::{MetricError, MetricValue, Subscriber};
@@ -183,7 +182,7 @@ impl MetricsMap {
                 let mut filtered = vec![(name.to_owned(), metric.to_filtered())];
 
                 // convert time metrics to a histogram format, on top of percentiles
-                if let AggregatedMetric::Time(ref hist) = metric {
+                if let AggregatedMetric::Time(hist) = metric {
                     filtered.push((format!("{}_histogram", name), filter_histogram(hist)));
                 }
                 filtered.into_iter()
@@ -606,10 +605,7 @@ impl Subscriber for LocalDrain {
     ) {
         trace!(
             "receiving metric with key {}, cluster_id: {:?}, backend_id: {:?}, metric data: {:?}",
-            key,
-            cluster_id,
-            backend_id,
-            metric
+            key, cluster_id, backend_id, metric
         );
 
         let receive_result = match (cluster_id, backend_id) {
@@ -627,7 +623,7 @@ impl Subscriber for LocalDrain {
 }
 #[cfg(test)]
 mod tests {
-    use sozu_command::proto::command::{filtered_metrics::Inner, FilteredMetrics};
+    use sozu_command::proto::command::{FilteredMetrics, filtered_metrics::Inner};
 
     use super::*;
 

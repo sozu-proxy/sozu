@@ -8,18 +8,17 @@ use std::{
 
 use mio::Token;
 use nom::{HexDisplay, Offset};
-
 use sozu_command_lib::{
     buffer::fixed::Buffer,
     config::Config,
     logging,
     parser::parse_several_requests,
     proto::command::{
-        request::RequestType, response_content::ContentType, AggregatedMetrics, AvailableMetrics,
-        CertificatesWithFingerprints, ClusterHashes, ClusterInformations, FrontendFilters,
-        HardStop, QueryCertificatesFilters, QueryMetricsOptions, Request, ResponseContent,
-        ResponseStatus, RunState, SoftStop, Status, WorkerInfo, WorkerInfos, WorkerRequest,
-        WorkerResponses,
+        AggregatedMetrics, AvailableMetrics, CertificatesWithFingerprints, ClusterHashes,
+        ClusterInformations, FrontendFilters, HardStop, QueryCertificatesFilters,
+        QueryMetricsOptions, Request, ResponseContent, ResponseStatus, RunState, SoftStop, Status,
+        WorkerInfo, WorkerInfos, WorkerRequest, WorkerResponses, request::RequestType,
+        response_content::ContentType,
     },
 };
 use sozu_lib::metrics::METRICS;
@@ -256,7 +255,8 @@ fn set_logging_level(server: &mut Server, client: &mut ClientSession, logging_fi
 
     // also change / set the content of RUST_LOG so future workers / main thread
     // will have the new logging filter value
-    env::set_var("RUST_LOG", &logging_filter);
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { env::set_var("RUST_LOG", &logging_filter) };
     debug!(
         "Logging level now: {}",
         env::var("RUST_LOG").unwrap_or("could get RUST_LOG from env".to_string())

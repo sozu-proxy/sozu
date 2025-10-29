@@ -348,19 +348,18 @@ use std::{
 
 use backends::BackendError;
 use hex::FromHexError;
-use mio::{net::TcpStream, Interest, Token};
+use mio::{Interest, Token, net::TcpStream};
 use protocol::http::{answers::TemplateError, parser::Method};
 use router::RouterError;
 use socket::ServerBindError;
-use tls::CertificateResolverError;
-
 use sozu_command::{
+    AsStr, ObjectKind,
     logging::{CachedTags, LogContext},
     proto::command::{Cluster, ListenerType, RequestHttpFrontend, WorkerRequest, WorkerResponse},
     ready::Ready,
     state::ClusterId,
-    AsStr, ObjectKind,
 };
+use tls::CertificateResolverError;
 
 use crate::{backends::BackendMap, router::Route};
 
@@ -1154,7 +1153,7 @@ pub mod testing {
     pub use std::{cell::RefCell, os::fd::IntoRawFd, rc::Rc};
 
     pub use anyhow::Context;
-    pub use mio::{net::UnixStream, Poll, Registry, Token};
+    pub use mio::{Poll, Registry, Token, net::UnixStream};
     pub use slab::Slab;
     pub use sozu_command::{
         proto::command::{
@@ -1164,14 +1163,13 @@ pub mod testing {
     };
 
     pub use crate::{
+        Protocol, ProxySession,
         backends::BackendMap,
         http::HttpProxy,
         https::HttpsProxy,
         pool::Pool,
-        server::Server,
-        server::{ListenSession, ProxyChannel, SessionManager},
+        server::{ListenSession, ProxyChannel, Server, SessionManager},
         tcp::TcpProxy,
-        Protocol, ProxySession,
     };
 
     /// Everything needed to create a Server

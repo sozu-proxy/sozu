@@ -5,10 +5,6 @@ use std::{
 };
 
 use mio::net::UnixStream;
-
-use sozu_command_lib as sozu_command;
-use sozu_lib as sozu;
-
 use sozu::server::Server;
 use sozu_command::{
     channel::Channel,
@@ -22,6 +18,8 @@ use sozu_command::{
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,
 };
+use sozu_command_lib as sozu_command;
+use sozu_lib as sozu;
 
 use crate::sozu::command_id::CommandID;
 

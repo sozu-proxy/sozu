@@ -6,12 +6,12 @@ use std::{
 };
 
 use nom::{
+    Err, IResult,
     bytes::{self, complete::take_while},
     character::{complete::digit1, is_alphanumeric},
     combinator::opt,
     error::{Error, ErrorKind},
     sequence::preceded,
-    Err, IResult,
 };
 
 pub fn compare_no_case(left: &[u8], right: &[u8]) -> bool {

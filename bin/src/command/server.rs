@@ -9,38 +9,36 @@ use std::{
 
 use libc::pid_t;
 use mio::{
-    net::{UnixListener, UnixStream},
     Events, Interest, Poll, Token,
+    net::{UnixListener, UnixStream},
 };
 use nix::{
-    sys::signal::{kill, Signal},
+    sys::signal::{Signal, kill},
     unistd::Pid,
 };
-
 use sozu_command_lib::{
     channel::Channel,
     config::Config,
     proto::command::{
-        request::RequestType, response_content::ContentType, Request, ResponseContent,
-        ResponseStatus, RunState, Status, WorkerRequest, WorkerResponse,
+        Request, ResponseContent, ResponseStatus, RunState, Status, WorkerRequest, WorkerResponse,
+        request::RequestType, response_content::ContentType,
     },
     ready::Ready,
     scm_socket::{Listeners, ScmSocket, ScmSocketError},
     state::ConfigState,
 };
 
+use super::upgrade::SerializedWorkerSession;
 use crate::{
     command::{
         sessions::{
-            wants_to_tick, ClientResult, ClientSession, OptionalClient, WorkerResult, WorkerSession,
+            ClientResult, ClientSession, OptionalClient, WorkerResult, WorkerSession, wants_to_tick,
         },
         upgrade::UpgradeData,
     },
-    util::{disable_close_on_exec, enable_close_on_exec, get_executable_path, UtilError},
-    worker::{fork_main_into_worker, WorkerError},
+    util::{UtilError, disable_close_on_exec, enable_close_on_exec, get_executable_path},
+    worker::{WorkerError, fork_main_into_worker},
 };
-
-use super::upgrade::SerializedWorkerSession;
 
 pub type ClientId = u32;
 pub type SessionId = usize;

@@ -151,8 +151,9 @@ impl RetryPolicy for RetryPolicyWrapper {
 
 #[cfg(test)]
 mod tests {
-    use super::{ExponentialBackoffPolicy, RetryAction, RetryPolicy};
     use serial_test::serial;
+
+    use super::{ExponentialBackoffPolicy, RetryAction, RetryPolicy};
 
     const MAX_FAILS: usize = 10;
 

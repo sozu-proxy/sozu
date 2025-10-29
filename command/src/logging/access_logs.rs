@@ -1,12 +1,14 @@
-use rusty_ulid::Ulid;
-use std::fmt::Formatter;
-use std::{collections::BTreeMap, fmt, mem::ManuallyDrop, net::SocketAddr, time::Duration};
+use std::{
+    collections::BTreeMap, fmt, fmt::Formatter, mem::ManuallyDrop, net::SocketAddr, time::Duration,
+};
 
-use crate::proto::command::OpenTelemetry as ProtobufOpenTelemetry;
+use rusty_ulid::Ulid;
+
 use crate::{
     logging::{LogLevel, Rfc3339Time},
     proto::command::{
-        protobuf_endpoint, HttpEndpoint, ProtobufAccessLog, ProtobufEndpoint, TcpEndpoint,
+        HttpEndpoint, OpenTelemetry as ProtobufOpenTelemetry, ProtobufAccessLog, ProtobufEndpoint,
+        TcpEndpoint, protobuf_endpoint,
     },
 };
 
@@ -28,7 +30,7 @@ trait DuplicateOwnership {
 impl<T> DuplicateOwnership for &T {
     type Target = T;
     unsafe fn duplicate(self) -> T {
-        std::ptr::read(self as *const T)
+        unsafe { std::ptr::read(self as *const T) }
     }
 }
 impl<'a, T> DuplicateOwnership for Option<&'a T>
@@ -38,19 +40,19 @@ where
 {
     type Target = Option<<&'a T as DuplicateOwnership>::Target>;
     unsafe fn duplicate(self) -> Self::Target {
-        self.map(|t| t.duplicate())
+        unsafe { self.map(|t| t.duplicate()) }
     }
 }
 impl DuplicateOwnership for &str {
     type Target = String;
     unsafe fn duplicate(self) -> Self::Target {
-        String::from_raw_parts(self.as_ptr() as *mut _, self.len(), self.len())
+        unsafe { String::from_raw_parts(self.as_ptr() as *mut _, self.len(), self.len()) }
     }
 }
 impl<T> DuplicateOwnership for &[T] {
     type Target = Vec<T>;
     unsafe fn duplicate(self) -> Self::Target {
-        Vec::from_raw_parts(self.as_ptr() as *mut _, self.len(), self.len())
+        unsafe { Vec::from_raw_parts(self.as_ptr() as *mut _, self.len(), self.len()) }
     }
 }
 

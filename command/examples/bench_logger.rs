@@ -7,8 +7,7 @@ extern crate sozu_command_lib;
 
 use std::time::Instant;
 
-use rand::{rngs::StdRng, Rng, RngCore, SeedableRng};
-
+use rand::{Rng, RngCore, SeedableRng, rngs::StdRng};
 use sozu_command_lib::logging::setup_logging;
 
 struct LogLine {
@@ -98,9 +97,7 @@ fn main() {
             ),
             _ => trace!(
                 "first argument: {}, second: {}, third: {}",
-                arg0,
-                arg1,
-                arg2
+                arg0, arg1, arg2
             ),
         }
     }

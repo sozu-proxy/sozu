@@ -3,8 +3,8 @@ use std::collections::{HashMap, VecDeque};
 use nom::Offset;
 
 use crate::{
-    protocol::h2::{parser, serializer, stream},
     Ready,
+    protocol::h2::{parser, serializer, stream},
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -132,7 +132,7 @@ impl State {
         }
     }
 
-    pub fn gen(&mut self, mut output: &mut [u8]) -> Result<usize, ()> {
+    pub fn r#gen(&mut self, mut output: &mut [u8]) -> Result<usize, ()> {
         if let Some(frame) = self.output.pop_front() {
             match serializer::gen_frame_header((output, 0), &frame.header) {
                 Err(e) => {

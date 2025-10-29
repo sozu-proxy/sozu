@@ -192,7 +192,10 @@ impl Display for TimeoutContainer {
 impl std::ops::Drop for TimeoutContainer {
     fn drop(&mut self) {
         if self.cancel() {
-            debug!("Cancel a dangling timeout that haven't be handled in session lifecycle, token ({:?}), duration {}", self.token, self);
+            debug!(
+                "Cancel a dangling timeout that haven't be handled in session lifecycle, token ({:?}), duration {}",
+                self.token, self
+            );
         }
     }
 }
@@ -296,9 +299,7 @@ impl<T> Timer<T> {
         let mut tick = duration_to_tick(delay_from_start, self.tick_ms);
         trace!(
             "setting timeout; delay={:?}; tick={:?}; current-tick={:?}",
-            delay_from_start,
-            tick,
-            self.tick
+            delay_from_start, tick, self.tick
         );
 
         // Always target at least 1 tick in the future
@@ -382,8 +383,7 @@ impl<T> Timer<T> {
     fn poll_to(&mut self, mut target_tick: Tick) -> Option<T> {
         trace!(
             "tick_to; target_tick={}; current_tick={}",
-            target_tick,
-            self.tick
+            target_tick, self.tick
         );
 
         if target_tick < self.tick {
@@ -517,8 +517,9 @@ impl<T> Entry<T> {
 
 #[cfg(test)]
 mod test {
-    use super::*;
     use std::time::{Duration, Instant};
+
+    use super::*;
 
     #[test]
     pub fn test_timeout_next_tick() {

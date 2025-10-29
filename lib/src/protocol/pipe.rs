@@ -1,6 +1,6 @@
 use std::{cell::RefCell, net::SocketAddr, rc::Rc};
 
-use mio::{net::TcpStream, Token};
+use mio::{Token, net::TcpStream};
 use rusty_ulid::Ulid;
 use sozu_command::{
     config::MAX_LOOP_ITERATIONS,
@@ -8,13 +8,13 @@ use sozu_command::{
 };
 
 use crate::{
+    L7Proxy, ListenerHandler, Protocol, Readiness, SessionMetrics, SessionResult, StateResult,
     backends::Backend,
     pool::Checkout,
-    protocol::{http::parser::Method, SessionState},
-    socket::{stats::socket_rtt, SocketHandler, SocketResult, TransportProtocol},
+    protocol::{SessionState, http::parser::Method},
+    socket::{SocketHandler, SocketResult, TransportProtocol, stats::socket_rtt},
     sozu_command::ready::Ready,
     timer::TimeoutContainer,
-    L7Proxy, ListenerHandler, Protocol, Readiness, SessionMetrics, SessionResult, StateResult,
 };
 
 /// This macro is defined uniquely in this module to help the tracking of pipelining
@@ -326,14 +326,20 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         if self.backend_buffer.available_data() == 0 {
             if self.backend_readiness.event.is_readable() {
                 self.backend_readiness.interest.insert(Ready::READABLE);
-                debug!("{} Pipe::backend_hup: backend connection closed, keeping alive due to inflight data in kernel.", log_context!(self));
+                debug!(
+                    "{} Pipe::backend_hup: backend connection closed, keeping alive due to inflight data in kernel.",
+                    log_context!(self)
+                );
                 SessionResult::Continue
             } else {
                 self.log_request_success(metrics);
                 SessionResult::Close
             }
         } else {
-            debug!("{} Pipe::backend_hup: backend connection closed, keeping alive due to inflight data in buffers.", log_context!(self));
+            debug!(
+                "{} Pipe::backend_hup: backend connection closed, keeping alive due to inflight data in buffers.",
+                log_context!(self)
+            );
             self.frontend_readiness.interest.insert(Ready::WRITABLE);
             if self.backend_readiness.event.is_readable() {
                 self.backend_readiness.interest.insert(Ready::READABLE);
@@ -742,7 +748,8 @@ impl<Front: SocketHandler, L: ListenerHandler> SessionState for Pipe<Front, L> {
         if counter >= MAX_LOOP_ITERATIONS {
             error!(
                 "{}\tHandling session went through {} iterations, there's a probable infinite loop bug, closing the connection",
-                log_context!(self), MAX_LOOP_ITERATIONS
+                log_context!(self),
+                MAX_LOOP_ITERATIONS
             );
 
             incr!("http.infinite_loop.error");

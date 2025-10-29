@@ -94,17 +94,16 @@ pub fn splice_out(pipe: Pipe, stream: &dyn AsRawFd) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use std::{
         io::{Read, Write},
-        net::SocketAddr,
-        net::{TcpListener, TcpStream},
+        net::{SocketAddr, TcpListener, TcpStream},
         str,
         str::FromStr,
         sync::{Arc, Barrier},
         thread,
     };
+
+    use super::*;
 
     #[test]
     fn zerocopy() {

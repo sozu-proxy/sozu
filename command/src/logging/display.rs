@@ -1,11 +1,11 @@
 use std::fmt;
 
 use crate::{
+    AsStr,
     logging::{
         EndpointRecord, FullTags, LogContext, LogDuration, LogLevel, LogMessage, LoggerBackend,
         Rfc3339Time,
     },
-    AsStr,
 };
 
 impl LogLevel {

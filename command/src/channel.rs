@@ -23,7 +23,9 @@ pub enum ChannelError {
     NoByteWritten,
     #[error("no byte left to read on the channel")]
     NoByteToRead,
-    #[error("message too large for the capacity of the back fuffer ({0}. Consider increasing the back buffer size")]
+    #[error(
+        "message too large for the capacity of the back fuffer ({0}. Consider increasing the back buffer size"
+    )]
     MessageTooLarge(usize),
     #[error("channel could not write on the back buffer")]
     Write(std::io::Error),
@@ -37,7 +39,9 @@ pub enum ChannelError {
     InvalidCharSet(String),
     #[error("could not set the timeout of the unix stream with file descriptor {fd}: {error}")]
     SetTimeout { fd: i32, error: String },
-    #[error("Could not change the blocking status ef the unix stream with file descriptor {fd}: {error}")]
+    #[error(
+        "Could not change the blocking status ef the unix stream with file descriptor {fd}: {error}"
+    )]
     BlockingStatus { fd: i32, error: String },
     #[error("Connection error: {0:?}")]
     Connection(Option<std::io::Error>),

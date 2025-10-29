@@ -1,5 +1,5 @@
 use std::{
-    collections::{hash_map::Entry, HashMap, VecDeque},
+    collections::{HashMap, VecDeque, hash_map::Entry},
     io::{ErrorKind, Write},
     net::SocketAddr,
     str,
@@ -9,8 +9,8 @@ use std::{
 use mio::net::UdpSocket;
 
 use super::{
-    writer::{MetricSocket, MetricsWriter},
     MetricValue, StoredMetricValue, Subscriber,
+    writer::{MetricSocket, MetricsWriter},
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -14,18 +14,22 @@ pub trait UnwrapLog<T> {
 impl<T> UnwrapLog<T> for Option<T> {
     fn unwrap_log(self, file: &str, line: u32, module_path: &str, expression: &str) -> T {
         match self {
-      Some(t) => t,
-      None    => panic!("{file}:{line} {module_path} this should not have panicked:\ntried to unwrap `None` in:\nunwrap_msg!({expression})")
-    }
+            Some(t) => t,
+            None => panic!(
+                "{file}:{line} {module_path} this should not have panicked:\ntried to unwrap `None` in:\nunwrap_msg!({expression})"
+            ),
+        }
     }
 }
 
 impl<T, E: Debug> UnwrapLog<T> for Result<T, E> {
     fn unwrap_log(self, file: &str, line: u32, module_path: &str, expression: &str) -> T {
         match self {
-      Ok(t)  => t,
-      Err(e) => panic!("{file}:{line} {module_path} this should not have panicked:\ntried to unwrap Err({e:?}) in\nunwrap_msg!({expression})")
-    }
+            Ok(t) => t,
+            Err(e) => panic!(
+                "{file}:{line} {module_path} this should not have panicked:\ntried to unwrap Err({e:?}) in\nunwrap_msg!({expression})"
+            ),
+        }
     }
 }
 

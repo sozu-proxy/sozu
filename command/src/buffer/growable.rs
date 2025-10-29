@@ -235,8 +235,9 @@ impl Reset for Buffer {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::io::Write;
+
+    use super::*;
 
     #[test]
     fn fill_and_consume() {

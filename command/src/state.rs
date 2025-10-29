@@ -1,7 +1,7 @@
 use std::{
     collections::{
-        btree_map::Entry as BTreeMapEntry, hash_map::DefaultHasher, BTreeMap, BTreeSet, HashMap,
-        HashSet,
+        BTreeMap, BTreeSet, HashMap, HashSet, btree_map::Entry as BTreeMapEntry,
+        hash_map::DefaultHasher,
     },
     fs::File,
     hash::{Hash, Hasher},
@@ -13,20 +13,20 @@ use std::{
 use prost::{Message, UnknownEnumValue};
 
 use crate::{
-    certificate::{calculate_fingerprint, CertificateError, Fingerprint},
+    ObjectKind,
+    certificate::{CertificateError, Fingerprint, calculate_fingerprint},
     proto::{
         command::{
-            request::RequestType, ActivateListener, AddBackend, AddCertificate, CertificateAndKey,
-            Cluster, ClusterInformation, DeactivateListener, FrontendFilters, HttpListenerConfig,
+            ActivateListener, AddBackend, AddCertificate, CertificateAndKey, Cluster,
+            ClusterInformation, DeactivateListener, FrontendFilters, HttpListenerConfig,
             HttpsListenerConfig, InitialState, ListedFrontends, ListenerType, ListenersList,
             PathRule, QueryCertificatesFilters, RemoveBackend, RemoveCertificate, RemoveListener,
             ReplaceCertificate, Request, RequestCounts, RequestHttpFrontend, RequestTcpFrontend,
-            SocketAddress, TcpListenerConfig, WorkerRequest,
+            SocketAddress, TcpListenerConfig, WorkerRequest, request::RequestType,
         },
         display::format_request_type,
     },
     response::{Backend, HttpFrontend, TcpFrontend},
-    ObjectKind,
 };
 
 /// To use throughout Sōzu
@@ -182,7 +182,7 @@ impl ConfigState {
                 return Err(StateError::Exists {
                     kind: ObjectKind::HttpListener,
                     id: address.to_string(),
-                })
+                });
             }
         };
         Ok(())
@@ -196,7 +196,7 @@ impl ConfigState {
                 return Err(StateError::Exists {
                     kind: ObjectKind::HttpsListener,
                     id: address.to_string(),
-                })
+                });
             }
         };
         Ok(())
@@ -210,7 +210,7 @@ impl ConfigState {
                 return Err(StateError::Exists {
                     kind: ObjectKind::TcpListener,
                     id: address.to_string(),
-                })
+                });
             }
         };
         Ok(())
@@ -319,7 +319,7 @@ impl ConfigState {
                 return Err(StateError::Exists {
                     kind: ObjectKind::HttpFrontend,
                     id: front.to_string(),
-                })
+                });
             }
         };
         Ok(())
@@ -341,7 +341,7 @@ impl ConfigState {
                 return Err(StateError::Exists {
                     kind: ObjectKind::HttpsFrontend,
                     id: front.to_string(),
-                })
+                });
             }
         };
         Ok(())
@@ -383,7 +383,9 @@ impl ConfigState {
         if entry.contains_key(&fingerprint) {
             info!(
                 "Skip loading of certificate '{}' for domain '{}' on listener '{}', the certificate is already present.",
-                fingerprint, add.certificate.names.join(", "), add.address
+                fingerprint,
+                add.certificate.names.join(", "),
+                add.address
             );
             return Ok(());
         }
@@ -1387,7 +1389,7 @@ fn domain_check(
         return false;
     }
 
-    if let Some(ref path) = &path_prefix {
+    if let Some(path) = &path_prefix {
         return path == &front_path_rule.value;
     }
 
@@ -1428,13 +1430,8 @@ enum DiffResult {
 
 // this will iterate over the keys of both iterators
 // since keys are sorted, it should be easy to see which ones are in common or not
-impl<
-        'a,
-        K: Ord,
-        V: PartialEq,
-        I1: Iterator<Item = (K, &'a V)>,
-        I2: Iterator<Item = (K, &'a V)>,
-    > std::iter::Iterator for DiffMap<'a, K, V, I1, I2>
+impl<'a, K: Ord, V: PartialEq, I1: Iterator<Item = (K, &'a V)>, I2: Iterator<Item = (K, &'a V)>>
+    std::iter::Iterator for DiffMap<'a, K, V, I1, I2>
 {
     type Item = (K, DiffResult);
 
@@ -1478,7 +1475,7 @@ impl<
 
 #[cfg(test)]
 mod tests {
-    use rand::{rng, seq::SliceRandom, Rng};
+    use rand::{Rng, rng, seq::SliceRandom};
 
     use super::*;
     use crate::proto::command::{

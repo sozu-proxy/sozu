@@ -4,10 +4,11 @@ use std::{
     rc::Rc,
 };
 
-use mio::{net::TcpStream, Token};
+use mio::{Token, net::TcpStream};
 use rusty_ulid::Ulid;
 
 use crate::{
+    BackendConnectionStatus, Protocol, Readiness, SessionMetrics, SessionResult,
     pool::Checkout,
     protocol::{
         pipe::{Pipe, WebSocketContext},
@@ -16,7 +17,6 @@ use crate::{
     socket::SocketHandler,
     sozu_command::ready::Ready,
     tcp::TcpListener,
-    BackendConnectionStatus, Protocol, Readiness, SessionMetrics, SessionResult,
 };
 
 pub struct SendProxyProtocol<Front: SocketHandler> {

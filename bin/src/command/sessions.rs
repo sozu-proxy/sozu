@@ -3,7 +3,6 @@ use std::fmt::Debug;
 use libc::pid_t;
 use mio::Token;
 use prost::Message;
-
 use sozu_command_lib::{
     channel::Channel,
     proto::command::{

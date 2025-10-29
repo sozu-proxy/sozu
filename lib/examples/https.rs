@@ -12,8 +12,8 @@ use sozu_command_lib::{
     config::ListenerBuilder,
     logging::setup_default_logging,
     proto::command::{
-        request::RequestType, AddBackend, AddCertificate, CertificateAndKey, LoadBalancingParams,
-        PathRule, RequestHttpFrontend, SocketAddress, WorkerRequest,
+        AddBackend, AddCertificate, CertificateAndKey, LoadBalancingParams, PathRule,
+        RequestHttpFrontend, SocketAddress, WorkerRequest, request::RequestType,
     },
 };
 

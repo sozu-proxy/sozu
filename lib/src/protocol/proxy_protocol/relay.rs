@@ -1,10 +1,11 @@
 use std::{cell::RefCell, io::Write, rc::Rc};
 
-use mio::{net::TcpStream, Token};
+use mio::{Token, net::TcpStream};
 use nom::{Err, Offset};
 use rusty_ulid::Ulid;
 
 use crate::{
+    Protocol, Readiness, SessionMetrics, SessionResult,
     pool::Checkout,
     protocol::{
         pipe::{Pipe, WebSocketContext},
@@ -13,7 +14,6 @@ use crate::{
     socket::{SocketHandler, SocketResult},
     sozu_command::ready::Ready,
     tcp::TcpListener,
-    Protocol, Readiness, SessionMetrics, SessionResult,
 };
 
 pub struct RelayProxyProtocol<Front: SocketHandler> {
@@ -96,8 +96,10 @@ impl<Front: SocketHandler> RelayProxyProtocol<Front> {
                 }
                 Err(Err::Incomplete(_)) => return SessionResult::Continue,
                 Err(e) => {
-                    error!("[{:?}] error parsing the proxy protocol header(error={:?}), closing the connection",
-            self.frontend_token, e);
+                    error!(
+                        "[{:?}] error parsing the proxy protocol header(error={:?}), closing the connection",
+                        self.frontend_token, e
+                    );
                     return SessionResult::Close;
                 }
             };

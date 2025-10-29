@@ -8,19 +8,17 @@ use std::{
 };
 
 use mio::net::UnixListener;
-
 use sozu_command_lib::{
     config::{Config, ConfigError},
-    logging::{setup_logging_with_config, LogError},
-};
-
-use crate::{
-    cli::Args,
-    command::{requests::load_static_config, server::CommandHub},
-    util::{get_config_file_path, get_executable_path, setup_metrics, write_pid_file, UtilError},
+    logging::{LogError, setup_logging_with_config},
 };
 
 use self::server::{HubError, ServerError};
+use crate::{
+    cli::Args,
+    command::{requests::load_static_config, server::CommandHub},
+    util::{UtilError, get_config_file_path, get_executable_path, setup_metrics, write_pid_file},
+};
 
 #[derive(thiserror::Error, Debug)]
 pub enum StartError {

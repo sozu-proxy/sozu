@@ -5,20 +5,19 @@ use nom::{Err, HexDisplay};
 use rusty_ulid::Ulid;
 use sozu_command::{config::MAX_LOOP_ITERATIONS, logging::LogContext};
 
+use super::{header::ProxyAddr, parser::parse_v2_header};
 use crate::{
+    Protocol, Readiness, SessionMetrics, StateResult,
     pool::Checkout,
     protocol::{
-        pipe::{Pipe, WebSocketContext},
         SessionResult, SessionState,
+        pipe::{Pipe, WebSocketContext},
     },
     socket::{SocketHandler, SocketResult},
     sozu_command::ready::Ready,
     tcp::TcpListener,
     timer::TimeoutContainer,
-    Protocol, Readiness, SessionMetrics, StateResult,
 };
-
-use super::{header::ProxyAddr, parser::parse_v2_header};
 
 #[derive(Clone, Copy)]
 pub enum HeaderLen {
@@ -78,11 +77,7 @@ impl<Front: SocketHandler> ExpectProxyProtocol<Front> {
             .socket_read(&mut self.frontend_buffer[self.index..total_len]);
         trace!(
             "FRONT proxy protocol [{:?}]: read {} bytes and res={:?}, index = {}, total_len = {}",
-            self.frontend_token,
-            sz,
-            socket_result,
-            self.index,
-            total_len
+            self.frontend_token, sz, socket_result, self.index, total_len
         );
 
         if sz > 0 {
@@ -100,7 +95,10 @@ impl<Front: SocketHandler> ExpectProxyProtocol<Front> {
 
         match socket_result {
             SocketResult::Error => {
-                error!("[{:?}] (expect proxy) front socket error, closing the connection(read {}, wrote {})", self.frontend_token, metrics.bin, metrics.bout);
+                error!(
+                    "[{:?}] (expect proxy) front socket error, closing the connection(read {}, wrote {})",
+                    self.frontend_token, metrics.bin, metrics.bout
+                );
                 incr!("proxy_protocol.errors");
                 self.frontend_readiness.reset();
                 return SessionResult::Close;
@@ -148,7 +146,11 @@ impl<Front: SocketHandler> ExpectProxyProtocol<Front> {
                 SessionResult::Continue
             }
             Err(Err::Error(e)) | Err(Err::Failure(e)) => {
-                error!("[{:?}] expect proxy protocol front socket parse error, closing the connection:\n{}", self.frontend_token, e.input.to_hex(16));
+                error!(
+                    "[{:?}] expect proxy protocol front socket parse error, closing the connection:\n{}",
+                    self.frontend_token,
+                    e.input.to_hex(16)
+                );
                 incr!("proxy_protocol.errors");
                 self.frontend_readiness.reset();
                 SessionResult::Close
@@ -301,18 +303,18 @@ impl<Front: SocketHandler> SessionState for ExpectProxyProtocol<Front> {
 
 #[cfg(test)]
 mod expect_test {
-    use super::*;
-    use mio::net::TcpListener;
-    use rusty_ulid::Ulid;
     use std::{
         io::Write,
-        net::TcpStream as StdTcpStream,
-        net::{IpAddr, Ipv4Addr, SocketAddr},
+        net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream as StdTcpStream},
         sync::{Arc, Barrier},
         thread::{self, JoinHandle},
         time::Duration,
     };
 
+    use mio::net::TcpListener;
+    use rusty_ulid::Ulid;
+
+    use super::*;
     use crate::protocol::proxy_protocol::header::*;
 
     // Flow diagram of the test below

@@ -1,6 +1,6 @@
 use std::{
     ffi::OsString,
-    fs::{read_link, File},
+    fs::{File, read_link},
     io::{Error as IoError, Write},
     os::{
         fd::{FromRawFd, OwnedFd},
@@ -9,18 +9,16 @@ use std::{
     path::PathBuf,
 };
 
+#[cfg(target_os = "linux")]
+use libc::{cpu_set_t, pid_t};
 use nix::{
     errno::Errno,
-    fcntl::{fcntl, FcntlArg, FdFlag},
+    fcntl::{FcntlArg, FdFlag, fcntl},
 };
-
 use sozu_command_lib::config::Config;
 use sozu_lib::metrics::{self, MetricError};
 
 use crate::{cli, command};
-
-#[cfg(target_os = "linux")]
-use libc::{cpu_set_t, pid_t};
 
 #[derive(thiserror::Error, Debug)]
 pub enum UtilError {

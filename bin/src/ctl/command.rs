@@ -3,12 +3,12 @@ use std::time::Duration;
 use sozu_command_lib::{
     logging::setup_logging_with_config,
     proto::command::{
-        request::RequestType, response_content::ContentType, ListWorkers, QueryMetricsOptions,
-        Request, Response, ResponseContent, ResponseStatus, UpgradeMain,
+        ListWorkers, QueryMetricsOptions, Request, Response, ResponseContent, ResponseStatus,
+        UpgradeMain, request::RequestType, response_content::ContentType,
     },
 };
 
-use crate::ctl::{create_channel, CommandManager, CtlError};
+use crate::ctl::{CommandManager, CtlError, create_channel};
 
 impl CommandManager {
     fn write_request_on_channel(&mut self, request: Request) -> Result<(), CtlError> {

@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::{hash_map::Entry, BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, hash_map::Entry},
     io::ErrorKind,
     net::{Shutdown, SocketAddr as StdSocketAddr},
     os::unix::io::AsRawFd,
@@ -11,37 +11,36 @@ use std::{
 };
 
 use mio::{
+    Interest, Registry, Token,
     net::{TcpListener as MioTcpListener, TcpStream as MioTcpStream},
     unix::SourceFd,
-    Interest, Registry, Token,
 };
 use rustls::{
+    CipherSuite, ProtocolVersion, ServerConfig as RustlsServerConfig, ServerConnection,
+    SupportedCipherSuite,
     crypto::{
+        CryptoProvider,
         ring::{
             self,
             cipher_suite::{
-                TLS13_AES_128_GCM_SHA256, TLS13_AES_256_GCM_SHA384, TLS13_CHACHA20_POLY1305_SHA256,
                 TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
                 TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
                 TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256, TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-                TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+                TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256, TLS13_AES_128_GCM_SHA256,
+                TLS13_AES_256_GCM_SHA384, TLS13_CHACHA20_POLY1305_SHA256,
             },
         },
-        CryptoProvider,
     },
-    CipherSuite, ProtocolVersion, ServerConfig as RustlsServerConfig, ServerConnection,
-    SupportedCipherSuite,
 };
 use rusty_ulid::Ulid;
-
 use sozu_command::{
     certificate::Fingerprint,
     config::DEFAULT_CIPHER_SUITES,
     proto::command::{
-        request::RequestType, response_content::ContentType, AddCertificate, CertificateSummary,
-        CertificatesByAddress, Cluster, HttpsListenerConfig, ListOfCertificatesByAddress,
-        ListenerType, RemoveCertificate, RemoveListener, ReplaceCertificate, RequestHttpFrontend,
-        ResponseContent, TlsVersion, WorkerRequest, WorkerResponse,
+        AddCertificate, CertificateSummary, CertificatesByAddress, Cluster, HttpsListenerConfig,
+        ListOfCertificatesByAddress, ListenerType, RemoveCertificate, RemoveListener,
+        ReplaceCertificate, RequestHttpFrontend, ResponseContent, TlsVersion, WorkerRequest,
+        WorkerResponse, request::RequestType, response_content::ContentType,
     },
     ready::Ready,
     response::HttpFrontend,
@@ -49,28 +48,28 @@ use sozu_command::{
 };
 
 use crate::{
-    backends::BackendMap,
-    pool::Pool,
-    protocol::{
-        h2::Http2,
-        http::{
-            answers::HttpAnswers,
-            parser::{hostname_and_port, Method},
-            ResponseStream,
-        },
-        proxy_protocol::expect::ExpectProxyProtocol,
-        rustls::TlsHandshake,
-        Http, Pipe, SessionState,
-    },
-    router::{Route, Router},
-    server::{ListenToken, SessionManager},
-    socket::{server_bind, FrontRustls},
-    timer::TimeoutContainer,
-    tls::MutexCertificateResolver,
-    util::UnwrapLog,
     AcceptError, CachedTags, FrontendFromRequestError, L7ListenerHandler, L7Proxy, ListenerError,
     ListenerHandler, Protocol, ProxyConfiguration, ProxyError, ProxySession, SessionIsToBeClosed,
     SessionMetrics, SessionResult, StateMachineBuilder, StateResult,
+    backends::BackendMap,
+    pool::Pool,
+    protocol::{
+        Http, Pipe, SessionState,
+        h2::Http2,
+        http::{
+            ResponseStream,
+            answers::HttpAnswers,
+            parser::{Method, hostname_and_port},
+        },
+        proxy_protocol::expect::ExpectProxyProtocol,
+        rustls::TlsHandshake,
+    },
+    router::{Route, Router},
+    server::{ListenToken, SessionManager},
+    socket::{FrontRustls, server_bind},
+    timer::TimeoutContainer,
+    tls::MutexCertificateResolver,
+    util::UnwrapLog,
 };
 
 // const SERVER_PROTOS: &[&str] = &["http/1.1", "h2"];
@@ -245,7 +244,9 @@ impl HttpsSession {
 
         // currently, only happens in expect proxy protocol with AF_UNSPEC address
         if !expect.container_frontend_timeout.cancel() {
-            error!("failed to cancel request timeout on expect upgrade phase for 'expect proxy protocol with AF_UNSPEC address'");
+            error!(
+                "failed to cancel request timeout on expect upgrade phase for 'expect proxy protocol with AF_UNSPEC address'"
+            );
         }
 
         None
@@ -341,7 +342,10 @@ impl HttpsSession {
             None => {
                 warn!(
                     "Could not upgrade https request on cluster '{:?}' ({:?}) using backend '{:?}' into secure websocket for request '{}'",
-                    http.context.cluster_id, self.frontend_token, http.context.backend_id, http.context.id
+                    http.context.cluster_id,
+                    self.frontend_token,
+                    http.context.backend_id,
+                    http.context.id
                 );
                 return None;
             }
@@ -1500,8 +1504,6 @@ pub mod testing {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use std::sync::Arc;
 
     use sozu_command::{
@@ -1509,7 +1511,8 @@ mod tests {
         proto::command::{CustomHttpAnswers, SocketAddress},
     };
 
-    use crate::router::{pattern_trie::TrieNode, MethodRule, PathRule, Route, Router};
+    use super::*;
+    use crate::router::{MethodRule, PathRule, Route, Router, pattern_trie::TrieNode};
 
     /*
     #[test]

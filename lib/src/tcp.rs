@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::{hash_map::Entry, BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, hash_map::Entry},
     io::ErrorKind,
     net::{Shutdown, SocketAddr},
     os::unix::io::AsRawFd,
@@ -9,30 +9,33 @@ use std::{
 };
 
 use mio::{
-    net::TcpListener as MioTcpListener, net::TcpStream as MioTcpStream, unix::SourceFd, Interest,
-    Registry, Token,
+    Interest, Registry, Token,
+    net::{TcpListener as MioTcpListener, TcpStream as MioTcpStream},
+    unix::SourceFd,
 };
 use rusty_ulid::Ulid;
-
 use sozu_command::{
+    ObjectKind,
     config::MAX_LOOP_ITERATIONS,
     logging::{EndpointRecord, LogContext},
     proto::command::request::RequestType,
-    ObjectKind,
 };
 
 use crate::{
+    AcceptError, BackendConnectAction, BackendConnectionError, BackendConnectionStatus, CachedTags,
+    ListenerError, ListenerHandler, Protocol, ProxyConfiguration, ProxyError, ProxySession,
+    Readiness, SessionIsToBeClosed, SessionMetrics, SessionResult, StateMachineBuilder,
     backends::{Backend, BackendMap},
     pool::{Checkout, Pool},
     protocol::{
+        Pipe,
         pipe::WebSocketContext,
         proxy_protocol::{
             expect::ExpectProxyProtocol, relay::RelayProxyProtocol, send::SendProxyProtocol,
         },
-        Pipe,
     },
     retry::RetryPolicy,
-    server::{push_event, ListenToken, SessionManager, CONN_RETRIES},
+    server::{CONN_RETRIES, ListenToken, SessionManager, push_event},
     socket::{server_bind, stats::socket_rtt},
     sozu_command::{
         proto::command::{
@@ -43,9 +46,6 @@ use crate::{
         state::ClusterId,
     },
     timer::TimeoutContainer,
-    AcceptError, BackendConnectAction, BackendConnectionError, BackendConnectionStatus, CachedTags,
-    ListenerError, ListenerHandler, Protocol, ProxyConfiguration, ProxyError, ProxySession,
-    Readiness, SessionIsToBeClosed, SessionMetrics, SessionResult, StateMachineBuilder,
 };
 
 StateMachineBuilder! {
@@ -748,7 +748,8 @@ impl TcpSession {
         if counter >= MAX_LOOP_ITERATIONS {
             error!(
                 "{} Handling session went through {} iterations, there's a probable infinite loop bug, closing the connection",
-                log_context!(self), MAX_LOOP_ITERATIONS
+                log_context!(self),
+                MAX_LOOP_ITERATIONS
             );
 
             incr!("tcp.infinite_loop.error");
@@ -1577,17 +1578,13 @@ pub mod testing {
 
 #[cfg(test)]
 mod tests {
-    use super::testing::start_tcp_worker;
-    use crate::testing::*;
-
-    use sozu_command::proto::command::SocketAddress;
     use std::{
         io::{Read, Write},
         net::{Shutdown, TcpListener, TcpStream},
         str,
         sync::{
-            atomic::{AtomicBool, Ordering},
             Arc, Barrier,
+            atomic::{AtomicBool, Ordering},
         },
         thread,
     };
@@ -1596,10 +1593,13 @@ mod tests {
         channel::Channel,
         config::ListenerBuilder,
         proto::command::{
-            request::RequestType, LoadBalancingParams, RequestTcpFrontend, WorkerRequest,
-            WorkerResponse,
+            LoadBalancingParams, RequestTcpFrontend, SocketAddress, WorkerRequest, WorkerResponse,
+            request::RequestType,
         },
     };
+
+    use super::testing::start_tcp_worker;
+    use crate::testing::*;
     static TEST_FINISHED: AtomicBool = AtomicBool::new(false);
 
     /*

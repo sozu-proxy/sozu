@@ -49,7 +49,7 @@ impl Feature {
     }
 
     pub fn is_string(&self, s: &str) -> bool {
-        if let Feature::String(ref s1) = self {
+        if let Feature::String(s1) = self {
             s1 == s
         } else {
             false

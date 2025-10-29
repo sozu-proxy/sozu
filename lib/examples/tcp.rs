@@ -10,8 +10,8 @@ use sozu_command_lib::{
     channel::Channel,
     logging::setup_default_logging,
     proto::command::{
-        request::RequestType, AddBackend, LoadBalancingParams, RequestTcpFrontend, SocketAddress,
-        TcpListenerConfig, WorkerRequest,
+        AddBackend, LoadBalancingParams, RequestTcpFrontend, SocketAddress, TcpListenerConfig,
+        WorkerRequest, request::RequestType,
     },
 };
 

@@ -2,38 +2,36 @@
 use std::{ffi::c_void, iter::repeat, mem::size_of};
 use std::{
     fs::File,
-    io::Error as IoError,
-    io::Seek,
+    io::{Error as IoError, Seek},
     net::SocketAddr,
-    os::unix::io::{AsRawFd, FromRawFd, IntoRawFd},
-    os::unix::process::CommandExt,
+    os::unix::{
+        io::{AsRawFd, FromRawFd, IntoRawFd},
+        process::CommandExt,
+    },
     process::Command,
 };
 
 use libc::pid_t;
-
 use mio::net::UnixStream;
 use nix::{
     errno::Errno,
-    unistd::{fork, ForkResult},
+    unistd::{ForkResult, fork},
 };
-use tempfile::tempfile;
-
 use sozu_command_lib::{
     channel::{Channel, ChannelError},
     config::Config,
-    logging::{setup_logging, AccessLogFormat, LogError},
+    logging::{AccessLogFormat, LogError, setup_logging},
     proto::command::{ServerConfig, WorkerRequest, WorkerResponse},
     ready::Ready,
-    request::{read_initial_state_from_file, RequestError},
+    request::{RequestError, read_initial_state_from_file},
     scm_socket::{Listeners, ScmSocket, ScmSocketError},
     state::{ConfigState, StateError},
 };
-
 use sozu_lib::{
     metrics::{self, MetricError},
     server::{Server, ServerError as LibServerError},
 };
+use tempfile::tempfile;
 
 use crate::util::{self, UtilError};
 
@@ -126,8 +124,7 @@ pub fn begin_worker_process(
 
     trace!(
         "Creating worker {} with config: {:#?}",
-        worker_id,
-        worker_config
+        worker_id, worker_config
     );
     info!("worker {} starting...", id);
 

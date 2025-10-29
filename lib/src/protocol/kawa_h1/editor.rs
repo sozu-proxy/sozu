@@ -1,13 +1,15 @@
-use crate::{
-    pool::Checkout,
-    protocol::http::{parser::compare_no_case, GenericHttpStream, Method},
-    Protocol,
-};
-use rusty_ulid::Ulid;
-use sozu_command_lib::logging::LogContext;
 use std::{
     net::{IpAddr, SocketAddr},
     str::{from_utf8, from_utf8_unchecked},
+};
+
+use rusty_ulid::Ulid;
+use sozu_command_lib::logging::LogContext;
+
+use crate::{
+    Protocol,
+    pool::Checkout,
+    protocol::http::{GenericHttpStream, Method, parser::compare_no_case},
 };
 
 #[cfg(feature = "opentelemetry")]
