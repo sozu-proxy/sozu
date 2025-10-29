@@ -63,10 +63,10 @@ tiny_http = { workspace = true }
 default = ["simd"]
 logs-debug = []
 logs-trace = []
+opentelemetry = []
 simd = ["kawa/simd"]
 splice = []
 tolerant-http1-parser = ["kawa/tolerant-parsing"]
-unstable = []
 
 [badges]
 travis-ci = { repository = "sozu-proxy/sozu" }

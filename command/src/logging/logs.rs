@@ -276,7 +276,7 @@ impl InnerLogger {
                     log.tag,
                 ],
                 standard: {
-                    formats: ["{} {} {} {}/{}/{}/{}/{} {} {} [{}] {} {}{}\n"],
+                    formats: ["{} {} {} {}/{}/{}/{}/{} {} {} [{}] {:?} {} {}{}\n"],
                     args: [
                         log.context,
                         log.session_address.as_string_or("-"),
@@ -289,13 +289,14 @@ impl InnerLogger {
                         log.bytes_in,
                         log.bytes_out,
                         log.full_tags(),
+                        log.otel,
                         log.protocol,
                         log.endpoint,
                         LogMessage(log.message),
                     ]
                 },
                 colored: {
-                    formats: ["\x1b[;1m{}\x1b[m {} {} {}/{}/{}/{}/{} {} {} \x1b[2m[{}] \x1b[;1m{} {:#}\x1b[m{}\n"],
+                    formats: ["\x1b[;1m{}\x1b[m {} {} {}/{}/{}/{}/{} {} {} \x1b[2m[{}] {:?} \x1b[;1m{} {:#}\x1b[m{}\n"],
                     args: @,
                 }
             },

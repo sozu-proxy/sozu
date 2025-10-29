@@ -753,6 +753,12 @@ message InitialState {
     repeated WorkerRequest requests = 1;
 }
 
+message OpenTelemetry {
+    required string trace_id = 1;
+    required string span_id = 2;
+    optional string parent_span_id = 3;
+}
+
 // An access log, meant to be passed to another agent
 message ProtobufAccessLog {
     // error message if any
@@ -795,6 +801,8 @@ message ProtobufAccessLog {
     optional uint64 request_time = 20;
     // time for the backend to respond (microseconds)
     optional uint64 response_time = 21;
+    // OpenTelemetry tracing information
+    optional OpenTelemetry otel = 22;
 }
 
 message ProtobufEndpoint {

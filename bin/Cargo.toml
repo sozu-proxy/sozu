@@ -53,6 +53,7 @@ default = ["jemallocator"]
 unstable = []
 logs-debug = ["sozu-lib/logs-debug", "sozu-command-lib/logs-debug"]
 logs-trace = ["sozu-lib/logs-trace", "sozu-command-lib/logs-trace"]
+opentelemetry = ["sozu-lib/opentelemetry"]
 tolerant-http1-parser = ["sozu-lib/tolerant-http1-parser"]
 
 [badges]

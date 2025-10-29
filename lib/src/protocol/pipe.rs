@@ -253,7 +253,8 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             request_time: metrics.request_time(),
             bytes_in: metrics.bin,
             bytes_out: metrics.bout,
-            user_agent: None
+            user_agent: None,
+            otel: None,
         );
     }
 

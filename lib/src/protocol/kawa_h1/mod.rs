@@ -241,28 +241,13 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 kawa::Kind::Response,
                 kawa::Buffer::new(back_buffer),
             )),
-            context: HttpContext {
-                id: request_id,
-                backend_id: None,
-                cluster_id: None,
-
-                closing: false,
-                keep_alive_backend: true,
-                keep_alive_frontend: true,
+            context: HttpContext::new(
+                request_id,
                 protocol,
                 public_address,
                 session_address,
                 sticky_name,
-                sticky_session: None,
-                sticky_session_found: None,
-
-                method: None,
-                authority: None,
-                path: None,
-                status: None,
-                reason: None,
-                user_agent: None,
-            },
+            ),
         })
     }
 
@@ -944,7 +929,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         log_access! {
             error,
             on_failure: { incr!("unsent-access-logs") },
-            message: message,
+            message,
             context,
             session_address: self.get_session_address(),
             backend_address: self.get_backend_address(),
@@ -959,6 +944,10 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             bytes_in: metrics.bin,
             bytes_out: metrics.bout,
             user_agent: self.context.user_agent.as_deref(),
+            #[cfg(feature = "opentelemetry")]
+            otel: self.context.otel.as_ref(),
+            #[cfg(not(feature = "opentelemetry"))]
+            otel: None,
         };
     }
 
@@ -1208,6 +1197,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         metrics.backend_id = self.backend.as_ref().map(|i| i.borrow().backend_id.clone());
 
         metrics.backend_start();
+        metrics.backend_connected();
         if let Some(b) = self.backend.as_mut() {
             b.borrow_mut().active_requests += 1;
         }
