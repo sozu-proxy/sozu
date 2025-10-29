@@ -9,13 +9,12 @@ use std::{cell::RefCell, rc::Rc};
 use mio::Token;
 use sozu_command::ready::Ready;
 
-use crate::{
-    L7Proxy, ProxySession, SessionIsToBeClosed, SessionMetrics, SessionResult, StateResult,
-};
-
 pub use crate::protocol::{
     http::Http, kawa_h1 as http, pipe::Pipe, proxy_protocol::send::SendProxyProtocol,
     rustls::TlsHandshake,
+};
+use crate::{
+    L7Proxy, ProxySession, SessionIsToBeClosed, SessionMetrics, SessionResult, StateResult,
 };
 
 /// All States should satisfy this trait in order to receive and handle Session events

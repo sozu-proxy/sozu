@@ -1,7 +1,6 @@
 use std::{collections::BTreeMap, net::SocketAddr};
 
 use clap::{Parser, Subcommand};
-
 use sozu_command_lib::{
     proto::command::{LoadBalancingAlgorithms, TlsVersion},
     state::ClusterId as StateClusterId,

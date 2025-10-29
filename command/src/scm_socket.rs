@@ -245,19 +245,19 @@ impl Listeners {
 
     /// Deactivate all listeners by closing their file descriptors
     pub fn close(&self) {
-        for (_, ref fd) in &self.http {
+        for (_, fd) in &self.http {
             unsafe {
                 let _ = TcpListener::from_raw_fd(*fd);
             }
         }
 
-        for (_, ref fd) in &self.tls {
+        for (_, fd) in &self.tls {
             unsafe {
                 let _ = TcpListener::from_raw_fd(*fd);
             }
         }
 
-        for (_, ref fd) in &self.tcp {
+        for (_, fd) in &self.tcp {
             unsafe {
                 let _ = TcpListener::from_raw_fd(*fd);
             }
@@ -281,9 +281,11 @@ fn parse_addresses(addresses: &[String]) -> Result<Vec<SocketAddr>, ScmSocketErr
 #[cfg(test)]
 mod tests {
 
-    use super::*;
-    use mio::net::UnixStream as MioUnixStream;
     use std::{net::SocketAddr, os::unix::prelude::AsRawFd, str::FromStr};
+
+    use mio::net::UnixStream as MioUnixStream;
+
+    use super::*;
 
     #[test]
     fn create_block_unblock_an_scm_socket() {

@@ -6,16 +6,16 @@ use sozu_command_lib::{
     },
     config::ListenerBuilder,
     proto::command::{
-        request::RequestType, ActivateListener, AddBackend, AddCertificate, Cluster, CountRequests,
-        DeactivateListener, FrontendFilters, HardStop, ListListeners, ListenerType,
-        LoadBalancingParams, MetricsConfiguration, PathRule, ProxyProtocolConfig,
-        QueryCertificatesFilters, QueryClusterByDomain, QueryClustersHashes, RemoveBackend,
-        RemoveCertificate, RemoveListener, ReplaceCertificate, RequestHttpFrontend,
-        RequestTcpFrontend, RulePosition, SocketAddress, SoftStop, Status, SubscribeEvents,
-        TlsVersion,
+        ActivateListener, AddBackend, AddCertificate, Cluster, CountRequests, DeactivateListener,
+        FrontendFilters, HardStop, ListListeners, ListenerType, LoadBalancingParams,
+        MetricsConfiguration, PathRule, ProxyProtocolConfig, QueryCertificatesFilters,
+        QueryClusterByDomain, QueryClustersHashes, RemoveBackend, RemoveCertificate,
+        RemoveListener, ReplaceCertificate, RequestHttpFrontend, RequestTcpFrontend, RulePosition,
+        SocketAddress, SoftStop, Status, SubscribeEvents, TlsVersion, request::RequestType,
     },
 };
 
+use super::CtlError;
 use crate::{
     cli::{
         BackendCmd, ClusterCmd, HttpFrontendCmd, HttpListenerCmd, HttpsListenerCmd, MetricsCmd,
@@ -23,8 +23,6 @@ use crate::{
     },
     ctl::CommandManager,
 };
-
-use super::CtlError;
 
 impl CommandManager {
     pub fn save_state(&mut self, path: String) -> Result<(), CtlError> {
@@ -537,7 +535,7 @@ impl CommandManager {
                 return Err(CtlError::ArgsNeeded(
                     "the path to the old certificate".to_string(),
                     "the path to the old fingerprint".to_string(),
-                ))
+                ));
             }
             (Some(old_certificate_path), None) => {
                 get_fingerprint_from_certificate_path(old_certificate_path)
@@ -581,7 +579,7 @@ impl CommandManager {
                 return Err(CtlError::ArgsNeeded(
                     "the path to the certificate".to_string(),
                     "the fingerprint of the certificate".to_string(),
-                ))
+                ));
             }
             (Some(certificate_path), None) => {
                 get_fingerprint_from_certificate_path(certificate_path)

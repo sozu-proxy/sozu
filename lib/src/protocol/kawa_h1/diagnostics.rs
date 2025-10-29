@@ -66,9 +66,7 @@ pub fn diagnostic_400_502(
                 ParsingPhaseMarker::Body
                 | ParsingPhaseMarker::Chunks
                 | ParsingPhaseMarker::Terminated
-                | ParsingPhaseMarker::Error => {
-                    "The parser stopped in an unexpected phase.".into()
-                }
+                | ParsingPhaseMarker::Error => "The parser stopped in an unexpected phase.".into(),
             };
             let buffer = kawa.storage.buffer();
             let successfully_parsed = hex_dump(buffer, 32, kawa.storage.start, kawa.storage.head);
@@ -77,7 +75,9 @@ pub fn diagnostic_400_502(
             (message, successfully_parsed, partially_parsed, invalid)
         }
         ParsingErrorKind::Processing { message } => (
-            format!("The request is correctly structured but presents inconsistent or invalid values: {message}."),
+            format!(
+                "The request is correctly structured but presents inconsistent or invalid values: {message}."
+            ),
             "null".into(),
             "null".into(),
             "null".into(),

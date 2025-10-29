@@ -12,7 +12,6 @@ use std::{
 };
 
 use mio::net::UdpSocket;
-
 use sozu_command::proto::command::{
     FilteredMetrics, MetricsConfiguration, QueryMetricsOptions, ResponseContent,
 };

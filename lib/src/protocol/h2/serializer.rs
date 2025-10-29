@@ -1,8 +1,8 @@
 use cookie_factory::{
-    bytes::{be_u24, be_u32, be_u8},
-    gen,
-    sequence::tuple,
     GenError,
+    bytes::{be_u8, be_u24, be_u32},
+    r#gen,
+    sequence::tuple,
 };
 
 use crate::protocol::h2::parser::{FrameHeader, FrameType};
@@ -18,7 +18,7 @@ pub fn gen_frame_header<'a, 'b>(
         be_u32(frame.stream_id),
     ));
 
-    gen(serializer, x.0).map(|(buf, sz)| (buf, sz as usize))
+    r#gen(serializer, x.0).map(|(buf, sz)| (buf, sz as usize))
 }
 
 pub fn serialize_frame_type(f: &FrameType) -> u8 {

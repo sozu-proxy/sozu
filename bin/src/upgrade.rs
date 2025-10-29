@@ -1,9 +1,10 @@
 use std::{
     fs::File,
-    io::{Error as IoError, Write},
-    io::{Read, Seek},
-    os::unix::io::{AsRawFd, FromRawFd},
-    os::unix::process::CommandExt,
+    io::{Error as IoError, Read, Seek, Write},
+    os::unix::{
+        io::{AsRawFd, FromRawFd},
+        process::CommandExt,
+    },
     process::Command,
 };
 
@@ -11,15 +12,14 @@ use libc::pid_t;
 use mio::net::UnixStream;
 use nix::{
     errno::Errno,
-    unistd::{fork, ForkResult},
+    unistd::{ForkResult, fork},
 };
 use serde_json::Error as SerdeError;
-use tempfile::tempfile;
-
 use sozu_command_lib::{
     channel::{Channel, ChannelError},
-    logging::{setup_logging_with_config, LogError},
+    logging::{LogError, setup_logging_with_config},
 };
+use tempfile::tempfile;
 
 use crate::{
     command::{
@@ -63,7 +63,9 @@ pub enum UpgradeError {
         result: String,
         channel_err: ChannelError,
     },
-    #[error("Could not block the fork confirmation channel: {0}. This is not normal, you may need to restart sozu")]
+    #[error(
+        "Could not block the fork confirmation channel: {0}. This is not normal, you may need to restart sozu"
+    )]
     BlockChannel(ChannelError),
     #[error("could not create a command hub from the upgrade data: {0}")]
     CreateHub(HubError),

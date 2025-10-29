@@ -3,7 +3,7 @@ use std::{
     cmp, env,
     fmt::Arguments,
     fs::{File, OpenOptions},
-    io::{stdout, Error as IoError, ErrorKind as IoErrorKind, Stdout, Write},
+    io::{Error as IoError, ErrorKind as IoErrorKind, Stdout, Write, stdout},
     net::{SocketAddr, TcpStream, UdpSocket},
     ops::{Deref, DerefMut},
     path::Path,
@@ -11,14 +11,14 @@ use std::{
 };
 
 use mio::net::UnixDatagram;
-use prost::{encoding::encoded_len_varint, Message};
+use prost::{Message, encoding::encoded_len_varint};
 
 use crate::{
+    AsString,
     config::{Config, DEFAULT_LOG_TARGET},
     logging::{LogDuration, LogError, LogMessage, RequestRecord},
     proto::command::ProtobufAccessLogFormat,
     writer::MultiLineWriter,
-    AsString,
 };
 
 thread_local! {

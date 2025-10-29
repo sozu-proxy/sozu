@@ -10,8 +10,7 @@ pub mod logs;
 
 use std::net::AddrParseError;
 
-pub use crate::logging::access_logs::*;
-pub use crate::logging::logs::*;
+pub use crate::logging::{access_logs::*, logs::*};
 
 #[derive(thiserror::Error, Debug)]
 pub enum LogError {

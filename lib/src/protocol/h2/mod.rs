@@ -6,11 +6,10 @@ use mio::{net::TcpStream, *};
 use rusty_ulid::Ulid;
 
 use crate::{
+    Protocol, Readiness, SessionMetrics, StateResult,
     pool::{Checkout, Pool},
     socket::{SocketHandler, SocketResult},
-    sozu_command::buffer::fixed::Buffer,
-    sozu_command::ready::Ready,
-    {Protocol, Readiness, SessionMetrics, StateResult},
+    sozu_command::{buffer::fixed::Buffer, ready::Ready},
 };
 
 mod parser;
@@ -236,7 +235,7 @@ impl<Front: SocketHandler> Http2<Front> {
 
         let mut state = self.state.take().unwrap();
         //FIXME: do that in a loop until no more frames or WouldBlock
-        match state.gen(self.frontend.write_buffer.space()) {
+        match state.r#gen(self.frontend.write_buffer.space()) {
             Ok(sz) => {
                 self.frontend.write_buffer.fill(sz);
                 //FIXME: use real condition here to indicate there was nothing to write

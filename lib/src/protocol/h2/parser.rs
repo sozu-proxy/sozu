@@ -1,13 +1,13 @@
 use std::convert::From;
 
 use nom::{
+    Err, HexDisplay, IResult, Offset,
     bytes::streaming::{tag, take},
     combinator::{complete, map, map_opt},
     error::{ErrorKind, ParseError},
     multi::many0,
-    number::streaming::{be_u16, be_u24, be_u32, be_u8},
+    number::streaming::{be_u8, be_u16, be_u24, be_u32},
     sequence::tuple,
-    Err, HexDisplay, IResult, Offset,
 };
 
 #[derive(Clone, Debug, PartialEq)]

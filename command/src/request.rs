@@ -13,9 +13,9 @@ use rusty_ulid::Ulid;
 use crate::{
     proto::{
         command::{
-            ip_address, request::RequestType, InitialState, IpAddress, LoadBalancingAlgorithms,
-            PathRuleKind, Request, RequestHttpFrontend, RulePosition, SocketAddress, Uint128,
-            WorkerRequest,
+            InitialState, IpAddress, LoadBalancingAlgorithms, PathRuleKind, Request,
+            RequestHttpFrontend, RulePosition, SocketAddress, Uint128, WorkerRequest, ip_address,
+            request::RequestType,
         },
         display::format_request_type,
     },

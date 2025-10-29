@@ -1,14 +1,16 @@
-use crate::{protocol::http::DefaultAnswer, sozu_command::state::ClusterId};
-use kawa::{
-    h1::NoCallbacks, AsBuffer, Block, BodySize, Buffer, Chunk, Kawa, Kind, Pair, ParsingPhase,
-    ParsingPhaseMarker, StatusLine, Store,
-};
-use sozu_command::proto::command::CustomHttpAnswers;
 use std::{
     collections::{HashMap, VecDeque},
     fmt,
     rc::Rc,
 };
+
+use kawa::{
+    AsBuffer, Block, BodySize, Buffer, Chunk, Kawa, Kind, Pair, ParsingPhase, ParsingPhaseMarker,
+    StatusLine, Store, h1::NoCallbacks,
+};
+use sozu_command::proto::command::CustomHttpAnswers;
+
+use crate::{protocol::http::DefaultAnswer, sozu_command::state::ClusterId};
 
 #[derive(Clone)]
 pub struct SharedBuffer(Rc<[u8]>);

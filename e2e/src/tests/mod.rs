@@ -15,6 +15,7 @@ use sozu_command_lib::{
     state::ConfigState,
 };
 
+use self::tests::create_local_address;
 use crate::{
     http_utils::http_ok_response,
     mock::{
@@ -23,8 +24,6 @@ use crate::{
     },
     sozu::worker::Worker,
 };
-
-use self::tests::create_local_address;
 
 #[derive(PartialEq, Eq, Debug)]
 pub enum State {

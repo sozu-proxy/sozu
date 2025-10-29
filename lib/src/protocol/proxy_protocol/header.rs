@@ -328,8 +328,9 @@ fn u16_to_array_of_u8(x: u16) -> [u8; 2] {
 #[cfg(test)]
 mod test_v2 {
 
-    use super::*;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    use super::*;
 
     #[test]
     fn test_u16_to_array_of_u8() {

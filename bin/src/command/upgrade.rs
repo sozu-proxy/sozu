@@ -3,16 +3,16 @@ use std::os::fd::AsRawFd;
 use libc::pid_t;
 use mio::Token;
 use serde::{Deserialize, Serialize};
-
 use sozu_command_lib::{
     config::Config,
     proto::command::{
-        request::RequestType, ResponseStatus, ReturnListenSockets, RunState, SoftStop,
-        WorkerResponse,
+        ResponseStatus, ReturnListenSockets, RunState, SoftStop, WorkerResponse,
+        request::RequestType,
     },
     state::ConfigState,
 };
 
+use super::sessions::WorkerSession;
 use crate::{
     command::{
         server::{
@@ -21,11 +21,9 @@ use crate::{
         },
         sessions::{ClientSession, OptionalClient},
     },
-    upgrade::{fork_main_into_new_main, UpgradeError},
+    upgrade::{UpgradeError, fork_main_into_new_main},
     util::disable_close_on_exec,
 };
-
-use super::sessions::WorkerSession;
 
 #[derive(Debug)]
 enum UpgradeWorkerProgress {
@@ -133,7 +131,7 @@ impl UpgradeWorkerTask {
         let new_worker = match server.launch_new_worker(Some(listeners)) {
             Ok(worker) => worker,
             Err(worker_err) => {
-                return client.finish_failure(format!("could not launch new worker: {worker_err}"))
+                return client.finish_failure(format!("could not launch new worker: {worker_err}"));
             }
         };
         client.return_processing(format!("Launched a new worker with id {}", new_worker.id));

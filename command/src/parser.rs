@@ -1,11 +1,11 @@
 use nom::{
+    IResult,
     bytes::streaming::is_not,
     character::complete::char,
     combinator::map_res,
     error::{ErrorKind, FromExternalError},
     multi::many0,
     sequence::terminated,
-    IResult,
 };
 
 #[derive(Debug)]
@@ -68,8 +68,7 @@ where
 #[cfg(test)]
 mod test {
     use super::*;
-
-    use crate::proto::command::{request::RequestType, Status, SubscribeEvents, WorkerRequest};
+    use crate::proto::command::{Status, SubscribeEvents, WorkerRequest, request::RequestType};
 
     #[test]
     fn parse_one_worker_request() {

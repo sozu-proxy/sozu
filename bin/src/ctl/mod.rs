@@ -7,16 +7,16 @@ use sozu_command_lib::{
     certificate::CertificateError,
     channel::{Channel, ChannelError},
     config::{Config, ConfigError},
-    logging::{setup_logging_with_config, LogError},
+    logging::{LogError, setup_logging_with_config},
     proto::{
-        command::{Request, Response},
         DisplayError,
+        command::{Request, Response},
     },
 };
 
 use crate::{
     cli::{self, *},
-    util::{get_config_file_path, UtilError},
+    util::{UtilError, get_config_file_path},
 };
 
 #[derive(thiserror::Error, Debug)]

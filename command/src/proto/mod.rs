@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use command::{
-    filtered_metrics::Inner, AggregatedMetrics, BackendMetrics, Bucket, FilteredHistogram,
-    FilteredMetrics,
+    AggregatedMetrics, BackendMetrics, Bucket, FilteredHistogram, FilteredMetrics,
+    filtered_metrics::Inner,
 };
 use prost::UnknownEnumValue;
 
@@ -166,7 +166,7 @@ impl FilteredMetrics {
 
 #[cfg(test)]
 mod tests {
-    use super::command::{filtered_metrics::Inner, Bucket, FilteredHistogram, FilteredMetrics};
+    use super::command::{Bucket, FilteredHistogram, FilteredMetrics, filtered_metrics::Inner};
 
     #[test]
     fn merge_counts_and_gauges() {

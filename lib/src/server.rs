@@ -9,21 +9,20 @@ use std::{
 };
 
 use mio::{
-    net::{TcpListener as MioTcpListener, TcpStream},
     Events, Interest, Poll, Token,
+    net::{TcpListener as MioTcpListener, TcpStream},
 };
 use slab::Slab;
-
 use sozu_command::{
     channel::Channel,
     logging,
     proto::command::{
-        request::RequestType, response_content::ContentType, ActivateListener, AddBackend,
-        CertificatesWithFingerprints, Cluster, ClusterHashes, ClusterInformations,
-        DeactivateListener, Event, HttpListenerConfig, HttpsListenerConfig, InitialState,
-        ListenerType, LoadBalancingAlgorithms, LoadMetric, MetricsConfiguration, RemoveBackend,
-        Request, ResponseStatus, ServerConfig, TcpListenerConfig as CommandTcpListener,
-        WorkerRequest, WorkerResponse,
+        ActivateListener, AddBackend, CertificatesWithFingerprints, Cluster, ClusterHashes,
+        ClusterInformations, DeactivateListener, Event, HttpListenerConfig, HttpsListenerConfig,
+        InitialState, ListenerType, LoadBalancingAlgorithms, LoadMetric, MetricsConfiguration,
+        RemoveBackend, Request, ResponseStatus, ServerConfig,
+        TcpListenerConfig as CommandTcpListener, WorkerRequest, WorkerResponse,
+        request::RequestType, response_content::ContentType,
     },
     ready::Ready,
     scm_socket::{Listeners, ScmSocket, ScmSocketError},
@@ -31,6 +30,7 @@ use sozu_command::{
 };
 
 use crate::{
+    AcceptError, Protocol, ProxyConfiguration, ProxySession, SessionIsToBeClosed,
     backends::{Backend, BackendMap},
     features::FEATURES,
     http, https,
@@ -38,7 +38,6 @@ use crate::{
     pool::Pool,
     tcp,
     timer::Timer,
-    AcceptError, Protocol, ProxyConfiguration, ProxySession, SessionIsToBeClosed,
 };
 
 // Number of retries to perform on a server after a connection failure
@@ -436,7 +435,10 @@ impl Server {
                     error!("Could not send an ok to the main process: {}", e);
                 }
             } else {
-                panic!("plz give me a status request first when I start, you sent me this instead: {:?}", msg);
+                panic!(
+                    "plz give me a status request first when I start, you sent me this instead: {:?}",
+                    msg
+                );
             }
             server.unblock_channel();
         }
@@ -1270,7 +1272,7 @@ impl Server {
                             format!(
                                 "Couldn't deactivate HTTP listener at address {address:?}: {e}"
                             ),
-                        )
+                        );
                     }
                 };
 
@@ -1306,18 +1308,21 @@ impl Server {
                 WorkerResponse::ok(req_id)
             }
             Ok(ListenerType::Https) => {
-                let (token, mut listener) =
-                    match self.https.borrow_mut().give_back_listener(address) {
-                        Ok((token, listener)) => (token, listener),
-                        Err(e) => {
-                            return worker_response_error(
-                                req_id,
-                                format!(
+                let (token, mut listener) = match self
+                    .https
+                    .borrow_mut()
+                    .give_back_listener(address)
+                {
+                    Ok((token, listener)) => (token, listener),
+                    Err(e) => {
+                        return worker_response_error(
+                            req_id,
+                            format!(
                                 "Couldn't deactivate HTTPS listener at address {address:?}: {e}",
                             ),
-                            )
-                        }
-                    };
+                        );
+                    }
+                };
                 if let Err(e) = self.poll.registry().deregister(&mut listener) {
                     error!(
                         "error deregistering HTTPS listen socket({:?}): {:?}",
@@ -1356,7 +1361,7 @@ impl Server {
                                 "Could not deactivate TCP listener at address {:?}: {}",
                                 address, e
                             ),
-                        )
+                        );
                     }
                 };
 

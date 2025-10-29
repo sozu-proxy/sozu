@@ -11,19 +11,23 @@ use std::{
     time::{Duration, Instant},
 };
 
-use mio::{net::TcpStream, Interest, Token};
+use mio::{Interest, Token, net::TcpStream};
 use rusty_ulid::Ulid;
 use sozu_command::{
     config::MAX_LOOP_ITERATIONS,
     logging::EndpointRecord,
     proto::command::{Event, EventKind, ListenerType},
 };
-// use time::{Duration, Instant};
 
+// use time::{Duration, Instant};
 use crate::{
+    AcceptError, BackendConnectAction, BackendConnectionError, BackendConnectionStatus,
+    L7ListenerHandler, L7Proxy, ListenerHandler, Protocol, ProxySession, Readiness,
+    RetrieveClusterError, SessionIsToBeClosed, SessionMetrics, SessionResult, StateResult,
     backends::{Backend, BackendError},
     pool::{Checkout, Pool},
     protocol::{
+        SessionState,
         http::{
             answers::DefaultAnswerStream,
             diagnostics::{diagnostic_400_502, diagnostic_413_507},
@@ -31,17 +35,13 @@ use crate::{
             parser::Method,
         },
         pipe::WebSocketContext,
-        SessionState,
     },
     retry::RetryPolicy,
     router::Route,
-    server::{push_event, CONN_RETRIES},
-    socket::{stats::socket_rtt, SocketHandler, SocketResult, TransportProtocol},
+    server::{CONN_RETRIES, push_event},
+    socket::{SocketHandler, SocketResult, TransportProtocol, stats::socket_rtt},
     sozu_command::{logging::LogContext, ready::Ready},
     timer::TimeoutContainer,
-    AcceptError, BackendConnectAction, BackendConnectionError, BackendConnectionStatus,
-    L7ListenerHandler, L7Proxy, ListenerHandler, Protocol, ProxySession, Readiness,
-    RetrieveClusterError, SessionIsToBeClosed, SessionMetrics, SessionResult, StateResult,
 };
 
 /// This macro is defined uniquely in this module to help the tracking of kawa h1
@@ -1610,7 +1610,10 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                     log_context!(self),
                 );
 
-                trace!("{} Backend hang-up, setting the parsing phase of the response stream to terminated, this also takes care of responses that lack length information.", log_context!(self));
+                trace!(
+                    "{} Backend hang-up, setting the parsing phase of the response stream to terminated, this also takes care of responses that lack length information.",
+                    log_context!(self)
+                );
 
                 response_stream.parsing_phase = kawa::ParsingPhase::Terminated;
 
@@ -1833,7 +1836,8 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         if counter >= MAX_LOOP_ITERATIONS {
             error!(
                 "{}\tHandling session went through {} iterations, there's a probable infinite loop bug, closing the connection",
-                log_context!(self), MAX_LOOP_ITERATIONS
+                log_context!(self),
+                MAX_LOOP_ITERATIONS
             );
 
             incr!("http.infinite_loop.error");

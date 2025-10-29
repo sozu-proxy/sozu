@@ -1,17 +1,16 @@
 use std::{cell::RefCell, collections::HashMap, net::SocketAddr, rc::Rc, time::Duration};
 
 use mio::net::TcpStream;
-
 use sozu_command::{
     proto::command::{Event, EventKind, LoadBalancingAlgorithms, LoadBalancingParams, LoadMetric},
     state::ClusterId,
 };
 
 use crate::{
+    PeakEWMA,
     load_balancing::{LeastLoaded, LoadBalancingAlgorithm, PowerOfTwo, Random, RoundRobin},
     retry::{self, RetryPolicy},
     server::{self, push_event},
-    PeakEWMA,
 };
 
 #[derive(thiserror::Error, Debug)]
@@ -22,9 +21,7 @@ pub enum BackendError {
     MioConnection(std::io::Error),
     #[error("This backend is not in a normal status: status={0:?}")]
     Status(BackendStatus),
-    #[error(
-        "could not connect {cluster_id} to {backend_address:?} ({failures} failures): {error}"
-    )]
+    #[error("could not connect {cluster_id} to {backend_address:?} ({failures} failures): {error}")]
     ConnectionFailures {
         cluster_id: String,
         backend_address: SocketAddr,
@@ -492,8 +489,9 @@ impl BackendList {
 #[cfg(test)]
 mod backends_test {
 
-    use super::*;
     use std::{net::TcpListener, sync::mpsc::*, thread};
+
+    use super::*;
 
     fn run_mock_tcp_server(addr: &str, stopper: Receiver<()>) {
         let mut run = true;
@@ -544,9 +542,11 @@ mod backends_test {
             Backend::new("foo-1", "127.0.0.1:9001".parse().unwrap(), None, None, None),
         );
 
-        assert!(backend_map
-            .backend_from_cluster_id(cluster_not_recorded)
-            .is_err());
+        assert!(
+            backend_map
+                .backend_from_cluster_id(cluster_not_recorded)
+                .is_err()
+        );
     }
 
     #[test]
@@ -598,9 +598,11 @@ mod backends_test {
             ),
         );
 
-        assert!(backend_map
-            .backend_from_sticky_session(cluster_id, sticky_session)
-            .is_ok());
+        assert!(
+            backend_map
+                .backend_from_sticky_session(cluster_id, sticky_session)
+                .is_ok()
+        );
         sender.send(()).unwrap();
     }
 
@@ -611,9 +613,11 @@ mod backends_test {
         let cluster_id = "mycluster";
         let sticky_session = "test";
 
-        assert!(backend_map
-            .backend_from_sticky_session(cluster_id, sticky_session)
-            .is_err());
+        assert!(
+            backend_map
+                .backend_from_sticky_session(cluster_id, sticky_session)
+                .is_err()
+        );
     }
 
     #[test]
@@ -622,9 +626,11 @@ mod backends_test {
         let mycluster_not_recorded = "mycluster";
         let sticky_session = "test";
 
-        assert!(backend_map
-            .backend_from_sticky_session(mycluster_not_recorded, sticky_session)
-            .is_err());
+        assert!(
+            backend_map
+                .backend_from_sticky_session(mycluster_not_recorded, sticky_session)
+                .is_err()
+        );
     }
 
     #[test]

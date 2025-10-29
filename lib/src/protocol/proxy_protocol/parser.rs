@@ -1,10 +1,10 @@
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 
 use nom::{
+    Err, IResult,
     bytes::streaming::{tag, take},
     error::{Error, ErrorKind, ParseError},
-    number::streaming::{be_u16, be_u8},
-    Err, IResult,
+    number::streaming::{be_u8, be_u16},
 };
 
 use crate::protocol::proxy_protocol::header::{Command, HeaderV2, ProxyAddr};
@@ -96,10 +96,11 @@ pub fn slice_to_ipv6(sl: &[u8]) -> Ipv6Addr {
 #[cfg(test)]
 mod test {
 
-    use super::*;
-    use nom::Err;
-    use nom::Needed;
     use std::net::{IpAddr, SocketAddr};
+
+    use nom::{Err, Needed};
+
+    use super::*;
 
     #[test]
     fn test_parse_proxy_protocol_v2_local_ipv4_addr_header() {

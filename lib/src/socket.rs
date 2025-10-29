@@ -213,7 +213,10 @@ impl SocketHandler for FrontRustls {
                     }
                     // https://github.com/rustls/rustls/blob/main/rustls/src/conn.rs#L482-L500,
                     ErrorKind::Other => {
-                        warn!("rustls buffer is full, we will consume it, before processing new incoming packets, to mitigate this issue, you could try to increase the buffer size, {:?}", e);
+                        warn!(
+                            "rustls buffer is full, we will consume it, before processing new incoming packets, to mitigate this issue, you could try to increase the buffer size, {:?}",
+                            e
+                        );
                     }
                     _ => {
                         error!("could not read TLS stream from socket: {:?}", e);
@@ -501,7 +504,7 @@ pub fn server_bind(addr: SocketAddr) -> Result<TcpListener, ServerBindError> {
 pub mod stats {
     use std::{os::fd::AsRawFd, time::Duration};
 
-    use internal::{TcpInfo, OPT_LEVEL, OPT_NAME};
+    use internal::{OPT_LEVEL, OPT_NAME, TcpInfo};
 
     /// Round trip time for a TCP socket
     pub fn socket_rtt<A: AsRawFd>(socket: &A) -> Option<Duration> {
@@ -521,11 +524,7 @@ pub mod stats {
                 &mut len,
             )
         };
-        if status != 0 {
-            None
-        } else {
-            Some(tcp_info)
-        }
+        if status != 0 { None } else { Some(tcp_info) }
     }
     #[cfg(not(unix))]
     pub fn socketinfo(fd: libc::c_int) -> Option<TcpInfo> {

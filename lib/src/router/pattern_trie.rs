@@ -288,7 +288,7 @@ impl<V: Debug + Clone> TrieNode<V> {
                 } else {
                     //println!("there's still a subdomain, wildcard does not apply");
 
-                    for (ref regexp, ref child) in self.regexps.iter() {
+                    for (regexp, child) in self.regexps.iter() {
                         let suffix = if suffix[0] == b'.' {
                             &suffix[1..]
                         } else {
@@ -361,7 +361,7 @@ impl<V: Debug + Clone> TrieNode<V> {
                 } else {
                     //println!("there's still a subdomain, wildcard does not apply");
 
-                    for (ref regexp, ref mut child) in self.regexps.iter_mut() {
+                    for &mut (ref regexp, ref mut child) in self.regexps.iter_mut() {
                         let suffix = if suffix[0] == b'.' {
                             &suffix[1..]
                         } else {

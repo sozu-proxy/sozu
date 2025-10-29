@@ -3,7 +3,6 @@ pub mod pattern_trie;
 use std::{str::from_utf8, time::Instant};
 
 use regex::bytes::Regex;
-
 use sozu_command::{
     proto::command::{PathRule as CommandPathRule, PathRuleKind, RulePosition},
     response::HttpFrontend,
@@ -216,9 +215,7 @@ impl Router {
             Ok(hostname) => {
                 //FIXME: necessary ti build on stable rust (1.35), can be removed once 1.36 is there
                 let mut empty = true;
-                if let Some((_, ref mut paths)) =
-                    self.tree.domain_lookup_mut(hostname.as_bytes(), false)
-                {
+                if let Some((_, paths)) = self.tree.domain_lookup_mut(hostname.as_bytes(), false) {
                     empty = false;
                     if !paths.iter().any(|(p, m, _)| p == path && m == method) {
                         paths.push((path.to_owned(), method.to_owned(), cluster.to_owned()));
@@ -665,20 +662,28 @@ mod tests {
         assert!(
             DomainRule::Wildcard("*.example.com".to_string()).matches("www.example.com".as_bytes())
         );
-        assert!(!DomainRule::Wildcard("*.example.com".to_string())
-            .matches("test.www.example.com".as_bytes()));
-        assert!("/cdn[0-9]+/.example.com"
-            .parse::<DomainRule>()
-            .unwrap()
-            .matches("cdn1.example.com".as_bytes()));
-        assert!(!"/cdn[0-9]+/.example.com"
-            .parse::<DomainRule>()
-            .unwrap()
-            .matches("www.example.com".as_bytes()));
-        assert!(!"/cdn[0-9]+/.example.com"
-            .parse::<DomainRule>()
-            .unwrap()
-            .matches("cdn10.exampleAcom".as_bytes()));
+        assert!(
+            !DomainRule::Wildcard("*.example.com".to_string())
+                .matches("test.www.example.com".as_bytes())
+        );
+        assert!(
+            "/cdn[0-9]+/.example.com"
+                .parse::<DomainRule>()
+                .unwrap()
+                .matches("cdn1.example.com".as_bytes())
+        );
+        assert!(
+            !"/cdn[0-9]+/.example.com"
+                .parse::<DomainRule>()
+                .unwrap()
+                .matches("www.example.com".as_bytes())
+        );
+        assert!(
+            !"/cdn[0-9]+/.example.com"
+                .parse::<DomainRule>()
+                .unwrap()
+                .matches("cdn10.exampleAcom".as_bytes())
+        );
     }
 
     #[test]
@@ -858,9 +863,11 @@ mod tests {
             ),
             Ok(Route::ClusterId("acme".to_string()))
         );
-        assert!(router
-            .lookup("www.test.example.com", "/", &Method::new(&b"GET"[..]))
-            .is_err());
+        assert!(
+            router
+                .lookup("www.test.example.com", "/", &Method::new(&b"GET"[..]))
+                .is_err()
+        );
         assert_eq!(
             router.lookup(
                 "www.test.example.com",

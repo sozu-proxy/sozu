@@ -9,8 +9,9 @@ use sozu_command_lib::{
     config::ListenerBuilder,
     logging::setup_default_logging,
     proto::command::{
-        request::RequestType, AddBackend, Cluster, LoadBalancingAlgorithms, LoadBalancingParams,
-        PathRule, RequestHttpFrontend, RulePosition, SocketAddress, WorkerRequest, WorkerResponse,
+        AddBackend, Cluster, LoadBalancingAlgorithms, LoadBalancingParams, PathRule,
+        RequestHttpFrontend, RulePosition, SocketAddress, WorkerRequest, WorkerResponse,
+        request::RequestType,
     },
 };
 

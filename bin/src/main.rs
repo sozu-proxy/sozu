@@ -50,11 +50,10 @@ mod worker;
 
 use std::panic;
 
-use sozu::metrics::METRICS;
-
 use cli::Args;
-use command::{begin_main_process, StartError};
+use command::{StartError, begin_main_process};
 use ctl::CtlError;
+use sozu::metrics::METRICS;
 use upgrade::UpgradeError;
 use worker::WorkerError;
 

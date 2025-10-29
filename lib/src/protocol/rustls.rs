@@ -1,13 +1,13 @@
 use std::{cell::RefCell, io::ErrorKind, net::SocketAddr, rc::Rc};
 
-use mio::{net::TcpStream, Token};
+use mio::{Token, net::TcpStream};
 use rustls::ServerConnection;
 use rusty_ulid::Ulid;
 use sozu_command::{config::MAX_LOOP_ITERATIONS, logging::LogContext};
 
 use crate::{
-    protocol::SessionState, timer::TimeoutContainer, Readiness, Ready, SessionMetrics,
-    SessionResult, StateResult,
+    Readiness, Ready, SessionMetrics, SessionResult, StateResult, protocol::SessionState,
+    timer::TimeoutContainer,
 };
 
 /// This macro is defined uniquely in this module to help the tracking of tls
@@ -269,7 +269,8 @@ impl SessionState for TlsHandshake {
         if counter >= MAX_LOOP_ITERATIONS {
             error!(
                 "{}\tHandling session went through {} iterations, there's a probable infinite loop bug, closing the connection",
-                 log_context!(self), MAX_LOOP_ITERATIONS
+                log_context!(self),
+                MAX_LOOP_ITERATIONS
             );
 
             incr!("http.infinite_loop.error");
