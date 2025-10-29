@@ -4,6 +4,93 @@
 
 See milestone [`v1.1.0`](https://github.com/sozu-proxy/sozu/projects/3?card_filter_query=milestone%3Av1.1.0)
 
+## 1.1.0 - 2025-10-29
+
+> **⚠️ BREAKING CHANGE**: This release requires **Rust 1.85.0** or later (previously 1.80.0) due to the migration to Rust Edition 2024. Please ensure your toolchain is updated before upgrading.
+
+### 🌟 Features
+
+- **OpenTelemetry Support**: We have added comprehensive OpenTelemetry integration for distributed tracing and observability. Sōzu now supports `traceparent` and `tracestate` headers in access logs, enabling seamless integration with OpenTelemetry-compatible monitoring systems. This significantly improves the ability to trace requests across distributed systems, see [PR #1176](https://github.com/sozu-proxy/sozu/pull/1176), [`7035eebb`](https://github.com/sozu-proxy/sozu/commit/7035eebb72d7a6a9ad17540d4a24f8de59dea669), [`f72bb977`](https://github.com/sozu-proxy/sozu/commit/f72bb977dfd62403f30a3f4e2bb2e048cd8b6510), [`fbce7f65`](https://github.com/sozu-proxy/sozu/commit/fbce7f65c7c404036c1dd90a3a70c41174581669).
+
+- **Sōzu as a Library**: The bin crate has been restructured to allow Sōzu to be used as a library in other Rust packages. This enables embedding Sōzu's reverse proxy functionality directly into your applications, see [PR #1165](https://github.com/sozu-proxy/sozu/pull/1165), [`3f5f63fa`](https://github.com/sozu-proxy/sozu/commit/3f5f63fae7de9955589aa3e7cadbf26147f56230).
+
+- **Cross-platform Improvements**: We have improved build support for non-x86_64 architectures, particularly MacOS ARM. Kawa's SIMD features are now properly disabled on non-x86_64 platforms, resolving build issues on ARM architectures, see [PR #1136](https://github.com/sozu-proxy/sozu/pull/1136), [`2f478d08`](https://github.com/sozu-proxy/sozu/commit/2f478d0862f9f277a8a2fd89cd09bd71abaa5dd3).
+
+### ⛑️ Fixed
+
+- We fixed an issue with incorrect `backend_response_time` metric calculation on keep-alive requests, see [`5f3371b7`](https://github.com/sozu-proxy/sozu/commit/5f3371b7775dd185f77ed5c3313876acd11290fc).
+- We fixed improper quoting in the `forwarded` header field, see [PR #1175](https://github.com/sozu-proxy/sozu/pull/1175), [`3c660faf`](https://github.com/sozu-proxy/sozu/commit/3c660faf2d955bcb6dd5326770f56991469b11e9).
+- We fixed path resolution issues when saving state, ensuring relative paths are properly handled, see [PR #1171](https://github.com/sozu-proxy/sozu/pull/1171), [`a7ecc65a`](https://github.com/sozu-proxy/sozu/commit/a7ecc65a978e9a925d868a66930e82cff2478f99).
+- We fixed security vulnerability RUSTSEC-2024-0402, see [PR #1168](https://github.com/sozu-proxy/sozu/pull/1168), [`9d1fbbe9`](https://github.com/sozu-proxy/sozu/commit/9d1fbbe9fdcfccf399c37ce0feb1052871827198).
+- We fixed the Dockerfile build process, see [PR #1163](https://github.com/sozu-proxy/sozu/pull/1163), [`93a4ea43`](https://github.com/sozu-proxy/sozu/commit/93a4ea4372bf0d4a51e2cbc1eb0fdae9fadb428c).
+- We fixed CI issues with bombardier by updating the Go version, see [PR #1172](https://github.com/sozu-proxy/sozu/pull/1172), [`a1138973`](https://github.com/sozu-proxy/sozu/commit/a1138973538ec80a5bcf890e3cec79eaa65893d6).
+
+### ✍️ Changed
+
+- **Rust Edition 2024 Migration**: The entire workspace has been migrated to Rust Edition 2024, requiring Rust 1.85.0 or later. This migration includes automatic formatting updates, import reorganization, added unsafe blocks for environment variable access, modernized macro syntax, and applied clippy suggestions, see [PR #1179](https://github.com/sozu-proxy/sozu/pull/1179), [`6650be58`](https://github.com/sozu-proxy/sozu/commit/6650be58c9b6067529599ba54fea866ba52c6575).
+- We updated multiple dependencies to their latest versions, including general dependency bumps and Cargo.lock updates, see [PR #1177](https://github.com/sozu-proxy/sozu/pull/1177), [`f96444e9`](https://github.com/sozu-proxy/sozu/commit/f96444e9aa5f2f9fcd58252f98a421feaa65cf59), [`703a3df3`](https://github.com/sozu-proxy/sozu/commit/703a3df3f01e2407c644c8be619a2115a328cc2a), [`e678ebc2`](https://github.com/sozu-proxy/sozu/commit/e678ebc22851ea1bf809c006fd9582b217ea951f).
+- We avoided duplicate crates in the dependency tree to improve build times and binary size, see [PR #1170](https://github.com/sozu-proxy/sozu/pull/1170), [`e3f81b46`](https://github.com/sozu-proxy/sozu/commit/e3f81b4603cfe860f00a0149a58d17a896920a7d).
+- We removed the double definition of the global allocator in the lib crate, see [`6e3e7e12`](https://github.com/sozu-proxy/sozu/commit/6e3e7e12343838c9f6c5d2a3c9ee893711446455).
+- We improved CI/CD by configuring Docker build and push on every commit, see [PR #1166](https://github.com/sozu-proxy/sozu/pull/1166), [`a77c928f`](https://github.com/sozu-proxy/sozu/commit/a77c928fc7300cfbed76bf4d07dba9de13ea3dc6).
+- We removed coverage upload from CI, see [`b9f0e52d`](https://github.com/sozu-proxy/sozu/commit/b9f0e52d2147d6771d85da36de078e5ad55fed4c).
+
+### ➖ Removed
+
+- We removed @keksoj from CODEOWNERS, see [`ebdda472`](https://github.com/sozu-proxy/sozu/commit/ebdda472fadf99b1afea797d7859a2ede6505b50).
+
+### 📚 Documentation
+
+- We added missing CHANGELOG entries for versions 1.0.5 and 1.0.6, see [`e0017baf`](https://github.com/sozu-proxy/sozu/commit/e0017baf81b94f78cfbd7b0e58fd18e2186b4aa6).
+- We fixed documentation for query commands, see [PR #1164](https://github.com/sozu-proxy/sozu/pull/1164), [`e89e1a40`](https://github.com/sozu-proxy/sozu/commit/e89e1a40ec26de96c41aef7133a220ed988e9e27).
+
+### Changelog
+
+#### ⚠️ BREAKING CHANGE
+
+- [ [`6650be58`](https://github.com/sozu-proxy/sozu/commit/6650be58c9b6067529599ba54fea866ba52c6575) ] chore(toolchain): migrate to Rust edition 2024 and update to 1.85.0 [`Florentin Dubois`] (`2025-10-29`)
+
+#### 🌟 Features
+
+- [ [`fbce7f65`](https://github.com/sozu-proxy/sozu/commit/fbce7f65c7c404036c1dd90a3a70c41174581669) ] refactor: use headers `traceparent` and `tracestate` [`llenotre`] (`2025-10-01`)
+- [ [`7035eebb`](https://github.com/sozu-proxy/sozu/commit/7035eebb72d7a6a9ad17540d4a24f8de59dea669) ] feat(accesslogs): opentelemetry [`llenotre`] (`2025-09-26`)
+- [ [`f72bb977`](https://github.com/sozu-proxy/sozu/commit/f72bb977dfd62403f30a3f4e2bb2e048cd8b6510) ] feat: opentelemetry (wip) [`llenotre`] (`2025-09-25`)
+- [ [`3f5f63fa`](https://github.com/sozu-proxy/sozu/commit/3f5f63fae7de9955589aa3e7cadbf26147f56230) ] feat: allow sozu to be used as lib by another package [`anonkey`] (`2024-12-26`)
+- [ [`2f478d08`](https://github.com/sozu-proxy/sozu/commit/2f478d0862f9f277a8a2fd89cd09bd71abaa5dd3) ] build: disable kawa default features on non x86_64 [`anonkey`] (`2024-09-13`)
+
+#### ⛑️ Fixed
+
+- [ [`5f3371b7`](https://github.com/sozu-proxy/sozu/commit/5f3371b7775dd185f77ed5c3313876acd11290fc) ] Fix backend_reponse_time on keep alive requests [`Eloi Démolis`] (`2025-09-30`)
+- [ [`3c660faf`](https://github.com/sozu-proxy/sozu/commit/3c660faf2d955bcb6dd5326770f56991469b11e9) ] fix: `forwarded` field quoting [`llenotre`] (`2025-05-28`)
+- [ [`a1138973`](https://github.com/sozu-proxy/sozu/commit/a1138973538ec80a5bcf890e3cec79eaa65893d6) ] fix(ci): Update go version for bombardier [`Helian Caumeil`] (`2025-02-25`)
+- [ [`a7ecc65a`](https://github.com/sozu-proxy/sozu/commit/a7ecc65a978e9a925d868a66930e82cff2478f99) ] fix: Resolve path when saving state [`hcaumeil`] (`2025-02-25`)
+- [ [`9d1fbbe9`](https://github.com/sozu-proxy/sozu/commit/9d1fbbe9fdcfccf399c37ce0feb1052871827198) ] fix: fix RUSTSEC-2024-0402 [`Dimitris Apostolou`] (`2024-12-31`)
+- [ [`93a4ea43`](https://github.com/sozu-proxy/sozu/commit/93a4ea4372bf0d4a51e2cbc1eb0fdae9fadb428c) ] build: fix dockerfile [`anonkey`] (`2024-12-26`)
+
+#### ✍️ Changed
+
+- [ [`b9f0e52d`](https://github.com/sozu-proxy/sozu/commit/b9f0e52d2147d6771d85da36de078e5ad55fed4c) ] ci: remove coverage upload [`Florentin Dubois`] (`2025-10-29`)
+- [ [`6e3e7e12`](https://github.com/sozu-proxy/sozu/commit/6e3e7e12343838c9f6c5d2a3c9ee893711446455) ] chore(lib): remove double definition of global allocator [`Florentin Dubois`] (`2025-10-29`)
+- [ [`e678ebc2`](https://github.com/sozu-proxy/sozu/commit/e678ebc22851ea1bf809c006fd9582b217ea951f) ] chore: update nix dependency [`Florentin Dubois`] (`2025-10-29`)
+- [ [`703a3df3`](https://github.com/sozu-proxy/sozu/commit/703a3df3f01e2407c644c8be619a2115a328cc2a) ] chore(deps): update Cargo.lock with latest dependency versions [`Florentin Dubois`] (`2025-10-29`)
+- [ [`f96444e9`](https://github.com/sozu-proxy/sozu/commit/f96444e9aa5f2f9fcd58252f98a421feaa65cf59) ] chore: bump dependencies [`llenotre`] (`2025-09-30`)
+- [ [`e3f81b46`](https://github.com/sozu-proxy/sozu/commit/e3f81b4603cfe860f00a0149a58d17a896920a7d) ] deps: avoid duplicate crates [`Dimitris Apostolou`] (`2025-02-24`)
+- [ [`a77c928f`](https://github.com/sozu-proxy/sozu/commit/a77c928fc7300cfbed76bf4d07dba9de13ea3dc6) ] ci(docker): build and push on every commits [`Florentin Dubois`] (`2024-12-26`)
+
+#### ➖ Removed
+
+- [ [`ebdda472`](https://github.com/sozu-proxy/sozu/commit/ebdda472fadf99b1afea797d7859a2ede6505b50) ] chore: remove @keksoj from code owners [`Florentin Dubois`] (`2024-12-26`)
+
+#### 📚 Documentation
+
+- [ [`e0017baf`](https://github.com/sozu-proxy/sozu/commit/e0017baf81b94f78cfbd7b0e58fd18e2186b4aa6) ] doc(changelog): add missing entries for 1.0.5 and 1.0.6 [`Florentin Dubois`] (`2025-01-07`)
+- [ [`e89e1a40`](https://github.com/sozu-proxy/sozu/commit/e89e1a40ec26de96c41aef7133a220ed988e9e27) ] docs: fix query commands [`anonkey`] (`2024-12-26`)
+
+### 🥹 Contributors
+
+@FlorentinDUBOIS, @Wonshtrum, @llenotre, @anonkey, @rex4539, @hcaumeil
+
+**Full Changelog**: https://github.com/sozu-proxy/sozu/compare/1.0.6...1.1.0
+
 ## 1.0.6 - 2024-12-05
 
 ### 🌟 Features
