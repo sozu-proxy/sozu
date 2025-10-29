@@ -55,32 +55,6 @@ jobs:
         with:
           command: doc
           args: --verbose
-  coverage:
-    name: Coverage
-    runs-on: ubuntu-latest
-    steps:
-      - name: install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - name: Checkout sources
-        uses: actions/checkout@v4
-      - name: Install rust
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          profile: minimal
-          override: true
-      - name: Install cargo-tarpaulin
-        uses: actions-rs/cargo@v1
-        with:
-          command: install
-          args: cargo-tarpaulin
-      - name: Run cargo tarpaulin
-        uses: actions-rs/cargo@v1
-        env:
-          TOKEN: ${{ secrets.COVERALLS_TOKEN }}
-        with:
-          command: tarpaulin
-          args: --coveralls $TOKEN
   dockerhub:
     name: Docker build and push to Docker Hub
     runs-on: ubuntu-latest
