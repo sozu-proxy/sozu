@@ -57,14 +57,6 @@ touch %{buildroot}%{_localstatedir}/var/lib/%{name}/state.json
 # runtime directory
 mkdir -p %{buildroot}%{_localstatedir}/run/%{name}
 
-# selinux
-cd os-build/selinux
-make -f /usr/share/selinux/devel/Makefile
-bzip2 -z %{name}.pp
-
-mkdir -p %{buildroot}%{_datadir}/selinux/packages
-cp -p %{name}.pp.bz2 %{buildroot}%{_datadir}/selinux/packages
-
 # Return to source root for license and documentation installation
 cd ../..
 
@@ -96,9 +88,6 @@ install -m 644 doc/why_you_should_use.md %{buildroot}%{_docdir}/%{name}/doc
 rm -rf %{buildroot}
 
 %post
-semodule -i %{_datadir}/selinux/packages/%{name}.pp.bz2
-
-# selinux initial set file types
 chcon -t %{name}_unit_file_t %{_unitdir}/%{name}.service
 chcon -t %{name}_unit_file_t %{_unitdir}/%{name}@.service
 chcon -t %{name}_exec_t %{_bindir}/%{name}*
@@ -115,7 +104,6 @@ semodule -r %{name}
 %{_rundir}/%{name}
 %{_sharedstatedir}/%{name}
 %{_datadir}/%{name}
-%{_datadir}/selinux/packages/%{name}.pp.bz2
 %{_unitdir}/%{name}.service
 %{_unitdir}/%{name}@.service
 
