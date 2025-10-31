@@ -114,11 +114,11 @@ semodule -r %{name}
 - release 1.0.4
 * Wed Jul 17 2024 Emmanuel Bosquet <bjokac@gmail.com>
 - release 1.0.3
-* Wed may 29 2024 Florentin Dubois <florentin.dubois@clever-cloud.com>
+* Wed May 29 2024 Florentin Dubois <florentin.dubois@clever-cloud.com>
 - release 1.0.1
 * Tue Apr 16 2024 Florentin Dubois <florentin.dubois@clever-cloud.com>
 - release 1.0.0
-* Fri Apr 5 2024 Florentin Dubois <florentin.dubois@clever-cloud.com>
+* Fri Apr 05 2024 Florentin Dubois <florentin.dubois@clever-cloud.com>
 - release 1.0.0-rc.2
 * Tue Mar 19 2024 Florentin Dubois <florentin.dubois@clever-cloud.com>
 - release 1.0.0-rc.1
@@ -131,4 +131,6 @@ semodule -r %{name}
 * Mon Jan 23 2023 Florentin Dubois <florentin.dubois@clever-cloud.com>
 - Update packaging
 * Sat Jul 31 2021 Igal Alkon <igal.alkon@versatile.ai>
-* Mon May 15 2017 Philip Woolford <woolford.philip@gmail.com> 0.1-1
+- 0.13.0-1
+* Mon May 15 2017 Philip Woolford <woolford.philip@gmail.com>
+- 0.1-1
