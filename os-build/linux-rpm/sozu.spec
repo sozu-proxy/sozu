@@ -51,14 +51,19 @@ cp -p command/assets/custom_404.html %{buildroot}%{_datadir}/%{name}/html/404.ht
 cp -p command/assets/custom_503.html %{buildroot}%{_datadir}/%{name}/html/503.html
 
 #service running directory
-mkdir -p %{buildroot}%{_localstatedir}/var/lib/%{name}
-touch %{buildroot}%{_localstatedir}/var/lib/%{name}/state.json
+mkdir -p %{buildroot}%{_sharedstatedir}/%{name}
+touch %{buildroot}%{_sharedstatedir}/%{name}/state.json
+
+# selinux
+cd os-build/selinux
+make -f /usr/share/selinux/devel/Makefile
+bzip2 -z %{name}.pp
+mkdir -p %{buildroot}%{_datadir}/selinux/packages
+cp -p %{name}.pp.bz2 %{buildroot}%{_datadir}/selinux/packages
+cd ../../
 
 # runtime directory
-mkdir -p %{buildroot}%{_localstatedir}/run/%{name}
-
-# Return to source root for license and documentation installation
-cd ../..
+mkdir -p %{buildroot}%{_rundir}/%{name}
 
 # Install license and documentation
 install -d %{buildroot}%{_licensedir}/%{name}
@@ -88,6 +93,7 @@ install -m 644 doc/why_you_should_use.md %{buildroot}%{_docdir}/%{name}/doc
 rm -rf %{buildroot}
 
 %post
+semodule -i %{_datadir}/selinux/packages/%{name}.pp.bz2
 chcon -t %{name}_unit_file_t %{_unitdir}/%{name}.service
 chcon -t %{name}_unit_file_t %{_unitdir}/%{name}@.service
 chcon -t %{name}_exec_t %{_bindir}/%{name}*
@@ -101,6 +107,7 @@ chcon -R -t %{name}_var_run_t %{_rundir}/%{name}/
 %{_rundir}/%{name}
 %{_sharedstatedir}/%{name}
 %{_datadir}/%{name}
+%{_datadir}/selinux/packages/%{name}.pp.bz2
 %{_unitdir}/%{name}.service
 %{_unitdir}/%{name}@.service
 
