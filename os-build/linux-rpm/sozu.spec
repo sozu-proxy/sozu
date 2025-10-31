@@ -94,9 +94,6 @@ chcon -t %{name}_exec_t %{_bindir}/%{name}*
 chcon -R -t %{name}_var_run_t %{_sharedstatedir}/%{name}/
 chcon -R -t %{name}_var_run_t %{_rundir}/%{name}/
 
-%postun
-semodule -r %{name}
-
 %files
 %defattr(-,root,root,-)
 %config(noreplace) %{_sysconfdir}/%{name}/config.toml
