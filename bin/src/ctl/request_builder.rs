@@ -80,11 +80,7 @@ impl CommandManager {
 
     pub fn reload_configuration(&mut self, path: Option<String>) -> Result<(), CtlError> {
         debug!("Reloading configuration…");
-        let path = match path {
-            Some(p) => p,
-            None => String::new(),
-        };
-        self.send_request(RequestType::ReloadConfiguration(path).into())
+        self.send_request(RequestType::ReloadConfiguration(path.unwrap_or_default()).into())
     }
 
     pub fn list_frontends(
@@ -248,12 +244,9 @@ impl CommandManager {
                     address: address.into(),
                     hostname,
                     path: PathRule::from_cli_options(path_prefix, path_regex, path_equals),
-                    method: method.map(String::from),
+                    method,
                     position: RulePosition::Tree.into(),
-                    tags: match tags {
-                        Some(tags) => tags,
-                        None => BTreeMap::new(),
-                    },
+                    tags: tags.unwrap_or_default(),
                 })
                 .into(),
             ),
@@ -271,7 +264,7 @@ impl CommandManager {
                     address: address.into(),
                     hostname,
                     path: PathRule::from_cli_options(path_prefix, path_regex, path_equals),
-                    method: method.map(String::from),
+                    method,
                     ..Default::default()
                 })
                 .into(),
@@ -296,12 +289,9 @@ impl CommandManager {
                     address: address.into(),
                     hostname,
                     path: PathRule::from_cli_options(path_prefix, path_regex, path_equals),
-                    method: method.map(String::from),
+                    method,
                     position: RulePosition::Tree.into(),
-                    tags: match tags {
-                        Some(tags) => tags,
-                        None => BTreeMap::new(),
-                    },
+                    tags: tags.unwrap_or_default(),
                 })
                 .into(),
             ),
@@ -319,7 +309,7 @@ impl CommandManager {
                     address: address.into(),
                     hostname,
                     path: PathRule::from_cli_options(path_prefix, path_regex, path_equals),
-                    method: method.map(String::from),
+                    method,
                     ..Default::default()
                 })
                 .into(),
