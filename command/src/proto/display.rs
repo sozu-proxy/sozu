@@ -157,7 +157,10 @@ impl ResponseContent {
     fn display(&self, json: bool) -> Result<(), DisplayError> {
         let content_type = match &self.content_type {
             Some(content_type) => content_type,
-            None => return Ok(println!("No content")),
+            None => {
+                println!("No content");
+                return Ok(());
+            }
         };
 
         if json {
@@ -876,7 +879,8 @@ pub fn print_certificates_with_validity(
     certs: &CertificatesWithFingerprints,
 ) -> Result<(), DisplayError> {
     if certs.certs.is_empty() {
-        return Ok(println!("No certificates match your request."));
+        println!("No certificates match your request.");
+        return Ok(());
     }
 
     let mut table = Table::new();

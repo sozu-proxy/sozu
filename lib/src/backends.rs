@@ -311,12 +311,11 @@ impl BackendMap {
                 let conn = borrowed.try_connect();
 
                 conn.map(|tcp_stream| (backend.clone(), tcp_stream))
-                    .map_err(|e| {
+                    .inspect_err(|_| {
                         error!(
                             "could not connect {} to {:?} using session {} ({} failures)",
                             cluster_id, borrowed.address, sticky_session, borrowed.failures
-                        );
-                        e
+                        )
                     })
             });
 
