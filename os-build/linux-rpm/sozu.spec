@@ -19,6 +19,8 @@ BuildRequires: m4
 BuildRequires: selinux-policy-devel
 BuildRequires: systemd
 BuildRequires: protobuf
+BuildRequires: protobuf-compiler
+BuildRequires: gcc
 BuildRequires: cargo
 BuildRequires: rust >= 1.85.0
 
