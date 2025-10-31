@@ -102,8 +102,8 @@ semodule -i %{_datadir}/selinux/packages/%{name}.pp.bz2
 chcon -t %{name}_unit_file_t %{_unitdir}/%{name}.service
 chcon -t %{name}_unit_file_t %{_unitdir}/%{name}@.service
 chcon -t %{name}_exec_t %{_bindir}/%{name}*
-chcon -R -t %{name}_var_run_t %{_localstatedir}/var/lib/%{name}/
-chcon -R -t %{name}_var_run_t %{_localstatedir}/run/%{name}/
+chcon -R -t %{name}_var_run_t %{_sharedstatedir}/%{name}/
+chcon -R -t %{name}_var_run_t %{_rundir}/%{name}/
 
 %postun
 semodule -r %{name}
@@ -112,8 +112,8 @@ semodule -r %{name}
 %defattr(-,root,root,-)
 %config(noreplace) %{_sysconfdir}/%{name}/config.toml
 %{_bindir}/%{name}
-%dir %{_localstatedir}/run/%{name}
-%{_localstatedir}/var/lib/%{name}
+%{_rundir}/%{name}
+%{_sharedstatedir}/%{name}
 %{_datadir}/%{name}
 %{_datadir}/selinux/packages/%{name}.pp.bz2
 %{_unitdir}/%{name}.service
