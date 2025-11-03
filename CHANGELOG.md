@@ -4,6 +4,41 @@
 
 See milestone [`v1.1.0`](https://github.com/sozu-proxy/sozu/projects/3?card_filter_query=milestone%3Av1.1.0)
 
+## 1.1.1 - 2025-11-03
+
+### ⛑️ Fixed
+
+- We fixed a critical file descriptor handling bug introduced in v1.1.0. The Rust Edition 2024 migration incorrectly used `OwnedFd` instead of `BorrowedFd` in the `enable_close_on_exec()` and `disable_close_on_exec()` functions, causing file descriptors to be closed prematurely and breaking Sōzu's operation. This has been corrected by using `BorrowedFd::borrow_raw()` which only borrows the file descriptor without taking ownership, see [PR #1181](https://github.com/sozu-proxy/sozu/pull/1181), [`fd68885a`](https://github.com/sozu-proxy/sozu/commit/fd68885a1df16e739a2cf2e104e6d09c1da23902).
+
+### ✍️ Changed
+
+- We fixed the RPM spec file to enable successful builds on COPR, EPEL 10, and Fedora 42+. Changes include: adding missing build dependencies (rust, cargo, protobuf-compiler, gcc), fixing changelog date formatting, improving FHS compliance with proper use of `_rundir` and `_sharedstatedir` macros, simplifying the build mode logic, and resolving SELinux policy installation issues, see [PR #1182](https://github.com/sozu-proxy/sozu/pull/1182).
+- We applied clippy suggestions for code quality improvements in request builder, display modules, and backend error handling, see [`28fff561`](https://github.com/sozu-proxy/sozu/commit/28fff561e45a9acbd139e0c0ee3863c91046d4b5).
+
+### Changelog
+
+#### ⛑️ Fixed
+
+- [ [`fd68885a`](https://github.com/sozu-proxy/sozu/commit/fd68885a1df16e739a2cf2e104e6d09c1da23902) ] Change OwnedFd to BorrowedFd (solve file close) [`Eloi DEMOLIS`] (`2025-10-31`)
+
+#### ✍️ Changed
+
+- [ [`28fff561`](https://github.com/sozu-proxy/sozu/commit/28fff561e45a9acbd139e0c0ee3863c91046d4b5) ] Apply clippy suggestions [`Eloi DEMOLIS`] (`2025-10-31`)
+- [ [`32efc7dd`](https://github.com/sozu-proxy/sozu/commit/32efc7dd5f2a366062204bf112d9291bd2f0806e) ] fix dates in rpm spec [`Ante de Baas`] (`2025-10-31`)
+- [ [`a4c87bd2`](https://github.com/sozu-proxy/sozu/commit/a4c87bd25c1e42814bfda8e76fadb419a10373ba) ] Add cargo and update rust build requirements in spec file [`Ante de Baas`] (`2025-10-31`)
+- [ [`7c89a137`](https://github.com/sozu-proxy/sozu/commit/7c89a13760a176c1496d55813be02e10a85a7a00) ] Add protobuf-compiler and gcc to BuildRequires [`Ante de Baas`] (`2025-10-31`)
+- [ [`eae22d4f`](https://github.com/sozu-proxy/sozu/commit/eae22d4f2fd86772a373f80af1899967e3320316) ] Refactor sozu.spec for simplified build and improved packaging [`Ante de Baas`] (`2025-10-31`)
+- [ [`afc25353`](https://github.com/sozu-proxy/sozu/commit/afc2535396a61145f5e3b6d09c1ee9fbea37ae12) ] Update sozu.spec to use _rundir and _sharedstatedir paths [`Ante de Baas`] (`2025-10-31`)
+- [ [`7f92fff8`](https://github.com/sozu-proxy/sozu/commit/7f92fff82f6a44503a8d20639f22869d5c55e005) ] Remove Broken SELinux policy build and install steps from spec file [`Ante de Baas`] (`2025-10-31`)
+- [ [`d8183052`](https://github.com/sozu-proxy/sozu/commit/d8183052d7781abd6e34723bcae39c3a052a19c9) ] remove postun too [`Ante de Baas`] (`2025-10-31`)
+- [ [`1d46d4fd`](https://github.com/sozu-proxy/sozu/commit/1d46d4fd0cfb4dfc36ced7f74e36da731f799ace) ] re-add selinux policy [`Ante de Baas`] (`2025-10-31`)
+
+### 🥹 Contributors
+
+@Wonshtrum, @FlorentinDUBOIS, @antedebaas
+
+**Full Changelog**: https://github.com/sozu-proxy/sozu/compare/1.1.0...1.1.1
+
 ## 1.1.0 - 2025-10-29
 
 > **⚠️ BREAKING CHANGE**: This release requires **Rust 1.85.0** or later (previously 1.80.0) due to the migration to Rust Edition 2024. Please ensure your toolchain is updated before upgrading.
