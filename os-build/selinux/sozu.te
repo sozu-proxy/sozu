@@ -1,4 +1,24 @@
 policy_module(sozu, 0.1.0)
+require {
+	type init_t;
+	type sozu_exec_t;
+	type sozu_var_run_t;
+	type websm_port_t;
+	class file { execute execute_no_trans map open read write };
+	class dir { add_name remove_name };
+	class sock_file { create setattr unlink };
+	class tcp_socket name_connect;
+}
+
+#============= init_t ==============
+allow init_t sozu_exec_t:file { execute execute_no_trans open read };
+
+#!!!! This avc can be allowed using the boolean 'domain_can_mmap_files'
+allow init_t sozu_exec_t:file map;
+allow init_t sozu_var_run_t:dir { add_name remove_name };
+allow init_t sozu_var_run_t:file { open read write };
+allow init_t sozu_var_run_t:sock_file { create setattr unlink };
+allow init_t websm_port_t:tcp_socket name_connect;
 
 ########################################
 #
@@ -51,4 +71,3 @@ tunable_policy(`sozu_connect_any',`
 	corenet_sendrecv_all_packets(sozu_t)
 	corenet_tcp_sendrecv_all_ports(sozu_t)
 ')
-
