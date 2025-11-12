@@ -1,4 +1,21 @@
-policy_module(sozu, 0.1.0)
+policy_module(sozu, 0.2.0)
+require {
+	type init_t;
+	type sozu_exec_t;
+	type sozu_var_run_t;
+	type websm_port_t;
+	class file { execute execute_no_trans map open read write };
+	class dir { add_name remove_name };
+	class sock_file { create setattr unlink };
+	class tcp_socket name_connect;
+}
+
+#============= init_t ==============
+allow init_t sozu_exec_t:file { execute execute_no_trans map open read };
+allow init_t sozu_var_run_t:dir { add_name remove_name };
+allow init_t sozu_var_run_t:file { create open read write };
+allow init_t sozu_var_run_t:sock_file { create setattr unlink };
+allow init_t websm_port_t:tcp_socket name_connect;
 
 ########################################
 #
@@ -22,6 +39,9 @@ files_type(sozu_exec_t)
 type sozu_var_run_t;
 files_type(sozu_var_run_t)
 
+type sozu_var_lib_t;
+files_type(sozu_var_lib_t)
+
 type sozu_unit_file_t;
 systemd_unit_file(sozu_unit_file_t)
 
@@ -33,8 +53,12 @@ allow sozu_t self:unix_stream_socket create_stream_socket_perms;
 allow sozu_t self:tcp_socket create_stream_socket_perms;
 
 manage_dirs_pattern(sozu_t, sozu_var_run_t, sozu_var_run_t)
+manage_dirs_pattern(init_t, sozu_var_run_t, sozu_var_run_t)
 manage_files_pattern(sozu_t, sozu_var_run_t, sozu_var_run_t)
 manage_sock_files_pattern(sozu_t, sozu_var_run_t, sozu_var_run_t)
+
+manage_dirs_pattern(sozu_t, sozu_var_lib_t, sozu_var_lib_t)
+manage_files_pattern(sozu_t, sozu_var_lib_t, sozu_var_lib_t)
 
 corenet_sendrecv_unlabeled_packets(sozu_t)
 corenet_tcp_bind_http_port(sozu_t)
@@ -51,4 +75,3 @@ tunable_policy(`sozu_connect_any',`
 	corenet_sendrecv_all_packets(sozu_t)
 	corenet_tcp_sendrecv_all_ports(sozu_t)
 ')
-
