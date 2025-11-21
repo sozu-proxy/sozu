@@ -118,9 +118,11 @@ pub fn get_config_file_path(args: &cli::Args) -> Result<&str, UtilError> {
 
 #[cfg(target_os = "freebsd")]
 pub unsafe fn get_executable_path() -> Result<String, UtilError> {
+    use libc::{CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, PATH_MAX};
+    use libc::{c_void, sysctl};
+
     let mut capacity = PATH_MAX as usize;
-    let mut path: Vec<u8> = Vec::with_capacity(capacity);
-    path.extend(repeat(0).take(capacity));
+    let mut path = vec![0; capacity];
 
     let mib: Vec<i32> = vec![CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1];
     let len = mib.len() * size_of::<i32>();

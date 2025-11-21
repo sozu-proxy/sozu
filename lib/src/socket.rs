@@ -534,7 +534,17 @@ pub mod stats {
     #[cfg(unix)]
     #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     mod internal {
+        #[cfg(target_os = "linux")]
         pub const OPT_LEVEL: libc::c_int = libc::SOL_TCP;
+
+        #[cfg(any(
+            target_os = "freebsd",
+            target_os = "dragonfly",
+            target_os = "openbsd",
+            target_os = "netbsd"
+        ))]
+        pub const OPT_LEVEL: libc::c_int = libc::IPPROTO_TCP;
+
         pub const OPT_NAME: libc::c_int = libc::TCP_INFO;
 
         #[derive(Clone, Debug)]
