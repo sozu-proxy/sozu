@@ -168,7 +168,7 @@ pub unsafe fn get_executable_path() -> Result<String, UtilError> {
 }
 
 #[cfg(target_os = "macos")]
-extern "C" {
+unsafe extern "C" {
     pub fn _NSGetExecutablePath(buf: *mut libc::c_char, size: *mut u32) -> i32;
 }
 
