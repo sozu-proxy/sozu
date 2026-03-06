@@ -146,7 +146,7 @@ fn display_status(status: Option<u16>, pretty: bool) -> String {
     }
 }
 
-impl<'a> fmt::Display for FullTags<'a> {
+impl fmt::Display for FullTags<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match (self.concatenated, self.user_agent) {
             (None, None) => Ok(()),
