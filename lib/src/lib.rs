@@ -316,6 +316,7 @@ pub mod util;
 pub mod metrics;
 
 pub mod backends;
+pub mod crypto;
 pub mod features;
 pub mod http;
 pub mod load_balancing;

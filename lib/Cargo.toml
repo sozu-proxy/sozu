@@ -22,6 +22,7 @@ include = [
   "Cargo.toml",
   "src/**/*",
   "/examples/*",
+  "benches/**/*",
   "assets/certificate.pem",
   "assets/certificate_chain.pem",
   "assets/key.pem",
@@ -43,6 +44,7 @@ poule = { workspace = true }
 rand = { workspace = true }
 regex = { workspace = true }
 rustls = { workspace = true }
+rustls-openssl = { workspace = true, optional = true }
 rustls-pemfile = { workspace = true }
 rusty_ulid = { workspace = true }
 sha2 = { workspace = true }
@@ -54,13 +56,22 @@ time = { workspace = true }
 sozu-command-lib = { workspace = true }
 
 [dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
 quickcheck = { workspace = true }
 rand = { workspace = true }
 serial_test = { workspace = true }
 tiny_http = { workspace = true }
 
+[[bench]]
+name = "crypto_provider"
+harness = false
+
 [features]
 default = []
+crypto-ring = ["rustls/ring"]
+crypto-aws-lc-rs = ["rustls/aws_lc_rs"]
+crypto-openssl = ["dep:rustls-openssl"]
+fips = ["crypto-aws-lc-rs", "rustls/fips"]
 logs-debug = []
 logs-trace = []
 opentelemetry = []

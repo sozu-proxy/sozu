@@ -17,25 +17,12 @@ use mio::{
 };
 use rustls::{
     CipherSuite, ProtocolVersion, ServerConfig as RustlsServerConfig, ServerConnection,
-    SupportedCipherSuite,
-    crypto::{
-        CryptoProvider,
-        ring::{
-            self,
-            cipher_suite::{
-                TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-                TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
-                TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256, TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-                TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256, TLS13_AES_128_GCM_SHA256,
-                TLS13_AES_256_GCM_SHA384, TLS13_CHACHA20_POLY1305_SHA256,
-            },
-        },
-    },
+    SupportedCipherSuite, crypto::CryptoProvider,
 };
 use rusty_ulid::Ulid;
 use sozu_command::{
     certificate::Fingerprint,
-    config::DEFAULT_CIPHER_SUITES,
+    config::DEFAULT_RUSTLS_CIPHER_LIST,
     proto::command::{
         AddCertificate, CertificateSummary, CertificatesByAddress, Cluster, HttpsListenerConfig,
         ListOfCertificatesByAddress, ListenerType, RemoveCertificate, RemoveListener,
@@ -52,6 +39,13 @@ use crate::{
     ListenerHandler, Protocol, ProxyConfiguration, ProxyError, ProxySession, SessionIsToBeClosed,
     SessionMetrics, SessionResult, StateMachineBuilder, StateResult,
     backends::BackendMap,
+    crypto::{
+        TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+        TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256, TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+        TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384, TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+        TLS13_AES_128_GCM_SHA256, TLS13_AES_256_GCM_SHA384, TLS13_CHACHA20_POLY1305_SHA256,
+        default_provider,
+    },
     pool::Pool,
     protocol::{
         Http, Pipe, SessionState,
@@ -672,7 +666,7 @@ impl HttpsListener {
         resolver: Arc<MutexCertificateResolver>,
     ) -> Result<RustlsServerConfig, ListenerError> {
         let cipher_names = if config.cipher_list.is_empty() {
-            DEFAULT_CIPHER_SUITES.to_vec()
+            DEFAULT_RUSTLS_CIPHER_LIST.to_vec()
         } else {
             config
                 .cipher_list
@@ -720,7 +714,7 @@ impl HttpsListener {
 
         let provider = CryptoProvider {
             cipher_suites: ciphers,
-            ..ring::default_provider()
+            ..default_provider()
         };
 
         let mut server_config = RustlsServerConfig::builder_with_provider(provider.into())
@@ -1569,7 +1563,7 @@ mod tests {
         let address = SocketAddress::new_v4(127, 0, 0, 1, 1032);
         let resolver = Arc::new(MutexCertificateResolver::default());
 
-        let crypto_provider = Arc::new(ring::default_provider());
+        let crypto_provider = Arc::new(default_provider());
 
         let server_config = RustlsServerConfig::builder_with_provider(crypto_provider)
             .with_protocol_versions(&[&rustls::version::TLS12, &rustls::version::TLS13])

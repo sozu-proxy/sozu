@@ -147,6 +147,10 @@ sticky_name = "SOZUBALANCEID"
 
 #### Options specific to HTTPS listeners
 
+> **Crypto provider**: The cryptographic backend used by Rustls is a compile-time choice
+> (feature flags `crypto-ring`, `crypto-aws-lc-rs`, `crypto-openssl`, `fips`).
+> It cannot be changed at runtime. See [Getting started — Choosing a crypto provider](./getting_started.md#choosing-a-crypto-provider) for build instructions.
+
 ```toml
 # supported TLS versions. Possible values are "SSL_V2", "SSL_V3",
 # "TLS_V12", "TLS_V13". Defaults to "TLS_V12" and "TLS_V13"

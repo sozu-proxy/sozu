@@ -61,12 +61,15 @@ jobs:
           path: target/release/lagging_server
 
   build-sozu:
-    name: Build Sozu 🦀
+    name: Build Sozu 🦀 (${{ matrix.provider }})
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        provider: [crypto-ring, crypto-aws-lc-rs, crypto-openssl]
     steps:
-      - name: Install protobuf compiler
-        run:  sudo apt-get install -y protobuf-compiler
-      
+      - name: Install protobuf compiler and cmake
+        run: sudo apt-get install -y protobuf-compiler cmake
+
       - name: Install rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -77,15 +80,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-all-crates: true
-          prefix-key: "sozu"
+          prefix-key: "sozu-${{ matrix.provider }}"
 
       - name: Build Sozu
-        run: cargo build --release
+        run: cargo build --release --no-default-features --features jemallocator,${{ matrix.provider }}
 
       - name: 📤 Upload sozu
         uses: actions/upload-artifact@v4
         with:
-          name: sozu
+          name: sozu-${{ matrix.provider }}
           path: target/release/sozu
 
   build-bench-logger:
@@ -117,9 +120,12 @@ jobs:
           path: target/release/examples/bench_logger
 
   bench:
-      name: Benchmark 🎯
+      name: Benchmark 🎯 (${{ matrix.provider }})
       runs-on: ubuntu-latest
       needs: [build-bombardier, build-lagging_server, build-sozu]
+      strategy:
+        matrix:
+          provider: [crypto-ring, crypto-aws-lc-rs, crypto-openssl]
       steps:
       - uses: actions/checkout@v4
 
@@ -136,7 +142,7 @@ jobs:
       - name: 📥 Download sozu
         uses: actions/download-artifact@v4
         with:
-          name: sozu
+          name: sozu-${{ matrix.provider }}
           path: .github/workflows
 
       - name: Host mapping sozu.io domains
@@ -197,7 +203,7 @@ jobs:
       - name: 📥 Download sozu
         uses: actions/download-artifact@v4
         with:
-          name: sozu
+          name: sozu-crypto-ring
           path: .github/workflows
 
       - name: 📥 Download sozu bench logger

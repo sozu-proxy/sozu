@@ -8,7 +8,7 @@ arch=('i686' 'x86_64')
 url="https://github.com/sozu-proxy/sozu"
 license=('GPL')
 depends=()
-makedepends=('cargo' 'protobuf')
+makedepends=('cargo' 'protobuf' 'cmake')
 backup=('etc/sozu/config.toml')
 source=(
   'git://github.com/sozu-proxy/sozu'
@@ -28,7 +28,8 @@ pkgver() {
 build() {
   cd "$srcdir/$_gitname"
 
-  cargo build --release -p bin --locked
+  # Crypto provider options: crypto-ring (default), crypto-aws-lc-rs, crypto-openssl, fips
+  cargo build --release -p bin --locked --no-default-features --features jemallocator,crypto-ring
 }
 
 package() {

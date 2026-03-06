@@ -9,18 +9,21 @@ RUN apk update && apk add --no-cache --virtual .build-dependencies \
   libgcc \
   musl-dev \
   protobuf \
+  cmake \
   protobuf-dev \
   rust
 
 RUN apk add --no-cache llvm-libunwind \
   pkgconfig
 
+ARG CRYPTO_PROVIDER=crypto-ring
+
 COPY . /usr/src/sozu
 WORKDIR /usr/src/sozu
 
 RUN mkdir .cargo
 RUN cargo vendor --locked >.cargo/config.toml
-RUN cargo build --release --frozen
+RUN cargo build --release --frozen --no-default-features --features jemallocator,${CRYPTO_PROVIDER}
 
 FROM alpine:$ALPINE_VERSION as bin
 

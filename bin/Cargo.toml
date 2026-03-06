@@ -49,7 +49,11 @@ sozu-lib = { workspace = true }
 num_cpus = { workspace = true }
 
 [features]
-default = ["jemallocator"]
+default = ["jemallocator", "crypto-ring"]
+crypto-ring = ["sozu-lib/crypto-ring"]
+crypto-aws-lc-rs = ["sozu-lib/crypto-aws-lc-rs"]
+crypto-openssl = ["sozu-lib/crypto-openssl"]
+fips = ["sozu-lib/fips"]
 unstable = []
 logs-debug = ["sozu-lib/logs-debug", "sozu-command-lib/logs-debug"]
 logs-trace = ["sozu-lib/logs-trace", "sozu-command-lib/logs-trace"]
