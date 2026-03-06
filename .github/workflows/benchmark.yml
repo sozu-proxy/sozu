@@ -83,7 +83,7 @@ jobs:
           prefix-key: "sozu-${{ matrix.provider }}"
 
       - name: Build Sozu
-        run: cargo build --release --no-default-features --features jemallocator,${{ matrix.provider }}
+        run: cargo build --release -p sozu --no-default-features --features jemallocator,${{ matrix.provider }}
 
       - name: 📤 Upload sozu
         uses: actions/upload-artifact@v4
