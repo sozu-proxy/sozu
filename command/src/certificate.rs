@@ -144,7 +144,7 @@ impl serde::Serialize for Fingerprint {
 
 struct FingerprintVisitor;
 
-impl<'de> Visitor<'de> for FingerprintVisitor {
+impl Visitor<'_> for FingerprintVisitor {
     type Value = Fingerprint;
 
     fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {

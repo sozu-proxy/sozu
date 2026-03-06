@@ -1,7 +1,7 @@
 use std::{cell::RefCell, fmt::Debug, rc::Rc};
 
 use rand::{
-    Rng,
+    RngExt,
     distr::{Distribution, weighted::WeightedIndex},
     prelude::IndexedRandom,
     rng,
