@@ -159,8 +159,10 @@ tls_versions = ["TLS_V12", "TLS_V13"]
 
 #### Options specific to Rustls based HTTPS listeners
 
+##### Cipher suites
+
 ```toml
-# option specific to rustls based HTTPS listeners
+# Sets the list of available cipher suites, in order of preference.
 cipher_list = [
     # TLS 1.3 cipher suites
     "TLS13_AES_256_GCM_SHA384",
@@ -175,6 +177,98 @@ cipher_list = [
     "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
 ]
 ```
+
+> **Note**: When using the `fips` crypto provider, CHACHA20_POLY1305 cipher suites are not available. Only AES-GCM suites are FIPS-approved.
+
+##### Key exchange groups
+
+The `groups_list` option controls which key exchange algorithms are offered during the TLS handshake. Groups are listed in order of preference.
+
+```toml
+# Default: ["X25519MLKEM768", "x25519", "P-256", "P-384"]
+groups_list = ["X25519MLKEM768", "x25519", "P-256", "P-384"]
+```
+
+| Group name | Description | Provider support |
+|------------|-------------|------------------|
+| `x25519` / `X25519` | Curve25519 ECDHE | All providers |
+| `secp256r1` / `P-256` | NIST P-256 ECDHE | All providers |
+| `secp384r1` / `P-384` | NIST P-384 ECDHE | All providers |
+| `X25519MLKEM768` | Post-quantum hybrid (X25519 + ML-KEM 768) | `crypto-aws-lc-rs`, `crypto-openssl` (OpenSSL 3.5+) |
+
+Unknown or unsupported group names are silently skipped with a log warning. This allows using the same configuration across different crypto providers — for example, `X25519MLKEM768` is safely ignored when building with `crypto-ring`.
+
+**Examples:**
+
+```toml
+# Post-quantum enabled (default). PQ-capable clients negotiate X25519MLKEM768,
+# others fall back to classical X25519.
+groups_list = ["X25519MLKEM768", "x25519", "P-256", "P-384"]
+
+# Classical only (explicitly disable post-quantum)
+groups_list = ["x25519", "P-256", "P-384"]
+
+# FIPS 140-3 compliant (NIST curves only, no X25519)
+groups_list = ["P-256", "P-384"]
+```
+
+> **Post-quantum key exchange**: X25519MLKEM768 is a hybrid scheme that combines classical X25519 with the ML-KEM 768 post-quantum algorithm. It protects against future quantum computer attacks while maintaining security against current classical attacks. The handshake is slightly larger (~1 KB overhead) but has negligible latency impact. Clients that do not support it automatically negotiate a classical group.
+
+##### Certificates
+
+TLS certificates can be configured in two ways:
+
+**1. Default certificate on the HTTPS listener** (without SNI):
+
+```toml
+[[listeners]]
+protocol = "https"
+address = "0.0.0.0:8443"
+certificate = "/path/to/certificate.pem"
+certificate_chain = "/path/to/chain.pem"
+key = "/path/to/private-key.pem"
+```
+
+**2. Per-frontend certificates** (with SNI, recommended):
+
+```toml
+[clusters.MyCluster]
+protocol = "http"
+frontends = [
+    { address = "0.0.0.0:8443", hostname = "example.com",
+      certificate = "/path/to/example.com.pem",
+      certificate_chain = "/path/to/chain.pem",
+      key = "/path/to/example.com.key" },
+]
+backends = [
+    { address = "127.0.0.1:8080" }
+]
+```
+
+Sōzu supports the following certificate and key types:
+
+| Type | Key format | Notes |
+|------|-----------|-------|
+| RSA 2048+ | PKCS#1 or PKCS#8 PEM | Most common, widely supported |
+| ECDSA P-256 | SEC1 or PKCS#8 PEM | Faster handshakes, smaller certificates |
+| ECDSA P-384 | SEC1 or PKCS#8 PEM | Higher security margin |
+
+All certificate files must be PEM-encoded. The `certificate_chain` should contain intermediate CA certificates (not the root CA).
+
+**Generating test certificates:**
+
+```bash
+# RSA 2048
+openssl req -newkey rsa:2048 -nodes -keyout rsa.key -x509 -days 365 \
+    -subj "/CN=example.com" -addext "subjectAltName=DNS:example.com" -out rsa.pem
+
+# ECDSA P-256
+openssl ecparam -name prime256v1 -genkey -out ecdsa.key
+openssl req -new -key ecdsa.key -x509 -days 365 \
+    -subj "/CN=example.com" -addext "subjectAltName=DNS:example.com" -out ecdsa.pem
+```
+
+> **Important**: Certificates must include a Subject Alternative Name (SAN) extension matching the frontend hostname. Certificates without SANs may cause TLS handshake failures.
 
 ### Clusters
 

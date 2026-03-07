@@ -254,6 +254,28 @@ cipher_list = [
     "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
 ]
 
+# TLS key exchange groups, in order of preference.
+# Controls which key exchange algorithms are offered during the TLS handshake.
+# Supported group names:
+#   - "x25519" / "X25519"       — Curve25519 ECDHE (fast, widely supported)
+#   - "secp256r1" / "P-256"     — NIST P-256 ECDHE
+#   - "secp384r1" / "P-384"     — NIST P-384 ECDHE
+#   - "X25519MLKEM768"          — Post-quantum hybrid (X25519 + ML-KEM 768)
+#                                 Only available with crypto-aws-lc-rs or crypto-openssl (OpenSSL 3.5+).
+#                                 Silently skipped if the compiled provider does not support it.
+#
+# Defaults to ["X25519MLKEM768", "x25519", "P-256", "P-384"].
+# The default order prioritizes post-quantum protection when the provider supports it,
+# with automatic fallback to classical key exchange otherwise.
+#
+# groups_list = ["X25519MLKEM768", "x25519", "P-256", "P-384"]
+#
+# For FIPS 140-3 compliance (--features fips), only NIST curves are allowed:
+# groups_list = ["P-256", "P-384"]
+#
+# To explicitly disable post-quantum key exchange:
+# groups_list = ["x25519", "P-256", "P-384"]
+
 # default certificate and key
 # in case you want to set up TLS without SNI, you can define the default
 # certificate here
