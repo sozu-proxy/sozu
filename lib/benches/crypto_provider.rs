@@ -4,8 +4,8 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use rustls::{ServerConfig, crypto::CryptoProvider};
 use sozu_command_lib::proto::command::{AddCertificate, CertificateAndKey, SocketAddress};
 use sozu_lib::{
-    crypto::{default_provider, any_supported_type},
-    tls::{CertifiedKeyWrapper, CertificateResolver, MutexCertificateResolver},
+    crypto::{any_supported_type, default_provider},
+    tls::{CertificateResolver, CertifiedKeyWrapper, MutexCertificateResolver},
 };
 
 const CERT_PEM: &str = include_str!("../assets/certificate.pem");
