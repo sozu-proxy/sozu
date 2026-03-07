@@ -307,7 +307,6 @@
 #[macro_use]
 extern crate sozu_command_lib as sozu_command;
 #[cfg(test)]
-#[macro_use]
 extern crate quickcheck;
 
 #[macro_use]
