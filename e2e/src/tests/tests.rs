@@ -10,7 +10,8 @@ use sozu_command_lib::{
     logging::setup_default_logging,
     proto::command::{
         ActivateListener, AddCertificate, CertificateAndKey, Cluster, CustomHttpAnswers,
-        ListenerType, RemoveBackend, RequestHttpFrontend, SocketAddress, request::RequestType,
+        ListenerType, RemoveBackend, RequestHttpFrontend, SocketAddress, TlsVersion,
+        request::RequestType,
     },
     scm_socket::Listeners,
     state::ConfigState,
@@ -349,18 +350,27 @@ pub fn try_issue_810_panic(part2: bool) -> State {
     if success { State::Success } else { State::Fail }
 }
 
-pub fn try_tls_endpoint() -> State {
+/// Helper that sets up an HTTPS worker with the given certificate/key and optional TLS version
+/// constraint, sends a request, and checks the response.
+fn try_tls_with_cert(
+    test_name: &str,
+    cert_pem: &str,
+    key_pem: &str,
+    tls_versions: Option<Vec<TlsVersion>>,
+) -> State {
     let front_port = provide_port();
     let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
     let back_address = create_local_address();
 
     let (config, listeners, state) = Worker::empty_config();
-    let mut worker = Worker::start_new_worker("TLS-ENDPOINT", config, &listeners, state);
+    let mut worker = Worker::start_new_worker(test_name, config, &listeners, state);
 
+    let mut listener_builder = ListenerBuilder::new_https(front_address.clone());
+    if let Some(versions) = tls_versions {
+        listener_builder.with_tls_versions(versions);
+    }
     worker.send_proxy_request_type(RequestType::AddHttpsListener(
-        ListenerBuilder::new_https(front_address.clone())
-            .to_tls(None)
-            .unwrap(),
+        listener_builder.to_tls(None).unwrap(),
     ));
 
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
@@ -380,9 +390,9 @@ pub fn try_tls_endpoint() -> State {
     }));
 
     let certificate_and_key = CertificateAndKey {
-        certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
-        key: String::from(include_str!("../../../lib/assets/local-key.pem")),
-        certificate_chain: vec![], // in config.toml the certificate chain would be the same as the certificate
+        certificate: String::from(cert_pem),
+        key: String::from(key_pem),
+        certificate_chain: vec![],
         versions: vec![],
         names: vec![],
     };
@@ -435,6 +445,69 @@ pub fn try_tls_endpoint() -> State {
     } else {
         State::Fail
     }
+}
+
+pub fn try_tls_endpoint() -> State {
+    try_tls_with_cert(
+        "TLS-ENDPOINT",
+        include_str!("../../../lib/assets/local-certificate.pem"),
+        include_str!("../../../lib/assets/local-key.pem"),
+        None,
+    )
+}
+
+pub fn try_tls_rsa_2048() -> State {
+    try_tls_with_cert(
+        "TLS-RSA-2048",
+        include_str!("../../../lib/assets/tests/localhost.crt"),
+        include_str!("../../../lib/assets/tests/localhost.key"),
+        None,
+    )
+}
+
+pub fn try_tls_ecdsa() -> State {
+    try_tls_with_cert(
+        "TLS-ECDSA",
+        include_str!("../../../lib/assets/tests/ecdsa-localhost.pem"),
+        include_str!("../../../lib/assets/tests/ecdsa-localhost.key"),
+        None,
+    )
+}
+
+pub fn try_tls_1_3_rsa() -> State {
+    try_tls_with_cert(
+        "TLS13-RSA",
+        include_str!("../../../lib/assets/local-certificate.pem"),
+        include_str!("../../../lib/assets/local-key.pem"),
+        Some(vec![TlsVersion::TlsV13]),
+    )
+}
+
+pub fn try_tls_1_3_ecdsa() -> State {
+    try_tls_with_cert(
+        "TLS13-ECDSA",
+        include_str!("../../../lib/assets/tests/ecdsa-localhost.pem"),
+        include_str!("../../../lib/assets/tests/ecdsa-localhost.key"),
+        Some(vec![TlsVersion::TlsV13]),
+    )
+}
+
+pub fn try_tls_1_2_rsa() -> State {
+    try_tls_with_cert(
+        "TLS12-RSA",
+        include_str!("../../../lib/assets/local-certificate.pem"),
+        include_str!("../../../lib/assets/local-key.pem"),
+        Some(vec![TlsVersion::TlsV12]),
+    )
+}
+
+pub fn try_tls_1_2_ecdsa() -> State {
+    try_tls_with_cert(
+        "TLS12-ECDSA",
+        include_str!("../../../lib/assets/tests/ecdsa-localhost.pem"),
+        include_str!("../../../lib/assets/tests/ecdsa-localhost.key"),
+        Some(vec![TlsVersion::TlsV12]),
+    )
 }
 
 pub fn test_upgrade() -> State {
@@ -1729,6 +1802,78 @@ fn test_tls_endpoint() {
             100,
             "TLS endpoint: Sōzu should decrypt an HTTPS request",
             try_tls_endpoint
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_tls_rsa_2048() {
+    assert_eq!(
+        repeat_until_error_or(
+            100,
+            "TLS RSA-2048: HTTPS with RSA-2048 certificate",
+            try_tls_rsa_2048
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_tls_ecdsa() {
+    assert_eq!(
+        repeat_until_error_or(
+            100,
+            "TLS ECDSA: HTTPS with ECDSA P-256 certificate",
+            try_tls_ecdsa
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_tls_1_3_rsa() {
+    assert_eq!(
+        repeat_until_error_or(
+            100,
+            "TLS 1.3 RSA: HTTPS with TLS 1.3 only and RSA certificate",
+            try_tls_1_3_rsa
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_tls_1_3_ecdsa() {
+    assert_eq!(
+        repeat_until_error_or(
+            100,
+            "TLS 1.3 ECDSA: HTTPS with TLS 1.3 only and ECDSA certificate",
+            try_tls_1_3_ecdsa
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_tls_1_2_rsa() {
+    assert_eq!(
+        repeat_until_error_or(
+            100,
+            "TLS 1.2 RSA: HTTPS with TLS 1.2 only and RSA certificate",
+            try_tls_1_2_rsa
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_tls_1_2_ecdsa() {
+    assert_eq!(
+        repeat_until_error_or(
+            100,
+            "TLS 1.2 ECDSA: HTTPS with TLS 1.2 only and ECDSA certificate",
+            try_tls_1_2_ecdsa
         ),
         State::Success
     );
