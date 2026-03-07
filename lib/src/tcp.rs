@@ -1587,6 +1587,7 @@ mod tests {
             atomic::{AtomicBool, Ordering},
         },
         thread,
+        time::Duration,
     };
 
     use sozu_command::{
@@ -1627,6 +1628,9 @@ mod tests {
         let s3 = TcpStream::connect("127.0.0.1:1234").expect("could not connect");
         let mut s2 = TcpStream::connect("127.0.0.1:1234").expect("could not connect");
 
+        s1.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s2.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
         s1.write(&b"hello "[..])
             .map_err(|e| {
                 TEST_FINISHED.store(true, Ordering::Relaxed);
@@ -1663,19 +1667,28 @@ mod tests {
         println!("s2 received {:?}", str::from_utf8(&res[..sz2]));
         assert_eq!(&res[..sz2], &b"pouet pouet"[..]);
 
-        let sz1 = s1
-            .read(&mut res[..])
-            .map_err(|e| {
-                TEST_FINISHED.store(true, Ordering::Relaxed);
-                e
-            })
-            .expect("could not read from socket");
+        // Read in a loop: a single read() on a TCP stream is not guaranteed
+        // to return all echoed data if the second write's round trip
+        // (client → proxy → backend → proxy → client) is still in flight.
+        let expected = b"hello coucou";
+        let mut total = 0;
+        while total < expected.len() {
+            let sz = s1
+                .read(&mut res[total..])
+                .map_err(|e| {
+                    TEST_FINISHED.store(true, Ordering::Relaxed);
+                    e
+                })
+                .expect("could not read from socket");
+            assert!(sz > 0, "connection closed before receiving all data");
+            total += sz;
+        }
         println!(
             "s1 received again({}): {:?}",
-            sz1,
-            str::from_utf8(&res[..sz1])
+            total,
+            str::from_utf8(&res[..total])
         );
-        assert_eq!(&res[..sz1], &b"hello coucou"[..]);
+        assert_eq!(&res[..total], &expected[..]);
         TEST_FINISHED.store(true, Ordering::Relaxed);
     }
 
