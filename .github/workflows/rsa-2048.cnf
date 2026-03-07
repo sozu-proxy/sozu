@@ -12,4 +12,4 @@ subjectAltName = @alt_names
 
 [ alt_names ]
 DNS.1 = sozu.io
-DNS.2 = ecdsa.sozu.io
+DNS.2 = rsa-2048.sozu.io
