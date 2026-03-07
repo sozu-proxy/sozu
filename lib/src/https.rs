@@ -721,7 +721,7 @@ impl HttpsListener {
                 .filter_map(|group| match kx_group_by_name(group) {
                     Some(kx) => Some(kx),
                     None => {
-                        error!("unknown or unsupported key exchange group: {:?}", group);
+                        warn!("key exchange group {:?} not supported by the compiled crypto provider, skipping", group);
                         None
                     }
                 })

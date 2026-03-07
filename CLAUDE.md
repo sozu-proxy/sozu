@@ -10,14 +10,18 @@ Sōzu is a lightweight, fast, always-up reverse proxy server written in Rust. It
 
 ### Standard Build
 ```bash
-# Build all workspace members
+# Build all workspace members (uses default crypto provider: crypto-ring)
 cargo build --workspace
-
-# Build with all features enabled
-cargo build --all-features
 
 # Release build (includes LTO optimization)
 cargo build --release
+```
+
+**Note:** `cargo build --all-features` does NOT work because crypto providers are mutually exclusive
+(`crypto-ring`, `crypto-aws-lc-rs`, `crypto-openssl`). Use `--workspace` or select a provider explicitly:
+```bash
+cargo build -p sozu --no-default-features --features crypto-aws-lc-rs
+cargo build -p sozu --no-default-features --features crypto-openssl
 ```
 
 ### Architecture-Specific Builds
@@ -31,11 +35,11 @@ cargo build --workspace --no-default-features
 
 After making changes, run these commands to ensure code quality:
 ```bash
-# Build all features
-cargo build --all-features
+# Build workspace (default provider)
+cargo build --workspace
 
 # Run clippy
-cargo clippy --all-features
+cargo clippy --workspace
 
 # Format code with nightly rustfmt
 cargo +nightly fmt
