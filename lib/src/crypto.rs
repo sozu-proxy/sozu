@@ -114,6 +114,8 @@ mod tests {
             names.contains(&rustls::CipherSuite::TLS13_AES_128_GCM_SHA256),
             "provider must support TLS13_AES_128_GCM_SHA256"
         );
+        // CHACHA20_POLY1305 is not FIPS-approved
+        #[cfg(not(feature = "fips"))]
         assert!(
             names.contains(&rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256),
             "provider must support TLS13_CHACHA20_POLY1305_SHA256"
@@ -138,6 +140,8 @@ mod tests {
     fn default_provider_has_classical_kx_groups() {
         let provider = default_provider();
         let groups: Vec<_> = provider.kx_groups.iter().map(|g| g.name()).collect();
+        // X25519 is not FIPS-approved (only NIST curves are)
+        #[cfg(not(feature = "fips"))]
         assert!(
             groups.contains(&NamedGroup::X25519),
             "provider must support X25519 key exchange"
@@ -152,7 +156,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "crypto-aws-lc-rs")]
+    #[cfg(all(feature = "crypto-aws-lc-rs", not(feature = "fips")))]
     #[test]
     fn aws_lc_rs_supports_post_quantum_kx() {
         let provider = default_provider();
@@ -163,7 +167,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "crypto-aws-lc-rs")]
+    #[cfg(all(feature = "crypto-aws-lc-rs", not(feature = "fips")))]
     #[test]
     fn aws_lc_rs_has_more_kx_groups_than_classical() {
         let provider = default_provider();
@@ -173,6 +177,36 @@ mod tests {
             provider.kx_groups.len() > 3,
             "aws-lc-rs should have more than 3 kx groups (has {}), including post-quantum",
             provider.kx_groups.len()
+        );
+    }
+
+    #[cfg(feature = "fips")]
+    #[test]
+    fn fips_provider_has_nist_kx_groups() {
+        let provider = default_provider();
+        let groups: Vec<_> = provider.kx_groups.iter().map(|g| g.name()).collect();
+        assert!(
+            groups.contains(&NamedGroup::secp256r1),
+            "FIPS provider must support secp256r1"
+        );
+        assert!(
+            groups.contains(&NamedGroup::secp384r1),
+            "FIPS provider must support secp384r1"
+        );
+    }
+
+    #[cfg(feature = "fips")]
+    #[test]
+    fn fips_provider_has_aes_gcm_cipher_suites() {
+        let provider = default_provider();
+        let suites: Vec<_> = provider.cipher_suites.iter().map(|cs| cs.suite()).collect();
+        assert!(
+            suites.contains(&rustls::CipherSuite::TLS13_AES_256_GCM_SHA384),
+            "FIPS provider must support TLS13_AES_256_GCM_SHA384"
+        );
+        assert!(
+            suites.contains(&rustls::CipherSuite::TLS13_AES_128_GCM_SHA256),
+            "FIPS provider must support TLS13_AES_128_GCM_SHA256"
         );
     }
 
@@ -205,16 +239,31 @@ mod tests {
         assert!(groups.contains(&NamedGroup::secp256r1));
     }
 
+    #[cfg(not(feature = "fips"))]
     #[test]
     fn kx_group_by_name_resolves_x25519() {
         let group = kx_group_by_name("x25519").expect("x25519 should be supported");
         assert_eq!(group.name(), NamedGroup::X25519);
     }
 
+    #[cfg(not(feature = "fips"))]
     #[test]
     fn kx_group_by_name_resolves_x25519_uppercase() {
         let group = kx_group_by_name("X25519").expect("X25519 should be supported");
         assert_eq!(group.name(), NamedGroup::X25519);
+    }
+
+    #[cfg(feature = "fips")]
+    #[test]
+    fn kx_group_by_name_returns_none_for_x25519_in_fips() {
+        assert!(
+            kx_group_by_name("x25519").is_none(),
+            "X25519 is not FIPS-approved"
+        );
+        assert!(
+            kx_group_by_name("X25519").is_none(),
+            "X25519 is not FIPS-approved"
+        );
     }
 
     #[test]
@@ -242,7 +291,7 @@ mod tests {
         assert!(kx_group_by_name("").is_none());
     }
 
-    #[cfg(feature = "crypto-aws-lc-rs")]
+    #[cfg(all(feature = "crypto-aws-lc-rs", not(feature = "fips")))]
     #[test]
     fn kx_group_by_name_resolves_x25519mlkem768() {
         let group = kx_group_by_name("X25519MLKEM768").expect("X25519MLKEM768 should be supported");
@@ -305,7 +354,7 @@ mod tests {
             .with_cert_resolver(Arc::new(crate::tls::MutexCertificateResolver::default()));
     }
 
-    #[cfg(feature = "crypto-aws-lc-rs")]
+    #[cfg(all(feature = "crypto-aws-lc-rs", not(feature = "fips")))]
     #[test]
     fn pq_kx_compatible_with_server_config() {
         use std::sync::Arc;
