@@ -108,7 +108,7 @@ pub const DEFAULT_SIGNATURE_ALGORITHMS: [&str; 9] = [
     "RSA-PSS+SHA512",
 ];
 
-pub const DEFAULT_GROUPS_LIST: [&str; 4] = ["P-521", "P-384", "P-256", "x25519"];
+pub const DEFAULT_GROUPS_LIST: [&str; 4] = ["X25519MLKEM768", "x25519", "P-256", "P-384"];
 
 /// maximum time of inactivity for a frontend socket (60 seconds)
 pub const DEFAULT_FRONT_TIMEOUT: u32 = 60;

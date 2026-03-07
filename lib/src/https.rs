@@ -44,7 +44,7 @@ use crate::{
         TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256, TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
         TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384, TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
         TLS13_AES_128_GCM_SHA256, TLS13_AES_256_GCM_SHA384, TLS13_CHACHA20_POLY1305_SHA256,
-        default_provider,
+        default_provider, kx_group_by_name,
     },
     pool::Pool,
     protocol::{
@@ -712,8 +712,25 @@ impl HttpsListener {
             })
             .collect::<Vec<_>>();
 
+        let kx_groups = if config.groups_list.is_empty() {
+            default_provider().kx_groups
+        } else {
+            config
+                .groups_list
+                .iter()
+                .filter_map(|group| match kx_group_by_name(group) {
+                    Some(kx) => Some(kx),
+                    None => {
+                        error!("unknown or unsupported key exchange group: {:?}", group);
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+
         let provider = CryptoProvider {
             cipher_suites: ciphers,
+            kx_groups,
             ..default_provider()
         };
 

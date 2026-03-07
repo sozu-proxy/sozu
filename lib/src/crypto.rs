@@ -72,6 +72,31 @@ pub fn any_supported_type(
     rustls_openssl::KeyProvider.load_private_key(der.clone_key())
 }
 
+/// Look up a key exchange group by its string name.
+///
+/// Accepts the standard TLS named group identifiers used in sozu configuration:
+/// - `"x25519"` / `"X25519"` — Curve25519 ECDHE
+/// - `"secp256r1"` / `"P-256"` — NIST P-256 ECDHE
+/// - `"secp384r1"` / `"P-384"` — NIST P-384 ECDHE
+/// - `"X25519MLKEM768"` — Post-quantum hybrid (aws-lc-rs and openssl only)
+///
+/// Returns `None` if the group name is unknown or not supported by the compiled provider.
+pub fn kx_group_by_name(name: &str) -> Option<&'static dyn rustls::crypto::SupportedKxGroup> {
+    let provider = default_provider();
+    let named_group = match name {
+        "x25519" | "X25519" => rustls::NamedGroup::X25519,
+        "secp256r1" | "P-256" => rustls::NamedGroup::secp256r1,
+        "secp384r1" | "P-384" => rustls::NamedGroup::secp384r1,
+        "X25519MLKEM768" => rustls::NamedGroup::X25519MLKEM768,
+        _ => return None,
+    };
+    provider
+        .kx_groups
+        .iter()
+        .find(|g| g.name() == named_group)
+        .copied()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,6 +195,59 @@ mod tests {
         assert!(
             groups.contains(&NamedGroup::X25519MLKEM768),
             "openssl provider should support X25519MLKEM768 post-quantum key exchange"
+        );
+    }
+
+    #[test]
+    fn kx_group_by_name_resolves_x25519() {
+        let group = kx_group_by_name("x25519").expect("x25519 should be supported");
+        assert_eq!(group.name(), NamedGroup::X25519);
+    }
+
+    #[test]
+    fn kx_group_by_name_resolves_x25519_uppercase() {
+        let group = kx_group_by_name("X25519").expect("X25519 should be supported");
+        assert_eq!(group.name(), NamedGroup::X25519);
+    }
+
+    #[test]
+    fn kx_group_by_name_resolves_p256() {
+        let group = kx_group_by_name("P-256").expect("P-256 should be supported");
+        assert_eq!(group.name(), NamedGroup::secp256r1);
+    }
+
+    #[test]
+    fn kx_group_by_name_resolves_secp256r1() {
+        let group = kx_group_by_name("secp256r1").expect("secp256r1 should be supported");
+        assert_eq!(group.name(), NamedGroup::secp256r1);
+    }
+
+    #[test]
+    fn kx_group_by_name_resolves_p384() {
+        let group = kx_group_by_name("P-384").expect("P-384 should be supported");
+        assert_eq!(group.name(), NamedGroup::secp384r1);
+    }
+
+    #[test]
+    fn kx_group_by_name_returns_none_for_unknown() {
+        assert!(kx_group_by_name("P-521").is_none());
+        assert!(kx_group_by_name("unknown").is_none());
+        assert!(kx_group_by_name("").is_none());
+    }
+
+    #[cfg(feature = "crypto-aws-lc-rs")]
+    #[test]
+    fn kx_group_by_name_resolves_x25519mlkem768() {
+        let group = kx_group_by_name("X25519MLKEM768").expect("X25519MLKEM768 should be supported");
+        assert_eq!(group.name(), NamedGroup::X25519MLKEM768);
+    }
+
+    #[cfg(feature = "crypto-ring")]
+    #[test]
+    fn kx_group_by_name_returns_none_for_mlkem_on_ring() {
+        assert!(
+            kx_group_by_name("X25519MLKEM768").is_none(),
+            "ring does not support X25519MLKEM768"
         );
     }
 
