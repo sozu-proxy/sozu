@@ -1475,7 +1475,7 @@ impl<'a, K: Ord, V: PartialEq, I1: Iterator<Item = (K, &'a V)>, I2: Iterator<Ite
 
 #[cfg(test)]
 mod tests {
-    use rand::{Rng, rng, seq::SliceRandom};
+    use rand::{RngExt, rng, seq::SliceRandom};
 
     use super::*;
     use crate::proto::command::{

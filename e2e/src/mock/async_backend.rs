@@ -8,9 +8,9 @@ use std::{
 use futures::channel::mpsc;
 
 use crate::{
+    BUFFER_SIZE,
     http_utils::http_ok_response,
     mock::aggregator::{Aggregator, SimpleAggregator},
-    BUFFER_SIZE,
 };
 
 /// Handle to a detached thread where a Backend runs
@@ -67,8 +67,8 @@ impl<A: Aggregator + Send + Sync + 'static> BackendHandle<A> {
                 for client in &clients {
                     aggregator = handler(client, &thread_name, aggregator);
                 }
-                match stop_rx.try_next() {
-                    Ok(Some(_)) => break,
+                match stop_rx.try_recv() {
+                    Ok(_) => break,
                     _ => continue,
                 }
             }
@@ -87,8 +87,8 @@ impl<A: Aggregator + Send + Sync + 'static> BackendHandle<A> {
     pub fn stop_and_get_aggregator(&mut self) -> Option<A> {
         self.stop_tx.try_send(()).expect("could not stop backend");
         loop {
-            match self.aggregator_rx.try_next() {
-                Ok(Some(aggregator)) => return Some(aggregator),
+            match self.aggregator_rx.try_recv() {
+                Ok(aggregator) => return Some(aggregator),
                 _ => continue,
             }
         }
