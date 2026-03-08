@@ -26,7 +26,10 @@ use crate::{
         sync_backend::Backend as SyncBackend,
     },
     sozu::worker::Worker,
-    tests::{State, provide_port, repeat_until_error_or, setup_async_test, setup_sync_test},
+    tests::{
+        State, provide_port, repeat_until_error_or, setup_async_test, setup_sync_test,
+        setup_tcp_async_test, setup_tcp_sync_test,
+    },
 };
 
 pub fn create_local_address() -> SocketAddr {
@@ -1619,6 +1622,271 @@ fn try_wildcard() -> State {
     State::Success
 }
 
+// --- TCP proxy tests ---
+// These tests exercise the TCP proxy path. When compiled with --features splice,
+// sozu uses zero-copy kernel splice(2) for data transfer; without the feature,
+// it uses the normal buffer-copy path. Observable behavior is identical.
+
+pub fn try_tcp_roundtrip_sync() -> State {
+    let front_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, mut backends) =
+        setup_tcp_sync_test("TCP_SYNC", config, listeners, state, front_address, 1);
+    let mut backend = backends.pop().unwrap();
+
+    backend.connect();
+
+    let mut client = Client::new("client", front_address, "ping");
+    client.connect();
+    client.send();
+
+    backend.accept(0);
+    let received = backend.receive(0);
+    println!("Backend received: {received:?}");
+
+    backend.send(0);
+    let response = client.receive();
+    println!("Client received: {response:?}");
+
+    worker.soft_stop();
+    let success = worker.wait_for_server_stop();
+
+    println!(
+        "{} sent: {}, received: {}",
+        client.name, client.requests_sent, client.responses_received
+    );
+    println!(
+        "{} sent: {}, received: {}",
+        backend.name, backend.responses_sent, backend.requests_received
+    );
+
+    if !success {
+        return State::Fail;
+    }
+
+    match response {
+        Some(r) if r == "pong" => State::Success,
+        other => {
+            println!("Expected \"pong\", got {other:?}");
+            State::Fail
+        }
+    }
+}
+
+pub fn try_tcp_multiple_requests_sync() -> State {
+    let front_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, mut backends) =
+        setup_tcp_sync_test("TCP_MULTI", config, listeners, state, front_address, 1);
+    let mut backend = backends.pop().unwrap();
+
+    backend.connect();
+
+    let mut client = Client::new("client", front_address, "request_1");
+    client.connect();
+
+    // First request
+    client.send();
+    backend.accept(0);
+    backend.receive(0);
+    backend.send(0);
+    let response1 = client.receive();
+    println!("Response 1: {response1:?}");
+
+    // Second request on same connection
+    client.set_request("request_2");
+    client.send();
+    backend.receive(0);
+    backend.send(0);
+    let response2 = client.receive();
+    println!("Response 2: {response2:?}");
+
+    // Third request
+    client.set_request("request_3");
+    client.send();
+    backend.receive(0);
+    backend.send(0);
+    let response3 = client.receive();
+    println!("Response 3: {response3:?}");
+
+    worker.soft_stop();
+    let success = worker.wait_for_server_stop();
+
+    println!(
+        "{} sent: {}, received: {}",
+        client.name, client.requests_sent, client.responses_received
+    );
+    println!(
+        "{} sent: {}, received: {}",
+        backend.name, backend.responses_sent, backend.requests_received
+    );
+
+    if !success {
+        return State::Fail;
+    }
+    if client.requests_sent != 3 || client.responses_received != 3 {
+        println!(
+            "Expected 3 sent and 3 received, got {} sent and {} received",
+            client.requests_sent, client.responses_received
+        );
+        return State::Fail;
+    }
+    State::Success
+}
+
+pub fn try_tcp_roundtrip_async(nb_backends: usize, nb_clients: usize, nb_requests: usize) -> State {
+    let front_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, mut backends) = setup_tcp_async_test(
+        "TCP_ASYNC",
+        config,
+        listeners,
+        state,
+        front_address,
+        nb_backends,
+    );
+
+    let mut clients = (0..nb_clients)
+        .map(|i| Client::new(format!("client{i}"), front_address, format!("ping{i}")))
+        .collect::<Vec<_>>();
+    for client in clients.iter_mut() {
+        client.connect();
+    }
+
+    for _ in 0..nb_requests {
+        for client in clients.iter_mut() {
+            client.send();
+        }
+        thread::sleep(Duration::from_millis(10));
+        for client in clients.iter_mut() {
+            client.receive();
+        }
+    }
+
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+
+    for client in &clients {
+        println!(
+            "{} sent: {}, received: {}",
+            client.name, client.requests_sent, client.responses_received
+        );
+    }
+    for backend in backends.iter_mut() {
+        let aggregator = backend.stop_and_get_aggregator();
+        println!("{} aggregated: {:?}", backend.name, aggregator);
+    }
+
+    if clients
+        .iter()
+        .all(|c| c.requests_sent == nb_requests && c.responses_received == nb_requests)
+    {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+pub fn try_tcp_backend_close() -> State {
+    let front_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, mut backends) =
+        setup_tcp_sync_test("TCP_BACK_CLOSE", config, listeners, state, front_address, 1);
+    let mut backend = backends.pop().unwrap();
+
+    backend.connect();
+
+    let mut client = Client::new("client", front_address, "request");
+    client.connect();
+    client.send();
+
+    backend.accept(0);
+    backend.receive(0);
+    backend.send(0);
+
+    let response = client.receive();
+    println!("Client received before backend close: {response:?}");
+
+    // Backend closes its connection
+    backend.close(0);
+    thread::sleep(Duration::from_millis(50));
+
+    worker.soft_stop();
+    let success = worker.wait_for_server_stop();
+
+    println!(
+        "{} sent: {}, received: {}",
+        client.name, client.requests_sent, client.responses_received
+    );
+    println!(
+        "{} sent: {}, received: {}",
+        backend.name, backend.responses_sent, backend.requests_received
+    );
+
+    if !success {
+        return State::Fail;
+    }
+    match response {
+        Some(r) if r == "pong" => State::Success,
+        other => {
+            println!("Expected \"pong\", got {other:?}");
+            State::Fail
+        }
+    }
+}
+
+pub fn try_tcp_soft_stop() -> State {
+    let front_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, mut backends) =
+        setup_tcp_sync_test("TCP_SOFT_STOP", config, listeners, state, front_address, 1);
+    let mut backend = backends.pop().unwrap();
+
+    backend.connect();
+
+    let mut client = Client::new("client", front_address, "request");
+    client.connect();
+    client.send();
+
+    backend.accept(0);
+    backend.receive(0);
+    backend.send(0);
+
+    // Soft stop right after backend responds, before client reads the response.
+    // The worker should drain the response data before shutting down.
+    worker.soft_stop();
+
+    let response = client.receive();
+    println!("Response after soft stop: {response:?}");
+
+    let success = worker.wait_for_server_stop();
+
+    println!(
+        "{} sent: {}, received: {}",
+        client.name, client.requests_sent, client.responses_received
+    );
+    println!(
+        "{} sent: {}, received: {}",
+        backend.name, backend.responses_sent, backend.requests_received
+    );
+
+    if !success {
+        return State::Fail;
+    }
+    match response {
+        Some(r) if r == "pong" => State::Success,
+        other => {
+            println!("Expected \"pong\" after soft stop, got {other:?}");
+            State::Fail
+        }
+    }
+}
+
 #[test]
 fn test_sync() {
     assert_eq!(try_sync(10, 100), State::Success);
@@ -1810,6 +2078,61 @@ fn test_wildcard() {
 fn test_status_header_split() {
     assert_eq!(
         repeat_until_error_or(2, "Status line and Headers split", try_status_header_split),
+        State::Success
+    );
+}
+
+// --- TCP proxy tests ---
+
+#[test]
+fn test_tcp_roundtrip_sync() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "TCP roundtrip: basic data transfer through TCP proxy",
+            try_tcp_roundtrip_sync
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_tcp_multiple_requests() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "TCP multiple requests: multiple request-response cycles on same connection",
+            try_tcp_multiple_requests_sync
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_tcp_roundtrip_async() {
+    assert_eq!(try_tcp_roundtrip_async(2, 5, 10), State::Success);
+}
+
+#[test]
+fn test_tcp_backend_close() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "TCP backend close: data drains after backend closes connection",
+            try_tcp_backend_close
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_tcp_soft_stop() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "TCP soft stop: worker waits for in-flight TCP data before stopping",
+            try_tcp_soft_stop
+        ),
         State::Success
     );
 }
