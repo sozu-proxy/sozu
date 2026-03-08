@@ -1076,10 +1076,15 @@ impl HttpsProxy {
             .ok_or(ProxyError::NoListenerFound(front.address))?
             .borrow_mut();
 
-        listener.set_tags(front.hostname.to_owned(), None);
+        let hostname = front.hostname.to_owned();
+
         listener
             .remove_https_front(front)
             .map_err(ProxyError::RemoveFrontend)?;
+
+        if !listener.fronts.has_hostname(&hostname) {
+            listener.set_tags(hostname, None);
+        }
         Ok(None)
     }
 

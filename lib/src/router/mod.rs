@@ -359,6 +359,41 @@ impl Router {
             }
         }
     }
+
+    /// Returns true if any route (pre, tree, or post) references the given hostname.
+    ///
+    /// This is used after removing a frontend to decide whether the hostname's
+    /// tags should be cleaned up. Tags must only be removed when no routes remain.
+    pub fn has_hostname(&self, hostname: &str) -> bool {
+        let hostname_b = hostname.as_bytes();
+
+        // Check pre rules
+        for (domain_rule, _, _, _) in &self.pre {
+            if domain_rule.matches(hostname_b) {
+                return true;
+            }
+        }
+
+        // Check tree rules (exact match only, no wildcard resolution)
+        if let Ok(ascii_hostname) = ::idna::domain_to_ascii(hostname) {
+            if self
+                .tree
+                .domain_lookup(ascii_hostname.as_bytes(), false)
+                .is_some()
+            {
+                return true;
+            }
+        }
+
+        // Check post rules
+        for (domain_rule, _, _, _) in &self.post {
+            if domain_rule.matches(hostname_b) {
+                return true;
+            }
+        }
+
+        false
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -880,5 +915,95 @@ mod tests {
             router.lookup("test1.example.com", "/helloAB/", &Method::new(&b"GET"[..])),
             Ok(Route::ClusterId("exampleregex".to_string()))
         );
+    }
+
+    #[test]
+    fn has_hostname_checks_tree_pre_and_post() {
+        let mut router = Router::new();
+
+        // Empty router has no hostnames
+        assert!(!router.has_hostname("www.example.com"));
+
+        // Add a tree rule
+        assert!(router.add_tree_rule(
+            b"www.example.com",
+            &PathRule::Prefix("/".to_string()),
+            &MethodRule::new(Some("GET".to_string())),
+            &Route::ClusterId("cluster1".to_string())
+        ));
+        assert!(router.has_hostname("www.example.com"));
+        assert!(!router.has_hostname("api.example.com"));
+
+        // Remove the tree rule — hostname should disappear
+        assert!(router.remove_tree_rule(
+            b"www.example.com",
+            &PathRule::Prefix("/".to_string()),
+            &MethodRule::new(Some("GET".to_string()))
+        ));
+        assert!(!router.has_hostname("www.example.com"));
+
+        // Add a pre rule with an exact domain
+        assert!(router.add_pre_rule(
+            &DomainRule::Exact("api.example.com".to_string()),
+            &PathRule::Prefix("/".to_string()),
+            &MethodRule::new(None),
+            &Route::ClusterId("cluster2".to_string())
+        ));
+        assert!(router.has_hostname("api.example.com"));
+        assert!(!router.has_hostname("www.example.com"));
+
+        // Add a post rule
+        assert!(router.add_post_rule(
+            &DomainRule::Exact("cdn.example.com".to_string()),
+            &PathRule::Prefix("/".to_string()),
+            &MethodRule::new(None),
+            &Route::ClusterId("cluster3".to_string())
+        ));
+        assert!(router.has_hostname("cdn.example.com"));
+
+        // Remove pre rule, post rule should still be detected
+        assert!(router.remove_pre_rule(
+            &DomainRule::Exact("api.example.com".to_string()),
+            &PathRule::Prefix("/".to_string()),
+            &MethodRule::new(None),
+        ));
+        assert!(!router.has_hostname("api.example.com"));
+        assert!(router.has_hostname("cdn.example.com"));
+    }
+
+    #[test]
+    fn has_hostname_false_after_last_route_removed() {
+        let mut router = Router::new();
+
+        // Add two routes for the same hostname with different paths
+        assert!(router.add_tree_rule(
+            b"www.example.com",
+            &PathRule::Prefix("/".to_string()),
+            &MethodRule::new(Some("GET".to_string())),
+            &Route::ClusterId("cluster1".to_string())
+        ));
+        assert!(router.add_tree_rule(
+            b"www.example.com",
+            &PathRule::Prefix("/api".to_string()),
+            &MethodRule::new(Some("GET".to_string())),
+            &Route::ClusterId("cluster2".to_string())
+        ));
+        assert!(router.has_hostname("www.example.com"));
+
+        // Remove first route — hostname should still exist
+        assert!(router.remove_tree_rule(
+            b"www.example.com",
+            &PathRule::Prefix("/".to_string()),
+            &MethodRule::new(Some("GET".to_string()))
+        ));
+        assert!(router.has_hostname("www.example.com"));
+
+        // Remove second route — hostname should be gone
+        assert!(router.remove_tree_rule(
+            b"www.example.com",
+            &PathRule::Prefix("/api".to_string()),
+            &MethodRule::new(Some("GET".to_string()))
+        ));
+        assert!(!router.has_hostname("www.example.com"));
     }
 }
