@@ -163,7 +163,7 @@ impl HttpContext {
 
     /// Callback for request:
     ///
-    /// - edit headers (connection, forwarded, sticky cookie, sozu-id)
+    /// - edit headers (connection, forwarded, x-real-ip, sticky cookie, sozu-id)
     /// - save information:
     ///   - method
     ///   - authority
