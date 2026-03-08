@@ -124,7 +124,7 @@ Commands to Sozu use binary protobuf messages (`command/command.proto`) over uni
 | `bin/src/command/` | Main process command hub |
 | `bin/src/worker.rs` | Worker fork + exec logic |
 | `command/command.proto` | Protobuf message definitions |
-| `command/src/config.rs` | Configuration types, defaults (`DEFAULT_GROUPS_LIST`, `DEFAULT_RUSTLS_CIPHER_LIST`) |
+| `command/src/config.rs` | Configuration types, defaults (`DEFAULT_GROUPS_LIST`, `DEFAULT_CIPHER_LIST`) |
 | `bin/config.toml` | Reference configuration file |
 
 ## Configuration
