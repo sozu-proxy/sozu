@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Sozu is a lightweight, fast, always-up reverse proxy server written in Rust. It supports hot reconfiguration without reloading and upgrades itself while still processing requests.
+Sōzu is a lightweight, fast, always-up reverse proxy server written in Rust. It supports hot reconfiguration without reloading and upgrades itself while still processing requests.
 
 ## Build Commands
 
@@ -107,7 +107,7 @@ Sessions can upgrade: ExpectProxyProtocol → TLS Handshake → HTTP/1 or HTTP/2
 
 ### Communication Protocol
 
-Commands to Sozu use binary protobuf messages (`command/command.proto`) over unix sockets. Messages are separated by `\0` bytes. Responses have three statuses: `Ok`, `Processing`, `Failure`. The `Channel` abstraction in `command/src/channel.rs` handles serialization.
+Commands to Sōzu use binary protobuf messages (`command/command.proto`) over unix sockets. Messages are separated by `\0` bytes. Responses have three statuses: `Ok`, `Processing`, `Failure`. The `Channel` abstraction in `command/src/channel.rs` handles serialization.
 
 ## Key Files
 
@@ -153,5 +153,6 @@ sozu -c /etc/config.toml clusters list
 - `doc/architecture.md` — System architecture
 - `doc/lifetime_of_a_session.md` — Session lifecycle details
 - `doc/configure.md` — Configuration reference (KX groups, certificates, cipher suites)
+- `doc/metrics.md` — Key metrics to monitor
 - `doc/debugging_strategies.md` — Debugging guide
 - `doc/getting_started.md` — Getting started
