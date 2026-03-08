@@ -1776,6 +1776,7 @@ dependencies = [
  "hex",
  "hpack",
  "idna",
+ "itoa",
  "kawa",
  "libc",
  "memchr",

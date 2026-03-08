@@ -34,6 +34,7 @@ hdrhistogram = { workspace = true }
 hex = { workspace = true }
 hpack = { workspace = true }
 idna = { workspace = true }
+itoa = { workspace = true }
 kawa = { workspace = true }
 libc = { workspace = true }
 memchr = { workspace = true }
