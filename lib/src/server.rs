@@ -991,6 +991,14 @@ impl Server {
                 self.add_cluster(cluster);
                 //not returning because the message must still be handled by each proxy
             }
+            Some(RequestType::RemoveCluster(ref cluster_id)) => {
+                self.health_checker.remove_cluster(cluster_id);
+                self.backends
+                    .borrow_mut()
+                    .health_check_configs
+                    .remove(cluster_id.as_str());
+                //not returning because the message must still be handled by each proxy
+            }
             Some(RequestType::AddBackend(ref backend)) => {
                 push_queue(self.add_backend(&req_id, backend));
                 return;

@@ -34,7 +34,8 @@ struct InFlightCheck {
     address: SocketAddr,
     started_at: Instant,
     timeout: Duration,
-    request_sent: bool,
+    request_bytes: Option<Vec<u8>>,
+    write_offset: usize,
     response_buf: Vec<u8>,
     config: HealthCheckConfig,
 }
@@ -63,6 +64,9 @@ impl HealthChecker {
     /// Called on each event loop iteration. Initiates new health checks when intervals
     /// have elapsed, and progresses in-flight checks.
     pub fn poll(&mut self, backends: &Rc<RefCell<BackendMap>>) {
+        if self.in_flight.is_empty() && backends.borrow().health_check_configs.is_empty() {
+            return;
+        }
         self.initiate_checks(backends);
         self.progress_checks(backends);
     }
@@ -119,6 +123,11 @@ impl HealthChecker {
                             "health check: initiated connection to {} ({}) for cluster {}",
                             backend_id, address, cluster_id
                         );
+                        let request = format!(
+                            "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+                            config.uri,
+                            address.ip()
+                        );
                         self.in_flight.push(InFlightCheck {
                             stream,
                             cluster_id: cluster_id.to_owned(),
@@ -126,7 +135,8 @@ impl HealthChecker {
                             address,
                             started_at: now,
                             timeout: Duration::from_secs(u64::from(config.timeout)),
-                            request_sent: false,
+                            request_bytes: Some(request.into_bytes()),
+                            write_offset: 0,
                             response_buf: Vec::with_capacity(256),
                             config: config.to_owned(),
                         });
@@ -164,15 +174,15 @@ impl HealthChecker {
                 continue;
             }
 
-            if !check.request_sent {
-                let request = format!(
-                    "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-                    check.config.uri,
-                    check.address.ip()
-                );
-                match check.stream.write_all(request.as_bytes()) {
-                    Ok(()) => {
-                        check.request_sent = true;
+            if let Some(ref request_bytes) = check.request_bytes {
+                match check.stream.write(&request_bytes[check.write_offset..]) {
+                    Ok(n) => {
+                        check.write_offset += n;
+                        if check.write_offset >= request_bytes.len() {
+                            check.request_bytes = None;
+                        } else {
+                            continue;
+                        }
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         continue;
