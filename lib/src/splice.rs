@@ -7,7 +7,7 @@ use std::{
 use libc::{c_int, c_uint, off_t, size_t, ssize_t};
 
 const SPLICE_F_NONBLOCK: c_uint = 2;
-extern "C" {
+unsafe extern "C" {
     //ssize_t splice(int fd_in, loff_t *off_in, int fd_out,
     //                      loff_t *off_out, size_t len, unsigned int flags);
     pub fn splice(

@@ -43,12 +43,12 @@ fn skip_separator(buf: &[u8]) -> Option<&[u8]> {
 
 #[cfg(feature = "opentelemetry")]
 fn random_id<const N: usize>() -> [u8; N] {
-    use rand::Rng;
+    use rand::RngExt;
     const CHARSET: &[u8] = b"0123456789abcdef";
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let mut buf = [0; N];
     buf.fill_with(|| {
-        let n = rng.gen_range(0..CHARSET.len());
+        let n = rng.random_range(0..CHARSET.len());
         CHARSET[n]
     });
     buf

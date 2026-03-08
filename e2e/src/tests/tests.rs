@@ -9,8 +9,8 @@ use sozu_command_lib::{
     info,
     logging::setup_default_logging,
     proto::command::{
-        request::RequestType, ActivateListener, AddCertificate, CertificateAndKey, Cluster,
-        CustomHttpAnswers, ListenerType, RemoveBackend, RequestHttpFrontend, SocketAddress,
+        ActivateListener, AddCertificate, CertificateAndKey, Cluster, CustomHttpAnswers,
+        ListenerType, RemoveBackend, RequestHttpFrontend, SocketAddress, request::RequestType,
     },
     scm_socket::Listeners,
     state::ConfigState,
@@ -26,7 +26,7 @@ use crate::{
         sync_backend::Backend as SyncBackend,
     },
     sozu::worker::Worker,
-    tests::{provide_port, repeat_until_error_or, setup_async_test, setup_sync_test, State},
+    tests::{State, provide_port, repeat_until_error_or, setup_async_test, setup_sync_test},
 };
 
 pub fn create_local_address() -> SocketAddr {
@@ -346,11 +346,7 @@ pub fn try_issue_810_panic(part2: bool) -> State {
         backend.name, backend.responses_sent, backend.requests_received
     );
 
-    if success {
-        State::Success
-    } else {
-        State::Fail
-    }
+    if success { State::Success } else { State::Fail }
 }
 
 pub fn try_tls_endpoint() -> State {
@@ -413,12 +409,10 @@ pub fn try_tls_endpoint() -> State {
     );
 
     let client = build_https_client();
-    let request = client.get(
-        format!("https://{hostname}:{front_port}/api")
-            .parse()
-            .unwrap(),
-    );
-    if let Some((status, body)) = resolve_request(request) {
+    let uri: hyper::Uri = format!("https://{hostname}:{front_port}/api")
+        .parse()
+        .unwrap();
+    if let Some((status, body)) = resolve_request(&client, uri) {
         println!("response status: {status:?}");
         println!("response body: {body}");
     } else {
@@ -621,11 +615,7 @@ pub fn try_hard_or_soft_stop(soft: bool) -> State {
         backend.name, backend.responses_sent, backend.requests_received
     );
 
-    if success {
-        State::Success
-    } else {
-        State::Fail
-    }
+    if success { State::Success } else { State::Fail }
 }
 
 fn try_http_behaviors() -> State {
@@ -1269,9 +1259,11 @@ pub fn try_stick() -> State {
     let response = client.receive();
     println!("response: {response:?}");
     assert!(request.unwrap().starts_with("GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nCookie: foo=bar\r\nX-Forwarded-For:"));
-    assert!(response
-        .unwrap()
-        .starts_with("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nSozu-Id:"));
+    assert!(
+        response
+            .unwrap()
+            .starts_with("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nSozu-Id:")
+    );
 
     worker.soft_stop();
     worker.wait_for_server_stop();
@@ -1652,13 +1644,13 @@ fn test_hard_stop() {
 #[test]
 fn test_soft_stop() {
     assert_eq!(
-            repeat_until_error_or(
-                10,
-                "Hard Stop: Test that the worker waits for all backends to process requests before shutting down",
-                || try_hard_or_soft_stop(true)
-            ),
-            State::Success
-        );
+        repeat_until_error_or(
+            10,
+            "Hard Stop: Test that the worker waits for all backends to process requests before shutting down",
+            || try_hard_or_soft_stop(true)
+        ),
+        State::Success
+    );
 }
 
 // https://github.com/sozu-proxy/sozu/issues/806
@@ -1721,13 +1713,13 @@ fn test_issue_810_panic_on_session_close() {
 #[test]
 fn test_issue_810_panic_on_missing_listener() {
     assert_eq!(
-            repeat_until_error_or(
-                100,
-                "issue 810: shutdown panics on tcp connection after proxy cleared its listeners\n(opinionated fix)",
-                || try_issue_810_panic(true)
-            ),
-            State::Success
-        );
+        repeat_until_error_or(
+            100,
+            "issue 810: shutdown panics on tcp connection after proxy cleared its listeners\n(opinionated fix)",
+            || try_issue_810_panic(true)
+        ),
+        State::Success
+    );
 }
 
 #[test]

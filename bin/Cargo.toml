@@ -32,7 +32,7 @@ jemallocator = { workspace = true, optional = true }
 libc = { workspace = true }
 log = { workspace = true }
 mio = { workspace = true, features = ["os-poll", "net"] }
-nix = { workspace = true, features = ["signal", "fs"] }
+nix = { workspace = true, features = ["signal", "fs", "process"] }
 nom = { workspace = true }
 paw = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
@@ -46,7 +46,7 @@ sozu-command-lib = { workspace = true }
 sozu-lib = { workspace = true }
 
 [target.'cfg(target_os="linux")'.dependencies]
-num_cpus = "^1.17.0"
+num_cpus = { workspace = true }
 
 [features]
 default = ["jemallocator"]

@@ -11,9 +11,9 @@ use sozu_command::{
     config::{ConfigBuilder, FileConfig},
     logging::setup_default_logging,
     proto::command::{
-        request::RequestType, AddBackend, Cluster, HardStop, LoadBalancingParams, PathRule,
-        Request, RequestHttpFrontend, RequestTcpFrontend, ReturnListenSockets, RulePosition,
-        ServerConfig, SoftStop, WorkerRequest, WorkerResponse,
+        AddBackend, Cluster, HardStop, LoadBalancingParams, PathRule, Request, RequestHttpFrontend,
+        RequestTcpFrontend, ReturnListenSockets, RulePosition, ServerConfig, SoftStop,
+        WorkerRequest, WorkerResponse, request::RequestType,
     },
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,
