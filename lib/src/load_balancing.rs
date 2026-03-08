@@ -198,6 +198,7 @@ mod test {
             load_balancing_parameters: None,
             backup: false,
             connection_time: PeakEWMA::new(),
+            health: crate::backends::HealthState::default(),
         }
     }
 

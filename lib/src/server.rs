@@ -33,6 +33,7 @@ use crate::{
     AcceptError, Protocol, ProxyConfiguration, ProxySession, SessionIsToBeClosed,
     backends::{Backend, BackendMap},
     features::FEATURES,
+    health_check::HealthChecker,
     http, https,
     metrics::METRICS,
     pool::Pool,
@@ -218,6 +219,7 @@ pub struct Server {
     channel: ProxyChannel,
     config_state: ConfigState,
     current_poll_errors: i32,
+    health_checker: HealthChecker,
     http: Rc<RefCell<http::HttpProxy>>,
     https: Rc<RefCell<https::HttpsProxy>>,
     last_sessions_len: usize,
@@ -383,6 +385,7 @@ impl Server {
             channel,
             config_state: ConfigState::new(),
             current_poll_errors: 0,
+            health_checker: HealthChecker::new(),
             http,
             https,
             last_sessions_len: 0, // to be reset on server run
@@ -573,6 +576,7 @@ impl Server {
             self.should_poll_at = TIMER.with(|timer| timer.borrow().next_poll_date());
 
             self.zombie_check();
+            self.health_checker.poll(&self.backends);
 
             let now = time::OffsetDateTime::now_utc();
             // clear the local metrics drain every plain hour (01:00, 02:00, etc.) to prevent memory overuse
@@ -1052,15 +1056,15 @@ impl Server {
     }
 
     fn add_cluster(&mut self, cluster: &Cluster) {
-        self.backends
-            .borrow_mut()
-            .set_load_balancing_policy_for_cluster(
-                &cluster.cluster_id,
-                LoadBalancingAlgorithms::try_from(cluster.load_balancing).unwrap_or_default(),
-                cluster
-                    .load_metric
-                    .and_then(|n| LoadMetric::try_from(n).ok()),
-            );
+        let mut backends = self.backends.borrow_mut();
+        backends.set_load_balancing_policy_for_cluster(
+            &cluster.cluster_id,
+            LoadBalancingAlgorithms::try_from(cluster.load_balancing).unwrap_or_default(),
+            cluster
+                .load_metric
+                .and_then(|n| LoadMetric::try_from(n).ok()),
+        );
+        backends.set_health_check_config(&cluster.cluster_id, cluster.health_check.to_owned());
     }
 
     fn add_backend(&mut self, req_id: &str, add_backend: &AddBackend) -> WorkerResponse {

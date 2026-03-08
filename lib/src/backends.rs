@@ -1,8 +1,17 @@
-use std::{cell::RefCell, collections::HashMap, net::SocketAddr, rc::Rc, time::Duration};
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    net::SocketAddr,
+    rc::Rc,
+    time::{Duration, Instant},
+};
 
 use mio::net::TcpStream;
 use sozu_command::{
-    proto::command::{Event, EventKind, LoadBalancingAlgorithms, LoadBalancingParams, LoadMetric},
+    proto::command::{
+        Event, EventKind, HealthCheckConfig, LoadBalancingAlgorithms, LoadBalancingParams,
+        LoadMetric,
+    },
     state::ClusterId,
 };
 
@@ -37,6 +46,65 @@ pub enum BackendStatus {
     Closed,
 }
 
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum HealthStatus {
+    Healthy,
+    Unhealthy,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HealthState {
+    pub status: HealthStatus,
+    pub consecutive_successes: u32,
+    pub consecutive_failures: u32,
+    pub last_check: Option<Instant>,
+}
+
+impl Default for HealthState {
+    fn default() -> Self {
+        HealthState {
+            status: HealthStatus::Healthy,
+            consecutive_successes: 0,
+            consecutive_failures: 0,
+            last_check: None,
+        }
+    }
+}
+
+impl HealthState {
+    /// Record a successful health check. Returns true if the backend transitioned to healthy.
+    pub fn record_success(&mut self, healthy_threshold: u32) -> bool {
+        self.last_check = Some(Instant::now());
+        self.consecutive_failures = 0;
+        self.consecutive_successes += 1;
+
+        if self.status == HealthStatus::Unhealthy && self.consecutive_successes >= healthy_threshold
+        {
+            self.status = HealthStatus::Healthy;
+            return true;
+        }
+        false
+    }
+
+    /// Record a failed health check. Returns true if the backend transitioned to unhealthy.
+    pub fn record_failure(&mut self, unhealthy_threshold: u32) -> bool {
+        self.last_check = Some(Instant::now());
+        self.consecutive_successes = 0;
+        self.consecutive_failures += 1;
+
+        if self.status == HealthStatus::Healthy && self.consecutive_failures >= unhealthy_threshold
+        {
+            self.status = HealthStatus::Unhealthy;
+            return true;
+        }
+        false
+    }
+
+    pub fn is_healthy(&self) -> bool {
+        self.status == HealthStatus::Healthy
+    }
+}
+
 #[derive(Debug, PartialEq, Clone)]
 pub struct Backend {
     pub sticky_id: Option<String>,
@@ -50,6 +118,7 @@ pub struct Backend {
     pub load_balancing_parameters: Option<LoadBalancingParams>,
     pub backup: bool,
     pub connection_time: PeakEWMA,
+    pub health: HealthState,
 }
 
 impl Backend {
@@ -73,6 +142,7 @@ impl Backend {
             load_balancing_parameters,
             backup: backup.unwrap_or(false),
             connection_time: PeakEWMA::new(),
+            health: HealthState::default(),
         }
     }
 
@@ -85,6 +155,9 @@ impl Backend {
     }
 
     pub fn can_open(&self) -> bool {
+        if !self.health.is_healthy() {
+            return false;
+        }
         if let Some(action) = self.retry_policy.can_try() {
             self.status == BackendStatus::Normal && action == retry::RetryAction::OKAY
         } else {
@@ -176,6 +249,7 @@ pub struct BackendMap {
     pub backends: HashMap<ClusterId, BackendList>,
     pub max_failures: usize,
     pub available: bool,
+    pub health_check_configs: HashMap<ClusterId, HealthCheckConfig>,
 }
 
 impl Default for BackendMap {
@@ -190,6 +264,18 @@ impl BackendMap {
             backends: HashMap::new(),
             max_failures: 3,
             available: true,
+            health_check_configs: HashMap::new(),
+        }
+    }
+
+    pub fn set_health_check_config(&mut self, cluster_id: &str, config: Option<HealthCheckConfig>) {
+        match config {
+            Some(c) => {
+                self.health_check_configs.insert(cluster_id.to_owned(), c);
+            }
+            None => {
+                self.health_check_configs.remove(cluster_id);
+            }
         }
     }
 

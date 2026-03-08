@@ -63,11 +63,11 @@ use crate::{
     logging::AccessLogFormat,
     proto::command::{
         ActivateListener, AddBackend, AddCertificate, CertificateAndKey, Cluster,
-        CustomHttpAnswers, HttpListenerConfig, HttpsListenerConfig, ListenerType,
-        LoadBalancingAlgorithms, LoadBalancingParams, LoadMetric, MetricsConfiguration, PathRule,
-        ProtobufAccessLogFormat, ProxyProtocolConfig, Request, RequestHttpFrontend,
-        RequestTcpFrontend, RulePosition, ServerConfig, ServerMetricsConfig, SocketAddress,
-        TcpListenerConfig, TlsVersion, WorkerRequest, request::RequestType,
+        CustomHttpAnswers, HealthCheckConfig, HttpListenerConfig, HttpsListenerConfig,
+        ListenerType, LoadBalancingAlgorithms, LoadBalancingParams, LoadMetric,
+        MetricsConfiguration, PathRule, ProtobufAccessLogFormat, ProxyProtocolConfig, Request,
+        RequestHttpFrontend, RequestTcpFrontend, RulePosition, ServerConfig, ServerMetricsConfig,
+        SocketAddress, TcpListenerConfig, TlsVersion, WorkerRequest, request::RequestType,
     },
 };
 
@@ -773,6 +773,45 @@ pub enum FileClusterProtocolConfig {
     Tcp,
 }
 
+fn default_health_check_interval() -> u32 {
+    10
+}
+fn default_health_check_timeout() -> u32 {
+    5
+}
+fn default_health_check_threshold() -> u32 {
+    3
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileHealthCheckConfig {
+    pub uri: String,
+    #[serde(default = "default_health_check_interval")]
+    pub interval: u32,
+    #[serde(default = "default_health_check_timeout")]
+    pub timeout: u32,
+    #[serde(default = "default_health_check_threshold")]
+    pub healthy_threshold: u32,
+    #[serde(default = "default_health_check_threshold")]
+    pub unhealthy_threshold: u32,
+    #[serde(default)]
+    pub expected_status: u32,
+}
+
+impl FileHealthCheckConfig {
+    pub fn to_proto(&self) -> HealthCheckConfig {
+        HealthCheckConfig {
+            uri: self.uri.to_owned(),
+            interval: self.interval,
+            timeout: self.timeout,
+            healthy_threshold: self.healthy_threshold,
+            unhealthy_threshold: self.unhealthy_threshold,
+            expected_status: self.expected_status,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileClusterConfig {
@@ -788,6 +827,7 @@ pub struct FileClusterConfig {
     pub answer_503: Option<String>,
     #[serde(default)]
     pub load_metric: Option<LoadMetric>,
+    pub health_check: Option<FileHealthCheckConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -856,6 +896,7 @@ impl FileClusterConfig {
                     proxy_protocol,
                     load_balancing: self.load_balancing,
                     load_metric: self.load_metric,
+                    health_check: self.health_check.as_ref().map(|hc| hc.to_proto()),
                 }))
             }
             FileClusterProtocolConfig::Http => {
@@ -883,6 +924,7 @@ impl FileClusterConfig {
                     load_balancing: self.load_balancing,
                     load_metric: self.load_metric,
                     answer_503,
+                    health_check: self.health_check.as_ref().map(|hc| hc.to_proto()),
                 }))
             }
         }
@@ -975,6 +1017,7 @@ pub struct HttpClusterConfig {
     pub load_balancing: LoadBalancingAlgorithms,
     pub load_metric: Option<LoadMetric>,
     pub answer_503: Option<String>,
+    pub health_check: Option<HealthCheckConfig>,
 }
 
 impl HttpClusterConfig {
@@ -988,6 +1031,7 @@ impl HttpClusterConfig {
                 load_balancing: self.load_balancing as i32,
                 answer_503: self.answer_503.clone(),
                 load_metric: self.load_metric.map(|s| s as i32),
+                health_check: self.health_check.clone(),
             })
             .into(),
         ];
@@ -1036,6 +1080,7 @@ pub struct TcpClusterConfig {
     pub proxy_protocol: Option<ProxyProtocolConfig>,
     pub load_balancing: LoadBalancingAlgorithms,
     pub load_metric: Option<LoadMetric>,
+    pub health_check: Option<HealthCheckConfig>,
 }
 
 impl TcpClusterConfig {
@@ -1049,6 +1094,7 @@ impl TcpClusterConfig {
                 load_balancing: self.load_balancing as i32,
                 load_metric: self.load_metric.map(|s| s as i32),
                 answer_503: None,
+                health_check: self.health_check.clone(),
             })
             .into(),
         ];

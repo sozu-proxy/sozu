@@ -376,6 +376,17 @@ message Cluster {
     required LoadBalancingAlgorithms load_balancing = 5 [default = ROUND_ROBIN];
     optional string answer_503 = 6;
     optional LoadMetric load_metric = 7;
+    // optional HTTP health check configuration for backends in this cluster
+    optional HealthCheckConfig health_check = 8;
+}
+
+message HealthCheckConfig {
+    required string uri = 1;
+    required uint32 interval = 2 [default = 10];
+    required uint32 timeout = 3 [default = 5];
+    required uint32 healthy_threshold = 4 [default = 3];
+    required uint32 unhealthy_threshold = 5 [default = 3];
+    required uint32 expected_status = 6 [default = 0];
 }
 
 enum LoadBalancingAlgorithms {
@@ -537,6 +548,8 @@ enum EventKind {
     BACKEND_UP = 1;
     NO_AVAILABLE_BACKENDS = 2;
     REMOVED_BACKEND_HAS_NO_CONNECTIONS = 3;
+    HEALTH_CHECK_UNHEALTHY = 4;
+    HEALTH_CHECK_HEALTHY = 5;
 }
 
 message ClusterHashes {

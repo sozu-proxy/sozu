@@ -1115,6 +1115,8 @@ impl Display for Event {
             EventKind::BackendUp => "backend up",
             EventKind::NoAvailableBackends => "no available backends",
             EventKind::RemovedBackendHasNoConnections => "removed backend has no connections",
+            EventKind::HealthCheckUnhealthy => "health check: backend unhealthy",
+            EventKind::HealthCheckHealthy => "health check: backend healthy",
         };
         let address = match &self.address {
             Some(a) => a.to_string(),
