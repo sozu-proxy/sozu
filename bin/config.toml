@@ -81,8 +81,10 @@ max_connections = 500
 
 # when the accept queue is full (max_connections reached), evict the
 # least recently active sessions to make room for new connections.
-# defaults to true
-# evict_on_queue_full = true
+# defaults to false: during a DDoS, existing connections are more likely
+# to be legitimate clients — evicting them would serve attackers instead.
+# enable this if your workload is dominated by normal traffic spikes.
+# evict_on_queue_full = false
 
 # maximum number of buffers in the pool used by the protocol implementations
 # for active connections (ie currently serving a request). For now, you should

@@ -134,8 +134,14 @@ pub const DEFAULT_ZOMBIE_CHECK_INTERVAL: u32 = 1_800;
 /// timeout to accept connection events in the accept queue (60 seconds)
 pub const DEFAULT_ACCEPT_QUEUE_TIMEOUT: u32 = 60;
 
-/// whether to evict least recently active sessions when the accept queue is full (true)
-pub const DEFAULT_EVICT_ON_QUEUE_FULL: bool = true;
+/// whether to evict least recently active sessions when the accept queue is full (false).
+///
+/// Defaults to false because during a DDoS attack, existing connections are more
+/// likely to be legitimate clients. Evicting them to make room for new connections
+/// — which are overwhelmingly attack traffic — would hurt real users.
+/// Enable this only if your traffic pattern is dominated by normal load spikes
+/// rather than attacks.
+pub const DEFAULT_EVICT_ON_QUEUE_FULL: bool = false;
 
 /// number of workers, i.e. Sōzu processes that scale horizontally (2)
 pub const DEFAULT_WORKER_COUNT: u16 = 2;
