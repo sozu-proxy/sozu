@@ -2069,7 +2069,8 @@ fn save_http_status_metric(status: Option<u16>, context: LogContext) {
             }
         }
 
-        // Track individual status codes for the most common ones
+        // Track individual status codes for the most common ones,
+        // including all codes that Sozu generates as default answers
         let key: &'static str = match status {
             200 => "http.status.200",
             201 => "http.status.201",
@@ -2088,6 +2089,7 @@ fn save_http_status_metric(status: Option<u16>, context: LogContext) {
             502 => "http.status.502",
             503 => "http.status.503",
             504 => "http.status.504",
+            507 => "http.status.507",
             _ => return,
         };
         incr!(key, context.cluster_id, context.backend_id);

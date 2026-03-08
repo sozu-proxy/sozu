@@ -621,6 +621,7 @@ impl Subscriber for LocalDrain {
         }
     }
 }
+
 #[cfg(test)]
 mod tests {
     use sozu_command::proto::command::{FilteredMetrics, filtered_metrics::Inner};
@@ -702,6 +703,7 @@ mod tests {
 
         assert_eq!(expected_cluster_metrics, returned_cluster_metrics);
     }
+
     #[test]
     fn receive_and_yield_http_status_metrics() {
         let mut local_drain = LocalDrain::new("prefix".to_string());
