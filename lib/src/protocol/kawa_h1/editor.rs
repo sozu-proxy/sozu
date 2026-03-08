@@ -110,6 +110,8 @@ pub struct HttpContext {
     /// the sticky session that should be used
     /// used to create a "Set-Cookie" header in the response in case it differs from sticky_session_found
     pub sticky_session: Option<String>,
+    /// whether to remove any client-provided X-Real-IP header (anti-spoofing)
+    pub elide_x_real_ip: bool,
     /// whether to add the X-Real-IP header with the client's source IP address
     pub send_x_real_ip: bool,
 }
@@ -131,6 +133,7 @@ impl HttpContext {
         public_address: SocketAddr,
         session_address: Option<SocketAddr>,
         sticky_name: String,
+        elide_x_real_ip: bool,
         send_x_real_ip: bool,
     ) -> Self {
         Self {
@@ -139,6 +142,7 @@ impl HttpContext {
             cluster_id: None,
 
             closing: false,
+            elide_x_real_ip,
             keep_alive_backend: true,
             keep_alive_frontend: true,
             protocol,
@@ -274,8 +278,7 @@ impl HttpContext {
                         x_for = Some(header);
                     } else if compare_no_case(key, b"Forwarded") {
                         forwarded = Some(header);
-                    } else if compare_no_case(key, b"X-Real-IP") {
-                        // Always remove client-provided X-Real-IP; sozu sets it
+                    } else if compare_no_case(key, b"X-Real-IP") && self.elide_x_real_ip {
                         header.elide();
                     } else if compare_no_case(key, b"User-Agent") {
                         self.user_agent = header

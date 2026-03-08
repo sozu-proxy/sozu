@@ -201,9 +201,13 @@ address = "0.0.0.0:8080"
 # a cluster. Defaults to "SOZUBALANCEID"
 # sticky_name = "SOZUBALANCEID"
 #
+# Whether to remove any client-provided X-Real-IP header (anti-spoofing).
+# Defaults to false.
+# elide_x_real_ip = false
+#
 # Whether to add the X-Real-IP header with the client's source IP address.
-# Sozu always overwrites any client-provided value. Defaults to true.
-# send_x_real_ip = true
+# Defaults to false.
+# send_x_real_ip = false
 #
 # Configures the client socket to receive a PROXY protocol header
 # this option is incompatible with public_address
@@ -243,9 +247,13 @@ address = "0.0.0.0:8443"
 # a cluster. Defaults to "SOZUBALANCEID"
 # sticky_name = "SOZUBALANCEID"
 
+# Whether to remove any client-provided X-Real-IP header (anti-spoofing).
+# Defaults to false.
+# elide_x_real_ip = false
+#
 # Whether to add the X-Real-IP header with the client's source IP address.
-# Sozu always overwrites any client-provided value. Defaults to true.
-# send_x_real_ip = true
+# Defaults to false.
+# send_x_real_ip = false
 
 # Configures the client socket to receive a PROXY protocol header
 # this option is incompatible with public_address
