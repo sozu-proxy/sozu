@@ -224,20 +224,26 @@ impl CertificateResolver {
     ) -> Result<(), CertificateResolverError> {
         if let Some(certificate_to_remove) = self.get_certificate(fingerprint) {
             for name in certificate_to_remove.names {
-                self.domains.domain_remove(&name.clone().into_bytes());
+                self.domains.domain_remove(&name.as_bytes().to_vec());
 
                 if let Some(fingerprints_and_exp) = self.name_fingerprint_idx.get_mut(&name) {
                     // remove fingerprints from the index for this name
-                    *fingerprints_and_exp = fingerprints_and_exp
-                        .drain(..)
-                        .filter(|t| &t.0 != fingerprint)
-                        .collect();
+                    fingerprints_and_exp.retain(|t| &t.0 != fingerprint);
 
-                    // if present, reinsert the longest lived certificate in the TrieNode
+                    // reinsert the longest lived certificate in the TrieNode
                     if let Some(longest_lived_cert) = fingerprints_and_exp.last() {
                         self.domains
-                            .insert(name.into_bytes(), longest_lived_cert.0.to_owned());
+                            .insert(name.as_bytes().to_vec(), longest_lived_cert.0.to_owned());
                     }
+                }
+
+                // clean up empty index entries to avoid memory leaks
+                if self
+                    .name_fingerprint_idx
+                    .get(&name)
+                    .is_some_and(Vec::is_empty)
+                {
+                    self.name_fingerprint_idx.remove(&name);
                 }
             }
 
@@ -248,13 +254,19 @@ impl CertificateResolver {
         Ok(())
     }
 
-    /// Short-hand for `add_certificate` and then `remove_certificate`.
-    /// It is possible that the certificate will not be replaced, if the
-    /// new certificate does not match `add_certificate` rules.
+    /// Add the new certificate first, then remove the old one.
+    /// This ordering ensures that the old certificate remains available
+    /// if adding the new one fails.
     pub fn replace_certificate(
         &mut self,
         replace: &ReplaceCertificate,
     ) -> Result<Fingerprint, CertificateResolverError> {
+        let new_fingerprint = self.add_certificate(&AddCertificate {
+            address: replace.address.to_owned(),
+            certificate: replace.new_certificate.to_owned(),
+            expired_at: replace.new_expired_at.to_owned(),
+        })?;
+
         match Fingerprint::from_str(&replace.old_fingerprint) {
             Ok(old_fingerprint) => self.remove_certificate(&old_fingerprint)?,
             Err(err) => {
@@ -262,11 +274,7 @@ impl CertificateResolver {
             }
         }
 
-        self.add_certificate(&AddCertificate {
-            address: replace.address.to_owned(),
-            certificate: replace.new_certificate.to_owned(),
-            expired_at: replace.new_expired_at.to_owned(),
-        })
+        Ok(new_fingerprint)
     }
 
     /// return all fingerprints that are available for these domain names,
@@ -331,27 +339,36 @@ impl ResolvesServerCert for MutexCertificateResolver {
             "trying to resolve name: {:?} for signature scheme: {:?}",
             name, sigschemes
         );
-        if let Ok(ref mut resolver) = self.0.try_lock() {
-            //resolver.domains.print();
-            if let Some((_, fingerprint)) = resolver.domains.domain_lookup(name.as_bytes(), true) {
-                trace!(
-                    "looking for certificate for {:?} with fingerprint {:?}",
-                    name, fingerprint
+        match self.0.lock() {
+            Ok(ref resolver) => {
+                if let Some((_, fingerprint)) =
+                    resolver.domains.domain_lookup(name.as_bytes(), true)
+                {
+                    trace!(
+                        "looking for certificate for {:?} with fingerprint {:?}",
+                        name, fingerprint
+                    );
+
+                    let cert = resolver
+                        .certificates
+                        .get(fingerprint)
+                        .map(|cert| cert.inner.clone());
+
+                    trace!("Found for fingerprint {}: {}", fingerprint, cert.is_some());
+                    return cert;
+                }
+            }
+            Err(e) => {
+                error!(
+                    "certificate resolver lock is poisoned: {}, \
+                     falling back to default certificate",
+                    e
                 );
-
-                let cert = resolver
-                    .certificates
-                    .get(fingerprint)
-                    .map(|cert| cert.inner.clone());
-
-                trace!("Found for fingerprint {}: {}", fingerprint, cert.is_some());
-                return cert;
             }
         }
 
-        // error!("could not look up a certificate for server name '{}'", name);
-        // This certificate is used for TLS tunneling with another TLS termination endpoint
-        // Note that this is unsafe and you should provide a valid certificate
+        // This certificate is used for TLS tunneling with another TLS termination endpoint.
+        // Note that this is unsafe and you should provide a valid certificate.
         debug!("Default certificate is used for {}", name);
         incr!("tls.default_cert_used");
         DEFAULT_CERTIFICATE.clone()
@@ -376,7 +393,9 @@ mod tests {
     };
 
     // use rand::{seq::SliceRandom, thread_rng};
-    use sozu_command::proto::command::{AddCertificate, CertificateAndKey, SocketAddress};
+    use sozu_command::proto::command::{
+        AddCertificate, CertificateAndKey, ReplaceCertificate, SocketAddress,
+    };
 
     use super::CertificateResolver;
 
@@ -674,6 +693,117 @@ mod tests {
             .expect("there should be a localhost cert");
 
         assert_eq!(localhost_cert.1, fingerprint_2y);
+
+        Ok(())
+    }
+
+    /// Verify that `replace_certificate` adds the new cert before removing
+    /// the old one, so lookup always returns a valid certificate.
+    #[test]
+    fn replace_certificate_add_before_remove() -> Result<(), Box<dyn Error + Send + Sync>> {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8080);
+        let mut resolver = CertificateResolver::default();
+
+        // add the initial (1-year) certificate
+        let cert_1y = CertificateAndKey {
+            certificate: String::from(include_str!("../assets/tests/certificate-1y.pem")),
+            key: String::from(include_str!("../assets/tests/key-1y.pem")),
+            ..Default::default()
+        };
+
+        let fingerprint_1y = resolver.add_certificate(&AddCertificate {
+            address: address.clone(),
+            certificate: cert_1y,
+            expired_at: None,
+        })?;
+
+        // sanity: the 1y cert is resolvable
+        assert!(
+            resolver
+                .domain_lookup("localhost".as_bytes(), true)
+                .is_some(),
+            "initial certificate should be resolvable"
+        );
+
+        // replace with the 2-year certificate
+        let cert_2y = CertificateAndKey {
+            certificate: String::from(include_str!("../assets/tests/certificate-2y.pem")),
+            key: String::from(include_str!("../assets/tests/key-2y.pem")),
+            ..Default::default()
+        };
+
+        let new_fingerprint = resolver.replace_certificate(&ReplaceCertificate {
+            address: address.clone(),
+            new_certificate: cert_2y,
+            old_fingerprint: fingerprint_1y.to_string(),
+            new_expired_at: None,
+        })?;
+
+        // the old certificate should be gone
+        assert!(
+            resolver.get_certificate(&fingerprint_1y).is_none(),
+            "old certificate should have been removed"
+        );
+
+        // the new certificate should be present and resolvable
+        assert!(
+            resolver.get_certificate(&new_fingerprint).is_some(),
+            "new certificate should be present"
+        );
+        let resolved = resolver
+            .domain_lookup("localhost".as_bytes(), true)
+            .expect("a certificate should resolve for localhost");
+        assert_eq!(
+            resolved.1, new_fingerprint,
+            "resolved certificate should be the replacement"
+        );
+
+        Ok(())
+    }
+
+    /// Verify that removing the last certificate for a domain cleans up
+    /// the empty entry in `name_fingerprint_idx` (no memory leak).
+    #[test]
+    fn removal_cleans_up_empty_index_entries() -> Result<(), Box<dyn Error + Send + Sync>> {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8080);
+        let mut resolver = CertificateResolver::default();
+
+        let cert = CertificateAndKey {
+            certificate: String::from(include_str!("../assets/tests/certificate-1y.pem")),
+            key: String::from(include_str!("../assets/tests/key-1y.pem")),
+            ..Default::default()
+        };
+
+        let fingerprint = resolver.add_certificate(&AddCertificate {
+            address,
+            certificate: cert,
+            expired_at: None,
+        })?;
+
+        // record the names associated with this cert
+        let names = resolver.certificate_names(&fingerprint)?;
+        assert!(
+            !names.is_empty(),
+            "certificate should have at least one name"
+        );
+
+        // verify index is populated
+        for name in &names {
+            assert!(
+                resolver.name_fingerprint_idx.contains_key(name),
+                "name_fingerprint_idx should contain '{name}' before removal"
+            );
+        }
+
+        resolver.remove_certificate(&fingerprint)?;
+
+        // after removal, all index entries for these names should be gone
+        for name in &names {
+            assert!(
+                !resolver.name_fingerprint_idx.contains_key(name),
+                "name_fingerprint_idx should not contain empty entry for '{name}' after removal"
+            );
+        }
 
         Ok(())
     }
