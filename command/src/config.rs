@@ -1921,138 +1921,93 @@ mod tests {
     }
 
     #[test]
-    fn multiple_http_listeners_with_different_expect_proxy() {
-        let toml_content = "command_socket = \"/tmp/sozu_test.sock\"\n\
-            worker_count = 1\n\
-            max_connections = 500\n\
-            \n\
-            [[listeners]]\n\
-            protocol = \"http\"\n\
-            address = \"172.16.20.1:80\"\n\
-            expect_proxy = true\n\
-            \n\
-            [[listeners]]\n\
-            protocol = \"http\"\n\
-            address = \"10.22.0.1:80\"\n\
-            expect_proxy = false\n";
+    fn multiple_listeners_preserve_per_address_expect_proxy() {
+        let toml_content = r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+
+            [[listeners]]
+            protocol = "http"
+            address = "172.16.20.1:80"
+            expect_proxy = true
+
+            [[listeners]]
+            protocol = "http"
+            address = "10.22.0.1:80"
+            expect_proxy = false
+
+            [[listeners]]
+            protocol = "https"
+            address = "192.168.1.1:443"
+            expect_proxy = true
+
+            [[listeners]]
+            protocol = "https"
+            address = "192.168.2.1:443"
+            expect_proxy = false
+        "#;
 
         let file_config: FileConfig =
             toml::from_str(toml_content).expect("Could not parse TOML config");
 
         let listeners = file_config.listeners.as_ref().expect("No listeners found");
-        assert_eq!(listeners.len(), 2, "Should have two listeners");
+        assert_eq!(listeners.len(), 4);
 
         let config = ConfigBuilder::new(file_config, "/tmp/test_config.toml")
             .into_config()
             .expect("Could not build config");
 
-        assert_eq!(
-            config.http_listeners.len(),
-            2,
-            "Should have two HTTP listeners"
-        );
+        assert_eq!(config.http_listeners.len(), 2);
+        assert_eq!(config.https_listeners.len(), 2);
 
-        let listener_a = config
+        // HTTP listeners
+        let http_proxy = config
             .http_listeners
             .iter()
-            .find(|l| {
-                let addr: SocketAddr = l.address.into();
-                addr == "172.16.20.1:80".parse::<SocketAddr>().unwrap()
-            })
+            .find(|l| SocketAddr::from(l.address) == "172.16.20.1:80".parse().unwrap())
             .expect("Listener on 172.16.20.1:80 not found");
-
-        let listener_b = config
+        let http_direct = config
             .http_listeners
             .iter()
-            .find(|l| {
-                let addr: SocketAddr = l.address.into();
-                addr == "10.22.0.1:80".parse::<SocketAddr>().unwrap()
-            })
+            .find(|l| SocketAddr::from(l.address) == "10.22.0.1:80".parse().unwrap())
             .expect("Listener on 10.22.0.1:80 not found");
 
-        assert!(
-            listener_a.expect_proxy,
-            "172.16.20.1:80 should have expect_proxy=true"
-        );
-        assert!(
-            !listener_b.expect_proxy,
-            "10.22.0.1:80 should have expect_proxy=false"
-        );
-    }
+        assert!(http_proxy.expect_proxy);
+        assert!(!http_direct.expect_proxy);
 
-    #[test]
-    fn multiple_https_listeners_with_different_expect_proxy() {
-        let toml_content = "command_socket = \"/tmp/sozu_test.sock\"\n\
-            worker_count = 1\n\
-            max_connections = 500\n\
-            \n\
-            [[listeners]]\n\
-            protocol = \"https\"\n\
-            address = \"192.168.1.1:443\"\n\
-            expect_proxy = true\n\
-            \n\
-            [[listeners]]\n\
-            protocol = \"https\"\n\
-            address = \"192.168.2.1:443\"\n\
-            expect_proxy = false\n";
-
-        let file_config: FileConfig =
-            toml::from_str(toml_content).expect("Could not parse TOML config");
-
-        let config = ConfigBuilder::new(file_config, "/tmp/test_config.toml")
-            .into_config()
-            .expect("Could not build config");
-
-        assert_eq!(
-            config.https_listeners.len(),
-            2,
-            "Should have two HTTPS listeners"
-        );
-
-        let listener_a = config
+        // HTTPS listeners
+        let https_proxy = config
             .https_listeners
             .iter()
-            .find(|l| {
-                let addr: SocketAddr = l.address.into();
-                addr == "192.168.1.1:443".parse::<SocketAddr>().unwrap()
-            })
+            .find(|l| SocketAddr::from(l.address) == "192.168.1.1:443".parse().unwrap())
             .expect("Listener on 192.168.1.1:443 not found");
-
-        let listener_b = config
+        let https_direct = config
             .https_listeners
             .iter()
-            .find(|l| {
-                let addr: SocketAddr = l.address.into();
-                addr == "192.168.2.1:443".parse::<SocketAddr>().unwrap()
-            })
+            .find(|l| SocketAddr::from(l.address) == "192.168.2.1:443".parse().unwrap())
             .expect("Listener on 192.168.2.1:443 not found");
 
-        assert!(
-            listener_a.expect_proxy,
-            "192.168.1.1:443 should have expect_proxy=true"
-        );
-        assert!(
-            !listener_b.expect_proxy,
-            "192.168.2.1:443 should have expect_proxy=false"
-        );
+        assert!(https_proxy.expect_proxy);
+        assert!(!https_direct.expect_proxy);
     }
 
     #[test]
     fn multiple_listeners_generate_correct_worker_requests() {
-        let toml_content = "command_socket = \"/tmp/sozu_test.sock\"\n\
-            worker_count = 1\n\
-            max_connections = 500\n\
-            activate_listeners = true\n\
-            \n\
-            [[listeners]]\n\
-            protocol = \"http\"\n\
-            address = \"172.16.20.1:80\"\n\
-            expect_proxy = true\n\
-            \n\
-            [[listeners]]\n\
-            protocol = \"http\"\n\
-            address = \"10.22.0.1:80\"\n\
-            expect_proxy = false\n";
+        let toml_content = r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+            activate_listeners = true
+
+            [[listeners]]
+            protocol = "http"
+            address = "172.16.20.1:80"
+            expect_proxy = true
+
+            [[listeners]]
+            protocol = "http"
+            address = "10.22.0.1:80"
+            expect_proxy = false
+        "#;
 
         let file_config: FileConfig =
             toml::from_str(toml_content).expect("Could not parse TOML config");
@@ -2088,28 +2043,24 @@ mod tests {
             })
             .count();
 
-        assert_eq!(
-            add_listener_count, 2,
-            "Should generate two AddHttpListener requests"
-        );
-        assert_eq!(
-            activate_listener_count, 2,
-            "Should generate two ActivateListener requests for HTTP"
-        );
+        assert_eq!(add_listener_count, 2);
+        assert_eq!(activate_listener_count, 2);
     }
 
     #[test]
     fn duplicate_listener_address_rejected() {
-        let toml_content = "command_socket = \"/tmp/sozu_test.sock\"\n\
-            worker_count = 1\n\
-            \n\
-            [[listeners]]\n\
-            protocol = \"http\"\n\
-            address = \"0.0.0.0:80\"\n\
-            \n\
-            [[listeners]]\n\
-            protocol = \"http\"\n\
-            address = \"0.0.0.0:80\"\n";
+        let toml_content = r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+
+            [[listeners]]
+            protocol = "http"
+            address = "0.0.0.0:80"
+
+            [[listeners]]
+            protocol = "http"
+            address = "0.0.0.0:80"
+        "#;
 
         let file_config: FileConfig =
             toml::from_str(toml_content).expect("Could not parse TOML config");
