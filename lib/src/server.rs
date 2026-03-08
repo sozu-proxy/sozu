@@ -1545,16 +1545,14 @@ impl Server {
             return 0;
         }
 
-        let sessions = self.sessions.borrow();
-
-        // Collect non-listener sessions with their last event time
-        let mut candidates: Vec<(Token, Instant)> = sessions
+        let mut candidates: Vec<(Token, Instant)> = self
+            .sessions
+            .borrow()
             .slab
             .iter()
             .filter(|(_, session)| {
-                let protocol = session.borrow().protocol();
                 !matches!(
-                    protocol,
+                    session.borrow().protocol(),
                     Protocol::HTTPListen
                         | Protocol::HTTPSListen
                         | Protocol::TCPListen
@@ -1569,38 +1567,21 @@ impl Server {
             })
             .collect();
 
-        // Sort by last_event ascending (oldest first = least recently active)
-        candidates.sort_by_key(|&(_, last_event)| last_event);
-        candidates.truncate(count);
-
-        drop(sessions);
-
-        let mut evicted = 0;
-        let tokens_to_evict: HashSet<Token> =
-            candidates.into_iter().map(|(token, _)| token).collect();
-
-        for token in &tokens_to_evict {
-            if self.sessions.borrow().slab.contains(token.0) {
-                let session = { self.sessions.borrow_mut().slab.remove(token.0) };
-                session.borrow_mut().close();
-                self.sessions.borrow_mut().decr();
-                evicted += 1;
-            }
+        if candidates.is_empty() {
+            return 0;
         }
 
-        // Clean up dangling entries (back tokens, etc.)
-        let mut dangling = HashSet::new();
-        for (entry_key, session) in &self.sessions.borrow().slab {
-            if tokens_to_evict.contains(&session.borrow().frontend_token()) {
-                dangling.insert(entry_key);
-            }
-        }
-        for entry_key in dangling {
-            let mut sessions = self.sessions.borrow_mut();
-            if sessions.slab.contains(entry_key) {
-                sessions.slab.remove(entry_key);
-            }
-        }
+        // Partial sort: move the `count` oldest entries to the front in O(n)
+        let pivot = count.min(candidates.len()) - 1;
+        candidates.select_nth_unstable_by_key(pivot, |&(_, last_event)| last_event);
+
+        let tokens: HashSet<Token> = candidates[..=pivot]
+            .iter()
+            .map(|&(token, _)| token)
+            .collect();
+        let evicted = tokens.len();
+
+        self.shut_down_sessions_by_frontend_tokens(tokens);
 
         evicted
     }
@@ -1615,24 +1596,25 @@ impl Server {
             }
 
             if !self.sessions.borrow_mut().check_limits() {
-                if self.evict_on_queue_full {
-                    // Evict a small batch of least recently active sessions
-                    let to_evict = std::cmp::max(1, self.sessions.borrow().max_connections / 100);
-                    let evicted = self.evict_least_active_sessions(to_evict);
-                    if evicted > 0 {
-                        count!("sessions.evicted", evicted as i64);
-                        warn!(
-                            "evicted {} least recently active sessions to make room for new connections",
-                            evicted
-                        );
-                        // Re-enable accepting after eviction
-                        self.sessions.borrow_mut().can_accept = true;
-                        gauge!("accept_queue.backpressure", 0);
-                    } else {
-                        error!("eviction enabled but no sessions could be evicted");
-                        break;
-                    }
-                } else {
+                if !self.evict_on_queue_full {
+                    break;
+                }
+
+                let to_evict = (self.sessions.borrow().max_connections / 100).max(1);
+                let evicted = self.evict_least_active_sessions(to_evict);
+                if evicted == 0 {
+                    error!("eviction enabled but no sessions could be evicted");
+                    break;
+                }
+
+                count!("sessions.evicted", evicted as i64);
+                warn!(
+                    "evicted {} least recently active sessions to make room",
+                    evicted
+                );
+
+                // Re-check limits after eviction instead of forcing can_accept
+                if !self.sessions.borrow_mut().check_limits() {
                     break;
                 }
             }

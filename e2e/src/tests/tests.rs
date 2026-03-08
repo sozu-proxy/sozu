@@ -1285,6 +1285,7 @@ fn try_max_connections() -> State {
 
     let (mut config, listeners, state) = Worker::empty_config();
     config.max_connections = 15;
+    config.evict_on_queue_full = false;
     let (mut worker, mut backends) =
         setup_sync_test("MAXCONN", config, listeners, state, front_address, 1, false);
 
