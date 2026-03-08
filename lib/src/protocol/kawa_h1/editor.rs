@@ -1,7 +1,7 @@
 use std::{
     io::Write as _,
     net::{IpAddr, SocketAddr},
-    str::{from_utf8, from_utf8_unchecked},
+    str::from_utf8,
 };
 
 use rusty_ulid::Ulid;
@@ -354,9 +354,6 @@ impl HttpContext {
             (otel, traceparent.is_some())
         };
 
-        // Reusable buffer for header values to avoid per-header String allocations
-        let mut hdr_buf = Vec::with_capacity(128);
-
         // If session_address is set:
         // - append its ip address to the list of "X-Forwarded-For" if it was found, creates it if not
         // - append "proto=[PROTO];for=[PEER];by=[PUBLIC]" to the list of "Forwarded" if it was found, creates it if not
@@ -366,10 +363,12 @@ impl HttpContext {
             let has_x_for = x_for.is_some();
             let has_forwarded = forwarded.is_some();
 
+            // Buffer for building header values — ownership is transferred to Store
+            // via `take`, so each header gets its own allocation.
+            let mut hdr_buf = Vec::with_capacity(128);
+
             if let Some(header) = x_for {
-                hdr_buf.extend_from_slice(
-                    unsafe { from_utf8_unchecked(header.val.data(buf)) }.as_bytes(),
-                );
+                hdr_buf.extend_from_slice(header.val.data(buf));
                 let _ = write!(hdr_buf, ", {peer_ip}");
                 header.val = kawa::Store::from_vec(std::mem::take(&mut hdr_buf));
             }
