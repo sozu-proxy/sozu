@@ -155,6 +155,9 @@ pub const DEFAULT_BUFFER_SIZE: u64 = 16_393;
 /// maximum number of simultaneous connections (10 000)
 pub const DEFAULT_MAX_CONNECTIONS: usize = 10_000;
 
+/// maximum number of simultaneous connections per source IP (0 = unlimited)
+pub const DEFAULT_MAX_CONNECTIONS_PER_IP: usize = 0;
+
 /// size of the buffer for the channels, in bytes. Must be bigger than the size of the data received. (1 MB)
 pub const DEFAULT_COMMAND_BUFFER_SIZE: u64 = 1_000_000;
 
@@ -1110,6 +1113,7 @@ pub struct FileConfig {
     pub command_buffer_size: Option<u64>,
     pub max_command_buffer_size: Option<u64>,
     pub max_connections: Option<usize>,
+    pub max_connections_per_ip: Option<usize>,
     pub min_buffers: Option<u64>,
     pub max_buffers: Option<u64>,
     pub buffer_size: Option<u64>,
@@ -1255,6 +1259,9 @@ impl ConfigBuilder {
             max_connections: file_config
                 .max_connections
                 .unwrap_or(DEFAULT_MAX_CONNECTIONS),
+            max_connections_per_ip: file_config
+                .max_connections_per_ip
+                .unwrap_or(DEFAULT_MAX_CONNECTIONS_PER_IP),
             metrics: file_config.metrics.clone(),
             disable_cluster_metrics: file_config
                 .disable_cluster_metrics
@@ -1478,6 +1485,8 @@ pub struct Config {
     pub command_buffer_size: u64,
     pub max_command_buffer_size: u64,
     pub max_connections: usize,
+    #[serde(default)]
+    pub max_connections_per_ip: usize,
     pub min_buffers: u64,
     pub max_buffers: u64,
     pub buffer_size: u64,
@@ -1791,6 +1800,7 @@ impl fmt::Debug for Config {
             .field("command_buffer_size", &self.command_buffer_size)
             .field("max_command_buffer_size", &self.max_command_buffer_size)
             .field("max_connections", &self.max_connections)
+            .field("max_connections_per_ip", &self.max_connections_per_ip)
             .field("min_buffers", &self.min_buffers)
             .field("max_buffers", &self.max_buffers)
             .field("buffer_size", &self.buffer_size)
@@ -1843,6 +1853,7 @@ impl From<&Config> for ServerConfig {
         });
         Self {
             max_connections: config.max_connections as u64,
+            max_connections_per_ip: config.max_connections_per_ip as u64,
             front_timeout: config.front_timeout,
             back_timeout: config.back_timeout,
             connect_timeout: config.connect_timeout,
