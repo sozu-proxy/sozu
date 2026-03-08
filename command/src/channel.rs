@@ -15,6 +15,9 @@ use prost::{DecodeError, Message as ProstMessage};
 
 use crate::{buffer::growable::Buffer, ready::Ready};
 
+/// High watermark threshold: log a warning when buffer usage exceeds 80% of max
+const HIGH_WATERMARK_RATIO: f64 = 0.8;
+
 #[derive(thiserror::Error, Debug)]
 pub enum ChannelError {
     #[error("io read error")]
@@ -24,13 +27,17 @@ pub enum ChannelError {
     #[error("no byte left to read on the channel")]
     NoByteToRead,
     #[error(
-        "message too large for the capacity of the back fuffer ({0}. Consider increasing the back buffer size"
+        "message ({message_len} bytes) too large for back buffer capacity ({capacity} bytes, max {max} bytes)"
     )]
-    MessageTooLarge(usize),
+    MessageTooLarge {
+        message_len: usize,
+        capacity: usize,
+        max: usize,
+    },
     #[error("channel could not write on the back buffer")]
     Write(std::io::Error),
-    #[error("channel buffer is full ({0} bytes), cannot grow more")]
-    BufferFull(usize),
+    #[error("channel buffer is full ({capacity} bytes, max {max} bytes), cannot grow more")]
+    BufferFull { capacity: usize, max: usize },
     #[error("Timeout is reached: {0:?}")]
     TimeoutReached(Duration),
     #[error("Could not read anything on the channel")]
@@ -60,10 +67,15 @@ pub struct Channel<Tx, Rx> {
     pub sock: MioUnixStream,
     pub front_buf: Buffer,
     pub back_buf: Buffer,
-    max_buffer_size: u64,
+    initial_buffer_size: usize,
+    max_buffer_size: usize,
     pub readiness: Ready,
     pub interest: Ready,
     blocking: bool,
+    /// true if a high watermark warning has been logged for the front buffer
+    front_high_watermark_logged: bool,
+    /// true if a high watermark warning has been logged for the back buffer
+    back_high_watermark_logged: bool,
     phantom_tx: PhantomData<Tx>,
     phantom_rx: PhantomData<Rx>,
 }
@@ -100,14 +112,19 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
 
     /// Creates a nonblocking channel, using a unix stream
     pub fn new(sock: MioUnixStream, buffer_size: u64, max_buffer_size: u64) -> Channel<Tx, Rx> {
+        let buffer_size = buffer_size as usize;
+        let max_buffer_size = max_buffer_size as usize;
         Channel {
             sock,
-            front_buf: Buffer::with_capacity(buffer_size as usize),
-            back_buf: Buffer::with_capacity(buffer_size as usize),
+            front_buf: Buffer::with_capacity(buffer_size),
+            back_buf: Buffer::with_capacity(buffer_size),
+            initial_buffer_size: buffer_size,
             max_buffer_size,
             readiness: Ready::EMPTY,
             interest: Ready::READABLE,
             blocking: false,
+            front_high_watermark_logged: false,
+            back_high_watermark_logged: false,
             phantom_tx: PhantomData,
             phantom_rx: PhantomData,
         }
@@ -120,10 +137,13 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
             sock: self.sock,
             front_buf: self.front_buf,
             back_buf: self.back_buf,
+            initial_buffer_size: self.initial_buffer_size,
             max_buffer_size: self.max_buffer_size,
             readiness: self.readiness,
             interest: self.interest,
             blocking: self.blocking,
+            front_high_watermark_logged: self.front_high_watermark_logged,
+            back_high_watermark_logged: self.back_high_watermark_logged,
             phantom_tx: PhantomData,
             phantom_rx: PhantomData,
         }
@@ -191,6 +211,42 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
         self.readiness & self.interest
     }
 
+    /// Compute the next buffer size using a doubling strategy, capped at max_buffer_size.
+    /// Returns None if the buffer is already at max capacity.
+    fn grow_size(&self, current_capacity: usize) -> Option<usize> {
+        if current_capacity >= self.max_buffer_size {
+            return None;
+        }
+        // double the capacity, but don't exceed max
+        let new_size = min(current_capacity.saturating_mul(2), self.max_buffer_size);
+        // ensure we grow by at least something (in case current_capacity is 0)
+        let new_size = new_size.max(current_capacity + 1);
+        Some(min(new_size, self.max_buffer_size))
+    }
+
+    /// Check if a buffer has exceeded the high watermark and log a warning once
+    fn check_high_watermark(
+        buffer_name: &str,
+        capacity: usize,
+        max: usize,
+        already_logged: &mut bool,
+    ) {
+        if *already_logged {
+            return;
+        }
+        let threshold = (max as f64 * HIGH_WATERMARK_RATIO) as usize;
+        if capacity >= threshold {
+            warn!(
+                "channel {} buffer reached high watermark: {} bytes ({:.0}% of {} max)",
+                buffer_name,
+                capacity,
+                (capacity as f64 / max as f64) * 100.0,
+                max,
+            );
+            *already_logged = true;
+        }
+    }
+
     /// Check wether we want and can read or write, and calls the appropriate handler.
     pub fn run(&mut self) -> Result<(), ChannelError> {
         let interest = self.interest & self.readiness;
@@ -206,6 +262,7 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
     }
 
     /// Handle readability by filling the front buffer with the socket data.
+    /// Grows the front buffer when full using a doubling strategy, up to max_buffer_size.
     pub fn readable(&mut self) -> Result<usize, ChannelError> {
         if !(self.interest & self.readiness).is_readable() {
             return Err(ChannelError::Connection(None));
@@ -216,8 +273,19 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
             let size = self.front_buf.available_space();
             trace!("channel available space: {}", size);
             if size == 0 {
-                self.interest.remove(Ready::READABLE);
-                break;
+                // try to grow the buffer before giving up
+                if let Some(new_size) = self.grow_size(self.front_buf.capacity()) {
+                    Self::check_high_watermark(
+                        "front",
+                        new_size,
+                        self.max_buffer_size,
+                        &mut self.front_high_watermark_logged,
+                    );
+                    self.front_buf.grow(new_size);
+                } else {
+                    self.interest.remove(Ready::READABLE);
+                    break;
+                }
             }
 
             match self.sock.read(self.front_buf.space()) {
@@ -248,7 +316,8 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
         Ok(count)
     }
 
-    /// Handle writability by writing the content of the back buffer onto the socket
+    /// Handle writability by writing the content of the back buffer onto the socket.
+    /// Shrinks the back buffer back toward initial size once fully drained.
     pub fn writable(&mut self) -> Result<usize, ChannelError> {
         if !(self.interest & self.readiness).is_writable() {
             return Err(ChannelError::Connection(None));
@@ -259,6 +328,7 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
             let size = self.back_buf.available_data();
             if size == 0 {
                 self.interest.remove(Ready::WRITABLE);
+                self.try_shrink_back_buf();
                 break;
             }
 
@@ -310,6 +380,7 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
     /// Parse a message from the front buffer, without waiting
     fn read_message_nonblocking(&mut self) -> Result<Rx, ChannelError> {
         if let Some(message) = self.try_read_delimited_message()? {
+            self.try_shrink_front_buf();
             return Ok(message);
         }
 
@@ -335,6 +406,7 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
             }
 
             if let Some(message) = self.try_read_delimited_message()? {
+                self.try_shrink_front_buf();
                 return Ok(message);
             }
 
@@ -371,12 +443,20 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
         }
 
         if self.front_buf.available_space() == 0 {
-            if (self.front_buf.capacity() as u64) >= self.max_buffer_size {
-                return Err(ChannelError::BufferFull(self.front_buf.capacity()));
+            if self.front_buf.capacity() >= self.max_buffer_size {
+                return Err(ChannelError::BufferFull {
+                    capacity: self.front_buf.capacity(),
+                    max: self.max_buffer_size,
+                });
             }
-            let new_size = min(
-                self.front_buf.capacity() + 5000,
-                self.max_buffer_size as usize,
+            let new_size = self
+                .grow_size(self.front_buf.capacity())
+                .unwrap_or(self.max_buffer_size);
+            Self::check_high_watermark(
+                "front",
+                new_size,
+                self.max_buffer_size,
+                &mut self.front_high_watermark_logged,
             );
             self.front_buf.grow(new_size);
         }
@@ -439,14 +519,27 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
         }
 
         if payload_len > self.back_buf.available_space() {
-            if payload_len - self.back_buf.available_space() + self.back_buf.capacity()
-                > (self.max_buffer_size as usize)
-            {
-                return Err(ChannelError::MessageTooLarge(self.back_buf.capacity()));
+            let needed = payload_len - self.back_buf.available_space() + self.back_buf.capacity();
+            if needed > self.max_buffer_size {
+                return Err(ChannelError::MessageTooLarge {
+                    message_len: payload_len,
+                    capacity: self.back_buf.capacity(),
+                    max: self.max_buffer_size,
+                });
             }
 
-            let new_length =
-                payload_len - self.back_buf.available_space() + self.back_buf.capacity();
+            // use doubling strategy to reach at least `needed`
+            let mut new_length = self.back_buf.capacity();
+            while new_length < needed {
+                new_length = min(new_length.saturating_mul(2).max(new_length + 1), needed);
+            }
+            new_length = min(new_length, self.max_buffer_size);
+            Self::check_high_watermark(
+                "back",
+                new_length,
+                self.max_buffer_size,
+                &mut self.back_high_watermark_logged,
+            );
             self.back_buf.grow(new_length);
         }
 
@@ -458,6 +551,40 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
             .map_err(ChannelError::Write)?;
 
         Ok(())
+    }
+
+    /// Shrink the front buffer back toward initial_buffer_size when it is
+    /// mostly empty (data consumed) and was previously grown.
+    fn try_shrink_front_buf(&mut self) {
+        let capacity = self.front_buf.capacity();
+        if capacity <= self.initial_buffer_size {
+            return;
+        }
+        // only shrink when the buffer has little pending data
+        if self.front_buf.available_data() * 4 < self.initial_buffer_size {
+            self.front_buf.shrink(self.initial_buffer_size);
+            self.front_high_watermark_logged = false;
+            trace!(
+                "front buffer shrunk from {} to {} bytes",
+                capacity, self.initial_buffer_size
+            );
+        }
+    }
+
+    /// Shrink the back buffer back toward initial_buffer_size when fully drained.
+    fn try_shrink_back_buf(&mut self) {
+        let capacity = self.back_buf.capacity();
+        if capacity <= self.initial_buffer_size {
+            return;
+        }
+        if self.back_buf.available_data() == 0 {
+            self.back_buf.shrink(self.initial_buffer_size);
+            self.back_high_watermark_logged = false;
+            trace!(
+                "back buffer shrunk from {} to {} bytes",
+                capacity, self.initial_buffer_size
+            );
+        }
     }
 }
 
@@ -690,5 +817,98 @@ mod tests {
             .read_message()
             .expect("Could not read message on channel");
         assert_eq!(message_2, ProtobufMessage { inner: 2 });
+    }
+
+    #[test]
+    fn buffer_grows_with_doubling_strategy() {
+        let (mut writing_channel, _reading_channel): (
+            Channel<ProtobufMessage, ProtobufMessage>,
+            Channel<ProtobufMessage, ProtobufMessage>,
+        ) = Channel::generate(100, 10000).expect("could not generate channels");
+
+        assert_eq!(writing_channel.back_buf.capacity(), 100);
+
+        assert_eq!(writing_channel.grow_size(100), Some(200));
+        assert_eq!(writing_channel.grow_size(200), Some(400));
+        assert_eq!(writing_channel.grow_size(5000), Some(10000));
+        assert_eq!(writing_channel.grow_size(10000), None);
+    }
+
+    #[test]
+    fn buffer_cap_returns_error() {
+        let (mut writing_channel, _reading_channel): (
+            Channel<ProtobufMessage, ProtobufMessage>,
+            Channel<ProtobufMessage, ProtobufMessage>,
+        ) = Channel::generate(50, 50).expect("could not generate channels");
+
+        writing_channel.blocking().expect("Could not block channel");
+
+        let mut i = 0u32;
+        let result = loop {
+            let msg = ProtobufMessage { inner: i };
+            match writing_channel.write_delimited_message(&msg) {
+                Ok(()) => i += 1,
+                Err(e) => break Err(e),
+            }
+            if i > 10000 {
+                break Ok(());
+            }
+        };
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let err_msg = format!("{}", err);
+        assert!(
+            err_msg.contains("too large") || err_msg.contains("cannot grow"),
+            "unexpected error: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn back_buffer_shrinks_after_drain() {
+        let (mut channel, _other): (
+            Channel<ProtobufMessage, ProtobufMessage>,
+            Channel<ProtobufMessage, ProtobufMessage>,
+        ) = Channel::generate(100, 10000).expect("could not generate channels");
+
+        // Write directly to the back buffer (without draining to socket)
+        // to force growth. Each message is ~10 bytes (delimiter + varint).
+        for i in 0..20 {
+            channel
+                .write_delimited_message(&ProtobufMessage { inner: i })
+                .expect("Could not write message");
+        }
+
+        let grown_capacity = channel.back_buf.capacity();
+        assert!(
+            grown_capacity > 100,
+            "expected buffer growth, got capacity {}",
+            grown_capacity
+        );
+
+        // Simulate full drain by consuming all data
+        let data_len = channel.back_buf.available_data();
+        channel.back_buf.consume(data_len);
+        assert_eq!(channel.back_buf.available_data(), 0);
+
+        channel.try_shrink_back_buf();
+        assert_eq!(
+            channel.back_buf.capacity(),
+            100,
+            "back buffer should shrink to initial size after drain"
+        );
+    }
+
+    #[test]
+    fn front_buffer_grows_on_readable() {
+        let (_, channel): (
+            Channel<ProtobufMessage, ProtobufMessage>,
+            Channel<ProtobufMessage, ProtobufMessage>,
+        ) = Channel::generate(100, 10000).expect("could not generate channels");
+
+        assert_eq!(channel.grow_size(100), Some(200));
+        assert_eq!(channel.grow_size(5000), Some(10000));
+        assert_eq!(channel.grow_size(10000), None);
     }
 }
