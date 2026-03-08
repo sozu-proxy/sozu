@@ -145,6 +145,15 @@ If a frontend has a `sticky_session`, the sticky name is defined at the listener
 sticky_name = "SOZUBALANCEID"
 ```
 
+Sozu can add the `X-Real-IP` header to requests forwarded to backends,
+containing the client's source IP address. This header is always set by
+sozu (any client-provided value is removed). It is enabled by default.
+
+```toml
+# whether to add the X-Real-IP header. Defaults to true.
+# send_x_real_ip = true
+```
+
 #### Options specific to HTTPS listeners
 
 ```toml

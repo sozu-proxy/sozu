@@ -200,6 +200,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         request_id: Ulid,
         session_address: Option<SocketAddr>,
         sticky_name: String,
+        send_x_real_ip: bool,
     ) -> Result<Http<Front, L>, AcceptError> {
         let (front_buffer, back_buffer) = match pool.upgrade() {
             Some(pool) => {
@@ -247,6 +248,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 public_address,
                 session_address,
                 sticky_name,
+                send_x_real_ip,
             ),
         })
     }

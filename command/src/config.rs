@@ -275,6 +275,9 @@ pub struct ListenerBuilder {
     /// The ticket allow the client to resume a session. This protects the client
     /// agains session tracking. Defaults to 4.
     pub send_tls13_tickets: Option<u64>,
+    /// Whether to add the X-Real-IP header with the client's source IP address.
+    /// Defaults to true.
+    pub send_x_real_ip: Option<bool>,
 }
 
 pub fn default_sticky_name() -> String {
@@ -328,6 +331,7 @@ impl ListenerBuilder {
             public_address: None,
             request_timeout: None,
             send_tls13_tickets: None,
+            send_x_real_ip: None,
             sticky_name: DEFAULT_STICKY_NAME.to_string(),
             tls_versions: None,
         }
@@ -481,6 +485,7 @@ impl ListenerBuilder {
             connect_timeout: self.connect_timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT),
             request_timeout: self.request_timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT),
             http_answers,
+            send_x_real_ip: self.send_x_real_ip.unwrap_or(true),
             ..Default::default()
         };
 
@@ -580,6 +585,7 @@ impl ListenerBuilder {
                 .send_tls13_tickets
                 .unwrap_or(DEFAULT_SEND_TLS_13_TICKETS),
             http_answers,
+            send_x_real_ip: self.send_x_real_ip.unwrap_or(true),
         };
 
         Ok(https_listener_config)

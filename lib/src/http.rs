@@ -82,6 +82,7 @@ pub struct HttpSession {
     proxy: Rc<RefCell<HttpProxy>>,
     state: HttpStateMachine,
     sticky_name: String,
+    send_x_real_ip: bool,
     has_been_closed: bool,
 }
 
@@ -98,6 +99,7 @@ impl HttpSession {
         pool: Weak<RefCell<Pool>>,
         proxy: Rc<RefCell<HttpProxy>>,
         public_address: SocketAddr,
+        send_x_real_ip: bool,
         sock: TcpStream,
         sticky_name: String,
         token: Token,
@@ -135,6 +137,7 @@ impl HttpSession {
                 request_id,
                 session_address,
                 sticky_name.clone(),
+                send_x_real_ip,
             )?)
         };
 
@@ -151,6 +154,7 @@ impl HttpSession {
             metrics,
             pool,
             proxy,
+            send_x_real_ip,
             state,
             sticky_name,
         })
@@ -201,6 +205,7 @@ impl HttpSession {
                     expect.request_id,
                     Some(session_address),
                     self.sticky_name.clone(),
+                    self.send_x_real_ip,
                 )
                 .ok()?;
                 http.frontend_readiness.event = expect.frontend_readiness.event;
@@ -930,6 +935,7 @@ impl ProxyConfiguration for HttpProxy {
             Rc::downgrade(&self.pool),
             proxy,
             public_address,
+            owned.config.send_x_real_ip,
             frontend_sock,
             owned.config.sticky_name.clone(),
             session_token,

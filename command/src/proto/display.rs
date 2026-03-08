@@ -1034,6 +1034,7 @@ impl Display for HttpListenerConfig {
         table.add_row(row!["connect timeout", self.connect_timeout]);
         table.add_row(row!["request timeout", self.request_timeout]);
         table.add_row(row!["activated", self.active]);
+        table.add_row(row!["send X-Real-IP", self.send_x_real_ip]);
         write!(f, "{}", table)
     }
 }
@@ -1068,6 +1069,7 @@ impl Display for HttpsListenerConfig {
         table.add_row(row!["connect timeout", self.connect_timeout]);
         table.add_row(row!["request timeout", self.request_timeout]);
         table.add_row(row!["activated", self.active]);
+        table.add_row(row!["send X-Real-IP", self.send_x_real_ip]);
         write!(f, "{}", table)
     }
 }

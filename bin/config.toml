@@ -201,6 +201,10 @@ address = "0.0.0.0:8080"
 # a cluster. Defaults to "SOZUBALANCEID"
 # sticky_name = "SOZUBALANCEID"
 #
+# Whether to add the X-Real-IP header with the client's source IP address.
+# Sozu always overwrites any client-provided value. Defaults to true.
+# send_x_real_ip = true
+#
 # Configures the client socket to receive a PROXY protocol header
 # this option is incompatible with public_address
 # expect_proxy = false
@@ -238,6 +242,10 @@ address = "0.0.0.0:8443"
 # defines the sticky session cookie's name, if `sticky_session` is activated for
 # a cluster. Defaults to "SOZUBALANCEID"
 # sticky_name = "SOZUBALANCEID"
+
+# Whether to add the X-Real-IP header with the client's source IP address.
+# Sozu always overwrites any client-provided value. Defaults to true.
+# send_x_real_ip = true
 
 # Configures the client socket to receive a PROXY protocol header
 # this option is incompatible with public_address
