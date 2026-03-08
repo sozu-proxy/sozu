@@ -730,6 +730,8 @@ message ServerConfig {
     optional ServerMetricsConfig metrics = 15;
     required ProtobufAccessLogFormat access_log_format = 16;
     required bool log_colored = 17;
+    // whether to evict least recently active sessions when the accept queue is full
+    required bool evict_on_queue_full = 18 [default = true];
 }
 
 enum ProtobufAccessLogFormat {

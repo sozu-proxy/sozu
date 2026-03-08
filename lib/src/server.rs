@@ -212,6 +212,7 @@ pub enum ServerError {
 pub struct Server {
     accept_queue_timeout: Duration,
     accept_queue: VecDeque<(TcpStream, ListenToken, Protocol, Instant)>,
+    evict_on_queue_full: bool,
     accept_ready: HashSet<ListenToken>,
     backends: Rc<RefCell<BackendMap>>,
     base_sessions_count: usize,
@@ -378,6 +379,7 @@ impl Server {
             )),
             accept_queue: VecDeque::new(),
             accept_ready: HashSet::new(),
+            evict_on_queue_full: server_config.evict_on_queue_full,
             backends,
             base_sessions_count,
             channel,
@@ -1536,6 +1538,73 @@ impl Server {
         gauge!("accept_queue.connections", self.accept_queue.len());
     }
 
+    /// Evict the least recently active sessions to make room for new connections.
+    /// Returns the number of sessions evicted.
+    fn evict_least_active_sessions(&self, count: usize) -> usize {
+        if count == 0 {
+            return 0;
+        }
+
+        let sessions = self.sessions.borrow();
+
+        // Collect non-listener sessions with their last event time
+        let mut candidates: Vec<(Token, Instant)> = sessions
+            .slab
+            .iter()
+            .filter(|(_, session)| {
+                let protocol = session.borrow().protocol();
+                !matches!(
+                    protocol,
+                    Protocol::HTTPListen
+                        | Protocol::HTTPSListen
+                        | Protocol::TCPListen
+                        | Protocol::Channel
+                        | Protocol::Metrics
+                        | Protocol::Timer
+                )
+            })
+            .map(|(_, session)| {
+                let s = session.borrow();
+                (s.frontend_token(), s.last_event())
+            })
+            .collect();
+
+        // Sort by last_event ascending (oldest first = least recently active)
+        candidates.sort_by_key(|&(_, last_event)| last_event);
+        candidates.truncate(count);
+
+        drop(sessions);
+
+        let mut evicted = 0;
+        let tokens_to_evict: HashSet<Token> =
+            candidates.into_iter().map(|(token, _)| token).collect();
+
+        for token in &tokens_to_evict {
+            if self.sessions.borrow().slab.contains(token.0) {
+                let session = { self.sessions.borrow_mut().slab.remove(token.0) };
+                session.borrow_mut().close();
+                self.sessions.borrow_mut().decr();
+                evicted += 1;
+            }
+        }
+
+        // Clean up dangling entries (back tokens, etc.)
+        let mut dangling = HashSet::new();
+        for (entry_key, session) in &self.sessions.borrow().slab {
+            if tokens_to_evict.contains(&session.borrow().frontend_token()) {
+                dangling.insert(entry_key);
+            }
+        }
+        for entry_key in dangling {
+            let mut sessions = self.sessions.borrow_mut();
+            if sessions.slab.contains(entry_key) {
+                sessions.slab.remove(entry_key);
+            }
+        }
+
+        evicted
+    }
+
     pub fn create_sessions(&mut self) {
         while let Some((sock, token, protocol, timestamp)) = self.accept_queue.pop_back() {
             let wait_time = Instant::now() - timestamp;
@@ -1546,7 +1615,26 @@ impl Server {
             }
 
             if !self.sessions.borrow_mut().check_limits() {
-                break;
+                if self.evict_on_queue_full {
+                    // Evict a small batch of least recently active sessions
+                    let to_evict = std::cmp::max(1, self.sessions.borrow().max_connections / 100);
+                    let evicted = self.evict_least_active_sessions(to_evict);
+                    if evicted > 0 {
+                        count!("sessions.evicted", evicted as i64);
+                        warn!(
+                            "evicted {} least recently active sessions to make room for new connections",
+                            evicted
+                        );
+                        // Re-enable accepting after eviction
+                        self.sessions.borrow_mut().can_accept = true;
+                        gauge!("accept_queue.backpressure", 0);
+                    } else {
+                        error!("eviction enabled but no sessions could be evicted");
+                        break;
+                    }
+                } else {
+                    break;
+                }
             }
 
             //FIXME: check the timestamp

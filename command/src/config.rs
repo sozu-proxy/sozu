@@ -134,6 +134,9 @@ pub const DEFAULT_ZOMBIE_CHECK_INTERVAL: u32 = 1_800;
 /// timeout to accept connection events in the accept queue (60 seconds)
 pub const DEFAULT_ACCEPT_QUEUE_TIMEOUT: u32 = 60;
 
+/// whether to evict least recently active sessions when the accept queue is full (true)
+pub const DEFAULT_EVICT_ON_QUEUE_FULL: bool = true;
+
 /// number of workers, i.e. Sōzu processes that scale horizontally (2)
 pub const DEFAULT_WORKER_COUNT: u16 = 2;
 
@@ -1147,6 +1150,8 @@ pub struct FileConfig {
     #[serde(default)]
     pub accept_queue_timeout: Option<u32>,
     #[serde(default)]
+    pub evict_on_queue_full: Option<bool>,
+    #[serde(default)]
     pub request_timeout: Option<u32>,
     #[serde(default)]
     pub worker_timeout: Option<u32>,
@@ -1220,6 +1225,9 @@ impl ConfigBuilder {
             accept_queue_timeout: file_config
                 .accept_queue_timeout
                 .unwrap_or(DEFAULT_ACCEPT_QUEUE_TIMEOUT),
+            evict_on_queue_full: file_config
+                .evict_on_queue_full
+                .unwrap_or(DEFAULT_EVICT_ON_QUEUE_FULL),
             activate_listeners: file_config.activate_listeners.unwrap_or(true),
             automatic_state_save: file_config
                 .automatic_state_save
@@ -1514,6 +1522,8 @@ pub struct Config {
     pub zombie_check_interval: u32,
     #[serde(default = "default_accept_queue_timeout")]
     pub accept_queue_timeout: u32,
+    #[serde(default = "default_evict_on_queue_full")]
+    pub evict_on_queue_full: bool,
     #[serde(default = "default_request_timeout")]
     pub request_timeout: u32,
     #[serde(default = "default_worker_timeout")]
@@ -1542,6 +1552,10 @@ fn default_zombie_check_interval() -> u32 {
 
 fn default_accept_queue_timeout() -> u32 {
     DEFAULT_ACCEPT_QUEUE_TIMEOUT
+}
+
+fn default_evict_on_queue_full() -> bool {
+    DEFAULT_EVICT_ON_QUEUE_FULL
 }
 
 fn default_disable_cluster_metrics() -> bool {
@@ -1813,6 +1827,7 @@ impl fmt::Debug for Config {
             .field("connect_timeout", &self.connect_timeout)
             .field("zombie_check_interval", &self.zombie_check_interval)
             .field("accept_queue_timeout", &self.accept_queue_timeout)
+            .field("evict_on_queue_full", &self.evict_on_queue_full)
             .field("request_timeout", &self.request_timeout)
             .field("worker_timeout", &self.worker_timeout)
             .finish()
@@ -1859,6 +1874,7 @@ impl From<&Config> for ServerConfig {
             metrics,
             access_log_format: ProtobufAccessLogFormat::from(&config.access_logs_format) as i32,
             log_colored: config.log_colored,
+            evict_on_queue_full: config.evict_on_queue_full,
         }
     }
 }
