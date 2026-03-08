@@ -7,7 +7,7 @@ extern crate sozu_command_lib;
 
 use std::time::Instant;
 
-use rand::{Rng, RngCore, SeedableRng, rngs::StdRng};
+use rand::{Rng, RngExt, SeedableRng, rngs::StdRng};
 use sozu_command_lib::logging::setup_logging;
 
 struct LogLine {
