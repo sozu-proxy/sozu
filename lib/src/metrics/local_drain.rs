@@ -702,4 +702,95 @@ mod tests {
 
         assert_eq!(expected_cluster_metrics, returned_cluster_metrics);
     }
+    #[test]
+    fn receive_and_yield_http_status_metrics() {
+        let mut local_drain = LocalDrain::new("prefix".to_string());
+
+        local_drain.receive_metric(
+            "http.status.2xx",
+            Some("test-cluster"),
+            Some("test-backend"),
+            MetricValue::Count(1),
+        );
+        local_drain.receive_metric(
+            "http.status.2xx",
+            Some("test-cluster"),
+            Some("test-backend"),
+            MetricValue::Count(1),
+        );
+        local_drain.receive_metric(
+            "http.status.200",
+            Some("test-cluster"),
+            Some("test-backend"),
+            MetricValue::Count(1),
+        );
+        local_drain.receive_metric(
+            "http.status.200",
+            Some("test-cluster"),
+            Some("test-backend"),
+            MetricValue::Count(1),
+        );
+        local_drain.receive_metric(
+            "http.status.404",
+            Some("test-cluster"),
+            Some("test-backend"),
+            MetricValue::Count(1),
+        );
+
+        let backend_metrics = local_drain
+            .metrics_of_one_backend(
+                "test-backend",
+                [
+                    "http.status.2xx".to_string(),
+                    "http.status.200".to_string(),
+                    "http.status.404".to_string(),
+                ]
+                .as_ref(),
+            )
+            .expect("could not query metrics for this backend");
+
+        assert_eq!(
+            backend_metrics.metrics.get("http.status.2xx"),
+            Some(&FilteredMetrics {
+                inner: Some(Inner::Count(2)),
+            })
+        );
+        assert_eq!(
+            backend_metrics.metrics.get("http.status.200"),
+            Some(&FilteredMetrics {
+                inner: Some(Inner::Count(2)),
+            })
+        );
+        assert_eq!(
+            backend_metrics.metrics.get("http.status.404"),
+            Some(&FilteredMetrics {
+                inner: Some(Inner::Count(1)),
+            })
+        );
+    }
+
+    #[test]
+    fn receive_and_yield_http_error_metrics_per_backend() {
+        let mut local_drain = LocalDrain::new("prefix".to_string());
+
+        for _ in 0..3 {
+            local_drain.receive_metric(
+                "http.errors",
+                Some("test-cluster"),
+                Some("test-backend"),
+                MetricValue::Count(1),
+            );
+        }
+
+        let backend_metrics = local_drain
+            .metrics_of_one_backend("test-backend", ["http.errors".to_string()].as_ref())
+            .expect("could not query metrics for this backend");
+
+        assert_eq!(
+            backend_metrics.metrics.get("http.errors"),
+            Some(&FilteredMetrics {
+                inner: Some(Inner::Count(3)),
+            })
+        );
+    }
 }

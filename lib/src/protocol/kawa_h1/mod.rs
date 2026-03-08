@@ -961,6 +961,11 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
     }
     pub fn log_request_error(&self, metrics: &mut SessionMetrics, message: &str) {
         incr!("http.errors");
+        incr!(
+            "http.errors",
+            self.context.cluster_id.as_deref(),
+            self.context.backend_id.as_deref()
+        );
         error!(
             "{} Could not process request properly got: {}",
             log_context!(self),
@@ -2063,5 +2068,28 @@ fn save_http_status_metric(status: Option<u16>, context: LogContext) {
                 incr!("http.status.other");
             }
         }
+
+        // Track individual status codes for the most common ones
+        let key: &'static str = match status {
+            200 => "http.status.200",
+            201 => "http.status.201",
+            204 => "http.status.204",
+            301 => "http.status.301",
+            302 => "http.status.302",
+            304 => "http.status.304",
+            400 => "http.status.400",
+            401 => "http.status.401",
+            403 => "http.status.403",
+            404 => "http.status.404",
+            408 => "http.status.408",
+            413 => "http.status.413",
+            429 => "http.status.429",
+            500 => "http.status.500",
+            502 => "http.status.502",
+            503 => "http.status.503",
+            504 => "http.status.504",
+            _ => return,
+        };
+        incr!(key, context.cluster_id, context.backend_id);
     }
 }

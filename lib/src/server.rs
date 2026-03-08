@@ -235,6 +235,7 @@ pub struct Server {
     last_zombie_check: Instant,
     loop_start: Instant,
     max_poll_errors: i32, // TODO: make this configurable? this defaults to 10000 for now
+    pool: Rc<RefCell<Pool>>,
     pub poll: Poll,
     poll_timeout: Option<Duration>, // TODO: make this configurable? this defaults to 1000 milliseconds for now
     scm_listeners: Option<Listeners>,
@@ -400,6 +401,7 @@ impl Server {
             last_zombie_check: Instant::now(), // to be reset on server run
             loop_start: Instant::now(),        // to be reset on server run
             max_poll_errors: 10000,            // TODO: make it configurable?
+            pool,
             poll_timeout: Some(Duration::from_millis(1000)), // TODO: make it configurable?
             poll,
             scm_listeners: None,
@@ -595,6 +597,11 @@ impl Server {
 
             gauge!("client.connections", self.sessions.borrow().nb_connections);
             gauge!("slab.entries", self.sessions.borrow().slab.len());
+            {
+                let pool = self.pool.borrow();
+                gauge!("buffer.used", pool.inner.used());
+                gauge!("buffer.capacity", pool.inner.capacity());
+            }
             METRICS.with(|metrics| {
                 (*metrics.borrow_mut()).send_data();
             });
