@@ -528,10 +528,10 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
                 });
             }
 
-            // use doubling strategy to reach at least `needed`
+            // use doubling strategy to reach at least `needed`, amortizing future writes
             let mut new_length = self.back_buf.capacity();
             while new_length < needed {
-                new_length = min(new_length.saturating_mul(2).max(new_length + 1), needed);
+                new_length = new_length.saturating_mul(2).max(new_length + 1);
             }
             new_length = min(new_length, self.max_buffer_size);
             Self::check_high_watermark(
@@ -821,7 +821,7 @@ mod tests {
 
     #[test]
     fn buffer_grows_with_doubling_strategy() {
-        let (mut writing_channel, _reading_channel): (
+        let (writing_channel, _reading_channel): (
             Channel<ProtobufMessage, ProtobufMessage>,
             Channel<ProtobufMessage, ProtobufMessage>,
         ) = Channel::generate(100, 10000).expect("could not generate channels");
@@ -901,14 +901,34 @@ mod tests {
     }
 
     #[test]
-    fn front_buffer_grows_on_readable() {
-        let (_, channel): (
+    fn back_buffer_grows_with_doubling_on_write() {
+        let (mut channel, _other): (
             Channel<ProtobufMessage, ProtobufMessage>,
             Channel<ProtobufMessage, ProtobufMessage>,
-        ) = Channel::generate(100, 10000).expect("could not generate channels");
+        ) = Channel::generate(32, 10000).expect("could not generate channels");
 
-        assert_eq!(channel.grow_size(100), Some(200));
-        assert_eq!(channel.grow_size(5000), Some(10000));
-        assert_eq!(channel.grow_size(10000), None);
+        assert_eq!(channel.back_buf.capacity(), 32);
+
+        // Write enough messages to force growth beyond initial capacity.
+        // Each ProtobufMessage encodes to ~4 bytes + 8-byte delimiter = ~12 bytes.
+        for i in 0..10 {
+            channel
+                .write_delimited_message(&ProtobufMessage { inner: i })
+                .expect("Could not write message");
+        }
+
+        let grown = channel.back_buf.capacity();
+        assert!(
+            grown > 32,
+            "expected buffer growth beyond 32, got {}",
+            grown
+        );
+        // doubling from 32 should yield a power-of-two-like size (64, 128, 256, ...)
+        // rather than the exact needed amount
+        assert!(
+            grown.is_power_of_two() || grown == 10000,
+            "expected doubling growth pattern, got {}",
+            grown
+        );
     }
 }
