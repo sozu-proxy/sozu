@@ -180,7 +180,7 @@ mod test {
     use super::*;
     use crate::{
         PeakEWMA,
-        backends::BackendStatus,
+        backends::{BackendStatus, HealthState},
         retry::{ExponentialBackoffPolicy, RetryPolicyWrapper},
         sozu_command::proto::command::LoadMetric,
     };
@@ -198,7 +198,7 @@ mod test {
             load_balancing_parameters: None,
             backup: false,
             connection_time: PeakEWMA::new(),
-            health: crate::backends::HealthState::default(),
+            health: HealthState::default(),
         }
     }
 
