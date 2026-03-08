@@ -17,8 +17,8 @@ use crate::{
     timer::TimeoutContainer,
 };
 
-#[cfg(feature = "splice")]
-use crate::splice::SplicePipe;
+#[cfg(all(target_os = "linux", feature = "splice"))]
+use crate::splice::{self, SplicePipe};
 
 /// This macro is defined uniquely in this module to help the tracking of pipelining
 /// issues inside Sōzu
@@ -82,7 +82,7 @@ pub struct Pipe<Front: SocketHandler, L: ListenerHandler> {
     protocol: Protocol,
     request_id: Ulid,
     session_address: Option<SocketAddr>,
-    #[cfg(feature = "splice")]
+    #[cfg(all(target_os = "linux", feature = "splice"))]
     splice_pipe: Option<SplicePipe>,
     websocket_context: WebSocketContext,
 }
@@ -147,7 +147,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             protocol,
             request_id,
             session_address,
-            #[cfg(feature = "splice")]
+            #[cfg(all(target_os = "linux", feature = "splice"))]
             splice_pipe: if protocol == Protocol::TCP {
                 SplicePipe::new()
             } else {
@@ -284,15 +284,16 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         self.log_request(metrics, true, Some(message));
     }
 
-    /// Wether the session should be kept open, depending on endpoints status
+    /// Whether the session should be kept open, depending on endpoints status
     /// and buffer usage (both in memory and in kernel)
+    #[cfg_attr(not(all(target_os = "linux", feature = "splice")), allow(unused_mut))]
     pub fn check_connections(&self) -> bool {
         let mut request_is_inflight = self.frontend_buffer.available_data() > 0
             || self.frontend_readiness.event.is_readable();
         let mut response_is_inflight =
             self.backend_buffer.available_data() > 0 || self.backend_readiness.event.is_readable();
 
-        #[cfg(feature = "splice")]
+        #[cfg(all(target_os = "linux", feature = "splice"))]
         if let Some(ref sp) = self.splice_pipe {
             request_is_inflight = request_is_inflight || sp.in_pipe_pending > 0;
             response_is_inflight = response_is_inflight || sp.out_pipe_pending > 0;
@@ -338,9 +339,18 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         SessionResult::Close
     }
 
+    #[cfg_attr(not(all(target_os = "linux", feature = "splice")), allow(unused_mut))]
     pub fn backend_hup(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
         self.backend_status = ConnectionStatus::Closed;
-        if self.backend_buffer.available_data() == 0 {
+
+        let mut has_inflight_data = self.backend_buffer.available_data() > 0;
+
+        #[cfg(all(target_os = "linux", feature = "splice"))]
+        if let Some(ref sp) = self.splice_pipe {
+            has_inflight_data = has_inflight_data || sp.out_pipe_pending > 0;
+        }
+
+        if !has_inflight_data {
             if self.backend_readiness.event.is_readable() {
                 self.backend_readiness.interest.insert(Ready::READABLE);
                 debug!(
@@ -367,7 +377,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
 
     // Read content from the session
     pub fn readable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
-        #[cfg(feature = "splice")]
+        #[cfg(all(target_os = "linux", feature = "splice"))]
         if self.splice_pipe.is_some() {
             return self.splice_readable(metrics);
         }
@@ -439,7 +449,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
 
     // Forward content to session
     pub fn writable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
-        #[cfg(feature = "splice")]
+        #[cfg(all(target_os = "linux", feature = "splice"))]
         if self.splice_pipe.is_some() {
             return self.splice_writable(metrics);
         }
@@ -522,7 +532,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
 
     // Forward content to cluster
     pub fn backend_writable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
-        #[cfg(feature = "splice")]
+        #[cfg(all(target_os = "linux", feature = "splice"))]
         if self.splice_pipe.is_some() {
             return self.splice_backend_writable(metrics);
         }
@@ -606,7 +616,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
 
     // Read content from cluster
     pub fn backend_readable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
-        #[cfg(feature = "splice")]
+        #[cfg(all(target_os = "linux", feature = "splice"))]
         if self.splice_pipe.is_some() {
             return self.splice_backend_readable(metrics);
         }
@@ -675,10 +685,8 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
 
     // --- Zero-copy splice methods (Linux only) ---
 
-    #[cfg(feature = "splice")]
+    #[cfg(all(target_os = "linux", feature = "splice"))]
     fn splice_readable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
-        use crate::splice;
-
         self.reset_timeouts();
         trace!("{} splice_readable", log_context!(self));
 
@@ -697,7 +705,9 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             self.backend_readiness.interest.insert(Ready::WRITABLE);
         } else {
             self.frontend_readiness.event.remove(Ready::READABLE);
-            if res == SocketResult::Continue {
+            // splice(2) returns 0 for EOF — transition to half-close so the
+            // session can keep draining data from backend to frontend.
+            if res == SocketResult::Closed {
                 self.frontend_status = match self.frontend_status {
                     ConnectionStatus::Normal => ConnectionStatus::WriteOpen,
                     ConnectionStatus::ReadOpen => ConnectionStatus::Closed,
@@ -721,10 +731,9 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
                 SessionResult::Close
             }
             SocketResult::Closed => {
-                self.frontend_readiness.reset();
-                self.backend_readiness.reset();
-                self.log_request_success(metrics);
-                SessionResult::Close
+                // Half-close: frontend sent FIN. check_connections above already
+                // verified whether we should keep draining, so continue.
+                SessionResult::Continue
             }
             SocketResult::WouldBlock => {
                 self.frontend_readiness.event.remove(Ready::READABLE);
@@ -737,10 +746,8 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         }
     }
 
-    #[cfg(feature = "splice")]
+    #[cfg(all(target_os = "linux", feature = "splice"))]
     fn splice_writable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
-        use crate::splice;
-
         trace!("{} splice_writable", log_context!(self));
 
         let sp = self.splice_pipe.as_ref().unwrap();
@@ -794,10 +801,8 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         }
     }
 
-    #[cfg(feature = "splice")]
+    #[cfg(all(target_os = "linux", feature = "splice"))]
     fn splice_backend_writable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
-        use crate::splice;
-
         trace!("{} splice_backend_writable", log_context!(self));
 
         let sp = self.splice_pipe.as_ref().unwrap();
@@ -855,10 +860,8 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         SessionResult::Continue
     }
 
-    #[cfg(feature = "splice")]
+    #[cfg(all(target_os = "linux", feature = "splice"))]
     fn splice_backend_readable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
-        use crate::splice;
-
         self.reset_timeouts();
         trace!("{} splice_backend_readable", log_context!(self));
 

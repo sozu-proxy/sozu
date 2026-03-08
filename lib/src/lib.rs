@@ -327,7 +327,7 @@ pub mod socket;
 pub mod timer;
 pub mod tls;
 
-#[cfg(feature = "splice")]
+#[cfg(all(target_os = "linux", feature = "splice"))]
 pub(crate) mod splice;
 
 pub mod server;
