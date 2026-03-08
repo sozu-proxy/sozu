@@ -1,7 +1,7 @@
 //! event loop management
 use std::{
     cell::RefCell,
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque, hash_map::Entry},
     io::Error as IoError,
     net::IpAddr,
     os::unix::io::{AsRawFd, FromRawFd},
@@ -106,11 +106,9 @@ pub struct SessionManager {
     pub nb_connections: usize,
     pub can_accept: bool,
     pub slab: Slab<Rc<RefCell<dyn ProxySession>>>,
-    /// Tracks active connection count per source IP address.
-    /// Only populated when `max_connections_per_ip > 0`.
+    /// Active connection count per source IP, empty when `max_connections_per_ip == 0`.
     connections_per_ip: HashMap<IpAddr, usize>,
-    /// Maps session tokens to their source IP for decrement on close.
-    /// Only populated when `max_connections_per_ip > 0`.
+    /// Reverse map from session token to source IP, empty when `max_connections_per_ip == 0`.
     token_to_ip: HashMap<Token, IpAddr>,
 }
 
@@ -174,7 +172,7 @@ impl SessionManager {
         if self.max_connections_per_ip == 0 {
             return;
         }
-        *self.connections_per_ip.entry(ip).or_insert(0) += 1;
+        *self.connections_per_ip.entry(ip).or_default() += 1;
         self.token_to_ip.insert(token, ip);
     }
 
@@ -183,12 +181,9 @@ impl SessionManager {
             return;
         }
         if let Some(ip) = self.token_to_ip.remove(token) {
-            if let std::collections::hash_map::Entry::Occupied(mut entry) =
-                self.connections_per_ip.entry(ip)
-            {
-                let count = entry.get_mut();
-                *count = count.saturating_sub(1);
-                if *count == 0 {
+            if let Entry::Occupied(mut entry) = self.connections_per_ip.entry(ip) {
+                *entry.get_mut() = entry.get().saturating_sub(1);
+                if *entry.get() == 0 {
                     entry.remove();
                 }
             }
@@ -791,8 +786,9 @@ impl Server {
             if self.sessions.borrow().slab.contains(token.0) {
                 let session = { self.sessions.borrow_mut().slab.remove(token.0) };
                 session.borrow_mut().close();
-                self.sessions.borrow_mut().untrack_ip(token);
-                self.sessions.borrow_mut().decr();
+                let mut sessions = self.sessions.borrow_mut();
+                sessions.untrack_ip(token);
+                sessions.decr();
             }
         }
 
@@ -1609,6 +1605,7 @@ impl Server {
             //FIXME: check the timestamp
             //TODO: create_session should return the session and
             // the server should insert it in the the SessionManager
+            let session_token = Token(self.sessions.borrow().slab.vacant_key());
             match protocol {
                 Protocol::TCPListen => {
                     let proxy = self.tcp.clone();
@@ -1645,17 +1642,7 @@ impl Server {
                 _ => panic!("should not call accept() on a HTTP, HTTPS or TCP session"),
             };
             if let Some(ip) = peer_ip {
-                let frontend_token = {
-                    let sessions = self.sessions.borrow();
-                    sessions
-                        .slab
-                        .iter()
-                        .last()
-                        .map(|(_, session)| session.borrow().frontend_token())
-                };
-                if let Some(token) = frontend_token {
-                    self.sessions.borrow_mut().track_ip(ip, token);
-                }
+                self.sessions.borrow_mut().track_ip(ip, session_token);
             }
             self.sessions.borrow_mut().incr();
         }
@@ -1820,7 +1807,6 @@ mod tests {
     fn ip_at_limit_disabled_when_zero() {
         let sm = make_session_manager(100, 0);
         let ip: IpAddr = Ipv4Addr::new(192, 168, 1, 1).into();
-        // When limit is 0, ip_at_limit should always return false
         assert!(!sm.borrow().ip_at_limit(&ip));
     }
 
@@ -1828,7 +1814,6 @@ mod tests {
     fn ip_at_limit_not_reached() {
         let sm = make_session_manager(100, 3);
         let ip: IpAddr = Ipv4Addr::new(10, 0, 0, 1).into();
-        // Track 2 connections (limit is 3)
         sm.borrow_mut().track_ip(ip, Token(10));
         sm.borrow_mut().track_ip(ip, Token(11));
         assert!(!sm.borrow().ip_at_limit(&ip));
@@ -1850,7 +1835,6 @@ mod tests {
         sm.borrow_mut().track_ip(ip, Token(10));
         sm.borrow_mut().track_ip(ip, Token(11));
         assert!(sm.borrow().ip_at_limit(&ip));
-        // Untrack one connection
         sm.borrow_mut().untrack_ip(&Token(10));
         assert!(!sm.borrow().ip_at_limit(&ip));
     }
@@ -1861,7 +1845,6 @@ mod tests {
         let ip: IpAddr = Ipv4Addr::new(10, 0, 0, 1).into();
         sm.borrow_mut().track_ip(ip, Token(10));
         sm.borrow_mut().untrack_ip(&Token(10));
-        // The IP should be removed from the map entirely
         assert!(sm.borrow().connections_per_ip.is_empty());
         assert!(sm.borrow().token_to_ip.is_empty());
     }
@@ -1869,7 +1852,6 @@ mod tests {
     #[test]
     fn untrack_unknown_token_is_noop() {
         let sm = make_session_manager(100, 2);
-        // Untracking a token that was never tracked should not panic
         sm.borrow_mut().untrack_ip(&Token(999));
         assert!(sm.borrow().connections_per_ip.is_empty());
     }
@@ -1891,7 +1873,6 @@ mod tests {
         let sm = make_session_manager(100, 0);
         let ip: IpAddr = Ipv4Addr::new(10, 0, 0, 1).into();
         sm.borrow_mut().track_ip(ip, Token(10));
-        // Maps should remain empty when feature is disabled
         assert!(sm.borrow().connections_per_ip.is_empty());
         assert!(sm.borrow().token_to_ip.is_empty());
     }
