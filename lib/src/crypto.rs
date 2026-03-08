@@ -380,4 +380,58 @@ mod tests {
             "default config should not have ALPN set"
         );
     }
+
+    #[test]
+    fn default_cipher_list_names_resolve_to_valid_suites() {
+        use sozu_command::config::DEFAULT_CIPHER_LIST;
+
+        let all_suites = [
+            ("TLS13_AES_256_GCM_SHA384", TLS13_AES_256_GCM_SHA384.suite()),
+            ("TLS13_AES_128_GCM_SHA256", TLS13_AES_128_GCM_SHA256.suite()),
+            (
+                "TLS13_CHACHA20_POLY1305_SHA256",
+                TLS13_CHACHA20_POLY1305_SHA256.suite(),
+            ),
+            (
+                "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+                TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384.suite(),
+            ),
+            (
+                "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+                TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256.suite(),
+            ),
+            (
+                "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+                TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256.suite(),
+            ),
+            (
+                "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+                TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384.suite(),
+            ),
+            (
+                "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+                TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256.suite(),
+            ),
+            (
+                "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+                TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256.suite(),
+            ),
+        ];
+
+        // Verify every name in DEFAULT_CIPHER_LIST matches a known suite
+        for name in DEFAULT_CIPHER_LIST {
+            let found = all_suites.iter().any(|(n, _)| *n == name);
+            assert!(
+                found,
+                "DEFAULT_CIPHER_LIST entry {name:?} does not match any known cipher suite"
+            );
+        }
+
+        // Verify the count matches (no duplicates, no missing)
+        assert_eq!(
+            DEFAULT_CIPHER_LIST.len(),
+            all_suites.len(),
+            "DEFAULT_CIPHER_LIST length should match number of known suites"
+        );
+    }
 }

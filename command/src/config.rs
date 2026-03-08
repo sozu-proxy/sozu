@@ -71,11 +71,14 @@ use crate::{
     },
 };
 
-/// provides all supported cipher suites exported by Rustls TLS
-/// provider as it support only strongly secure ones.
+/// Authoritative list of default cipher suites for all rustls-based TLS providers.
+///
+/// These use rustls naming conventions and are supported by all three crypto providers
+/// (ring, aws-lc-rs, rustls-openssl). Order follows ANSSI recommendations: AES-256
+/// preferred over AES-128, ECDSA preferred over RSA, TLS 1.3 preferred over TLS 1.2.
 ///
 /// See the [documentation](https://docs.rs/rustls/latest/rustls/static.ALL_CIPHER_SUITES.html)
-pub const DEFAULT_RUSTLS_CIPHER_LIST: [&str; 9] = [
+pub const DEFAULT_CIPHER_LIST: [&str; 9] = [
     // TLS 1.3 cipher suites
     "TLS13_AES_256_GCM_SHA384",
     "TLS13_AES_128_GCM_SHA256",
@@ -87,13 +90,6 @@ pub const DEFAULT_RUSTLS_CIPHER_LIST: [&str; 9] = [
     "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
     "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
     "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
-];
-
-pub const DEFAULT_CIPHER_SUITES: [&str; 4] = [
-    "TLS_AES_256_GCM_SHA384",
-    "TLS_AES_128_GCM_SHA256",
-    "TLS_AES_128_CCM_SHA256",
-    "TLS_CHACHA20_POLY1305_SHA256",
 ];
 
 pub const DEFAULT_SIGNATURE_ALGORITHMS: [&str; 9] = [
@@ -496,19 +492,14 @@ impl ListenerBuilder {
             });
         }
 
-        let default_cipher_list = DEFAULT_RUSTLS_CIPHER_LIST
-            .into_iter()
-            .map(String::from)
-            .collect();
+        let default_cipher_list = DEFAULT_CIPHER_LIST.into_iter().map(String::from).collect();
 
         let cipher_list = self.cipher_list.clone().unwrap_or(default_cipher_list);
 
-        let default_cipher_suites = DEFAULT_CIPHER_SUITES
-            .into_iter()
-            .map(String::from)
-            .collect();
-
-        let cipher_suites = self.cipher_suites.clone().unwrap_or(default_cipher_suites);
+        let cipher_suites = self
+            .cipher_suites
+            .clone()
+            .unwrap_or_else(|| DEFAULT_CIPHER_LIST.into_iter().map(String::from).collect());
 
         let signature_algorithms: Vec<String> = DEFAULT_SIGNATURE_ALGORITHMS
             .into_iter()

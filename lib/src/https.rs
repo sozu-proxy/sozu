@@ -22,7 +22,7 @@ use rustls::{
 use rusty_ulid::Ulid;
 use sozu_command::{
     certificate::Fingerprint,
-    config::DEFAULT_RUSTLS_CIPHER_LIST,
+    config::DEFAULT_CIPHER_LIST,
     proto::command::{
         AddCertificate, CertificateSummary, CertificatesByAddress, Cluster, HttpsListenerConfig,
         ListOfCertificatesByAddress, ListenerType, RemoveCertificate, RemoveListener,
@@ -666,7 +666,7 @@ impl HttpsListener {
         resolver: Arc<MutexCertificateResolver>,
     ) -> Result<RustlsServerConfig, ListenerError> {
         let cipher_names = if config.cipher_list.is_empty() {
-            DEFAULT_RUSTLS_CIPHER_LIST.to_vec()
+            DEFAULT_CIPHER_LIST.to_vec()
         } else {
             config
                 .cipher_list

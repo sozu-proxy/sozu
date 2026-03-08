@@ -163,6 +163,7 @@ tls_versions = ["TLS_V12", "TLS_V13"]
 
 ```toml
 # Sets the list of available cipher suites, in order of preference.
+# If omitted, the following default list is used (ANSSI-recommended order):
 cipher_list = [
     # TLS 1.3 cipher suites
     "TLS13_AES_256_GCM_SHA384",
