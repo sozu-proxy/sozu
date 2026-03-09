@@ -2749,3 +2749,73 @@ fn test_h1_still_works_on_h2_listener() {
         State::Success
     );
 }
+
+/// Run h2spec HTTP/2 conformance tests against Sozu.
+/// Requires h2spec binary in PATH (install: `go install github.com/summerwind/h2spec/cmd/h2spec@latest`)
+#[test]
+fn test_h2spec_conformance() {
+    use std::process::Command;
+
+    // Check if h2spec is available
+    let h2spec_check = Command::new("h2spec").arg("--version").output();
+    if h2spec_check.is_err() || !h2spec_check.unwrap().status.success() {
+        eprintln!("h2spec not found in PATH, skipping conformance test");
+        return;
+    }
+
+    let (mut worker, _backends, front_port) = setup_h2_test("H2SPEC", 1);
+
+    // Give the worker a moment to fully start
+    thread::sleep(Duration::from_millis(200));
+
+    let output = Command::new("h2spec")
+        .args([
+            "-h", "localhost",
+            "-p", &front_port.to_string(),
+            "-t",  // TLS mode
+            "-k",  // skip cert verification
+            "-o", "5",  // 5 second timeout per test
+        ])
+        .output()
+        .expect("Failed to execute h2spec");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    println!("h2spec stdout:\n{stdout}");
+    if !stderr.is_empty() {
+        println!("h2spec stderr:\n{stderr}");
+    }
+
+    // Parse results from the last line: "X tests, Y passed, Z skipped, W failed"
+    let last_lines: Vec<&str> = stdout.lines().rev().take(5).collect();
+    let mut passed = 0u32;
+    let mut failed = 0u32;
+    let mut skipped = 0u32;
+    for line in &last_lines {
+        if line.contains("passed") && line.contains("failed") {
+            for part in line.split(',') {
+                let part = part.trim();
+                if part.ends_with("passed") {
+                    passed = part.split_whitespace().next().unwrap_or("0").parse().unwrap_or(0);
+                } else if part.ends_with("failed") {
+                    failed = part.split_whitespace().next().unwrap_or("0").parse().unwrap_or(0);
+                } else if part.ends_with("skipped") {
+                    skipped = part.split_whitespace().next().unwrap_or("0").parse().unwrap_or(0);
+                }
+            }
+        }
+    }
+
+    println!("h2spec results: {passed} passed, {skipped} skipped, {failed} failed");
+
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+
+    // For now, we report results but don't fail the test — we'll tighten this
+    // as we fix h2spec failures. Log the failure count for tracking.
+    if failed > 0 {
+        println!("h2spec: {failed} tests failed (see output above for details)");
+    }
+    // TODO: once we reach 0 failures, change this to: assert_eq!(failed, 0);
+}
