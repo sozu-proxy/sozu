@@ -196,7 +196,7 @@ impl Worker {
     }
 
     pub fn send_proxy_request(&mut self, request: Request) {
-        //self.state.handle_order(&order);
+        let _ = self.state.dispatch(&request);
         self.command_channel
             .write_message(&WorkerRequest {
                 id: self.command_id.next(),
