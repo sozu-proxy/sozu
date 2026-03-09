@@ -20,6 +20,7 @@ pub struct H2BlockConverter<'a> {
     pub stream_id: StreamId,
     pub encoder: &'a mut loona_hpack::Encoder<'static>,
     pub out: Vec<u8>,
+    pub scheme: &'static [u8],
 }
 
 impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
@@ -63,7 +64,7 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                         .encode_header_into((b":path", path.data(buffer)), &mut self.out)
                         .unwrap();
                     self.encoder
-                        .encode_header_into((b":scheme", b"https"), &mut self.out)
+                        .encode_header_into((b":scheme", self.scheme), &mut self.out)
                         .unwrap();
                 }
                 StatusLine::Response { status, .. } => {
