@@ -318,13 +318,21 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                                 || header.frame_type == FrameType::Priority
                                 || header.frame_type == FrameType::RstStream;
                             let stream = &context.streams[*global_stream_id];
+                            // Use the position-aware end_of_stream flag:
+                            // - Server reads from front (client requests)
+                            // - Client reads from back (backend responses)
+                            let received_eos = if self.position.is_server() {
+                                stream.front_received_end_of_stream
+                            } else {
+                                stream.back_received_end_of_stream
+                            };
                             println_!(
                                 "REQUESTING EXISTING STREAM {stream_id}: {}/{:?}",
-                                stream.received_end_of_stream,
+                                received_eos,
                                 stream.state
                             );
                             if !allowed_on_half_closed
-                                && (stream.received_end_of_stream || !stream.state.is_open())
+                                && (received_eos || !stream.state.is_open())
                             {
                                 error!(
                                     "CANNOT RECEIVE {:?} ON THIS STREAM {:?}",
@@ -901,7 +909,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         end_stream: true,
                     }));
                     kawa.parsing_phase = kawa::ParsingPhase::Terminated;
-                    stream.received_end_of_stream = true;
+                    if self.position.is_server() {
+                        stream.front_received_end_of_stream = true;
+                    } else {
+                        stream.back_received_end_of_stream = true;
+                    }
                 }
                 if let StreamState::Linked(token) = stream.state {
                     endpoint
@@ -964,7 +976,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     }
                 }
                 debug_kawa(parts.rbuffer);
-                stream.received_end_of_stream |= headers.end_stream;
+                if headers.end_stream {
+                    if self.position.is_server() {
+                        stream.front_received_end_of_stream = true;
+                    } else {
+                        stream.back_received_end_of_stream = true;
+                    }
+                }
                 if let StreamState::Linked(token) = stream.state {
                     endpoint
                         .readiness_mut(token)

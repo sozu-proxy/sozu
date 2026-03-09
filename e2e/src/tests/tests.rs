@@ -22,6 +22,7 @@ use crate::{
         aggregator::SimpleAggregator,
         async_backend::BackendHandle as AsyncBackend,
         client::Client,
+        h2_backend::H2Backend,
         https_client::{
             build_h2_client, build_h2_or_h1_client, build_https_client,
             resolve_concurrent_requests, resolve_post_request, resolve_request,
@@ -2833,5 +2834,237 @@ fn test_h2spec_conformance() {
     assert_eq!(
         failed, 0,
         "h2spec: {failed} tests failed (see output above)"
+    );
+}
+
+// ============================================================================
+// H2 Backend Tests (H1→H2 and H2→H2)
+// ============================================================================
+
+/// Setup an HTTPS frontend with H2 backends (cluster.http2 = true).
+/// The backends speak cleartext HTTP/2 (h2c) — Sozu connects to them over
+/// plain TCP and initiates an H2 connection.
+fn setup_h2_backend_test(
+    name: &str,
+    nb_backends: usize,
+    frontend_h2: bool,
+) -> (Worker, Vec<H2Backend>, u16) {
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+
+    let (config, listeners, state) = Worker::empty_config();
+    let mut worker = Worker::start_new_worker(name, config, &listeners, state);
+
+    if frontend_h2 {
+        // HTTPS listener (supports H2 via ALPN)
+        worker.send_proxy_request_type(RequestType::AddHttpsListener(
+            ListenerBuilder::new_https(front_address.clone())
+                .to_tls(None)
+                .unwrap(),
+        ));
+        worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+            address: front_address.clone(),
+            proxy: ListenerType::Https.into(),
+            from_scm: false,
+        }));
+    } else {
+        // HTTP listener (H1 frontend)
+        worker.send_proxy_request_type(RequestType::AddHttpListener(
+            ListenerBuilder::new_http(front_address.clone())
+                .to_http(None)
+                .unwrap(),
+        ));
+        worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+            address: front_address.clone(),
+            proxy: ListenerType::Http.into(),
+            from_scm: false,
+        }));
+    }
+
+    // Cluster with http2=true (backend speaks H2)
+    worker.send_proxy_request_type(RequestType::AddCluster(Cluster {
+        http2: Some(true),
+        ..Worker::default_cluster("cluster_0")
+    }));
+
+    if frontend_h2 {
+        worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+            hostname: String::from("localhost"),
+            ..Worker::default_http_frontend("cluster_0", front_address.clone().into())
+        }));
+
+        let certificate_and_key = CertificateAndKey {
+            certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
+            key: String::from(include_str!("../../../lib/assets/local-key.pem")),
+            certificate_chain: vec![],
+            versions: vec![],
+            names: vec![],
+        };
+        worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+            address: front_address,
+            certificate: certificate_and_key,
+            expired_at: None,
+        }));
+    } else {
+        worker.send_proxy_request_type(RequestType::AddHttpFrontend(
+            Worker::default_http_frontend("cluster_0", front_address.into()),
+        ));
+    }
+
+    let mut backends = Vec::new();
+    for i in 0..nb_backends {
+        let back_address = create_local_address();
+        worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+            "cluster_0",
+            format!("cluster_0-{i}"),
+            back_address,
+            None,
+        )));
+        backends.push(H2Backend::start(
+            format!("H2_BACKEND_{i}"),
+            back_address,
+            format!("h2-pong{i}"),
+        ));
+    }
+
+    worker.read_to_last();
+    // Give H2 backends time to bind
+    thread::sleep(Duration::from_millis(100));
+    (worker, backends, front_port)
+}
+
+/// H2 frontend → H2 backend: basic GET request
+fn try_h2_to_h2_basic_request() -> State {
+    let (mut worker, mut backends, front_port) =
+        setup_h2_backend_test("H2-TO-H2-BASIC", 1, true);
+
+    let client = build_h2_client();
+    let uri: hyper::Uri = format!("https://localhost:{front_port}/api")
+        .parse()
+        .unwrap();
+
+    if let Some((status, body)) = resolve_request(&client, uri) {
+        println!("H2→H2 basic - status: {status:?}, body: {body}");
+        if !status.is_success() || !body.contains("h2-pong") {
+            return State::Fail;
+        }
+    } else {
+        return State::Fail;
+    }
+
+    worker.soft_stop();
+    let success = worker.wait_for_server_stop();
+    let resp_sent = backends[0].get_responses_sent();
+    backends.iter_mut().for_each(|b| b.stop());
+
+    if success && resp_sent >= 1 {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+/// H1 frontend → H2 backend: client sends HTTP/1.1, Sozu upgrades to H2 on backend
+fn try_h1_to_h2_basic_request() -> State {
+    let (mut worker, mut backends, front_port) =
+        setup_h2_backend_test("H1-TO-H2-BASIC", 1, false);
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut client = Client::new(
+        "client",
+        front_addr,
+        http_request("GET", "/api", "", &format!("localhost:{front_port}")),
+    );
+    client.connect();
+    client.send();
+    let response = client.receive();
+    // Second read to get the body (may arrive in a separate TCP segment)
+    let body = client.receive();
+    println!("H1→H2 basic - response: {response:?}, body: {body:?}");
+
+    let success_response = response.as_ref().is_some_and(|r| r.contains("200"));
+
+    worker.soft_stop();
+    let success = worker.wait_for_server_stop();
+    let resp_sent = backends[0].get_responses_sent();
+    backends.iter_mut().for_each(|b| b.stop());
+
+    if success && success_response && resp_sent >= 1 {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+/// H2 frontend → H2 backend: multiple concurrent streams
+fn try_h2_to_h2_multiple_streams() -> State {
+    let (mut worker, mut backends, front_port) =
+        setup_h2_backend_test("H2-TO-H2-MULTI", 1, true);
+
+    let client = build_h2_client();
+    let uris: Vec<hyper::Uri> = (0..4)
+        .map(|i| {
+            format!("https://localhost:{front_port}/stream/{i}")
+                .parse()
+                .unwrap()
+        })
+        .collect();
+
+    let results = resolve_concurrent_requests(&client, uris);
+    let all_ok = results.iter().all(|r| {
+        r.as_ref()
+            .is_some_and(|(status, body)| status.is_success() && body.contains("h2-pong"))
+    });
+
+    if !all_ok || results.len() != 4 {
+        println!("H2→H2 multi streams failed: {results:?}");
+        return State::Fail;
+    }
+
+    worker.soft_stop();
+    let success = worker.wait_for_server_stop();
+    let resp_sent = backends[0].get_responses_sent();
+    backends.iter_mut().for_each(|b| b.stop());
+
+    if success && resp_sent >= 4 {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_to_h2_basic_request() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "H2→H2: basic GET request with H2 backend",
+            try_h2_to_h2_basic_request
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_h1_to_h2_basic_request() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "H1→H2: HTTP/1.1 frontend to H2 backend",
+            try_h1_to_h2_basic_request
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_h2_to_h2_multiple_streams() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "H2→H2: multiple concurrent streams with H2 backend",
+            try_h2_to_h2_multiple_streams
+        ),
+        State::Success
     );
 }
