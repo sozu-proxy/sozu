@@ -1199,10 +1199,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // reconnection is handled by the server for each stream separately
         for global_stream_id in self.streams.values() {
             println_!("end stream: {global_stream_id}");
-            let StreamState::Linked(token) = context.streams[*global_stream_id].state else {
-                unreachable!()
-            };
-            endpoint.end_stream(token, *global_stream_id, context)
+            if let StreamState::Linked(token) = context.streams[*global_stream_id].state {
+                endpoint.end_stream(token, *global_stream_id, context);
+            }
         }
     }
 
@@ -1245,7 +1244,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         return;
                     }
                 }
-                unreachable!()
+                error!("end_stream called for unknown global_stream_id {}", stream_gid);
             }
             Position::Server => {
                 let answers_rc = context.listener.borrow().get_answers().clone();
