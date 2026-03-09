@@ -9,15 +9,15 @@ use sozu_command_lib::{
     info,
     logging::setup_default_logging,
     proto::command::{
-        ActivateListener, AddCertificate, CertificateAndKey, Cluster, CustomHttpAnswers,
-        ListenerType, RemoveBackend, RequestHttpFrontend, SocketAddress, request::RequestType,
+        ActivateListener, AddCertificate, CertificateAndKey, Cluster, ListenerType, RemoveBackend,
+        RequestHttpFrontend, SocketAddress, request::RequestType,
     },
     scm_socket::Listeners,
     state::ConfigState,
 };
 
 use crate::{
-    http_utils::{http_ok_response, http_request, immutable_answer},
+    http_utils::{http_ok_response, http_request, immutable_answer, immutable_answer_expected},
     mock::{
         aggregator::SimpleAggregator,
         async_backend::BackendHandle as AsyncBackend,
@@ -633,14 +633,13 @@ fn try_http_behaviors() -> State {
     let mut http_config = ListenerBuilder::new_http(front_address.into())
         .to_http(None)
         .unwrap();
-    let http_answers = CustomHttpAnswers {
-        answer_400: Some(immutable_answer(400)),
-        answer_404: Some(immutable_answer(404)),
-        answer_502: Some(immutable_answer(502)),
-        answer_503: Some(immutable_answer(503)),
-        ..Default::default()
-    };
-    http_config.http_answers = Some(http_answers);
+    http_config.answers = [
+        ("400".to_owned(), immutable_answer(400)),
+        ("404".to_owned(), immutable_answer(404)),
+        ("502".to_owned(), immutable_answer(502)),
+        ("503".to_owned(), immutable_answer(503)),
+    ]
+    .into();
 
     worker.send_proxy_request_type(RequestType::AddHttpListener(http_config));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
@@ -662,7 +661,7 @@ fn try_http_behaviors() -> State {
 
     let response = client.receive();
     println!("response: {response:?}");
-    assert_eq!(response, Some(immutable_answer(404)));
+    assert_eq!(response, Some(immutable_answer_expected(404)));
     assert_eq!(client.receive(), None);
 
     worker.send_proxy_request_type(RequestType::AddHttpFrontend(RequestHttpFrontend {
@@ -677,7 +676,7 @@ fn try_http_behaviors() -> State {
 
     let response = client.receive();
     println!("response: {response:?}");
-    assert_eq!(response, Some(immutable_answer(503)));
+    assert_eq!(response, Some(immutable_answer_expected(503)));
     assert_eq!(client.receive(), None);
 
     let back_address = create_local_address();
@@ -697,7 +696,7 @@ fn try_http_behaviors() -> State {
 
     let response = client.receive();
     println!("response: {response:?}");
-    assert_eq!(response, Some(immutable_answer(400)));
+    assert_eq!(response, Some(immutable_answer_expected(400)));
     assert_eq!(client.receive(), None);
 
     let mut backend = SyncBackend::new("backend", back_address, "TEST\r\n\r\n");
@@ -714,7 +713,7 @@ fn try_http_behaviors() -> State {
     let response = client.receive();
     println!("request: {request:?}");
     println!("response: {response:?}");
-    assert_eq!(response, Some(immutable_answer(502)));
+    assert_eq!(response, Some(immutable_answer_expected(502)));
     assert_eq!(client.receive(), None);
 
     info!("expecting 200");
@@ -777,7 +776,7 @@ fn try_http_behaviors() -> State {
     let response = client.receive();
     println!("request: {request:?}");
     println!("response: {response:?}");
-    assert_eq!(response, Some(immutable_answer(503)));
+    assert_eq!(response, Some(immutable_answer_expected(503)));
     assert_eq!(client.receive(), None);
 
     worker.send_proxy_request_type(RequestType::RemoveBackend(RemoveBackend {
@@ -942,11 +941,11 @@ fn try_https_redirect() -> State {
         .unwrap();
     let answer_301_prefix = "HTTP/1.1 301 Moved Permanently\r\nLocation: ";
 
-    let http_answers = CustomHttpAnswers {
-        answer_301: Some(format!("{answer_301_prefix}%REDIRECT_LOCATION\r\n\r\n")),
-        ..Default::default()
-    };
-    http_config.http_answers = Some(http_answers);
+    http_config.answers = [(
+        "301".to_owned(),
+        format!("{answer_301_prefix}%REDIRECT_LOCATION\r\n\r\n"),
+    )]
+    .into();
 
     worker.send_proxy_request_type(RequestType::AddHttpListener(http_config));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
@@ -977,7 +976,9 @@ fn try_https_redirect() -> State {
     client.connect();
     client.send();
     let answer = client.receive();
-    let expected_answer = format!("{answer_301_prefix}https://example.com/redirected?true\r\n\r\n");
+    let expected_answer = format!(
+        "{answer_301_prefix}https://example.com/redirected?true\r\nContent-Length: 0\r\n\r\n"
+    );
     assert_eq!(answer, Some(expected_answer));
 
     State::Success

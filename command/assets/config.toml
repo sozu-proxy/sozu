@@ -17,7 +17,7 @@ protocol = "http"
 [[listeners]]
 address = "0.0.0.0:443"
 protocol = "https"
-answer_404 = "./assets/custom_404.html"
+answers = { "404" = "./assets/custom_404.html" }
 tls_versions = ["TLS_V12"]
 
 [[listeners]]
@@ -28,7 +28,7 @@ expect_proxy = true
 [clusters]
 [clusters.MyCluster]
 protocol = "http"
-answer_503 = "./assets/custom_503.html"
+answers = { "503" = "./assets/custom_503.html" }
 #sticky_session = false
 #https_redirect = false
 frontends = [

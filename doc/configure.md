@@ -127,14 +127,12 @@ in `lib/src/protocol/kawa_h1/answers.rs`, and then change them to your liking. F
 `\r` newlines of the default strings for clarity.
 Sōzu will parse your file and replace whatever newline symbol(s) you use.
 
-Then, for each listener, provide the absolute paths of each custom answer.
+Then, for each listener, provide the answer templates as a map of status code to file path.
 
 ```toml
-# a 404 response is sent when sozu does not know about the requested domain or path
-answer_404 = "/path/to/my-404-answer.http"
-# a 503 response is sent if there are no backend servers available
-answer_503 = "/path/to/my-503-answer.http"
-# answer_507 = ...
+[listeners.answers]
+"404" = "/path/to/my-404-answer.http"
+"503" = "/path/to/my-503-answer.http"
 ```
 
 If a frontend has a `sticky_session`, the sticky name is defined at the listener level.

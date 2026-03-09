@@ -1,5 +1,14 @@
 use std::collections::BTreeMap;
 
+fn parse_answer_args(args: &[String]) -> BTreeMap<String, String> {
+    args.iter()
+        .filter_map(|arg| {
+            let (name, path) = arg.split_once('=')?;
+            Some((name.to_owned(), path.to_owned()))
+        })
+        .collect()
+}
+
 use sozu_command_lib::{
     certificate::{
         decode_fingerprint, get_fingerprint_from_certificate_path, load_full_certificate,
@@ -322,8 +331,7 @@ impl CommandManager {
             HttpsListenerCmd::Add {
                 address,
                 public_address,
-                answer_404,
-                answer_503,
+                answers,
                 tls_versions,
                 cipher_list,
                 expect_proxy,
@@ -333,10 +341,10 @@ impl CommandManager {
                 request_timeout,
                 connect_timeout,
             } => {
+                let answers_map = parse_answer_args(&answers);
                 let https_listener = ListenerBuilder::new_https(address.into())
                     .with_public_address(public_address)
-                    .with_answer_404_path(answer_404)
-                    .with_answer_503_path(answer_503)
+                    .with_answers(answers_map)
                     .with_tls_versions(tls_versions)
                     .with_cipher_list(cipher_list)
                     .with_expect_proxy(expect_proxy)
@@ -367,8 +375,7 @@ impl CommandManager {
             HttpListenerCmd::Add {
                 address,
                 public_address,
-                answer_404,
-                answer_503,
+                answers,
                 expect_proxy,
                 sticky_name,
                 front_timeout,
@@ -376,10 +383,10 @@ impl CommandManager {
                 request_timeout,
                 connect_timeout,
             } => {
+                let answers_map = parse_answer_args(&answers);
                 let http_listener = ListenerBuilder::new_http(address.into())
                     .with_public_address(public_address)
-                    .with_answer_404_path(answer_404)
-                    .with_answer_503_path(answer_503)
+                    .with_answers(answers_map)
                     .with_expect_proxy(expect_proxy)
                     .with_sticky_name(sticky_name)
                     .with_front_timeout(front_timeout)

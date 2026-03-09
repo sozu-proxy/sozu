@@ -63,11 +63,11 @@ use crate::{
     logging::AccessLogFormat,
     proto::command::{
         ActivateListener, AddBackend, AddCertificate, CertificateAndKey, Cluster,
-        CustomHttpAnswers, HttpListenerConfig, HttpsListenerConfig, ListenerType,
-        LoadBalancingAlgorithms, LoadBalancingParams, LoadMetric, MetricsConfiguration, PathRule,
-        ProtobufAccessLogFormat, ProxyProtocolConfig, Request, RequestHttpFrontend,
-        RequestTcpFrontend, RulePosition, ServerConfig, ServerMetricsConfig, SocketAddress,
-        TcpListenerConfig, TlsVersion, WorkerRequest, request::RequestType,
+        HttpListenerConfig, HttpsListenerConfig, ListenerType, LoadBalancingAlgorithms,
+        LoadBalancingParams, LoadMetric, MetricsConfiguration, PathRule, ProtobufAccessLogFormat,
+        ProxyProtocolConfig, Request, RequestHttpFrontend, RequestTcpFrontend, RulePosition,
+        ServerConfig, ServerMetricsConfig, SocketAddress, TcpListenerConfig, TlsVersion,
+        WorkerRequest, request::RequestType,
     },
 };
 
@@ -242,16 +242,7 @@ pub struct ListenerBuilder {
     pub address: SocketAddr,
     pub protocol: Option<ListenerProtocol>,
     pub public_address: Option<SocketAddr>,
-    pub answer_301: Option<String>,
-    pub answer_400: Option<String>,
-    pub answer_401: Option<String>,
-    pub answer_404: Option<String>,
-    pub answer_408: Option<String>,
-    pub answer_413: Option<String>,
-    pub answer_502: Option<String>,
-    pub answer_503: Option<String>,
-    pub answer_504: Option<String>,
-    pub answer_507: Option<String>,
+    pub answers: Option<BTreeMap<String, String>>,
     pub tls_versions: Option<Vec<TlsVersion>>,
     pub cipher_list: Option<Vec<String>>,
     pub cipher_suites: Option<Vec<String>>,
@@ -304,16 +295,7 @@ impl ListenerBuilder {
     fn new(address: SocketAddress, protocol: ListenerProtocol) -> ListenerBuilder {
         ListenerBuilder {
             address: address.into(),
-            answer_301: None,
-            answer_401: None,
-            answer_400: None,
-            answer_404: None,
-            answer_408: None,
-            answer_413: None,
-            answer_502: None,
-            answer_503: None,
-            answer_504: None,
-            answer_507: None,
+            answers: None,
             back_timeout: None,
             certificate_chain: None,
             certificate: None,
@@ -340,23 +322,19 @@ impl ListenerBuilder {
         self
     }
 
-    pub fn with_answer_404_path<S>(&mut self, answer_404_path: Option<S>) -> &mut Self
-    where
-        S: ToString,
-    {
-        if let Some(path) = answer_404_path {
-            self.answer_404 = Some(path.to_string());
+    pub fn with_answer<S: ToString>(&mut self, name: S, path: Option<String>) -> &mut Self {
+        if let Some(path) = path {
+            self.answers
+                .get_or_insert_with(BTreeMap::new)
+                .insert(name.to_string(), path);
         }
         self
     }
 
-    pub fn with_answer_503_path<S>(&mut self, answer_503_path: Option<S>) -> &mut Self
-    where
-        S: ToString,
-    {
-        if let Some(path) = answer_503_path {
-            self.answer_503 = Some(path.to_string());
-        }
+    pub fn with_answers(&mut self, answers: BTreeMap<String, String>) -> &mut Self {
+        self.answers
+            .get_or_insert_with(BTreeMap::new)
+            .extend(answers);
         self
     }
 
@@ -431,21 +409,9 @@ impl ListenerBuilder {
         self
     }
 
-    /// Get the custom HTTP answers from the file system using the provided paths
-    fn get_http_answers(&self) -> Result<Option<CustomHttpAnswers>, ConfigError> {
-        let http_answers = CustomHttpAnswers {
-            answer_301: read_http_answer_file(&self.answer_301)?,
-            answer_400: read_http_answer_file(&self.answer_400)?,
-            answer_401: read_http_answer_file(&self.answer_401)?,
-            answer_404: read_http_answer_file(&self.answer_404)?,
-            answer_408: read_http_answer_file(&self.answer_408)?,
-            answer_413: read_http_answer_file(&self.answer_413)?,
-            answer_502: read_http_answer_file(&self.answer_502)?,
-            answer_503: read_http_answer_file(&self.answer_503)?,
-            answer_504: read_http_answer_file(&self.answer_504)?,
-            answer_507: read_http_answer_file(&self.answer_507)?,
-        };
-        Ok(Some(http_answers))
+    /// Load the custom HTTP answers from the file system using the provided paths
+    fn load_answers(&self) -> Result<BTreeMap<String, String>, ConfigError> {
+        load_answers(self.answers.as_ref())
     }
 
     /// Assign the timeouts of the config to this listener, only if timeouts did not exist
@@ -469,7 +435,7 @@ impl ListenerBuilder {
             self.assign_config_timeouts(config);
         }
 
-        let http_answers = self.get_http_answers()?;
+        let answers = self.load_answers()?;
 
         let configuration = HttpListenerConfig {
             address: self.address.into(),
@@ -480,7 +446,7 @@ impl ListenerBuilder {
             back_timeout: self.back_timeout.unwrap_or(DEFAULT_BACK_TIMEOUT),
             connect_timeout: self.connect_timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT),
             request_timeout: self.request_timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT),
-            http_answers,
+            answers,
             ..Default::default()
         };
 
@@ -552,7 +518,7 @@ impl ListenerBuilder {
             .map(split_certificate_chain)
             .unwrap_or_default();
 
-        let http_answers = self.get_http_answers()?;
+        let answers = self.load_answers()?;
 
         if let Some(config) = config {
             self.assign_config_timeouts(config);
@@ -579,7 +545,7 @@ impl ListenerBuilder {
             send_tls13_tickets: self
                 .send_tls13_tickets
                 .unwrap_or(DEFAULT_SEND_TLS_13_TICKETS),
-            http_answers,
+            answers,
         };
 
         Ok(https_listener_config)
@@ -611,6 +577,24 @@ impl ListenerBuilder {
 }
 
 /// read a custom HTTP answer from a file
+/// Load answer templates from file paths into their contents.
+/// Each entry in the map is a template name -> file path.
+/// Returns a map of template name -> file contents.
+pub fn load_answers(
+    answers: Option<&BTreeMap<String, String>>,
+) -> Result<BTreeMap<String, String>, ConfigError> {
+    let Some(answers) = answers else {
+        return Ok(BTreeMap::new());
+    };
+    let mut loaded = BTreeMap::new();
+    for (name, path) in answers {
+        if let Some(content) = read_http_answer_file(&Some(path.clone()))? {
+            loaded.insert(name.clone(), content);
+        }
+    }
+    Ok(loaded)
+}
+
 fn read_http_answer_file(path: &Option<String>) -> Result<Option<String>, ConfigError> {
     match path {
         Some(path) => {
@@ -785,7 +769,7 @@ pub struct FileClusterConfig {
     pub send_proxy: Option<bool>,
     #[serde(default)]
     pub load_balancing: LoadBalancingAlgorithms,
-    pub answer_503: Option<String>,
+    pub answers: Option<BTreeMap<String, String>>,
     #[serde(default)]
     pub load_metric: Option<LoadMetric>,
 }
@@ -865,14 +849,7 @@ impl FileClusterConfig {
                     frontends.push(http_frontend);
                 }
 
-                let answer_503 = self.answer_503.as_ref().and_then(|path| {
-                    Config::load_file(path)
-                        .map_err(|e| {
-                            error!("cannot load 503 error page at path '{}': {:?}", path, e);
-                            e
-                        })
-                        .ok()
-                });
+                let answers = load_answers(self.answers.as_ref())?;
 
                 Ok(ClusterConfig::Http(HttpClusterConfig {
                     cluster_id: cluster_id.to_string(),
@@ -882,7 +859,7 @@ impl FileClusterConfig {
                     https_redirect: self.https_redirect.unwrap_or(false),
                     load_balancing: self.load_balancing,
                     load_metric: self.load_metric,
-                    answer_503,
+                    answers,
                 }))
             }
         }
@@ -974,7 +951,7 @@ pub struct HttpClusterConfig {
     pub https_redirect: bool,
     pub load_balancing: LoadBalancingAlgorithms,
     pub load_metric: Option<LoadMetric>,
-    pub answer_503: Option<String>,
+    pub answers: BTreeMap<String, String>,
 }
 
 impl HttpClusterConfig {
@@ -986,7 +963,7 @@ impl HttpClusterConfig {
                 https_redirect: self.https_redirect,
                 proxy_protocol: None,
                 load_balancing: self.load_balancing as i32,
-                answer_503: self.answer_503.clone(),
+                answers: self.answers.clone(),
                 load_metric: self.load_metric.map(|s| s as i32),
             })
             .into(),
@@ -1048,7 +1025,7 @@ impl TcpClusterConfig {
                 proxy_protocol: self.proxy_protocol.map(|s| s as i32),
                 load_balancing: self.load_balancing as i32,
                 load_metric: self.load_metric.map(|s| s as i32),
-                answer_503: None,
+                answers: BTreeMap::new(),
             })
             .into(),
         ];
@@ -1875,7 +1852,7 @@ mod tests {
             SocketAddress::new_v4(127, 0, 0, 1, 8080),
             ListenerProtocol::Http,
         )
-        .with_answer_404_path(Some("404.html"))
+        .with_answer("404", Some("404.html".to_owned()))
         .to_owned();
         println!("http: {:?}", to_string(&http));
 
@@ -1883,7 +1860,7 @@ mod tests {
             SocketAddress::new_v4(127, 0, 0, 1, 8443),
             ListenerProtocol::Https,
         )
-        .with_answer_404_path(Some("404.html"))
+        .with_answer("404", Some("404.html".to_owned()))
         .to_owned();
         println!("https: {:?}", to_string(&https));
 
