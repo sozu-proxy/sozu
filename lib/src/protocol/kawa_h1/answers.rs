@@ -351,8 +351,8 @@ Sozu-Id: %REQUEST_ID\r
 {
     \"status_code\": 404,
     \"route\": \"%ROUTE\",
-    \"request_id\": \"%REQUEST_ID\"
-    \"cluster_id\": \"%CLUSTER_ID\",
+    \"request_id\": \"%REQUEST_ID\",
+    \"cluster_id\": \"%CLUSTER_ID\"
 }
 </pre>
 <h1>A frontend requested template \"%TEMPLATE_NAME\" that couldn't be found</h1>
