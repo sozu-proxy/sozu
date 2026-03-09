@@ -13,9 +13,9 @@ use rusty_ulid::Ulid;
 use crate::{
     proto::{
         command::{
-            InitialState, IpAddress, LoadBalancingAlgorithms, PathRuleKind, Request,
-            RequestHttpFrontend, RulePosition, SocketAddress, Uint128, WorkerRequest, ip_address,
-            request::RequestType,
+            InitialState, IpAddress, LoadBalancingAlgorithms, PathRuleKind, RedirectPolicy,
+            RedirectScheme, Request, RequestHttpFrontend, RulePosition, SocketAddress, Uint128,
+            WorkerRequest, ip_address, request::RequestType,
         },
         display::format_request_type,
     },
@@ -173,6 +173,20 @@ impl RequestHttpFrontend {
                 }
             })?,
             tags: Some(self.tags),
+            required_auth: self.required_auth.unwrap_or(false),
+            redirect: self
+                .redirect
+                .and_then(|v| RedirectPolicy::try_from(v).ok())
+                .unwrap_or(RedirectPolicy::Forward),
+            redirect_scheme: self
+                .redirect_scheme
+                .and_then(|v| RedirectScheme::try_from(v).ok())
+                .unwrap_or(RedirectScheme::UseSame),
+            redirect_template: self.redirect_template,
+            rewrite_host: self.rewrite_host,
+            rewrite_path: self.rewrite_path,
+            rewrite_port: self.rewrite_port.map(|p| p as u16),
+            headers: self.headers,
         })
     }
 }

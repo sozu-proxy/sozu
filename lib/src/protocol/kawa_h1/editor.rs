@@ -1,15 +1,18 @@
 use std::{
     net::{IpAddr, SocketAddr},
+    rc::Rc,
     str::{from_utf8, from_utf8_unchecked},
 };
 
 use rusty_ulid::Ulid;
+use sozu_command::logging::CachedTags;
 use sozu_command_lib::logging::LogContext;
 
 use crate::{
     Protocol,
     pool::Checkout,
     protocol::http::{GenericHttpStream, Method, parser::compare_no_case},
+    router::HeaderEdit,
 };
 
 #[cfg(feature = "opentelemetry")]
@@ -65,6 +68,13 @@ fn build_traceparent(trace_id: &[u8; 32], parent_id: &[u8; 16]) -> [u8; 55] {
     buf
 }
 
+#[derive(Debug)]
+pub struct HttpRoute {
+    pub method: Option<Method>,
+    pub authority: Option<String>,
+    pub path: Option<String>,
+}
+
 /// This is the container used to store and use information about the session from within a Kawa parser callback
 #[derive(Debug)]
 pub struct HttpContext {
@@ -75,13 +85,10 @@ pub struct HttpContext {
     pub keep_alive_frontend: bool,
     /// the value of the sticky session cookie in the request
     pub sticky_session_found: Option<String>,
-    // ---------- Status Line
-    /// the value of the method in the request line
-    pub method: Option<Method>,
-    /// the value of the authority of the request (in the request line of "Host" header)
-    pub authority: Option<String>,
-    /// the value of the path in the request line
-    pub path: Option<String>,
+    /// position of the last header of the request (the "Sozu-Id"), only valid until prepare is called
+    pub last_header: Option<usize>,
+    // ---------- Route
+    pub route: HttpRoute,
     /// the value of the status code in the response line
     pub status: Option<u16>,
     /// the value of the reason in the response line
@@ -110,6 +117,10 @@ pub struct HttpContext {
     /// the sticky session that should be used
     /// used to create a "Set-Cookie" header in the response in case it differs from sticky_session_found
     pub sticky_session: Option<String>,
+    /// Headers to add to response
+    pub headers_response: Rc<[HeaderEdit]>,
+    /// tags of the contacted frontend
+    pub tags: Option<Rc<CachedTags>>,
 }
 
 impl kawa::h1::ParserCallbacks<Checkout> for HttpContext {
@@ -144,10 +155,15 @@ impl HttpContext {
             sticky_name,
             sticky_session: None,
             sticky_session_found: None,
+            last_header: None,
+            headers_response: Rc::new([]),
+            tags: None,
 
-            method: None,
-            authority: None,
-            path: None,
+            route: HttpRoute {
+                method: None,
+                authority: None,
+                path: None,
+            },
             status: None,
             reason: None,
             user_agent: None,
@@ -178,20 +194,16 @@ impl HttpContext {
             ..
         } = &request.detached.status_line
         {
-            self.method = method.data_opt(buf).map(Method::new);
-            self.authority = authority
+            self.route.method = method.data_opt(buf).map(Method::new);
+            self.route.authority = authority
                 .data_opt(buf)
                 .and_then(|data| from_utf8(data).ok())
                 .map(ToOwned::to_owned);
-            self.path = path
+            self.route.path = path
                 .data_opt(buf)
                 .and_then(|data| from_utf8(data).ok())
                 .map(ToOwned::to_owned);
         }
-
-        // if self.method == Some(Method::Get) && request.body_size == kawa::BodySize::Empty {
-        //     request.parsing_phase = kawa::ParsingPhase::Terminated;
-        // }
 
         let public_ip = self.public_address.ip();
         let public_port = self.public_address.port();
@@ -243,19 +255,17 @@ impl HttpContext {
                         }
                     } else if compare_no_case(key, b"X-Forwarded-Proto") {
                         has_x_proto = true;
-                        // header.val = kawa::Store::Static(proto.as_bytes());
                         incr!("http.trusting.x_proto");
                         let val = header.val.data(buf);
                         if !compare_no_case(val, proto.as_bytes()) {
                             incr!("http.trusting.x_proto.diff");
                             debug!(
                                 "Trusting X-Forwarded-Proto for {:?} even though {:?} != {}",
-                                self.authority, val, proto
+                                self.route.authority, val, proto
                             );
                         }
                     } else if compare_no_case(key, b"X-Forwarded-Port") {
                         has_x_port = true;
-                        // header.val = kawa::Store::from_string(public_port.to_string());
                         incr!("http.trusting.x_port");
                         let val = header.val.data(buf);
                         let expected = public_port.to_string();
@@ -263,7 +273,7 @@ impl HttpContext {
                             incr!("http.trusting.x_port.diff");
                             debug!(
                                 "Trusting X-Forwarded-Port for {:?} even though {:?} != {}",
-                                self.authority, val, expected
+                                self.route.authority, val, expected
                             );
                         }
                     } else if compare_no_case(key, b"X-Forwarded-For") {
@@ -402,6 +412,8 @@ impl HttpContext {
                 val: kawa::Store::Static(b"close"),
             }));
         }
+
+        self.last_header = Some(request.blocks.len());
         // Create a custom "Sozu-Id" header
         request.push_block(kawa::Block::Header(kawa::Pair {
             key: kawa::Store::Static(b"Sozu-Id"),
@@ -428,7 +440,7 @@ impl HttpContext {
                 .map(ToOwned::to_owned);
         }
 
-        if self.method == Some(Method::Head) {
+        if self.route.method == Some(Method::Head) {
             response.parsing_phase = kawa::ParsingPhase::Terminated;
         }
 
@@ -452,6 +464,8 @@ impl HttpContext {
             }
         }
 
+        response.blocks.reserve(2 + self.headers_response.len());
+
         // If the sticky_session is set and differs from the one found in the request
         // create a "Set-Cookie" header to update the sticky_name value
         if let Some(sticky_session) = &self.sticky_session {
@@ -466,6 +480,8 @@ impl HttpContext {
             }
         }
 
+        apply_header_edits(response, self.headers_response.clone());
+
         // Create a custom "Sozu-Id" header
         response.push_block(kawa::Block::Header(kawa::Pair {
             key: kawa::Store::Static(b"Sozu-Id"),
@@ -477,12 +493,15 @@ impl HttpContext {
         self.keep_alive_backend = true;
         self.keep_alive_frontend = true;
         self.sticky_session_found = None;
-        self.method = None;
-        self.authority = None;
-        self.path = None;
+        self.route.method = None;
+        self.route.authority = None;
+        self.route.path = None;
         self.status = None;
         self.reason = None;
         self.user_agent = None;
+        self.cluster_id = None;
+        self.backend_id = None;
+        self.headers_response = Rc::new([]);
     }
 
     pub fn log_context(&self) -> LogContext<'_> {
@@ -491,5 +510,33 @@ impl HttpContext {
             cluster_id: self.cluster_id.as_deref(),
             backend_id: self.backend_id.as_deref(),
         }
+    }
+}
+
+impl HttpRoute {
+    pub fn extract(&self) -> Result<(&str, &str, &Method), crate::RetrieveClusterError> {
+        let given_method = self
+            .method
+            .as_ref()
+            .ok_or(crate::RetrieveClusterError::NoMethod)?;
+        let given_authority = self
+            .authority
+            .as_deref()
+            .ok_or(crate::RetrieveClusterError::NoHost)?;
+        let given_path = self
+            .path
+            .as_deref()
+            .ok_or(crate::RetrieveClusterError::NoPath)?;
+
+        Ok((given_authority, given_path, given_method))
+    }
+}
+
+pub fn apply_header_edits(kawa: &mut GenericHttpStream, headers: Rc<[HeaderEdit]>) {
+    for header in &*headers {
+        kawa.push_block(kawa::Block::Header(kawa::Pair {
+            key: kawa::Store::from_slice(&header.key),
+            val: kawa::Store::from_slice(&header.val),
+        }));
     }
 }

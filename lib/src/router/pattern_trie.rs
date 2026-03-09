@@ -4,6 +4,12 @@ use regex::bytes::Regex;
 
 pub type Key = Vec<u8>;
 pub type KeyValue<K, V> = (K, V);
+pub type TrieMatches<'a, 'b> = Vec<TrieSubMatch<'b, 'a>>;
+
+pub enum TrieSubMatch<'a, 'b> {
+    Wildcard(&'a [u8]),
+    Regexp(&'a [u8], &'b Regex),
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum InsertResult {
@@ -19,12 +25,10 @@ pub enum RemoveResult {
 }
 
 fn find_last_dot(input: &[u8]) -> Option<usize> {
-    //println!("find_last_dot: input = {}", from_utf8(input).unwrap());
     (0..input.len()).rev().find(|&i| input[i] == b'.')
 }
 
 fn find_last_slash(input: &[u8]) -> Option<usize> {
-    //println!("find_last_dot: input = {}", from_utf8(input).unwrap());
     (0..input.len()).rev().find(|&i| input[i] == b'/')
 }
 
@@ -94,7 +98,6 @@ impl<V: Debug + Clone> TrieNode<V> {
     }
 
     pub fn insert(&mut self, key: Key, value: V) -> InsertResult {
-        //println!("insert: key == {}", std::str::from_utf8(&key).unwrap());
         if key.is_empty() {
             return InsertResult::Failed;
         }
@@ -108,7 +111,6 @@ impl<V: Debug + Clone> TrieNode<V> {
     }
 
     pub fn insert_recursive(&mut self, partial_key: &[u8], key: &Key, value: V) -> InsertResult {
-        //println!("insert_rec: key == {}", std::str::from_utf8(partial_key).unwrap());
         assert_ne!(partial_key, &b""[..]);
 
         if partial_key[partial_key.len() - 1] == b'/' {
@@ -120,13 +122,15 @@ impl<V: Debug + Clone> TrieNode<V> {
                 }
 
                 if let Ok(s) = str::from_utf8(&partial_key[pos + 1..partial_key.len() - 1]) {
+                    let anchored = format!("\\A{s}\\z");
                     for t in self.regexps.iter_mut() {
-                        if t.0.as_str() == s {
+                        if t.0.as_str() == anchored {
                             return t.1.insert_recursive(&partial_key[..pos - 1], key, value);
                         }
                     }
 
-                    if let Ok(r) = Regex::new(s) {
+                    let s = anchored;
+                    if let Ok(r) = Regex::new(&s) {
                         if pos > 0 {
                             let mut node = TrieNode::root();
                             let pos = pos - 1;
@@ -190,8 +194,6 @@ impl<V: Debug + Clone> TrieNode<V> {
     }
 
     pub fn remove_recursive(&mut self, partial_key: &[u8]) -> RemoveResult {
-        //println!("remove: key == {}", std::str::from_utf8(partial_key).unwrap());
-
         if partial_key.is_empty() {
             if self.key_value.is_some() {
                 self.key_value = None;
@@ -219,10 +221,11 @@ impl<V: Debug + Clone> TrieNode<V> {
                 }
 
                 if let Ok(s) = str::from_utf8(&partial_key[pos + 1..partial_key.len() - 1]) {
+                    let anchored = format!("\\A{s}\\z");
                     if pos > 0 {
                         let mut remove_result = RemoveResult::NotFound;
                         for t in self.regexps.iter_mut() {
-                            if t.0.as_str() == s
+                            if t.0.as_str() == anchored
                                 && t.1.remove_recursive(&partial_key[..pos - 1]) == RemoveResult::Ok
                             {
                                 remove_result = RemoveResult::Ok;
@@ -231,7 +234,7 @@ impl<V: Debug + Clone> TrieNode<V> {
                         return remove_result;
                     } else {
                         let len = self.regexps.len();
-                        self.regexps.retain(|(r, _)| r.as_str() != s);
+                        self.regexps.retain(|(r, _)| r.as_str() != anchored);
                         if len > self.regexps.len() {
                             return RemoveResult::Ok;
                         }
@@ -247,7 +250,6 @@ impl<V: Debug + Clone> TrieNode<V> {
             None => (&b""[..], partial_key),
             Some(pos) => (&partial_key[..pos], &partial_key[pos..]),
         };
-        //println!("remove: prefix|suffix: {} | {}", std::str::from_utf8(prefix).unwrap(), std::str::from_utf8(suffix).unwrap());
 
         match self.children.get_mut(suffix) {
             Some(child) => match child.remove_recursive(prefix) {
@@ -263,11 +265,14 @@ impl<V: Debug + Clone> TrieNode<V> {
         }
     }
 
-    pub fn lookup(&self, partial_key: &[u8], accept_wildcard: bool) -> Option<&KeyValue<Key, V>> {
-        //println!("lookup: key == {}", std::str::from_utf8(partial_key).unwrap());
-
+    pub fn lookup<'a, 'b>(
+        &'a self,
+        partial_key: &'b [u8],
+        accept_wildcard: bool,
+        mut path: TrieMatches<'a, 'b>,
+    ) -> Option<(&'a KeyValue<Key, V>, TrieMatches<'a, 'b>)> {
         if partial_key.is_empty() {
-            return self.key_value.as_ref();
+            return self.key_value.as_ref().map(|kv| (kv, path));
         }
 
         let pos = find_last_dot(partial_key);
@@ -275,30 +280,23 @@ impl<V: Debug + Clone> TrieNode<V> {
             None => (&b""[..], partial_key),
             Some(pos) => (&partial_key[..pos], &partial_key[pos..]),
         };
-        //println!("lookup: prefix|suffix: {} | {}", std::str::from_utf8(prefix).unwrap(), std::str::from_utf8(suffix).unwrap());
 
         match self.children.get(suffix) {
-            Some(child) => child.lookup(prefix, accept_wildcard),
+            Some(child) => child.lookup(prefix, accept_wildcard, path),
             None => {
-                //println!("no child found, testing wildcard and regexps");
-
                 if prefix.is_empty() && self.wildcard.is_some() && accept_wildcard {
-                    //println!("no dot, wildcard applies");
-                    self.wildcard.as_ref()
+                    path.insert(0, TrieSubMatch::Wildcard(suffix));
+                    self.wildcard.as_ref().map(|kv| (kv, path))
                 } else {
-                    //println!("there's still a subdomain, wildcard does not apply");
-
-                    for (regexp, child) in self.regexps.iter() {
-                        let suffix = if suffix[0] == b'.' {
-                            &suffix[1..]
-                        } else {
-                            suffix
-                        };
-                        //println!("testing regexp: {} on suffix {}", r.as_str(), str::from_utf8(s).unwrap());
-
+                    let suffix = if suffix[0] == b'.' {
+                        &suffix[1..]
+                    } else {
+                        suffix
+                    };
+                    for (regexp, child) in &self.regexps {
                         if regexp.is_match(suffix) {
-                            //println!("matched");
-                            return child.lookup(prefix, accept_wildcard);
+                            path.insert(0, TrieSubMatch::Regexp(suffix, regexp));
+                            return child.lookup(prefix, accept_wildcard, path);
                         }
                     }
 
@@ -313,8 +311,6 @@ impl<V: Debug + Clone> TrieNode<V> {
         partial_key: &[u8],
         accept_wildcard: bool,
     ) -> Option<&mut KeyValue<Key, V>> {
-        //println!("lookup: key == {}", std::str::from_utf8(partial_key).unwrap());
-
         if partial_key.is_empty() {
             return self.key_value.as_mut();
         }
@@ -332,8 +328,9 @@ impl<V: Debug + Clone> TrieNode<V> {
                 }
 
                 if let Ok(s) = str::from_utf8(&partial_key[pos + 1..partial_key.len() - 1]) {
+                    let anchored = format!("\\A{s}\\z");
                     for t in self.regexps.iter_mut() {
-                        if t.0.as_str() == s {
+                        if t.0.as_str() == anchored {
                             return t.1.lookup_mut(&partial_key[..pos - 1], accept_wildcard);
                         }
                     }
@@ -348,29 +345,20 @@ impl<V: Debug + Clone> TrieNode<V> {
             None => (&b""[..], partial_key),
             Some(pos) => (&partial_key[..pos], &partial_key[pos..]),
         };
-        //println!("lookup: prefix|suffix: {} | {}", std::str::from_utf8(prefix).unwrap(), std::str::from_utf8(suffix).unwrap());
 
         match self.children.get_mut(suffix) {
             Some(child) => child.lookup_mut(prefix, accept_wildcard),
             None => {
-                //println!("no child found, testing wildcard and regexps");
-
                 if prefix.is_empty() && self.wildcard.is_some() && accept_wildcard {
-                    //println!("no dot, wildcard applies");
                     self.wildcard.as_mut()
                 } else {
-                    //println!("there's still a subdomain, wildcard does not apply");
-
-                    for &mut (ref regexp, ref mut child) in self.regexps.iter_mut() {
-                        let suffix = if suffix[0] == b'.' {
-                            &suffix[1..]
-                        } else {
-                            suffix
-                        };
-                        //println!("testing regexp: {} on suffix {}", r.as_str(), str::from_utf8(s).unwrap());
-
+                    let suffix = if suffix[0] == b'.' {
+                        &suffix[1..]
+                    } else {
+                        suffix
+                    };
+                    for (regexp, child) in &mut self.regexps {
                         if regexp.is_match(suffix) {
-                            //println!("matched");
                             return child.lookup_mut(prefix, accept_wildcard);
                         }
                     }
@@ -407,7 +395,6 @@ impl<V: Debug + Clone> TrieNode<V> {
         }
 
         for (regexp, child) in self.regexps.iter() {
-            //print!("{}{}:", prefix, regexp.as_str());
             child.print_recursive(regexp.as_str().as_bytes(), indent + 1);
         }
     }
@@ -421,7 +408,8 @@ impl<V: Debug + Clone> TrieNode<V> {
     }
 
     pub fn domain_lookup(&self, key: &[u8], accept_wildcard: bool) -> Option<&KeyValue<Key, V>> {
-        self.lookup(key, accept_wildcard)
+        let path = Vec::new();
+        self.lookup(key, accept_wildcard, path).map(|(kv, _)| kv)
     }
 
     pub fn domain_lookup_mut(
@@ -493,7 +481,6 @@ mod tests {
             root.domain_lookup(&b"abce"[..], true),
             Some(&(b"abce"[..].to_vec(), 2))
         );
-        //assert!(false);
     }
 
     #[test]
@@ -780,17 +767,13 @@ mod tests {
                 continue;
             }
 
-            //println!("inserting key: '{}', value: '{}'", k, v);
-            //assert_eq!(root.domain_insert(Vec::from(k.as_bytes()), *v), InsertResult::Ok);
             assert_eq!(
                 root.insert(Vec::from(k.as_bytes()), *v),
                 InsertResult::Ok,
                 "could not insert ({k}, {v})"
             );
-            //root.print();
         }
 
-        //root.print();
         for (k, v) in h.iter() {
             if k.is_empty() {
                 continue;
@@ -808,8 +791,7 @@ mod tests {
                 continue;
             }
 
-            //match root.domain_lookup(k.as_bytes()) {
-            match root.lookup(k.as_bytes(), false) {
+            match root.domain_lookup(k.as_bytes(), false) {
                 None => {
                     println!("did not find key '{k}'");
                     return false;

@@ -215,6 +215,26 @@ message ListenersList {
     map<string, TcpListenerConfig> tcp_listeners = 3;
 }
 
+// Redirect policy for a frontend
+enum RedirectPolicy {
+    // Forward traffic to the backend (default)
+    FORWARD = 0;
+    // Return a 301 Moved Permanently
+    PERMANENT = 1;
+    // Return a 401 Unauthorized
+    UNAUTHORIZED = 2;
+}
+
+// Scheme to use when building a redirect URL
+enum RedirectScheme {
+    // Use the same scheme as the incoming request
+    USE_SAME = 0;
+    // Force HTTP
+    USE_HTTP = 1;
+    // Force HTTPS
+    USE_HTTPS = 2;
+}
+
 // An HTTP or HTTPS frontend, as order to, or received from, Sōzu
 message RequestHttpFrontend {
     optional string cluster_id = 1;
@@ -225,6 +245,36 @@ message RequestHttpFrontend {
     required RulePosition position = 6 [default = TREE];
     // custom tags to identify the frontend in the access logs
     map<string, string> tags = 7;
+    // redirect policy: forward, permanent redirect, or deny
+    optional RedirectPolicy redirect = 8;
+    // whether basic auth is required
+    optional bool required_auth = 9;
+    // scheme to use when building a redirect URL
+    optional RedirectScheme redirect_scheme = 10;
+    // template for building redirect URLs, supports $HOST[n] and $PATH[n] placeholders
+    optional string redirect_template = 11;
+    // rewrite the host header before forwarding to the backend
+    optional string rewrite_host = 12;
+    // rewrite the path before forwarding to the backend
+    optional string rewrite_path = 13;
+    // rewrite the port in the forwarded URL
+    optional uint32 rewrite_port = 14;
+    // custom headers to add on this frontend
+    repeated Header headers = 15;
+}
+
+// Position of a custom header (on request, response, or both)
+enum HeaderPosition {
+    REQUEST = 1;
+    RESPONSE = 2;
+    BOTH = 3;
+}
+
+// A custom header to add to requests/responses on a frontend
+message Header {
+    required HeaderPosition position = 1;
+    required string key = 2;
+    required string val = 3;
 }
 
 message RequestTcpFrontend {
@@ -355,6 +405,8 @@ message Cluster {
     reserved 6;
     optional LoadMetric load_metric = 7;
     map<string, string> answers = 8;
+    // optional port to use when building HTTPS redirect URLs
+    optional uint32 https_redirect_port = 9;
 }
 
 enum LoadBalancingAlgorithms {

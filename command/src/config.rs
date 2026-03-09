@@ -62,12 +62,12 @@ use crate::{
     certificate::split_certificate_chain,
     logging::AccessLogFormat,
     proto::command::{
-        ActivateListener, AddBackend, AddCertificate, CertificateAndKey, Cluster,
-        HttpListenerConfig, HttpsListenerConfig, ListenerType, LoadBalancingAlgorithms,
-        LoadBalancingParams, LoadMetric, MetricsConfiguration, PathRule, ProtobufAccessLogFormat,
-        ProxyProtocolConfig, Request, RequestHttpFrontend, RequestTcpFrontend, RulePosition,
-        ServerConfig, ServerMetricsConfig, SocketAddress, TcpListenerConfig, TlsVersion,
-        WorkerRequest, request::RequestType,
+        ActivateListener, AddBackend, AddCertificate, CertificateAndKey, Cluster, Header,
+        HeaderPosition, HttpListenerConfig, HttpsListenerConfig, ListenerType,
+        LoadBalancingAlgorithms, LoadBalancingParams, LoadMetric, MetricsConfiguration, PathRule,
+        ProtobufAccessLogFormat, ProxyProtocolConfig, RedirectPolicy, RedirectScheme, Request,
+        RequestHttpFrontend, RequestTcpFrontend, RulePosition, ServerConfig, ServerMetricsConfig,
+        SocketAddress, TcpListenerConfig, TlsVersion, WorkerRequest, request::RequestType,
     },
 };
 
@@ -635,6 +635,14 @@ pub enum PathRuleType {
     Equals,
 }
 
+/// A custom header to add on a frontend, as configured in the TOML file
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct HeaderConfig {
+    pub position: HeaderPosition,
+    pub key: String,
+    pub val: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileClusterFrontendConfig {
@@ -653,6 +661,16 @@ pub struct FileClusterFrontendConfig {
     #[serde(default)]
     pub position: RulePosition,
     pub tags: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    pub required_auth: Option<bool>,
+    pub redirect: Option<RedirectPolicy>,
+    pub redirect_scheme: Option<RedirectScheme>,
+    pub redirect_template: Option<String>,
+    pub rewrite_host: Option<String>,
+    pub rewrite_path: Option<String>,
+    pub rewrite_port: Option<u16>,
+    #[serde(default)]
+    pub headers: Vec<HeaderConfig>,
 }
 
 impl FileClusterFrontendConfig {
@@ -738,6 +756,14 @@ impl FileClusterFrontendConfig {
             path,
             method: self.method.clone(),
             tags: self.tags.clone(),
+            required_auth: self.required_auth.unwrap_or(false),
+            redirect: self.redirect,
+            redirect_scheme: self.redirect_scheme,
+            redirect_template: self.redirect_template.clone(),
+            rewrite_host: self.rewrite_host.clone(),
+            rewrite_path: self.rewrite_path.clone(),
+            rewrite_port: self.rewrite_port,
+            headers: self.headers.clone(),
         })
     }
 }
@@ -765,6 +791,7 @@ pub struct FileClusterConfig {
     pub protocol: FileClusterProtocolConfig,
     pub sticky_session: Option<bool>,
     pub https_redirect: Option<bool>,
+    pub https_redirect_port: Option<u16>,
     #[serde(default)]
     pub send_proxy: Option<bool>,
     #[serde(default)]
@@ -857,6 +884,7 @@ impl FileClusterConfig {
                     backends: self.backends,
                     sticky_session: self.sticky_session.unwrap_or(false),
                     https_redirect: self.https_redirect.unwrap_or(false),
+                    https_redirect_port: self.https_redirect_port,
                     load_balancing: self.load_balancing,
                     load_metric: self.load_metric,
                     answers,
@@ -881,6 +909,16 @@ pub struct HttpFrontendConfig {
     #[serde(default)]
     pub position: RulePosition,
     pub tags: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    pub required_auth: bool,
+    pub redirect: Option<RedirectPolicy>,
+    pub redirect_scheme: Option<RedirectScheme>,
+    pub redirect_template: Option<String>,
+    pub rewrite_host: Option<String>,
+    pub rewrite_path: Option<String>,
+    pub rewrite_port: Option<u16>,
+    #[serde(default)]
+    pub headers: Vec<HeaderConfig>,
 }
 
 impl HttpFrontendConfig {
@@ -888,6 +926,33 @@ impl HttpFrontendConfig {
         let mut v = Vec::new();
 
         let tags = self.tags.clone().unwrap_or_default();
+        let headers: Vec<Header> = self
+            .headers
+            .iter()
+            .map(|h| Header {
+                position: h.position.into(),
+                key: h.key.clone(),
+                val: h.val.clone(),
+            })
+            .collect();
+
+        let make_frontend = |tags| RequestHttpFrontend {
+            cluster_id: Some(cluster_id.to_string()),
+            address: self.address.into(),
+            hostname: self.hostname.clone(),
+            path: self.path.clone(),
+            method: self.method.clone(),
+            position: self.position.into(),
+            tags,
+            required_auth: Some(self.required_auth),
+            redirect: self.redirect.map(Into::into),
+            redirect_scheme: self.redirect_scheme.map(Into::into),
+            redirect_template: self.redirect_template.clone(),
+            rewrite_host: self.rewrite_host.clone(),
+            rewrite_path: self.rewrite_path.clone(),
+            rewrite_port: self.rewrite_port.map(|x| x as u32),
+            headers: headers.clone(),
+        };
 
         if self.key.is_some() && self.certificate.is_some() {
             v.push(
@@ -898,10 +963,6 @@ impl HttpFrontendConfig {
                         certificate: self.certificate.clone().unwrap(),
                         certificate_chain: self.certificate_chain.clone().unwrap_or_default(),
                         versions: self.tls_versions.iter().map(|v| *v as i32).collect(),
-                        // This field is used to override the certificate subject and san, we should not set it when
-                        // loading the configuration, as we may provide a wildcard certificate for a specific domain.
-                        // As a result, we will reject legit traffic for others domains as the certificate resolver will
-                        // not load twice the same certificate and then do not register the certificate for others domains.
                         names: vec![],
                     },
                     expired_at: None,
@@ -909,32 +970,9 @@ impl HttpFrontendConfig {
                 .into(),
             );
 
-            v.push(
-                RequestType::AddHttpsFrontend(RequestHttpFrontend {
-                    cluster_id: Some(cluster_id.to_string()),
-                    address: self.address.into(),
-                    hostname: self.hostname.clone(),
-                    path: self.path.clone(),
-                    method: self.method.clone(),
-                    position: self.position.into(),
-                    tags,
-                })
-                .into(),
-            );
+            v.push(RequestType::AddHttpsFrontend(make_frontend(tags)).into());
         } else {
-            //create the front both for HTTP and HTTPS if possible
-            v.push(
-                RequestType::AddHttpFrontend(RequestHttpFrontend {
-                    cluster_id: Some(cluster_id.to_string()),
-                    address: self.address.into(),
-                    hostname: self.hostname.clone(),
-                    path: self.path.clone(),
-                    method: self.method.clone(),
-                    position: self.position.into(),
-                    tags,
-                })
-                .into(),
-            );
+            v.push(RequestType::AddHttpFrontend(make_frontend(tags)).into());
         }
 
         v
@@ -949,6 +987,8 @@ pub struct HttpClusterConfig {
     pub backends: Vec<BackendConfig>,
     pub sticky_session: bool,
     pub https_redirect: bool,
+    #[serde(default)]
+    pub https_redirect_port: Option<u16>,
     pub load_balancing: LoadBalancingAlgorithms,
     pub load_metric: Option<LoadMetric>,
     pub answers: BTreeMap<String, String>,
@@ -965,6 +1005,7 @@ impl HttpClusterConfig {
                 load_balancing: self.load_balancing as i32,
                 answers: self.answers.clone(),
                 load_metric: self.load_metric.map(|s| s as i32),
+                https_redirect_port: self.https_redirect_port.map(|p| p as u32),
             })
             .into(),
         ];
@@ -1026,6 +1067,7 @@ impl TcpClusterConfig {
                 load_balancing: self.load_balancing as i32,
                 load_metric: self.load_metric.map(|s| s as i32),
                 answers: BTreeMap::new(),
+                https_redirect_port: None,
             })
             .into(),
         ];

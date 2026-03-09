@@ -20,6 +20,8 @@ use sozu_command::{
     proto::command::{Event, EventKind, ListenerType},
 };
 
+use sozu_command::proto::command::{RedirectPolicy, RedirectScheme};
+
 use crate::{
     AcceptError, BackendConnectAction, BackendConnectionError, L7ListenerHandler, L7Proxy,
     ListenerHandler, Protocol, ProxySession, Readiness, RetrieveClusterError, SessionIsToBeClosed,
@@ -31,13 +33,13 @@ use crate::{
         http::{
             answers::DefaultAnswerStream,
             diagnostics::{diagnostic_400_502, diagnostic_413_507},
-            editor::HttpContext,
-            parser::Method,
+            editor::{HttpContext, apply_header_edits},
+            parser::{Method, hostname_and_port},
         },
         pipe::WebSocketContext,
     },
     retry::RetryPolicy,
-    router::Route,
+    router::RouteResult,
     server::{CONN_RETRIES, push_event},
     socket::{SocketHandler, SocketResult, TransportProtocol, stats::socket_rtt},
     sozu_command::{logging::LogContext, ready::Ready},
@@ -863,9 +865,9 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L> {
     fn log_endpoint(&self) -> EndpointRecord<'_> {
         EndpointRecord::Http {
-            method: self.context.method.as_deref(),
-            authority: self.context.authority.as_deref(),
-            path: self.context.path.as_deref(),
+            method: self.context.route.method.as_deref(),
+            authority: self.context.route.authority.as_deref(),
+            path: self.context.route.path.as_deref(),
             reason: self.context.reason.as_deref(),
             status: self.context.status,
         }
@@ -903,9 +905,9 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
     /// Format the context of the websocket into a loggable String
     pub fn websocket_context(&self) -> WebSocketContext {
         WebSocketContext::Http {
-            method: self.context.method.clone(),
-            authority: self.context.authority.clone(),
-            path: self.context.path.clone(),
+            method: self.context.route.method.clone(),
+            authority: self.context.route.authority.clone(),
+            path: self.context.route.path.clone(),
             reason: self.context.reason.clone(),
             status: self.context.status,
         }
@@ -913,7 +915,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
     pub fn log_request(&self, metrics: &SessionMetrics, error: bool, message: Option<&str>) {
         let listener = self.listener.borrow();
-        let tags = self.context.authority.as_ref().and_then(|host| {
+        let tags = self.context.route.authority.as_ref().and_then(|host| {
             let hostname = match host.split_once(':') {
                 None => host,
                 Some((hostname, _)) => hostname,
@@ -1178,29 +1180,13 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
     // -> host, path, method
     pub fn extract_route(&self) -> Result<(&str, &str, &Method), RetrieveClusterError> {
-        let given_method = self
-            .context
-            .method
-            .as_ref()
-            .ok_or(RetrieveClusterError::NoMethod)?;
-        let given_authority = self
-            .context
-            .authority
-            .as_deref()
-            .ok_or(RetrieveClusterError::NoHost)?;
-        let given_path = self
-            .context
-            .path
-            .as_deref()
-            .ok_or(RetrieveClusterError::NoPath)?;
-
-        Ok((given_authority, given_path, given_method))
+        self.context.route.extract()
     }
 
     pub fn get_route(&self) -> String {
-        if let Some(method) = &self.context.method {
-            if let Some(authority) = &self.context.authority {
-                if let Some(path) = &self.context.path {
+        if let Some(method) = &self.context.route.method {
+            if let Some(authority) = &self.context.route.authority {
+                if let Some(path) = &self.context.route.path {
                     return format!("{method} {authority}{path}");
                 }
                 return format!("{method} {authority}");
@@ -1214,8 +1200,8 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         &mut self,
         proxy: Rc<RefCell<dyn L7Proxy>>,
     ) -> Result<String, RetrieveClusterError> {
-        let (host, uri, method) = match self.extract_route() {
-            Ok(tuple) => tuple,
+        let (host, path, method) = match self.extract_route() {
+            Ok((h, p, m)) => (h.to_owned(), p.to_owned(), m.to_owned()),
             Err(cluster_error) => {
                 self.set_answer(DefaultAnswer::Answer400 {
                     message: "Could not extract the route after connection started, this should not happen.".into(),
@@ -1228,43 +1214,133 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             }
         };
 
+        let (_remaining, (_hostname, port)) = hostname_and_port(host.as_bytes()).map_err(|e| {
+            let error = e.to_string();
+            self.set_answer(DefaultAnswer::Answer400 {
+                message: format!("Could not parse host: {error}"),
+                phase: self.request_stream.parsing_phase.marker(),
+                successfully_parsed: "null".into(),
+                partially_parsed: "null".into(),
+                invalid: "null".into(),
+            });
+            RetrieveClusterError::RetrieveFrontend(crate::FrontendFromRequestError::HostParse {
+                host: host.to_owned(),
+                error,
+            })
+        })?;
+
         let route_result = self
             .listener
             .borrow()
-            .frontend_from_request(host, uri, method);
+            .frontend_from_request(&host, &path, &method);
 
-        let route = match route_result {
+        let RouteResult {
+            cluster_id,
+            redirect,
+            redirect_scheme,
+            redirect_template: _,
+            rewritten_host,
+            rewritten_path,
+            rewritten_port,
+            headers_request,
+            headers_response,
+            tags,
+        } = match route_result {
             Ok(route) => route,
             Err(frontend_error) => {
                 self.set_answer(DefaultAnswer::Answer404 {});
                 return Err(RetrieveClusterError::RetrieveFrontend(frontend_error));
             }
         };
+        self.context.cluster_id = cluster_id;
+        self.context.headers_response = headers_response;
+        self.context.tags = tags;
 
-        let cluster_id = match route {
-            Route::ClusterId(cluster_id) => cluster_id,
-            Route::Deny => {
-                self.set_answer(DefaultAnswer::Answer401 {});
-                return Err(RetrieveClusterError::UnauthorizedRoute);
-            }
+        let body = if let Some(position) = self.context.last_header {
+            self.request_stream.blocks.split_off(position)
+        } else {
+            Default::default()
         };
 
-        let frontend_should_redirect_https = matches!(proxy.borrow().kind(), ListenerType::Http)
-            && proxy
-                .borrow()
-                .clusters()
-                .get(&cluster_id)
-                .map(|cluster| cluster.https_redirect)
-                .unwrap_or(false);
-
-        if frontend_should_redirect_https {
-            self.set_answer(DefaultAnswer::Answer301 {
-                location: format!("https://{host}{uri}"),
-            });
-            return Err(RetrieveClusterError::UnauthorizedRoute);
+        let original_host = host.to_owned();
+        match &mut self.request_stream.detached.status_line {
+            kawa::StatusLine::Request { authority, uri, .. } => {
+                let buf = self.request_stream.storage.mut_buffer();
+                if let Some(new) = &rewritten_host {
+                    authority.modify(buf, new.as_bytes());
+                    self.request_stream
+                        .blocks
+                        .push_back(kawa::Block::Header(kawa::Pair {
+                            key: kawa::Store::Static(b"X-Forwarded-Host"),
+                            val: kawa::Store::from_slice(original_host.as_bytes()),
+                        }));
+                }
+                if let Some(new) = &rewritten_path {
+                    uri.modify(buf, new.as_bytes());
+                }
+            }
+            _ => unreachable!(),
         }
 
-        Ok(cluster_id)
+        let host = rewritten_host.as_deref().unwrap_or(&host);
+        let path = rewritten_path.as_deref().unwrap_or(&path);
+        let is_https = matches!(proxy.borrow().kind(), ListenerType::Https);
+        let proto = match (redirect_scheme, is_https) {
+            (RedirectScheme::UseHttp, _) | (RedirectScheme::UseSame, false) => "http",
+            (RedirectScheme::UseHttps, _) | (RedirectScheme::UseSame, true) => "https",
+        };
+
+        let cluster_id = &self.context.cluster_id;
+        let (https_redirect, https_redirect_port) = match cluster_id {
+            Some(cid) => proxy
+                .borrow()
+                .clusters()
+                .get(cid)
+                .map_or((false, None), |cluster| {
+                    (cluster.https_redirect, cluster.https_redirect_port)
+                }),
+            None => (false, None),
+        };
+
+        let port = match (
+            port,
+            rewritten_port,
+            https_redirect_port,
+            !is_https && https_redirect,
+        ) {
+            (_, Some(p), _, _) => format!(":{p}"),
+            (_, _, Some(p), true) => format!(":{p}"),
+            (Some(p), _, _, _) => {
+                format!(":{}", std::str::from_utf8(p).unwrap_or_default())
+            }
+            _ => String::new(),
+        };
+
+        match (cluster_id, redirect) {
+            (_, RedirectPolicy::Unauthorized) => {
+                self.set_answer(DefaultAnswer::Answer401 {});
+                Err(RetrieveClusterError::UnauthorizedRoute)
+            }
+            (_, RedirectPolicy::Permanent) => {
+                let location = format!("{proto}://{host}{port}{path}");
+                self.set_answer(DefaultAnswer::Answer301 { location });
+                Err(RetrieveClusterError::Redirected)
+            }
+            (None, RedirectPolicy::Forward) => {
+                self.set_answer(DefaultAnswer::Answer401 {});
+                Err(RetrieveClusterError::UnauthorizedRoute)
+            }
+            (Some(cluster_id), RedirectPolicy::Forward) => {
+                if !is_https && https_redirect {
+                    let location = format!("https://{host}{port}{path}");
+                    self.set_answer(DefaultAnswer::Answer301 { location });
+                    return Err(RetrieveClusterError::Redirected);
+                }
+                apply_header_edits(&mut self.request_stream, headers_request);
+                self.request_stream.blocks.extend(body);
+                Ok(cluster_id.to_owned())
+            }
+        }
     }
 
     pub fn backend_from_request(

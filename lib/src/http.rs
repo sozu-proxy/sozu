@@ -5,7 +5,6 @@ use std::{
     net::{Shutdown, SocketAddr},
     os::unix::io::AsRawFd,
     rc::{Rc, Weak},
-    str::from_utf8_unchecked,
     time::{Duration, Instant},
 };
 
@@ -41,7 +40,7 @@ use crate::{
         },
         proxy_protocol::expect::ExpectProxyProtocol,
     },
-    router::{Route, Router},
+    router::{RouteResult, Router},
     server::{ListenToken, SessionManager},
     socket::server_bind,
     timer::TimeoutContainer,
@@ -437,7 +436,7 @@ impl L7ListenerHandler for HttpListener {
         host: &str,
         uri: &str,
         method: &Method,
-    ) -> Result<Route, FrontendFromRequestError> {
+    ) -> Result<RouteResult, FrontendFromRequestError> {
         let start = Instant::now();
         let (remaining_input, (hostname, _)) = match hostname_and_port(host.as_bytes()) {
             Ok(tuple) => tuple,
@@ -455,16 +454,7 @@ impl L7ListenerHandler for HttpListener {
             ));
         }
 
-        /*if port == Some(&b"80"[..]) {
-        // it is alright to call from_utf8_unchecked,
-        // we already verified that there are only ascii
-        // chars in there
-          unsafe { from_utf8_unchecked(hostname) }
-        } else {
-          host
-        }
-        */
-        let host = unsafe { from_utf8_unchecked(hostname) };
+        let host = std::str::from_utf8(hostname).unwrap_or(host);
 
         let route = self.fronts.lookup(host, uri, method).map_err(|e| {
             incr!("http.failed_backend_matching");
@@ -473,7 +463,7 @@ impl L7ListenerHandler for HttpListener {
 
         let now = Instant::now();
 
-        if let Route::ClusterId(cluster) = &route {
+        if let Some(cluster) = &route.cluster_id {
             time!("frontend_matching_time", cluster, (now - start).as_millis());
         }
 
@@ -1326,6 +1316,14 @@ mod tests {
                 position: RulePosition::Tree,
                 cluster_id: Some(cluster_id1),
                 tags: None,
+                required_auth: false,
+                redirect: Default::default(),
+                redirect_scheme: Default::default(),
+                redirect_template: None,
+                rewrite_host: None,
+                rewrite_path: None,
+                rewrite_port: None,
+                headers: Vec::new(),
             })
             .expect("Could not add http frontend");
         fronts
@@ -1337,6 +1335,14 @@ mod tests {
                 position: RulePosition::Tree,
                 cluster_id: Some(cluster_id2),
                 tags: None,
+                required_auth: false,
+                redirect: Default::default(),
+                redirect_scheme: Default::default(),
+                redirect_template: None,
+                rewrite_host: None,
+                rewrite_path: None,
+                rewrite_port: None,
+                headers: Vec::new(),
             })
             .expect("Could not add http frontend");
         fronts
@@ -1348,6 +1354,14 @@ mod tests {
                 position: RulePosition::Tree,
                 cluster_id: Some(cluster_id3),
                 tags: None,
+                required_auth: false,
+                redirect: Default::default(),
+                redirect_scheme: Default::default(),
+                redirect_template: None,
+                rewrite_host: None,
+                rewrite_path: None,
+                rewrite_port: None,
+                headers: Vec::new(),
             })
             .expect("Could not add http frontend");
         fronts
@@ -1359,6 +1373,14 @@ mod tests {
                 position: RulePosition::Tree,
                 cluster_id: Some("cluster_1".to_owned()),
                 tags: None,
+                required_auth: false,
+                redirect: Default::default(),
+                redirect_scheme: Default::default(),
+                redirect_template: None,
+                rewrite_host: None,
+                rewrite_path: None,
+                rewrite_port: None,
+                headers: Vec::new(),
             })
             .expect("Could not add http frontend");
 
@@ -1385,20 +1407,20 @@ mod tests {
         let frontend4 = listener.frontend_from_request("lolcatho.st", "/yolo/swag", &Method::Get);
         let frontend5 = listener.frontend_from_request("domain", "/", &Method::Get);
         assert_eq!(
-            frontend1.expect("should find frontend"),
-            Route::ClusterId("cluster_1".to_string())
+            frontend1.expect("should find frontend").cluster_id,
+            Some("cluster_1".to_string())
         );
         assert_eq!(
-            frontend2.expect("should find frontend"),
-            Route::ClusterId("cluster_1".to_string())
+            frontend2.expect("should find frontend").cluster_id,
+            Some("cluster_1".to_string())
         );
         assert_eq!(
-            frontend3.expect("should find frontend"),
-            Route::ClusterId("cluster_2".to_string())
+            frontend3.expect("should find frontend").cluster_id,
+            Some("cluster_2".to_string())
         );
         assert_eq!(
-            frontend4.expect("should find frontend"),
-            Route::ClusterId("cluster_3".to_string())
+            frontend4.expect("should find frontend").cluster_id,
+            Some("cluster_3".to_string())
         );
         assert!(frontend5.is_err());
     }
