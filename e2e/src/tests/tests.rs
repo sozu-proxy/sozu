@@ -2294,10 +2294,8 @@ fn test_h2spec_conformance() {
     worker.soft_stop();
     worker.wait_for_server_stop();
 
-    // For now, we report results but don't fail the test — we'll tighten this
-    // as we fix h2spec failures. Log the failure count for tracking.
-    if failed > 0 {
-        println!("h2spec: {failed} tests failed (see output above for details)");
-    }
-    // TODO: once we reach 0 failures, change this to: assert_eq!(failed, 0);
+    assert_eq!(
+        failed, 0,
+        "h2spec: {failed} tests failed (see output above)"
+    );
 }
