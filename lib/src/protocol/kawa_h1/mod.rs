@@ -14,6 +14,7 @@ use std::{
 
 use mio::{Interest, Token, net::TcpStream};
 use rusty_ulid::Ulid;
+use subtle::ConstantTimeEq;
 use sozu_command::{
     config::MAX_LOOP_ITERATIONS,
     logging::EndpointRecord,
@@ -1315,8 +1316,11 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                                     (false, _) => true,
                                     // no auth found
                                     (true, None) => false,
-                                    // validation
-                                    (true, Some(hash)) => cluster.authorized_hashes.contains(hash),
+                                    // validation (constant-time comparison to prevent timing attacks)
+                                    (true, Some(hash)) => cluster
+                                        .authorized_hashes
+                                        .iter()
+                                        .any(|h| h.as_bytes().ct_eq(hash.as_bytes()).into()),
                                 };
                             (
                                 authorized,

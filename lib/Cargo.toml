@@ -47,6 +47,7 @@ rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 rusty_ulid = { workspace = true }
 sha2 = { workspace = true }
+subtle = { workspace = true }
 slab = { workspace = true }
 socket2 = { workspace = true, features = ["all"] }
 thiserror = { workspace = true }
