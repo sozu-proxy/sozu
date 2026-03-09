@@ -173,12 +173,24 @@ impl Worker {
         println!("State from old worker: {:?}", self.state);
         self.soft_stop();
 
-        let mut worker = Worker::start_new_worker(
-            name,
-            self.config.to_owned(),
-            &listeners,
-            self.state.to_owned(),
-        );
+        // Deactivate listeners in the state clone so that produce_initial_state()
+        // won't generate ActivateListener requests. The initial state is processed
+        // BEFORE SCM listeners are received by the worker, so activating without
+        // the SCM FDs would fall back to server_bind() and fail or create duplicates.
+        // Activation is handled explicitly below via generate_activate_requests().
+        let mut upgrade_state = self.state.to_owned();
+        for listener in upgrade_state.http_listeners.values_mut() {
+            listener.active = false;
+        }
+        for listener in upgrade_state.https_listeners.values_mut() {
+            listener.active = false;
+        }
+        for listener in upgrade_state.tcp_listeners.values_mut() {
+            listener.active = false;
+        }
+
+        let mut worker =
+            Worker::start_new_worker(name, self.config.to_owned(), &listeners, upgrade_state);
         worker
             .scm_main_to_worker
             .send_listeners(&listeners)
