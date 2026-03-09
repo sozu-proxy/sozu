@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, HashMap, hash_map::Entry},
+    collections::{hash_map::Entry, BTreeMap, HashMap},
     io::ErrorKind,
     net::{Shutdown, SocketAddr as StdSocketAddr},
     os::unix::io::AsRawFd,
@@ -11,36 +11,36 @@ use std::{
 };
 
 use mio::{
-    Interest, Registry, Token,
     net::{TcpListener as MioTcpListener, TcpStream as MioTcpStream},
     unix::SourceFd,
+    Interest, Registry, Token,
 };
 use rustls::{
-    CipherSuite, ProtocolVersion, ServerConfig as RustlsServerConfig, ServerConnection,
-    SupportedCipherSuite,
     crypto::{
-        CryptoProvider,
         ring::{
             self,
             cipher_suite::{
+                TLS13_AES_128_GCM_SHA256, TLS13_AES_256_GCM_SHA384, TLS13_CHACHA20_POLY1305_SHA256,
                 TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
                 TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
                 TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256, TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-                TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256, TLS13_AES_128_GCM_SHA256,
-                TLS13_AES_256_GCM_SHA384, TLS13_CHACHA20_POLY1305_SHA256,
+                TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
             },
         },
+        CryptoProvider,
     },
+    CipherSuite, ProtocolVersion, ServerConfig as RustlsServerConfig, ServerConnection,
+    SupportedCipherSuite,
 };
 use rusty_ulid::Ulid;
 use sozu_command::{
     certificate::Fingerprint,
     config::DEFAULT_CIPHER_SUITES,
     proto::command::{
-        AddCertificate, CertificateSummary, CertificatesByAddress, Cluster, HttpsListenerConfig,
-        ListOfCertificatesByAddress, ListenerType, RemoveCertificate, RemoveListener,
-        ReplaceCertificate, RequestHttpFrontend, ResponseContent, TlsVersion, WorkerRequest,
-        WorkerResponse, request::RequestType, response_content::ContentType,
+        request::RequestType, response_content::ContentType, AddCertificate, CertificateSummary,
+        CertificatesByAddress, Cluster, HttpsListenerConfig, ListOfCertificatesByAddress,
+        ListenerType, RemoveCertificate, RemoveListener, ReplaceCertificate, RequestHttpFrontend,
+        ResponseContent, TlsVersion, WorkerRequest, WorkerResponse,
     },
     ready::Ready,
     response::HttpFrontend,
@@ -48,28 +48,27 @@ use sozu_command::{
 };
 
 use crate::{
-    AcceptError, CachedTags, FrontendFromRequestError, L7ListenerHandler, L7Proxy, ListenerError,
-    ListenerHandler, Protocol, ProxyConfiguration, ProxyError, ProxySession, SessionIsToBeClosed,
-    SessionMetrics, SessionResult, StateMachineBuilder, StateResult,
     backends::BackendMap,
     pool::Pool,
     protocol::{
-        Http, Pipe, SessionState,
-        h2::Http2,
         http::{
-            ResponseStream,
             answers::HttpAnswers,
-            parser::{Method, hostname_and_port},
+            parser::{hostname_and_port, Method},
+            ResponseStream,
         },
         proxy_protocol::expect::ExpectProxyProtocol,
         rustls::TlsHandshake,
+        Http, Pipe, SessionState,
     },
     router::{Route, Router},
     server::{ListenToken, SessionManager},
-    socket::{FrontRustls, server_bind},
+    socket::{server_bind, FrontRustls},
     timer::TimeoutContainer,
     tls::MutexCertificateResolver,
     util::UnwrapLog,
+    AcceptError, CachedTags, FrontendFromRequestError, L7ListenerHandler, L7Proxy, ListenerError,
+    ListenerHandler, Protocol, ProxyConfiguration, ProxyError, ProxySession, SessionIsToBeClosed,
+    SessionMetrics, SessionResult, StateMachineBuilder, StateResult,
 };
 
 // const SERVER_PROTOS: &[&str] = &["http/1.1", "h2"];
@@ -80,14 +79,13 @@ StateMachineBuilder! {
     ///
     /// - optional (ExpectProxyProtocol)
     /// - TLS handshake
-    /// - HTTP or HTTP2
+    /// - HTTP
     /// - WebSocket (passthrough), only from HTTP
     enum HttpsStateMachine impl SessionState {
         Expect(ExpectProxyProtocol<MioTcpStream>, ServerConnection),
         Handshake(TlsHandshake),
         Http(Http<FrontRustls, HttpsListener>),
         WebSocket(Pipe<FrontRustls, HttpsListener>),
-        Http2(Http2<FrontRustls>) -> todo!("H2"),
     }
 }
 
@@ -188,7 +186,6 @@ impl HttpsSession {
             HttpsStateMachine::Expect(expect, ssl) => self.upgrade_expect(expect, ssl),
             HttpsStateMachine::Handshake(handshake) => self.upgrade_handshake(handshake),
             HttpsStateMachine::Http(http) => self.upgrade_http(http),
-            HttpsStateMachine::Http2(_) => self.upgrade_http2(),
             HttpsStateMachine::WebSocket(wss) => self.upgrade_websocket(wss),
             HttpsStateMachine::FailedUpgrade(_) => unreachable!(),
         };
@@ -317,19 +314,9 @@ impl HttpsSession {
                 Some(HttpsStateMachine::Http(http))
             }
             AlpnProtocols::H2 => {
-                let mut http = Http2::new(
-                    front_stream,
-                    self.frontend_token,
-                    self.pool.clone(),
-                    Some(self.public_address),
-                    None,
-                    self.sticky_name.clone(),
-                );
-
-                http.frontend.readiness.event = handshake.frontend_readiness.event;
-
-                gauge_add!("protocol.http2", 1);
-                Some(HttpsStateMachine::Http2(http))
+                // TODO(task #5): wire Mux state machine here
+                error!("H2 ALPN negotiated but Mux integration not yet wired");
+                None
             }
         }
     }
@@ -337,8 +324,9 @@ impl HttpsSession {
     fn upgrade_http(&self, http: Http<FrontRustls, HttpsListener>) -> Option<HttpsStateMachine> {
         debug!("https switching to wss");
         let front_token = self.frontend_token;
-        let back_token = match http.backend_token {
-            Some(back_token) => back_token,
+        let ws_context = http.websocket_context();
+        let (back_token, backend_socket, backend) = match http.origin {
+            Some(origin) => (origin.token, Some(origin.socket), Some(origin.backend)),
             None => {
                 warn!(
                     "Could not upgrade https request on cluster '{:?}' ({:?}) using backend '{:?}' into secure websocket for request '{}'",
@@ -350,8 +338,6 @@ impl HttpsSession {
                 return None;
             }
         };
-
-        let ws_context = http.websocket_context();
         let mut container_frontend_timeout = http.container_frontend_timeout;
         let mut container_backend_timeout = http.container_backend_timeout;
         container_frontend_timeout.reset();
@@ -366,8 +352,8 @@ impl HttpsSession {
         let mut pipe = Pipe::new(
             backend_buffer,
             http.context.backend_id,
-            http.backend_socket,
-            http.backend,
+            backend_socket,
+            backend,
             Some(container_backend_timeout),
             Some(container_frontend_timeout),
             http.context.cluster_id,
@@ -390,10 +376,6 @@ impl HttpsSession {
         gauge_add!("http.active_requests", -1);
         gauge_add!("websocket.active_requests", 1);
         Some(HttpsStateMachine::WebSocket(pipe))
-    }
-
-    fn upgrade_http2(&self) -> Option<HttpsStateMachine> {
-        todo!()
     }
 
     fn upgrade_websocket(
@@ -424,7 +406,6 @@ impl ProxySession for HttpsSession {
                 gauge_add!("protocol.wss", -1);
                 gauge_add!("websocket.active_requests", -1);
             }
-            StateMarker::Http2 => gauge_add!("protocol.http2", -1),
         }
 
         if self.state.failed() {
@@ -433,7 +414,6 @@ impl ProxySession for HttpsSession {
                 StateMarker::Handshake => incr!("https.upgrade.handshake.failed"),
                 StateMarker::Http => incr!("https.upgrade.http.failed"),
                 StateMarker::WebSocket => incr!("https.upgrade.wss.failed"),
-                StateMarker::Http2 => incr!("https.upgrade.http2.failed"),
             }
             return;
         }
@@ -1512,7 +1492,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::router::{MethodRule, PathRule, Route, Router, pattern_trie::TrieNode};
+    use crate::router::{pattern_trie::TrieNode, MethodRule, PathRule, Route, Router};
 
     /*
     #[test]

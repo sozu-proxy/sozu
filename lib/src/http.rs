@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, HashMap, hash_map::Entry},
+    collections::{hash_map::Entry, BTreeMap, HashMap},
     io::ErrorKind,
     net::{Shutdown, SocketAddr},
     os::unix::io::AsRawFd,
@@ -10,16 +10,16 @@ use std::{
 };
 
 use mio::{
-    Interest, Registry, Token,
     net::{TcpListener as MioTcpListener, TcpStream},
     unix::SourceFd,
+    Interest, Registry, Token,
 };
 use rusty_ulid::Ulid;
 use sozu_command::{
     logging::CachedTags,
     proto::command::{
-        Cluster, HttpListenerConfig, ListenerType, RemoveListener, RequestHttpFrontend,
-        WorkerRequest, WorkerResponse, request::RequestType,
+        request::RequestType, Cluster, HttpListenerConfig, ListenerType, RemoveListener,
+        RequestHttpFrontend, WorkerRequest, WorkerResponse,
     },
     ready::Ready,
     response::HttpFrontend,
@@ -27,24 +27,24 @@ use sozu_command::{
 };
 
 use crate::{
-    AcceptError, FrontendFromRequestError, L7ListenerHandler, L7Proxy, ListenerError,
-    ListenerHandler, Protocol, ProxyConfiguration, ProxyError, ProxySession, SessionIsToBeClosed,
-    SessionMetrics, SessionResult, StateMachineBuilder, StateResult,
     backends::BackendMap,
     pool::Pool,
     protocol::{
-        Http, Pipe, SessionState,
         http::{
-            ResponseStream,
             answers::HttpAnswers,
-            parser::{Method, hostname_and_port},
+            parser::{hostname_and_port, Method},
+            ResponseStream,
         },
         proxy_protocol::expect::ExpectProxyProtocol,
+        Http, Pipe, SessionState,
     },
     router::{Route, Router},
     server::{ListenToken, SessionManager},
     socket::server_bind,
     timer::TimeoutContainer,
+    AcceptError, FrontendFromRequestError, L7ListenerHandler, L7Proxy, ListenerError,
+    ListenerHandler, Protocol, ProxyConfiguration, ProxyError, ProxySession, SessionIsToBeClosed,
+    SessionMetrics, SessionResult, StateMachineBuilder, StateResult,
 };
 
 #[derive(PartialEq, Eq)]
@@ -216,8 +216,9 @@ impl HttpSession {
     fn upgrade_http(&mut self, http: Http<TcpStream, HttpListener>) -> Option<HttpStateMachine> {
         debug!("http switching to ws");
         let front_token = self.frontend_token;
-        let back_token = match http.backend_token {
-            Some(back_token) => back_token,
+        let ws_context = http.websocket_context();
+        let (back_token, backend_socket, backend) = match http.origin {
+            Some(origin) => (origin.token, Some(origin.socket), Some(origin.backend)),
             None => {
                 warn!(
                     "Could not upgrade http request on cluster '{:?}' ({:?}) using backend '{:?}' into websocket for request '{}'",
@@ -229,8 +230,6 @@ impl HttpSession {
                 return None;
             }
         };
-
-        let ws_context = http.websocket_context();
         let mut container_frontend_timeout = http.container_frontend_timeout;
         let mut container_backend_timeout = http.container_backend_timeout;
         container_frontend_timeout.reset();
@@ -245,8 +244,8 @@ impl HttpSession {
         let mut pipe = Pipe::new(
             backend_buffer,
             http.context.backend_id,
-            http.backend_socket,
-            http.backend,
+            backend_socket,
+            backend,
             Some(container_backend_timeout),
             Some(container_frontend_timeout),
             http.context.cluster_id,

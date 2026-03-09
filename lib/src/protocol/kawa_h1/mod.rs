@@ -6,12 +6,13 @@ pub mod parser;
 use std::{
     cell::RefCell,
     io::ErrorKind,
+    mem,
     net::{Shutdown, SocketAddr},
     rc::{Rc, Weak},
     time::{Duration, Instant},
 };
 
-use mio::{Interest, Token, net::TcpStream};
+use mio::{net::TcpStream, Interest, Token};
 use rusty_ulid::Ulid;
 use sozu_command::{
     config::MAX_LOOP_ITERATIONS,
@@ -19,15 +20,10 @@ use sozu_command::{
     proto::command::{Event, EventKind, ListenerType},
 };
 
-// use time::{Duration, Instant};
 use crate::{
-    AcceptError, BackendConnectAction, BackendConnectionError, BackendConnectionStatus,
-    L7ListenerHandler, L7Proxy, ListenerHandler, Protocol, ProxySession, Readiness,
-    RetrieveClusterError, SessionIsToBeClosed, SessionMetrics, SessionResult, StateResult,
     backends::{Backend, BackendError},
     pool::{Checkout, Pool},
     protocol::{
-        SessionState,
         http::{
             answers::DefaultAnswerStream,
             diagnostics::{diagnostic_400_502, diagnostic_413_507},
@@ -35,13 +31,17 @@ use crate::{
             parser::Method,
         },
         pipe::WebSocketContext,
+        SessionState,
     },
     retry::RetryPolicy,
     router::Route,
-    server::{CONN_RETRIES, push_event},
-    socket::{SocketHandler, SocketResult, TransportProtocol, stats::socket_rtt},
+    server::{push_event, CONN_RETRIES},
+    socket::{stats::socket_rtt, SocketHandler, SocketResult, TransportProtocol},
     sozu_command::{logging::LogContext, ready::Ready},
     timer::TimeoutContainer,
+    AcceptError, BackendConnectAction, BackendConnectionError, L7ListenerHandler, L7Proxy,
+    ListenerHandler, Protocol, ProxySession, Readiness, RetrieveClusterError, SessionIsToBeClosed,
+    SessionMetrics, SessionResult, StateResult,
 };
 
 /// This macro is defined uniquely in this module to help the tracking of kawa h1
@@ -55,7 +55,7 @@ macro_rules! log_context {
             $self.context.session_address.map(|addr| addr.to_string()).unwrap_or_else(|| "<none>".to_string()),
             $self.frontend_token.0,
             $self.frontend_readiness,
-            $self.backend_token.map(|token| token.0.to_string()).unwrap_or_else(|| "<none>".to_string()),
+            $self.origin.as_ref().map(|origin| origin.token.0.to_string()).unwrap_or_else(|| "<none>".to_string()),
             $self.backend_readiness,
         )
     };
@@ -143,17 +143,35 @@ pub enum TimeoutStatus {
 pub enum ResponseStream {
     BackendAnswer(GenericHttpStream),
     DefaultAnswer(u16, DefaultAnswerStream),
+    DefaultAnswerKA(u16, DefaultAnswerStream, Box<GenericHttpStream>),
+    Swaping,
+}
+
+#[derive(Debug)]
+pub struct Origin {
+    pub cluster_id: String,
+    pub backend_id: String,
+    pub backend: Rc<RefCell<Backend>>,
+    pub token: Token,
+    connected: bool,
+    pub socket: TcpStream,
+}
+
+impl Origin {
+    fn is_connected_to(&self, cluster_id: &str) -> bool {
+        self.cluster_id == cluster_id && self.connected
+    }
 }
 
 /// Http will be contained in State which itself is contained by Session
 pub struct Http<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> {
     answers: Rc<RefCell<answers::HttpAnswers>>,
-    pub backend: Option<Rc<RefCell<Backend>>>,
-    backend_connection_status: BackendConnectionStatus,
-    pub backend_readiness: Readiness,
-    pub backend_socket: Option<TcpStream>,
+    /// The last origin server we tried to communicate with.
+    /// It may be connected or connecting. It may be the server serving the current response,
+    /// or a server kept alive while a default answer is sent. Its cluster_id might differ from context.cluster_id
+    pub origin: Option<Origin>,
     backend_stop: Option<Instant>,
-    pub backend_token: Option<Token>,
+    pub backend_readiness: Readiness,
     pub container_backend_timeout: TimeoutContainer,
     pub container_frontend_timeout: TimeoutContainer,
     configured_backend_timeout: Duration,
@@ -213,12 +231,9 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         };
         Ok(Http {
             answers,
-            backend_connection_status: BackendConnectionStatus::NotConnected,
-            backend_readiness: Readiness::new(),
-            backend_socket: None,
+            origin: None,
             backend_stop: None,
-            backend_token: None,
-            backend: None,
+            backend_readiness: Readiness::new(),
             configured_backend_timeout,
             configured_connect_timeout,
             configured_frontend_timeout,
@@ -267,9 +282,11 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         self.keepalive_count += 1;
         gauge_add!("http.active_requests", -1);
 
-        if let Some(backend) = &mut self.backend {
-            let mut backend = backend.borrow_mut();
-            backend.active_requests = backend.active_requests.saturating_sub(1);
+        if let Some(origin) = &self.origin {
+            if origin.connected {
+                let mut backend = origin.backend.borrow_mut();
+                backend.active_requests = backend.active_requests.saturating_sub(1);
+            }
         }
 
         // reset the front timeout and cancel the back timeout while we are
@@ -319,7 +336,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
         let response_stream = match &mut self.response_stream {
             ResponseStream::BackendAnswer(response_stream) => response_stream,
-            ResponseStream::DefaultAnswer(..) => {
+            _ => {
                 error!(
                     "{} Sending default answer, should not read from frontend socket",
                     log_context!(self)
@@ -356,9 +373,6 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             self.request_stream.storage.fill(size);
             count!("bytes_in", size as i64);
             metrics.bin += size;
-            // if self.kawa_request.storage.is_full() {
-            //     self.frontend_readiness.interest.remove(Ready::READABLE);
-            // }
         } else {
             self.frontend_readiness.event.remove(Ready::READABLE);
         }
@@ -397,7 +411,6 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         let was_not_proxying = !self.request_stream.is_main_phase();
 
         kawa::h1::parse(&mut self.request_stream, &mut self.context);
-        // kawa::debug_kawa(&self.request_stream);
 
         if was_initial && !self.request_stream.is_initial() {
             // if it was the first request, the front timeout duration
@@ -553,14 +566,8 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                     log_context!(self)
                 );
                 incr!("http.early_response_close");
-                // FIXME: this will cause problems with pipelining
-                // return StateResult::CloseSession;
             }
 
-            // FIXME: we could get smarter about this
-            // with no keepalive on backend, we could open a new backend ConnectionError
-            // with no keepalive on front but keepalive on backend, we could have
-            // a pool of connections
             trace!(
                 "{} ============== HANDLE KEEP-ALIVE: {} {} {}",
                 log_context!(self),
@@ -602,7 +609,8 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             log_context!(self)
         );
         let response_stream = match &mut self.response_stream {
-            ResponseStream::DefaultAnswer(_, response_stream) => response_stream,
+            ResponseStream::DefaultAnswer(_, response_stream)
+            | ResponseStream::DefaultAnswerKA(_, response_stream, _) => response_stream,
             _ => return StateResult::CloseSession,
         };
         let bufs = response_stream.as_io_slice();
@@ -618,10 +626,20 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
         if response_stream.is_completed() {
             save_http_status_metric(self.context.status, self.context.log_context());
-            self.log_default_answer_success(metrics);
-            self.frontend_readiness.reset();
-            self.backend_readiness.reset();
-            return StateResult::CloseSession;
+            self.log_request_success(metrics);
+            return match mem::replace(&mut self.response_stream, ResponseStream::Swaping) {
+                ResponseStream::DefaultAnswerKA(_, _, kawa_back) => {
+                    self.response_stream = ResponseStream::BackendAnswer(*kawa_back);
+                    metrics.reset();
+                    self.reset();
+                    StateResult::Continue
+                }
+                _ => {
+                    self.frontend_readiness.reset();
+                    self.backend_readiness.reset();
+                    StateResult::CloseSession
+                }
+            };
         }
 
         if socket_state == SocketResult::Error {
@@ -648,10 +666,10 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             return SessionResult::Continue;
         }
 
-        let backend_socket = if let Some(backend_socket) = &mut self.backend_socket {
-            backend_socket
+        let backend_socket = if let Some(origin) = &mut self.origin {
+            &mut origin.socket
         } else {
-            self.log_request_error(metrics, "back socket not found, closing session");
+            self.log_request_error(metrics, "backend socket not found, closing session");
             return SessionResult::Close;
         };
 
@@ -677,15 +695,6 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         }
 
         match socket_state {
-            // the back socket is not writable anymore, so we can drop
-            // the front buffer, no more data can be transmitted.
-            // But the socket might still be readable, or if it is
-            // closed, we might still have some data in the buffer.
-            // As an example, we can get an early response for a large
-            // POST request to refuse it and prevent all of the data
-            // from being transmitted, with the backend server closing
-            // the socket right after sending the response
-            // FIXME: shouldn't we test for response_state then?
             SocketResult::Error | SocketResult::Closed => {
                 self.frontend_readiness.interest.remove(Ready::READABLE);
                 self.backend_readiness.interest.remove(Ready::WRITABLE);
@@ -733,12 +742,10 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             }
         };
 
-        let backend_socket = if let Some(backend_socket) = &mut self.backend_socket {
-            backend_socket
-        } else {
+        if self.origin.is_none() {
             self.log_request_error(metrics, "back socket not found, closing session");
             return SessionResult::Close;
-        };
+        }
 
         if response_stream.storage.is_full() {
             self.backend_readiness.interest.remove(Ready::READABLE);
@@ -758,23 +765,20 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             return SessionResult::Continue;
         }
 
-        let (size, socket_state) = backend_socket.socket_read(response_stream.storage.space());
+        // scope the mutable borrow of origin.socket so it doesn't conflict with log_context!
+        let (size, socket_state) = {
+            let backend_socket = &mut self.origin.as_mut().unwrap().socket;
+            backend_socket.socket_read(response_stream.storage.space())
+        };
         debug!("{} Read {} bytes", log_context!(self), size);
 
         if size > 0 {
             response_stream.storage.fill(size);
             count!("back_bytes_in", size as i64);
             metrics.backend_bin += size;
-            // if self.kawa_response.storage.is_full() {
-            //     self.backend_readiness.interest.remove(Ready::READABLE);
-            // }
 
             // In case the response starts while the request is not tagged as "terminated",
             // we place the timeout responsibility on the backend.
-            // This can happen when:
-            // - the request is malformed and doesn't have length information
-            // - kawa fails to detect a properly terminated request (e.g. a GET request with no body and no length)
-            // - the response can start before the end of the request (e.g. stream processing like compression)
             self.container_frontend_timeout.cancel();
         } else {
             self.backend_readiness.event.remove(Ready::READABLE);
@@ -783,7 +787,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         // TODO: close delimited and backend_hup should be handled better
         match socket_state {
             SocketResult::Error => {
-                backend_socket.read_error();
+                self.origin.as_mut().unwrap().socket.read_error();
                 self.log_request_error(
                     metrics,
                     &format!(
@@ -805,7 +809,6 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             log_context!(self)
         );
         kawa::h1::parse(response_stream, &mut self.context);
-        // kawa::debug_kawa(&self.response_stream);
 
         if let kawa::ParsingPhase::Error { marker, kind } = response_stream.parsing_phase {
             incr!("http.backend_parse_errors");
@@ -875,14 +878,9 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
     }
 
     pub fn get_backend_address(&self) -> Option<SocketAddr> {
-        self.backend
+        self.origin
             .as_ref()
-            .map(|backend| backend.borrow().address)
-            .or_else(|| {
-                self.backend_socket
-                    .as_ref()
-                    .and_then(|backend| backend.peer_addr().ok())
-            })
+            .map(|origin| origin.backend.borrow().address)
     }
 
     // The protocol name used in the access logs
@@ -937,7 +935,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             endpoint: self.log_endpoint(),
             tags,
             client_rtt: socket_rtt(self.front_socket()),
-            server_rtt: self.backend_socket.as_ref().and_then(socket_rtt),
+            server_rtt: self.origin.as_ref().and_then(|origin| socket_rtt(&origin.socket)),
             service_time: metrics.service_time(),
             response_time: metrics.backend_response_time(),
             request_time: metrics.request_time(),
@@ -956,9 +954,6 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         self.log_request(metrics, false, None);
     }
 
-    pub fn log_default_answer_success(&self, metrics: &SessionMetrics) {
-        self.log_request(metrics, false, None);
-    }
     pub fn log_request_error(&self, metrics: &mut SessionMetrics, message: &str) {
         incr!("http.errors");
         error!(
@@ -971,86 +966,97 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
     }
 
     pub fn set_answer(&mut self, answer: DefaultAnswer) {
-        let status = u16::from(&answer);
-        if let ResponseStream::DefaultAnswer(old_status, ..) = self.response_stream {
-            error!(
-                "already set the default answer to {}, trying to set to {}",
-                old_status, status
-            );
-        } else {
-            match answer {
-                DefaultAnswer::Answer301 { .. } => incr!(
-                    "http.301.redirection",
-                    self.context.cluster_id.as_deref(),
-                    self.context.backend_id.as_deref()
-                ),
-                DefaultAnswer::Answer400 { .. } => incr!("http.400.errors"),
-                DefaultAnswer::Answer401 { .. } => incr!(
-                    "http.401.errors",
-                    self.context.cluster_id.as_deref(),
-                    self.context.backend_id.as_deref()
-                ),
-                DefaultAnswer::Answer404 { .. } => incr!("http.404.errors"),
-                DefaultAnswer::Answer408 { .. } => incr!(
-                    "http.408.errors",
-                    self.context.cluster_id.as_deref(),
-                    self.context.backend_id.as_deref()
-                ),
-                DefaultAnswer::Answer413 { .. } => incr!(
-                    "http.413.errors",
-                    self.context.cluster_id.as_deref(),
-                    self.context.backend_id.as_deref()
-                ),
-                DefaultAnswer::Answer502 { .. } => incr!(
-                    "http.502.errors",
-                    self.context.cluster_id.as_deref(),
-                    self.context.backend_id.as_deref()
-                ),
-                DefaultAnswer::Answer503 { .. } => incr!(
-                    "http.503.errors",
-                    self.context.cluster_id.as_deref(),
-                    self.context.backend_id.as_deref()
-                ),
-                DefaultAnswer::Answer504 { .. } => incr!(
-                    "http.504.errors",
-                    self.context.cluster_id.as_deref(),
-                    self.context.backend_id.as_deref()
-                ),
-                DefaultAnswer::Answer507 { .. } => incr!(
-                    "http.507.errors",
-                    self.context.cluster_id.as_deref(),
-                    self.context.backend_id.as_deref()
-                ),
-            };
+        match &answer {
+            DefaultAnswer::Answer301 { .. } => incr!(
+                "http.301.redirection",
+                self.context.cluster_id.as_deref(),
+                self.context.backend_id.as_deref()
+            ),
+            DefaultAnswer::Answer400 { .. } => incr!("http.400.errors"),
+            DefaultAnswer::Answer401 { .. } => incr!(
+                "http.401.errors",
+                self.context.cluster_id.as_deref(),
+                self.context.backend_id.as_deref()
+            ),
+            DefaultAnswer::Answer404 { .. } => incr!("http.404.errors"),
+            DefaultAnswer::Answer408 { .. } => incr!(
+                "http.408.errors",
+                self.context.cluster_id.as_deref(),
+                self.context.backend_id.as_deref()
+            ),
+            DefaultAnswer::Answer413 { .. } => incr!(
+                "http.413.errors",
+                self.context.cluster_id.as_deref(),
+                self.context.backend_id.as_deref()
+            ),
+            DefaultAnswer::Answer502 { .. } => incr!(
+                "http.502.errors",
+                self.context.cluster_id.as_deref(),
+                self.context.backend_id.as_deref()
+            ),
+            DefaultAnswer::Answer503 { .. } => incr!(
+                "http.503.errors",
+                self.context.cluster_id.as_deref(),
+                self.context.backend_id.as_deref()
+            ),
+            DefaultAnswer::Answer504 { .. } => incr!(
+                "http.504.errors",
+                self.context.cluster_id.as_deref(),
+                self.context.backend_id.as_deref()
+            ),
+            DefaultAnswer::Answer507 { .. } => incr!(
+                "http.507.errors",
+                self.context.cluster_id.as_deref(),
+                self.context.backend_id.as_deref()
+            ),
         }
-
-        let mut kawa = self.answers.borrow().get(
+        let (answer_status, keep_alive, mut kawa) = self.answers.borrow().get(
             answer,
             self.context.id.to_string(),
             self.context.cluster_id.as_deref(),
             self.context.backend_id.as_deref(),
             self.get_route(),
         );
+        if let ResponseStream::DefaultAnswer(old_status, ..) = self.response_stream {
+            error!(
+                "already set the default answer to {}, trying to set to {}",
+                old_status, answer_status
+            );
+        }
         kawa.prepare(&mut kawa::h1::BlockConverter);
-        self.context.status = Some(status);
+        self.context.status = Some(answer_status);
         self.context.reason = None;
-        self.context.keep_alive_frontend = false;
-        self.response_stream = ResponseStream::DefaultAnswer(status, kawa);
+        if keep_alive {
+            match mem::replace(&mut self.response_stream, ResponseStream::Swaping) {
+                ResponseStream::BackendAnswer(back_kawa) => {
+                    self.response_stream =
+                        ResponseStream::DefaultAnswerKA(answer_status, kawa, Box::new(back_kawa));
+                }
+                _ => {
+                    // fallback: if not a backend answer, just use non-KA default
+                    self.response_stream = ResponseStream::DefaultAnswer(answer_status, kawa);
+                    self.context.keep_alive_frontend = false;
+                }
+            }
+        } else {
+            self.context.keep_alive_frontend = false;
+            self.response_stream = ResponseStream::DefaultAnswer(answer_status, kawa);
+        }
         self.frontend_readiness.interest = Ready::WRITABLE | Ready::HUP | Ready::ERROR;
         self.backend_readiness.interest = Ready::HUP | Ready::ERROR;
     }
 
     pub fn test_backend_socket(&self) -> bool {
-        match self.backend_socket {
-            Some(ref s) => {
+        match &self.origin {
+            Some(origin) => {
                 let mut tmp = [0u8; 1];
-                let res = s.peek(&mut tmp[..]);
+                let res = origin.socket.peek(&mut tmp[..]);
 
                 match res {
                     // if the socket is half open, it will report 0 bytes read (EOF)
                     Ok(0) => false,
                     Ok(_) => true,
-                    Err(e) => matches!(e.kind(), std::io::ErrorKind::WouldBlock),
+                    Err(e) => matches!(e.kind(), ErrorKind::WouldBlock),
                 }
             }
             None => false,
@@ -1059,110 +1065,80 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
     pub fn is_valid_backend_socket(&self) -> bool {
         // if socket was last used in the last second, test it
-        match self.backend_stop.as_ref() {
+        match &self.backend_stop {
             Some(stop_instant) => {
-                let now = Instant::now();
-                let dur = now - *stop_instant;
-                if dur > Duration::from_secs(1) {
-                    return self.test_backend_socket();
-                }
+                stop_instant.elapsed() < Duration::from_secs(1) || self.test_backend_socket()
             }
-            None => return self.test_backend_socket(),
+            None => self.test_backend_socket(),
         }
-
-        true
     }
 
-    pub fn set_backend_socket(&mut self, socket: TcpStream, backend: Option<Rc<RefCell<Backend>>>) {
-        self.backend_socket = Some(socket);
-        self.backend = backend;
-    }
-
-    pub fn set_cluster_id(&mut self, cluster_id: String) {
-        self.context.cluster_id = Some(cluster_id);
-    }
-
-    pub fn set_backend_id(&mut self, backend_id: String) {
-        self.context.backend_id = Some(backend_id);
-    }
-
-    pub fn set_backend_token(&mut self, token: Token) {
-        self.backend_token = Some(token);
-    }
-
-    pub fn clear_backend_token(&mut self) {
-        self.backend_token = None;
-    }
-
-    pub fn set_backend_timeout(&mut self, dur: Duration) {
-        if let Some(token) = self.backend_token.as_ref() {
-            self.container_backend_timeout.set_duration(dur);
-            self.container_backend_timeout.set(*token);
-        }
+    pub fn set_backend_timeout(&mut self, token: Token, dur: Duration) {
+        self.container_backend_timeout.set_duration(dur);
+        self.container_backend_timeout.set(token);
     }
 
     pub fn front_socket(&self) -> &TcpStream {
         self.frontend_socket.socket_ref()
     }
 
-    /// WARNING: this function removes the backend entry in the session manager
-    /// IF the backend_token is set, so that entry can be reused for new backend.
-    /// I don't think this is a good idea, but it is a quick fix
-    fn close_backend(&mut self, proxy: Rc<RefCell<dyn L7Proxy>>, metrics: &mut SessionMetrics) {
+    /// Close the backend connection and clean up the Origin.
+    /// If `reuse_entry` is true, the token is NOT removed from the session manager
+    /// so it can be reused for a new backend connection.
+    /// Returns the token of the closed backend, if any.
+    fn close_backend(
+        &mut self,
+        proxy: Rc<RefCell<dyn L7Proxy>>,
+        reuse_entry: bool,
+    ) -> Option<Token> {
         self.container_backend_timeout.cancel();
-        debug!(
-            "{}\tPROXY [{}->{}] CLOSED BACKEND",
-            log_context!(self),
-            self.frontend_token.0,
-            self.backend_token
-                .map(|t| format!("{}", t.0))
-                .unwrap_or_else(|| "-".to_string())
-        );
 
         let proxy = proxy.borrow();
-        if let Some(socket) = &mut self.backend_socket.take() {
-            if let Err(e) = proxy.deregister_socket(socket) {
+        if let Some(mut origin) = self.origin.take() {
+            debug!(
+                "{}\tPROXY [{}->{}] CLOSE BACKEND {:?}",
+                log_context!(self),
+                self.frontend_token.0,
+                origin.token.0,
+                origin
+            );
+
+            if let Err(e) = proxy.deregister_socket(&mut origin.socket) {
                 error!(
                     "{} Error deregistering back socket({:?}): {:?}",
                     log_context!(self),
-                    socket,
+                    origin.socket,
                     e
                 );
             }
-            if let Err(e) = socket.shutdown(Shutdown::Both) {
+            if let Err(e) = origin.socket.shutdown(Shutdown::Both) {
                 if e.kind() != ErrorKind::NotConnected {
                     error!(
                         "{} Error shutting down back socket({:?}): {:?}",
                         log_context!(self),
-                        socket,
+                        origin.socket,
                         e
                     );
                 }
             }
-        }
-
-        if let Some(token) = self.backend_token.take() {
-            proxy.remove_session(token);
-
-            if self.backend_connection_status != BackendConnectionStatus::NotConnected {
-                self.backend_readiness.event = Ready::EMPTY;
-            }
-
-            if self.backend_connection_status == BackendConnectionStatus::Connected {
+            self.backend_readiness.event = Ready::EMPTY;
+            if origin.connected {
                 gauge_add!("backend.connections", -1);
                 gauge_add!(
                     "connections_per_backend",
                     -1,
-                    self.context.cluster_id.as_deref(),
-                    metrics.backend_id.as_deref()
+                    Some(&origin.cluster_id),
+                    Some(&origin.backend_id)
                 );
             }
+            origin.backend.borrow_mut().dec_connections();
 
-            self.set_backend_connected(BackendConnectionStatus::NotConnected, metrics);
-
-            if let Some(backend) = self.backend.take() {
-                backend.borrow_mut().dec_connections();
+            if !reuse_entry {
+                proxy.remove_session(origin.token);
             }
+            Some(origin.token)
+        } else {
+            None
         }
     }
 
@@ -1186,20 +1162,16 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         Ok(())
     }
 
-    fn check_backend_connection(&mut self, metrics: &mut SessionMetrics) -> bool {
+    fn check_backend_connection(&self, metrics: &mut SessionMetrics) -> bool {
         let is_valid_backend_socket = self.is_valid_backend_socket();
 
         if !is_valid_backend_socket {
             return false;
         }
 
-        //matched on keepalive
-        metrics.backend_id = self.backend.as_ref().map(|i| i.borrow().backend_id.clone());
-
         metrics.backend_start();
-        metrics.backend_connected();
-        if let Some(b) = self.backend.as_mut() {
-            b.borrow_mut().active_requests += 1;
+        if let Some(origin) = &self.origin {
+            origin.backend.borrow_mut().active_requests += 1;
         }
         true
     }
@@ -1300,8 +1272,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         cluster_id: &str,
         frontend_should_stick: bool,
         proxy: Rc<RefCell<dyn L7Proxy>>,
-        metrics: &mut SessionMetrics,
-    ) -> Result<TcpStream, BackendConnectionError> {
+    ) -> Result<(Rc<RefCell<Backend>>, TcpStream), BackendConnectionError> {
         let (backend, conn) = self
             .get_backend_for_sticky_session(
                 frontend_should_stick,
@@ -1310,8 +1281,6 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 proxy,
             )
             .map_err(|backend_error| {
-                // some backend errors are actually retryable
-                // TODO: maybe retry or return a different default answer
                 self.set_answer(DefaultAnswer::Answer503 {
                     message: backend_error.to_string(),
                 });
@@ -1319,7 +1288,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             })?;
 
         if frontend_should_stick {
-            // update sticky name in case it changed I guess?
+            // update sticky name in case it changed
             self.context.sticky_name = self.listener.borrow().get_sticky_name().to_string();
 
             self.context.sticky_session = Some(
@@ -1331,12 +1300,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             );
         }
 
-        metrics.backend_id = Some(backend.borrow().backend_id.clone());
-        metrics.backend_start();
-        self.set_backend_id(backend.borrow().backend_id.clone());
-
-        self.backend = Some(backend);
-        Ok(conn)
+        Ok((backend, conn))
     }
 
     fn get_backend_for_sticky_session(
@@ -1366,55 +1330,48 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         proxy: Rc<RefCell<dyn L7Proxy>>,
         metrics: &mut SessionMetrics,
     ) -> Result<BackendConnectAction, BackendConnectionError> {
-        let old_cluster_id = self.context.cluster_id.clone();
-        let old_backend_token = self.backend_token;
-
         self.check_circuit_breaker()?;
 
-        let cluster_id = self
-            .cluster_id_from_request(proxy.clone())
-            .map_err(BackendConnectionError::RetrieveClusterError)?;
+        let cluster_id = if self.connection_attempts == 0 {
+            // cluster_id is determined from the triplet (method, authority, path)
+            // which doesn't ever change for a request
+            // WARNING: cluster_id_from_request is NOT idempotent, but connect_to_backend SHOULD be
+            self.cluster_id_from_request(proxy.clone())
+                .map_err(BackendConnectionError::RetrieveClusterError)?
+        } else if let Some(cluster_id) = self.context.cluster_id.take() {
+            cluster_id
+        } else {
+            unreachable!();
+        };
+
+        // update response cluster producer
+        self.context.cluster_id = Some(cluster_id.clone());
 
         trace!(
-            "{} Connect_to_backend: {:?} {:?} {:?}",
+            "{} Connect_to_backend: {:?}",
             log_context!(self),
-            self.context.cluster_id,
             cluster_id,
-            self.backend_connection_status
         );
-        // check if we can reuse the backend connection
-        if (self.context.cluster_id.as_ref()) == Some(&cluster_id)
-            && self.backend_connection_status == BackendConnectionStatus::Connected
-        {
-            let has_backend = self
-                .backend
-                .as_ref()
-                .map(|backend| {
-                    let backend = backend.borrow();
-                    proxy
-                        .borrow()
-                        .backends()
-                        .borrow()
-                        .has_backend(&cluster_id, &backend)
-                })
-                .unwrap_or(false);
 
-            if has_backend && self.check_backend_connection(metrics) {
-                return Ok(BackendConnectAction::Reuse);
-            } else if self.backend_token.take().is_some() {
-                self.close_backend(proxy.clone(), metrics);
+        // check if we can reuse the backend connection
+        if let Some(origin) = &self.origin {
+            if origin.is_connected_to(&cluster_id) {
+                let has_backend = proxy
+                    .borrow()
+                    .backends()
+                    .borrow()
+                    .has_backend(&cluster_id, &origin.backend.borrow());
+
+                if has_backend && self.check_backend_connection(metrics) {
+                    // update response backend producer
+                    self.context.backend_id = Some(origin.backend.borrow().backend_id.clone());
+                    return Ok(BackendConnectAction::Reuse);
+                }
             }
         }
 
-        //replacing with a connection to another cluster
-        if old_cluster_id.is_some()
-            && old_cluster_id.as_ref() != Some(&cluster_id)
-            && self.backend_token.take().is_some()
-        {
-            self.close_backend(proxy.clone(), metrics);
-        }
-
-        self.context.cluster_id = Some(cluster_id.clone());
+        // close old backend (if it exists), replace with a connection to another cluster
+        let reusable_token = self.close_backend(proxy.clone(), true);
 
         let frontend_should_stick = proxy
             .borrow()
@@ -1423,8 +1380,9 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             .map(|cluster| cluster.sticky_session)
             .unwrap_or(false);
 
-        let mut socket =
-            self.backend_from_request(&cluster_id, frontend_should_stick, proxy.clone(), metrics)?;
+        let (backend, mut socket) =
+            self.backend_from_request(&cluster_id, frontend_should_stick, proxy.clone())?;
+        metrics.backend_start();
         if let Err(e) = socket.set_nodelay(true) {
             error!(
                 "{} Error setting nodelay on backend socket({:?}): {:?}",
@@ -1435,90 +1393,69 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         }
 
         self.backend_readiness.interest = Ready::WRITABLE | Ready::HUP | Ready::ERROR;
-        self.backend_connection_status = BackendConnectionStatus::Connecting(Instant::now());
+        let backend_id = backend.borrow().backend_id.clone();
+        // update response backend producer
+        self.context.backend_id = Some(backend_id.clone());
 
-        match old_backend_token {
-            Some(backend_token) => {
-                self.set_backend_token(backend_token);
-                if let Err(e) = proxy.borrow().register_socket(
-                    &mut socket,
-                    backend_token,
-                    Interest::READABLE | Interest::WRITABLE,
-                ) {
-                    error!(
-                        "{} Error registering back socket({:?}): {:?}",
-                        log_context!(self),
-                        socket,
-                        e
-                    );
-                }
+        let (token, action) = if let Some(token) = reusable_token {
+            (token, BackendConnectAction::Replace)
+        } else {
+            (
+                proxy.borrow().add_session(session_rc),
+                BackendConnectAction::New,
+            )
+        };
 
-                self.set_backend_socket(socket, self.backend.clone());
-                self.set_backend_timeout(self.configured_connect_timeout);
-
-                Ok(BackendConnectAction::Replace)
-            }
-            None => {
-                let backend_token = proxy.borrow().add_session(session_rc);
-
-                if let Err(e) = proxy.borrow().register_socket(
-                    &mut socket,
-                    backend_token,
-                    Interest::READABLE | Interest::WRITABLE,
-                ) {
-                    error!(
-                        "{} Error registering back socket({:?}): {:?}",
-                        log_context!(self),
-                        socket,
-                        e
-                    );
-                }
-
-                self.set_backend_socket(socket, self.backend.clone());
-                self.set_backend_token(backend_token);
-                self.set_backend_timeout(self.configured_connect_timeout);
-
-                Ok(BackendConnectAction::New)
-            }
+        if let Err(e) = proxy.borrow().register_socket(
+            &mut socket,
+            token,
+            Interest::READABLE | Interest::WRITABLE,
+        ) {
+            error!(
+                "{} Error registering backend socket({:?}): {:?}",
+                log_context!(self),
+                socket,
+                e
+            );
         }
+
+        self.origin = Some(Origin {
+            cluster_id,
+            backend_id,
+            backend,
+            token,
+            connected: false,
+            socket,
+        });
+        self.set_backend_timeout(token, self.configured_connect_timeout);
+
+        Ok(action)
     }
 
-    fn set_backend_connected(
-        &mut self,
-        connected: BackendConnectionStatus,
-        metrics: &mut SessionMetrics,
-    ) {
-        let last = self.backend_connection_status;
-        self.backend_connection_status = connected;
+    fn set_backend_connected(&mut self, metrics: &mut SessionMetrics) {
+        if let Some(Origin {
+            connected: connected @ false,
+            token,
+            backend,
+            backend_id,
+            cluster_id,
+            ..
+        }) = &mut self.origin
+        {
+            *connected = true;
 
-        if connected == BackendConnectionStatus::Connected {
             gauge_add!("backend.connections", 1);
             gauge_add!(
                 "connections_per_backend",
                 1,
-                self.context.cluster_id.as_deref(),
-                metrics.backend_id.as_deref()
+                Some(cluster_id),
+                Some(backend_id)
             );
 
-            // the back timeout was of connect_timeout duration before,
-            // now that we're connected, move to backend_timeout duration
-            self.set_backend_timeout(self.configured_backend_timeout);
-            // if we are not waiting for the backend response, its timeout is concelled
-            // it should be set when the request has been entirely transmitted
-            if !self.backend_readiness.interest.is_readable() {
-                self.container_backend_timeout.cancel();
-            }
-
-            if let Some(backend) = &self.backend {
+            {
                 let mut backend = backend.borrow_mut();
-
                 if backend.retry_policy.is_down() {
-                    incr!(
-                        "backend.up",
-                        self.context.cluster_id.as_deref(),
-                        metrics.backend_id.as_deref()
-                    );
-
+                    incr!("backend.up", Some(cluster_id), Some(backend_id));
                     info!(
                         "backend server {} at {} is up",
                         backend.backend_id, backend.address
@@ -1531,21 +1468,36 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                         cluster_id: None,
                     });
                 }
-
-                if let BackendConnectionStatus::Connecting(start) = last {
-                    backend.set_connection_time(Instant::now() - start);
+                if let Some(time) = metrics.backend_connection_time() {
+                    backend.set_connection_time(time);
                 }
-
                 //successful connection, reset failure counter
                 backend.failures = 0;
                 backend.active_requests += 1;
                 backend.retry_policy.succeed();
             }
+
+            // the back timeout was of connect_timeout duration before,
+            // now that we're connected, move to backend_timeout duration
+            let token = *token;
+            self.set_backend_timeout(token, self.configured_backend_timeout);
+            // if we are not waiting for the backend response, its timeout is cancelled
+            // it should be set when the request has been entirely transmitted
+            if !self.backend_readiness.interest.is_readable() {
+                self.container_backend_timeout.cancel();
+            }
         }
     }
 
-    fn fail_backend_connection(&mut self, metrics: &SessionMetrics) {
-        if let Some(backend) = &self.backend {
+    fn fail_backend_connection(&mut self) {
+        if let Some(Origin {
+            connected: false,
+            backend,
+            backend_id,
+            cluster_id,
+            ..
+        }) = &self.origin
+        {
             let mut backend = backend.borrow_mut();
             backend.failures += 1;
 
@@ -1553,8 +1505,8 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             backend.retry_policy.fail();
             incr!(
                 "backend.connections.error",
-                self.context.cluster_id.as_deref(),
-                metrics.backend_id.as_deref()
+                Some(cluster_id),
+                Some(backend_id)
             );
 
             if !already_unavailable && backend.retry_policy.is_down() {
@@ -1565,11 +1517,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                     backend.address
                 );
 
-                incr!(
-                    "backend.down",
-                    self.context.cluster_id.as_deref(),
-                    metrics.backend_id.as_deref()
-                );
+                incr!("backend.down", Some(cluster_id), Some(backend_id));
 
                 push_event(Event {
                     kind: EventKind::BackendDown as i32,
@@ -1666,7 +1614,11 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
     ) -> SessionResult {
         let mut counter = 0;
 
-        if self.backend_connection_status.is_connecting()
+        if self
+            .origin
+            .as_ref()
+            .map(|origin| !origin.connected)
+            .unwrap_or(false)
             && !self.backend_readiness.event.is_empty()
         {
             if self.backend_readiness.event.is_hup() && !self.test_backend_socket() {
@@ -1678,13 +1630,10 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 );
 
                 self.connection_attempts += 1;
-                self.fail_backend_connection(metrics);
-
-                self.backend_connection_status =
-                    BackendConnectionStatus::Connecting(Instant::now());
+                self.fail_backend_connection();
 
                 // trigger a backend reconnection
-                self.close_backend(proxy.clone(), metrics);
+                self.close_backend(proxy.clone(), false);
 
                 let connection_result =
                     self.connect_to_backend(session.clone(), proxy.clone(), metrics);
@@ -1702,7 +1651,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             } else {
                 metrics.backend_connected();
                 self.connection_attempts = 0;
-                self.set_backend_connected(BackendConnectionStatus::Connected, metrics);
+                self.set_backend_connected(metrics);
                 // we might get an early response from the backend, so we want to look
                 // at readable events
                 self.backend_readiness.interest.insert(Ready::READABLE);
@@ -1801,7 +1750,9 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                     state_result
                 );
                 match state_result {
-                    StateResult::CloseBackend => self.close_backend(proxy.clone(), metrics),
+                    StateResult::CloseBackend => {
+                        self.close_backend(proxy.clone(), false);
+                    }
                     StateResult::CloseSession => return SessionResult::Close,
                     StateResult::Upgrade => return SessionResult::Upgrade,
                     StateResult::Continue => {}
@@ -1824,7 +1775,9 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 trace!("{} backend_hup: {:?}", log_context!(self), state_result);
                 match state_result {
                     StateResult::Continue => {}
-                    StateResult::CloseBackend => self.close_backend(proxy.clone(), metrics),
+                    StateResult::CloseBackend => {
+                        self.close_backend(proxy.clone(), false);
+                    }
                     StateResult::CloseSession => return SessionResult::Close,
                     StateResult::ConnectBackend | StateResult::Upgrade => unreachable!(),
                 }
@@ -1836,8 +1789,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         if counter >= MAX_LOOP_ITERATIONS {
             error!(
                 "{}\tHandling session went through {} iterations, there's a probable infinite loop bug, closing the connection",
-                log_context!(self),
-                MAX_LOOP_ITERATIONS
+                log_context!(self), MAX_LOOP_ITERATIONS
             );
 
             incr!("http.infinite_loop.error");
@@ -1895,29 +1847,35 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> SessionState 
     fn update_readiness(&mut self, token: Token, events: Ready) {
         if self.frontend_token == token {
             self.frontend_readiness.event |= events;
-        } else if self.backend_token == Some(token) {
+        } else if self
+            .origin
+            .as_ref()
+            .map(|origin| origin.token == token)
+            .unwrap_or(false)
+        {
             self.backend_readiness.event |= events;
         }
     }
 
-    fn close(&mut self, proxy: Rc<RefCell<dyn L7Proxy>>, metrics: &mut SessionMetrics) {
-        self.close_backend(proxy, metrics);
-        self.frontend_socket.socket_close();
-        let _ = self.frontend_socket.socket_write_vectored(&[]);
-
+    fn close(&mut self, proxy: Rc<RefCell<dyn L7Proxy>>, _metrics: &mut SessionMetrics) {
         //if the state was initial, the connection was already reset
         if !self.request_stream.is_initial() {
             gauge_add!("http.active_requests", -1);
 
-            if let Some(b) = self.backend.as_mut() {
-                let mut backend = b.borrow_mut();
-                backend.active_requests = backend.active_requests.saturating_sub(1);
+            if let Some(origin) = &self.origin {
+                if origin.connected {
+                    let mut backend = origin.backend.borrow_mut();
+                    backend.active_requests = backend.active_requests.saturating_sub(1);
+                }
             }
         }
+
+        self.close_backend(proxy, false);
+        self.frontend_socket.socket_close();
+        let _ = self.frontend_socket.socket_write_vectored(&[]);
     }
 
     fn timeout(&mut self, token: Token, metrics: &mut SessionMetrics) -> StateResult {
-        //info!("got timeout for token: {:?}", token);
         if self.frontend_token == token {
             self.container_frontend_timeout.triggered();
             return match self.timeout_status() {
@@ -1945,8 +1903,12 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> SessionState 
             };
         }
 
-        if self.backend_token == Some(token) {
-            //info!("backend timeout triggered for token {:?}", token);
+        if self
+            .origin
+            .as_ref()
+            .map(|origin| origin.token == token)
+            .unwrap_or(false)
+        {
             self.container_backend_timeout.triggered();
             return match self.timeout_status() {
                 TimeoutStatus::Request => {
@@ -1986,28 +1948,23 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> SessionState 
     }
 
     fn print_state(&self, context: &str) {
+        let kawa_back = match &self.response_stream {
+            ResponseStream::BackendAnswer(kawa) => format!("{:?}", kawa.parsing_phase),
+            ResponseStream::DefaultAnswer(status, ..)
+            | ResponseStream::DefaultAnswerKA(status, ..) => format!("DefaultAnswer({status})"),
+            ResponseStream::Swaping => unreachable!(),
+        };
         error!(
-            "\
-{} {} Session(Kawa)
-\tFrontend:
-\t\ttoken: {:?}\treadiness: {:?}\tstate: {:?}
-\tBackend:
-\t\ttoken: {:?}\treadiness: {:?}",
+            "{} {} kawa_front={:?}, kawa_back={}",
             log_context!(self),
             context,
-            self.frontend_token,
-            self.frontend_readiness,
             self.request_stream.parsing_phase,
-            self.backend_token,
-            self.backend_readiness,
-            // self.response_stream.parsing_phase
+            kawa_back
         );
     }
 
     fn shutting_down(&mut self) -> SessionIsToBeClosed {
-        if self.request_stream.is_initial() && self.request_stream.storage.is_empty()
-        // && self.response_stream.storage.is_empty()
-        {
+        if self.request_stream.is_initial() && self.request_stream.storage.is_empty() {
             true
         } else {
             self.context.closing = true;
@@ -2029,11 +1986,6 @@ fn handle_connection_result(
         Err(_) => {
             // All BackendConnectionError already set a default answer
             // the session must continue to serve it
-            // - NotFound: not used for http (only tcp)
-            // - RetrieveClusterError: 301/400/401/404,
-            // - MaxConnectionRetries: 503,
-            // - Backend: 503,
-            // - MaxSessionsMemory: not checked in connect_to_backend (TODO: check it?)
             None
         }
     }
