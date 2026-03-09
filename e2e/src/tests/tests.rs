@@ -10,7 +10,8 @@ use sozu_command_lib::{
     logging::setup_default_logging,
     proto::command::{
         ActivateListener, AddCertificate, CertificateAndKey, Cluster, CustomHttpAnswers,
-        ListenerType, RemoveBackend, RequestHttpFrontend, SocketAddress, request::RequestType,
+        ListenerType, QueryMaxConnectionsPerIp, RemoveBackend, RequestHttpFrontend, ResponseStatus,
+        SocketAddress, request::RequestType, response_content::ContentType,
     },
     scm_socket::Listeners,
     state::ConfigState,
@@ -1810,6 +1811,388 @@ fn test_wildcard() {
 fn test_status_header_split() {
     assert_eq!(
         repeat_until_error_or(2, "Status line and Headers split", try_status_header_split),
+        State::Success
+    );
+}
+
+// =========================================================
+// Per-IP connection limit e2e tests
+
+/// Test that max_connections_per_ip set in config is enforced:
+/// connections beyond the limit from the same IP are dropped.
+pub fn try_max_connections_per_ip_config() -> State {
+    let front_address = create_local_address();
+
+    let config = Worker::into_config(FileConfig {
+        max_connections_per_ip: Some(3),
+        ..FileConfig::default()
+    });
+    let listeners = Listeners::default();
+    let state = ConfigState::new();
+    let (mut worker, mut backends) = setup_sync_test(
+        "PERIP-CFG",
+        config,
+        listeners,
+        state,
+        front_address,
+        1,
+        false,
+    );
+    let mut backend = backends.pop().unwrap();
+    backend.connect();
+
+    let expected_response_start = String::from("HTTP/1.1 200 OK\r\nContent-Length:");
+
+    // Connect 3 clients (at the limit) — all should succeed
+    let mut clients = Vec::new();
+    for i in 0..3 {
+        let mut client = Client::new(
+            format!("client{i}"),
+            front_address,
+            http_request("GET", "/api", format!("ping{i}"), "localhost"),
+        );
+        client.connect();
+        client.send();
+        assert!(backend.accept(i), "backend should accept client {i}");
+        backend.receive(i);
+        backend.send(i);
+        let response = client.receive();
+        assert!(
+            response
+                .as_ref()
+                .is_some_and(|r| r.starts_with(&expected_response_start)),
+            "client {i} should get 200 OK, got: {response:?}"
+        );
+        clients.push(client);
+    }
+
+    // Connect a 4th client — should be rejected (connection dropped by sozu)
+    let mut rejected_client = Client::new(
+        "rejected",
+        front_address,
+        http_request("GET", "/api", "rejected", "localhost"),
+    );
+    rejected_client.connect();
+    rejected_client.send();
+    // backend should not accept this connection
+    assert!(
+        !backend.accept(3),
+        "backend should NOT accept client beyond per-IP limit"
+    );
+    let response = rejected_client.receive();
+    assert_eq!(
+        response, None,
+        "rejected client should receive nothing (connection dropped)"
+    );
+
+    // Close one client by dropping it, wait for sozu to process the close
+    drop(clients.remove(0));
+    thread::sleep(Duration::from_millis(100));
+
+    // Now a new connection should succeed
+    let mut new_client = Client::new(
+        "new_client",
+        front_address,
+        http_request("GET", "/api", "new", "localhost"),
+    );
+    new_client.connect();
+    new_client.send();
+    assert!(
+        backend.accept(4),
+        "backend should accept new client after one was closed"
+    );
+    backend.receive(4);
+    backend.send(4);
+    let response = new_client.receive();
+    assert!(
+        response
+            .as_ref()
+            .is_some_and(|r| r.starts_with(&expected_response_start)),
+        "new client should get 200 OK after slot freed, got: {response:?}"
+    );
+
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+
+    State::Success
+}
+
+/// Test runtime limit change via SetMaxConnectionsPerIp:
+/// start with no limit, enable it at runtime, verify enforcement.
+pub fn try_max_connections_per_ip_runtime_set() -> State {
+    let front_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, mut backends) = setup_sync_test(
+        "PERIP-SET",
+        config,
+        listeners,
+        state,
+        front_address,
+        1,
+        false,
+    );
+    let mut backend = backends.pop().unwrap();
+    backend.connect();
+
+    let expected_response_start = String::from("HTTP/1.1 200 OK\r\nContent-Length:");
+
+    // Set per-IP limit to 3 at runtime
+    // Only new connections after this point are tracked
+    worker.send_proxy_request_type(RequestType::SetMaxConnectionsPerIp(3));
+    worker.read_to_last();
+
+    // Connect 3 clients — all should succeed (within limit)
+    let mut clients = Vec::new();
+    for i in 0..3 {
+        let mut client = Client::new(
+            format!("client{i}"),
+            front_address,
+            http_request("GET", "/api", format!("ping{i}"), "localhost"),
+        );
+        client.connect();
+        client.send();
+        assert!(backend.accept(i), "backend should accept client {i}");
+        backend.receive(i);
+        backend.send(i);
+        let response = client.receive();
+        assert!(
+            response
+                .as_ref()
+                .is_some_and(|r| r.starts_with(&expected_response_start)),
+            "client {i} should get 200 OK, got: {response:?}"
+        );
+        clients.push(client);
+    }
+
+    // 4th connection should be rejected (limit is 3)
+    let mut rejected = Client::new(
+        "rejected",
+        front_address,
+        http_request("GET", "/api", "rejected", "localhost"),
+    );
+    rejected.connect();
+    rejected.send();
+    assert!(
+        !backend.accept(3),
+        "backend should NOT accept 4th client (per-IP limit reached)"
+    );
+    let response = rejected.receive();
+    assert_eq!(response, None, "rejected client should receive nothing");
+
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+
+    State::Success
+}
+
+/// Test runtime limit removal via SetMaxConnectionsPerIp(0):
+/// start with a limit, remove it at runtime, verify unlimited connections.
+pub fn try_max_connections_per_ip_runtime_remove() -> State {
+    let front_address = create_local_address();
+
+    let config = Worker::into_config(FileConfig {
+        max_connections_per_ip: Some(2),
+        ..FileConfig::default()
+    });
+    let listeners = Listeners::default();
+    let state = ConfigState::new();
+    let (mut worker, mut backends) = setup_sync_test(
+        "PERIP-RM",
+        config,
+        listeners,
+        state,
+        front_address,
+        1,
+        false,
+    );
+    let mut backend = backends.pop().unwrap();
+    backend.connect();
+
+    let expected_response_start = String::from("HTTP/1.1 200 OK\r\nContent-Length:");
+
+    // Connect 2 clients (at the limit)
+    let mut clients = Vec::new();
+    for i in 0..2 {
+        let mut client = Client::new(
+            format!("client{i}"),
+            front_address,
+            http_request("GET", "/api", format!("ping{i}"), "localhost"),
+        );
+        client.connect();
+        client.send();
+        assert!(backend.accept(i), "backend should accept client {i}");
+        backend.receive(i);
+        backend.send(i);
+        let response = client.receive();
+        assert!(
+            response
+                .as_ref()
+                .is_some_and(|r| r.starts_with(&expected_response_start)),
+            "client {i} should get 200 OK"
+        );
+        clients.push(client);
+    }
+
+    // 3rd connection should be rejected (limit is 2)
+    let mut rejected = Client::new(
+        "rejected",
+        front_address,
+        http_request("GET", "/api", "rejected", "localhost"),
+    );
+    rejected.connect();
+    rejected.send();
+    assert!(!backend.accept(2), "3rd client should be rejected");
+    let response = rejected.receive();
+    assert_eq!(response, None, "rejected client should receive nothing");
+
+    // Remove the limit at runtime
+    worker.send_proxy_request_type(RequestType::SetMaxConnectionsPerIp(0));
+    worker.read_to_last();
+
+    // Now new connections should succeed (unlimited)
+    for i in 3..6 {
+        let mut client = Client::new(
+            format!("client{i}"),
+            front_address,
+            http_request("GET", "/api", format!("ping{i}"), "localhost"),
+        );
+        client.connect();
+        client.send();
+        assert!(
+            backend.accept(i),
+            "backend should accept client {i} after limit removed"
+        );
+        backend.receive(i);
+        backend.send(i);
+        let response = client.receive();
+        assert!(
+            response
+                .as_ref()
+                .is_some_and(|r| r.starts_with(&expected_response_start)),
+            "client {i} should get 200 OK after limit removed"
+        );
+        clients.push(client);
+    }
+
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+
+    State::Success
+}
+
+/// Test QueryMaxConnectionsPerIp returns the correct value.
+pub fn try_query_max_connections_per_ip() -> State {
+    let front_address = create_local_address();
+
+    let config = Worker::into_config(FileConfig {
+        max_connections_per_ip: Some(42),
+        ..FileConfig::default()
+    });
+    let listeners = Listeners::default();
+    let state = ConfigState::new();
+    let (mut worker, _backends) =
+        setup_async_test("PERIP-Q", config, listeners, state, front_address, 1, false);
+
+    // Query the current limit
+    worker.send_proxy_request_type(RequestType::QueryMaxConnectionsPerIp(
+        QueryMaxConnectionsPerIp {},
+    ));
+    let response = worker.read_proxy_response().expect("should get a response");
+    assert_eq!(response.status(), ResponseStatus::Ok);
+
+    if let Some(content) = response.content {
+        if let Some(ContentType::MaxConnectionsPerIpLimit(limit_info)) = content.content_type {
+            assert_eq!(
+                limit_info.limit, 42,
+                "queried limit should be 42, got {}",
+                limit_info.limit
+            );
+        } else {
+            panic!(
+                "expected MaxConnectionsPerIpLimit content type, got: {:?}",
+                content
+            );
+        }
+    } else {
+        panic!("expected response content, got none");
+    }
+
+    // Change the limit at runtime and query again
+    worker.send_proxy_request_type(RequestType::SetMaxConnectionsPerIp(100));
+    let response = worker.read_proxy_response().expect("should get a response");
+    assert_eq!(response.status(), ResponseStatus::Ok);
+
+    worker.send_proxy_request_type(RequestType::QueryMaxConnectionsPerIp(
+        QueryMaxConnectionsPerIp {},
+    ));
+    let response = worker.read_proxy_response().expect("should get a response");
+    assert_eq!(response.status(), ResponseStatus::Ok);
+
+    if let Some(content) = response.content {
+        if let Some(ContentType::MaxConnectionsPerIpLimit(limit_info)) = content.content_type {
+            assert_eq!(
+                limit_info.limit, 100,
+                "queried limit should be 100 after runtime change, got {}",
+                limit_info.limit
+            );
+        } else {
+            panic!("expected MaxConnectionsPerIpLimit content type");
+        }
+    } else {
+        panic!("expected response content");
+    }
+
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+
+    State::Success
+}
+
+#[test]
+fn test_max_connections_per_ip_config() {
+    assert_eq!(
+        repeat_until_error_or(
+            2,
+            "Per-IP connection limit (config)",
+            try_max_connections_per_ip_config
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_max_connections_per_ip_runtime_set() {
+    assert_eq!(
+        repeat_until_error_or(
+            2,
+            "Per-IP connection limit (runtime set)",
+            try_max_connections_per_ip_runtime_set
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_max_connections_per_ip_runtime_remove() {
+    assert_eq!(
+        repeat_until_error_or(
+            2,
+            "Per-IP connection limit (runtime remove)",
+            try_max_connections_per_ip_runtime_remove
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_query_max_connections_per_ip() {
+    assert_eq!(
+        repeat_until_error_or(
+            2,
+            "Query per-IP connection limit",
+            try_query_max_connections_per_ip
+        ),
         State::Success
     );
 }

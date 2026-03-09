@@ -621,11 +621,9 @@ impl CommandManager {
             ConnectionLimitCmd::Remove => {
                 self.send_request(RequestType::SetMaxConnectionsPerIp(0).into())
             }
-            ConnectionLimitCmd::Show => {
-                self.send_request(
-                    RequestType::QueryMaxConnectionsPerIp(QueryMaxConnectionsPerIp {}).into(),
-                )
-            }
+            ConnectionLimitCmd::Show => self.send_request(
+                RequestType::QueryMaxConnectionsPerIp(QueryMaxConnectionsPerIp {}).into(),
+            ),
         }
     }
 }

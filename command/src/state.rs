@@ -136,6 +136,7 @@ impl ConfigState {
             | RequestType::ConfigureMetrics(_)
             | RequestType::ReturnListenSockets(_)
             | RequestType::HardStop(_)
+            // Runtime-only: not persisted in config state, handled directly by workers
             | RequestType::SetMaxConnectionsPerIp(_)
             | RequestType::QueryMaxConnectionsPerIp(_) => Ok(()),
 

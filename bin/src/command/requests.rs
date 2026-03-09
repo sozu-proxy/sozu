@@ -15,10 +15,10 @@ use sozu_command_lib::{
     parser::parse_several_requests,
     proto::command::{
         AggregatedMetrics, AvailableMetrics, CertificatesWithFingerprints, ClusterHashes,
-        ClusterInformations, FrontendFilters, HardStop, QueryCertificatesFilters,
-        QueryMetricsOptions, Request, ResponseContent, ResponseStatus, RunState, SoftStop, Status,
-        WorkerInfo, WorkerInfos, WorkerRequest, WorkerResponses, request::RequestType,
-        response_content::ContentType,
+        ClusterInformations, FrontendFilters, HardStop, MaxConnectionsPerIpLimit,
+        QueryCertificatesFilters, QueryMetricsOptions, Request, ResponseContent, ResponseStatus,
+        RunState, SoftStop, Status, WorkerInfo, WorkerInfos, WorkerRequest, WorkerResponses,
+        request::RequestType, response_content::ContentType,
     },
 };
 use sozu_lib::metrics::METRICS;
@@ -74,9 +74,11 @@ impl Server {
             | RequestType::RemoveListener(_)
             | RequestType::RemoveTcpFrontend(_)
             | RequestType::ReplaceCertificate(_)
-            | RequestType::SetMaxConnectionsPerIp(_)
-            | RequestType::QueryMaxConnectionsPerIp(_) => {
+            | RequestType::SetMaxConnectionsPerIp(_) => {
                 worker_request(self, client, request_type);
+            }
+            RequestType::QueryMaxConnectionsPerIp(_) => {
+                query_connection_limit(self, client, request_type);
             }
             RequestType::QueryClustersHashes(_)
             | RequestType::QueryClustersByDomain(_)
@@ -514,6 +516,75 @@ impl GatheringTask for WorkerTask {
         } else {
             client.finish_ok("Successfully applied request to all workers");
         }
+    }
+}
+
+// =========================================================
+// Query connection limit
+
+#[derive(Debug)]
+struct QueryConnectionLimitTask {
+    pub client_token: Token,
+    pub gatherer: DefaultGatherer,
+}
+
+fn query_connection_limit(
+    server: &mut Server,
+    client: &mut ClientSession,
+    request_content: RequestType,
+) {
+    client.return_processing("Querying connection limit...");
+
+    server.scatter(
+        request_content.into(),
+        Box::new(QueryConnectionLimitTask {
+            client_token: client.token,
+            gatherer: DefaultGatherer::default(),
+        }),
+        Timeout::Default,
+        None,
+    );
+}
+
+impl GatheringTask for QueryConnectionLimitTask {
+    fn client_token(&self) -> Option<Token> {
+        Some(self.client_token)
+    }
+
+    fn get_gatherer(&mut self) -> &mut dyn Gatherer {
+        &mut self.gatherer
+    }
+
+    fn on_finish(
+        self: Box<Self>,
+        _server: &mut Server,
+        client: &mut OptionalClient,
+        timed_out: bool,
+    ) {
+        if timed_out {
+            client.finish_failure("Timed out querying connection limit from workers");
+            return;
+        }
+
+        // Extract the limit from the first worker response that contains it
+        for (_worker_id, response) in &self.gatherer.responses {
+            if let Some(ResponseContent {
+                content_type:
+                    Some(ContentType::MaxConnectionsPerIpLimit(MaxConnectionsPerIpLimit { limit })),
+            }) = &response.content
+            {
+                client.finish_ok_with_content(
+                    ContentType::MaxConnectionsPerIpLimit(MaxConnectionsPerIpLimit {
+                        limit: *limit,
+                    })
+                    .into(),
+                    "Successfully queried connection limit",
+                );
+                return;
+            }
+        }
+
+        client.finish_failure("No worker returned connection limit information");
     }
 }
 

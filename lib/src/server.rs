@@ -20,9 +20,9 @@ use sozu_command::{
     proto::command::{
         ActivateListener, AddBackend, CertificatesWithFingerprints, Cluster, ClusterHashes,
         ClusterInformations, DeactivateListener, Event, HttpListenerConfig, HttpsListenerConfig,
-        InitialState, ListenerType, LoadBalancingAlgorithms, LoadMetric,
-        MaxConnectionsPerIpLimit, MetricsConfiguration, RemoveBackend, Request, ResponseStatus,
-        ServerConfig, TcpListenerConfig as CommandTcpListener, WorkerRequest, WorkerResponse,
+        InitialState, ListenerType, LoadBalancingAlgorithms, LoadMetric, MaxConnectionsPerIpLimit,
+        MetricsConfiguration, RemoveBackend, Request, ResponseStatus, ServerConfig,
+        TcpListenerConfig as CommandTcpListener, WorkerRequest, WorkerResponse,
         request::RequestType, response_content::ContentType,
     },
     ready::Ready,
@@ -188,6 +188,12 @@ impl SessionManager {
                 }
             }
         }
+    }
+
+    /// Clear all IP tracking state. Called when the limit is disabled (set to 0).
+    pub fn clear_ip_tracking(&mut self) {
+        self.connections_per_ip.clear();
+        self.token_to_ip.clear();
     }
 
     pub fn to_session(token: Token) -> SessionToken {
@@ -956,16 +962,16 @@ impl Server {
             }
             Some(RequestType::SetMaxConnectionsPerIp(limit)) => {
                 let limit = *limit as usize;
-                info!(
-                    "{} setting max_connections_per_ip to {}",
-                    message.id,
-                    if limit == 0 {
-                        "unlimited".to_owned()
-                    } else {
-                        limit.to_string()
-                    }
-                );
-                self.sessions.borrow_mut().max_connections_per_ip = limit;
+                if limit == 0 {
+                    info!("{} setting max_connections_per_ip to unlimited", message.id);
+                } else {
+                    info!("{} setting max_connections_per_ip to {}", message.id, limit);
+                }
+                let mut sessions = self.sessions.borrow_mut();
+                sessions.max_connections_per_ip = limit;
+                if limit == 0 {
+                    sessions.clear_ip_tracking();
+                }
                 push_queue(WorkerResponse::ok(message.id));
                 return;
             }
@@ -973,7 +979,8 @@ impl Server {
                 let limit = self.sessions.borrow().max_connections_per_ip as u64;
                 push_queue(WorkerResponse::ok_with_content(
                     message.id,
-                    ContentType::MaxConnectionsPerIpLimit(MaxConnectionsPerIpLimit { limit }).into(),
+                    ContentType::MaxConnectionsPerIpLimit(MaxConnectionsPerIpLimit { limit })
+                        .into(),
                 ));
                 return;
             }
@@ -1898,5 +1905,63 @@ mod tests {
         sm.borrow_mut().track_ip(ip, Token(10));
         assert!(sm.borrow().connections_per_ip.is_empty());
         assert!(sm.borrow().token_to_ip.is_empty());
+    }
+
+    #[test]
+    fn set_limit_from_zero_to_nonzero() {
+        let sm = make_session_manager(100, 0);
+        let ip: IpAddr = Ipv4Addr::new(10, 0, 0, 1).into();
+
+        // With limit 0, tracking is a no-op
+        sm.borrow_mut().track_ip(ip, Token(10));
+        assert!(sm.borrow().connections_per_ip.is_empty());
+
+        // Enable limit
+        sm.borrow_mut().max_connections_per_ip = 2;
+
+        // New connections should now be tracked
+        sm.borrow_mut().track_ip(ip, Token(11));
+        sm.borrow_mut().track_ip(ip, Token(12));
+        assert!(sm.borrow().ip_at_limit(&ip));
+    }
+
+    #[test]
+    fn set_limit_from_nonzero_to_zero_clears_tracking() {
+        let sm = make_session_manager(100, 2);
+        let ip: IpAddr = Ipv4Addr::new(10, 0, 0, 1).into();
+
+        // Track some connections
+        sm.borrow_mut().track_ip(ip, Token(10));
+        sm.borrow_mut().track_ip(ip, Token(11));
+        assert!(sm.borrow().ip_at_limit(&ip));
+
+        // Disable limit and clear tracking
+        sm.borrow_mut().max_connections_per_ip = 0;
+        sm.borrow_mut().clear_ip_tracking();
+
+        // Maps should be empty
+        assert!(sm.borrow().connections_per_ip.is_empty());
+        assert!(sm.borrow().token_to_ip.is_empty());
+        // ip_at_limit should return false when disabled
+        assert!(!sm.borrow().ip_at_limit(&ip));
+    }
+
+    #[test]
+    fn set_limit_between_nonzero_values() {
+        let sm = make_session_manager(100, 2);
+        let ip: IpAddr = Ipv4Addr::new(10, 0, 0, 1).into();
+
+        // Track connections up to old limit
+        sm.borrow_mut().track_ip(ip, Token(10));
+        sm.borrow_mut().track_ip(ip, Token(11));
+        assert!(sm.borrow().ip_at_limit(&ip));
+
+        // Raise the limit — existing tracking should remain valid
+        sm.borrow_mut().max_connections_per_ip = 3;
+        assert!(!sm.borrow().ip_at_limit(&ip));
+
+        // One more connection reaches the new limit
+        sm.borrow_mut().track_ip(ip, Token(12));
+        assert!(sm.borrow().ip_at_limit(&ip));
     }
 }

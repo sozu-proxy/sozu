@@ -193,12 +193,23 @@ pub enum SubCmd {
 
 #[derive(Subcommand, PartialEq, Eq, Clone, Debug)]
 pub enum ConnectionLimitCmd {
-    #[clap(name = "set", about = "Set the maximum number of connections per source IP (0 = unlimited)")]
+    #[clap(
+        name = "set",
+        about = "Set the maximum number of connections per source IP (0 = unlimited)",
+        long_about = "Set the maximum number of connections per source IP (0 = unlimited).\n\n\
+            This change is ephemeral and will not survive worker upgrades.\n\
+            Update the configuration file for persistence.\n\n\
+            Only new connections are affected; existing connections established\n\
+            before the limit change are not retroactively tracked or rejected."
+    )]
     Set {
         #[clap(help = "maximum number of connections per IP address (0 = unlimited)")]
         limit: u64,
     },
-    #[clap(name = "remove", about = "Remove the per-IP connection limit (set to unlimited)")]
+    #[clap(
+        name = "remove",
+        about = "Remove the per-IP connection limit (set to unlimited)"
+    )]
     Remove,
     #[clap(name = "show", about = "Show the current per-IP connection limit")]
     Show,
