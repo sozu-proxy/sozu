@@ -173,6 +173,14 @@ pub struct FrontRustls {
     pub session: ServerConnection,
 }
 
+impl std::fmt::Debug for FrontRustls {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FrontRustls")
+            .field("stream", &self.stream)
+            .finish_non_exhaustive()
+    }
+}
+
 impl SocketHandler for FrontRustls {
     fn socket_read(&mut self, buf: &mut [u8]) -> (usize, SocketResult) {
         let mut size = 0usize;
