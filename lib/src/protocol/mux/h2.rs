@@ -118,7 +118,15 @@ pub struct ConnectionH2<Front: SocketHandler> {
     pub state: H2State,
     pub streams: HashMap<StreamId, GlobalStreamId>,
     pub timeout_container: TimeoutContainer,
+    /// Outgoing flow control window: how many DATA bytes we can still send.
+    /// Decremented when we send DATA, incremented when we receive WINDOW_UPDATE.
     pub window: i32,
+    /// Accumulated connection-level DATA bytes received since last WINDOW_UPDATE sent.
+    /// When this exceeds the threshold, we send a connection-level WINDOW_UPDATE.
+    pub received_bytes_since_update: u32,
+    /// Queued WINDOW_UPDATE frames to send: Vec<(stream_id, increment)>.
+    /// stream_id=0 means connection-level update.
+    pub pending_window_updates: Vec<(u32, u32)>,
     pub zero: GenericHttpStream,
 }
 impl<Front: SocketHandler> std::fmt::Debug for ConnectionH2<Front> {
@@ -483,6 +491,39 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             self.readiness.interest.insert(Ready::READABLE);
             self.expect_write = None;
         }
+
+        // Send pending WINDOW_UPDATE frames before processing stream data.
+        // Write them inline to avoid extra event loop iterations that could
+        // cause response data to be sent before validating subsequent frames.
+        if !self.pending_window_updates.is_empty() && self.expect_write.is_none() {
+            let kawa = &mut self.zero;
+            kawa.storage.clear();
+            let buf = kawa.storage.space();
+            let mut offset = 0;
+            for (stream_id, increment) in self.pending_window_updates.drain(..) {
+                if increment == 0 {
+                    continue;
+                }
+                if let Ok((_, size)) =
+                    serializer::gen_window_update(&mut buf[offset..], stream_id, increment)
+                {
+                    offset += size;
+                }
+            }
+            if offset > 0 {
+                kawa.storage.fill(offset);
+                // Flush WINDOW_UPDATE frames directly without returning
+                while !kawa.storage.is_empty() {
+                    let (size, status) = self.socket.socket_write(kawa.storage.data());
+                    kawa.storage.consume(size);
+                    if update_readiness_after_write(size, status, &mut self.readiness) {
+                        self.expect_write = Some(H2StreamId::Zero);
+                        return MuxResult::Continue;
+                    }
+                }
+            }
+        }
+
         match (&self.state, &self.position) {
             (H2State::Error, _)
             | (H2State::Discard, _)
@@ -811,6 +852,32 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 kawa.push_block(kawa::Block::Chunk(kawa::Chunk {
                     data: kawa::Store::Slice(slice),
                 }));
+
+                // RFC 9113 §6.9: Update flow control after consuming DATA.
+                // Track bytes received and queue WINDOW_UPDATE when threshold reached.
+                let payload_u32 = payload_len as u32;
+                let initial_window = self.local_settings.settings_initial_window_size;
+                let threshold = initial_window / 2;
+
+                // Connection-level flow control
+                self.received_bytes_since_update += payload_u32;
+                if self.received_bytes_since_update >= threshold {
+                    let increment = self.received_bytes_since_update;
+                    self.pending_window_updates.push((0, increment));
+                    self.received_bytes_since_update = 0;
+                }
+
+                // Stream-level flow control (only if stream is still open)
+                if !data.end_stream {
+                    self.pending_window_updates
+                        .push((data.stream_id, payload_u32));
+                }
+
+                // If we have pending updates, ensure we get a writable event
+                if !self.pending_window_updates.is_empty() {
+                    self.readiness.interest.insert(Ready::WRITABLE);
+                }
+
                 if data.end_stream {
                     // RFC 9113 §8.1.1: on end_stream, total DATA must equal Content-Length
                     if let Some(expected) = declared_length {
@@ -978,7 +1045,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     let mut is_error = false;
                     #[rustfmt::skip]
                     match setting.identifier {
-                        1 => { self.peer_settings.settings_header_table_size = v },
+                        1 => {
+                            self.peer_settings.settings_header_table_size = v;
+                            // Propagate peer's table size to our HPACK encoder
+                            self.encoder.set_max_table_size(v as usize);
+                        },
                         2 => { self.peer_settings.settings_enable_push = v == 1;                is_error |= v > 1 },
                         3 => { self.peer_settings.settings_max_concurrent_streams = v },
                         4 => { is_error |= self.update_initial_window_size(v, context) },
@@ -1077,8 +1148,15 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         let delta = value as i32 - self.peer_settings.settings_initial_window_size as i32;
         let mut open_window = false;
         for stream in context.streams.iter_mut() {
-            open_window |= stream.window <= 0 && stream.window + delta > 0;
-            stream.window += delta;
+            // RFC 9113 §6.9.2: changes to SETTINGS_INITIAL_WINDOW_SIZE can cause
+            // stream windows to exceed 2^31-1, which is a flow control error.
+            match stream.window.checked_add(delta) {
+                Some(new_window) => {
+                    open_window |= stream.window <= 0 && new_window > 0;
+                    stream.window = new_window;
+                }
+                None => return true,
+            }
         }
         println_!(
             "UPDATE INIT WINDOW: {delta} {open_window} {:?}",
