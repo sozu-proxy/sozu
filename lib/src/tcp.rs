@@ -1115,6 +1115,17 @@ impl ListenerHandler for TcpListener {
             None => self.tags.remove(&key),
         };
     }
+
+    fn protocol(&self) -> Protocol {
+        Protocol::TCP
+    }
+
+    fn public_address(&self) -> SocketAddr {
+        self.config
+            .public_address
+            .map(|addr| addr.into())
+            .unwrap_or(self.address)
+    }
 }
 
 impl TcpListener {

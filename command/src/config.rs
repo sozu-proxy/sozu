@@ -988,6 +988,7 @@ impl HttpClusterConfig {
                 load_balancing: self.load_balancing as i32,
                 answer_503: self.answer_503.clone(),
                 load_metric: self.load_metric.map(|s| s as i32),
+                http2: None,
             })
             .into(),
         ];
@@ -1049,6 +1050,7 @@ impl TcpClusterConfig {
                 load_balancing: self.load_balancing as i32,
                 load_metric: self.load_metric.map(|s| s as i32),
                 answer_503: None,
+                http2: None,
             })
             .into(),
         ];

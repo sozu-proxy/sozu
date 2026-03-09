@@ -55,7 +55,6 @@ use crate::{
     pool::Pool,
     protocol::{
         Http, Pipe, SessionState,
-        h2::Http2,
         http::{
             ResponseStream,
             answers::HttpAnswers,
@@ -80,14 +79,13 @@ StateMachineBuilder! {
     ///
     /// - optional (ExpectProxyProtocol)
     /// - TLS handshake
-    /// - HTTP or HTTP2
+    /// - HTTP
     /// - WebSocket (passthrough), only from HTTP
     enum HttpsStateMachine impl SessionState {
         Expect(ExpectProxyProtocol<MioTcpStream>, ServerConnection),
         Handshake(TlsHandshake),
         Http(Http<FrontRustls, HttpsListener>),
         WebSocket(Pipe<FrontRustls, HttpsListener>),
-        Http2(Http2<FrontRustls>) -> todo!("H2"),
     }
 }
 
@@ -188,7 +186,6 @@ impl HttpsSession {
             HttpsStateMachine::Expect(expect, ssl) => self.upgrade_expect(expect, ssl),
             HttpsStateMachine::Handshake(handshake) => self.upgrade_handshake(handshake),
             HttpsStateMachine::Http(http) => self.upgrade_http(http),
-            HttpsStateMachine::Http2(_) => self.upgrade_http2(),
             HttpsStateMachine::WebSocket(wss) => self.upgrade_websocket(wss),
             HttpsStateMachine::FailedUpgrade(_) => unreachable!(),
         };
@@ -317,19 +314,9 @@ impl HttpsSession {
                 Some(HttpsStateMachine::Http(http))
             }
             AlpnProtocols::H2 => {
-                let mut http = Http2::new(
-                    front_stream,
-                    self.frontend_token,
-                    self.pool.clone(),
-                    Some(self.public_address),
-                    None,
-                    self.sticky_name.clone(),
-                );
-
-                http.frontend.readiness.event = handshake.frontend_readiness.event;
-
-                gauge_add!("protocol.http2", 1);
-                Some(HttpsStateMachine::Http2(http))
+                // TODO(task #5): wire Mux state machine here
+                error!("H2 ALPN negotiated but Mux integration not yet wired");
+                None
             }
         }
     }
@@ -392,10 +379,6 @@ impl HttpsSession {
         Some(HttpsStateMachine::WebSocket(pipe))
     }
 
-    fn upgrade_http2(&self) -> Option<HttpsStateMachine> {
-        todo!()
-    }
-
     fn upgrade_websocket(
         &self,
         wss: Pipe<FrontRustls, HttpsListener>,
@@ -424,7 +407,6 @@ impl ProxySession for HttpsSession {
                 gauge_add!("protocol.wss", -1);
                 gauge_add!("websocket.active_requests", -1);
             }
-            StateMarker::Http2 => gauge_add!("protocol.http2", -1),
         }
 
         if self.state.failed() {
@@ -433,7 +415,6 @@ impl ProxySession for HttpsSession {
                 StateMarker::Handshake => incr!("https.upgrade.handshake.failed"),
                 StateMarker::Http => incr!("https.upgrade.http.failed"),
                 StateMarker::WebSocket => incr!("https.upgrade.wss.failed"),
-                StateMarker::Http2 => incr!("https.upgrade.http2.failed"),
             }
             return;
         }
@@ -556,6 +537,17 @@ impl ListenerHandler for HttpsListener {
             Some(tags) => self.tags.insert(key, CachedTags::new(tags)),
             None => self.tags.remove(&key),
         };
+    }
+
+    fn protocol(&self) -> Protocol {
+        Protocol::HTTPS
+    }
+
+    fn public_address(&self) -> StdSocketAddr {
+        self.config
+            .public_address
+            .map(|addr| addr.into())
+            .unwrap_or(self.address)
     }
 }
 

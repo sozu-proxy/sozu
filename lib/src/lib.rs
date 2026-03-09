@@ -530,6 +530,10 @@ pub trait ListenerHandler {
     }
 
     fn set_tags(&mut self, key: String, tags: Option<BTreeMap<String, String>>);
+
+    fn protocol(&self) -> Protocol;
+
+    fn public_address(&self) -> SocketAddr;
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -588,6 +592,8 @@ pub enum BackendConnectionError {
     Backend(BackendError),
     #[error("failed to retrieve the cluster: {0}")]
     RetrieveClusterError(RetrieveClusterError),
+    #[error("maximum number of buffers reached")]
+    MaxBuffers,
 }
 
 /// used in kawa_h1 module for the Http session state
@@ -603,6 +609,8 @@ pub enum RetrieveClusterError {
     UnauthorizedRoute,
     #[error("{0}")]
     RetrieveFrontend(FrontendFromRequestError),
+    #[error("HTTPS redirect required")]
+    HttpsRedirect,
 }
 
 /// Used in sessions
