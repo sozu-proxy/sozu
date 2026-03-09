@@ -825,8 +825,14 @@ impl Debug for Stream {
             .field("window", &self.window)
             .field("attempts", &self.attempts)
             .field("state", &self.state)
-            .field("front_received_end_of_stream", &self.front_received_end_of_stream)
-            .field("back_received_end_of_stream", &self.back_received_end_of_stream)
+            .field(
+                "front_received_end_of_stream",
+                &self.front_received_end_of_stream,
+            )
+            .field(
+                "back_received_end_of_stream",
+                &self.back_received_end_of_stream,
+            )
             .field("front_data_received", &self.front_data_received)
             .field("back_data_received", &self.back_data_received)
             .field("front", &KawaSummary(&self.front))
