@@ -256,6 +256,7 @@ impl CommandManager {
                     method,
                     position: RulePosition::Tree.into(),
                     tags: tags.unwrap_or_default(),
+                    ..Default::default()
                 })
                 .into(),
             ),
@@ -301,6 +302,7 @@ impl CommandManager {
                     method,
                     position: RulePosition::Tree.into(),
                     tags: tags.unwrap_or_default(),
+                    ..Default::default()
                 })
                 .into(),
             ),

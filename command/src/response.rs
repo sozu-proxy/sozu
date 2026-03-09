@@ -2,9 +2,9 @@ use std::{cmp::Ordering, collections::BTreeMap, fmt, net::SocketAddr};
 
 use crate::{
     proto::command::{
-        AddBackend, FilteredTimeSerie, LoadBalancingParams, PathRule, PathRuleKind,
-        RequestHttpFrontend, RequestTcpFrontend, Response, ResponseContent, ResponseStatus,
-        RulePosition, RunState, WorkerResponse,
+        AddBackend, FilteredTimeSerie, Header, LoadBalancingParams, PathRule, PathRuleKind,
+        RedirectPolicy, RedirectScheme, RequestHttpFrontend, RequestTcpFrontend, Response,
+        ResponseContent, ResponseStatus, RulePosition, RunState, WorkerResponse,
     },
     state::ClusterId,
 };
@@ -39,6 +39,26 @@ pub struct HttpFrontend {
     #[serde(default)]
     pub position: RulePosition,
     pub tags: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    pub required_auth: bool,
+    #[serde(default)]
+    pub redirect: RedirectPolicy,
+    #[serde(default)]
+    pub redirect_scheme: RedirectScheme,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redirect_template: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rewrite_host: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rewrite_path: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rewrite_port: Option<u16>,
+    #[serde(default)]
+    pub headers: Vec<Header>,
 }
 
 impl From<HttpFrontend> for RequestHttpFrontend {
@@ -51,6 +71,22 @@ impl From<HttpFrontend> for RequestHttpFrontend {
             method: val.method,
             position: val.position.into(),
             tags: val.tags.unwrap_or_default(),
+            required_auth: if val.required_auth { Some(true) } else { None },
+            redirect: if val.redirect != RedirectPolicy::Forward {
+                Some(val.redirect.into())
+            } else {
+                None
+            },
+            redirect_scheme: if val.redirect_scheme != RedirectScheme::UseSame {
+                Some(val.redirect_scheme.into())
+            } else {
+                None
+            },
+            redirect_template: val.redirect_template,
+            rewrite_host: val.rewrite_host,
+            rewrite_path: val.rewrite_path,
+            rewrite_port: val.rewrite_port.map(|x| x as u32),
+            headers: val.headers,
         }
     }
 }

@@ -5,7 +5,7 @@ use std::{
     net::{Shutdown, SocketAddr as StdSocketAddr},
     os::unix::io::AsRawFd,
     rc::{Rc, Weak},
-    str::{from_utf8, from_utf8_unchecked},
+    str::from_utf8,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -63,7 +63,7 @@ use crate::{
         proxy_protocol::expect::ExpectProxyProtocol,
         rustls::TlsHandshake,
     },
-    router::{Route, Router},
+    router::{RouteResult, Router},
     server::{ListenToken, SessionManager},
     socket::{FrontRustls, server_bind},
     timer::TimeoutContainer,
@@ -553,7 +553,7 @@ impl L7ListenerHandler for HttpsListener {
         host: &str,
         uri: &str,
         method: &Method,
-    ) -> Result<Route, FrontendFromRequestError> {
+    ) -> Result<RouteResult, FrontendFromRequestError> {
         let start = Instant::now();
         let (remaining_input, (hostname, _)) = match hostname_and_port(host.as_bytes()) {
             Ok(tuple) => tuple,
@@ -572,10 +572,7 @@ impl L7ListenerHandler for HttpsListener {
             ));
         }
 
-        // it is alright to call from_utf8_unchecked,
-        // we already verified that there are only ascii
-        // chars in there
-        let host = unsafe { from_utf8_unchecked(hostname) };
+        let host = std::str::from_utf8(hostname).unwrap_or(host);
 
         let route = self.fronts.lookup(host, uri, method).map_err(|e| {
             incr!("http.failed_backend_matching");
@@ -584,7 +581,7 @@ impl L7ListenerHandler for HttpsListener {
 
         let now = Instant::now();
 
-        if let Route::ClusterId(cluster) = &route {
+        if let Some(cluster) = &route.cluster_id {
             time!("frontend_matching_time", cluster, (now - start).as_millis());
         }
 
@@ -1486,7 +1483,7 @@ mod tests {
     use sozu_command::{config::ListenerBuilder, proto::command::SocketAddress};
 
     use super::*;
-    use crate::router::{MethodRule, PathRule, Route, Router, pattern_trie::TrieNode};
+    use crate::router::{Frontend, MethodRule, PathRule, Router, pattern_trie::TrieNode};
 
     /*
     #[test]
@@ -1519,25 +1516,25 @@ mod tests {
             "lolcatho.st".as_bytes(),
             &PathRule::Prefix(uri1),
             &MethodRule::new(None),
-            &Route::ClusterId(cluster_id1.clone())
+            &Frontend::forward(cluster_id1.clone())
         ));
         assert!(fronts.add_tree_rule(
             "lolcatho.st".as_bytes(),
             &PathRule::Prefix(uri2),
             &MethodRule::new(None),
-            &Route::ClusterId(cluster_id2)
+            &Frontend::forward(cluster_id2)
         ));
         assert!(fronts.add_tree_rule(
             "lolcatho.st".as_bytes(),
             &PathRule::Prefix(uri3),
             &MethodRule::new(None),
-            &Route::ClusterId(cluster_id3)
+            &Frontend::forward(cluster_id3)
         ));
         assert!(fronts.add_tree_rule(
             "other.domain".as_bytes(),
             &PathRule::Prefix("test".to_string()),
             &MethodRule::new(None),
-            &Route::ClusterId(cluster_id1)
+            &Frontend::forward(cluster_id1)
         ));
 
         let address = SocketAddress::new_v4(127, 0, 0, 1, 1032);
@@ -1575,31 +1572,30 @@ mod tests {
         println!("TEST {}", line!());
         let frontend1 = listener.frontend_from_request("lolcatho.st", "/", &Method::Get);
         assert_eq!(
-            frontend1.expect("should find a frontend"),
-            Route::ClusterId("cluster_1".to_string())
+            frontend1.expect("should find a frontend").cluster_id,
+            Some("cluster_1".to_string())
         );
         println!("TEST {}", line!());
         let frontend2 = listener.frontend_from_request("lolcatho.st", "/test", &Method::Get);
         assert_eq!(
-            frontend2.expect("should find a frontend"),
-            Route::ClusterId("cluster_1".to_string())
+            frontend2.expect("should find a frontend").cluster_id,
+            Some("cluster_1".to_string())
         );
         println!("TEST {}", line!());
         let frontend3 = listener.frontend_from_request("lolcatho.st", "/yolo/test", &Method::Get);
         assert_eq!(
-            frontend3.expect("should find a frontend"),
-            Route::ClusterId("cluster_2".to_string())
+            frontend3.expect("should find a frontend").cluster_id,
+            Some("cluster_2".to_string())
         );
         println!("TEST {}", line!());
         let frontend4 = listener.frontend_from_request("lolcatho.st", "/yolo/swag", &Method::Get);
         assert_eq!(
-            frontend4.expect("should find a frontend"),
-            Route::ClusterId("cluster_3".to_string())
+            frontend4.expect("should find a frontend").cluster_id,
+            Some("cluster_3".to_string())
         );
         println!("TEST {}", line!());
         let frontend5 = listener.frontend_from_request("domain", "/", &Method::Get);
         assert!(frontend5.is_err());
-        // assert!(false);
     }
 
     #[test]

@@ -2,7 +2,6 @@ use std::{
     cmp::min,
     fmt::{self, Write},
     ops::Deref,
-    str::from_utf8_unchecked,
 };
 
 use nom::{
@@ -60,7 +59,7 @@ impl Method {
         } else if compare_no_case(s, b"CONNECT") {
             Method::Connect
         } else {
-            Method::Custom(String::from(unsafe { from_utf8_unchecked(s) }))
+            Method::Custom(String::from(std::str::from_utf8(s).unwrap_or_default()))
         }
     }
 }
