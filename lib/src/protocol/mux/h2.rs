@@ -331,8 +331,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                                 received_eos,
                                 stream.state
                             );
-                            if !allowed_on_half_closed
-                                && (received_eos || !stream.state.is_open())
+                            if !allowed_on_half_closed && (received_eos || !stream.state.is_open())
                             {
                                 error!(
                                     "CANNOT RECEIVE {:?} ON THIS STREAM {:?}",
@@ -1272,7 +1271,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         return;
                     }
                 }
-                error!("end_stream called for unknown global_stream_id {}", stream_gid);
+                error!(
+                    "end_stream called for unknown global_stream_id {}",
+                    stream_gid
+                );
             }
             Position::Server => {
                 let answers_rc = context.listener.borrow().get_answers().clone();

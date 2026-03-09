@@ -2399,8 +2399,7 @@ fn setup_h2_backend_test(
 
 /// H2 frontend → H2 backend: basic GET request
 fn try_h2_to_h2_basic_request() -> State {
-    let (mut worker, mut backends, front_port) =
-        setup_h2_backend_test("H2-TO-H2-BASIC", 1, true);
+    let (mut worker, mut backends, front_port) = setup_h2_backend_test("H2-TO-H2-BASIC", 1, true);
 
     let client = build_h2_client();
     let uri: hyper::Uri = format!("https://localhost:{front_port}/api")
@@ -2430,8 +2429,7 @@ fn try_h2_to_h2_basic_request() -> State {
 
 /// H1 frontend → H2 backend: client sends HTTP/1.1, Sozu upgrades to H2 on backend
 fn try_h1_to_h2_basic_request() -> State {
-    let (mut worker, mut backends, front_port) =
-        setup_h2_backend_test("H1-TO-H2-BASIC", 1, false);
+    let (mut worker, mut backends, front_port) = setup_h2_backend_test("H1-TO-H2-BASIC", 1, false);
 
     let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
     let mut client = Client::new(
@@ -2462,8 +2460,7 @@ fn try_h1_to_h2_basic_request() -> State {
 
 /// H2 frontend → H2 backend: multiple concurrent streams
 fn try_h2_to_h2_multiple_streams() -> State {
-    let (mut worker, mut backends, front_port) =
-        setup_h2_backend_test("H2-TO-H2-MULTI", 1, true);
+    let (mut worker, mut backends, front_port) = setup_h2_backend_test("H2-TO-H2-MULTI", 1, true);
 
     let client = build_h2_client();
     let uris: Vec<hyper::Uri> = (0..4)
