@@ -83,7 +83,10 @@ where
                 }
 
                 let start = kawa.storage.end as u32;
-                kawa.storage.write_all(&v).unwrap();
+                if kawa.storage.write_all(&v).is_err() {
+                    invalid_headers = true;
+                    return;
+                }
                 let len_key = k.len() as u32;
                 let len_val = v.len() as u32;
                 let val = Store::Slice(Slice {
@@ -117,7 +120,10 @@ where
                     regular_headers = true;
                     // TODO: cookies should be split into individual pairs per RFC 9113 section 8.2.3
                     // For now, forward the full cookie header as-is
-                    kawa.storage.write_all(&k).unwrap();
+                    if kawa.storage.write_all(&k).is_err() {
+                        invalid_headers = true;
+                        return;
+                    }
                     let key = Store::Slice(Slice {
                         start: start + len_val,
                         len: len_key,
@@ -143,7 +149,10 @@ where
                             },
                         );
                     }
-                    kawa.storage.write_all(&k).unwrap();
+                    if kawa.storage.write_all(&k).is_err() {
+                        invalid_headers = true;
+                        return;
+                    }
                     let key = Store::Slice(Slice {
                         start: start + len_val,
                         len: len_key,
@@ -201,7 +210,10 @@ where
                 }
 
                 let start = kawa.storage.end as u32;
-                kawa.storage.write_all(&v).unwrap();
+                if kawa.storage.write_all(&v).is_err() {
+                    invalid_headers = true;
+                    return;
+                }
                 let len_key = k.len() as u32;
                 let len_val = v.len() as u32;
                 let val = Store::Slice(Slice {
@@ -225,7 +237,10 @@ where
                     invalid_headers = true;
                 } else {
                     regular_headers = true;
-                    kawa.storage.write_all(&k).unwrap();
+                    if kawa.storage.write_all(&k).is_err() {
+                        invalid_headers = true;
+                        return;
+                    }
                     let key = Store::Slice(Slice {
                         start: start + len_val,
                         len: len_key,
@@ -299,10 +314,23 @@ pub fn handle_trailer(
     if !end_stream {
         return Err((H2Error::ProtocolError, false));
     }
+    let mut invalid_trailers = false;
     let decode_status = decoder.decode_with_cb(input, |k, v| {
+        // RFC 9113 §8.1: Trailers MUST NOT contain pseudo-header fields.
+        if k.starts_with(b":") {
+            invalid_trailers = true;
+            return;
+        }
+        // RFC 9113 §8.2: reject uppercase header names in HTTP/2
+        if has_uppercase_ascii(&k) {
+            invalid_trailers = true;
+            return;
+        }
         let start = kawa.storage.end as u32;
-        kawa.storage.write_all(&k).unwrap();
-        kawa.storage.write_all(&v).unwrap();
+        if kawa.storage.write_all(&k).is_err() || kawa.storage.write_all(&v).is_err() {
+            invalid_trailers = true;
+            return;
+        }
         let len_key = k.len() as u32;
         let len_val = v.len() as u32;
         let key = Store::Slice(Slice {
@@ -319,6 +347,10 @@ pub fn handle_trailer(
     if let Err(error) = decode_status {
         error!("INVALID FRAGMENT: {:?}", error);
         return Err((H2Error::CompressionError, true));
+    }
+    if invalid_trailers {
+        error!("INVALID TRAILERS");
+        return Err((H2Error::ProtocolError, false));
     }
 
     kawa.push_block(Block::Flags(Flags {
