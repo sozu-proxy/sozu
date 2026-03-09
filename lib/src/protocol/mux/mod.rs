@@ -47,7 +47,7 @@ use crate::{
     pool::{Checkout, Pool},
     protocol::{
         SessionState,
-        http::editor::HttpContext,
+        http::{DefaultAnswer, answers::HttpAnswers, editor::HttpContext},
         mux::h2::{H2Settings, H2State, H2StreamId, Prioriser},
     },
     retry::RetryPolicy,
@@ -140,8 +140,83 @@ pub fn terminate_default_answer<T: kawa::AsBuffer>(kawa: &mut kawa::Kawa<T>, clo
     kawa.parsing_phase = kawa::ParsingPhase::Terminated;
 }
 
-/// Replace the content of the kawa message with a default Sozu answer for a given status code
-fn set_default_answer(stream: &mut Stream, readiness: &mut Readiness, code: u16) {
+/// Build a route string from the stream's HTTP context, matching kawa_h1's `get_route()`
+fn get_route(context: &HttpContext) -> String {
+    if let Some(method) = &context.method {
+        if let Some(authority) = &context.authority {
+            if let Some(path) = &context.path {
+                return format!("{method} {authority}{path}");
+            }
+            return format!("{method} {authority}");
+        }
+        return format!("{method}");
+    }
+    String::new()
+}
+
+/// Copy blocks from a rendered `DefaultAnswerStream` into `stream.back`.
+///
+/// The template-rendered stream uses `SharedBuffer` storage, so any `Store::Slice`
+/// references must be captured (converted to owned `Store::Alloc`) before copying.
+fn copy_default_answer_to_stream(
+    rendered: crate::protocol::http::answers::DefaultAnswerStream,
+    kawa: &mut GenericHttpStream,
+) {
+    let buf = rendered.storage.buffer();
+
+    // Copy the status line, capturing any buffer-dependent Stores
+    kawa.detached.status_line = match rendered.detached.status_line {
+        kawa::StatusLine::Response {
+            version,
+            code,
+            status,
+            reason,
+        } => kawa::StatusLine::Response {
+            version,
+            code,
+            status: status.capture(buf),
+            reason: reason.capture(buf),
+        },
+        other => other,
+    };
+    kawa.push_block(kawa::Block::StatusLine);
+
+    // Copy all remaining blocks, capturing buffer-dependent Stores
+    for block in rendered.blocks {
+        let captured = match block {
+            kawa::Block::StatusLine => continue, // already handled above
+            kawa::Block::Header(kawa::Pair { key, val }) => kawa::Block::Header(kawa::Pair {
+                key: key.capture(buf),
+                val: val.capture(buf),
+            }),
+            kawa::Block::Chunk(kawa::Chunk { data }) => kawa::Block::Chunk(kawa::Chunk {
+                data: data.capture(buf),
+            }),
+            kawa::Block::Flags(flags) => kawa::Block::Flags(flags),
+            kawa::Block::Cookies => kawa::Block::Cookies,
+            kawa::Block::ChunkHeader(kawa::ChunkHeader { length }) => {
+                kawa::Block::ChunkHeader(kawa::ChunkHeader {
+                    length: length.capture(buf),
+                })
+            }
+        };
+        kawa.push_block(captured);
+    }
+
+    kawa.parsing_phase = rendered.parsing_phase;
+    kawa.body_size = rendered.body_size;
+}
+
+/// Replace the content of the kawa message with a default Sozu answer for a given status code.
+///
+/// Uses the listener's `HttpAnswers` templates to produce responses matching the configured
+/// custom answers, preserving backward compatibility with the kawa_h1 code path.
+fn set_default_answer(
+    stream: &mut Stream,
+    readiness: &mut Readiness,
+    code: u16,
+    answers: &HttpAnswers,
+) {
     let context = &mut stream.context;
     let kawa = &mut stream.back;
     kawa.clear();
@@ -159,22 +234,62 @@ fn set_default_answer(stream: &mut Stream, readiness: &mut Readiness, code: u16)
         507 => "http.507.errors",
         _ => "http.other.errors",
     };
-    // if context.cluster_id.is_some() {
-    //     incr!(key);
-    // }
     incr!(
         key,
         context.cluster_id.as_deref(),
         context.backend_id.as_deref()
     );
-    if code == 301 {
-        let host = context.authority.as_deref().unwrap();
-        let uri = context.path.as_deref().unwrap();
-        fill_default_301_answer(kawa, host, uri);
-    } else {
-        fill_default_answer(kawa, code);
+
+    let request_id = context.id.to_string();
+    let route = get_route(context);
+    let cluster_id = context.cluster_id.as_deref();
+    let backend_id = context.backend_id.as_deref();
+
+    let answer = match code {
+        301 => DefaultAnswer::Answer301 {
+            location: format!(
+                "https://{}{}",
+                context.authority.as_deref().unwrap_or_default(),
+                context.path.as_deref().unwrap_or_default()
+            ),
+        },
+        400 => DefaultAnswer::Answer400 {
+            message: String::new(),
+            phase: kawa::ParsingPhaseMarker::Error,
+            successfully_parsed: String::from("null"),
+            partially_parsed: String::from("null"),
+            invalid: String::from("null"),
+        },
+        401 => DefaultAnswer::Answer401 {},
+        404 => DefaultAnswer::Answer404 {},
+        408 => DefaultAnswer::Answer408 {
+            duration: String::new(),
+        },
+        502 => DefaultAnswer::Answer502 {
+            message: String::new(),
+            phase: kawa::ParsingPhaseMarker::Error,
+            successfully_parsed: String::from("null"),
+            partially_parsed: String::from("null"),
+            invalid: String::from("null"),
+        },
+        503 => DefaultAnswer::Answer503 {
+            message: String::new(),
+        },
+        504 => DefaultAnswer::Answer504 {
+            duration: String::new(),
+        },
+        _ => DefaultAnswer::Answer503 {
+            message: format!("Unexpected error code: {code}"),
+        },
+    };
+
+    if code != 301 {
         context.keep_alive_frontend = false;
     }
+
+    let rendered = answers.get(answer, request_id, cluster_id, backend_id, route);
+    copy_default_answer_to_stream(rendered, kawa);
+
     context.status = Some(code);
     stream.state = StreamState::Unlinked;
     readiness.interest.insert(Ready::WRITABLE);
@@ -1526,6 +1641,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             }
 
             let context = &mut self.context;
+            let answers_rc = context.listener.borrow().get_answers().clone();
             let mut dirty = false;
             for stream_id in 0..context.streams.len() {
                 if context.streams[stream_id].state == StreamState::Link {
@@ -1547,26 +1663,27 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                         Err(error) => {
                             println_!("Connection error: {error}");
                             let stream = &mut context.streams[stream_id];
+                            let answers = answers_rc.borrow();
                             use BackendConnectionError as BE;
                             match error {
                                 BE::Backend(BackendError::NoBackendForCluster(_))
                                 | BE::MaxConnectionRetries(_)
                                 | BE::MaxSessionsMemory
                                 | BE::MaxBuffers => {
-                                    set_default_answer(stream, front_readiness, 503);
+                                    set_default_answer(stream, front_readiness, 503, &answers);
                                 }
                                 BE::RetrieveClusterError(
                                     RetrieveClusterError::RetrieveFrontend(_),
                                 ) => {
-                                    set_default_answer(stream, front_readiness, 404);
+                                    set_default_answer(stream, front_readiness, 404, &answers);
                                 }
                                 BE::RetrieveClusterError(
                                     RetrieveClusterError::UnauthorizedRoute,
                                 ) => {
-                                    set_default_answer(stream, front_readiness, 401);
+                                    set_default_answer(stream, front_readiness, 401, &answers);
                                 }
                                 BE::RetrieveClusterError(RetrieveClusterError::HttpsRedirect) => {
-                                    set_default_answer(stream, front_readiness, 301);
+                                    set_default_answer(stream, front_readiness, 301, &answers);
                                 }
 
                                 BE::Backend(_) => {}
@@ -1603,6 +1720,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             Connection::H1(_) => false,
             Connection::H2(_) => true,
         };
+        let answers_rc = self.context.listener.borrow().get_answers().clone();
         let mut should_close = true;
         let mut should_write = false;
         if self.frontend_token == token {
@@ -1616,14 +1734,16 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                         // In h2 an Idle stream doesn't necessarily hold a request yet,
                         // in most cases it was just reserved, so we can just ignore them.
                         if !front_is_h2 {
-                            set_default_answer(stream, front_readiness, 408);
+                            let answers = answers_rc.borrow();
+                            set_default_answer(stream, front_readiness, 408, &answers);
                             should_write = true;
                         }
                     }
                     StreamState::Link => {
                         // This is an unusual case, as we have both a complete request and no
                         // available backend yet. For now, we answer with 503
-                        set_default_answer(stream, front_readiness, 503);
+                        let answers = answers_rc.borrow();
+                        set_default_answer(stream, front_readiness, 503, &answers);
                         should_write = true;
                     }
                     StreamState::Linked(_) => {
@@ -1666,7 +1786,8 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                         } else if !stream.back.consumed {
                             // The response has not started yet
                             println_!("Stream still waiting for response, send 504");
-                            set_default_answer(stream, front_readiness, 504);
+                            let answers = answers_rc.borrow();
+                            set_default_answer(stream, front_readiness, 504, &answers);
                             should_write = true;
                         } else {
                             println_!(

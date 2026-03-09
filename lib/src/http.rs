@@ -523,6 +523,10 @@ impl L7ListenerHandler for HttpListener {
 
         Ok(route)
     }
+
+    fn get_answers(&self) -> &Rc<RefCell<HttpAnswers>> {
+        &self.answers
+    }
 }
 
 pub struct HttpProxy {

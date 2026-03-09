@@ -614,6 +614,10 @@ impl L7ListenerHandler for HttpsListener {
 
         Ok(route)
     }
+
+    fn get_answers(&self) -> &Rc<RefCell<HttpAnswers>> {
+        &self.answers
+    }
 }
 
 impl HttpsListener {

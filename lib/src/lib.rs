@@ -349,7 +349,7 @@ use std::{
 use backends::BackendError;
 use hex::FromHexError;
 use mio::{Interest, Token, net::TcpStream};
-use protocol::http::{answers::TemplateError, parser::Method};
+use protocol::http::{answers::HttpAnswers, answers::TemplateError, parser::Method};
 use router::RouterError;
 use socket::ServerBindError;
 use sozu_command::{
@@ -558,6 +558,9 @@ pub trait L7ListenerHandler {
         uri: &str,
         method: &Method,
     ) -> Result<Route, FrontendFromRequestError>;
+
+    /// retrieve the listener's configured HTTP answers (templates)
+    fn get_answers(&self) -> &Rc<RefCell<HttpAnswers>>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
