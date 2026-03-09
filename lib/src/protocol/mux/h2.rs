@@ -168,7 +168,6 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         E: Endpoint,
         L: ListenerHandler + L7ListenerHandler,
     {
-        println_!("======= MUX H2 READABLE {:?}", self.position);
         self.timeout_container.reset();
         let (stream_id, kawa) = if let Some((stream_id, amount)) = self.expect_read {
             let (kawa, did) = match stream_id {
@@ -481,11 +480,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         E: Endpoint,
         L: ListenerHandler + L7ListenerHandler,
     {
-        println_!("======= MUX H2 WRITABLE {:?}", self.position);
         self.timeout_container.reset();
         if let Some(H2StreamId::Zero) = self.expect_write {
             let kawa = &mut self.zero;
-            println_!("{:?}", kawa.storage.data());
             while !kawa.storage.is_empty() {
                 let (size, status) = self.socket.socket_write(kawa.storage.data());
                 context.debug.push(DebugEvent::I2(1, size));
@@ -972,7 +969,6 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         return self.goaway(H2Error::ProtocolError);
                     }
                 }
-                println_!("{:#?}", self.peer_settings);
 
                 let kawa = &mut self.zero;
                 kawa.storage.space()[0..serializer::SETTINGS_ACKNOWLEDGEMENT.len()]
