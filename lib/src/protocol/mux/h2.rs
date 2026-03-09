@@ -1150,6 +1150,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 unreachable!()
             }
             Position::Server => {
+                let answers_rc = context.listener.borrow().get_answers().clone();
                 let stream = &mut context.streams[stream_gid];
                 match (stream.front.consumed, stream.back.is_main_phase()) {
                     (_, true) => {
@@ -1184,7 +1185,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         context.debug.push(DebugEvent::Str(format!(
                             "Can't retry, send 502 on {stream_gid}"
                         )));
-                        set_default_answer(stream, &mut self.readiness, 502);
+                        let answers = answers_rc.borrow();
+                        set_default_answer(stream, &mut self.readiness, 502, &answers);
                     }
                     (false, false) => {
                         // we do not have an answer, but the request is untouched so we can retry
