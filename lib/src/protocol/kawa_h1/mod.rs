@@ -144,7 +144,7 @@ pub enum ResponseStream {
     BackendAnswer(GenericHttpStream),
     DefaultAnswer(u16, DefaultAnswerStream),
     DefaultAnswerKA(u16, DefaultAnswerStream, Box<GenericHttpStream>),
-    Swaping,
+    Swapping,
 }
 
 #[derive(Debug)]
@@ -627,7 +627,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         if response_stream.is_completed() {
             save_http_status_metric(self.context.status, self.context.log_context());
             self.log_request_success(metrics);
-            return match mem::replace(&mut self.response_stream, ResponseStream::Swaping) {
+            return match mem::replace(&mut self.response_stream, ResponseStream::Swapping) {
                 ResponseStream::DefaultAnswerKA(_, _, kawa_back) => {
                     self.response_stream = ResponseStream::BackendAnswer(*kawa_back);
                     metrics.reset();
@@ -656,7 +656,10 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
     pub fn backend_writable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
         trace!("{} ============== backend_writable", log_context!(self));
-        if let ResponseStream::DefaultAnswer(..) = self.response_stream {
+        if matches!(
+            self.response_stream,
+            ResponseStream::DefaultAnswer(..) | ResponseStream::DefaultAnswerKA(..)
+        ) {
             error!(
                 "{}\tsending default answer, should not write to back",
                 log_context!(self)
@@ -1027,7 +1030,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         self.context.status = Some(answer_status);
         self.context.reason = None;
         if keep_alive {
-            match mem::replace(&mut self.response_stream, ResponseStream::Swaping) {
+            match mem::replace(&mut self.response_stream, ResponseStream::Swapping) {
                 ResponseStream::BackendAnswer(back_kawa) => {
                     self.response_stream =
                         ResponseStream::DefaultAnswerKA(answer_status, kawa, Box::new(back_kawa));
@@ -1341,7 +1344,14 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         } else if let Some(cluster_id) = self.context.cluster_id.take() {
             cluster_id
         } else {
-            unreachable!();
+            error!(
+                "{} connect_to_backend called with connection_attempts > 0 but no cluster_id",
+                log_context!(self),
+            );
+            self.set_answer(DefaultAnswer::Answer503 {
+                message: "Missing cluster_id on backend reconnection attempt".into(),
+            });
+            return Err(BackendConnectionError::MaxConnectionRetries(None));
         };
 
         // update response cluster producer
@@ -1952,7 +1962,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> SessionState 
             ResponseStream::BackendAnswer(kawa) => format!("{:?}", kawa.parsing_phase),
             ResponseStream::DefaultAnswer(status, ..)
             | ResponseStream::DefaultAnswerKA(status, ..) => format!("DefaultAnswer({status})"),
-            ResponseStream::Swaping => unreachable!(),
+            ResponseStream::Swapping => unreachable!(),
         };
         error!(
             "{} {} kawa_front={:?}, kawa_back={}",
