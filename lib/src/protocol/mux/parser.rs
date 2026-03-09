@@ -593,9 +593,10 @@ pub fn ping_frame<'a>(
 
 #[derive(Clone, Debug)]
 pub struct GoAway {
-    pub _last_stream_id: u32,
+    pub last_stream_id: u32,
     pub error_code: u32,
-    pub _additional_debug_data: Slice,
+    #[allow(dead_code)]
+    pub additional_debug_data: Slice,
 }
 
 pub fn goaway_frame<'a>(
@@ -608,9 +609,9 @@ pub fn goaway_frame<'a>(
     Ok((
         remaining,
         Frame::GoAway(GoAway {
-            _last_stream_id: last_stream_id,
+            last_stream_id,
             error_code,
-            _additional_debug_data: Slice::new(input, additional_debug_data),
+            additional_debug_data: Slice::new(input, additional_debug_data),
         }),
     ))
 }

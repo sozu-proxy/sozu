@@ -1118,12 +1118,14 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 self.expect_write = Some(H2StreamId::Zero);
             }
             Frame::GoAway(goaway) => {
-                println_!(
-                    "GoAway({} -> {})",
-                    goaway.error_code,
+                error!(
+                    "Received GOAWAY: last_stream_id={}, error={}",
+                    goaway.last_stream_id,
                     error_code_to_str(goaway.error_code)
                 );
-                // return self.goaway(H2Error::NoError);
+                // RFC 9113 §6.8: respond with GOAWAY and begin graceful shutdown.
+                // Streams above last_stream_id were not processed by the peer.
+                return self.goaway(H2Error::NoError);
             }
             Frame::WindowUpdate(WindowUpdate {
                 stream_id,
