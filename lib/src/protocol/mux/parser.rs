@@ -1,16 +1,3 @@
-#![allow(
-    unused_variables,
-    unused_assignments,
-    dead_code,
-    clippy::large_enum_variant,
-    clippy::match_like_matches_macro,
-    clippy::match_single_binding,
-    clippy::needless_lifetimes,
-    clippy::clone_on_copy,
-    clippy::len_zero,
-    clippy::manual_range_contains,
-    clippy::new_without_default
-)]
 use std::convert::From;
 
 use kawa::repr::Slice;
@@ -253,6 +240,7 @@ pub enum Frame {
 }
 
 impl Frame {
+    #[allow(dead_code)]
     pub fn is_stream_specific(&self) -> bool {
         match self {
             Frame::Data(_)
@@ -266,14 +254,15 @@ impl Frame {
         }
     }
 
+    #[allow(dead_code)]
     pub fn stream_id(&self) -> u32 {
         match self {
             Frame::Data(d) => d.stream_id,
             Frame::Headers(h) => h.stream_id,
             Frame::Priority(p) => p.stream_id,
             Frame::RstStream(r) => r.stream_id,
-            Frame::PushPromise(p) => p.stream_id,
-            Frame::Continuation(c) => c.stream_id,
+            Frame::PushPromise(p) => p._stream_id,
+            Frame::Continuation(c) => c._stream_id,
             Frame::Settings(_) | Frame::Ping(_) | Frame::GoAway(_) => 0,
             Frame::WindowUpdate(w) => w.stream_id,
         }
@@ -541,10 +530,10 @@ pub fn settings_frame<'a>(
 
 #[derive(Clone, Debug)]
 pub struct PushPromise {
-    pub stream_id: u32,
-    pub promised_stream_id: u32,
-    pub header_block_fragment: Slice,
-    pub end_headers: bool,
+    pub _stream_id: u32,
+    pub _promised_stream_id: u32,
+    pub _header_block_fragment: Slice,
+    pub _end_headers: bool,
 }
 
 pub fn push_promise_frame<'a>(
@@ -573,10 +562,10 @@ pub fn push_promise_frame<'a>(
     Ok((
         remaining,
         Frame::PushPromise(PushPromise {
-            stream_id: header.stream_id,
-            promised_stream_id,
-            header_block_fragment: Slice::new(input, header_block_fragment),
-            end_headers: header.flags & 0x4 != 0,
+            _stream_id: header.stream_id,
+            _promised_stream_id: promised_stream_id,
+            _header_block_fragment: Slice::new(input, header_block_fragment),
+            _end_headers: header.flags & 0x4 != 0,
         }),
     ))
 }
@@ -604,9 +593,9 @@ pub fn ping_frame<'a>(
 
 #[derive(Clone, Debug)]
 pub struct GoAway {
-    pub last_stream_id: u32,
+    pub _last_stream_id: u32,
     pub error_code: u32,
-    pub additional_debug_data: Slice,
+    pub _additional_debug_data: Slice,
 }
 
 pub fn goaway_frame<'a>(
@@ -619,9 +608,9 @@ pub fn goaway_frame<'a>(
     Ok((
         remaining,
         Frame::GoAway(GoAway {
-            last_stream_id,
+            _last_stream_id: last_stream_id,
             error_code,
-            additional_debug_data: Slice::new(input, additional_debug_data),
+            _additional_debug_data: Slice::new(input, additional_debug_data),
         }),
     ))
 }
@@ -658,9 +647,9 @@ pub fn window_update_frame<'a>(
 
 #[derive(Clone, Debug)]
 pub struct Continuation {
-    pub stream_id: u32,
-    pub header_block_fragment: Slice,
-    pub end_headers: bool,
+    pub _stream_id: u32,
+    pub _header_block_fragment: Slice,
+    pub _end_headers: bool,
 }
 
 pub fn continuation_frame<'a>(
@@ -671,9 +660,9 @@ pub fn continuation_frame<'a>(
     Ok((
         i,
         Frame::Continuation(Continuation {
-            stream_id: header.stream_id,
-            header_block_fragment: Slice::new(input, header_block_fragment),
-            end_headers: header.flags & 0x4 != 0,
+            _stream_id: header.stream_id,
+            _header_block_fragment: Slice::new(input, header_block_fragment),
+            _end_headers: header.flags & 0x4 != 0,
         }),
     ))
 }

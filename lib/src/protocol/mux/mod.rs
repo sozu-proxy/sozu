@@ -1,16 +1,3 @@
-#![allow(
-    unused_variables,
-    unused_assignments,
-    clippy::large_enum_variant,
-    clippy::match_like_matches_macro,
-    clippy::match_single_binding,
-    clippy::needless_lifetimes,
-    clippy::clone_on_copy,
-    clippy::len_zero,
-    clippy::manual_range_contains,
-    clippy::new_without_default,
-    dead_code
-)]
 use std::{
     cell::RefCell,
     collections::HashMap,
@@ -301,12 +288,6 @@ fn forcefully_terminate_answer(stream: &mut Stream, readiness: &mut Readiness, e
     let kawa = &mut stream.back;
     kawa.out.clear();
     kawa.blocks.clear();
-    // kawa.push_block(kawa::Block::Flags(kawa::Flags {
-    //     end_body: false,
-    //     end_chunk: false,
-    //     end_header: false,
-    //     end_stream: true,
-    // }));
     kawa.parsing_phase
         .error(error_code_to_str(error as u32).into());
     debug_kawa(kawa);
@@ -389,6 +370,7 @@ pub trait Endpoint: Debug {
 }
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum Connection<Front: SocketHandler> {
     H1(ConnectionH1<Front>),
     H2(ConnectionH2<Front>),
@@ -553,6 +535,7 @@ impl<Front: SocketHandler> Connection<Front> {
             Connection::H2(c) => &mut c.timeout_container,
         }
     }
+    #[allow(dead_code)]
     fn force_disconnect(&mut self) -> MuxResult {
         match self {
             Connection::H1(c) => c.force_disconnect(),
@@ -645,7 +628,7 @@ struct EndpointClient<'a>(&'a mut Router);
 
 // note: EndpointServer are used by client Connection, they do not know the frontend Token
 // they will use the Stream's Token which is their backend token
-impl<'a, Front: SocketHandler + Debug> Endpoint for EndpointServer<'a, Front> {
+impl<Front: SocketHandler + Debug> Endpoint for EndpointServer<'_, Front> {
     fn readiness(&self, _token: Token) -> &Readiness {
         self.0.readiness()
     }
@@ -662,16 +645,17 @@ impl<'a, Front: SocketHandler + Debug> Endpoint for EndpointServer<'a, Front> {
         self.0.end_stream(stream, context);
     }
 
-    fn start_stream<L>(&mut self, token: Token, stream: GlobalStreamId, context: &mut Context<L>)
+    fn start_stream<L>(&mut self, _token: Token, stream: GlobalStreamId, context: &mut Context<L>)
     where
         L: ListenerHandler + L7ListenerHandler,
     {
-        // this may be used to forward H2<->H2 PushPromise
-        todo!()
-        // self.0.start_stream(stream, context);
+        // Forward stream start to the frontend connection.
+        // This is used when a backend H2 connection starts a new stream
+        // (e.g. for H2<->H2 proxying or PUSH_PROMISE forwarding).
+        self.0.start_stream(stream, context);
     }
 }
-impl<'a> Endpoint for EndpointClient<'a> {
+impl Endpoint for EndpointClient<'_> {
     fn readiness(&self, token: Token) -> &Readiness {
         self.0.backends.get(&token).unwrap().readiness()
     }
@@ -792,15 +776,11 @@ pub enum StreamState {
 
 impl StreamState {
     fn is_open(&self) -> bool {
-        match self {
-            StreamState::Idle | StreamState::Recycle => false,
-            _ => true,
-        }
+        !matches!(self, StreamState::Idle | StreamState::Recycle)
     }
 }
 
 pub struct Stream {
-    // pub request_id: Ulid,
     pub window: i32,
     pub attempts: u8,
     pub state: StreamState,
@@ -976,26 +956,20 @@ impl Stream {
     }
 }
 
-// trait DebugHistory {
-//     fn push(&mut self, event: DebugEvent);
-//     fn set_interesting(&mut self, val: bool);
-// }
+#[derive(Default)]
 pub struct DebugHistory {
     pub events: Vec<DebugEvent>,
     pub is_interesting: bool,
 }
 impl DebugHistory {
     pub fn new() -> Self {
-        Self {
-            events: Vec::new(),
-            is_interesting: false,
-        }
+        Self::default()
     }
-    pub fn push(&mut self, event: DebugEvent) {
-        //self.events.push(event);
+    pub fn push(&mut self, _event: DebugEvent) {
+        //self.events.push(_event);
     }
-    pub fn set_interesting(&mut self, val: bool) {
-        //self.is_interesting = val;
+    pub fn set_interesting(&mut self, _val: bool) {
+        //self.is_interesting = _val;
     }
     pub fn is_interesting(&mut self) -> bool {
         self.is_interesting
@@ -1143,8 +1117,7 @@ impl Router {
          */
 
         let mut reuse_token = None;
-        // let mut priority = 0;
-        let mut reuse_connecting = true;
+        let reuse_connecting = true;
         for (token, backend) in &self.backends {
             match (h2, reuse_connecting, backend.position()) {
                 (_, _, Position::Server) => {
@@ -1156,7 +1129,6 @@ impl Router {
                 (true, _, Position::Client(other_cluster_id, _, BackendStatus::Connected)) => {
                     if *other_cluster_id == cluster_id {
                         reuse_token = Some(*token);
-                        reuse_connecting = false;
                         break;
                     }
                 }
@@ -1178,7 +1150,6 @@ impl Router {
                 (false, _, Position::Client(old_cluster_id, _, BackendStatus::KeepAlive)) => {
                     if *old_cluster_id == cluster_id {
                         reuse_token = Some(*token);
-                        reuse_connecting = false;
                         break;
                     }
                 }
@@ -1193,8 +1164,6 @@ impl Router {
 
         let token = if let Some(token) = reuse_token {
             println_!("reused backend: {:#?}", self.backends.get(&token).unwrap());
-            // stream.metrics.backend_start();
-            // stream.metrics.backend_connected();
             token
         } else {
             let (mut socket, backend) = self.backend_from_request(
@@ -1671,7 +1640,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                         .connect(stream_id, context, session.clone(), proxy.clone())
                     {
                         Ok(_) => {
-                            let state = context.streams[stream_id].state.clone();
+                            let state = context.streams[stream_id].state;
                             context.debug.push(DebugEvent::CC(stream_id, state));
                         }
                         Err(error) => {

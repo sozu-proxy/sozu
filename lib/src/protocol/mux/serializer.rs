@@ -1,16 +1,3 @@
-#![allow(
-    unused_variables,
-    unused_assignments,
-    dead_code,
-    clippy::large_enum_variant,
-    clippy::match_like_matches_macro,
-    clippy::match_single_binding,
-    clippy::needless_lifetimes,
-    clippy::clone_on_copy,
-    clippy::len_zero,
-    clippy::manual_range_contains,
-    clippy::new_without_default
-)]
 use cookie_factory::{
     GenError,
     bytes::{be_u8, be_u16, be_u24, be_u32},

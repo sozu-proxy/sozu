@@ -1,16 +1,3 @@
-#![allow(
-    unused_variables,
-    unused_assignments,
-    dead_code,
-    clippy::large_enum_variant,
-    clippy::match_like_matches_macro,
-    clippy::match_single_binding,
-    clippy::needless_lifetimes,
-    clippy::clone_on_copy,
-    clippy::len_zero,
-    clippy::manual_range_contains,
-    clippy::new_without_default
-)]
 use std::{io::Write, str::from_utf8};
 
 use kawa::{
@@ -33,7 +20,7 @@ use crate::{
 /// Returns true if the header name contains any uppercase ASCII letter (A-Z).
 /// RFC 9113 section 8.2 requires all header field names to be lowercase in HTTP/2.
 fn has_uppercase_ascii(name: &[u8]) -> bool {
-    name.iter().any(|&b| b >= b'A' && b <= b'Z')
+    name.iter().any(|b| b.is_ascii_uppercase())
 }
 
 /// Returns true if the header name is a connection-specific header field
@@ -168,6 +155,10 @@ where
                 error!("INVALID FRAGMENT: {:?}", error);
                 return Err((H2Error::CompressionError, true));
             }
+            // Note: Store::is_empty() only matches Store::Empty, not Store::Slice { len: 0 }.
+            // We must use len() == 0 to catch empty pseudo-header values like `:path: ""`.
+            // RFC 9113 §8.3.1 requires all four pseudo-headers to be present and non-empty.
+            #[allow(clippy::len_zero)]
             if invalid_headers
                 || method.len() == 0
                 || authority.len() == 0
@@ -246,6 +237,7 @@ where
                 error!("INVALID FRAGMENT: {:?}", error);
                 return Err((H2Error::CompressionError, true));
             }
+            #[allow(clippy::len_zero)]
             if invalid_headers || status.len() == 0 {
                 error!("INVALID HEADERS");
                 return Err((H2Error::ProtocolError, false));
