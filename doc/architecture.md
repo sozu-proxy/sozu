@@ -43,9 +43,21 @@ Each proxy implementation (HTTP, HTTPS and TCP) will use in each client session 
 - once the handshake is done, upgrade to the HTTP protocol over the recently negotiated TLS stream
 - upgrade to websockets
 
-Each protocol will work with the `Readiness` structure to indicate if it wants to read or write on each socket. As an example, the [OpenSSL based handshake](https://github.com/sozu-proxy/sozu/blob/3111e2db420d2773b1f0404d6556f40b2f2ea85b/lib/src/network/protocol/openssl.rs) is only interested in the frontend socket.
+Each protocol will work with the `Readiness` structure to indicate if it wants to read or write on each socket. As an example, the [rustls based handshake](https://github.com/sozu-proxy/sozu/blob/main/lib/src/protocol/rustls.rs) is only interested in the frontend socket.
 
-They are all defined in [`lib/src/network/protocol`](https://github.com/sozu-proxy/sozu/tree/3111e2db420d2773b1f0404d6556f40b2f2ea85b/lib/src/network/protocol).
+They are all defined in [`lib/src/protocol`](https://github.com/sozu-proxy/sozu/tree/main/lib/src/protocol).
+
+### HTTP/2 and the Mux layer
+
+HTTP/2 support is implemented via a unified multiplexer (`Mux`) in `lib/src/protocol/mux/`. The Mux layer handles both HTTP/1.1 and HTTP/2 connections through a `Connection` enum with `H1` and `H2` variants. This allows any combination of frontend and backend protocols: H1→H1, H1→H2, H2→H1, and H2→H2.
+
+Key design decisions:
+
+- **Bidirectional streams**: Each `Stream` is shared between a frontend and backend connection. Direction-specific fields (e.g., `front_received_end_of_stream`, `back_received_end_of_stream`) prevent cross-contamination between the two sides.
+- **StreamParts pattern**: `Stream::split(&position)` returns position-aware mutable borrows — a server reads from `front` and writes to `back`, while a client reads from `back` and writes to `front`.
+- **Flow control**: RFC 9113 §6.9 connection-level and stream-level WINDOW_UPDATE with threshold-based sending (50% of initial window size). WINDOW_UPDATE frames are flushed inline during `writable()` to avoid extra event loop iterations.
+- **HPACK**: Header compression uses `loona-hpack`. Decode callbacks are hardened against panics — all `write_all()` calls use fallible error handling.
+- **H2 backend**: Controlled by `cluster.http2` in the protobuf config. Sōzu connects to backends over plain TCP speaking H2 (h2c). The `:scheme` pseudo-header is derived from the frontend listener protocol (HTTP or HTTPS).
 
 ## Logging
 
