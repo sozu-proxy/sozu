@@ -115,21 +115,22 @@ pub enum ParserErrorKind {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+#[repr(u32)]
 pub enum H2Error {
-    NoError,
-    ProtocolError,
-    InternalError,
-    FlowControlError,
-    SettingsTimeout,
-    StreamClosed,
-    FrameSizeError,
-    RefusedStream,
-    Cancel,
-    CompressionError,
-    ConnectError,
-    EnhanceYourCalm,
-    InadequateSecurity,
-    HTTP11Required,
+    NoError = 0x0,
+    ProtocolError = 0x1,
+    InternalError = 0x2,
+    FlowControlError = 0x3,
+    SettingsTimeout = 0x4,
+    StreamClosed = 0x5,
+    FrameSizeError = 0x6,
+    RefusedStream = 0x7,
+    Cancel = 0x8,
+    CompressionError = 0x9,
+    ConnectError = 0xa,
+    EnhanceYourCalm = 0xb,
+    InadequateSecurity = 0xc,
+    HTTP11Required = 0xd,
 }
 
 impl<'a> ParserError<'a> {
@@ -174,21 +175,6 @@ pub fn preface(i: &[u8]) -> IResult<&[u8], &[u8]> {
 }
 
 // https://httpwg.org/specs/rfc7540.html#rfc.section.4.1
-/*named!(pub frame_header<FrameHeader>,
-  do_parse!(
-    payload_len: dbg_dmp!(be_u24) >>
-    frame_type: map_opt!(be_u8, convert_frame_type) >>
-    flags: dbg_dmp!(be_u8) >>
-    stream_id: dbg_dmp!(verify!(be_u32, |id| {
-      match frame_type {
-
-      }
-    }) >>
-    (FrameHeader { payload_len, frame_type, flags, stream_id })
-  )
-);
-  */
-
 pub fn frame_header(input: &[u8], max_frame_size: u32) -> IResult<&[u8], FrameHeader, ParserError> {
     let (i, payload_len) = be_u24(input)?;
     if payload_len > max_frame_size {
@@ -653,7 +639,7 @@ pub fn window_update_frame<'a>(
     let (i, increment) = be_u32(input)?;
     let increment = increment & 0x7FFFFFFF;
 
-    //FIXME: if stream id is 0, trat it as connection error?
+    //FIXME: if stream id is 0, treat it as connection error?
     if increment == 0 {
         return Err(Err::Failure(ParserError::new_h2(
             input,

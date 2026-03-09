@@ -86,9 +86,16 @@ where
                     authority = val;
                 } else if k.starts_with(b":") {
                     invalid_headers = true;
-                } else if compare_no_case(&k, b"cookie---") {
+                } else if compare_no_case(&k, b"cookie") {
                     regular_headers = true;
-                    todo!("cookies should be split in pairs");
+                    // TODO: cookies should be split into individual pairs per RFC 9113 section 8.2.3
+                    // For now, forward the full cookie header as-is
+                    kawa.storage.write_all(&k).unwrap();
+                    let key = Store::Slice(Slice {
+                        start: start + len_val,
+                        len: len_key,
+                    });
+                    kawa.push_block(Block::Header(Pair { key, val }));
                 } else {
                     regular_headers = true;
                     if compare_no_case(&k, b"content-length") {

@@ -84,7 +84,7 @@ pub type MuxTls = Mux<FrontRustls, HttpsListener>;
 
 pub fn fill_default_301_answer<T: kawa::AsBuffer>(kawa: &mut kawa::Kawa<T>, host: &str, uri: &str) {
     kawa.detached.status_line = kawa::StatusLine::Response {
-        version: kawa::Version::V20,
+        version: kawa::Version::V11,
         code: 301,
         status: kawa::Store::Static(b"301"),
         reason: kawa::Store::Static(b"Moved Permanently"),
@@ -98,11 +98,23 @@ pub fn fill_default_301_answer<T: kawa::AsBuffer>(kawa: &mut kawa::Kawa<T>, host
 }
 
 pub fn fill_default_answer<T: kawa::AsBuffer>(kawa: &mut kawa::Kawa<T>, code: u16) {
+    let reason: &'static [u8] = match code {
+        400 => b"Bad Request",
+        401 => b"Unauthorized",
+        404 => b"Not Found",
+        408 => b"Request Timeout",
+        413 => b"Payload Too Large",
+        502 => b"Bad Gateway",
+        503 => b"Service Unavailable",
+        504 => b"Gateway Timeout",
+        507 => b"Insufficient Storage",
+        _ => b"Sozu Default Answer",
+    };
     kawa.detached.status_line = kawa::StatusLine::Response {
-        version: kawa::Version::V20,
+        version: kawa::Version::V11,
         code,
         status: kawa::Store::from_string(code.to_string()),
-        reason: kawa::Store::Static(b"Sozu Default Answer"),
+        reason: kawa::Store::Static(reason),
     };
     kawa.push_block(kawa::Block::StatusLine);
     terminate_default_answer(kawa, true);
@@ -119,10 +131,6 @@ pub fn terminate_default_answer<T: kawa::AsBuffer>(kawa: &mut kawa::Kawa<T>, clo
             val: kawa::Store::Static(b"close"),
         }));
     }
-    kawa.push_block(kawa::Block::Header(kawa::Pair {
-        key: kawa::Store::Static(b"Content-Length"),
-        val: kawa::Store::Static(b"0"),
-    }));
     kawa.push_block(kawa::Block::Flags(kawa::Flags {
         end_body: false,
         end_chunk: false,

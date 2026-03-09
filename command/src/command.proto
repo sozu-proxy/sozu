@@ -376,6 +376,7 @@ message Cluster {
     required LoadBalancingAlgorithms load_balancing = 5 [default = ROUND_ROBIN];
     optional string answer_503 = 6;
     optional LoadMetric load_metric = 7;
+    // whether to use HTTP/2 for backend connections to this cluster
     optional bool http2 = 8;
 }
 
