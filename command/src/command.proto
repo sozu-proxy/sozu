@@ -99,6 +99,10 @@ message Request {
     // query the state about how many requests of each type has been received
     // since startup
     CountRequests count_requests = 46;
+    // set the maximum number of connections per source IP (0 = unlimited)
+    uint64 set_max_connections_per_ip = 47;
+    // query the current maximum connections per source IP limit
+    QueryMaxConnectionsPerIp query_max_connections_per_ip = 48;
   }
 }
 
@@ -112,6 +116,7 @@ message SoftStop {}
 message HardStop {}
 message ReturnListenSockets {}
 message CountRequests {}
+message QueryMaxConnectionsPerIp {}
 
 // details of an HTTP listener
 message HttpListenerConfig {
@@ -495,6 +500,8 @@ message ResponseContent {
         CertificatesWithFingerprints certificates_with_fingerprints = 12;
         // a census of the types of requests received since startup,
         RequestCounts request_counts = 13;
+        // the current max connections per IP limit
+        MaxConnectionsPerIpLimit max_connections_per_ip_limit = 14;
     }
 }
 
@@ -663,6 +670,10 @@ message Bucket {
 
 message RequestCounts {
     map<string, int32> map = 1;
+}
+
+message MaxConnectionsPerIpLimit {
+    required uint64 limit = 1;
 }
 
 // matches std::net::SocketAddr in the Rust library

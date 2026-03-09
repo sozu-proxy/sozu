@@ -79,7 +79,9 @@ impl Request {
             | RequestType::Logging(_)
             | RequestType::QueryClustersHashes(_)
             | RequestType::QueryClusterById(_)
-            | RequestType::QueryClustersByDomain(_) => {}
+            | RequestType::QueryClustersByDomain(_)
+            | RequestType::SetMaxConnectionsPerIp(_)
+            | RequestType::QueryMaxConnectionsPerIp(_) => {}
 
             // the Add***Listener and other Listener orders will be handled separately
             // by the notify_proxys function, so we don't give them destinations

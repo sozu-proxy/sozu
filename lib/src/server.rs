@@ -20,9 +20,9 @@ use sozu_command::{
     proto::command::{
         ActivateListener, AddBackend, CertificatesWithFingerprints, Cluster, ClusterHashes,
         ClusterInformations, DeactivateListener, Event, HttpListenerConfig, HttpsListenerConfig,
-        InitialState, ListenerType, LoadBalancingAlgorithms, LoadMetric, MetricsConfiguration,
-        RemoveBackend, Request, ResponseStatus, ServerConfig,
-        TcpListenerConfig as CommandTcpListener, WorkerRequest, WorkerResponse,
+        InitialState, ListenerType, LoadBalancingAlgorithms, LoadMetric,
+        MaxConnectionsPerIpLimit, MetricsConfiguration, RemoveBackend, Request, ResponseStatus,
+        ServerConfig, TcpListenerConfig as CommandTcpListener, WorkerRequest, WorkerResponse,
         request::RequestType, response_content::ContentType,
     },
     ready::Ready,
@@ -952,6 +952,29 @@ impl Server {
                     logger.borrow_mut().set_directives(directives);
                 });
                 push_queue(WorkerResponse::ok(message.id));
+                return;
+            }
+            Some(RequestType::SetMaxConnectionsPerIp(limit)) => {
+                let limit = *limit as usize;
+                info!(
+                    "{} setting max_connections_per_ip to {}",
+                    message.id,
+                    if limit == 0 {
+                        "unlimited".to_owned()
+                    } else {
+                        limit.to_string()
+                    }
+                );
+                self.sessions.borrow_mut().max_connections_per_ip = limit;
+                push_queue(WorkerResponse::ok(message.id));
+                return;
+            }
+            Some(RequestType::QueryMaxConnectionsPerIp(_)) => {
+                let limit = self.sessions.borrow().max_connections_per_ip as u64;
+                push_queue(WorkerResponse::ok_with_content(
+                    message.id,
+                    ContentType::MaxConnectionsPerIpLimit(MaxConnectionsPerIpLimit { limit }).into(),
+                ));
                 return;
             }
             Some(RequestType::QueryClustersHashes(_)) => {

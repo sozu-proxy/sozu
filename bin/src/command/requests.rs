@@ -73,7 +73,9 @@ impl Server {
             | RequestType::RemoveHttpsFrontend(_)
             | RequestType::RemoveListener(_)
             | RequestType::RemoveTcpFrontend(_)
-            | RequestType::ReplaceCertificate(_) => {
+            | RequestType::ReplaceCertificate(_)
+            | RequestType::SetMaxConnectionsPerIp(_)
+            | RequestType::QueryMaxConnectionsPerIp(_) => {
                 worker_request(self, client, request_type);
             }
             RequestType::QueryClustersHashes(_)

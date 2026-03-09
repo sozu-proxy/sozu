@@ -179,11 +179,29 @@ pub enum SubCmd {
         #[clap(subcommand)]
         cmd: ConfigCmd,
     },
+    #[clap(name = "connection-limit", about = "manage per-IP connection limits")]
+    ConnectionLimit {
+        #[clap(subcommand)]
+        cmd: ConnectionLimitCmd,
+    },
     #[clap(
         name = "events",
         about = "receive sozu events about the status of backends"
     )]
     Events,
+}
+
+#[derive(Subcommand, PartialEq, Eq, Clone, Debug)]
+pub enum ConnectionLimitCmd {
+    #[clap(name = "set", about = "Set the maximum number of connections per source IP (0 = unlimited)")]
+    Set {
+        #[clap(help = "maximum number of connections per IP address (0 = unlimited)")]
+        limit: u64,
+    },
+    #[clap(name = "remove", about = "Remove the per-IP connection limit (set to unlimited)")]
+    Remove,
+    #[clap(name = "show", about = "Show the current per-IP connection limit")]
+    Show,
 }
 
 #[derive(Subcommand, PartialEq, Eq, Clone, Debug)]

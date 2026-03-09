@@ -113,6 +113,8 @@ pub fn format_request_type(request_type: &RequestType) -> &str {
         RequestType::ReturnListenSockets(_) => "ReturnListenSockets",
         RequestType::QueryCertificatesFromTheState(_) => "QueryCertificatesFromTheState",
         RequestType::QueryCertificatesFromWorkers(_) => "QueryCertificatesFromWorkers",
+        RequestType::SetMaxConnectionsPerIp(_) => "SetMaxConnectionsPerIp",
+        RequestType::QueryMaxConnectionsPerIp(_) => "QueryMaxConnectionsPerIp",
     }
 }
 
@@ -190,6 +192,14 @@ impl ResponseContent {
             }
             ContentType::Clusters(_) | ContentType::ClusterHashes(_) => Ok(()), // not displayed directly, see print_cluster_responses
             ContentType::CertificatesByAddress(certs) => print_certificates_by_address(certs),
+            ContentType::MaxConnectionsPerIpLimit(limit_info) => {
+                if limit_info.limit == 0 {
+                    println!("Max connections per IP: unlimited (0)");
+                } else {
+                    println!("Max connections per IP: {}", limit_info.limit);
+                }
+                Ok(())
+            }
             ContentType::Event(_event) => Ok(()), // not event displayed yet!
         }
     }

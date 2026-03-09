@@ -207,6 +207,7 @@ impl CommandManager {
                     query_workers,
                 } => self.query_certificates(fingerprint, domain, query_workers),
             },
+            SubCmd::ConnectionLimit { cmd } => self.connection_limit_command(cmd),
             SubCmd::Config { cmd: _ } => Ok(()), // noop, handled at the beginning of the method
             SubCmd::Events => self.events(),
             rest => {

@@ -135,7 +135,9 @@ impl ConfigState {
             | RequestType::QueryClustersHashes(_)
             | RequestType::ConfigureMetrics(_)
             | RequestType::ReturnListenSockets(_)
-            | RequestType::HardStop(_) => Ok(()),
+            | RequestType::HardStop(_)
+            | RequestType::SetMaxConnectionsPerIp(_)
+            | RequestType::QueryMaxConnectionsPerIp(_) => Ok(()),
 
             _other_request => Err(StateError::UndispatchableRequest),
         }

@@ -9,17 +9,18 @@ use sozu_command_lib::{
         ActivateListener, AddBackend, AddCertificate, Cluster, CountRequests, DeactivateListener,
         FrontendFilters, HardStop, ListListeners, ListenerType, LoadBalancingParams,
         MetricsConfiguration, PathRule, ProxyProtocolConfig, QueryCertificatesFilters,
-        QueryClusterByDomain, QueryClustersHashes, RemoveBackend, RemoveCertificate,
-        RemoveListener, ReplaceCertificate, RequestHttpFrontend, RequestTcpFrontend, RulePosition,
-        SocketAddress, SoftStop, Status, SubscribeEvents, TlsVersion, request::RequestType,
+        QueryClusterByDomain, QueryClustersHashes, QueryMaxConnectionsPerIp, RemoveBackend,
+        RemoveCertificate, RemoveListener, ReplaceCertificate, RequestHttpFrontend,
+        RequestTcpFrontend, RulePosition, SocketAddress, SoftStop, Status, SubscribeEvents,
+        TlsVersion, request::RequestType,
     },
 };
 
 use super::CtlError;
 use crate::{
     cli::{
-        BackendCmd, ClusterCmd, HttpFrontendCmd, HttpListenerCmd, HttpsListenerCmd, MetricsCmd,
-        TcpFrontendCmd, TcpListenerCmd,
+        BackendCmd, ClusterCmd, ConnectionLimitCmd, HttpFrontendCmd, HttpListenerCmd,
+        HttpsListenerCmd, MetricsCmd, TcpFrontendCmd, TcpListenerCmd,
     },
     ctl::CommandManager,
 };
@@ -610,5 +611,21 @@ impl CommandManager {
     pub fn upgrade_worker(&mut self, worker_id: u32) -> Result<(), CtlError> {
         debug!("upgrading worker {}", worker_id);
         self.send_request(RequestType::UpgradeWorker(worker_id).into())
+    }
+
+    pub fn connection_limit_command(&mut self, cmd: ConnectionLimitCmd) -> Result<(), CtlError> {
+        match cmd {
+            ConnectionLimitCmd::Set { limit } => {
+                self.send_request(RequestType::SetMaxConnectionsPerIp(limit).into())
+            }
+            ConnectionLimitCmd::Remove => {
+                self.send_request(RequestType::SetMaxConnectionsPerIp(0).into())
+            }
+            ConnectionLimitCmd::Show => {
+                self.send_request(
+                    RequestType::QueryMaxConnectionsPerIp(QueryMaxConnectionsPerIp {}).into(),
+                )
+            }
+        }
     }
 }
