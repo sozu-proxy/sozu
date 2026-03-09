@@ -32,7 +32,7 @@ anyhow = { workspace = true }
 cookie-factory = { workspace = true }
 hdrhistogram = { workspace = true }
 hex = { workspace = true }
-hpack = { workspace = true }
+loona-hpack = { workspace = true }
 idna = { workspace = true }
 itoa = { workspace = true }
 kawa = { workspace = true }

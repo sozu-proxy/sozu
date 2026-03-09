@@ -9,7 +9,7 @@ cookie-factory = "^0.3.3"
 futures = "^0.3.32"
 hdrhistogram = "^7.5.4"
 hex = "^0.4.3"
-hpack = "^0.3.0"
+loona-hpack = "^0.4.3"
 http-body-util = "^0.1"
 hyper = "^1.8.1"
 hyper-rustls = { version = "^0.27.7", default-features = false }

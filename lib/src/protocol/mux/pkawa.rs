@@ -31,7 +31,7 @@ use crate::{
 };
 
 pub fn handle_header<C>(
-    decoder: &mut hpack::Decoder,
+    decoder: &mut loona_hpack::Decoder<'static>,
     prioriser: &mut Prioriser,
     stream_id: StreamId,
     kawa: &mut GenericHttpStream,
@@ -46,21 +46,6 @@ where
         return handle_trailer(kawa, input, end_stream, decoder);
     }
     kawa.push_block(Block::StatusLine);
-    // kawa.detached.status_line = match kawa.kind {
-    //     Kind::Request => StatusLine::Request {
-    //         version: Version::V20,
-    //         method: Store::Static(b"GET"),
-    //         uri: Store::Static(b"/"),
-    //         authority: Store::Static(b"lolcatho.st:8443"),
-    //         path: Store::Static(b"/"),
-    //     },
-    //     Kind::Response => StatusLine::Response {
-    //         version: Version::V20,
-    //         code: 200,
-    //         status: Store::Static(b"200"),
-    //         reason: Store::Static(b"FromH2"),
-    //     },
-    // };
     kawa.detached.status_line = match kawa.kind {
         Kind::Request => {
             let mut method = Store::Empty;
@@ -145,22 +130,10 @@ where
                 error!("INVALID HEADERS");
                 return Err((H2Error::ProtocolError, false));
             }
-            // uri is only used by H1 statusline, in most cases it only consists of the path
-            // a better algorithm should be used though
-            // let buffer = kawa.storage.data();
-            // let uri = unsafe {
-            //     format!(
-            //         "{}://{}{}",
-            //         from_utf8_unchecked(scheme.data(buffer)),
-            //         from_utf8_unchecked(authority.data(buffer)),
-            //         from_utf8_unchecked(path.data(buffer))
-            //     )
-            // };
-            // println!("Reconstructed URI: {uri}");
             StatusLine::Request {
                 version: Version::V20,
                 method,
-                uri: path.clone(), //Store::from_string(uri),
+                uri: path.clone(),
                 authority,
                 path,
             }
@@ -264,7 +237,7 @@ pub fn handle_trailer(
     kawa: &mut GenericHttpStream,
     input: &[u8],
     end_stream: bool,
-    decoder: &mut hpack::Decoder,
+    decoder: &mut loona_hpack::Decoder<'static>,
 ) -> Result<(), (H2Error, bool)> {
     if !end_stream {
         return Err((H2Error::ProtocolError, false));
@@ -287,7 +260,7 @@ pub fn handle_trailer(
     });
 
     if let Err(error) = decode_status {
-        println!("INVALID FRAGMENT: {error:?}");
+        error!("INVALID FRAGMENT: {:?}", error);
         return Err((H2Error::CompressionError, true));
     }
 
