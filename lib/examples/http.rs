@@ -46,7 +46,7 @@ fn main() -> anyhow::Result<()> {
         sticky_session: false,
         https_redirect: false,
         load_balancing: LoadBalancingAlgorithms::RoundRobin as i32,
-        answer_503: Some("A custom forbidden message".to_string()),
+        answers: [("503".to_owned(), "A custom forbidden message".to_owned())].into(),
         ..Default::default()
     };
 

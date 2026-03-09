@@ -527,15 +527,11 @@ pub enum HttpListenerCmd {
         )]
         public_address: Option<SocketAddr>,
         #[clap(
-            long = "answer-404",
-            help = "path to file of the 404 answer sent to the client when a frontend is not found"
+            long = "answer",
+            value_name = "NAME=PATH",
+            help = "custom answer template as NAME=PATH (e.g. 404=/path/to/404.http)"
         )]
-        answer_404: Option<String>,
-        #[clap(
-            long = "answer-503",
-            help = "path to file of the 503 answer sent to the client when a cluster has no backends available"
-        )]
-        answer_503: Option<String>,
+        answers: Vec<String>,
         #[clap(
             long = "expect-proxy",
             help = "Configures the client socket to receive a PROXY protocol header"
@@ -605,15 +601,11 @@ pub enum HttpsListenerCmd {
         )]
         public_address: Option<SocketAddr>,
         #[clap(
-            long = "answer-404",
-            help = "path to file of the 404 answer sent to the client when a frontend is not found"
+            long = "answer",
+            value_name = "NAME=PATH",
+            help = "custom answer template as NAME=PATH (e.g. 404=/path/to/404.http)"
         )]
-        answer_404: Option<String>,
-        #[clap(
-            long = "answer-503",
-            help = "path to file of the 503 answer sent to the client when a cluster has no backends available"
-        )]
-        answer_503: Option<String>,
+        answers: Vec<String>,
         #[clap(long = "tls-versions", help = "list of TLS versions to use")]
         tls_versions: Vec<TlsVersion>,
         #[clap(

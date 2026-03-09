@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::{hash_map::Entry, BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, hash_map::Entry},
     io::ErrorKind,
     net::{Shutdown, SocketAddr as StdSocketAddr},
     os::unix::io::AsRawFd,
@@ -11,36 +11,36 @@ use std::{
 };
 
 use mio::{
+    Interest, Registry, Token,
     net::{TcpListener as MioTcpListener, TcpStream as MioTcpStream},
     unix::SourceFd,
-    Interest, Registry, Token,
 };
 use rustls::{
+    CipherSuite, ProtocolVersion, ServerConfig as RustlsServerConfig, ServerConnection,
+    SupportedCipherSuite,
     crypto::{
+        CryptoProvider,
         ring::{
             self,
             cipher_suite::{
-                TLS13_AES_128_GCM_SHA256, TLS13_AES_256_GCM_SHA384, TLS13_CHACHA20_POLY1305_SHA256,
                 TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
                 TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
                 TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256, TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-                TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+                TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256, TLS13_AES_128_GCM_SHA256,
+                TLS13_AES_256_GCM_SHA384, TLS13_CHACHA20_POLY1305_SHA256,
             },
         },
-        CryptoProvider,
     },
-    CipherSuite, ProtocolVersion, ServerConfig as RustlsServerConfig, ServerConnection,
-    SupportedCipherSuite,
 };
 use rusty_ulid::Ulid;
 use sozu_command::{
     certificate::Fingerprint,
     config::DEFAULT_CIPHER_SUITES,
     proto::command::{
-        request::RequestType, response_content::ContentType, AddCertificate, CertificateSummary,
-        CertificatesByAddress, Cluster, HttpsListenerConfig, ListOfCertificatesByAddress,
-        ListenerType, RemoveCertificate, RemoveListener, ReplaceCertificate, RequestHttpFrontend,
-        ResponseContent, TlsVersion, WorkerRequest, WorkerResponse,
+        AddCertificate, CertificateSummary, CertificatesByAddress, Cluster, HttpsListenerConfig,
+        ListOfCertificatesByAddress, ListenerType, RemoveCertificate, RemoveListener,
+        ReplaceCertificate, RequestHttpFrontend, ResponseContent, TlsVersion, WorkerRequest,
+        WorkerResponse, request::RequestType, response_content::ContentType,
     },
     ready::Ready,
     response::HttpFrontend,
@@ -48,27 +48,27 @@ use sozu_command::{
 };
 
 use crate::{
-    backends::BackendMap,
-    pool::Pool,
-    protocol::{
-        http::{
-            answers::HttpAnswers,
-            parser::{hostname_and_port, Method},
-            ResponseStream,
-        },
-        proxy_protocol::expect::ExpectProxyProtocol,
-        rustls::TlsHandshake,
-        Http, Pipe, SessionState,
-    },
-    router::{Route, Router},
-    server::{ListenToken, SessionManager},
-    socket::{server_bind, FrontRustls},
-    timer::TimeoutContainer,
-    tls::MutexCertificateResolver,
-    util::UnwrapLog,
     AcceptError, CachedTags, FrontendFromRequestError, L7ListenerHandler, L7Proxy, ListenerError,
     ListenerHandler, Protocol, ProxyConfiguration, ProxyError, ProxySession, SessionIsToBeClosed,
     SessionMetrics, SessionResult, StateMachineBuilder, StateResult,
+    backends::BackendMap,
+    pool::Pool,
+    protocol::{
+        Http, Pipe, SessionState,
+        http::{
+            ResponseStream,
+            answers::HttpAnswers,
+            parser::{Method, hostname_and_port},
+        },
+        proxy_protocol::expect::ExpectProxyProtocol,
+        rustls::TlsHandshake,
+    },
+    router::{Route, Router},
+    server::{ListenToken, SessionManager},
+    socket::{FrontRustls, server_bind},
+    timer::TimeoutContainer,
+    tls::MutexCertificateResolver,
+    util::UnwrapLog,
 };
 
 // const SERVER_PROTOS: &[&str] = &["http/1.1", "h2"];
@@ -609,8 +609,8 @@ impl HttpsListener {
             active: false,
             fronts: Router::new(),
             answers: Rc::new(RefCell::new(
-                HttpAnswers::new(&config.http_answers)
-                    .map_err(|(status, error)| ListenerError::TemplateParse(status, error))?,
+                HttpAnswers::new(&config.answers)
+                    .map_err(|(name, error)| ListenerError::TemplateParse(name, error))?,
             )),
             config,
             token,
@@ -977,19 +977,16 @@ impl HttpsProxy {
         Ok((owned.token, taken_listener))
     }
 
-    pub fn add_cluster(
-        &mut self,
-        mut cluster: Cluster,
-    ) -> Result<Option<ResponseContent>, ProxyError> {
-        if let Some(answer_503) = cluster.answer_503.take() {
+    pub fn add_cluster(&mut self, cluster: Cluster) -> Result<Option<ResponseContent>, ProxyError> {
+        if !cluster.answers.is_empty() {
             for listener in self.listeners.values() {
                 listener
                     .borrow()
                     .answers
                     .borrow_mut()
-                    .add_custom_answer(&cluster.cluster_id, answer_503.clone())
-                    .map_err(|(status, error)| {
-                        ProxyError::AddCluster(ListenerError::TemplateParse(status, error))
+                    .add_cluster_answers(&cluster.cluster_id, &cluster.answers)
+                    .map_err(|(name, error)| {
+                        ProxyError::AddCluster(ListenerError::TemplateParse(name, error))
                     })?;
             }
         }
@@ -1007,7 +1004,7 @@ impl HttpsProxy {
                 .borrow()
                 .answers
                 .borrow_mut()
-                .remove_custom_answer(cluster_id);
+                .remove_cluster_answers(cluster_id);
         }
 
         Ok(None)
@@ -1486,13 +1483,10 @@ pub mod testing {
 mod tests {
     use std::sync::Arc;
 
-    use sozu_command::{
-        config::ListenerBuilder,
-        proto::command::{CustomHttpAnswers, SocketAddress},
-    };
+    use sozu_command::{config::ListenerBuilder, proto::command::SocketAddress};
 
     use super::*;
-    use crate::router::{pattern_trie::TrieNode, MethodRule, PathRule, Route, Router};
+    use crate::router::{MethodRule, PathRule, Route, Router, pattern_trie::TrieNode};
 
     /*
     #[test]
@@ -1571,9 +1565,7 @@ mod tests {
             fronts,
             rustls_details,
             resolver,
-            answers: Rc::new(RefCell::new(
-                HttpAnswers::new(&Some(CustomHttpAnswers::default())).unwrap(),
-            )),
+            answers: Rc::new(RefCell::new(HttpAnswers::new(&BTreeMap::new()).unwrap())),
             config: default_config,
             token: Token(0),
             active: true,

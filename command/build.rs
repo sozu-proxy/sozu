@@ -30,6 +30,9 @@ pub fn main() {
         .message_attribute("Response", "#[derive(Hash, Eq)]")
         .message_attribute("InitialState", "#[derive(Hash, Eq)]")
         .message_attribute("ProtobufAccessLog", "#[derive(Hash, Eq)]")
+        .message_attribute("HttpListenerConfig", "#[derive(Hash, Eq)]")
+        .message_attribute("HttpsListenerConfig", "#[derive(Hash, Eq)]")
+        .message_attribute("Cluster", "#[derive(Hash, Eq)]")
         .enum_attribute(".", "#[serde(rename_all = \"SCREAMING_SNAKE_CASE\")]")
         .enum_attribute(
             "ResponseContent.content_type",
