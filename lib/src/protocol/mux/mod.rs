@@ -792,8 +792,10 @@ pub struct Stream {
     pub front_received_end_of_stream: bool,
     /// True when the backend connection has received end_of_stream from the backend server.
     pub back_received_end_of_stream: bool,
-    /// Tracks total DATA payload bytes received for content-length validation (RFC 9113 §8.1.1)
-    pub data_received: usize,
+    /// Tracks total DATA payload bytes received on the frontend for content-length validation (RFC 9113 §8.1.1)
+    pub front_data_received: usize,
+    /// Tracks total DATA payload bytes received on the backend for content-length validation (RFC 9113 §8.1.1)
+    pub back_data_received: usize,
     pub front: GenericHttpStream,
     pub back: GenericHttpStream,
     pub context: HttpContext,
@@ -825,7 +827,8 @@ impl Debug for Stream {
             .field("state", &self.state)
             .field("front_received_end_of_stream", &self.front_received_end_of_stream)
             .field("back_received_end_of_stream", &self.back_received_end_of_stream)
-            .field("data_received", &self.data_received)
+            .field("front_data_received", &self.front_data_received)
+            .field("back_data_received", &self.back_data_received)
             .field("front", &KawaSummary(&self.front))
             .field("back", &KawaSummary(&self.back))
             .field("context", &self.context)
@@ -842,6 +845,8 @@ pub struct StreamParts<'a> {
     pub wbuffer: &'a mut GenericHttpStream,
     /// Tracks whether end_of_stream has been received on the read side of this connection.
     pub received_end_of_stream: &'a mut bool,
+    /// Tracks total DATA payload bytes received on the read side (for content-length validation).
+    pub data_received: &'a mut usize,
     pub context: &'a mut HttpContext,
     pub metrics: &'a mut SessionMetrics,
 }
@@ -864,7 +869,8 @@ impl Stream {
             window: window as i32,
             front_received_end_of_stream: false,
             back_received_end_of_stream: false,
-            data_received: 0,
+            front_data_received: 0,
+            back_data_received: 0,
             front: GenericHttpStream::new(kawa::Kind::Request, kawa::Buffer::new(front_buffer)),
             back: GenericHttpStream::new(kawa::Kind::Response, kawa::Buffer::new(back_buffer)),
             context,
@@ -878,6 +884,7 @@ impl Stream {
                 rbuffer: &mut self.back,
                 wbuffer: &mut self.front,
                 received_end_of_stream: &mut self.back_received_end_of_stream,
+                data_received: &mut self.back_data_received,
                 context: &mut self.context,
                 metrics: &mut self.metrics,
             },
@@ -886,6 +893,7 @@ impl Stream {
                 rbuffer: &mut self.front,
                 wbuffer: &mut self.back,
                 received_end_of_stream: &mut self.front_received_end_of_stream,
+                data_received: &mut self.front_data_received,
                 context: &mut self.context,
                 metrics: &mut self.metrics,
             },
@@ -1038,6 +1046,8 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
                 stream.attempts = 0;
                 stream.front_received_end_of_stream = false;
                 stream.back_received_end_of_stream = false;
+                stream.front_data_received = 0;
+                stream.back_data_received = 0;
                 stream.window = window as i32;
                 stream.context = http_context;
                 stream.back.clear();

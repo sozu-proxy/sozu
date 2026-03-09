@@ -819,16 +819,17 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 let mut slice = data.payload;
                 let stream = &mut context.streams[global_stream_id];
                 let payload_len = slice.len();
-                stream.data_received += payload_len;
 
-                // Extract declared content-length and current total before borrowing parts
-                let data_received = stream.data_received;
-                let declared_length = {
+                // Extract declared content-length and update position-aware data counter
+                let (data_received, declared_length) = {
                     let parts = stream.split(&self.position);
-                    match parts.rbuffer.body_size {
+                    *parts.data_received += payload_len;
+                    let total = *parts.data_received;
+                    let declared = match parts.rbuffer.body_size {
                         kawa::BodySize::Length(n) => Some(n),
                         _ => None,
-                    }
+                    };
+                    (total, declared)
                 };
 
                 // RFC 9113 §8.1.1: if Content-Length is present, total DATA payload
