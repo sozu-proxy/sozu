@@ -442,13 +442,18 @@ impl<Front: SocketHandler> Connection<Front> {
         let buffer = pool
             .upgrade()
             .and_then(|pool| pool.borrow_mut().checkout())?;
+        let local_settings = H2Settings::default();
+        let mut decoder = loona_hpack::Decoder::new();
+        // RFC 7541 §4.2: enforce SETTINGS_HEADER_TABLE_SIZE as the upper bound
+        // for dynamic table size updates from the peer
+        decoder.set_max_allowed_table_size(local_settings.settings_header_table_size as usize);
         Some(Connection::H2(ConnectionH2 {
-            decoder: loona_hpack::Decoder::new(),
+            decoder,
             encoder: loona_hpack::Encoder::new(),
             expect_read: Some((H2StreamId::Zero, 24 + 9)),
             expect_write: None,
             last_stream_id: 0,
-            local_settings: H2Settings::default(),
+            local_settings,
             peer_settings: H2Settings::default(),
             position: Position::Server,
             prioriser: Prioriser::default(),
@@ -474,13 +479,18 @@ impl<Front: SocketHandler> Connection<Front> {
         let buffer = pool
             .upgrade()
             .and_then(|pool| pool.borrow_mut().checkout())?;
+        let local_settings = H2Settings::default();
+        let mut decoder = loona_hpack::Decoder::new();
+        // RFC 7541 §4.2: enforce SETTINGS_HEADER_TABLE_SIZE as the upper bound
+        // for dynamic table size updates from the peer
+        decoder.set_max_allowed_table_size(local_settings.settings_header_table_size as usize);
         Some(Connection::H2(ConnectionH2 {
-            decoder: loona_hpack::Decoder::new(),
+            decoder,
             encoder: loona_hpack::Encoder::new(),
             expect_read: None,
             expect_write: None,
             last_stream_id: 0,
-            local_settings: H2Settings::default(),
+            local_settings,
             peer_settings: H2Settings::default(),
             position: Position::Client(
                 cluster_id,
@@ -795,6 +805,8 @@ pub struct Stream {
     pub attempts: u8,
     pub state: StreamState,
     pub received_end_of_stream: bool,
+    /// Tracks total DATA payload bytes received for content-length validation (RFC 9113 §8.1.1)
+    pub data_received: usize,
     pub front: GenericHttpStream,
     pub back: GenericHttpStream,
     pub context: HttpContext,
@@ -825,6 +837,7 @@ impl Debug for Stream {
             .field("attempts", &self.attempts)
             .field("state", &self.state)
             .field("received_end_of_stream", &self.received_end_of_stream)
+            .field("data_received", &self.data_received)
             .field("front", &KawaSummary(&self.front))
             .field("back", &KawaSummary(&self.back))
             .field("context", &self.context)
@@ -860,6 +873,7 @@ impl Stream {
             attempts: 0,
             window: window as i32,
             received_end_of_stream: false,
+            data_received: 0,
             front: GenericHttpStream::new(kawa::Kind::Request, kawa::Buffer::new(front_buffer)),
             back: GenericHttpStream::new(kawa::Kind::Response, kawa::Buffer::new(back_buffer)),
             context,
