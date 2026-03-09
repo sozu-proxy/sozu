@@ -7,9 +7,9 @@ edition = "2024"
 [dependencies]
 futures = { workspace = true }
 http-body-util = { workspace = true }
-hyper = { workspace = true, features = ["client", "http1", "http2"] }
+hyper = { workspace = true, features = ["client", "server", "http1", "http2"] }
 hyper-rustls = { workspace = true, features = ["ring", "webpki-tokio", "http1", "http2", "tls12", "logging"] }
-hyper-util = { workspace = true, features = ["client-legacy", "http1", "http2"] }
+hyper-util = { workspace = true, features = ["client-legacy", "http1", "http2", "server-auto", "service", "tokio"] }
 libc = { workspace = true }
 mio = { workspace = true }
 rustls = { workspace = true }
