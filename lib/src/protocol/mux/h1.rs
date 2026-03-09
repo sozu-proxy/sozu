@@ -55,6 +55,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
     {
         println_!("======= MUX H1 READABLE {:?}", self.position);
         self.timeout_container.reset();
+        let answers_rc = context.listener.borrow().get_answers().clone();
         let stream = &mut context.streams[self.stream];
         if stream.metrics.start.is_none() {
             stream.metrics.start = Some(Instant::now());
@@ -92,7 +93,8 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                     endpoint.end_stream(token, global_stream_id, context);
                 }
                 Position::Server => {
-                    set_default_answer(stream, &mut self.readiness, 400);
+                    let answers = answers_rc.borrow();
+                    set_default_answer(stream, &mut self.readiness, 400, &answers);
                 }
             }
             return MuxResult::Continue;
@@ -123,7 +125,8 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                         error!("Unexpected malformed request");
                         kawa::debug_kawa(kawa);
                     }
-                    set_default_answer(stream, &mut self.readiness, 400);
+                    let answers = answers_rc.borrow();
+                    set_default_answer(stream, &mut self.readiness, 400, &answers);
                     return MuxResult::Continue;
                 }
                 self.requests += 1;
@@ -309,6 +312,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         L: ListenerHandler + L7ListenerHandler,
     {
         assert_eq!(stream, self.stream);
+        let answers_rc = context.listener.borrow().get_answers().clone();
         let stream = &mut context.streams[stream];
         let stream_context = &mut stream.context;
         println_!("end H1 stream {}: {stream_context:#?}", self.stream);
@@ -354,8 +358,16 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                 }
                 (true, false) => {
                     // we do not have an answer, but the request has already been partially consumed
-                    // so we can't retry, send a 502 bad gateway instead
-                    set_default_answer(stream, &mut self.readiness, 502);
+                    // so we can't retry
+                    let answers = answers_rc.borrow();
+                    if stream.back.is_error() {
+                        // The backend sent an invalid response → 502 Bad Gateway
+                        set_default_answer(stream, &mut self.readiness, 502, &answers);
+                    } else {
+                        // The backend closed without sending a response → 503 Service Unavailable
+                        // (matches kawa_h1: "Backend closed after consuming part of the request")
+                        set_default_answer(stream, &mut self.readiness, 503, &answers);
+                    }
                 }
                 (false, false) => {
                     // we do not have an answer, but the request is untouched so we can retry
