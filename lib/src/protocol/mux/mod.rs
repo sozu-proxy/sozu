@@ -320,8 +320,8 @@ impl<Front: SocketHandler> Connection<Front> {
             .upgrade()
             .and_then(|pool| pool.borrow_mut().checkout())?;
         Some(Connection::H2(ConnectionH2 {
-            decoder: hpack::Decoder::new(),
-            encoder: hpack::Encoder::new(),
+            decoder: loona_hpack::Decoder::new(),
+            encoder: loona_hpack::Encoder::new(),
             expect_read: Some((H2StreamId::Zero, 24 + 9)),
             expect_write: None,
             last_stream_id: 0,
@@ -352,8 +352,8 @@ impl<Front: SocketHandler> Connection<Front> {
             .upgrade()
             .and_then(|pool| pool.borrow_mut().checkout())?;
         Some(Connection::H2(ConnectionH2 {
-            decoder: hpack::Decoder::new(),
-            encoder: hpack::Encoder::new(),
+            decoder: loona_hpack::Decoder::new(),
+            encoder: loona_hpack::Encoder::new(),
             expect_read: None,
             expect_write: None,
             last_stream_id: 0,

@@ -31,7 +31,7 @@ pub struct H2BlockConverter<'a> {
     pub max_frame_size: usize,
     pub window: i32,
     pub stream_id: StreamId,
-    pub encoder: &'a mut hpack::Encoder<'static>,
+    pub encoder: &'a mut loona_hpack::Encoder<'static>,
     pub out: Vec<u8>,
 }
 

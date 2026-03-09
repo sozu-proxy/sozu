@@ -118,8 +118,8 @@ impl Prioriser {
 }
 
 pub struct ConnectionH2<Front: SocketHandler> {
-    pub decoder: hpack::Decoder<'static>,
-    pub encoder: hpack::Encoder<'static>,
+    pub decoder: loona_hpack::Decoder<'static>,
+    pub encoder: loona_hpack::Encoder<'static>,
     pub expect_read: Option<(H2StreamId, usize)>,
     pub expect_write: Option<H2StreamId>,
     pub last_stream_id: StreamId,
