@@ -4,7 +4,9 @@ use std::{
     str::{from_utf8, from_utf8_unchecked},
 };
 
+use base64::Engine;
 use rusty_ulid::Ulid;
+use sha2::{Digest, Sha256};
 use sozu_command::logging::CachedTags;
 use sozu_command_lib::logging::LogContext;
 
@@ -85,6 +87,8 @@ pub struct HttpContext {
     pub keep_alive_frontend: bool,
     /// the value of the sticky session cookie in the request
     pub sticky_session_found: Option<String>,
+    /// hashed value of the last authorization header ("user:" + hex(sha256(password)))
+    pub authorization_found: Option<String>,
     /// position of the last header of the request (the "Sozu-Id"), only valid until prepare is called
     pub last_header: Option<usize>,
     // ---------- Route
@@ -155,6 +159,7 @@ impl HttpContext {
             sticky_name,
             sticky_session: None,
             sticky_session_found: None,
+            authorization_found: None,
             last_header: None,
             headers_response: Rc::new([]),
             tags: None,
@@ -237,6 +242,7 @@ impl HttpContext {
         let mut has_x_port = false;
         let mut has_x_proto = false;
         let mut has_connection = false;
+        let mut auth = None;
         #[cfg(feature = "opentelemetry")]
         let mut traceparent: Option<&mut kawa::Pair> = None;
         #[cfg(feature = "opentelemetry")]
@@ -286,6 +292,8 @@ impl HttpContext {
                             .data_opt(buf)
                             .and_then(|data| from_utf8(data).ok())
                             .map(ToOwned::to_owned);
+                    } else if compare_no_case(key, b"Authorization") {
+                        auth = Some(header);
                     } else {
                         #[cfg(feature = "opentelemetry")]
                         if compare_no_case(key, b"traceparent") {
@@ -304,6 +312,26 @@ impl HttpContext {
                 _ => {}
             }
         }
+
+        // Extract and hash the Authorization header for basic auth verification.
+        // Format: "Authorization: Basic <base64(user:password)>"
+        // Produces: "user:" + hex(sha256(password))
+        self.authorization_found =
+            auth.and_then(|header| header.val.data_opt(buf))
+                .and_then(|auth_val| {
+                    let trimmed = auth_val.trim_ascii_start();
+                    if trimmed.len() <= b"Basic ".len() {
+                        return None;
+                    }
+                    let (kind, token) = trimmed.split_at(b"Basic ".len());
+                    compare_no_case(kind, b"Basic ").then_some(())?;
+                    let token = base64::prelude::BASE64_STANDARD.decode(token).ok()?;
+                    let colon_pos = token.iter().position(|c| *c == b':')?;
+                    let (name, pwd) = token.split_at(colon_pos + 1);
+                    let mut result = String::from_utf8(name.to_vec()).ok()?;
+                    result.push_str(&hex::encode(Sha256::digest(pwd)));
+                    Some(result)
+                });
 
         #[cfg(feature = "opentelemetry")]
         let (otel, has_traceparent) = {
@@ -493,6 +521,7 @@ impl HttpContext {
         self.keep_alive_backend = true;
         self.keep_alive_frontend = true;
         self.sticky_session_found = None;
+        self.authorization_found = None;
         self.route.method = None;
         self.route.authority = None;
         self.route.path = None;

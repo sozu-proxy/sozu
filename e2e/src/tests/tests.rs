@@ -984,6 +984,105 @@ fn try_https_redirect() -> State {
     State::Success
 }
 
+fn try_basic_auth() -> State {
+    let front_address: SocketAddr = create_local_address();
+    let back_address: SocketAddr = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_config();
+    let mut worker = Worker::start_new_worker("AUTH-WORKER", config, &listeners, state);
+
+    let answer_401 = "HTTP/1.1 401 Unauthorized\r\n\
+                       WWW-Authenticate: %WWW_AUTHENTICATE\r\n\
+                       Connection: close\r\n\r\n";
+
+    let mut http_config = ListenerBuilder::new_http(front_address.into())
+        .to_http(None)
+        .unwrap();
+    http_config.answers = [("401".to_owned(), answer_401.to_owned())].into();
+
+    worker.send_proxy_request_type(RequestType::AddHttpListener(http_config));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        address: front_address.into(),
+        proxy: ListenerType::Http.into(),
+        from_scm: false,
+    }));
+
+    // SHA256 of "secret" = 2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b
+    // authorized_hash = "admin:" + hex(sha256("secret"))
+    let authorized_hash =
+        "admin:2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b".to_owned();
+
+    worker.send_proxy_request(
+        RequestType::AddCluster(Cluster {
+            authorized_hashes: vec![authorized_hash],
+            www_authenticate: Some("Basic realm=\"sozu\"".to_owned()),
+            ..Worker::default_cluster("cluster_0")
+        })
+        .into(),
+    );
+
+    worker.send_proxy_request_type(RequestType::AddHttpFrontend(RequestHttpFrontend {
+        hostname: String::from("example.com"),
+        required_auth: Some(true),
+        ..Worker::default_http_frontend("cluster_0", front_address)
+    }));
+
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address,
+        None,
+    )));
+    worker.read_to_last();
+
+    let mut backend = SyncBackend::new("backend", back_address, http_ok_response("hello"));
+    backend.connect();
+
+    // Test 1: No auth header -> 401
+    let no_auth_request = "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n";
+    let mut client = Client::new("no-auth-client", front_address, no_auth_request);
+    client.connect();
+    client.send();
+    let response = client.receive().unwrap_or_default();
+    println!("no-auth response: {response:?}");
+    assert!(
+        response.starts_with("HTTP/1.1 401"),
+        "Expected 401, got: {response}"
+    );
+    assert!(
+        response.contains("WWW-Authenticate: Basic realm=\"sozu\""),
+        "Expected WWW-Authenticate header, got: {response}"
+    );
+
+    // Test 2: Wrong credentials -> 401
+    // base64("admin:wrong") = "YWRtaW46d3Jvbmc="
+    let wrong_auth_request = "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\nAuthorization: Basic YWRtaW46d3Jvbmc=\r\n\r\n";
+    let mut client = Client::new("wrong-auth-client", front_address, wrong_auth_request);
+    client.connect();
+    client.send();
+    let response = client.receive().unwrap_or_default();
+    println!("wrong-auth response: {response:?}");
+    assert!(
+        response.starts_with("HTTP/1.1 401"),
+        "Expected 401, got: {response}"
+    );
+
+    // Test 3: Correct credentials -> 200 (forwarded to backend)
+    // base64("admin:secret") = "YWRtaW46c2VjcmV0"
+    let correct_auth_request = "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\nAuthorization: Basic YWRtaW46c2VjcmV0\r\n\r\n";
+    let mut client = Client::new("correct-auth-client", front_address, correct_auth_request);
+    client.connect();
+    client.send();
+    backend.accept(0);
+    backend.receive(0);
+    backend.send(0);
+    let response = client.receive().unwrap_or_default();
+    println!("correct-auth response: {response:?}");
+    assert!(response.contains("200 OK"), "Expected 200, got: {response}");
+
+    State::Success
+}
+
 fn try_msg_close() -> State {
     let front_address = create_local_address();
 
@@ -1811,6 +1910,14 @@ fn test_wildcard() {
 fn test_status_header_split() {
     assert_eq!(
         repeat_until_error_or(2, "Status line and Headers split", try_status_header_split),
+        State::Success
+    );
+}
+
+#[test]
+fn test_basic_auth() {
+    assert_eq!(
+        repeat_until_error_or(2, "Basic authentication", try_basic_auth),
         State::Success
     );
 }

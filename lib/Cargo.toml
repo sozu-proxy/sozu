@@ -29,6 +29,7 @@ include = [
 
 [dependencies]
 anyhow = { workspace = true }
+base64 = { workspace = true }
 cookie-factory = { workspace = true }
 hdrhistogram = { workspace = true }
 hex = { workspace = true }

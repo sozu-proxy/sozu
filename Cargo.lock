@@ -1771,6 +1771,7 @@ name = "sozu-lib"
 version = "1.1.1"
 dependencies = [
  "anyhow",
+ "base64",
  "cookie-factory",
  "hdrhistogram",
  "hex",

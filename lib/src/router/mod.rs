@@ -728,6 +728,7 @@ impl Debug for HeaderEdit {
 #[derive(Debug, Clone)]
 pub struct Frontend {
     cluster_id: Option<ClusterId>,
+    required_auth: bool,
     redirect: RedirectPolicy,
     redirect_scheme: RedirectScheme,
     redirect_template: Option<String>,
@@ -774,6 +775,7 @@ impl Frontend {
         if deny {
             return Ok(Self {
                 cluster_id: cluster_id.clone(),
+                required_auth: false,
                 redirect: RedirectPolicy::Unauthorized,
                 redirect_scheme,
                 redirect_template: None,
@@ -852,6 +854,7 @@ impl Frontend {
         }
         Ok(Frontend {
             cluster_id,
+            required_auth: front.required_auth,
             redirect,
             redirect_scheme,
             redirect_template,
@@ -870,6 +873,7 @@ impl Frontend {
     pub fn forward(cluster_id: ClusterId) -> Self {
         Self {
             cluster_id: Some(cluster_id),
+            required_auth: false,
             redirect: RedirectPolicy::Forward,
             redirect_scheme: RedirectScheme::UseSame,
             redirect_template: None,
@@ -888,6 +892,7 @@ impl Frontend {
 #[derive(Debug, Clone)]
 pub struct RouteResult {
     pub cluster_id: Option<ClusterId>,
+    pub required_auth: bool,
     pub redirect: RedirectPolicy,
     pub redirect_scheme: RedirectScheme,
     pub redirect_template: Option<String>,
@@ -903,6 +908,7 @@ impl RouteResult {
     fn deny(cluster_id: &Option<ClusterId>) -> Self {
         Self {
             cluster_id: cluster_id.clone(),
+            required_auth: false,
             redirect: RedirectPolicy::Unauthorized,
             redirect_scheme: RedirectScheme::UseSame,
             redirect_template: None,
@@ -923,6 +929,7 @@ impl RouteResult {
     ) -> Self {
         let Frontend {
             cluster_id,
+            required_auth,
             redirect,
             redirect_scheme,
             redirect_template,
@@ -953,6 +960,7 @@ impl RouteResult {
         }
         Self {
             cluster_id: cluster_id.clone(),
+            required_auth: *required_auth,
             redirect: *redirect,
             redirect_scheme: *redirect_scheme,
             redirect_template: redirect_template.clone(),

@@ -87,7 +87,9 @@ pub enum DefaultAnswer {
         partially_parsed: String,
         invalid: String,
     },
-    Answer401 {},
+    Answer401 {
+        www_authenticate: Option<String>,
+    },
     Answer404 {},
     Answer408 {
         duration: String,
@@ -1236,6 +1238,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
         let RouteResult {
             cluster_id,
+            required_auth,
             redirect,
             redirect_scheme,
             redirect_template: _,
@@ -1291,16 +1294,40 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         };
 
         let cluster_id = &self.context.cluster_id;
-        let (https_redirect, https_redirect_port) = match cluster_id {
-            Some(cid) => proxy
-                .borrow()
-                .clusters()
-                .get(cid)
-                .map_or((false, None), |cluster| {
-                    (cluster.https_redirect, cluster.https_redirect_port)
-                }),
-            None => (false, None),
-        };
+        let (authorized, www_authenticate, https_redirect, https_redirect_port) =
+            match (&cluster_id, redirect, required_auth) {
+                // unauthorized frontends
+                (_, RedirectPolicy::Unauthorized, _) => (false, None, false, None),
+                // forward frontends with no target (no cluster nor template)
+                (None, RedirectPolicy::Forward, _) => (false, None, false, None),
+                // clusterless frontend with auth (unsupported)
+                (None, _, true) => (false, None, false, None),
+                // clusterless frontends
+                (None, _, false) => (true, None, false, None),
+                // "attached" frontends
+                (Some(cluster_id), _, _) => {
+                    proxy.borrow().clusters().get(cluster_id).map_or(
+                        (true, None, false, None),
+                        |cluster| {
+                            let authorized =
+                                match (required_auth, &self.context.authorization_found) {
+                                    // auth not required
+                                    (false, _) => true,
+                                    // no auth found
+                                    (true, None) => false,
+                                    // validation
+                                    (true, Some(hash)) => cluster.authorized_hashes.contains(hash),
+                                };
+                            (
+                                authorized,
+                                cluster.www_authenticate.clone(),
+                                cluster.https_redirect,
+                                cluster.https_redirect_port,
+                            )
+                        },
+                    )
+                }
+            };
 
         let port = match (
             port,
@@ -1316,21 +1343,13 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             _ => String::new(),
         };
 
-        match (cluster_id, redirect) {
-            (_, RedirectPolicy::Unauthorized) => {
-                self.set_answer(DefaultAnswer::Answer401 {});
-                Err(RetrieveClusterError::UnauthorizedRoute)
-            }
-            (_, RedirectPolicy::Permanent) => {
+        match (cluster_id, redirect, authorized) {
+            (_, RedirectPolicy::Permanent, true) => {
                 let location = format!("{proto}://{host}{port}{path}");
                 self.set_answer(DefaultAnswer::Answer301 { location });
                 Err(RetrieveClusterError::Redirected)
             }
-            (None, RedirectPolicy::Forward) => {
-                self.set_answer(DefaultAnswer::Answer401 {});
-                Err(RetrieveClusterError::UnauthorizedRoute)
-            }
-            (Some(cluster_id), RedirectPolicy::Forward) => {
+            (Some(cluster_id), RedirectPolicy::Forward, true) => {
                 if !is_https && https_redirect {
                     let location = format!("https://{host}{port}{path}");
                     self.set_answer(DefaultAnswer::Answer301 { location });
@@ -1339,6 +1358,10 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 apply_header_edits(&mut self.request_stream, headers_request);
                 self.request_stream.blocks.extend(body);
                 Ok(cluster_id.to_owned())
+            }
+            _ => {
+                self.set_answer(DefaultAnswer::Answer401 { www_authenticate });
+                Err(RetrieveClusterError::UnauthorizedRoute)
             }
         }
     }
