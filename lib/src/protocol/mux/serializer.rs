@@ -119,6 +119,28 @@ pub fn gen_rst_stream(
     })
 }
 
+/// Serialize a WINDOW_UPDATE frame (RFC 9113 §6.9).
+/// Payload is 4 bytes: 1 reserved bit + 31-bit window size increment.
+pub fn gen_window_update(
+    buf: &mut [u8],
+    stream_id: u32,
+    increment: u32,
+) -> Result<(&mut [u8], usize), GenError> {
+    gen_frame_header(
+        buf,
+        &FrameHeader {
+            payload_len: 4,
+            frame_type: FrameType::WindowUpdate,
+            flags: 0,
+            stream_id,
+        },
+    )
+    .and_then(|(buf, old_size)| {
+        r#gen(be_u32(increment & 0x7FFFFFFF), buf)
+            .map(|(buf, size)| (buf, (old_size + size as usize)))
+    })
+}
+
 pub fn gen_goaway(
     buf: &mut [u8],
     last_stream_id: u32,

@@ -448,6 +448,8 @@ impl<Front: SocketHandler> Connection<Front> {
             streams: HashMap::new(),
             timeout_container,
             window: (1 << 16) - 1,
+            received_bytes_since_update: 0,
+            pending_window_updates: Vec::new(),
             zero: kawa::Kawa::new(kawa::Kind::Request, kawa::Buffer::new(buffer)),
         }))
     }
@@ -489,6 +491,8 @@ impl<Front: SocketHandler> Connection<Front> {
             streams: HashMap::new(),
             timeout_container,
             window: (1 << 16) - 1,
+            received_bytes_since_update: 0,
+            pending_window_updates: Vec::new(),
             zero: kawa::Kawa::new(kawa::Kind::Request, kawa::Buffer::new(buffer)),
         }))
     }
