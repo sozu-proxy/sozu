@@ -1,16 +1,3 @@
-#![allow(
-    unused_variables,
-    unused_assignments,
-    dead_code,
-    clippy::large_enum_variant,
-    clippy::match_like_matches_macro,
-    clippy::match_single_binding,
-    clippy::needless_lifetimes,
-    clippy::clone_on_copy,
-    clippy::len_zero,
-    clippy::manual_range_contains,
-    clippy::new_without_default
-)]
 use std::cmp::min;
 
 use kawa::{
@@ -35,7 +22,7 @@ pub struct H2BlockConverter<'a> {
     pub out: Vec<u8>,
 }
 
-impl<'a, T: AsBuffer> BlockConverter<T> for H2BlockConverter<'a> {
+impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
     fn initialize(&mut self, kawa: &mut Kawa<T>) {
         // This is very ugly... we may add a h2 variant in kawa::ParsingErrorKind
         match kawa.parsing_phase {
