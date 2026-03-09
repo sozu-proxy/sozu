@@ -22,7 +22,10 @@ use crate::{
         aggregator::SimpleAggregator,
         async_backend::BackendHandle as AsyncBackend,
         client::Client,
-        https_client::{build_https_client, resolve_request},
+        https_client::{
+            build_h2_client, build_h2_or_h1_client, build_https_client,
+            resolve_concurrent_requests, resolve_post_request, resolve_request,
+        },
         sync_backend::Backend as SyncBackend,
     },
     sozu::worker::Worker,
@@ -1810,6 +1813,403 @@ fn test_wildcard() {
 fn test_status_header_split() {
     assert_eq!(
         repeat_until_error_or(2, "Status line and Headers split", try_status_header_split),
+        State::Success
+    );
+}
+
+// ---------------------------------------------------------------------------
+// HTTP/2 tests
+// ---------------------------------------------------------------------------
+
+/// Helper: set up a Sozu worker with an HTTPS listener, a cluster, a certificate,
+/// and `nb_backends` async backends. Returns (worker, backends, front_port).
+fn setup_h2_test(
+    name: &str,
+    nb_backends: usize,
+) -> (Worker, Vec<AsyncBackend<SimpleAggregator>>, u16) {
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+
+    let (config, listeners, state) = Worker::empty_config();
+    let mut worker = Worker::start_new_worker(name, config, &listeners, state);
+
+    worker.send_proxy_request_type(RequestType::AddHttpsListener(
+        ListenerBuilder::new_https(front_address.clone())
+            .to_tls(None)
+            .unwrap(),
+    ));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        address: front_address.clone(),
+        proxy: ListenerType::Https.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        hostname: String::from("localhost"),
+        ..Worker::default_http_frontend("cluster_0", front_address.clone().into())
+    }));
+
+    let certificate_and_key = CertificateAndKey {
+        certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
+        key: String::from(include_str!("../../../lib/assets/local-key.pem")),
+        certificate_chain: vec![],
+        versions: vec![],
+        names: vec![],
+    };
+    worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+        address: front_address,
+        certificate: certificate_and_key,
+        expired_at: None,
+    }));
+
+    let mut backends = Vec::new();
+    for i in 0..nb_backends {
+        let back_address = create_local_address();
+        worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+            "cluster_0",
+            format!("cluster_0-{i}"),
+            back_address,
+            None,
+        )));
+        backends.push(AsyncBackend::spawn_detached_backend(
+            format!("BACKEND_{i}"),
+            back_address,
+            SimpleAggregator::default(),
+            AsyncBackend::http_handler(format!("pong{i}")),
+        ));
+    }
+
+    worker.read_to_last();
+    (worker, backends, front_port)
+}
+
+/// Send a basic GET request over HTTP/2 and verify the response.
+fn try_h2_basic_request() -> State {
+    let (mut worker, mut backends, front_port) = setup_h2_test("H2-BASIC", 1);
+
+    let client = build_h2_client();
+    let uri: hyper::Uri = format!("https://localhost:{front_port}/api")
+        .parse()
+        .unwrap();
+
+    if let Some((status, body)) = resolve_request(&client, uri) {
+        println!("H2 basic - status: {status:?}, body: {body}");
+        if !status.is_success() || !body.contains("pong") {
+            return State::Fail;
+        }
+    } else {
+        return State::Fail;
+    }
+
+    worker.soft_stop();
+    let success = worker.wait_for_server_stop();
+
+    let aggregator = backends[0]
+        .stop_and_get_aggregator()
+        .expect("Could not get aggregator");
+    if success && aggregator.responses_sent == 1 {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+/// Verify that when a client advertises both h2 and http/1.1, the server selects h2
+/// (since Sozu's SERVER_PROTOS lists "h2" first).
+fn try_h2_alpn_negotiation() -> State {
+    let (mut worker, mut backends, front_port) = setup_h2_test("H2-ALPN", 1);
+
+    // Client advertises both h2 and http/1.1
+    let client = build_h2_or_h1_client();
+    let uri: hyper::Uri = format!("https://localhost:{front_port}/api")
+        .parse()
+        .unwrap();
+
+    if let Some((status, body)) = resolve_request(&client, uri) {
+        println!("H2 ALPN - status: {status:?}, body: {body}");
+        if !status.is_success() || !body.contains("pong") {
+            return State::Fail;
+        }
+    } else {
+        return State::Fail;
+    }
+
+    worker.soft_stop();
+    let success = worker.wait_for_server_stop();
+
+    let aggregator = backends[0]
+        .stop_and_get_aggregator()
+        .expect("Could not get aggregator");
+    if success && aggregator.responses_sent == 1 {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+/// Send a POST request with a body over HTTP/2.
+fn try_h2_post_with_body() -> State {
+    let (mut worker, mut backends, front_port) = setup_h2_test("H2-POST", 1);
+
+    let client = build_h2_client();
+    let uri: hyper::Uri = format!("https://localhost:{front_port}/api")
+        .parse()
+        .unwrap();
+    let payload = "hello from h2 post".to_owned();
+
+    if let Some((status, body)) = resolve_post_request(&client, uri, payload) {
+        println!("H2 POST - status: {status:?}, body: {body}");
+        if !status.is_success() {
+            return State::Fail;
+        }
+    } else {
+        return State::Fail;
+    }
+
+    worker.soft_stop();
+    let success = worker.wait_for_server_stop();
+
+    let aggregator = backends[0]
+        .stop_and_get_aggregator()
+        .expect("Could not get aggregator");
+    if success && aggregator.responses_sent == 1 {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+/// Send multiple concurrent requests over a single H2 connection (multiple streams).
+fn try_h2_multiple_streams() -> State {
+    let (mut worker, mut backends, front_port) = setup_h2_test("H2-STREAMS", 1);
+
+    let client = build_h2_client();
+    let uris: Vec<hyper::Uri> = (0..4)
+        .map(|i| {
+            format!("https://localhost:{front_port}/api/stream{i}")
+                .parse()
+                .unwrap()
+        })
+        .collect();
+
+    let results = resolve_concurrent_requests(&client, uris);
+    let all_ok = results
+        .iter()
+        .all(|r| r.as_ref().is_some_and(|(s, _)| s.is_success()));
+    if !all_ok {
+        println!("H2 streams - not all requests succeeded: {results:?}");
+        return State::Fail;
+    }
+
+    worker.soft_stop();
+    let success = worker.wait_for_server_stop();
+
+    let aggregator = backends[0]
+        .stop_and_get_aggregator()
+        .expect("Could not get aggregator");
+    println!(
+        "H2 streams - backend received: {}, sent: {}",
+        aggregator.requests_received, aggregator.responses_sent
+    );
+    if success && aggregator.responses_sent == 4 {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+/// Send a large payload over HTTP/2 to exercise flow control.
+fn try_h2_large_payload() -> State {
+    let (mut worker, mut backends, front_port) = setup_h2_test("H2-LARGE", 1);
+
+    let client = build_h2_client();
+    let uri: hyper::Uri = format!("https://localhost:{front_port}/api")
+        .parse()
+        .unwrap();
+    // 128 KiB payload — large enough to trigger H2 flow control windows
+    let payload = "X".repeat(128 * 1024);
+
+    if let Some((status, _body)) = resolve_post_request(&client, uri, payload) {
+        println!("H2 large payload - status: {status:?}");
+        if !status.is_success() {
+            return State::Fail;
+        }
+    } else {
+        return State::Fail;
+    }
+
+    worker.soft_stop();
+    let success = worker.wait_for_server_stop();
+
+    let aggregator = backends[0]
+        .stop_and_get_aggregator()
+        .expect("Could not get aggregator");
+    if success && aggregator.responses_sent == 1 {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+/// Verify that custom and standard headers are forwarded correctly through H2.
+fn try_h2_headers() -> State {
+    let (mut worker, mut backends, front_port) = setup_h2_test("H2-HEADERS", 1);
+
+    let client = build_h2_client();
+    let uri: hyper::Uri = format!("https://localhost:{front_port}/api")
+        .parse()
+        .unwrap();
+
+    let rt = tokio::runtime::Runtime::new().expect("Could not create Runtime");
+    let result = rt.block_on(async {
+        let request = hyper::Request::builder()
+            .method(hyper::Method::GET)
+            .uri(uri)
+            .header("host", "localhost")
+            .header("x-custom-header", "test-value")
+            .header("content-type", "text/plain")
+            .body(String::new())
+            .expect("Could not build request");
+        match client.request(request).await {
+            Ok(response) => {
+                let status = response.status();
+                println!("H2 headers - status: {status:?}");
+                Some(status)
+            }
+            Err(error) => {
+                println!("H2 headers - error: {error}");
+                None
+            }
+        }
+    });
+
+    if result.is_none_or(|s| !s.is_success()) {
+        return State::Fail;
+    }
+
+    worker.soft_stop();
+    let success = worker.wait_for_server_stop();
+
+    let aggregator = backends[0]
+        .stop_and_get_aggregator()
+        .expect("Could not get aggregator");
+    if success && aggregator.responses_sent == 1 {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+/// Verify that HTTP/1.1 requests still work on the same HTTPS listener (ALPN fallback).
+fn try_h1_still_works_on_h2_listener() -> State {
+    let (mut worker, mut backends, front_port) = setup_h2_test("H1-FALLBACK", 1);
+
+    // Use the HTTP/1.1-only client on the same listener that supports H2
+    let client = build_https_client();
+    let uri: hyper::Uri = format!("https://localhost:{front_port}/api")
+        .parse()
+        .unwrap();
+
+    if let Some((status, body)) = resolve_request(&client, uri) {
+        println!("H1 fallback - status: {status:?}, body: {body}");
+        if !status.is_success() || !body.contains("pong") {
+            return State::Fail;
+        }
+    } else {
+        return State::Fail;
+    }
+
+    worker.soft_stop();
+    let success = worker.wait_for_server_stop();
+
+    let aggregator = backends[0]
+        .stop_and_get_aggregator()
+        .expect("Could not get aggregator");
+    if success && aggregator.responses_sent == 1 {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_basic_request() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "H2: basic GET request over HTTP/2",
+            try_h2_basic_request
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_h2_alpn_negotiation() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "H2: ALPN negotiation selects h2 when both h2 and http/1.1 are offered",
+            try_h2_alpn_negotiation
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_h2_post_with_body() {
+    assert_eq!(
+        repeat_until_error_or(10, "H2: POST request with body", try_h2_post_with_body),
+        State::Success
+    );
+}
+
+#[test]
+fn test_h2_multiple_streams() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "H2: multiple concurrent streams on a single connection",
+            try_h2_multiple_streams
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_h2_large_payload() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "H2: large payload exercises flow control",
+            try_h2_large_payload
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_h2_headers() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "H2: custom and standard headers are forwarded",
+            try_h2_headers
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_h1_still_works_on_h2_listener() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "H2: HTTP/1.1 still works on HTTPS listener with H2 support",
+            try_h1_still_works_on_h2_listener
+        ),
         State::Success
     );
 }
