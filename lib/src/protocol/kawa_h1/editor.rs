@@ -1,7 +1,7 @@
 use std::{
     net::{IpAddr, SocketAddr},
     rc::Rc,
-    str::{from_utf8, from_utf8_unchecked},
+    str::from_utf8,
 };
 
 use rusty_ulid::Ulid;
@@ -338,12 +338,11 @@ impl HttpContext {
             let has_forwarded = forwarded.is_some();
 
             if let Some(header) = x_for {
-                header.val = kawa::Store::from_string(format!("{}, {peer_ip}", unsafe {
-                    from_utf8_unchecked(header.val.data(buf))
-                }));
+                let prev = from_utf8(header.val.data(buf)).unwrap_or_default();
+                header.val = kawa::Store::from_string(format!("{prev}, {peer_ip}"));
             }
             if let Some(header) = &mut forwarded {
-                let value = unsafe { from_utf8_unchecked(header.val.data(buf)) };
+                let value = from_utf8(header.val.data(buf)).unwrap_or_default();
                 let new_value = match public_ip {
                     IpAddr::V4(_) => {
                         format!(

@@ -617,9 +617,6 @@ enum RewritePart {
 }
 
 impl RewritePart {
-    pub fn string(s: &str) -> Self {
-        Self::String(String::from(s))
-    }
     pub fn bytes(b: &[u8]) -> Self {
         Self::String(from_utf8(b).unwrap_or_default().to_owned())
     }
@@ -1170,7 +1167,6 @@ mod tests {
             &MethodRule::new(Some("GET".to_string())),
             &Frontend::forward("base".to_string())
         ));
-        println!("{:#?}", router.tree);
         assert_eq!(
             router
                 .lookup("www.sozu.io", "/api", &Method::Get)
@@ -1183,7 +1179,6 @@ mod tests {
             &MethodRule::new(Some("GET".to_string())),
             &Frontend::forward("api".to_string())
         ));
-        println!("{:#?}", router.tree);
         assert_eq!(
             router
                 .lookup("www.sozu.io", "/ap", &Method::Get)
@@ -1215,7 +1210,6 @@ mod tests {
             &MethodRule::new(Some("GET".to_string())),
             &Frontend::forward("base".to_string())
         ));
-        println!("{:#?}", router.tree);
         assert_eq!(
             router
                 .lookup("www.sozu.io", "/api", &Method::Get)
@@ -1228,7 +1222,6 @@ mod tests {
             &MethodRule::new(Some("GET".to_string())),
             &Frontend::forward("api".to_string())
         ));
-        println!("{:#?}", router.tree);
         assert_eq!(
             router
                 .lookup("www.sozu.io", "/api", &Method::Get)
@@ -1253,14 +1246,14 @@ mod tests {
             &MethodRule::new(Some("GET".to_string())),
             &Frontend::forward("base".to_string())
         ));
-        println!("{:#?}", router.tree);
+
         assert!(router.add_tree_rule(
             b"www.doc./.*/.io",
             &PathRule::Prefix("".to_string()),
             &MethodRule::new(Some("GET".to_string())),
             &Frontend::forward("doc".to_string())
         ));
-        println!("{:#?}", router.tree);
+
         assert_eq!(
             router
                 .lookup("www.sozu.io", "/", &Method::Get)
@@ -1278,7 +1271,7 @@ mod tests {
             &PathRule::Prefix("".to_string()),
             &MethodRule::new(Some("GET".to_string()))
         ));
-        println!("{:#?}", router.tree);
+
         assert!(router.lookup("www.sozu.io", "/", &Method::Get).is_err());
         assert_eq!(
             router
