@@ -788,7 +788,10 @@ pub struct Stream {
     pub window: i32,
     pub attempts: u8,
     pub state: StreamState,
-    pub received_end_of_stream: bool,
+    /// True when the frontend connection has received end_of_stream from the client.
+    pub front_received_end_of_stream: bool,
+    /// True when the backend connection has received end_of_stream from the backend server.
+    pub back_received_end_of_stream: bool,
     /// Tracks total DATA payload bytes received for content-length validation (RFC 9113 §8.1.1)
     pub data_received: usize,
     pub front: GenericHttpStream,
@@ -820,7 +823,8 @@ impl Debug for Stream {
             .field("window", &self.window)
             .field("attempts", &self.attempts)
             .field("state", &self.state)
-            .field("received_end_of_stream", &self.received_end_of_stream)
+            .field("front_received_end_of_stream", &self.front_received_end_of_stream)
+            .field("back_received_end_of_stream", &self.back_received_end_of_stream)
             .field("data_received", &self.data_received)
             .field("front", &KawaSummary(&self.front))
             .field("back", &KawaSummary(&self.back))
@@ -836,6 +840,8 @@ pub struct StreamParts<'a> {
     pub window: &'a mut i32,
     pub rbuffer: &'a mut GenericHttpStream,
     pub wbuffer: &'a mut GenericHttpStream,
+    /// Tracks whether end_of_stream has been received on the read side of this connection.
+    pub received_end_of_stream: &'a mut bool,
     pub context: &'a mut HttpContext,
     pub metrics: &'a mut SessionMetrics,
 }
@@ -856,7 +862,8 @@ impl Stream {
             state: StreamState::Idle,
             attempts: 0,
             window: window as i32,
-            received_end_of_stream: false,
+            front_received_end_of_stream: false,
+            back_received_end_of_stream: false,
             data_received: 0,
             front: GenericHttpStream::new(kawa::Kind::Request, kawa::Buffer::new(front_buffer)),
             back: GenericHttpStream::new(kawa::Kind::Response, kawa::Buffer::new(back_buffer)),
@@ -870,6 +877,7 @@ impl Stream {
                 window: &mut self.window,
                 rbuffer: &mut self.back,
                 wbuffer: &mut self.front,
+                received_end_of_stream: &mut self.back_received_end_of_stream,
                 context: &mut self.context,
                 metrics: &mut self.metrics,
             },
@@ -877,6 +885,7 @@ impl Stream {
                 window: &mut self.window,
                 rbuffer: &mut self.front,
                 wbuffer: &mut self.back,
+                received_end_of_stream: &mut self.front_received_end_of_stream,
                 context: &mut self.context,
                 metrics: &mut self.metrics,
             },
@@ -1027,7 +1036,8 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
                 println_!("Reuse stream: {stream_id}");
                 stream.state = StreamState::Idle;
                 stream.attempts = 0;
-                stream.received_end_of_stream = false;
+                stream.front_received_end_of_stream = false;
+                stream.back_received_end_of_stream = false;
                 stream.window = window as i32;
                 stream.context = http_context;
                 stream.back.clear();
