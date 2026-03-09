@@ -7,9 +7,12 @@ use rusty_ulid::Ulid;
 use sozu_command_lib::logging::LogContext;
 
 use crate::{
-    Protocol,
+    Protocol, RetrieveClusterError,
     pool::Checkout,
-    protocol::http::{GenericHttpStream, Method, parser::compare_no_case},
+    protocol::{
+        http::{GenericHttpStream, Method, parser::compare_no_case},
+        pipe::WebSocketContext,
+    },
 };
 
 #[cfg(feature = "opentelemetry")]
@@ -110,6 +113,8 @@ pub struct HttpContext {
     /// the sticky session that should be used
     /// used to create a "Set-Cookie" header in the response in case it differs from sticky_session_found
     pub sticky_session: Option<String>,
+    /// the address of the backend server
+    pub backend_address: Option<SocketAddr>,
 }
 
 impl kawa::h1::ParserCallbacks<Checkout> for HttpContext {
@@ -154,6 +159,8 @@ impl HttpContext {
 
             #[cfg(feature = "opentelemetry")]
             otel: Default::default(),
+
+            backend_address: None,
         }
     }
 
@@ -483,6 +490,40 @@ impl HttpContext {
         self.status = None;
         self.reason = None;
         self.user_agent = None;
+    }
+
+    pub fn extract_route(&self) -> Result<(&str, &str, &Method), RetrieveClusterError> {
+        let given_method = self.method.as_ref().ok_or(RetrieveClusterError::NoMethod)?;
+        let given_authority = self
+            .authority
+            .as_deref()
+            .ok_or(RetrieveClusterError::NoHost)?;
+        let given_path = self.path.as_deref().ok_or(RetrieveClusterError::NoPath)?;
+
+        Ok((given_authority, given_path, given_method))
+    }
+
+    pub fn get_route(&self) -> String {
+        if let Some(method) = &self.method {
+            if let Some(authority) = &self.authority {
+                if let Some(path) = &self.path {
+                    return format!("{method} {authority}{path}");
+                }
+                return format!("{method} {authority}");
+            }
+            return format!("{method}");
+        }
+        String::new()
+    }
+
+    pub fn websocket_context(&self) -> WebSocketContext {
+        WebSocketContext::Http {
+            method: self.method.clone(),
+            authority: self.authority.clone(),
+            path: self.path.clone(),
+            reason: self.reason.clone(),
+            status: self.status,
+        }
     }
 
     pub fn log_context(&self) -> LogContext<'_> {
