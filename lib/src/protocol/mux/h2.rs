@@ -1,17 +1,3 @@
-#![allow(
-    unused_variables,
-    unused_assignments,
-    dead_code,
-    clippy::large_enum_variant,
-    clippy::match_like_matches_macro,
-    clippy::match_single_binding,
-    clippy::single_match,
-    clippy::needless_lifetimes,
-    clippy::clone_on_copy,
-    clippy::len_zero,
-    clippy::manual_range_contains,
-    clippy::new_without_default
-)]
 use std::{cmp::min, collections::HashMap};
 
 use rusty_ulid::Ulid;
@@ -100,7 +86,7 @@ impl Prioriser {
         match priority {
             parser::PriorityPart::Rfc7540 {
                 stream_dependency,
-                weight,
+                weight: _,
             } => {
                 if stream_dependency.stream_id == stream_id {
                     error!("STREAM CAN'T DEPEND ON ITSELF");
@@ -110,8 +96,8 @@ impl Prioriser {
                 }
             }
             parser::PriorityPart::Rfc9218 {
-                urgency,
-                incremental,
+                urgency: _,
+                incremental: _,
             } => false,
         }
     }
@@ -202,15 +188,14 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     self.expect_read = None;
                 } else {
                     self.expect_read = Some((stream_id, amount - size));
-                    match (&self.state, &self.position) {
-                        (H2State::ClientPreface, Position::Server) => {
-                            let i = kawa.storage.data();
-                            if !b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".starts_with(i) {
-                                println_!("EARLY INVALID PREFACE: {i:?}");
-                                return self.force_disconnect();
-                            }
+                    if let (H2State::ClientPreface, Position::Server) =
+                        (&self.state, &self.position)
+                    {
+                        let i = kawa.storage.data();
+                        if !b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".starts_with(i) {
+                            println_!("EARLY INVALID PREFACE: {i:?}");
+                            return self.force_disconnect();
                         }
-                        _ => {}
                     }
                     return MuxResult::Continue;
                 }
@@ -232,8 +217,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 self.state, self.position
             ),
             (H2State::Discard, _) => {
-                let i = kawa.storage.data();
-                println_!("DISCARDING: {i:?}");
+                let _i = kawa.storage.data();
+                println_!("DISCARDING: {_i:?}");
                 kawa.storage.clear();
                 self.expect_header();
             }
@@ -373,13 +358,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                                     && header.payload_len == 0
                                     && header.flags == 1
                                 {
-                                    // error!(
-                                    //     "SKIPPED DATA: {} {} {} {}",
-                                    //     stream_id,
-                                    //     self.last_stream_id,
-                                    //     header.flags,
-                                    //     header.payload_len
-                                    // );
+                                    // Empty DATA with END_STREAM on closed stream — safe to ignore
                                     self.expect_header();
                                     return MuxResult::Continue;
                                 }
@@ -556,7 +535,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     self.expect_write
                 {
                     let stream = &mut context.streams[global_stream_id];
-                    let stream_state = stream.state;
+                    let _stream_state = stream.state;
                     let parts = stream.split(&self.position);
                     let kawa = parts.wbuffer;
                     while !kawa.out.is_empty() {
@@ -933,15 +912,14 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             }
             Frame::PushPromise(_push_promise) => match self.position {
                 Position::Client(..) => {
-                    if self.local_settings.settings_enable_push {
-                        todo!("forward the push")
-                    } else {
-                        error!("DID NOT ALLOW PUSH");
-                        return self.goaway(H2Error::ProtocolError);
-                    }
+                    // RFC 9113 §8.4: Server push is deprecated. Sozu never sends
+                    // SETTINGS_ENABLE_PUSH=1, so receiving PUSH_PROMISE is a protocol error.
+                    error!("Received PUSH_PROMISE but server push is not supported");
+                    return self.goaway(H2Error::ProtocolError);
                 }
                 Position::Server => {
-                    error!("INVALID PUSH FROM CLIENT");
+                    // Clients must never send PUSH_PROMISE (RFC 9113 §8.4)
+                    error!("Received PUSH_PROMISE from client");
                     return self.goaway(H2Error::ProtocolError);
                 }
             },
@@ -1004,7 +982,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         2 => { self.peer_settings.settings_enable_push = v == 1;                is_error |= v > 1 },
                         3 => { self.peer_settings.settings_max_concurrent_streams = v },
                         4 => { is_error |= self.update_initial_window_size(v, context) },
-                        5 => { self.peer_settings.settings_max_frame_size = v;                  is_error |= v >= 1<<24 || v < 1<<14 },
+                        5 => { self.peer_settings.settings_max_frame_size = v;                  is_error |= !(1u32<<14..1u32<<24).contains(&v) },
                         6 => { self.peer_settings.settings_max_header_list_size = v },
                         8 => { self.peer_settings.settings_enable_connect_protocol = v == 1;    is_error |= v > 1 },
                         9 => { self.peer_settings.settings_no_rfc7540_priorities = v == 1;      is_error |= v > 1 },
@@ -1243,7 +1221,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         }
     }
 
-    pub fn start_stream<L>(&mut self, stream: GlobalStreamId, context: &mut Context<L>)
+    pub fn start_stream<L>(&mut self, stream: GlobalStreamId, _context: &mut Context<L>)
     where
         L: ListenerHandler + L7ListenerHandler,
     {

@@ -1,16 +1,3 @@
-#![allow(
-    unused_variables,
-    unused_assignments,
-    dead_code,
-    clippy::large_enum_variant,
-    clippy::match_like_matches_macro,
-    clippy::match_single_binding,
-    clippy::needless_lifetimes,
-    clippy::clone_on_copy,
-    clippy::len_zero,
-    clippy::manual_range_contains,
-    clippy::new_without_default
-)]
 use std::time::Instant;
 
 use sozu_command::ready::Ready;
@@ -379,7 +366,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         }
     }
 
-    pub fn start_stream<L>(&mut self, stream: GlobalStreamId, context: &mut Context<L>)
+    pub fn start_stream<L>(&mut self, stream: GlobalStreamId, _context: &mut Context<L>)
     where
         L: ListenerHandler + L7ListenerHandler,
     {
