@@ -4,7 +4,7 @@ use rusty_ulid::Ulid;
 use sozu_command::ready::Ready;
 
 use crate::{
-    L7ListenerHandler, ListenerHandler, Readiness, println_,
+    L7ListenerHandler, ListenerHandler, Protocol, Readiness, println_,
     protocol::mux::{
         BackendStatus, Context, DebugEvent, Endpoint, GenericHttpStream, GlobalStreamId, MuxResult,
         Position, StreamId, StreamState, converter, debug_kawa, forcefully_terminate_answer,
@@ -640,12 +640,19 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     }
                 }
 
+                let scheme: &'static [u8] =
+                    if context.listener.borrow().protocol() == Protocol::HTTPS {
+                        b"https"
+                    } else {
+                        b"http"
+                    };
                 let mut converter = converter::H2BlockConverter {
                     max_frame_size: self.peer_settings.settings_max_frame_size as usize,
                     window: 0,
                     stream_id: 0,
                     encoder: &mut self.encoder,
                     out: Vec::new(),
+                    scheme,
                 };
                 let mut priorities = self.streams.keys().collect::<Vec<_>>();
                 priorities.sort();
