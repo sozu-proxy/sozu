@@ -2770,11 +2770,14 @@ fn test_h2spec_conformance() {
 
     let output = Command::new("h2spec")
         .args([
-            "-h", "localhost",
-            "-p", &front_port.to_string(),
-            "-t",  // TLS mode
-            "-k",  // skip cert verification
-            "-o", "5",  // 5 second timeout per test
+            "-h",
+            "localhost",
+            "-p",
+            &front_port.to_string(),
+            "-t", // TLS mode
+            "-k", // skip cert verification
+            "-o",
+            "5", // 5 second timeout per test
         ])
         .output()
         .expect("Failed to execute h2spec");
@@ -2797,11 +2800,26 @@ fn test_h2spec_conformance() {
             for part in line.split(',') {
                 let part = part.trim();
                 if part.ends_with("passed") {
-                    passed = part.split_whitespace().next().unwrap_or("0").parse().unwrap_or(0);
+                    passed = part
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("0")
+                        .parse()
+                        .unwrap_or(0);
                 } else if part.ends_with("failed") {
-                    failed = part.split_whitespace().next().unwrap_or("0").parse().unwrap_or(0);
+                    failed = part
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("0")
+                        .parse()
+                        .unwrap_or(0);
                 } else if part.ends_with("skipped") {
-                    skipped = part.split_whitespace().next().unwrap_or("0").parse().unwrap_or(0);
+                    skipped = part
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("0")
+                        .parse()
+                        .unwrap_or(0);
                 }
             }
         }

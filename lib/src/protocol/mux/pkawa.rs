@@ -30,6 +30,28 @@ use crate::{
     },
 };
 
+/// Returns true if the header name contains any uppercase ASCII letter (A-Z).
+/// RFC 9113 section 8.2 requires all header field names to be lowercase in HTTP/2.
+fn has_uppercase_ascii(name: &[u8]) -> bool {
+    name.iter().any(|&b| b >= b'A' && b <= b'Z')
+}
+
+/// Returns true if the header name is a connection-specific header field
+/// that MUST NOT appear in HTTP/2 (RFC 9113 section 8.2.2).
+fn is_connection_specific_header(name: &[u8]) -> bool {
+    compare_no_case(name, b"connection")
+        || compare_no_case(name, b"proxy-connection")
+        || compare_no_case(name, b"transfer-encoding")
+        || compare_no_case(name, b"upgrade")
+        || compare_no_case(name, b"keep-alive")
+}
+
+/// Returns true if the TE header has a value other than "trailers".
+/// RFC 9113 section 8.2.2: the only acceptable value for TE in HTTP/2 is "trailers".
+fn is_invalid_te_value(value: &[u8]) -> bool {
+    !compare_no_case(value, b"trailers")
+}
+
 pub fn handle_header<C>(
     decoder: &mut loona_hpack::Decoder<'static>,
     prioriser: &mut Prioriser,
@@ -55,6 +77,24 @@ where
             let mut invalid_headers = false;
             let mut regular_headers = false;
             let decode_status = decoder.decode_with_cb(input, |k, v| {
+                // RFC 9113 §8.2: reject header field names with uppercase ASCII
+                if has_uppercase_ascii(&k) {
+                    invalid_headers = true;
+                    return;
+                }
+
+                // RFC 9113 §8.2.2: reject connection-specific headers
+                if is_connection_specific_header(&k) {
+                    invalid_headers = true;
+                    return;
+                }
+
+                // RFC 9113 §8.2.2: TE header is only allowed with value "trailers"
+                if compare_no_case(&k, b"te") && is_invalid_te_value(&v) {
+                    invalid_headers = true;
+                    return;
+                }
+
                 let start = kawa.storage.end as u32;
                 kawa.storage.write_all(&v).unwrap();
                 let len_key = k.len() as u32;
@@ -151,6 +191,24 @@ where
             let mut invalid_headers = false;
             let mut regular_headers = false;
             let decode_status = decoder.decode_with_cb(input, |k, v| {
+                // RFC 9113 §8.2: reject header field names with uppercase ASCII
+                if has_uppercase_ascii(&k) {
+                    invalid_headers = true;
+                    return;
+                }
+
+                // RFC 9113 §8.2.2: reject connection-specific headers
+                if is_connection_specific_header(&k) {
+                    invalid_headers = true;
+                    return;
+                }
+
+                // RFC 9113 §8.2.2: TE header is only allowed with value "trailers"
+                if compare_no_case(&k, b"te") && is_invalid_te_value(&v) {
+                    invalid_headers = true;
+                    return;
+                }
+
                 let start = kawa.storage.end as u32;
                 kawa.storage.write_all(&v).unwrap();
                 let len_key = k.len() as u32;

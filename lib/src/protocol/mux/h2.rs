@@ -790,18 +790,64 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 };
                 let mut slice = data.payload;
                 let stream = &mut context.streams[global_stream_id];
+                let payload_len = slice.len();
+                stream.data_received += payload_len;
+
+                // Extract declared content-length and current total before borrowing parts
+                let data_received = stream.data_received;
+                let declared_length = {
+                    let parts = stream.split(&self.position);
+                    match parts.rbuffer.body_size {
+                        kawa::BodySize::Length(n) => Some(n),
+                        _ => None,
+                    }
+                };
+
+                // RFC 9113 §8.1.1: if Content-Length is present, total DATA payload
+                // must not exceed the declared length (check on every frame)
+                if let Some(expected) = declared_length {
+                    if data_received > expected {
+                        error!(
+                            "Content-Length mismatch: received {} > declared {}",
+                            data_received, expected
+                        );
+                        return self.reset_stream(
+                            global_stream_id,
+                            context,
+                            endpoint,
+                            H2Error::ProtocolError,
+                        );
+                    }
+                }
+
+                let stream = &mut context.streams[global_stream_id];
                 let parts = stream.split(&self.position);
                 let kawa = parts.rbuffer;
                 match self.position {
-                    Position::Client(..) => parts.metrics.backend_bin += slice.len(),
-                    Position::Server => parts.metrics.bin += slice.len(),
+                    Position::Client(..) => parts.metrics.backend_bin += payload_len,
+                    Position::Server => parts.metrics.bin += payload_len,
                 }
                 slice.start += kawa.storage.head as u32;
-                kawa.storage.head += slice.len();
+                kawa.storage.head += payload_len;
                 kawa.push_block(kawa::Block::Chunk(kawa::Chunk {
                     data: kawa::Store::Slice(slice),
                 }));
                 if data.end_stream {
+                    // RFC 9113 §8.1.1: on end_stream, total DATA must equal Content-Length
+                    if let Some(expected) = declared_length {
+                        if data_received != expected {
+                            error!(
+                                "Content-Length mismatch: received {} != declared {}",
+                                data_received, expected
+                            );
+                            return self.reset_stream(
+                                global_stream_id,
+                                context,
+                                endpoint,
+                                H2Error::ProtocolError,
+                            );
+                        }
+                    }
                     kawa.push_block(kawa::Block::Flags(kawa::Flags {
                         end_body: true,
                         end_chunk: false,
