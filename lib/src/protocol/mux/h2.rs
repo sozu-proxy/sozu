@@ -131,6 +131,13 @@ pub struct ConnectionH2<Front: SocketHandler> {
     pub highest_peer_stream_id: StreamId,
     /// Reusable buffer for HPACK-encoded headers in the H2 block converter.
     pub converter_buf: Vec<u8>,
+    /// RFC 9113 §6.8: when true, this connection is draining — no new streams accepted.
+    /// Set when we receive or send a GoAway frame. The connection closes once all
+    /// active streams complete (or are reset).
+    pub draining: bool,
+    /// RFC 9113 §6.8: the last_stream_id from a received GoAway frame.
+    /// Streams with ID > this value were not processed by the peer and should be retried.
+    pub peer_last_stream_id: Option<StreamId>,
     pub zero: GenericHttpStream,
 }
 impl<Front: SocketHandler> std::fmt::Debug for ConnectionH2<Front> {
@@ -762,6 +769,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 // Reclaim the converter's HPACK buffer for reuse
                 self.converter_buf = converter.out;
 
+                // RFC 9113 §6.8: if draining and all streams have completed, close
+                if self.draining && self.streams.is_empty() {
+                    return self.goaway(H2Error::NoError);
+                }
+
                 if self.socket.socket_wants_write() {
                     if !socket_write {
                         self.socket.socket_write(&[]);
@@ -797,6 +809,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
 
     pub fn goaway(&mut self, error: H2Error) -> MuxResult {
         self.state = H2State::Error;
+        self.draining = true;
         self.expect_read = None;
         let kawa = &mut self.zero;
         kawa.storage.clear();
@@ -826,6 +839,14 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     where
         L: ListenerHandler + L7ListenerHandler,
     {
+        // RFC 9113 §6.8: reject new streams on a draining connection
+        if self.draining {
+            error!(
+                "Rejecting new stream {} on draining connection",
+                stream_id
+            );
+            return None;
+        }
         // Track the highest peer-initiated stream ID for GoAway frames
         // before any early return, so GoAway always reports the correct last stream.
         if stream_id > self.highest_peer_stream_id {
@@ -1165,9 +1186,36 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     goaway.last_stream_id,
                     error_code_to_str(goaway.error_code)
                 );
-                // RFC 9113 §6.8: respond with GOAWAY and begin graceful shutdown.
-                // Streams above last_stream_id were not processed by the peer.
-                return self.goaway(H2Error::NoError);
+                // RFC 9113 §6.8: begin graceful drain.
+                self.draining = true;
+                self.peer_last_stream_id = Some(goaway.last_stream_id);
+
+                // Streams with ID > last_stream_id were NOT processed by the peer.
+                // Mark them for retry (StreamState::Link) so they can be retried
+                // on a new connection.
+                let mut retry_streams = Vec::new();
+                for (&stream_id, &global_stream_id) in &self.streams {
+                    if stream_id > goaway.last_stream_id {
+                        retry_streams.push((stream_id, global_stream_id));
+                    }
+                }
+                for (stream_id, global_stream_id) in &retry_streams {
+                    let stream = &mut context.streams[*global_stream_id];
+                    if let StreamState::Linked(token) = stream.state {
+                        endpoint.end_stream(token, *global_stream_id, context);
+                    }
+                    let stream = &mut context.streams[*global_stream_id];
+                    stream.state = StreamState::Link;
+                    self.streams.remove(stream_id);
+                }
+
+                // If no active streams remain, close immediately
+                if self.streams.is_empty() {
+                    return self.goaway(H2Error::NoError);
+                }
+
+                // Otherwise, let remaining streams (ID <= last_stream_id) complete.
+                // The connection will be closed when all streams finish.
             }
             Frame::WindowUpdate(WindowUpdate {
                 stream_id,
@@ -1313,9 +1361,20 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 for (stream_id, global_stream_id) in &self.streams {
                     if *global_stream_id == stream_gid {
                         let id = *stream_id;
-                        // if the stream is not in a closed state we should probably send an
-                        // RST_STREAM frame here. We also need to handle frames coming from
-                        // the backend on this stream after it was closed
+                        // Send RST_STREAM to cleanly signal the backend that we are
+                        // done with this stream (e.g., frontend disconnected).
+                        let kawa = &mut self.zero;
+                        let mut frame = [0; 13];
+                        if let Ok((_, _size)) =
+                            serializer::gen_rst_stream(&mut frame, id, H2Error::Cancel)
+                        {
+                            let buf = kawa.storage.space();
+                            if buf.len() >= frame.len() {
+                                buf[..frame.len()].copy_from_slice(&frame);
+                                kawa.storage.fill(frame.len());
+                                self.readiness.interest.insert(Ready::WRITABLE);
+                            }
+                        }
                         self.streams.remove(&id);
                         return;
                     }
@@ -1381,6 +1440,14 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     where
         L: ListenerHandler + L7ListenerHandler,
     {
+        // RFC 9113 §6.8: reject new streams on a draining connection
+        if self.draining {
+            error!(
+                "Cannot open new stream on draining connection (stream {})",
+                stream
+            );
+            return false;
+        }
         // RFC 9113 §5.1.2: respect peer's max concurrent streams limit
         if self.streams.len() >= self.peer_settings.settings_max_concurrent_streams as usize {
             error!(
