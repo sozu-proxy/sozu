@@ -71,6 +71,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         if kawa.is_error() {
             match self.position {
                 Position::Client(..) => {
+                    incr!("http.backend_parse_errors");
                     let StreamState::Linked(token) = stream.state else {
                         error!("client stream in error is not in Linked state");
                         return MuxResult::CloseSession;
@@ -80,6 +81,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                     endpoint.end_stream(token, global_stream_id, context);
                 }
                 Position::Server => {
+                    incr!("http.frontend_parse_errors");
                     let answers = answers_rc.borrow();
                     set_default_answer(stream, &mut self.readiness, 400, &answers);
                 }
@@ -118,6 +120,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                 }
                 self.requests += 1;
                 trace!("REQUESTS: {}", self.requests);
+                incr!("http.requests");
                 gauge_add!("http.active_requests", 1);
                 stream.state = StreamState::Link
             }
