@@ -9,7 +9,7 @@ use crate::protocol::{
     http::parser::compare_no_case,
     mux::{
         StreamId,
-        parser::{FrameHeader, FrameType, H2Error, str_to_error_code},
+        parser::{self, FrameHeader, FrameType, H2Error, str_to_error_code},
         serializer::{gen_frame_header, gen_rst_stream},
     },
 };
@@ -32,7 +32,8 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                 ..
             } => {
                 let error = str_to_error_code(message);
-                let mut frame = [0; 13];
+                let mut frame =
+                    [0; parser::FRAME_HEADER_SIZE + parser::RST_STREAM_PAYLOAD_SIZE as usize];
                 if let Err(e) = gen_rst_stream(&mut frame, self.stream_id, error) {
                     error!("failed to serialize RST_STREAM frame: {:?}", e);
                     return;
@@ -40,7 +41,8 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                 kawa.push_out(Store::from_slice(&frame));
             }
             ParsingPhase::Error { .. } => {
-                let mut frame = [0; 13];
+                let mut frame =
+                    [0; parser::FRAME_HEADER_SIZE + parser::RST_STREAM_PAYLOAD_SIZE as usize];
                 if let Err(e) = gen_rst_stream(&mut frame, self.stream_id, H2Error::InternalError) {
                     error!("failed to serialize RST_STREAM frame: {:?}", e);
                     return;
@@ -157,7 +159,7 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                 // this converter doesn't align H1 chunks on H2 data frames
             }
             Block::Chunk(Chunk { data }) => {
-                let mut header = [0; 9];
+                let mut header = [0; parser::FRAME_HEADER_SIZE];
                 let payload_len = data.len();
                 let (data, payload_len, can_continue) =
                     if self.window >= payload_len as i32 && self.max_frame_size >= payload_len {
@@ -203,12 +205,19 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
             }) => {
                 let sent_end_stream = if end_header {
                     let payload = std::mem::take(&mut self.out);
-                    let mut header = [0; 9];
+                    let mut header = [0; parser::FRAME_HEADER_SIZE];
                     let chunks = payload.chunks(self.max_frame_size);
                     let n_chunks = chunks.len();
                     for (i, chunk) in chunks.enumerate() {
-                        let flags = if i == 0 && end_stream { 1 } else { 0 }
-                            | if i + 1 == n_chunks { 4 } else { 0 };
+                        let flags = if i == 0 && end_stream {
+                            parser::FLAG_END_STREAM
+                        } else {
+                            0
+                        } | if i + 1 == n_chunks {
+                            parser::FLAG_END_HEADERS
+                        } else {
+                            0
+                        };
                         if i == 0 {
                             if let Err(e) = gen_frame_header(
                                 &mut header,
@@ -242,13 +251,13 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                     false
                 };
                 if end_stream && !sent_end_stream {
-                    let mut header = [0; 9];
+                    let mut header = [0; parser::FRAME_HEADER_SIZE];
                     if let Err(e) = gen_frame_header(
                         &mut header,
                         &FrameHeader {
                             payload_len: 0,
                             frame_type: FrameType::Data,
-                            flags: 1,
+                            flags: parser::FLAG_END_STREAM,
                             stream_id: self.stream_id,
                         },
                     ) {

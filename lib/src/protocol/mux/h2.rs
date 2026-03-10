@@ -19,6 +19,23 @@ use crate::{
     timer::TimeoutContainer,
 };
 
+// ── RFC 9113 §6.5.2 Settings Defaults ───────────────────────────────────────
+
+const DEFAULT_HEADER_TABLE_SIZE: u32 = 4096;
+const DEFAULT_MAX_CONCURRENT_STREAMS: u32 = 100;
+pub(super) const DEFAULT_INITIAL_WINDOW_SIZE: u32 = (1 << 16) - 1; // 65535
+const DEFAULT_MAX_FRAME_SIZE: u32 = 1 << 14; // 16384
+
+// RFC 9113 §6.5.2: SETTINGS_MAX_FRAME_SIZE valid range [2^14, 2^24)
+const MIN_MAX_FRAME_SIZE: u32 = 1 << 14; // 16384
+const MAX_MAX_FRAME_SIZE: u32 = 1 << 24; // 16777216 (exclusive upper bound)
+
+// RFC 9113 §6.9: maximum flow control window size (2^31 - 1)
+const FLOW_CONTROL_MAX_WINDOW: u32 = 1 << 31;
+
+/// H2 client connection preface size: 24-byte magic + 9-byte SETTINGS frame header
+pub(super) const CLIENT_PREFACE_SIZE: usize = 24 + parser::FRAME_HEADER_SIZE;
+
 #[inline(always)]
 fn error_nom_to_h2(error: nom::Err<parser::ParserError>) -> H2Error {
     match error {
@@ -65,11 +82,11 @@ pub struct H2Settings {
 impl Default for H2Settings {
     fn default() -> Self {
         Self {
-            settings_header_table_size: 4096,
+            settings_header_table_size: DEFAULT_HEADER_TABLE_SIZE,
             settings_enable_push: false,
-            settings_max_concurrent_streams: 100,
-            settings_initial_window_size: (1 << 16) - 1,
-            settings_max_frame_size: 1 << 14,
+            settings_max_concurrent_streams: DEFAULT_MAX_CONCURRENT_STREAMS,
+            settings_initial_window_size: DEFAULT_INITIAL_WINDOW_SIZE,
+            settings_max_frame_size: DEFAULT_MAX_FRAME_SIZE,
             settings_max_header_list_size: u32::MAX,
             settings_enable_connect_protocol: false,
             settings_no_rfc7540_priorities: true,
@@ -460,7 +477,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         }
                         self.expect_read = Some((H2StreamId::Zero, payload_len as usize));
                         let mut headers = headers.clone();
-                        headers.end_headers = flags & 0x4 != 0;
+                        headers.end_headers = flags & parser::FLAG_END_HEADERS != 0;
                         headers.header_block_fragment.len += payload_len;
                         self.state = H2State::ContinuationFrame(headers);
                     }
@@ -1155,18 +1172,18 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     let mut is_error = false;
                     #[rustfmt::skip]
                     match setting.identifier {
-                        1 => {
+                        parser::SETTINGS_HEADER_TABLE_SIZE => {
                             self.peer_settings.settings_header_table_size = v;
                             // Propagate peer's table size to our HPACK encoder
                             self.encoder.set_max_table_size(v as usize);
                         },
-                        2 => { self.peer_settings.settings_enable_push = v == 1;                is_error |= v > 1 },
-                        3 => { self.peer_settings.settings_max_concurrent_streams = v },
-                        4 => { is_error |= self.update_initial_window_size(v, context) },
-                        5 => { self.peer_settings.settings_max_frame_size = v;                  is_error |= !(1u32<<14..1u32<<24).contains(&v) },
-                        6 => { self.peer_settings.settings_max_header_list_size = v },
-                        8 => { self.peer_settings.settings_enable_connect_protocol = v == 1;    is_error |= v > 1 },
-                        9 => { self.peer_settings.settings_no_rfc7540_priorities = v == 1;      is_error |= v > 1 },
+                        parser::SETTINGS_ENABLE_PUSH       => { self.peer_settings.settings_enable_push = v == 1;             is_error |= v > 1 },
+                        parser::SETTINGS_MAX_CONCURRENT_STREAMS => { self.peer_settings.settings_max_concurrent_streams = v },
+                        parser::SETTINGS_INITIAL_WINDOW_SIZE    => { is_error |= self.update_initial_window_size(v, context) },
+                        parser::SETTINGS_MAX_FRAME_SIZE         => { self.peer_settings.settings_max_frame_size = v;           is_error |= !(MIN_MAX_FRAME_SIZE..MAX_MAX_FRAME_SIZE).contains(&v) },
+                        parser::SETTINGS_MAX_HEADER_LIST_SIZE   => { self.peer_settings.settings_max_header_list_size = v },
+                        parser::SETTINGS_ENABLE_CONNECT_PROTOCOL => { self.peer_settings.settings_enable_connect_protocol = v == 1; is_error |= v > 1 },
+                        parser::SETTINGS_NO_RFC7540_PRIORITIES   => { self.peer_settings.settings_no_rfc7540_priorities = v == 1;   is_error |= v > 1 },
                         other => warn!("Unknown setting_id: {}, we MUST ignore this", other),
                     };
                     if is_error {
@@ -1287,7 +1304,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     where
         L: ListenerHandler + L7ListenerHandler,
     {
-        if value >= 1 << 31 {
+        if value >= FLOW_CONTROL_MAX_WINDOW {
             return true;
         }
         let delta = value as i32 - self.peer_settings.settings_initial_window_size as i32;
