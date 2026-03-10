@@ -245,7 +245,10 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
     }
     fn finalize(&mut self, _kawa: &mut Kawa<T>) {
         if !self.out.is_empty() {
-            error!("H2BlockConverter finalize: out buffer not empty ({} bytes remaining)", self.out.len());
+            error!(
+                "H2BlockConverter finalize: out buffer not empty ({} bytes remaining), clearing",
+                self.out.len()
+            );
             self.out.clear();
         }
     }
