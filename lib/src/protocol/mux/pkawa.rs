@@ -118,17 +118,37 @@ where
                     invalid_headers = true;
                 } else if compare_no_case(&k, b"cookie") {
                     regular_headers = true;
-                    // TODO: cookies should be split into individual pairs per RFC 9113 section 8.2.3
-                    // For now, forward the full cookie header as-is
-                    if kawa.storage.write_all(&k).is_err() {
-                        invalid_headers = true;
-                        return;
+                    // RFC 9113 §8.2.3: split combined cookie headers into individual pairs.
+                    // Each cookie-pair separated by "; " becomes a separate cookie header.
+                    for cookie_pair in v.split(|&b| b == b';') {
+                        let trimmed = cookie_pair
+                            .iter()
+                            .position(|&b| b != b' ')
+                            .map_or(&[][..], |pos| &cookie_pair[pos..]);
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        let pair_start = kawa.storage.end as u32;
+                        if kawa.storage.write_all(trimmed).is_err()
+                            || kawa.storage.write_all(&k).is_err()
+                        {
+                            invalid_headers = true;
+                            return;
+                        }
+                        let pair_len = trimmed.len() as u32;
+                        let pair_val = Store::Slice(Slice {
+                            start: pair_start,
+                            len: pair_len,
+                        });
+                        let pair_key = Store::Slice(Slice {
+                            start: pair_start + pair_len,
+                            len: len_key,
+                        });
+                        kawa.push_block(Block::Header(Pair {
+                            key: pair_key,
+                            val: pair_val,
+                        }));
                     }
-                    let key = Store::Slice(Slice {
-                        start: start + len_val,
-                        len: len_key,
-                    });
-                    kawa.push_block(Block::Header(Pair { key, val }));
                 } else {
                     regular_headers = true;
                     if compare_no_case(&k, b"content-length") {
