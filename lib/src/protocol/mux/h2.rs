@@ -4,10 +4,10 @@ use rusty_ulid::Ulid;
 use sozu_command::ready::Ready;
 
 use crate::{
-    L7ListenerHandler, ListenerHandler, Protocol, Readiness, println_,
+    L7ListenerHandler, ListenerHandler, Protocol, Readiness,
     protocol::mux::{
         BackendStatus, Context, DebugEvent, Endpoint, GenericHttpStream, GlobalStreamId, MuxResult,
-        Position, StreamId, StreamState, converter, debug_kawa, forcefully_terminate_answer,
+        Position, StreamId, StreamState, converter, forcefully_terminate_answer,
         parser::{
             self, Frame, FrameHeader, FrameType, H2Error, Headers, ParserError, ParserErrorKind,
             WindowUpdate, error_code_to_str,
@@ -82,7 +82,7 @@ pub struct Prioriser {}
 
 impl Prioriser {
     pub fn push_priority(&mut self, stream_id: StreamId, priority: parser::PriorityPart) -> bool {
-        println_!("PRIORITY REQUEST FOR {stream_id}: {priority:?}");
+        trace!("PRIORITY REQUEST FOR {}: {:?}", stream_id, priority);
         match priority {
             parser::PriorityPart::Rfc7540 {
                 stream_dependency,
@@ -177,7 +177,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     global_stream_id,
                 ),
             };
-            println_!("{:?}({stream_id:?}, {amount})", self.state);
+            trace!("{:?}({:?}, {})", self.state, stream_id, amount);
             if amount > 0 {
                 if amount > kawa.storage.available_space() {
                     self.readiness.interest.remove(Ready::READABLE);
@@ -205,7 +205,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     {
                         let i = kawa.storage.data();
                         if !b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".starts_with(i) {
-                            println_!("EARLY INVALID PREFACE: {i:?}");
+                            debug!("EARLY INVALID PREFACE: {:?}", i);
                             return self.force_disconnect();
                         }
                     }
@@ -224,13 +224,16 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             | (H2State::GoAway, _)
             | (H2State::ServerSettings, Position::Server)
             | (H2State::ClientPreface, Position::Client(..))
-            | (H2State::ClientSettings, Position::Client(..)) => unreachable!(
-                "Unexpected combination: (Readable, {:?}, {:?})",
-                self.state, self.position
-            ),
+            | (H2State::ClientSettings, Position::Client(..)) => {
+                error!(
+                    "Unexpected combination: (Readable, {:?}, {:?})",
+                    self.state, self.position
+                );
+                return self.force_disconnect();
+            }
             (H2State::Discard, _) => {
                 let _i = kawa.storage.data();
-                println_!("DISCARDING: {_i:?}");
+                trace!("DISCARDING: {:?}", _i);
                 kawa.storage.clear();
                 self.expect_header();
             }
@@ -308,10 +311,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             }
             (H2State::Header, _) => {
                 let i = kawa.storage.data();
-                println_!("  header: {i:?}");
+                trace!("  header: {:?}", i);
                 match parser::frame_header(i, self.local_settings.settings_max_frame_size) {
                     Ok((_, header)) => {
-                        println_!("{header:#?}");
+                        trace!("{:#?}", header);
                         kawa.storage.clear();
                         let stream_id = header.stream_id;
                         let read_stream = if stream_id == 0 {
@@ -330,10 +333,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                             } else {
                                 stream.back_received_end_of_stream
                             };
-                            println_!(
-                                "REQUESTING EXISTING STREAM {stream_id}: {}/{:?}",
-                                received_eos,
-                                stream.state
+                            trace!(
+                                "REQUESTING EXISTING STREAM {}: {}/{:?}",
+                                stream_id, received_eos, stream.state
                             );
                             if !allowed_on_half_closed && (received_eos || !stream.state.is_open())
                             {
@@ -389,7 +391,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                             }
                             H2StreamId::Zero
                         };
-                        println_!("{} {stream_id:?} {:#?}", header.stream_id, self.streams);
+                        trace!("{} {:?} {:#?}", header.stream_id, stream_id, self.streams);
                         self.expect_read = Some((read_stream, header.payload_len as usize));
                         self.state = H2State::Frame(header);
                     }
@@ -409,7 +411,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             }
             (H2State::ContinuationHeader(headers), _) => {
                 let i = kawa.storage.unparsed_data();
-                println_!("  continuation header: {i:?}");
+                trace!("  continuation header: {:?}", i);
                 match parser::frame_header(i, self.local_settings.settings_max_frame_size) {
                     Ok((
                         _,
@@ -420,9 +422,14 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                             stream_id,
                         },
                     )) => {
-                        // println_!("{header:#?}");
                         kawa.storage.end -= 9;
-                        assert_eq!(stream_id, headers.stream_id);
+                        if stream_id != headers.stream_id {
+                            error!(
+                                "CONTINUATION stream_id {} does not match HEADERS stream_id {}",
+                                stream_id, headers.stream_id
+                            );
+                            return self.goaway(H2Error::ProtocolError);
+                        }
                         self.expect_read = Some((H2StreamId::Zero, payload_len as usize));
                         let mut headers = headers.clone();
                         headers.end_headers = flags & 0x4 != 0;
@@ -442,7 +449,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             }
             (H2State::Frame(header), _) => {
                 let i = kawa.storage.unparsed_data();
-                println_!("  data: {i:?}");
+                trace!("  data: {:?}", i);
                 let frame = match parser::frame_body(i, header) {
                     Ok((_, frame)) => frame,
                     Err(error) => {
@@ -464,7 +471,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             (H2State::ContinuationFrame(headers), _) => {
                 kawa.storage.head = kawa.storage.end;
                 let i = kawa.storage.data();
-                println_!("  data: {:?}", i);
+                trace!("  data: {:?}", i);
                 let headers = headers.clone();
                 self.expect_header();
                 return self.handle_frame(Frame::Headers(headers), context, endpoint);
@@ -540,13 +547,16 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             | (H2State::Discard, _)
             | (H2State::ClientPreface, Position::Server)
             | (H2State::ClientSettings, Position::Server)
-            | (H2State::ServerSettings, Position::Client(..)) => unreachable!(
-                "Unexpected combination: (Writable, {:?}, {:?})",
-                self.state, self.position
-            ),
+            | (H2State::ServerSettings, Position::Client(..)) => {
+                error!(
+                    "Unexpected combination: (Writable, {:?}, {:?})",
+                    self.state, self.position
+                );
+                self.force_disconnect()
+            }
             (H2State::GoAway, _) => self.force_disconnect(),
             (H2State::ClientPreface, Position::Client(..)) => {
-                println_!("Preparing preface and settings");
+                trace!("Preparing preface and settings");
                 let pri = serializer::H2_PRI.as_bytes();
                 let kawa = &mut self.zero;
 
@@ -565,7 +575,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 MuxResult::Continue
             }
             (H2State::ClientSettings, Position::Client(..)) => {
-                println_!("Sent preface and settings");
+                trace!("Sent preface and settings");
                 self.state = H2State::ServerSettings;
                 self.expect_read = Some((H2StreamId::Zero, 9));
                 self.readiness.interest.remove(Ready::WRITABLE);
@@ -625,7 +635,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                             Position::Server => {
                                 // mark stream as reusable
                                 context.debug.push(DebugEvent::I2(4, global_stream_id));
-                                println_!("Recycle stream: {global_stream_id}");
+                                trace!("Recycle stream: {}", global_stream_id);
                                 incr!("http.e2e.h2");
                                 stream.generate_access_log(
                                     false,
@@ -662,13 +672,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 let mut priorities = self.streams.keys().collect::<Vec<_>>();
                 priorities.sort();
 
-                println_!("PRIORITIES: {priorities:?}");
+                trace!("PRIORITIES: {:?}", priorities);
                 let mut socket_write = false;
                 'outer: for stream_id in priorities {
-                    let global_stream_id = *self
-                        .streams
-                        .get(stream_id)
-                        .expect("stream_id from sorted keys must exist in streams map");
+                    let Some(&global_stream_id) = self.streams.get(stream_id) else {
+                        error!("stream_id {} from sorted keys missing in streams map", stream_id);
+                        continue;
+                    };
                     let stream = &mut context.streams[global_stream_id];
                     let parts = stream.split(&self.position);
                     let kawa = parts.wbuffer;
@@ -680,7 +690,6 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         let consumed = window - converter.window;
                         *parts.window -= consumed;
                         self.window -= consumed;
-                        debug_kawa(kawa);
                     }
                     context.debug.push(DebugEvent::S(
                         *stream_id,
@@ -727,7 +736,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                                     warn!("{:?}", context.debug.events);
                                     context.debug.set_interesting(false);
                                 }
-                                println_!("Recycle1 stream: {global_stream_id}");
+                                trace!("Recycle1 stream: {}", global_stream_id);
                                 incr!("http.e2e.h2");
                                 stream.generate_access_log(
                                     false,
@@ -745,9 +754,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     }
                 }
                 for stream_id in dead_streams {
-                    self.streams
-                        .remove(&stream_id)
-                        .expect("dead stream_id must exist in streams map");
+                    if self.streams.remove(&stream_id).is_none() {
+                        error!("dead stream_id {} missing from streams map", stream_id);
+                    }
                 }
 
                 // Reclaim the converter's HPACK buffer for reuse
@@ -849,7 +858,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         E: Endpoint,
         L: ListenerHandler + L7ListenerHandler,
     {
-        println_!("{frame:#?}");
+        trace!("{:#?}", frame);
         match frame {
             Frame::Data(data) => {
                 let Some(global_stream_id) = self.streams.get(&data.stream_id).copied() else {
@@ -1017,7 +1026,6 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         return self.reset_stream(global_stream_id, context, endpoint, error);
                     }
                 }
-                debug_kawa(parts.rbuffer);
                 if headers.end_stream {
                     if self.position.is_server() {
                         stream.front_received_end_of_stream = true;
@@ -1069,7 +1077,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 }
             }
             Frame::RstStream(rst_stream) => {
-                println_!(
+                debug!(
                     "RstStream({} -> {})",
                     rst_stream.error_code,
                     error_code_to_str(rst_stream.error_code)
@@ -1192,11 +1200,12 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         );
                     }
                 } else {
-                    println_!("Ignoring window update on closed stream {stream_id}: {increment}");
+                    trace!("Ignoring window update on closed stream {}: {}", stream_id, increment);
                 };
             }
             Frame::Continuation(_) => {
-                unreachable!("CONTINUATION frames are handled inline during header parsing")
+                error!("CONTINUATION frames are handled inline during header parsing");
+                return self.goaway(H2Error::ProtocolError);
             }
         }
         MuxResult::Continue
@@ -1222,9 +1231,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 None => return true,
             }
         }
-        println_!(
-            "UPDATE INIT WINDOW: {delta} {open_window} {:?}",
-            self.readiness
+        trace!(
+            "UPDATE INIT WINDOW: {} {} {:?}",
+            delta, open_window, self.readiness
         );
         if open_window {
             self.readiness.interest.insert(Ready::WRITABLE);
@@ -1252,11 +1261,12 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     {
         match self.position {
             Position::Client(_, _, BackendStatus::KeepAlive) => {
-                unreachable!("H2 connections do not use KeepAlive backend status")
+                error!("H2 connections do not use KeepAlive backend status");
+                return;
             }
             Position::Client(..) => {}
             Position::Server => {
-                println_!("H2 SENDING CLOSE NOTIFY");
+                trace!("H2 SENDING CLOSE NOTIFY");
                 self.socket.socket_close();
                 let _ = self.socket.socket_write_vectored(&[]);
                 return;
@@ -1264,7 +1274,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         }
         // reconnection is handled by the server for each stream separately
         for global_stream_id in self.streams.values() {
-            println_!("end stream: {global_stream_id}");
+            trace!("end stream: {}", global_stream_id);
             if let StreamState::Linked(token) = context.streams[*global_stream_id].state {
                 endpoint.end_stream(token, *global_stream_id, context);
             }
@@ -1283,7 +1293,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         L: ListenerHandler + L7ListenerHandler,
     {
         let stream = &mut context.streams[stream_id];
-        println_!("reset H2 stream {stream_id}: {:#?}", stream.context);
+        trace!("reset H2 stream {}: {:#?}", stream_id, stream.context);
         let old_state = std::mem::replace(&mut stream.state, StreamState::Unlinked);
         forcefully_terminate_answer(stream, &mut self.readiness, error);
         if let StreamState::Linked(token) = old_state {
@@ -1297,7 +1307,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         L: ListenerHandler + L7ListenerHandler,
     {
         let stream_context = &mut context.streams[stream_gid].context;
-        println_!("end H2 stream {}: {:#?}", stream_gid, stream_context);
+        trace!("end H2 stream {}: {:#?}", stream_gid, stream_context);
         match self.position {
             Position::Client(..) => {
                 for (stream_id, global_stream_id) in &self.streams {
@@ -1380,7 +1390,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             );
             return false;
         }
-        println_!("start new H2 stream {stream} {:?}", self.readiness);
+        trace!("start new H2 stream {} {:?}", stream, self.readiness);
         let stream_id = self.new_stream_id();
         self.streams.insert(stream_id, stream);
         self.readiness.interest.insert(Ready::WRITABLE);
