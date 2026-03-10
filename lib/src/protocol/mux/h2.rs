@@ -125,8 +125,12 @@ pub struct ConnectionH2<Front: SocketHandler> {
     /// When this exceeds the threshold, we send a connection-level WINDOW_UPDATE.
     pub received_bytes_since_update: u32,
     /// Queued WINDOW_UPDATE frames to send: Vec<(stream_id, increment)>.
-    /// stream_id=0 means connection-level update.
+    /// stream_id=0 means connection-level update. Entries are coalesced per stream_id.
     pub pending_window_updates: Vec<(u32, u32)>,
+    /// Highest stream ID accepted from the peer (used for GoAway last_stream_id).
+    pub highest_peer_stream_id: StreamId,
+    /// Reusable buffer for HPACK-encoded headers in the H2 block converter.
+    pub converter_buf: Vec<u8>,
     pub zero: GenericHttpStream,
 }
 impl<Front: SocketHandler> std::fmt::Debug for ConnectionH2<Front> {
@@ -645,12 +649,14 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     } else {
                         b"http"
                     };
+                let mut converter_buf = std::mem::take(&mut self.converter_buf);
+                converter_buf.clear();
                 let mut converter = converter::H2BlockConverter {
                     max_frame_size: self.peer_settings.settings_max_frame_size as usize,
                     window: 0,
                     stream_id: 0,
                     encoder: &mut self.encoder,
-                    out: Vec::new(),
+                    out: converter_buf,
                     scheme,
                 };
                 let mut priorities = self.streams.keys().collect::<Vec<_>>();
@@ -739,6 +745,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     self.streams.remove(&stream_id).unwrap();
                 }
 
+                // Reclaim the converter's HPACK buffer for reuse
+                self.converter_buf = converter.out;
+
                 if self.socket.socket_wants_write() {
                     if !socket_write {
                         self.socket.socket_write(&[]);
@@ -756,14 +765,28 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         }
     }
 
+    /// Queue a WINDOW_UPDATE, coalescing with any existing entry for the same stream_id.
+    fn queue_window_update(&mut self, stream_id: u32, increment: u32) {
+        if let Some(entry) = self
+            .pending_window_updates
+            .iter_mut()
+            .find(|(sid, _)| *sid == stream_id)
+        {
+            entry.1 = entry.1.saturating_add(increment);
+        } else {
+            self.pending_window_updates.push((stream_id, increment));
+        }
+    }
+
     pub fn goaway(&mut self, error: H2Error) -> MuxResult {
         self.state = H2State::Error;
         self.expect_read = None;
         let kawa = &mut self.zero;
         kawa.storage.clear();
-        error!("//////////////GOAWAY: {:?}", error);
+        error!("GOAWAY: {:?}", error);
 
-        match serializer::gen_goaway(kawa.storage.space(), self.last_stream_id, error) {
+        // RFC 9113 §6.8: last_stream_id is the highest peer-initiated stream we processed
+        match serializer::gen_goaway(kawa.storage.space(), self.highest_peer_stream_id, error) {
             Ok((_, size)) => {
                 kawa.storage.fill(size);
                 self.state = H2State::GoAway;
@@ -791,6 +814,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             self.peer_settings.settings_initial_window_size,
         )?;
         self.last_stream_id = (stream_id + 2) & !1;
+        // Track the highest peer-initiated stream ID for GoAway frames
+        if stream_id > self.highest_peer_stream_id {
+            self.highest_peer_stream_id = stream_id;
+        }
         self.streams.insert(stream_id, global_stream_id);
         Some(global_stream_id)
     }
@@ -878,14 +905,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 self.received_bytes_since_update += payload_u32;
                 if self.received_bytes_since_update >= threshold {
                     let increment = self.received_bytes_since_update;
-                    self.pending_window_updates.push((0, increment));
+                    self.queue_window_update(0, increment);
                     self.received_bytes_since_update = 0;
                 }
 
                 // Stream-level flow control (only if stream is still open)
                 if !data.end_stream {
-                    self.pending_window_updates
-                        .push((data.stream_id, payload_u32));
+                    self.queue_window_update(data.stream_id, payload_u32);
                 }
 
                 // If we have pending updates, ensure we get a writable event
@@ -1332,6 +1358,15 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     where
         L: ListenerHandler + L7ListenerHandler,
     {
+        // RFC 9113 §5.1.2: respect peer's max concurrent streams limit
+        if self.streams.len() >= self.peer_settings.settings_max_concurrent_streams as usize {
+            error!(
+                "Cannot open new stream: active={} >= peer max_concurrent_streams={}",
+                self.streams.len(),
+                self.peer_settings.settings_max_concurrent_streams
+            );
+            return;
+        }
         println_!("start new H2 stream {stream} {:?}", self.readiness);
         let stream_id = self.new_stream_id();
         self.streams.insert(stream_id, stream);
