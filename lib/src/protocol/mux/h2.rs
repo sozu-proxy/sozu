@@ -1361,18 +1361,26 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 for (stream_id, global_stream_id) in &self.streams {
                     if *global_stream_id == stream_gid {
                         let id = *stream_id;
-                        // Send RST_STREAM to cleanly signal the backend that we are
-                        // done with this stream (e.g., frontend disconnected).
-                        let kawa = &mut self.zero;
-                        let mut frame = [0; 13];
-                        if let Ok((_, _size)) =
-                            serializer::gen_rst_stream(&mut frame, id, H2Error::Cancel)
-                        {
-                            let buf = kawa.storage.space();
-                            if buf.len() >= frame.len() {
-                                buf[..frame.len()].copy_from_slice(&frame);
-                                kawa.storage.fill(frame.len());
-                                self.readiness.interest.insert(Ready::WRITABLE);
+                        // Only send RST_STREAM if the stream hasn't fully completed.
+                        // If both request and response are terminated, the stream is
+                        // already in "closed" state (RFC 9113 §5.1) — sending RST_STREAM
+                        // on a closed stream would be a protocol error that could cause
+                        // the H2 peer to close the entire connection.
+                        let stream = &context.streams[stream_gid];
+                        let fully_completed = stream.back_received_end_of_stream
+                            && stream.front.is_terminated();
+                        if !fully_completed {
+                            let kawa = &mut self.zero;
+                            let mut frame = [0; 13];
+                            if let Ok((_, _size)) =
+                                serializer::gen_rst_stream(&mut frame, id, H2Error::Cancel)
+                            {
+                                let buf = kawa.storage.space();
+                                if buf.len() >= frame.len() {
+                                    buf[..frame.len()].copy_from_slice(&frame);
+                                    kawa.storage.fill(frame.len());
+                                    self.readiness.interest.insert(Ready::WRITABLE);
+                                }
                             }
                         }
                         self.streams.remove(&id);
