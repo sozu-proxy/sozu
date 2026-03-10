@@ -280,7 +280,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             }
             Position::Client(_, _, BackendStatus::Connecting(_))
             | Position::Client(_, _, BackendStatus::Connected) => {
-                warn!("BACKEND CLOSING FOR: {:?} {}", self.position, self.stream);
+                debug!("BACKEND CLOSING FOR: {:?} {}", self.position, self.stream);
             }
             Position::Server => {
                 trace!("H1 SENDING CLOSE NOTIFY");
@@ -340,7 +340,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                     // if the answer is not terminated we send an RstStream to properly clean the stream
                     // if it is terminated, we finish the transfer, the backend is not necessary anymore
                     if !stream.context.keep_alive_backend {
-                        warn!("CLOSE DELIMITED");
+                        debug!("CLOSE DELIMITED");
                         // TODO why not force_disconnect?
                         self.readiness.event = Ready::HUP;
                     } else if !stream.back.is_terminated() {

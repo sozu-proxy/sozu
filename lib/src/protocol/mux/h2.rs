@@ -854,7 +854,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         self.expect_read = None;
         let kawa = &mut self.zero;
         kawa.storage.clear();
-        error!("GOAWAY: {:?}", error);
+        if matches!(error, H2Error::NoError) {
+            debug!("GOAWAY: {:?}", error);
+        } else {
+            error!("GOAWAY: {:?}", error);
+        }
 
         // RFC 9113 §6.8: last_stream_id is the highest peer-initiated stream we processed
         match serializer::gen_goaway(kawa.storage.space(), self.highest_peer_stream_id, error) {
@@ -1224,11 +1228,19 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 self.expect_write = Some(H2StreamId::Zero);
             }
             Frame::GoAway(goaway) => {
-                error!(
-                    "Received GOAWAY: last_stream_id={}, error={}",
-                    goaway.last_stream_id,
-                    error_code_to_str(goaway.error_code)
-                );
+                if goaway.error_code == H2Error::NoError as u32 {
+                    debug!(
+                        "Received GOAWAY: last_stream_id={}, error={}",
+                        goaway.last_stream_id,
+                        error_code_to_str(goaway.error_code)
+                    );
+                } else {
+                    error!(
+                        "Received GOAWAY: last_stream_id={}, error={}",
+                        goaway.last_stream_id,
+                        error_code_to_str(goaway.error_code)
+                    );
+                }
                 // RFC 9113 §6.8: begin graceful drain.
                 self.draining = true;
                 self.peer_last_stream_id = Some(goaway.last_stream_id);
@@ -1451,7 +1463,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                             context
                                 .debug
                                 .push(DebugEvent::Str(format!("Close unterminated {stream_gid}")));
-                            warn!("CLOSING H2 UNTERMINATED STREAM {} {:?}", stream_gid, stream);
+                            debug!("CLOSING H2 UNTERMINATED STREAM {} {:?}", stream_gid, stream);
                             forcefully_terminate_answer(
                                 stream,
                                 &mut self.readiness,
@@ -1461,7 +1473,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                             context
                                 .debug
                                 .push(DebugEvent::Str(format!("Close terminated {stream_gid}")));
-                            warn!("CLOSING H2 TERMINATED STREAM {} {:?}", stream_gid, stream);
+                            debug!("CLOSING H2 TERMINATED STREAM {} {:?}", stream_gid, stream);
                             stream.state = StreamState::Unlinked;
                             self.readiness.interest.insert(Ready::WRITABLE);
                         }

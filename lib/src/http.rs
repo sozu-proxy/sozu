@@ -214,7 +214,7 @@ impl HttpSession {
                 Some(HttpStateMachine::Mux(mux))
             }
             _ => {
-                warn!(
+                debug!(
                     "HTTP expect upgrade failed: bad header {:?}",
                     expect.addresses
                 );
