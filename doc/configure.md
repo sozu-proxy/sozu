@@ -288,6 +288,87 @@ address = "127.0.0.1:8125"
 
 Currently, we can't change the frequency of sending messages.
 
+### Available metrics
+
+Sōzu emits the following metrics via statsd. All metrics are emitted by both HTTP/1.1
+and HTTP/2 code paths unless noted otherwise.
+
+#### Request lifecycle
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `http.requests` | counter | Total HTTP requests received (incremented when headers are fully parsed) |
+| `http.active_requests` | gauge | Currently in-flight requests |
+| `http.e2e.http11` | counter | Completed HTTP/1.1 request/response cycles (mux path) |
+| `http.e2e.h2` | counter | Completed HTTP/2 request/response cycles |
+| `http.errors` | counter | General HTTP processing errors |
+
+#### Byte counters
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `bytes_in` | counter | Bytes received from frontend clients |
+| `bytes_out` | counter | Bytes sent to frontend clients |
+| `back_bytes_in` | counter | Bytes received from backend servers |
+| `back_bytes_out` | counter | Bytes sent to backend servers |
+
+#### Parse errors
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `http.frontend_parse_errors` | counter | Frontend request parsing failures (malformed HTTP/1.1 or HPACK decode errors in HTTP/2) |
+| `http.backend_parse_errors` | counter | Backend response parsing failures |
+
+#### Default answer / error responses
+
+These are incremented when Sōzu generates a default error response:
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `http.301.redirection` | counter | 301 Moved Permanently (HTTP→HTTPS redirect) |
+| `http.400.errors` | counter | 400 Bad Request |
+| `http.401.errors` | counter | 401 Unauthorized |
+| `http.404.errors` | counter | 404 Not Found (no matching cluster) |
+| `http.408.errors` | counter | 408 Request Timeout |
+| `http.413.errors` | counter | 413 Payload Too Large |
+| `http.502.errors` | counter | 502 Bad Gateway |
+| `http.503.errors` | counter | 503 Service Unavailable (no backends) |
+| `http.504.errors` | counter | 504 Gateway Timeout |
+| `http.507.errors` | counter | 507 Insufficient Storage (buffer full) |
+
+#### Response status classes
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `http.status.1xx` | counter | 1xx informational responses |
+| `http.status.2xx` | counter | 2xx success responses |
+| `http.status.3xx` | counter | 3xx redirection responses |
+| `http.status.4xx` | counter | 4xx client error responses |
+| `http.status.5xx` | counter | 5xx server error responses |
+| `http.status.other` | counter | Non-standard status codes |
+| `http.status.none` | counter | Responses without a status code |
+
+#### Backend health
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `backend.up` | counter | Backend marked as healthy |
+| `backend.down` | counter | Backend marked as unhealthy |
+| `backend.connections.error` | counter | Backend connection failures |
+
+#### HTTP/2 specific
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `h2.headers_no_stream.error` | counter | HEADERS frame received with no matching stream (protocol error) |
+
+#### Other
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `http.infinite_loop.error` | counter | Event loop safety breaker triggered |
+| `unsent-access-logs` | counter | Access log entries that could not be sent |
+
 ### Example of externals services
 
 - [statsd](https://github.com/etsy/statsd)
