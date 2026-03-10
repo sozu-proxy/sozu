@@ -2751,6 +2751,165 @@ fn test_h1_still_works_on_h2_listener() {
     );
 }
 
+/// Set up an HTTPS listener with custom ALPN protocols.
+fn setup_h2_test_with_alpn(
+    name: &str,
+    nb_backends: usize,
+    alpn_protocols: Vec<String>,
+) -> (Worker, Vec<AsyncBackend<SimpleAggregator>>, u16) {
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+
+    let (config, listeners, state) = Worker::empty_config();
+    let mut worker = Worker::start_new_worker(name, config, &listeners, state);
+
+    let mut listener_builder = ListenerBuilder::new_https(front_address.clone());
+    listener_builder.with_alpn_protocols(Some(alpn_protocols));
+    worker.send_proxy_request_type(RequestType::AddHttpsListener(
+        listener_builder.to_tls(None).unwrap(),
+    ));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        address: front_address.clone(),
+        proxy: ListenerType::Https.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        hostname: String::from("localhost"),
+        ..Worker::default_http_frontend("cluster_0", front_address.clone().into())
+    }));
+
+    let certificate_and_key = CertificateAndKey {
+        certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
+        key: String::from(include_str!("../../../lib/assets/local-key.pem")),
+        certificate_chain: vec![],
+        versions: vec![],
+        names: vec![],
+    };
+    worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+        address: front_address,
+        certificate: certificate_and_key,
+        expired_at: None,
+    }));
+
+    let mut backends = Vec::new();
+    for i in 0..nb_backends {
+        let back_address = create_local_address();
+        worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+            "cluster_0",
+            format!("cluster_0-{i}"),
+            back_address,
+            None,
+        )));
+        backends.push(AsyncBackend::spawn_detached_backend(
+            format!("BACKEND_{i}"),
+            back_address,
+            SimpleAggregator::default(),
+            AsyncBackend::http_handler(format!("pong{i}")),
+        ));
+    }
+
+    worker.read_to_last();
+    (worker, backends, front_port)
+}
+
+/// Verify that an HTTPS listener with alpn_protocols = ["http/1.1"] only
+/// serves HTTP/1.1 even when the client offers both H2 and HTTP/1.1.
+fn try_alpn_http11_only_listener() -> State {
+    let (mut worker, mut backends, front_port) =
+        setup_h2_test_with_alpn("ALPN-H1ONLY", 1, vec!["http/1.1".to_owned()]);
+
+    // Client advertises both h2 and http/1.1, but the listener only supports http/1.1
+    let client = build_h2_or_h1_client();
+    let uri: hyper::Uri = format!("https://localhost:{front_port}/api")
+        .parse()
+        .unwrap();
+
+    if let Some((status, body)) = resolve_request(&client, uri) {
+        println!("ALPN H1-only - status: {status:?}, body: {body}");
+        if !status.is_success() || !body.contains("pong") {
+            return State::Fail;
+        }
+    } else {
+        return State::Fail;
+    }
+
+    worker.soft_stop();
+    let success = worker.wait_for_server_stop();
+
+    let aggregator = backends[0]
+        .stop_and_get_aggregator()
+        .expect("Could not get aggregator");
+    if success && aggregator.responses_sent == 1 {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+/// Verify that an HTTPS listener with alpn_protocols = ["http/1.1", "h2"]
+/// (preferring HTTP/1.1) still works with an H2-only client.
+fn try_alpn_prefer_h1_with_h2_client() -> State {
+    let (mut worker, mut backends, front_port) = setup_h2_test_with_alpn(
+        "ALPN-PREFER-H1",
+        1,
+        vec!["http/1.1".to_owned(), "h2".to_owned()],
+    );
+
+    // Client requires H2 only — the listener supports it (just prefers H1)
+    let client = build_h2_client();
+    let uri: hyper::Uri = format!("https://localhost:{front_port}/api")
+        .parse()
+        .unwrap();
+
+    if let Some((status, body)) = resolve_request(&client, uri) {
+        println!("ALPN prefer-H1 with H2 client - status: {status:?}, body: {body}");
+        if !status.is_success() || !body.contains("pong") {
+            return State::Fail;
+        }
+    } else {
+        return State::Fail;
+    }
+
+    worker.soft_stop();
+    let success = worker.wait_for_server_stop();
+
+    let aggregator = backends[0]
+        .stop_and_get_aggregator()
+        .expect("Could not get aggregator");
+    if success && aggregator.responses_sent == 1 {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_alpn_http11_only_listener() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "ALPN: HTTP/1.1-only listener serves H1 even when client offers H2",
+            try_alpn_http11_only_listener
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_alpn_prefer_h1_with_h2_client() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "ALPN: listener preferring HTTP/1.1 still serves H2-only client",
+            try_alpn_prefer_h1_with_h2_client
+        ),
+        State::Success
+    );
+}
+
 /// Run h2spec HTTP/2 conformance tests against Sozu.
 /// Requires h2spec binary in PATH (install: `go install github.com/summerwind/h2spec/cmd/h2spec@latest`)
 #[test]
