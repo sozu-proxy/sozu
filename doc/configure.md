@@ -266,6 +266,13 @@ backends = [
 When `http2 = true`, Sōzu opens cleartext HTTP/2 connections to the backend servers.
 This is useful when your backends natively support HTTP/2 (e.g., gRPC servers).
 
+You can also toggle HTTP/2 at runtime on an existing cluster via the CLI:
+
+```bash
+sozu cluster h2 enable --id MyH2Cluster
+sozu cluster h2 disable --id MyH2Cluster
+```
+
 The frontend and backend protocols are independent. All four combinations work:
 
 | Client → Sōzu | Sōzu → Backend | Configuration |

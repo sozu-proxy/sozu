@@ -12,14 +12,15 @@ use sozu_command_lib::{
         QueryClusterByDomain, QueryClustersHashes, RemoveBackend, RemoveCertificate,
         RemoveListener, ReplaceCertificate, RequestHttpFrontend, RequestTcpFrontend, RulePosition,
         SocketAddress, SoftStop, Status, SubscribeEvents, TlsVersion, request::RequestType,
+        response_content,
     },
 };
 
 use super::CtlError;
 use crate::{
     cli::{
-        BackendCmd, ClusterCmd, HttpFrontendCmd, HttpListenerCmd, HttpsListenerCmd, MetricsCmd,
-        TcpFrontendCmd, TcpListenerCmd,
+        BackendCmd, ClusterCmd, ClusterH2Cmd, HttpFrontendCmd, HttpListenerCmd, HttpsListenerCmd,
+        MetricsCmd, TcpFrontendCmd, TcpListenerCmd,
     },
     ctl::CommandManager,
 };
@@ -150,6 +151,7 @@ impl CommandManager {
                 send_proxy,
                 expect_proxy,
                 load_balancing_policy,
+                http2,
             } => {
                 let proxy_protocol = match (send_proxy, expect_proxy) {
                     (true, true) => Some(ProxyProtocolConfig::RelayHeader),
@@ -164,12 +166,14 @@ impl CommandManager {
                         https_redirect,
                         proxy_protocol: proxy_protocol.map(|pp| pp as i32),
                         load_balancing: load_balancing_policy as i32,
+                        http2: if http2 { Some(true) } else { None },
                         ..Default::default()
                     })
                     .into(),
                 )
             }
             ClusterCmd::Remove { id } => self.send_request(RequestType::RemoveCluster(id).into()),
+            ClusterCmd::H2 { cmd } => self.cluster_h2_command(cmd),
             ClusterCmd::List {
                 id: cluster_id,
                 domain,
@@ -204,6 +208,45 @@ impl CommandManager {
                 self.send_request(request)
             }
         }
+    }
+
+    pub fn cluster_h2_command(&mut self, cmd: ClusterH2Cmd) -> Result<(), CtlError> {
+        let (cluster_id, enable) = match cmd {
+            ClusterH2Cmd::Enable { id } => (id, true),
+            ClusterH2Cmd::Disable { id } => (id, false),
+        };
+
+        let request = RequestType::QueryClusterById(cluster_id.clone()).into();
+        let response = self.send_request_get_response(request, true)?;
+
+        let cluster = response
+            .content
+            .and_then(|c| c.content_type)
+            .and_then(|ct| match ct {
+                response_content::ContentType::Clusters(infos) => infos
+                    .vec
+                    .into_iter()
+                    .find(|info| {
+                        info.configuration
+                            .as_ref()
+                            .is_some_and(|c| c.cluster_id == cluster_id)
+                    })
+                    .and_then(|info| info.configuration),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                CtlError::ArgsNeeded(
+                    "cluster not found".to_owned(),
+                    cluster_id.clone(),
+                )
+            })?;
+
+        let updated = Cluster {
+            http2: Some(enable),
+            ..cluster
+        };
+
+        self.send_request(RequestType::AddCluster(updated).into())
     }
 
     pub fn tcp_frontend_command(&mut self, cmd: TcpFrontendCmd) -> Result<(), CtlError> {
