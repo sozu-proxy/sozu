@@ -390,6 +390,18 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                                     self.expect_header();
                                     return MuxResult::Continue;
                                 }
+                                if matches!(header.frame_type,
+                                    FrameType::RstStream | FrameType::WindowUpdate)
+                                {
+                                    // RFC 9113 §5.1: RST_STREAM and WINDOW_UPDATE on a
+                                    // closed stream can arrive due to race conditions and
+                                    // SHOULD be ignored. Treat as stream 0 so the frame
+                                    // body is parsed and discarded normally.
+                                    debug!(
+                                        "Ignoring {:?} on closed stream {}",
+                                        header.frame_type, header.stream_id
+                                    );
+                                }
                                 error!(
                                     "CANNOT RECEIVE {:?} FRAME ON IDLE/CLOSED STREAMS",
                                     header.frame_type
