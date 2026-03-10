@@ -49,15 +49,263 @@ They are all defined in [`lib/src/protocol`](https://github.com/sozu-proxy/sozu/
 
 ### HTTP/2 and the Mux layer
 
-HTTP/2 support is implemented via a unified multiplexer (`Mux`) in `lib/src/protocol/mux/`. The Mux layer handles both HTTP/1.1 and HTTP/2 connections through a `Connection` enum with `H1` and `H2` variants. This allows any combination of frontend and backend protocols: H1→H1, H1→H2, H2→H1, and H2→H2.
+HTTP/2 support is implemented via a unified multiplexer (`Mux`) in `lib/src/protocol/mux/`.
+The Mux layer handles both HTTP/1.1 and HTTP/2 connections through a `Connection` enum with
+`H1` and `H2` variants, enabling any combination of frontend and backend protocols.
 
-Key design decisions:
+#### Protocol combinations
 
-- **Bidirectional streams**: Each `Stream` is shared between a frontend and backend connection. Direction-specific fields (e.g., `front_received_end_of_stream`, `back_received_end_of_stream`) prevent cross-contamination between the two sides.
-- **StreamParts pattern**: `Stream::split(&position)` returns position-aware mutable borrows — a server reads from `front` and writes to `back`, while a client reads from `back` and writes to `front`.
-- **Flow control**: RFC 9113 §6.9 connection-level and stream-level WINDOW_UPDATE with threshold-based sending (50% of initial window size). WINDOW_UPDATE frames are flushed inline during `writable()` to avoid extra event loop iterations.
-- **HPACK**: Header compression uses `loona-hpack`. Decode callbacks are hardened against panics — all `write_all()` calls use fallible error handling.
-- **H2 backend**: Controlled by `cluster.http2` in the protobuf config. Sōzu connects to backends over plain TCP speaking H2 (h2c). The `:scheme` pseudo-header is derived from the frontend listener protocol (HTTP or HTTPS).
+```
+  Client             Sōzu               Backend
+  ──────           ────────            ─────────
+   H1  ──────────▶  Mux  ──────────▶   H1        (classic)
+   H1  ──────────▶  Mux  ──────────▶   H2        (H2 backend, h2c)
+   H2  ──────────▶  Mux  ──────────▶   H1        (H2 frontend, H1 backend)
+   H2  ──────────▶  Mux  ──────────▶   H2        (end-to-end H2)
+```
+
+The frontend protocol is determined by ALPN negotiation during TLS handshake (or H2 prior
+knowledge for cleartext). The backend protocol is controlled by the `cluster.http2` protobuf
+config flag.
+
+#### Mux session structure
+
+A `MuxState` session owns one frontend `Connection` and a `Router` containing zero or more
+backend `Connection`s. All connections share a `Context` holding a `Vec<Stream>`.
+
+```
+MuxState
+├── frontend: Connection<FrontRustls>     ◄── one frontend socket
+│   ├── H1(ConnectionH1)                      (either H1 or H2)
+│   └── H2(ConnectionH2)
+│
+├── router: Router
+│   └── backends: HashMap<Token, Connection<TcpStream>>
+│       ├── Token(7)  → H1(ConnectionH1)  ◄── backend to cluster "app-1"
+│       ├── Token(12) → H2(ConnectionH2)  ◄── backend to cluster "app-2" (h2c)
+│       └── ...
+│
+└── context: Context
+    ├── streams: Vec<Stream>              ◄── shared stream pool
+    │   ├── [0] Stream { state: Linked(Token(7)),  front: Kawa, back: Kawa, ... }
+    │   ├── [1] Stream { state: Linked(Token(12)), front: Kawa, back: Kawa, ... }
+    │   ├── [2] Stream { state: Recycle, ... }
+    │   └── ...
+    ├── pool: Weak<RefCell<Pool>>         ◄── buffer allocator
+    └── listener: Rc<RefCell<L>>
+```
+
+#### Stream lifecycle
+
+Each `Stream` transitions through states as it processes a request/response pair:
+
+```
+             ┌──────────────────────────────────────────────────┐
+             │                                                  │
+             ▼                                                  │
+          ┌──────┐   HEADERS    ┌──────┐   connect()   ┌────────┐
+  new ──▶ │ Idle │ ──────────▶ │ Link │ ────────────▶ │ Linked  │
+          └──────┘   received   └──────┘   to backend  │(Token)  │
+             ▲                                          └────┬───┘
+             │                                               │
+             │       ┌─────────┐   response    ┌─────────┐   │ backend
+             │       │ Recycle │ ◀──────────── │end_stream│ ◀─┘ done or
+             │       └────┬────┘   complete     └─────────┘    error
+             │            │                         │
+             │ reuse      │                         │ can't retry
+             └────────────┘                         ▼
+                                              ┌──────────┐
+                                              │ Unlinked │ ──▶ error response
+                                              └──────────┘
+```
+
+- **Idle**: Stream allocated but no request yet. In H2, streams in this state can be
+  recycled from a previous request.
+- **Link**: Request headers fully parsed, waiting for the `Router` to connect to a backend.
+- **Linked(Token)**: Connected to a backend identified by `Token`. Data flows bidirectionally.
+- **Unlinked**: Backend disconnected and the request cannot be retried. A default error
+  response (502/503/504) is generated.
+- **Recycle**: Response fully sent. In H2, the stream is returned to the pool for reuse.
+  In H1, the session closes or resets for keep-alive.
+
+#### StreamParts: direction-aware borrows
+
+A `Stream` contains two Kawa buffers (`front` and `back`). The `split(&position)` method
+returns a `StreamParts` struct with direction-appropriate aliases:
+
+```
+                        Stream
+             ┌─────────────────────────┐
+             │  front: Kawa (Request)  │
+             │  back:  Kawa (Response) │
+             │  window: i32            │
+             │  context: HttpContext    │
+             └────────┬────────────────┘
+                      │
+          ┌───────────┴───────────┐
+          │                       │
+   Position::Server          Position::Client
+   (frontend conn)           (backend conn)
+          │                       │
+          ▼                       ▼
+   StreamParts {             StreamParts {
+     rbuffer: &front,          rbuffer: &back,
+     wbuffer: &back,           wbuffer: &front,
+     window, context           window, context
+   }                         }
+```
+
+The frontend (Server position) reads from `front` and writes to `back`.
+The backend (Client position) reads from `back` and writes to `front`.
+This inversion is the key abstraction that lets H1 and H2 connections share streams.
+
+#### H2 connection state machine
+
+Each `ConnectionH2` runs a frame-level state machine for reading:
+
+```
+              ┌───────────────┐
+              │ ClientPreface │   (server waits for "PRI * HTTP/2.0..." + SETTINGS)
+              └───────┬───────┘
+                      │ preface valid
+                      ▼
+              ┌───────────────┐
+              │ServerSettings │   (server sends own SETTINGS + ACK)
+              └───────┬───────┘
+                      │ settings exchanged
+                      ▼
+     ┌──────────────────────────────────┐
+     │            Header                │ ◄──────────────────────────┐
+     │  (read 9-byte frame header)      │                            │
+     └───────────────┬──────────────────┘                            │
+                     │ parsed FrameHeader                            │
+                     ▼                                               │
+     ┌──────────────────────────────────┐                            │
+     │         Frame(header)            │   expect_header()          │
+     │  (read payload_len bytes)        │ ──────────────────────────▶│
+     └───────────────┬──────────────────┘                            │
+                     │                                               │
+          ┌──────────┼───────────┐                                   │
+          │          │           │                                    │
+          ▼          ▼           ▼                                    │
+     HEADERS      DATA      SETTINGS/PING/...                        │
+     (if end_headers=0)         │                                    │
+          │                     └────────────────────────────────────▶│
+          ▼                                                          │
+     ┌──────────────────────┐                                        │
+     │ ContinuationHeader   │  (read 9-byte continuation header)     │
+     └──────────┬───────────┘                                        │
+                │                                                    │
+                ▼                                                    │
+     ┌──────────────────────┐                                        │
+     │ ContinuationFrame    │  (accumulate header block)             │
+     └──────────┬───────────┘                                        │
+                │ end_headers=1                                      │
+                └────────────────────────────────────────────────────▶│
+                                                                     │
+     ┌──────────────────────┐                                        │
+     │       GoAway         │  (drain: send GOAWAY, close)           │
+     └──────────────────────┘                                        │
+     ┌──────────────────────┐                                        │
+     │       Error          │  (protocol error detected)             │
+     └──────────────────────┘
+```
+
+For writing, the `writable()` method iterates over all streams in stream-ID order,
+converting Kawa blocks to H2 frames via `H2BlockConverter`. Connection-level and
+stream-level flow control windows limit how many DATA bytes can be sent per iteration.
+
+#### H2 flow control
+
+Flow control operates at two levels per RFC 9113 §6.9:
+
+```
+    ConnectionH2                          Stream
+  ┌──────────────┐                    ┌──────────────┐
+  │ window: i32  │  ◄── connection    │ window: i32  │  ◄── stream
+  │              │      level         │              │      level
+  └──────┬───────┘                    └──────┬───────┘
+         │                                   │
+         │  effective window = min(connection.window, stream.window)
+         │
+         ▼
+  Sending DATA: decrement both windows by bytes sent.
+  Receiving DATA: track received_bytes_since_update.
+
+  When received_bytes_since_update > initial_window_size / 2:
+    → Queue connection-level WINDOW_UPDATE
+    → Queue stream-level WINDOW_UPDATE
+    → Flush during writable() before sending DATA
+```
+
+WINDOW_UPDATE frames are coalesced per stream ID in `pending_window_updates` and flushed
+inline at the start of `writable()`, avoiding extra event loop iterations.
+
+#### H2 frame processing pipeline
+
+```
+  Socket ──read──▶ zero.storage ──parse──▶ FrameHeader ──▶ Frame
+                   (connection                              │
+                    buffer)                                  │
+                                                ┌───────────┼───────────┐
+                                                ▼           ▼           ▼
+                                             HEADERS      DATA     SETTINGS
+                                                │           │        PING
+                                                │           │       GOAWAY
+                                                ▼           ▼      WINDOW_UPDATE
+                                          ┌──────────┐ ┌────────┐
+                                          │  pkawa   │ │ stream │
+                                          │  HPACK   │ │ .front │
+                                          │  decode  │ │ .push  │
+                                          │  + kawa  │ │ _block │
+                                          │  blocks  │ └────────┘
+                                          └──────────┘
+
+  stream.back ──kawa::prepare()──▶ H2BlockConverter ──▶ HPACK encode
+                                                           │
+                                   gen_frame_header() ◄────┘
+                                          │
+                                          ▼
+                                   kawa.out ──write──▶ Socket
+```
+
+- **Inbound**: `parser.rs` (nom) decodes binary frames. `pkawa.rs` decodes HPACK headers
+  into Kawa blocks. DATA payloads are zero-copy slices into the stream's storage buffer.
+- **Outbound**: `converter.rs` (`H2BlockConverter`) encodes Kawa blocks into H2 frames.
+  HPACK encoding uses `loona-hpack::Encoder`. Large header blocks are automatically split
+  into HEADERS + CONTINUATION frames respecting `max_frame_size`.
+
+#### Module layout
+
+```
+lib/src/protocol/mux/
+├── mod.rs          Mux session, Stream, Router, ready() loop, stream lifecycle
+├── h1.rs           HTTP/1.1 connection (ConnectionH1)
+├── h2.rs           HTTP/2 connection (ConnectionH2), H2 state machine, flow control
+├── parser.rs       H2 binary frame parser (nom), wire format constants
+├── serializer.rs   H2 frame serializer (cookie-factory), SETTINGS/GOAWAY/RST_STREAM
+├── converter.rs    Kawa → H2 frame converter (H2BlockConverter), HPACK encoding
+└── pkawa.rs        H2 → Kawa converter, HPACK decoding, pseudo-header validation
+```
+
+#### Key design decisions
+
+- **Bidirectional end-of-stream tracking**: Separate `front_received_end_of_stream` and
+  `back_received_end_of_stream` fields on each `Stream` prevent the frontend and backend
+  connections from interfering with each other's stream state.
+- **Shared-nothing stream pool**: Streams are stored in `Vec<Stream>` indexed by
+  `GlobalStreamId`. Each `ConnectionH2` maps its H2 stream IDs to global IDs via
+  `HashMap<StreamId, GlobalStreamId>`. This allows H2 frontend and H2 backend to reference
+  the same stream without shared ownership.
+- **HPACK safety**: Decode callbacks (`pkawa.rs`) use fallible `write_all()` calls and
+  validate headers per RFC 9113 §8.2 (no uppercase, no connection-specific headers,
+  pseudo-header ordering). Invalid headers trigger a stream reset, not a connection error.
+- **GoAway drain**: When a GoAway frame is received, the connection enters `draining` mode.
+  New streams are rejected, but existing streams complete normally. Streams above
+  `peer_last_stream_id` are eligible for retry on a new connection.
+- **H2 backend (h2c)**: Controlled by `cluster.http2` in protobuf config. Sōzu speaks
+  cleartext H2 to backends. The `:scheme` pseudo-header is derived from the frontend
+  listener protocol (HTTP or HTTPS), not the backend connection.
 
 ## Logging
 
