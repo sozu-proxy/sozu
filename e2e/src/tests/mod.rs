@@ -1,3 +1,4 @@
+mod h2_tests;
 mod tests;
 
 use std::{
