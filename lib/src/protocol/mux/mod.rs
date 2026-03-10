@@ -50,6 +50,14 @@ pub use crate::protocol::mux::{
     parser::{H2Error, error_code_to_str},
 };
 
+// ── Tuning Constants ─────────────────────────────────────────────────────────
+
+/// Maximum event loop iterations before forcefully closing a session.
+/// Prevents infinite loops from consuming the single-threaded worker.
+const MAX_LOOP_ITERATIONS: i32 = 10_000;
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 /// Generic Http representation using the Kawa crate using the Checkout of Sozu as buffer
 type GenericHttpStream = kawa::Kawa<Checkout>;
 type StreamId = u32;
@@ -420,7 +428,7 @@ impl<Front: SocketHandler> Connection<Front> {
         Some(Connection::H2(ConnectionH2 {
             decoder,
             encoder: loona_hpack::Encoder::new(),
-            expect_read: Some((H2StreamId::Zero, 24 + 9)),
+            expect_read: Some((H2StreamId::Zero, h2::CLIENT_PREFACE_SIZE)),
             expect_write: None,
             last_stream_id: 0,
             local_settings,
@@ -435,7 +443,7 @@ impl<Front: SocketHandler> Connection<Front> {
             state: H2State::ClientPreface,
             streams: HashMap::new(),
             timeout_container,
-            window: (1 << 16) - 1,
+            window: h2::DEFAULT_INITIAL_WINDOW_SIZE as i32,
             received_bytes_since_update: 0,
             pending_window_updates: Vec::new(),
             highest_peer_stream_id: 0,
@@ -482,7 +490,7 @@ impl<Front: SocketHandler> Connection<Front> {
             state: H2State::ClientPreface,
             streams: HashMap::new(),
             timeout_container,
-            window: (1 << 16) - 1,
+            window: h2::DEFAULT_INITIAL_WINDOW_SIZE as i32,
             received_bytes_since_update: 0,
             pending_window_updates: Vec::new(),
             highest_peer_stream_id: 0,
@@ -1473,7 +1481,6 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         _metrics: &mut SessionMetrics,
     ) -> SessionResult {
         let mut counter = 0;
-        let max_loop_iterations = 10000;
 
         if self.frontend.readiness().event.is_hup() {
             return SessionResult::Close;
@@ -1720,7 +1727,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 }
 
                 counter += 1;
-                if counter >= max_loop_iterations {
+                if counter >= MAX_LOOP_ITERATIONS {
                     incr!("http.infinite_loop.error");
                     return SessionResult::Close;
                 }

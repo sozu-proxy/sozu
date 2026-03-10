@@ -11,6 +11,48 @@ use nom::{
     sequence::tuple,
 };
 
+// ── RFC 9113 Wire Format Constants ──────────────────────────────────────────
+
+/// H2 frame header size in bytes (RFC 9113 §4.1)
+pub const FRAME_HEADER_SIZE: usize = 9;
+
+/// Mask to extract 31-bit stream ID, clearing the reserved MSB (RFC 9113 §4.1)
+pub const STREAM_ID_MASK: u32 = 0x7FFFFFFF;
+
+// Frame flags (RFC 9113 §6)
+/// END_STREAM flag — signals last frame for this stream (§6.1, §6.2)
+pub const FLAG_END_STREAM: u8 = 0x1;
+/// END_HEADERS flag — signals last header block fragment (§6.2, §6.10)
+pub const FLAG_END_HEADERS: u8 = 0x4;
+/// PADDED flag — indicates padding is present (§6.1, §6.2)
+pub const FLAG_PADDED: u8 = 0x8;
+/// PRIORITY flag on HEADERS — stream dependency follows (§6.2)
+pub const FLAG_PRIORITY: u8 = 0x20;
+/// ACK flag on SETTINGS/PING (§6.5, §6.7)
+pub const FLAG_ACK: u8 = 0x1;
+
+// Fixed-size frame payload lengths (RFC 9113)
+pub const PRIORITY_PAYLOAD_SIZE: u32 = 5;
+pub const RST_STREAM_PAYLOAD_SIZE: u32 = 4;
+pub const SETTINGS_ENTRY_SIZE: u32 = 6;
+pub const PING_PAYLOAD_SIZE: u32 = 8;
+pub const WINDOW_UPDATE_PAYLOAD_SIZE: u32 = 4;
+pub const GOAWAY_PAYLOAD_SIZE: u32 = 8;
+
+// SETTINGS identifiers (RFC 9113 §6.5.1, RFC 8441, RFC 9218)
+pub const SETTINGS_HEADER_TABLE_SIZE: u16 = 1;
+pub const SETTINGS_ENABLE_PUSH: u16 = 2;
+pub const SETTINGS_MAX_CONCURRENT_STREAMS: u16 = 3;
+pub const SETTINGS_INITIAL_WINDOW_SIZE: u16 = 4;
+pub const SETTINGS_MAX_FRAME_SIZE: u16 = 5;
+pub const SETTINGS_MAX_HEADER_LIST_SIZE: u16 = 6;
+pub const SETTINGS_ENABLE_CONNECT_PROTOCOL: u16 = 8;
+pub const SETTINGS_NO_RFC7540_PRIORITIES: u16 = 9;
+/// Number of settings entries we send in our SETTINGS frame
+pub const SETTINGS_COUNT: u32 = 8;
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct FrameHeader {
     pub payload_len: u32,
@@ -180,7 +222,7 @@ pub fn frame_header(input: &[u8], max_frame_size: u32) -> IResult<&[u8], FrameHe
     };
     let (i, flags) = be_u8(i)?;
     let (i, stream_id) = be_u32(i)?;
-    let stream_id = stream_id & 0x7FFFFFFF;
+    let stream_id = stream_id & STREAM_ID_MASK;
 
     let valid_stream_id = match frame_type {
         FrameType::Data
@@ -277,7 +319,7 @@ pub fn frame_body<'a>(
         FrameType::Data => data_frame(i, header)?,
         FrameType::Headers => headers_frame(i, header)?,
         FrameType::Priority => {
-            if header.payload_len != 5 {
+            if header.payload_len != PRIORITY_PAYLOAD_SIZE {
                 return Err(Err::Failure(ParserError::new_h2(
                     i,
                     H2Error::FrameSizeError,
@@ -286,7 +328,7 @@ pub fn frame_body<'a>(
             priority_frame(i, header)?
         }
         FrameType::RstStream => {
-            if header.payload_len != 4 {
+            if header.payload_len != RST_STREAM_PAYLOAD_SIZE {
                 return Err(Err::Failure(ParserError::new_h2(
                     i,
                     H2Error::FrameSizeError,
@@ -297,7 +339,7 @@ pub fn frame_body<'a>(
         FrameType::PushPromise => push_promise_frame(i, header)?,
         FrameType::Continuation => continuation_frame(i, header)?,
         FrameType::Settings => {
-            if header.payload_len % 6 != 0 {
+            if header.payload_len % SETTINGS_ENTRY_SIZE != 0 {
                 return Err(Err::Failure(ParserError::new_h2(
                     i,
                     H2Error::FrameSizeError,
@@ -306,7 +348,7 @@ pub fn frame_body<'a>(
             settings_frame(i, header)?
         }
         FrameType::Ping => {
-            if header.payload_len != 8 {
+            if header.payload_len != PING_PAYLOAD_SIZE {
                 return Err(Err::Failure(ParserError::new_h2(
                     i,
                     H2Error::FrameSizeError,
@@ -316,7 +358,7 @@ pub fn frame_body<'a>(
         }
         FrameType::GoAway => goaway_frame(i, header)?,
         FrameType::WindowUpdate => {
-            if header.payload_len != 4 {
+            if header.payload_len != WINDOW_UPDATE_PAYLOAD_SIZE {
                 return Err(Err::Failure(ParserError::new_h2(
                     i,
                     H2Error::FrameSizeError,
@@ -342,7 +384,7 @@ pub fn data_frame<'a>(
 ) -> IResult<&'a [u8], Frame, ParserError<'a>> {
     let (remaining, i) = take(header.payload_len)(input)?;
 
-    let (i, pad_length) = if header.flags & 0x8 != 0 {
+    let (i, pad_length) = if header.flags & FLAG_PADDED != 0 {
         let (i, pad_length) = be_u8(i)?;
         (i, Some(pad_length))
     } else {
@@ -363,7 +405,7 @@ pub fn data_frame<'a>(
         Frame::Data(Data {
             stream_id: header.stream_id,
             payload: Slice::new(input, payload),
-            end_stream: header.flags & 0x1 != 0,
+            end_stream: header.flags & FLAG_END_STREAM != 0,
         }),
     ))
 }
@@ -386,8 +428,8 @@ pub struct StreamDependency {
 
 fn stream_dependency(i: &[u8]) -> IResult<&[u8], StreamDependency, ParserError<'_>> {
     let (i, stream) = map(be_u32, |i| StreamDependency {
-        exclusive: i & 0x8000 != 0,
-        stream_id: i & 0x7FFFFFFF,
+        exclusive: i & 0x80000000 != 0,
+        stream_id: i & STREAM_ID_MASK,
     })(i)?;
     Ok((i, stream))
 }
@@ -398,14 +440,14 @@ pub fn headers_frame<'a>(
 ) -> IResult<&'a [u8], Frame, ParserError<'a>> {
     let (remaining, i) = take(header.payload_len)(input)?;
 
-    let (i, pad_length) = if header.flags & 0x8 != 0 {
+    let (i, pad_length) = if header.flags & FLAG_PADDED != 0 {
         let (i, pad_length) = be_u8(i)?;
         (i, Some(pad_length))
     } else {
         (i, None)
     };
 
-    let (i, priority) = if header.flags & 0x20 != 0 {
+    let (i, priority) = if header.flags & FLAG_PRIORITY != 0 {
         let (i, stream_dependency) = stream_dependency(i)?;
         let (i, weight) = be_u8(i)?;
         (
@@ -434,8 +476,8 @@ pub fn headers_frame<'a>(
             stream_id: header.stream_id,
             priority,
             header_block_fragment: Slice::new(input, header_block_fragment),
-            end_stream: header.flags & 0x1 != 0,
-            end_headers: header.flags & 0x4 != 0,
+            end_stream: header.flags & FLAG_END_STREAM != 0,
+            end_headers: header.flags & FLAG_END_HEADERS != 0,
         }),
     ))
 }
@@ -523,7 +565,7 @@ pub fn settings_frame<'a>(
         i,
         Frame::Settings(Settings {
             settings,
-            ack: header.flags & 0x1 != 0,
+            ack: header.flags & FLAG_ACK != 0,
         }),
     ))
 }
@@ -542,7 +584,7 @@ pub fn push_promise_frame<'a>(
 ) -> IResult<&'a [u8], Frame, ParserError<'a>> {
     let (remaining, i) = take(header.payload_len)(input)?;
 
-    let (i, pad_length) = if header.flags & 0x8 != 0 {
+    let (i, pad_length) = if header.flags & FLAG_PADDED != 0 {
         let (i, pad_length) = be_u8(i)?;
         (i, Some(pad_length))
     } else {
@@ -558,7 +600,7 @@ pub fn push_promise_frame<'a>(
 
     let (i, raw_promised_stream_id) = be_u32(i)?;
     // RFC 9113 §6.6: reserved bit must be masked
-    let promised_stream_id = raw_promised_stream_id & 0x7FFFFFFF;
+    let promised_stream_id = raw_promised_stream_id & STREAM_ID_MASK;
     let (_, header_block_fragment) = take(i.len() - pad_length.unwrap_or(0) as usize)(i)?;
 
     Ok((
@@ -567,7 +609,7 @@ pub fn push_promise_frame<'a>(
             _stream_id: header.stream_id,
             _promised_stream_id: promised_stream_id,
             _header_block_fragment: Slice::new(input, header_block_fragment),
-            _end_headers: header.flags & 0x4 != 0,
+            _end_headers: header.flags & FLAG_END_HEADERS != 0,
         }),
     ))
 }
@@ -586,7 +628,7 @@ pub fn ping_frame<'a>(
 
     let mut p = Ping {
         payload: [0; 8],
-        ack: header.flags & 1 != 0,
+        ack: header.flags & FLAG_ACK != 0,
     };
     p.payload[..8].copy_from_slice(&data[..8]);
 
@@ -608,7 +650,7 @@ pub fn goaway_frame<'a>(
     let (remaining, i) = take(header.payload_len)(input)?;
     let (i, raw_last_stream_id) = be_u32(i)?;
     // RFC 9113 §6.8: reserved bit must be masked (same as frame_header stream_id)
-    let last_stream_id = raw_last_stream_id & 0x7FFFFFFF;
+    let last_stream_id = raw_last_stream_id & STREAM_ID_MASK;
     let (additional_debug_data, error_code) = be_u32(i)?;
     Ok((
         remaining,
@@ -631,7 +673,7 @@ pub fn window_update_frame<'a>(
     header: &FrameHeader,
 ) -> IResult<&'a [u8], Frame, ParserError<'a>> {
     let (i, increment) = be_u32(input)?;
-    let increment = increment & 0x7FFFFFFF;
+    let increment = increment & STREAM_ID_MASK;
 
     //FIXME: if stream id is 0, treat it as connection error?
     if increment == 0 {
@@ -667,7 +709,7 @@ pub fn continuation_frame<'a>(
         Frame::Continuation(Continuation {
             _stream_id: header.stream_id,
             _header_block_fragment: Slice::new(input, header_block_fragment),
-            _end_headers: header.flags & 0x4 != 0,
+            _end_headers: header.flags & FLAG_END_HEADERS != 0,
         }),
     ))
 }
