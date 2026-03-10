@@ -799,6 +799,11 @@ pub struct FileClusterConfig {
     pub answers: Option<BTreeMap<String, String>>,
     #[serde(default)]
     pub load_metric: Option<LoadMetric>,
+    /// SHA256 hashes of authorized "user:password" credentials for basic auth
+    #[serde(default)]
+    pub authorized_hashes: Vec<String>,
+    /// realm name for the WWW-Authenticate header in 401 responses
+    pub www_authenticate: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -888,6 +893,8 @@ impl FileClusterConfig {
                     load_balancing: self.load_balancing,
                     load_metric: self.load_metric,
                     answers,
+                    authorized_hashes: self.authorized_hashes,
+                    www_authenticate: self.www_authenticate,
                 }))
             }
         }
@@ -992,6 +999,9 @@ pub struct HttpClusterConfig {
     pub load_balancing: LoadBalancingAlgorithms,
     pub load_metric: Option<LoadMetric>,
     pub answers: BTreeMap<String, String>,
+    #[serde(default)]
+    pub authorized_hashes: Vec<String>,
+    pub www_authenticate: Option<String>,
 }
 
 impl HttpClusterConfig {
@@ -1006,6 +1016,8 @@ impl HttpClusterConfig {
                 answers: self.answers.clone(),
                 load_metric: self.load_metric.map(|s| s as i32),
                 https_redirect_port: self.https_redirect_port.map(|p| p as u32),
+                authorized_hashes: self.authorized_hashes.clone(),
+                www_authenticate: self.www_authenticate.clone(),
             })
             .into(),
         ];
@@ -1068,6 +1080,8 @@ impl TcpClusterConfig {
                 load_metric: self.load_metric.map(|s| s as i32),
                 answers: BTreeMap::new(),
                 https_redirect_port: None,
+                authorized_hashes: Vec::new(),
+                www_authenticate: None,
             })
             .into(),
         ];

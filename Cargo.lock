@@ -1771,6 +1771,7 @@ name = "sozu-lib"
 version = "1.1.1"
 dependencies = [
  "anyhow",
+ "base64",
  "cookie-factory",
  "hdrhistogram",
  "hex",
@@ -1793,6 +1794,7 @@ dependencies = [
  "slab",
  "socket2",
  "sozu-command-lib",
+ "subtle",
  "thiserror 2.0.18",
  "time",
  "tiny_http",

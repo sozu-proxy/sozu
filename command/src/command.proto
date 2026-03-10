@@ -407,6 +407,10 @@ message Cluster {
     map<string, string> answers = 8;
     // optional port to use when building HTTPS redirect URLs
     optional uint32 https_redirect_port = 9;
+    // SHA256 hashes of authorized "user:password" credentials for basic auth
+    repeated string authorized_hashes = 10;
+    // realm name for the WWW-Authenticate header in 401 responses
+    optional string www_authenticate = 11;
 }
 
 enum LoadBalancingAlgorithms {

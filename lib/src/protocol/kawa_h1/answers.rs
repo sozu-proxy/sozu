@@ -423,6 +423,7 @@ fn default_401() -> String {
     String::from(
         "\
 HTTP/1.1 401 Unauthorized\r
+WWW-Authenticate: %WWW_AUTHENTICATE\r
 Cache-Control: no-cache\r
 Connection: close\r
 Sozu-Id: %REQUEST_ID\r
@@ -707,6 +708,13 @@ impl HttpAnswers {
             or_elide_header: false,
             typ: ReplacementType::VariableOnce(0),
         };
+        let www_authenticate = TemplateVariable {
+            name: "WWW_AUTHENTICATE",
+            valid_in_body: false,
+            valid_in_header: true,
+            or_elide_header: true,
+            typ: ReplacementType::VariableOnce(0),
+        };
         let message = TemplateVariable {
             name: "MESSAGE",
             valid_in_body: true,
@@ -757,7 +765,7 @@ impl HttpAnswers {
             "401" => Template::new(
                 Some(401),
                 answer,
-                &[route, request_id]
+                &[route, request_id, www_authenticate]
             ),
             "404" => Template::new(
                 Some(404),
@@ -890,9 +898,9 @@ impl HttpAnswers {
                 variables_once = vec![message.into()];
                 "400"
             }
-            DefaultAnswer::Answer401 {} => {
+            DefaultAnswer::Answer401 { www_authenticate } => {
                 variables = vec![route.into(), request_id.into()];
-                variables_once = vec![];
+                variables_once = vec![www_authenticate.map(Into::into).unwrap_or_default()];
                 "401"
             }
             DefaultAnswer::Answer404 {} => {
