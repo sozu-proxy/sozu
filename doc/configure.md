@@ -181,8 +181,9 @@ as supported protocols. The client chooses which protocol to use:
 - If the client requests `h2`, the connection uses HTTP/2 with full multiplexing
 - If the client requests `http/1.1` or does not send ALPN, the connection uses HTTP/1.1
 
-No listener configuration is needed to enable HTTP/2. It works out of the box on every
-HTTPS listener.
+The ALPN protocol list is currently hardcoded to `["h2", "http/1.1"]` and applies to all
+HTTPS listeners. To disable HTTP/2 on a specific listener, there is no configuration
+option yet — all HTTPS listeners advertise both protocols.
 
 > **Note:** HTTP/2 is only supported over TLS (HTTPS listeners). Plain HTTP listeners
 > always use HTTP/1.1.
@@ -355,6 +356,13 @@ These are incremented when Sōzu generates a default error response:
 | `backend.up` | counter | Backend marked as healthy |
 | `backend.down` | counter | Backend marked as unhealthy |
 | `backend.connections.error` | counter | Backend connection failures |
+
+#### ALPN negotiation
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `http.alpn.h2` | counter | TLS connections where client negotiated HTTP/2 via ALPN |
+| `http.alpn.http11` | counter | TLS connections where client negotiated HTTP/1.1 via ALPN (or no ALPN) |
 
 #### HTTP/2 specific
 
