@@ -33,14 +33,18 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
             } => {
                 let error = str_to_error_code(message);
                 let mut frame = [0; 13];
-                gen_rst_stream(&mut frame, self.stream_id, error)
-                    .expect("fixed-size buffer sufficient for RST_STREAM frame");
+                if let Err(e) = gen_rst_stream(&mut frame, self.stream_id, error) {
+                    error!("failed to serialize RST_STREAM frame: {:?}", e);
+                    return;
+                }
                 kawa.push_out(Store::from_slice(&frame));
             }
             ParsingPhase::Error { .. } => {
                 let mut frame = [0; 13];
-                gen_rst_stream(&mut frame, self.stream_id, H2Error::InternalError)
-                    .expect("fixed-size buffer sufficient for RST_STREAM frame");
+                if let Err(e) = gen_rst_stream(&mut frame, self.stream_id, H2Error::InternalError) {
+                    error!("failed to serialize RST_STREAM frame: {:?}", e);
+                    return;
+                }
                 kawa.push_out(Store::from_slice(&frame));
             }
             _ => {}
@@ -56,26 +60,32 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                     path,
                     ..
                 } => {
-                    self.encoder
-                        .encode_header_into((b":method", method.data(buffer)), &mut self.out)
-                        .expect("HPACK encoding of :method pseudo-header");
-                    self.encoder
-                        .encode_header_into((b":authority", authority.data(buffer)), &mut self.out)
-                        .expect("HPACK encoding of :authority pseudo-header");
-                    self.encoder
-                        .encode_header_into((b":path", path.data(buffer)), &mut self.out)
-                        .expect("HPACK encoding of :path pseudo-header");
-                    self.encoder
-                        .encode_header_into((b":scheme", self.scheme), &mut self.out)
-                        .expect("HPACK encoding of :scheme pseudo-header");
+                    if let Err(e) = self.encoder.encode_header_into((b":method", method.data(buffer)), &mut self.out) {
+                        error!("HPACK encoding of :method pseudo-header failed: {:?}", e);
+                        return false;
+                    }
+                    if let Err(e) = self.encoder.encode_header_into((b":authority", authority.data(buffer)), &mut self.out) {
+                        error!("HPACK encoding of :authority pseudo-header failed: {:?}", e);
+                        return false;
+                    }
+                    if let Err(e) = self.encoder.encode_header_into((b":path", path.data(buffer)), &mut self.out) {
+                        error!("HPACK encoding of :path pseudo-header failed: {:?}", e);
+                        return false;
+                    }
+                    if let Err(e) = self.encoder.encode_header_into((b":scheme", self.scheme), &mut self.out) {
+                        error!("HPACK encoding of :scheme pseudo-header failed: {:?}", e);
+                        return false;
+                    }
                 }
                 StatusLine::Response { status, .. } => {
-                    self.encoder
-                        .encode_header_into((b":status", status.data(buffer)), &mut self.out)
-                        .expect("HPACK encoding of :status pseudo-header");
+                    if let Err(e) = self.encoder.encode_header_into((b":status", status.data(buffer)), &mut self.out) {
+                        error!("HPACK encoding of :status pseudo-header failed: {:?}", e);
+                        return false;
+                    }
                 }
                 StatusLine::Unknown => {
-                    unreachable!("status line must be Request or Response before H2 conversion")
+                    error!("status line must be Request or Response before H2 conversion");
+                    return false;
                 }
             },
             Block::Cookies => {
@@ -89,9 +99,10 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                     .filter(|cookie| !cookie.is_elided())
                 {
                     let cookie = [cookie.key.data(buffer), b"=", cookie.val.data(buffer)].concat();
-                    self.encoder
-                        .encode_header_into((b"cookie", &cookie), &mut self.out)
-                        .expect("HPACK encoding of cookie header");
+                    if let Err(e) = self.encoder.encode_header_into((b"cookie", &cookie), &mut self.out) {
+                        error!("HPACK encoding of cookie header failed: {:?}", e);
+                        return false;
+                    }
                 }
             }
             Block::Header(Pair {
@@ -116,12 +127,13 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                         return true;
                     }
                 }
-                self.encoder
-                    .encode_header_into(
-                        (&key.data(buffer).to_ascii_lowercase(), val.data(buffer)),
-                        &mut self.out,
-                    )
-                    .expect("HPACK encoding of header");
+                if let Err(e) = self.encoder.encode_header_into(
+                    (&key.data(buffer).to_ascii_lowercase(), val.data(buffer)),
+                    &mut self.out,
+                ) {
+                    error!("HPACK encoding of header failed: {:?}", e);
+                    return false;
+                }
             }
             Block::ChunkHeader(_) => {
                 // this converter doesn't align H1 chunks on H2 data frames
@@ -149,7 +161,7 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                         return false;
                     };
                 self.window -= payload_len as i32;
-                gen_frame_header(
+                if let Err(e) = gen_frame_header(
                     &mut header,
                     &FrameHeader {
                         payload_len,
@@ -157,8 +169,10 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                         flags: 0,
                         stream_id: self.stream_id,
                     },
-                )
-                .expect("fixed-size buffer sufficient for DATA frame header");
+                ) {
+                    error!("failed to serialize DATA frame header: {:?}", e);
+                    return false;
+                }
                 kawa.push_out(Store::from_slice(&header));
                 kawa.push_out(data);
                 // kawa.push_delimiter();
@@ -178,7 +192,7 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                         let flags = if i == 0 && end_stream { 1 } else { 0 }
                             | if i + 1 == n_chunks { 4 } else { 0 };
                         if i == 0 {
-                            gen_frame_header(
+                            if let Err(e) = gen_frame_header(
                                 &mut header,
                                 &FrameHeader {
                                     payload_len: chunk.len() as u32,
@@ -186,19 +200,21 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                                     flags,
                                     stream_id: self.stream_id,
                                 },
-                            )
-                            .expect("fixed-size buffer sufficient for HEADERS frame header");
-                        } else {
-                            gen_frame_header(
-                                &mut header,
-                                &FrameHeader {
-                                    payload_len: chunk.len() as u32,
-                                    frame_type: FrameType::Continuation,
-                                    flags,
-                                    stream_id: self.stream_id,
-                                },
-                            )
-                            .expect("fixed-size buffer sufficient for CONTINUATION frame header");
+                            ) {
+                                error!("failed to serialize HEADERS frame header: {:?}", e);
+                                return false;
+                            }
+                        } else if let Err(e) = gen_frame_header(
+                            &mut header,
+                            &FrameHeader {
+                                payload_len: chunk.len() as u32,
+                                frame_type: FrameType::Continuation,
+                                flags,
+                                stream_id: self.stream_id,
+                            },
+                        ) {
+                            error!("failed to serialize CONTINUATION frame header: {:?}", e);
+                            return false;
                         }
                         kawa.push_out(Store::from_slice(&header));
                         kawa.push_out(Store::from_slice(chunk));
@@ -209,7 +225,7 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                 };
                 if end_stream && !sent_end_stream {
                     let mut header = [0; 9];
-                    gen_frame_header(
+                    if let Err(e) = gen_frame_header(
                         &mut header,
                         &FrameHeader {
                             payload_len: 0,
@@ -217,8 +233,10 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                             flags: 1,
                             stream_id: self.stream_id,
                         },
-                    )
-                    .expect("fixed-size buffer sufficient for empty DATA frame header");
+                    ) {
+                        error!("failed to serialize empty DATA frame header: {:?}", e);
+                        return false;
+                    }
                     kawa.push_out(Store::from_slice(&header));
                 }
             }
@@ -226,6 +244,9 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
         true
     }
     fn finalize(&mut self, _kawa: &mut Kawa<T>) {
-        assert!(self.out.is_empty());
+        if !self.out.is_empty() {
+            error!("H2BlockConverter finalize: out buffer not empty ({} bytes remaining)", self.out.len());
+            self.out.clear();
+        }
     }
 }

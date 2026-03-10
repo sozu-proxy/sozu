@@ -50,17 +50,6 @@ pub use crate::protocol::mux::{
     parser::{H2Error, error_code_to_str},
 };
 
-#[macro_export]
-macro_rules! println_ {
-    ($($t:expr),*) => {
-        // print!("{}:{} ", file!(), line!());
-        // println!($($t),*)
-        $(let _ = &$t;)*
-    };
-}
-fn debug_kawa(_kawa: &GenericHttpStream) {
-    // kawa::debug_kawa(_kawa);
-}
 
 /// Generic Http representation using the Kawa crate using the Checkout of Sozu as buffer
 type GenericHttpStream = kawa::Kawa<Checkout>;
@@ -290,7 +279,6 @@ fn forcefully_terminate_answer(stream: &mut Stream, readiness: &mut Readiness, e
     kawa.blocks.clear();
     kawa.parsing_phase
         .error(error_code_to_str(error as u32).into());
-    debug_kawa(kawa);
     stream.state = StreamState::Unlinked;
     readiness.interest.insert(Ready::WRITABLE);
 }
@@ -589,7 +577,7 @@ impl<Front: SocketHandler> Connection<Front> {
                     Some(cluster_id),
                     Some(&backend_borrow.backend_id)
                 );
-                println_!("--------------- CONNECTION CLOSE: {backend_borrow:#?}");
+                trace!("connection close: {:#?}", backend_borrow);
             }
             Position::Server => {}
         }
@@ -606,7 +594,7 @@ impl<Front: SocketHandler> Connection<Front> {
         if let Position::Client(_, backend, BackendStatus::Connected) = self.position() {
             let mut backend_borrow = backend.borrow_mut();
             backend_borrow.active_requests = backend_borrow.active_requests.saturating_sub(1);
-            println_!("--------------- CONNECTION END STREAM: {backend_borrow:#?}");
+            trace!("connection end stream: {:#?}", backend_borrow);
         }
         match self {
             Connection::H1(c) => c.end_stream(stream, context),
@@ -621,7 +609,7 @@ impl<Front: SocketHandler> Connection<Front> {
         if let Position::Client(_, backend, BackendStatus::Connected) = self.position() {
             let mut backend_borrow = backend.borrow_mut();
             backend_borrow.active_requests += 1;
-            println_!("--------------- CONNECTION START STREAM: {backend_borrow:#?}");
+            trace!("connection start stream: {:#?}", backend_borrow);
         }
         let started = match self {
             Connection::H1(c) => c.start_stream(stream, context),
@@ -679,29 +667,34 @@ impl<Front: SocketHandler + Debug> Endpoint for EndpointServer<'_, Front> {
 }
 impl Endpoint for EndpointClient<'_> {
     fn readiness(&self, token: Token) -> &Readiness {
-        self.0
-            .backends
-            .get(&token)
-            .expect("backend token must exist in backends map")
-            .readiness()
+        match self.0.backends.get(&token) {
+            Some(backend) => backend.readiness(),
+            None => {
+                error!("backend token {:?} missing from backends map (readiness)", token);
+                &self.0.fallback_readiness
+            }
+        }
     }
     fn readiness_mut(&mut self, token: Token) -> &mut Readiness {
-        self.0
-            .backends
-            .get_mut(&token)
-            .expect("backend token must exist in backends map")
-            .readiness_mut()
+        match self.0.backends.get_mut(&token) {
+            Some(backend) => backend.readiness_mut(),
+            None => {
+                error!("backend token {:?} missing from backends map (readiness_mut)", token);
+                &mut self.0.fallback_readiness
+            }
+        }
     }
 
     fn end_stream<L>(&mut self, token: Token, stream: GlobalStreamId, context: &mut Context<L>)
     where
         L: ListenerHandler + L7ListenerHandler,
     {
-        self.0
-            .backends
-            .get_mut(&token)
-            .expect("backend token must exist in backends map")
-            .end_stream(stream, context);
+        match self.0.backends.get_mut(&token) {
+            Some(backend) => backend.end_stream(stream, context),
+            None => {
+                error!("backend token {:?} missing from backends map (end_stream)", token);
+            }
+        }
     }
 
     fn start_stream<L>(
@@ -713,11 +706,13 @@ impl Endpoint for EndpointClient<'_> {
     where
         L: ListenerHandler + L7ListenerHandler,
     {
-        self.0
-            .backends
-            .get_mut(&token)
-            .expect("backend token must exist in backends map")
-            .start_stream(stream, context)
+        match self.0.backends.get_mut(&token) {
+            Some(backend) => backend.start_stream(stream, context),
+            None => {
+                error!("backend token {:?} missing from backends map (start_stream)", token);
+                false
+            }
+        }
     }
 }
 
@@ -726,7 +721,7 @@ fn update_readiness_after_read(
     status: SocketResult,
     readiness: &mut Readiness,
 ) -> bool {
-    println_!("  size={size}, status={status:?}");
+    trace!("  size={}, status={:?}", size, status);
     match status {
         SocketResult::Continue => {}
         SocketResult::Closed | SocketResult::Error => {
@@ -748,7 +743,7 @@ fn update_readiness_after_write(
     status: SocketResult,
     readiness: &mut Readiness,
 ) -> bool {
-    println_!("  size={size}, status={status:?}");
+    trace!("  size={}, status={:?}", size, status);
     match status {
         SocketResult::Continue => {}
         SocketResult::Closed | SocketResult::Error => {
@@ -949,7 +944,10 @@ impl Stream {
         let protocol = match context.protocol {
             Protocol::HTTP => "http",
             Protocol::HTTPS => "https",
-            _ => unreachable!("mux streams only handle HTTP or HTTPS protocols"),
+            other => {
+                error!("mux streams only handle HTTP or HTTPS protocols, got {:?}", other);
+                "unknown"
+            }
         };
 
         // Save the HTTP status code of the backend response
@@ -1078,7 +1076,7 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
         );
         for (stream_id, stream) in self.streams.iter_mut().enumerate() {
             if stream.state == StreamState::Recycle {
-                println_!("Reuse stream: {stream_id}");
+                trace!("Reuse stream: {}", stream_id);
                 stream.state = StreamState::Idle;
                 stream.attempts = 0;
                 stream.front_received_end_of_stream = false;
@@ -1107,6 +1105,9 @@ pub struct Router {
     pub backends: HashMap<Token, Connection<TcpStream>>,
     pub configured_backend_timeout: Duration,
     pub configured_connect_timeout: Duration,
+    /// Fallback readiness used when a backend token is missing from the map.
+    /// This prevents panicking in the Endpoint trait methods that return references.
+    fallback_readiness: Readiness,
 }
 
 impl Router {
@@ -1115,6 +1116,7 @@ impl Router {
             backends: HashMap::new(),
             configured_backend_timeout,
             configured_connect_timeout,
+            fallback_readiness: Readiness::new(),
         }
     }
 
@@ -1128,7 +1130,10 @@ impl Router {
         let stream = &mut context.streams[stream_id];
         // when reused, a stream should be detached from its old connection, if not we could end
         // with concurrent connections on a single endpoint
-        assert!(matches!(stream.state, StreamState::Link));
+        if !matches!(stream.state, StreamState::Link) {
+            error!("stream {} expected to be in Link state, got {:?}", stream_id, stream.state);
+            return Err(BackendConnectionError::MaxSessionsMemory);
+        }
         context
             .debug
             .push(DebugEvent::Str(stream.context.get_route()));
@@ -1182,7 +1187,8 @@ impl Router {
         for (token, backend) in &self.backends {
             match (h2, reuse_connecting, backend.position()) {
                 (_, _, Position::Server) => {
-                    unreachable!("Backend connection behaves like a server")
+                    error!("Backend connection unexpectedly behaves like a server");
+                    continue;
                 }
                 (_, _, Position::Client(_, _, BackendStatus::Disconnecting)) => {}
                 (true, false, Position::Client(_, _, BackendStatus::Connecting(_))) => {}
@@ -1204,7 +1210,7 @@ impl Router {
                 }
                 (true, _, Position::Client(other_cluster_id, _, BackendStatus::KeepAlive)) => {
                     if *other_cluster_id == cluster_id {
-                        unreachable!("ConnectionH2 behaves like H1")
+                        error!("ConnectionH2 unexpectedly behaves like H1 with KeepAlive");
                     }
                 }
 
@@ -1219,12 +1225,13 @@ impl Router {
                 | (false, _, Position::Client(_, _, BackendStatus::Connecting(_))) => {}
             }
         }
-        println_!(
-            "connect: {cluster_id} (stick={frontend_should_stick}, h2={h2}) -> (reuse={reuse_token:?})"
+        trace!(
+            "connect: {} (stick={}, h2={}) -> (reuse={:?})",
+            cluster_id, frontend_should_stick, h2, reuse_token
         );
 
         let token = if let Some(token) = reuse_token {
-            println_!("reused backend: {:#?}", self.backends.get(&token).unwrap());
+            trace!("reused backend: {:#?}", self.backends.get(&token));
             token
         } else {
             let (mut socket, backend) = self.backend_from_request(
@@ -1280,11 +1287,11 @@ impl Router {
         };
 
         // Link backend to stream, checking if the backend can accept it
-        let started = self
-            .backends
-            .get_mut(&token)
-            .expect("just-inserted or reused backend token must exist")
-            .start_stream(stream_id, context);
+        let Some(backend_conn) = self.backends.get_mut(&token) else {
+            error!("just-inserted or reused backend token {:?} missing from backends map", token);
+            return Err(BackendConnectionError::MaxSessionsMemory);
+        };
+        let started = backend_conn.start_stream(stream_id, context);
         if !started {
             error!("Backend rejected stream start (max concurrent streams reached)");
             return Err(BackendConnectionError::MaxSessionsMemory);
@@ -1305,10 +1312,10 @@ impl Router {
                 // we are past kawa parsing if it succeeded this can't fail
                 // if the request was malformed it was caught by kawa and we sent a 400
                 error!(
-                    "Malformed request in connect (should be caught at parsing) {:?}",
-                    context
+                    "Malformed request in connect (should be caught at parsing) {:?}: {}",
+                    context, cluster_error
                 );
-                unreachable!("{cluster_error}");
+                return Err(cluster_error);
             }
         };
 
@@ -1317,7 +1324,7 @@ impl Router {
         let route = match route_result {
             Ok(route) => route,
             Err(frontend_error) => {
-                println_!("{}", frontend_error);
+                trace!("{}", frontend_error);
                 // self.set_answer(DefaultAnswerStatus::Answer404, None);
                 return Err(RetrieveClusterError::RetrieveFrontend(frontend_error));
             }
@@ -1326,7 +1333,7 @@ impl Router {
         let cluster_id = match route {
             Route::ClusterId(id) => id,
             Route::Deny => {
-                println_!("Route::Deny");
+                trace!("Route::Deny");
                 // self.set_answer(DefaultAnswerStatus::Answer401, None);
                 return Err(RetrieveClusterError::UnauthorizedRoute);
             }
@@ -1351,7 +1358,7 @@ impl Router {
                 proxy,
             )
             .map_err(|backend_error| {
-                println_!("{backend_error}");
+                trace!("{}", backend_error);
                 // self.set_answer(DefaultAnswerStatus::Answer503, None);
                 BackendConnectionError::Backend(backend_error)
             })?;
@@ -1452,10 +1459,10 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         self.context.debug.push(DebugEvent::R(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock must not be before UNIX epoch")
+                .unwrap_or_default()
                 .as_millis() as usize,
         ));
-        println_!("{:?}", start);
+        trace!("{:?}", start);
         loop {
             self.context.debug.push(DebugEvent::L1);
             loop {
@@ -1485,7 +1492,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                     let dead = readiness.filter_interest().is_hup()
                         || readiness.filter_interest().is_error();
                     if dead {
-                        println_!("Backend({token:?}) -> {readiness:?}");
+                        trace!("Backend({:?}) -> {:?}", token, readiness);
                         readiness.event.remove(Ready::WRITABLE);
                     }
 
@@ -1534,8 +1541,8 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                         _ => {}
                                     }
                                 }
-                                println_!(
-                                    "--------------- CONNECTION SUCCESS: {backend_borrow:#?}"
+                                trace!(
+                                    "connection success: {:#?}", backend_borrow
                                 );
                                 drop(backend_borrow);
                                 *position = Position::Client(
@@ -1549,7 +1556,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                             }
                             Position::Client(..) => {}
                             Position::Server => {
-                                unreachable!("backend connection cannot be in Server position")
+                                error!("backend connection cannot be in Server position");
                             }
                         }
                         let res = client.writable(context, EndpointServer(&mut self.frontend));
@@ -1559,7 +1566,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                         match res {
                             MuxResult::Continue => {}
                             MuxResult::Upgrade => {
-                                unreachable!("only frontend connections can trigger Upgrade")
+                                error!("only frontend connections can trigger Upgrade");
                             }
                             MuxResult::CloseSession => return SessionResult::Close,
                         }
@@ -1573,7 +1580,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                         match res {
                             MuxResult::Continue => {}
                             MuxResult::Upgrade => {
-                                unreachable!("only frontend connections can trigger Upgrade")
+                                error!("only frontend connections can trigger Upgrade (readable)");
                             }
                             MuxResult::CloseSession => return SessionResult::Close,
                         }
@@ -1583,7 +1590,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                         context
                             .debug
                             .push(DebugEvent::CH(*token, client.readiness().clone()));
-                        println_!("Closing {:#?}", client);
+                        trace!("Closing {:#?}", client);
                         match client.position() {
                             Position::Client(cluster_id, backend, BackendStatus::Connecting(_)) => {
                                 let mut backend_borrow = backend.borrow_mut();
@@ -1613,7 +1620,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                         cluster_id: Some(cluster_id.to_owned()),
                                     });
                                 }
-                                println_!("--------------- CONNECTION FAIL: {backend_borrow:#?}");
+                                trace!("connection fail: {:#?}", backend_borrow);
                             }
                             Position::Client(_, backend, _) => {
                                 let mut backend_borrow = backend.borrow_mut();
@@ -1628,7 +1635,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                 }
                             }
                             Position::Server => {
-                                unreachable!("dead backend cannot be in Server position")
+                                error!("dead backend cannot be in Server position");
                             }
                         }
                         client.close(context, EndpointServer(&mut self.frontend));
@@ -1663,8 +1670,8 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                             error!("session {:?} was already removed!", token);
                         }
                     }
-                    println_!("FRONTEND: {:#?}", self.frontend);
-                    println_!("BACKENDS: {:#?}", self.router.backends);
+                    trace!("FRONTEND: {:#?}", self.frontend);
+                    trace!("BACKENDS: {:#?}", self.router.backends);
                 }
 
                 let context = &mut self.context;
@@ -1718,7 +1725,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                             context.debug.push(DebugEvent::CC(stream_id, state));
                         }
                         Err(error) => {
-                            println_!("Connection error: {error}");
+                            trace!("Connection error: {}", error);
                             let stream = &mut context.streams[stream_id];
                             let answers = answers_rc.borrow();
                             use BackendConnectionError as BE;
@@ -1744,12 +1751,14 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                 }
 
                                 BE::Backend(_) => {}
-                                BE::RetrieveClusterError(_) => {
-                                    unreachable!("all RetrieveClusterError variants handled above")
+                                BE::RetrieveClusterError(ref other) => {
+                                    error!("unexpected RetrieveClusterError variant: {:?}", other);
+                                    set_default_answer(stream, front_readiness, 503, &answers);
                                 }
                                 // TCP specific error
-                                BE::NotFound(_) => {
-                                    unreachable!("NotFound is TCP-specific, not reachable in mux")
+                                BE::NotFound(ref msg) => {
+                                    error!("NotFound is TCP-specific, not reachable in mux: {:?}", msg);
+                                    set_default_answer(stream, front_readiness, 503, &answers);
                                 }
                             }
                             context.debug.push(DebugEvent::CCF(stream_id, error));
@@ -1766,7 +1775,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
     }
 
     fn update_readiness(&mut self, token: Token, events: Ready) {
-        println_!("EVENTS: {events:?} on {token:?}");
+        trace!("EVENTS: {:?} on {:?}", events, token);
         self.context.debug.push(DebugEvent::EV(token, events));
         if token == self.frontend_token {
             self.frontend.readiness_mut().event |= events;
@@ -1776,7 +1785,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
     }
 
     fn timeout(&mut self, token: Token, _metrics: &mut SessionMetrics) -> StateResult {
-        println_!("MuxState::timeout({token:?})");
+        trace!("MuxState::timeout({:?})", token);
         let front_is_h2 = match self.frontend {
             Connection::H1(_) => false,
             Connection::H2(_) => true,
@@ -1785,7 +1794,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         let mut should_close = true;
         let mut should_write = false;
         if self.frontend_token == token {
-            println_!("MuxState::timeout_frontend({:#?})", self.frontend);
+            trace!("MuxState::timeout_frontend({:#?})", self.frontend);
             self.frontend.timeout_container().triggered();
             let front_readiness = self.frontend.readiness_mut();
             for stream in &mut self.context.streams {
@@ -1828,7 +1837,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 }
             }
         } else if let Some(backend) = self.router.backends.get_mut(&token) {
-            println_!("MuxState::timeout_backend({:#?})", backend);
+            trace!("MuxState::timeout_backend({:#?})", backend);
             backend.timeout_container().triggered();
             let front_readiness = self.frontend.readiness_mut();
             for stream_id in 0..self.context.streams.len() {
@@ -1837,7 +1846,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                     if token == back_token {
                         // This stream is linked to the backend that timedout
                         if stream.back.is_terminated() || stream.back.is_error() {
-                            println_!(
+                            trace!(
                                 "Stream terminated or in error, do nothing, just wait a bit more"
                             );
                             // Nothing to do, simply wait for the remaining bytes to be proxied
@@ -1846,12 +1855,12 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                             }
                         } else if !stream.back.consumed {
                             // The response has not started yet
-                            println_!("Stream still waiting for response, send 504");
+                            trace!("Stream still waiting for response, send 504");
                             let answers = answers_rc.borrow();
                             set_default_answer(stream, front_readiness, 504, &answers);
                             should_write = true;
                         } else {
-                            println_!(
+                            trace!(
                                 "Stream waiting for end of response, forcefully terminate it"
                             );
                             forcefully_terminate_answer(
@@ -1888,7 +1897,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
     }
 
     fn cancel_timeouts(&mut self) {
-        println_!("MuxState::cancel_timeouts");
+        trace!("MuxState::cancel_timeouts");
         self.frontend.timeout_container().cancel();
         for backend in self.router.backends.values_mut() {
             backend.timeout_container().cancel();
@@ -1920,8 +1929,8 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             warn!("{:?}", self.context.debug.events);
         }
         debug!("MUX CLOSE");
-        println_!("FRONTEND: {:#?}", self.frontend);
-        println_!("BACKENDS: {:#?}", self.router.backends);
+        trace!("FRONTEND: {:#?}", self.frontend);
+        trace!("BACKENDS: {:#?}", self.router.backends);
 
         self.frontend
             .close(&mut self.context, EndpointClient(&mut self.router));
@@ -1962,9 +1971,11 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                             _ => {}
                         }
                     }
-                    println_!("--------------- CONNECTION(SESSION) CLOSED: {backend_borrow:#?}");
+                    trace!("connection (session) closed: {:#?}", backend_borrow);
                 }
-                Position::Server => unreachable!("close_backend called on Server position"),
+                Position::Server => {
+                    error!("close_backend called on Server position");
+                }
             }
         }
         /*

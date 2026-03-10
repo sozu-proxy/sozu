@@ -3,10 +3,10 @@ use std::time::Instant;
 use sozu_command::ready::Ready;
 
 use crate::{
-    L7ListenerHandler, ListenerHandler, Readiness, println_,
+    L7ListenerHandler, ListenerHandler, Readiness,
     protocol::mux::{
         BackendStatus, Context, DebugEvent, Endpoint, GlobalStreamId, MuxResult, Position,
-        StreamState, debug_kawa, forcefully_terminate_answer, parser::H2Error, set_default_answer,
+        StreamState, forcefully_terminate_answer, parser::H2Error, set_default_answer,
         update_readiness_after_read, update_readiness_after_write,
     },
     socket::SocketHandler,
@@ -40,7 +40,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         E: Endpoint,
         L: ListenerHandler + L7ListenerHandler,
     {
-        println_!("======= MUX H1 READABLE {:?}", self.position);
+        trace!("======= MUX H1 READABLE {:?}", self.position);
         self.timeout_container.reset();
         let answers_rc = context.listener.borrow().get_answers().clone();
         let stream = &mut context.streams[self.stream];
@@ -68,12 +68,12 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
 
         let was_main_phase = kawa.is_main_phase();
         kawa::h1::parse(kawa, parts.context);
-        debug_kawa(kawa);
         if kawa.is_error() {
             match self.position {
                 Position::Client(..) => {
                     let StreamState::Linked(token) = stream.state else {
-                        unreachable!("client stream in error must be in Linked state")
+                        error!("client stream in error is not in Linked state");
+                        return MuxResult::CloseSession;
                     };
                     let global_stream_id = self.stream;
                     self.end_stream(global_stream_id, context);
@@ -117,7 +117,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                     return MuxResult::Continue;
                 }
                 self.requests += 1;
-                println_!("REQUESTS: {}", self.requests);
+                trace!("REQUESTS: {}", self.requests);
                 gauge_add!("http.active_requests", 1);
                 stream.state = StreamState::Link
             }
@@ -136,13 +136,12 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         E: Endpoint,
         L: ListenerHandler + L7ListenerHandler,
     {
-        println_!("======= MUX H1 WRITABLE {:?}", self.position);
+        trace!("======= MUX H1 WRITABLE {:?}", self.position);
         self.timeout_container.reset();
         let stream = &mut context.streams[self.stream];
         let parts = stream.split(&self.position);
         let kawa = parts.wbuffer;
         kawa.prepare(&mut kawa::h1::BlockConverter);
-        debug_kawa(kawa);
         let bufs = kawa.as_io_slice();
         if bufs.is_empty() && !self.socket.socket_wants_write() {
             self.readiness.interest.remove(Ready::WRITABLE);
@@ -273,7 +272,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         match self.position {
             Position::Client(_, _, BackendStatus::KeepAlive)
             | Position::Client(_, _, BackendStatus::Disconnecting) => {
-                println_!("close detached client ConnectionH1");
+                trace!("close detached client ConnectionH1");
                 return;
             }
             Position::Client(_, _, BackendStatus::Connecting(_))
@@ -281,7 +280,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                 warn!("BACKEND CLOSING FOR: {:?} {}", self.position, self.stream);
             }
             Position::Server => {
-                println_!("H1 SENDING CLOSE NOTIFY");
+                trace!("H1 SENDING CLOSE NOTIFY");
                 self.socket.socket_close();
                 let _ = self.socket.socket_write_vectored(&[]);
                 return;
@@ -289,7 +288,8 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         }
         // reconnection is handled by the server
         let StreamState::Linked(token) = context.streams[self.stream].state else {
-            unreachable!("closing H1 client must be in Linked state")
+            error!("closing H1 client is not in Linked state");
+            return;
         };
         endpoint.end_stream(token, self.stream, context)
     }
@@ -298,11 +298,14 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
     where
         L: ListenerHandler + L7ListenerHandler,
     {
-        assert_eq!(stream, self.stream);
+        if stream != self.stream {
+            error!("end_stream called with stream {} but expected {}", stream, self.stream);
+            return;
+        }
         let answers_rc = context.listener.borrow().get_answers().clone();
         let stream = &mut context.streams[stream];
         let stream_context = &mut stream.context;
-        println_!("end H1 stream {}: {stream_context:#?}", self.stream);
+        trace!("end H1 stream {}: {:#?}", self.stream, stream_context);
         match &mut self.position {
             Position::Client(_, _, BackendStatus::Connecting(_)) => {
                 self.stream = usize::MAX;
@@ -323,7 +326,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             }
             Position::Client(_, _, BackendStatus::KeepAlive)
             | Position::Client(_, _, BackendStatus::Disconnecting) => {
-                unreachable!("end_stream called on KeepAlive or Disconnecting H1 client")
+                error!("end_stream called on KeepAlive or Disconnecting H1 client");
             }
             Position::Server => match (stream.front.consumed, stream.back.is_main_phase()) {
                 (true, true) => {
@@ -364,7 +367,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                     stream.state = StreamState::Link;
                 }
                 (false, true) => {
-                    unreachable!("backend response in main phase but request not yet consumed")
+                    error!("backend response in main phase but request not yet consumed");
                 }
             },
         }
@@ -374,7 +377,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
     where
         L: ListenerHandler + L7ListenerHandler,
     {
-        println_!("start H1 stream {stream} {:?}", self.readiness);
+        trace!("start H1 stream {} {:?}", stream, self.readiness);
         self.readiness.interest.insert(Ready::ALL);
         self.stream = stream;
         match &mut self.position {
@@ -382,11 +385,13 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                 *status = BackendStatus::Connected;
             }
             Position::Client(_, _, BackendStatus::Disconnecting) => {
-                unreachable!("start_stream called on Disconnecting H1 client")
+                error!("start_stream called on Disconnecting H1 client");
+                return false;
             }
             Position::Client(_, _, _) => {}
             Position::Server => {
-                unreachable!("start_stream must not be called on H1 server connection")
+                error!("start_stream must not be called on H1 server connection");
+                return false;
             }
         }
         true
