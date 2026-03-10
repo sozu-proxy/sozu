@@ -556,7 +556,9 @@ pub fn push_promise_frame<'a>(
         )));
     }
 
-    let (i, promised_stream_id) = be_u32(i)?;
+    let (i, raw_promised_stream_id) = be_u32(i)?;
+    // RFC 9113 §6.6: reserved bit must be masked
+    let promised_stream_id = raw_promised_stream_id & 0x7FFFFFFF;
     let (_, header_block_fragment) = take(i.len() - pad_length.unwrap_or(0) as usize)(i)?;
 
     Ok((
@@ -604,7 +606,9 @@ pub fn goaway_frame<'a>(
     header: &FrameHeader,
 ) -> IResult<&'a [u8], Frame, ParserError<'a>> {
     let (remaining, i) = take(header.payload_len)(input)?;
-    let (i, last_stream_id) = be_u32(i)?;
+    let (i, raw_last_stream_id) = be_u32(i)?;
+    // RFC 9113 §6.8: reserved bit must be masked (same as frame_header stream_id)
+    let last_stream_id = raw_last_stream_id & 0x7FFFFFFF;
     let (additional_debug_data, error_code) = be_u32(i)?;
     Ok((
         remaining,

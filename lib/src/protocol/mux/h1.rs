@@ -299,7 +299,10 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         L: ListenerHandler + L7ListenerHandler,
     {
         if stream != self.stream {
-            error!("end_stream called with stream {} but expected {}", stream, self.stream);
+            error!(
+                "end_stream called with stream {} but expected {}",
+                stream, self.stream
+            );
             return;
         }
         let answers_rc = context.listener.borrow().get_answers().clone();
