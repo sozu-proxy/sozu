@@ -679,10 +679,18 @@ impl<Front: SocketHandler + Debug> Endpoint for EndpointServer<'_, Front> {
 }
 impl Endpoint for EndpointClient<'_> {
     fn readiness(&self, token: Token) -> &Readiness {
-        self.0.backends.get(&token).unwrap().readiness()
+        self.0
+            .backends
+            .get(&token)
+            .expect("backend token must exist in backends map")
+            .readiness()
     }
     fn readiness_mut(&mut self, token: Token) -> &mut Readiness {
-        self.0.backends.get_mut(&token).unwrap().readiness_mut()
+        self.0
+            .backends
+            .get_mut(&token)
+            .expect("backend token must exist in backends map")
+            .readiness_mut()
     }
 
     fn end_stream<L>(&mut self, token: Token, stream: GlobalStreamId, context: &mut Context<L>)
@@ -692,7 +700,7 @@ impl Endpoint for EndpointClient<'_> {
         self.0
             .backends
             .get_mut(&token)
-            .unwrap()
+            .expect("backend token must exist in backends map")
             .end_stream(stream, context);
     }
 
@@ -708,7 +716,7 @@ impl Endpoint for EndpointClient<'_> {
         self.0
             .backends
             .get_mut(&token)
-            .unwrap()
+            .expect("backend token must exist in backends map")
             .start_stream(stream, context)
     }
 }
@@ -941,7 +949,7 @@ impl Stream {
         let protocol = match context.protocol {
             Protocol::HTTP => "http",
             Protocol::HTTPS => "https",
-            _ => unreachable!(),
+            _ => unreachable!("mux streams only handle HTTP or HTTPS protocols"),
         };
 
         // Save the HTTP status code of the backend response
@@ -1271,13 +1279,11 @@ impl Router {
             token
         };
 
-        // Release the stream borrow before passing context to start_stream
-        let _ = stream;
         // Link backend to stream, checking if the backend can accept it
         let started = self
             .backends
             .get_mut(&token)
-            .unwrap()
+            .expect("just-inserted or reused backend token must exist")
             .start_stream(stream_id, context);
         if !started {
             error!("Backend rejected stream start (max concurrent streams reached)");
@@ -1446,7 +1452,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         self.context.debug.push(DebugEvent::R(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .expect("system clock must not be before UNIX epoch")
                 .as_millis() as usize,
         ));
         println_!("{:?}", start);
@@ -1542,7 +1548,9 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                     .set_duration(self.router.configured_backend_timeout);
                             }
                             Position::Client(..) => {}
-                            Position::Server => unreachable!(),
+                            Position::Server => {
+                                unreachable!("backend connection cannot be in Server position")
+                            }
                         }
                         let res = client.writable(context, EndpointServer(&mut self.frontend));
                         context
@@ -1550,7 +1558,9 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                             .push(DebugEvent::CW(*token, res, client.readiness().clone()));
                         match res {
                             MuxResult::Continue => {}
-                            MuxResult::Upgrade => unreachable!(), // only frontend can upgrade
+                            MuxResult::Upgrade => {
+                                unreachable!("only frontend connections can trigger Upgrade")
+                            }
                             MuxResult::CloseSession => return SessionResult::Close,
                         }
                     }
@@ -1562,7 +1572,9 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                             .push(DebugEvent::CR(*token, res, client.readiness().clone()));
                         match res {
                             MuxResult::Continue => {}
-                            MuxResult::Upgrade => unreachable!(), // only frontend can upgrade
+                            MuxResult::Upgrade => {
+                                unreachable!("only frontend connections can trigger Upgrade")
+                            }
                             MuxResult::CloseSession => return SessionResult::Close,
                         }
                     }
@@ -1615,7 +1627,9 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                     }
                                 }
                             }
-                            Position::Server => unreachable!(),
+                            Position::Server => {
+                                unreachable!("dead backend cannot be in Server position")
+                            }
                         }
                         client.close(context, EndpointServer(&mut self.frontend));
                         dead_backends.push(*token);
@@ -1730,9 +1744,13 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                 }
 
                                 BE::Backend(_) => {}
-                                BE::RetrieveClusterError(_) => unreachable!(),
+                                BE::RetrieveClusterError(_) => {
+                                    unreachable!("all RetrieveClusterError variants handled above")
+                                }
                                 // TCP specific error
-                                BE::NotFound(_) => unreachable!(),
+                                BE::NotFound(_) => {
+                                    unreachable!("NotFound is TCP-specific, not reachable in mux")
+                                }
                             }
                             context.debug.push(DebugEvent::CCF(stream_id, error));
                         }
@@ -1946,7 +1964,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                     }
                     println_!("--------------- CONNECTION(SESSION) CLOSED: {backend_borrow:#?}");
                 }
-                Position::Server => unreachable!(),
+                Position::Server => unreachable!("close_backend called on Server position"),
             }
         }
         /*
