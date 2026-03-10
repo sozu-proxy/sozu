@@ -1794,6 +1794,7 @@ dependencies = [
  "slab",
  "socket2",
  "sozu-command-lib",
+ "subtle",
  "thiserror 2.0.18",
  "time",
  "tiny_http",
