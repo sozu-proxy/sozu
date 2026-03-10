@@ -8,7 +8,7 @@ use cookie_factory::{
 
 use crate::protocol::mux::{
     h2::H2Settings,
-    parser::{FrameHeader, FrameType, H2Error},
+    parser::{self, FrameHeader, FrameType, H2Error},
 };
 
 pub const H2_PRI: &str = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
@@ -68,7 +68,7 @@ pub fn gen_settings<'a>(
     gen_frame_header(
         buf,
         &FrameHeader {
-            payload_len: 6 * 8,
+            payload_len: parser::SETTINGS_ENTRY_SIZE * parser::SETTINGS_COUNT,
             frame_type: FrameType::Settings,
             flags: 0,
             stream_id: 0,
@@ -77,21 +77,21 @@ pub fn gen_settings<'a>(
     .and_then(|(buf, old_size)| {
         r#gen(
             tuple((
-                be_u16(1),
+                be_u16(parser::SETTINGS_HEADER_TABLE_SIZE),
                 be_u32(settings.settings_header_table_size),
-                be_u16(2),
+                be_u16(parser::SETTINGS_ENABLE_PUSH),
                 be_u32(settings.settings_enable_push as u32),
-                be_u16(3),
+                be_u16(parser::SETTINGS_MAX_CONCURRENT_STREAMS),
                 be_u32(settings.settings_max_concurrent_streams),
-                be_u16(4),
+                be_u16(parser::SETTINGS_INITIAL_WINDOW_SIZE),
                 be_u32(settings.settings_initial_window_size),
-                be_u16(5),
+                be_u16(parser::SETTINGS_MAX_FRAME_SIZE),
                 be_u32(settings.settings_max_frame_size),
-                be_u16(6),
+                be_u16(parser::SETTINGS_MAX_HEADER_LIST_SIZE),
                 be_u32(settings.settings_max_header_list_size),
-                be_u16(8),
+                be_u16(parser::SETTINGS_ENABLE_CONNECT_PROTOCOL),
                 be_u32(settings.settings_enable_connect_protocol as u32),
-                be_u16(9),
+                be_u16(parser::SETTINGS_NO_RFC7540_PRIORITIES),
                 be_u32(settings.settings_no_rfc7540_priorities as u32),
             )),
             buf,
@@ -108,7 +108,7 @@ pub fn gen_rst_stream(
     gen_frame_header(
         buf,
         &FrameHeader {
-            payload_len: 4,
+            payload_len: parser::RST_STREAM_PAYLOAD_SIZE,
             frame_type: FrameType::RstStream,
             flags: 0,
             stream_id,
@@ -129,14 +129,14 @@ pub fn gen_window_update(
     gen_frame_header(
         buf,
         &FrameHeader {
-            payload_len: 4,
+            payload_len: parser::WINDOW_UPDATE_PAYLOAD_SIZE,
             frame_type: FrameType::WindowUpdate,
             flags: 0,
             stream_id,
         },
     )
     .and_then(|(buf, old_size)| {
-        r#gen(be_u32(increment & 0x7FFFFFFF), buf)
+        r#gen(be_u32(increment & parser::STREAM_ID_MASK), buf)
             .map(|(buf, size)| (buf, (old_size + size as usize)))
     })
 }
@@ -149,7 +149,7 @@ pub fn gen_goaway(
     gen_frame_header(
         buf,
         &FrameHeader {
-            payload_len: 8,
+            payload_len: parser::GOAWAY_PAYLOAD_SIZE,
             frame_type: FrameType::GoAway,
             flags: 0,
             stream_id: 0,
