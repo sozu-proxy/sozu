@@ -39,6 +39,19 @@ fn is_invalid_te_value(value: &[u8]) -> bool {
     !compare_no_case(value, b"trailers")
 }
 
+/// Trims leading and trailing ASCII whitespace (spaces and tabs) from a byte slice.
+fn trim_ascii(input: &[u8]) -> &[u8] {
+    let start = input
+        .iter()
+        .position(|&b| b != b' ' && b != b'\t')
+        .unwrap_or(input.len());
+    let end = input
+        .iter()
+        .rposition(|&b| b != b' ' && b != b'\t')
+        .map_or(start, |p| p + 1);
+    &input[start..end]
+}
+
 pub fn handle_header<C>(
     decoder: &mut loona_hpack::Decoder<'static>,
     prioriser: &mut Prioriser,
@@ -82,49 +95,74 @@ where
                     return;
                 }
 
-                let start = kawa.storage.end as u32;
-                if kawa.storage.write_all(&v).is_err() {
-                    invalid_headers = true;
-                    return;
-                }
                 let len_key = k.len() as u32;
                 let len_val = v.len() as u32;
-                let val = Store::Slice(Slice {
-                    start,
-                    len: len_val,
-                });
 
                 if compare_no_case(&k, b":method") {
                     if !method.is_empty() || regular_headers {
                         invalid_headers = true;
+                        return;
                     }
-                    method = val;
+                    let start = kawa.storage.end as u32;
+                    if kawa.storage.write_all(&v).is_err() {
+                        invalid_headers = true;
+                        return;
+                    }
+                    method = Store::Slice(Slice {
+                        start,
+                        len: len_val,
+                    });
                 } else if compare_no_case(&k, b":scheme") {
                     if !scheme.is_empty() || regular_headers {
                         invalid_headers = true;
+                        return;
                     }
-                    scheme = val;
+                    let start = kawa.storage.end as u32;
+                    if kawa.storage.write_all(&v).is_err() {
+                        invalid_headers = true;
+                        return;
+                    }
+                    scheme = Store::Slice(Slice {
+                        start,
+                        len: len_val,
+                    });
                 } else if compare_no_case(&k, b":path") {
                     if !path.is_empty() || regular_headers {
                         invalid_headers = true;
+                        return;
                     }
-                    path = val;
+                    let start = kawa.storage.end as u32;
+                    if kawa.storage.write_all(&v).is_err() {
+                        invalid_headers = true;
+                        return;
+                    }
+                    path = Store::Slice(Slice {
+                        start,
+                        len: len_val,
+                    });
                 } else if compare_no_case(&k, b":authority") {
                     if !authority.is_empty() || regular_headers {
                         invalid_headers = true;
+                        return;
                     }
-                    authority = val;
+                    let start = kawa.storage.end as u32;
+                    if kawa.storage.write_all(&v).is_err() {
+                        invalid_headers = true;
+                        return;
+                    }
+                    authority = Store::Slice(Slice {
+                        start,
+                        len: len_val,
+                    });
                 } else if k.starts_with(b":") {
                     invalid_headers = true;
                 } else if compare_no_case(&k, b"cookie") {
                     regular_headers = true;
                     // RFC 9113 §8.2.3: split combined cookie headers into individual pairs.
                     // Each cookie-pair separated by "; " becomes a separate cookie header.
+                    // Only the split pairs are written to storage (not the full combined value).
                     for cookie_pair in v.split(|&b| b == b';') {
-                        let trimmed = cookie_pair
-                            .iter()
-                            .position(|&b| b != b' ')
-                            .map_or(&[][..], |pos| &cookie_pair[pos..]);
+                        let trimmed = trim_ascii(cookie_pair);
                         if trimmed.is_empty() {
                             continue;
                         }
@@ -151,6 +189,15 @@ where
                     }
                 } else {
                     regular_headers = true;
+                    let start = kawa.storage.end as u32;
+                    if kawa.storage.write_all(&v).is_err() {
+                        invalid_headers = true;
+                        return;
+                    }
+                    let val = Store::Slice(Slice {
+                        start,
+                        len: len_val,
+                    });
                     if compare_no_case(&k, b"content-length") {
                         if let Some(length) =
                             from_utf8(&v).ok().and_then(|v| v.parse::<usize>().ok())
