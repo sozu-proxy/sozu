@@ -361,12 +361,13 @@ pub trait Endpoint: Debug {
     /// If start_stream is called on a client it means the stream should be attached to this endpoint,
     /// the stream might be recovering from a disconnection, in any case at this point its response MUST be empty.
     /// If the start_stream is called on a H2 server it means the stream is a server push and its request MUST be empty.
+    /// Returns false if the stream could not be started (e.g. max concurrent streams reached).
     fn start_stream<L: ListenerHandler + L7ListenerHandler>(
         &mut self,
         token: Token,
         stream: GlobalStreamId,
         context: &mut Context<L>,
-    );
+    ) -> bool;
 }
 
 #[derive(Debug)]
@@ -613,7 +614,7 @@ impl<Front: SocketHandler> Connection<Front> {
         }
     }
 
-    fn start_stream<L>(&mut self, stream: GlobalStreamId, context: &mut Context<L>)
+    fn start_stream<L>(&mut self, stream: GlobalStreamId, context: &mut Context<L>) -> bool
     where
         L: ListenerHandler + L7ListenerHandler,
     {
@@ -622,10 +623,18 @@ impl<Front: SocketHandler> Connection<Front> {
             backend_borrow.active_requests += 1;
             println_!("--------------- CONNECTION START STREAM: {backend_borrow:#?}");
         }
-        match self {
+        let started = match self {
             Connection::H1(c) => c.start_stream(stream, context),
             Connection::H2(c) => c.start_stream(stream, context),
+        };
+        if !started {
+            // Undo active_requests increment on failure
+            if let Position::Client(_, backend, BackendStatus::Connected) = self.position() {
+                let mut backend_borrow = backend.borrow_mut();
+                backend_borrow.active_requests -= 1;
+            }
         }
+        started
     }
 }
 
@@ -653,14 +662,19 @@ impl<Front: SocketHandler + Debug> Endpoint for EndpointServer<'_, Front> {
         self.0.end_stream(stream, context);
     }
 
-    fn start_stream<L>(&mut self, _token: Token, stream: GlobalStreamId, context: &mut Context<L>)
+    fn start_stream<L>(
+        &mut self,
+        _token: Token,
+        stream: GlobalStreamId,
+        context: &mut Context<L>,
+    ) -> bool
     where
         L: ListenerHandler + L7ListenerHandler,
     {
         // Forward stream start to the frontend connection.
         // This is used when a backend H2 connection starts a new stream
         // (e.g. for H2<->H2 proxying or PUSH_PROMISE forwarding).
-        self.0.start_stream(stream, context);
+        self.0.start_stream(stream, context)
     }
 }
 impl Endpoint for EndpointClient<'_> {
@@ -682,7 +696,12 @@ impl Endpoint for EndpointClient<'_> {
             .end_stream(stream, context);
     }
 
-    fn start_stream<L>(&mut self, token: Token, stream: GlobalStreamId, context: &mut Context<L>)
+    fn start_stream<L>(
+        &mut self,
+        token: Token,
+        stream: GlobalStreamId,
+        context: &mut Context<L>,
+    ) -> bool
     where
         L: ListenerHandler + L7ListenerHandler,
     {
@@ -690,7 +709,7 @@ impl Endpoint for EndpointClient<'_> {
             .backends
             .get_mut(&token)
             .unwrap()
-            .start_stream(stream, context);
+            .start_stream(stream, context)
     }
 }
 
@@ -1252,13 +1271,20 @@ impl Router {
             token
         };
 
-        // link stream to backend
-        stream.state = StreamState::Linked(token);
-        // link backend to stream
-        self.backends
+        // Release the stream borrow before passing context to start_stream
+        let _ = stream;
+        // Link backend to stream, checking if the backend can accept it
+        let started = self
+            .backends
             .get_mut(&token)
             .unwrap()
             .start_stream(stream_id, context);
+        if !started {
+            error!("Backend rejected stream start (max concurrent streams reached)");
+            return Err(BackendConnectionError::MaxSessionsMemory);
+        }
+        // Reborrow stream to set linked state
+        context.streams[stream_id].state = StreamState::Linked(token);
         Ok(())
     }
 
