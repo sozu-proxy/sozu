@@ -390,23 +390,32 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                                     self.expect_header();
                                     return MuxResult::Continue;
                                 }
-                                if matches!(header.frame_type,
-                                    FrameType::RstStream | FrameType::WindowUpdate)
+                                // Distinguish closed vs idle: if stream_id <=
+                                // highest_peer_stream_id, the stream existed and is
+                                // now closed; otherwise it was never opened (idle).
+                                let is_closed_stream =
+                                    header.stream_id <= self.highest_peer_stream_id;
+                                if is_closed_stream
+                                    && matches!(
+                                        header.frame_type,
+                                        FrameType::RstStream | FrameType::WindowUpdate
+                                    )
                                 {
                                     // RFC 9113 §5.1: RST_STREAM and WINDOW_UPDATE on a
-                                    // closed stream can arrive due to race conditions and
-                                    // SHOULD be ignored. Treat as stream 0 so the frame
-                                    // body is parsed and discarded normally.
+                                    // closed stream can arrive due to race conditions
+                                    // and SHOULD be ignored. Treat as stream 0 so the
+                                    // frame body is parsed and discarded normally.
                                     debug!(
                                         "Ignoring {:?} on closed stream {}",
                                         header.frame_type, header.stream_id
                                     );
+                                } else {
+                                    error!(
+                                        "CANNOT RECEIVE {:?} FRAME ON IDLE/CLOSED STREAMS",
+                                        header.frame_type
+                                    );
+                                    return self.goaway(H2Error::ProtocolError);
                                 }
-                                error!(
-                                    "CANNOT RECEIVE {:?} FRAME ON IDLE/CLOSED STREAMS",
-                                    header.frame_type
-                                );
-                                return self.goaway(H2Error::ProtocolError);
                             }
                             H2StreamId::Zero
                         };
@@ -695,7 +704,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 let mut socket_write = false;
                 'outer: for stream_id in priorities {
                     let Some(&global_stream_id) = self.streams.get(stream_id) else {
-                        error!("stream_id {} from sorted keys missing in streams map", stream_id);
+                        error!(
+                            "stream_id {} from sorted keys missing in streams map",
+                            stream_id
+                        );
                         continue;
                     };
                     let stream = &mut context.streams[global_stream_id];
@@ -853,10 +865,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     {
         // RFC 9113 §6.8: reject new streams on a draining connection
         if self.draining {
-            error!(
-                "Rejecting new stream {} on draining connection",
-                stream_id
-            );
+            error!("Rejecting new stream {} on draining connection", stream_id);
             return None;
         }
         // Track the highest peer-initiated stream ID for GoAway frames
@@ -1260,7 +1269,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         );
                     }
                 } else {
-                    trace!("Ignoring window update on closed stream {}: {}", stream_id, increment);
+                    trace!(
+                        "Ignoring window update on closed stream {}: {}",
+                        stream_id, increment
+                    );
                 };
             }
             Frame::Continuation(_) => {
@@ -1379,8 +1391,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         // on a closed stream would be a protocol error that could cause
                         // the H2 peer to close the entire connection.
                         let stream = &context.streams[stream_gid];
-                        let fully_completed = stream.back_received_end_of_stream
-                            && stream.front.is_terminated();
+                        let fully_completed =
+                            stream.back_received_end_of_stream && stream.front.is_terminated();
                         if !fully_completed {
                             let kawa = &mut self.zero;
                             let mut frame = [0; 13];

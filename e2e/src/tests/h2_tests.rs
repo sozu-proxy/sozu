@@ -41,9 +41,7 @@ use crate::{
     mock::{
         aggregator::SimpleAggregator,
         async_backend::BackendHandle as AsyncBackend,
-        https_client::{
-            Verifier, build_h2_client, resolve_concurrent_requests, resolve_request,
-        },
+        https_client::{Verifier, build_h2_client, resolve_concurrent_requests, resolve_request},
     },
     sozu::worker::Worker,
     tests::{State, provide_port, repeat_until_error_or, tests::create_local_address},
@@ -261,9 +259,7 @@ fn h2_handshake(stream: &mut rustls::StreamOwned<rustls::ClientConnection, TcpSt
     // Send client preface
     stream.write_all(H2_CLIENT_PREFACE).unwrap();
     // Send empty SETTINGS
-    stream
-        .write_all(&H2Frame::settings(&[]).encode())
-        .unwrap();
+    stream.write_all(&H2Frame::settings(&[]).encode()).unwrap();
     stream.flush().unwrap();
 
     // Read server's response (SETTINGS, possibly WINDOW_UPDATE, etc.)
@@ -272,9 +268,7 @@ fn h2_handshake(stream: &mut rustls::StreamOwned<rustls::ClientConnection, TcpSt
     let _ = read_all_available(stream, Duration::from_millis(500));
 
     // Send SETTINGS ACK
-    stream
-        .write_all(&H2Frame::settings_ack().encode())
-        .unwrap();
+    stream.write_all(&H2Frame::settings_ack().encode()).unwrap();
     stream.flush().unwrap();
 
     // Small delay for the ACK to be processed
@@ -398,9 +392,7 @@ impl DisconnectingBackend {
                 }
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        stream
-                            .set_read_timeout(Some(Duration::from_secs(2)))
-                            .ok();
+                        stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
                         // Read the request
                         let mut buf = [0u8; 4096];
                         let _ = stream.read(&mut buf);
@@ -479,16 +471,13 @@ impl ContentLengthMismatchBackend {
                 }
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        stream
-                            .set_read_timeout(Some(Duration::from_secs(2)))
-                            .ok();
+                        stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
                         let mut buf = [0u8; 4096];
                         let _ = stream.read(&mut buf);
                         req_count.fetch_add(1, Ordering::Relaxed);
 
                         // Content-Length says 100, but we only send 5 bytes of body
-                        let response =
-                            b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nhello";
+                        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nhello";
                         let _ = stream.write_all(response);
                         let _ = stream.flush();
                         // Close the connection after sending mismatched response
@@ -564,11 +553,8 @@ impl DelayedH2Backend {
                         break;
                     }
 
-                    let accept = tokio::time::timeout(
-                        Duration::from_millis(50),
-                        listener.accept(),
-                    )
-                    .await;
+                    let accept =
+                        tokio::time::timeout(Duration::from_millis(50), listener.accept()).await;
 
                     let (stream, _) = match accept {
                         Ok(Ok(s)) => s,
@@ -582,25 +568,26 @@ impl DelayedH2Backend {
 
                     tokio::spawn(async move {
                         let io = TokioIo::new(stream);
-                        let service = service_fn(move |_req: hyper::Request<hyper::body::Incoming>| {
-                            let body = body.clone();
-                            let req_count = req_count.clone();
-                            let resp_count = resp_count.clone();
-                            async move {
-                                req_count.fetch_add(1, Ordering::Relaxed);
-                                // Delay the response
-                                tokio::time::sleep(delay).await;
+                        let service =
+                            service_fn(move |_req: hyper::Request<hyper::body::Incoming>| {
+                                let body = body.clone();
+                                let req_count = req_count.clone();
+                                let resp_count = resp_count.clone();
+                                async move {
+                                    req_count.fetch_add(1, Ordering::Relaxed);
+                                    // Delay the response
+                                    tokio::time::sleep(delay).await;
 
-                                let response = Response::builder()
-                                    .status(200)
-                                    .header("content-type", "text/plain")
-                                    .body(Full::new(body))
-                                    .unwrap();
+                                    let response = Response::builder()
+                                        .status(200)
+                                        .header("content-type", "text/plain")
+                                        .body(Full::new(body))
+                                        .unwrap();
 
-                                resp_count.fetch_add(1, Ordering::Relaxed);
-                                Ok::<_, hyper::Error>(response)
-                            }
-                        });
+                                    resp_count.fetch_add(1, Ordering::Relaxed);
+                                    Ok::<_, hyper::Error>(response)
+                                }
+                            });
 
                         let builder = ServerBuilder::new(TokioExecutor::new());
                         let _ = builder.serve_connection(io, service).await;
@@ -648,9 +635,7 @@ impl Drop for DelayedH2Backend {
 
 /// Setup HTTPS listener with TLS and a cluster, but do NOT add backends.
 /// The caller is responsible for adding backends and calling worker.read_to_last().
-fn setup_h2_listener_only(
-    name: &str,
-) -> (Worker, u16, SocketAddress) {
+fn setup_h2_listener_only(name: &str) -> (Worker, u16, SocketAddress) {
     let front_port = provide_port();
     let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
 
@@ -757,8 +742,7 @@ fn try_h2_continuation_wrong_stream_id() -> State {
     // Send CONTINUATION on stream 3 (WRONG — should be stream 1)
     let continuation_block = vec![
         0x40, 0x0a, // literal header with indexing, name length 10
-        b'x', b'-', b'c', b'u', b's', b't', b'o', b'm', b'-', b'h',
-        0x05, // value length 5
+        b'x', b'-', b'c', b'u', b's', b't', b'o', b'm', b'-', b'h', 0x05, // value length 5
         b'v', b'a', b'l', b'u', b'e',
     ];
     let bad_continuation = H2Frame::continuation(3, continuation_block, true);
@@ -770,7 +754,10 @@ fn try_h2_continuation_wrong_stream_id() -> State {
     let response_data = read_all_available(&mut tls, Duration::from_secs(2));
     let frames = parse_h2_frames(&response_data);
 
-    println!("H2 CONTINUATION bad stream_id - received {} frames", frames.len());
+    println!(
+        "H2 CONTINUATION bad stream_id - received {} frames",
+        frames.len()
+    );
     for (i, (ft, fl, sid, _)) in frames.iter().enumerate() {
         println!("  frame {i}: type=0x{ft:02x} flags=0x{fl:02x} stream={sid}");
     }
@@ -827,9 +814,9 @@ fn try_h2_goaway_graceful_drain() -> State {
         proxy: ListenerType::Https.into(),
         from_scm: false,
     }));
-    worker.send_proxy_request_type(RequestType::AddCluster(
-        Worker::default_cluster("cluster_0"),
-    ));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
     worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
         hostname: String::from("localhost"),
         ..Worker::default_http_frontend("cluster_0", front_address.clone().into())
@@ -855,11 +842,8 @@ fn try_h2_goaway_graceful_drain() -> State {
     worker.read_to_last();
 
     // Start a backend that delays responses by 500ms
-    let mut delayed_backend = DelayedH2Backend::start(
-        back_address,
-        Duration::from_millis(500),
-        "delayed-pong",
-    );
+    let mut delayed_backend =
+        DelayedH2Backend::start(back_address, Duration::from_millis(500), "delayed-pong");
 
     // Use hyper H2 client: send a request, then verify it completes
     // Even though we trigger a soft_stop (which sends GoAway), the in-flight
@@ -979,7 +963,10 @@ fn try_h2_malformed_frames_no_crash() -> State {
         thread::sleep(Duration::from_millis(300));
         let data = read_all_available(&mut tls, Duration::from_secs(1));
         let frames = parse_h2_frames(&data);
-        println!("Malformed A (invalid type) - {} frames received", frames.len());
+        println!(
+            "Malformed A (invalid type) - {} frames received",
+            frames.len()
+        );
         // Unknown frame types MUST be ignored per RFC 9113 Section 4.1
         // So sozu should NOT disconnect. But even if it does, it must not crash.
         drop(tls);
@@ -1006,7 +993,10 @@ fn try_h2_malformed_frames_no_crash() -> State {
         thread::sleep(Duration::from_millis(300));
         let data = read_all_available(&mut tls, Duration::from_secs(1));
         let frames = parse_h2_frames(&data);
-        println!("Malformed B (SETTINGS on stream 1) - {} frames received", frames.len());
+        println!(
+            "Malformed B (SETTINGS on stream 1) - {} frames received",
+            frames.len()
+        );
         let got_goaway = contains_goaway(&frames);
         println!("  got GOAWAY: {got_goaway}");
         drop(tls);
@@ -1032,7 +1022,10 @@ fn try_h2_malformed_frames_no_crash() -> State {
         thread::sleep(Duration::from_millis(300));
         let data = read_all_available(&mut tls, Duration::from_secs(1));
         let frames = parse_h2_frames(&data);
-        println!("Malformed C (DATA on stream 0) - {} frames received", frames.len());
+        println!(
+            "Malformed C (DATA on stream 0) - {} frames received",
+            frames.len()
+        );
         let got_goaway = contains_goaway(&frames);
         println!("  got GOAWAY: {got_goaway}");
         drop(tls);
@@ -1059,7 +1052,10 @@ fn try_h2_malformed_frames_no_crash() -> State {
         thread::sleep(Duration::from_millis(300));
         let data = read_all_available(&mut tls, Duration::from_secs(1));
         let frames = parse_h2_frames(&data);
-        println!("Malformed D (WINDOW_UPDATE 0 increment) - {} frames received", frames.len());
+        println!(
+            "Malformed D (WINDOW_UPDATE 0 increment) - {} frames received",
+            frames.len()
+        );
         let got_goaway = contains_goaway(&frames);
         println!("  got GOAWAY: {got_goaway}");
         drop(tls);
@@ -1097,7 +1093,10 @@ fn try_h2_malformed_frames_no_crash() -> State {
         thread::sleep(Duration::from_millis(300));
         let data = read_all_available(&mut tls, Duration::from_secs(1));
         let frames = parse_h2_frames(&data);
-        println!("Malformed E (oversized frame) - {} frames received", frames.len());
+        println!(
+            "Malformed E (oversized frame) - {} frames received",
+            frames.len()
+        );
         let got_goaway = contains_goaway(&frames);
         let got_rst = contains_rst_stream(&frames);
         println!("  got GOAWAY: {got_goaway}, got RST_STREAM: {got_rst}");
@@ -1152,7 +1151,10 @@ fn try_h2_content_length_mismatch() -> State {
     let result = resolve_request(&client, uri);
     match &result {
         Some((status, body)) => {
-            println!("H2 CL mismatch - status: {status:?}, body len: {}", body.len());
+            println!(
+                "H2 CL mismatch - status: {status:?}, body len: {}",
+                body.len()
+            );
         }
         None => {
             println!("H2 CL mismatch - request failed (may be expected for mismatch)");
@@ -1218,7 +1220,10 @@ fn try_h2_concurrent_streams() -> State {
         return State::Fail;
     }
 
-    println!("H2 concurrent streams - all {} requests succeeded", results.len());
+    println!(
+        "H2 concurrent streams - all {} requests succeeded",
+        results.len()
+    );
 
     worker.soft_stop();
     let success = worker.wait_for_server_stop();

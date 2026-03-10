@@ -50,7 +50,6 @@ pub use crate::protocol::mux::{
     parser::{H2Error, error_code_to_str},
 };
 
-
 /// Generic Http representation using the Kawa crate using the Checkout of Sozu as buffer
 type GenericHttpStream = kawa::Kawa<Checkout>;
 type StreamId = u32;
@@ -674,7 +673,10 @@ impl Endpoint for EndpointClient<'_> {
         match self.0.backends.get(&token) {
             Some(backend) => backend.readiness(),
             None => {
-                error!("backend token {:?} missing from backends map (readiness)", token);
+                error!(
+                    "backend token {:?} missing from backends map (readiness)",
+                    token
+                );
                 &self.0.fallback_readiness
             }
         }
@@ -683,7 +685,10 @@ impl Endpoint for EndpointClient<'_> {
         match self.0.backends.get_mut(&token) {
             Some(backend) => backend.readiness_mut(),
             None => {
-                error!("backend token {:?} missing from backends map (readiness_mut)", token);
+                error!(
+                    "backend token {:?} missing from backends map (readiness_mut)",
+                    token
+                );
                 &mut self.0.fallback_readiness
             }
         }
@@ -696,7 +701,10 @@ impl Endpoint for EndpointClient<'_> {
         match self.0.backends.get_mut(&token) {
             Some(backend) => backend.end_stream(stream, context),
             None => {
-                error!("backend token {:?} missing from backends map (end_stream)", token);
+                error!(
+                    "backend token {:?} missing from backends map (end_stream)",
+                    token
+                );
             }
         }
     }
@@ -713,7 +721,10 @@ impl Endpoint for EndpointClient<'_> {
         match self.0.backends.get_mut(&token) {
             Some(backend) => backend.start_stream(stream, context),
             None => {
-                error!("backend token {:?} missing from backends map (start_stream)", token);
+                error!(
+                    "backend token {:?} missing from backends map (start_stream)",
+                    token
+                );
                 false
             }
         }
@@ -949,7 +960,10 @@ impl Stream {
             Protocol::HTTP => "http",
             Protocol::HTTPS => "https",
             other => {
-                error!("mux streams only handle HTTP or HTTPS protocols, got {:?}", other);
+                error!(
+                    "mux streams only handle HTTP or HTTPS protocols, got {:?}",
+                    other
+                );
                 "unknown"
             }
         };
@@ -1135,7 +1149,10 @@ impl Router {
         // when reused, a stream should be detached from its old connection, if not we could end
         // with concurrent connections on a single endpoint
         if !matches!(stream.state, StreamState::Link) {
-            error!("stream {} expected to be in Link state, got {:?}", stream_id, stream.state);
+            error!(
+                "stream {} expected to be in Link state, got {:?}",
+                stream_id, stream.state
+            );
             return Err(BackendConnectionError::MaxSessionsMemory);
         }
         context
@@ -1292,7 +1309,10 @@ impl Router {
 
         // Link backend to stream, checking if the backend can accept it
         let Some(backend_conn) = self.backends.get_mut(&token) else {
-            error!("just-inserted or reused backend token {:?} missing from backends map", token);
+            error!(
+                "just-inserted or reused backend token {:?} missing from backends map",
+                token
+            );
             return Err(BackendConnectionError::MaxSessionsMemory);
         };
         let started = backend_conn.start_stream(stream_id, context);
@@ -1453,7 +1473,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         _metrics: &mut SessionMetrics,
     ) -> SessionResult {
         let mut counter = 0;
-        let max_loop_iterations = 100000;
+        let max_loop_iterations = 10000;
 
         if self.frontend.readiness().event.is_hup() {
             return SessionResult::Close;
@@ -1545,9 +1565,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                         _ => {}
                                     }
                                 }
-                                trace!(
-                                    "connection success: {:#?}", backend_borrow
-                                );
+                                trace!("connection success: {:#?}", backend_borrow);
                                 drop(backend_borrow);
                                 *position = Position::Client(
                                     std::mem::take(cluster_id),
@@ -1761,7 +1779,10 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                 }
                                 // TCP specific error
                                 BE::NotFound(ref msg) => {
-                                    error!("NotFound is TCP-specific, not reachable in mux: {:?}", msg);
+                                    error!(
+                                        "NotFound is TCP-specific, not reachable in mux: {:?}",
+                                        msg
+                                    );
                                     set_default_answer(stream, front_readiness, 503, &answers);
                                 }
                             }
@@ -1864,9 +1885,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                             set_default_answer(stream, front_readiness, 504, &answers);
                             should_write = true;
                         } else {
-                            trace!(
-                                "Stream waiting for end of response, forcefully terminate it"
-                            );
+                            trace!("Stream waiting for end of response, forcefully terminate it");
                             forcefully_terminate_answer(
                                 stream,
                                 front_readiness,
