@@ -74,6 +74,13 @@ backends = [
 Make sure `buffer_size` is at least **16393** (16384 max H2 frame + 9 byte header) in
 the global configuration section.
 
+You can also toggle HTTP/2 at runtime using the CLI:
+
+```bash
+sozu cluster h2 enable --id MyCluster
+sozu cluster h2 disable --id MyCluster
+```
+
 See the [configuration reference](./configure.md) for details on all HTTP/2 options.
 
 [ru]: https://rustup.rs
