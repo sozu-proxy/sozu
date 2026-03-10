@@ -826,6 +826,8 @@ pub struct FileClusterConfig {
     pub answer_503: Option<String>,
     #[serde(default)]
     pub load_metric: Option<LoadMetric>,
+    /// Use HTTP/2 for backend connections to this cluster
+    pub http2: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -921,6 +923,7 @@ impl FileClusterConfig {
                     load_balancing: self.load_balancing,
                     load_metric: self.load_metric,
                     answer_503,
+                    http2: self.http2,
                 }))
             }
         }
@@ -1013,6 +1016,7 @@ pub struct HttpClusterConfig {
     pub load_balancing: LoadBalancingAlgorithms,
     pub load_metric: Option<LoadMetric>,
     pub answer_503: Option<String>,
+    pub http2: Option<bool>,
 }
 
 impl HttpClusterConfig {
@@ -1026,7 +1030,7 @@ impl HttpClusterConfig {
                 load_balancing: self.load_balancing as i32,
                 answer_503: self.answer_503.clone(),
                 load_metric: self.load_metric.map(|s| s as i32),
-                http2: None,
+                http2: self.http2,
             })
             .into(),
         ];
