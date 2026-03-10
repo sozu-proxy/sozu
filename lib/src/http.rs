@@ -70,7 +70,6 @@ StateMachineBuilder! {
 ///
 /// 1 session <=> 1 HTTP connection (client to sozu)
 pub struct HttpSession {
-    answers: Rc<RefCell<HttpAnswers>>,
     configured_backend_timeout: Duration,
     configured_connect_timeout: Duration,
     configured_frontend_timeout: Duration,
@@ -87,7 +86,6 @@ pub struct HttpSession {
 impl HttpSession {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        answers: Rc<RefCell<HttpAnswers>>,
         configured_backend_timeout: Duration,
         configured_connect_timeout: Duration,
         configured_frontend_timeout: Duration,
@@ -140,7 +138,6 @@ impl HttpSession {
 
         let metrics = SessionMetrics::new(Some(wait_time));
         Ok(HttpSession {
-            answers,
             configured_backend_timeout,
             configured_connect_timeout,
             configured_frontend_timeout,
@@ -967,7 +964,6 @@ impl ProxyConfiguration for HttpProxy {
         };
 
         let session = HttpSession::new(
-            owned.answers.clone(),
             Duration::from_secs(owned.config.back_timeout as u64),
             Duration::from_secs(owned.config.connect_timeout as u64),
             Duration::from_secs(owned.config.front_timeout as u64),

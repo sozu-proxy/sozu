@@ -349,7 +349,7 @@ pub fn data_frame<'a>(
         (i, None)
     };
 
-    if pad_length.is_some() && i.len() <= pad_length.unwrap() as usize {
+    if pad_length.is_some_and(|p| i.len() <= p as usize) {
         return Err(Err::Failure(ParserError::new_h2(
             input,
             H2Error::ProtocolError,
@@ -419,7 +419,7 @@ pub fn headers_frame<'a>(
         (i, None)
     };
 
-    if pad_length.is_some() && i.len() <= pad_length.unwrap() as usize {
+    if pad_length.is_some_and(|p| i.len() <= p as usize) {
         return Err(Err::Failure(ParserError::new_h2(
             input,
             H2Error::ProtocolError,
@@ -549,7 +549,7 @@ pub fn push_promise_frame<'a>(
         (i, None)
     };
 
-    if pad_length.is_some() && i.len() <= pad_length.unwrap() as usize {
+    if pad_length.is_some_and(|p| i.len() <= p as usize) {
         return Err(Err::Failure(ParserError::new_h2(
             input,
             H2Error::ProtocolError,
