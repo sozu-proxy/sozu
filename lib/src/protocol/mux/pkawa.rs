@@ -234,6 +234,9 @@ where
             // Note: Store::is_empty() only matches Store::Empty, not Store::Slice { len: 0 }.
             // We must use len() == 0 to catch empty pseudo-header values like `:path: ""`.
             // RFC 9113 §8.3.1 requires all four pseudo-headers to be present and non-empty.
+            // Note: CONNECT requests (RFC 9113 §8.5) only need :method + :authority,
+            // but we don't advertise SETTINGS_ENABLE_CONNECT_PROTOCOL so CONNECT is
+            // intentionally unsupported for now.
             #[allow(clippy::len_zero)]
             if invalid_headers
                 || method.len() == 0

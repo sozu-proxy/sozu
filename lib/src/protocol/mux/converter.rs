@@ -60,25 +60,40 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                     path,
                     ..
                 } => {
-                    if let Err(e) = self.encoder.encode_header_into((b":method", method.data(buffer)), &mut self.out) {
+                    if let Err(e) = self
+                        .encoder
+                        .encode_header_into((b":method", method.data(buffer)), &mut self.out)
+                    {
                         error!("HPACK encoding of :method pseudo-header failed: {:?}", e);
                         return false;
                     }
-                    if let Err(e) = self.encoder.encode_header_into((b":authority", authority.data(buffer)), &mut self.out) {
+                    if let Err(e) = self
+                        .encoder
+                        .encode_header_into((b":authority", authority.data(buffer)), &mut self.out)
+                    {
                         error!("HPACK encoding of :authority pseudo-header failed: {:?}", e);
                         return false;
                     }
-                    if let Err(e) = self.encoder.encode_header_into((b":path", path.data(buffer)), &mut self.out) {
+                    if let Err(e) = self
+                        .encoder
+                        .encode_header_into((b":path", path.data(buffer)), &mut self.out)
+                    {
                         error!("HPACK encoding of :path pseudo-header failed: {:?}", e);
                         return false;
                     }
-                    if let Err(e) = self.encoder.encode_header_into((b":scheme", self.scheme), &mut self.out) {
+                    if let Err(e) = self
+                        .encoder
+                        .encode_header_into((b":scheme", self.scheme), &mut self.out)
+                    {
                         error!("HPACK encoding of :scheme pseudo-header failed: {:?}", e);
                         return false;
                     }
                 }
                 StatusLine::Response { status, .. } => {
-                    if let Err(e) = self.encoder.encode_header_into((b":status", status.data(buffer)), &mut self.out) {
+                    if let Err(e) = self
+                        .encoder
+                        .encode_header_into((b":status", status.data(buffer)), &mut self.out)
+                    {
                         error!("HPACK encoding of :status pseudo-header failed: {:?}", e);
                         return false;
                     }
@@ -99,7 +114,10 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                     .filter(|cookie| !cookie.is_elided())
                 {
                     let cookie = [cookie.key.data(buffer), b"=", cookie.val.data(buffer)].concat();
-                    if let Err(e) = self.encoder.encode_header_into((b"cookie", &cookie), &mut self.out) {
+                    if let Err(e) = self
+                        .encoder
+                        .encode_header_into((b"cookie", &cookie), &mut self.out)
+                    {
                         error!("HPACK encoding of cookie header failed: {:?}", e);
                         return false;
                     }
