@@ -1078,6 +1078,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 );
                 kawa.storage.clear();
                 if let Err((error, global)) = status {
+                    match self.position {
+                        Position::Client(..) => incr!("http.backend_parse_errors"),
+                        Position::Server => incr!("http.frontend_parse_errors"),
+                    }
                     if global {
                         error!("GOT GLOBAL ERROR WHILE PROCESSING HEADERS");
                         return self.goaway(error);
@@ -1100,6 +1104,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 }
                 // was_initial prevents trailers from triggering connection
                 if was_initial && self.position.is_server() {
+                    incr!("http.requests");
                     gauge_add!("http.active_requests", 1);
                     stream.state = StreamState::Link;
                 }
