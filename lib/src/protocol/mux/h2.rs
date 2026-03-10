@@ -665,7 +665,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 println_!("PRIORITIES: {priorities:?}");
                 let mut socket_write = false;
                 'outer: for stream_id in priorities {
-                    let global_stream_id = *self.streams.get(stream_id).unwrap();
+                    let global_stream_id = *self
+                        .streams
+                        .get(stream_id)
+                        .expect("stream_id from sorted keys must exist in streams map");
                     let stream = &mut context.streams[global_stream_id];
                     let parts = stream.split(&self.position);
                     let kawa = parts.wbuffer;
@@ -742,7 +745,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     }
                 }
                 for stream_id in dead_streams {
-                    self.streams.remove(&stream_id).unwrap();
+                    self.streams
+                        .remove(&stream_id)
+                        .expect("dead stream_id must exist in streams map");
                 }
 
                 // Reclaim the converter's HPACK buffer for reuse
@@ -1190,7 +1195,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     println_!("Ignoring window update on closed stream {stream_id}: {increment}");
                 };
             }
-            Frame::Continuation(_) => unreachable!(),
+            Frame::Continuation(_) => {
+                unreachable!("CONTINUATION frames are handled inline during header parsing")
+            }
         }
         MuxResult::Continue
     }
@@ -1244,7 +1251,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         L: ListenerHandler + L7ListenerHandler,
     {
         match self.position {
-            Position::Client(_, _, BackendStatus::KeepAlive) => unreachable!(),
+            Position::Client(_, _, BackendStatus::KeepAlive) => {
+                unreachable!("H2 connections do not use KeepAlive backend status")
+            }
             Position::Client(..) => {}
             Position::Server => {
                 println_!("H2 SENDING CLOSE NOTIFY");
