@@ -35,7 +35,7 @@ use rustls::{
 use rusty_ulid::Ulid;
 use sozu_command::{
     certificate::Fingerprint,
-    config::DEFAULT_CIPHER_SUITES,
+    config::{DEFAULT_ALPN_PROTOCOLS, DEFAULT_CIPHER_SUITES},
     proto::command::{
         AddCertificate, CertificateSummary, CertificatesByAddress, Cluster, HttpsListenerConfig,
         ListOfCertificatesByAddress, ListenerType, RemoveCertificate, RemoveListener,
@@ -69,7 +69,6 @@ use crate::{
     util::UnwrapLog,
 };
 
-const SERVER_PROTOS: &[&str] = &["h2", "http/1.1"];
 
 StateMachineBuilder! {
     /// The various Stages of an HTTPS connection:
@@ -735,11 +734,18 @@ impl HttpsListener {
             .with_cert_resolver(resolver);
         server_config.send_tls13_tickets = config.send_tls13_tickets as usize;
 
-        let mut protocols = SERVER_PROTOS
-            .iter()
-            .map(|proto| proto.as_bytes().to_vec())
-            .collect::<Vec<_>>();
-        server_config.alpn_protocols.append(&mut protocols);
+        server_config.alpn_protocols = if config.alpn_protocols.is_empty() {
+            DEFAULT_ALPN_PROTOCOLS
+                .iter()
+                .map(|p| p.as_bytes().to_vec())
+                .collect()
+        } else {
+            config
+                .alpn_protocols
+                .iter()
+                .map(|p| p.as_bytes().to_vec())
+                .collect()
+        };
 
         Ok(server_config)
     }

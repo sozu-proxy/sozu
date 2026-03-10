@@ -110,6 +110,10 @@ pub const DEFAULT_SIGNATURE_ALGORITHMS: [&str; 9] = [
 
 pub const DEFAULT_GROUPS_LIST: [&str; 4] = ["P-521", "P-384", "P-256", "x25519"];
 
+/// Default ALPN protocols advertised by HTTPS listeners.
+/// Both HTTP/2 and HTTP/1.1 are enabled, allowing clients to negotiate either.
+pub const DEFAULT_ALPN_PROTOCOLS: [&str; 2] = ["h2", "http/1.1"];
+
 /// maximum time of inactivity for a frontend socket (60 seconds)
 pub const DEFAULT_FRONT_TIMEOUT: u32 = 60;
 
@@ -233,6 +237,8 @@ pub enum ConfigError {
         expected: ListenerProtocol,
         found: Option<ListenerProtocol>,
     },
+    #[error("Invalid ALPN protocol '{0}'. Valid values: \"h2\", \"http/1.1\"")]
+    InvalidAlpnProtocol(String),
 }
 
 /// An HTTP, HTTPS or TCP listener as parsed from the `Listeners` section in the toml
@@ -275,6 +281,9 @@ pub struct ListenerBuilder {
     /// The ticket allow the client to resume a session. This protects the client
     /// agains session tracking. Defaults to 4.
     pub send_tls13_tickets: Option<u64>,
+    /// ALPN protocols to advertise during TLS handshake, in order of preference.
+    /// Valid values: "h2", "http/1.1". Defaults to ["h2", "http/1.1"].
+    pub alpn_protocols: Option<Vec<String>>,
 }
 
 pub fn default_sticky_name() -> String {
@@ -330,6 +339,7 @@ impl ListenerBuilder {
             send_tls13_tickets: None,
             sticky_name: DEFAULT_STICKY_NAME.to_string(),
             tls_versions: None,
+            alpn_protocols: None,
         }
     }
 
@@ -372,6 +382,11 @@ impl ListenerBuilder {
 
     pub fn with_cipher_suites(&mut self, cipher_suites: Option<Vec<String>>) -> &mut Self {
         self.cipher_suites = cipher_suites;
+        self
+    }
+
+    pub fn with_alpn_protocols(&mut self, alpn_protocols: Option<Vec<String>>) -> &mut Self {
+        self.alpn_protocols = alpn_protocols;
         self
     }
 
@@ -517,6 +532,28 @@ impl ListenerBuilder {
 
         let groups_list: Vec<String> = DEFAULT_GROUPS_LIST.into_iter().map(String::from).collect();
 
+        let alpn_protocols: Vec<String> = match &self.alpn_protocols {
+            Some(protos) if !protos.is_empty() => {
+                for proto in protos {
+                    match proto.as_str() {
+                        "h2" | "http/1.1" => {}
+                        other => return Err(ConfigError::InvalidAlpnProtocol(other.to_owned())),
+                    }
+                }
+                if !protos.iter().any(|p| p == "http/1.1") {
+                    warn!("ALPN protocols do not include 'http/1.1'. Clients without H2 support will fail TLS negotiation.");
+                }
+                // Deduplicate while preserving order
+                let mut seen = std::collections::HashSet::new();
+                protos
+                    .iter()
+                    .filter(|p| seen.insert(p.as_str()))
+                    .cloned()
+                    .collect()
+            }
+            _ => DEFAULT_ALPN_PROTOCOLS.iter().map(|s| s.to_string()).collect(),
+        };
+
         let versions = match self.tls_versions {
             None => vec![TlsVersion::TlsV12 as i32, TlsVersion::TlsV13 as i32],
             Some(ref v) => v.iter().map(|v| *v as i32).collect(),
@@ -580,6 +617,7 @@ impl ListenerBuilder {
                 .send_tls13_tickets
                 .unwrap_or(DEFAULT_SEND_TLS_13_TICKETS),
             http_answers,
+            alpn_protocols,
         };
 
         Ok(https_listener_config)
@@ -1920,5 +1958,61 @@ mod tests {
         });
         println!("config: {config:#?}");
         //panic!();
+    }
+
+    #[test]
+    fn alpn_protocols_default() {
+        let mut builder = ListenerBuilder::new_https(SocketAddress::new_v4(127, 0, 0, 1, 8443));
+        let config = builder.to_tls(None).expect("to_tls should succeed");
+        assert_eq!(config.alpn_protocols, vec!["h2", "http/1.1"]);
+    }
+
+    #[test]
+    fn alpn_protocols_custom() {
+        let mut builder = ListenerBuilder::new_https(SocketAddress::new_v4(127, 0, 0, 1, 8443));
+        builder.with_alpn_protocols(Some(vec!["http/1.1".to_owned()]));
+        let config = builder.to_tls(None).expect("to_tls should succeed");
+        assert_eq!(config.alpn_protocols, vec!["http/1.1"]);
+    }
+
+    #[test]
+    fn alpn_protocols_invalid_rejected() {
+        let mut builder = ListenerBuilder::new_https(SocketAddress::new_v4(127, 0, 0, 1, 8443));
+        builder.with_alpn_protocols(Some(vec!["h3".to_owned()]));
+        let result = builder.to_tls(None);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("h3"),
+            "error should mention the invalid protocol: {err}"
+        );
+    }
+
+    #[test]
+    fn alpn_protocols_empty_uses_default() {
+        let mut builder = ListenerBuilder::new_https(SocketAddress::new_v4(127, 0, 0, 1, 8443));
+        builder.with_alpn_protocols(Some(vec![]));
+        let config = builder.to_tls(None).expect("to_tls should succeed");
+        assert_eq!(config.alpn_protocols, vec!["h2", "http/1.1"]);
+    }
+
+    #[test]
+    fn alpn_protocols_deduplicated() {
+        let mut builder = ListenerBuilder::new_https(SocketAddress::new_v4(127, 0, 0, 1, 8443));
+        builder.with_alpn_protocols(Some(vec![
+            "h2".to_owned(),
+            "h2".to_owned(),
+            "http/1.1".to_owned(),
+        ]));
+        let config = builder.to_tls(None).expect("to_tls should succeed");
+        assert_eq!(config.alpn_protocols, vec!["h2", "http/1.1"]);
+    }
+
+    #[test]
+    fn alpn_protocols_order_preserved() {
+        let mut builder = ListenerBuilder::new_https(SocketAddress::new_v4(127, 0, 0, 1, 8443));
+        builder.with_alpn_protocols(Some(vec!["http/1.1".to_owned(), "h2".to_owned()]));
+        let config = builder.to_tls(None).expect("to_tls should succeed");
+        assert_eq!(config.alpn_protocols, vec!["http/1.1", "h2"]);
     }
 }
