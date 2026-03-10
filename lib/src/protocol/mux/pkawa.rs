@@ -313,6 +313,15 @@ where
                         start,
                         len: len_val,
                     });
+                    if compare_no_case(&k, b"content-length") {
+                        if let Some(length) =
+                            from_utf8(&v).ok().and_then(|v| v.parse::<usize>().ok())
+                        {
+                            kawa.body_size = BodySize::Length(length);
+                        } else {
+                            invalid_headers = true;
+                        }
+                    }
                     if kawa.storage.write_all(&k).is_err() {
                         invalid_headers = true;
                         return;

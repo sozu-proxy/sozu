@@ -441,6 +441,8 @@ impl<Front: SocketHandler> Connection<Front> {
             pending_window_updates: Vec::new(),
             highest_peer_stream_id: 0,
             converter_buf: Vec::new(),
+            draining: false,
+            peer_last_stream_id: None,
             zero: kawa::Kawa::new(kawa::Kind::Request, kawa::Buffer::new(buffer)),
         }))
     }
@@ -486,6 +488,8 @@ impl<Front: SocketHandler> Connection<Front> {
             pending_window_updates: Vec::new(),
             highest_peer_stream_id: 0,
             converter_buf: Vec::new(),
+            draining: false,
+            peer_last_stream_id: None,
             zero: kawa::Kawa::new(kawa::Kind::Request, kawa::Buffer::new(buffer)),
         }))
     }
