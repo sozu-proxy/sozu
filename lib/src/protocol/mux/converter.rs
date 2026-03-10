@@ -33,12 +33,14 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
             } => {
                 let error = str_to_error_code(message);
                 let mut frame = [0; 13];
-                gen_rst_stream(&mut frame, self.stream_id, error).unwrap();
+                gen_rst_stream(&mut frame, self.stream_id, error)
+                    .expect("fixed-size buffer sufficient for RST_STREAM frame");
                 kawa.push_out(Store::from_slice(&frame));
             }
             ParsingPhase::Error { .. } => {
                 let mut frame = [0; 13];
-                gen_rst_stream(&mut frame, self.stream_id, H2Error::InternalError).unwrap();
+                gen_rst_stream(&mut frame, self.stream_id, H2Error::InternalError)
+                    .expect("fixed-size buffer sufficient for RST_STREAM frame");
                 kawa.push_out(Store::from_slice(&frame));
             }
             _ => {}
@@ -56,23 +58,25 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                 } => {
                     self.encoder
                         .encode_header_into((b":method", method.data(buffer)), &mut self.out)
-                        .unwrap();
+                        .expect("HPACK encoding of :method pseudo-header");
                     self.encoder
                         .encode_header_into((b":authority", authority.data(buffer)), &mut self.out)
-                        .unwrap();
+                        .expect("HPACK encoding of :authority pseudo-header");
                     self.encoder
                         .encode_header_into((b":path", path.data(buffer)), &mut self.out)
-                        .unwrap();
+                        .expect("HPACK encoding of :path pseudo-header");
                     self.encoder
                         .encode_header_into((b":scheme", self.scheme), &mut self.out)
-                        .unwrap();
+                        .expect("HPACK encoding of :scheme pseudo-header");
                 }
                 StatusLine::Response { status, .. } => {
                     self.encoder
                         .encode_header_into((b":status", status.data(buffer)), &mut self.out)
-                        .unwrap();
+                        .expect("HPACK encoding of :status pseudo-header");
                 }
-                StatusLine::Unknown => unreachable!(),
+                StatusLine::Unknown => {
+                    unreachable!("status line must be Request or Response before H2 conversion")
+                }
             },
             Block::Cookies => {
                 if kawa.detached.jar.is_empty() {
@@ -87,7 +91,7 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                     let cookie = [cookie.key.data(buffer), b"=", cookie.val.data(buffer)].concat();
                     self.encoder
                         .encode_header_into((b"cookie", &cookie), &mut self.out)
-                        .unwrap();
+                        .expect("HPACK encoding of cookie header");
                 }
             }
             Block::Header(Pair {
@@ -117,7 +121,7 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                         (&key.data(buffer).to_ascii_lowercase(), val.data(buffer)),
                         &mut self.out,
                     )
-                    .unwrap();
+                    .expect("HPACK encoding of header");
             }
             Block::ChunkHeader(_) => {
                 // this converter doesn't align H1 chunks on H2 data frames
@@ -154,7 +158,7 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                         stream_id: self.stream_id,
                     },
                 )
-                .unwrap();
+                .expect("fixed-size buffer sufficient for DATA frame header");
                 kawa.push_out(Store::from_slice(&header));
                 kawa.push_out(data);
                 // kawa.push_delimiter();
@@ -183,7 +187,7 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                                     stream_id: self.stream_id,
                                 },
                             )
-                            .unwrap();
+                            .expect("fixed-size buffer sufficient for HEADERS frame header");
                         } else {
                             gen_frame_header(
                                 &mut header,
@@ -194,7 +198,7 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                                     stream_id: self.stream_id,
                                 },
                             )
-                            .unwrap();
+                            .expect("fixed-size buffer sufficient for CONTINUATION frame header");
                         }
                         kawa.push_out(Store::from_slice(&header));
                         kawa.push_out(Store::from_slice(chunk));
@@ -214,7 +218,7 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                             stream_id: self.stream_id,
                         },
                     )
-                    .unwrap();
+                    .expect("fixed-size buffer sufficient for empty DATA frame header");
                     kawa.push_out(Store::from_slice(&header));
                 }
             }

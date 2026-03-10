@@ -39,8 +39,8 @@ fn is_invalid_te_value(value: &[u8]) -> bool {
     !compare_no_case(value, b"trailers")
 }
 
-/// Trims leading and trailing ASCII whitespace (spaces and tabs) from a byte slice.
-fn trim_ascii(input: &[u8]) -> &[u8] {
+/// Trims leading and trailing OWS (SP / HTAB per RFC 9110 §5.6.3) from a byte slice.
+fn trim_ows(input: &[u8]) -> &[u8] {
     let start = input
         .iter()
         .position(|&b| b != b' ' && b != b'\t')
@@ -162,7 +162,7 @@ where
                     // Each cookie-pair separated by "; " becomes a separate cookie header.
                     // Only the split pairs are written to storage (not the full combined value).
                     for cookie_pair in v.split(|&b| b == b';') {
-                        let trimmed = trim_ascii(cookie_pair);
+                        let trimmed = trim_ows(cookie_pair);
                         if trimmed.is_empty() {
                             continue;
                         }
@@ -276,23 +276,23 @@ where
                     return;
                 }
 
-                let start = kawa.storage.end as u32;
-                if kawa.storage.write_all(&v).is_err() {
-                    invalid_headers = true;
-                    return;
-                }
                 let len_key = k.len() as u32;
                 let len_val = v.len() as u32;
-                let val = Store::Slice(Slice {
-                    start,
-                    len: len_val,
-                });
 
                 if compare_no_case(&k, b":status") {
                     if !status.is_empty() || regular_headers {
                         invalid_headers = true;
+                        return;
                     }
-                    status = val;
+                    let start = kawa.storage.end as u32;
+                    if kawa.storage.write_all(&v).is_err() {
+                        invalid_headers = true;
+                        return;
+                    }
+                    status = Store::Slice(Slice {
+                        start,
+                        len: len_val,
+                    });
                     if let Some(parsed_code) =
                         from_utf8(&v).ok().and_then(|v| v.parse::<u16>().ok())
                     {
@@ -304,6 +304,15 @@ where
                     invalid_headers = true;
                 } else {
                     regular_headers = true;
+                    let start = kawa.storage.end as u32;
+                    if kawa.storage.write_all(&v).is_err() {
+                        invalid_headers = true;
+                        return;
+                    }
+                    let val = Store::Slice(Slice {
+                        start,
+                        len: len_val,
+                    });
                     if kawa.storage.write_all(&k).is_err() {
                         invalid_headers = true;
                         return;

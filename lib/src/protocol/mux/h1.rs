@@ -73,7 +73,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             match self.position {
                 Position::Client(..) => {
                     let StreamState::Linked(token) = stream.state else {
-                        unreachable!()
+                        unreachable!("client stream in error must be in Linked state")
                     };
                     let global_stream_id = self.stream;
                     self.end_stream(global_stream_id, context);
@@ -289,7 +289,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         }
         // reconnection is handled by the server
         let StreamState::Linked(token) = context.streams[self.stream].state else {
-            unreachable!()
+            unreachable!("closing H1 client must be in Linked state")
         };
         endpoint.end_stream(token, self.stream, context)
     }
@@ -322,7 +322,9 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                 }
             }
             Position::Client(_, _, BackendStatus::KeepAlive)
-            | Position::Client(_, _, BackendStatus::Disconnecting) => unreachable!(),
+            | Position::Client(_, _, BackendStatus::Disconnecting) => {
+                unreachable!("end_stream called on KeepAlive or Disconnecting H1 client")
+            }
             Position::Server => match (stream.front.consumed, stream.back.is_main_phase()) {
                 (true, true) => {
                     // we have a "forwardable" answer from the back
@@ -361,7 +363,9 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                     debug!("H1 RECONNECT");
                     stream.state = StreamState::Link;
                 }
-                (false, true) => unreachable!(),
+                (false, true) => {
+                    unreachable!("backend response in main phase but request not yet consumed")
+                }
             },
         }
     }
@@ -377,9 +381,13 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             Position::Client(_, _, status @ BackendStatus::KeepAlive) => {
                 *status = BackendStatus::Connected;
             }
-            Position::Client(_, _, BackendStatus::Disconnecting) => unreachable!(),
+            Position::Client(_, _, BackendStatus::Disconnecting) => {
+                unreachable!("start_stream called on Disconnecting H1 client")
+            }
             Position::Client(_, _, _) => {}
-            Position::Server => unreachable!(),
+            Position::Server => {
+                unreachable!("start_stream must not be called on H1 server connection")
+            }
         }
         true
     }
