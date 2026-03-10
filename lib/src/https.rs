@@ -92,7 +92,6 @@ enum AlpnProtocol {
 }
 
 pub struct HttpsSession {
-    answers: Rc<RefCell<HttpAnswers>>,
     configured_backend_timeout: Duration,
     configured_connect_timeout: Duration,
     configured_frontend_timeout: Duration,
@@ -111,7 +110,6 @@ pub struct HttpsSession {
 impl HttpsSession {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        answers: Rc<RefCell<HttpAnswers>>,
         configured_backend_timeout: Duration,
         configured_connect_timeout: Duration,
         configured_frontend_timeout: Duration,
@@ -157,7 +155,6 @@ impl HttpsSession {
 
         let metrics = SessionMetrics::new(Some(wait_time));
         HttpsSession {
-            answers,
             configured_backend_timeout,
             configured_connect_timeout,
             configured_frontend_timeout,
@@ -1233,7 +1230,6 @@ impl ProxyConfiguration for HttpsProxy {
         };
 
         let session = Rc::new(RefCell::new(HttpsSession::new(
-            owned.answers.clone(),
             Duration::from_secs(owned.config.back_timeout as u64),
             Duration::from_secs(owned.config.connect_timeout as u64),
             Duration::from_secs(owned.config.front_timeout as u64),
