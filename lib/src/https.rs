@@ -325,6 +325,7 @@ impl HttpsSession {
                 Some(HttpsStateMachine::Http(http))
             }
             AlpnProtocols::H2 => {
+                // TODO: pass elide_x_real_ip/send_x_real_ip and peer_address when H2 header editing is implemented
                 let mut http = Http2::new(
                     front_stream,
                     self.frontend_token,

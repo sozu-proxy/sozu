@@ -419,6 +419,11 @@ impl HttpContext {
                     key: kawa::Store::Static(b"X-Real-IP"),
                     val: kawa::Store::from_string(peer_addr.ip().to_string()),
                 }));
+            } else {
+                warn!(
+                    "send_x_real_ip is enabled but session address is unknown, skipping X-Real-IP header for request {}",
+                    self.id
+                );
             }
         }
         // Create a custom "Sozu-Id" header

@@ -388,6 +388,16 @@ impl ListenerBuilder {
         self
     }
 
+    pub fn with_elide_x_real_ip(&mut self, elide: bool) -> &mut Self {
+        self.elide_x_real_ip = Some(elide);
+        self
+    }
+
+    pub fn with_send_x_real_ip(&mut self, send: bool) -> &mut Self {
+        self.send_x_real_ip = Some(send);
+        self
+    }
+
     pub fn with_sticky_name<S>(&mut self, sticky_name: Option<S>) -> &mut Self
     where
         S: ToString,
