@@ -1060,6 +1060,7 @@ impl Display for HttpsListenerConfig {
             list_string_vec(&self.signature_algorithms),
         ]);
         table.add_row(row!["groups list", list_string_vec(&self.groups_list),]);
+        table.add_row(row!["alpn protocols", list_string_vec(&self.alpn_protocols),]);
         table.add_row(row!["key", format!("{:?}", self.key),]);
         table.add_row(row!["expect proxy", self.expect_proxy]);
         table.add_row(row!["sticky name", self.sticky_name]);

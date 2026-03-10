@@ -53,8 +53,8 @@ Sōzu supports HTTP/2 out of the box, with no additional configuration needed fo
 use cases.
 
 **Frontend (client → Sōzu):** HTTP/2 is automatically available on all HTTPS listeners.
-Clients negotiate the protocol during the TLS handshake via ALPN. No configuration
-is required.
+Clients negotiate the protocol during the TLS handshake via ALPN. To disable HTTP/2
+on a specific listener, set `alpn_protocols = ["http/1.1"]`.
 
 **Backend (Sōzu → server):** By default, Sōzu speaks HTTP/1.1 to backends. To use
 cleartext HTTP/2 (h2c) for backend connections, set `http2 = true` on the cluster:

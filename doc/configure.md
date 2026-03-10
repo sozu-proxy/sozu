@@ -172,18 +172,42 @@ cipher_list = [
 ]
 ```
 
-#### HTTP/2 support on HTTPS listeners
+#### HTTP/2 support and ALPN protocols
 
-HTTP/2 is automatically available on all HTTPS listeners through ALPN (Application-Layer
-Protocol Negotiation). During the TLS handshake, Sōzu advertises both `h2` and `http/1.1`
-as supported protocols. The client chooses which protocol to use:
+HTTP/2 is available on HTTPS listeners through ALPN (Application-Layer Protocol
+Negotiation). During the TLS handshake, Sōzu advertises protocols from the `alpn_protocols`
+list. The server selects the first protocol from its list that the client also supports.
 
-- If the client requests `h2`, the connection uses HTTP/2 with full multiplexing
-- If the client requests `http/1.1` or does not send ALPN, the connection uses HTTP/1.1
+By default, Sōzu advertises both `h2` and `http/1.1`, preferring HTTP/2:
 
-The ALPN protocol list is currently hardcoded to `["h2", "http/1.1"]` and applies to all
-HTTPS listeners. To disable HTTP/2 on a specific listener, there is no configuration
-option yet — all HTTPS listeners advertise both protocols.
+```toml
+# Default: both protocols, H2 preferred
+alpn_protocols = ["h2", "http/1.1"]
+```
+
+| Value | Protocol | Notes |
+|-------|----------|-------|
+| `h2` | HTTP/2 | Multiplexed, binary framing (RFC 9113) |
+| `http/1.1` | HTTP/1.1 | Traditional text-based protocol (RFC 9112) |
+
+Invalid values are rejected at configuration load time. Order matters: the first entry
+is the most preferred protocol.
+
+**Examples:**
+
+```toml
+# HTTP/1.1 only — disables HTTP/2 on this listener
+alpn_protocols = ["http/1.1"]
+
+# HTTP/2 only — clients without H2 support will fail TLS negotiation
+alpn_protocols = ["h2"]
+
+# Prefer HTTP/1.1 over HTTP/2
+alpn_protocols = ["http/1.1", "h2"]
+```
+
+When `alpn_protocols` is omitted or empty, the default `["h2", "http/1.1"]` is used.
+Clients that do not send an ALPN extension default to HTTP/1.1.
 
 > **Note:** HTTP/2 is only supported over TLS (HTTPS listeners). Plain HTTP listeners
 > always use HTTP/1.1.

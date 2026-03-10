@@ -162,6 +162,9 @@ message HttpsListenerConfig {
     // agains session tracking. Defaults to 4.
     required uint64 send_tls13_tickets = 20;
     optional CustomHttpAnswers http_answers = 21;
+    // ALPN protocols to advertise during TLS handshake, in order of preference.
+    // Valid values: "h2", "http/1.1". Defaults to ["h2", "http/1.1"].
+    repeated string alpn_protocols = 22;
 }
 
 // details of an TCP listener
