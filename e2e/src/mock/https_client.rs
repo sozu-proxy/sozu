@@ -129,12 +129,13 @@ pub fn resolve_request(client: &HttpsClient, uri: hyper::Uri) -> Option<(StatusC
         };
         println!("Response: {response:?}");
         let status = response.status();
-        let body_bytes = response
-            .into_body()
-            .collect()
-            .await
-            .expect("Could not get body")
-            .to_bytes();
+        let body_bytes = match response.into_body().collect().await {
+            Ok(collected) => collected.to_bytes(),
+            Err(error) => {
+                println!("Could not get body: {error}");
+                return Some((status, String::new()));
+            }
+        };
         let body = String::from_utf8(body_bytes.to_vec()).expect("Invalid UTF-8 body");
         Some((status, body))
     })
@@ -163,12 +164,13 @@ pub fn resolve_post_request(
         };
         println!("Response: {response:?}");
         let status = response.status();
-        let body_bytes = response
-            .into_body()
-            .collect()
-            .await
-            .expect("Could not get body")
-            .to_bytes();
+        let body_bytes = match response.into_body().collect().await {
+            Ok(collected) => collected.to_bytes(),
+            Err(error) => {
+                println!("Could not get body: {error}");
+                return Some((status, String::new()));
+            }
+        };
         let body = String::from_utf8(body_bytes.to_vec()).expect("Invalid UTF-8 body");
         Some((status, body))
     })
@@ -194,12 +196,13 @@ pub fn resolve_concurrent_requests(
                         }
                     };
                     let status = response.status();
-                    let body_bytes = response
-                        .into_body()
-                        .collect()
-                        .await
-                        .expect("Could not get body")
-                        .to_bytes();
+                    let body_bytes = match response.into_body().collect().await {
+                        Ok(collected) => collected.to_bytes(),
+                        Err(error) => {
+                            println!("Could not get body: {error}");
+                            return Some((status, String::new()));
+                        }
+                    };
                     let body = String::from_utf8(body_bytes.to_vec()).expect("Invalid UTF-8 body");
                     Some((status, body))
                 }
