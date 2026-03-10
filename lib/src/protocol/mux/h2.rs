@@ -766,15 +766,18 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     }
 
     /// Queue a WINDOW_UPDATE, coalescing with any existing entry for the same stream_id.
+    /// RFC 9113 §6.9.1: window size increment MUST be 1..2^31-1 (0x7FFFFFFF).
     fn queue_window_update(&mut self, stream_id: u32, increment: u32) {
+        let max_increment = i32::MAX as u32;
         if let Some(entry) = self
             .pending_window_updates
             .iter_mut()
             .find(|(sid, _)| *sid == stream_id)
         {
-            entry.1 = entry.1.saturating_add(increment);
+            entry.1 = entry.1.saturating_add(increment).min(max_increment);
         } else {
-            self.pending_window_updates.push((stream_id, increment));
+            self.pending_window_updates
+                .push((stream_id, increment.min(max_increment)));
         }
     }
 
@@ -809,15 +812,16 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     where
         L: ListenerHandler + L7ListenerHandler,
     {
+        // Track the highest peer-initiated stream ID for GoAway frames
+        // before any early return, so GoAway always reports the correct last stream.
+        if stream_id > self.highest_peer_stream_id {
+            self.highest_peer_stream_id = stream_id;
+        }
         let global_stream_id = context.create_stream(
             Ulid::generate(),
             self.peer_settings.settings_initial_window_size,
         )?;
         self.last_stream_id = (stream_id + 2) & !1;
-        // Track the highest peer-initiated stream ID for GoAway frames
-        if stream_id > self.highest_peer_stream_id {
-            self.highest_peer_stream_id = stream_id;
-        }
         self.streams.insert(stream_id, global_stream_id);
         Some(global_stream_id)
     }
@@ -1354,7 +1358,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         }
     }
 
-    pub fn start_stream<L>(&mut self, stream: GlobalStreamId, _context: &mut Context<L>)
+    pub fn start_stream<L>(&mut self, stream: GlobalStreamId, _context: &mut Context<L>) -> bool
     where
         L: ListenerHandler + L7ListenerHandler,
     {
@@ -1365,11 +1369,12 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 self.streams.len(),
                 self.peer_settings.settings_max_concurrent_streams
             );
-            return;
+            return false;
         }
         println_!("start new H2 stream {stream} {:?}", self.readiness);
         let stream_id = self.new_stream_id();
         self.streams.insert(stream_id, stream);
         self.readiness.interest.insert(Ready::WRITABLE);
+        true
     }
 }

@@ -366,7 +366,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         }
     }
 
-    pub fn start_stream<L>(&mut self, stream: GlobalStreamId, _context: &mut Context<L>)
+    pub fn start_stream<L>(&mut self, stream: GlobalStreamId, _context: &mut Context<L>) -> bool
     where
         L: ListenerHandler + L7ListenerHandler,
     {
@@ -381,5 +381,6 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             Position::Client(_, _, _) => {}
             Position::Server => unreachable!(),
         }
+        true
     }
 }
