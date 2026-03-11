@@ -69,7 +69,6 @@ use crate::{
     util::UnwrapLog,
 };
 
-
 StateMachineBuilder! {
     /// The various Stages of an HTTPS connection:
     ///

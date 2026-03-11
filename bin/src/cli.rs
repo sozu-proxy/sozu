@@ -304,7 +304,10 @@ pub enum ClusterCmd {
         )]
         http2: bool,
     },
-    #[clap(name = "h2", about = "Enable or disable HTTP/2 for backend connections")]
+    #[clap(
+        name = "h2",
+        about = "Enable or disable HTTP/2 for backend connections"
+    )]
     H2 {
         #[clap(subcommand)]
         cmd: ClusterH2Cmd,
