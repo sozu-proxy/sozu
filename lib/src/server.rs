@@ -157,6 +157,11 @@ impl SessionManager {
         self.nb_connections += 1;
         assert!(self.nb_connections <= self.max_connections);
         gauge!("client.connections", self.nb_connections);
+        gauge!(
+            "client.connections_percentage",
+            self.nb_connections * 100 / self.max_connections
+        );
+        gauge!("client.max_connections", self.max_connections);
     }
 
     /// Decrements the number of sessions, start accepting new connections
@@ -165,6 +170,11 @@ impl SessionManager {
         assert!(self.nb_connections != 0);
         self.nb_connections -= 1;
         gauge!("client.connections", self.nb_connections);
+        gauge!(
+            "client.connections_percentage",
+            self.nb_connections * 100 / self.max_connections
+        );
+        gauge!("client.max_connections", self.max_connections);
 
         // do not be ready to accept right away, wait until we get back to 10% capacity
         if !self.can_accept && self.nb_connections < self.max_connections * 90 / 100 {
