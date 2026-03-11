@@ -1,7 +1,7 @@
 //! event loop management
 use std::{
     cell::RefCell,
-    collections::{HashSet, VecDeque},
+    collections::{BinaryHeap, HashSet, VecDeque},
     io::Error as IoError,
     os::unix::io::{AsRawFd, FromRawFd},
     rc::Rc,
@@ -1545,40 +1545,45 @@ impl Server {
             return 0;
         }
 
-        let mut candidates: Vec<(Token, Instant)> = self
-            .sessions
-            .borrow()
-            .slab
-            .iter()
-            .filter(|(_, session)| {
-                !matches!(
-                    session.borrow().protocol(),
-                    Protocol::HTTPListen
-                        | Protocol::HTTPSListen
-                        | Protocol::TCPListen
-                        | Protocol::Channel
-                        | Protocol::Metrics
-                        | Protocol::Timer
-                )
-            })
-            .map(|(_, session)| {
-                let s = session.borrow();
-                (s.frontend_token(), s.last_event())
-            })
-            .collect();
+        // Bounded max-heap of size `count` keyed by (Instant, Token).
+        // Because BinaryHeap is a max-heap, the *largest* Instant (most recent)
+        // sits at the top. We keep only the `count` smallest (oldest) entries:
+        // when the heap is full and a candidate is older than the top, we pop the
+        // top (most recent of the kept set) and push the older candidate.
+        // This runs in O(n log k) time with O(k) space, where k = count.
+        let mut heap = BinaryHeap::with_capacity(count);
 
-        if candidates.is_empty() {
+        for (_, session) in self.sessions.borrow().slab.iter() {
+            let s = session.borrow();
+            if matches!(
+                s.protocol(),
+                Protocol::HTTPListen
+                    | Protocol::HTTPSListen
+                    | Protocol::TCPListen
+                    | Protocol::Channel
+                    | Protocol::Metrics
+                    | Protocol::Timer
+            ) {
+                continue;
+            }
+
+            let entry = (s.last_event(), s.frontend_token());
+
+            if heap.len() < count {
+                heap.push(entry);
+            } else if let Some(&top) = heap.peek() {
+                if entry < top {
+                    heap.pop();
+                    heap.push(entry);
+                }
+            }
+        }
+
+        if heap.is_empty() {
             return 0;
         }
 
-        // Partial sort: move the `count` oldest entries to the front in O(n)
-        let pivot = count.min(candidates.len()) - 1;
-        candidates.select_nth_unstable_by_key(pivot, |&(_, last_event)| last_event);
-
-        let tokens: HashSet<Token> = candidates[..=pivot]
-            .iter()
-            .map(|&(token, _)| token)
-            .collect();
+        let tokens: HashSet<Token> = heap.into_iter().map(|(_, token)| token).collect();
         let evicted = tokens.len();
 
         self.shut_down_sessions_by_frontend_tokens(tokens);
