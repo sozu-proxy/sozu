@@ -541,7 +541,9 @@ impl ListenerBuilder {
                     }
                 }
                 if !protos.iter().any(|p| p == "http/1.1") {
-                    warn!("ALPN protocols do not include 'http/1.1'. Clients without H2 support will fail TLS negotiation.");
+                    warn!(
+                        "ALPN protocols do not include 'http/1.1'. Clients without H2 support will fail TLS negotiation."
+                    );
                 }
                 // Deduplicate while preserving order
                 let mut seen = std::collections::HashSet::new();
@@ -551,7 +553,10 @@ impl ListenerBuilder {
                     .cloned()
                     .collect()
             }
-            _ => DEFAULT_ALPN_PROTOCOLS.iter().map(|s| s.to_string()).collect(),
+            _ => DEFAULT_ALPN_PROTOCOLS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
         };
 
         let versions = match self.tls_versions {
