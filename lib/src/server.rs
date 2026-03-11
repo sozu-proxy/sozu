@@ -1,7 +1,7 @@
 //! event loop management
 use std::{
     cell::RefCell,
-    collections::{BinaryHeap, HashSet, VecDeque},
+    collections::{HashSet, VecDeque},
     io::Error as IoError,
     os::unix::io::{AsRawFd, FromRawFd},
     rc::Rc,
@@ -1540,54 +1540,56 @@ impl Server {
 
     /// Evict the least recently active sessions to make room for new connections.
     /// Returns the number of sessions evicted.
+    ///
+    /// Uses `select_nth_unstable_by_key` (introselect, O(n) average) to partition
+    /// the oldest `count` sessions in-place, avoiding a full sort. The candidates
+    /// Vec is unavoidable due to RefCell borrow constraints, but the HashSet for
+    /// shutdown only contains the `count` selected tokens (O(k) space).
     fn evict_least_active_sessions(&self, count: usize) -> usize {
         if count == 0 {
             return 0;
         }
 
-        // Bounded max-heap of size `count` keyed by (Instant, Token).
-        // Because BinaryHeap is a max-heap, the *largest* Instant (most recent)
-        // sits at the top. We keep only the `count` smallest (oldest) entries:
-        // when the heap is full and a candidate is older than the top, we pop the
-        // top (most recent of the kept set) and push the older candidate.
-        // This runs in O(n log k) time with O(k) space, where k = count.
-        let mut heap = BinaryHeap::with_capacity(count);
+        // Scope the sessions borrow to release it before shutdown
+        let tokens = {
+            let sessions = self.sessions.borrow();
+            let mut candidates: Vec<(Token, Instant)> = sessions
+                .slab
+                .iter()
+                .filter(|(_, session)| {
+                    !matches!(
+                        session.borrow().protocol(),
+                        Protocol::HTTPListen
+                            | Protocol::HTTPSListen
+                            | Protocol::TCPListen
+                            | Protocol::Channel
+                            | Protocol::Metrics
+                            | Protocol::Timer
+                    )
+                })
+                .map(|(_, session)| {
+                    let s = session.borrow();
+                    (s.frontend_token(), s.last_event())
+                })
+                .collect();
 
-        for (_, session) in self.sessions.borrow().slab.iter() {
-            let s = session.borrow();
-            if matches!(
-                s.protocol(),
-                Protocol::HTTPListen
-                    | Protocol::HTTPSListen
-                    | Protocol::TCPListen
-                    | Protocol::Channel
-                    | Protocol::Metrics
-                    | Protocol::Timer
-            ) {
-                continue;
+            if candidates.is_empty() {
+                return 0;
             }
 
-            let entry = (s.last_event(), s.frontend_token());
+            let pivot = count.min(candidates.len()) - 1;
+            candidates.select_nth_unstable_by_key(pivot, |&(_, last_event)| last_event);
 
-            if heap.len() < count {
-                heap.push(entry);
-            } else if let Some(&top) = heap.peek() {
-                if entry < top {
-                    heap.pop();
-                    heap.push(entry);
-                }
-            }
-        }
+            // Extract tokens from the partitioned slice — only O(k) elements
+            candidates[..=pivot]
+                .iter()
+                .map(|&(token, _)| token)
+                .collect::<HashSet<Token>>()
+        };
+        // sessions borrow is released here
 
-        if heap.is_empty() {
-            return 0;
-        }
-
-        let tokens: HashSet<Token> = heap.into_iter().map(|(_, token)| token).collect();
         let evicted = tokens.len();
-
         self.shut_down_sessions_by_frontend_tokens(tokens);
-
         evicted
     }
 
