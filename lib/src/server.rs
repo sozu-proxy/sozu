@@ -1,8 +1,9 @@
 //! event loop management
 use std::{
     cell::RefCell,
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque, hash_map::Entry},
     io::Error as IoError,
+    net::IpAddr,
     os::unix::io::{AsRawFd, FromRawFd},
     rc::Rc,
     time::{Duration, Instant},
@@ -101,21 +102,30 @@ impl From<SessionToken> for usize {
 
 pub struct SessionManager {
     pub max_connections: usize,
+    pub max_connections_per_ip: usize,
     pub nb_connections: usize,
     pub can_accept: bool,
     pub slab: Slab<Rc<RefCell<dyn ProxySession>>>,
+    /// Active connection count per source IP, empty when `max_connections_per_ip == 0`.
+    connections_per_ip: HashMap<IpAddr, usize>,
+    /// Reverse map from session token to source IP, empty when `max_connections_per_ip == 0`.
+    token_to_ip: HashMap<Token, IpAddr>,
 }
 
 impl SessionManager {
     pub fn new(
         slab: Slab<Rc<RefCell<dyn ProxySession>>>,
         max_connections: usize,
+        max_connections_per_ip: usize,
     ) -> Rc<RefCell<Self>> {
         Rc::new(RefCell::new(SessionManager {
             max_connections,
+            max_connections_per_ip,
             nb_connections: 0,
             can_accept: true,
             slab,
+            connections_per_ip: HashMap::new(),
+            token_to_ip: HashMap::new(),
         }))
     }
 
@@ -147,6 +157,37 @@ impl SessionManager {
         }
 
         true
+    }
+
+    pub fn ip_at_limit(&self, ip: &IpAddr) -> bool {
+        if self.max_connections_per_ip == 0 {
+            return false;
+        }
+        self.connections_per_ip
+            .get(ip)
+            .is_some_and(|count| *count >= self.max_connections_per_ip)
+    }
+
+    pub fn track_ip(&mut self, ip: IpAddr, token: Token) {
+        if self.max_connections_per_ip == 0 {
+            return;
+        }
+        *self.connections_per_ip.entry(ip).or_default() += 1;
+        self.token_to_ip.insert(token, ip);
+    }
+
+    pub fn untrack_ip(&mut self, token: &Token) {
+        if self.max_connections_per_ip == 0 {
+            return;
+        }
+        if let Some(ip) = self.token_to_ip.remove(token) {
+            if let Entry::Occupied(mut entry) = self.connections_per_ip.entry(ip) {
+                *entry.get_mut() = entry.get().saturating_sub(1);
+                if *entry.get() == 0 {
+                    entry.remove();
+                }
+            }
+        }
     }
 
     pub fn to_session(token: Token) -> SessionToken {
@@ -267,6 +308,7 @@ impl Server {
         let sessions: Rc<RefCell<SessionManager>> = SessionManager::new(
             Slab::with_capacity(config.slab_capacity() as usize),
             config.max_connections as usize,
+            config.max_connections_per_ip as usize,
         );
         {
             let mut s = sessions.borrow_mut();
@@ -754,7 +796,9 @@ impl Server {
             if self.sessions.borrow().slab.contains(token.0) {
                 let session = { self.sessions.borrow_mut().slab.remove(token.0) };
                 session.borrow_mut().close();
-                self.sessions.borrow_mut().decr();
+                let mut sessions = self.sessions.borrow_mut();
+                sessions.untrack_ip(token);
+                sessions.decr();
             }
         }
 
@@ -1559,9 +1603,19 @@ impl Server {
                 break;
             }
 
+            let peer_ip = sock.peer_addr().ok().map(|addr| addr.ip());
+            if let Some(ref ip) = peer_ip {
+                if self.sessions.borrow().ip_at_limit(ip) {
+                    incr!("connections.rejected_per_ip");
+                    warn!("per-IP connection limit reached for {}, rejecting", ip);
+                    continue;
+                }
+            }
+
             //FIXME: check the timestamp
             //TODO: create_session should return the session and
             // the server should insert it in the the SessionManager
+            let session_token = Token(self.sessions.borrow().slab.vacant_key());
             match protocol {
                 Protocol::TCPListen => {
                     let proxy = self.tcp.clone();
@@ -1597,6 +1651,9 @@ impl Server {
                 }
                 _ => panic!("should not call accept() on a HTTP, HTTPS or TCP session"),
             };
+            if let Some(ip) = peer_ip {
+                self.sessions.borrow_mut().track_ip(ip, session_token);
+            }
             self.sessions.borrow_mut().incr();
         }
 
@@ -1740,5 +1797,93 @@ impl ProxySession for ListenSession {
             _token, self.protocol
         );
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn make_session_manager(
+        max_connections: usize,
+        max_connections_per_ip: usize,
+    ) -> Rc<RefCell<SessionManager>> {
+        let slab = Slab::with_capacity(10 + 2 * max_connections);
+        SessionManager::new(slab, max_connections, max_connections_per_ip)
+    }
+
+    #[test]
+    fn ip_at_limit_disabled_when_zero() {
+        let sm = make_session_manager(100, 0);
+        let ip: IpAddr = Ipv4Addr::new(192, 168, 1, 1).into();
+        assert!(!sm.borrow().ip_at_limit(&ip));
+    }
+
+    #[test]
+    fn ip_at_limit_not_reached() {
+        let sm = make_session_manager(100, 3);
+        let ip: IpAddr = Ipv4Addr::new(10, 0, 0, 1).into();
+        sm.borrow_mut().track_ip(ip, Token(10));
+        sm.borrow_mut().track_ip(ip, Token(11));
+        assert!(!sm.borrow().ip_at_limit(&ip));
+    }
+
+    #[test]
+    fn ip_at_limit_reached() {
+        let sm = make_session_manager(100, 2);
+        let ip: IpAddr = Ipv4Addr::new(10, 0, 0, 1).into();
+        sm.borrow_mut().track_ip(ip, Token(10));
+        sm.borrow_mut().track_ip(ip, Token(11));
+        assert!(sm.borrow().ip_at_limit(&ip));
+    }
+
+    #[test]
+    fn untrack_ip_decrements_count() {
+        let sm = make_session_manager(100, 2);
+        let ip: IpAddr = Ipv4Addr::new(10, 0, 0, 1).into();
+        sm.borrow_mut().track_ip(ip, Token(10));
+        sm.borrow_mut().track_ip(ip, Token(11));
+        assert!(sm.borrow().ip_at_limit(&ip));
+        sm.borrow_mut().untrack_ip(&Token(10));
+        assert!(!sm.borrow().ip_at_limit(&ip));
+    }
+
+    #[test]
+    fn untrack_ip_removes_entry_at_zero() {
+        let sm = make_session_manager(100, 2);
+        let ip: IpAddr = Ipv4Addr::new(10, 0, 0, 1).into();
+        sm.borrow_mut().track_ip(ip, Token(10));
+        sm.borrow_mut().untrack_ip(&Token(10));
+        assert!(sm.borrow().connections_per_ip.is_empty());
+        assert!(sm.borrow().token_to_ip.is_empty());
+    }
+
+    #[test]
+    fn untrack_unknown_token_is_noop() {
+        let sm = make_session_manager(100, 2);
+        sm.borrow_mut().untrack_ip(&Token(999));
+        assert!(sm.borrow().connections_per_ip.is_empty());
+    }
+
+    #[test]
+    fn different_ips_tracked_independently() {
+        let sm = make_session_manager(100, 2);
+        let ip1: IpAddr = Ipv4Addr::new(10, 0, 0, 1).into();
+        let ip2: IpAddr = Ipv4Addr::new(10, 0, 0, 2).into();
+        sm.borrow_mut().track_ip(ip1, Token(10));
+        sm.borrow_mut().track_ip(ip1, Token(11));
+        sm.borrow_mut().track_ip(ip2, Token(12));
+        assert!(sm.borrow().ip_at_limit(&ip1));
+        assert!(!sm.borrow().ip_at_limit(&ip2));
+    }
+
+    #[test]
+    fn track_ip_noop_when_disabled() {
+        let sm = make_session_manager(100, 0);
+        let ip: IpAddr = Ipv4Addr::new(10, 0, 0, 1).into();
+        sm.borrow_mut().track_ip(ip, Token(10));
+        assert!(sm.borrow().connections_per_ip.is_empty());
+        assert!(sm.borrow().token_to_ip.is_empty());
     }
 }

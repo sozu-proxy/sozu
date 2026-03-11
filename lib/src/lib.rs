@@ -1225,7 +1225,7 @@ pub mod testing {
                 protocol: Protocol::Metrics,
             })));
         }
-        let sessions = SessionManager::new(sessions, max_buffers);
+        let sessions = SessionManager::new(sessions, max_buffers, 0);
 
         let registry = event_loop
             .registry()
