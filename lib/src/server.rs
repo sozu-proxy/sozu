@@ -33,6 +33,7 @@ use crate::{
     AcceptError, Protocol, ProxyConfiguration, ProxySession, SessionIsToBeClosed,
     backends::{Backend, BackendMap},
     features::FEATURES,
+    health_check::HealthChecker,
     http, https,
     metrics::METRICS,
     pool::Pool,
@@ -157,11 +158,6 @@ impl SessionManager {
         self.nb_connections += 1;
         assert!(self.nb_connections <= self.max_connections);
         gauge!("client.connections", self.nb_connections);
-        gauge!(
-            "client.connections_percentage",
-            self.nb_connections * 100 / self.max_connections
-        );
-        gauge!("client.max_connections", self.max_connections);
     }
 
     /// Decrements the number of sessions, start accepting new connections
@@ -170,11 +166,6 @@ impl SessionManager {
         assert!(self.nb_connections != 0);
         self.nb_connections -= 1;
         gauge!("client.connections", self.nb_connections);
-        gauge!(
-            "client.connections_percentage",
-            self.nb_connections * 100 / self.max_connections
-        );
-        gauge!("client.max_connections", self.max_connections);
 
         // do not be ready to accept right away, wait until we get back to 10% capacity
         if !self.can_accept && self.nb_connections < self.max_connections * 90 / 100 {
@@ -228,6 +219,7 @@ pub struct Server {
     channel: ProxyChannel,
     config_state: ConfigState,
     current_poll_errors: i32,
+    health_checker: HealthChecker,
     http: Rc<RefCell<http::HttpProxy>>,
     https: Rc<RefCell<https::HttpsProxy>>,
     last_sessions_len: usize,
@@ -393,6 +385,7 @@ impl Server {
             channel,
             config_state: ConfigState::new(),
             current_poll_errors: 0,
+            health_checker: HealthChecker::new(),
             http,
             https,
             last_sessions_len: 0, // to be reset on server run
@@ -565,6 +558,9 @@ impl Server {
                     }),
                     // ListenToken: 1 listener <=> 1 token
                     // ProtocolToken (HTTP/HTTPS/TCP): 1 connection <=> 1 token
+                    token if self.health_checker.owns_token(token) => {
+                        self.health_checker.ready(token);
+                    }
                     token => self.ready(token, Ready::from(event)),
                 }
             }
@@ -583,6 +579,7 @@ impl Server {
             self.should_poll_at = TIMER.with(|timer| timer.borrow().next_poll_date());
 
             self.zombie_check();
+            self.health_checker.poll(&self.backends, self.poll.registry());
 
             let now = time::OffsetDateTime::now_utc();
             // clear the local metrics drain every plain hour (01:00, 02:00, etc.) to prevent memory overuse
@@ -997,6 +994,44 @@ impl Server {
                 self.add_cluster(cluster);
                 //not returning because the message must still be handled by each proxy
             }
+            Some(RequestType::RemoveCluster(ref cluster_id)) => {
+                self.remove_health_check_state(cluster_id);
+                //not returning because the message must still be handled by each proxy
+            }
+            Some(RequestType::SetHealthCheck(ref set)) => {
+                let config = &set.config;
+                if config.interval == 0
+                    || config.timeout == 0
+                    || config.healthy_threshold == 0
+                    || config.unhealthy_threshold == 0
+                {
+                    push_queue(worker_response_error(
+                        req_id,
+                        "invalid health check config: interval, timeout, and thresholds must be > 0",
+                    ));
+                    return;
+                }
+                if !set.config.uri.starts_with('/')
+                    || set.config.uri.contains('\r')
+                    || set.config.uri.contains('\n')
+                {
+                    push_queue(worker_response_error(
+                        req_id,
+                        "invalid health check URI: must start with '/' and not contain CR/LF",
+                    ));
+                    return;
+                }
+                self.backends
+                    .borrow_mut()
+                    .set_health_check_config(&set.cluster_id, Some(set.config.to_owned()));
+                push_queue(WorkerResponse::ok(req_id));
+                return;
+            }
+            Some(RequestType::RemoveHealthCheck(ref cluster_id)) => {
+                self.remove_health_check_state(cluster_id);
+                push_queue(WorkerResponse::ok(req_id));
+                return;
+            }
             Some(RequestType::AddBackend(ref backend)) => {
                 push_queue(self.add_backend(&req_id, backend));
                 return;
@@ -1062,15 +1097,15 @@ impl Server {
     }
 
     fn add_cluster(&mut self, cluster: &Cluster) {
-        self.backends
-            .borrow_mut()
-            .set_load_balancing_policy_for_cluster(
-                &cluster.cluster_id,
-                LoadBalancingAlgorithms::try_from(cluster.load_balancing).unwrap_or_default(),
-                cluster
-                    .load_metric
-                    .and_then(|n| LoadMetric::try_from(n).ok()),
-            );
+        let mut backends = self.backends.borrow_mut();
+        backends.set_load_balancing_policy_for_cluster(
+            &cluster.cluster_id,
+            LoadBalancingAlgorithms::try_from(cluster.load_balancing).unwrap_or_default(),
+            cluster
+                .load_metric
+                .and_then(|n| LoadMetric::try_from(n).ok()),
+        );
+        backends.set_health_check_config(&cluster.cluster_id, cluster.health_check.to_owned());
     }
 
     fn add_backend(&mut self, req_id: &str, add_backend: &AddBackend) -> WorkerResponse {
@@ -1086,6 +1121,14 @@ impl Server {
             .add_backend(&add_backend.cluster_id, new_backend);
 
         WorkerResponse::ok(req_id)
+    }
+
+    fn remove_health_check_state(&mut self, cluster_id: &str) {
+        self.health_checker.remove_cluster(cluster_id);
+        self.backends
+            .borrow_mut()
+            .health_check_configs
+            .remove(cluster_id);
     }
 
     fn remove_backend(&mut self, req_id: &str, backend: &RemoveBackend) -> WorkerResponse {

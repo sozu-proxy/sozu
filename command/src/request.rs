@@ -65,6 +65,8 @@ impl Request {
             | RequestType::AddBackend(_)
             | RequestType::RemoveCluster(_)
             | RequestType::RemoveBackend(_)
+            | RequestType::SetHealthCheck(_)
+            | RequestType::RemoveHealthCheck(_)
             | RequestType::SoftStop(_)
             | RequestType::HardStop(_)
             | RequestType::Status(_) => {
@@ -95,6 +97,7 @@ impl Request {
             RequestType::SaveState(_)
             | RequestType::CountRequests(_)
             | RequestType::QueryCertificatesFromTheState(_)
+            | RequestType::QueryHealthChecks(_)
             | RequestType::LoadState(_)
             | RequestType::ListWorkers(_)
             | RequestType::ListFrontends(_)

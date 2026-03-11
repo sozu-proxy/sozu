@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, net::SocketAddr};
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use sozu_command_lib::{
     proto::command::{LoadBalancingAlgorithms, TlsVersion},
     state::ClusterId as StateClusterId,
@@ -38,7 +38,37 @@ impl paw::ParseArgs for Args {
     type Error = std::io::Error;
 
     fn parse_args() -> Result<Self, Self::Error> {
-        Ok(Self::parse())
+        const GREEN: &str = "\x1b[32m";
+        const RED: &str = "\x1b[31m";
+        const RESET: &str = "\x1b[0m";
+
+        let colored_features: String = env!("SOZU_BUILD_FEATURES")
+            .split(' ')
+            .map(|flag| {
+                if let Some(name) = flag.strip_prefix('+') {
+                    format!("{GREEN}+{name}{RESET}")
+                } else if let Some(name) = flag.strip_prefix('-') {
+                    format!("{RED}-{name}{RESET}")
+                } else {
+                    flag.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let long_version = format!(
+            "{} ({})\n{}",
+            env!("CARGO_PKG_VERSION"),
+            env!("SOZU_BUILD_GIT"),
+            colored_features,
+        );
+
+        // clap requires &'static str for long_version. This intentional leak occurs once
+        // during argument parsing (~300 bytes) and lasts for the process lifetime.
+        let cmd = Self::command().long_version(long_version.leak() as &'static str);
+        let matches = cmd.get_matches();
+        Self::from_arg_matches(&matches)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
     }
 }
 
@@ -298,6 +328,70 @@ pub enum ClusterCmd {
             help = "Configures the load balancing policy. Possible values are 'roundrobin', 'random' or 'leastconnections'"
         )]
         load_balancing_policy: LoadBalancingAlgorithms,
+    },
+    #[clap(name = "health-check", about = "health check management")]
+    HealthCheck {
+        #[clap(subcommand)]
+        cmd: HealthCheckCmd,
+    },
+}
+
+#[derive(Subcommand, PartialEq, Eq, Clone, Debug)]
+pub enum HealthCheckCmd {
+    #[clap(name = "set", about = "Set or update the health check for a cluster")]
+    Set {
+        #[clap(short = 'i', long = "id", help = "cluster id")]
+        id: String,
+        #[clap(
+            short = 'u',
+            long = "uri",
+            help = "health check URI path (e.g. /health)"
+        )]
+        uri: String,
+        #[clap(
+            long = "interval",
+            help = "check interval in seconds",
+            default_value = "10"
+        )]
+        interval: u32,
+        #[clap(
+            long = "timeout",
+            help = "check timeout in seconds",
+            default_value = "5"
+        )]
+        timeout: u32,
+        #[clap(
+            long = "healthy-threshold",
+            help = "consecutive successes to mark healthy",
+            default_value = "3"
+        )]
+        healthy_threshold: u32,
+        #[clap(
+            long = "unhealthy-threshold",
+            help = "consecutive failures to mark unhealthy",
+            default_value = "3"
+        )]
+        unhealthy_threshold: u32,
+        #[clap(
+            long = "expected-status",
+            help = "expected HTTP status code (0 = any 2xx)",
+            default_value = "0"
+        )]
+        expected_status: u32,
+    },
+    #[clap(name = "remove", about = "Remove the health check from a cluster")]
+    Remove {
+        #[clap(short = 'i', long = "id", help = "cluster id")]
+        id: String,
+    },
+    #[clap(name = "list", about = "List health check configurations")]
+    List {
+        #[clap(
+            short = 'i',
+            long = "id",
+            help = "filter by cluster id (lists all if omitted)"
+        )]
+        id: Option<String>,
     },
 }
 
@@ -830,10 +924,16 @@ pub enum ConfigCmd {
 
 fn parse_tls_versions(i: &str) -> Result<TlsVersion, String> {
     match i {
-        "TLSv1" => Ok(TlsVersion::TlsV10),
-        "TLS_V11" => Ok(TlsVersion::TlsV11),
+        "TLSv1" => {
+            eprintln!("warning: TLS 1.0 is deprecated and insecure (RFC 8996)");
+            Ok(TlsVersion::TlsV10)
+        }
+        "TLS_V11" => {
+            eprintln!("warning: TLS 1.1 is deprecated and insecure (RFC 8996)");
+            Ok(TlsVersion::TlsV11)
+        }
         "TLS_V12" => Ok(TlsVersion::TlsV12),
-        "TLS_V13" => Ok(TlsVersion::TlsV12),
+        "TLS_V13" => Ok(TlsVersion::TlsV13),
         s => Err(format!("unrecognized TLS version: {s}")),
     }
 }
