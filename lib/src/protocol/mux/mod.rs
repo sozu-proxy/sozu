@@ -964,6 +964,9 @@ impl Stream {
     {
         let context = &self.context;
         gauge_add!("http.active_requests", -1);
+        if error {
+            incr!("http.errors");
+        }
         let protocol = match context.protocol {
             Protocol::HTTP => "http",
             Protocol::HTTPS => "https",
@@ -1035,6 +1038,7 @@ impl Stream {
             user_agent: context.user_agent.as_deref(),
             otel: None,
         };
+        self.metrics.register_end_of_session(&context.log_context());
     }
 }
 
@@ -1271,6 +1275,7 @@ impl Router {
                 &context.listener,
             )?;
             stream.metrics.backend_start();
+            stream.metrics.backend_id = stream.context.backend_id.to_owned();
             gauge_add!("backend.connections", 1);
             gauge_add!(
                 "connections_per_backend",
@@ -1330,6 +1335,21 @@ impl Router {
         }
         // Reborrow stream to set linked state
         context.streams[stream_id].state = StreamState::Linked(token);
+
+        // For reused backends: set context fields and metrics lifecycle
+        if reuse_token.is_some() {
+            if let Some(backend_conn) = self.backends.get(&token) {
+                if let Position::Client(_, backend_ref, _) = backend_conn.position() {
+                    let backend = backend_ref.borrow();
+                    let stream = &mut context.streams[stream_id];
+                    stream.context.backend_id = Some(backend.backend_id.to_owned());
+                    stream.context.backend_address = Some(backend.address);
+                    stream.metrics.backend_id = Some(backend.backend_id.to_owned());
+                    stream.metrics.backend_start();
+                    stream.metrics.backend_connected();
+                }
+            }
+        }
         Ok(())
     }
 

@@ -122,6 +122,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                 trace!("REQUESTS: {}", self.requests);
                 incr!("http.requests");
                 gauge_add!("http.active_requests", 1);
+                parts.metrics.service_start();
                 stream.state = StreamState::Link
             }
             if let StreamState::Linked(token) = stream.state {
@@ -180,6 +181,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                     match kawa.detached.status_line {
                         kawa::StatusLine::Response { code: 101, .. } => {
                             debug!("============== HANDLE UPGRADE!");
+                            stream.metrics.backend_stop();
                             stream.generate_access_log(
                                 false,
                                 Some(String::from("H1::Upgrade")),
@@ -193,6 +195,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                             self.timeout_container.reset();
                             self.readiness.interest.insert(Ready::READABLE);
                             kawa.clear();
+                            stream.metrics.backend_stop();
                             stream.generate_access_log(
                                 false,
                                 Some(String::from("H1::Continue")),
@@ -209,6 +212,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                                     .interest
                                     .insert(Ready::READABLE);
                                 kawa.clear();
+                                stream.metrics.backend_stop();
                                 stream.generate_access_log(
                                     false,
                                     Some(String::from("H1::EarlyHint+Error")),
@@ -216,6 +220,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                                 );
                                 return MuxResult::Continue;
                             } else {
+                                stream.metrics.backend_stop();
                                 stream.generate_access_log(
                                     false,
                                     Some(String::from("H1::EarlyHint")),
@@ -227,6 +232,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                         _ => {}
                     }
                     incr!("http.e2e.http11");
+                    stream.metrics.backend_stop();
                     stream.generate_access_log(
                         false,
                         Some(String::from("H1::Continue")),
