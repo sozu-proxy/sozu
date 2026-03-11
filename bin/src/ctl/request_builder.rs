@@ -7,19 +7,20 @@ use sozu_command_lib::{
     config::ListenerBuilder,
     proto::command::{
         ActivateListener, AddBackend, AddCertificate, Cluster, CountRequests, DeactivateListener,
-        FrontendFilters, HardStop, ListListeners, ListenerType, LoadBalancingParams,
-        MetricsConfiguration, PathRule, ProxyProtocolConfig, QueryCertificatesFilters,
-        QueryClusterByDomain, QueryClustersHashes, RemoveBackend, RemoveCertificate,
-        RemoveListener, ReplaceCertificate, RequestHttpFrontend, RequestTcpFrontend, RulePosition,
-        SocketAddress, SoftStop, Status, SubscribeEvents, TlsVersion, request::RequestType,
+        FrontendFilters, HardStop, HealthCheckConfig, ListListeners, ListenerType,
+        LoadBalancingParams, MetricsConfiguration, PathRule, ProxyProtocolConfig,
+        QueryCertificatesFilters, QueryClusterByDomain, QueryClustersHashes, QueryHealthChecks,
+        RemoveBackend, RemoveCertificate, RemoveListener, ReplaceCertificate, RequestHttpFrontend,
+        RequestTcpFrontend, RulePosition, SetHealthCheck, SocketAddress, SoftStop, Status,
+        SubscribeEvents, TlsVersion, request::RequestType,
     },
 };
 
 use super::CtlError;
 use crate::{
     cli::{
-        BackendCmd, ClusterCmd, HttpFrontendCmd, HttpListenerCmd, HttpsListenerCmd, MetricsCmd,
-        TcpFrontendCmd, TcpListenerCmd,
+        BackendCmd, ClusterCmd, HealthCheckCmd, HttpFrontendCmd, HttpListenerCmd, HttpsListenerCmd,
+        MetricsCmd, TcpFrontendCmd, TcpListenerCmd,
     },
     ctl::CommandManager,
 };
@@ -170,6 +171,7 @@ impl CommandManager {
                 )
             }
             ClusterCmd::Remove { id } => self.send_request(RequestType::RemoveCluster(id).into()),
+            ClusterCmd::HealthCheck { cmd } => self.health_check_command(cmd),
             ClusterCmd::List {
                 id: cluster_id,
                 domain,
@@ -203,6 +205,73 @@ impl CommandManager {
 
                 self.send_request(request)
             }
+        }
+    }
+
+    pub fn health_check_command(&mut self, cmd: HealthCheckCmd) -> Result<(), CtlError> {
+        match cmd {
+            HealthCheckCmd::Set {
+                id,
+                uri,
+                interval,
+                timeout,
+                healthy_threshold,
+                unhealthy_threshold,
+                expected_status,
+            } => {
+                if interval == 0 {
+                    return Err(CtlError::Failure("interval must be > 0".to_owned()));
+                }
+                if timeout == 0 {
+                    return Err(CtlError::Failure("timeout must be > 0".to_owned()));
+                }
+                if healthy_threshold == 0 {
+                    return Err(CtlError::Failure(
+                        "healthy-threshold must be > 0".to_owned(),
+                    ));
+                }
+                if unhealthy_threshold == 0 {
+                    return Err(CtlError::Failure(
+                        "unhealthy-threshold must be > 0".to_owned(),
+                    ));
+                }
+                if uri.contains('\r') || uri.contains('\n') {
+                    return Err(CtlError::Failure(
+                        "health check URI must not contain CR or LF characters".to_owned(),
+                    ));
+                }
+                if !uri.starts_with('/') {
+                    return Err(CtlError::Failure(
+                        "health check URI must start with '/'".to_owned(),
+                    ));
+                }
+                if timeout >= interval {
+                    warn!(
+                        "health check timeout ({}s) >= interval ({}s), checks may overlap",
+                        timeout, interval
+                    );
+                }
+                self.send_request(
+                    RequestType::SetHealthCheck(SetHealthCheck {
+                        cluster_id: id,
+                        config: HealthCheckConfig {
+                            uri,
+                            interval,
+                            timeout,
+                            healthy_threshold,
+                            unhealthy_threshold,
+                            expected_status,
+                        },
+                    })
+                    .into(),
+                )
+            }
+            HealthCheckCmd::Remove { id } => {
+                self.send_request(RequestType::RemoveHealthCheck(id).into())
+            }
+            HealthCheckCmd::List { id } => self.send_request(
+                RequestType::QueryHealthChecks(QueryHealthChecks { cluster_id: id }).into(),
+            ),
         }
     }
 

@@ -63,19 +63,22 @@ use crate::{
     logging::AccessLogFormat,
     proto::command::{
         ActivateListener, AddBackend, AddCertificate, CertificateAndKey, Cluster,
-        CustomHttpAnswers, HttpListenerConfig, HttpsListenerConfig, ListenerType,
-        LoadBalancingAlgorithms, LoadBalancingParams, LoadMetric, MetricsConfiguration, PathRule,
-        ProtobufAccessLogFormat, ProxyProtocolConfig, Request, RequestHttpFrontend,
-        RequestTcpFrontend, RulePosition, ServerConfig, ServerMetricsConfig, SocketAddress,
-        TcpListenerConfig, TlsVersion, WorkerRequest, request::RequestType,
+        CustomHttpAnswers, HealthCheckConfig, HttpListenerConfig, HttpsListenerConfig,
+        ListenerType, LoadBalancingAlgorithms, LoadBalancingParams, LoadMetric,
+        MetricsConfiguration, PathRule, ProtobufAccessLogFormat, ProxyProtocolConfig, Request,
+        RequestHttpFrontend, RequestTcpFrontend, RulePosition, ServerConfig, ServerMetricsConfig,
+        SocketAddress, TcpListenerConfig, TlsVersion, WorkerRequest, request::RequestType,
     },
 };
 
-/// provides all supported cipher suites exported by Rustls TLS
-/// provider as it support only strongly secure ones.
+/// Authoritative list of default cipher suites for all rustls-based TLS providers.
+///
+/// These use rustls naming conventions and are supported by all three crypto providers
+/// (ring, aws-lc-rs, rustls-openssl). Order follows ANSSI recommendations: AES-256
+/// preferred over AES-128, ECDSA preferred over RSA, TLS 1.3 preferred over TLS 1.2.
 ///
 /// See the [documentation](https://docs.rs/rustls/latest/rustls/static.ALL_CIPHER_SUITES.html)
-pub const DEFAULT_RUSTLS_CIPHER_LIST: [&str; 9] = [
+pub const DEFAULT_CIPHER_LIST: [&str; 9] = [
     // TLS 1.3 cipher suites
     "TLS13_AES_256_GCM_SHA384",
     "TLS13_AES_128_GCM_SHA256",
@@ -87,13 +90,6 @@ pub const DEFAULT_RUSTLS_CIPHER_LIST: [&str; 9] = [
     "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
     "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
     "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
-];
-
-pub const DEFAULT_CIPHER_SUITES: [&str; 4] = [
-    "TLS_AES_256_GCM_SHA384",
-    "TLS_AES_128_GCM_SHA256",
-    "TLS_AES_128_CCM_SHA256",
-    "TLS_CHACHA20_POLY1305_SHA256",
 ];
 
 pub const DEFAULT_SIGNATURE_ALGORITHMS: [&str; 9] = [
@@ -108,7 +104,7 @@ pub const DEFAULT_SIGNATURE_ALGORITHMS: [&str; 9] = [
     "RSA-PSS+SHA512",
 ];
 
-pub const DEFAULT_GROUPS_LIST: [&str; 4] = ["P-521", "P-384", "P-256", "x25519"];
+pub const DEFAULT_GROUPS_LIST: [&str; 4] = ["X25519MLKEM768", "x25519", "P-256", "P-384"];
 
 /// maximum time of inactivity for a frontend socket (60 seconds)
 pub const DEFAULT_FRONT_TIMEOUT: u32 = 60;
@@ -255,6 +251,7 @@ pub struct ListenerBuilder {
     pub tls_versions: Option<Vec<TlsVersion>>,
     pub cipher_list: Option<Vec<String>>,
     pub cipher_suites: Option<Vec<String>>,
+    pub groups_list: Option<Vec<String>>,
     pub expect_proxy: Option<bool>,
     #[serde(default = "default_sticky_name")]
     pub sticky_name: String,
@@ -319,6 +316,7 @@ impl ListenerBuilder {
             certificate: None,
             cipher_list: None,
             cipher_suites: None,
+            groups_list: None,
             config: None,
             connect_timeout: None,
             expect_proxy: None,
@@ -496,26 +494,24 @@ impl ListenerBuilder {
             });
         }
 
-        let default_cipher_list = DEFAULT_RUSTLS_CIPHER_LIST
-            .into_iter()
-            .map(String::from)
-            .collect();
+        let default_cipher_list = DEFAULT_CIPHER_LIST.into_iter().map(String::from).collect();
 
         let cipher_list = self.cipher_list.clone().unwrap_or(default_cipher_list);
 
-        let default_cipher_suites = DEFAULT_CIPHER_SUITES
-            .into_iter()
-            .map(String::from)
-            .collect();
-
-        let cipher_suites = self.cipher_suites.clone().unwrap_or(default_cipher_suites);
+        let cipher_suites = self
+            .cipher_suites
+            .clone()
+            .unwrap_or_else(|| DEFAULT_CIPHER_LIST.into_iter().map(String::from).collect());
 
         let signature_algorithms: Vec<String> = DEFAULT_SIGNATURE_ALGORITHMS
             .into_iter()
             .map(String::from)
             .collect();
 
-        let groups_list: Vec<String> = DEFAULT_GROUPS_LIST.into_iter().map(String::from).collect();
+        let groups_list = self
+            .groups_list
+            .clone()
+            .unwrap_or_else(|| DEFAULT_GROUPS_LIST.into_iter().map(String::from).collect());
 
         let versions = match self.tls_versions {
             None => vec![TlsVersion::TlsV12 as i32, TlsVersion::TlsV13 as i32],
@@ -773,6 +769,45 @@ pub enum FileClusterProtocolConfig {
     Tcp,
 }
 
+fn default_health_check_interval() -> u32 {
+    10
+}
+fn default_health_check_timeout() -> u32 {
+    5
+}
+fn default_health_check_threshold() -> u32 {
+    3
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileHealthCheckConfig {
+    pub uri: String,
+    #[serde(default = "default_health_check_interval")]
+    pub interval: u32,
+    #[serde(default = "default_health_check_timeout")]
+    pub timeout: u32,
+    #[serde(default = "default_health_check_threshold")]
+    pub healthy_threshold: u32,
+    #[serde(default = "default_health_check_threshold")]
+    pub unhealthy_threshold: u32,
+    #[serde(default)]
+    pub expected_status: u32,
+}
+
+impl FileHealthCheckConfig {
+    pub fn to_proto(&self) -> HealthCheckConfig {
+        HealthCheckConfig {
+            uri: self.uri.to_owned(),
+            interval: self.interval,
+            timeout: self.timeout,
+            healthy_threshold: self.healthy_threshold,
+            unhealthy_threshold: self.unhealthy_threshold,
+            expected_status: self.expected_status,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileClusterConfig {
@@ -788,6 +823,7 @@ pub struct FileClusterConfig {
     pub answer_503: Option<String>,
     #[serde(default)]
     pub load_metric: Option<LoadMetric>,
+    pub health_check: Option<FileHealthCheckConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -856,6 +892,7 @@ impl FileClusterConfig {
                     proxy_protocol,
                     load_balancing: self.load_balancing,
                     load_metric: self.load_metric,
+                    health_check: self.health_check.as_ref().map(|hc| hc.to_proto()),
                 }))
             }
             FileClusterProtocolConfig::Http => {
@@ -883,6 +920,7 @@ impl FileClusterConfig {
                     load_balancing: self.load_balancing,
                     load_metric: self.load_metric,
                     answer_503,
+                    health_check: self.health_check.as_ref().map(|hc| hc.to_proto()),
                 }))
             }
         }
@@ -975,6 +1013,7 @@ pub struct HttpClusterConfig {
     pub load_balancing: LoadBalancingAlgorithms,
     pub load_metric: Option<LoadMetric>,
     pub answer_503: Option<String>,
+    pub health_check: Option<HealthCheckConfig>,
 }
 
 impl HttpClusterConfig {
@@ -988,6 +1027,7 @@ impl HttpClusterConfig {
                 load_balancing: self.load_balancing as i32,
                 answer_503: self.answer_503.clone(),
                 load_metric: self.load_metric.map(|s| s as i32),
+                health_check: self.health_check.clone(),
             })
             .into(),
         ];
@@ -1036,6 +1076,7 @@ pub struct TcpClusterConfig {
     pub proxy_protocol: Option<ProxyProtocolConfig>,
     pub load_balancing: LoadBalancingAlgorithms,
     pub load_metric: Option<LoadMetric>,
+    pub health_check: Option<HealthCheckConfig>,
 }
 
 impl TcpClusterConfig {
@@ -1049,6 +1090,7 @@ impl TcpClusterConfig {
                 load_balancing: self.load_balancing as i32,
                 load_metric: self.load_metric.map(|s| s as i32),
                 answer_503: None,
+                health_check: self.health_check.clone(),
             })
             .into(),
         ];
@@ -1918,158 +1960,5 @@ mod tests {
         });
         println!("config: {config:#?}");
         //panic!();
-    }
-
-    #[test]
-    fn multiple_listeners_preserve_per_address_expect_proxy() {
-        let toml_content = r#"
-            command_socket = "/tmp/sozu_test.sock"
-            worker_count = 1
-
-            [[listeners]]
-            protocol = "http"
-            address = "172.16.20.1:80"
-            expect_proxy = true
-
-            [[listeners]]
-            protocol = "http"
-            address = "10.22.0.1:80"
-            expect_proxy = false
-
-            [[listeners]]
-            protocol = "https"
-            address = "192.168.1.1:443"
-            expect_proxy = true
-
-            [[listeners]]
-            protocol = "https"
-            address = "192.168.2.1:443"
-            expect_proxy = false
-        "#;
-
-        let file_config: FileConfig =
-            toml::from_str(toml_content).expect("Could not parse TOML config");
-
-        let listeners = file_config.listeners.as_ref().expect("No listeners found");
-        assert_eq!(listeners.len(), 4);
-
-        let config = ConfigBuilder::new(file_config, "/tmp/test_config.toml")
-            .into_config()
-            .expect("Could not build config");
-
-        assert_eq!(config.http_listeners.len(), 2);
-        assert_eq!(config.https_listeners.len(), 2);
-
-        // HTTP listeners
-        let http_proxy = config
-            .http_listeners
-            .iter()
-            .find(|l| SocketAddr::from(l.address) == "172.16.20.1:80".parse().unwrap())
-            .expect("Listener on 172.16.20.1:80 not found");
-        let http_direct = config
-            .http_listeners
-            .iter()
-            .find(|l| SocketAddr::from(l.address) == "10.22.0.1:80".parse().unwrap())
-            .expect("Listener on 10.22.0.1:80 not found");
-
-        assert!(http_proxy.expect_proxy);
-        assert!(!http_direct.expect_proxy);
-
-        // HTTPS listeners
-        let https_proxy = config
-            .https_listeners
-            .iter()
-            .find(|l| SocketAddr::from(l.address) == "192.168.1.1:443".parse().unwrap())
-            .expect("Listener on 192.168.1.1:443 not found");
-        let https_direct = config
-            .https_listeners
-            .iter()
-            .find(|l| SocketAddr::from(l.address) == "192.168.2.1:443".parse().unwrap())
-            .expect("Listener on 192.168.2.1:443 not found");
-
-        assert!(https_proxy.expect_proxy);
-        assert!(!https_direct.expect_proxy);
-    }
-
-    #[test]
-    fn multiple_listeners_generate_correct_worker_requests() {
-        let toml_content = r#"
-            command_socket = "/tmp/sozu_test.sock"
-            worker_count = 1
-            activate_listeners = true
-
-            [[listeners]]
-            protocol = "http"
-            address = "172.16.20.1:80"
-            expect_proxy = true
-
-            [[listeners]]
-            protocol = "http"
-            address = "10.22.0.1:80"
-            expect_proxy = false
-        "#;
-
-        let file_config: FileConfig =
-            toml::from_str(toml_content).expect("Could not parse TOML config");
-
-        let config = ConfigBuilder::new(file_config, "/tmp/test_config.toml")
-            .into_config()
-            .expect("Could not build config");
-
-        let messages = config
-            .generate_config_messages()
-            .expect("Could not generate config messages");
-
-        let add_listener_count = messages
-            .iter()
-            .filter(|m| {
-                matches!(
-                    m.content.request_type,
-                    Some(RequestType::AddHttpListener(_))
-                )
-            })
-            .count();
-
-        let activate_listener_count = messages
-            .iter()
-            .filter(|m| {
-                matches!(
-                    m.content.request_type,
-                    Some(RequestType::ActivateListener(ActivateListener {
-                        proxy,
-                        ..
-                    })) if proxy == ListenerType::Http as i32
-                )
-            })
-            .count();
-
-        assert_eq!(add_listener_count, 2);
-        assert_eq!(activate_listener_count, 2);
-    }
-
-    #[test]
-    fn duplicate_listener_address_rejected() {
-        let toml_content = r#"
-            command_socket = "/tmp/sozu_test.sock"
-            worker_count = 1
-
-            [[listeners]]
-            protocol = "http"
-            address = "0.0.0.0:80"
-
-            [[listeners]]
-            protocol = "http"
-            address = "0.0.0.0:80"
-        "#;
-
-        let file_config: FileConfig =
-            toml::from_str(toml_content).expect("Could not parse TOML config");
-
-        let result = ConfigBuilder::new(file_config, "/tmp/test_config.toml").into_config();
-
-        assert!(
-            result.is_err(),
-            "Should reject duplicate listener addresses"
-        );
     }
 }

@@ -78,7 +78,9 @@ pub enum WorkerError {
     SpawnChild(std::io::Error),
 }
 
-/// called within a worker process, this starts the actual proxy
+/// Called within a worker process, this starts the actual proxy.
+/// Only called from the binary entry point (main.rs), not from the library.
+#[allow(dead_code)]
 pub fn begin_worker_process(
     worker_to_main_channel_fd: i32,
     worker_to_main_scm_fd: i32,

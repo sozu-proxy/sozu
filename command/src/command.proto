@@ -99,7 +99,22 @@ message Request {
     // query the state about how many requests of each type has been received
     // since startup
     CountRequests count_requests = 46;
+    // set or update the health check configuration for a cluster
+    SetHealthCheck set_health_check = 47;
+    // remove the health check configuration from a cluster
+    string remove_health_check = 48;
+    // list health check configurations (optional cluster id filter)
+    QueryHealthChecks query_health_checks = 49;
   }
+}
+
+message QueryHealthChecks {
+    optional string cluster_id = 1;
+}
+
+message SetHealthCheck {
+    required string cluster_id = 1;
+    required HealthCheckConfig config = 2;
 }
 
 message ListWorkers {}
@@ -376,6 +391,17 @@ message Cluster {
     required LoadBalancingAlgorithms load_balancing = 5 [default = ROUND_ROBIN];
     optional string answer_503 = 6;
     optional LoadMetric load_metric = 7;
+    // optional HTTP health check configuration for backends in this cluster
+    optional HealthCheckConfig health_check = 8;
+}
+
+message HealthCheckConfig {
+    required string uri = 1;
+    required uint32 interval = 2 [default = 10];
+    required uint32 timeout = 3 [default = 5];
+    required uint32 healthy_threshold = 4 [default = 3];
+    required uint32 unhealthy_threshold = 5 [default = 3];
+    required uint32 expected_status = 6 [default = 0];
 }
 
 enum LoadBalancingAlgorithms {
@@ -495,7 +521,13 @@ message ResponseContent {
         CertificatesWithFingerprints certificates_with_fingerprints = 12;
         // a census of the types of requests received since startup,
         RequestCounts request_counts = 13;
+        // health check configurations by cluster
+        HealthChecksList health_checks_list = 14;
     }
+}
+
+message HealthChecksList {
+    map<string, HealthCheckConfig> map = 1;
 }
 
 // a map of worker_id -> ResponseContent
@@ -537,6 +569,8 @@ enum EventKind {
     BACKEND_UP = 1;
     NO_AVAILABLE_BACKENDS = 2;
     REMOVED_BACKEND_HAS_NO_CONNECTIONS = 3;
+    HEALTH_CHECK_UNHEALTHY = 4;
+    HEALTH_CHECK_HEALTHY = 5;
 }
 
 message ClusterHashes {
