@@ -152,6 +152,20 @@ activate_listeners = true
 
 # Listeners
 # configuration options specific to a TCP listen socket
+#
+# Multiple listeners of the same protocol can be configured on different addresses.
+# Each listener has its own settings, including expect_proxy. For example, to listen
+# on one address behind a proxy (with PROXY protocol) and another without:
+#
+# [[listeners]]
+# protocol = "http"
+# address = "172.16.20.1:80"
+# expect_proxy = true
+#
+# [[listeners]]
+# protocol = "http"
+# address = "10.22.0.1:80"
+# expect_proxy = false
 
 # Example for a HTTP (plaintext) listener
 [[listeners]]
