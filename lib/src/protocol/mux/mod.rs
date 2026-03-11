@@ -1869,10 +1869,30 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                         should_write = true;
                     }
                     StreamState::Linked(_) => {
-                        // A stream Linked to a backend is waiting for the response, not the request.
-                        // For streaming or malformed requests, it is possible that the request is not
-                        // terminated at this point. For now, we do nothing
-                        should_close = false;
+                        // The frontend timed out while a stream is linked to a backend.
+                        // The backend timeout should handle this, but in case the backend
+                        // is also stalled, send a 504 and terminate the stream.
+                        if !stream.back.consumed {
+                            let answers = answers_rc.borrow();
+                            set_default_answer(stream, front_readiness, 504, &answers);
+                            should_write = true;
+                        } else if stream.back.is_completed() {
+                            // Response fully proxied, stream can be closed
+                        } else if stream.back.is_terminated() || stream.back.is_error() {
+                            // Response is terminated/error but not fully written to frontend.
+                            // Keep the session alive briefly to flush remaining data.
+                            should_close = false;
+                        } else {
+                            // Partial response in progress — forcefully terminate
+                            forcefully_terminate_answer(
+                                stream,
+                                front_readiness,
+                                H2Error::InternalError,
+                            );
+                            should_write = true;
+                        }
+                        // end_stream is called in a second pass below to avoid
+                        // borrow conflicts on context.streams.
                     }
                     StreamState::Unlinked => {
                         // A stream Unlinked already has a response and its backend closed.
@@ -1886,6 +1906,26 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                         // A recycled stream is an h2 stream which doesn't hold a request anymore.
                         // We can ignore it.
                     }
+                }
+            }
+            // Second pass: end streams that were linked to backends.
+            // This is done separately to avoid borrow conflicts on context.streams.
+            let linked_streams: Vec<(GlobalStreamId, Token)> = self
+                .context
+                .streams
+                .iter()
+                .enumerate()
+                .filter_map(|(id, stream)| {
+                    if let StreamState::Linked(back_token) = stream.state {
+                        Some((id, back_token))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for (stream_id, back_token) in linked_streams {
+                if let Some(backend) = self.router.backends.get_mut(&back_token) {
+                    backend.end_stream(stream_id, &mut self.context);
                 }
             }
         } else if let Some(backend) = self.router.backends.get_mut(&token) {
@@ -1921,16 +1961,21 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                             should_write = true;
                         }
                         backend.end_stream(stream_id, &mut self.context);
-                        // backend.force_disconnect();
                     }
                 }
+            }
+            // Re-arm the backend timeout if the session stays alive (draining streams).
+            // Without this, the timeout is consumed and the session becomes immortal
+            // until the zombie checker runs.
+            if !should_close {
+                backend.timeout_container().set(token);
             }
         } else {
             // Session received a timeout for an unknown token, ignore it
             return StateResult::Continue;
         }
         if should_write {
-            return match self
+            let result = match self
                 .frontend
                 .writable(&mut self.context, EndpointClient(&mut self.router))
             {
@@ -1938,10 +1983,21 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 MuxResult::Upgrade => StateResult::Upgrade,
                 MuxResult::CloseSession => StateResult::CloseSession,
             };
+            // Re-arm the frontend timeout so the session doesn't become immortal.
+            // The writable call may have partially flushed the response — we need
+            // the timeout to fire again if the flush stalls.
+            if result == StateResult::Continue {
+                self.frontend.timeout_container().set(self.frontend_token);
+            }
+            return result;
         }
         if should_close {
             StateResult::CloseSession
         } else {
+            // Re-arm the frontend timeout. Without this, the timeout is consumed
+            // by triggered() and the session stays alive indefinitely until the
+            // zombie checker runs (default: 30 minutes).
+            self.frontend.timeout_container().set(self.frontend_token);
             StateResult::Continue
         }
     }
