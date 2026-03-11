@@ -1876,9 +1876,13 @@ fn display_toml_error(file: &str, error: &toml::de::Error) {
 }
 
 impl ServerConfig {
-    /// size of the slab for the Session manager
+    /// Size of the slab for the Session manager.
+    ///
+    /// With HTTP/2 multiplexing, each frontend session can have multiple backend
+    /// connections (one per cluster), so we allocate more slab entries than the
+    /// old `10 + 2 * max_connections` formula.
     pub fn slab_capacity(&self) -> u64 {
-        10 + 2 * self.max_connections
+        10 + 4 * self.max_connections
     }
 }
 

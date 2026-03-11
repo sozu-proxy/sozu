@@ -190,16 +190,27 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         E: Endpoint,
         L: ListenerHandler + L7ListenerHandler,
     {
-        self.timeout_container.reset();
+        // Don't reset the timeout unconditionally here. Only application data
+        // (DATA/HEADERS frames) should reset the timeout. H2 control frames
+        // (PING, WINDOW_UPDATE, SETTINGS) must NOT reset it, otherwise a peer
+        // sending periodic PINGs prevents timeout detection on stuck sessions.
+        // The timeout is reset:
+        // - Below, when reading DATA payload (H2StreamId::Other)
+        // - In handle_frame(), when processing HEADERS frames
         let (stream_id, kawa) = if let Some((stream_id, amount)) = self.expect_read {
             let (kawa, did) = match stream_id {
                 H2StreamId::Zero => (&mut self.zero, usize::MAX),
-                H2StreamId::Other(_, global_stream_id) => (
-                    context.streams[global_stream_id]
-                        .split(&self.position)
-                        .rbuffer,
-                    global_stream_id,
-                ),
+                H2StreamId::Other(_, global_stream_id) => {
+                    // Reading DATA frame payload for an application stream.
+                    // This is real application activity — reset the timeout.
+                    self.timeout_container.reset();
+                    (
+                        context.streams[global_stream_id]
+                            .split(&self.position)
+                            .rbuffer,
+                        global_stream_id,
+                    )
+                }
             };
             trace!("{:?}({:?}, {})", self.state, stream_id, amount);
             if amount > 0 {
@@ -530,7 +541,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         E: Endpoint,
         L: ListenerHandler + L7ListenerHandler,
     {
-        self.timeout_container.reset();
+        // Don't reset the timeout for control frame writes (SETTINGS ACK, PING
+        // response, WINDOW_UPDATE). Only application data writes should reset it.
+        // The timeout is reset below in the Header/Frame states when writing
+        // actual request/response data.
         if let Some(H2StreamId::Zero) = self.expect_write {
             let kawa = &mut self.zero;
             while !kawa.storage.is_empty() {
@@ -631,11 +645,14 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 self.readiness.interest.remove(Ready::WRITABLE);
                 MuxResult::Continue
             }
-            // Proxying states
+            // Proxying states — writing application data (request/response).
+            // Reset the timeout here, not at the top of writable(), so that
+            // control frame writes (PING, WINDOW_UPDATE) don't reset it.
             (H2State::Header, _)
             | (H2State::Frame(_), _)
             | (H2State::ContinuationFrame(_), _)
             | (H2State::ContinuationHeader(_), _) => {
+                self.timeout_container.reset();
                 let mut dead_streams = Vec::new();
 
                 if let Some(write_stream @ H2StreamId::Other(stream_id, global_stream_id)) =
@@ -1039,6 +1056,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 }
             }
             Frame::Headers(headers) => {
+                // HEADERS frames represent real application activity (new request
+                // or response). Reset the timeout since the peer is actively
+                // communicating, unlike control frames (PING, WINDOW_UPDATE).
+                self.timeout_container.reset();
                 if !headers.end_headers {
                     debug!("FRAGMENT: {:?}", self.zero.storage.data());
                     self.state = H2State::ContinuationHeader(headers);
