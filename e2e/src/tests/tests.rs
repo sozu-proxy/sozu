@@ -10,7 +10,8 @@ use sozu_command_lib::{
     logging::setup_default_logging,
     proto::command::{
         ActivateListener, AddCertificate, CertificateAndKey, Cluster, CustomHttpAnswers,
-        ListenerType, RemoveBackend, RequestHttpFrontend, SocketAddress, request::RequestType,
+        HealthCheckConfig, ListenerType, RemoveBackend, RequestHttpFrontend, ResponseStatus,
+        SetHealthCheck, SocketAddress, TlsVersion, request::RequestType,
     },
     scm_socket::Listeners,
     state::ConfigState,
@@ -26,8 +27,53 @@ use crate::{
         sync_backend::Backend as SyncBackend,
     },
     sozu::worker::Worker,
-    tests::{State, provide_port, repeat_until_error_or, setup_async_test, setup_sync_test},
+    tests::{
+        State, provide_port, repeat_until_error_or, setup_async_test, setup_sync_test, setup_test,
+    },
 };
+
+/// Health check test timing constants.
+/// The interval (3s) × threshold (2) = 6s minimum detection time,
+/// plus margin for event loop scheduling.
+const HEALTH_CHECK_SETTLE: Duration = Duration::from_secs(10);
+const HEALTH_CHECK_LONG_SETTLE: Duration = Duration::from_secs(15);
+const HEALTH_CHECK_VERIFY: Duration = Duration::from_secs(5);
+
+fn default_health_check_config() -> HealthCheckConfig {
+    HealthCheckConfig {
+        uri: "/health".to_owned(),
+        interval: 3,
+        timeout: 2,
+        healthy_threshold: 2,
+        unhealthy_threshold: 2,
+        expected_status: 0,
+    }
+}
+
+/// Poll with HTTP requests until a condition is met or deadline expires.
+/// Returns true if the condition was met before the deadline.
+fn poll_until<F>(front_address: SocketAddr, timeout: Duration, mut condition: F) -> bool
+where
+    F: FnMut(Option<&str>) -> bool,
+{
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let mut client = Client::new(
+            "poll",
+            front_address,
+            http_request("GET", "/api", "ping", "localhost"),
+        );
+        client.connect();
+        client.send();
+        let response = client.receive();
+
+        if condition(response.as_deref()) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    false
+}
 
 pub fn create_local_address() -> SocketAddr {
     let address: SocketAddr = format!("127.0.0.1:{}", provide_port())
@@ -349,18 +395,27 @@ pub fn try_issue_810_panic(part2: bool) -> State {
     if success { State::Success } else { State::Fail }
 }
 
-pub fn try_tls_endpoint() -> State {
+/// Helper that sets up an HTTPS worker with the given certificate/key and optional TLS version
+/// constraint, sends a request, and checks the response.
+fn try_tls_with_cert(
+    test_name: &str,
+    cert_pem: &str,
+    key_pem: &str,
+    tls_versions: Option<Vec<TlsVersion>>,
+) -> State {
     let front_port = provide_port();
     let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
     let back_address = create_local_address();
 
     let (config, listeners, state) = Worker::empty_config();
-    let mut worker = Worker::start_new_worker("TLS-ENDPOINT", config, &listeners, state);
+    let mut worker = Worker::start_new_worker(test_name, config, &listeners, state);
 
+    let mut listener_builder = ListenerBuilder::new_https(front_address.clone());
+    if let Some(versions) = tls_versions {
+        listener_builder.with_tls_versions(versions);
+    }
     worker.send_proxy_request_type(RequestType::AddHttpsListener(
-        ListenerBuilder::new_https(front_address.clone())
-            .to_tls(None)
-            .unwrap(),
+        listener_builder.to_tls(None).unwrap(),
     ));
 
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
@@ -380,9 +435,9 @@ pub fn try_tls_endpoint() -> State {
     }));
 
     let certificate_and_key = CertificateAndKey {
-        certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
-        key: String::from(include_str!("../../../lib/assets/local-key.pem")),
-        certificate_chain: vec![], // in config.toml the certificate chain would be the same as the certificate
+        certificate: String::from(cert_pem),
+        key: String::from(key_pem),
+        certificate_chain: vec![],
         versions: vec![],
         names: vec![],
     };
@@ -435,6 +490,69 @@ pub fn try_tls_endpoint() -> State {
     } else {
         State::Fail
     }
+}
+
+pub fn try_tls_endpoint() -> State {
+    try_tls_with_cert(
+        "TLS-ENDPOINT",
+        include_str!("../../../lib/assets/local-certificate.pem"),
+        include_str!("../../../lib/assets/local-key.pem"),
+        None,
+    )
+}
+
+pub fn try_tls_rsa_2048() -> State {
+    try_tls_with_cert(
+        "TLS-RSA-2048",
+        include_str!("../../../lib/assets/tests/localhost.crt"),
+        include_str!("../../../lib/assets/tests/localhost.key"),
+        None,
+    )
+}
+
+pub fn try_tls_ecdsa() -> State {
+    try_tls_with_cert(
+        "TLS-ECDSA",
+        include_str!("../../../lib/assets/tests/ecdsa-localhost.pem"),
+        include_str!("../../../lib/assets/tests/ecdsa-localhost.key"),
+        None,
+    )
+}
+
+pub fn try_tls_1_3_rsa() -> State {
+    try_tls_with_cert(
+        "TLS13-RSA",
+        include_str!("../../../lib/assets/local-certificate.pem"),
+        include_str!("../../../lib/assets/local-key.pem"),
+        Some(vec![TlsVersion::TlsV13]),
+    )
+}
+
+pub fn try_tls_1_3_ecdsa() -> State {
+    try_tls_with_cert(
+        "TLS13-ECDSA",
+        include_str!("../../../lib/assets/tests/ecdsa-localhost.pem"),
+        include_str!("../../../lib/assets/tests/ecdsa-localhost.key"),
+        Some(vec![TlsVersion::TlsV13]),
+    )
+}
+
+pub fn try_tls_1_2_rsa() -> State {
+    try_tls_with_cert(
+        "TLS12-RSA",
+        include_str!("../../../lib/assets/local-certificate.pem"),
+        include_str!("../../../lib/assets/local-key.pem"),
+        Some(vec![TlsVersion::TlsV12]),
+    )
+}
+
+pub fn try_tls_1_2_ecdsa() -> State {
+    try_tls_with_cert(
+        "TLS12-ECDSA",
+        include_str!("../../../lib/assets/tests/ecdsa-localhost.pem"),
+        include_str!("../../../lib/assets/tests/ecdsa-localhost.key"),
+        Some(vec![TlsVersion::TlsV12]),
+    )
 }
 
 pub fn test_upgrade() -> State {
@@ -1735,6 +1853,78 @@ fn test_tls_endpoint() {
 }
 
 #[test]
+fn test_tls_rsa_2048() {
+    assert_eq!(
+        repeat_until_error_or(
+            100,
+            "TLS RSA-2048: HTTPS with RSA-2048 certificate",
+            try_tls_rsa_2048
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_tls_ecdsa() {
+    assert_eq!(
+        repeat_until_error_or(
+            100,
+            "TLS ECDSA: HTTPS with ECDSA P-256 certificate",
+            try_tls_ecdsa
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_tls_1_3_rsa() {
+    assert_eq!(
+        repeat_until_error_or(
+            100,
+            "TLS 1.3 RSA: HTTPS with TLS 1.3 only and RSA certificate",
+            try_tls_1_3_rsa
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_tls_1_3_ecdsa() {
+    assert_eq!(
+        repeat_until_error_or(
+            100,
+            "TLS 1.3 ECDSA: HTTPS with TLS 1.3 only and ECDSA certificate",
+            try_tls_1_3_ecdsa
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_tls_1_2_rsa() {
+    assert_eq!(
+        repeat_until_error_or(
+            100,
+            "TLS 1.2 RSA: HTTPS with TLS 1.2 only and RSA certificate",
+            try_tls_1_2_rsa
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_tls_1_2_ecdsa() {
+    assert_eq!(
+        repeat_until_error_or(
+            100,
+            "TLS 1.2 ECDSA: HTTPS with TLS 1.2 only and ECDSA certificate",
+            try_tls_1_2_ecdsa
+        ),
+        State::Success
+    );
+}
+
+#[test]
 fn test_http_behaviors() {
     assert_eq!(
         repeat_until_error_or(10, "HTTP stack", try_http_behaviors),
@@ -1810,6 +2000,721 @@ fn test_wildcard() {
 fn test_status_header_split() {
     assert_eq!(
         repeat_until_error_or(2, "Status line and Headers split", try_status_header_split),
+        State::Success
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Health check tests
+// ---------------------------------------------------------------------------
+
+/// When a backend goes down, health checks should mark it unhealthy and Sōzu
+/// should stop routing traffic to it. All requests go to the remaining healthy
+/// backend.
+pub fn try_health_check_excludes_unhealthy() -> State {
+    let front_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_config();
+    // Setup cluster with 0 backends — we add them manually below
+    let (mut worker, _) =
+        setup_async_test("HC-EXCL", config, listeners, state, front_address, 0, false);
+
+    let backend0_addr = create_local_address();
+    let backend1_addr = create_local_address();
+
+    let aggregator = SimpleAggregator {
+        requests_received: 0,
+        responses_sent: 0,
+    };
+
+    let mut backend0 = AsyncBackend::spawn_detached_backend(
+        "HC_BACKEND_0",
+        backend0_addr,
+        aggregator.to_owned(),
+        AsyncBackend::http_handler("pong0"),
+    );
+    let mut backend1 = AsyncBackend::spawn_detached_backend(
+        "HC_BACKEND_1",
+        backend1_addr,
+        aggregator,
+        AsyncBackend::http_handler("pong1"),
+    );
+
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        backend0_addr,
+        None,
+    )));
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-1",
+        backend1_addr,
+        None,
+    )));
+    worker.read_to_last();
+
+    // Configure health check with generous timeout so the mio event loop
+    // (which polls every ~1s) has time to complete the write/read cycle.
+    worker.send_proxy_request_type(RequestType::SetHealthCheck(SetHealthCheck {
+        cluster_id: "cluster_0".to_owned(),
+        config: HealthCheckConfig {
+            timeout: 3,
+            healthy_threshold: 1,
+            ..default_health_check_config()
+        },
+    }));
+    worker.read_to_last();
+
+    // Verify both backends serve traffic — client requests also keep the event
+    // loop active so health checks are processed.
+    let deadline = Instant::now() + HEALTH_CHECK_SETTLE;
+    let mut got_pong0 = false;
+    let mut got_pong1 = false;
+    while Instant::now() < deadline && !(got_pong0 && got_pong1) {
+        let mut client = Client::new(
+            "client",
+            front_address,
+            http_request("GET", "/api", "ping", "localhost"),
+        );
+        client.connect();
+        client.send();
+        if let Some(response) = client.receive() {
+            if response.contains("pong0") {
+                got_pong0 = true;
+            }
+            if response.contains("pong1") {
+                got_pong1 = true;
+            }
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+
+    if !got_pong0 || !got_pong1 {
+        println!(
+            "Phase 1: expected traffic to both backends, got pong0={} pong1={}",
+            got_pong0, got_pong1
+        );
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        backend0.stop_and_get_aggregator();
+        backend1.stop_and_get_aggregator();
+        return State::Fail;
+    }
+
+    // Stop backend 0 — its listener closes, health checks will fail to connect
+    backend0.stop_and_get_aggregator();
+
+    // Poll until all responses come from backend 1 only. Sending requests
+    // keeps the event loop active so health checks fire promptly.
+    let deadline = Instant::now() + HEALTH_CHECK_LONG_SETTLE;
+    let mut backend0_excluded = false;
+    while Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(500));
+        let mut all_pong1 = true;
+        for _ in 0..3 {
+            let mut client = Client::new(
+                "client",
+                front_address,
+                http_request("GET", "/api", "ping", "localhost"),
+            );
+            client.connect();
+            client.send();
+            if let Some(response) = client.receive() {
+                if !response.contains("pong1") {
+                    all_pong1 = false;
+                    break;
+                }
+            }
+        }
+        if all_pong1 {
+            backend0_excluded = true;
+            break;
+        }
+    }
+
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+    backend1.stop_and_get_aggregator();
+
+    if backend0_excluded {
+        State::Success
+    } else {
+        println!("Phase 2: backend 0 was not excluded after going down");
+        State::Fail
+    }
+}
+
+/// After a backend recovers (starts responding to health checks again), Sōzu
+/// should mark it healthy and resume routing traffic to it.
+pub fn try_health_check_recovery() -> State {
+    let front_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, _) =
+        setup_async_test("HC-REC", config, listeners, state, front_address, 0, false);
+
+    let backend_addr = create_local_address();
+    let aggregator = SimpleAggregator {
+        requests_received: 0,
+        responses_sent: 0,
+    };
+
+    // Start backend so initial requests work
+    let mut backend = AsyncBackend::spawn_detached_backend(
+        "HC_BACKEND",
+        backend_addr,
+        aggregator.to_owned(),
+        AsyncBackend::http_handler("pong"),
+    );
+
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        backend_addr,
+        None,
+    )));
+    worker.read_to_last();
+
+    // Use generous timeout so the mio event loop (polling every ~1s) has time
+    // to complete the TCP write/read cycle for each health check.
+    worker.send_proxy_request_type(RequestType::SetHealthCheck(SetHealthCheck {
+        cluster_id: "cluster_0".to_owned(),
+        config: HealthCheckConfig {
+            timeout: 3,
+            ..default_health_check_config()
+        },
+    }));
+    worker.read_to_last();
+
+    // Phase 1: confirm traffic works (requests also keep event loop active)
+    let phase1_ok = poll_until(front_address, HEALTH_CHECK_VERIFY, |resp| {
+        resp.map(|r| r.contains("pong")).unwrap_or(false)
+    });
+    if !phase1_ok {
+        println!("Phase 1: backend never responded");
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        backend.stop_and_get_aggregator();
+        return State::Fail;
+    }
+
+    // Phase 2: stop backend — poll until we see 503 (backend marked unhealthy)
+    backend.stop_and_get_aggregator();
+    let backend_down = poll_until(front_address, HEALTH_CHECK_LONG_SETTLE, |resp| {
+        match resp {
+            Some(r) => r.contains("503"),
+            None => true,
+        }
+    });
+    if !backend_down {
+        println!("Phase 2: backend never marked unhealthy");
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        return State::Fail;
+    }
+
+    // Phase 3: restart backend at the same address
+    let mut backend = AsyncBackend::spawn_detached_backend(
+        "HC_BACKEND_RECOVERED",
+        backend_addr,
+        aggregator,
+        AsyncBackend::http_handler("pong_recovered"),
+    );
+
+    // Phase 4: poll until traffic resumes — each request keeps the event loop
+    // active so health checks are processed promptly. Recovery needs two full
+    // health check cycles (settle + verify), so we allow extra time.
+    let recovered = poll_until(
+        front_address,
+        HEALTH_CHECK_LONG_SETTLE + HEALTH_CHECK_VERIFY,
+        |resp| resp.map(|r| r.contains("pong_recovered")).unwrap_or(false),
+    );
+
+    if !recovered {
+        println!("Phase 4: backend never recovered");
+    }
+
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+    backend.stop_and_get_aggregator();
+
+    if recovered {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+/// Configuring a health check via `SetHealthCheck` should be accepted, and
+/// removing it via `RemoveHealthCheck` should stop health-checking the cluster.
+pub fn try_health_check_remove() -> State {
+    let front_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, _) =
+        setup_async_test("HC-RM", config, listeners, state, front_address, 0, false);
+
+    let backend_addr = create_local_address();
+    let aggregator = SimpleAggregator {
+        requests_received: 0,
+        responses_sent: 0,
+    };
+
+    let mut backend = AsyncBackend::spawn_detached_backend(
+        "HC_BACKEND",
+        backend_addr,
+        aggregator,
+        AsyncBackend::http_handler("pong"),
+    );
+
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        backend_addr,
+        None,
+    )));
+    worker.read_to_last();
+
+    // Set health check
+    worker.send_proxy_request_type(RequestType::SetHealthCheck(SetHealthCheck {
+        cluster_id: "cluster_0".to_owned(),
+        config: HealthCheckConfig {
+            timeout: 3,
+            healthy_threshold: 1,
+            unhealthy_threshold: 1,
+            ..default_health_check_config()
+        },
+    }));
+    worker.read_to_last();
+
+    // Verify traffic works while health checks are active (requests keep event
+    // loop active so health checks fire)
+    let phase1_ok = poll_until(front_address, HEALTH_CHECK_VERIFY, |resp| {
+        resp.map(|r| r.contains("pong")).unwrap_or(false)
+    });
+    if !phase1_ok {
+        println!("Phase 1: expected pong, got nothing");
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        backend.stop_and_get_aggregator();
+        return State::Fail;
+    }
+
+    // Remove health check
+    worker.send_proxy_request_type(RequestType::RemoveHealthCheck("cluster_0".to_owned()));
+    worker.read_to_last();
+
+    // Traffic should still work after removing the health check
+    let mut client = Client::new(
+        "client",
+        front_address,
+        http_request("GET", "/api", "ping", "localhost"),
+    );
+    client.connect();
+    client.send();
+    let phase2 = client.receive();
+    let still_works = phase2.as_ref().map(|r| r.contains("pong")).unwrap_or(false);
+    if !still_works {
+        println!("Phase 2: expected pong after remove, got: {:?}", phase2);
+    }
+
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+    backend.stop_and_get_aggregator();
+
+    if still_works {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_health_check_excludes_unhealthy() {
+    assert_eq!(
+        repeat_until_error_or(
+            2,
+            "Health check excludes unhealthy backend",
+            try_health_check_excludes_unhealthy,
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_health_check_recovery() {
+    assert_eq!(
+        repeat_until_error_or(
+            2,
+            "Health check recovery after backend restart",
+            try_health_check_recovery,
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_health_check_remove() {
+    assert_eq!(
+        repeat_until_error_or(2, "Health check set and remove", try_health_check_remove,),
+        State::Success
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Health check — fail-open
+// ---------------------------------------------------------------------------
+
+/// When ALL backends are unhealthy, Sōzu should fail-open and route to them
+/// anyway, rather than returning 503 to all clients.
+pub fn try_health_check_fail_open() -> State {
+    let front_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, _) =
+        setup_async_test("HC-FOPEN", config, listeners, state, front_address, 0, false);
+
+    let backend_addr = create_local_address();
+    let aggregator = SimpleAggregator {
+        requests_received: 0,
+        responses_sent: 0,
+    };
+
+    // Start a backend that responds on /api but NOT on /health — health checks
+    // will get connection refused or a non-2xx, marking the backend unhealthy.
+    let mut backend = AsyncBackend::spawn_detached_backend(
+        "HC_BACKEND_NO_HEALTH",
+        backend_addr,
+        aggregator,
+        AsyncBackend::http_handler("fail-open-ok"),
+    );
+
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        backend_addr,
+        None,
+    )));
+    worker.read_to_last();
+
+    // Configure health check expecting status 204 — the backend returns 200,
+    // so health checks will consistently fail, marking it unhealthy.
+    worker.send_proxy_request_type(RequestType::SetHealthCheck(SetHealthCheck {
+        cluster_id: "cluster_0".to_owned(),
+        config: HealthCheckConfig {
+            expected_status: 204,
+            unhealthy_threshold: 1,
+            healthy_threshold: 1,
+            timeout: 3,
+            ..default_health_check_config()
+        },
+    }));
+    worker.read_to_last();
+
+    // Continuously send requests to keep the event loop active while health
+    // checks fire. With interval=3s and unhealthy_threshold=1, detection
+    // should happen within ~6s. We send traffic for HEALTH_CHECK_SETTLE to
+    // ensure health checks have fired.
+    let start = Instant::now();
+    while Instant::now().duration_since(start) < HEALTH_CHECK_SETTLE {
+        let mut client = Client::new(
+            "keepalive",
+            front_address,
+            http_request("GET", "/api", "ping", "localhost"),
+        );
+        client.connect();
+        client.send();
+        let _ = client.receive();
+        thread::sleep(Duration::from_secs(1));
+    }
+
+    // Verify fail-open: the backend should be marked unhealthy by now, but
+    // fail-open should still route traffic since it's the only backend.
+    let mut success_count = 0;
+    for _ in 0..5 {
+        let mut client = Client::new(
+            "failopen",
+            front_address,
+            http_request("GET", "/api", "ping", "localhost"),
+        );
+        client.connect();
+        client.send();
+        if let Some(response) = client.receive() {
+            if response.contains("fail-open-ok") {
+                success_count += 1;
+            }
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+    backend.stop_and_get_aggregator();
+
+    if success_count >= 3 {
+        State::Success
+    } else {
+        println!(
+            "Fail-open: expected traffic to route despite unhealthy backend, got {}/5 successes",
+            success_count
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_health_check_fail_open() {
+    assert_eq!(
+        repeat_until_error_or(
+            2,
+            "Health check fail-open when all backends unhealthy",
+            try_health_check_fail_open,
+        ),
+        State::Success
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Health check — server-side config validation
+// ---------------------------------------------------------------------------
+
+/// Invalid health check configurations should be rejected by the worker with
+/// an error response.
+pub fn try_health_check_invalid_config() -> State {
+    let front_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, _) =
+        setup_async_test("HC-INVAL", config, listeners, state, front_address, 0, false);
+
+    // Test 1: zero interval should be rejected
+    worker.send_proxy_request_type(RequestType::SetHealthCheck(SetHealthCheck {
+        cluster_id: "cluster_0".to_owned(),
+        config: HealthCheckConfig {
+            interval: 0,
+            ..default_health_check_config()
+        },
+    }));
+    let response = worker.read_proxy_response();
+    let zero_interval_rejected = response
+        .as_ref()
+        .map(|r| r.status == ResponseStatus::Failure as i32)
+        .unwrap_or(false);
+
+    // Test 2: zero timeout should be rejected
+    worker.send_proxy_request_type(RequestType::SetHealthCheck(SetHealthCheck {
+        cluster_id: "cluster_0".to_owned(),
+        config: HealthCheckConfig {
+            timeout: 0,
+            ..default_health_check_config()
+        },
+    }));
+    let response = worker.read_proxy_response();
+    let zero_timeout_rejected = response
+        .as_ref()
+        .map(|r| r.status == ResponseStatus::Failure as i32)
+        .unwrap_or(false);
+
+    // Test 3: URI without leading slash should be rejected
+    worker.send_proxy_request_type(RequestType::SetHealthCheck(SetHealthCheck {
+        cluster_id: "cluster_0".to_owned(),
+        config: HealthCheckConfig {
+            uri: "no-leading-slash".to_owned(),
+            ..default_health_check_config()
+        },
+    }));
+    let response = worker.read_proxy_response();
+    let bad_uri_rejected = response
+        .as_ref()
+        .map(|r| r.status == ResponseStatus::Failure as i32)
+        .unwrap_or(false);
+
+    // Test 4: URI with CRLF should be rejected
+    worker.send_proxy_request_type(RequestType::SetHealthCheck(SetHealthCheck {
+        cluster_id: "cluster_0".to_owned(),
+        config: HealthCheckConfig {
+            uri: "/health\r\nX-Injected: true".to_owned(),
+            ..default_health_check_config()
+        },
+    }));
+    let response = worker.read_proxy_response();
+    let crlf_uri_rejected = response
+        .as_ref()
+        .map(|r| r.status == ResponseStatus::Failure as i32)
+        .unwrap_or(false);
+
+    // Test 5: valid config should be accepted
+    worker.send_proxy_request_type(RequestType::SetHealthCheck(SetHealthCheck {
+        cluster_id: "cluster_0".to_owned(),
+        config: default_health_check_config(),
+    }));
+    let response = worker.read_proxy_response();
+    let valid_accepted = response
+        .as_ref()
+        .map(|r| r.status == ResponseStatus::Ok as i32)
+        .unwrap_or(false);
+
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+
+    let mut all_ok = true;
+    if !zero_interval_rejected {
+        println!("FAIL: zero interval config was not rejected");
+        all_ok = false;
+    }
+    if !zero_timeout_rejected {
+        println!("FAIL: zero timeout config was not rejected");
+        all_ok = false;
+    }
+    if !bad_uri_rejected {
+        println!("FAIL: URI without leading slash was not rejected");
+        all_ok = false;
+    }
+    if !crlf_uri_rejected {
+        println!("FAIL: URI with CRLF was not rejected");
+        all_ok = false;
+    }
+    if !valid_accepted {
+        println!("FAIL: valid config was not accepted");
+        all_ok = false;
+    }
+
+    if all_ok {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_health_check_invalid_config() {
+    assert_eq!(
+        repeat_until_error_or(
+            2,
+            "Health check rejects invalid configs",
+            try_health_check_invalid_config,
+        ),
+        State::Success
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Health check — expected status code
+// ---------------------------------------------------------------------------
+
+/// When `expected_status` is set to a specific code that the backend does not
+/// return, health checks should fail. Combined with fail-open, the backend
+/// remains reachable. This validates the `expected_status` matching logic.
+pub fn try_health_check_expected_status() -> State {
+    let front_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, _) =
+        setup_async_test("HC-STATUS", config, listeners, state, front_address, 0, false);
+
+    let backend_addr = create_local_address();
+    let aggregator = SimpleAggregator {
+        requests_received: 0,
+        responses_sent: 0,
+    };
+
+    // Backend returns 200 OK — but health check expects 204
+    let mut backend = AsyncBackend::spawn_detached_backend(
+        "HC_BACKEND_200",
+        backend_addr,
+        aggregator,
+        AsyncBackend::http_handler("status-check-ok"),
+    );
+
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        backend_addr,
+        None,
+    )));
+    worker.read_to_last();
+
+    // First: confirm traffic works with default health check (expects any 2xx)
+    worker.send_proxy_request_type(RequestType::SetHealthCheck(SetHealthCheck {
+        cluster_id: "cluster_0".to_owned(),
+        config: HealthCheckConfig {
+            expected_status: 0, // any 2xx
+            healthy_threshold: 1,
+            unhealthy_threshold: 1,
+            timeout: 3,
+            ..default_health_check_config()
+        },
+    }));
+    worker.read_to_last();
+
+    let phase1 = poll_until(front_address, HEALTH_CHECK_VERIFY, |resp| {
+        resp.map(|r| r.contains("status-check-ok")).unwrap_or(false)
+    });
+    if !phase1 {
+        println!("Phase 1: backend never responded with default health check");
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        backend.stop_and_get_aggregator();
+        return State::Fail;
+    }
+
+    // Now switch to expected_status=204 — backend returns 200, so health checks
+    // will fail. The backend should be marked unhealthy.
+    worker.send_proxy_request_type(RequestType::SetHealthCheck(SetHealthCheck {
+        cluster_id: "cluster_0".to_owned(),
+        config: HealthCheckConfig {
+            expected_status: 204,
+            healthy_threshold: 1,
+            unhealthy_threshold: 1,
+            timeout: 3,
+            ..default_health_check_config()
+        },
+    }));
+    worker.read_to_last();
+
+    // Keep the event loop active while health checks fire and mark the
+    // backend unhealthy (status mismatch: expects 204, gets 200).
+    let start = Instant::now();
+    while Instant::now().duration_since(start) < HEALTH_CHECK_SETTLE {
+        let mut client = Client::new(
+            "keepalive",
+            front_address,
+            http_request("GET", "/api", "ping", "localhost"),
+        );
+        client.connect();
+        client.send();
+        let _ = client.receive();
+        thread::sleep(Duration::from_secs(1));
+    }
+
+    // With fail-open, traffic should still reach the backend even though it's
+    // unhealthy (status mismatch). This validates both expected_status matching
+    // AND fail-open working together.
+    let phase2 = poll_until(front_address, HEALTH_CHECK_VERIFY, |resp| {
+        resp.map(|r| r.contains("status-check-ok")).unwrap_or(false)
+    });
+
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+    backend.stop_and_get_aggregator();
+
+    if phase2 {
+        State::Success
+    } else {
+        println!("Phase 2: traffic did not reach backend via fail-open after status mismatch");
+        State::Fail
+    }
+}
+
+#[test]
+fn test_health_check_expected_status() {
+    assert_eq!(
+        repeat_until_error_or(
+            2,
+            "Health check with specific expected status",
+            try_health_check_expected_status,
+        ),
         State::Success
     );
 }

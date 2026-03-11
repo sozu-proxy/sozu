@@ -4,6 +4,10 @@ version = "1.1.1"
 rust-version = "1.85.0"
 edition = "2024"
 
+[lints.rust.unexpected_cfgs]
+level = "warn"
+check-cfg = ["cfg(tarpaulin)"]
+
 [dependencies]
 futures = { workspace = true }
 http-body-util = { workspace = true }
@@ -17,4 +21,4 @@ time = { workspace = true }
 tokio = { workspace = true, features = ["net", "rt-multi-thread"] }
 
 sozu-command-lib = { workspace = true }
-sozu-lib = { workspace = true }
+sozu-lib = { workspace = true, features = ["crypto-ring"] }
