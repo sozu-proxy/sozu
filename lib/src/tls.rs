@@ -224,7 +224,7 @@ impl CertificateResolver {
     ) -> Result<(), CertificateResolverError> {
         if let Some(certificate_to_remove) = self.get_certificate(fingerprint) {
             for name in certificate_to_remove.names {
-                self.domains.domain_remove(&name.as_bytes().to_vec());
+                self.domains.domain_remove(&name.clone().into_bytes());
 
                 if let Some(fingerprints_and_exp) = self.name_fingerprint_idx.get_mut(&name) {
                     // remove fingerprints from the index for this name
@@ -233,7 +233,7 @@ impl CertificateResolver {
                     // reinsert the longest lived certificate in the TrieNode
                     if let Some(longest_lived_cert) = fingerprints_and_exp.last() {
                         self.domains
-                            .insert(name.as_bytes().to_vec(), longest_lived_cert.0.to_owned());
+                            .insert(name.clone().into_bytes(), longest_lived_cert.0.to_owned());
                     }
                 }
 
