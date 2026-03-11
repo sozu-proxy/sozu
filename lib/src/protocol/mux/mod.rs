@@ -828,7 +828,7 @@ pub enum StreamState {
 }
 
 impl StreamState {
-    fn is_open(&self) -> bool {
+    pub fn is_open(&self) -> bool {
         !matches!(self, StreamState::Idle | StreamState::Recycle)
     }
 }
@@ -1506,6 +1506,15 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             return SessionResult::Close;
         }
 
+        // Start service timers on all active streams after the HUP check.
+        // This mirrors session-level service_start/service_stop in Http(s)Session::ready()
+        // to measure only CPU processing time, excluding epoll wait between cycles.
+        for stream in &mut self.context.streams {
+            if stream.state.is_open() {
+                stream.metrics.service_start();
+            }
+        }
+
         let start = Instant::now();
         self.context.debug.push(DebugEvent::R(
             std::time::SystemTime::now()
@@ -1823,6 +1832,14 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             }
         }
 
+        // Stop service timers before yielding to epoll, so idle wait time is excluded
+        // from the service_time metric. For Close/Upgrade returns, close() handles cleanup.
+        for stream in &mut self.context.streams {
+            if stream.state.is_open() {
+                stream.metrics.service_stop();
+            }
+        }
+
         SessionResult::Continue
     }
 
@@ -2037,6 +2054,24 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         debug!("MUX CLOSE");
         trace!("FRONTEND: {:#?}", self.frontend);
         trace!("BACKENDS: {:#?}", self.router.backends);
+
+        // Generate access logs for in-flight streams on session teardown.
+        // Skip streams that already had their access log emitted (metrics.start is
+        // set to None by metrics.reset() after generate_access_log in the happy path).
+        for stream in &mut self.context.streams {
+            if stream.state.is_open() && stream.metrics.start.is_some() {
+                stream.metrics.service_stop();
+                if stream.metrics.backend_stop.is_none() {
+                    stream.metrics.backend_stop();
+                }
+                stream.generate_access_log(
+                    true,
+                    Some(String::from("session close")),
+                    self.context.listener.clone(),
+                );
+                stream.state = StreamState::Recycle;
+            }
+        }
 
         self.frontend
             .close(&mut self.context, EndpointClient(&mut self.router));
