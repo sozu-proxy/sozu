@@ -327,9 +327,8 @@ pub mod socket;
 pub mod timer;
 pub mod tls;
 
-/// unused for now but may be usefull for bypassing sozu on a low level
-#[cfg(feature = "splice")]
-mod splice;
+#[cfg(all(target_os = "linux", feature = "splice"))]
+pub(crate) mod splice;
 
 pub mod server;
 pub mod tcp;

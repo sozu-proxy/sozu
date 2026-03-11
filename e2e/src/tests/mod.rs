@@ -176,6 +176,99 @@ pub fn setup_sync_test<S: Into<String>>(
     (worker, backends)
 }
 
+/// Setup a Sozu worker with a TCP listener, cluster, frontend, and N backends.
+/// This is the TCP equivalent of `setup_test` (which sets up HTTP).
+pub fn setup_tcp_test<S: Into<String>>(
+    name: S,
+    config: ServerConfig,
+    listeners: Listeners,
+    state: ConfigState,
+    front_address: SocketAddr,
+    nb_backends: usize,
+) -> (Worker, Vec<SocketAddr>) {
+    let mut worker = Worker::start_new_worker(name, config, &listeners, state);
+
+    worker.send_proxy_request_type(RequestType::AddTcpListener(
+        ListenerBuilder::new_tcp(front_address.into())
+            .to_tcp(None)
+            .unwrap(),
+    ));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        address: front_address.into(),
+        proxy: ListenerType::Tcp.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
+    worker.send_proxy_request_type(RequestType::AddTcpFrontend(Worker::default_tcp_frontend(
+        "cluster_0",
+        front_address,
+    )));
+
+    let mut backends = Vec::new();
+    for i in 0..nb_backends {
+        let back_address = create_local_address();
+        worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+            "cluster_0",
+            format!("cluster_0-{i}"),
+            back_address,
+            None,
+        )));
+        backends.push(back_address);
+    }
+
+    worker.read_to_last();
+    (worker, backends)
+}
+
+pub fn setup_tcp_sync_test<S: Into<String>>(
+    name: S,
+    config: ServerConfig,
+    listeners: Listeners,
+    state: ConfigState,
+    front_address: SocketAddr,
+    nb_backends: usize,
+) -> (Worker, Vec<SyncBackend>) {
+    let (worker, backends) =
+        setup_tcp_test(name, config, listeners, state, front_address, nb_backends);
+    let backends = backends
+        .into_iter()
+        .enumerate()
+        .map(|(i, back_address)| SyncBackend::new(format!("BACKEND_{i}"), back_address, "pong"))
+        .collect::<Vec<_>>();
+    (worker, backends)
+}
+
+pub fn setup_tcp_async_test<S: Into<String>>(
+    name: S,
+    config: ServerConfig,
+    listeners: Listeners,
+    state: ConfigState,
+    front_address: SocketAddr,
+    nb_backends: usize,
+) -> (Worker, Vec<AsyncBackend<SimpleAggregator>>) {
+    let (worker, backends) =
+        setup_tcp_test(name, config, listeners, state, front_address, nb_backends);
+    let backends = backends
+        .into_iter()
+        .enumerate()
+        .map(|(i, back_address)| {
+            let aggregator = SimpleAggregator {
+                requests_received: 0,
+                responses_sent: 0,
+            };
+            AsyncBackend::spawn_detached_backend(
+                format!("BACKEND_{i}"),
+                back_address,
+                aggregator,
+                AsyncBackend::tcp_handler(format!("pong{i}")),
+            )
+        })
+        .collect::<Vec<_>>();
+    (worker, backends)
+}
+
 pub fn repeat_until_error_or<F>(times: usize, test_description: &str, test: F) -> State
 where
     F: Fn() -> State + Sized,
