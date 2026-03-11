@@ -732,7 +732,7 @@ message ServerConfig {
     required bool log_colored = 17;
     // whether to evict least recently active sessions when the accept queue is full.
     // defaults to false: during DDoS, existing connections are likely real clients
-    required bool evict_on_queue_full = 18 [default = false];
+    optional bool evict_on_queue_full = 18 [default = false];
 }
 
 enum ProtobufAccessLogFormat {

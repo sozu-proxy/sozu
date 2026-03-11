@@ -379,7 +379,7 @@ impl Server {
             )),
             accept_queue: VecDeque::new(),
             accept_ready: HashSet::new(),
-            evict_on_queue_full: server_config.evict_on_queue_full,
+            evict_on_queue_full: server_config.evict_on_queue_full.unwrap_or(false),
             backends,
             base_sessions_count,
             channel,
@@ -1607,6 +1607,11 @@ impl Server {
                     break;
                 }
 
+                // Evict 1% of max_connections per iteration. This is a conservative
+                // ratio: large enough to make meaningful progress clearing the accept
+                // queue, small enough to limit collateral damage to active sessions.
+                // The loop re-checks limits after each eviction round, so multiple
+                // rounds may run if the accept queue has many pending connections.
                 let to_evict = (self.sessions.borrow().max_connections / 100).max(1);
                 let evicted = self.evict_least_active_sessions(to_evict);
                 if evicted == 0 {
@@ -1807,5 +1812,59 @@ impl ProxySession for ListenSession {
             _token, self.protocol
         );
         false
+    }
+}
+
+#[cfg(test)]
+mod eviction_tests {
+    use std::collections::HashSet;
+    use std::time::{Duration, Instant};
+
+    use mio::Token;
+
+    #[test]
+    fn select_nth_finds_oldest_sessions() {
+        // Verify that select_nth_unstable_by_key correctly partitions
+        // by Instant, selecting the k oldest entries
+        let now = Instant::now();
+        let mut candidates = vec![
+            (Token(1), now - Duration::from_secs(10)), // 10s old
+            (Token(2), now - Duration::from_secs(50)), // 50s old (oldest)
+            (Token(3), now - Duration::from_secs(5)),  // 5s old (newest)
+            (Token(4), now - Duration::from_secs(30)), // 30s old
+            (Token(5), now - Duration::from_secs(20)), // 20s old
+        ];
+
+        let count = 2;
+        let pivot = count.min(candidates.len()) - 1;
+        candidates.select_nth_unstable_by_key(pivot, |&(_, last_event)| last_event);
+
+        // The first `count` entries should be the oldest two (tokens 2 and 4)
+        let selected: HashSet<Token> = candidates[..=pivot]
+            .iter()
+            .map(|&(token, _)| token)
+            .collect();
+
+        assert_eq!(selected.len(), 2);
+        assert!(selected.contains(&Token(2)), "should contain 50s-old session");
+        assert!(selected.contains(&Token(4)), "should contain 30s-old session");
+    }
+
+    #[test]
+    fn select_nth_with_count_exceeding_candidates() {
+        let now = Instant::now();
+        let mut candidates = vec![(Token(1), now - Duration::from_secs(10))];
+
+        let count = 5;
+        let pivot = count.min(candidates.len()) - 1;
+        candidates.select_nth_unstable_by_key(pivot, |&(_, last_event)| last_event);
+
+        let selected: HashSet<Token> = candidates[..=pivot]
+            .iter()
+            .map(|&(token, _)| token)
+            .collect();
+
+        assert_eq!(selected.len(), 1);
+        assert!(selected.contains(&Token(1)));
     }
 }

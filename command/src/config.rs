@@ -1880,7 +1880,7 @@ impl From<&Config> for ServerConfig {
             metrics,
             access_log_format: ProtobufAccessLogFormat::from(&config.access_logs_format) as i32,
             log_colored: config.log_colored,
-            evict_on_queue_full: config.evict_on_queue_full,
+            evict_on_queue_full: Some(config.evict_on_queue_full),
         }
     }
 }
