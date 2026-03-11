@@ -235,10 +235,7 @@ impl CommandManager {
                 _ => None,
             })
             .ok_or_else(|| {
-                CtlError::ArgsNeeded(
-                    "cluster not found".to_owned(),
-                    cluster_id.clone(),
-                )
+                CtlError::ArgsNeeded("cluster not found".to_owned(), cluster_id.clone())
             })?;
 
         let updated = Cluster {
