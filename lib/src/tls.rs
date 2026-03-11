@@ -227,7 +227,7 @@ impl CertificateResolver {
                 self.domains.domain_remove(&name.as_bytes().to_vec());
 
                 if let std::collections::hash_map::Entry::Occupied(mut entry) =
-                    self.name_fingerprint_idx.entry(name.clone())
+                    self.name_fingerprint_idx.entry(name.to_owned())
                 {
                     // remove fingerprints from the index for this name
                     entry.get_mut().retain(|t| &t.0 != fingerprint);
@@ -270,7 +270,15 @@ impl CertificateResolver {
         match Fingerprint::from_str(&replace.old_fingerprint) {
             Ok(old_fingerprint) => self.remove_certificate(&old_fingerprint)?,
             Err(err) => {
-                error!("failed to parse fingerprint, {}", err);
+                // The new certificate was already added above. If we can't parse the old
+                // fingerprint, the old certificate remains in the resolver (leaked).
+                // We return Ok to indicate the new certificate is available, but warn
+                // that cleanup of the old one failed.
+                warn!(
+                    "new certificate added but could not remove old one: \
+                     failed to parse old fingerprint, {}",
+                    err
+                );
             }
         }
 
