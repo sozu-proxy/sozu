@@ -224,26 +224,26 @@ impl CertificateResolver {
     ) -> Result<(), CertificateResolverError> {
         if let Some(certificate_to_remove) = self.get_certificate(fingerprint) {
             for name in certificate_to_remove.names {
-                self.domains.domain_remove(&name.clone().into_bytes());
+                self.domains.domain_remove(&name.as_bytes().to_vec());
 
-                if let Some(fingerprints_and_exp) = self.name_fingerprint_idx.get_mut(&name) {
+                if let std::collections::hash_map::Entry::Occupied(mut entry) =
+                    self.name_fingerprint_idx.entry(name.clone())
+                {
                     // remove fingerprints from the index for this name
-                    fingerprints_and_exp.retain(|t| &t.0 != fingerprint);
+                    entry.get_mut().retain(|t| &t.0 != fingerprint);
 
                     // reinsert the longest lived certificate in the TrieNode
-                    if let Some(longest_lived_cert) = fingerprints_and_exp.last() {
-                        self.domains
-                            .insert(name.clone().into_bytes(), longest_lived_cert.0.to_owned());
+                    if let Some(longest_lived_cert) = entry.get().last() {
+                        self.domains.insert(
+                            name.as_bytes().to_vec(),
+                            longest_lived_cert.0.to_owned(),
+                        );
                     }
-                }
 
-                // clean up empty index entries to avoid memory leaks
-                if self
-                    .name_fingerprint_idx
-                    .get(&name)
-                    .is_some_and(Vec::is_empty)
-                {
-                    self.name_fingerprint_idx.remove(&name);
+                    // clean up empty index entries to avoid memory leaks
+                    if entry.get().is_empty() {
+                        entry.remove();
+                    }
                 }
             }
 
@@ -329,12 +329,10 @@ impl ResolvesServerCert for MutexCertificateResolver {
         let server_name = client_hello.server_name();
         let sigschemes = client_hello.signature_schemes();
 
-        if server_name.is_none() {
+        let Some(name) = server_name else {
             error!("cannot look up certificate: no SNI from session");
             return None;
-        }
-
-        let name: &str = server_name.unwrap();
+        };
         trace!(
             "trying to resolve name: {:?} for signature scheme: {:?}",
             name, sigschemes
