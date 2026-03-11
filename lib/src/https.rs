@@ -17,25 +17,12 @@ use mio::{
 };
 use rustls::{
     CipherSuite, ProtocolVersion, ServerConfig as RustlsServerConfig, ServerConnection,
-    SupportedCipherSuite,
-    crypto::{
-        CryptoProvider,
-        ring::{
-            self,
-            cipher_suite::{
-                TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-                TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
-                TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256, TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-                TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256, TLS13_AES_128_GCM_SHA256,
-                TLS13_AES_256_GCM_SHA384, TLS13_CHACHA20_POLY1305_SHA256,
-            },
-        },
-    },
+    SupportedCipherSuite, crypto::CryptoProvider,
 };
 use rusty_ulid::Ulid;
 use sozu_command::{
     certificate::Fingerprint,
-    config::DEFAULT_CIPHER_SUITES,
+    config::DEFAULT_CIPHER_LIST,
     proto::command::{
         AddCertificate, CertificateSummary, CertificatesByAddress, Cluster, HttpsListenerConfig,
         ListOfCertificatesByAddress, ListenerType, RemoveCertificate, RemoveListener,
@@ -52,6 +39,7 @@ use crate::{
     ListenerHandler, Protocol, ProxyConfiguration, ProxyError, ProxySession, SessionIsToBeClosed,
     SessionMetrics, SessionResult, StateMachineBuilder, StateResult,
     backends::BackendMap,
+    crypto::{cipher_suite_by_name, default_provider, kx_group_by_name},
     pool::Pool,
     protocol::{
         Http, Pipe, SessionState,
@@ -672,7 +660,7 @@ impl HttpsListener {
         resolver: Arc<MutexCertificateResolver>,
     ) -> Result<RustlsServerConfig, ListenerError> {
         let cipher_names = if config.cipher_list.is_empty() {
-            DEFAULT_CIPHER_SUITES.to_vec()
+            DEFAULT_CIPHER_LIST.to_vec()
         } else {
             config
                 .cipher_list
@@ -681,23 +669,13 @@ impl HttpsListener {
                 .collect::<Vec<_>>()
         };
 
-        #[rustfmt::skip]
         let ciphers = cipher_names
             .into_iter()
-            .filter_map(|cipher| match cipher {
-                "TLS13_CHACHA20_POLY1305_SHA256" => Some(TLS13_CHACHA20_POLY1305_SHA256),
-                "TLS13_AES_256_GCM_SHA384" => Some(TLS13_AES_256_GCM_SHA384),
-                "TLS13_AES_128_GCM_SHA256" => Some(TLS13_AES_128_GCM_SHA256),
-                "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256" => Some(TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256),
-                "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256" => Some(TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256),
-                "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384" => Some(TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384),
-                "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256" => Some(TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256),
-                "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384" => Some(TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384),
-                "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256" => Some(TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256),
-                other_cipher => {
-                    error!("unknown cipher: {:?}", other_cipher);
+            .filter_map(|cipher| {
+                cipher_suite_by_name(cipher).or_else(|| {
+                    error!("unknown cipher: {:?}", cipher);
                     None
-                }
+                })
             })
             .collect::<Vec<_>>();
 
@@ -718,9 +696,26 @@ impl HttpsListener {
             })
             .collect::<Vec<_>>();
 
+        let kx_groups = if config.groups_list.is_empty() {
+            default_provider().kx_groups
+        } else {
+            config
+                .groups_list
+                .iter()
+                .filter_map(|group| match kx_group_by_name(group) {
+                    Some(kx) => Some(kx),
+                    None => {
+                        debug!("key exchange group {:?} not supported by the compiled crypto provider, skipping", group);
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+
         let provider = CryptoProvider {
             cipher_suites: ciphers,
-            ..ring::default_provider()
+            kx_groups,
+            ..default_provider()
         };
 
         let mut server_config = RustlsServerConfig::builder_with_provider(provider.into())
@@ -1076,15 +1071,10 @@ impl HttpsProxy {
             .ok_or(ProxyError::NoListenerFound(front.address))?
             .borrow_mut();
 
-        let hostname = front.hostname.to_owned();
-
+        listener.set_tags(front.hostname.to_owned(), None);
         listener
             .remove_https_front(front)
             .map_err(ProxyError::RemoveFrontend)?;
-
-        if !listener.fronts.has_hostname(&hostname) {
-            listener.set_tags(hostname, None);
-        }
         Ok(None)
     }
 
@@ -1574,7 +1564,7 @@ mod tests {
         let address = SocketAddress::new_v4(127, 0, 0, 1, 1032);
         let resolver = Arc::new(MutexCertificateResolver::default());
 
-        let crypto_provider = Arc::new(ring::default_provider());
+        let crypto_provider = Arc::new(default_provider());
 
         let server_config = RustlsServerConfig::builder_with_provider(crypto_provider)
             .with_protocol_versions(&[&rustls::version::TLS12, &rustls::version::TLS13])

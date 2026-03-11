@@ -36,6 +36,29 @@ jobs:
         with:
           command: test
           args: --verbose ${{ matrix.features }}
+  crypto-providers:
+    name: Crypto provider ${{ matrix.provider }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        provider:
+          - crypto-ring
+          - crypto-aws-lc-rs
+          - crypto-openssl
+          - fips
+    steps:
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler cmake
+      - name: Checkout sources
+        uses: actions/checkout@v4
+      - name: Install rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+      - name: Build with ${{ matrix.provider }}
+        run: cargo build -p sozu -p sozu-lib -p sozu-command-lib --no-default-features --features ${{ matrix.provider }}
+      - name: Test with ${{ matrix.provider }}
+        run: cargo test -p sozu-lib --no-default-features --features ${{ matrix.provider }} --verbose
   doc:
     name: Build documentation
     runs-on: ubuntu-latest
