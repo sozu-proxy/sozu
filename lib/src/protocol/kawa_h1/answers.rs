@@ -5,8 +5,8 @@ use std::{
 };
 
 use kawa::{
-    AsBuffer, Block, BodySize, Buffer, Chunk, Kawa, Kind, Pair, ParsingPhase, ParsingPhaseMarker,
-    StatusLine, Store, h1::NoCallbacks,
+    h1::NoCallbacks, AsBuffer, Block, BodySize, Buffer, Chunk, Kawa, Kind, Pair, ParsingPhase,
+    ParsingPhaseMarker, StatusLine, Store,
 };
 use sozu_command::proto::command::CustomHttpAnswers;
 
@@ -868,7 +868,8 @@ impl HttpAnswers {
         cluster_id: Option<&str>,
         backend_id: Option<&str>,
         route: String,
-    ) -> DefaultAnswerStream {
+    ) -> (u16, bool, DefaultAnswerStream) {
+        let status = u16::from(&answer);
         let variables: Vec<Vec<u8>>;
         let mut variables_once: Vec<Vec<u8>>;
         let template = match answer {
@@ -985,8 +986,12 @@ impl HttpAnswers {
                 &self.listener_answers.answer_507
             }
         };
-        // kawa::debug_kawa(&template.kawa);
-        // println!("{template:#?}");
-        template.fill(&variables, &mut variables_once)
+        // keep_alive is always false for now; PR B will add template-level keep_alive detection
+        let keep_alive = false;
+        (
+            status,
+            keep_alive,
+            template.fill(&variables, &mut variables_once),
+        )
     }
 }
