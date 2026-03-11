@@ -20,12 +20,12 @@ Launch sozu with `worker_automatic_restart` on, test a request, kill a worker, t
 
 ### Upgrades
 
-- compile a sozu and sozuctl of the previous published version, store the binaries somewhere
+- compile a sozu of the previous published version, store the binary somewhere
 - compile a sozu of the latest version
 - start the old sozu version
 - query its configuration state
 - replace the old sozu file with the new one
-- launch an upgrade with sozuctl
+- launch an upgrade with sozu
 - check that the new sozu runs properly (listens for new connections, handles requests, etc)
 - check the new sozu's state, compared to the previous one
 - verify that the old workers quit correctly (if they were handling WebSocket connections, check that the master detetcs when you kill them)
