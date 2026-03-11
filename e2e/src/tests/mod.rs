@@ -1,4 +1,5 @@
 mod h2_tests;
+mod mux_tests;
 mod tests;
 
 use std::{

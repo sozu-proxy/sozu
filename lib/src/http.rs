@@ -226,6 +226,8 @@ impl HttpSession {
     fn upgrade_mux(&mut self, mut mux: MuxClear) -> Option<HttpStateMachine> {
         debug!("mux switching to ws");
         let stream = mux.context.streams.pop().unwrap();
+        // http.active_requests was already decremented by generate_access_log()
+        // in h1.rs before MuxResult::Upgrade was returned to us.
 
         let (frontend_readiness, frontend_socket, mut container_frontend_timeout) =
             match mux.frontend {
@@ -294,6 +296,8 @@ impl HttpSession {
         pipe.backend_readiness.event = backend_readiness.event;
         pipe.set_back_token(back_token);
 
+        // http.active_requests was already decremented by generate_access_log()
+        // in h1.rs when the 101 response was written (before MuxResult::Upgrade).
         gauge_add!("protocol.http", -1);
         gauge_add!("protocol.ws", 1);
         gauge_add!("websocket.active_requests", 1);

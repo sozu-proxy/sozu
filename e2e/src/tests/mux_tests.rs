@@ -1,0 +1,1241 @@
+/// Regression tests for mux layer fixes:
+/// - P0: close() stream cleanup (http.active_requests gauge leak)
+/// - P1: service_start/service_stop bracketing (service_time inflation)
+/// - P3: WebSocket upgrade gauge correctness
+///
+/// Tests cover scenarios with and without proxy protocol, simulating
+/// HAProxy healthcheck patterns (connect + PP + disconnect every ~10ms).
+use std::{
+    io::{Read, Write},
+    net::{SocketAddr, TcpStream},
+    thread,
+    time::Duration,
+};
+
+use sozu_command_lib::{
+    config::ListenerBuilder,
+    proto::command::{
+        ActivateListener, Cluster, ListenerType, Request, request::RequestType,
+    },
+};
+
+use crate::{
+    http_utils::http_ok_response,
+    mock::{client::Client, sync_backend::Backend as SyncBackend},
+    sozu::worker::Worker,
+    tests::{State, repeat_until_error_or, setup_sync_test},
+};
+
+use super::tests::create_local_address;
+
+const BUFFER_SIZE: usize = 4096;
+
+// =========================================================================
+// Proxy protocol V2 helpers
+// =========================================================================
+
+/// Build a proxy protocol V2 PROXY header with IPv4 addresses (28 bytes).
+/// Uses 127.0.0.1 for both source and destination.
+fn pp_v2_proxy_ipv4(src_port: u16, dst_port: u16) -> Vec<u8> {
+    let mut h = vec![
+        0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A, // magic
+        0x21, // version 2, command PROXY
+        0x11, // AF_INET, STREAM
+        0x00, 0x0C, // address length: 12
+        127, 0, 0, 1, // source IP
+        127, 0, 0, 1, // dest IP
+    ];
+    h.extend_from_slice(&src_port.to_be_bytes());
+    h.extend_from_slice(&dst_port.to_be_bytes());
+    h
+}
+
+/// Build a proxy protocol V2 LOCAL header with IPv4 addresses (28 bytes).
+/// This is what HAProxy sends for healthchecks when the listener expects
+/// proxy protocol and the address family is IPv4.
+fn pp_v2_local_ipv4() -> Vec<u8> {
+    vec![
+        0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A, // magic
+        0x20, // version 2, command LOCAL
+        0x11, // AF_INET, STREAM
+        0x00, 0x0C, // address length: 12
+        127, 0, 0, 1, // source IP
+        127, 0, 0, 1, // dest IP
+        0x00, 0x50, // source port (80)
+        0x00, 0x50, // dest port (80)
+    ]
+}
+
+/// Build a proxy protocol V2 LOCAL header with AF_UNSPEC (16 bytes only).
+/// This is the most minimal healthcheck header. Sozu's ExpectProxyProtocol
+/// reads 28 bytes minimum (V4 size), so this header is incomplete from
+/// sozu's perspective — the connection will close before sozu can parse it.
+fn pp_v2_local_af_unspec() -> Vec<u8> {
+    vec![
+        0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A, // magic
+        0x20, // version 2, command LOCAL
+        0x00, // AF_UNSPEC
+        0x00, 0x00, // address length: 0
+    ]
+}
+
+// =========================================================================
+// Test setup helpers
+// =========================================================================
+
+/// Set up a sozu worker with proxy protocol enabled on the HTTP listener.
+/// Returns (worker, backend_addresses, front_address).
+fn setup_proxy_protocol_test(
+    name: &str,
+    nb_backends: usize,
+) -> (Worker, Vec<SocketAddr>, SocketAddr) {
+    let front_address = create_local_address();
+    let (config, listeners, state) = Worker::empty_config();
+    let mut worker = Worker::start_new_worker(name, config, &listeners, state);
+
+    worker.send_proxy_request(Request {
+        request_type: Some(RequestType::AddHttpListener(
+            ListenerBuilder::new_http(front_address.into())
+                .with_expect_proxy(true)
+                .to_http(None)
+                .unwrap(),
+        )),
+    });
+    worker.send_proxy_request(Request {
+        request_type: Some(RequestType::ActivateListener(ActivateListener {
+            address: front_address.into(),
+            proxy: ListenerType::Http.into(),
+            from_scm: false,
+        })),
+    });
+    worker.send_proxy_request(Request {
+        request_type: Some(RequestType::AddCluster(Cluster {
+            ..Worker::default_cluster("cluster_0")
+        })),
+    });
+    worker.send_proxy_request(Request {
+        request_type: Some(RequestType::AddHttpFrontend(Worker::default_http_frontend(
+            "cluster_0",
+            front_address,
+        ))),
+    });
+
+    let mut backends = Vec::new();
+    for i in 0..nb_backends {
+        let back_address = create_local_address();
+        worker.send_proxy_request(
+            RequestType::AddBackend(Worker::default_backend(
+                "cluster_0",
+                format!("cluster_0-{i}"),
+                back_address,
+                None,
+            ))
+            .into(),
+        );
+        backends.push(back_address);
+    }
+
+    worker.read_to_last();
+    (worker, backends, front_address)
+}
+
+/// Connect a raw TCP stream with timeouts.
+fn raw_connect(addr: SocketAddr) -> TcpStream {
+    let stream = TcpStream::connect(addr).expect("could not connect");
+    stream
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    stream
+}
+
+/// Read from a raw TCP stream, returning the data as a String.
+fn raw_read(stream: &mut TcpStream) -> Option<String> {
+    let mut buf = [0u8; BUFFER_SIZE];
+    match stream.read(&mut buf) {
+        Ok(0) => None,
+        Ok(n) => Some(String::from_utf8_lossy(&buf[..n]).to_string()),
+        Err(_) => None,
+    }
+}
+
+// =========================================================================
+// Test 1: Client HUP during in-flight request
+// =========================================================================
+
+fn try_client_hup_during_request() -> State {
+    let front_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, mut backends) = setup_sync_test(
+        "CLIENT-HUP",
+        config,
+        listeners,
+        state,
+        front_address,
+        1,
+        false,
+    );
+    let mut backend = backends.pop().unwrap();
+    backend.connect();
+
+    // Client sends request, then disconnects before response
+    let mut client1 = Client::new(
+        "client1",
+        front_address,
+        "GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    client1.connect();
+    client1.send();
+    backend.accept(0);
+    backend.receive(0);
+
+    // Client HUP — sozu's close() must clean up the in-flight stream
+    client1.disconnect();
+    thread::sleep(Duration::from_millis(100));
+    backend.send(0);
+    thread::sleep(Duration::from_millis(100));
+
+    // Verify sozu still serves requests
+    let mut client2 = Client::new(
+        "client2",
+        front_address,
+        "GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    client2.connect();
+    client2.send();
+    backend.accept(1);
+    backend.receive(1);
+    backend.send(1);
+
+    match client2.receive() {
+        Some(response) if response.contains("200") => {}
+        _ => return State::Fail,
+    }
+
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+    State::Success
+}
+
+#[test]
+fn test_client_hup_during_request() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "Client HUP during in-flight request (mux close cleanup)",
+            try_client_hup_during_request,
+        ),
+        State::Success,
+    );
+}
+
+// =========================================================================
+// Test 2: WebSocket upgrade via 101 Switching Protocols
+// =========================================================================
+
+fn try_websocket_upgrade() -> State {
+    let front_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, mut backends) = setup_sync_test(
+        "WS-UPGRADE",
+        config,
+        listeners,
+        state,
+        front_address,
+        1,
+        false,
+    );
+    let mut backend = backends.pop().unwrap();
+    backend.set_response(
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+    );
+    backend.connect();
+
+    let mut client = Client::new(
+        "ws-client",
+        front_address,
+        "GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+    );
+    client.connect();
+    client.send();
+    backend.accept(0);
+    backend.receive(0);
+    backend.send(0);
+
+    let response = match client.receive() {
+        Some(r) => r,
+        None => return State::Fail,
+    };
+    if !response.contains("101") {
+        return State::Fail;
+    }
+
+    thread::sleep(Duration::from_millis(100));
+
+    // Post-upgrade: raw bidirectional data through the pipe
+    client.set_request("hello from client");
+    client.send();
+    thread::sleep(Duration::from_millis(50));
+    match backend.receive(0) {
+        Some(data) if data.contains("hello from client") => {}
+        _ => return State::Fail,
+    }
+
+    backend.set_response("hello from backend");
+    backend.send(0);
+    thread::sleep(Duration::from_millis(50));
+    match client.receive() {
+        Some(data) if data.contains("hello from backend") => {}
+        _ => return State::Fail,
+    }
+
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+    State::Success
+}
+
+#[test]
+fn test_websocket_upgrade() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "WebSocket upgrade via 101 (gauge correctness)",
+            try_websocket_upgrade,
+        ),
+        State::Success,
+    );
+}
+
+// =========================================================================
+// Test 3: Rapid connect-disconnect without proxy protocol
+// =========================================================================
+
+fn try_rapid_connect_disconnect() -> State {
+    let front_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, mut backends) = setup_sync_test(
+        "RAPID-HUP",
+        config,
+        listeners,
+        state,
+        front_address,
+        1,
+        false,
+    );
+    let mut backend = backends.pop().unwrap();
+    backend.connect();
+
+    for i in 0..50 {
+        let mut ephemeral = Client::new(format!("ephemeral-{i}"), front_address, "");
+        ephemeral.connect();
+        ephemeral.disconnect();
+    }
+
+    thread::sleep(Duration::from_millis(500));
+
+    let mut client = Client::new(
+        "real-client",
+        front_address,
+        "GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    client.connect();
+    client.send();
+    backend.accept(0);
+    backend.receive(0);
+    backend.send(0);
+
+    match client.receive() {
+        Some(response) if response.contains("200") => {}
+        _ => return State::Fail,
+    }
+
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+    State::Success
+}
+
+#[test]
+fn test_rapid_connect_disconnect() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "Rapid connect-disconnect cycles (no proxy protocol)",
+            try_rapid_connect_disconnect,
+        ),
+        State::Success,
+    );
+}
+
+// =========================================================================
+// Test 4: Keep-alive requests then client HUP mid-request
+// =========================================================================
+
+fn try_keepalive_then_hup() -> State {
+    let front_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, mut backends) = setup_sync_test(
+        "KA-HUP",
+        config,
+        listeners,
+        state,
+        front_address,
+        1,
+        false,
+    );
+    let mut backend = backends.pop().unwrap();
+    backend.set_response(
+        "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\npong",
+    );
+    backend.connect();
+
+    let mut client = Client::new(
+        "ka-client",
+        front_address,
+        "GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n",
+    );
+    client.connect();
+
+    // Complete 3 keep-alive cycles (metrics.reset() → start=None after each)
+    for i in 0..3 {
+        client.send();
+        if i == 0 {
+            backend.accept(0);
+        }
+        backend.receive(0);
+        backend.send(0);
+        match client.receive() {
+            Some(response) if response.contains("200") => {}
+            _ => return State::Fail,
+        }
+    }
+
+    // 4th request: HUP before response. close() must only log this one.
+    client.send();
+    backend.receive(0);
+    client.disconnect();
+    thread::sleep(Duration::from_millis(100));
+    backend.send(0);
+    thread::sleep(Duration::from_millis(100));
+
+    // Verify sozu is still functional
+    let mut client2 = Client::new(
+        "verify-client",
+        front_address,
+        "GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    client2.connect();
+    client2.send();
+    backend.accept(1);
+    backend.receive(1);
+    backend.send(1);
+
+    match client2.receive() {
+        Some(response) if response.contains("200") => {}
+        _ => return State::Fail,
+    }
+
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+    State::Success
+}
+
+#[test]
+fn test_keepalive_then_hup() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "Keep-alive requests then client HUP (no double access log)",
+            try_keepalive_then_hup,
+        ),
+        State::Success,
+    );
+}
+
+// =========================================================================
+// Test 5: Concurrent clients with staggered HUPs
+// =========================================================================
+
+fn try_concurrent_hup() -> State {
+    let front_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, mut backends) = setup_sync_test(
+        "CONC-HUP",
+        config,
+        listeners,
+        state,
+        front_address,
+        1,
+        false,
+    );
+    let mut backend = backends.pop().unwrap();
+    backend.connect();
+
+    // Client A: completes normally
+    let mut client_a = Client::new(
+        "client-A",
+        front_address,
+        "GET /a HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    client_a.connect();
+    client_a.send();
+    backend.accept(0);
+    backend.receive(0);
+    backend.send(0);
+    if client_a.receive().is_none() {
+        return State::Fail;
+    }
+
+    // Client B: HUP mid-flight
+    let mut client_b = Client::new(
+        "client-B",
+        front_address,
+        "GET /b HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    client_b.connect();
+    client_b.send();
+    backend.accept(1);
+    backend.receive(1);
+    client_b.disconnect();
+    thread::sleep(Duration::from_millis(100));
+    backend.send(1);
+    thread::sleep(Duration::from_millis(50));
+
+    // Client C: completes normally
+    let mut client_c = Client::new(
+        "client-C",
+        front_address,
+        "GET /c HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    client_c.connect();
+    client_c.send();
+    backend.accept(2);
+    backend.receive(2);
+    backend.send(2);
+    match client_c.receive() {
+        Some(r) if r.contains("200") => {}
+        _ => return State::Fail,
+    }
+
+    // Client D: HUP mid-flight
+    let mut client_d = Client::new(
+        "client-D",
+        front_address,
+        "GET /d HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    client_d.connect();
+    client_d.send();
+    backend.accept(3);
+    backend.receive(3);
+    client_d.disconnect();
+    thread::sleep(Duration::from_millis(100));
+    backend.send(3);
+    thread::sleep(Duration::from_millis(50));
+
+    // Client E: final validation
+    let mut client_e = Client::new(
+        "client-E",
+        front_address,
+        "GET /e HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    client_e.connect();
+    client_e.send();
+    backend.accept(4);
+    backend.receive(4);
+    backend.send(4);
+    match client_e.receive() {
+        Some(r) if r.contains("200") => {}
+        _ => return State::Fail,
+    }
+
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+    State::Success
+}
+
+#[test]
+fn test_concurrent_hup() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "Concurrent clients with staggered HUPs (mixed cleanup paths)",
+            try_concurrent_hup,
+        ),
+        State::Success,
+    );
+}
+
+// =========================================================================
+// Test 6: Proxy protocol PROXY + HTTP request (normal flow)
+//
+// Validates that the full proxy protocol → Expect → Mux → request → response
+// path works correctly with the new service_start/service_stop bracketing.
+// =========================================================================
+
+fn try_proxy_protocol_request() -> State {
+    let (mut worker, backend_addrs, front_address) =
+        setup_proxy_protocol_test("PP-REQ", 1);
+
+    let mut backend = SyncBackend::new(
+        "BACKEND_0",
+        backend_addrs[0],
+        http_ok_response("pp-pong"),
+    );
+    backend.connect();
+
+    // Send proxy protocol V2 PROXY header + HTTP request on raw TCP
+    let pp_header = pp_v2_proxy_ipv4(12345, front_address.port());
+    let http_req = b"GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+
+    let mut stream = raw_connect(front_address);
+    stream.write_all(&pp_header).expect("write pp header");
+    stream.write_all(http_req).expect("write http request");
+
+    backend.accept(0);
+    backend.receive(0);
+    backend.send(0);
+
+    match raw_read(&mut stream) {
+        Some(response) if response.contains("200") => {
+            println!("PP-REQ response: {response}");
+        }
+        other => {
+            println!("PP-REQ unexpected response: {other:?}");
+            worker.soft_stop();
+            worker.wait_for_server_stop();
+            return State::Fail;
+        }
+    }
+
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+    State::Success
+}
+
+#[test]
+fn test_proxy_protocol_request() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "Proxy protocol V2 PROXY + HTTP request (normal flow)",
+            try_proxy_protocol_request,
+        ),
+        State::Success,
+    );
+}
+
+// =========================================================================
+// Test 7: Proxy protocol PROXY + HTTP request + client HUP
+//
+// Exercises Mux::close() stream cleanup behind proxy protocol.
+// The session transitions Expect → Mux, starts an HTTP request, then the
+// client HUPs before receiving a response. close() must generate access logs.
+// =========================================================================
+
+fn try_proxy_protocol_hup() -> State {
+    let (mut worker, backend_addrs, front_address) =
+        setup_proxy_protocol_test("PP-HUP", 1);
+
+    let mut backend = SyncBackend::new(
+        "BACKEND_0",
+        backend_addrs[0],
+        http_ok_response("pp-pong"),
+    );
+    backend.connect();
+
+    // Send PP header + HTTP request, then disconnect before response
+    let pp_header = pp_v2_proxy_ipv4(12345, front_address.port());
+    let http_req = b"GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+
+    let mut stream = raw_connect(front_address);
+    stream.write_all(&pp_header).expect("write pp header");
+    stream.write_all(http_req).expect("write http request");
+
+    backend.accept(0);
+    backend.receive(0);
+
+    // HUP before response
+    drop(stream);
+    thread::sleep(Duration::from_millis(100));
+    backend.send(0);
+    thread::sleep(Duration::from_millis(100));
+
+    // Verify sozu still works with a second request
+    let mut stream2 = raw_connect(front_address);
+    let pp_header2 = pp_v2_proxy_ipv4(12346, front_address.port());
+    stream2.write_all(&pp_header2).expect("write pp header 2");
+    stream2
+        .write_all(b"GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .expect("write http request 2");
+
+    backend.accept(1);
+    backend.receive(1);
+    backend.send(1);
+
+    match raw_read(&mut stream2) {
+        Some(response) if response.contains("200") => {}
+        _ => {
+            worker.soft_stop();
+            worker.wait_for_server_stop();
+            return State::Fail;
+        }
+    }
+
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+    State::Success
+}
+
+#[test]
+fn test_proxy_protocol_hup() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "Proxy protocol V2 PROXY + HTTP request + client HUP",
+            try_proxy_protocol_hup,
+        ),
+        State::Success,
+    );
+}
+
+// =========================================================================
+// Test 8: Proxy protocol LOCAL + IPv4 healthcheck then disconnect
+//
+// Simulates HAProxy healthcheck with LOCAL command (IPv4 family, 28 bytes).
+// Sozu parses the header, transitions Expect → Mux (with valid addresses),
+// but the client disconnects immediately — no HTTP request is ever sent.
+// Validates Mux::close() handles sessions with no active streams.
+// =========================================================================
+
+fn try_proxy_protocol_local_healthcheck() -> State {
+    let (mut worker, backend_addrs, front_address) =
+        setup_proxy_protocol_test("PP-LOCAL", 1);
+
+    let mut backend = SyncBackend::new(
+        "BACKEND_0",
+        backend_addrs[0],
+        http_ok_response("pp-pong"),
+    );
+    backend.connect();
+
+    // Send LOCAL header and disconnect immediately (healthcheck pattern)
+    let local_header = pp_v2_local_ipv4();
+    let mut stream = raw_connect(front_address);
+    stream.write_all(&local_header).expect("write LOCAL header");
+    drop(stream);
+    thread::sleep(Duration::from_millis(100));
+
+    // Verify sozu is still healthy with a real request
+    let pp_header = pp_v2_proxy_ipv4(12345, front_address.port());
+    let mut stream2 = raw_connect(front_address);
+    stream2.write_all(&pp_header).expect("write pp header");
+    stream2
+        .write_all(b"GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .expect("write http request");
+
+    backend.accept(0);
+    backend.receive(0);
+    backend.send(0);
+
+    match raw_read(&mut stream2) {
+        Some(response) if response.contains("200") => {}
+        _ => {
+            worker.soft_stop();
+            worker.wait_for_server_stop();
+            return State::Fail;
+        }
+    }
+
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+    State::Success
+}
+
+#[test]
+fn test_proxy_protocol_local_healthcheck() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "Proxy protocol LOCAL + IPv4 healthcheck then disconnect",
+            try_proxy_protocol_local_healthcheck,
+        ),
+        State::Success,
+    );
+}
+
+// =========================================================================
+// Test 9: Proxy protocol AF_UNSPEC healthcheck then disconnect
+//
+// Simulates the most minimal HAProxy healthcheck: LOCAL + AF_UNSPEC (16 bytes).
+// Sozu's ExpectProxyProtocol reads 28 bytes minimum (V4), so this header is
+// incomplete — sozu waits for more data, then sees the connection close.
+// Session closes in Expect state without ever reaching Mux.
+// =========================================================================
+
+fn try_proxy_protocol_af_unspec_healthcheck() -> State {
+    let (mut worker, backend_addrs, front_address) =
+        setup_proxy_protocol_test("PP-UNSPEC", 1);
+
+    let mut backend = SyncBackend::new(
+        "BACKEND_0",
+        backend_addrs[0],
+        http_ok_response("pp-pong"),
+    );
+    backend.connect();
+
+    // Send 16-byte AF_UNSPEC header and disconnect
+    let unspec_header = pp_v2_local_af_unspec();
+    let mut stream = raw_connect(front_address);
+    stream
+        .write_all(&unspec_header)
+        .expect("write AF_UNSPEC header");
+    drop(stream);
+    thread::sleep(Duration::from_millis(100));
+
+    // Verify sozu is still healthy
+    let pp_header = pp_v2_proxy_ipv4(12345, front_address.port());
+    let mut stream2 = raw_connect(front_address);
+    stream2.write_all(&pp_header).expect("write pp header");
+    stream2
+        .write_all(b"GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .expect("write http request");
+
+    backend.accept(0);
+    backend.receive(0);
+    backend.send(0);
+
+    match raw_read(&mut stream2) {
+        Some(response) if response.contains("200") => {}
+        _ => {
+            worker.soft_stop();
+            worker.wait_for_server_stop();
+            return State::Fail;
+        }
+    }
+
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+    State::Success
+}
+
+#[test]
+fn test_proxy_protocol_af_unspec_healthcheck() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "Proxy protocol AF_UNSPEC healthcheck then disconnect",
+            try_proxy_protocol_af_unspec_healthcheck,
+        ),
+        State::Success,
+    );
+}
+
+// =========================================================================
+// Test 10: Rapid proxy protocol healthchecks (HAProxy pattern at ~10ms)
+//
+// Simulates HAProxy sending healthchecks every ~10ms with proxy protocol.
+// Mix of LOCAL+IPv4 (28-byte, parseable) and AF_UNSPEC (16-byte, incomplete)
+// headers followed by immediate disconnect. Validates sozu doesn't leak
+// resources under sustained healthcheck traffic.
+// =========================================================================
+
+fn try_rapid_proxy_protocol_healthchecks() -> State {
+    let (mut worker, backend_addrs, front_address) =
+        setup_proxy_protocol_test("PP-RAPID", 1);
+
+    let mut backend = SyncBackend::new(
+        "BACKEND_0",
+        backend_addrs[0],
+        http_ok_response("pp-pong"),
+    );
+    backend.connect();
+
+    // 100 rapid healthchecks alternating between LOCAL+IPv4 and AF_UNSPEC
+    for i in 0..100 {
+        let mut stream = raw_connect(front_address);
+        if i % 2 == 0 {
+            // LOCAL+IPv4 (28 bytes — sozu can parse this)
+            let _ = stream.write_all(&pp_v2_local_ipv4());
+        } else {
+            // AF_UNSPEC (16 bytes — incomplete for sozu)
+            let _ = stream.write_all(&pp_v2_local_af_unspec());
+        }
+        drop(stream);
+        // ~10ms between healthchecks (like real HAProxy)
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    // Let sozu drain all the closed sessions
+    thread::sleep(Duration::from_millis(500));
+
+    // Verify sozu is still healthy with a real proxied request
+    let pp_header = pp_v2_proxy_ipv4(54321, front_address.port());
+    let mut stream = raw_connect(front_address);
+    stream.write_all(&pp_header).expect("write pp header");
+    stream
+        .write_all(b"GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .expect("write http request");
+
+    backend.accept(0);
+    backend.receive(0);
+    backend.send(0);
+
+    match raw_read(&mut stream) {
+        Some(response) if response.contains("200") => {
+            println!("post-healthcheck-storm response OK");
+        }
+        _ => {
+            worker.soft_stop();
+            worker.wait_for_server_stop();
+            return State::Fail;
+        }
+    }
+
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+    State::Success
+}
+
+#[test]
+fn test_rapid_proxy_protocol_healthchecks() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "Rapid proxy protocol healthchecks (~10ms interval, 100 cycles)",
+            try_rapid_proxy_protocol_healthchecks,
+        ),
+        State::Success,
+    );
+}
+
+// =========================================================================
+// Test 11: Partial proxy protocol header then disconnect
+//
+// Client sends only the 12-byte magic signature (incomplete V2 header),
+// then disconnects. Validates ExpectProxyProtocol state cleanup when the
+// header is truncated — sozu must not crash or leak.
+// =========================================================================
+
+fn try_proxy_protocol_partial_header() -> State {
+    let (mut worker, backend_addrs, front_address) =
+        setup_proxy_protocol_test("PP-PARTIAL", 1);
+
+    let mut backend = SyncBackend::new(
+        "BACKEND_0",
+        backend_addrs[0],
+        http_ok_response("pp-pong"),
+    );
+    backend.connect();
+
+    // Send only the 12-byte magic (incomplete header)
+    let partial = &[
+        0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A,
+    ];
+    let mut stream = raw_connect(front_address);
+    stream.write_all(partial).expect("write partial header");
+    drop(stream);
+    thread::sleep(Duration::from_millis(100));
+
+    // Verify sozu still works
+    let pp_header = pp_v2_proxy_ipv4(12345, front_address.port());
+    let mut stream2 = raw_connect(front_address);
+    stream2.write_all(&pp_header).expect("write pp header");
+    stream2
+        .write_all(b"GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .expect("write http request");
+
+    backend.accept(0);
+    backend.receive(0);
+    backend.send(0);
+
+    match raw_read(&mut stream2) {
+        Some(response) if response.contains("200") => {}
+        _ => {
+            worker.soft_stop();
+            worker.wait_for_server_stop();
+            return State::Fail;
+        }
+    }
+
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+    State::Success
+}
+
+#[test]
+fn test_proxy_protocol_partial_header() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "Partial proxy protocol header then disconnect",
+            try_proxy_protocol_partial_header,
+        ),
+        State::Success,
+    );
+}
+
+// =========================================================================
+// Test 12: Proxy protocol + WebSocket upgrade
+//
+// Full path: PP PROXY → Expect → Mux → WebSocket upgrade → pipe mode.
+// Validates gauge correctness when proxy protocol and WebSocket upgrade
+// are combined — the most complex state machine path.
+// =========================================================================
+
+fn try_proxy_protocol_websocket_upgrade() -> State {
+    let (mut worker, backend_addrs, front_address) =
+        setup_proxy_protocol_test("PP-WS", 1);
+
+    let mut backend = SyncBackend::new(
+        "BACKEND_0",
+        backend_addrs[0],
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+    );
+    backend.connect();
+
+    // Send PP header + WebSocket upgrade request
+    let pp_header = pp_v2_proxy_ipv4(12345, front_address.port());
+    let ws_req = b"GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+
+    let mut stream = raw_connect(front_address);
+    stream.write_all(&pp_header).expect("write pp header");
+    stream.write_all(ws_req).expect("write ws upgrade request");
+
+    backend.accept(0);
+    backend.receive(0);
+    backend.send(0);
+
+    // Should receive 101 Switching Protocols
+    match raw_read(&mut stream) {
+        Some(response) if response.contains("101") => {
+            println!("PP-WS upgrade response: {response}");
+        }
+        other => {
+            println!("PP-WS unexpected response: {other:?}");
+            worker.soft_stop();
+            worker.wait_for_server_stop();
+            return State::Fail;
+        }
+    }
+
+    thread::sleep(Duration::from_millis(100));
+
+    // Post-upgrade bidirectional data
+    stream
+        .write_all(b"ws-ping")
+        .expect("write post-upgrade data");
+    thread::sleep(Duration::from_millis(50));
+    match backend.receive(0) {
+        Some(data) if data.contains("ws-ping") => {}
+        _ => {
+            worker.soft_stop();
+            worker.wait_for_server_stop();
+            return State::Fail;
+        }
+    }
+
+    backend.set_response("ws-pong");
+    backend.send(0);
+    thread::sleep(Duration::from_millis(50));
+    match raw_read(&mut stream) {
+        Some(data) if data.contains("ws-pong") => {}
+        _ => {
+            worker.soft_stop();
+            worker.wait_for_server_stop();
+            return State::Fail;
+        }
+    }
+
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+    State::Success
+}
+
+#[test]
+fn test_proxy_protocol_websocket_upgrade() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "Proxy protocol V2 + WebSocket upgrade (full state machine path)",
+            try_proxy_protocol_websocket_upgrade,
+        ),
+        State::Success,
+    );
+}
+
+// =========================================================================
+// Test 13: Proxy protocol + keep-alive + HUP mid-request
+//
+// Full path: PP PROXY → Expect → Mux → 3 keep-alive requests → HUP on 4th.
+// Exercises the start.is_some() guard in close() behind proxy protocol.
+// =========================================================================
+
+fn try_proxy_protocol_keepalive_hup() -> State {
+    let (mut worker, backend_addrs, front_address) =
+        setup_proxy_protocol_test("PP-KA-HUP", 1);
+
+    let mut backend = SyncBackend::new(
+        "BACKEND_0",
+        backend_addrs[0],
+        "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\npong",
+    );
+    backend.connect();
+
+    // PP header + first request
+    let pp_header = pp_v2_proxy_ipv4(12345, front_address.port());
+    let http_req = b"GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n";
+
+    let mut stream = raw_connect(front_address);
+    stream.write_all(&pp_header).expect("write pp header");
+    stream.write_all(http_req).expect("write request 1");
+
+    backend.accept(0);
+    backend.receive(0);
+    backend.send(0);
+    match raw_read(&mut stream) {
+        Some(r) if r.contains("200") => {}
+        _ => {
+            worker.soft_stop();
+            worker.wait_for_server_stop();
+            return State::Fail;
+        }
+    }
+
+    // 2 more keep-alive requests on the same connection
+    for _ in 0..2 {
+        stream.write_all(http_req).expect("write keep-alive request");
+        backend.receive(0);
+        backend.send(0);
+        match raw_read(&mut stream) {
+            Some(r) if r.contains("200") => {}
+            _ => {
+                worker.soft_stop();
+                worker.wait_for_server_stop();
+                return State::Fail;
+            }
+        }
+    }
+
+    // 4th request: HUP before response
+    stream.write_all(http_req).expect("write request 4");
+    backend.receive(0);
+    drop(stream);
+    thread::sleep(Duration::from_millis(100));
+    backend.send(0);
+    thread::sleep(Duration::from_millis(100));
+
+    // Verify sozu still works
+    let pp_header2 = pp_v2_proxy_ipv4(12346, front_address.port());
+    let mut stream2 = raw_connect(front_address);
+    stream2.write_all(&pp_header2).expect("write pp header 2");
+    stream2
+        .write_all(b"GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .expect("write verification request");
+
+    backend.accept(1);
+    backend.receive(1);
+    backend.send(1);
+
+    match raw_read(&mut stream2) {
+        Some(r) if r.contains("200") => {}
+        _ => {
+            worker.soft_stop();
+            worker.wait_for_server_stop();
+            return State::Fail;
+        }
+    }
+
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+    State::Success
+}
+
+#[test]
+fn test_proxy_protocol_keepalive_hup() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "Proxy protocol + keep-alive + HUP mid-request",
+            try_proxy_protocol_keepalive_hup,
+        ),
+        State::Success,
+    );
+}
+
+// =========================================================================
+// Test 14: Mixed proxy protocol healthchecks and real traffic
+//
+// Simulates production conditions: concurrent healthcheck probes interleaved
+// with legitimate proxied HTTP requests. Validates sozu handles the mixture
+// without leaking sessions or corrupting state.
+// =========================================================================
+
+fn try_proxy_protocol_mixed_traffic() -> State {
+    let (mut worker, backend_addrs, front_address) =
+        setup_proxy_protocol_test("PP-MIXED", 1);
+
+    let mut backend = SyncBackend::new(
+        "BACKEND_0",
+        backend_addrs[0],
+        http_ok_response("pp-pong"),
+    );
+    backend.connect();
+
+    let mut backend_client_id = 0;
+
+    for round in 0..5 {
+        // Burst of 10 healthchecks
+        for _ in 0..10 {
+            let mut stream = raw_connect(front_address);
+            let _ = stream.write_all(&pp_v2_local_ipv4());
+            drop(stream);
+        }
+        thread::sleep(Duration::from_millis(50));
+
+        // Real request
+        let pp_header = pp_v2_proxy_ipv4(30000 + round, front_address.port());
+        let mut stream = raw_connect(front_address);
+        stream.write_all(&pp_header).expect("write pp header");
+        stream
+            .write_all(b"GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .expect("write http request");
+
+        backend.accept(backend_client_id);
+        backend.receive(backend_client_id);
+        backend.send(backend_client_id);
+        backend_client_id += 1;
+
+        match raw_read(&mut stream) {
+            Some(response) if response.contains("200") => {
+                println!("round {round}: request OK");
+            }
+            _ => {
+                worker.soft_stop();
+                worker.wait_for_server_stop();
+                return State::Fail;
+            }
+        }
+    }
+
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+    State::Success
+}
+
+#[test]
+fn test_proxy_protocol_mixed_traffic() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "Mixed proxy protocol healthchecks and real traffic",
+            try_proxy_protocol_mixed_traffic,
+        ),
+        State::Success,
+    );
+}
