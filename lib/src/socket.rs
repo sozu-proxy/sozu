@@ -173,6 +173,14 @@ pub struct FrontRustls {
     pub session: ServerConnection,
 }
 
+impl std::fmt::Debug for FrontRustls {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FrontRustls")
+            .field("stream", &self.stream)
+            .finish_non_exhaustive()
+    }
+}
+
 impl SocketHandler for FrontRustls {
     fn socket_read(&mut self, buf: &mut [u8]) -> (usize, SocketResult) {
         let mut size = 0usize;
@@ -262,6 +270,12 @@ impl SocketHandler for FrontRustls {
             (size, SocketResult::Error)
         } else if is_closed {
             (size, SocketResult::Closed)
+        } else if size == buf.len() {
+            // The full requested amount was read (possibly from the rustls
+            // plaintext buffer). Report Continue so the caller keeps
+            // READABLE in the readiness set — there may be more decrypted
+            // data available without a new mio event.
+            (size, SocketResult::Continue)
         } else if !can_read {
             (size, SocketResult::WouldBlock)
         } else {

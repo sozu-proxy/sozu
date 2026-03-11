@@ -65,17 +65,51 @@ impl ServerCertVerifier for Verifier {
 
 pub type HttpsClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, String>;
 
-/// Build a Hyper HTTP Client that supports TLS and self signed certificates
-pub fn build_https_client() -> HttpsClient {
-    let config = ClientConfig::builder()
+fn insecure_tls_config() -> ClientConfig {
+    ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(Verifier))
-        .with_no_client_auth();
+        .with_no_client_auth()
+}
+
+/// Build a Hyper HTTP Client that supports TLS and self signed certificates
+pub fn build_https_client() -> HttpsClient {
+    let config = insecure_tls_config();
 
     let https = HttpsConnectorBuilder::new()
         .with_tls_config(config)
         .https_or_http()
         .enable_http1()
+        .build();
+
+    Client::builder(TokioExecutor::new()).build(https)
+}
+
+/// Build a Hyper HTTP Client that negotiates H2 via ALPN over TLS.
+/// The connector advertises only "h2" in ALPN and the client is forced to HTTP/2.
+pub fn build_h2_client() -> HttpsClient {
+    let config = insecure_tls_config();
+
+    let https = HttpsConnectorBuilder::new()
+        .with_tls_config(config)
+        .https_or_http()
+        .enable_http2()
+        .build();
+
+    Client::builder(TokioExecutor::new())
+        .http2_only(true)
+        .build(https)
+}
+
+/// Build a Hyper HTTP Client that advertises both h2 and http/1.1 via ALPN,
+/// letting the server choose the protocol.
+pub fn build_h2_or_h1_client() -> HttpsClient {
+    let config = insecure_tls_config();
+
+    let https = HttpsConnectorBuilder::new()
+        .with_tls_config(config)
+        .https_or_http()
+        .enable_all_versions()
         .build();
 
     Client::builder(TokioExecutor::new()).build(https)
@@ -95,13 +129,85 @@ pub fn resolve_request(client: &HttpsClient, uri: hyper::Uri) -> Option<(StatusC
         };
         println!("Response: {response:?}");
         let status = response.status();
-        let body_bytes = response
-            .into_body()
-            .collect()
-            .await
-            .expect("Could not get body")
-            .to_bytes();
+        let body_bytes = match response.into_body().collect().await {
+            Ok(collected) => collected.to_bytes(),
+            Err(error) => {
+                println!("Could not get body: {error}");
+                return Some((status, String::new()));
+            }
+        };
         let body = String::from_utf8(body_bytes.to_vec()).expect("Invalid UTF-8 body");
         Some((status, body))
+    })
+}
+
+/// Sends a POST request with the given body, returns status code and response body
+pub fn resolve_post_request(
+    client: &HttpsClient,
+    uri: hyper::Uri,
+    body: String,
+) -> Option<(StatusCode, String)> {
+    let rt = tokio::runtime::Runtime::new().expect("Could not create Runtime");
+    rt.block_on(async {
+        let request = hyper::Request::builder()
+            .method(hyper::Method::POST)
+            .uri(uri)
+            .header("content-type", "application/octet-stream")
+            .body(body)
+            .expect("Could not build request");
+        let response = match client.request(request).await {
+            Ok(response) => response,
+            Err(error) => {
+                println!("Could not get response: {error}");
+                return None;
+            }
+        };
+        println!("Response: {response:?}");
+        let status = response.status();
+        let body_bytes = match response.into_body().collect().await {
+            Ok(collected) => collected.to_bytes(),
+            Err(error) => {
+                println!("Could not get body: {error}");
+                return Some((status, String::new()));
+            }
+        };
+        let body = String::from_utf8(body_bytes.to_vec()).expect("Invalid UTF-8 body");
+        Some((status, body))
+    })
+}
+
+/// Sends multiple concurrent GET requests over a single H2 connection
+pub fn resolve_concurrent_requests(
+    client: &HttpsClient,
+    uris: Vec<hyper::Uri>,
+) -> Vec<Option<(StatusCode, String)>> {
+    let rt = tokio::runtime::Runtime::new().expect("Could not create Runtime");
+    rt.block_on(async {
+        let futures: Vec<_> = uris
+            .into_iter()
+            .map(|uri| {
+                let client = client.clone();
+                async move {
+                    let response = match client.get(uri).await {
+                        Ok(response) => response,
+                        Err(error) => {
+                            println!("Could not get response: {error}");
+                            return None;
+                        }
+                    };
+                    let status = response.status();
+                    let body_bytes = match response.into_body().collect().await {
+                        Ok(collected) => collected.to_bytes(),
+                        Err(error) => {
+                            println!("Could not get body: {error}");
+                            return Some((status, String::new()));
+                        }
+                    };
+                    let body = String::from_utf8(body_bytes.to_vec()).expect("Invalid UTF-8 body");
+                    Some((status, body))
+                }
+            })
+            .collect();
+        futures::future::join_all(futures).await
     })
 }

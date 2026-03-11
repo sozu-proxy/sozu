@@ -31,7 +31,7 @@ Parameters in the global section allow you to define the global settings shared 
 | `max_connections`          | maximum number of simultaneous / opened connections                                 |                                          |
 | `max_buffers`              | maximum number of buffers use to proxying                                           |                                          |
 | `min_buffers`              | minimum number of buffers preallocated for proxying                                 |                                          |
-| `buffer_size`              | size, in bytes, of requests buffer use by the workers                               |                                          |
+| `buffer_size`              | size, in bytes, of requests buffer used by the workers. Must be at least 16393 for HTTP/2 (16384 max frame size + 9 byte frame header) |                                          |
 | `ctl_command_timeout`      | maximum time the command line will wait for a command to complete                            |                                          |
 | `pid_file_path`            | stores the pid in a specific file location                                          |                                          |
 | `front_timeout`            | maximum time of inactivity for a front socket                                       |                                          |
@@ -172,12 +172,52 @@ cipher_list = [
 ]
 ```
 
+#### HTTP/2 support and ALPN protocols
+
+HTTP/2 is available on HTTPS listeners through ALPN (Application-Layer Protocol
+Negotiation). During the TLS handshake, Sōzu advertises protocols from the `alpn_protocols`
+list. The server selects the first protocol from its list that the client also supports.
+
+By default, Sōzu advertises both `h2` and `http/1.1`, preferring HTTP/2:
+
+```toml
+# Default: both protocols, H2 preferred
+alpn_protocols = ["h2", "http/1.1"]
+```
+
+| Value | Protocol | Notes |
+|-------|----------|-------|
+| `h2` | HTTP/2 | Multiplexed, binary framing (RFC 9113) |
+| `http/1.1` | HTTP/1.1 | Traditional text-based protocol (RFC 9112) |
+
+Invalid values are rejected at configuration load time. Order matters: the first entry
+is the most preferred protocol.
+
+**Examples:**
+
+```toml
+# HTTP/1.1 only — disables HTTP/2 on this listener
+alpn_protocols = ["http/1.1"]
+
+# HTTP/2 only — clients without H2 support will fail TLS negotiation
+alpn_protocols = ["h2"]
+
+# Prefer HTTP/1.1 over HTTP/2
+alpn_protocols = ["http/1.1", "h2"]
+```
+
+When `alpn_protocols` is omitted or empty, the default `["h2", "http/1.1"]` is used.
+Clients that do not send an ALPN extension default to HTTP/1.1.
+
+> **Note:** HTTP/2 is only supported over TLS (HTTPS listeners). Plain HTTP listeners
+> always use HTTP/1.1.
+
 ### Clusters
 
 You can declare the list of your _clusters_ under the `[clusters]` section.
 They follow the format:
 
-_Mandatories parameters:_
+_Mandatory parameters:_
 
 ```toml
 [clusters]
@@ -205,6 +245,59 @@ backends  = [
 ]
 ```
 
+#### HTTP/2 backend connections (h2c)
+
+By default, Sōzu speaks HTTP/1.1 to backend servers. You can enable cleartext HTTP/2 (h2c)
+for backend connections on a per-cluster basis using the `http2` option:
+
+```toml
+[clusters.MyH2Cluster]
+protocol = "http"
+http2 = true
+
+frontends = [
+  { address = "0.0.0.0:8443", hostname = "app.example.com", certificate = "cert.pem", key = "key.pem", certificate_chain = "chain.pem" }
+]
+backends = [
+  { address = "127.0.0.1:8080" }
+]
+```
+
+When `http2 = true`, Sōzu opens cleartext HTTP/2 connections to the backend servers.
+This is useful when your backends natively support HTTP/2 (e.g., gRPC servers).
+
+You can also toggle HTTP/2 at runtime on an existing cluster via the CLI:
+
+```bash
+sozu cluster h2 enable --id MyH2Cluster
+sozu cluster h2 disable --id MyH2Cluster
+```
+
+The frontend and backend protocols are independent. All four combinations work:
+
+| Client → Sōzu | Sōzu → Backend | Configuration |
+|----------------|-----------------|---------------|
+| HTTP/1.1       | HTTP/1.1        | Default (no `http2` flag) |
+| HTTP/2         | HTTP/1.1        | Client negotiates H2 via ALPN, default backend |
+| HTTP/1.1       | HTTP/2          | `http2 = true` on cluster |
+| HTTP/2         | HTTP/2          | Client negotiates H2 via ALPN + `http2 = true` |
+
+> **Note:** The `http2` option controls the backend protocol only. The frontend protocol
+> is determined by TLS ALPN negotiation between the client and Sōzu.
+
+#### Buffer size for HTTP/2
+
+HTTP/2 uses a default maximum frame size of 16384 bytes (16 KiB). Sōzu needs at least
+9 additional bytes for the frame header. Set `buffer_size` in the global section to at
+least **16393**:
+
+```toml
+buffer_size = 16393
+```
+
+A smaller buffer size will cause HTTP/2 frames to be rejected by peers that expect the
+default maximum frame size.
+
 ## Metrics
 
 Sōzu reports its own state to another network component through a `UDP` socket.
@@ -226,6 +319,94 @@ address = "127.0.0.1:8125"
 ```
 
 Currently, we can't change the frequency of sending messages.
+
+### Available metrics
+
+Sōzu emits the following metrics via statsd. All metrics are emitted by both HTTP/1.1
+and HTTP/2 code paths unless noted otherwise.
+
+#### Request lifecycle
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `http.requests` | counter | Total HTTP requests received (incremented when headers are fully parsed) |
+| `http.active_requests` | gauge | Currently in-flight requests |
+| `http.e2e.http11` | counter | Completed HTTP/1.1 request/response cycles (mux path) |
+| `http.e2e.h2` | counter | Completed HTTP/2 request/response cycles |
+| `http.errors` | counter | General HTTP processing errors |
+
+#### Byte counters
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `bytes_in` | counter | Bytes received from frontend clients |
+| `bytes_out` | counter | Bytes sent to frontend clients |
+| `back_bytes_in` | counter | Bytes received from backend servers |
+| `back_bytes_out` | counter | Bytes sent to backend servers |
+
+#### Parse errors
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `http.frontend_parse_errors` | counter | Frontend request parsing failures (malformed HTTP/1.1 or HPACK decode errors in HTTP/2) |
+| `http.backend_parse_errors` | counter | Backend response parsing failures |
+
+#### Default answer / error responses
+
+These are incremented when Sōzu generates a default error response:
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `http.301.redirection` | counter | 301 Moved Permanently (HTTP→HTTPS redirect) |
+| `http.400.errors` | counter | 400 Bad Request |
+| `http.401.errors` | counter | 401 Unauthorized |
+| `http.404.errors` | counter | 404 Not Found (no matching cluster) |
+| `http.408.errors` | counter | 408 Request Timeout |
+| `http.413.errors` | counter | 413 Payload Too Large |
+| `http.502.errors` | counter | 502 Bad Gateway |
+| `http.503.errors` | counter | 503 Service Unavailable (no backends) |
+| `http.504.errors` | counter | 504 Gateway Timeout |
+| `http.507.errors` | counter | 507 Insufficient Storage (buffer full) |
+
+#### Response status classes
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `http.status.1xx` | counter | 1xx informational responses |
+| `http.status.2xx` | counter | 2xx success responses |
+| `http.status.3xx` | counter | 3xx redirection responses |
+| `http.status.4xx` | counter | 4xx client error responses |
+| `http.status.5xx` | counter | 5xx server error responses |
+| `http.status.other` | counter | Non-standard status codes |
+| `http.status.none` | counter | Responses without a status code |
+
+#### Backend health
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `backend.up` | counter | Backend marked as healthy |
+| `backend.down` | counter | Backend marked as unhealthy |
+| `backend.connections.error` | counter | Backend connection failures |
+
+#### ALPN negotiation
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `http.alpn.h2` | counter | TLS connections where client negotiated HTTP/2 via ALPN |
+| `http.alpn.http11` | counter | TLS connections where client negotiated HTTP/1.1 via ALPN (or no ALPN) |
+
+#### HTTP/2 specific
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `h2.headers_no_stream.error` | counter | HEADERS frame received with no matching stream (protocol error) |
+
+#### Other
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `http.infinite_loop.error` | counter | Event loop safety breaker triggered |
+| `unsent-access-logs` | counter | Access log entries that could not be sent |
 
 ### Example of externals services
 
