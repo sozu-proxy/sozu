@@ -682,6 +682,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                                 context.debug.push(DebugEvent::I2(4, global_stream_id));
                                 trace!("Recycle stream: {}", global_stream_id);
                                 incr!("http.e2e.h2");
+                                stream.metrics.backend_stop();
                                 stream.generate_access_log(
                                     false,
                                     Some(String::from("H2::SplitFrame")),
@@ -786,6 +787,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                                 }
                                 trace!("Recycle1 stream: {}", global_stream_id);
                                 incr!("http.e2e.h2");
+                                stream.metrics.backend_stop();
                                 stream.generate_access_log(
                                     false,
                                     Some(String::from("H2::WholeFrame")),
@@ -1110,6 +1112,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 if was_initial && self.position.is_server() {
                     incr!("http.requests");
                     gauge_add!("http.active_requests", 1);
+                    stream.metrics.service_start();
                     stream.state = StreamState::Link;
                 }
             }
@@ -1162,6 +1165,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                             // This is a special case, normally, all stream are terminated by the server
                             // when the last byte of the response is written. Here, the reset is requested
                             // on the server endpoint and immediately terminates, shortcutting the other path
+                            stream.metrics.backend_stop();
                             stream.generate_access_log(
                                 true,
                                 Some(String::from("H2::ResetFrame")),
@@ -1404,6 +1408,18 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         forcefully_terminate_answer(stream, &mut self.readiness, error);
         if let StreamState::Linked(token) = old_state {
             endpoint.end_stream(token, stream_id, context);
+        }
+        // Emit access log for server-side resets on streams that had active requests
+        if self.position.is_server()
+            && matches!(old_state, StreamState::Link | StreamState::Linked(_))
+        {
+            let stream = &mut context.streams[stream_id];
+            stream.metrics.backend_stop();
+            stream.generate_access_log(
+                true,
+                Some(String::from("H2::Reset")),
+                context.listener.clone(),
+            );
         }
         MuxResult::Continue
     }
