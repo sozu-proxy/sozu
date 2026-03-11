@@ -252,8 +252,8 @@ impl Server {
         )));
         let backends = Rc::new(RefCell::new(BackendMap::new()));
 
-        //FIXME: we will use a few entries for the channel, metrics socket and the listeners
-        //FIXME: for HTTP/2, we will have more than 2 entries per session
+        // Note: slab_capacity uses 4x multiplier (up from 2x) to account for H2
+        // multiplexing where each session can have multiple backend connections.
         let sessions: Rc<RefCell<SessionManager>> = SessionManager::new(
             Slab::with_capacity(config.slab_capacity() as usize),
             config.max_connections as usize,
