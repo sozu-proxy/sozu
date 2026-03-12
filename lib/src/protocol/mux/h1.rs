@@ -351,8 +351,8 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                     // if it is terminated, we finish the transfer, the backend is not necessary anymore
                     if !stream.context.keep_alive_backend {
                         debug!("CLOSE DELIMITED");
-                        // TODO why not force_disconnect?
-                        self.readiness.event = Ready::HUP;
+                        stream.state = StreamState::Unlinked;
+                        self.readiness.interest.insert(Ready::WRITABLE);
                     } else if !stream.back.is_terminated() {
                         forcefully_terminate_answer(
                             stream,
