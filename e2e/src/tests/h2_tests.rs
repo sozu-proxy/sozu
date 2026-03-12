@@ -12,7 +12,7 @@
 
 use std::{
     io::{Read, Write},
-    net::SocketAddr,
+    net::{SocketAddr, TcpStream},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
