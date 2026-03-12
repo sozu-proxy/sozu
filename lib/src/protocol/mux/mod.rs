@@ -437,6 +437,9 @@ impl<Front: SocketHandler> Connection<Front> {
             draining: false,
             peer_last_stream_id: None,
             zero: kawa::Kawa::new(kawa::Kind::Request, kawa::Buffer::new(buffer)),
+            zero_bytes_read: 0,
+            overhead_bin: 0,
+            overhead_bout: 0,
         }))
     }
     pub fn new_h2_client(
@@ -484,6 +487,9 @@ impl<Front: SocketHandler> Connection<Front> {
             draining: false,
             peer_last_stream_id: None,
             zero: kawa::Kawa::new(kawa::Kind::Request, kawa::Buffer::new(buffer)),
+            zero_bytes_read: 0,
+            overhead_bin: 0,
+            overhead_bout: 0,
         }))
     }
 
@@ -529,6 +535,15 @@ impl<Front: SocketHandler> Connection<Front> {
             Connection::H2(c) => &mut c.timeout_container,
         }
     }
+
+    /// Returns connection-level byte overhead (bin, bout) for H2, (0, 0) for H1.
+    pub fn overhead_bytes(&self) -> (usize, usize) {
+        match self {
+            Connection::H1(_) => (0, 0),
+            Connection::H2(c) => (c.overhead_bin, c.overhead_bout),
+        }
+    }
+
     #[allow(dead_code)]
     fn force_disconnect(&mut self) -> MuxResult {
         match self {
@@ -2059,11 +2074,27 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         trace!("FRONTEND: {:#?}", self.frontend);
         trace!("BACKENDS: {:#?}", self.router.backends);
 
+        // Distribute H2 connection-level overhead (control frames) across in-flight
+        // streams so that access log bytes_in/bytes_out reflect actual wire cost.
+        // Integer division may lose up to (active_count - 1) bytes, which is acceptable.
+        let active_count = self
+            .context
+            .streams
+            .iter()
+            .filter(|s| s.state.is_open() && s.metrics.start.is_some())
+            .count()
+            .max(1);
+        let (total_overhead_in, total_overhead_out) = self.frontend.overhead_bytes();
+        let share_in = total_overhead_in / active_count;
+        let share_out = total_overhead_out / active_count;
+
         // Generate access logs for in-flight streams on session teardown.
         // Skip streams that already had their access log emitted (metrics.start is
         // set to None by metrics.reset() after generate_access_log in the happy path).
         for stream in &mut self.context.streams {
             if stream.state.is_open() && stream.metrics.start.is_some() {
+                stream.metrics.bin += share_in;
+                stream.metrics.bout += share_out;
                 stream.metrics.service_stop();
                 if stream.metrics.backend_stop.is_none() {
                     stream.metrics.backend_stop();

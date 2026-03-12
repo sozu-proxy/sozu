@@ -124,6 +124,7 @@ impl<Front: SocketHandler> RelayProxyProtocol<Front> {
                         Ok(sz) => {
                             self.cursor_header += sz;
 
+                            count!("back_bytes_out", sz as i64);
                             metrics.backend_bout += sz;
                             self.frontend_buffer.consume(sz);
 

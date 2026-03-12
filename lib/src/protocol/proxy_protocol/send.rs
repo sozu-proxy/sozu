@@ -91,6 +91,7 @@ impl<Front: SocketHandler> SendProxyProtocol<Front> {
                     match socket.write(&header[self.cursor_header..]) {
                         Ok(sz) => {
                             self.cursor_header += sz;
+                            count!("back_bytes_out", sz as i64);
                             metrics.backend_bout += sz;
 
                             if self.cursor_header == header.len() {
