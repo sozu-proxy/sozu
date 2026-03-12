@@ -21,6 +21,8 @@ pub struct H2BlockConverter<'a> {
     pub encoder: &'a mut loona_hpack::Encoder<'static>,
     pub out: Vec<u8>,
     pub scheme: &'static [u8],
+    /// Reusable buffer for lowercasing header keys, avoiding per-header allocation.
+    pub lowercase_buf: Vec<u8>,
 }
 
 impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
@@ -147,8 +149,11 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                         return true;
                     }
                 }
+                self.lowercase_buf.clear();
+                self.lowercase_buf.extend_from_slice(key.data(buffer));
+                self.lowercase_buf.make_ascii_lowercase();
                 if let Err(e) = self.encoder.encode_header_into(
-                    (&key.data(buffer).to_ascii_lowercase(), val.data(buffer)),
+                    (&self.lowercase_buf, val.data(buffer)),
                     &mut self.out,
                 ) {
                     error!("HPACK encoding of header failed: {:?}", e);

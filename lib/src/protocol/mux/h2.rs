@@ -915,6 +915,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     encoder: &mut self.encoder,
                     out: converter_buf,
                     scheme,
+                    lowercase_buf: Vec::new(),
                 };
                 let mut priorities = self.streams.keys().collect::<Vec<_>>();
                 priorities.sort();
