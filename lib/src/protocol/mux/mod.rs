@@ -591,6 +591,13 @@ impl<Front: SocketHandler> Connection<Front> {
         }
     }
 
+    fn graceful_goaway(&mut self) -> MuxResult {
+        match self {
+            Connection::H1(_) => MuxResult::Continue,
+            Connection::H2(c) => c.graceful_goaway(),
+        }
+    }
+
     fn close<E, L>(&mut self, context: &mut Context<L>, endpoint: E)
     where
         E: Endpoint,
@@ -2154,6 +2161,10 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
     }
 
     fn shutting_down(&mut self) -> SessionIsToBeClosed {
+        // RFC 9113 §6.8: initiate graceful shutdown with double-GOAWAY pattern
+        if matches!(self.frontend.graceful_goaway(), MuxResult::CloseSession) {
+            return true;
+        }
         let mut can_stop = true;
         for stream in &mut self.context.streams {
             match stream.state {

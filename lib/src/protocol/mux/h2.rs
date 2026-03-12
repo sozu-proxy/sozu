@@ -868,6 +868,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 // proxying and causes excessive WINDOW_UPDATE round-trips.
                 let increment = ENLARGED_CONNECTION_WINDOW - DEFAULT_INITIAL_WINDOW_SIZE;
                 self.queue_window_update(0, increment);
+                self.window = ENLARGED_CONNECTION_WINDOW as i32;
                 self.expect_header();
                 // Keep WRITABLE so the queued WINDOW_UPDATE gets flushed.
                 MuxResult::Continue
