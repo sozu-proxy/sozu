@@ -35,7 +35,7 @@ use crate::{
     protocol::{
         SessionState,
         http::{DefaultAnswer, answers::HttpAnswers, editor::HttpContext},
-        mux::h2::{H2Settings, H2State, H2StreamId, Prioriser},
+        mux::h2::{H2FloodDetector, H2Settings, H2State, H2StreamId, Prioriser},
     },
     retry::RetryPolicy,
     router::Route,
@@ -440,6 +440,7 @@ impl<Front: SocketHandler> Connection<Front> {
             zero_bytes_read: 0,
             overhead_bin: 0,
             overhead_bout: 0,
+            flood_detector: H2FloodDetector::new(),
         }))
     }
     pub fn new_h2_client(
@@ -490,6 +491,7 @@ impl<Front: SocketHandler> Connection<Front> {
             zero_bytes_read: 0,
             overhead_bin: 0,
             overhead_bout: 0,
+            flood_detector: H2FloodDetector::new(),
         }))
     }
 

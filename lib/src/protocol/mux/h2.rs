@@ -1,4 +1,4 @@
-use std::{cmp::min, collections::HashMap};
+use std::{cmp::min, collections::HashMap, time::Instant};
 
 use rusty_ulid::Ulid;
 use sozu_command::ready::Ready;
@@ -36,6 +36,25 @@ const FLOW_CONTROL_MAX_WINDOW: u32 = 1 << 31;
 /// H2 client connection preface size: 24-byte magic + 9-byte SETTINGS frame header
 pub(super) const CLIENT_PREFACE_SIZE: usize = 24 + parser::FRAME_HEADER_SIZE;
 
+// ── Flood Detection Thresholds (CVE mitigations) ────────────────────────────
+
+/// Maximum RST_STREAM frames per window (CVE-2023-44487 Rapid Reset + CVE-2019-9514)
+const MAX_RST_STREAM_PER_WINDOW: u32 = 100;
+/// Maximum PING frames per window (CVE-2019-9512 Ping Flood)
+const MAX_PING_PER_WINDOW: u32 = 100;
+/// Maximum SETTINGS frames per window (CVE-2019-9515 Settings Flood)
+const MAX_SETTINGS_PER_WINDOW: u32 = 50;
+/// Maximum empty DATA frames per window (CVE-2019-9518 Empty Frames)
+const MAX_EMPTY_DATA_PER_WINDOW: u32 = 100;
+/// Maximum CONTINUATION frames per header block (CVE-2024-27316)
+const MAX_CONTINUATION_FRAMES: u32 = 20;
+/// Maximum accumulated header block size across CONTINUATION frames (64KB)
+const MAX_HEADER_LIST_SIZE: u32 = 65536;
+/// Duration of the sliding window for rate-based flood counters
+const FLOOD_WINDOW_DURATION: std::time::Duration = std::time::Duration::from_secs(1);
+/// Maximum general anomaly count before triggering ENHANCE_YOUR_CALM
+const MAX_GLITCH_COUNT: u32 = 100;
+
 #[inline(always)]
 fn error_nom_to_h2(error: nom::Err<parser::ParserError>) -> H2Error {
     match error {
@@ -48,6 +67,126 @@ fn error_nom_to_h2(error: nom::Err<parser::ParserError>) -> H2Error {
             ..
         }) => e,
         _ => H2Error::ProtocolError,
+    }
+}
+
+/// Tracks per-connection frame rates to detect and mitigate H2 flood attacks.
+///
+/// Monitors RST_STREAM (CVE-2023-44487), PING (CVE-2019-9512), SETTINGS (CVE-2019-9515),
+/// empty DATA (CVE-2019-9518), and CONTINUATION (CVE-2024-27316) flood patterns.
+/// When any counter exceeds its threshold, `check_flood()` returns `EnhanceYourCalm`.
+#[derive(Debug)]
+pub struct H2FloodDetector {
+    /// RST_STREAM frames received in current window (CVE-2023-44487 + CVE-2019-9514)
+    pub rst_stream_count: u32,
+    /// PING frames received in current window (CVE-2019-9512)
+    pub ping_count: u32,
+    /// SETTINGS frames received in current window (CVE-2019-9515)
+    pub settings_count: u32,
+    /// Empty DATA frames received in current window (CVE-2019-9518)
+    pub empty_data_count: u32,
+    /// CONTINUATION frames received for current header block (CVE-2024-27316)
+    pub continuation_count: u32,
+    /// Total accumulated header block size across CONTINUATION frames
+    pub accumulated_header_size: u32,
+    /// General anomaly counter
+    pub glitch_count: u32,
+    /// Window start for rate-based counters
+    pub window_start: Instant,
+}
+
+impl Default for H2FloodDetector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl H2FloodDetector {
+    pub fn new() -> Self {
+        Self {
+            rst_stream_count: 0,
+            ping_count: 0,
+            settings_count: 0,
+            empty_data_count: 0,
+            continuation_count: 0,
+            accumulated_header_size: 0,
+            glitch_count: 0,
+            window_start: Instant::now(),
+        }
+    }
+
+    /// Reset rate-based counters if the current window has expired.
+    fn maybe_reset_window(&mut self) {
+        if self.window_start.elapsed() >= FLOOD_WINDOW_DURATION {
+            self.rst_stream_count = 0;
+            self.ping_count = 0;
+            self.settings_count = 0;
+            self.empty_data_count = 0;
+            self.glitch_count = 0;
+            self.window_start = Instant::now();
+        }
+    }
+
+    /// Check all flood counters. Returns `Some(EnhanceYourCalm)` if any threshold is exceeded.
+    pub fn check_flood(&mut self) -> Option<H2Error> {
+        self.maybe_reset_window();
+
+        if self.rst_stream_count > MAX_RST_STREAM_PER_WINDOW {
+            error!(
+                "H2 flood detected: RST_STREAM count {} exceeds threshold {}",
+                self.rst_stream_count, MAX_RST_STREAM_PER_WINDOW
+            );
+            return Some(H2Error::EnhanceYourCalm);
+        }
+        if self.ping_count > MAX_PING_PER_WINDOW {
+            error!(
+                "H2 flood detected: PING count {} exceeds threshold {}",
+                self.ping_count, MAX_PING_PER_WINDOW
+            );
+            return Some(H2Error::EnhanceYourCalm);
+        }
+        if self.settings_count > MAX_SETTINGS_PER_WINDOW {
+            error!(
+                "H2 flood detected: SETTINGS count {} exceeds threshold {}",
+                self.settings_count, MAX_SETTINGS_PER_WINDOW
+            );
+            return Some(H2Error::EnhanceYourCalm);
+        }
+        if self.empty_data_count > MAX_EMPTY_DATA_PER_WINDOW {
+            error!(
+                "H2 flood detected: empty DATA count {} exceeds threshold {}",
+                self.empty_data_count, MAX_EMPTY_DATA_PER_WINDOW
+            );
+            return Some(H2Error::EnhanceYourCalm);
+        }
+        if self.continuation_count > MAX_CONTINUATION_FRAMES {
+            error!(
+                "H2 flood detected: CONTINUATION count {} exceeds threshold {}",
+                self.continuation_count, MAX_CONTINUATION_FRAMES
+            );
+            return Some(H2Error::EnhanceYourCalm);
+        }
+        if self.accumulated_header_size > MAX_HEADER_LIST_SIZE {
+            error!(
+                "H2 flood detected: accumulated header size {} exceeds threshold {}",
+                self.accumulated_header_size, MAX_HEADER_LIST_SIZE
+            );
+            return Some(H2Error::EnhanceYourCalm);
+        }
+        if self.glitch_count > MAX_GLITCH_COUNT {
+            error!(
+                "H2 flood detected: glitch count {} exceeds threshold {}",
+                self.glitch_count, MAX_GLITCH_COUNT
+            );
+            return Some(H2Error::EnhanceYourCalm);
+        }
+        None
+    }
+
+    /// Reset CONTINUATION-specific counters when a header block is complete.
+    pub fn reset_continuation(&mut self) {
+        self.continuation_count = 0;
+        self.accumulated_header_size = 0;
     }
 }
 
@@ -87,7 +226,7 @@ impl Default for H2Settings {
             settings_max_concurrent_streams: DEFAULT_MAX_CONCURRENT_STREAMS,
             settings_initial_window_size: DEFAULT_INITIAL_WINDOW_SIZE,
             settings_max_frame_size: DEFAULT_MAX_FRAME_SIZE,
-            settings_max_header_list_size: u32::MAX,
+            settings_max_header_list_size: MAX_HEADER_LIST_SIZE,
             settings_enable_connect_protocol: false,
             settings_no_rfc7540_priorities: true,
         }
@@ -168,6 +307,8 @@ pub struct ConnectionH2<Front: SocketHandler> {
     /// PING responses, WINDOW_UPDATE frames, GOAWAY) on stream 0.
     /// Distributed proportionally to active streams when access logs are generated.
     pub overhead_bout: usize,
+    /// Flood detector for CVE mitigations (Rapid Reset, CONTINUATION, Ping, Settings floods).
+    pub flood_detector: H2FloodDetector,
 }
 impl<Front: SocketHandler> std::fmt::Debug for ConnectionH2<Front> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -500,6 +641,12 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                             );
                             return self.goaway(H2Error::ProtocolError);
                         }
+                        // CVE-2024-27316: track CONTINUATION frame count and accumulated size
+                        self.flood_detector.continuation_count += 1;
+                        self.flood_detector.accumulated_header_size += payload_len;
+                        if let Some(error) = self.flood_detector.check_flood() {
+                            return self.goaway(error);
+                        }
                         self.expect_read = Some((H2StreamId::Zero, payload_len as usize));
                         let mut headers = headers.clone();
                         headers.end_headers = flags & parser::FLAG_END_HEADERS != 0;
@@ -592,16 +739,27 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             kawa.storage.clear();
             let buf = kawa.storage.space();
             let mut offset = 0;
-            for (stream_id, increment) in self.pending_window_updates.drain(..) {
+            // Track how many entries we successfully serialized so we only drain those.
+            // Each WINDOW_UPDATE frame is 13 bytes (9-byte header + 4-byte payload).
+            let mut written_count = 0;
+            for &(stream_id, increment) in &self.pending_window_updates {
                 if increment == 0 {
+                    written_count += 1;
                     continue;
                 }
-                if let Ok((_, size)) =
-                    serializer::gen_window_update(&mut buf[offset..], stream_id, increment)
-                {
-                    offset += size;
+                match serializer::gen_window_update(&mut buf[offset..], stream_id, increment) {
+                    Ok((_, size)) => {
+                        offset += size;
+                        written_count += 1;
+                    }
+                    Err(_) => {
+                        // Buffer full — stop here, remaining entries stay in the vec
+                        break;
+                    }
                 }
             }
+            // Remove only the entries we successfully wrote (or skipped)
+            self.pending_window_updates.drain(..written_count);
             if offset > 0 {
                 kawa.storage.fill(offset);
                 // Flush WINDOW_UPDATE frames directly without returning
@@ -1004,6 +1162,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         trace!("{:#?}", frame);
         match frame {
             Frame::Data(data) => {
+                // CVE-2019-9518: track empty DATA frames (no payload, no END_STREAM)
+                if data.payload.is_empty() && !data.end_stream {
+                    self.flood_detector.empty_data_count += 1;
+                    if let Some(error) = self.flood_detector.check_flood() {
+                        return self.goaway(error);
+                    }
+                }
                 let Some(global_stream_id) = self.streams.get(&data.stream_id).copied() else {
                     // The stream was terminated while data was expected,
                     // probably due to automatic answer for invalid/unauthorized access.
@@ -1139,10 +1304,19 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 // communicating, unlike control frames (PING, WINDOW_UPDATE).
                 self.timeout_container.reset();
                 if !headers.end_headers {
+                    // CVE-2024-27316: only initialize tracking on the very first HEADERS
+                    // fragment, not on re-entries from ContinuationFrame (which call
+                    // handle_frame(Frame::Headers) with the accumulated header block).
+                    if self.flood_detector.continuation_count == 0 {
+                        self.flood_detector.accumulated_header_size =
+                            headers.header_block_fragment.len;
+                    }
                     debug!("FRAGMENT: {:?}", self.zero.storage.data());
                     self.state = H2State::ContinuationHeader(headers);
                     return MuxResult::Continue;
                 }
+                // Header block is complete — reset CONTINUATION counters
+                self.flood_detector.reset_continuation();
                 // can this fail?
                 let stream_id = headers.stream_id;
                 let Some(global_stream_id) = self.streams.get(&stream_id).copied() else {
@@ -1256,6 +1430,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 }
             }
             Frame::RstStream(rst_stream) => {
+                // CVE-2023-44487 Rapid Reset + CVE-2019-9514: track RST_STREAM rate
+                self.flood_detector.rst_stream_count += 1;
+                if let Some(error) = self.flood_detector.check_flood() {
+                    return self.goaway(error);
+                }
                 debug!(
                     "RstStream({} -> {})",
                     rst_stream.error_code,
@@ -1290,8 +1469,18 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             }
             Frame::Settings(settings) => {
                 if settings.ack {
+                    // RFC 9113 §6.5: SETTINGS ACK must have empty payload
+                    if !settings.settings.is_empty() {
+                        error!("SETTINGS ACK with non-empty payload");
+                        return self.goaway(H2Error::FrameSizeError);
+                    }
                     self.attribute_bytes_to_overhead();
                     return MuxResult::Continue;
+                }
+                // CVE-2019-9515: track SETTINGS frame rate
+                self.flood_detector.settings_count += 1;
+                if let Some(error) = self.flood_detector.check_flood() {
+                    return self.goaway(error);
                 }
                 for setting in settings.settings {
                     let v = setting.value;
@@ -1334,6 +1523,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 if ping.ack {
                     self.attribute_bytes_to_overhead();
                     return MuxResult::Continue;
+                }
+                // CVE-2019-9512: track non-ACK PING frame rate
+                self.flood_detector.ping_count += 1;
+                if let Some(error) = self.flood_detector.check_flood() {
+                    return self.goaway(error);
                 }
                 self.attribute_bytes_to_overhead();
                 let kawa = &mut self.zero;
