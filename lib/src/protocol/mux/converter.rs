@@ -139,7 +139,7 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                         || compare_no_case(key, b"http2-settings")
                         || compare_no_case(key, b"keep-alive")
                         || compare_no_case(key, b"proxy-connection")
-                        || compare_no_case(key, b"te") && !compare_no_case(val, b"trailers")
+                        || (compare_no_case(key, b"te") && !compare_no_case(val, b"trailers"))
                         || compare_no_case(key, b"trailer")
                         || compare_no_case(key, b"transfer-encoding")
                         || compare_no_case(key, b"upgrade")

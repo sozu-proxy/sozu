@@ -225,7 +225,11 @@ impl HttpSession {
 
     fn upgrade_mux(&mut self, mut mux: MuxClear) -> Option<HttpStateMachine> {
         debug!("mux switching to ws");
-        let stream = mux.context.streams.pop().expect("mux session must have at least one stream during upgrade");
+        let stream = mux
+            .context
+            .streams
+            .pop()
+            .expect("mux session must have at least one stream during upgrade");
         // http.active_requests was already decremented by generate_access_log()
         // in h1.rs before MuxResult::Upgrade was returned to us.
 
@@ -247,7 +251,11 @@ impl HttpSession {
             error!("Upgrading stream should be linked to a backend");
             return None;
         };
-        let backend = mux.router.backends.remove(&back_token).expect("backend for back_token must exist during upgrade");
+        let backend = mux
+            .router
+            .backends
+            .remove(&back_token)
+            .expect("backend for back_token must exist during upgrade");
         let (cluster_id, backend, backend_readiness, backend_socket, mut container_backend_timeout) =
             match backend {
                 mux::Connection::H1(mux::ConnectionH1 {

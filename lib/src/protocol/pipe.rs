@@ -593,6 +593,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             }
             if size > 0 {
                 self.frontend_readiness.interest.insert(Ready::WRITABLE);
+                count!("back_bytes_in", size as i64);
                 metrics.backend_bin += size;
             }
 
