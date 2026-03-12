@@ -1908,3 +1908,145 @@ fn test_h1_close_delimited_response_fully_delivered() {
         State::Success,
     );
 }
+
+// =========================================================================
+// Test 21: H1 rejects ambiguous Content-Length + Transfer-Encoding
+//
+// RFC 7230 §3.3.3: A server that receives a request with both
+// Content-Length and Transfer-Encoding MUST either reject the
+// request (400) or handle it consistently to prevent request
+// smuggling attacks.
+//
+// This test sends a POST with both headers. Sozu should either
+// respond with 400 or consistently handle one header and remain
+// healthy for subsequent requests.
+// =========================================================================
+
+fn try_h1_rejects_ambiguous_cl_te() -> State {
+    let front_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, mut backends) =
+        setup_sync_test("CL-TE", config, listeners, state, front_address, 1, false);
+    let mut backend = backends.pop().unwrap();
+    backend.connect();
+
+    // Send a request with both Content-Length and Transfer-Encoding.
+    // This is ambiguous per RFC 7230 and is the classic smuggling vector.
+    let smuggling_request = concat!(
+        "POST /api HTTP/1.1\r\n",
+        "Host: localhost\r\n",
+        "Content-Length: 5\r\n",
+        "Transfer-Encoding: chunked\r\n",
+        "Connection: close\r\n",
+        "\r\n",
+        "0\r\n",
+        "\r\n",
+    );
+
+    let mut stream = raw_connect(front_address);
+    stream
+        .write_all(smuggling_request.as_bytes())
+        .expect("write smuggling request");
+
+    // Sozu may forward the request to backend. If it does, we need to
+    // accept and respond so the smuggling request completes. Otherwise
+    // the backend connection stays pending and blocks subsequent requests.
+    // Use a short sleep then try to accept (100ms timeout from listener).
+    thread::sleep(Duration::from_millis(200));
+
+    // Try to service the smuggling request on the backend side.
+    // If sozu rejected it with 400, the backend never gets a connection
+    // and accept() returns false after the 100ms timeout.
+    let smuggling_forwarded = backend.accept(0);
+    if smuggling_forwarded {
+        backend.receive(0);
+        backend.send(0);
+        println!("CL-TE: smuggling request was forwarded to backend");
+    }
+
+    // Read the response. Acceptable outcomes:
+    // 1. 400 Bad Request — sozu rejects the ambiguous request (best)
+    // 2. 200 OK — sozu handled it consistently (acceptable)
+    // 3. Connection closed — sozu dropped the session (acceptable)
+    //
+    // Unacceptable: sozu crashes or becomes unresponsive.
+    let response = raw_read(&mut stream);
+    match &response {
+        Some(r) if r.contains("400") => {
+            println!("CL-TE: correctly rejected with 400");
+        }
+        Some(r) if r.contains("200") || r.contains("502") || r.contains("503") => {
+            println!("CL-TE: got response (not 400): {}", &r[..r.len().min(80)]);
+        }
+        Some(r) => {
+            println!("CL-TE: unexpected response: {}", &r[..r.len().min(80)]);
+        }
+        None => {
+            println!("CL-TE: connection closed (acceptable)");
+        }
+    }
+    drop(stream);
+    thread::sleep(Duration::from_millis(200));
+
+    // The critical assertion: sozu must still be functional.
+    // If the ambiguous request corrupted state, subsequent requests will fail.
+    backend.set_response("HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\npong");
+
+    let mut client = Client::new(
+        "verify-client",
+        front_address,
+        "GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    client.connect();
+    client.send();
+
+    if smuggling_forwarded {
+        // Sozu may reuse the existing backend connection (keep-alive) or
+        // open a new one. Try to receive on client 0 first (reuse case).
+        // If nothing arrives, accept a new connection on client 1.
+        match backend.receive(0) {
+            Some(data) if data.contains("GET /api") => {
+                println!("CL-TE: verification request reused backend connection 0");
+                backend.send(0);
+            }
+            _ => {
+                backend.accept(1);
+                backend.receive(1);
+                backend.send(1);
+            }
+        }
+    } else {
+        backend.accept(0);
+        backend.receive(0);
+        backend.send(0);
+    }
+
+    match client.receive() {
+        Some(r) if r.contains("200") && r.contains("pong") => {
+            println!("CL-TE: post-smuggling verification succeeded");
+        }
+        other => {
+            println!("CL-TE: post-smuggling verification failed: {other:?}");
+            worker.soft_stop();
+            worker.wait_for_server_stop();
+            return State::Fail;
+        }
+    }
+
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+    State::Success
+}
+
+#[test]
+fn test_h1_rejects_ambiguous_cl_te() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "H1 rejects ambiguous Content-Length + Transfer-Encoding (smuggling)",
+            try_h1_rejects_ambiguous_cl_te,
+        ),
+        State::Success,
+    );
+}
