@@ -334,6 +334,11 @@ pub struct ConnectionH2<Front: SocketHandler> {
     /// If the peer does not ACK within SETTINGS_ACK_TIMEOUT, we send GOAWAY
     /// with SettingsTimeout error.
     pub settings_sent_at: Option<Instant>,
+    /// Queued RST_STREAM frames to send: Vec<(stream_id, error_code)>.
+    /// Used when refusing streams (MAX_CONCURRENT_STREAMS, buffer exhaustion)
+    /// during readable — the actual write happens in the writable preamble
+    /// to avoid conflicting with kawa.storage usage for frame payload discard.
+    pub pending_rst_streams: Vec<(StreamId, H2Error)>,
     /// RFC 9113 §6.8: tracks stream IDs for which RST_STREAM has already been sent,
     /// preventing duplicate RST_STREAM frames on the wire.
     pub rst_sent: HashSet<StreamId>,
@@ -597,29 +602,42 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                                         self.local_settings.settings_max_concurrent_streams,
                                         self.streams.len()
                                     );
-                                    // RFC 9113 §5.1.2: refuse with RST_STREAM, not GOAWAY
-                                    let kawa = &mut self.zero;
-                                    let mut frame = [0; 13];
-                                    if let Ok((_, _)) = serializer::gen_rst_stream(
-                                        &mut frame,
-                                        stream_id,
-                                        H2Error::RefusedStream,
-                                    ) {
-                                        let buf = kawa.storage.space();
-                                        if buf.len() >= frame.len() {
-                                            buf[..frame.len()].copy_from_slice(&frame);
-                                            kawa.storage.fill(frame.len());
-                                            self.readiness.interest.insert(Ready::WRITABLE);
-                                        }
-                                    }
-                                    self.expect_header();
+                                    // RFC 9113 §5.1.2: refuse with RST_STREAM, not GOAWAY.
+                                    // Queue the RST_STREAM for the writable path to send
+                                    // (can't write to kawa.storage here because we also
+                                    // need to discard the HEADERS payload through it).
+                                    self.pending_rst_streams.push((stream_id, H2Error::RefusedStream));
+                                    self.readiness.interest.insert(Ready::WRITABLE);
+                                    // Discard the HEADERS payload before reading the
+                                    // next frame — otherwise the HPACK bytes would be
+                                    // misinterpreted as a frame header.
+                                    self.state = H2State::Discard;
+                                    self.expect_read = Some((
+                                        H2StreamId::Zero,
+                                        header.payload_len as usize,
+                                    ));
                                     return MuxResult::Continue;
                                 }
                                 match self.create_stream(stream_id, context) {
                                     Some(_) => {}
                                     None => {
-                                        error!("COULD NOT CREATE NEW STREAM");
-                                        return self.goaway(H2Error::InternalError);
+                                        // Buffer pool exhaustion is transient — refuse
+                                        // this stream but keep the connection alive so
+                                        // existing streams can complete and free buffers.
+                                        error!(
+                                            "Could not create stream {}: buffer pool exhausted",
+                                            stream_id
+                                        );
+                                        self.pending_rst_streams.push((stream_id, H2Error::RefusedStream));
+                                        self.readiness.interest.insert(Ready::WRITABLE);
+                                        // Discard the HEADERS payload (same as
+                                        // MAX_CONCURRENT_STREAMS path above).
+                                        self.state = H2State::Discard;
+                                        self.expect_read = Some((
+                                            H2StreamId::Zero,
+                                            header.payload_len as usize,
+                                        ));
+                                        return MuxResult::Continue;
                                     }
                                 }
                             } else if header.frame_type != FrameType::Priority {
@@ -859,9 +877,51 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             }
         }
 
+        // Flush pending RST_STREAM frames (queued when refusing streams).
+        if !self.pending_rst_streams.is_empty() && self.expect_write.is_none() {
+            let kawa = &mut self.zero;
+            kawa.storage.clear();
+            let buf = kawa.storage.space();
+            let mut offset = 0;
+            let mut written_count = 0;
+            for &(stream_id, ref error) in &self.pending_rst_streams {
+                let frame_size = parser::FRAME_HEADER_SIZE + parser::RST_STREAM_PAYLOAD_SIZE as usize;
+                if offset + frame_size > buf.len() {
+                    break;
+                }
+                match serializer::gen_rst_stream(&mut buf[offset..], stream_id, error.to_owned()) {
+                    Ok((_, _)) => {
+                        offset += frame_size;
+                        written_count += 1;
+                    }
+                    Err(_) => break,
+                }
+            }
+            self.pending_rst_streams.drain(..written_count);
+            if offset > 0 {
+                kawa.storage.fill(offset);
+                while !kawa.storage.is_empty() {
+                    let (size, status) = self.socket.socket_write(kawa.storage.data());
+                    kawa.storage.consume(size);
+                    match self.position {
+                        Position::Client(..) => {
+                            count!("back_bytes_out", size as i64);
+                        }
+                        Position::Server => {
+                            count!("bytes_out", size as i64);
+                        }
+                    }
+                    self.overhead_bout += size;
+                    if update_readiness_after_write(size, status, &mut self.readiness) {
+                        self.expect_write = Some(H2StreamId::Zero);
+                        return MuxResult::Continue;
+                    }
+                }
+            }
+        }
+
         match (&self.state, &self.position) {
             (H2State::Error, _)
-            | (H2State::Discard, _)
             | (H2State::ClientPreface, Position::Server)
             | (H2State::ClientSettings, Position::Server)
             | (H2State::ServerSettings, Position::Client(..)) => {
@@ -871,6 +931,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 );
                 self.force_disconnect()
             }
+            // Discard state: pending data (e.g. RST_STREAM) was already
+            // written in the preamble above; let the readable path consume
+            // the remaining frame payload.
+            (H2State::Discard, _) => MuxResult::Continue,
             (H2State::GoAway, _) => self.force_disconnect(),
             (H2State::ClientPreface, Position::Client(..)) => {
                 trace!("Preparing preface and settings");
