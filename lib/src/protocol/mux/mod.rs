@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt::Debug,
     io::ErrorKind,
     net::{Shutdown, SocketAddr},
@@ -440,6 +440,8 @@ impl<Front: SocketHandler> Connection<Front> {
             overhead_bin: 0,
             overhead_bout: 0,
             flood_detector: H2FloodDetector::new(),
+            settings_sent_at: None,
+            rst_sent: HashSet::new(),
         }))
     }
     pub fn new_h2_client(
@@ -491,6 +493,8 @@ impl<Front: SocketHandler> Connection<Front> {
             overhead_bin: 0,
             overhead_bout: 0,
             flood_detector: H2FloodDetector::new(),
+            settings_sent_at: None,
+            rst_sent: HashSet::new(),
         }))
     }
 
