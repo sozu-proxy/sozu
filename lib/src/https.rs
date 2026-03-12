@@ -435,6 +435,12 @@ impl ProxySession for HttpsSession {
                 StateMarker::Mux => incr!("https.upgrade.mux.failed"),
                 StateMarker::WebSocket => incr!("https.upgrade.wss.failed"),
             }
+            // FailedUpgrade means the socket was consumed by a failed upgrade
+            // attempt, so we can only close the state (no-op) and remove the
+            // session — cancel_timeouts / front_socket are unreachable.
+            self.state.close(self.proxy.clone(), &mut self.metrics);
+            self.proxy.borrow().remove_session(self.frontend_token);
+            self.has_been_closed = true;
             return;
         }
 
