@@ -56,12 +56,21 @@ use crate::{
 
 const H2_FRAME_DATA: u8 = 0x0;
 const H2_FRAME_HEADERS: u8 = 0x1;
+const H2_FRAME_RST_STREAM: u8 = 0x3;
 const H2_FRAME_SETTINGS: u8 = 0x4;
+const H2_FRAME_PING: u8 = 0x6;
 const H2_FRAME_GOAWAY: u8 = 0x7;
 const H2_FRAME_WINDOW_UPDATE: u8 = 0x8;
 const H2_FRAME_CONTINUATION: u8 = 0x9;
 
+const H2_FLAG_ACK: u8 = 0x1;
+const H2_FLAG_END_STREAM: u8 = 0x1;
 const H2_FLAG_END_HEADERS: u8 = 0x4;
+
+/// H2 error code: ENHANCE_YOUR_CALM (0xb) — RFC 9113 §7
+const H2_ERROR_ENHANCE_YOUR_CALM: u32 = 0xb;
+/// H2 error code: FRAME_SIZE_ERROR (0x6) — RFC 9113 §7
+const H2_ERROR_FRAME_SIZE_ERROR: u32 = 0x6;
 
 /// The HTTP/2 connection preface sent by the client (RFC 9113 Section 3.4).
 const H2_CLIENT_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
@@ -166,6 +175,26 @@ impl H2Frame {
         let payload = vec![0u8; 16385]; // 1 byte over default max
         Self::new(H2_FRAME_DATA, 0, stream_id, payload)
     }
+
+    /// Build a RST_STREAM frame with the given error code.
+    fn rst_stream(stream_id: u32, error_code: u32) -> Self {
+        Self::new(
+            H2_FRAME_RST_STREAM,
+            0,
+            stream_id,
+            error_code.to_be_bytes().to_vec(),
+        )
+    }
+
+    /// Build a PING frame (non-ACK) with the given 8-byte payload.
+    fn ping(payload: [u8; 8]) -> Self {
+        Self::new(H2_FRAME_PING, 0, 0, payload.to_vec())
+    }
+
+    /// Build a SETTINGS ACK frame WITH a non-empty payload (invalid per RFC 9113 §6.5).
+    fn settings_ack_with_payload(payload: Vec<u8>) -> Self {
+        Self::new(H2_FRAME_SETTINGS, H2_FLAG_ACK, 0, payload)
+    }
 }
 
 /// Read raw bytes from a TcpStream / TLS stream, tolerating timeouts.
@@ -227,6 +256,24 @@ fn contains_goaway(frames: &[(u8, u8, u32, Vec<u8>)]) -> bool {
 /// Check if any parsed frame is a RST_STREAM (type 0x3).
 fn contains_rst_stream(frames: &[(u8, u8, u32, Vec<u8>)]) -> bool {
     frames.iter().any(|(t, _, _, _)| *t == 0x3)
+}
+
+/// Extract the error code from the first GOAWAY frame, if any.
+/// GOAWAY payload: 4 bytes last_stream_id + 4 bytes error_code.
+fn goaway_error_code(frames: &[(u8, u8, u32, Vec<u8>)]) -> Option<u32> {
+    for (t, _, _, payload) in frames {
+        if *t == H2_FRAME_GOAWAY && payload.len() >= 8 {
+            return Some(u32::from_be_bytes([
+                payload[4], payload[5], payload[6], payload[7],
+            ]));
+        }
+    }
+    None
+}
+
+/// Check if frames contain a GOAWAY with a specific error code.
+fn contains_goaway_with_error(frames: &[(u8, u8, u32, Vec<u8>)], expected_error: u32) -> bool {
+    goaway_error_code(frames) == Some(expected_error)
 }
 
 // ============================================================================
@@ -1597,6 +1644,395 @@ fn test_h2_te_header_filtering() {
             5,
             "H2 edge: TE header filtering (operator precedence regression)",
             try_h2_te_header_filtering
+        ),
+        State::Success
+    );
+}
+
+// ============================================================================
+// Security tests: H2 flood protection (CVE mitigations)
+// ============================================================================
+
+// ---- CVE-2023-44487: Rapid Reset triggers GOAWAY(ENHANCE_YOUR_CALM) ----
+
+/// Open an H2 connection and send 200 HEADERS+RST_STREAM pairs rapidly.
+/// Sozu must detect the flood and respond with GOAWAY(ENHANCE_YOUR_CALM).
+fn try_h2_rapid_reset_triggers_goaway() -> State {
+    let (mut worker, mut backends, front_port) = setup_h2_edge_test("H2-RAPID-RESET", 1);
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+
+    let mut tls = tls_connect(front_addr);
+    h2_handshake(&mut tls);
+
+    // Send 200 HEADERS + RST_STREAM pairs rapidly on odd stream IDs
+    for i in 0..200u32 {
+        let stream_id = 1 + i * 2; // 1, 3, 5, 7, ...
+        let header_block = vec![
+            0x82, // :method GET (index 2)
+            0x84, // :path / (index 4)
+            0x86, // :scheme https (index 6)
+        ];
+        let headers = H2Frame::headers(stream_id, header_block, true, true);
+        if tls.write_all(&headers.encode()).is_err() {
+            break;
+        }
+        let rst = H2Frame::rst_stream(stream_id, 0x8); // CANCEL
+        if tls.write_all(&rst.encode()).is_err() {
+            break;
+        }
+    }
+    let _ = tls.flush();
+
+    // Read response — expect GOAWAY with ENHANCE_YOUR_CALM
+    thread::sleep(Duration::from_millis(500));
+    let response_data = read_all_available(&mut tls, Duration::from_secs(2));
+    let frames = parse_h2_frames(&response_data);
+
+    println!("H2 Rapid Reset - received {} frames", frames.len());
+    for (i, (ft, fl, sid, payload)) in frames.iter().enumerate() {
+        if *ft == H2_FRAME_GOAWAY && payload.len() >= 8 {
+            let error_code = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
+            println!("  frame {i}: GOAWAY error_code=0x{error_code:x}");
+        } else {
+            println!("  frame {i}: type=0x{ft:02x} flags=0x{fl:02x} stream={sid}");
+        }
+    }
+
+    let got_enhance_your_calm = contains_goaway_with_error(&frames, H2_ERROR_ENHANCE_YOUR_CALM);
+    println!("H2 Rapid Reset - got ENHANCE_YOUR_CALM: {got_enhance_your_calm}");
+
+    drop(tls);
+
+    // Verify sozu is still alive
+    thread::sleep(Duration::from_millis(200));
+    let still_alive = verify_sozu_alive(front_port);
+    println!("H2 Rapid Reset - sozu still alive: {still_alive}");
+
+    worker.soft_stop();
+    let success = worker.wait_for_server_stop();
+    for backend in backends.iter_mut() {
+        backend.stop_and_get_aggregator();
+    }
+
+    if success && still_alive && got_enhance_your_calm {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_rapid_reset_triggers_goaway() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "H2 security: CVE-2023-44487 Rapid Reset triggers GOAWAY(ENHANCE_YOUR_CALM)",
+            try_h2_rapid_reset_triggers_goaway
+        ),
+        State::Success
+    );
+}
+
+// ---- CVE-2024-27316: CONTINUATION flood triggers GOAWAY(ENHANCE_YOUR_CALM) ----
+
+/// Open an H2 connection, send HEADERS without END_HEADERS, then 50 CONTINUATION
+/// frames. Sozu must detect the flood and respond with GOAWAY(ENHANCE_YOUR_CALM).
+fn try_h2_continuation_flood_triggers_goaway() -> State {
+    let (mut worker, mut backends, front_port) = setup_h2_edge_test("H2-CONT-FLOOD", 1);
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+
+    let mut tls = tls_connect(front_addr);
+    h2_handshake(&mut tls);
+
+    // Send HEADERS on stream 1 WITHOUT END_HEADERS
+    let header_block = vec![
+        0x82, // :method GET (index 2)
+        0x84, // :path / (index 4)
+        0x86, // :scheme https (index 6)
+    ];
+    let headers = H2Frame::headers(1, header_block, false, true);
+    tls.write_all(&headers.encode()).unwrap();
+    tls.flush().unwrap();
+
+    // Send 50 CONTINUATION frames without END_HEADERS.
+    // Batch them into the same write for speed.
+    let mut batch = Vec::new();
+    for i in 0..50u32 {
+        // Each CONTINUATION carries a small header fragment
+        let fragment = vec![
+            0x40, // literal header with indexing
+            0x05, // name length 5
+            b'x',
+            b'-',
+            b'f',
+            b'l',
+            b'd', // name "x-fld"
+            0x03, // value length 3
+            b'v',
+            (b'0' + (i % 10) as u8),
+            (b'0' + (i / 10) as u8), // value "vNN"
+        ];
+        let cont = H2Frame::continuation(1, fragment, false);
+        batch.extend_from_slice(&cont.encode());
+    }
+    let write_result = tls.write_all(&batch);
+    let flush_result = tls.flush();
+    println!(
+        "CONTINUATION flood: write={:?}, flush={:?}",
+        write_result.is_ok(),
+        flush_result.is_ok()
+    );
+
+    // Read response — expect GOAWAY with ENHANCE_YOUR_CALM
+    // Give sozu time to process the frames through its event loop
+    thread::sleep(Duration::from_millis(1000));
+    let response_data = read_all_available(&mut tls, Duration::from_secs(3));
+    let frames = parse_h2_frames(&response_data);
+
+    println!("H2 CONTINUATION flood - received {} frames", frames.len());
+    for (i, (ft, fl, sid, payload)) in frames.iter().enumerate() {
+        if *ft == H2_FRAME_GOAWAY && payload.len() >= 8 {
+            let error_code = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
+            println!("  frame {i}: GOAWAY error_code=0x{error_code:x}");
+        } else {
+            println!("  frame {i}: type=0x{ft:02x} flags=0x{fl:02x} stream={sid}");
+        }
+    }
+
+    let got_enhance_your_calm = contains_goaway_with_error(&frames, H2_ERROR_ENHANCE_YOUR_CALM);
+    println!("H2 CONTINUATION flood - got ENHANCE_YOUR_CALM: {got_enhance_your_calm}");
+
+    drop(tls);
+
+    // Verify sozu is still alive
+    thread::sleep(Duration::from_millis(200));
+    let still_alive = verify_sozu_alive(front_port);
+    println!("H2 CONTINUATION flood - sozu still alive: {still_alive}");
+
+    worker.soft_stop();
+    let success = worker.wait_for_server_stop();
+    for backend in backends.iter_mut() {
+        backend.stop_and_get_aggregator();
+    }
+
+    if success && still_alive && got_enhance_your_calm {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_continuation_flood_triggers_goaway() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "H2 security: CVE-2024-27316 CONTINUATION flood triggers GOAWAY(ENHANCE_YOUR_CALM)",
+            try_h2_continuation_flood_triggers_goaway
+        ),
+        State::Success
+    );
+}
+
+// ---- CVE-2019-9512: Ping flood triggers GOAWAY(ENHANCE_YOUR_CALM) ----
+
+/// Open an H2 connection and send 200 PING frames rapidly.
+/// Sozu must detect the flood and respond with GOAWAY(ENHANCE_YOUR_CALM).
+fn try_h2_ping_flood_triggers_goaway() -> State {
+    let (mut worker, mut backends, front_port) = setup_h2_edge_test("H2-PING-FLOOD", 1);
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+
+    let mut tls = tls_connect(front_addr);
+    h2_handshake(&mut tls);
+
+    // Send 200 PING frames rapidly
+    for i in 0..200u32 {
+        let mut payload = [0u8; 8];
+        payload[0..4].copy_from_slice(&i.to_be_bytes());
+        let ping = H2Frame::ping(payload);
+        if tls.write_all(&ping.encode()).is_err() {
+            break;
+        }
+    }
+    let _ = tls.flush();
+
+    // Read response — expect GOAWAY with ENHANCE_YOUR_CALM
+    thread::sleep(Duration::from_millis(500));
+    let response_data = read_all_available(&mut tls, Duration::from_secs(2));
+    let frames = parse_h2_frames(&response_data);
+
+    println!("H2 Ping flood - received {} frames", frames.len());
+
+    let got_enhance_your_calm = contains_goaway_with_error(&frames, H2_ERROR_ENHANCE_YOUR_CALM);
+    if let Some(error_code) = goaway_error_code(&frames) {
+        println!("H2 Ping flood - GOAWAY error_code=0x{error_code:x}");
+    }
+    println!("H2 Ping flood - got ENHANCE_YOUR_CALM: {got_enhance_your_calm}");
+
+    drop(tls);
+
+    // Verify sozu is still alive
+    thread::sleep(Duration::from_millis(200));
+    let still_alive = verify_sozu_alive(front_port);
+    println!("H2 Ping flood - sozu still alive: {still_alive}");
+
+    worker.soft_stop();
+    let success = worker.wait_for_server_stop();
+    for backend in backends.iter_mut() {
+        backend.stop_and_get_aggregator();
+    }
+
+    if success && still_alive && got_enhance_your_calm {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_ping_flood_triggers_goaway() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "H2 security: CVE-2019-9512 Ping flood triggers GOAWAY(ENHANCE_YOUR_CALM)",
+            try_h2_ping_flood_triggers_goaway
+        ),
+        State::Success
+    );
+}
+
+// ---- CVE-2019-9515: Settings flood triggers GOAWAY(ENHANCE_YOUR_CALM) ----
+
+/// Open an H2 connection and send 100 SETTINGS frames rapidly.
+/// Sozu must detect the flood and respond with GOAWAY(ENHANCE_YOUR_CALM).
+fn try_h2_settings_flood_triggers_goaway() -> State {
+    let (mut worker, mut backends, front_port) = setup_h2_edge_test("H2-SETTINGS-FLOOD", 1);
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+
+    let mut tls = tls_connect(front_addr);
+    h2_handshake(&mut tls);
+
+    // Send 100 SETTINGS frames rapidly (each with a valid setting)
+    for _i in 0..100u32 {
+        // SETTINGS_MAX_CONCURRENT_STREAMS = 100 (a valid, harmless setting)
+        let settings = H2Frame::settings(&[(0x3, 100)]);
+        if tls.write_all(&settings.encode()).is_err() {
+            break;
+        }
+    }
+    let _ = tls.flush();
+
+    // Read response — expect GOAWAY with ENHANCE_YOUR_CALM
+    thread::sleep(Duration::from_millis(500));
+    let response_data = read_all_available(&mut tls, Duration::from_secs(2));
+    let frames = parse_h2_frames(&response_data);
+
+    println!("H2 Settings flood - received {} frames", frames.len());
+
+    let got_enhance_your_calm = contains_goaway_with_error(&frames, H2_ERROR_ENHANCE_YOUR_CALM);
+    if let Some(error_code) = goaway_error_code(&frames) {
+        println!("H2 Settings flood - GOAWAY error_code=0x{error_code:x}");
+    }
+    println!("H2 Settings flood - got ENHANCE_YOUR_CALM: {got_enhance_your_calm}");
+
+    drop(tls);
+
+    // Verify sozu is still alive
+    thread::sleep(Duration::from_millis(200));
+    let still_alive = verify_sozu_alive(front_port);
+    println!("H2 Settings flood - sozu still alive: {still_alive}");
+
+    worker.soft_stop();
+    let success = worker.wait_for_server_stop();
+    for backend in backends.iter_mut() {
+        backend.stop_and_get_aggregator();
+    }
+
+    if success && still_alive && got_enhance_your_calm {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_settings_flood_triggers_goaway() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "H2 security: CVE-2019-9515 Settings flood triggers GOAWAY(ENHANCE_YOUR_CALM)",
+            try_h2_settings_flood_triggers_goaway
+        ),
+        State::Success
+    );
+}
+
+// ---- RFC 9113 §6.5: SETTINGS ACK with non-empty payload rejected ----
+
+/// Send a SETTINGS frame with ACK flag set AND non-zero payload.
+/// Sozu must respond with GOAWAY(FRAME_SIZE_ERROR).
+fn try_h2_settings_ack_with_payload_rejected() -> State {
+    let (mut worker, mut backends, front_port) = setup_h2_edge_test("H2-SETTINGS-ACK-PAYLOAD", 1);
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+
+    let mut tls = tls_connect(front_addr);
+    h2_handshake(&mut tls);
+
+    // Send a SETTINGS ACK with non-empty payload (invalid per RFC 9113 §6.5)
+    // The payload contains a valid SETTINGS entry, but ACK frames MUST be empty.
+    let bad_settings_ack =
+        H2Frame::settings_ack_with_payload(vec![0x00, 0x03, 0x00, 0x00, 0x00, 0x64]);
+    tls.write_all(&bad_settings_ack.encode()).unwrap();
+    tls.flush().unwrap();
+
+    // Read response — expect GOAWAY with FRAME_SIZE_ERROR
+    thread::sleep(Duration::from_millis(500));
+    let response_data = read_all_available(&mut tls, Duration::from_secs(2));
+    let frames = parse_h2_frames(&response_data);
+
+    println!(
+        "H2 Settings ACK with payload - received {} frames",
+        frames.len()
+    );
+
+    let got_frame_size_error = contains_goaway_with_error(&frames, H2_ERROR_FRAME_SIZE_ERROR);
+    if let Some(error_code) = goaway_error_code(&frames) {
+        println!("H2 Settings ACK with payload - GOAWAY error_code=0x{error_code:x}");
+    }
+    println!("H2 Settings ACK with payload - got FRAME_SIZE_ERROR: {got_frame_size_error}");
+
+    drop(tls);
+
+    // Verify sozu is still alive
+    thread::sleep(Duration::from_millis(200));
+    let still_alive = verify_sozu_alive(front_port);
+    println!("H2 Settings ACK with payload - sozu still alive: {still_alive}");
+
+    worker.soft_stop();
+    let success = worker.wait_for_server_stop();
+    for backend in backends.iter_mut() {
+        backend.stop_and_get_aggregator();
+    }
+
+    if success && still_alive && got_frame_size_error {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_settings_ack_with_payload_rejected() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "H2 security: SETTINGS ACK with payload rejected (FRAME_SIZE_ERROR)",
+            try_h2_settings_ack_with_payload_rejected
         ),
         State::Success
     );
