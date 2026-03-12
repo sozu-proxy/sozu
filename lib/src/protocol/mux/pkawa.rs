@@ -365,11 +365,21 @@ where
 
     if end_stream {
         if let BodySize::Empty = kawa.body_size {
-            kawa.body_size = BodySize::Length(0);
-            kawa.push_block(Block::Header(Pair {
-                key: Store::Static(b"Content-Length"),
-                val: Store::Static(b"0"),
-            }));
+            // RFC 9110 §8.6: Do not inject Content-Length: 0 for responses where
+            // message body is forbidden (1xx, 204, 304). Only inject for requests
+            // and other response codes.
+            let skip_content_length = matches!(kawa.kind, Kind::Response)
+                && matches!(
+                    kawa.detached.status_line,
+                    StatusLine::Response { code, .. } if (100..200).contains(&code) || code == 204 || code == 304
+                );
+            if !skip_content_length {
+                kawa.body_size = BodySize::Length(0);
+                kawa.push_block(Block::Header(Pair {
+                    key: Store::Static(b"Content-Length"),
+                    val: Store::Static(b"0"),
+                }));
+            }
         }
     }
 
