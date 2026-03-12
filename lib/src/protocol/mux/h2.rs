@@ -4,7 +4,7 @@ use rusty_ulid::Ulid;
 use sozu_command::ready::Ready;
 
 use crate::{
-    L7ListenerHandler, ListenerHandler, Protocol, Readiness,
+    L7ListenerHandler, ListenerHandler, Protocol, Readiness, SessionMetrics,
     protocol::mux::{
         BackendStatus, Context, DebugEvent, Endpoint, GenericHttpStream, GlobalStreamId, MuxResult,
         Position, StreamId, StreamState, converter, forcefully_terminate_answer,
@@ -156,6 +156,18 @@ pub struct ConnectionH2<Front: SocketHandler> {
     /// Streams with ID > this value were not processed by the peer and should be retried.
     pub peer_last_stream_id: Option<StreamId>,
     pub zero: GenericHttpStream,
+    /// Accumulates raw bytes read with H2StreamId::Zero (frame headers, HEADERS payloads,
+    /// control frame payloads). Attributed to the owning stream or connection overhead
+    /// once the frame is fully parsed.
+    pub zero_bytes_read: usize,
+    /// Connection-level read overhead: bytes from control frames (SETTINGS, PING,
+    /// WINDOW_UPDATE on stream 0, GOAWAY, unknown frames) that don't belong to any stream.
+    /// Distributed proportionally to active streams when access logs are generated.
+    pub overhead_bin: usize,
+    /// Connection-level write overhead: bytes from control frame writes (SETTINGS ACK,
+    /// PING responses, WINDOW_UPDATE frames, GOAWAY) on stream 0.
+    /// Distributed proportionally to active streams when access logs are generated.
+    pub overhead_bout: usize,
 }
 impl<Front: SocketHandler> std::fmt::Debug for ConnectionH2<Front> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -229,6 +241,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         count!("bytes_in", size as i64);
                     }
                 }
+                self.zero_bytes_read += size;
                 if update_readiness_after_read(size, status, &mut self.readiness) {
                     return MuxResult::Continue;
                 } else if size == amount {
@@ -270,6 +283,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 let _i = kawa.storage.data();
                 trace!("DISCARDING: {:?}", _i);
                 kawa.storage.clear();
+                self.attribute_bytes_to_overhead();
                 self.expect_header();
             }
             (H2State::ClientPreface, Position::Server) => {
@@ -559,6 +573,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         count!("bytes_out", size as i64);
                     }
                 }
+                self.overhead_bout += size;
                 if update_readiness_after_write(size, status, &mut self.readiness) {
                     return MuxResult::Continue;
                 }
@@ -593,6 +608,15 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 while !kawa.storage.is_empty() {
                     let (size, status) = self.socket.socket_write(kawa.storage.data());
                     kawa.storage.consume(size);
+                    match self.position {
+                        Position::Client(..) => {
+                            count!("back_bytes_out", size as i64);
+                        }
+                        Position::Server => {
+                            count!("bytes_out", size as i64);
+                        }
+                    }
+                    self.overhead_bout += size;
                     if update_readiness_after_write(size, status, &mut self.readiness) {
                         self.expect_write = Some(H2StreamId::Zero);
                         return MuxResult::Continue;
@@ -695,6 +719,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         match self.position {
                             Position::Client(..) => {}
                             Position::Server => {
+                                self.distribute_overhead(&mut stream.metrics);
                                 // mark stream as reusable
                                 context.debug.push(DebugEvent::I2(4, global_stream_id));
                                 trace!("Recycle stream: {}", global_stream_id);
@@ -794,9 +819,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         match self.position {
                             Position::Client(..) => {}
                             Position::Server => {
-                                // Handle 1xx, this code should probably be merged with the h2 SplitFrame case and h1 nominal case
-                                // to avoid code duplication
-
+                                // Inline distribute_overhead: can't call self method
+                                // while converter borrows self.encoder
+                                let active_streams = self.streams.len().max(1);
+                                stream.metrics.bin += self.overhead_bin / active_streams;
+                                stream.metrics.bout += self.overhead_bout / active_streams;
+                                self.overhead_bin -= self.overhead_bin / active_streams;
+                                self.overhead_bout -= self.overhead_bout / active_streams;
                                 // mark stream as reusable
                                 context.debug.push(DebugEvent::I2(5, global_stream_id));
                                 if context.debug.is_interesting() {
@@ -851,6 +880,36 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 MuxResult::Continue
             }
         }
+    }
+
+    /// Distribute connection-level byte overhead proportionally to a single stream.
+    /// Returns `(share_in, share_out)` and decrements the connection totals.
+    fn distribute_overhead(&mut self, metrics: &mut SessionMetrics) {
+        let active_streams = self.streams.len().max(1);
+        let share_in = self.overhead_bin / active_streams;
+        let share_out = self.overhead_bout / active_streams;
+        metrics.bin += share_in;
+        metrics.bout += share_out;
+        self.overhead_bin -= share_in;
+        self.overhead_bout -= share_out;
+    }
+
+    /// Attribute accumulated `zero_bytes_read` to the stream or to connection overhead.
+    fn attribute_bytes_to_stream(&mut self, metrics: &mut SessionMetrics) {
+        match self.position {
+            Position::Client(..) => {
+                metrics.backend_bin += self.zero_bytes_read;
+            }
+            Position::Server => {
+                metrics.bin += self.zero_bytes_read;
+            }
+        }
+        self.zero_bytes_read = 0;
+    }
+
+    fn attribute_bytes_to_overhead(&mut self) {
+        self.overhead_bin += self.zero_bytes_read;
+        self.zero_bytes_read = 0;
     }
 
     /// Queue a WINDOW_UPDATE, coalescing with any existing entry for the same stream_id.
@@ -946,9 +1005,21 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         match frame {
             Frame::Data(data) => {
                 let Some(global_stream_id) = self.streams.get(&data.stream_id).copied() else {
-                    // the stream was terminated while data was expected,
-                    // probably due to automatic answer for invalid/unauthorized access
-                    // ignore this frame
+                    // The stream was terminated while data was expected,
+                    // probably due to automatic answer for invalid/unauthorized access.
+                    // RFC 9113 §6.9: we MUST still account for the DATA payload in
+                    // connection-level flow control, otherwise the window shrinks
+                    // permanently and eventually stalls the connection.
+                    let payload_len = data.payload.len() as u32;
+                    self.received_bytes_since_update += payload_len;
+                    let threshold = self.local_settings.settings_initial_window_size / 2;
+                    if self.received_bytes_since_update >= threshold {
+                        let increment = self.received_bytes_since_update;
+                        self.queue_window_update(0, increment);
+                        self.received_bytes_since_update = 0;
+                        self.readiness.interest.insert(Ready::WRITABLE);
+                    }
+                    self.attribute_bytes_to_overhead();
                     return MuxResult::Continue;
                 };
                 let mut slice = data.payload;
@@ -985,11 +1056,16 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 }
 
                 let stream = &mut context.streams[global_stream_id];
+                self.attribute_bytes_to_stream(&mut stream.metrics);
                 let parts = stream.split(&self.position);
                 let kawa = parts.rbuffer;
                 match self.position {
-                    Position::Client(..) => parts.metrics.backend_bin += payload_len,
-                    Position::Server => parts.metrics.bin += payload_len,
+                    Position::Client(..) => {
+                        parts.metrics.backend_bin += payload_len;
+                    }
+                    Position::Server => {
+                        parts.metrics.bin += payload_len;
+                    }
                 }
                 slice.start += kawa.storage.head as u32;
                 kawa.storage.head += payload_len;
@@ -1072,6 +1148,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 let Some(global_stream_id) = self.streams.get(&stream_id).copied() else {
                     error!("Handling Headers frame with no attached stream {:#?}", self);
                     incr!("h2.headers_no_stream.error");
+                    self.attribute_bytes_to_overhead();
                     return self.force_disconnect();
                 };
 
@@ -1087,14 +1164,12 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     }
                 }
 
+                let stream = &mut context.streams[global_stream_id];
+                self.attribute_bytes_to_stream(&mut stream.metrics);
                 let kawa = &mut self.zero;
                 let buffer = headers.header_block_fragment.data(kawa.storage.buffer());
                 let stream = &mut context.streams[global_stream_id];
                 let parts = &mut stream.split(&self.position);
-                match self.position {
-                    Position::Client(..) => parts.metrics.backend_bin += buffer.len(),
-                    Position::Server => parts.metrics.bin += buffer.len(),
-                }
                 let was_initial = parts.rbuffer.is_initial();
                 let status = pkawa::handle_header(
                     &mut self.decoder,
@@ -1140,20 +1215,29 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     stream.state = StreamState::Link;
                 }
             }
-            Frame::PushPromise(_push_promise) => match self.position {
-                Position::Client(..) => {
-                    // RFC 9113 §8.4: Server push is deprecated. Sozu never sends
-                    // SETTINGS_ENABLE_PUSH=1, so receiving PUSH_PROMISE is a protocol error.
-                    error!("Received PUSH_PROMISE but server push is not supported");
-                    return self.goaway(H2Error::ProtocolError);
+            Frame::PushPromise(_push_promise) => {
+                self.attribute_bytes_to_overhead();
+                match self.position {
+                    Position::Client(..) => {
+                        // RFC 9113 §8.4: Server push is deprecated. Sozu never sends
+                        // SETTINGS_ENABLE_PUSH=1, so receiving PUSH_PROMISE is a protocol error.
+                        error!("Received PUSH_PROMISE but server push is not supported");
+                        return self.goaway(H2Error::ProtocolError);
+                    }
+                    Position::Server => {
+                        // Clients must never send PUSH_PROMISE (RFC 9113 §8.4)
+                        error!("Received PUSH_PROMISE from client");
+                        return self.goaway(H2Error::ProtocolError);
+                    }
                 }
-                Position::Server => {
-                    // Clients must never send PUSH_PROMISE (RFC 9113 §8.4)
-                    error!("Received PUSH_PROMISE from client");
-                    return self.goaway(H2Error::ProtocolError);
-                }
-            },
+            }
             Frame::Priority(priority) => {
+                if let Some(global_stream_id) = self.streams.get(&priority.stream_id).copied() {
+                    let stream = &mut context.streams[global_stream_id];
+                    self.attribute_bytes_to_stream(&mut stream.metrics);
+                } else {
+                    self.attribute_bytes_to_overhead();
+                }
                 if self
                     .prioriser
                     .push_priority(priority.stream_id, priority.inner)
@@ -1179,6 +1263,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 );
                 if let Some(stream_id) = self.streams.remove(&rst_stream.stream_id) {
                     let stream = &mut context.streams[stream_id];
+                    self.attribute_bytes_to_stream(&mut stream.metrics);
                     if let StreamState::Linked(token) = stream.state {
                         endpoint.end_stream(token, stream_id, context);
                     }
@@ -1186,6 +1271,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     match self.position {
                         Position::Client(..) => {}
                         Position::Server => {
+                            self.distribute_overhead(&mut stream.metrics);
                             // This is a special case, normally, all stream are terminated by the server
                             // when the last byte of the response is written. Here, the reset is requested
                             // on the server endpoint and immediately terminates, shortcutting the other path
@@ -1198,10 +1284,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                             stream.state = StreamState::Recycle;
                         }
                     }
+                } else {
+                    self.attribute_bytes_to_overhead();
                 }
             }
             Frame::Settings(settings) => {
                 if settings.ack {
+                    self.attribute_bytes_to_overhead();
                     return MuxResult::Continue;
                 }
                 for setting in settings.settings {
@@ -1229,6 +1318,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     }
                 }
 
+                self.attribute_bytes_to_overhead();
+
                 let kawa = &mut self.zero;
                 kawa.storage.space()[0..serializer::SETTINGS_ACKNOWLEDGEMENT.len()]
                     .copy_from_slice(&serializer::SETTINGS_ACKNOWLEDGEMENT);
@@ -1241,8 +1332,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             }
             Frame::Ping(ping) => {
                 if ping.ack {
+                    self.attribute_bytes_to_overhead();
                     return MuxResult::Continue;
                 }
+                self.attribute_bytes_to_overhead();
                 let kawa = &mut self.zero;
                 match serializer::gen_ping_acknolegment(kawa.storage.space(), &ping.payload) {
                     Ok((_, size)) => kawa.storage.fill(size),
@@ -1256,6 +1349,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 self.expect_write = Some(H2StreamId::Zero);
             }
             Frame::GoAway(goaway) => {
+                self.attribute_bytes_to_overhead();
                 if goaway.error_code == H2Error::NoError as u32 {
                     debug!(
                         "Received GOAWAY: last_stream_id={}, error={}",
@@ -1276,6 +1370,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 // Streams with ID > last_stream_id were NOT processed by the peer.
                 // Mark them for retry (StreamState::Link) so they can be retried
                 // on a new connection.
+                // IMPORTANT: do NOT call endpoint.end_stream() here — that would
+                // remove the stream from the frontend's H2 stream map and send
+                // RST_STREAM to the client, killing the request instead of retrying it.
                 let mut retry_streams = Vec::new();
                 for (&stream_id, &global_stream_id) in &self.streams {
                     if stream_id > goaway.last_stream_id {
@@ -1283,10 +1380,6 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     }
                 }
                 for (stream_id, global_stream_id) in &retry_streams {
-                    let stream = &mut context.streams[*global_stream_id];
-                    if let StreamState::Linked(token) = stream.state {
-                        endpoint.end_stream(token, *global_stream_id, context);
-                    }
                     let stream = &mut context.streams[*global_stream_id];
                     stream.state = StreamState::Link;
                     self.streams.remove(stream_id);
@@ -1306,6 +1399,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             }) => {
                 let increment = increment as i32;
                 if stream_id == 0 {
+                    self.attribute_bytes_to_overhead();
                     if let Some(window) = self.window.checked_add(increment) {
                         if self.window <= 0 && window > 0 {
                             self.readiness.interest.insert(Ready::WRITABLE);
@@ -1315,8 +1409,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         error!("INVALID WINDOW INCREMENT");
                         return self.goaway(H2Error::FlowControlError);
                     }
-                } else if let Some(global_stream_id) = self.streams.get(&stream_id) {
-                    let stream = &mut context.streams[*global_stream_id];
+                } else if let Some(global_stream_id) = self.streams.get(&stream_id).copied() {
+                    let stream = &mut context.streams[global_stream_id];
+                    self.attribute_bytes_to_stream(&mut stream.metrics);
                     if let Some(window) = stream.window.checked_add(increment) {
                         if stream.window <= 0 && window > 0 {
                             self.readiness.interest.insert(Ready::WRITABLE);
@@ -1324,13 +1419,14 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         stream.window = window;
                     } else {
                         return self.reset_stream(
-                            *global_stream_id,
+                            global_stream_id,
                             context,
                             endpoint,
                             H2Error::FlowControlError,
                         );
                     }
                 } else {
+                    self.attribute_bytes_to_overhead();
                     trace!(
                         "Ignoring window update on closed stream {}: {}",
                         stream_id, increment
@@ -1338,6 +1434,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 };
             }
             Frame::Continuation(_) => {
+                self.attribute_bytes_to_overhead();
                 error!("CONTINUATION frames are handled inline during header parsing");
                 return self.goaway(H2Error::ProtocolError);
             }
@@ -1438,12 +1535,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             && matches!(old_state, StreamState::Link | StreamState::Linked(_))
         {
             let stream = &mut context.streams[stream_id];
+            self.distribute_overhead(&mut stream.metrics);
             stream.metrics.backend_stop();
-            stream.generate_access_log(
-                true,
-                Some("H2::Reset"),
-                context.listener.clone(),
-            );
+            stream.generate_access_log(true, Some("H2::Reset"), context.listener.clone());
         }
         MuxResult::Continue
     }
