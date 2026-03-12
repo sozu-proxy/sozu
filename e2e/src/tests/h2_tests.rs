@@ -2038,3 +2038,684 @@ fn test_h2_settings_ack_with_payload_rejected() {
         State::Success
     );
 }
+
+// ============================================================================
+// Backend: large body via H2 (cleartext h2c)
+// ============================================================================
+
+struct LargeBodyH2Backend {
+    stop: Arc<AtomicBool>,
+    responses_sent: Arc<AtomicUsize>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl LargeBodyH2Backend {
+    fn start(address: SocketAddr, body_size: usize) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let responses_sent = Arc::new(AtomicUsize::new(0));
+        let stop_clone = stop.clone();
+        let resp_count = responses_sent.clone();
+        let thread = thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async move {
+                let listener = TcpListener::bind(address).await.unwrap();
+                loop {
+                    if stop_clone.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let accept =
+                        tokio::time::timeout(Duration::from_millis(50), listener.accept()).await;
+                    let (stream, _) = match accept {
+                        Ok(Ok(s)) => s,
+                        _ => continue,
+                    };
+                    let resp_count = resp_count.clone();
+                    tokio::spawn(async move {
+                        let io = TokioIo::new(stream);
+                        let svc = service_fn(move |_req: hyper::Request<hyper::body::Incoming>| {
+                            let resp_count = resp_count.clone();
+                            async move {
+                                let body = Bytes::from(vec![b'X'; body_size]);
+                                let resp = Response::builder()
+                                    .status(200)
+                                    .header("content-type", "application/octet-stream")
+                                    .body(Full::new(body))
+                                    .unwrap();
+                                resp_count.fetch_add(1, Ordering::Relaxed);
+                                Ok::<_, hyper::Error>(resp)
+                            }
+                        });
+                        let _ = ServerBuilder::new(TokioExecutor::new())
+                            .serve_connection(io, svc)
+                            .await;
+                    });
+                }
+            });
+        });
+        Self {
+            stop,
+            responses_sent,
+            thread: Some(thread),
+        }
+    }
+    fn get_responses_sent(&self) -> usize {
+        self.responses_sent.load(Ordering::Relaxed)
+    }
+    fn stop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            thread::sleep(Duration::from_millis(100));
+            drop(t);
+        }
+    }
+}
+impl Drop for LargeBodyH2Backend {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+// ============================================================================
+// Backend: GoAway(NO_ERROR, last_stream_id=0) on every connection
+// ============================================================================
+
+struct GoAwayH2Backend {
+    stop: Arc<AtomicBool>,
+    connections_received: Arc<AtomicUsize>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl GoAwayH2Backend {
+    fn start(address: SocketAddr) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let connections_received = Arc::new(AtomicUsize::new(0));
+        let stop_clone = stop.clone();
+        let conn_count = connections_received.clone();
+        let thread = thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async move {
+                let listener = TcpListener::bind(address).await.unwrap();
+                loop {
+                    if stop_clone.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let accept =
+                        tokio::time::timeout(Duration::from_millis(50), listener.accept()).await;
+                    let (mut stream, _) = match accept {
+                        Ok(Ok(s)) => s,
+                        _ => continue,
+                    };
+                    conn_count.fetch_add(1, Ordering::Relaxed);
+                    let mut buf = vec![0u8; 4096];
+                    let _ = tokio::time::timeout(
+                        Duration::from_millis(500),
+                        tokio::io::AsyncReadExt::read(&mut stream, &mut buf),
+                    )
+                    .await;
+                    // SETTINGS
+                    let _ = tokio::io::AsyncWriteExt::write_all(
+                        &mut stream,
+                        &[0, 0, 0, 0x04, 0, 0, 0, 0, 0],
+                    )
+                    .await;
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    // SETTINGS ACK
+                    let _ = tokio::io::AsyncWriteExt::write_all(
+                        &mut stream,
+                        &[0, 0, 0, 0x04, 0x01, 0, 0, 0, 0],
+                    )
+                    .await;
+                    let _ = tokio::time::timeout(
+                        Duration::from_millis(200),
+                        tokio::io::AsyncReadExt::read(&mut stream, &mut buf),
+                    )
+                    .await;
+                    // GOAWAY(last_stream_id=0, NO_ERROR)
+                    let _ = tokio::io::AsyncWriteExt::write_all(
+                        &mut stream,
+                        &[0, 0, 8, 0x07, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                    )
+                    .await;
+                    let _ = tokio::io::AsyncWriteExt::flush(&mut stream).await;
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    drop(stream);
+                }
+            });
+        });
+        Self {
+            stop,
+            connections_received,
+            thread: Some(thread),
+        }
+    }
+    #[allow(dead_code)]
+    fn get_connections_received(&self) -> usize {
+        self.connections_received.load(Ordering::Relaxed)
+    }
+    fn stop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            thread::sleep(Duration::from_millis(100));
+            drop(t);
+        }
+    }
+}
+impl Drop for GoAwayH2Backend {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+// ============================================================================
+// Backend: per-stream delay H2 (for multiplexing independence test)
+// ============================================================================
+
+struct PerStreamDelayH2Backend {
+    stop: Arc<AtomicBool>,
+    responses_sent: Arc<AtomicUsize>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl PerStreamDelayH2Backend {
+    fn start(address: SocketAddr, slow_delay: Duration) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let responses_sent = Arc::new(AtomicUsize::new(0));
+        let stop_clone = stop.clone();
+        let resp_count = responses_sent.clone();
+        let thread = thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async move {
+                let listener = TcpListener::bind(address).await.unwrap();
+                loop {
+                    if stop_clone.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let accept =
+                        tokio::time::timeout(Duration::from_millis(50), listener.accept()).await;
+                    let (stream, _) = match accept {
+                        Ok(Ok(s)) => s,
+                        _ => continue,
+                    };
+                    let resp_count = resp_count.clone();
+                    tokio::spawn(async move {
+                        let io = TokioIo::new(stream);
+                        let conn_req_count = Arc::new(AtomicUsize::new(0));
+                        let svc = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                            let resp_count = resp_count.clone();
+                            let conn_req_count = conn_req_count.clone();
+                            async move {
+                                let idx = conn_req_count.fetch_add(1, Ordering::Relaxed);
+                                let path = req.uri().path().to_string();
+                                if path.contains("slow") {
+                                    tokio::time::sleep(slow_delay).await;
+                                }
+                                let body_text = if path.contains("slow") {
+                                    format!("slow-pong-{idx}")
+                                } else {
+                                    format!("fast-pong-{idx}")
+                                };
+                                let resp = Response::builder()
+                                    .status(200)
+                                    .header("content-type", "text/plain")
+                                    .body(Full::new(Bytes::from(body_text)))
+                                    .unwrap();
+                                resp_count.fetch_add(1, Ordering::Relaxed);
+                                Ok::<_, hyper::Error>(resp)
+                            }
+                        });
+                        let _ = ServerBuilder::new(TokioExecutor::new())
+                            .serve_connection(io, svc)
+                            .await;
+                    });
+                }
+            });
+        });
+        Self {
+            stop,
+            responses_sent,
+            thread: Some(thread),
+        }
+    }
+    fn get_responses_sent(&self) -> usize {
+        self.responses_sent.load(Ordering::Relaxed)
+    }
+    fn stop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            thread::sleep(Duration::from_millis(100));
+            drop(t);
+        }
+    }
+}
+impl Drop for PerStreamDelayH2Backend {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+// ============================================================================
+// Test: H1 frontend -> H2 backend protocol conversion
+// ============================================================================
+
+fn try_h1_frontend_h2_backend() -> State {
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+    let (config, listeners, state) = Worker::empty_config();
+    let mut worker = Worker::start_new_worker("H1-TO-H2", config, &listeners, state);
+
+    worker.send_proxy_request_type(RequestType::AddHttpsListener(
+        ListenerBuilder::new_https(front_address.clone())
+            .to_tls(None)
+            .unwrap(),
+    ));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        address: front_address.clone(),
+        proxy: ListenerType::Https.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Cluster {
+        http2: Some(true),
+        ..Worker::default_cluster("cluster_0")
+    }));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        hostname: String::from("localhost"),
+        ..Worker::default_http_frontend("cluster_0", front_address.clone().into())
+    }));
+    let certificate_and_key = CertificateAndKey {
+        certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
+        key: String::from(include_str!("../../../lib/assets/local-key.pem")),
+        certificate_chain: vec![],
+        versions: vec![],
+        names: vec![],
+    };
+    worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+        address: front_address,
+        certificate: certificate_and_key,
+        expired_at: None,
+    }));
+
+    let back_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address,
+        None,
+    )));
+    worker.read_to_last();
+
+    let mut h2_backend = H2Backend::start("H2-BACKEND-0", back_address, "h2-pong");
+    let client = build_https_client();
+    let uri: hyper::Uri = format!("https://localhost:{front_port}/api")
+        .parse()
+        .unwrap();
+
+    if let Some((status, body)) = resolve_request(&client, uri) {
+        println!("H1->H2 conversion - status: {status:?}, body: {body}");
+        if !status.is_success() || !body.contains("h2-pong") {
+            h2_backend.stop();
+            worker.soft_stop();
+            worker.wait_for_server_stop();
+            return State::Fail;
+        }
+    } else {
+        h2_backend.stop();
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        return State::Fail;
+    }
+
+    let responses_sent = h2_backend.get_responses_sent();
+    h2_backend.stop();
+    worker.soft_stop();
+    let success = worker.wait_for_server_stop();
+    if success && responses_sent == 1 {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h1_frontend_h2_backend() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "H1 frontend -> H2 backend protocol conversion",
+            try_h1_frontend_h2_backend
+        ),
+        State::Success
+    );
+}
+
+// ============================================================================
+// Test: GoAway retry correctness
+// ============================================================================
+
+fn try_h2_goaway_retry_succeeds() -> State {
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+    let (config, listeners, state) = Worker::empty_config();
+    let mut worker = Worker::start_new_worker("H2-GOAWAY-RETRY", config, &listeners, state);
+
+    worker.send_proxy_request_type(RequestType::AddHttpsListener(
+        ListenerBuilder::new_https(front_address.clone())
+            .to_tls(None)
+            .unwrap(),
+    ));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        address: front_address.clone(),
+        proxy: ListenerType::Https.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Cluster {
+        http2: Some(true),
+        ..Worker::default_cluster("cluster_0")
+    }));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        hostname: String::from("localhost"),
+        ..Worker::default_http_frontend("cluster_0", front_address.clone().into())
+    }));
+    let certificate_and_key = CertificateAndKey {
+        certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
+        key: String::from(include_str!("../../../lib/assets/local-key.pem")),
+        certificate_chain: vec![],
+        versions: vec![],
+        names: vec![],
+    };
+    worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+        address: front_address,
+        certificate: certificate_and_key,
+        expired_at: None,
+    }));
+
+    let back_address_0 = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address_0,
+        None,
+    )));
+    let back_address_1 = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-1",
+        back_address_1,
+        None,
+    )));
+    worker.read_to_last();
+
+    let mut goaway_backend = GoAwayH2Backend::start(back_address_0);
+    let mut normal_backend = H2Backend::start("H2-NORMAL", back_address_1, "retry-pong");
+    thread::sleep(Duration::from_millis(200));
+
+    let client = build_h2_client();
+    let uri: hyper::Uri = format!("https://localhost:{front_port}/api")
+        .parse()
+        .unwrap();
+
+    let result = resolve_request(&client, uri);
+    let ok = result.as_ref().is_some_and(|(s, _)| {
+        println!("H2 GoAway retry - status: {s:?}");
+        s.is_success()
+    });
+
+    goaway_backend.stop();
+    normal_backend.stop();
+    worker.soft_stop();
+    let success = worker.wait_for_server_stop();
+    if success && ok {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_goaway_retry_succeeds() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "H2: GoAway retry - rejected stream retried on another backend",
+            try_h2_goaway_retry_succeeds
+        ),
+        State::Success
+    );
+}
+
+// ============================================================================
+// Test: H2 large response completes (flow control under pressure)
+// ============================================================================
+
+fn try_h2_large_response_completes() -> State {
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+    let (config, listeners, state) = Worker::empty_config();
+    let mut worker = Worker::start_new_worker("H2-LARGE-RESP", config, &listeners, state);
+
+    worker.send_proxy_request_type(RequestType::AddHttpsListener(
+        ListenerBuilder::new_https(front_address.clone())
+            .to_tls(None)
+            .unwrap(),
+    ));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        address: front_address.clone(),
+        proxy: ListenerType::Https.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Cluster {
+        http2: Some(true),
+        ..Worker::default_cluster("cluster_0")
+    }));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        hostname: String::from("localhost"),
+        ..Worker::default_http_frontend("cluster_0", front_address.clone().into())
+    }));
+    let certificate_and_key = CertificateAndKey {
+        certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
+        key: String::from(include_str!("../../../lib/assets/local-key.pem")),
+        certificate_chain: vec![],
+        versions: vec![],
+        names: vec![],
+    };
+    worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+        address: front_address,
+        certificate: certificate_and_key,
+        expired_at: None,
+    }));
+
+    let back_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address,
+        None,
+    )));
+    worker.read_to_last();
+
+    let body_size = 1024 * 1024;
+    let mut large_backend = LargeBodyH2Backend::start(back_address, body_size);
+
+    let client = build_h2_client();
+    let uri: hyper::Uri = format!("https://localhost:{front_port}/api/large")
+        .parse()
+        .unwrap();
+
+    let result = resolve_request(&client, uri);
+    let correct = result.as_ref().is_some_and(|(status, body)| {
+        println!(
+            "H2 large response - status: {status:?}, body len: {}",
+            body.len()
+        );
+        status.is_success() && body.len() == body_size
+    });
+
+    large_backend.stop();
+    worker.soft_stop();
+    let success = worker.wait_for_server_stop();
+    if success && correct {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_large_response_completes() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "H2: large 1MB response completes (flow control)",
+            try_h2_large_response_completes
+        ),
+        State::Success
+    );
+}
+
+// ============================================================================
+// Test: H2 per-stream independence
+// ============================================================================
+
+fn try_h2_slow_stream_does_not_block_fast_stream() -> State {
+    use http_body_util::BodyExt;
+
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+    let (config, listeners, state) = Worker::empty_config();
+    let mut worker = Worker::start_new_worker("H2-STREAM-INDEP", config, &listeners, state);
+
+    worker.send_proxy_request_type(RequestType::AddHttpsListener(
+        ListenerBuilder::new_https(front_address.clone())
+            .to_tls(None)
+            .unwrap(),
+    ));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        address: front_address.clone(),
+        proxy: ListenerType::Https.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Cluster {
+        http2: Some(true),
+        ..Worker::default_cluster("cluster_0")
+    }));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        hostname: String::from("localhost"),
+        ..Worker::default_http_frontend("cluster_0", front_address.clone().into())
+    }));
+    let certificate_and_key = CertificateAndKey {
+        certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
+        key: String::from(include_str!("../../../lib/assets/local-key.pem")),
+        certificate_chain: vec![],
+        versions: vec![],
+        names: vec![],
+    };
+    worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+        address: front_address,
+        certificate: certificate_and_key,
+        expired_at: None,
+    }));
+
+    let back_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address,
+        None,
+    )));
+    worker.read_to_last();
+
+    let mut backend = PerStreamDelayH2Backend::start(back_address, Duration::from_secs(2));
+    let client = build_h2_client();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    let (fast_result, fast_elapsed, slow_result, slow_elapsed) = rt.block_on(async {
+        let fast_uri: hyper::Uri = format!("https://localhost:{front_port}/fast")
+            .parse()
+            .unwrap();
+        let slow_uri: hyper::Uri = format!("https://localhost:{front_port}/slow")
+            .parse()
+            .unwrap();
+        let cf = client.clone();
+        let cs = client.clone();
+
+        let fh = tokio::spawn(async move {
+            let start = Instant::now();
+            let r = match cf.get(fast_uri).await {
+                Ok(resp) => {
+                    let s = resp.status();
+                    let b = resp
+                        .into_body()
+                        .collect()
+                        .await
+                        .map(|c| c.to_bytes())
+                        .unwrap_or_default();
+                    Some((s, String::from_utf8(b.to_vec()).unwrap_or_default()))
+                }
+                Err(_) => None,
+            };
+            (r, start.elapsed())
+        });
+        let sh = tokio::spawn(async move {
+            let start = Instant::now();
+            let r = match cs.get(slow_uri).await {
+                Ok(resp) => {
+                    let s = resp.status();
+                    let b = resp
+                        .into_body()
+                        .collect()
+                        .await
+                        .map(|c| c.to_bytes())
+                        .unwrap_or_default();
+                    Some((s, String::from_utf8(b.to_vec()).unwrap_or_default()))
+                }
+                Err(_) => None,
+            };
+            (r, start.elapsed())
+        });
+
+        let (f, s) = tokio::join!(fh, sh);
+        let (fr, fe) = f.unwrap();
+        let (sr, se) = s.unwrap();
+        (fr, fe, sr, se)
+    });
+
+    println!(
+        "H2 stream indep - fast: {:?} in {:?}, slow: {:?} in {:?}",
+        fast_result.as_ref().map(|(s, _)| s),
+        fast_elapsed,
+        slow_result.as_ref().map(|(s, _)| s),
+        slow_elapsed,
+    );
+
+    let fast_ok = fast_result
+        .as_ref()
+        .is_some_and(|(s, b)| s.is_success() && b.contains("fast-pong"));
+    let fast_was_fast = fast_elapsed < Duration::from_secs(1);
+    let slow_ok = slow_result
+        .as_ref()
+        .is_some_and(|(s, b)| s.is_success() && b.contains("slow-pong"));
+
+    if !fast_was_fast {
+        println!("  fast took {:?} (expected <1s)", fast_elapsed);
+    }
+
+    backend.stop();
+    worker.soft_stop();
+    let success = worker.wait_for_server_stop();
+    if success && fast_ok && fast_was_fast && slow_ok {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_slow_stream_does_not_block_fast_stream() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "H2: slow stream does not block fast stream",
+            try_h2_slow_stream_does_not_block_fast_stream
+        ),
+        State::Success
+    );
+}
