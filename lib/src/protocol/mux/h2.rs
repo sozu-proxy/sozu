@@ -702,9 +702,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                                 stream.metrics.backend_stop();
                                 stream.generate_access_log(
                                     false,
-                                    Some(String::from("H2::SplitFrame")),
+                                    Some("H2::Complete"),
                                     context.listener.clone(),
                                 );
+                                stream.metrics.reset();
                                 let state =
                                     std::mem::replace(&mut stream.state, StreamState::Recycle);
                                 if let StreamState::Linked(token) = state {
@@ -807,9 +808,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                                 stream.metrics.backend_stop();
                                 stream.generate_access_log(
                                     false,
-                                    Some(String::from("H2::WholeFrame")),
+                                    Some("H2::Complete"),
                                     context.listener.clone(),
                                 );
+                                stream.metrics.reset();
                                 let state =
                                     std::mem::replace(&mut stream.state, StreamState::Recycle);
                                 if let StreamState::Linked(token) = state {
@@ -1134,6 +1136,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     incr!("http.requests");
                     gauge_add!("http.active_requests", 1);
                     stream.metrics.service_start();
+                    stream.request_counted = true;
                     stream.state = StreamState::Link;
                 }
             }
@@ -1189,7 +1192,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                             stream.metrics.backend_stop();
                             stream.generate_access_log(
                                 true,
-                                Some(String::from("H2::ResetFrame")),
+                                Some("H2::ResetFrame"),
                                 context.listener.clone(),
                             );
                             stream.state = StreamState::Recycle;
@@ -1438,7 +1441,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             stream.metrics.backend_stop();
             stream.generate_access_log(
                 true,
-                Some(String::from("H2::Reset")),
+                Some("H2::Reset"),
                 context.listener.clone(),
             );
         }

@@ -123,6 +123,8 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                 incr!("http.requests");
                 gauge_add!("http.active_requests", 1);
                 parts.metrics.service_start();
+                // Set request_counted after the last use of `parts` to satisfy the borrow checker
+                stream.request_counted = true;
                 stream.state = StreamState::Link
             }
             if let StreamState::Linked(token) = stream.state {
@@ -184,27 +186,34 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                             stream.metrics.backend_stop();
                             stream.generate_access_log(
                                 false,
-                                Some(String::from("H1::Upgrade")),
+                                Some("H1::Upgrade"),
                                 context.listener.clone(),
                             );
                             return MuxResult::Upgrade;
                         }
                         kawa::StatusLine::Response { code: 100, .. } => {
                             debug!("============== HANDLE CONTINUE!");
-                            // after a 100 continue, we expect the client to continue with its request
+                            // After a 100 Continue, we expect the client to continue
+                            // with its request body. Do NOT call generate_access_log
+                            // here — the final response will emit the access log.
+                            // Calling it here would double-decrement http.active_requests.
                             self.timeout_container.reset();
                             self.readiness.interest.insert(Ready::READABLE);
                             kawa.clear();
                             stream.metrics.backend_stop();
-                            stream.generate_access_log(
-                                false,
-                                Some(String::from("H1::Continue")),
-                                context.listener.clone(),
-                            );
+                            if let StreamState::Linked(token) = stream.state {
+                                endpoint
+                                    .readiness_mut(token)
+                                    .interest
+                                    .insert(Ready::READABLE);
+                            }
                             return MuxResult::Continue;
                         }
                         kawa::StatusLine::Response { code: 103, .. } => {
                             debug!("============== HANDLE EARLY HINT!");
+                            // Do NOT call generate_access_log for 103 Early Hints.
+                            // The final response will emit the access log.
+                            // Calling it here would double-decrement http.active_requests.
                             if let StreamState::Linked(token) = stream.state {
                                 // after a 103 early hints, we expect the backend to send its response
                                 endpoint
@@ -213,17 +222,12 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                                     .insert(Ready::READABLE);
                                 kawa.clear();
                                 stream.metrics.backend_stop();
-                                stream.generate_access_log(
-                                    false,
-                                    Some(String::from("H1::EarlyHint+Error")),
-                                    context.listener.clone(),
-                                );
                                 return MuxResult::Continue;
                             } else {
                                 stream.metrics.backend_stop();
                                 stream.generate_access_log(
                                     false,
-                                    Some(String::from("H1::EarlyHint")),
+                                    Some("H1::EarlyHint"),
                                     context.listener.clone(),
                                 );
                                 return MuxResult::CloseSession;
@@ -235,7 +239,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                     stream.metrics.backend_stop();
                     stream.generate_access_log(
                         false,
-                        Some(String::from("H1::Continue")),
+                        Some("H1::Complete"),
                         context.listener.clone(),
                     );
                     stream.metrics.reset();

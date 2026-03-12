@@ -123,20 +123,6 @@ pub fn terminate_default_answer<T: kawa::AsBuffer>(kawa: &mut kawa::Kawa<T>, clo
     kawa.parsing_phase = kawa::ParsingPhase::Terminated;
 }
 
-/// Build a route string from the stream's HTTP context, matching kawa_h1's `get_route()`
-fn get_route(context: &HttpContext) -> String {
-    if let Some(method) = &context.method {
-        if let Some(authority) = &context.authority {
-            if let Some(path) = &context.path {
-                return format!("{method} {authority}{path}");
-            }
-            return format!("{method} {authority}");
-        }
-        return format!("{method}");
-    }
-    String::new()
-}
-
 /// Copy blocks from a rendered `DefaultAnswerStream` into `stream.back`.
 ///
 /// The template-rendered stream uses `SharedBuffer` storage, so any `Store::Slice`
@@ -224,7 +210,7 @@ fn set_default_answer(
     );
 
     let request_id = context.id.to_string();
-    let route = get_route(context);
+    let route = context.get_route();
     let cluster_id = context.cluster_id.as_deref();
     let backend_id = context.backend_id.as_deref();
 
@@ -845,6 +831,10 @@ pub struct Stream {
     pub front_data_received: usize,
     /// Tracks total DATA payload bytes received on the backend for content-length validation (RFC 9113 §8.1.1)
     pub back_data_received: usize,
+    /// True when `gauge_add!("http.active_requests", 1)` was emitted for this stream.
+    /// Prevents underflow when `generate_access_log` is called for streams that never
+    /// had their request fully parsed (idle timeouts, malformed requests).
+    pub request_counted: bool,
     pub front: GenericHttpStream,
     pub back: GenericHttpStream,
     pub context: HttpContext,
@@ -884,6 +874,7 @@ impl Debug for Stream {
             )
             .field("front_data_received", &self.front_data_received)
             .field("back_data_received", &self.back_data_received)
+            .field("request_counted", &self.request_counted)
             .field("front", &KawaSummary(&self.front))
             .field("back", &KawaSummary(&self.back))
             .field("context", &self.context)
@@ -926,10 +917,11 @@ impl Stream {
             back_received_end_of_stream: false,
             front_data_received: 0,
             back_data_received: 0,
+            request_counted: false,
             front: GenericHttpStream::new(kawa::Kind::Request, kawa::Buffer::new(front_buffer)),
             back: GenericHttpStream::new(kawa::Kind::Response, kawa::Buffer::new(back_buffer)),
             context,
-            metrics: SessionMetrics::new(None), // FIXME
+            metrics: SessionMetrics::new(None),
         })
     }
     pub fn split(&mut self, position: &Position) -> StreamParts<'_> {
@@ -957,13 +949,16 @@ impl Stream {
     pub fn generate_access_log<L>(
         &mut self,
         error: bool,
-        message: Option<String>,
+        message: Option<&str>,
         listener: Rc<RefCell<L>>,
     ) where
         L: ListenerHandler + L7ListenerHandler,
     {
         let context = &self.context;
-        gauge_add!("http.active_requests", -1);
+        if self.request_counted {
+            gauge_add!("http.active_requests", -1);
+            self.request_counted = false;
+        }
         if error {
             incr!("http.errors");
         }
@@ -992,9 +987,6 @@ impl Stream {
         } else {
             "http.status.none"
         };
-        // if context.cluster_id.is_some() {
-        //     incr!(key);
-        // }
         incr!(
             key,
             context.cluster_id.as_deref(),
@@ -1021,7 +1013,7 @@ impl Stream {
         log_access! {
             error,
             on_failure: { incr!("unsent-access-logs") },
-            message: message.as_deref(),
+            message,
             context: context.log_context(),
             session_address: context.session_address,
             backend_address: context.backend_address,
@@ -1052,13 +1044,24 @@ impl DebugHistory {
         Self::default()
     }
     pub fn push(&mut self, _event: DebugEvent) {
-        //self.events.push(_event);
+        #[cfg(debug_assertions)]
+        self.events.push(_event);
     }
-    pub fn set_interesting(&mut self, _val: bool) {
-        //self.is_interesting = _val;
+    pub fn set_interesting(&mut self, _interesting: bool) {
+        #[cfg(debug_assertions)]
+        {
+            self.is_interesting = _interesting;
+        }
     }
-    pub fn is_interesting(&mut self) -> bool {
-        self.is_interesting
+    pub fn is_interesting(&self) -> bool {
+        #[cfg(debug_assertions)]
+        {
+            return self.is_interesting;
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            false
+        }
     }
 }
 
@@ -1113,6 +1116,7 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
                 stream.back_received_end_of_stream = false;
                 stream.front_data_received = 0;
                 stream.back_data_received = 0;
+                stream.request_counted = false;
                 stream.window = window as i32;
                 stream.context = http_context;
                 stream.back.clear();
@@ -2064,9 +2068,13 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 if stream.metrics.backend_stop.is_none() {
                     stream.metrics.backend_stop();
                 }
+                // Only mark as error if the stream had an actual protocol/processing failure
+                // (kawa parse error, backend error). Normal timeouts, client disconnects,
+                // and graceful connection closures are not errors.
+                let is_error = stream.front.is_error() || stream.back.is_error();
                 stream.generate_access_log(
-                    true,
-                    Some(String::from("session close")),
+                    is_error,
+                    Some("session close"),
                     self.context.listener.clone(),
                 );
                 stream.state = StreamState::Recycle;
