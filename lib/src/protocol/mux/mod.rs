@@ -426,7 +426,7 @@ impl<Front: SocketHandler> Connection<Front> {
             },
             socket: front_stream,
             state: H2State::ClientPreface,
-            streams: HashMap::new(),
+            streams: HashMap::with_capacity(100),
             timeout_container,
             window: h2::DEFAULT_INITIAL_WINDOW_SIZE as i32,
             received_bytes_since_update: 0,
@@ -479,7 +479,7 @@ impl<Front: SocketHandler> Connection<Front> {
             },
             socket: front_stream,
             state: H2State::ClientPreface,
-            streams: HashMap::new(),
+            streams: HashMap::with_capacity(100),
             timeout_container,
             window: h2::DEFAULT_INITIAL_WINDOW_SIZE as i32,
             received_bytes_since_update: 0,
@@ -1634,6 +1634,8 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                             }
                             MuxResult::CloseSession => return SessionResult::Close,
                         }
+                        // Cross-readiness: backend wrote → wake frontend reader
+                        self.frontend.try_resume_reading(context);
                     }
 
                     if client.readiness().filter_interest().is_readable() {
@@ -1752,6 +1754,10 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                         MuxResult::Continue => {}
                         MuxResult::CloseSession => return SessionResult::Close,
                         MuxResult::Upgrade => return SessionResult::Upgrade,
+                    }
+                    // Cross-readiness: frontend wrote → wake parked backends
+                    for (_token, backend) in self.router.backends.iter_mut() {
+                        backend.try_resume_reading(context);
                     }
                 }
 
