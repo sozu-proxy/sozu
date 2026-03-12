@@ -1,4 +1,8 @@
-use std::{cmp::min, collections::HashMap, time::Instant};
+use std::{
+    cmp::min,
+    collections::{HashMap, HashSet},
+    time::Instant,
+};
 
 use rusty_ulid::Ulid;
 use sozu_command::ready::Ready;
@@ -54,6 +58,10 @@ const MAX_HEADER_LIST_SIZE: u32 = 65536;
 const FLOOD_WINDOW_DURATION: std::time::Duration = std::time::Duration::from_secs(1);
 /// Maximum general anomaly count before triggering ENHANCE_YOUR_CALM
 const MAX_GLITCH_COUNT: u32 = 100;
+
+/// RFC 9113 §6.5: maximum time (in seconds) to wait for SETTINGS ACK before
+/// sending GOAWAY with SETTINGS_TIMEOUT error code.
+const SETTINGS_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[inline(always)]
 fn error_nom_to_h2(error: nom::Err<parser::ParserError>) -> H2Error {
@@ -309,6 +317,13 @@ pub struct ConnectionH2<Front: SocketHandler> {
     pub overhead_bout: usize,
     /// Flood detector for CVE mitigations (Rapid Reset, CONTINUATION, Ping, Settings floods).
     pub flood_detector: H2FloodDetector,
+    /// RFC 9113 §6.5: timestamp when we sent SETTINGS and are awaiting ACK.
+    /// If the peer does not ACK within SETTINGS_ACK_TIMEOUT, we send GOAWAY
+    /// with SettingsTimeout error.
+    pub settings_sent_at: Option<Instant>,
+    /// RFC 9113 §6.8: tracks stream IDs for which RST_STREAM has already been sent,
+    /// preventing duplicate RST_STREAM frames on the wire.
+    pub rst_sent: HashSet<StreamId>,
 }
 impl<Front: SocketHandler> std::fmt::Debug for ConnectionH2<Front> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -343,6 +358,17 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         E: Endpoint,
         L: ListenerHandler + L7ListenerHandler,
     {
+        // RFC 9113 §6.5: check if peer has timed out on SETTINGS ACK
+        if let Some(sent_at) = self.settings_sent_at {
+            if sent_at.elapsed() >= SETTINGS_ACK_TIMEOUT {
+                error!(
+                    "SETTINGS ACK timeout: peer did not acknowledge within {:?}",
+                    SETTINGS_ACK_TIMEOUT
+                );
+                return self.goaway(H2Error::SettingsTimeout);
+            }
+        }
+
         // Don't reset the timeout unconditionally here. Only application data
         // (DATA/HEADERS frames) should reset the timeout. H2 control frames
         // (PING, WINDOW_UPDATE, SETTINGS) must NOT reset it, otherwise a peer
@@ -469,7 +495,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 };
                 let kawa = &mut self.zero;
                 match serializer::gen_settings(kawa.storage.space(), &self.local_settings) {
-                    Ok((_, size)) => kawa.storage.fill(size),
+                    Ok((_, size)) => {
+                        kawa.storage.fill(size);
+                        // RFC 9113 §6.5: start tracking SETTINGS ACK timeout
+                        self.settings_sent_at = Some(Instant::now());
+                    }
                     Err(error) => {
                         error!("Could not serialize SettingsFrame: {:?}", error);
                         return self.force_disconnect();
@@ -804,7 +834,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 kawa.storage.space()[0..pri.len()].copy_from_slice(pri);
                 kawa.storage.fill(pri.len());
                 match serializer::gen_settings(kawa.storage.space(), &self.local_settings) {
-                    Ok((_, size)) => kawa.storage.fill(size),
+                    Ok((_, size)) => {
+                        kawa.storage.fill(size);
+                        // RFC 9113 §6.5: start tracking SETTINGS ACK timeout
+                        self.settings_sent_at = Some(Instant::now());
+                    }
                     Err(error) => {
                         error!("Could not serialize SettingsFrame: {:?}", error);
                         return self.force_disconnect();
@@ -1110,6 +1144,48 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             }
             Err(error) => {
                 error!("Could not serialize GoAwayFrame: {:?}", error);
+                self.force_disconnect()
+            }
+        }
+    }
+
+    /// RFC 9113 §6.8: Initiate graceful shutdown using the double-GOAWAY pattern.
+    ///
+    /// First call sends GOAWAY with `last_stream_id = 0x7FFFFFFF` (MAX) to signal
+    /// the intent to stop accepting new streams while allowing in-flight streams
+    /// to complete. The connection enters draining mode.
+    ///
+    /// When `draining` is already true (second invocation), sends the final GOAWAY
+    /// with the actual `highest_peer_stream_id` so the peer knows which streams
+    /// were processed.
+    pub fn graceful_goaway(&mut self) -> MuxResult {
+        if self.draining {
+            // Second GOAWAY: send with the real last_stream_id
+            return self.goaway(H2Error::NoError);
+        }
+
+        // First GOAWAY: advertise MAX stream ID so the peer knows we are draining
+        // but does not yet know the cutoff. This gives in-flight requests a chance
+        // to arrive before we commit to a final last_stream_id.
+        self.draining = true;
+        self.expect_read = None;
+        let kawa = &mut self.zero;
+        kawa.storage.clear();
+        debug!("GOAWAY (graceful, phase 1): last_stream_id=0x7FFFFFFF");
+
+        const MAX_STREAM_ID: u32 = 0x7FFF_FFFF;
+        match serializer::gen_goaway(kawa.storage.space(), MAX_STREAM_ID, H2Error::NoError) {
+            Ok((_, size)) => {
+                kawa.storage.fill(size);
+                // Stay in the current state so the connection can continue processing
+                // existing streams. The second GOAWAY will transition to GoAway state.
+                self.expect_write = Some(H2StreamId::Zero);
+                self.readiness.interest.insert(Ready::WRITABLE);
+                self.readiness.interest.remove(Ready::READABLE);
+                MuxResult::Continue
+            }
+            Err(error) => {
+                error!("Could not serialize graceful GoAwayFrame: {:?}", error);
                 self.force_disconnect()
             }
         }
@@ -1475,6 +1551,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         error!("SETTINGS ACK with non-empty payload");
                         return self.goaway(H2Error::FrameSizeError);
                     }
+                    // RFC 9113 §6.5: peer acknowledged our SETTINGS — clear timeout
+                    self.settings_sent_at = None;
                     self.attribute_bytes_to_overhead();
                     return MuxResult::Continue;
                 }
