@@ -1706,3 +1706,205 @@ fn test_rapid_idle_with_valid_traffic() {
         State::Success,
     );
 }
+
+// =========================================================================
+// Test 20: Close-delimited response is fully delivered to the client
+//
+// When a backend sends a response with `Connection: close`, sozu must
+// drain the full response buffer to the client before closing the session.
+//
+// Before the fix, end_stream() set `self.readiness.event = Ready::HUP` on
+// the frontend connection, which prevented the main event loop from
+// flushing the response buffer. The session would spin 10,000 iterations
+// and be force-closed, causing ECONNRESET on the client side.
+//
+// The fix sets `stream.state = StreamState::Unlinked` and inserts
+// `Ready::WRITABLE` into the interest set, allowing writable() to flush
+// the response buffer and then cleanly close via CloseSession.
+// =========================================================================
+
+/// Read all available data from a TCP stream until EOF or timeout.
+/// Returns the accumulated data as a String.
+fn raw_read_all(stream: &mut TcpStream) -> String {
+    let mut all_data = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => all_data.extend_from_slice(&buf[..n]),
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => break,
+            Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&all_data).to_string()
+}
+
+fn try_close_delimited_response() -> State {
+    let front_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, mut backends) = setup_sync_test(
+        "CLOSE-DELIM",
+        config,
+        listeners,
+        state,
+        front_address,
+        1,
+        false,
+    );
+    let mut backend = backends.pop().unwrap();
+
+    // Backend sends a response with Connection: close
+    let body = "close-delimited-body-ok";
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body,
+    );
+    backend.set_response(response);
+    backend.connect();
+
+    // Client sends a request with Connection: close
+    let mut stream = raw_connect(front_address);
+    stream
+        .write_all(b"GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .expect("write request");
+
+    backend.accept(0);
+    backend.receive(0);
+    backend.send(0);
+    // Backend closes its side after sending (close-delimited)
+    backend.close(0);
+
+    // Give sozu time to process the backend close and flush the buffer
+    thread::sleep(Duration::from_millis(200));
+
+    // Client must receive the full response body
+    let response_data = raw_read_all(&mut stream);
+    if !response_data.contains("200 OK") {
+        println!("close-delimited: missing 200 status line in: {response_data}");
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        return State::Fail;
+    }
+    if !response_data.contains(body) {
+        println!("close-delimited: missing body in response: {response_data}");
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        return State::Fail;
+    }
+
+    println!(
+        "close-delimited: received full response ({} bytes)",
+        response_data.len()
+    );
+
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+    State::Success
+}
+
+fn try_close_delimited_large_response() -> State {
+    let front_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, mut backends) = setup_sync_test(
+        "CLOSE-DELIM-LARGE",
+        config,
+        listeners,
+        state,
+        front_address,
+        1,
+        false,
+    );
+    let mut backend = backends.pop().unwrap();
+
+    // Generate a body larger than sozu's buffer_size (default ~16KB).
+    // Use 48KB to ensure multiple flush cycles are needed.
+    let body = "X".repeat(48 * 1024);
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body,
+    );
+    backend.set_response(response);
+    backend.connect();
+
+    // Client sends a request with Connection: close
+    let mut stream = raw_connect_with_timeout(front_address, Duration::from_secs(5));
+    stream
+        .write_all(b"GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .expect("write request");
+
+    backend.accept(0);
+    backend.receive(0);
+
+    // The backend response is larger than the mock's write buffer,
+    // so we may need to send in chunks. SyncBackend::send writes once,
+    // but the kernel TCP buffer usually handles ~48KB on loopback.
+    backend.send(0);
+    // Backend closes its side after sending (close-delimited)
+    backend.close(0);
+
+    // Give sozu time to process the backend close and flush the buffer.
+    // Larger body needs more flush cycles.
+    thread::sleep(Duration::from_millis(500));
+
+    // Client reads all available data
+    let response_data = raw_read_all(&mut stream);
+    if !response_data.contains("200 OK") {
+        println!(
+            "close-delimited-large: missing 200 status line (got {} bytes)",
+            response_data.len()
+        );
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        return State::Fail;
+    }
+
+    // Verify we got the full body. The response includes HTTP headers,
+    // so just check the body portion is present in full.
+    let body_start = response_data.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
+    let received_body_len = response_data.len() - body_start;
+    if received_body_len < body.len() {
+        println!(
+            "close-delimited-large: truncated body: got {} bytes, expected {}",
+            received_body_len,
+            body.len()
+        );
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        return State::Fail;
+    }
+
+    println!(
+        "close-delimited-large: received full response ({} bytes, body {} bytes)",
+        response_data.len(),
+        received_body_len,
+    );
+
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+    State::Success
+}
+
+#[test]
+fn test_h1_close_delimited_response_fully_delivered() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "Close-delimited response (small body) fully delivered to client",
+            try_close_delimited_response,
+        ),
+        State::Success,
+    );
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "Close-delimited response (large 48KB body) fully delivered to client",
+            try_close_delimited_large_response,
+        ),
+        State::Success,
+    );
+}
