@@ -294,7 +294,6 @@ impl Debug for Position {
     }
 }
 
-#[allow(dead_code)]
 impl Position {
     fn is_server(&self) -> bool {
         match self {
@@ -788,34 +787,6 @@ fn update_readiness_after_write(
     }
 }
 
-// enum Stream {
-//     Idle {
-//         window: i32,
-//     },
-//     Open {
-//         window: i32,
-//         token: Token,
-//         front: GenericHttpStream,
-//         back: GenericHttpStream,
-//         context: HttpContext,
-//     },
-//     Reserved {
-//         window: i32,
-//         token: Token,
-//         position: Position,
-//         buffer: GenericHttpStream,
-//         context: HttpContext,
-//     },
-//     HalfClosed {
-//         window: i32,
-//         token: Token,
-//         position: Position,
-//         buffer: GenericHttpStream,
-//         context: HttpContext,
-//     },
-//     Closed,
-// }
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamState {
     Idle,
@@ -1073,7 +1044,7 @@ impl DebugHistory {
     pub fn is_interesting(&self) -> bool {
         #[cfg(debug_assertions)]
         {
-            return self.is_interesting;
+            self.is_interesting
         }
         #[cfg(not(debug_assertions))]
         {
@@ -1398,7 +1369,6 @@ impl Router {
             Ok(route) => route,
             Err(frontend_error) => {
                 trace!("{}", frontend_error);
-                // self.set_answer(DefaultAnswerStatus::Answer404, None);
                 return Err(RetrieveClusterError::RetrieveFrontend(frontend_error));
             }
         };
@@ -1407,7 +1377,6 @@ impl Router {
             Route::ClusterId(id) => id,
             Route::Deny => {
                 trace!("Route::Deny");
-                // self.set_answer(DefaultAnswerStatus::Answer401, None);
                 return Err(RetrieveClusterError::UnauthorizedRoute);
             }
         };
@@ -1432,7 +1401,6 @@ impl Router {
             )
             .map_err(|backend_error| {
                 trace!("{}", backend_error);
-                // self.set_answer(DefaultAnswerStatus::Answer503, None);
                 BackendConnectionError::Backend(backend_error)
             })?;
 
@@ -2160,28 +2128,6 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 }
             }
         }
-        /*
-        let s = match &mut self.frontend {
-            Connection::H1(c) => &mut c.socket,
-            Connection::H2(c) => &mut c.socket,
-        };
-        let mut b = [0; 1024];
-        let (size, status) = s.socket_read(&mut b);
-        println_!("socket: {size} {status:?} {:?}", &b[..size]);
-        for stream in &mut self.context.streams {
-            for kawa in [&mut stream.front, &mut stream.back] {
-                kawa::debug_kawa(kawa);
-                kawa.prepare(&mut kawa::h1::BlockConverter);
-                let out = kawa.as_io_slice();
-                let mut writer = std::io::BufWriter::new(Vec::new());
-                let amount = writer.write_vectored(&out).unwrap();
-                println_!(
-                    "amount: {amount}\n{}",
-                    String::from_utf8_lossy(writer.buffer())
-                );
-            }
-        }
-        */
     }
 
     fn shutting_down(&mut self) -> SessionIsToBeClosed {

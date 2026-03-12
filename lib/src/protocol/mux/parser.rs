@@ -251,7 +251,7 @@ pub fn frame_header(input: &[u8], max_frame_size: u32) -> IResult<&[u8], FrameHe
 }
 
 fn convert_frame_type(t: u8) -> Option<FrameType> {
-    debug!("got frame type: {}", t);
+    trace!("got frame type: {}", t);
     match t {
         0 => Some(FrameType::Data),
         1 => Some(FrameType::Headers),
