@@ -152,6 +152,11 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                 self.lowercase_buf.clear();
                 self.lowercase_buf.extend_from_slice(key.data(buffer));
                 self.lowercase_buf.make_ascii_lowercase();
+                // RFC 9113 §8.2: reject header names with control chars or high bytes
+                if self.lowercase_buf.iter().any(|&b| b <= 0x20 || b >= 0x7f) {
+                    error!("H1->H2 header name contains invalid characters, skipping");
+                    return true; // skip this header, continue with next
+                }
                 if let Err(e) = self
                     .encoder
                     .encode_header_into((&self.lowercase_buf, val.data(buffer)), &mut self.out)
@@ -172,9 +177,11 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                         (data, payload_len as u32, true)
                     } else if self.window > 0 {
                         // we split the chunk to fit in the window
-                        let payload_len = min(self.max_frame_size, self.window as usize);
+                        let payload_len = min(self.max_frame_size, self.window.max(0) as usize);
                         let (before, after) = data.split(payload_len);
-                        kawa.blocks.push_front(Block::Chunk(Chunk { data: after }));
+                        if !after.is_empty() {
+                            kawa.blocks.push_front(Block::Chunk(Chunk { data: after }));
+                        }
                         (
                             before,
                             payload_len as u32,

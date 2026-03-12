@@ -433,6 +433,7 @@ impl<Front: SocketHandler> Connection<Front> {
             pending_window_updates: Vec::new(),
             highest_peer_stream_id: 0,
             converter_buf: Vec::new(),
+            lowercase_buf: Vec::new(),
             draining: false,
             peer_last_stream_id: None,
             zero: kawa::Kawa::new(kawa::Kind::Request, kawa::Buffer::new(buffer)),
@@ -486,6 +487,7 @@ impl<Front: SocketHandler> Connection<Front> {
             pending_window_updates: Vec::new(),
             highest_peer_stream_id: 0,
             converter_buf: Vec::new(),
+            lowercase_buf: Vec::new(),
             draining: false,
             peer_last_stream_id: None,
             zero: kawa::Kawa::new(kawa::Kind::Request, kawa::Buffer::new(buffer)),
@@ -656,7 +658,7 @@ impl<Front: SocketHandler> Connection<Front> {
             // Undo active_requests increment on failure
             if let Position::Client(_, backend, BackendStatus::Connected) = self.position() {
                 let mut backend_borrow = backend.borrow_mut();
-                backend_borrow.active_requests -= 1;
+                backend_borrow.active_requests = backend_borrow.active_requests.saturating_sub(1);
             }
         }
         started
@@ -1197,7 +1199,7 @@ impl Router {
         let cluster_id = self
             .route_from_request(stream_context, &context.listener)
             .map_err(BackendConnectionError::RetrieveClusterError)?;
-        stream_context.cluster_id = Some(cluster_id.clone());
+        stream_context.cluster_id = Some(cluster_id.to_owned());
 
         let (frontend_should_stick, frontend_should_redirect_https, h2) = proxy
             .borrow()
@@ -1232,46 +1234,40 @@ impl Router {
          */
 
         let mut reuse_token = None;
-        let reuse_connecting = true;
         for (token, backend) in &self.backends {
-            match (h2, reuse_connecting, backend.position()) {
-                (_, _, Position::Server) => {
+            match (h2, backend.position()) {
+                (_, Position::Server) => {
                     error!("Backend connection unexpectedly behaves like a server");
                     continue;
                 }
-                (_, _, Position::Client(_, _, BackendStatus::Disconnecting)) => {}
-                (true, false, Position::Client(_, _, BackendStatus::Connecting(_))) => {}
+                (_, Position::Client(_, _, BackendStatus::Disconnecting)) => {}
 
-                (true, _, Position::Client(other_cluster_id, _, BackendStatus::Connected)) => {
+                (true, Position::Client(other_cluster_id, _, BackendStatus::Connected)) => {
                     if *other_cluster_id == cluster_id {
                         reuse_token = Some(*token);
                         break;
                     }
                 }
-                (
-                    true,
-                    true,
-                    Position::Client(other_cluster_id, _, BackendStatus::Connecting(_)),
-                ) => {
+                (true, Position::Client(other_cluster_id, _, BackendStatus::Connecting(_))) => {
                     if *other_cluster_id == cluster_id {
                         reuse_token = Some(*token)
                     }
                 }
-                (true, _, Position::Client(other_cluster_id, _, BackendStatus::KeepAlive)) => {
+                (true, Position::Client(other_cluster_id, _, BackendStatus::KeepAlive)) => {
                     if *other_cluster_id == cluster_id {
                         error!("ConnectionH2 unexpectedly behaves like H1 with KeepAlive");
                     }
                 }
 
-                (false, _, Position::Client(old_cluster_id, _, BackendStatus::KeepAlive)) => {
+                (false, Position::Client(old_cluster_id, _, BackendStatus::KeepAlive)) => {
                     if *old_cluster_id == cluster_id {
                         reuse_token = Some(*token);
                         break;
                     }
                 }
                 // can't bundle H1 streams together
-                (false, _, Position::Client(_, _, BackendStatus::Connected))
-                | (false, _, Position::Client(_, _, BackendStatus::Connecting(_))) => {}
+                (false, Position::Client(_, _, BackendStatus::Connected))
+                | (false, Position::Client(_, _, BackendStatus::Connecting(_))) => {}
             }
         }
         trace!(
@@ -1437,11 +1433,11 @@ impl Router {
                     .borrow()
                     .sticky_id
                     .clone()
-                    .unwrap_or_else(|| backend.borrow().backend_id.clone()),
+                    .unwrap_or_else(|| backend.borrow().backend_id.to_owned()),
             );
         }
 
-        context.backend_id = Some(backend.borrow().backend_id.clone());
+        context.backend_id = Some(backend.borrow().backend_id.to_owned());
         context.backend_address = Some(backend.borrow().address);
 
         Ok((conn, backend))

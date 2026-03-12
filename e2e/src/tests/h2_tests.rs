@@ -68,10 +68,14 @@ const H2_FLAG_ACK: u8 = 0x1;
 const H2_FLAG_END_STREAM: u8 = 0x1;
 const H2_FLAG_END_HEADERS: u8 = 0x4;
 
-/// H2 error code: ENHANCE_YOUR_CALM (0xb) — RFC 9113 §7
-const H2_ERROR_ENHANCE_YOUR_CALM: u32 = 0xb;
+/// H2 error code: FLOW_CONTROL_ERROR (0x3) — RFC 9113 §7
+const H2_ERROR_FLOW_CONTROL_ERROR: u32 = 0x3;
 /// H2 error code: FRAME_SIZE_ERROR (0x6) — RFC 9113 §7
 const H2_ERROR_FRAME_SIZE_ERROR: u32 = 0x6;
+/// H2 error code: REFUSED_STREAM (0x7) — RFC 9113 §7
+const H2_ERROR_REFUSED_STREAM: u32 = 0x7;
+/// H2 error code: ENHANCE_YOUR_CALM (0xb) — RFC 9113 §7
+const H2_ERROR_ENHANCE_YOUR_CALM: u32 = 0xb;
 
 /// The HTTP/2 connection preface sent by the client (RFC 9113 Section 3.4).
 const H2_CLIENT_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
@@ -196,6 +200,21 @@ impl H2Frame {
     fn settings_ack_with_payload(payload: Vec<u8>) -> Self {
         Self::new(H2_FRAME_SETTINGS, H2_FLAG_ACK, 0, payload)
     }
+
+    /// Build a DATA frame on a given stream.
+    fn data(stream_id: u32, payload: Vec<u8>, end_stream: bool) -> Self {
+        let flags = if end_stream { H2_FLAG_END_STREAM } else { 0 };
+        Self::new(H2_FRAME_DATA, flags, stream_id, payload)
+    }
+
+    /// Build a GOAWAY frame.
+    #[allow(dead_code)]
+    fn goaway(last_stream_id: u32, error_code: u32) -> Self {
+        let mut payload = Vec::with_capacity(8);
+        payload.extend_from_slice(&(last_stream_id & 0x7FFFFFFF).to_be_bytes());
+        payload.extend_from_slice(&error_code.to_be_bytes());
+        Self::new(H2_FRAME_GOAWAY, 0, 0, payload)
+    }
 }
 
 /// Read raw bytes from a TcpStream / TLS stream, tolerating timeouts.
@@ -275,6 +294,31 @@ fn goaway_error_code(frames: &[(u8, u8, u32, Vec<u8>)]) -> Option<u32> {
 /// Check if frames contain a GOAWAY with a specific error code.
 fn contains_goaway_with_error(frames: &[(u8, u8, u32, Vec<u8>)], expected_error: u32) -> bool {
     goaway_error_code(frames) == Some(expected_error)
+}
+
+/// Extract RST_STREAM frames: returns (stream_id, error_code) tuples.
+/// RST_STREAM payload: 4 bytes error_code.
+fn extract_rst_streams(frames: &[(u8, u8, u32, Vec<u8>)]) -> Vec<(u32, u32)> {
+    frames
+        .iter()
+        .filter(|(t, _, _, payload)| *t == 0x3 && payload.len() >= 4)
+        .map(|(_, _, sid, payload)| {
+            let error_code = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+            (*sid, error_code)
+        })
+        .collect()
+}
+
+/// Check if any RST_STREAM frame has a given error code for a given stream.
+#[allow(dead_code)]
+fn contains_rst_stream_with_error(
+    frames: &[(u8, u8, u32, Vec<u8>)],
+    stream_id: u32,
+    expected_error: u32,
+) -> bool {
+    extract_rst_streams(frames)
+        .iter()
+        .any(|(sid, ec)| *sid == stream_id && *ec == expected_error)
 }
 
 // ============================================================================
@@ -3580,6 +3624,282 @@ fn test_h2_close_delimited_large_response() {
             5,
             "H2: close-delimited H1 backend large response (>32KB) fully delivered (HUP regression)",
             try_h2_close_delimited_large_response
+        ),
+        State::Success
+    );
+}
+
+// ============================================================================
+// Test: MAX_CONCURRENT_STREAMS exceeded -> RST_STREAM(REFUSED_STREAM)
+// ============================================================================
+
+/// When a client opens more streams than the server's MAX_CONCURRENT_STREAMS
+/// limit, sozu MUST send RST_STREAM(REFUSED_STREAM) on the excess stream
+/// but keep the connection alive for existing streams (RFC 9113 §5.1.2).
+///
+/// Strategy: sozu advertises MAX_CONCURRENT_STREAMS=100 by default. We open
+/// streams rapidly on odd stream IDs without consuming responses (so they
+/// pile up). Once the limit is hit, verify:
+///   1. RST_STREAM(REFUSED_STREAM) for the excess stream
+///   2. No GOAWAY — connection stays alive
+///   3. Sozu is still alive and accepting connections
+fn try_h2_max_concurrent_streams_rst_not_goaway() -> State {
+    let (mut worker, mut backends, front_port) = setup_h2_edge_test("H2-MAX-CONCURRENT", 1);
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+
+    let mut tls = tls_connect(front_addr);
+    h2_handshake(&mut tls);
+
+    // Read server's SETTINGS to find the advertised MAX_CONCURRENT_STREAMS.
+    // We already drained during h2_handshake, but sozu sends it in the
+    // initial SETTINGS. The default is 100.
+    let max_streams: u32 = 100;
+
+    // Open max_streams + 5 streams rapidly. Each HEADERS has END_HEADERS
+    // but NOT END_STREAM, keeping the streams open.
+    let header_block = vec![
+        0x82, // :method GET (index 2)
+        0x84, // :path / (index 4)
+        0x86, // :scheme https (index 6)
+    ];
+
+    // Batch all frames into one write to minimise round-trips.
+    let mut batch = Vec::new();
+    for i in 0..=(max_streams + 5) {
+        let stream_id = 1 + i * 2; // 1, 3, 5, ...
+        let headers = H2Frame::headers(stream_id, header_block.clone(), true, false);
+        batch.extend_from_slice(&headers.encode());
+    }
+    let write_ok = tls.write_all(&batch).is_ok() && tls.flush().is_ok();
+    if !write_ok {
+        println!("H2 MAX_CONCURRENT_STREAMS - write failed early (connection closed)");
+        // Even a write failure is acceptable — sozu may have cut the connection.
+        // The key assertion is that sozu doesn't crash.
+    }
+
+    // Read all response frames
+    thread::sleep(Duration::from_millis(500));
+    let response_data = read_all_available(&mut tls, Duration::from_secs(2));
+    let frames = parse_h2_frames(&response_data);
+
+    println!(
+        "H2 MAX_CONCURRENT_STREAMS - received {} frames",
+        frames.len()
+    );
+
+    // Check for RST_STREAM(REFUSED_STREAM) on excess streams
+    let rst_streams = extract_rst_streams(&frames);
+    let refused_count = rst_streams
+        .iter()
+        .filter(|(_sid, ec)| *ec == H2_ERROR_REFUSED_STREAM)
+        .count();
+    println!("H2 MAX_CONCURRENT_STREAMS - RST_STREAM(REFUSED_STREAM) count: {refused_count}");
+
+    // We must NOT get GOAWAY — the connection should stay alive
+    let got_goaway = contains_goaway(&frames);
+    println!("H2 MAX_CONCURRENT_STREAMS - got GOAWAY: {got_goaway}");
+
+    drop(tls);
+
+    // Verify sozu is still alive
+    thread::sleep(Duration::from_millis(200));
+    let still_alive = verify_sozu_alive(front_port);
+    println!("H2 MAX_CONCURRENT_STREAMS - sozu still alive: {still_alive}");
+
+    worker.soft_stop();
+    let success = worker.wait_for_server_stop();
+    for backend in backends.iter_mut() {
+        backend.stop_and_get_aggregator();
+    }
+
+    // Key assertions:
+    // 1. At least one RST_STREAM(REFUSED_STREAM) was sent
+    // 2. No GOAWAY (connection-level error) for stream exhaustion
+    // 3. Sozu stayed alive
+    if success && still_alive && refused_count > 0 && !got_goaway {
+        State::Success
+    } else {
+        println!(
+            "H2 MAX_CONCURRENT_STREAMS - success={success}, alive={still_alive}, \
+             refused={refused_count}, goaway={got_goaway}"
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_max_concurrent_streams_rst_not_goaway() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2: MAX_CONCURRENT_STREAMS exceeded -> RST_STREAM(REFUSED_STREAM), not GOAWAY",
+            try_h2_max_concurrent_streams_rst_not_goaway
+        ),
+        State::Success
+    );
+}
+
+// ============================================================================
+// Test: WINDOW_UPDATE overflow -> GOAWAY(FLOW_CONTROL_ERROR)
+// ============================================================================
+
+/// RFC 9113 §6.9.1: if a WINDOW_UPDATE causes the connection-level flow
+/// control window to exceed 2^31-1, the endpoint MUST send
+/// GOAWAY(FLOW_CONTROL_ERROR).
+///
+/// Strategy: the initial connection window is 65535 (default). Sending a
+/// WINDOW_UPDATE with increment=2^31-1 (0x7FFFFFFF) on stream 0 would make
+/// the total 65535 + 2147483647 = 2147549182, which exceeds 2^31-1.
+/// Sozu must respond with GOAWAY(FLOW_CONTROL_ERROR).
+fn try_h2_window_update_overflow() -> State {
+    let (mut worker, mut backends, front_port) = setup_h2_edge_test("H2-WINDOW-OVERFLOW", 1);
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+
+    let mut tls = tls_connect(front_addr);
+    h2_handshake(&mut tls);
+
+    // Send WINDOW_UPDATE on stream 0 with max increment (0x7FFFFFFF).
+    // Initial window = 65535, so 65535 + 2^31-1 > 2^31-1 => overflow.
+    let window_update = H2Frame::window_update(0, 0x7FFFFFFF);
+    tls.write_all(&window_update.encode()).unwrap();
+    tls.flush().unwrap();
+
+    // Read response — expect GOAWAY(FLOW_CONTROL_ERROR)
+    thread::sleep(Duration::from_millis(500));
+    let response_data = read_all_available(&mut tls, Duration::from_secs(2));
+    let frames = parse_h2_frames(&response_data);
+
+    println!(
+        "H2 WINDOW_UPDATE overflow - received {} frames",
+        frames.len()
+    );
+
+    let got_flow_control_error = contains_goaway_with_error(&frames, H2_ERROR_FLOW_CONTROL_ERROR);
+    if let Some(error_code) = goaway_error_code(&frames) {
+        println!("H2 WINDOW_UPDATE overflow - GOAWAY error_code=0x{error_code:x}");
+    }
+    println!("H2 WINDOW_UPDATE overflow - got FLOW_CONTROL_ERROR: {got_flow_control_error}");
+
+    drop(tls);
+
+    // Verify sozu is still alive
+    thread::sleep(Duration::from_millis(200));
+    let still_alive = verify_sozu_alive(front_port);
+    println!("H2 WINDOW_UPDATE overflow - sozu still alive: {still_alive}");
+
+    worker.soft_stop();
+    let success = worker.wait_for_server_stop();
+    for backend in backends.iter_mut() {
+        backend.stop_and_get_aggregator();
+    }
+
+    if success && still_alive && got_flow_control_error {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_window_update_overflow() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "H2: WINDOW_UPDATE overflow triggers GOAWAY(FLOW_CONTROL_ERROR)",
+            try_h2_window_update_overflow
+        ),
+        State::Success
+    );
+}
+
+// ============================================================================
+// Test: Empty DATA frame flood (CVE-2019-9518)
+// ============================================================================
+
+/// CVE-2019-9518: an attacker sends many empty DATA frames (payload_len=0,
+/// no END_STREAM) on a stream. Without flood detection, the server wastes
+/// CPU processing each frame with no useful work. Sozu must detect this and
+/// respond with GOAWAY(ENHANCE_YOUR_CALM).
+///
+/// Strategy:
+///   1. H2 handshake
+///   2. Send HEADERS on stream 1 (END_HEADERS, no END_STREAM) to open a stream
+///   3. Flood with 200+ empty DATA frames on stream 1
+///   4. Verify GOAWAY(ENHANCE_YOUR_CALM)
+fn try_h2_empty_data_flood() -> State {
+    let (mut worker, mut backends, front_port) = setup_h2_edge_test("H2-EMPTY-DATA-FLOOD", 1);
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+
+    let mut tls = tls_connect(front_addr);
+    h2_handshake(&mut tls);
+
+    // Open stream 1 with HEADERS (END_HEADERS but NOT END_STREAM)
+    let header_block = vec![
+        0x82, // :method GET (index 2)
+        0x84, // :path / (index 4)
+        0x86, // :scheme https (index 6)
+    ];
+    let headers = H2Frame::headers(1, header_block, true, false);
+    tls.write_all(&headers.encode()).unwrap();
+    tls.flush().unwrap();
+
+    // Brief pause to let sozu process the HEADERS
+    thread::sleep(Duration::from_millis(100));
+
+    // Flood with 200 empty DATA frames (no END_STREAM) on stream 1
+    let mut batch = Vec::new();
+    for _ in 0..200 {
+        let empty_data = H2Frame::data(1, Vec::new(), false);
+        batch.extend_from_slice(&empty_data.encode());
+    }
+    let write_ok = tls.write_all(&batch).is_ok() && tls.flush().is_ok();
+    if !write_ok {
+        println!("H2 empty DATA flood - write failed (connection may have been closed)");
+    }
+
+    // Read response — expect GOAWAY(ENHANCE_YOUR_CALM)
+    thread::sleep(Duration::from_millis(500));
+    let response_data = read_all_available(&mut tls, Duration::from_secs(2));
+    let frames = parse_h2_frames(&response_data);
+
+    println!("H2 empty DATA flood - received {} frames", frames.len());
+
+    let got_enhance_your_calm = contains_goaway_with_error(&frames, H2_ERROR_ENHANCE_YOUR_CALM);
+    if let Some(error_code) = goaway_error_code(&frames) {
+        println!("H2 empty DATA flood - GOAWAY error_code=0x{error_code:x}");
+    }
+    println!("H2 empty DATA flood - got ENHANCE_YOUR_CALM: {got_enhance_your_calm}");
+
+    drop(tls);
+
+    // Verify sozu is still alive
+    thread::sleep(Duration::from_millis(200));
+    let still_alive = verify_sozu_alive(front_port);
+    println!("H2 empty DATA flood - sozu still alive: {still_alive}");
+
+    worker.soft_stop();
+    let success = worker.wait_for_server_stop();
+    for backend in backends.iter_mut() {
+        backend.stop_and_get_aggregator();
+    }
+
+    if success && still_alive && got_enhance_your_calm {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_empty_data_flood() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "H2 security: CVE-2019-9518 empty DATA flood triggers GOAWAY(ENHANCE_YOUR_CALM)",
+            try_h2_empty_data_flood
         ),
         State::Success
     );
