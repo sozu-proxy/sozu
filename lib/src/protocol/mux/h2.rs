@@ -37,6 +37,12 @@ const MAX_MAX_FRAME_SIZE: u32 = 1 << 24; // 16777216 (exclusive upper bound)
 // RFC 9113 §6.9: maximum flow control window size (2^31 - 1)
 const FLOW_CONTROL_MAX_WINDOW: u32 = 1 << 31;
 
+/// Enlarged connection-level receive window (1 MB).
+/// The RFC 9113 default is 65 535 bytes, which is too small for high-throughput
+/// proxying and causes excessive WINDOW_UPDATE round-trips. 1 MB matches the
+/// initial window used by HAProxy, the h2 crate, and other production proxies.
+const ENLARGED_CONNECTION_WINDOW: u32 = 1_048_576;
+
 /// H2 client connection preface size: 24-byte magic + 9-byte SETTINGS frame header
 pub(super) const CLIENT_PREFACE_SIZE: usize = 24 + parser::FRAME_HEADER_SIZE;
 
@@ -857,8 +863,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 MuxResult::Continue
             }
             (H2State::ServerSettings, Position::Server) => {
+                // Enlarge the connection-level receive window from 64KB to 1MB.
+                // The default 65 535-byte window is too small for high-throughput
+                // proxying and causes excessive WINDOW_UPDATE round-trips.
+                let increment = ENLARGED_CONNECTION_WINDOW - DEFAULT_INITIAL_WINDOW_SIZE;
+                self.queue_window_update(0, increment);
                 self.expect_header();
-                self.readiness.interest.remove(Ready::WRITABLE);
+                // Keep WRITABLE so the queued WINDOW_UPDATE gets flushed.
                 MuxResult::Continue
             }
             // Proxying states — writing application data (request/response).
@@ -1053,9 +1064,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 // Reclaim the converter's HPACK buffer for reuse
                 self.converter_buf = converter.out;
 
-                // RFC 9113 §6.8: if draining and all streams have completed, close
+                // RFC 9113 §6.8: if draining and all streams have completed,
+                // send the final GOAWAY with the actual last_stream_id
                 if self.draining && self.streams.is_empty() {
-                    return self.goaway(H2Error::NoError);
+                    return self.graceful_goaway();
                 }
 
                 if self.socket.socket_wants_write() {
@@ -1119,6 +1131,34 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             self.pending_window_updates
                 .push((stream_id, increment.min(max_increment)));
         }
+    }
+
+    /// Re-enable READABLE if this connection is parked waiting for buffer space
+    /// and the target stream's buffer now has enough room.
+    ///
+    /// This is the cross-readiness counterpart to the same-connection check in
+    /// `writable()`. When the *other side* of a stream (frontend or backend)
+    /// drains data via its own `writable()`, it frees buffer space that this
+    /// connection was waiting for. Without this explicit wake-up the connection
+    /// stays parked and the session deadlocks until a timeout fires.
+    ///
+    /// Returns `true` if READABLE was re-enabled.
+    pub fn try_resume_reading<L>(&mut self, context: &Context<L>) -> bool
+    where
+        L: ListenerHandler + L7ListenerHandler,
+    {
+        if let Some((H2StreamId::Other(_, global_stream_id), amount)) = self.expect_read {
+            let stream = &context.streams[global_stream_id];
+            let kawa = match self.position {
+                Position::Client(..) => &stream.back,
+                Position::Server => &stream.front,
+            };
+            if kawa.storage.available_space() >= amount {
+                self.readiness.interest.insert(Ready::READABLE);
+                return true;
+            }
+        }
+        false
     }
 
     pub fn goaway(&mut self, error: H2Error) -> MuxResult {

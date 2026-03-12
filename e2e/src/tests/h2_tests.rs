@@ -12,16 +12,16 @@
 
 use std::{
     io::{Read, Write},
-    net::{SocketAddr, TcpStream},
+    net::SocketAddr,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
-use http_body_util::Full;
+use http_body_util::{BodyExt, Full};
 use hyper::{Response, body::Bytes, service::service_fn};
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
@@ -31,8 +31,8 @@ use rustls::ClientConfig;
 use sozu_command_lib::{
     config::ListenerBuilder,
     proto::command::{
-        ActivateListener, AddCertificate, CertificateAndKey, ListenerType, RequestHttpFrontend,
-        SocketAddress, request::RequestType,
+        ActivateListener, AddCertificate, CertificateAndKey, Cluster, ListenerType,
+        RequestHttpFrontend, SocketAddress, request::RequestType,
     },
 };
 use tokio::net::TcpListener;
@@ -41,9 +41,10 @@ use crate::{
     mock::{
         aggregator::SimpleAggregator,
         async_backend::BackendHandle as AsyncBackend,
+        h2_backend::H2Backend,
         https_client::{
-            Verifier, build_h2_client, resolve_concurrent_requests, resolve_post_request,
-            resolve_request,
+            Verifier, build_h2_client, build_https_client, resolve_concurrent_requests,
+            resolve_post_request, resolve_request,
         },
     },
     sozu::worker::Worker,
