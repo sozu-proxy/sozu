@@ -1479,7 +1479,8 @@ mod tests {
 
     use super::*;
     use crate::proto::command::{
-        CustomHttpAnswers, LoadBalancingParams, RequestHttpFrontend, RulePosition,
+        CustomHttpAnswers, LoadBalancingParams, RequestHttpFrontend, RequestTcpFrontend,
+        RulePosition,
     };
 
     #[test]
@@ -2191,5 +2192,146 @@ mod tests {
         });
 
         assert!(!certificate_found_by_domain_name.is_empty());
+    }
+
+    #[test]
+    fn count_backends_across_clusters() {
+        let mut state: ConfigState = Default::default();
+
+        assert_eq!(state.count_backends(), 0);
+
+        state
+            .dispatch(
+                &RequestType::AddBackend(AddBackend {
+                    cluster_id: String::from("cluster_1"),
+                    backend_id: String::from("cluster_1-0"),
+                    address: SocketAddress::new_v4(127, 0, 0, 1, 1026),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        assert_eq!(state.count_backends(), 1);
+
+        state
+            .dispatch(
+                &RequestType::AddBackend(AddBackend {
+                    cluster_id: String::from("cluster_1"),
+                    backend_id: String::from("cluster_1-1"),
+                    address: SocketAddress::new_v4(127, 0, 0, 1, 1027),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        assert_eq!(state.count_backends(), 2);
+
+        // add backend to a second cluster
+        state
+            .dispatch(
+                &RequestType::AddBackend(AddBackend {
+                    cluster_id: String::from("cluster_2"),
+                    backend_id: String::from("cluster_2-0"),
+                    address: SocketAddress::new_v4(192, 168, 1, 1, 8080),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        assert_eq!(state.count_backends(), 3);
+
+        // remove a backend and verify count decreases
+        state
+            .dispatch(
+                &RequestType::RemoveBackend(RemoveBackend {
+                    cluster_id: String::from("cluster_1"),
+                    backend_id: String::from("cluster_1-0"),
+                    address: SocketAddress::new_v4(127, 0, 0, 1, 1026),
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        assert_eq!(state.count_backends(), 2);
+    }
+
+    #[test]
+    fn count_frontends_across_types() {
+        let mut state: ConfigState = Default::default();
+
+        assert_eq!(state.count_frontends(), 0);
+
+        // add an HTTP frontend
+        state
+            .dispatch(
+                &RequestType::AddHttpFrontend(RequestHttpFrontend {
+                    cluster_id: Some(String::from("cluster_1")),
+                    hostname: String::from("example.com"),
+                    path: PathRule::prefix(String::from("/")),
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
+                    position: RulePosition::Tree.into(),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        assert_eq!(state.count_frontends(), 1);
+
+        // add an HTTPS frontend
+        state
+            .dispatch(
+                &RequestType::AddHttpsFrontend(RequestHttpFrontend {
+                    cluster_id: Some(String::from("cluster_1")),
+                    hostname: String::from("secure.example.com"),
+                    path: PathRule::prefix(String::from("/")),
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 8443),
+                    position: RulePosition::Tree.into(),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        assert_eq!(state.count_frontends(), 2);
+
+        // add a TCP frontend
+        state
+            .dispatch(
+                &RequestType::AddTcpFrontend(RequestTcpFrontend {
+                    cluster_id: String::from("cluster_2"),
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 5432),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        assert_eq!(state.count_frontends(), 3);
+
+        // add a second TCP frontend on the same cluster
+        state
+            .dispatch(
+                &RequestType::AddTcpFrontend(RequestTcpFrontend {
+                    cluster_id: String::from("cluster_2"),
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 5433),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        assert_eq!(state.count_frontends(), 4);
+
+        // remove the HTTP frontend
+        state
+            .dispatch(
+                &RequestType::RemoveHttpFrontend(RequestHttpFrontend {
+                    cluster_id: Some(String::from("cluster_1")),
+                    hostname: String::from("example.com"),
+                    path: PathRule::prefix(String::from("/")),
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
+                    position: RulePosition::Tree.into(),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        assert_eq!(state.count_frontends(), 3);
     }
 }
