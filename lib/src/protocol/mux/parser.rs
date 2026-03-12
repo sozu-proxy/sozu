@@ -675,7 +675,7 @@ pub fn window_update_frame<'a>(
     let (i, increment) = be_u32(input)?;
     let increment = increment & STREAM_ID_MASK;
 
-    //FIXME: if stream id is 0, treat it as connection error?
+    // RFC 9113 §6.9: increment of 0 is PROTOCOL_ERROR (stream or connection error)
     if increment == 0 {
         return Err(Err::Failure(ParserError::new_h2(
             input,
