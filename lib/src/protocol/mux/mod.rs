@@ -578,6 +578,19 @@ impl<Front: SocketHandler> Connection<Front> {
         }
     }
 
+    /// Re-enable READABLE if this connection is parked waiting for buffer space
+    /// and the target stream's buffer now has enough room. H1 connections never
+    /// park on `expect_read`, so they always return `false`.
+    fn try_resume_reading<L>(&mut self, context: &Context<L>) -> bool
+    where
+        L: ListenerHandler + L7ListenerHandler,
+    {
+        match self {
+            Connection::H1(_) => false,
+            Connection::H2(c) => c.try_resume_reading(context),
+        }
+    }
+
     fn close<E, L>(&mut self, context: &mut Context<L>, endpoint: E)
     where
         E: Endpoint,
