@@ -492,7 +492,7 @@ impl GatheringTask for WorkerTask {
 
     fn on_finish(
         self: Box<Self>,
-        _server: &mut Server,
+        server: &mut Server,
         client: &mut OptionalClient,
         timed_out: bool,
     ) {
@@ -512,6 +512,8 @@ impl GatheringTask for WorkerTask {
         } else {
             client.finish_ok("Successfully applied request to all workers");
         }
+
+        server.update_counts();
     }
 }
 
@@ -729,11 +731,12 @@ impl GatheringTask for LoadStateTask {
 
     fn on_finish(
         self: Box<Self>,
-        _server: &mut Server,
+        server: &mut Server,
         client: &mut OptionalClient,
         _timed_out: bool,
     ) {
         let DefaultGatherer { ok, errors, .. } = self.gatherer;
+        server.update_counts();
         if errors == 0 {
             client.finish_ok(format!(
                 "Successfully loaded state from path {}, {} ok messages, {} errors",
