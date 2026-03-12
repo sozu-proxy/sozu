@@ -1876,13 +1876,18 @@ fn display_toml_error(file: &str, error: &toml::de::Error) {
 }
 
 impl ServerConfig {
+    /// Number of slab entries per connection. Set to 4 to accommodate H2 multiplexing
+    /// (1 frontend + up to 3 backend connections per frontend with stream multiplexing).
+    /// Previous value was 2 for H1-only operation.
+    const SLAB_ENTRIES_PER_CONNECTION: u64 = 4;
+
     /// Size of the slab for the Session manager.
     ///
     /// With HTTP/2 multiplexing, each frontend session can have multiple backend
-    /// connections (one per cluster), so we allocate more slab entries than the
-    /// old `10 + 2 * max_connections` formula.
+    /// connections (one per cluster), so we allocate `SLAB_ENTRIES_PER_CONNECTION` (4)
+    /// entries per connection instead of the old H1-only multiplier of 2.
     pub fn slab_capacity(&self) -> u64 {
-        10 + 4 * self.max_connections
+        10 + Self::SLAB_ENTRIES_PER_CONNECTION * self.max_connections
     }
 }
 
