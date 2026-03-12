@@ -923,21 +923,18 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                             Position::Client(..) => {}
                             Position::Server => {
                                 self.distribute_overhead(&mut stream.metrics);
-                                // mark stream as reusable
                                 context.debug.push(DebugEvent::I2(4, global_stream_id));
                                 trace!("Recycle stream: {}", global_stream_id);
-                                incr!("http.e2e.h2");
-                                stream.metrics.backend_stop();
-                                stream.generate_access_log(
-                                    false,
-                                    Some("H2::Complete"),
+                                let token = Self::complete_server_stream(
+                                    stream,
                                     context.listener.clone(),
                                 );
-                                stream.metrics.reset();
-                                let state =
-                                    std::mem::replace(&mut stream.state, StreamState::Recycle);
-                                if let StreamState::Linked(token) = state {
-                                    endpoint.end_stream(token, global_stream_id, context);
+                                if let Some(token) = token {
+                                    endpoint.end_stream(
+                                        token,
+                                        global_stream_id,
+                                        context,
+                                    );
                                 }
                                 dead_streams.push(stream_id);
                             }
@@ -978,10 +975,18 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     let stream = &mut context.streams[global_stream_id];
                     let parts = stream.split(&self.position);
                     let kawa = parts.wbuffer;
-                    if kawa.is_main_phase() || kawa.is_error() {
+                    if kawa.is_main_phase()
+                        || (kawa.is_error() && !self.rst_sent.contains(stream_id))
+                    {
                         let window = min(*parts.window, self.window);
                         converter.window = window;
                         converter.stream_id = *stream_id;
+                        // Track RST_STREAM dedup: if kawa is in error state, the converter
+                        // will generate a RST_STREAM frame. Mark it so we don't send a
+                        // duplicate on the next writable cycle.
+                        if kawa.is_error() {
+                            self.rst_sent.insert(*stream_id);
+                        }
                         kawa.prepare(&mut converter);
                         let consumed = window - converter.window;
                         *parts.window -= consumed;
@@ -1084,6 +1089,34 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 }
                 MuxResult::Continue
             }
+        }
+    }
+
+    /// Finalize a server-side stream after its response has been fully written.
+    ///
+    /// Generates an access log, resets metrics, and transitions the stream to `Recycle`.
+    /// Returns the backend token if the stream was `Linked`, so the caller can call
+    /// `endpoint.end_stream()` with the full `Context` (which can't be passed here
+    /// because `stream` borrows from `context.streams`).
+    ///
+    /// Callers must distribute overhead *before* calling this, since the converter
+    /// borrow may prevent `distribute_overhead()`.
+    fn complete_server_stream<L>(
+        stream: &mut crate::protocol::mux::Stream,
+        listener: std::rc::Rc<std::cell::RefCell<L>>,
+    ) -> Option<mio::Token>
+    where
+        L: ListenerHandler + L7ListenerHandler,
+    {
+        incr!("http.e2e.h2");
+        stream.metrics.backend_stop();
+        stream.generate_access_log(false, Some("H2::Complete"), listener);
+        stream.metrics.reset();
+        let state = std::mem::replace(&mut stream.state, StreamState::Recycle);
+        if let StreamState::Linked(token) = state {
+            Some(token)
+        } else {
+            None
         }
     }
 
@@ -1874,7 +1907,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         let stream = &context.streams[stream_gid];
                         let fully_completed =
                             stream.back_received_end_of_stream && stream.front.is_terminated();
-                        if !fully_completed {
+                        if !fully_completed && !self.rst_sent.contains(&id) {
                             let kawa = &mut self.zero;
                             let mut frame = [0; 13];
                             if let Ok((_, _size)) =
@@ -1885,6 +1918,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                                     buf[..frame.len()].copy_from_slice(&frame);
                                     kawa.storage.fill(frame.len());
                                     self.readiness.interest.insert(Ready::WRITABLE);
+                                    self.rst_sent.insert(id);
                                 }
                             }
                         }
