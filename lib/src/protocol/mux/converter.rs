@@ -152,10 +152,10 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                 self.lowercase_buf.clear();
                 self.lowercase_buf.extend_from_slice(key.data(buffer));
                 self.lowercase_buf.make_ascii_lowercase();
-                if let Err(e) = self.encoder.encode_header_into(
-                    (&self.lowercase_buf, val.data(buffer)),
-                    &mut self.out,
-                ) {
+                if let Err(e) = self
+                    .encoder
+                    .encode_header_into((&self.lowercase_buf, val.data(buffer)), &mut self.out)
+                {
                     error!("HPACK encoding of header failed: {:?}", e);
                     return false;
                 }

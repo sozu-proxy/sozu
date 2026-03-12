@@ -14,7 +14,7 @@ libc = { workspace = true }
 mio = { workspace = true }
 rustls = { workspace = true }
 time = { workspace = true }
-tokio = { workspace = true, features = ["net", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "time"] }
 
 sozu-command-lib = { workspace = true }
 sozu-lib = { workspace = true }

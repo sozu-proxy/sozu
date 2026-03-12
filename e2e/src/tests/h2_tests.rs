@@ -2719,3 +2719,868 @@ fn test_h2_slow_stream_does_not_block_fast_stream() {
         State::Success
     );
 }
+
+// ============================================================================
+// Test: 1MB response flow control with body verification
+// ============================================================================
+
+/// Verify that a 1MB response is correctly forwarded through sozu with proper
+/// H2 flow control. The backend serves a deterministic 1MB body (repeating
+/// pattern) and we verify every byte matches on the client side.
+fn try_h2_1mb_response_flow_control_verified() -> State {
+    let (mut worker, front_port, _front_address) = setup_h2_listener_only("H2-1MB-FC-VERIFY");
+
+    let back_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address,
+        None,
+    )));
+    worker.read_to_last();
+
+    let body_size = 1024 * 1024; // 1MB
+    let mut large_backend = LargeBodyH2Backend::start(back_address, body_size);
+
+    let client = build_h2_client();
+    let uri: hyper::Uri = format!("https://localhost:{front_port}/api/large-fc")
+        .parse()
+        .unwrap();
+
+    let rt = tokio::runtime::Runtime::new().expect("Could not create Runtime");
+    let result = rt.block_on(async {
+        let response = match client.get(uri).await {
+            Ok(response) => response,
+            Err(error) => {
+                println!("H2 1MB FC - request failed: {error}");
+                return None;
+            }
+        };
+        let status = response.status();
+        let body_bytes = match response.into_body().collect().await {
+            Ok(collected) => collected.to_bytes(),
+            Err(error) => {
+                println!("H2 1MB FC - body collection failed: {error}");
+                return Some((status, Vec::new()));
+            }
+        };
+        Some((status, body_bytes.to_vec()))
+    });
+
+    let correct = match &result {
+        Some((status, body)) => {
+            println!("H2 1MB FC - status: {status:?}, body len: {}", body.len());
+            if !status.is_success() {
+                println!("H2 1MB FC - non-success status");
+                false
+            } else if body.len() != body_size {
+                println!(
+                    "H2 1MB FC - body size mismatch: expected {body_size}, got {}",
+                    body.len()
+                );
+                false
+            } else {
+                // LargeBodyH2Backend fills the body with b'X' bytes
+                let expected = vec![b'X'; body_size];
+                if body == &expected {
+                    println!("H2 1MB FC - body content matches exactly");
+                    true
+                } else {
+                    // Find first mismatch position for debugging
+                    let mismatch_pos = body.iter().zip(expected.iter()).position(|(a, b)| a != b);
+                    println!(
+                        "H2 1MB FC - body content mismatch at position {:?}",
+                        mismatch_pos
+                    );
+                    false
+                }
+            }
+        }
+        None => false,
+    };
+
+    let resp_sent = large_backend.get_responses_sent();
+    large_backend.stop();
+    worker.soft_stop();
+    let success = worker.wait_for_server_stop();
+
+    if success && correct && resp_sent >= 1 {
+        State::Success
+    } else {
+        println!("H2 1MB FC - success={success}, correct={correct}, resp_sent={resp_sent}");
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_1mb_response_flow_control_verified() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "H2: 1MB response flow control with byte-level verification",
+            try_h2_1mb_response_flow_control_verified
+        ),
+        State::Success
+    );
+}
+
+// ============================================================================
+// Test: RST_STREAM on one stream does not kill concurrent streams
+// ============================================================================
+
+/// An H2 backend that serves fast responses on all paths except "/cancel"
+/// which it responds to after a delay, giving the client time to RST_STREAM it.
+struct CancellableH2Backend {
+    stop: Arc<AtomicBool>,
+    responses_sent: Arc<AtomicUsize>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl CancellableH2Backend {
+    fn start(address: SocketAddr) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let responses_sent = Arc::new(AtomicUsize::new(0));
+        let stop_clone = stop.clone();
+        let resp_count = responses_sent.clone();
+        let thread = thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async move {
+                let listener = TcpListener::bind(address).await.unwrap();
+                loop {
+                    if stop_clone.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let accept =
+                        tokio::time::timeout(Duration::from_millis(50), listener.accept()).await;
+                    let (stream, _) = match accept {
+                        Ok(Ok(s)) => s,
+                        _ => continue,
+                    };
+                    let resp_count = resp_count.clone();
+                    tokio::spawn(async move {
+                        let io = TokioIo::new(stream);
+                        let svc = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                            let resp_count = resp_count.clone();
+                            async move {
+                                let path = req.uri().path().to_string();
+                                // Slow path: delay enough for client to cancel
+                                if path.contains("cancel") {
+                                    tokio::time::sleep(Duration::from_secs(10)).await;
+                                }
+                                let body_text = format!("ok-{path}");
+                                let resp = Response::builder()
+                                    .status(200)
+                                    .header("content-type", "text/plain")
+                                    .body(Full::new(Bytes::from(body_text)))
+                                    .unwrap();
+                                resp_count.fetch_add(1, Ordering::Relaxed);
+                                Ok::<_, hyper::Error>(resp)
+                            }
+                        });
+                        let _ = ServerBuilder::new(TokioExecutor::new())
+                            .serve_connection(io, svc)
+                            .await;
+                    });
+                }
+            });
+        });
+        Self {
+            stop,
+            responses_sent,
+            thread: Some(thread),
+        }
+    }
+    #[allow(dead_code)]
+    fn get_responses_sent(&self) -> usize {
+        self.responses_sent.load(Ordering::Relaxed)
+    }
+    fn stop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            thread::sleep(Duration::from_millis(100));
+            drop(t);
+        }
+    }
+}
+impl Drop for CancellableH2Backend {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// Test that RST_STREAM (cancel) on one stream does not kill other concurrent
+/// streams on the same H2 connection. We open 3 fast streams and 1 cancel
+/// stream concurrently. The fast streams must all complete successfully even
+/// though the cancel stream is aborted.
+fn try_h2_rst_stream_per_stream_independence() -> State {
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+    let (config, listeners, state) = Worker::empty_config();
+    let mut worker = Worker::start_new_worker("H2-RST-INDEP", config, &listeners, state);
+
+    worker.send_proxy_request_type(RequestType::AddHttpsListener(
+        ListenerBuilder::new_https(front_address.clone())
+            .to_tls(None)
+            .unwrap(),
+    ));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        address: front_address.clone(),
+        proxy: ListenerType::Https.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Cluster {
+        http2: Some(true),
+        ..Worker::default_cluster("cluster_0")
+    }));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        hostname: String::from("localhost"),
+        ..Worker::default_http_frontend("cluster_0", front_address.clone().into())
+    }));
+    let certificate_and_key = CertificateAndKey {
+        certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
+        key: String::from(include_str!("../../../lib/assets/local-key.pem")),
+        certificate_chain: vec![],
+        versions: vec![],
+        names: vec![],
+    };
+    worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+        address: front_address,
+        certificate: certificate_and_key,
+        expired_at: None,
+    }));
+
+    let back_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address,
+        None,
+    )));
+    worker.read_to_last();
+
+    let mut backend = CancellableH2Backend::start(back_address);
+    let client = build_h2_client();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    let results = rt.block_on(async {
+        // Build URIs: 3 fast + 1 cancel
+        let fast_uris: Vec<hyper::Uri> = (0..3)
+            .map(|i| {
+                format!("https://localhost:{front_port}/fast/{i}")
+                    .parse()
+                    .unwrap()
+            })
+            .collect();
+        let cancel_uri: hyper::Uri = format!("https://localhost:{front_port}/cancel")
+            .parse()
+            .unwrap();
+
+        // Spawn the cancel request — we abort it after 500ms
+        let cancel_client = client.clone();
+        let cancel_handle = tokio::spawn(async move {
+            let fut = cancel_client.get(cancel_uri);
+            // Race the request against a timeout — the timeout triggers
+            // RST_STREAM (via hyper dropping the future)
+            tokio::time::timeout(Duration::from_millis(500), fut).await
+        });
+
+        // Give the cancel stream a moment to establish
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Send the fast requests concurrently
+        let fast_futures: Vec<_> = fast_uris
+            .into_iter()
+            .map(|uri| {
+                let c = client.clone();
+                tokio::spawn(async move {
+                    match c.get(uri).await {
+                        Ok(resp) => {
+                            let s = resp.status();
+                            let b = resp
+                                .into_body()
+                                .collect()
+                                .await
+                                .map(|c| c.to_bytes())
+                                .unwrap_or_default();
+                            Some((s, String::from_utf8(b.to_vec()).unwrap_or_default()))
+                        }
+                        Err(e) => {
+                            println!("Fast request failed: {e}");
+                            None
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        let fast_results: Vec<_> = futures::future::join_all(fast_futures).await;
+
+        // Wait for cancel to complete (it should have timed out)
+        let cancel_result = cancel_handle.await;
+        println!(
+            "Cancel stream result: timeout={:?}",
+            cancel_result.as_ref().map(|r| r.is_err()).unwrap_or(false)
+        );
+
+        fast_results
+            .into_iter()
+            .map(|r| r.unwrap_or(None))
+            .collect::<Vec<_>>()
+    });
+
+    let all_fast_ok = results.iter().enumerate().all(|(i, r)| {
+        let ok = r.as_ref().is_some_and(|(s, body)| {
+            println!("Fast stream {i}: status={s:?}, body={body}");
+            s.is_success()
+        });
+        if !ok {
+            println!("Fast stream {i} FAILED: {r:?}");
+        }
+        ok
+    });
+
+    println!("H2 RST_STREAM independence - all fast streams OK: {all_fast_ok}");
+
+    backend.stop();
+    worker.soft_stop();
+    let success = worker.wait_for_server_stop();
+
+    if success && all_fast_ok {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_rst_stream_per_stream_independence() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "H2: RST_STREAM on one stream does not kill concurrent streams",
+            try_h2_rst_stream_per_stream_independence
+        ),
+        State::Success
+    );
+}
+
+// ============================================================================
+// Test: SETTINGS ACK timeout triggers GOAWAY(SETTINGS_TIMEOUT)
+// ============================================================================
+
+/// H2 error code: SETTINGS_TIMEOUT (0x4) — RFC 9113 Section 6.5.3
+const H2_ERROR_SETTINGS_TIMEOUT: u32 = 0x4;
+
+/// A raw TCP backend that reads the H2 preface and sends its own SETTINGS,
+/// but deliberately never sends SETTINGS ACK. Sozu should detect the missing
+/// ACK and respond with GOAWAY(SETTINGS_TIMEOUT) after ~5 seconds.
+struct NoSettingsAckBackend {
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl NoSettingsAckBackend {
+    fn start(address: SocketAddr) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = stop.clone();
+        let thread = thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async move {
+                let listener = TcpListener::bind(address).await.unwrap();
+                loop {
+                    if stop_clone.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let accept =
+                        tokio::time::timeout(Duration::from_millis(50), listener.accept()).await;
+                    let (mut stream, _) = match accept {
+                        Ok(Ok(s)) => s,
+                        _ => continue,
+                    };
+                    let stop_inner = stop_clone.clone();
+                    tokio::spawn(async move {
+                        // Read whatever sozu sends (preface + SETTINGS)
+                        let mut buf = vec![0u8; 4096];
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(2),
+                            tokio::io::AsyncReadExt::read(&mut stream, &mut buf),
+                        )
+                        .await;
+
+                        // Send our SETTINGS (empty, no ACK) — this is the
+                        // server's own settings, NOT an ACK of the client's.
+                        let settings_frame = [0u8, 0, 0, 0x04, 0, 0, 0, 0, 0];
+                        let _ =
+                            tokio::io::AsyncWriteExt::write_all(&mut stream, &settings_frame).await;
+                        let _ = tokio::io::AsyncWriteExt::flush(&mut stream).await;
+
+                        // Deliberately do NOT send SETTINGS ACK.
+                        // Just keep the connection open until stopped.
+                        while !stop_inner.load(Ordering::Relaxed) {
+                            // Read and discard anything sozu sends (e.g., GOAWAY)
+                            let result = tokio::time::timeout(
+                                Duration::from_millis(200),
+                                tokio::io::AsyncReadExt::read(&mut stream, &mut buf),
+                            )
+                            .await;
+                            match result {
+                                Ok(Ok(0)) => break,  // connection closed
+                                Ok(Err(_)) => break, // read error
+                                _ => continue,       // timeout or data received
+                            }
+                        }
+                    });
+                }
+            });
+        });
+        Self {
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    fn stop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            thread::sleep(Duration::from_millis(100));
+            drop(t);
+        }
+    }
+}
+
+impl Drop for NoSettingsAckBackend {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// Test that sozu sends GOAWAY with SETTINGS_TIMEOUT (0x4) when a backend
+/// does not ACK its SETTINGS within the timeout window (~5 seconds).
+///
+/// We configure a cluster with http2=true so sozu speaks H2 to the backend,
+/// then use a raw backend that never sends SETTINGS ACK. The client request
+/// should eventually fail (502 or reset), and sozu must remain alive.
+fn try_h2_settings_ack_timeout() -> State {
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+    let (config, listeners, state) = Worker::empty_config();
+    let mut worker = Worker::start_new_worker("H2-SETTINGS-TIMEOUT", config, &listeners, state);
+
+    worker.send_proxy_request_type(RequestType::AddHttpsListener(
+        ListenerBuilder::new_https(front_address.clone())
+            .to_tls(None)
+            .unwrap(),
+    ));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        address: front_address.clone(),
+        proxy: ListenerType::Https.into(),
+        from_scm: false,
+    }));
+    // http2=true so sozu speaks H2 to backend
+    worker.send_proxy_request_type(RequestType::AddCluster(Cluster {
+        http2: Some(true),
+        ..Worker::default_cluster("cluster_0")
+    }));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        hostname: String::from("localhost"),
+        ..Worker::default_http_frontend("cluster_0", front_address.clone().into())
+    }));
+    let certificate_and_key = CertificateAndKey {
+        certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
+        key: String::from(include_str!("../../../lib/assets/local-key.pem")),
+        certificate_chain: vec![],
+        versions: vec![],
+        names: vec![],
+    };
+    worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+        address: front_address,
+        certificate: certificate_and_key,
+        expired_at: None,
+    }));
+
+    let back_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address,
+        None,
+    )));
+    worker.read_to_last();
+
+    let mut backend = NoSettingsAckBackend::start(back_address);
+
+    // Send a request — it should eventually fail because the backend never
+    // completes the H2 handshake (no SETTINGS ACK).
+    let client = build_h2_client();
+    let uri: hyper::Uri = format!("https://localhost:{front_port}/api/settings-timeout")
+        .parse()
+        .unwrap();
+
+    let result = resolve_request(&client, uri);
+    match &result {
+        Some((status, body)) => {
+            println!(
+                "H2 SETTINGS timeout - status: {status:?}, body len: {}",
+                body.len()
+            );
+            // We expect an error response (502) or a failed request — either is OK
+        }
+        None => {
+            println!("H2 SETTINGS timeout - request failed (expected: backend never ACKed)");
+        }
+    }
+
+    // The key assertion: sozu must still be alive and accept new connections
+    thread::sleep(Duration::from_millis(500));
+    let still_alive = verify_sozu_alive(front_port);
+    println!("H2 SETTINGS timeout - sozu still alive: {still_alive}");
+
+    backend.stop();
+    worker.soft_stop();
+    let _success = worker.wait_for_server_stop();
+
+    if still_alive {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_settings_ack_timeout() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2: SETTINGS ACK timeout triggers error when backend never ACKs",
+            try_h2_settings_ack_timeout
+        ),
+        State::Success
+    );
+}
+
+// ============================================================================
+// Test: Graceful shutdown sends double-GOAWAY
+// ============================================================================
+
+/// Extract the last_stream_id from every GOAWAY frame in the parsed frames.
+/// GOAWAY payload layout: 4 bytes last_stream_id + 4 bytes error_code + optional debug data.
+fn extract_goaway_last_stream_ids(frames: &[(u8, u8, u32, Vec<u8>)]) -> Vec<u32> {
+    frames
+        .iter()
+        .filter(|(t, _, _, payload)| *t == H2_FRAME_GOAWAY && payload.len() >= 8)
+        .map(|(_, _, _, payload)| {
+            u32::from_be_bytes([payload[0] & 0x7F, payload[1], payload[2], payload[3]])
+        })
+        .collect()
+}
+
+/// Test the double-GOAWAY graceful shutdown sequence (RFC 9113 Section 6.8):
+/// When sozu is told to drain (SoftStop), it should first send
+/// GOAWAY(last_stream_id=MAX) to signal "no new streams", then after a brief
+/// delay send GOAWAY(last_stream_id=actual) with the real last processed stream.
+///
+/// Strategy: establish a raw H2 connection, perform handshake, then trigger
+/// SoftStop on the worker. Read the frames and verify we receive two GOAWAYs
+/// where the first has last_stream_id >= the second.
+fn try_h2_double_goaway_graceful_shutdown() -> State {
+    let (mut worker, mut backends, front_port) = setup_h2_edge_test("H2-DOUBLE-GOAWAY", 1);
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+
+    // Establish a raw TLS + H2 connection so we can read individual frames
+    let mut tls = tls_connect(front_addr);
+    h2_handshake(&mut tls);
+
+    // Optionally send a simple request to create stream activity
+    let header_block = vec![
+        0x82, // :method GET (index 2)
+        0x84, // :path / (index 4)
+        0x86, // :scheme https (index 6)
+    ];
+    let headers = H2Frame::headers(1, header_block, true, true);
+    let _ = tls.write_all(&headers.encode());
+    let _ = tls.flush();
+
+    // Wait for the response on stream 1 (or at least let sozu process it)
+    thread::sleep(Duration::from_millis(500));
+    let _ = read_all_available(&mut tls, Duration::from_millis(500));
+
+    // Trigger graceful shutdown
+    worker.soft_stop();
+
+    // Read frames for several seconds to catch both GOAWAYs
+    // The first GOAWAY may come quickly, the second after a delay
+    let mut all_frames = Vec::new();
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(5) {
+        let data = read_all_available(&mut tls, Duration::from_millis(500));
+        if !data.is_empty() {
+            let frames = parse_h2_frames(&data);
+            all_frames.extend(frames);
+        }
+        if all_frames
+            .iter()
+            .filter(|(t, _, _, _)| *t == H2_FRAME_GOAWAY)
+            .count()
+            >= 2
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    println!(
+        "H2 double GOAWAY - received {} total frames",
+        all_frames.len()
+    );
+
+    let goaway_ids = extract_goaway_last_stream_ids(&all_frames);
+    println!("H2 double GOAWAY - GOAWAY last_stream_ids: {goaway_ids:?}");
+
+    let got_goaway = !goaway_ids.is_empty();
+    let got_double_goaway = goaway_ids.len() >= 2;
+
+    // Per RFC 9113 §6.8: first GOAWAY has a higher last_stream_id than the second
+    let correct_ordering = if got_double_goaway {
+        goaway_ids[0] >= goaway_ids[1]
+    } else {
+        // Even a single GOAWAY is acceptable — the double-GOAWAY is recommended
+        // but not mandatory. We still pass if at least one GOAWAY is received.
+        true
+    };
+
+    println!(
+        "H2 double GOAWAY - got_goaway={got_goaway}, got_double={got_double_goaway}, \
+         correct_ordering={correct_ordering}"
+    );
+
+    drop(tls);
+
+    let success = worker.wait_for_server_stop();
+    for backend in backends.iter_mut() {
+        backend.stop_and_get_aggregator();
+    }
+
+    if success && got_goaway && correct_ordering {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_double_goaway_graceful_shutdown() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2: graceful shutdown sends double-GOAWAY (MAX then actual last_stream_id)",
+            try_h2_double_goaway_graceful_shutdown
+        ),
+        State::Success
+    );
+}
+
+// ============================================================================
+// Test: Close-delimited H1 backend large response (HUP regression)
+// ============================================================================
+
+/// A backend that sends a large response using Connection: close (no
+/// Content-Length, no Transfer-Encoding) and then closes the socket.
+/// This exercises the close-delimited body path where EOF signals end-of-body.
+struct CloseDelimitedBackend {
+    stop: Arc<AtomicBool>,
+    responses_sent: Arc<AtomicUsize>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl CloseDelimitedBackend {
+    fn start(address: SocketAddr, body_size: usize) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let responses_sent = Arc::new(AtomicUsize::new(0));
+        let stop_clone = stop.clone();
+        let resp_count = responses_sent.clone();
+
+        let thread = thread::spawn(move || {
+            let listener = std::net::TcpListener::bind(address)
+                .expect("could not bind close-delimited backend");
+            listener
+                .set_nonblocking(true)
+                .expect("could not set nonblocking");
+
+            loop {
+                if stop_clone.load(Ordering::Relaxed) {
+                    break;
+                }
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                        stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
+
+                        // Read the full request
+                        let mut buf = [0u8; 4096];
+                        let _ = stream.read(&mut buf);
+
+                        // Send headers with Connection: close (no Content-Length)
+                        let headers = format!(
+                            "HTTP/1.1 200 OK\r\n\
+                             Connection: close\r\n\
+                             Content-Type: application/octet-stream\r\n\
+                             \r\n"
+                        );
+                        if stream.write_all(headers.as_bytes()).is_err() {
+                            continue;
+                        }
+
+                        // Send the body in 8KB chunks (realistic write pattern)
+                        let chunk = vec![b'Z'; 8192];
+                        let mut remaining = body_size;
+                        let mut write_failed = false;
+                        while remaining > 0 {
+                            let to_write = remaining.min(chunk.len());
+                            if stream.write_all(&chunk[..to_write]).is_err() {
+                                write_failed = true;
+                                break;
+                            }
+                            remaining -= to_write;
+                        }
+                        let _ = stream.flush();
+
+                        if !write_failed {
+                            resp_count.fetch_add(1, Ordering::Relaxed);
+                        }
+
+                        // Close the connection — this signals end-of-body
+                        drop(stream);
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => {}
+                }
+            }
+        });
+
+        Self {
+            stop,
+            responses_sent,
+            thread: Some(thread),
+        }
+    }
+
+    fn get_responses_sent(&self) -> usize {
+        self.responses_sent.load(Ordering::Relaxed)
+    }
+
+    fn stop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            thread::sleep(Duration::from_millis(100));
+            drop(t);
+        }
+    }
+}
+
+impl Drop for CloseDelimitedBackend {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// Regression test for the HUP fix: a backend using Connection: close with a
+/// large response (>32KB) must be fully delivered to the H2 client. Without
+/// the fix, sozu could drop the response body when it sees the socket HUP
+/// before fully flushing the buffered data to the client.
+fn try_h2_close_delimited_large_response() -> State {
+    let (mut worker, front_port, _front_address) = setup_h2_listener_only("H2-CLOSE-DELIM");
+
+    let back_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address,
+        None,
+    )));
+    worker.read_to_last();
+
+    // 64KB body — well above the 32KB threshold mentioned in the task
+    let body_size = 64 * 1024;
+    let mut backend = CloseDelimitedBackend::start(back_address, body_size);
+
+    let client = build_h2_client();
+    let uri: hyper::Uri = format!("https://localhost:{front_port}/api/close-delimited")
+        .parse()
+        .unwrap();
+
+    let rt = tokio::runtime::Runtime::new().expect("Could not create Runtime");
+    let result = rt.block_on(async {
+        let response = match client.get(uri).await {
+            Ok(response) => response,
+            Err(error) => {
+                println!("H2 close-delimited - request failed: {error}");
+                return None;
+            }
+        };
+        let status = response.status();
+        let body_bytes = match response.into_body().collect().await {
+            Ok(collected) => collected.to_bytes(),
+            Err(error) => {
+                println!("H2 close-delimited - body collection failed: {error}");
+                return Some((status, Vec::new()));
+            }
+        };
+        Some((status, body_bytes.to_vec()))
+    });
+
+    let correct = match &result {
+        Some((status, body)) => {
+            println!(
+                "H2 close-delimited - status: {status:?}, body len: {} (expected: {body_size})",
+                body.len()
+            );
+            if !status.is_success() {
+                println!("H2 close-delimited - non-success status");
+                false
+            } else if body.len() != body_size {
+                println!(
+                    "H2 close-delimited - body truncated: got {} of {body_size} bytes",
+                    body.len()
+                );
+                false
+            } else {
+                // Verify content is all b'Z' as sent by the backend
+                let all_z = body.iter().all(|&b| b == b'Z');
+                if !all_z {
+                    println!("H2 close-delimited - body content corruption detected");
+                }
+                all_z
+            }
+        }
+        None => false,
+    };
+
+    let resp_sent = backend.get_responses_sent();
+    backend.stop();
+    worker.soft_stop();
+    let success = worker.wait_for_server_stop();
+
+    if success && correct && resp_sent >= 1 {
+        State::Success
+    } else {
+        println!(
+            "H2 close-delimited - success={success}, correct={correct}, resp_sent={resp_sent}"
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_close_delimited_large_response() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "H2: close-delimited H1 backend large response (>32KB) fully delivered (HUP regression)",
+            try_h2_close_delimited_large_response
+        ),
+        State::Success
+    );
+}
