@@ -442,6 +442,7 @@ impl<Front: SocketHandler> Connection<Front> {
             overhead_bout: 0,
             flood_detector: H2FloodDetector::new(),
             settings_sent_at: None,
+            pending_rst_streams: Vec::new(),
             rst_sent: HashSet::new(),
         }))
     }
@@ -496,6 +497,7 @@ impl<Front: SocketHandler> Connection<Front> {
             overhead_bout: 0,
             flood_detector: H2FloodDetector::new(),
             settings_sent_at: None,
+            pending_rst_streams: Vec::new(),
             rst_sent: HashSet::new(),
         }))
     }

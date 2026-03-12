@@ -3657,18 +3657,21 @@ fn try_h2_max_concurrent_streams_rst_not_goaway() -> State {
     let max_streams: u32 = 100;
 
     // Open max_streams + 5 streams rapidly. Each HEADERS has END_HEADERS
-    // but NOT END_STREAM, keeping the streams open.
+    // and END_STREAM (half-closed remote). We include :authority so sozu
+    // accepts the headers as valid HTTP/2 requests.
     let header_block = vec![
         0x82, // :method GET (index 2)
+        0x87, // :scheme https (index 7)
         0x84, // :path / (index 4)
-        0x86, // :scheme https (index 6)
+        0x41, 0x09, // :authority (literal, name index 1, value length 9)
+        b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't',
     ];
 
     // Batch all frames into one write to minimise round-trips.
     let mut batch = Vec::new();
     for i in 0..=(max_streams + 5) {
         let stream_id = 1 + i * 2; // 1, 3, 5, ...
-        let headers = H2Frame::headers(stream_id, header_block.clone(), true, false);
+        let headers = H2Frame::headers(stream_id, header_block.clone(), true, true);
         batch.extend_from_slice(&headers.encode());
     }
     let write_ok = tls.write_all(&batch).is_ok() && tls.flush().is_ok();
@@ -3836,21 +3839,22 @@ fn try_h2_empty_data_flood() -> State {
     let mut tls = tls_connect(front_addr);
     h2_handshake(&mut tls);
 
-    // Open stream 1 with HEADERS (END_HEADERS but NOT END_STREAM)
+    // Open stream 1 with HEADERS (END_HEADERS but NOT END_STREAM).
+    // Use POST so sozu expects a body. Include :authority.
+    // HPACK: 0x83 = :method POST (index 3)
     let header_block = vec![
-        0x82, // :method GET (index 2)
+        0x83, // :method POST (index 3)
+        0x87, // :scheme https (index 7)
         0x84, // :path / (index 4)
-        0x86, // :scheme https (index 6)
+        0x41, 0x09, // :authority (literal, name index 1, value length 9)
+        b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't',
     ];
-    let headers = H2Frame::headers(1, header_block, true, false);
-    tls.write_all(&headers.encode()).unwrap();
-    tls.flush().unwrap();
 
-    // Brief pause to let sozu process the HEADERS
-    thread::sleep(Duration::from_millis(100));
-
-    // Flood with 200 empty DATA frames (no END_STREAM) on stream 1
+    // Send HEADERS + 200 empty DATA frames in a single batch to ensure
+    // sozu processes them in a tight loop within one flood window.
     let mut batch = Vec::new();
+    let headers = H2Frame::headers(1, header_block, true, false);
+    batch.extend_from_slice(&headers.encode());
     for _ in 0..200 {
         let empty_data = H2Frame::data(1, Vec::new(), false);
         batch.extend_from_slice(&empty_data.encode());
@@ -3861,16 +3865,28 @@ fn try_h2_empty_data_flood() -> State {
     }
 
     // Read response — expect GOAWAY(ENHANCE_YOUR_CALM)
-    thread::sleep(Duration::from_millis(500));
-    let response_data = read_all_available(&mut tls, Duration::from_secs(2));
-    let frames = parse_h2_frames(&response_data);
+    // Use multiple read attempts with short sleeps for reliability.
+    let mut all_data = Vec::new();
+    for _ in 0..5 {
+        thread::sleep(Duration::from_millis(200));
+        let chunk = read_all_available(&mut tls, Duration::from_millis(500));
+        if !chunk.is_empty() {
+            all_data.extend_from_slice(&chunk);
+        }
+    }
+    let frames = parse_h2_frames(&all_data);
 
-    println!("H2 empty DATA flood - received {} frames", frames.len());
+    println!("H2 empty DATA flood - received {} frames ({} bytes)", frames.len(), all_data.len());
+    for (i, (ft, fl, sid, payload)) in frames.iter().enumerate() {
+        if *ft == H2_FRAME_GOAWAY && payload.len() >= 8 {
+            let error_code = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
+            println!("  frame {i}: GOAWAY error_code=0x{error_code:x}");
+        } else {
+            println!("  frame {i}: type=0x{ft:02x} flags=0x{fl:02x} stream={sid} len={}", payload.len());
+        }
+    }
 
     let got_enhance_your_calm = contains_goaway_with_error(&frames, H2_ERROR_ENHANCE_YOUR_CALM);
-    if let Some(error_code) = goaway_error_code(&frames) {
-        println!("H2 empty DATA flood - GOAWAY error_code=0x{error_code:x}");
-    }
     println!("H2 empty DATA flood - got ENHANCE_YOUR_CALM: {got_enhance_your_calm}");
 
     drop(tls);
