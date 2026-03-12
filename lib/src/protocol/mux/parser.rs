@@ -339,6 +339,13 @@ pub fn frame_body<'a>(
         FrameType::PushPromise => push_promise_frame(i, header)?,
         FrameType::Continuation => continuation_frame(i, header)?,
         FrameType::Settings => {
+            // RFC 9113 §6.5: SETTINGS ACK with non-zero payload is FRAME_SIZE_ERROR
+            if header.flags & FLAG_ACK != 0 && header.payload_len != 0 {
+                return Err(Err::Failure(ParserError::new_h2(
+                    i,
+                    H2Error::FrameSizeError,
+                )));
+            }
             if header.payload_len % SETTINGS_ENTRY_SIZE != 0 {
                 return Err(Err::Failure(ParserError::new_h2(
                     i,
@@ -712,4 +719,346 @@ pub fn continuation_frame<'a>(
             _end_headers: header.flags & FLAG_END_HEADERS != 0,
         }),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Default max frame size per RFC 9113 §6.5.2 (2^14 = 16384)
+    const DEFAULT_MAX_FRAME_SIZE: u32 = 1 << 14;
+
+    // ---- SETTINGS ACK with non-zero payload (C-2 regression) ----
+
+    /// RFC 9113 §6.5: a SETTINGS frame with the ACK flag AND a non-empty
+    /// payload is a FRAME_SIZE_ERROR. The parser now enforces this directly
+    /// (moved from the mux layer for defense-in-depth).
+    #[test]
+    fn test_settings_ack_with_payload_rejected() {
+        // SETTINGS ACK (flags=0x01) with 6-byte payload (one setting entry)
+        let input = [
+            0x00, 0x00, 0x06, // payload_len = 6
+            0x04, // type = SETTINGS
+            0x01, // flags = ACK
+            0x00, 0x00, 0x00, 0x00, // stream_id = 0
+            // payload: SETTINGS_MAX_CONCURRENT_STREAMS (0x0003) = 100 (0x00000064)
+            0x00, 0x03, 0x00, 0x00, 0x00, 0x64,
+        ];
+
+        let (remaining, header) = frame_header(&input, DEFAULT_MAX_FRAME_SIZE).unwrap();
+        assert_eq!(header.frame_type, FrameType::Settings);
+        assert_eq!(header.flags & FLAG_ACK, FLAG_ACK);
+        assert_eq!(header.payload_len, 6);
+
+        let result = frame_body(remaining, &header);
+        assert!(
+            result.is_err(),
+            "SETTINGS ACK with non-empty payload must be rejected"
+        );
+        match result {
+            Err(nom::Err::Failure(e)) => {
+                assert_eq!(e.kind, ParserErrorKind::H2(H2Error::FrameSizeError));
+            }
+            other => panic!("expected Failure(FrameSizeError), got {other:?}"),
+        }
+    }
+
+    // ---- SETTINGS ACK with empty payload (valid) ----
+
+    /// RFC 9113 §6.5: a SETTINGS ACK with zero-length payload is the only
+    /// valid form. The parser must accept it and produce ack=true with no
+    /// settings entries.
+    #[test]
+    fn test_settings_ack_empty_accepted() {
+        let input = [
+            0x00, 0x00, 0x00, // payload_len = 0
+            0x04, // type = SETTINGS
+            0x01, // flags = ACK
+            0x00, 0x00, 0x00, 0x00, // stream_id = 0
+        ];
+
+        let (remaining, header) = frame_header(&input, DEFAULT_MAX_FRAME_SIZE).unwrap();
+        assert_eq!(header.frame_type, FrameType::Settings);
+        assert_eq!(header.flags & FLAG_ACK, FLAG_ACK);
+
+        let (_, frame) = frame_body(remaining, &header).unwrap();
+        match frame {
+            Frame::Settings(settings) => {
+                assert!(settings.ack, "ACK flag must be set");
+                assert!(
+                    settings.settings.is_empty(),
+                    "should have no settings entries"
+                );
+            }
+            other => panic!("expected Frame::Settings, got {other:?}"),
+        }
+    }
+
+    // ---- WINDOW_UPDATE with max increment (flow control boundary) ----
+
+    /// RFC 9113 §6.9: increment = 2^31-1 (0x7FFFFFFF) is the maximum valid
+    /// window size increment. The parser must accept it.
+    #[test]
+    fn test_window_update_max_increment() {
+        let input = [
+            0x00, 0x00, 0x04, // payload_len = 4
+            0x08, // type = WINDOW_UPDATE
+            0x00, // flags = 0
+            0x00, 0x00, 0x00, 0x01, // stream_id = 1
+            0x7F, 0xFF, 0xFF, 0xFF, // increment = 2^31-1
+        ];
+
+        let (remaining, header) = frame_header(&input, DEFAULT_MAX_FRAME_SIZE).unwrap();
+        assert_eq!(header.frame_type, FrameType::WindowUpdate);
+        assert_eq!(header.stream_id, 1);
+
+        let (_, frame) = frame_body(remaining, &header).unwrap();
+        match frame {
+            Frame::WindowUpdate(wu) => {
+                assert_eq!(wu.increment, 0x7FFFFFFF);
+                assert_eq!(wu.stream_id, 1);
+            }
+            other => panic!("expected Frame::WindowUpdate, got {other:?}"),
+        }
+    }
+
+    // ---- WINDOW_UPDATE with zero increment (must reject) ----
+
+    /// RFC 9113 §6.9: a WINDOW_UPDATE with increment of 0 MUST be treated
+    /// as a connection error of type PROTOCOL_ERROR.
+    #[test]
+    fn test_window_update_zero_increment_rejected() {
+        let input = [
+            0x00, 0x00, 0x04, // payload_len = 4
+            0x08, // type = WINDOW_UPDATE
+            0x00, // flags = 0
+            0x00, 0x00, 0x00, 0x00, // stream_id = 0
+            0x00, 0x00, 0x00, 0x00, // increment = 0
+        ];
+
+        let (remaining, header) = frame_header(&input, DEFAULT_MAX_FRAME_SIZE).unwrap();
+        assert_eq!(header.frame_type, FrameType::WindowUpdate);
+
+        let result = frame_body(remaining, &header);
+        assert!(result.is_err(), "zero increment must be rejected");
+        match result {
+            Err(nom::Err::Failure(e)) => {
+                assert_eq!(e.kind, ParserErrorKind::H2(H2Error::ProtocolError));
+            }
+            other => panic!("expected Failure(ProtocolError), got {other:?}"),
+        }
+    }
+
+    // ---- Unknown frame type returns UnknownFrame error ----
+
+    /// RFC 9113 §4.1: unknown frame types must not crash the parser. Our
+    /// parser returns `ParserErrorKind::UnknownFrame(payload_len)` so the
+    /// caller can skip the payload and continue.
+    #[test]
+    fn test_unknown_frame_type_returns_unknown_frame_error() {
+        let input = [
+            0x00, 0x00, 0x04, // payload_len = 4
+            0xFF, // type = unknown (255)
+            0x00, // flags = 0
+            0x00, 0x00, 0x00, 0x00, // stream_id = 0
+        ];
+
+        let result = frame_header(&input, DEFAULT_MAX_FRAME_SIZE);
+        assert!(result.is_err(), "unknown frame type must be rejected");
+        match result {
+            Err(nom::Err::Failure(e)) => {
+                assert!(
+                    matches!(e.kind, ParserErrorKind::UnknownFrame(4)),
+                    "expected UnknownFrame(4), got {:?}",
+                    e.kind
+                );
+            }
+            other => panic!("expected Failure(UnknownFrame(4)), got {other:?}"),
+        }
+    }
+
+    // ---- SETTINGS with odd payload size (not a multiple of 6) ----
+
+    /// RFC 9113 §6.5: a SETTINGS frame payload that is not a multiple of 6
+    /// octets MUST be treated as a FRAME_SIZE_ERROR.
+    #[test]
+    fn test_settings_payload_not_multiple_of_6_rejected() {
+        let input = [
+            0x00, 0x00, 0x05, // payload_len = 5 (not a multiple of 6)
+            0x04, // type = SETTINGS
+            0x00, // flags = 0 (not ACK)
+            0x00, 0x00, 0x00, 0x00, // stream_id = 0
+            0x00, 0x03, 0x00, 0x00, 0x00, // 5 bytes of incomplete setting
+        ];
+
+        let (remaining, header) = frame_header(&input, DEFAULT_MAX_FRAME_SIZE).unwrap();
+        assert_eq!(header.frame_type, FrameType::Settings);
+
+        let result = frame_body(remaining, &header);
+        assert!(
+            result.is_err(),
+            "odd-size SETTINGS payload must be rejected"
+        );
+        match result {
+            Err(nom::Err::Failure(e)) => {
+                assert_eq!(e.kind, ParserErrorKind::H2(H2Error::FrameSizeError));
+            }
+            other => panic!("expected Failure(FrameSizeError), got {other:?}"),
+        }
+    }
+
+    // ---- RST_STREAM with wrong payload size ----
+
+    /// RFC 9113 §6.4: RST_STREAM payload MUST be exactly 4 octets.
+    #[test]
+    fn test_rst_stream_wrong_payload_size_rejected() {
+        // 8 bytes instead of 4
+        let input = [
+            0x00, 0x00, 0x08, // payload_len = 8
+            0x03, // type = RST_STREAM
+            0x00, // flags = 0
+            0x00, 0x00, 0x00, 0x01, // stream_id = 1
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 8 bytes
+        ];
+
+        let (remaining, header) = frame_header(&input, DEFAULT_MAX_FRAME_SIZE).unwrap();
+        assert_eq!(header.frame_type, FrameType::RstStream);
+
+        let result = frame_body(remaining, &header);
+        assert!(
+            result.is_err(),
+            "wrong RST_STREAM payload size must be rejected"
+        );
+        match result {
+            Err(nom::Err::Failure(e)) => {
+                assert_eq!(e.kind, ParserErrorKind::H2(H2Error::FrameSizeError));
+            }
+            other => panic!("expected Failure(FrameSizeError), got {other:?}"),
+        }
+    }
+
+    // ---- PING with wrong payload size ----
+
+    /// RFC 9113 §6.7: PING payload MUST be exactly 8 octets.
+    #[test]
+    fn test_ping_wrong_payload_size_rejected() {
+        let input = [
+            0x00, 0x00, 0x04, // payload_len = 4 (should be 8)
+            0x06, // type = PING
+            0x00, // flags = 0
+            0x00, 0x00, 0x00, 0x00, // stream_id = 0
+            0x01, 0x02, 0x03, 0x04, // only 4 bytes
+        ];
+
+        let (remaining, header) = frame_header(&input, DEFAULT_MAX_FRAME_SIZE).unwrap();
+        assert_eq!(header.frame_type, FrameType::Ping);
+
+        let result = frame_body(remaining, &header);
+        assert!(result.is_err(), "wrong PING payload size must be rejected");
+        match result {
+            Err(nom::Err::Failure(e)) => {
+                assert_eq!(e.kind, ParserErrorKind::H2(H2Error::FrameSizeError));
+            }
+            other => panic!("expected Failure(FrameSizeError), got {other:?}"),
+        }
+    }
+
+    // ---- Frame exceeding max_frame_size ----
+
+    /// RFC 9113 §4.2: a frame with payload_len > max_frame_size is a
+    /// FRAME_SIZE_ERROR at the frame header parsing stage.
+    #[test]
+    fn test_frame_exceeding_max_frame_size_rejected() {
+        // payload_len = 16385 (0x004001), which exceeds the default 16384
+        let input = [
+            0x00, 0x40, 0x01, // payload_len = 16385
+            0x00, // type = DATA
+            0x00, // flags = 0
+            0x00, 0x00, 0x00, 0x01, // stream_id = 1
+        ];
+
+        let result = frame_header(&input, DEFAULT_MAX_FRAME_SIZE);
+        assert!(result.is_err(), "oversized frame must be rejected");
+        match result {
+            Err(nom::Err::Failure(e)) => {
+                assert_eq!(e.kind, ParserErrorKind::H2(H2Error::FrameSizeError));
+            }
+            other => panic!("expected Failure(FrameSizeError), got {other:?}"),
+        }
+    }
+
+    // ---- SETTINGS on non-zero stream (PROTOCOL_ERROR) ----
+
+    /// RFC 9113 §6.5: SETTINGS frames MUST be associated with stream 0.
+    #[test]
+    fn test_settings_on_nonzero_stream_rejected() {
+        let input = [
+            0x00, 0x00, 0x00, // payload_len = 0
+            0x04, // type = SETTINGS
+            0x00, // flags = 0
+            0x00, 0x00, 0x00, 0x01, // stream_id = 1 (invalid!)
+        ];
+
+        let result = frame_header(&input, DEFAULT_MAX_FRAME_SIZE);
+        assert!(
+            result.is_err(),
+            "SETTINGS on non-zero stream must be rejected"
+        );
+        match result {
+            Err(nom::Err::Failure(e)) => {
+                assert_eq!(e.kind, ParserErrorKind::H2(H2Error::ProtocolError));
+            }
+            other => panic!("expected Failure(ProtocolError), got {other:?}"),
+        }
+    }
+
+    // ---- DATA on stream 0 (PROTOCOL_ERROR) ----
+
+    /// RFC 9113 §6.1: DATA frames MUST be associated with a stream.
+    #[test]
+    fn test_data_on_stream_zero_rejected() {
+        let input = [
+            0x00, 0x00, 0x02, // payload_len = 2
+            0x00, // type = DATA
+            0x00, // flags = 0
+            0x00, 0x00, 0x00, 0x00, // stream_id = 0 (invalid!)
+            0xCA, 0xFE,
+        ];
+
+        let result = frame_header(&input, DEFAULT_MAX_FRAME_SIZE);
+        assert!(result.is_err(), "DATA on stream 0 must be rejected");
+        match result {
+            Err(nom::Err::Failure(e)) => {
+                assert_eq!(e.kind, ParserErrorKind::H2(H2Error::ProtocolError));
+            }
+            other => panic!("expected Failure(ProtocolError), got {other:?}"),
+        }
+    }
+
+    // ---- WINDOW_UPDATE with reserved bit set (must be masked) ----
+
+    /// RFC 9113 §6.9: the reserved bit (MSB) of the window size increment
+    /// MUST be ignored. An increment of 0x80000001 should be read as 1.
+    #[test]
+    fn test_window_update_reserved_bit_masked() {
+        let input = [
+            0x00, 0x00, 0x04, // payload_len = 4
+            0x08, // type = WINDOW_UPDATE
+            0x00, // flags = 0
+            0x00, 0x00, 0x00, 0x01, // stream_id = 1
+            0x80, 0x00, 0x00, 0x01, // increment with reserved bit set = 1
+        ];
+
+        let (remaining, header) = frame_header(&input, DEFAULT_MAX_FRAME_SIZE).unwrap();
+        let (_, frame) = frame_body(remaining, &header).unwrap();
+        match frame {
+            Frame::WindowUpdate(wu) => {
+                assert_eq!(
+                    wu.increment, 1,
+                    "reserved bit must be masked to yield increment=1"
+                );
+            }
+            other => panic!("expected Frame::WindowUpdate, got {other:?}"),
+        }
+    }
 }

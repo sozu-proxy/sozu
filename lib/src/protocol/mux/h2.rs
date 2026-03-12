@@ -65,6 +65,10 @@ const FLOOD_WINDOW_DURATION: std::time::Duration = std::time::Duration::from_sec
 /// Maximum general anomaly count before triggering ENHANCE_YOUR_CALM
 const MAX_GLITCH_COUNT: u32 = 100;
 
+/// Maximum pending WINDOW_UPDATE entries before forcing a flush.
+/// Sized to cover connection-level + per-stream entries.
+const MAX_PENDING_WINDOW_UPDATES: usize = 202; // 1 connection + 100 streams * 2
+
 /// RFC 9113 §6.5: maximum time (in seconds) to wait for SETTINGS ACK before
 /// sending GOAWAY with SETTINGS_TIMEOUT error code.
 const SETTINGS_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -92,21 +96,21 @@ fn error_nom_to_h2(error: nom::Err<parser::ParserError>) -> H2Error {
 #[derive(Debug)]
 pub struct H2FloodDetector {
     /// RST_STREAM frames received in current window (CVE-2023-44487 + CVE-2019-9514)
-    pub rst_stream_count: u32,
+    pub(super) rst_stream_count: u32,
     /// PING frames received in current window (CVE-2019-9512)
-    pub ping_count: u32,
+    pub(super) ping_count: u32,
     /// SETTINGS frames received in current window (CVE-2019-9515)
-    pub settings_count: u32,
+    pub(super) settings_count: u32,
     /// Empty DATA frames received in current window (CVE-2019-9518)
-    pub empty_data_count: u32,
+    pub(super) empty_data_count: u32,
     /// CONTINUATION frames received for current header block (CVE-2024-27316)
-    pub continuation_count: u32,
+    pub(super) continuation_count: u32,
     /// Total accumulated header block size across CONTINUATION frames
-    pub accumulated_header_size: u32,
+    pub(super) accumulated_header_size: u32,
     /// General anomaly counter
-    pub glitch_count: u32,
+    pub(super) glitch_count: u32,
     /// Window start for rate-based counters
-    pub window_start: Instant,
+    pub(super) window_start: Instant,
 }
 
 impl Default for H2FloodDetector {
@@ -129,14 +133,15 @@ impl H2FloodDetector {
         }
     }
 
-    /// Reset rate-based counters if the current window has expired.
+    /// Half-decay rate-based counters if the current window has expired.
+    /// Uses half-window decay instead of full reset to catch burst-then-wait attacks.
     fn maybe_reset_window(&mut self) {
         if self.window_start.elapsed() >= FLOOD_WINDOW_DURATION {
-            self.rst_stream_count = 0;
-            self.ping_count = 0;
-            self.settings_count = 0;
-            self.empty_data_count = 0;
-            self.glitch_count = 0;
+            self.rst_stream_count /= 2;
+            self.ping_count /= 2;
+            self.settings_count /= 2;
+            self.empty_data_count /= 2;
+            self.glitch_count /= 2;
             self.window_start = Instant::now();
         }
     }
@@ -301,6 +306,8 @@ pub struct ConnectionH2<Front: SocketHandler> {
     pub highest_peer_stream_id: StreamId,
     /// Reusable buffer for HPACK-encoded headers in the H2 block converter.
     pub converter_buf: Vec<u8>,
+    /// Reusable buffer for lowercasing header keys in the H2 block converter.
+    pub lowercase_buf: Vec<u8>,
     /// RFC 9113 §6.8: when true, this connection is draining — no new streams accepted.
     /// Set when we receive or send a GoAway frame. The connection closes once all
     /// active streams complete (or are reset).
@@ -582,16 +589,31 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                                 && stream_id % 2 == 1
                                 && stream_id >= self.last_stream_id
                             {
-                                if context.active_len()
+                                if self.streams.len()
                                     >= self.local_settings.settings_max_concurrent_streams as usize
                                 {
                                     error!(
-                                        "MAX CONCURRENT STREAMS: {} {} {}",
+                                        "MAX CONCURRENT STREAMS: limit={}, current={}",
                                         self.local_settings.settings_max_concurrent_streams,
-                                        context.active_len(),
-                                        context.streams.len()
+                                        self.streams.len()
                                     );
-                                    return self.goaway(H2Error::RefusedStream);
+                                    // RFC 9113 §5.1.2: refuse with RST_STREAM, not GOAWAY
+                                    let kawa = &mut self.zero;
+                                    let mut frame = [0; 13];
+                                    if let Ok((_, _)) = serializer::gen_rst_stream(
+                                        &mut frame,
+                                        stream_id,
+                                        H2Error::RefusedStream,
+                                    ) {
+                                        let buf = kawa.storage.space();
+                                        if buf.len() >= frame.len() {
+                                            buf[..frame.len()].copy_from_slice(&frame);
+                                            kawa.storage.fill(frame.len());
+                                            self.readiness.interest.insert(Ready::WRITABLE);
+                                        }
+                                    }
+                                    self.expect_header();
+                                    return MuxResult::Continue;
                                 }
                                 match self.create_stream(stream_id, context) {
                                     Some(_) => {}
@@ -669,6 +691,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                             stream_id,
                         },
                     )) => {
+                        if kawa.storage.end < 9 {
+                            error!(
+                                "CONTINUATION header: storage.end ({}) too small to remove frame header",
+                                kawa.storage.end
+                            );
+                            return self.goaway(H2Error::InternalError);
+                        }
                         kawa.storage.end -= 9;
                         if stream_id != headers.stream_id {
                             error!(
@@ -738,6 +767,17 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         E: Endpoint,
         L: ListenerHandler + L7ListenerHandler,
     {
+        // RFC 9113 §6.5: check if peer has timed out on SETTINGS ACK
+        if let Some(sent_at) = self.settings_sent_at {
+            if sent_at.elapsed() >= SETTINGS_ACK_TIMEOUT {
+                error!(
+                    "SETTINGS ACK timeout: peer did not acknowledge within {:?}",
+                    SETTINGS_ACK_TIMEOUT
+                );
+                return self.goaway(H2Error::SettingsTimeout);
+            }
+        }
+
         // Don't reset the timeout for control frame writes (SETTINGS ACK, PING
         // response, WINDOW_UPDATE). Only application data writes should reset it.
         // The timeout is reset below in the Header/Frame states when writing
@@ -952,7 +992,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     encoder: &mut self.encoder,
                     out: converter_buf,
                     scheme,
-                    lowercase_buf: Vec::new(),
+                    lowercase_buf: std::mem::take(&mut self.lowercase_buf),
                 };
                 let mut priorities = self.streams.keys().collect::<Vec<_>>();
                 priorities.sort();
@@ -1061,8 +1101,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     }
                 }
 
-                // Reclaim the converter's HPACK buffer for reuse
+                // Reclaim the converter's reusable buffers
                 self.converter_buf = converter.out;
+                self.lowercase_buf = converter.lowercase_buf;
 
                 // RFC 9113 §6.8: if draining and all streams have completed,
                 // send the final GOAWAY with the actual last_stream_id
@@ -1155,9 +1196,14 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             .find(|(sid, _)| *sid == stream_id)
         {
             entry.1 = entry.1.saturating_add(increment).min(max_increment);
-        } else {
+        } else if self.pending_window_updates.len() < MAX_PENDING_WINDOW_UPDATES {
             self.pending_window_updates
                 .push((stream_id, increment.min(max_increment)));
+        } else {
+            warn!(
+                "pending_window_updates at capacity ({}), dropping update for stream {}",
+                MAX_PENDING_WINDOW_UPDATES, stream_id
+            );
         }
     }
 
@@ -1286,11 +1332,15 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         Some(global_stream_id)
     }
 
-    pub fn new_stream_id(&mut self) -> StreamId {
-        self.last_stream_id += 2;
+    pub fn new_stream_id(&mut self) -> Option<StreamId> {
+        let next = self.last_stream_id.checked_add(2)?;
+        if next > FLOW_CONTROL_MAX_WINDOW {
+            return None;
+        }
+        self.last_stream_id = next;
         match self.position {
-            Position::Client(..) => self.last_stream_id - 1,
-            Position::Server => self.last_stream_id - 2,
+            Position::Client(..) => Some(self.last_stream_id - 1),
+            Position::Server => Some(self.last_stream_id - 2),
         }
     }
 
@@ -1656,10 +1706,18 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 self.attribute_bytes_to_overhead();
 
                 let kawa = &mut self.zero;
-                kawa.storage.space()[0..serializer::SETTINGS_ACKNOWLEDGEMENT.len()]
-                    .copy_from_slice(&serializer::SETTINGS_ACKNOWLEDGEMENT);
-                kawa.storage
-                    .fill(serializer::SETTINGS_ACKNOWLEDGEMENT.len());
+                let ack = &serializer::SETTINGS_ACKNOWLEDGEMENT;
+                let buf = kawa.storage.space();
+                if buf.len() < ack.len() {
+                    error!(
+                        "No space in zero buffer for SETTINGS ACK ({} available, {} needed)",
+                        buf.len(),
+                        ack.len()
+                    );
+                    return self.force_disconnect();
+                }
+                buf[..ack.len()].copy_from_slice(ack);
+                kawa.storage.fill(ack.len());
 
                 self.readiness.interest.insert(Ready::WRITABLE);
                 self.readiness.interest.remove(Ready::READABLE);
@@ -1677,6 +1735,15 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 }
                 self.attribute_bytes_to_overhead();
                 let kawa = &mut self.zero;
+                let ping_response_size = serializer::PING_ACKNOWLEDGEMENT_HEADER.len() + 8;
+                if kawa.storage.space().len() < ping_response_size {
+                    error!(
+                        "No space in zero buffer for PING response ({} available, {} needed)",
+                        kawa.storage.space().len(),
+                        ping_response_size
+                    );
+                    return self.force_disconnect();
+                }
                 match serializer::gen_ping_acknolegment(kawa.storage.space(), &ping.payload) {
                     Ok((_, size)) => kawa.storage.fill(size),
                     Err(error) => {
@@ -1789,7 +1856,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         if value > FLOW_CONTROL_MAX_WINDOW {
             return true;
         }
-        let delta = value as i32 - self.peer_settings.settings_initial_window_size as i32;
+        let delta = (value as i64 - self.peer_settings.settings_initial_window_size as i64) as i32;
         let mut open_window = false;
         // Only update windows for streams owned by this connection
         for &global_stream_id in self.streams.values() {
@@ -2001,7 +2068,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             return false;
         }
         trace!("start new H2 stream {} {:?}", stream, self.readiness);
-        let stream_id = self.new_stream_id();
+        let Some(stream_id) = self.new_stream_id() else {
+            error!("Stream ID space exhausted, cannot open new stream");
+            return false;
+        };
         self.streams.insert(stream_id, stream);
         self.readiness.interest.insert(Ready::WRITABLE);
         true
