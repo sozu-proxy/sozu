@@ -4,6 +4,62 @@
 
 See milestone [`v1.1.0`](https://github.com/sozu-proxy/sozu/projects/3?card_filter_query=milestone%3Av1.1.0)
 
+## feat/h2-mux - Unreleased
+
+### 🌟 Added
+
+- **HTTP/2 Multiplexing (Mux layer)**: Introduced a unified `Mux` protocol handler (`lib/src/protocol/mux/`) that replaces the separate H1 and H2 session handlers. The new layer supports full HTTP/2 multiplexing over a single connection, with shared stream state, flow control, and HPACK compression via the `loona-hpack` crate, see [`f7d1b659`](https://github.com/sozu-proxy/sozu/commit/f7d1b659865e7d92e732fcf8c52783713140f6a8), [`b6bffd36`](https://github.com/sozu-proxy/sozu/commit/b6bffd364355c8001da7403066c2dbcbc04445a1).
+
+- **ALPN Protocol Negotiation**: Added per-listener ALPN configuration so Sōzu can advertise `h2` and `http/1.1` during the TLS handshake and route each connection to the correct Mux path, see [`4f67d07d`](https://github.com/sozu-proxy/sozu/commit/4f67d07d6179c2af61108a24d1e1d57eec663787).
+
+- **`cluster h2 enable` / `cluster h2 disable` CLI commands**: New `sozuctl` sub-commands and a `--http2` flag allow operators to toggle HTTP/2 support on a cluster at runtime without restarting workers, see [`2a65aa78`](https://github.com/sozu-proxy/sozu/commit/2a65aa78313f359d22d38c1c828c1960bb411bd8).
+
+- **End-to-end test suite for H2 and Mux**: Added `e2e/src/tests/h2_tests.rs` and `e2e/src/tests/mux_tests.rs` (2 500+ lines) covering multiplexed streams, request pipelining, WebSocket upgrades, and mixed H1/H2 scenarios, see [`f7d1b659`](https://github.com/sozu-proxy/sozu/commit/f7d1b659865e7d92e732fcf8c52783713140f6a8).
+
+### ✍️ Changed
+
+- **Slab capacity multiplier doubled to 4× per connection**: The internal slab allocator now reserves 4× the per-connection slot count (previously 2×) to accommodate the higher stream concurrency introduced by HTTP/2 multiplexing.
+
+- **`hpack` dependency replaced by `loona-hpack`**: The HPACK encoder/decoder used for HTTP/2 header compression has been migrated from the `hpack` crate to `loona-hpack`, see [`Cargo.toml`](https://github.com/sozu-proxy/sozu/blob/feat/h2-mux/lib/Cargo.toml).
+
+### ⛑️ Fixed
+
+- We fixed an `http.active_requests` gauge underflow where idle-timeout teardown and malformed-request rejection paths decremented the counter without a prior increment, causing the gauge to wrap to `u64::MAX`, see [`9b6f9987`](https://github.com/sozu-proxy/sozu/commit/9b6f99871f2a74f120cceb13a3c3ffeab5525515).
+
+- We fixed a double-decrement of `http.active_requests` on `100 Continue` and `103 Early Hints` informational responses, which were incorrectly treated as terminal responses in the mux H2 path, see [`9b6f9987`](https://github.com/sozu-proxy/sozu/commit/9b6f99871f2a74f120cceb13a3c3ffeab5525515).
+
+- We fixed `http.errors` over-counting on session teardown: the mux `close()` path was emitting an error metric for every open stream even when the session ended cleanly, see [`9b6f9987`](https://github.com/sozu-proxy/sozu/commit/9b6f99871f2a74f120cceb13a3c3ffeab5525515).
+
+- We fixed the `local_drain` gauge wrapping to `u64::MAX` on negative values: the gauge is now clamped to zero rather than wrapping on unsigned underflow, see [`9b6f9987`](https://github.com/sozu-proxy/sozu/commit/9b6f99871f2a74f120cceb13a3c3ffeab5525515).
+
+- We fixed missing backend metrics (response time, request count, error rate) in the mux layer that were silently dropped compared to the legacy H1/H2 handlers, see [`5a02f634`](https://github.com/sozu-proxy/sozu/commit/5a02f634e848600651a350a60e2f1fb39d0cc4dc).
+
+- We fixed frontend timeout handling in the mux layer: timeouts are now re-armed after partial reads and H2 linked-stream wakeups are handled correctly to avoid spurious session drops, see [`560fac2f`](https://github.com/sozu-proxy/sozu/commit/560fac2f2cc249a66264a9233bb908059bb01ca0).
+
+### Changelog
+
+#### 🌟 Added
+
+- [ [`f7d1b659`](https://github.com/sozu-proxy/sozu/commit/f7d1b659865e7d92e732fcf8c52783713140f6a8) ] Add HTTP/2 configuration guide to getting_started and configure [`FlorentinDUBOIS`] (`2026-03-12`)
+- [ [`b6bffd36`](https://github.com/sozu-proxy/sozu/commit/b6bffd364355c8001da7403066c2dbcbc04445a1) ] Add missing metrics to mux H1/H2 paths and document all mux metrics [`FlorentinDUBOIS`] (`2026-03-12`)
+- [ [`4f67d07d`](https://github.com/sozu-proxy/sozu/commit/4f67d07d6179c2af61108a24d1e1d57eec663787) ] Add per-listener ALPN protocol configuration [`FlorentinDUBOIS`] (`2026-03-12`)
+- [ [`2a65aa78`](https://github.com/sozu-proxy/sozu/commit/2a65aa78313f359d22d38c1c828c1960bb411bd8) ] Add cluster H2 enable/disable commands and --http2 flag [`FlorentinDUBOIS`] (`2026-03-12`)
+
+#### ⛑️ Fixed
+
+- [ [`9b6f9987`](https://github.com/sozu-proxy/sozu/commit/9b6f99871f2a74f120cceb13a3c3ffeab5525515) ] Fix service_time inflation, gauge leak, and WebSocket upgrade accounting [`FlorentinDUBOIS`] (`2026-03-12`)
+- [ [`560fac2f`](https://github.com/sozu-proxy/sozu/commit/560fac2f2cc249a66264a9233bb908059bb01ca0) ] Re-arm timeouts and handle H2 Linked streams on frontend timeout [`FlorentinDUBOIS`] (`2026-03-12`)
+- [ [`5a02f634`](https://github.com/sozu-proxy/sozu/commit/5a02f634e848600651a350a60e2f1fb39d0cc4dc) ] Restore missing backend metrics in mux layer [`FlorentinDUBOIS`] (`2026-03-12`)
+- [ [`479a0bfe`](https://github.com/sozu-proxy/sozu/commit/479a0bfeba7fd9c4418b6e8652d66ec03ad58fe3) ] Downgrade noisy mux/H1/H2 logs from warn/error to debug [`FlorentinDUBOIS`] (`2026-03-12`)
+
+#### ✍️ Changed
+
+- [ [`303675e9`](https://github.com/sozu-proxy/sozu/commit/303675e9707fd64055a93f0ee27bb58b72faa344) ] Apply cargo fmt to CLI, config, and HTTPS modules [`FlorentinDUBOIS`] (`2026-03-12`)
+
+#### 📚 Documentation
+
+- [ [`6d100d1c`](https://github.com/sozu-proxy/sozu/commit/6d100d1c5bfa46889a14b5ab7b2cd6b938c0950e) ] Document ALPN behavior and add ALPN metrics to metrics reference [`FlorentinDUBOIS`] (`2026-03-12`)
+
 ## 1.1.1 - 2025-11-03
 
 ### ⛑️ Fixed
