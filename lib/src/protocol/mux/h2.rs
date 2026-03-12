@@ -35,7 +35,7 @@ const MIN_MAX_FRAME_SIZE: u32 = 1 << 14; // 16384
 const MAX_MAX_FRAME_SIZE: u32 = 1 << 24; // 16777216 (exclusive upper bound)
 
 // RFC 9113 §6.9: maximum flow control window size (2^31 - 1)
-const FLOW_CONTROL_MAX_WINDOW: u32 = 1 << 31;
+const FLOW_CONTROL_MAX_WINDOW: u32 = (1 << 31) - 1;
 
 /// Enlarged connection-level receive window (1 MB).
 /// The RFC 9113 default is 65 535 bytes, which is too small for high-throughput
@@ -146,49 +146,49 @@ impl H2FloodDetector {
         self.maybe_reset_window();
 
         if self.rst_stream_count > MAX_RST_STREAM_PER_WINDOW {
-            error!(
+            warn!(
                 "H2 flood detected: RST_STREAM count {} exceeds threshold {}",
                 self.rst_stream_count, MAX_RST_STREAM_PER_WINDOW
             );
             return Some(H2Error::EnhanceYourCalm);
         }
         if self.ping_count > MAX_PING_PER_WINDOW {
-            error!(
+            warn!(
                 "H2 flood detected: PING count {} exceeds threshold {}",
                 self.ping_count, MAX_PING_PER_WINDOW
             );
             return Some(H2Error::EnhanceYourCalm);
         }
         if self.settings_count > MAX_SETTINGS_PER_WINDOW {
-            error!(
+            warn!(
                 "H2 flood detected: SETTINGS count {} exceeds threshold {}",
                 self.settings_count, MAX_SETTINGS_PER_WINDOW
             );
             return Some(H2Error::EnhanceYourCalm);
         }
         if self.empty_data_count > MAX_EMPTY_DATA_PER_WINDOW {
-            error!(
+            warn!(
                 "H2 flood detected: empty DATA count {} exceeds threshold {}",
                 self.empty_data_count, MAX_EMPTY_DATA_PER_WINDOW
             );
             return Some(H2Error::EnhanceYourCalm);
         }
         if self.continuation_count > MAX_CONTINUATION_FRAMES {
-            error!(
+            warn!(
                 "H2 flood detected: CONTINUATION count {} exceeds threshold {}",
                 self.continuation_count, MAX_CONTINUATION_FRAMES
             );
             return Some(H2Error::EnhanceYourCalm);
         }
         if self.accumulated_header_size > MAX_HEADER_LIST_SIZE {
-            error!(
+            warn!(
                 "H2 flood detected: accumulated header size {} exceeds threshold {}",
                 self.accumulated_header_size, MAX_HEADER_LIST_SIZE
             );
             return Some(H2Error::EnhanceYourCalm);
         }
         if self.glitch_count > MAX_GLITCH_COUNT {
-            error!(
+            warn!(
                 "H2 flood detected: glitch count {} exceeds threshold {}",
                 self.glitch_count, MAX_GLITCH_COUNT
             );
@@ -925,16 +925,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                                 self.distribute_overhead(&mut stream.metrics);
                                 context.debug.push(DebugEvent::I2(4, global_stream_id));
                                 trace!("Recycle stream: {}", global_stream_id);
-                                let token = Self::complete_server_stream(
-                                    stream,
-                                    context.listener.clone(),
-                                );
+                                let token =
+                                    Self::complete_server_stream(stream, context.listener.clone());
                                 if let Some(token) = token {
-                                    endpoint.end_stream(
-                                        token,
-                                        global_stream_id,
-                                        context,
-                                    );
+                                    endpoint.end_stream(token, global_stream_id, context);
                                 }
                                 dead_streams.push(stream_id);
                             }
@@ -1327,8 +1321,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     // permanently and eventually stalls the connection.
                     let payload_len = data.payload.len() as u32;
                     self.received_bytes_since_update += payload_len;
-                    let threshold = self.local_settings.settings_initial_window_size / 2;
-                    if self.received_bytes_since_update >= threshold {
+                    let conn_threshold = ENLARGED_CONNECTION_WINDOW / 2;
+                    if self.received_bytes_since_update >= conn_threshold {
                         let increment = self.received_bytes_since_update;
                         self.queue_window_update(0, increment);
                         self.received_bytes_since_update = 0;
@@ -1391,12 +1385,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 // RFC 9113 §6.9: Update flow control after consuming DATA.
                 // Track bytes received and queue WINDOW_UPDATE when threshold reached.
                 let payload_u32 = payload_len as u32;
-                let initial_window = self.local_settings.settings_initial_window_size;
-                let threshold = initial_window / 2;
 
-                // Connection-level flow control
+                // Connection-level flow control (use enlarged window threshold)
+                let conn_threshold = ENLARGED_CONNECTION_WINDOW / 2;
                 self.received_bytes_since_update += payload_u32;
-                if self.received_bytes_since_update >= threshold {
+                if self.received_bytes_since_update >= conn_threshold {
                     let increment = self.received_bytes_since_update;
                     self.queue_window_update(0, increment);
                     self.received_bytes_since_update = 0;
@@ -1792,12 +1785,14 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     where
         L: ListenerHandler + L7ListenerHandler,
     {
-        if value >= FLOW_CONTROL_MAX_WINDOW {
+        if value > FLOW_CONTROL_MAX_WINDOW {
             return true;
         }
         let delta = value as i32 - self.peer_settings.settings_initial_window_size as i32;
         let mut open_window = false;
-        for stream in context.streams.iter_mut() {
+        // Only update windows for streams owned by this connection
+        for &global_stream_id in self.streams.values() {
+            let stream = &mut context.streams[global_stream_id];
             // RFC 9113 §6.9.2: changes to SETTINGS_INITIAL_WINDOW_SIZE can cause
             // stream windows to exceed 2^31-1, which is a flow control error.
             match stream.window.checked_add(delta) {
