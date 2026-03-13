@@ -602,6 +602,19 @@ impl<Front: SocketHandler> Connection<Front> {
         }
     }
 
+    fn has_pending_write(&self) -> bool {
+        match self {
+            Connection::H1(_) => false,
+            Connection::H2(c) => c.has_pending_write(),
+        }
+    }
+
+    fn flush_zero_buffer(&mut self) {
+        if let Connection::H2(c) = self {
+            c.flush_zero_buffer();
+        }
+    }
+
     fn close<E, L>(&mut self, context: &mut Context<L>, endpoint: E)
     where
         E: Endpoint,
@@ -2160,8 +2173,18 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
 
     fn shutting_down(&mut self) -> SessionIsToBeClosed {
         // RFC 9113 §6.8: initiate graceful shutdown with double-GOAWAY pattern
-        if matches!(self.frontend.graceful_goaway(), MuxResult::CloseSession) {
-            return true;
+        match self.frontend.graceful_goaway() {
+            MuxResult::CloseSession => return true,
+            MuxResult::Continue => {
+                // graceful_goaway() queued a GOAWAY frame. Flush it directly
+                // since the event loop uses edge-triggered epoll and won't
+                // deliver a new WRITABLE event for an already-writable socket.
+                self.frontend.flush_zero_buffer();
+                if self.frontend.has_pending_write() {
+                    return false;
+                }
+            }
+            _ => {}
         }
         let mut can_stop = true;
         for stream in &mut self.context.streams {

@@ -361,6 +361,39 @@ impl SocketHandler for FrontRustls {
             }
         }
 
+        // Flush any pending TLS records even if no application data was written.
+        // This handles the case where h2.rs calls socket_write(&[]) to flush
+        // buffered TLS data (e.g. NewSessionTicket, key updates). Without this,
+        // the main loop above exits immediately for empty buffers and write_tls
+        // is never called.
+        if !is_error && !is_closed && can_write && self.session.wants_write() {
+            loop {
+                match self.session.write_tls(&mut self.stream) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(e) => match e.kind() {
+                        ErrorKind::WouldBlock => {
+                            can_write = false;
+                            break;
+                        }
+                        ErrorKind::ConnectionReset
+                        | ErrorKind::ConnectionAborted
+                        | ErrorKind::BrokenPipe => {
+                            incr!("rustls.write.error");
+                            is_closed = true;
+                            break;
+                        }
+                        _ => {
+                            error!("could not flush TLS stream to socket: {:?}", e);
+                            incr!("rustls.write.error");
+                            is_error = true;
+                            break;
+                        }
+                    },
+                }
+            }
+        }
+
         if is_error {
             (buffered_size, SocketResult::Error)
         } else if is_closed {
