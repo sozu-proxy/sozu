@@ -171,27 +171,35 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
             Block::Chunk(Chunk { data }) => {
                 let mut header = [0; parser::FRAME_HEADER_SIZE];
                 let payload_len = data.len();
-                let (data, payload_len, can_continue) =
-                    if self.window >= payload_len as i32 && self.max_frame_size >= payload_len {
-                        // the window is wide enought to send the entire chunk
-                        (data, payload_len as u32, true)
-                    } else if self.window > 0 {
-                        // we split the chunk to fit in the window
-                        let payload_len = min(self.max_frame_size, self.window.max(0) as usize);
-                        let (before, after) = data.split(payload_len);
-                        if !after.is_empty() {
-                            kawa.blocks.push_front(Block::Chunk(Chunk { data: after }));
-                        }
-                        (
-                            before,
-                            payload_len as u32,
-                            self.max_frame_size < self.window as usize,
-                        )
-                    } else {
-                        // the window can't take any more bytes, return the chunk to the blocks
-                        kawa.blocks.push_front(Block::Chunk(Chunk { data }));
-                        return false;
-                    };
+                let (data, payload_len, can_continue) = if self.window >= payload_len as i32
+                    && self.max_frame_size >= payload_len
+                {
+                    // the window is wide enough to send the entire chunk
+                    (data, payload_len as u32, true)
+                } else if self.window > 0 {
+                    // we split the chunk to fit in the window
+                    let payload_len = min(self.max_frame_size, self.window.max(0) as usize);
+                    let (before, after) = data.split(payload_len);
+                    if !after.is_empty() {
+                        kawa.blocks.push_front(Block::Chunk(Chunk { data: after }));
+                    }
+                    (
+                        before,
+                        payload_len as u32,
+                        self.max_frame_size < self.window as usize,
+                    )
+                } else {
+                    // the window can't take any more bytes, return the chunk to the blocks
+                    trace!(
+                        "H2 flow control stall: stream={} connection_window={} pending_bytes={}",
+                        self.stream_id,
+                        self.window,
+                        data.len()
+                    );
+                    incr!("h2.flow_control_stall");
+                    kawa.blocks.push_front(Block::Chunk(Chunk { data }));
+                    return false;
+                };
                 self.window -= payload_len as i32;
                 if let Err(e) = gen_frame_header(
                     &mut header,

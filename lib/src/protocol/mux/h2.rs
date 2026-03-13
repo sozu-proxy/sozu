@@ -66,8 +66,8 @@ const FLOOD_WINDOW_DURATION: std::time::Duration = std::time::Duration::from_sec
 const MAX_GLITCH_COUNT: u32 = 100;
 
 /// Maximum pending WINDOW_UPDATE entries before forcing a flush.
-/// Sized to cover connection-level + per-stream entries.
-const MAX_PENDING_WINDOW_UPDATES: usize = 202; // 1 connection + 100 streams * 2
+/// Sized to cover connection-level + per-stream entries with headroom under load.
+const MAX_PENDING_WINDOW_UPDATES: usize = 401; // 1 connection + 100 streams * 4
 
 /// RFC 9113 §6.5: maximum time (in seconds) to wait for SETTINGS ACK before
 /// sending GOAWAY with SETTINGS_TIMEOUT error code.
@@ -1065,6 +1065,14 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     }
                 }
 
+                // H2 flow control observability
+                gauge!("h2.connection_window", self.window.max(0) as usize);
+                gauge!("h2.active_streams", self.streams.len());
+                gauge!(
+                    "h2.pending_window_updates",
+                    self.pending_window_updates.len()
+                );
+
                 let scheme: &'static [u8] =
                     if context.listener.borrow().protocol() == Protocol::HTTPS {
                         b"https"
@@ -1292,15 +1300,26 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             .iter_mut()
             .find(|(sid, _)| *sid == stream_id)
         {
+            let old = entry.1;
             entry.1 = entry.1.saturating_add(increment).min(max_increment);
+            trace!(
+                "WINDOW_UPDATE coalesced: stream={} old={} new={}",
+                stream_id, old, entry.1
+            );
         } else if self.pending_window_updates.len() < MAX_PENDING_WINDOW_UPDATES {
             self.pending_window_updates
                 .push((stream_id, increment.min(max_increment)));
-        } else {
-            warn!(
-                "pending_window_updates at capacity ({}), dropping update for stream {}",
-                MAX_PENDING_WINDOW_UPDATES, stream_id
+            trace!(
+                "WINDOW_UPDATE queued: stream={} increment={}",
+                stream_id,
+                increment.min(max_increment)
             );
+        } else {
+            error!(
+                "WINDOW_UPDATE dropped: queue full ({} entries), stream={} increment={}",
+                MAX_PENDING_WINDOW_UPDATES, stream_id, increment
+            );
+            incr!("h2.window_update_dropped");
         }
     }
 
@@ -1977,6 +1996,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                             self.readiness.interest.insert(Ready::WRITABLE);
                         }
                         self.window = window;
+                        debug!(
+                            "WINDOW_UPDATE received: stream=0 increment={} new_connection_window={}",
+                            increment, self.window
+                        );
                     } else {
                         error!("INVALID WINDOW INCREMENT");
                         return self.goaway(H2Error::FlowControlError);
@@ -1989,6 +2012,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                             self.readiness.interest.insert(Ready::WRITABLE);
                         }
                         stream.window = window;
+                        debug!(
+                            "WINDOW_UPDATE received: stream={} increment={} new_stream_window={}",
+                            stream_id, increment, stream.window
+                        );
                     } else {
                         return self.reset_stream(
                             global_stream_id,

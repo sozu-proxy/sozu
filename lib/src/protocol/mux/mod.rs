@@ -2085,16 +2085,40 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         trace!("FRONTEND: {:#?}", self.frontend);
         trace!("BACKENDS: {:#?}", self.router.backends);
 
-        // Distribute H2 connection-level overhead (control frames) across in-flight
-        // streams so that access log bytes_in/bytes_out reflect actual wire cost.
-        // Integer division may lose up to (active_count - 1) bytes, which is acceptable.
+        // Log active streams at session teardown for timeout diagnosis
         let active_count = self
             .context
             .streams
             .iter()
             .filter(|s| s.state.is_open() && s.metrics.start.is_some())
-            .count()
-            .max(1);
+            .count();
+        if active_count > 0 {
+            warn!("Session close with {} active stream(s)", active_count);
+            for (idx, stream) in self
+                .context
+                .streams
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.state.is_open() && s.metrics.start.is_some())
+            {
+                let elapsed = stream.metrics.service_time();
+                warn!(
+                    "  active stream[{}]: state={:?} service_time={:?} method={:?} path={:?} status={:?}",
+                    idx,
+                    stream.state,
+                    elapsed,
+                    stream.context.method,
+                    stream.context.path,
+                    stream.context.status,
+                );
+            }
+            incr!("h2.close_with_active_streams");
+        }
+
+        // Distribute H2 connection-level overhead (control frames) across in-flight
+        // streams so that access log bytes_in/bytes_out reflect actual wire cost.
+        // Integer division may lose up to (active_count - 1) bytes, which is acceptable.
+        let active_count = active_count.max(1);
         let (total_overhead_in, total_overhead_out) = self.frontend.overhead_bytes();
         let share_in = total_overhead_in / active_count;
         let share_out = total_overhead_out / active_count;
