@@ -298,6 +298,18 @@ impl HttpsSession {
             }
         };
         frontend.readiness_mut().event = handshake.frontend_readiness.event;
+        // Ensure the upgraded connection can both read and write immediately.
+        // With TLS 1.3 + NewSessionTicket, the upgrade may happen from writable()
+        // where READABLE is no longer in the event (consumed by the prior readable()
+        // call). The HTTP/2 preface may already be in rustls's plaintext buffer
+        // (not on the TCP socket), so no new READABLE event from epoll will arrive.
+        // Without WRITABLE in the event, the H2 state machine cannot transition from
+        // reading the preface to writing SETTINGS, causing a deadlock with clients
+        // (like hyper) that wait for the server's SETTINGS before proceeding.
+        frontend
+            .readiness_mut()
+            .event
+            .insert(Ready::READABLE | Ready::WRITABLE);
 
         gauge_add!("protocol.https", 1);
         Some(HttpsStateMachine::Mux(Mux {

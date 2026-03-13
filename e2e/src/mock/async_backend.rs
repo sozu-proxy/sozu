@@ -116,8 +116,14 @@ impl BackendHandle<SimpleAggregator> {
             }
             aggregator.requests_received += 1;
             let response = http_ok_response(&content);
-            stream.write_all(response.as_bytes()).unwrap();
-            aggregator.responses_sent += 1;
+            match stream.write_all(response.as_bytes()) {
+                Ok(()) => {
+                    aggregator.responses_sent += 1;
+                }
+                Err(_) => {
+                    // Connection closed by proxy (e.g. after forwarding response)
+                }
+            }
             aggregator
         })
     }

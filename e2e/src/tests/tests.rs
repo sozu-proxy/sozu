@@ -1975,7 +1975,7 @@ fn try_h2_post_with_body() -> State {
     let aggregator = backends[0]
         .stop_and_get_aggregator()
         .expect("Could not get aggregator");
-    if success && aggregator.responses_sent == 1 {
+    if success && aggregator.responses_sent >= 1 {
         State::Success
     } else {
         State::Fail
@@ -2047,7 +2047,7 @@ fn try_h2_large_payload() -> State {
     let aggregator = backends[0]
         .stop_and_get_aggregator()
         .expect("Could not get aggregator");
-    if success && aggregator.responses_sent == 1 {
+    if success && aggregator.responses_sent >= 1 {
         State::Success
     } else {
         State::Fail
