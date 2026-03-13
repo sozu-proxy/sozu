@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use http_body_util::BodyExt;
 use hyper::StatusCode;
@@ -120,24 +120,33 @@ pub fn build_h2_or_h1_client() -> HttpsClient {
 pub fn resolve_request(client: &HttpsClient, uri: hyper::Uri) -> Option<(StatusCode, String)> {
     let rt = tokio::runtime::Runtime::new().expect("Could not create Runtime");
     rt.block_on(async {
-        let response = match client.get(uri).await {
-            Ok(response) => response,
-            Err(error) => {
-                println!("Could not get response: {error}");
-                return None;
-            }
+        let fut = async {
+            let response = match client.get(uri).await {
+                Ok(response) => response,
+                Err(error) => {
+                    println!("Could not get response: {error}");
+                    return None;
+                }
+            };
+            println!("Response: {response:?}");
+            let status = response.status();
+            let body_bytes = match response.into_body().collect().await {
+                Ok(collected) => collected.to_bytes(),
+                Err(error) => {
+                    println!("Could not get body: {error}");
+                    return Some((status, String::new()));
+                }
+            };
+            let body = String::from_utf8(body_bytes.to_vec()).expect("Invalid UTF-8 body");
+            Some((status, body))
         };
-        println!("Response: {response:?}");
-        let status = response.status();
-        let body_bytes = match response.into_body().collect().await {
-            Ok(collected) => collected.to_bytes(),
-            Err(error) => {
-                println!("Could not get body: {error}");
-                return Some((status, String::new()));
+        match tokio::time::timeout(Duration::from_secs(10), fut).await {
+            Ok(result) => result,
+            Err(_) => {
+                println!("resolve_request timed out after 10s");
+                None
             }
-        };
-        let body = String::from_utf8(body_bytes.to_vec()).expect("Invalid UTF-8 body");
-        Some((status, body))
+        }
     })
 }
 
@@ -149,30 +158,39 @@ pub fn resolve_post_request(
 ) -> Option<(StatusCode, String)> {
     let rt = tokio::runtime::Runtime::new().expect("Could not create Runtime");
     rt.block_on(async {
-        let request = hyper::Request::builder()
-            .method(hyper::Method::POST)
-            .uri(uri)
-            .header("content-type", "application/octet-stream")
-            .body(body)
-            .expect("Could not build request");
-        let response = match client.request(request).await {
-            Ok(response) => response,
-            Err(error) => {
-                println!("Could not get response: {error}");
-                return None;
-            }
+        let fut = async {
+            let request = hyper::Request::builder()
+                .method(hyper::Method::POST)
+                .uri(uri)
+                .header("content-type", "application/octet-stream")
+                .body(body)
+                .expect("Could not build request");
+            let response = match client.request(request).await {
+                Ok(response) => response,
+                Err(error) => {
+                    println!("Could not get response: {error}");
+                    return None;
+                }
+            };
+            println!("Response: {response:?}");
+            let status = response.status();
+            let body_bytes = match response.into_body().collect().await {
+                Ok(collected) => collected.to_bytes(),
+                Err(error) => {
+                    println!("Could not get body: {error}");
+                    return Some((status, String::new()));
+                }
+            };
+            let body = String::from_utf8(body_bytes.to_vec()).expect("Invalid UTF-8 body");
+            Some((status, body))
         };
-        println!("Response: {response:?}");
-        let status = response.status();
-        let body_bytes = match response.into_body().collect().await {
-            Ok(collected) => collected.to_bytes(),
-            Err(error) => {
-                println!("Could not get body: {error}");
-                return Some((status, String::new()));
+        match tokio::time::timeout(Duration::from_secs(10), fut).await {
+            Ok(result) => result,
+            Err(_) => {
+                println!("resolve_post_request timed out after 10s");
+                None
             }
-        };
-        let body = String::from_utf8(body_bytes.to_vec()).expect("Invalid UTF-8 body");
-        Some((status, body))
+        }
     })
 }
 
@@ -183,31 +201,41 @@ pub fn resolve_concurrent_requests(
 ) -> Vec<Option<(StatusCode, String)>> {
     let rt = tokio::runtime::Runtime::new().expect("Could not create Runtime");
     rt.block_on(async {
-        let futures: Vec<_> = uris
-            .into_iter()
-            .map(|uri| {
-                let client = client.clone();
-                async move {
-                    let response = match client.get(uri).await {
-                        Ok(response) => response,
-                        Err(error) => {
-                            println!("Could not get response: {error}");
-                            return None;
-                        }
-                    };
-                    let status = response.status();
-                    let body_bytes = match response.into_body().collect().await {
-                        Ok(collected) => collected.to_bytes(),
-                        Err(error) => {
-                            println!("Could not get body: {error}");
-                            return Some((status, String::new()));
-                        }
-                    };
-                    let body = String::from_utf8(body_bytes.to_vec()).expect("Invalid UTF-8 body");
-                    Some((status, body))
-                }
-            })
-            .collect();
-        futures::future::join_all(futures).await
+        let fut = async {
+            let futures: Vec<_> = uris
+                .into_iter()
+                .map(|uri| {
+                    let client = client.clone();
+                    async move {
+                        let response = match client.get(uri).await {
+                            Ok(response) => response,
+                            Err(error) => {
+                                println!("Could not get response: {error}");
+                                return None;
+                            }
+                        };
+                        let status = response.status();
+                        let body_bytes = match response.into_body().collect().await {
+                            Ok(collected) => collected.to_bytes(),
+                            Err(error) => {
+                                println!("Could not get body: {error}");
+                                return Some((status, String::new()));
+                            }
+                        };
+                        let body =
+                            String::from_utf8(body_bytes.to_vec()).expect("Invalid UTF-8 body");
+                        Some((status, body))
+                    }
+                })
+                .collect();
+            futures::future::join_all(futures).await
+        };
+        match tokio::time::timeout(Duration::from_secs(30), fut).await {
+            Ok(result) => result,
+            Err(_) => {
+                println!("resolve_concurrent_requests timed out after 30s");
+                Vec::new()
+            }
+        }
     })
 }
