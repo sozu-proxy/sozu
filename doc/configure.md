@@ -298,6 +298,46 @@ buffer_size = 16393
 A smaller buffer size will cause HTTP/2 frames to be rejected by peers that expect the
 default maximum frame size.
 
+#### H2 flood detection thresholds
+
+Sozu includes built-in flood detection for HTTP/2 connections. When a client sends
+an excessive number of certain frame types within a rolling window, Sozu terminates
+the connection with a `GOAWAY(ENHANCE_YOUR_CALM)` frame. This protects against
+several known HTTP/2 denial-of-service vectors.
+
+Six thresholds are configurable per-listener. When omitted, compile-time defaults
+are used:
+
+| Parameter | Default | Protects against | CVE |
+|-----------|---------|-----------------|-----|
+| `h2_max_rst_stream_per_window` | 50 | Rapid Reset attack: client opens and immediately resets streams in a tight loop | CVE-2023-44487 |
+| `h2_max_ping_per_window` | 10 | Ping flood: client sends PING frames faster than the server can respond | |
+| `h2_max_settings_per_window` | 10 | Settings flood: client sends SETTINGS frames requiring ACKs, exhausting server resources | |
+| `h2_max_empty_data_per_window` | 50 | Empty DATA flood: client sends zero-length DATA frames to consume processing time | |
+| `h2_max_continuation_frames` | 50 | CONTINUATION flood: client sends many small CONTINUATION frames to exhaust header memory | CVE-2024-27316 |
+| `h2_max_glitch_count` | 10 | Cumulative protocol violations: total number of minor protocol errors before disconnection | |
+
+_Configuration example:_
+
+```toml
+[[listeners]]
+address = "0.0.0.0:443"
+protocol = "https"
+
+# H2 flood detection thresholds (optional, defaults shown)
+h2_max_rst_stream_per_window = 50     # Rapid Reset (CVE-2023-44487)
+h2_max_ping_per_window = 10           # Ping flood
+h2_max_settings_per_window = 10       # Settings flood
+h2_max_empty_data_per_window = 50     # Empty DATA flood
+h2_max_continuation_frames = 50       # CONTINUATION flood (CVE-2024-27316)
+h2_max_glitch_count = 10              # Cumulative protocol violations
+```
+
+> **Note:** When any threshold is exceeded, the connection is terminated with a
+> `GOAWAY` frame using the `ENHANCE_YOUR_CALM` error code (HTTP/2 error code 0xb).
+> The event is logged at `warn` level with the specific flood type that triggered
+> disconnection.
+
 ## Metrics
 
 Sōzu reports its own state to another network component through a `UDP` socket.
