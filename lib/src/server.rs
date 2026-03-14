@@ -157,11 +157,6 @@ impl SessionManager {
         self.nb_connections += 1;
         assert!(self.nb_connections <= self.max_connections);
         gauge!("client.connections", self.nb_connections);
-        gauge!(
-            "client.connections_percentage",
-            self.nb_connections * 100 / self.max_connections
-        );
-        gauge!("client.max_connections", self.max_connections);
     }
 
     /// Decrements the number of sessions, start accepting new connections
@@ -170,11 +165,6 @@ impl SessionManager {
         assert!(self.nb_connections != 0);
         self.nb_connections -= 1;
         gauge!("client.connections", self.nb_connections);
-        gauge!(
-            "client.connections_percentage",
-            self.nb_connections * 100 / self.max_connections
-        );
-        gauge!("client.max_connections", self.max_connections);
 
         // do not be ready to accept right away, wait until we get back to 10% capacity
         if !self.can_accept && self.nb_connections < self.max_connections * 90 / 100 {
@@ -235,6 +225,7 @@ pub struct Server {
     last_zombie_check: Instant,
     loop_start: Instant,
     max_poll_errors: i32, // TODO: make this configurable? this defaults to 10000 for now
+    pool: Rc<RefCell<Pool>>,
     pub poll: Poll,
     poll_timeout: Option<Duration>, // TODO: make this configurable? this defaults to 1000 milliseconds for now
     scm_listeners: Option<Listeners>,
@@ -400,6 +391,7 @@ impl Server {
             last_zombie_check: Instant::now(), // to be reset on server run
             loop_start: Instant::now(),        // to be reset on server run
             max_poll_errors: 10000,            // TODO: make it configurable?
+            pool,
             poll_timeout: Some(Duration::from_millis(1000)), // TODO: make it configurable?
             poll,
             scm_listeners: None,
@@ -593,8 +585,38 @@ impl Server {
                 });
             }
 
-            gauge!("client.connections", self.sessions.borrow().nb_connections);
-            gauge!("slab.entries", self.sessions.borrow().slab.len());
+            {
+                let sessions = self.sessions.borrow();
+                let nb_connections = sessions.nb_connections;
+                let max_connections = sessions.max_connections;
+                let slab_len = sessions.slab.len();
+                let slab_capacity = sessions.slab.capacity();
+
+                gauge!("client.connections", nb_connections);
+                gauge!("client.connections_max", max_connections);
+                if max_connections > 0 {
+                    gauge!(
+                        "client.connections_percent",
+                        nb_connections * 100 / max_connections
+                    );
+                }
+
+                gauge!("slab.entries", slab_len);
+                gauge!("slab.capacity", slab_capacity);
+                if slab_capacity > 0 {
+                    gauge!("slab.usage_percent", slab_len * 100 / slab_capacity);
+                }
+            }
+            {
+                let pool = self.pool.borrow();
+                let used = pool.inner.used();
+                let capacity = pool.inner.capacity();
+                gauge!("buffer.used", used);
+                gauge!("buffer.capacity", capacity);
+                if capacity > 0 {
+                    gauge!("buffer.usage_percent", used * 100 / capacity);
+                }
+            }
             METRICS.with(|metrics| {
                 (*metrics.borrow_mut()).send_data();
             });
