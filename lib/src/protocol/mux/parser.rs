@@ -162,6 +162,27 @@ pub enum H2Error {
     HTTP11Required = 0xd,
 }
 
+impl std::fmt::Display for H2Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            H2Error::NoError => "NO_ERROR",
+            H2Error::ProtocolError => "PROTOCOL_ERROR",
+            H2Error::InternalError => "INTERNAL_ERROR",
+            H2Error::FlowControlError => "FLOW_CONTROL_ERROR",
+            H2Error::SettingsTimeout => "SETTINGS_TIMEOUT",
+            H2Error::StreamClosed => "STREAM_CLOSED",
+            H2Error::FrameSizeError => "FRAME_SIZE_ERROR",
+            H2Error::RefusedStream => "REFUSED_STREAM",
+            H2Error::Cancel => "CANCEL",
+            H2Error::CompressionError => "COMPRESSION_ERROR",
+            H2Error::ConnectError => "CONNECT_ERROR",
+            H2Error::EnhanceYourCalm => "ENHANCE_YOUR_CALM",
+            H2Error::InadequateSecurity => "INADEQUATE_SECURITY",
+            H2Error::HTTP11Required => "HTTP_1_1_REQUIRED",
+        })
+    }
+}
+
 impl<'a> ParserError<'a> {
     pub fn new(input: &'a [u8], error: ParserErrorKind) -> ParserError<'a> {
         ParserError { input, kind: error }

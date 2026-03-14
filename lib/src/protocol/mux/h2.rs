@@ -78,7 +78,7 @@ const MAX_GLITCH_COUNT: u32 = 100;
 
 /// Maximum pending WINDOW_UPDATE entries before forcing a flush.
 /// Sized to cover connection-level + per-stream entries with headroom under load.
-const MAX_PENDING_WINDOW_UPDATES: usize = 401; // 1 connection + 100 streams * 4
+const MAX_PENDING_WINDOW_UPDATES: usize = 1 + DEFAULT_MAX_CONCURRENT_STREAMS as usize * 4;
 
 /// Maximum number of pending RST_STREAM frames before triggering GOAWAY.
 /// When a peer causes excessive RST_STREAM queueing (e.g. rapid stream creation
@@ -834,11 +834,12 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         MuxResult::Continue
     }
 
-    pub fn writable<E, L>(&mut self, context: &mut Context<L>, mut endpoint: E) -> MuxResult
-    where
-        E: Endpoint,
-        L: ListenerHandler + L7ListenerHandler,
-    {
+    /// Flush pending control frames (zero-buffer resume, WINDOW_UPDATEs, RST_STREAMs)
+    /// before entering the main writable state machine.
+    ///
+    /// Returns `Some(result)` if the caller should return early (e.g. socket would
+    /// block, GOAWAY triggered), or `None` if writable() should proceed normally.
+    fn flush_pending_control_frames(&mut self) -> Option<MuxResult> {
         // RFC 9113 §6.5: check if peer has timed out on SETTINGS ACK
         if let Some(sent_at) = self.settings_sent_at {
             if sent_at.elapsed() >= SETTINGS_ACK_TIMEOUT {
@@ -846,25 +847,24 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     "SETTINGS ACK timeout: peer did not acknowledge within {:?}",
                     SETTINGS_ACK_TIMEOUT
                 );
-                return self.goaway(H2Error::SettingsTimeout);
+                return Some(self.goaway(H2Error::SettingsTimeout));
             }
         }
 
+        // Phase 1: Resume flushing the zero buffer if a previous write was partial.
         // Don't reset the timeout for control frame writes (SETTINGS ACK, PING
         // response, WINDOW_UPDATE). Only application data writes should reset it.
-        // The timeout is reset below in the Header/Frame states when writing
-        // actual request/response data.
         if let Some(H2StreamId::Zero) = self.expect_write {
             if self.flush_zero_to_socket() {
-                return MuxResult::Continue;
+                return Some(MuxResult::Continue);
             }
-            // when H2StreamId::Zero is used to write READABLE is disabled
-            // so when we finish the write we enable READABLE again
+            // When H2StreamId::Zero is used to write, READABLE is disabled —
+            // re-enable it now that the flush is complete.
             self.readiness.interest.insert(Ready::READABLE);
             self.expect_write = None;
         }
 
-        // Send pending WINDOW_UPDATE frames before processing stream data.
+        // Phase 2: Serialize and flush pending WINDOW_UPDATE frames.
         // Write them inline to avoid extra event loop iterations that could
         // cause response data to be sent before validating subsequent frames.
         if !self.pending_window_updates.is_empty() && self.expect_write.is_none() {
@@ -897,12 +897,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 kawa.storage.fill(offset);
                 if self.flush_zero_to_socket() {
                     self.expect_write = Some(H2StreamId::Zero);
-                    return MuxResult::Continue;
+                    return Some(MuxResult::Continue);
                 }
             }
         }
 
-        // Cap: if too many RST_STREAM frames have accumulated, the peer is
+        // Phase 3: Cap check + flush pending RST_STREAM frames.
+        // If too many RST_STREAM frames have accumulated, the peer is
         // misbehaving (e.g. rapid stream creation). Trigger GOAWAY(ENHANCE_YOUR_CALM).
         if self.pending_rst_streams.len() > MAX_PENDING_RST_STREAMS {
             error!(
@@ -910,7 +911,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 self.pending_rst_streams.len(),
                 MAX_PENDING_RST_STREAMS
             );
-            return self.goaway(H2Error::EnhanceYourCalm);
+            return Some(self.goaway(H2Error::EnhanceYourCalm));
         }
 
         // Flush pending RST_STREAM frames (queued when refusing streams).
@@ -939,9 +940,21 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 kawa.storage.fill(offset);
                 if self.flush_zero_to_socket() {
                     self.expect_write = Some(H2StreamId::Zero);
-                    return MuxResult::Continue;
+                    return Some(MuxResult::Continue);
                 }
             }
+        }
+
+        None
+    }
+
+    pub fn writable<E, L>(&mut self, context: &mut Context<L>, mut endpoint: E) -> MuxResult
+    where
+        E: Endpoint,
+        L: ListenerHandler + L7ListenerHandler,
+    {
+        if let Some(result) = self.flush_pending_control_frames() {
+            return result;
         }
 
         match (&self.state, &self.position) {
@@ -1204,6 +1217,12 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 // Reclaim the converter's reusable buffers
                 self.converter_buf = converter.out;
                 self.lowercase_buf = converter.lowercase_buf;
+                if self.converter_buf.capacity() > 16_384 {
+                    self.converter_buf.shrink_to(4096);
+                }
+                if self.lowercase_buf.capacity() > 16_384 {
+                    self.lowercase_buf.shrink_to(4096);
+                }
 
                 // RFC 9113 §6.8: if draining and all streams have completed,
                 // send the final GOAWAY with the actual last_stream_id
@@ -1217,6 +1236,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     }
                 } else if self.expect_write.is_none() {
                     // We wrote everything
+                    #[cfg(debug_assertions)]
                     context.debug.push(DebugEvent::Str(format!(
                         "Wrote everything: {:?}",
                         self.streams
@@ -1717,6 +1737,25 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     }
                 }
                 if headers.end_stream {
+                    // RFC 9113 §8.1.1: when END_STREAM arrives via trailers,
+                    // validate that total DATA received matches Content-Length.
+                    if !was_initial {
+                        let parts = stream.split(&self.position);
+                        if let kawa::BodySize::Length(expected) = parts.rbuffer.body_size {
+                            if *parts.data_received != expected {
+                                error!(
+                                    "Content-Length mismatch on trailers: received {} != declared {}",
+                                    *parts.data_received, expected
+                                );
+                                return self.reset_stream(
+                                    global_stream_id,
+                                    context,
+                                    endpoint,
+                                    H2Error::ProtocolError,
+                                );
+                            }
+                        }
+                    }
                     if self.position.is_server() {
                         stream.front_received_end_of_stream = true;
                     } else {
@@ -1909,7 +1948,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     );
                     return self.force_disconnect();
                 }
-                match serializer::gen_ping_acknolegment(kawa.storage.space(), &ping.payload) {
+                match serializer::gen_ping_acknowledgement(kawa.storage.space(), &ping.payload) {
                     Ok((_, size)) => kawa.storage.fill(size),
                     Err(error) => {
                         error!("Could not serialize PingFrame: {:?}", error);
@@ -2208,6 +2247,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                             stream.state = StreamState::Unlinked;
                             self.readiness.interest.insert(Ready::WRITABLE);
                         } else if !stream.back.is_terminated() {
+                            #[cfg(debug_assertions)]
                             context
                                 .debug
                                 .push(DebugEvent::Str(format!("Close unterminated {stream_gid}")));
@@ -2218,6 +2258,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                                 H2Error::InternalError,
                             );
                         } else {
+                            #[cfg(debug_assertions)]
                             context
                                 .debug
                                 .push(DebugEvent::Str(format!("Close terminated {stream_gid}")));
@@ -2231,6 +2272,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         // we do not have an answer, but the request has already been partially consumed
                         // so we can't retry, send a 502 bad gateway instead
                         // note: it might be possible to send a RstStream with an adequate error code
+                        #[cfg(debug_assertions)]
                         context.debug.push(DebugEvent::Str(format!(
                             "Can't retry, send 502 on {stream_gid}"
                         )));
@@ -2240,6 +2282,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     (false, false) => {
                         // we do not have an answer, but the request is untouched so we can retry
                         debug!("H2 RECONNECT");
+                        #[cfg(debug_assertions)]
                         context
                             .debug
                             .push(DebugEvent::Str(format!("Retry {stream_gid}")));

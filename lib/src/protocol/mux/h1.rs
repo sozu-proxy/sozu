@@ -13,6 +13,12 @@ use crate::{
     timer::TimeoutContainer,
 };
 
+/// HTTP/1.1 connection handler within the mux layer.
+///
+/// Manages a single HTTP/1.1 connection (either frontend or backend),
+/// handling request/response forwarding through kawa buffers. Supports
+/// keep-alive, chunked transfer encoding, close-delimited responses,
+/// and upgrade (e.g., WebSocket).
 pub struct ConnectionH1<Front: SocketHandler> {
     pub position: Position,
     pub readiness: Readiness,
