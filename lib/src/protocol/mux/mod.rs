@@ -1,3 +1,20 @@
+//! HTTP/1.1 and HTTP/2 multiplexing layer.
+//!
+//! This module unifies HTTP/1.1 and HTTP/2 behind a single [`Mux`] session
+//! state machine that integrates with sozu's mio event loop. The key types:
+//!
+//! - [`Mux`]: The top-level session state, generic over socket (`TcpStream` or
+//!   `FrontRustls`) and listener. Implements `SessionState`.
+//! - [`Connection`]: Enum dispatching to [`ConnectionH1`] or [`ConnectionH2`]
+//!   for protocol-specific readable/writable logic.
+//! - [`Stream`]: Per-request state with front/back kawa buffers, metrics, and
+//!   lifecycle tracking. Shared between H1 and H2 paths.
+//! - [`Context`]: Per-session context (cluster, backends, routing, timeouts).
+//!
+//! The H2 implementation handles RFC 9113 framing, HPACK (RFC 7541), flow
+//! control, flood detection (CVE-2023-44487, CVE-2019-9512/9514/9515/9518,
+//! CVE-2024-27316), and graceful shutdown (double-GOAWAY per RFC 9113 §6.8).
+
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
@@ -455,7 +472,7 @@ impl<Front: SocketHandler> Connection<Front> {
             },
             socket: front_stream,
             state: H2State::ClientPreface,
-            streams: HashMap::with_capacity(100),
+            streams: HashMap::with_capacity(8),
             timeout_container,
             window: h2::DEFAULT_INITIAL_WINDOW_SIZE as i32,
             received_bytes_since_update: 0,
@@ -510,7 +527,7 @@ impl<Front: SocketHandler> Connection<Front> {
             },
             socket: front_stream,
             state: H2State::ClientPreface,
-            streams: HashMap::with_capacity(100),
+            streams: HashMap::with_capacity(8),
             timeout_container,
             window: h2::DEFAULT_INITIAL_WINDOW_SIZE as i32,
             received_bytes_since_update: 0,
@@ -579,14 +596,6 @@ impl<Front: SocketHandler> Connection<Front> {
         match self {
             Connection::H1(_) => (0, 0),
             Connection::H2(c) => (c.overhead_bin, c.overhead_bout),
-        }
-    }
-
-    #[allow(dead_code)]
-    fn force_disconnect(&mut self) -> MuxResult {
-        match self {
-            Connection::H1(c) => c.force_disconnect(),
-            Connection::H2(c) => c.force_disconnect(),
         }
     }
 
@@ -970,7 +979,7 @@ impl Stream {
         Some(Self {
             state: StreamState::Idle,
             attempts: 0,
-            window: window as i32,
+            window: i32::try_from(window).unwrap_or(i32::MAX),
             front_received_end_of_stream: false,
             back_received_end_of_stream: false,
             front_data_received: 0,
@@ -1103,7 +1112,12 @@ impl DebugHistory {
     }
     pub fn push(&mut self, _event: DebugEvent) {
         #[cfg(debug_assertions)]
-        self.events.push(_event);
+        {
+            if self.events.len() >= 10_000 {
+                self.events.drain(..5_000);
+            }
+            self.events.push(_event);
+        }
     }
     pub fn set_interesting(&mut self, _interesting: bool) {
         #[cfg(debug_assertions)]
@@ -1175,7 +1189,7 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
                 stream.front_data_received = 0;
                 stream.back_data_received = 0;
                 stream.request_counted = false;
-                stream.window = window as i32;
+                stream.window = i32::try_from(window).unwrap_or(i32::MAX);
                 stream.context = http_context;
                 stream.back.clear();
                 stream.back.storage.clear();
@@ -1229,6 +1243,7 @@ impl Router {
             );
             return Err(BackendConnectionError::MaxSessionsMemory);
         }
+        #[cfg(debug_assertions)]
         context
             .debug
             .push(DebugEvent::Str(stream.context.get_route()));
