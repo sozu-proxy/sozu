@@ -437,7 +437,7 @@ pub fn try_tls_endpoint() -> State {
     }
 }
 
-pub fn test_upgrade() -> State {
+pub fn try_upgrade() -> State {
     let front_address = create_local_address();
 
     let (config, listeners, state) = Worker::empty_config();
@@ -500,6 +500,466 @@ pub fn test_upgrade() -> State {
     );
 
     State::Success
+}
+
+pub fn try_upgrade_in_flight_request() -> State {
+    let front_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, mut backends) = setup_sync_test(
+        "UPGRADE-INFLIGHT",
+        config,
+        listeners,
+        state,
+        front_address,
+        1,
+        false,
+    );
+
+    let mut backend = backends.pop().expect("backend");
+    let mut client = Client::new(
+        "client",
+        front_address,
+        http_request("GET", "/api", "ping", "localhost"),
+    );
+
+    // Establish baseline: full request/response cycle
+    backend.connect();
+    client.connect();
+    client.send();
+    backend.accept(0);
+    backend.receive(0);
+    backend.send(0);
+    match client.receive() {
+        Some(msg) => println!("baseline response: {msg}"),
+        None => return State::Fail,
+    }
+
+    // Send request that will be in-flight during upgrade
+    client.send();
+    backend.receive(0);
+
+    // Trigger upgrade while request is in-flight
+    let mut new_worker = worker.upgrade("UPGRADE-INFLIGHT-NEW");
+    thread::sleep(Duration::from_millis(200));
+
+    // Backend responds — old worker should still forward the in-flight response
+    backend.send(0);
+    match client.receive() {
+        Some(msg) => println!("in-flight response after upgrade: {msg}"),
+        None => return State::Fail,
+    }
+
+    // Verify new worker accepts new connections
+    client.connect();
+    client.send();
+    backend.accept(1);
+    backend.receive(1);
+    backend.send(1);
+    match client.receive() {
+        Some(msg) => println!("new worker response: {msg}"),
+        None => return State::Fail,
+    }
+
+    new_worker.soft_stop();
+    if !worker.wait_for_server_stop() {
+        return State::Fail;
+    }
+    if !new_worker.wait_for_server_stop() {
+        return State::Fail;
+    }
+
+    State::Success
+}
+
+pub fn try_upgrade_new_connections_after() -> State {
+    let front_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, mut backends) = setup_sync_test(
+        "UPGRADE-NEWCONN",
+        config,
+        listeners,
+        state,
+        front_address,
+        1,
+        false,
+    );
+
+    let mut backend = backends.pop().expect("backend");
+    backend.connect();
+
+    // Baseline: verify worker is functional
+    let mut client = Client::new(
+        "client",
+        front_address,
+        http_request("GET", "/api", "ping", "localhost"),
+    );
+    client.connect();
+    client.send();
+    backend.accept(0);
+    backend.receive(0);
+    backend.send(0);
+    match client.receive() {
+        Some(msg) => println!("baseline response: {msg}"),
+        None => return State::Fail,
+    }
+
+    // Upgrade worker (no in-flight requests)
+    let mut new_worker = worker.upgrade("UPGRADE-NEWCONN-NEW");
+    thread::sleep(Duration::from_millis(200));
+
+    // Create a brand new client and connect to the new worker
+    let mut new_client = Client::new(
+        "new_client",
+        front_address,
+        http_request("GET", "/api", "hello", "localhost"),
+    );
+    new_client.connect();
+    new_client.send();
+    backend.accept(1);
+    backend.receive(1);
+    backend.send(1);
+    match new_client.receive() {
+        Some(msg) => println!("new client response from new worker: {msg}"),
+        None => return State::Fail,
+    }
+
+    // Send multiple requests on keep-alive to verify routing is stable
+    for i in 0..3 {
+        new_client.send();
+        backend.receive(1);
+        backend.send(1);
+        match new_client.receive() {
+            Some(msg) => println!("keep-alive request {i} response: {msg}"),
+            None => return State::Fail,
+        }
+    }
+
+    // Create yet another client to verify multiple new connections work
+    let mut another_client = Client::new(
+        "another_client",
+        front_address,
+        http_request("GET", "/api", "world", "localhost"),
+    );
+    another_client.connect();
+    another_client.send();
+    backend.accept(2);
+    backend.receive(2);
+    backend.send(2);
+    match another_client.receive() {
+        Some(msg) => println!("another client response: {msg}"),
+        None => return State::Fail,
+    }
+
+    new_worker.soft_stop();
+    if !worker.wait_for_server_stop() {
+        return State::Fail;
+    }
+    if !new_worker.wait_for_server_stop() {
+        return State::Fail;
+    }
+
+    println!(
+        "new_client sent: {}, received: {}",
+        new_client.requests_sent, new_client.responses_received
+    );
+    println!(
+        "another_client sent: {}, received: {}",
+        another_client.requests_sent, another_client.responses_received
+    );
+
+    State::Success
+}
+
+pub fn try_upgrade_multiple_in_flight() -> State {
+    let front_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, mut backends) = setup_sync_test(
+        "UPGRADE-MULTI",
+        config,
+        listeners,
+        state,
+        front_address,
+        1,
+        false,
+    );
+
+    let mut backend = backends.pop().expect("backend");
+    backend.connect();
+
+    // Create 3 clients, each establishes a keep-alive connection
+    let mut clients: Vec<Client> = (0..3)
+        .map(|i| {
+            Client::new(
+                format!("client{i}"),
+                front_address,
+                http_request("GET", "/api", format!("ping{i}"), "localhost"),
+            )
+        })
+        .collect();
+
+    // Establish keep-alive for all clients
+    for (i, client) in clients.iter_mut().enumerate() {
+        client.connect();
+        client.send();
+        backend.accept(i);
+        backend.receive(i);
+        backend.send(i);
+        match client.receive() {
+            Some(msg) => println!("client{i} baseline: {msg}"),
+            None => return State::Fail,
+        }
+    }
+
+    // All 3 clients send a request (all in-flight)
+    for client in clients.iter_mut() {
+        client.send();
+    }
+    // Backend receives all 3
+    for i in 0..3 {
+        backend.receive(i);
+    }
+
+    // Upgrade worker while all 3 requests are in-flight
+    let mut new_worker = worker.upgrade("UPGRADE-MULTI-NEW");
+    thread::sleep(Duration::from_millis(200));
+
+    // Backend responds to all 3 — old worker should forward them
+    for i in 0..3 {
+        backend.send(i);
+    }
+
+    // All 3 clients should receive their responses
+    for (i, client) in clients.iter_mut().enumerate() {
+        match client.receive() {
+            Some(msg) => println!("client{i} in-flight response: {msg}"),
+            None => return State::Fail,
+        }
+    }
+
+    // Verify new worker works: one client reconnects
+    clients[0].connect();
+    clients[0].send();
+    backend.accept(3);
+    backend.receive(3);
+    backend.send(3);
+    match clients[0].receive() {
+        Some(msg) => println!("client0 new worker response: {msg}"),
+        None => return State::Fail,
+    }
+
+    new_worker.soft_stop();
+    if !worker.wait_for_server_stop() {
+        return State::Fail;
+    }
+    if !new_worker.wait_for_server_stop() {
+        return State::Fail;
+    }
+
+    for (i, client) in clients.iter().enumerate() {
+        println!(
+            "client{i} sent: {}, received: {}",
+            client.requests_sent, client.responses_received
+        );
+    }
+
+    State::Success
+}
+
+pub fn try_upgrade_keepalive_reconnect() -> State {
+    let front_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, mut backends) = setup_sync_test(
+        "UPGRADE-KA",
+        config,
+        listeners,
+        state,
+        front_address,
+        1,
+        false,
+    );
+
+    let mut backend = backends.pop().expect("backend");
+    backend.connect();
+
+    let mut client = Client::new(
+        "client",
+        front_address,
+        http_request("GET", "/api", "ping", "localhost"),
+    );
+
+    // Establish keep-alive connection
+    client.connect();
+    client.send();
+    backend.accept(0);
+    backend.receive(0);
+    backend.send(0);
+    match client.receive() {
+        Some(msg) => println!("keep-alive established: {msg}"),
+        None => return State::Fail,
+    }
+
+    // Upgrade worker while client has an idle keep-alive connection (no in-flight request)
+    let mut new_worker = worker.upgrade("UPGRADE-KA-NEW");
+    thread::sleep(Duration::from_millis(200));
+
+    // Try sending on the old keep-alive connection
+    // The old worker is soft-stopping and should close idle sessions
+    let old_conn_result = client.send();
+    if old_conn_result.is_some() {
+        // If send succeeded, try to get a response
+        // The old worker may or may not process this
+        match client.receive() {
+            Some(msg) => {
+                println!("old connection still works during drain: {msg}");
+                // This means old worker accepted one more request during drain
+                // That's acceptable behavior
+            }
+            None => {
+                println!("old connection closed by draining worker (expected)");
+            }
+        }
+    } else {
+        println!("old connection already closed (expected)");
+    }
+
+    // Reconnect to the new worker — this must always work
+    client.connect();
+    client.send();
+    backend.accept(1);
+    backend.receive(1);
+    backend.send(1);
+    match client.receive() {
+        Some(msg) => println!("reconnected to new worker: {msg}"),
+        None => return State::Fail,
+    }
+
+    // Verify keep-alive works on the new worker
+    for i in 0..3 {
+        client.send();
+        backend.receive(1);
+        backend.send(1);
+        match client.receive() {
+            Some(msg) => println!("new worker keep-alive {i}: {msg}"),
+            None => return State::Fail,
+        }
+    }
+
+    new_worker.soft_stop();
+    if !worker.wait_for_server_stop() {
+        return State::Fail;
+    }
+    if !new_worker.wait_for_server_stop() {
+        return State::Fail;
+    }
+
+    println!(
+        "client sent: {}, received: {}",
+        client.requests_sent, client.responses_received
+    );
+
+    State::Success
+}
+
+pub fn try_upgrade_async() -> State {
+    let front_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, mut backends) = setup_async_test(
+        "UPGRADE-ASYNC",
+        config,
+        listeners,
+        state,
+        front_address,
+        2,
+        false,
+    );
+
+    // Send requests from multiple clients before upgrade
+    let nb_pre_upgrade = 5;
+    let mut clients: Vec<Client> = (0..3)
+        .map(|i| {
+            Client::new(
+                format!("client{i}"),
+                front_address,
+                http_request("GET", "/api", format!("ping{i}"), "localhost"),
+            )
+        })
+        .collect();
+
+    for client in clients.iter_mut() {
+        client.connect();
+    }
+
+    // Pre-upgrade: each client sends several requests
+    for _ in 0..nb_pre_upgrade {
+        for client in clients.iter_mut() {
+            client.send();
+        }
+        thread::sleep(Duration::from_millis(50));
+        for client in clients.iter_mut() {
+            match client.receive() {
+                Some(msg) => println!("pre-upgrade: {msg}"),
+                None => {}
+            }
+        }
+    }
+
+    // Upgrade worker
+    let mut new_worker = worker.upgrade("UPGRADE-ASYNC-NEW");
+    thread::sleep(Duration::from_millis(300));
+
+    // Post-upgrade: clients reconnect and send more requests
+    let nb_post_upgrade = 5;
+    for client in clients.iter_mut() {
+        client.connect();
+    }
+    for _ in 0..nb_post_upgrade {
+        for client in clients.iter_mut() {
+            client.send();
+        }
+        thread::sleep(Duration::from_millis(50));
+        for client in clients.iter_mut() {
+            match client.receive() {
+                Some(msg) => println!("post-upgrade: {msg}"),
+                None => {}
+            }
+        }
+    }
+
+    new_worker.soft_stop();
+    if !worker.wait_for_server_stop() {
+        return State::Fail;
+    }
+    if !new_worker.wait_for_server_stop() {
+        return State::Fail;
+    }
+
+    for (i, client) in clients.iter().enumerate() {
+        println!(
+            "client{i} sent: {}, received: {}",
+            client.requests_sent, client.responses_received
+        );
+    }
+
+    // Check backends handled requests
+    for backend in backends.iter_mut() {
+        let aggregator = backend.stop_and_get_aggregator();
+        println!("{} aggregated: {:?}", backend.name, aggregator);
+    }
+
+    // All clients should have received at least the post-upgrade responses
+    if clients
+        .iter()
+        .all(|c| c.responses_received >= nb_post_upgrade)
+    {
+        State::Success
+    } else {
+        State::Fail
+    }
 }
 
 /*
@@ -1810,6 +2270,82 @@ fn test_wildcard() {
 fn test_status_header_split() {
     assert_eq!(
         repeat_until_error_or(2, "Status line and Headers split", try_status_header_split),
+        State::Success
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Upgrade tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_upgrade() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "Upgrade: original upgrade test — in-flight request completes after worker upgrade",
+            try_upgrade
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_upgrade_in_flight_request() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "Upgrade: in-flight request completes after worker upgrade, new connections work",
+            try_upgrade_in_flight_request
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_upgrade_new_connections_after() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "Upgrade: new connections work after worker upgrade",
+            try_upgrade_new_connections_after
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_upgrade_multiple_in_flight() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "Upgrade: multiple in-flight requests complete after worker upgrade",
+            try_upgrade_multiple_in_flight
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_upgrade_keepalive_reconnect() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "Upgrade: keep-alive connection behavior across worker upgrade",
+            try_upgrade_keepalive_reconnect
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_upgrade_async() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "Upgrade: async backends with concurrent clients across worker upgrade",
+            try_upgrade_async
+        ),
         State::Success
     );
 }
