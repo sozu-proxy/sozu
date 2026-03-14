@@ -39,6 +39,40 @@ fn is_invalid_te_value(value: &[u8]) -> bool {
     !compare_no_case(value, b"trailers")
 }
 
+/// Returns true if the header violates HTTP/2 field requirements (RFC 9113 §8.2):
+/// - uppercase ASCII characters in the name
+/// - connection-specific header fields (RFC 9113 §8.2.2)
+/// - TE header with a value other than "trailers"
+fn is_invalid_h2_header(name: &[u8], value: &[u8]) -> bool {
+    has_uppercase_ascii(name)
+        || is_connection_specific_header(name)
+        || (compare_no_case(name, b"te") && is_invalid_te_value(value))
+}
+
+/// Store a pseudo-header value into kawa storage.
+///
+/// Returns `Some(Store::Slice)` on success, or `None` if the pseudo-header was
+/// already set (`dest` is non-empty), regular headers have already appeared, or
+/// the write to storage fails. Callers should set `invalid_headers = true` on `None`.
+fn store_pseudo_header(
+    dest: &Store,
+    regular_headers: bool,
+    kawa: &mut GenericHttpStream,
+    value: &[u8],
+) -> Option<Store> {
+    if !dest.is_empty() || regular_headers {
+        return None;
+    }
+    let start = kawa.storage.end as u32;
+    if kawa.storage.write_all(value).is_err() {
+        return None;
+    }
+    Some(Store::Slice(Slice {
+        start,
+        len: value.len() as u32,
+    }))
+}
+
 /// Trims leading and trailing OWS (SP / HTAB per RFC 9110 §5.6.3) from a byte slice.
 fn trim_ows(input: &[u8]) -> &[u8] {
     let start = input
@@ -77,20 +111,7 @@ where
             let mut invalid_headers = false;
             let mut regular_headers = false;
             let decode_status = decoder.decode_with_cb(input, |k, v| {
-                // RFC 9113 §8.2: reject header field names with uppercase ASCII
-                if has_uppercase_ascii(&k) {
-                    invalid_headers = true;
-                    return;
-                }
-
-                // RFC 9113 §8.2.2: reject connection-specific headers
-                if is_connection_specific_header(&k) {
-                    invalid_headers = true;
-                    return;
-                }
-
-                // RFC 9113 §8.2.2: TE header is only allowed with value "trailers"
-                if compare_no_case(&k, b"te") && is_invalid_te_value(&v) {
+                if is_invalid_h2_header(&k, &v) {
                     invalid_headers = true;
                     return;
                 }
@@ -99,61 +120,25 @@ where
                 let len_val = v.len() as u32;
 
                 if compare_no_case(&k, b":method") {
-                    if !method.is_empty() || regular_headers {
-                        invalid_headers = true;
-                        return;
+                    match store_pseudo_header(&method, regular_headers, kawa, &v) {
+                        Some(s) => method = s,
+                        None => invalid_headers = true,
                     }
-                    let start = kawa.storage.end as u32;
-                    if kawa.storage.write_all(&v).is_err() {
-                        invalid_headers = true;
-                        return;
-                    }
-                    method = Store::Slice(Slice {
-                        start,
-                        len: len_val,
-                    });
                 } else if compare_no_case(&k, b":scheme") {
-                    if !scheme.is_empty() || regular_headers {
-                        invalid_headers = true;
-                        return;
+                    match store_pseudo_header(&scheme, regular_headers, kawa, &v) {
+                        Some(s) => scheme = s,
+                        None => invalid_headers = true,
                     }
-                    let start = kawa.storage.end as u32;
-                    if kawa.storage.write_all(&v).is_err() {
-                        invalid_headers = true;
-                        return;
-                    }
-                    scheme = Store::Slice(Slice {
-                        start,
-                        len: len_val,
-                    });
                 } else if compare_no_case(&k, b":path") {
-                    if !path.is_empty() || regular_headers {
-                        invalid_headers = true;
-                        return;
+                    match store_pseudo_header(&path, regular_headers, kawa, &v) {
+                        Some(s) => path = s,
+                        None => invalid_headers = true,
                     }
-                    let start = kawa.storage.end as u32;
-                    if kawa.storage.write_all(&v).is_err() {
-                        invalid_headers = true;
-                        return;
-                    }
-                    path = Store::Slice(Slice {
-                        start,
-                        len: len_val,
-                    });
                 } else if compare_no_case(&k, b":authority") {
-                    if !authority.is_empty() || regular_headers {
-                        invalid_headers = true;
-                        return;
+                    match store_pseudo_header(&authority, regular_headers, kawa, &v) {
+                        Some(s) => authority = s,
+                        None => invalid_headers = true,
                     }
-                    let start = kawa.storage.end as u32;
-                    if kawa.storage.write_all(&v).is_err() {
-                        invalid_headers = true;
-                        return;
-                    }
-                    authority = Store::Slice(Slice {
-                        start,
-                        len: len_val,
-                    });
                 } else if k.starts_with(b":") {
                     invalid_headers = true;
                 } else if compare_no_case(&k, b"cookie") {
@@ -261,20 +246,7 @@ where
             let mut invalid_headers = false;
             let mut regular_headers = false;
             let decode_status = decoder.decode_with_cb(input, |k, v| {
-                // RFC 9113 §8.2: reject header field names with uppercase ASCII
-                if has_uppercase_ascii(&k) {
-                    invalid_headers = true;
-                    return;
-                }
-
-                // RFC 9113 §8.2.2: reject connection-specific headers
-                if is_connection_specific_header(&k) {
-                    invalid_headers = true;
-                    return;
-                }
-
-                // RFC 9113 §8.2.2: TE header is only allowed with value "trailers"
-                if compare_no_case(&k, b"te") && is_invalid_te_value(&v) {
+                if is_invalid_h2_header(&k, &v) {
                     invalid_headers = true;
                     return;
                 }
@@ -283,25 +255,18 @@ where
                 let len_val = v.len() as u32;
 
                 if compare_no_case(&k, b":status") {
-                    if !status.is_empty() || regular_headers {
-                        invalid_headers = true;
-                        return;
-                    }
-                    let start = kawa.storage.end as u32;
-                    if kawa.storage.write_all(&v).is_err() {
-                        invalid_headers = true;
-                        return;
-                    }
-                    status = Store::Slice(Slice {
-                        start,
-                        len: len_val,
-                    });
-                    if let Some(parsed_code) =
-                        from_utf8(&v).ok().and_then(|v| v.parse::<u16>().ok())
-                    {
-                        code = parsed_code;
-                    } else {
-                        invalid_headers = true;
+                    match store_pseudo_header(&status, regular_headers, kawa, &v) {
+                        Some(s) => {
+                            status = s;
+                            if let Some(parsed_code) =
+                                from_utf8(&v).ok().and_then(|v| v.parse::<u16>().ok())
+                            {
+                                code = parsed_code;
+                            } else {
+                                invalid_headers = true;
+                            }
+                        }
+                        None => invalid_headers = true,
                     }
                 } else if k.starts_with(b":") {
                     invalid_headers = true;
