@@ -64,7 +64,10 @@ use crate::{
 pub use crate::protocol::mux::{
     h1::ConnectionH1,
     h2::ConnectionH2,
+    h2::H2ByteAccounting,
+    h2::H2DrainState,
     h2::H2FloodConfig,
+    h2::H2FlowControl,
     parser::{H2Error, error_code_to_str},
 };
 
@@ -194,6 +197,54 @@ fn copy_default_answer_to_stream(
     kawa.body_size = rendered.body_size;
 }
 
+/// Build a `DefaultAnswer` variant for the given status code with placeholder fields.
+///
+/// The mux layer does not have HTTP/1.1 parse state, so error-detail fields
+/// (`message`, `phase`, `successfully_parsed`, etc.) are filled with neutral
+/// placeholders. The 301 redirect is the only code that needs real context data
+/// and is therefore handled inline in [`set_default_answer`].
+fn default_answer_for_code(code: u16) -> DefaultAnswer {
+    /// Helper for the 400/502 parse-error shape: empty message, Error phase,
+    /// `"null"` for each parse-state field.
+    fn parse_error_answer_400() -> DefaultAnswer {
+        DefaultAnswer::Answer400 {
+            message: String::new(),
+            phase: kawa::ParsingPhaseMarker::Error,
+            successfully_parsed: "null".to_owned(),
+            partially_parsed: "null".to_owned(),
+            invalid: "null".to_owned(),
+        }
+    }
+    fn parse_error_answer_502() -> DefaultAnswer {
+        DefaultAnswer::Answer502 {
+            message: String::new(),
+            phase: kawa::ParsingPhaseMarker::Error,
+            successfully_parsed: "null".to_owned(),
+            partially_parsed: "null".to_owned(),
+            invalid: "null".to_owned(),
+        }
+    }
+
+    match code {
+        400 => parse_error_answer_400(),
+        401 => DefaultAnswer::Answer401 {},
+        404 => DefaultAnswer::Answer404 {},
+        408 => DefaultAnswer::Answer408 {
+            duration: String::new(),
+        },
+        502 => parse_error_answer_502(),
+        503 => DefaultAnswer::Answer503 {
+            message: String::new(),
+        },
+        504 => DefaultAnswer::Answer504 {
+            duration: String::new(),
+        },
+        _ => DefaultAnswer::Answer503 {
+            message: format!("Unexpected error code: {code}"),
+        },
+    }
+}
+
 /// Replace the content of the kawa message with a default Sozu answer for a given status code.
 ///
 /// Uses the listener's `HttpAnswers` templates to produce responses matching the configured
@@ -227,52 +278,23 @@ fn set_default_answer(
         context.backend_id.as_deref()
     );
 
-    let request_id = context.id.to_string();
-    let route = context.get_route();
-    let cluster_id = context.cluster_id.as_deref();
-    let backend_id = context.backend_id.as_deref();
-
-    let answer = match code {
-        301 => DefaultAnswer::Answer301 {
+    let answer = if code == 301 {
+        DefaultAnswer::Answer301 {
             location: format!(
                 "https://{}{}",
                 context.authority.as_deref().unwrap_or_default(),
                 context.path.as_deref().unwrap_or_default()
             ),
-        },
-        400 => DefaultAnswer::Answer400 {
-            message: String::new(),
-            phase: kawa::ParsingPhaseMarker::Error,
-            successfully_parsed: String::from("null"),
-            partially_parsed: String::from("null"),
-            invalid: String::from("null"),
-        },
-        401 => DefaultAnswer::Answer401 {},
-        404 => DefaultAnswer::Answer404 {},
-        408 => DefaultAnswer::Answer408 {
-            duration: String::new(),
-        },
-        502 => DefaultAnswer::Answer502 {
-            message: String::new(),
-            phase: kawa::ParsingPhaseMarker::Error,
-            successfully_parsed: String::from("null"),
-            partially_parsed: String::from("null"),
-            invalid: String::from("null"),
-        },
-        503 => DefaultAnswer::Answer503 {
-            message: String::new(),
-        },
-        504 => DefaultAnswer::Answer504 {
-            duration: String::new(),
-        },
-        _ => DefaultAnswer::Answer503 {
-            message: format!("Unexpected error code: {code}"),
-        },
+        }
+    } else {
+        context.keep_alive_frontend = false;
+        default_answer_for_code(code)
     };
 
-    if code != 301 {
-        context.keep_alive_frontend = false;
-    }
+    let request_id = context.id.to_string();
+    let route = context.get_route();
+    let cluster_id = context.cluster_id.as_deref();
+    let backend_id = context.backend_id.as_deref();
 
     let rendered = answers.get(answer, request_id, cluster_id, backend_id, route);
     copy_default_answer_to_stream(rendered, kawa);
@@ -476,18 +498,24 @@ impl<Front: SocketHandler> Connection<Front> {
             state: H2State::ClientPreface,
             streams: HashMap::with_capacity(8),
             timeout_container,
-            window: h2::DEFAULT_INITIAL_WINDOW_SIZE as i32,
-            received_bytes_since_update: 0,
-            pending_window_updates: Vec::new(),
+            flow_control: h2::H2FlowControl {
+                window: h2::DEFAULT_INITIAL_WINDOW_SIZE as i32,
+                received_bytes_since_update: 0,
+                pending_window_updates: Vec::new(),
+            },
             highest_peer_stream_id: 0,
             converter_buf: Vec::new(),
             lowercase_buf: Vec::new(),
-            draining: false,
-            peer_last_stream_id: None,
+            drain: h2::H2DrainState {
+                draining: false,
+                peer_last_stream_id: None,
+            },
             zero: kawa::Kawa::new(kawa::Kind::Request, kawa::Buffer::new(buffer)),
-            zero_bytes_read: 0,
-            overhead_bin: 0,
-            overhead_bout: 0,
+            bytes: h2::H2ByteAccounting {
+                zero_bytes_read: 0,
+                overhead_bin: 0,
+                overhead_bout: 0,
+            },
             flood_detector: H2FloodDetector::new(flood_config),
             settings_sent_at: None,
             pending_rst_streams: Vec::new(),
@@ -532,18 +560,24 @@ impl<Front: SocketHandler> Connection<Front> {
             state: H2State::ClientPreface,
             streams: HashMap::with_capacity(8),
             timeout_container,
-            window: h2::DEFAULT_INITIAL_WINDOW_SIZE as i32,
-            received_bytes_since_update: 0,
-            pending_window_updates: Vec::new(),
+            flow_control: h2::H2FlowControl {
+                window: h2::DEFAULT_INITIAL_WINDOW_SIZE as i32,
+                received_bytes_since_update: 0,
+                pending_window_updates: Vec::new(),
+            },
             highest_peer_stream_id: 0,
             converter_buf: Vec::new(),
             lowercase_buf: Vec::new(),
-            draining: false,
-            peer_last_stream_id: None,
+            drain: h2::H2DrainState {
+                draining: false,
+                peer_last_stream_id: None,
+            },
             zero: kawa::Kawa::new(kawa::Kind::Request, kawa::Buffer::new(buffer)),
-            zero_bytes_read: 0,
-            overhead_bin: 0,
-            overhead_bout: 0,
+            bytes: h2::H2ByteAccounting {
+                zero_bytes_read: 0,
+                overhead_bin: 0,
+                overhead_bout: 0,
+            },
             flood_detector: H2FloodDetector::new(flood_config),
             settings_sent_at: None,
             pending_rst_streams: Vec::new(),
@@ -598,7 +632,7 @@ impl<Front: SocketHandler> Connection<Front> {
     pub fn overhead_bytes(&self) -> (usize, usize) {
         match self {
             Connection::H1(_) => (0, 0),
-            Connection::H2(c) => (c.overhead_bin, c.overhead_bout),
+            Connection::H2(c) => (c.bytes.overhead_bin, c.bytes.overhead_bout),
         }
     }
 
