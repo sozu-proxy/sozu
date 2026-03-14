@@ -107,6 +107,14 @@ fn error_nom_to_h2(error: nom::Err<parser::ParserError>) -> H2Error {
 
 /// Distribute connection-level byte overhead proportionally to a single stream.
 ///
+/// Overhead is distributed in proportion to the bytes this stream transferred
+/// relative to the total across all active streams. A stream that transferred
+/// 60% of total bytes gets 60% of the overhead.
+///
+/// `stream_bytes` and `total_bytes` are `(bytes_in, bytes_out)` tuples.
+/// Falls back to even distribution (1/active_streams) when no stream has
+/// transferred any bytes yet (total is zero).
+///
 /// Extracted as a free function to avoid borrow conflicts when `self` fields
 /// (e.g. `encoder`) are borrowed by the converter while we need to update
 /// per-stream metrics and connection overhead counters.
@@ -114,11 +122,22 @@ fn distribute_overhead(
     metrics: &mut SessionMetrics,
     overhead_bin: &mut usize,
     overhead_bout: &mut usize,
+    stream_bytes: (usize, usize),
+    total_bytes: (usize, usize),
     active_streams: usize,
 ) {
-    let active = active_streams.max(1);
-    let share_in = *overhead_bin / active;
-    let share_out = *overhead_bout / active;
+    let share_in = if total_bytes.0 > 0 {
+        *overhead_bin * stream_bytes.0 / total_bytes.0
+    } else {
+        // No stream has transferred any inbound bytes — fall back to even split.
+        *overhead_bin / active_streams.max(1)
+    };
+    let share_out = if total_bytes.1 > 0 {
+        *overhead_bout * stream_bytes.1 / total_bytes.1
+    } else {
+        // No stream has transferred any outbound bytes — fall back to even split.
+        *overhead_bout / active_streams.max(1)
+    };
     metrics.bin += share_in;
     metrics.bout += share_out;
     *overhead_bin -= share_in;
@@ -289,14 +308,28 @@ impl Default for H2Settings {
     }
 }
 
-/// Stub for RFC 9218 (Extensible Priorities).
+/// RFC 9218 Extensible Priorities for HTTP stream scheduling.
 ///
-/// Currently a no-op placeholder. When implemented, this will support
-/// urgency-based stream prioritization as specified in RFC 9218.
+/// Stores per-stream urgency (0-7, lower = more important) and incremental
+/// flag. Used by `writable()` to sort streams: lower urgency first, then
+/// stream ID for stability among same-urgency non-incremental streams.
+///
+/// Streams without an explicit `priority` header get the RFC 9218 defaults:
+/// urgency 3, incremental false.
 #[derive(Default)]
-pub struct Prioriser {}
+pub struct Prioriser {
+    /// Per-stream priority: stream_id -> (urgency 0-7, incremental flag)
+    priorities: HashMap<StreamId, (u8, bool)>,
+}
+
+/// RFC 9218 §4 default urgency value.
+const DEFAULT_URGENCY: u8 = 3;
 
 impl Prioriser {
+    /// Record or update the priority for a stream.
+    ///
+    /// Returns `true` if the priority is invalid (self-dependency for RFC 7540),
+    /// signalling the caller should reset the stream with a protocol error.
     pub fn push_priority(&mut self, stream_id: StreamId, priority: parser::PriorityPart) -> bool {
         trace!("PRIORITY REQUEST FOR {}: {:?}", stream_id, priority);
         match priority {
@@ -308,14 +341,33 @@ impl Prioriser {
                     error!("STREAM CAN'T DEPEND ON ITSELF");
                     true
                 } else {
+                    // RFC 7540 tree-based priority is deprecated; log and ignore.
                     false
                 }
             }
             parser::PriorityPart::Rfc9218 {
-                urgency: _,
-                incremental: _,
-            } => false,
+                urgency,
+                incremental,
+            } => {
+                self.priorities
+                    .insert(stream_id, (urgency.min(7), incremental));
+                false
+            }
         }
+    }
+
+    /// Remove a stream's priority entry (called when the stream is recycled).
+    pub fn remove(&mut self, stream_id: &StreamId) {
+        self.priorities.remove(stream_id);
+    }
+
+    /// Look up the priority for a stream, returning RFC 9218 defaults if absent.
+    #[inline]
+    pub fn get(&self, stream_id: &StreamId) -> (u8, bool) {
+        self.priorities
+            .get(stream_id)
+            .copied()
+            .unwrap_or((DEFAULT_URGENCY, false))
     }
 }
 
@@ -1023,6 +1075,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             | (H2State::ContinuationHeader(_), _) => {
                 self.timeout_container.reset();
                 let mut dead_streams = Vec::new();
+                // Pre-compute byte totals for proportional overhead distribution.
+                let byte_totals = self.compute_stream_byte_totals(context);
 
                 if let Some(write_stream @ H2StreamId::Other(stream_id, global_stream_id)) =
                     self.expect_write
@@ -1064,7 +1118,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                                         global_stream_id
                                     );
                                 } else {
-                                    self.distribute_overhead(&mut stream.metrics);
+                                    self.distribute_overhead(&mut stream.metrics, byte_totals);
                                     context.debug.push(DebugEvent::I2(4, global_stream_id));
                                     trace!("Recycle stream: {}", global_stream_id);
                                     let token = Self::complete_server_stream(
@@ -1107,7 +1161,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     lowercase_buf: std::mem::take(&mut self.lowercase_buf),
                 };
                 let mut priorities = self.streams.keys().collect::<Vec<_>>();
-                priorities.sort();
+                priorities.sort_by(|a, b| {
+                    let (ua, _) = self.prioriser.get(a);
+                    let (ub, _) = self.prioriser.get(b);
+                    ua.cmp(&ub).then_with(|| a.cmp(b))
+                });
 
                 trace!("PRIORITIES: {:?}", priorities);
                 let mut socket_write = false;
@@ -1175,12 +1233,20 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                                         global_stream_id
                                     );
                                 } else {
-                                    distribute_overhead(
-                                        &mut stream.metrics,
-                                        &mut self.overhead_bin,
-                                        &mut self.overhead_bout,
-                                        self.streams.len(),
-                                    );
+                                    {
+                                        let stream_bytes = (
+                                            stream.metrics.bin + stream.metrics.backend_bin,
+                                            stream.metrics.bout + stream.metrics.backend_bout,
+                                        );
+                                        distribute_overhead(
+                                            &mut stream.metrics,
+                                            &mut self.overhead_bin,
+                                            &mut self.overhead_bout,
+                                            stream_bytes,
+                                            byte_totals,
+                                            self.streams.len(),
+                                        );
+                                    }
                                     // mark stream as reusable
                                     context.debug.push(DebugEvent::I2(5, global_stream_id));
                                     if context.debug.is_interesting() {
@@ -1206,6 +1272,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         error!("dead stream_id {} missing from streams map", stream_id);
                     }
                     self.rst_sent.remove(&stream_id);
+                    self.prioriser.remove(&stream_id);
                 }
 
                 // Reclaim the converter's reusable buffers
@@ -1270,13 +1337,40 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         }
     }
 
+    /// Compute the total bytes transferred across all active streams.
+    ///
+    /// Returns `(total_bytes_in, total_bytes_out)` where bytes_in = `bin + backend_bin`
+    /// and bytes_out = `bout + backend_bout` for each stream.
+    fn compute_stream_byte_totals<L: ListenerHandler + L7ListenerHandler>(
+        &self,
+        context: &Context<L>,
+    ) -> (usize, usize) {
+        let mut total_in = 0usize;
+        let mut total_out = 0usize;
+        for &gid in self.streams.values() {
+            let m = &context.streams[gid].metrics;
+            total_in += m.bin + m.backend_bin;
+            total_out += m.bout + m.backend_bout;
+        }
+        (total_in, total_out)
+    }
+
     /// Distribute connection-level byte overhead proportionally to a single stream.
+    ///
+    /// `totals` should be pre-computed via [`compute_stream_byte_totals`] **before**
+    /// taking a mutable borrow on the target stream, to avoid borrow conflicts.
     /// Delegates to the free function [`distribute_overhead`].
-    fn distribute_overhead(&mut self, metrics: &mut SessionMetrics) {
+    fn distribute_overhead(&mut self, metrics: &mut SessionMetrics, totals: (usize, usize)) {
+        let stream_bytes = (
+            metrics.bin + metrics.backend_bin,
+            metrics.bout + metrics.backend_bout,
+        );
         distribute_overhead(
             metrics,
             &mut self.overhead_bin,
             &mut self.overhead_bout,
+            stream_bytes,
+            totals,
             self.streams.len(),
         );
     }
@@ -1822,7 +1916,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     rst_stream.error_code,
                     error_code_to_str(rst_stream.error_code)
                 );
+                // Compute totals before removing the stream from the map,
+                // so the removed stream's bytes are included in the total.
+                let rst_byte_totals = self.compute_stream_byte_totals(context);
                 if let Some(stream_id) = self.streams.remove(&rst_stream.stream_id) {
+                    self.prioriser.remove(&rst_stream.stream_id);
                     let stream = &mut context.streams[stream_id];
                     self.attribute_bytes_to_stream(&mut stream.metrics);
                     if let StreamState::Linked(token) = stream.state {
@@ -1832,7 +1930,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     match self.position {
                         Position::Client(..) => {}
                         Position::Server => {
-                            self.distribute_overhead(&mut stream.metrics);
+                            self.distribute_overhead(&mut stream.metrics, rst_byte_totals);
                             // This is a special case, normally, all stream are terminated by the server
                             // when the last byte of the response is written. Here, the reset is requested
                             // on the server endpoint and immediately terminates, shortcutting the other path
@@ -2010,6 +2108,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         stream.state = StreamState::Link;
                     }
                     self.streams.remove(stream_id);
+                    self.prioriser.remove(stream_id);
                 }
 
                 // If no active streams remain, close immediately
@@ -2160,6 +2259,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         E: Endpoint,
         L: ListenerHandler + L7ListenerHandler,
     {
+        // Compute totals before taking mutable borrows on the target stream.
+        let reset_byte_totals = self.compute_stream_byte_totals(context);
         let stream = &mut context.streams[stream_id];
         trace!("reset H2 stream {}: {:#?}", stream_id, stream.context);
         let old_state = std::mem::replace(&mut stream.state, StreamState::Unlinked);
@@ -2172,7 +2273,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             && matches!(old_state, StreamState::Link | StreamState::Linked(_))
         {
             let stream = &mut context.streams[stream_id];
-            self.distribute_overhead(&mut stream.metrics);
+            self.distribute_overhead(&mut stream.metrics, reset_byte_totals);
             stream.metrics.backend_stop();
             stream.generate_access_log(true, Some("H2::Reset"), context.listener.clone());
         }
@@ -2214,6 +2315,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                             }
                         }
                         self.streams.remove(&id);
+                        self.prioriser.remove(&id);
                         return;
                     }
                 }
