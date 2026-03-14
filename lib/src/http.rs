@@ -82,6 +82,8 @@ pub struct HttpSession {
     proxy: Rc<RefCell<HttpProxy>>,
     state: HttpStateMachine,
     sticky_name: String,
+    elide_x_real_ip: bool,
+    send_x_real_ip: bool,
     has_been_closed: bool,
 }
 
@@ -98,6 +100,8 @@ impl HttpSession {
         pool: Weak<RefCell<Pool>>,
         proxy: Rc<RefCell<HttpProxy>>,
         public_address: SocketAddr,
+        elide_x_real_ip: bool,
+        send_x_real_ip: bool,
         sock: TcpStream,
         sticky_name: String,
         token: Token,
@@ -135,6 +139,8 @@ impl HttpSession {
                 request_id,
                 session_address,
                 sticky_name.clone(),
+                elide_x_real_ip,
+                send_x_real_ip,
             )?)
         };
 
@@ -144,6 +150,7 @@ impl HttpSession {
             configured_backend_timeout,
             configured_connect_timeout,
             configured_frontend_timeout,
+            elide_x_real_ip,
             frontend_token: token,
             has_been_closed: false,
             last_event: Instant::now(),
@@ -151,6 +158,7 @@ impl HttpSession {
             metrics,
             pool,
             proxy,
+            send_x_real_ip,
             state,
             sticky_name,
         })
@@ -201,6 +209,8 @@ impl HttpSession {
                     expect.request_id,
                     Some(session_address),
                     self.sticky_name.clone(),
+                    self.elide_x_real_ip,
+                    self.send_x_real_ip,
                 )
                 .ok()?;
                 http.frontend_readiness.event = expect.frontend_readiness.event;
@@ -930,6 +940,8 @@ impl ProxyConfiguration for HttpProxy {
             Rc::downgrade(&self.pool),
             proxy,
             public_address,
+            owned.config.elide_x_real_ip,
+            owned.config.send_x_real_ip,
             frontend_sock,
             owned.config.sticky_name.clone(),
             session_token,

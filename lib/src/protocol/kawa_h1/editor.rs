@@ -110,6 +110,10 @@ pub struct HttpContext {
     /// the sticky session that should be used
     /// used to create a "Set-Cookie" header in the response in case it differs from sticky_session_found
     pub sticky_session: Option<String>,
+    /// whether to remove any client-provided X-Real-IP header (anti-spoofing)
+    pub elide_x_real_ip: bool,
+    /// whether to add the X-Real-IP header with the client's source IP address
+    pub send_x_real_ip: bool,
 }
 
 impl kawa::h1::ParserCallbacks<Checkout> for HttpContext {
@@ -129,6 +133,8 @@ impl HttpContext {
         public_address: SocketAddr,
         session_address: Option<SocketAddr>,
         sticky_name: String,
+        elide_x_real_ip: bool,
+        send_x_real_ip: bool,
     ) -> Self {
         Self {
             id: request_id,
@@ -136,10 +142,12 @@ impl HttpContext {
             cluster_id: None,
 
             closing: false,
+            elide_x_real_ip,
             keep_alive_backend: true,
             keep_alive_frontend: true,
             protocol,
             public_address,
+            send_x_real_ip,
             session_address,
             sticky_name,
             sticky_session: None,
@@ -159,7 +167,7 @@ impl HttpContext {
 
     /// Callback for request:
     ///
-    /// - edit headers (connection, forwarded, sticky cookie, sozu-id)
+    /// - edit headers (connection, forwarded, x-real-ip, sticky cookie, sozu-id)
     /// - save information:
     ///   - method
     ///   - authority
@@ -270,6 +278,8 @@ impl HttpContext {
                         x_for = Some(header);
                     } else if compare_no_case(key, b"Forwarded") {
                         forwarded = Some(header);
+                    } else if compare_no_case(key, b"X-Real-IP") && self.elide_x_real_ip {
+                        header.elide();
                     } else if compare_no_case(key, b"User-Agent") {
                         self.user_agent = header
                             .val
@@ -401,6 +411,20 @@ impl HttpContext {
                 key: kawa::Store::Static(b"Connection"),
                 val: kawa::Store::Static(b"close"),
             }));
+        }
+        // Create the X-Real-IP header with the client's source IP
+        if self.send_x_real_ip {
+            if let Some(peer_addr) = self.session_address {
+                request.push_block(kawa::Block::Header(kawa::Pair {
+                    key: kawa::Store::Static(b"X-Real-IP"),
+                    val: kawa::Store::from_string(peer_addr.ip().to_string()),
+                }));
+            } else {
+                warn!(
+                    "send_x_real_ip is enabled but session address is unknown, skipping X-Real-IP header for request {}",
+                    self.id
+                );
+            }
         }
         // Create a custom "Sozu-Id" header
         request.push_block(kawa::Block::Header(kawa::Pair {

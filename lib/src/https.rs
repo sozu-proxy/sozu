@@ -110,6 +110,8 @@ pub struct HttpsSession {
     pool: Weak<RefCell<Pool>>,
     proxy: Rc<RefCell<HttpsProxy>>,
     public_address: StdSocketAddr,
+    elide_x_real_ip: bool,
+    send_x_real_ip: bool,
     state: HttpsStateMachine,
     sticky_name: String,
 }
@@ -128,6 +130,8 @@ impl HttpsSession {
         proxy: Rc<RefCell<HttpsProxy>>,
         public_address: StdSocketAddr,
         rustls_details: ServerConnection,
+        elide_x_real_ip: bool,
+        send_x_real_ip: bool,
         sock: MioTcpStream,
         sticky_name: String,
         token: Token,
@@ -177,6 +181,8 @@ impl HttpsSession {
             pool,
             proxy,
             public_address,
+            elide_x_real_ip,
+            send_x_real_ip,
             state,
             sticky_name,
         }
@@ -308,6 +314,8 @@ impl HttpsSession {
                     handshake.request_id,
                     self.peer_address,
                     self.sticky_name.clone(),
+                    self.elide_x_real_ip,
+                    self.send_x_real_ip,
                 )
                 .ok()?;
 
@@ -317,6 +325,7 @@ impl HttpsSession {
                 Some(HttpsStateMachine::Http(http))
             }
             AlpnProtocols::H2 => {
+                // TODO: pass elide_x_real_ip/send_x_real_ip and peer_address when H2 header editing is implemented
                 let mut http = Http2::new(
                     front_stream,
                     self.frontend_token,
@@ -1241,6 +1250,8 @@ impl ProxyConfiguration for HttpsProxy {
             proxy,
             public_address,
             rustls_details,
+            owned.config.elide_x_real_ip,
+            owned.config.send_x_real_ip,
             frontend_sock,
             owned.config.sticky_name.clone(),
             session_token,
