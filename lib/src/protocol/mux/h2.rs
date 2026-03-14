@@ -639,40 +639,51 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                                     }
                                 }
                             } else if header.frame_type != FrameType::Priority {
-                                if header.frame_type == FrameType::Data
-                                    && header.payload_len == 0
-                                    && header.flags == 1
-                                {
-                                    // Empty DATA with END_STREAM on closed stream — safe to ignore
-                                    self.expect_header();
-                                    return MuxResult::Continue;
-                                }
                                 // Distinguish closed vs idle: if stream_id <=
                                 // highest_peer_stream_id, the stream existed and is
                                 // now closed; otherwise it was never opened (idle).
                                 let is_closed_stream =
                                     header.stream_id <= self.highest_peer_stream_id;
-                                if is_closed_stream
-                                    && matches!(
-                                        header.frame_type,
-                                        FrameType::RstStream
-                                            | FrameType::WindowUpdate
-                                            | FrameType::Data
-                                    )
-                                {
-                                    // RFC 9113 §5.1: RST_STREAM, WINDOW_UPDATE and late
-                                    // DATA frames on a closed stream can arrive due to
-                                    // race conditions and should be consumed/discarded.
-                                    // Route through stream 0 so handle_frame can do
-                                    // proper flow control accounting.
-                                    debug!(
-                                        "Ignoring {:?} on closed stream {}",
-                                        header.frame_type, header.stream_id
-                                    );
+                                if is_closed_stream {
+                                    match header.frame_type {
+                                        FrameType::RstStream | FrameType::WindowUpdate => {
+                                            // RFC 9113 §5.1: RST_STREAM and WINDOW_UPDATE
+                                            // on a closed stream can arrive due to race
+                                            // conditions and should be consumed/discarded.
+                                            debug!(
+                                                "Ignoring {:?} on closed stream {}",
+                                                header.frame_type, header.stream_id
+                                            );
+                                        }
+                                        FrameType::Data => {
+                                            // RFC 9113 §5.1: DATA on a closed stream is a
+                                            // stream error of type STREAM_CLOSED. Queue
+                                            // RST_STREAM (not GOAWAY) to preserve the
+                                            // connection for other streams. The payload is
+                                            // still routed through stream 0 so handle_frame
+                                            // can do connection-level flow control accounting.
+                                            debug!(
+                                                "DATA on closed stream {}, sending RST_STREAM(STREAM_CLOSED)",
+                                                header.stream_id
+                                            );
+                                            self.pending_rst_streams
+                                                .push((header.stream_id, H2Error::StreamClosed));
+                                            self.readiness.interest.insert(Ready::WRITABLE);
+                                        }
+                                        _ => {
+                                            // RFC 9113 §5.1: HEADERS or other frames on a
+                                            // closed stream → connection error STREAM_CLOSED.
+                                            error!(
+                                                "Received {:?} on closed stream {}, sending GOAWAY(STREAM_CLOSED)",
+                                                header.frame_type, header.stream_id
+                                            );
+                                            return self.goaway(H2Error::StreamClosed);
+                                        }
+                                    }
                                 } else {
                                     error!(
-                                        "CANNOT RECEIVE {:?} FRAME ON IDLE/CLOSED STREAMS",
-                                        header.frame_type
+                                        "Received {:?} on idle stream {}, sending GOAWAY(PROTOCOL_ERROR)",
+                                        header.frame_type, header.stream_id
                                     );
                                     return self.goaway(H2Error::ProtocolError);
                                 }
