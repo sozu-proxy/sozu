@@ -31,6 +31,7 @@ poule = "^0.3.2"
 prettytable-rs = { version = "^0.10.0", default-features = false }
 prost = "^0.14.3"
 prost-build = "^0.14.3"
+criterion = { version = "^0.5.1", features = ["html_reports"] }
 quickcheck = "^1.1.0"
 rand = "^0.10.0"
 regex = "^1.12.3"
