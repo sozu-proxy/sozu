@@ -1722,13 +1722,18 @@ fn try_h2_rapid_reset_triggers_goaway() -> State {
     let mut tls = tls_connect(front_addr);
     h2_handshake(&mut tls);
 
-    // Send 200 HEADERS + RST_STREAM pairs rapidly on odd stream IDs
+    // Send 200 HEADERS + RST_STREAM pairs rapidly on odd stream IDs.
+    // Must include all 4 pseudo-headers (RFC 9113 §8.3.1) so sozu parses
+    // them as valid requests — otherwise they're rejected as INVALID HEADERS
+    // and never counted by the flood detector.
     for i in 0..200u32 {
         let stream_id = 1 + i * 2; // 1, 3, 5, 7, ...
         let header_block = vec![
             0x82, // :method GET (index 2)
             0x84, // :path / (index 4)
             0x86, // :scheme https (index 6)
+            0x41, 0x09, // :authority (literal, name index 1, value length 9)
+            b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't', // "localhost"
         ];
         let headers = H2Frame::headers(stream_id, header_block, true, true);
         if tls.write_all(&headers.encode()).is_err() {
