@@ -86,6 +86,39 @@ fn trim_ows(input: &[u8]) -> &[u8] {
     &input[start..end]
 }
 
+/// Parse an RFC 9218 `priority` header value into (urgency, incremental).
+///
+/// The structured field format is: `u=N, i` or `u=N` or just `i`.
+/// - `u=N`: urgency, integer 0-7 (default 3 per RFC 9218 section 4)
+/// - `i`: incremental flag (default false)
+///
+/// Values outside the valid range are clamped (urgency to 0-7).
+/// Malformed tokens are silently ignored, falling back to defaults.
+fn parse_rfc9218_priority(value: &[u8]) -> (u8, bool) {
+    let mut urgency: u8 = 3; // RFC 9218 §4: default urgency
+    let mut incremental = false;
+
+    for token in value.split(|&b| b == b',') {
+        let token = trim_ows(token);
+        if token.is_empty() {
+            continue;
+        }
+        if token.len() >= 3 && token[0] == b'u' && token[1] == b'=' {
+            // Parse `u=N` where N is a single ASCII digit 0-7
+            if token[2].is_ascii_digit() {
+                let n = token[2] - b'0';
+                urgency = n.min(7);
+            }
+        } else if token == b"i" || token == b"i=?1" {
+            incremental = true;
+        } else if token == b"i=?0" {
+            incremental = false;
+        }
+    }
+
+    (urgency, incremental)
+}
+
 pub fn handle_header<C>(
     decoder: &mut loona_hpack::Decoder<'static>,
     prioriser: &mut Prioriser,
@@ -192,12 +225,12 @@ where
                             invalid_headers = true;
                         }
                     } else if compare_no_case(&k, b"priority") {
-                        // todo!("decode priority");
+                        let (urgency, incremental) = parse_rfc9218_priority(&v);
                         prioriser.push_priority(
                             stream_id,
                             PriorityPart::Rfc9218 {
-                                urgency: 0,
-                                incremental: false,
+                                urgency,
+                                incremental,
                             },
                         );
                     }
