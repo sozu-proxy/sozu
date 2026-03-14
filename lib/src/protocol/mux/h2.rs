@@ -410,6 +410,34 @@ impl Prioriser {
     }
 }
 
+/// Connection-level flow control state (RFC 9113 §6.9).
+pub struct H2FlowControl {
+    /// Connection-level send window (can go negative per RFC 9113 §6.9.2).
+    pub window: i32,
+    /// Bytes received since last connection-level WINDOW_UPDATE.
+    pub received_bytes_since_update: u32,
+    /// Queued (stream_id, increment) pairs for WINDOW_UPDATE frames.
+    pub pending_window_updates: Vec<(u32, u32)>,
+}
+
+/// Byte accounting for connection overhead attribution.
+pub struct H2ByteAccounting {
+    /// Bytes read on the zero stream not yet attributed to a stream.
+    pub zero_bytes_read: usize,
+    /// Overhead bytes received (connection-level frames).
+    pub overhead_bin: usize,
+    /// Overhead bytes sent (connection-level frames).
+    pub overhead_bout: usize,
+}
+
+/// Connection draining state for graceful shutdown.
+pub struct H2DrainState {
+    /// True when we've sent GOAWAY and are draining.
+    pub draining: bool,
+    /// Last stream ID from peer's GOAWAY (for retry decisions).
+    pub peer_last_stream_id: Option<StreamId>,
+}
+
 pub struct ConnectionH2<Front: SocketHandler> {
     pub decoder: loona_hpack::Decoder<'static>,
     pub encoder: loona_hpack::Encoder<'static>,
@@ -425,41 +453,19 @@ pub struct ConnectionH2<Front: SocketHandler> {
     pub state: H2State,
     pub streams: HashMap<StreamId, GlobalStreamId>,
     pub timeout_container: TimeoutContainer,
-    /// Outgoing flow control window: how many DATA bytes we can still send.
-    /// Decremented when we send DATA, incremented when we receive WINDOW_UPDATE.
-    pub window: i32,
-    /// Accumulated connection-level DATA bytes received since last WINDOW_UPDATE sent.
-    /// When this exceeds the threshold, we send a connection-level WINDOW_UPDATE.
-    pub received_bytes_since_update: u32,
-    /// Queued WINDOW_UPDATE frames to send: Vec<(stream_id, increment)>.
-    /// stream_id=0 means connection-level update. Entries are coalesced per stream_id.
-    pub pending_window_updates: Vec<(u32, u32)>,
+    /// Connection-level flow control state (send window, receive tracking, pending updates).
+    pub flow_control: H2FlowControl,
     /// Highest stream ID accepted from the peer (used for GoAway last_stream_id).
     pub highest_peer_stream_id: StreamId,
     /// Reusable buffer for HPACK-encoded headers in the H2 block converter.
     pub converter_buf: Vec<u8>,
     /// Reusable buffer for lowercasing header keys in the H2 block converter.
     pub lowercase_buf: Vec<u8>,
-    /// RFC 9113 §6.8: when true, this connection is draining — no new streams accepted.
-    /// Set when we receive or send a GoAway frame. The connection closes once all
-    /// active streams complete (or are reset).
-    pub draining: bool,
-    /// RFC 9113 §6.8: the last_stream_id from a received GoAway frame.
-    /// Streams with ID > this value were not processed by the peer and should be retried.
-    pub peer_last_stream_id: Option<StreamId>,
+    /// Connection draining state for graceful shutdown.
+    pub drain: H2DrainState,
     pub zero: GenericHttpStream,
-    /// Accumulates raw bytes read with H2StreamId::Zero (frame headers, HEADERS payloads,
-    /// control frame payloads). Attributed to the owning stream or connection overhead
-    /// once the frame is fully parsed.
-    pub zero_bytes_read: usize,
-    /// Connection-level read overhead: bytes from control frames (SETTINGS, PING,
-    /// WINDOW_UPDATE on stream 0, GOAWAY, unknown frames) that don't belong to any stream.
-    /// Distributed proportionally to active streams when access logs are generated.
-    pub overhead_bin: usize,
-    /// Connection-level write overhead: bytes from control frame writes (SETTINGS ACK,
-    /// PING responses, WINDOW_UPDATE frames, GOAWAY) on stream 0.
-    /// Distributed proportionally to active streams when access logs are generated.
-    pub overhead_bout: usize,
+    /// Byte accounting for connection overhead attribution.
+    pub bytes: H2ByteAccounting,
     /// Flood detector for CVE mitigations (Rapid Reset, CONTINUATION, Ping, Settings floods).
     pub flood_detector: H2FloodDetector,
     /// RFC 9113 §6.5: timestamp when we sent SETTINGS and are awaiting ACK.
@@ -487,7 +493,7 @@ impl<Front: SocketHandler> std::fmt::Debug for ConnectionH2<Front> {
             .field("socket", &self.socket.socket_ref())
             .field("streams", &self.streams)
             .field("zero", &self.zero.storage.meter(20))
-            .field("window", &self.window)
+            .field("window", &self.flow_control.window)
             .finish()
     }
 }
@@ -551,7 +557,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 context.debug.push(DebugEvent::I3(0, did, size));
                 kawa.storage.fill(size);
                 self.position.count_bytes_in_counter(size);
-                self.zero_bytes_read += size;
+                self.bytes.zero_bytes_read += size;
                 if update_readiness_after_read(size, status, &mut self.readiness) {
                     return MuxResult::Continue;
                 } else if size == amount {
@@ -958,7 +964,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // Phase 2: Serialize and flush pending WINDOW_UPDATE frames.
         // Write them inline to avoid extra event loop iterations that could
         // cause response data to be sent before validating subsequent frames.
-        if !self.pending_window_updates.is_empty() && self.expect_write.is_none() {
+        if !self.flow_control.pending_window_updates.is_empty() && self.expect_write.is_none() {
             let kawa = &mut self.zero;
             kawa.storage.clear();
             let buf = kawa.storage.space();
@@ -966,7 +972,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             // Track how many entries we successfully serialized so we only drain those.
             // Each WINDOW_UPDATE frame is 13 bytes (9-byte header + 4-byte payload).
             let mut written_count = 0;
-            for &(stream_id, increment) in &self.pending_window_updates {
+            for &(stream_id, increment) in &self.flow_control.pending_window_updates {
                 if increment == 0 {
                     written_count += 1;
                     continue;
@@ -983,7 +989,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 }
             }
             // Remove only the entries we successfully wrote (or skipped)
-            self.pending_window_updates.drain(..written_count);
+            self.flow_control
+                .pending_window_updates
+                .drain(..written_count);
             if offset > 0 {
                 kawa.storage.fill(offset);
                 if self.flush_zero_to_socket() {
@@ -1100,7 +1108,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 // proxying and causes excessive WINDOW_UPDATE round-trips.
                 let increment = ENLARGED_CONNECTION_WINDOW - DEFAULT_INITIAL_WINDOW_SIZE;
                 self.queue_window_update(0, increment);
-                self.window = ENLARGED_CONNECTION_WINDOW as i32;
+                self.flow_control.window = ENLARGED_CONNECTION_WINDOW as i32;
                 self.expect_header();
                 // Keep WRITABLE so the queued WINDOW_UPDATE gets flushed.
                 MuxResult::Continue
@@ -1175,11 +1183,14 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 }
 
                 // H2 flow control observability
-                gauge!("h2.connection_window", self.window.max(0) as usize);
+                gauge!(
+                    "h2.connection_window",
+                    self.flow_control.window.max(0) as usize
+                );
                 gauge!("h2.active_streams", self.streams.len());
                 gauge!(
                     "h2.pending_window_updates",
-                    self.pending_window_updates.len()
+                    self.flow_control.pending_window_updates.len()
                 );
 
                 let scheme: &'static [u8] =
@@ -1222,7 +1233,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     if kawa.is_main_phase()
                         || (kawa.is_error() && !self.rst_sent.contains(stream_id))
                     {
-                        let window = min(*parts.window, self.window);
+                        let window = min(*parts.window, self.flow_control.window);
                         converter.window = window;
                         converter.stream_id = *stream_id;
                         // Track RST_STREAM dedup: if kawa is in error state, the converter
@@ -1234,7 +1245,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         kawa.prepare(&mut converter);
                         let consumed = window - converter.window;
                         *parts.window -= consumed;
-                        self.window -= consumed;
+                        self.flow_control.window -= consumed;
                     }
                     context.debug.push(DebugEvent::S(
                         *stream_id,
@@ -1279,8 +1290,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                                         );
                                         distribute_overhead(
                                             &mut stream.metrics,
-                                            &mut self.overhead_bin,
-                                            &mut self.overhead_bout,
+                                            &mut self.bytes.overhead_bin,
+                                            &mut self.bytes.overhead_bout,
                                             stream_bytes,
                                             byte_totals,
                                             self.streams.len(),
@@ -1326,7 +1337,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
 
                 // RFC 9113 §6.8: if draining and all streams have completed,
                 // send the final GOAWAY with the actual last_stream_id
-                if self.draining && self.streams.is_empty() {
+                if self.drain.draining && self.streams.is_empty() {
                     return self.graceful_goaway();
                 }
 
@@ -1406,8 +1417,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         );
         distribute_overhead(
             metrics,
-            &mut self.overhead_bin,
-            &mut self.overhead_bout,
+            &mut self.bytes.overhead_bin,
+            &mut self.bytes.overhead_bout,
             stream_bytes,
             totals,
             self.streams.len(),
@@ -1416,13 +1427,14 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
 
     /// Attribute accumulated `zero_bytes_read` to the stream or to connection overhead.
     fn attribute_bytes_to_stream(&mut self, metrics: &mut SessionMetrics) {
-        self.position.count_bytes_in(metrics, self.zero_bytes_read);
-        self.zero_bytes_read = 0;
+        self.position
+            .count_bytes_in(metrics, self.bytes.zero_bytes_read);
+        self.bytes.zero_bytes_read = 0;
     }
 
     fn attribute_bytes_to_overhead(&mut self) {
-        self.overhead_bin += self.zero_bytes_read;
-        self.zero_bytes_read = 0;
+        self.bytes.overhead_bin += self.bytes.zero_bytes_read;
+        self.bytes.zero_bytes_read = 0;
     }
 
     /// Queue a WINDOW_UPDATE, coalescing with any existing entry for the same stream_id.
@@ -1430,6 +1442,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     fn queue_window_update(&mut self, stream_id: u32, increment: u32) {
         let max_increment = i32::MAX as u32;
         if let Some(entry) = self
+            .flow_control
             .pending_window_updates
             .iter_mut()
             .find(|(sid, _)| *sid == stream_id)
@@ -1440,8 +1453,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 "WINDOW_UPDATE coalesced: stream={} old={} new={}",
                 stream_id, old, entry.1
             );
-        } else if self.pending_window_updates.len() < MAX_PENDING_WINDOW_UPDATES {
-            self.pending_window_updates
+        } else if self.flow_control.pending_window_updates.len() < MAX_PENDING_WINDOW_UPDATES {
+            self.flow_control
+                .pending_window_updates
                 .push((stream_id, increment.min(max_increment)));
             trace!(
                 "WINDOW_UPDATE queued: stream={} increment={}",
@@ -1490,7 +1504,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
 
     pub fn goaway(&mut self, error: H2Error) -> MuxResult {
         self.state = H2State::Error;
-        self.draining = true;
+        self.drain.draining = true;
         self.expect_read = None;
         let kawa = &mut self.zero;
         kawa.storage.clear();
@@ -1526,7 +1540,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// with the actual `highest_peer_stream_id` so the peer knows which streams
     /// were processed.
     pub fn graceful_goaway(&mut self) -> MuxResult {
-        if self.draining {
+        if self.drain.draining {
             // Second GOAWAY: send with the real last_stream_id
             return self.goaway(H2Error::NoError);
         }
@@ -1534,7 +1548,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // First GOAWAY: advertise MAX stream ID so the peer knows we are draining
         // but does not yet know the cutoff. This gives in-flight requests a chance
         // to arrive before we commit to a final last_stream_id.
-        self.draining = true;
+        self.drain.draining = true;
         self.expect_read = None;
         let kawa = &mut self.zero;
         kawa.storage.clear();
@@ -1575,7 +1589,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             let (size, status) = self.socket.socket_write(self.zero.storage.data());
             self.zero.storage.consume(size);
             self.position.count_bytes_out_counter(size);
-            self.overhead_bout += size;
+            self.bytes.overhead_bout += size;
             if update_readiness_after_write(size, status, &mut self.readiness) {
                 return true;
             }
@@ -1605,7 +1619,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         L: ListenerHandler + L7ListenerHandler,
     {
         // RFC 9113 §6.8: reject new streams on a draining connection
-        if self.draining {
+        if self.drain.draining {
             error!("Rejecting new stream {} on draining connection", stream_id);
             return None;
         }
@@ -1662,12 +1676,12 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     // connection-level flow control, otherwise the window shrinks
                     // permanently and eventually stalls the connection.
                     let payload_len = data.payload.len() as u32;
-                    self.received_bytes_since_update += payload_len;
+                    self.flow_control.received_bytes_since_update += payload_len;
                     let conn_threshold = ENLARGED_CONNECTION_WINDOW / 2;
-                    if self.received_bytes_since_update >= conn_threshold {
-                        let increment = self.received_bytes_since_update;
+                    if self.flow_control.received_bytes_since_update >= conn_threshold {
+                        let increment = self.flow_control.received_bytes_since_update;
                         self.queue_window_update(0, increment);
-                        self.received_bytes_since_update = 0;
+                        self.flow_control.received_bytes_since_update = 0;
                         self.readiness.interest.insert(Ready::WRITABLE);
                     }
                     self.attribute_bytes_to_overhead();
@@ -1720,11 +1734,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
 
                 // Connection-level flow control (use enlarged window threshold)
                 let conn_threshold = ENLARGED_CONNECTION_WINDOW / 2;
-                self.received_bytes_since_update += payload_u32;
-                if self.received_bytes_since_update >= conn_threshold {
-                    let increment = self.received_bytes_since_update;
+                self.flow_control.received_bytes_since_update += payload_u32;
+                if self.flow_control.received_bytes_since_update >= conn_threshold {
+                    let increment = self.flow_control.received_bytes_since_update;
                     self.queue_window_update(0, increment);
-                    self.received_bytes_since_update = 0;
+                    self.flow_control.received_bytes_since_update = 0;
                 }
 
                 // Stream-level flow control (only if stream is still open)
@@ -1733,7 +1747,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 }
 
                 // If we have pending updates, ensure we get a writable event
-                if !self.pending_window_updates.is_empty() {
+                if !self.flow_control.pending_window_updates.is_empty() {
                     self.readiness.interest.insert(Ready::WRITABLE);
                 }
 
@@ -2040,10 +2054,12 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 // connections (Position::Client). The server side does this in
                 // the ServerSettings writable path, but the client needs to do
                 // it here after receiving the server's initial SETTINGS.
-                if self.position.is_client() && self.window == DEFAULT_INITIAL_WINDOW_SIZE as i32 {
+                if self.position.is_client()
+                    && self.flow_control.window == DEFAULT_INITIAL_WINDOW_SIZE as i32
+                {
                     let increment = ENLARGED_CONNECTION_WINDOW - DEFAULT_INITIAL_WINDOW_SIZE;
                     self.queue_window_update(0, increment);
-                    self.window = ENLARGED_CONNECTION_WINDOW as i32;
+                    self.flow_control.window = ENLARGED_CONNECTION_WINDOW as i32;
                 }
 
                 let kawa = &mut self.zero;
@@ -2112,8 +2128,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     );
                 }
                 // RFC 9113 §6.8: begin graceful drain.
-                self.draining = true;
-                self.peer_last_stream_id = Some(goaway.last_stream_id);
+                self.drain.draining = true;
+                self.drain.peer_last_stream_id = Some(goaway.last_stream_id);
 
                 // Streams with ID > last_stream_id were NOT processed by the peer.
                 // Mark them for retry (StreamState::Link) so they can be retried
@@ -2165,14 +2181,14 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 let increment = increment as i32;
                 if stream_id == 0 {
                     self.attribute_bytes_to_overhead();
-                    if let Some(window) = self.window.checked_add(increment) {
-                        if self.window <= 0 && window > 0 {
+                    if let Some(window) = self.flow_control.window.checked_add(increment) {
+                        if self.flow_control.window <= 0 && window > 0 {
                             self.readiness.interest.insert(Ready::WRITABLE);
                         }
-                        self.window = window;
+                        self.flow_control.window = window;
                         debug!(
                             "WINDOW_UPDATE received: stream=0 increment={} new_connection_window={}",
-                            increment, self.window
+                            increment, self.flow_control.window
                         );
                     } else {
                         error!("INVALID WINDOW INCREMENT");
@@ -2439,7 +2455,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         L: ListenerHandler + L7ListenerHandler,
     {
         // RFC 9113 §6.8: reject new streams on a draining connection
-        if self.draining {
+        if self.drain.draining {
             error!(
                 "Cannot open new stream on draining connection (stream {})",
                 stream
