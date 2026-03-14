@@ -59,22 +59,55 @@ pub(super) const CLIENT_PREFACE_SIZE: usize = 24 + parser::FRAME_HEADER_SIZE;
 
 // ── Flood Detection Thresholds (CVE mitigations) ────────────────────────────
 
-/// Maximum RST_STREAM frames per window (CVE-2023-44487 Rapid Reset + CVE-2019-9514)
-const MAX_RST_STREAM_PER_WINDOW: u32 = 100;
-/// Maximum PING frames per window (CVE-2019-9512 Ping Flood)
-const MAX_PING_PER_WINDOW: u32 = 100;
-/// Maximum SETTINGS frames per window (CVE-2019-9515 Settings Flood)
-const MAX_SETTINGS_PER_WINDOW: u32 = 50;
-/// Maximum empty DATA frames per window (CVE-2019-9518 Empty Frames)
-const MAX_EMPTY_DATA_PER_WINDOW: u32 = 100;
-/// Maximum CONTINUATION frames per header block (CVE-2024-27316)
-const MAX_CONTINUATION_FRAMES: u32 = 20;
+/// Default maximum RST_STREAM frames per window (CVE-2023-44487 Rapid Reset + CVE-2019-9514)
+const DEFAULT_MAX_RST_STREAM_PER_WINDOW: u32 = 100;
+/// Default maximum PING frames per window (CVE-2019-9512 Ping Flood)
+const DEFAULT_MAX_PING_PER_WINDOW: u32 = 100;
+/// Default maximum SETTINGS frames per window (CVE-2019-9515 Settings Flood)
+const DEFAULT_MAX_SETTINGS_PER_WINDOW: u32 = 50;
+/// Default maximum empty DATA frames per window (CVE-2019-9518 Empty Frames)
+const DEFAULT_MAX_EMPTY_DATA_PER_WINDOW: u32 = 100;
+/// Default maximum CONTINUATION frames per header block (CVE-2024-27316)
+const DEFAULT_MAX_CONTINUATION_FRAMES: u32 = 20;
 /// Maximum accumulated header block size across CONTINUATION frames (64KB)
 const MAX_HEADER_LIST_SIZE: u32 = 65536;
 /// Duration of the sliding window for rate-based flood counters
 const FLOOD_WINDOW_DURATION: std::time::Duration = std::time::Duration::from_secs(1);
-/// Maximum general anomaly count before triggering ENHANCE_YOUR_CALM
-const MAX_GLITCH_COUNT: u32 = 100;
+/// Default maximum general anomaly count before triggering ENHANCE_YOUR_CALM
+const DEFAULT_MAX_GLITCH_COUNT: u32 = 100;
+
+/// Configurable thresholds for H2 flood detection.
+///
+/// All values have safe defaults matching the compile-time constants.
+/// When configured via listener config, `None` values fall back to these defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct H2FloodConfig {
+    /// Maximum RST_STREAM frames per second window (CVE-2023-44487, CVE-2019-9514)
+    pub max_rst_stream_per_window: u32,
+    /// Maximum PING frames per second window (CVE-2019-9512)
+    pub max_ping_per_window: u32,
+    /// Maximum SETTINGS frames per second window (CVE-2019-9515)
+    pub max_settings_per_window: u32,
+    /// Maximum empty DATA frames per second window (CVE-2019-9518)
+    pub max_empty_data_per_window: u32,
+    /// Maximum CONTINUATION frames per header block (CVE-2024-27316)
+    pub max_continuation_frames: u32,
+    /// Maximum accumulated protocol anomalies before ENHANCE_YOUR_CALM
+    pub max_glitch_count: u32,
+}
+
+impl Default for H2FloodConfig {
+    fn default() -> Self {
+        Self {
+            max_rst_stream_per_window: DEFAULT_MAX_RST_STREAM_PER_WINDOW,
+            max_ping_per_window: DEFAULT_MAX_PING_PER_WINDOW,
+            max_settings_per_window: DEFAULT_MAX_SETTINGS_PER_WINDOW,
+            max_empty_data_per_window: DEFAULT_MAX_EMPTY_DATA_PER_WINDOW,
+            max_continuation_frames: DEFAULT_MAX_CONTINUATION_FRAMES,
+            max_glitch_count: DEFAULT_MAX_GLITCH_COUNT,
+        }
+    }
+}
 
 /// Maximum pending WINDOW_UPDATE entries before forcing a flush.
 /// Sized to cover connection-level + per-stream entries with headroom under load.
@@ -149,6 +182,9 @@ fn distribute_overhead(
 /// Monitors RST_STREAM (CVE-2023-44487), PING (CVE-2019-9512), SETTINGS (CVE-2019-9515),
 /// empty DATA (CVE-2019-9518), and CONTINUATION (CVE-2024-27316) flood patterns.
 /// When any counter exceeds its threshold, `check_flood()` returns `EnhanceYourCalm`.
+///
+/// Thresholds are configurable via [`H2FloodConfig`], with safe defaults matching
+/// the original compile-time constants.
 #[derive(Debug)]
 pub struct H2FloodDetector {
     /// RST_STREAM frames received in current window (CVE-2023-44487 + CVE-2019-9514)
@@ -167,16 +203,18 @@ pub struct H2FloodDetector {
     pub(super) glitch_count: u32,
     /// Window start for rate-based counters
     pub(super) window_start: Instant,
+    /// Configurable thresholds for flood detection
+    pub(super) config: H2FloodConfig,
 }
 
 impl Default for H2FloodDetector {
     fn default() -> Self {
-        Self::new()
+        Self::new(H2FloodConfig::default())
     }
 }
 
 impl H2FloodDetector {
-    pub fn new() -> Self {
+    pub fn new(config: H2FloodConfig) -> Self {
         Self {
             rst_stream_count: 0,
             ping_count: 0,
@@ -186,6 +224,7 @@ impl H2FloodDetector {
             accumulated_header_size: 0,
             glitch_count: 0,
             window_start: Instant::now(),
+            config,
         }
     }
 
@@ -206,38 +245,38 @@ impl H2FloodDetector {
     pub fn check_flood(&mut self) -> Option<H2Error> {
         self.maybe_reset_window();
 
-        if self.rst_stream_count > MAX_RST_STREAM_PER_WINDOW {
+        if self.rst_stream_count > self.config.max_rst_stream_per_window {
             warn!(
                 "H2 flood detected: RST_STREAM count {} exceeds threshold {}",
-                self.rst_stream_count, MAX_RST_STREAM_PER_WINDOW
+                self.rst_stream_count, self.config.max_rst_stream_per_window
             );
             return Some(H2Error::EnhanceYourCalm);
         }
-        if self.ping_count > MAX_PING_PER_WINDOW {
+        if self.ping_count > self.config.max_ping_per_window {
             warn!(
                 "H2 flood detected: PING count {} exceeds threshold {}",
-                self.ping_count, MAX_PING_PER_WINDOW
+                self.ping_count, self.config.max_ping_per_window
             );
             return Some(H2Error::EnhanceYourCalm);
         }
-        if self.settings_count > MAX_SETTINGS_PER_WINDOW {
+        if self.settings_count > self.config.max_settings_per_window {
             warn!(
                 "H2 flood detected: SETTINGS count {} exceeds threshold {}",
-                self.settings_count, MAX_SETTINGS_PER_WINDOW
+                self.settings_count, self.config.max_settings_per_window
             );
             return Some(H2Error::EnhanceYourCalm);
         }
-        if self.empty_data_count > MAX_EMPTY_DATA_PER_WINDOW {
+        if self.empty_data_count > self.config.max_empty_data_per_window {
             warn!(
                 "H2 flood detected: empty DATA count {} exceeds threshold {}",
-                self.empty_data_count, MAX_EMPTY_DATA_PER_WINDOW
+                self.empty_data_count, self.config.max_empty_data_per_window
             );
             return Some(H2Error::EnhanceYourCalm);
         }
-        if self.continuation_count > MAX_CONTINUATION_FRAMES {
+        if self.continuation_count > self.config.max_continuation_frames {
             warn!(
                 "H2 flood detected: CONTINUATION count {} exceeds threshold {}",
-                self.continuation_count, MAX_CONTINUATION_FRAMES
+                self.continuation_count, self.config.max_continuation_frames
             );
             return Some(H2Error::EnhanceYourCalm);
         }
@@ -248,10 +287,10 @@ impl H2FloodDetector {
             );
             return Some(H2Error::EnhanceYourCalm);
         }
-        if self.glitch_count > MAX_GLITCH_COUNT {
+        if self.glitch_count > self.config.max_glitch_count {
             warn!(
                 "H2 flood detected: glitch count {} exceeds threshold {}",
-                self.glitch_count, MAX_GLITCH_COUNT
+                self.glitch_count, self.config.max_glitch_count
             );
             return Some(H2Error::EnhanceYourCalm);
         }
