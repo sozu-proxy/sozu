@@ -16,11 +16,25 @@ See milestone [`v1.1.0`](https://github.com/sozu-proxy/sozu/projects/3?card_filt
 
 - **End-to-end test suite for H2 and Mux**: Added `e2e/src/tests/h2_tests.rs` and `e2e/src/tests/mux_tests.rs` (2 500+ lines) covering multiplexed streams, request pipelining, WebSocket upgrades, and mixed H1/H2 scenarios, see [`f7d1b659`](https://github.com/sozu-proxy/sozu/commit/f7d1b659865e7d92e732fcf8c52783713140f6a8).
 
+- **RFC 9218 Extensible Priorities**: Stream scheduling now respects RFC 9218 priority headers (`u=N, i` format). Higher-priority streams (lower urgency value) are written before lower-priority streams. The `Prioriser` struct tracks urgency and incremental flags per stream, see [`4c02e918`](https://github.com/sozu-proxy/sozu/commit/4c02e918).
+
+- **Configurable flood detection thresholds**: Six H2 flood detection limits (RST_STREAM, PING, SETTINGS, empty DATA, CONTINUATION frames, glitch count) are now configurable per-listener via protobuf config fields (`h2_max_rst_stream_per_window`, `h2_max_ping_per_window`, etc.), falling back to compile-time defaults when not set, see [`03942c11`](https://github.com/sozu-proxy/sozu/commit/03942c11).
+
+- **OpenTelemetry trace propagation**: Behind the `opentelemetry` feature flag, Sozu now extracts `traceparent` and `tracestate` HTTP/2 headers during stream creation and propagates the `SpanContext` into access log entries for distributed tracing correlation, see [`7da4f580`](https://github.com/sozu-proxy/sozu/commit/7da4f580).
+
+- **30 H2 security e2e tests**: `e2e/src/tests/h2_security_tests.rs` covering desync vectors, connection-specific headers, Content-Length fuzzing, cookie splitting, trailer forwarding, pseudo-header in trailers, half-closed streams, HPACK table size zero, and connection reuse.
+
 ### ✍️ Changed
 
 - **Slab capacity multiplier doubled to 4× per connection**: The internal slab allocator now reserves 4× the per-connection slot count (previously 2×) to accommodate the higher stream concurrency introduced by HTTP/2 multiplexing.
 
 - **`hpack` dependency replaced by `loona-hpack`**: The HPACK encoder/decoder used for HTTP/2 header compression has been migrated from the `hpack` crate to `loona-hpack`, see [`Cargo.toml`](https://github.com/sozu-proxy/sozu/blob/feat/h2-mux/lib/Cargo.toml).
+
+- **Proportional overhead distribution**: Connection-level overhead bytes (SETTINGS, PING, WINDOW_UPDATE) are now distributed to streams proportional to their bytes transferred instead of equally, see [`4c02e918`](https://github.com/sozu-proxy/sozu/commit/4c02e918).
+
+- **ConnectionH2 decomposed into sub-structs**: Fields grouped into `H2FlowControl`, `H2ByteAccounting`, `H2DrainState`, and `H2FloodConfig` for maintainability, see [`7917feeb`](https://github.com/sozu-proxy/sozu/commit/7917feeb).
+
+- **readable()/writable() method extraction**: Large monolithic functions decomposed into `handle_header_state()`, `handle_continuation_header_state()`, and `write_streams()` private methods. `readable()` reduced from ~420 to ~213 lines, `writable()` from ~310 to ~75 lines, see [`fc606d23`](https://github.com/sozu-proxy/sozu/commit/fc606d23).
 
 ### ⛑️ Fixed
 
@@ -36,6 +50,10 @@ See milestone [`v1.1.0`](https://github.com/sozu-proxy/sozu/projects/3?card_filt
 
 - We fixed frontend timeout handling in the mux layer: timeouts are now re-armed after partial reads and H2 linked-stream wakeups are handled correctly to avoid spurious session drops, see [`560fac2f`](https://github.com/sozu-proxy/sozu/commit/560fac2f2cc249a66264a9233bb908059bb01ca0).
 
+- **HPACK decoder table size sync**: Fixed HPACK decoder dynamic table synchronization on SETTINGS ACK per RFC 7541 §4.2, see [`21e7514d`](https://github.com/sozu-proxy/sozu/commit/21e7514d).
+
+- **Stream recycling dedup**: Replaced inlined `complete_server_stream` with static method call, removing duplicated stream cleanup logic, see [`21e7514d`](https://github.com/sozu-proxy/sozu/commit/21e7514d).
+
 ### Changelog
 
 #### 🌟 Added
@@ -44,6 +62,9 @@ See milestone [`v1.1.0`](https://github.com/sozu-proxy/sozu/projects/3?card_filt
 - [ [`b6bffd36`](https://github.com/sozu-proxy/sozu/commit/b6bffd364355c8001da7403066c2dbcbc04445a1) ] Add missing metrics to mux H1/H2 paths and document all mux metrics [`FlorentinDUBOIS`] (`2026-03-12`)
 - [ [`4f67d07d`](https://github.com/sozu-proxy/sozu/commit/4f67d07d6179c2af61108a24d1e1d57eec663787) ] Add per-listener ALPN protocol configuration [`FlorentinDUBOIS`] (`2026-03-12`)
 - [ [`2a65aa78`](https://github.com/sozu-proxy/sozu/commit/2a65aa78313f359d22d38c1c828c1960bb411bd8) ] Add cluster H2 enable/disable commands and --http2 flag [`FlorentinDUBOIS`] (`2026-03-12`)
+- [ [`7da4f580`](https://github.com/sozu-proxy/sozu/commit/7da4f580) ] OTel trace propagation [`FlorentinDUBOIS`] (`2026-03-14`)
+- [ [`4c02e918`](https://github.com/sozu-proxy/sozu/commit/4c02e918) ] RFC 9218 priorities + proportional overhead [`FlorentinDUBOIS`] (`2026-03-14`)
+- [ [`03942c11`](https://github.com/sozu-proxy/sozu/commit/03942c11) ] Configurable flood thresholds [`FlorentinDUBOIS`] (`2026-03-14`)
 
 #### ⛑️ Fixed
 
@@ -51,10 +72,15 @@ See milestone [`v1.1.0`](https://github.com/sozu-proxy/sozu/projects/3?card_filt
 - [ [`560fac2f`](https://github.com/sozu-proxy/sozu/commit/560fac2f2cc249a66264a9233bb908059bb01ca0) ] Re-arm timeouts and handle H2 Linked streams on frontend timeout [`FlorentinDUBOIS`] (`2026-03-12`)
 - [ [`5a02f634`](https://github.com/sozu-proxy/sozu/commit/5a02f634e848600651a350a60e2f1fb39d0cc4dc) ] Restore missing backend metrics in mux layer [`FlorentinDUBOIS`] (`2026-03-12`)
 - [ [`479a0bfe`](https://github.com/sozu-proxy/sozu/commit/479a0bfeba7fd9c4418b6e8652d66ec03ad58fe3) ] Downgrade noisy mux/H1/H2 logs from warn/error to debug [`FlorentinDUBOIS`] (`2026-03-12`)
+- [ [`21e7514d`](https://github.com/sozu-proxy/sozu/commit/21e7514d) ] HPACK sync + stream recycling dedup [`FlorentinDUBOIS`] (`2026-03-13`)
+- [ [`664bb659`](https://github.com/sozu-proxy/sozu/commit/664bb659) ] Round 2 review fixes [`FlorentinDUBOIS`] (`2026-03-13`)
+- [ [`025822cf`](https://github.com/sozu-proxy/sozu/commit/025822cf) ] Round 1 review findings [`FlorentinDUBOIS`] (`2026-03-13`)
 
 #### ✍️ Changed
 
 - [ [`303675e9`](https://github.com/sozu-proxy/sozu/commit/303675e9707fd64055a93f0ee27bb58b72faa344) ] Apply cargo fmt to CLI, config, and HTTPS modules [`FlorentinDUBOIS`] (`2026-03-12`)
+- [ [`7917feeb`](https://github.com/sozu-proxy/sozu/commit/7917feeb) ] Struct decomposition + DefaultAnswer [`FlorentinDUBOIS`] (`2026-03-14`)
+- [ [`fc606d23`](https://github.com/sozu-proxy/sozu/commit/fc606d23) ] readable/writable split [`FlorentinDUBOIS`] (`2026-03-14`)
 
 #### 📚 Documentation
 

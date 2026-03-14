@@ -81,7 +81,17 @@ sozu cluster h2 enable --id MyCluster
 sozu cluster h2 disable --id MyCluster
 ```
 
-See the [configuration reference](./configure.md) for details on all HTTP/2 options.
+**Security:** Sōzu includes built-in flood detection for HTTP/2 connections, protecting
+against Rapid Reset (CVE-2023-44487), CONTINUATION flood (CVE-2024-27316), and other
+protocol abuse vectors. Thresholds are configurable per-listener — see the
+[configuration reference](./configure.md#h2-flood-detection-thresholds) for details.
+
+**Priorities:** Sōzu implements RFC 9218 Extensible Priorities. Streams with the
+`priority` header (`u=N, i` format) are scheduled by urgency level, ensuring
+higher-priority responses are sent first.
+
+See the [configuration reference](./configure.md) for all HTTP/2 options, or the
+[H2 Mux Internals](./h2_mux_internals.md) for developer-facing implementation details.
 
 [ru]: https://rustup.rs
 [cr]: https://crates.io/

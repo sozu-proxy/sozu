@@ -32,6 +32,9 @@ Sōzu is a reverse proxy for load balancing, written in Rust. Its main job is to
 
 ## Going deeper
 
+* [H2 Mux Internals][h2] — Developer reference for the HTTP/2 multiplexer implementation
+
+
 * [Lifetime of a session][li]
 
 ## Testing
@@ -56,5 +59,6 @@ TODO
 [tl]: ./tools_libraries.md
 [ws]: ./why_you_should_use.md
 [r]: ./recipes.md
+[h2]: ./h2_mux_internals.md
 [li]: ./lifetime_of_a_session.md
 [ue]: ./upgrade_e2e_tests.md
