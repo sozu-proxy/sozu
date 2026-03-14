@@ -55,45 +55,47 @@ use crate::{
 // H2 frame constants (RFC 9113)
 // ============================================================================
 
-const H2_FRAME_DATA: u8 = 0x0;
-const H2_FRAME_HEADERS: u8 = 0x1;
-const H2_FRAME_RST_STREAM: u8 = 0x3;
-const H2_FRAME_SETTINGS: u8 = 0x4;
-const H2_FRAME_PING: u8 = 0x6;
-const H2_FRAME_GOAWAY: u8 = 0x7;
-const H2_FRAME_WINDOW_UPDATE: u8 = 0x8;
-const H2_FRAME_CONTINUATION: u8 = 0x9;
+pub(super) const H2_FRAME_DATA: u8 = 0x0;
+pub(super) const H2_FRAME_HEADERS: u8 = 0x1;
+pub(super) const H2_FRAME_RST_STREAM: u8 = 0x3;
+pub(super) const H2_FRAME_SETTINGS: u8 = 0x4;
+pub(super) const H2_FRAME_PING: u8 = 0x6;
+pub(super) const H2_FRAME_GOAWAY: u8 = 0x7;
+pub(super) const H2_FRAME_WINDOW_UPDATE: u8 = 0x8;
+pub(super) const H2_FRAME_CONTINUATION: u8 = 0x9;
 
-const H2_FLAG_ACK: u8 = 0x1;
-const H2_FLAG_END_STREAM: u8 = 0x1;
-const H2_FLAG_END_HEADERS: u8 = 0x4;
+pub(super) const H2_FLAG_ACK: u8 = 0x1;
+pub(super) const H2_FLAG_END_STREAM: u8 = 0x1;
+pub(super) const H2_FLAG_END_HEADERS: u8 = 0x4;
 
+/// H2 error code: PROTOCOL_ERROR (0x1) — RFC 9113 §7
+pub(super) const H2_ERROR_PROTOCOL_ERROR: u32 = 0x1;
 /// H2 error code: FLOW_CONTROL_ERROR (0x3) — RFC 9113 §7
-const H2_ERROR_FLOW_CONTROL_ERROR: u32 = 0x3;
+pub(super) const H2_ERROR_FLOW_CONTROL_ERROR: u32 = 0x3;
 /// H2 error code: FRAME_SIZE_ERROR (0x6) — RFC 9113 §7
-const H2_ERROR_FRAME_SIZE_ERROR: u32 = 0x6;
+pub(super) const H2_ERROR_FRAME_SIZE_ERROR: u32 = 0x6;
 /// H2 error code: REFUSED_STREAM (0x7) — RFC 9113 §7
-const H2_ERROR_REFUSED_STREAM: u32 = 0x7;
+pub(super) const H2_ERROR_REFUSED_STREAM: u32 = 0x7;
 /// H2 error code: ENHANCE_YOUR_CALM (0xb) — RFC 9113 §7
-const H2_ERROR_ENHANCE_YOUR_CALM: u32 = 0xb;
+pub(super) const H2_ERROR_ENHANCE_YOUR_CALM: u32 = 0xb;
 
 /// The HTTP/2 connection preface sent by the client (RFC 9113 Section 3.4).
-const H2_CLIENT_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+pub(super) const H2_CLIENT_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
 // ============================================================================
 // Raw H2 frame builder
 // ============================================================================
 
 /// A minimal H2 frame builder for crafting raw frames in tests.
-struct H2Frame {
-    frame_type: u8,
-    flags: u8,
-    stream_id: u32,
-    payload: Vec<u8>,
+pub(super) struct H2Frame {
+    pub(super) frame_type: u8,
+    pub(super) flags: u8,
+    pub(super) stream_id: u32,
+    pub(super) payload: Vec<u8>,
 }
 
 impl H2Frame {
-    fn new(frame_type: u8, flags: u8, stream_id: u32, payload: Vec<u8>) -> Self {
+    pub(super) fn new(frame_type: u8, flags: u8, stream_id: u32, payload: Vec<u8>) -> Self {
         Self {
             frame_type,
             flags,
@@ -102,7 +104,7 @@ impl H2Frame {
         }
     }
 
-    fn encode(&self) -> Vec<u8> {
+    pub(super) fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(9 + self.payload.len());
         let len = self.payload.len() as u32;
         // 3 bytes length (big-endian)
@@ -121,7 +123,7 @@ impl H2Frame {
     }
 
     /// Build a SETTINGS frame (stream 0, no flags = not ACK).
-    fn settings(settings: &[(u16, u32)]) -> Self {
+    pub(super) fn settings(settings: &[(u16, u32)]) -> Self {
         let mut payload = Vec::new();
         for &(id, value) in settings {
             payload.extend_from_slice(&id.to_be_bytes());
@@ -131,12 +133,17 @@ impl H2Frame {
     }
 
     /// Build a SETTINGS ACK frame.
-    fn settings_ack() -> Self {
+    pub(super) fn settings_ack() -> Self {
         Self::new(H2_FRAME_SETTINGS, 0x1, 0, Vec::new())
     }
 
     /// Build a HEADERS frame. If `end_headers` is false, CONTINUATION is expected.
-    fn headers(stream_id: u32, header_block: Vec<u8>, end_headers: bool, end_stream: bool) -> Self {
+    pub(super) fn headers(
+        stream_id: u32,
+        header_block: Vec<u8>,
+        end_headers: bool,
+        end_stream: bool,
+    ) -> Self {
         let mut flags = 0u8;
         if end_headers {
             flags |= H2_FLAG_END_HEADERS;
@@ -148,41 +155,41 @@ impl H2Frame {
     }
 
     /// Build a CONTINUATION frame.
-    fn continuation(stream_id: u32, header_block: Vec<u8>, end_headers: bool) -> Self {
+    pub(super) fn continuation(stream_id: u32, header_block: Vec<u8>, end_headers: bool) -> Self {
         let flags = if end_headers { H2_FLAG_END_HEADERS } else { 0 };
         Self::new(H2_FRAME_CONTINUATION, flags, stream_id, header_block)
     }
 
     /// Build a WINDOW_UPDATE frame.
-    fn window_update(stream_id: u32, increment: u32) -> Self {
+    pub(super) fn window_update(stream_id: u32, increment: u32) -> Self {
         let payload = (increment & 0x7FFFFFFF).to_be_bytes().to_vec();
         Self::new(H2_FRAME_WINDOW_UPDATE, 0, stream_id, payload)
     }
 
     /// Build a DATA frame on stream 0 (invalid per spec).
-    fn data_on_stream_zero(payload: Vec<u8>) -> Self {
+    pub(super) fn data_on_stream_zero(payload: Vec<u8>) -> Self {
         Self::new(H2_FRAME_DATA, 0, 0, payload)
     }
 
     /// Build a frame with an unknown/invalid type.
-    fn invalid_type(stream_id: u32) -> Self {
+    pub(super) fn invalid_type(stream_id: u32) -> Self {
         // Frame type 0xFF is not defined in the spec
         Self::new(0xFF, 0, stream_id, vec![0xDE, 0xAD])
     }
 
     /// Build a SETTINGS frame on a non-zero stream (invalid per spec).
-    fn settings_on_stream(stream_id: u32) -> Self {
+    pub(super) fn settings_on_stream(stream_id: u32) -> Self {
         Self::new(H2_FRAME_SETTINGS, 0, stream_id, Vec::new())
     }
 
-    /// Build an oversized frame — payload bigger than default max_frame_size (16384).
-    fn oversized(stream_id: u32) -> Self {
+    /// Build an oversized frame -- payload bigger than default max_frame_size (16384).
+    pub(super) fn oversized(stream_id: u32) -> Self {
         let payload = vec![0u8; 16385]; // 1 byte over default max
         Self::new(H2_FRAME_DATA, 0, stream_id, payload)
     }
 
     /// Build a RST_STREAM frame with the given error code.
-    fn rst_stream(stream_id: u32, error_code: u32) -> Self {
+    pub(super) fn rst_stream(stream_id: u32, error_code: u32) -> Self {
         Self::new(
             H2_FRAME_RST_STREAM,
             0,
@@ -192,24 +199,24 @@ impl H2Frame {
     }
 
     /// Build a PING frame (non-ACK) with the given 8-byte payload.
-    fn ping(payload: [u8; 8]) -> Self {
+    pub(super) fn ping(payload: [u8; 8]) -> Self {
         Self::new(H2_FRAME_PING, 0, 0, payload.to_vec())
     }
 
     /// Build a SETTINGS ACK frame WITH a non-empty payload (invalid per RFC 9113 §6.5).
-    fn settings_ack_with_payload(payload: Vec<u8>) -> Self {
+    pub(super) fn settings_ack_with_payload(payload: Vec<u8>) -> Self {
         Self::new(H2_FRAME_SETTINGS, H2_FLAG_ACK, 0, payload)
     }
 
     /// Build a DATA frame on a given stream.
-    fn data(stream_id: u32, payload: Vec<u8>, end_stream: bool) -> Self {
+    pub(super) fn data(stream_id: u32, payload: Vec<u8>, end_stream: bool) -> Self {
         let flags = if end_stream { H2_FLAG_END_STREAM } else { 0 };
         Self::new(H2_FRAME_DATA, flags, stream_id, payload)
     }
 
     /// Build a GOAWAY frame.
     #[allow(dead_code)]
-    fn goaway(last_stream_id: u32, error_code: u32) -> Self {
+    pub(super) fn goaway(last_stream_id: u32, error_code: u32) -> Self {
         let mut payload = Vec::with_capacity(8);
         payload.extend_from_slice(&(last_stream_id & 0x7FFFFFFF).to_be_bytes());
         payload.extend_from_slice(&error_code.to_be_bytes());
@@ -218,7 +225,7 @@ impl H2Frame {
 }
 
 /// Read raw bytes from a TcpStream / TLS stream, tolerating timeouts.
-fn read_all_available(stream: &mut impl Read, timeout: Duration) -> Vec<u8> {
+pub(super) fn read_all_available(stream: &mut impl Read, timeout: Duration) -> Vec<u8> {
     let mut buf = vec![0u8; 65536];
     let mut result = Vec::new();
     let start = std::time::Instant::now();
@@ -243,7 +250,7 @@ fn read_all_available(stream: &mut impl Read, timeout: Duration) -> Vec<u8> {
 }
 
 /// Parse H2 frames from raw bytes. Returns (frame_type, flags, stream_id, payload) tuples.
-fn parse_h2_frames(data: &[u8]) -> Vec<(u8, u8, u32, Vec<u8>)> {
+pub(super) fn parse_h2_frames(data: &[u8]) -> Vec<(u8, u8, u32, Vec<u8>)> {
     let mut frames = Vec::new();
     let mut pos = 0;
     while pos + 9 <= data.len() {
@@ -269,18 +276,18 @@ fn parse_h2_frames(data: &[u8]) -> Vec<(u8, u8, u32, Vec<u8>)> {
 }
 
 /// Check if any parsed frame is a GOAWAY frame.
-fn contains_goaway(frames: &[(u8, u8, u32, Vec<u8>)]) -> bool {
+pub(super) fn contains_goaway(frames: &[(u8, u8, u32, Vec<u8>)]) -> bool {
     frames.iter().any(|(t, _, _, _)| *t == H2_FRAME_GOAWAY)
 }
 
 /// Check if any parsed frame is a RST_STREAM (type 0x3).
-fn contains_rst_stream(frames: &[(u8, u8, u32, Vec<u8>)]) -> bool {
+pub(super) fn contains_rst_stream(frames: &[(u8, u8, u32, Vec<u8>)]) -> bool {
     frames.iter().any(|(t, _, _, _)| *t == 0x3)
 }
 
 /// Extract the error code from the first GOAWAY frame, if any.
 /// GOAWAY payload: 4 bytes last_stream_id + 4 bytes error_code.
-fn goaway_error_code(frames: &[(u8, u8, u32, Vec<u8>)]) -> Option<u32> {
+pub(super) fn goaway_error_code(frames: &[(u8, u8, u32, Vec<u8>)]) -> Option<u32> {
     for (t, _, _, payload) in frames {
         if *t == H2_FRAME_GOAWAY && payload.len() >= 8 {
             return Some(u32::from_be_bytes([
@@ -292,13 +299,16 @@ fn goaway_error_code(frames: &[(u8, u8, u32, Vec<u8>)]) -> Option<u32> {
 }
 
 /// Check if frames contain a GOAWAY with a specific error code.
-fn contains_goaway_with_error(frames: &[(u8, u8, u32, Vec<u8>)], expected_error: u32) -> bool {
+pub(super) fn contains_goaway_with_error(
+    frames: &[(u8, u8, u32, Vec<u8>)],
+    expected_error: u32,
+) -> bool {
     goaway_error_code(frames) == Some(expected_error)
 }
 
 /// Extract RST_STREAM frames: returns (stream_id, error_code) tuples.
 /// RST_STREAM payload: 4 bytes error_code.
-fn extract_rst_streams(frames: &[(u8, u8, u32, Vec<u8>)]) -> Vec<(u32, u32)> {
+pub(super) fn extract_rst_streams(frames: &[(u8, u8, u32, Vec<u8>)]) -> Vec<(u32, u32)> {
     frames
         .iter()
         .filter(|(t, _, _, payload)| *t == 0x3 && payload.len() >= 4)
@@ -311,7 +321,7 @@ fn extract_rst_streams(frames: &[(u8, u8, u32, Vec<u8>)]) -> Vec<(u32, u32)> {
 
 /// Check if any RST_STREAM frame has a given error code for a given stream.
 #[allow(dead_code)]
-fn contains_rst_stream_with_error(
+pub(super) fn contains_rst_stream_with_error(
     frames: &[(u8, u8, u32, Vec<u8>)],
     stream_id: u32,
     expected_error: u32,
@@ -327,7 +337,9 @@ fn contains_rst_stream_with_error(
 
 /// Establish a TLS connection to the given address with ALPN=h2,
 /// returning a rustls StreamOwned that can be used for raw I/O.
-fn tls_connect(addr: SocketAddr) -> rustls::StreamOwned<rustls::ClientConnection, TcpStream> {
+pub(super) fn tls_connect(
+    addr: SocketAddr,
+) -> rustls::StreamOwned<rustls::ClientConnection, TcpStream> {
     let config = ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(Verifier))
@@ -350,7 +362,7 @@ fn tls_connect(addr: SocketAddr) -> rustls::StreamOwned<rustls::ClientConnection
 
 /// Send the H2 client preface and an initial empty SETTINGS frame,
 /// then read and consume the server's SETTINGS + SETTINGS ACK.
-fn h2_handshake(stream: &mut rustls::StreamOwned<rustls::ClientConnection, TcpStream>) {
+pub(super) fn h2_handshake(stream: &mut rustls::StreamOwned<rustls::ClientConnection, TcpStream>) {
     // Send client preface
     stream.write_all(H2_CLIENT_PREFACE).unwrap();
     // Send empty SETTINGS
@@ -376,7 +388,7 @@ fn h2_handshake(stream: &mut rustls::StreamOwned<rustls::ClientConnection, TcpSt
 
 /// Setup an HTTPS listener with H2 support, a cluster, and N async backends.
 /// Returns (worker, backends, front_port).
-fn setup_h2_edge_test(
+pub(super) fn setup_h2_edge_test(
     name: &str,
     nb_backends: usize,
 ) -> (Worker, Vec<AsyncBackend<SimpleAggregator>>, u16) {
@@ -439,7 +451,7 @@ fn setup_h2_edge_test(
 }
 
 /// Check that sozu is still alive and accepts a new H2 connection + request.
-fn verify_sozu_alive(front_port: u16) -> bool {
+pub(super) fn verify_sozu_alive(front_port: u16) -> bool {
     // Just verify sozu is still accepting TCP connections.
     // We don't check HTTP response because the backend may be in a bad state.
     use std::net::TcpStream;
@@ -730,7 +742,7 @@ impl Drop for DelayedH2Backend {
 
 /// Setup HTTPS listener with TLS and a cluster, but do NOT add backends.
 /// The caller is responsible for adding backends and calling worker.read_to_last().
-fn setup_h2_listener_only(name: &str) -> (Worker, u16, SocketAddress) {
+pub(super) fn setup_h2_listener_only(name: &str) -> (Worker, u16, SocketAddress) {
     let front_port = provide_port();
     let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
 

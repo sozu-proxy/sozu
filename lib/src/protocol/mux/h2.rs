@@ -4,6 +4,17 @@ use std::{
     time::Instant,
 };
 
+/// Compile-time guard: `payload_len as usize` casts in the H2 parser assume at
+/// least 32-bit pointer width.  This prevents silent truncation on platforms
+/// with smaller pointers (e.g. 16-bit embedded targets).
+const _: () = assert!(
+    std::mem::size_of::<usize>() >= 4,
+    "sozu requires at least 32-bit pointers"
+);
+
+/// Sentinel token used when emitting GoAway — not routed to any real session.
+const GOAWAY_SENTINEL_TOKEN: mio::Token = mio::Token(usize::MAX);
+
 use rusty_ulid::Ulid;
 use sozu_command::ready::Ready;
 
@@ -69,6 +80,12 @@ const MAX_GLITCH_COUNT: u32 = 100;
 /// Sized to cover connection-level + per-stream entries with headroom under load.
 const MAX_PENDING_WINDOW_UPDATES: usize = 401; // 1 connection + 100 streams * 4
 
+/// Maximum number of pending RST_STREAM frames before triggering GOAWAY.
+/// When a peer causes excessive RST_STREAM queueing (e.g. rapid stream creation
+/// beyond MAX_CONCURRENT_STREAMS), this cap prevents unbounded memory growth
+/// and triggers an ENHANCE_YOUR_CALM connection error.
+const MAX_PENDING_RST_STREAMS: usize = 200;
+
 /// RFC 9113 §6.5: maximum time (in seconds) to wait for SETTINGS ACK before
 /// sending GOAWAY with SETTINGS_TIMEOUT error code.
 const SETTINGS_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -86,6 +103,26 @@ fn error_nom_to_h2(error: nom::Err<parser::ParserError>) -> H2Error {
         }) => e,
         _ => H2Error::ProtocolError,
     }
+}
+
+/// Distribute connection-level byte overhead proportionally to a single stream.
+///
+/// Extracted as a free function to avoid borrow conflicts when `self` fields
+/// (e.g. `encoder`) are borrowed by the converter while we need to update
+/// per-stream metrics and connection overhead counters.
+fn distribute_overhead(
+    metrics: &mut SessionMetrics,
+    overhead_bin: &mut usize,
+    overhead_bout: &mut usize,
+    active_streams: usize,
+) {
+    let active = active_streams.max(1);
+    let share_in = *overhead_bin / active;
+    let share_out = *overhead_bout / active;
+    metrics.bin += share_in;
+    metrics.bout += share_out;
+    *overhead_bin -= share_in;
+    *overhead_bout -= share_out;
 }
 
 /// Tracks per-connection frame rates to detect and mitigate H2 flood attacks.
@@ -252,6 +289,10 @@ impl Default for H2Settings {
     }
 }
 
+/// Stub for RFC 9218 (Extensible Priorities).
+///
+/// Currently a no-op placeholder. When implemented, this will support
+/// urgency-based stream prioritization as specified in RFC 9218.
 #[derive(Default)]
 pub struct Prioriser {}
 
@@ -418,14 +459,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 let (size, status) = self.socket.socket_read(&mut kawa.storage.space()[..amount]);
                 context.debug.push(DebugEvent::I3(0, did, size));
                 kawa.storage.fill(size);
-                match self.position {
-                    Position::Client(..) => {
-                        count!("back_bytes_in", size as i64);
-                    }
-                    Position::Server => {
-                        count!("bytes_in", size as i64);
-                    }
-                }
+                self.position.count_bytes_in_counter(size);
                 self.zero_bytes_read += size;
                 if update_readiness_after_read(size, status, &mut self.readiness) {
                     return MuxResult::Continue;
@@ -654,6 +688,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                                                 "Ignoring {:?} on closed stream {}",
                                                 header.frame_type, header.stream_id
                                             );
+                                            self.flood_detector.glitch_count += 1;
+                                            if let Some(error) = self.flood_detector.check_flood() {
+                                                return self.goaway(error);
+                                            }
                                         }
                                         FrameType::Data => {
                                             // RFC 9113 §5.1: DATA on a closed stream is a
@@ -666,6 +704,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                                                 "DATA on closed stream {}, sending RST_STREAM(STREAM_CLOSED)",
                                                 header.stream_id
                                             );
+                                            self.flood_detector.glitch_count += 1;
+                                            if let Some(error) = self.flood_detector.check_flood() {
+                                                return self.goaway(error);
+                                            }
                                             self.pending_rst_streams
                                                 .push((header.stream_id, H2Error::StreamClosed));
                                             self.readiness.interest.insert(Ready::WRITABLE);
@@ -813,29 +855,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // The timeout is reset below in the Header/Frame states when writing
         // actual request/response data.
         if let Some(H2StreamId::Zero) = self.expect_write {
-            let kawa = &mut self.zero;
-            while !kawa.storage.is_empty() {
-                let (size, status) = self.socket.socket_write(kawa.storage.data());
-                context.debug.push(DebugEvent::I2(1, size));
-                kawa.storage.consume(size);
-                match self.position {
-                    Position::Client(..) => {
-                        count!("back_bytes_out", size as i64);
-                    }
-                    Position::Server => {
-                        count!("bytes_out", size as i64);
-                    }
-                }
-                self.overhead_bout += size;
-                if update_readiness_after_write(size, status, &mut self.readiness) {
-                    return MuxResult::Continue;
-                }
+            if self.flush_zero_to_socket() {
+                return MuxResult::Continue;
             }
-            // Reset buffer positions after draining. consume() advances start
-            // but never resets it, so without clear() the next readable() call
-            // would fill from a non-zero end while start remains high, leading
-            // to start > end panics in data().
-            kawa.storage.clear();
             // when H2StreamId::Zero is used to write READABLE is disabled
             // so when we finish the write we enable READABLE again
             self.readiness.interest.insert(Ready::READABLE);
@@ -873,28 +895,22 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             self.pending_window_updates.drain(..written_count);
             if offset > 0 {
                 kawa.storage.fill(offset);
-                // Flush WINDOW_UPDATE frames directly without returning
-                while !kawa.storage.is_empty() {
-                    let (size, status) = self.socket.socket_write(kawa.storage.data());
-                    kawa.storage.consume(size);
-                    match self.position {
-                        Position::Client(..) => {
-                            count!("back_bytes_out", size as i64);
-                        }
-                        Position::Server => {
-                            count!("bytes_out", size as i64);
-                        }
-                    }
-                    self.overhead_bout += size;
-                    if update_readiness_after_write(size, status, &mut self.readiness) {
-                        self.expect_write = Some(H2StreamId::Zero);
-                        return MuxResult::Continue;
-                    }
+                if self.flush_zero_to_socket() {
+                    self.expect_write = Some(H2StreamId::Zero);
+                    return MuxResult::Continue;
                 }
-                // Reset buffer positions after draining (see zero-buffer
-                // comment above for why this is needed).
-                kawa.storage.clear();
             }
+        }
+
+        // Cap: if too many RST_STREAM frames have accumulated, the peer is
+        // misbehaving (e.g. rapid stream creation). Trigger GOAWAY(ENHANCE_YOUR_CALM).
+        if self.pending_rst_streams.len() > MAX_PENDING_RST_STREAMS {
+            error!(
+                "pending RST_STREAM count {} exceeds cap {}, sending GOAWAY(ENHANCE_YOUR_CALM)",
+                self.pending_rst_streams.len(),
+                MAX_PENDING_RST_STREAMS
+            );
+            return self.goaway(H2Error::EnhanceYourCalm);
         }
 
         // Flush pending RST_STREAM frames (queued when refusing streams).
@@ -921,26 +937,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             self.pending_rst_streams.drain(..written_count);
             if offset > 0 {
                 kawa.storage.fill(offset);
-                while !kawa.storage.is_empty() {
-                    let (size, status) = self.socket.socket_write(kawa.storage.data());
-                    kawa.storage.consume(size);
-                    match self.position {
-                        Position::Client(..) => {
-                            count!("back_bytes_out", size as i64);
-                        }
-                        Position::Server => {
-                            count!("bytes_out", size as i64);
-                        }
-                    }
-                    self.overhead_bout += size;
-                    if update_readiness_after_write(size, status, &mut self.readiness) {
-                        self.expect_write = Some(H2StreamId::Zero);
-                        return MuxResult::Continue;
-                    }
+                if self.flush_zero_to_socket() {
+                    self.expect_write = Some(H2StreamId::Zero);
+                    return MuxResult::Continue;
                 }
-                // Reset buffer positions after draining (see zero-buffer
-                // comment above for why this is needed).
-                kawa.storage.clear();
             }
         }
 
@@ -1025,16 +1025,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                             .debug
                             .push(DebugEvent::I3(2, global_stream_id, size));
                         kawa.consume(size);
-                        match self.position {
-                            Position::Client(..) => {
-                                count!("back_bytes_out", size as i64);
-                                parts.metrics.backend_bout += size;
-                            }
-                            Position::Server => {
-                                count!("bytes_out", size as i64);
-                                parts.metrics.bout += size;
-                            }
-                        }
+                        self.position.count_bytes_out_counter(size);
+                        self.position.count_bytes_out(parts.metrics, size);
                         if let Some((read_stream, amount)) = self.expect_read {
                             if write_stream == read_stream
                                 && kawa.storage.available_space() >= amount
@@ -1149,16 +1141,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                             .debug
                             .push(DebugEvent::I3(3, global_stream_id, size));
                         kawa.consume(size);
-                        match self.position {
-                            Position::Client(..) => {
-                                count!("back_bytes_out", size as i64);
-                                parts.metrics.backend_bout += size;
-                            }
-                            Position::Server => {
-                                count!("bytes_out", size as i64);
-                                parts.metrics.bout += size;
-                            }
-                        }
+                        self.position.count_bytes_out_counter(size);
+                        self.position.count_bytes_out(parts.metrics, size);
                         if update_readiness_after_write(size, status, &mut self.readiness) {
                             self.expect_write =
                                 Some(H2StreamId::Other(*stream_id, global_stream_id));
@@ -1178,13 +1162,12 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                                         global_stream_id
                                     );
                                 } else {
-                                    // Inline distribute_overhead: can't call self method
-                                    // while converter borrows self.encoder
-                                    let active_streams = self.streams.len().max(1);
-                                    stream.metrics.bin += self.overhead_bin / active_streams;
-                                    stream.metrics.bout += self.overhead_bout / active_streams;
-                                    self.overhead_bin -= self.overhead_bin / active_streams;
-                                    self.overhead_bout -= self.overhead_bout / active_streams;
+                                    distribute_overhead(
+                                        &mut stream.metrics,
+                                        &mut self.overhead_bin,
+                                        &mut self.overhead_bout,
+                                        self.streams.len(),
+                                    );
                                     // mark stream as reusable
                                     context.debug.push(DebugEvent::I2(5, global_stream_id));
                                     if context.debug.is_interesting() {
@@ -1215,6 +1198,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     if self.streams.remove(&stream_id).is_none() {
                         error!("dead stream_id {} missing from streams map", stream_id);
                     }
+                    self.rst_sent.remove(&stream_id);
                 }
 
                 // Reclaim the converter's reusable buffers
@@ -1273,27 +1257,19 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     }
 
     /// Distribute connection-level byte overhead proportionally to a single stream.
-    /// Returns `(share_in, share_out)` and decrements the connection totals.
+    /// Delegates to the free function [`distribute_overhead`].
     fn distribute_overhead(&mut self, metrics: &mut SessionMetrics) {
-        let active_streams = self.streams.len().max(1);
-        let share_in = self.overhead_bin / active_streams;
-        let share_out = self.overhead_bout / active_streams;
-        metrics.bin += share_in;
-        metrics.bout += share_out;
-        self.overhead_bin -= share_in;
-        self.overhead_bout -= share_out;
+        distribute_overhead(
+            metrics,
+            &mut self.overhead_bin,
+            &mut self.overhead_bout,
+            self.streams.len(),
+        );
     }
 
     /// Attribute accumulated `zero_bytes_read` to the stream or to connection overhead.
     fn attribute_bytes_to_stream(&mut self, metrics: &mut SessionMetrics) {
-        match self.position {
-            Position::Client(..) => {
-                metrics.backend_bin += self.zero_bytes_read;
-            }
-            Position::Server => {
-                metrics.bin += self.zero_bytes_read;
-            }
-        }
+        self.position.count_bytes_in(metrics, self.zero_bytes_read);
         self.zero_bytes_read = 0;
     }
 
@@ -1331,6 +1307,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 MAX_PENDING_WINDOW_UPDATES, stream_id, increment
             );
             incr!("h2.window_update_dropped");
+            // Ensure a writable event so the existing queue gets flushed,
+            // freeing space for the dropped WINDOW_UPDATE on the next cycle.
+            self.readiness.interest.insert(Ready::WRITABLE);
         }
     }
 
@@ -1439,21 +1418,35 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         self.expect_write.is_some() || !self.zero.storage.is_empty()
     }
 
+    /// Flush the zero buffer to the socket, counting bytes as connection overhead.
+    ///
+    /// Returns `true` if the socket stalled (WouldBlock / zero-length write),
+    /// meaning the caller should stop writing and wait for the next writable event.
+    /// Returns `false` when the buffer has been fully drained.
+    fn flush_zero_to_socket(&mut self) -> bool {
+        while !self.zero.storage.is_empty() {
+            let (size, status) = self.socket.socket_write(self.zero.storage.data());
+            self.zero.storage.consume(size);
+            self.position.count_bytes_out_counter(size);
+            self.overhead_bout += size;
+            if update_readiness_after_write(size, status, &mut self.readiness) {
+                return true;
+            }
+        }
+        // Reset buffer positions after draining. consume() advances start but
+        // never resets it, so without clear() the next fill would panic.
+        self.zero.storage.clear();
+        false
+    }
+
     /// Directly flush the zero buffer to the socket without going through
     /// the full writable() path. Used during shutdown when the event loop
     /// won't deliver new epoll events for this session (edge-triggered).
     pub fn flush_zero_buffer(&mut self) {
-        while !self.zero.storage.is_empty() {
-            let (size, status) = self.socket.socket_write(self.zero.storage.data());
-            self.zero.storage.consume(size);
-            if update_readiness_after_write(size, status, &mut self.readiness) {
-                break;
-            }
+        if self.flush_zero_to_socket() {
+            return;
         }
-        if self.zero.storage.is_empty() {
-            self.zero.storage.clear();
-            self.expect_write = None;
-        }
+        self.expect_write = None;
     }
 
     pub fn create_stream<L>(
@@ -1572,14 +1565,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 let is_unlinked = matches!(stream_state, StreamState::Unlinked);
                 let parts = stream.split(&self.position);
                 let kawa = parts.rbuffer;
-                match self.position {
-                    Position::Client(..) => {
-                        parts.metrics.backend_bin += payload_len;
-                    }
-                    Position::Server => {
-                        parts.metrics.bin += payload_len;
-                    }
-                }
+                self.position.count_bytes_in(parts.metrics, payload_len);
 
                 // RFC 9113 §6.9: Update flow control after consuming DATA.
                 // Track bytes received and queue WINDOW_UPDATE when threshold reached.
@@ -1864,7 +1850,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         parser::SETTINGS_MAX_HEADER_LIST_SIZE   => { self.peer_settings.settings_max_header_list_size = v },
                         parser::SETTINGS_ENABLE_CONNECT_PROTOCOL => { self.peer_settings.settings_enable_connect_protocol = v == 1; is_error |= v > 1 },
                         parser::SETTINGS_NO_RFC7540_PRIORITIES   => { self.peer_settings.settings_no_rfc7540_priorities = v == 1;   is_error |= v > 1 },
-                        other => warn!("Unknown setting_id: {}, we MUST ignore this", other),
+                        other => { warn!("Unknown setting_id: {}, we MUST ignore this", other); self.flood_detector.glitch_count += 1 },
                     };
                     if is_error {
                         error!("INVALID SETTING");
@@ -1975,7 +1961,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                             "GOAWAY: stream {} already consumed, cannot retry",
                             stream_id
                         );
-                        let front_readiness = endpoint.readiness_mut(mio::Token(0));
+                        let front_readiness = endpoint.readiness_mut(GOAWAY_SENTINEL_TOKEN);
                         forcefully_terminate_answer(
                             stream,
                             front_readiness,

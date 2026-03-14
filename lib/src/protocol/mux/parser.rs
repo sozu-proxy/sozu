@@ -281,36 +281,6 @@ pub enum Frame {
     Continuation(Continuation),
 }
 
-impl Frame {
-    #[allow(dead_code)]
-    pub fn is_stream_specific(&self) -> bool {
-        match self {
-            Frame::Data(_)
-            | Frame::Headers(_)
-            | Frame::Priority(_)
-            | Frame::RstStream(_)
-            | Frame::PushPromise(_)
-            | Frame::Continuation(_) => true,
-            Frame::Settings(_) | Frame::Ping(_) | Frame::GoAway(_) => false,
-            Frame::WindowUpdate(w) => w.stream_id != 0,
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn stream_id(&self) -> u32 {
-        match self {
-            Frame::Data(d) => d.stream_id,
-            Frame::Headers(h) => h.stream_id,
-            Frame::Priority(p) => p.stream_id,
-            Frame::RstStream(r) => r.stream_id,
-            Frame::PushPromise(p) => p._stream_id,
-            Frame::Continuation(c) => c._stream_id,
-            Frame::Settings(_) | Frame::Ping(_) | Frame::GoAway(_) => 0,
-            Frame::WindowUpdate(w) => w.stream_id,
-        }
-    }
-}
-
 pub fn frame_body<'a>(
     i: &'a [u8],
     header: &FrameHeader,

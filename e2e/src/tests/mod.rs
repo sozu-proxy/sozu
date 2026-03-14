@@ -1,6 +1,10 @@
+mod h1_security_tests;
+mod h2_security_tests;
 mod h2_tests;
 mod mux_tests;
+mod tcp_tests;
 mod tests;
+mod tls_tests;
 
 use std::{
     io::stdin,

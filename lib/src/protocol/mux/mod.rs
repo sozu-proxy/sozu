@@ -302,9 +302,38 @@ impl Position {
         }
     }
     fn is_client(&self) -> bool {
+        !self.is_server()
+    }
+
+    /// Increment the global `count!()` counter for bytes read on this side.
+    pub fn count_bytes_in_counter(&self, size: usize) {
         match self {
-            Position::Client(..) => true,
-            Position::Server => false,
+            Position::Client(..) => count!("back_bytes_in", size as i64),
+            Position::Server => count!("bytes_in", size as i64),
+        }
+    }
+
+    /// Increment the global `count!()` counter for bytes written on this side.
+    pub fn count_bytes_out_counter(&self, size: usize) {
+        match self {
+            Position::Client(..) => count!("back_bytes_out", size as i64),
+            Position::Server => count!("bytes_out", size as i64),
+        }
+    }
+
+    /// Attribute `size` bytes read to the appropriate `SessionMetrics` field.
+    pub fn count_bytes_in(&self, metrics: &mut SessionMetrics, size: usize) {
+        match self {
+            Position::Client(..) => metrics.backend_bin += size,
+            Position::Server => metrics.bin += size,
+        }
+    }
+
+    /// Attribute `size` bytes written to the appropriate `SessionMetrics` field.
+    pub fn count_bytes_out(&self, metrics: &mut SessionMetrics, size: usize) {
+        match self {
+            Position::Client(..) => metrics.backend_bout += size,
+            Position::Server => metrics.bout += size,
         }
     }
 }
