@@ -1095,6 +1095,9 @@ impl Stream {
             bytes_in: self.metrics.bin,
             bytes_out: self.metrics.bout,
             user_agent: context.user_agent.as_deref(),
+            #[cfg(feature = "opentelemetry")]
+            otel: context.otel.as_ref(),
+            #[cfg(not(feature = "opentelemetry"))]
             otel: None,
         };
         self.metrics.register_end_of_session(&context.log_context());
