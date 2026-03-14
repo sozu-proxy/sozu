@@ -1188,17 +1188,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                                         context.debug.set_interesting(false);
                                     }
                                     trace!("Recycle1 stream: {}", global_stream_id);
-                                    incr!("http.e2e.h2");
-                                    stream.metrics.backend_stop();
-                                    stream.generate_access_log(
-                                        false,
-                                        Some("H2::Complete"),
+                                    let token = Self::complete_server_stream(
+                                        stream,
                                         context.listener.clone(),
                                     );
-                                    stream.metrics.reset();
-                                    let state =
-                                        std::mem::replace(&mut stream.state, StreamState::Recycle);
-                                    if let StreamState::Linked(token) = state {
+                                    if let Some(token) = token {
                                         endpoint.end_stream(token, global_stream_id, context);
                                     }
                                     dead_streams.push(*stream_id);
@@ -1864,6 +1858,12 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     }
                     // RFC 9113 §6.5: peer acknowledged our SETTINGS — clear timeout
                     self.settings_sent_at = None;
+                    // RFC 7541 §4.2: sync the decoder's max allowed table size with
+                    // what we advertised. Currently a no-op (settings don't change at
+                    // runtime), but guards against future runtime SETTINGS updates.
+                    self.decoder.set_max_allowed_table_size(
+                        self.local_settings.settings_header_table_size as usize,
+                    );
                     self.attribute_bytes_to_overhead();
                     return MuxResult::Continue;
                 }
