@@ -509,6 +509,243 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         self.state = H2State::Header;
         self.expect_read = Some((H2StreamId::Zero, 9));
     }
+
+    /// Process the `H2State::Header` state: parse a 9-byte frame header from
+    /// `self.zero`, validate the stream, create new streams if needed, and
+    /// transition to `H2State::Frame` for the payload.
+    ///
+    /// Returns `MuxResult` — the caller should propagate the result directly.
+    fn handle_header_state<L>(&mut self, context: &mut Context<L>) -> MuxResult
+    where
+        L: ListenerHandler + L7ListenerHandler,
+    {
+        let i = self.zero.storage.data();
+        trace!("  header: {:?}", i);
+        match parser::frame_header(i, self.local_settings.settings_max_frame_size) {
+            Ok((_, header)) => {
+                trace!("{:#?}", header);
+                self.zero.storage.clear();
+                let stream_id = header.stream_id;
+                let read_stream = if stream_id == 0 {
+                    H2StreamId::Zero
+                } else if let Some(global_stream_id) = self.streams.get(&stream_id) {
+                    let allowed_on_half_closed = header.frame_type == FrameType::WindowUpdate
+                        || header.frame_type == FrameType::Priority
+                        || header.frame_type == FrameType::RstStream;
+                    let stream = &context.streams[*global_stream_id];
+                    // Use the position-aware end_of_stream flag:
+                    // - Server reads from front (client requests)
+                    // - Client reads from back (backend responses)
+                    let received_eos = if self.position.is_server() {
+                        stream.front_received_end_of_stream
+                    } else {
+                        stream.back_received_end_of_stream
+                    };
+                    trace!(
+                        "REQUESTING EXISTING STREAM {}: {}/{:?}",
+                        stream_id, received_eos, stream.state
+                    );
+                    if !allowed_on_half_closed && (received_eos || !stream.state.is_open()) {
+                        error!(
+                            "CANNOT RECEIVE {:?} ON THIS STREAM {:?}",
+                            header.frame_type, stream.state
+                        );
+                        return self.goaway(H2Error::StreamClosed);
+                    }
+                    if header.frame_type == FrameType::Data {
+                        H2StreamId::Other(stream_id, *global_stream_id)
+                    } else {
+                        H2StreamId::Zero
+                    }
+                } else {
+                    if header.frame_type == FrameType::Headers
+                        && self.position.is_server()
+                        && stream_id % 2 == 1
+                        && stream_id >= self.last_stream_id
+                    {
+                        if self.streams.len()
+                            >= self.local_settings.settings_max_concurrent_streams as usize
+                        {
+                            error!(
+                                "MAX CONCURRENT STREAMS: limit={}, current={}",
+                                self.local_settings.settings_max_concurrent_streams,
+                                self.streams.len()
+                            );
+                            // RFC 9113 §5.1.2: refuse with RST_STREAM, not GOAWAY.
+                            // Queue the RST_STREAM for the writable path to send
+                            // (can't write to kawa.storage here because we also
+                            // need to discard the HEADERS payload through it).
+                            self.pending_rst_streams
+                                .push((stream_id, H2Error::RefusedStream));
+                            self.readiness.interest.insert(Ready::WRITABLE);
+                            // Discard the HEADERS payload before reading the
+                            // next frame — otherwise the HPACK bytes would be
+                            // misinterpreted as a frame header.
+                            self.state = H2State::Discard;
+                            self.expect_read =
+                                Some((H2StreamId::Zero, header.payload_len as usize));
+                            return MuxResult::Continue;
+                        }
+                        match self.create_stream(stream_id, context) {
+                            Some(_) => {}
+                            None => {
+                                // Buffer pool exhaustion is transient — refuse
+                                // this stream but keep the connection alive so
+                                // existing streams can complete and free buffers.
+                                error!(
+                                    "Could not create stream {}: buffer pool exhausted",
+                                    stream_id
+                                );
+                                self.pending_rst_streams
+                                    .push((stream_id, H2Error::RefusedStream));
+                                self.readiness.interest.insert(Ready::WRITABLE);
+                                // Discard the HEADERS payload (same as
+                                // MAX_CONCURRENT_STREAMS path above).
+                                self.state = H2State::Discard;
+                                self.expect_read =
+                                    Some((H2StreamId::Zero, header.payload_len as usize));
+                                return MuxResult::Continue;
+                            }
+                        }
+                    } else if header.frame_type != FrameType::Priority {
+                        // Distinguish closed vs idle: if stream_id <=
+                        // highest_peer_stream_id, the stream existed and is
+                        // now closed; otherwise it was never opened (idle).
+                        let is_closed_stream = header.stream_id <= self.highest_peer_stream_id;
+                        if is_closed_stream {
+                            match header.frame_type {
+                                FrameType::RstStream | FrameType::WindowUpdate => {
+                                    // RFC 9113 §5.1: RST_STREAM and WINDOW_UPDATE
+                                    // on a closed stream can arrive due to race
+                                    // conditions and should be consumed/discarded.
+                                    debug!(
+                                        "Ignoring {:?} on closed stream {}",
+                                        header.frame_type, header.stream_id
+                                    );
+                                    self.flood_detector.glitch_count += 1;
+                                    if let Some(error) = self.flood_detector.check_flood() {
+                                        return self.goaway(error);
+                                    }
+                                }
+                                FrameType::Data => {
+                                    // RFC 9113 §5.1: DATA on a closed stream is a
+                                    // stream error of type STREAM_CLOSED. Queue
+                                    // RST_STREAM (not GOAWAY) to preserve the
+                                    // connection for other streams. The payload is
+                                    // still routed through stream 0 so handle_frame
+                                    // can do connection-level flow control accounting.
+                                    debug!(
+                                        "DATA on closed stream {}, sending RST_STREAM(STREAM_CLOSED)",
+                                        header.stream_id
+                                    );
+                                    self.flood_detector.glitch_count += 1;
+                                    if let Some(error) = self.flood_detector.check_flood() {
+                                        return self.goaway(error);
+                                    }
+                                    self.pending_rst_streams
+                                        .push((header.stream_id, H2Error::StreamClosed));
+                                    self.readiness.interest.insert(Ready::WRITABLE);
+                                }
+                                _ => {
+                                    // RFC 9113 §5.1: HEADERS or other frames on a
+                                    // closed stream → connection error STREAM_CLOSED.
+                                    error!(
+                                        "Received {:?} on closed stream {}, sending GOAWAY(STREAM_CLOSED)",
+                                        header.frame_type, header.stream_id
+                                    );
+                                    return self.goaway(H2Error::StreamClosed);
+                                }
+                            }
+                        } else {
+                            error!(
+                                "Received {:?} on idle stream {}, sending GOAWAY(PROTOCOL_ERROR)",
+                                header.frame_type, header.stream_id
+                            );
+                            return self.goaway(H2Error::ProtocolError);
+                        }
+                    }
+                    H2StreamId::Zero
+                };
+                trace!("{} {:?} {:#?}", header.stream_id, stream_id, self.streams);
+                self.expect_read = Some((read_stream, header.payload_len as usize));
+                self.state = H2State::Frame(header);
+            }
+            Err(nom::Err::Failure(ParserError {
+                kind: ParserErrorKind::UnknownFrame(skip),
+                ..
+            })) => {
+                self.expect_read = Some((H2StreamId::Zero, skip as usize));
+                self.state = H2State::Discard;
+            }
+            Err(error) => {
+                let error = error_nom_to_h2(error);
+                error!("COULD NOT PARSE FRAME HEADER");
+                return self.goaway(error);
+            }
+        };
+        MuxResult::Continue
+    }
+
+    /// Process the `H2State::ContinuationHeader` state: parse a CONTINUATION
+    /// frame header from `self.zero`, validate stream ID continuity, track
+    /// flood detection counters, and transition to `ContinuationFrame`.
+    ///
+    /// The `headers` parameter is the accumulated HEADERS context from the
+    /// initial HEADERS frame (cloned from the state enum to avoid borrow
+    /// conflicts).
+    fn handle_continuation_header_state(&mut self, headers: &Headers) -> MuxResult {
+        let i = self.zero.storage.unparsed_data();
+        trace!("  continuation header: {:?}", i);
+        match parser::frame_header(i, self.local_settings.settings_max_frame_size) {
+            Ok((
+                _,
+                FrameHeader {
+                    payload_len,
+                    frame_type: FrameType::Continuation,
+                    flags,
+                    stream_id,
+                },
+            )) => {
+                if self.zero.storage.end < 9 {
+                    error!(
+                        "CONTINUATION header: storage.end ({}) too small to remove frame header",
+                        self.zero.storage.end
+                    );
+                    return self.goaway(H2Error::InternalError);
+                }
+                self.zero.storage.end -= 9;
+                if stream_id != headers.stream_id {
+                    error!(
+                        "CONTINUATION stream_id {} does not match HEADERS stream_id {}",
+                        stream_id, headers.stream_id
+                    );
+                    return self.goaway(H2Error::ProtocolError);
+                }
+                // CVE-2024-27316: track CONTINUATION frame count and accumulated size
+                self.flood_detector.continuation_count += 1;
+                self.flood_detector.accumulated_header_size += payload_len;
+                if let Some(error) = self.flood_detector.check_flood() {
+                    return self.goaway(error);
+                }
+                self.expect_read = Some((H2StreamId::Zero, payload_len as usize));
+                let mut headers = headers.clone();
+                headers.end_headers = flags & parser::FLAG_END_HEADERS != 0;
+                headers.header_block_fragment.len += payload_len;
+                self.state = H2State::ContinuationFrame(headers);
+            }
+            Err(error) => {
+                let error = error_nom_to_h2(error);
+                error!("COULD NOT PARSE CONTINUATION HEADER");
+                return self.goaway(error);
+            }
+            other => {
+                error!("UNEXPECTED {:?} WHILE PARSING CONTINUATION HEADER", other);
+                return self.goaway(H2Error::ProtocolError);
+            }
+        };
+        MuxResult::Continue
+    }
+
     pub fn readable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
     where
         E: Endpoint,
@@ -679,224 +916,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 };
             }
             (H2State::Header, _) => {
-                let i = kawa.storage.data();
-                trace!("  header: {:?}", i);
-                match parser::frame_header(i, self.local_settings.settings_max_frame_size) {
-                    Ok((_, header)) => {
-                        trace!("{:#?}", header);
-                        kawa.storage.clear();
-                        let stream_id = header.stream_id;
-                        let read_stream = if stream_id == 0 {
-                            H2StreamId::Zero
-                        } else if let Some(global_stream_id) = self.streams.get(&stream_id) {
-                            let allowed_on_half_closed = header.frame_type
-                                == FrameType::WindowUpdate
-                                || header.frame_type == FrameType::Priority
-                                || header.frame_type == FrameType::RstStream;
-                            let stream = &context.streams[*global_stream_id];
-                            // Use the position-aware end_of_stream flag:
-                            // - Server reads from front (client requests)
-                            // - Client reads from back (backend responses)
-                            let received_eos = if self.position.is_server() {
-                                stream.front_received_end_of_stream
-                            } else {
-                                stream.back_received_end_of_stream
-                            };
-                            trace!(
-                                "REQUESTING EXISTING STREAM {}: {}/{:?}",
-                                stream_id, received_eos, stream.state
-                            );
-                            if !allowed_on_half_closed && (received_eos || !stream.state.is_open())
-                            {
-                                error!(
-                                    "CANNOT RECEIVE {:?} ON THIS STREAM {:?}",
-                                    header.frame_type, stream.state
-                                );
-                                return self.goaway(H2Error::StreamClosed);
-                            }
-                            if header.frame_type == FrameType::Data {
-                                H2StreamId::Other(stream_id, *global_stream_id)
-                            } else {
-                                H2StreamId::Zero
-                            }
-                        } else {
-                            if header.frame_type == FrameType::Headers
-                                && self.position.is_server()
-                                && stream_id % 2 == 1
-                                && stream_id >= self.last_stream_id
-                            {
-                                if self.streams.len()
-                                    >= self.local_settings.settings_max_concurrent_streams as usize
-                                {
-                                    error!(
-                                        "MAX CONCURRENT STREAMS: limit={}, current={}",
-                                        self.local_settings.settings_max_concurrent_streams,
-                                        self.streams.len()
-                                    );
-                                    // RFC 9113 §5.1.2: refuse with RST_STREAM, not GOAWAY.
-                                    // Queue the RST_STREAM for the writable path to send
-                                    // (can't write to kawa.storage here because we also
-                                    // need to discard the HEADERS payload through it).
-                                    self.pending_rst_streams
-                                        .push((stream_id, H2Error::RefusedStream));
-                                    self.readiness.interest.insert(Ready::WRITABLE);
-                                    // Discard the HEADERS payload before reading the
-                                    // next frame — otherwise the HPACK bytes would be
-                                    // misinterpreted as a frame header.
-                                    self.state = H2State::Discard;
-                                    self.expect_read =
-                                        Some((H2StreamId::Zero, header.payload_len as usize));
-                                    return MuxResult::Continue;
-                                }
-                                match self.create_stream(stream_id, context) {
-                                    Some(_) => {}
-                                    None => {
-                                        // Buffer pool exhaustion is transient — refuse
-                                        // this stream but keep the connection alive so
-                                        // existing streams can complete and free buffers.
-                                        error!(
-                                            "Could not create stream {}: buffer pool exhausted",
-                                            stream_id
-                                        );
-                                        self.pending_rst_streams
-                                            .push((stream_id, H2Error::RefusedStream));
-                                        self.readiness.interest.insert(Ready::WRITABLE);
-                                        // Discard the HEADERS payload (same as
-                                        // MAX_CONCURRENT_STREAMS path above).
-                                        self.state = H2State::Discard;
-                                        self.expect_read =
-                                            Some((H2StreamId::Zero, header.payload_len as usize));
-                                        return MuxResult::Continue;
-                                    }
-                                }
-                            } else if header.frame_type != FrameType::Priority {
-                                // Distinguish closed vs idle: if stream_id <=
-                                // highest_peer_stream_id, the stream existed and is
-                                // now closed; otherwise it was never opened (idle).
-                                let is_closed_stream =
-                                    header.stream_id <= self.highest_peer_stream_id;
-                                if is_closed_stream {
-                                    match header.frame_type {
-                                        FrameType::RstStream | FrameType::WindowUpdate => {
-                                            // RFC 9113 §5.1: RST_STREAM and WINDOW_UPDATE
-                                            // on a closed stream can arrive due to race
-                                            // conditions and should be consumed/discarded.
-                                            debug!(
-                                                "Ignoring {:?} on closed stream {}",
-                                                header.frame_type, header.stream_id
-                                            );
-                                            self.flood_detector.glitch_count += 1;
-                                            if let Some(error) = self.flood_detector.check_flood() {
-                                                return self.goaway(error);
-                                            }
-                                        }
-                                        FrameType::Data => {
-                                            // RFC 9113 §5.1: DATA on a closed stream is a
-                                            // stream error of type STREAM_CLOSED. Queue
-                                            // RST_STREAM (not GOAWAY) to preserve the
-                                            // connection for other streams. The payload is
-                                            // still routed through stream 0 so handle_frame
-                                            // can do connection-level flow control accounting.
-                                            debug!(
-                                                "DATA on closed stream {}, sending RST_STREAM(STREAM_CLOSED)",
-                                                header.stream_id
-                                            );
-                                            self.flood_detector.glitch_count += 1;
-                                            if let Some(error) = self.flood_detector.check_flood() {
-                                                return self.goaway(error);
-                                            }
-                                            self.pending_rst_streams
-                                                .push((header.stream_id, H2Error::StreamClosed));
-                                            self.readiness.interest.insert(Ready::WRITABLE);
-                                        }
-                                        _ => {
-                                            // RFC 9113 §5.1: HEADERS or other frames on a
-                                            // closed stream → connection error STREAM_CLOSED.
-                                            error!(
-                                                "Received {:?} on closed stream {}, sending GOAWAY(STREAM_CLOSED)",
-                                                header.frame_type, header.stream_id
-                                            );
-                                            return self.goaway(H2Error::StreamClosed);
-                                        }
-                                    }
-                                } else {
-                                    error!(
-                                        "Received {:?} on idle stream {}, sending GOAWAY(PROTOCOL_ERROR)",
-                                        header.frame_type, header.stream_id
-                                    );
-                                    return self.goaway(H2Error::ProtocolError);
-                                }
-                            }
-                            H2StreamId::Zero
-                        };
-                        trace!("{} {:?} {:#?}", header.stream_id, stream_id, self.streams);
-                        self.expect_read = Some((read_stream, header.payload_len as usize));
-                        self.state = H2State::Frame(header);
-                    }
-                    Err(nom::Err::Failure(ParserError {
-                        kind: ParserErrorKind::UnknownFrame(skip),
-                        ..
-                    })) => {
-                        self.expect_read = Some((H2StreamId::Zero, skip as usize));
-                        self.state = H2State::Discard;
-                    }
-                    Err(error) => {
-                        let error = error_nom_to_h2(error);
-                        error!("COULD NOT PARSE FRAME HEADER");
-                        return self.goaway(error);
-                    }
-                };
+                return self.handle_header_state(context);
             }
             (H2State::ContinuationHeader(headers), _) => {
-                let i = kawa.storage.unparsed_data();
-                trace!("  continuation header: {:?}", i);
-                match parser::frame_header(i, self.local_settings.settings_max_frame_size) {
-                    Ok((
-                        _,
-                        FrameHeader {
-                            payload_len,
-                            frame_type: FrameType::Continuation,
-                            flags,
-                            stream_id,
-                        },
-                    )) => {
-                        if kawa.storage.end < 9 {
-                            error!(
-                                "CONTINUATION header: storage.end ({}) too small to remove frame header",
-                                kawa.storage.end
-                            );
-                            return self.goaway(H2Error::InternalError);
-                        }
-                        kawa.storage.end -= 9;
-                        if stream_id != headers.stream_id {
-                            error!(
-                                "CONTINUATION stream_id {} does not match HEADERS stream_id {}",
-                                stream_id, headers.stream_id
-                            );
-                            return self.goaway(H2Error::ProtocolError);
-                        }
-                        // CVE-2024-27316: track CONTINUATION frame count and accumulated size
-                        self.flood_detector.continuation_count += 1;
-                        self.flood_detector.accumulated_header_size += payload_len;
-                        if let Some(error) = self.flood_detector.check_flood() {
-                            return self.goaway(error);
-                        }
-                        self.expect_read = Some((H2StreamId::Zero, payload_len as usize));
-                        let mut headers = headers.clone();
-                        headers.end_headers = flags & parser::FLAG_END_HEADERS != 0;
-                        headers.header_block_fragment.len += payload_len;
-                        self.state = H2State::ContinuationFrame(headers);
-                    }
-                    Err(error) => {
-                        let error = error_nom_to_h2(error);
-                        error!("COULD NOT PARSE CONTINUATION HEADER");
-                        return self.goaway(error);
-                    }
-                    other => {
-                        error!("UNEXPECTED {:?} WHILE PARSING CONTINUATION HEADER", other);
-                        return self.goaway(H2Error::ProtocolError);
-                    }
-                };
+                let headers = headers.clone();
+                return self.handle_continuation_header_state(&headers);
             }
             (H2State::Frame(header), _) => {
                 let i = kawa.storage.unparsed_data();
@@ -927,6 +951,248 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 self.expect_header();
                 return self.handle_frame(Frame::Headers(headers), context, endpoint);
             }
+        }
+        MuxResult::Continue
+    }
+
+    /// Write application data (request/response bodies, headers) across all
+    /// active streams, respecting priority ordering and flow control.
+    ///
+    /// This is the main data-plane write path: it resumes any partially-written
+    /// stream, prepares new frames via the H2 block converter, flushes them to
+    /// the socket, and recycles completed streams.
+    ///
+    /// NOTE: The priority iteration loop and converter setup remain inline here
+    /// because the converter borrows `self.encoder`, preventing further
+    /// decomposition into `&mut self` methods within the loop body.
+    fn write_streams<E, L>(&mut self, context: &mut Context<L>, mut endpoint: E) -> MuxResult
+    where
+        E: Endpoint,
+        L: ListenerHandler + L7ListenerHandler,
+    {
+        self.timeout_container.reset();
+        let mut dead_streams = Vec::new();
+        // Pre-compute byte totals for proportional overhead distribution.
+        let byte_totals = self.compute_stream_byte_totals(context);
+
+        if let Some(write_stream @ H2StreamId::Other(stream_id, global_stream_id)) =
+            self.expect_write
+        {
+            let stream = &mut context.streams[global_stream_id];
+            let _stream_state = stream.state;
+            let parts = stream.split(&self.position);
+            let kawa = parts.wbuffer;
+            while !kawa.out.is_empty() {
+                let bufs = kawa.as_io_slice();
+                let (size, status) = self.socket.socket_write_vectored(&bufs);
+                context
+                    .debug
+                    .push(DebugEvent::I3(2, global_stream_id, size));
+                kawa.consume(size);
+                self.position.count_bytes_out_counter(size);
+                self.position.count_bytes_out(parts.metrics, size);
+                if let Some((read_stream, amount)) = self.expect_read {
+                    if write_stream == read_stream && kawa.storage.available_space() >= amount {
+                        self.readiness.interest.insert(Ready::READABLE);
+                    }
+                }
+                if update_readiness_after_write(size, status, &mut self.readiness) {
+                    return MuxResult::Continue;
+                }
+            }
+            self.expect_write = None;
+            if (kawa.is_terminated() || kawa.is_error()) && kawa.is_completed() {
+                match self.position {
+                    Position::Client(..) => {}
+                    Position::Server => {
+                        // Don't recycle if the client hasn't sent END_STREAM yet —
+                        // more DATA frames may arrive for this stream.
+                        if !stream.front_received_end_of_stream {
+                            trace!(
+                                "Defer recycle stream {}: client still sending",
+                                global_stream_id
+                            );
+                        } else {
+                            self.distribute_overhead(&mut stream.metrics, byte_totals);
+                            context.debug.push(DebugEvent::I2(4, global_stream_id));
+                            trace!("Recycle stream: {}", global_stream_id);
+                            let token =
+                                Self::complete_server_stream(stream, context.listener.clone());
+                            if let Some(token) = token {
+                                endpoint.end_stream(token, global_stream_id, context);
+                            }
+                            dead_streams.push(stream_id);
+                        }
+                    }
+                }
+            }
+        }
+
+        // H2 flow control observability
+        gauge!(
+            "h2.connection_window",
+            self.flow_control.window.max(0) as usize
+        );
+        gauge!("h2.active_streams", self.streams.len());
+        gauge!(
+            "h2.pending_window_updates",
+            self.flow_control.pending_window_updates.len()
+        );
+
+        let scheme: &'static [u8] = if context.listener.borrow().protocol() == Protocol::HTTPS {
+            b"https"
+        } else {
+            b"http"
+        };
+        let mut converter_buf = std::mem::take(&mut self.converter_buf);
+        converter_buf.clear();
+        let mut converter = converter::H2BlockConverter {
+            max_frame_size: self.peer_settings.settings_max_frame_size as usize,
+            window: 0,
+            stream_id: 0,
+            encoder: &mut self.encoder,
+            out: converter_buf,
+            scheme,
+            lowercase_buf: std::mem::take(&mut self.lowercase_buf),
+        };
+        let mut priorities = self.streams.keys().collect::<Vec<_>>();
+        priorities.sort_by(|a, b| {
+            let (ua, _) = self.prioriser.get(a);
+            let (ub, _) = self.prioriser.get(b);
+            ua.cmp(&ub).then_with(|| a.cmp(b))
+        });
+
+        trace!("PRIORITIES: {:?}", priorities);
+        let mut socket_write = false;
+        'outer: for stream_id in priorities {
+            let Some(&global_stream_id) = self.streams.get(stream_id) else {
+                error!(
+                    "stream_id {} from sorted keys missing in streams map",
+                    stream_id
+                );
+                continue;
+            };
+            let stream = &mut context.streams[global_stream_id];
+            let parts = stream.split(&self.position);
+            let kawa = parts.wbuffer;
+            if kawa.is_main_phase() || (kawa.is_error() && !self.rst_sent.contains(stream_id)) {
+                let window = min(*parts.window, self.flow_control.window);
+                converter.window = window;
+                converter.stream_id = *stream_id;
+                // Track RST_STREAM dedup: if kawa is in error state, the converter
+                // will generate a RST_STREAM frame. Mark it so we don't send a
+                // duplicate on the next writable cycle.
+                if kawa.is_error() {
+                    self.rst_sent.insert(*stream_id);
+                }
+                kawa.prepare(&mut converter);
+                let consumed = window - converter.window;
+                *parts.window -= consumed;
+                self.flow_control.window -= consumed;
+            }
+            context.debug.push(DebugEvent::S(
+                *stream_id,
+                global_stream_id,
+                kawa.parsing_phase,
+                kawa.blocks.len(),
+                kawa.out.len(),
+            ));
+            while !kawa.out.is_empty() {
+                socket_write = true;
+                let bufs = kawa.as_io_slice();
+                let (size, status) = self.socket.socket_write_vectored(&bufs);
+                context
+                    .debug
+                    .push(DebugEvent::I3(3, global_stream_id, size));
+                kawa.consume(size);
+                self.position.count_bytes_out_counter(size);
+                self.position.count_bytes_out(parts.metrics, size);
+                if update_readiness_after_write(size, status, &mut self.readiness) {
+                    self.expect_write = Some(H2StreamId::Other(*stream_id, global_stream_id));
+                    break 'outer;
+                }
+            }
+            self.expect_write = None;
+            if (kawa.is_terminated() || kawa.is_error()) && kawa.is_completed() {
+                match self.position {
+                    Position::Client(..) => {}
+                    Position::Server => {
+                        // Don't recycle if the client hasn't sent END_STREAM yet —
+                        // more DATA frames may arrive for this stream.
+                        if !stream.front_received_end_of_stream {
+                            trace!(
+                                "Defer recycle1 stream {}: client still sending",
+                                global_stream_id
+                            );
+                        } else {
+                            {
+                                let stream_bytes = (
+                                    stream.metrics.bin + stream.metrics.backend_bin,
+                                    stream.metrics.bout + stream.metrics.backend_bout,
+                                );
+                                distribute_overhead(
+                                    &mut stream.metrics,
+                                    &mut self.bytes.overhead_bin,
+                                    &mut self.bytes.overhead_bout,
+                                    stream_bytes,
+                                    byte_totals,
+                                    self.streams.len(),
+                                );
+                            }
+                            // mark stream as reusable
+                            context.debug.push(DebugEvent::I2(5, global_stream_id));
+                            if context.debug.is_interesting() {
+                                warn!("{:?}", context.debug.events);
+                                context.debug.set_interesting(false);
+                            }
+                            trace!("Recycle1 stream: {}", global_stream_id);
+                            let token =
+                                Self::complete_server_stream(stream, context.listener.clone());
+                            if let Some(token) = token {
+                                endpoint.end_stream(token, global_stream_id, context);
+                            }
+                            dead_streams.push(*stream_id);
+                        }
+                    }
+                }
+            }
+        }
+        for stream_id in dead_streams {
+            if self.streams.remove(&stream_id).is_none() {
+                error!("dead stream_id {} missing from streams map", stream_id);
+            }
+            self.rst_sent.remove(&stream_id);
+            self.prioriser.remove(&stream_id);
+        }
+
+        // Reclaim the converter's reusable buffers
+        self.converter_buf = converter.out;
+        self.lowercase_buf = converter.lowercase_buf;
+        if self.converter_buf.capacity() > 16_384 {
+            self.converter_buf.shrink_to(4096);
+        }
+        if self.lowercase_buf.capacity() > 16_384 {
+            self.lowercase_buf.shrink_to(4096);
+        }
+
+        // RFC 9113 §6.8: if draining and all streams have completed,
+        // send the final GOAWAY with the actual last_stream_id
+        if self.drain.draining && self.streams.is_empty() {
+            return self.graceful_goaway();
+        }
+
+        if self.socket.socket_wants_write() {
+            if !socket_write {
+                self.socket.socket_write(&[]);
+            }
+        } else if self.expect_write.is_none() {
+            // We wrote everything
+            #[cfg(debug_assertions)]
+            context.debug.push(DebugEvent::Str(format!(
+                "Wrote everything: {:?}",
+                self.streams
+            )));
+            self.readiness.interest.remove(Ready::WRITABLE);
         }
         MuxResult::Continue
     }
@@ -1047,7 +1313,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         None
     }
 
-    pub fn writable<E, L>(&mut self, context: &mut Context<L>, mut endpoint: E) -> MuxResult
+    pub fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
     where
         E: Endpoint,
         L: ListenerHandler + L7ListenerHandler,
@@ -1119,243 +1385,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             (H2State::Header, _)
             | (H2State::Frame(_), _)
             | (H2State::ContinuationFrame(_), _)
-            | (H2State::ContinuationHeader(_), _) => {
-                self.timeout_container.reset();
-                let mut dead_streams = Vec::new();
-                // Pre-compute byte totals for proportional overhead distribution.
-                let byte_totals = self.compute_stream_byte_totals(context);
-
-                if let Some(write_stream @ H2StreamId::Other(stream_id, global_stream_id)) =
-                    self.expect_write
-                {
-                    let stream = &mut context.streams[global_stream_id];
-                    let _stream_state = stream.state;
-                    let parts = stream.split(&self.position);
-                    let kawa = parts.wbuffer;
-                    while !kawa.out.is_empty() {
-                        let bufs = kawa.as_io_slice();
-                        let (size, status) = self.socket.socket_write_vectored(&bufs);
-                        context
-                            .debug
-                            .push(DebugEvent::I3(2, global_stream_id, size));
-                        kawa.consume(size);
-                        self.position.count_bytes_out_counter(size);
-                        self.position.count_bytes_out(parts.metrics, size);
-                        if let Some((read_stream, amount)) = self.expect_read {
-                            if write_stream == read_stream
-                                && kawa.storage.available_space() >= amount
-                            {
-                                self.readiness.interest.insert(Ready::READABLE);
-                            }
-                        }
-                        if update_readiness_after_write(size, status, &mut self.readiness) {
-                            return MuxResult::Continue;
-                        }
-                    }
-                    self.expect_write = None;
-                    if (kawa.is_terminated() || kawa.is_error()) && kawa.is_completed() {
-                        match self.position {
-                            Position::Client(..) => {}
-                            Position::Server => {
-                                // Don't recycle if the client hasn't sent END_STREAM yet —
-                                // more DATA frames may arrive for this stream.
-                                if !stream.front_received_end_of_stream {
-                                    trace!(
-                                        "Defer recycle stream {}: client still sending",
-                                        global_stream_id
-                                    );
-                                } else {
-                                    self.distribute_overhead(&mut stream.metrics, byte_totals);
-                                    context.debug.push(DebugEvent::I2(4, global_stream_id));
-                                    trace!("Recycle stream: {}", global_stream_id);
-                                    let token = Self::complete_server_stream(
-                                        stream,
-                                        context.listener.clone(),
-                                    );
-                                    if let Some(token) = token {
-                                        endpoint.end_stream(token, global_stream_id, context);
-                                    }
-                                    dead_streams.push(stream_id);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // H2 flow control observability
-                gauge!(
-                    "h2.connection_window",
-                    self.flow_control.window.max(0) as usize
-                );
-                gauge!("h2.active_streams", self.streams.len());
-                gauge!(
-                    "h2.pending_window_updates",
-                    self.flow_control.pending_window_updates.len()
-                );
-
-                let scheme: &'static [u8] =
-                    if context.listener.borrow().protocol() == Protocol::HTTPS {
-                        b"https"
-                    } else {
-                        b"http"
-                    };
-                let mut converter_buf = std::mem::take(&mut self.converter_buf);
-                converter_buf.clear();
-                let mut converter = converter::H2BlockConverter {
-                    max_frame_size: self.peer_settings.settings_max_frame_size as usize,
-                    window: 0,
-                    stream_id: 0,
-                    encoder: &mut self.encoder,
-                    out: converter_buf,
-                    scheme,
-                    lowercase_buf: std::mem::take(&mut self.lowercase_buf),
-                };
-                let mut priorities = self.streams.keys().collect::<Vec<_>>();
-                priorities.sort_by(|a, b| {
-                    let (ua, _) = self.prioriser.get(a);
-                    let (ub, _) = self.prioriser.get(b);
-                    ua.cmp(&ub).then_with(|| a.cmp(b))
-                });
-
-                trace!("PRIORITIES: {:?}", priorities);
-                let mut socket_write = false;
-                'outer: for stream_id in priorities {
-                    let Some(&global_stream_id) = self.streams.get(stream_id) else {
-                        error!(
-                            "stream_id {} from sorted keys missing in streams map",
-                            stream_id
-                        );
-                        continue;
-                    };
-                    let stream = &mut context.streams[global_stream_id];
-                    let parts = stream.split(&self.position);
-                    let kawa = parts.wbuffer;
-                    if kawa.is_main_phase()
-                        || (kawa.is_error() && !self.rst_sent.contains(stream_id))
-                    {
-                        let window = min(*parts.window, self.flow_control.window);
-                        converter.window = window;
-                        converter.stream_id = *stream_id;
-                        // Track RST_STREAM dedup: if kawa is in error state, the converter
-                        // will generate a RST_STREAM frame. Mark it so we don't send a
-                        // duplicate on the next writable cycle.
-                        if kawa.is_error() {
-                            self.rst_sent.insert(*stream_id);
-                        }
-                        kawa.prepare(&mut converter);
-                        let consumed = window - converter.window;
-                        *parts.window -= consumed;
-                        self.flow_control.window -= consumed;
-                    }
-                    context.debug.push(DebugEvent::S(
-                        *stream_id,
-                        global_stream_id,
-                        kawa.parsing_phase,
-                        kawa.blocks.len(),
-                        kawa.out.len(),
-                    ));
-                    while !kawa.out.is_empty() {
-                        socket_write = true;
-                        let bufs = kawa.as_io_slice();
-                        let (size, status) = self.socket.socket_write_vectored(&bufs);
-                        context
-                            .debug
-                            .push(DebugEvent::I3(3, global_stream_id, size));
-                        kawa.consume(size);
-                        self.position.count_bytes_out_counter(size);
-                        self.position.count_bytes_out(parts.metrics, size);
-                        if update_readiness_after_write(size, status, &mut self.readiness) {
-                            self.expect_write =
-                                Some(H2StreamId::Other(*stream_id, global_stream_id));
-                            break 'outer;
-                        }
-                    }
-                    self.expect_write = None;
-                    if (kawa.is_terminated() || kawa.is_error()) && kawa.is_completed() {
-                        match self.position {
-                            Position::Client(..) => {}
-                            Position::Server => {
-                                // Don't recycle if the client hasn't sent END_STREAM yet —
-                                // more DATA frames may arrive for this stream.
-                                if !stream.front_received_end_of_stream {
-                                    trace!(
-                                        "Defer recycle1 stream {}: client still sending",
-                                        global_stream_id
-                                    );
-                                } else {
-                                    {
-                                        let stream_bytes = (
-                                            stream.metrics.bin + stream.metrics.backend_bin,
-                                            stream.metrics.bout + stream.metrics.backend_bout,
-                                        );
-                                        distribute_overhead(
-                                            &mut stream.metrics,
-                                            &mut self.bytes.overhead_bin,
-                                            &mut self.bytes.overhead_bout,
-                                            stream_bytes,
-                                            byte_totals,
-                                            self.streams.len(),
-                                        );
-                                    }
-                                    // mark stream as reusable
-                                    context.debug.push(DebugEvent::I2(5, global_stream_id));
-                                    if context.debug.is_interesting() {
-                                        warn!("{:?}", context.debug.events);
-                                        context.debug.set_interesting(false);
-                                    }
-                                    trace!("Recycle1 stream: {}", global_stream_id);
-                                    let token = Self::complete_server_stream(
-                                        stream,
-                                        context.listener.clone(),
-                                    );
-                                    if let Some(token) = token {
-                                        endpoint.end_stream(token, global_stream_id, context);
-                                    }
-                                    dead_streams.push(*stream_id);
-                                }
-                            }
-                        }
-                    }
-                }
-                for stream_id in dead_streams {
-                    if self.streams.remove(&stream_id).is_none() {
-                        error!("dead stream_id {} missing from streams map", stream_id);
-                    }
-                    self.rst_sent.remove(&stream_id);
-                    self.prioriser.remove(&stream_id);
-                }
-
-                // Reclaim the converter's reusable buffers
-                self.converter_buf = converter.out;
-                self.lowercase_buf = converter.lowercase_buf;
-                if self.converter_buf.capacity() > 16_384 {
-                    self.converter_buf.shrink_to(4096);
-                }
-                if self.lowercase_buf.capacity() > 16_384 {
-                    self.lowercase_buf.shrink_to(4096);
-                }
-
-                // RFC 9113 §6.8: if draining and all streams have completed,
-                // send the final GOAWAY with the actual last_stream_id
-                if self.drain.draining && self.streams.is_empty() {
-                    return self.graceful_goaway();
-                }
-
-                if self.socket.socket_wants_write() {
-                    if !socket_write {
-                        self.socket.socket_write(&[]);
-                    }
-                } else if self.expect_write.is_none() {
-                    // We wrote everything
-                    #[cfg(debug_assertions)]
-                    context.debug.push(DebugEvent::Str(format!(
-                        "Wrote everything: {:?}",
-                        self.streams
-                    )));
-                    self.readiness.interest.remove(Ready::WRITABLE);
-                }
-                MuxResult::Continue
-            }
+            | (H2State::ContinuationHeader(_), _) => self.write_streams(context, endpoint),
         }
     }
 
