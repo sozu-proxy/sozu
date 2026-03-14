@@ -542,6 +542,36 @@ impl L7ListenerHandler for HttpListener {
     fn get_answers(&self) -> &Rc<RefCell<HttpAnswers>> {
         &self.answers
     }
+
+    fn get_h2_flood_config(&self) -> crate::protocol::mux::H2FloodConfig {
+        let defaults = crate::protocol::mux::H2FloodConfig::default();
+        crate::protocol::mux::H2FloodConfig {
+            max_rst_stream_per_window: self
+                .config
+                .h2_max_rst_stream_per_window
+                .unwrap_or(defaults.max_rst_stream_per_window),
+            max_ping_per_window: self
+                .config
+                .h2_max_ping_per_window
+                .unwrap_or(defaults.max_ping_per_window),
+            max_settings_per_window: self
+                .config
+                .h2_max_settings_per_window
+                .unwrap_or(defaults.max_settings_per_window),
+            max_empty_data_per_window: self
+                .config
+                .h2_max_empty_data_per_window
+                .unwrap_or(defaults.max_empty_data_per_window),
+            max_continuation_frames: self
+                .config
+                .h2_max_continuation_frames
+                .unwrap_or(defaults.max_continuation_frames),
+            max_glitch_count: self
+                .config
+                .h2_max_glitch_count
+                .unwrap_or(defaults.max_glitch_count),
+        }
+    }
 }
 
 pub struct HttpProxy {

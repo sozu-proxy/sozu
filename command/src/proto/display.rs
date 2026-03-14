@@ -1034,6 +1034,15 @@ impl Display for HttpListenerConfig {
         table.add_row(row!["connect timeout", self.connect_timeout]);
         table.add_row(row!["request timeout", self.request_timeout]);
         table.add_row(row!["activated", self.active]);
+        add_h2_flood_rows(
+            &mut table,
+            &self.h2_max_rst_stream_per_window,
+            &self.h2_max_ping_per_window,
+            &self.h2_max_settings_per_window,
+            &self.h2_max_empty_data_per_window,
+            &self.h2_max_continuation_frames,
+            &self.h2_max_glitch_count,
+        );
         write!(f, "{}", table)
     }
 }
@@ -1072,7 +1081,47 @@ impl Display for HttpsListenerConfig {
         table.add_row(row!["connect timeout", self.connect_timeout]);
         table.add_row(row!["request timeout", self.request_timeout]);
         table.add_row(row!["activated", self.active]);
+        add_h2_flood_rows(
+            &mut table,
+            &self.h2_max_rst_stream_per_window,
+            &self.h2_max_ping_per_window,
+            &self.h2_max_settings_per_window,
+            &self.h2_max_empty_data_per_window,
+            &self.h2_max_continuation_frames,
+            &self.h2_max_glitch_count,
+        );
         write!(f, "{}", table)
+    }
+}
+
+/// Add H2 flood detection threshold rows to a display table.
+/// Only shows rows for values that have been explicitly configured.
+fn add_h2_flood_rows(
+    table: &mut Table,
+    max_rst_stream: &Option<u32>,
+    max_ping: &Option<u32>,
+    max_settings: &Option<u32>,
+    max_empty_data: &Option<u32>,
+    max_continuation: &Option<u32>,
+    max_glitch: &Option<u32>,
+) {
+    if let Some(v) = max_rst_stream {
+        table.add_row(row!["h2 max rst_stream/window", v]);
+    }
+    if let Some(v) = max_ping {
+        table.add_row(row!["h2 max ping/window", v]);
+    }
+    if let Some(v) = max_settings {
+        table.add_row(row!["h2 max settings/window", v]);
+    }
+    if let Some(v) = max_empty_data {
+        table.add_row(row!["h2 max empty_data/window", v]);
+    }
+    if let Some(v) = max_continuation {
+        table.add_row(row!["h2 max continuation frames", v]);
+    }
+    if let Some(v) = max_glitch {
+        table.add_row(row!["h2 max glitch count", v]);
     }
 }
 
