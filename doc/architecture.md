@@ -161,7 +161,18 @@ This inversion is the key abstraction that lets H1 and H2 connections share stre
 
 #### H2 connection state machine
 
-Each `ConnectionH2` runs a frame-level state machine for reading:
+Each `ConnectionH2` runs a frame-level state machine for reading. The struct is decomposed
+into logical sub-structs for maintainability:
+
+- `H2FlowControl` — connection-level window, peer window, initial window size
+- `H2ByteAccounting` — overhead bytes, zero-window count
+- `H2DrainState` — GoAway sent flag, last stream ID, pending RST streams
+- `H2FloodConfig` — 6 configurable flood detection thresholds (per-listener)
+- `Prioriser` — RFC 9218 urgency + incremental tracking per stream
+
+For detailed internals, see [h2_mux_internals.md](./h2_mux_internals.md).
+
+The H2 state machine:
 
 ```
               ┌───────────────┐
@@ -211,9 +222,11 @@ Each `ConnectionH2` runs a frame-level state machine for reading:
      └──────────────────────┘
 ```
 
-For writing, the `writable()` method iterates over all streams in stream-ID order,
-converting Kawa blocks to H2 frames via `H2BlockConverter`. Connection-level and
-stream-level flow control windows limit how many DATA bytes can be sent per iteration.
+For writing, the `writable()` method delegates to `write_streams()` which iterates over
+all streams sorted by RFC 9218 urgency (lower urgency = higher priority), then by stream
+ID for FIFO within the same urgency level. Each stream's Kawa blocks are converted to H2
+frames via `H2BlockConverter`. Connection-level and stream-level flow control windows
+limit how many DATA bytes can be sent per iteration.
 
 #### H2 flow control
 
@@ -279,14 +292,18 @@ inline at the start of `writable()`, avoiding extra event loop iterations.
 
 ```
 lib/src/protocol/mux/
-├── mod.rs          Mux session, Stream, Router, ready() loop, stream lifecycle
-├── h1.rs           HTTP/1.1 connection (ConnectionH1)
-├── h2.rs           HTTP/2 connection (ConnectionH2), H2 state machine, flow control
-├── parser.rs       H2 binary frame parser (nom), wire format constants
-├── serializer.rs   H2 frame serializer (cookie-factory), SETTINGS/GOAWAY/RST_STREAM
-├── converter.rs    Kawa → H2 frame converter (H2BlockConverter), HPACK encoding
-└── pkawa.rs        H2 → Kawa converter, HPACK decoding, pseudo-header validation
+├── mod.rs          Mux session, Stream, Router, ready() loop, stream lifecycle (2325 lines)
+├── h1.rs           HTTP/1.1 connection (ConnectionH1) (421 lines)
+├── h2.rs           HTTP/2 connection (ConnectionH2), state machine, flow control,
+│                   flood detection, RFC 9218 priorities, sub-structs (2513 lines)
+├── parser.rs       H2 binary frame parser (nom), wire format constants (1055 lines)
+├── serializer.rs   H2 frame serializer (cookie-factory), SETTINGS/GOAWAY/RST_STREAM (165 lines)
+├── converter.rs    Kawa → H2 frame converter (H2BlockConverter), HPACK encoding (297 lines)
+└── pkawa.rs        H2 → Kawa converter, HPACK decoding, pseudo-header validation,
+                    RFC 9218 priority header parsing (460 lines)
 ```
+
+Total: 7236 lines of Rust across 7 modules.
 
 #### Key design decisions
 
@@ -306,6 +323,19 @@ lib/src/protocol/mux/
 - **H2 backend (h2c)**: Controlled by `cluster.http2` in protobuf config. Sōzu speaks
   cleartext H2 to backends. The `:scheme` pseudo-header is derived from the frontend
   listener protocol (HTTP or HTTPS), not the backend connection.
+- **RFC 9218 priorities**: The `Prioriser` struct tracks urgency (0-7) and incremental
+  flags per stream from the `priority` header. Stream scheduling in `write_streams()`
+  sorts by urgency first (lower = higher priority), then by stream ID. Default urgency
+  is 3 per RFC 9218.
+- **Configurable flood detection**: Six thresholds (RST_STREAM, PING, SETTINGS, empty
+  DATA, CONTINUATION, glitch count) are configurable per-listener via protobuf, with
+  compile-time defaults. Exceeding any threshold triggers GOAWAY(ENHANCE_YOUR_CALM).
+- **Proportional overhead distribution**: Connection-level overhead bytes (SETTINGS, PING,
+  WINDOW_UPDATE) are distributed to streams proportional to their bytes transferred, not
+  equally. This ensures accurate per-stream accounting for billing and metrics.
+- **OpenTelemetry trace propagation**: Behind the `opentelemetry` feature flag,
+  `traceparent`/`tracestate` headers are extracted during H2 stream creation and
+  propagated into access log entries for distributed tracing correlation.
 
 ## Logging
 
