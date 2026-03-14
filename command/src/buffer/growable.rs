@@ -43,6 +43,22 @@ impl Buffer {
         true
     }
 
+    /// Shrink the buffer to target_size, preserving any pending data.
+    /// If pending data exceeds target_size, the buffer is not shrunk.
+    pub fn shrink(&mut self, target_size: usize) -> bool {
+        if target_size >= self.capacity {
+            return false;
+        }
+        self.shift();
+        if self.end > target_size {
+            return false;
+        }
+        self.memory.truncate(target_size);
+        self.memory.shrink_to_fit();
+        self.capacity = target_size;
+        true
+    }
+
     pub fn available_data(&self) -> usize {
         self.end - self.position
     }
