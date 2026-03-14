@@ -160,13 +160,15 @@ fn distribute_overhead(
     active_streams: usize,
 ) {
     let share_in = if total_bytes.0 > 0 {
-        *overhead_bin * stream_bytes.0 / total_bytes.0
+        // Clamp to remaining overhead — integer division rounding across multiple
+        // streams can cause accumulated shares to exceed the total.
+        (*overhead_bin * stream_bytes.0 / total_bytes.0).min(*overhead_bin)
     } else {
         // No stream has transferred any inbound bytes — fall back to even split.
         *overhead_bin / active_streams.max(1)
     };
     let share_out = if total_bytes.1 > 0 {
-        *overhead_bout * stream_bytes.1 / total_bytes.1
+        (*overhead_bout * stream_bytes.1 / total_bytes.1).min(*overhead_bout)
     } else {
         // No stream has transferred any outbound bytes — fall back to even split.
         *overhead_bout / active_streams.max(1)
@@ -608,10 +610,17 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                             }
                         }
                     } else if header.frame_type != FrameType::Priority {
-                        // Distinguish closed vs idle: if stream_id <=
-                        // highest_peer_stream_id, the stream existed and is
-                        // now closed; otherwise it was never opened (idle).
-                        let is_closed_stream = header.stream_id <= self.highest_peer_stream_id;
+                        // Distinguish closed vs idle: check whether the stream
+                        // was previously opened. For Server position, compare
+                        // against highest_peer_stream_id (client-initiated).
+                        // For Client position, compare against last_stream_id
+                        // (our own initiated streams) since the peer never
+                        // initiates streams on a backend connection.
+                        let is_closed_stream = if self.position.is_server() {
+                            header.stream_id <= self.highest_peer_stream_id
+                        } else {
+                            header.stream_id < self.last_stream_id
+                        };
                         if is_closed_stream {
                             match header.frame_type {
                                 FrameType::RstStream | FrameType::WindowUpdate => {
