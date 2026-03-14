@@ -284,6 +284,18 @@ pub struct ListenerBuilder {
     /// ALPN protocols to advertise during TLS handshake, in order of preference.
     /// Valid values: "h2", "http/1.1". Defaults to ["h2", "http/1.1"].
     pub alpn_protocols: Option<Vec<String>>,
+    /// H2 flood detection: max RST_STREAM frames per second window (CVE-2023-44487, CVE-2019-9514)
+    pub h2_max_rst_stream_per_window: Option<u32>,
+    /// H2 flood detection: max PING frames per second window (CVE-2019-9512)
+    pub h2_max_ping_per_window: Option<u32>,
+    /// H2 flood detection: max SETTINGS frames per second window (CVE-2019-9515)
+    pub h2_max_settings_per_window: Option<u32>,
+    /// H2 flood detection: max empty DATA frames per second window (CVE-2019-9518)
+    pub h2_max_empty_data_per_window: Option<u32>,
+    /// H2 flood detection: max CONTINUATION frames per header block (CVE-2024-27316)
+    pub h2_max_continuation_frames: Option<u32>,
+    /// H2 flood detection: max accumulated protocol anomalies before ENHANCE_YOUR_CALM
+    pub h2_max_glitch_count: Option<u32>,
 }
 
 pub fn default_sticky_name() -> String {
@@ -340,6 +352,12 @@ impl ListenerBuilder {
             sticky_name: DEFAULT_STICKY_NAME.to_string(),
             tls_versions: None,
             alpn_protocols: None,
+            h2_max_rst_stream_per_window: None,
+            h2_max_ping_per_window: None,
+            h2_max_settings_per_window: None,
+            h2_max_empty_data_per_window: None,
+            h2_max_continuation_frames: None,
+            h2_max_glitch_count: None,
         }
     }
 
@@ -496,6 +514,12 @@ impl ListenerBuilder {
             connect_timeout: self.connect_timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT),
             request_timeout: self.request_timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT),
             http_answers,
+            h2_max_rst_stream_per_window: self.h2_max_rst_stream_per_window,
+            h2_max_ping_per_window: self.h2_max_ping_per_window,
+            h2_max_settings_per_window: self.h2_max_settings_per_window,
+            h2_max_empty_data_per_window: self.h2_max_empty_data_per_window,
+            h2_max_continuation_frames: self.h2_max_continuation_frames,
+            h2_max_glitch_count: self.h2_max_glitch_count,
             ..Default::default()
         };
 
@@ -623,6 +647,12 @@ impl ListenerBuilder {
                 .unwrap_or(DEFAULT_SEND_TLS_13_TICKETS),
             http_answers,
             alpn_protocols,
+            h2_max_rst_stream_per_window: self.h2_max_rst_stream_per_window,
+            h2_max_ping_per_window: self.h2_max_ping_per_window,
+            h2_max_settings_per_window: self.h2_max_settings_per_window,
+            h2_max_empty_data_per_window: self.h2_max_empty_data_per_window,
+            h2_max_continuation_frames: self.h2_max_continuation_frames,
+            h2_max_glitch_count: self.h2_max_glitch_count,
         };
 
         Ok(https_listener_config)

@@ -64,6 +64,7 @@ use crate::{
 pub use crate::protocol::mux::{
     h1::ConnectionH1,
     h2::ConnectionH2,
+    h2::H2FloodConfig,
     parser::{H2Error, error_code_to_str},
 };
 
@@ -447,6 +448,7 @@ impl<Front: SocketHandler> Connection<Front> {
         front_stream: Front,
         pool: Weak<RefCell<Pool>>,
         timeout_container: TimeoutContainer,
+        flood_config: h2::H2FloodConfig,
     ) -> Option<Connection<Front>> {
         let buffer = pool
             .upgrade()
@@ -486,7 +488,7 @@ impl<Front: SocketHandler> Connection<Front> {
             zero_bytes_read: 0,
             overhead_bin: 0,
             overhead_bout: 0,
-            flood_detector: H2FloodDetector::new(),
+            flood_detector: H2FloodDetector::new(flood_config),
             settings_sent_at: None,
             pending_rst_streams: Vec::new(),
             rst_sent: HashSet::new(),
@@ -498,6 +500,7 @@ impl<Front: SocketHandler> Connection<Front> {
         backend: Rc<RefCell<Backend>>,
         pool: Weak<RefCell<Pool>>,
         timeout_container: TimeoutContainer,
+        flood_config: h2::H2FloodConfig,
     ) -> Option<Connection<Front>> {
         let buffer = pool
             .upgrade()
@@ -541,7 +544,7 @@ impl<Front: SocketHandler> Connection<Front> {
             zero_bytes_read: 0,
             overhead_bin: 0,
             overhead_bout: 0,
-            flood_detector: H2FloodDetector::new(),
+            flood_detector: H2FloodDetector::new(flood_config),
             settings_sent_at: None,
             pending_rst_streams: Vec::new(),
             rst_sent: HashSet::new(),
@@ -1376,6 +1379,7 @@ impl Router {
             }
 
             let timeout_container = TimeoutContainer::new(self.configured_connect_timeout, token);
+            let flood_config = context.listener.borrow().get_h2_flood_config();
             let connection = if h2 {
                 match Connection::new_h2_client(
                     socket,
@@ -1383,6 +1387,7 @@ impl Router {
                     backend,
                     context.pool.clone(),
                     timeout_container,
+                    flood_config,
                 ) {
                     Some(connection) => connection,
                     None => return Err(BackendConnectionError::MaxBuffers),

@@ -130,6 +130,20 @@ message HttpListenerConfig {
     // wether the listener is actively listening on its socket
     required bool active = 11 [default = false];
     optional CustomHttpAnswers http_answers = 12;
+    // H2 flood detection thresholds (CVE mitigations).
+    // All are optional; when absent, built-in defaults are used.
+    // Maximum RST_STREAM frames per second window (CVE-2023-44487, CVE-2019-9514)
+    optional uint32 h2_max_rst_stream_per_window = 13;
+    // Maximum PING frames per second window (CVE-2019-9512)
+    optional uint32 h2_max_ping_per_window = 14;
+    // Maximum SETTINGS frames per second window (CVE-2019-9515)
+    optional uint32 h2_max_settings_per_window = 15;
+    // Maximum empty DATA frames per second window (CVE-2019-9518)
+    optional uint32 h2_max_empty_data_per_window = 16;
+    // Maximum CONTINUATION frames per header block (CVE-2024-27316)
+    optional uint32 h2_max_continuation_frames = 17;
+    // Maximum accumulated protocol anomalies before ENHANCE_YOUR_CALM
+    optional uint32 h2_max_glitch_count = 18;
 }
 
 // details of an HTTPS listener
@@ -165,6 +179,20 @@ message HttpsListenerConfig {
     // ALPN protocols to advertise during TLS handshake, in order of preference.
     // Valid values: "h2", "http/1.1". Defaults to ["h2", "http/1.1"].
     repeated string alpn_protocols = 22;
+    // H2 flood detection thresholds (CVE mitigations).
+    // All are optional; when absent, built-in defaults are used.
+    // Maximum RST_STREAM frames per second window (CVE-2023-44487, CVE-2019-9514)
+    optional uint32 h2_max_rst_stream_per_window = 23;
+    // Maximum PING frames per second window (CVE-2019-9512)
+    optional uint32 h2_max_ping_per_window = 24;
+    // Maximum SETTINGS frames per second window (CVE-2019-9515)
+    optional uint32 h2_max_settings_per_window = 25;
+    // Maximum empty DATA frames per second window (CVE-2019-9518)
+    optional uint32 h2_max_empty_data_per_window = 26;
+    // Maximum CONTINUATION frames per header block (CVE-2024-27316)
+    optional uint32 h2_max_continuation_frames = 27;
+    // Maximum accumulated protocol anomalies before ENHANCE_YOUR_CALM
+    optional uint32 h2_max_glitch_count = 28;
 }
 
 // details of an TCP listener

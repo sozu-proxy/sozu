@@ -561,6 +561,12 @@ pub trait L7ListenerHandler {
 
     /// retrieve the listener's configured HTTP answers (templates)
     fn get_answers(&self) -> &Rc<RefCell<HttpAnswers>>;
+
+    /// H2 flood detection thresholds from the listener config.
+    /// Returns the default config when the listener does not provide custom values.
+    fn get_h2_flood_config(&self) -> protocol::mux::H2FloodConfig {
+        protocol::mux::H2FloodConfig::default()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
