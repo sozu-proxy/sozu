@@ -44,13 +44,13 @@ pub fn serialize_frame_type(f: &FrameType) -> u8 {
     }
 }
 
-// pub fn gen_settings_acknoledgement<'a>(buf: &'a mut [u8]) {
+// pub fn gen_settings_acknowledgement<'a>(buf: &'a mut [u8]) {
 //     for (i, b) in SETTINGS_ACKNOWLEDGEMENT.iter().enumerate() {
 //         buf[i] = *b;
 //     }
 // }
 
-pub fn gen_ping_acknolegment<'a>(
+pub fn gen_ping_acknowledgement<'a>(
     buf: &'a mut [u8],
     payload: &[u8],
 ) -> Result<(&'a mut [u8], usize), GenError> {

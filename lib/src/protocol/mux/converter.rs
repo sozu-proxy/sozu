@@ -10,6 +10,7 @@ use crate::protocol::{
     mux::{
         StreamId,
         parser::{self, FrameHeader, FrameType, H2Error, str_to_error_code},
+        pkawa::is_connection_specific_header,
         serializer::{gen_frame_header, gen_rst_stream},
     },
 };
@@ -136,15 +137,11 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                 {
                     let key = key.data(buffer);
                     let val = val.data(buffer);
-                    if compare_no_case(key, b"connection")
+                    if is_connection_specific_header(key)
                         || compare_no_case(key, b"host")
                         || compare_no_case(key, b"http2-settings")
-                        || compare_no_case(key, b"keep-alive")
-                        || compare_no_case(key, b"proxy-connection")
                         || (compare_no_case(key, b"te") && !compare_no_case(val, b"trailers"))
                         || compare_no_case(key, b"trailer")
-                        || compare_no_case(key, b"transfer-encoding")
-                        || compare_no_case(key, b"upgrade")
                     {
                         return true;
                     }
@@ -229,15 +226,13 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                     let chunks = payload.chunks(self.max_frame_size);
                     let n_chunks = chunks.len();
                     for (i, chunk) in chunks.enumerate() {
-                        let flags = if i == 0 && end_stream {
-                            parser::FLAG_END_STREAM
-                        } else {
-                            0
-                        } | if i + 1 == n_chunks {
-                            parser::FLAG_END_HEADERS
-                        } else {
-                            0
-                        };
+                        let mut flags = 0u8;
+                        if i == 0 && end_stream {
+                            flags |= parser::FLAG_END_STREAM;
+                        }
+                        if i + 1 == n_chunks {
+                            flags |= parser::FLAG_END_HEADERS;
+                        }
                         if i == 0 {
                             if let Err(e) = gen_frame_header(
                                 &mut header,
