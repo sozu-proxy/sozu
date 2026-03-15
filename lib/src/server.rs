@@ -222,6 +222,7 @@ pub enum ServerError {
 pub struct Server {
     accept_queue_timeout: Duration,
     accept_queue: VecDeque<(TcpStream, ListenToken, Protocol, Instant)>,
+    evict_on_queue_full: bool,
     accept_ready: HashSet<ListenToken>,
     backends: Rc<RefCell<BackendMap>>,
     base_sessions_count: usize,
@@ -388,6 +389,7 @@ impl Server {
             )),
             accept_queue: VecDeque::new(),
             accept_ready: HashSet::new(),
+            evict_on_queue_full: server_config.evict_on_queue_full.unwrap_or(false),
             backends,
             base_sessions_count,
             channel,
@@ -1546,6 +1548,61 @@ impl Server {
         gauge!("accept_queue.connections", self.accept_queue.len());
     }
 
+    /// Evict the least recently active sessions to make room for new connections.
+    /// Returns the number of sessions evicted.
+    ///
+    /// Uses `select_nth_unstable_by_key` (introselect, O(n) average) to partition
+    /// the oldest `count` sessions in-place, avoiding a full sort. The candidates
+    /// Vec is unavoidable due to RefCell borrow constraints, but the HashSet for
+    /// shutdown only contains the `count` selected tokens (O(k) space).
+    fn evict_least_active_sessions(&self, count: usize) -> usize {
+        if count == 0 {
+            return 0;
+        }
+
+        // Scope the sessions borrow to release it before shutdown
+        let tokens = {
+            let sessions = self.sessions.borrow();
+            let mut candidates: Vec<(Token, Instant)> = sessions
+                .slab
+                .iter()
+                .filter(|(_, session)| {
+                    !matches!(
+                        session.borrow().protocol(),
+                        Protocol::HTTPListen
+                            | Protocol::HTTPSListen
+                            | Protocol::TCPListen
+                            | Protocol::Channel
+                            | Protocol::Metrics
+                            | Protocol::Timer
+                    )
+                })
+                .map(|(_, session)| {
+                    let s = session.borrow();
+                    (s.frontend_token(), s.last_event())
+                })
+                .collect();
+
+            if candidates.is_empty() {
+                return 0;
+            }
+
+            let pivot = count.min(candidates.len()) - 1;
+            candidates.select_nth_unstable_by_key(pivot, |&(_, last_event)| last_event);
+
+            // Extract tokens from the partitioned slice — only O(k) elements
+            candidates[..=pivot]
+                .iter()
+                .map(|&(token, _)| token)
+                .collect::<HashSet<Token>>()
+        };
+        // sessions borrow is released here
+
+        let evicted = tokens.len();
+        self.shut_down_sessions_by_frontend_tokens(tokens);
+        evicted
+    }
+
     pub fn create_sessions(&mut self) {
         while let Some((sock, token, protocol, timestamp)) = self.accept_queue.pop_back() {
             let wait_time = Instant::now() - timestamp;
@@ -1556,7 +1613,32 @@ impl Server {
             }
 
             if !self.sessions.borrow_mut().check_limits() {
-                break;
+                if !self.evict_on_queue_full {
+                    break;
+                }
+
+                // Evict 1% of max_connections per iteration. This is a conservative
+                // ratio: large enough to make meaningful progress clearing the accept
+                // queue, small enough to limit collateral damage to active sessions.
+                // The loop re-checks limits after each eviction round, so multiple
+                // rounds may run if the accept queue has many pending connections.
+                let to_evict = (self.sessions.borrow().max_connections / 100).max(1);
+                let evicted = self.evict_least_active_sessions(to_evict);
+                if evicted == 0 {
+                    error!("eviction enabled but no sessions could be evicted");
+                    break;
+                }
+
+                count!("sessions.evicted", evicted as i64);
+                warn!(
+                    "evicted {} least recently active sessions to make room",
+                    evicted
+                );
+
+                // Re-check limits after eviction instead of forcing can_accept
+                if !self.sessions.borrow_mut().check_limits() {
+                    break;
+                }
             }
 
             //FIXME: check the timestamp
@@ -1740,5 +1822,59 @@ impl ProxySession for ListenSession {
             _token, self.protocol
         );
         false
+    }
+}
+
+#[cfg(test)]
+mod eviction_tests {
+    use std::collections::HashSet;
+    use std::time::{Duration, Instant};
+
+    use mio::Token;
+
+    #[test]
+    fn select_nth_finds_oldest_sessions() {
+        // Verify that select_nth_unstable_by_key correctly partitions
+        // by Instant, selecting the k oldest entries
+        let now = Instant::now();
+        let mut candidates = vec![
+            (Token(1), now - Duration::from_secs(10)), // 10s old
+            (Token(2), now - Duration::from_secs(50)), // 50s old (oldest)
+            (Token(3), now - Duration::from_secs(5)),  // 5s old (newest)
+            (Token(4), now - Duration::from_secs(30)), // 30s old
+            (Token(5), now - Duration::from_secs(20)), // 20s old
+        ];
+
+        let count = 2;
+        let pivot = count.min(candidates.len()) - 1;
+        candidates.select_nth_unstable_by_key(pivot, |&(_, last_event)| last_event);
+
+        // The first `count` entries should be the oldest two (tokens 2 and 4)
+        let selected: HashSet<Token> = candidates[..=pivot]
+            .iter()
+            .map(|&(token, _)| token)
+            .collect();
+
+        assert_eq!(selected.len(), 2);
+        assert!(selected.contains(&Token(2)), "should contain 50s-old session");
+        assert!(selected.contains(&Token(4)), "should contain 30s-old session");
+    }
+
+    #[test]
+    fn select_nth_with_count_exceeding_candidates() {
+        let now = Instant::now();
+        let mut candidates = vec![(Token(1), now - Duration::from_secs(10))];
+
+        let count = 5;
+        let pivot = count.min(candidates.len()) - 1;
+        candidates.select_nth_unstable_by_key(pivot, |&(_, last_event)| last_event);
+
+        let selected: HashSet<Token> = candidates[..=pivot]
+            .iter()
+            .map(|&(token, _)| token)
+            .collect();
+
+        assert_eq!(selected.len(), 1);
+        assert!(selected.contains(&Token(1)));
     }
 }
