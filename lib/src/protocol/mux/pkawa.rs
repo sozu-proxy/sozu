@@ -661,4 +661,94 @@ mod tests {
         let result = store_pseudo_header(&dest, true, &mut kawa, b"GET");
         assert!(result.is_none());
     }
+
+    // ── is_connection_specific_header (additional case sensitivity) ────
+
+    #[test]
+    fn test_is_connection_specific_header_mixed_case() {
+        // Verify case-insensitive matching for various mixed-case forms
+        assert!(is_connection_specific_header(b"CONNECTION"));
+        assert!(is_connection_specific_header(b"CoNnEcTiOn"));
+        assert!(is_connection_specific_header(b"PROXY-CONNECTION"));
+        assert!(is_connection_specific_header(b"Proxy-connection"));
+        assert!(is_connection_specific_header(b"TRANSFER-ENCODING"));
+        assert!(is_connection_specific_header(b"transfer-Encoding"));
+        assert!(is_connection_specific_header(b"UPGRADE"));
+        assert!(is_connection_specific_header(b"KEEP-ALIVE"));
+        assert!(is_connection_specific_header(b"Keep-alive"));
+    }
+
+    #[test]
+    fn test_is_connection_specific_header_partial_match() {
+        // Substrings or superstrings must not match
+        assert!(!is_connection_specific_header(b"connection-extra"));
+        assert!(!is_connection_specific_header(b"my-connection"));
+        assert!(!is_connection_specific_header(b"upgrade-insecure-requests"));
+        assert!(!is_connection_specific_header(b"keep-alive-timeout"));
+        assert!(!is_connection_specific_header(b"x-keep-alive"));
+    }
+
+    // ── is_invalid_te_value ─────────────────────────────────────────────
+
+    #[test]
+    fn test_is_invalid_te_value_trailers_ok() {
+        assert!(!is_invalid_te_value(b"trailers"));
+        assert!(!is_invalid_te_value(b"Trailers"));
+        assert!(!is_invalid_te_value(b"TRAILERS"));
+    }
+
+    #[test]
+    fn test_is_invalid_te_value_other_rejected() {
+        assert!(is_invalid_te_value(b"gzip"));
+        assert!(is_invalid_te_value(b"deflate"));
+        assert!(is_invalid_te_value(b"chunked"));
+        assert!(is_invalid_te_value(b"compress"));
+        assert!(is_invalid_te_value(b""));
+        assert!(is_invalid_te_value(b"trailers, gzip"));
+    }
+
+    // ── is_invalid_h2_header (additional edge cases) ──────────────────
+
+    #[test]
+    fn test_is_invalid_h2_header_empty_name() {
+        // Empty header name with empty value: no uppercase, not connection-specific, not TE
+        assert!(!is_invalid_h2_header(b"", b""));
+    }
+
+    #[test]
+    fn test_is_invalid_h2_header_single_uppercase() {
+        // Even a single uppercase letter makes it invalid
+        assert!(is_invalid_h2_header(b"X", b""));
+        assert!(is_invalid_h2_header(b"hostA", b"value"));
+    }
+
+    // ── has_uppercase_ascii (additional) ───────────────────────────────
+
+    #[test]
+    fn test_has_uppercase_ascii_non_ascii_bytes() {
+        // Non-ASCII bytes (128+) are not uppercase ASCII
+        assert!(!has_uppercase_ascii(&[0x80, 0xFF, 0xC0]));
+        assert!(!has_uppercase_ascii(b"\xc3\xa9")); // UTF-8 for 'e' with accent
+    }
+
+    #[test]
+    fn test_has_uppercase_ascii_mixed_with_numbers() {
+        assert!(!has_uppercase_ascii(b"content-type-2"));
+        assert!(has_uppercase_ascii(b"content-Type-2"));
+    }
+
+    // ── trim_ows (additional) ─────────────────────────────────────────
+
+    #[test]
+    fn test_trim_ows_single_char() {
+        assert_eq!(trim_ows(b"x"), b"x");
+        assert_eq!(trim_ows(b" "), b"" as &[u8]);
+        assert_eq!(trim_ows(b"\t"), b"" as &[u8]);
+    }
+
+    #[test]
+    fn test_trim_ows_preserves_internal_whitespace() {
+        assert_eq!(trim_ows(b"  hello world  "), b"hello world");
+        assert_eq!(trim_ows(b"\ta\tb\t"), b"a\tb");
+    }
 }

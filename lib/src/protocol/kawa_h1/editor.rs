@@ -564,3 +564,298 @@ impl HttpContext {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    /// Helper to create a minimal HttpContext for testing.
+    fn make_context() -> HttpContext {
+        HttpContext::new(
+            Ulid::generate(),
+            Protocol::HTTP,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
+            Some(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+                54321,
+            )),
+            "SERVERID".to_owned(),
+        )
+    }
+
+    // ── extract_route ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_extract_route_all_present() {
+        let mut ctx = make_context();
+        ctx.method = Some(Method::Get);
+        ctx.authority = Some("example.com".to_owned());
+        ctx.path = Some("/index.html".to_owned());
+
+        let (authority, path, method) = ctx.extract_route().unwrap();
+        assert_eq!(authority, "example.com");
+        assert_eq!(path, "/index.html");
+        assert_eq!(method, &Method::Get);
+    }
+
+    #[test]
+    fn test_extract_route_no_method() {
+        let mut ctx = make_context();
+        ctx.authority = Some("example.com".to_owned());
+        ctx.path = Some("/".to_owned());
+
+        let err = ctx.extract_route().unwrap_err();
+        assert!(matches!(err, RetrieveClusterError::NoMethod));
+    }
+
+    #[test]
+    fn test_extract_route_no_host() {
+        let mut ctx = make_context();
+        ctx.method = Some(Method::Get);
+        ctx.path = Some("/".to_owned());
+
+        let err = ctx.extract_route().unwrap_err();
+        assert!(matches!(err, RetrieveClusterError::NoHost));
+    }
+
+    #[test]
+    fn test_extract_route_no_path() {
+        let mut ctx = make_context();
+        ctx.method = Some(Method::Get);
+        ctx.authority = Some("example.com".to_owned());
+
+        let err = ctx.extract_route().unwrap_err();
+        assert!(matches!(err, RetrieveClusterError::NoPath));
+    }
+
+    // ── get_route ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_get_route_all_present() {
+        let mut ctx = make_context();
+        ctx.method = Some(Method::Get);
+        ctx.authority = Some("example.com".to_owned());
+        ctx.path = Some("/api/v1".to_owned());
+
+        assert_eq!(ctx.get_route(), "GET example.com/api/v1");
+    }
+
+    #[test]
+    fn test_get_route_method_and_authority_only() {
+        let mut ctx = make_context();
+        ctx.method = Some(Method::Post);
+        ctx.authority = Some("example.com".to_owned());
+
+        assert_eq!(ctx.get_route(), "POST example.com");
+    }
+
+    #[test]
+    fn test_get_route_method_only() {
+        let mut ctx = make_context();
+        ctx.method = Some(Method::Delete);
+
+        assert_eq!(ctx.get_route(), "DELETE");
+    }
+
+    #[test]
+    fn test_get_route_empty() {
+        let ctx = make_context();
+        assert_eq!(ctx.get_route(), "");
+    }
+
+    // ── reset ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_reset_clears_request_response_state() {
+        let mut ctx = make_context();
+        ctx.keep_alive_backend = false;
+        ctx.keep_alive_frontend = false;
+        ctx.sticky_session_found = Some("abc123".to_owned());
+        ctx.method = Some(Method::Post);
+        ctx.authority = Some("example.com".to_owned());
+        ctx.path = Some("/upload".to_owned());
+        ctx.status = Some(200);
+        ctx.reason = Some("OK".to_owned());
+        ctx.user_agent = Some("curl/7.81".to_owned());
+
+        ctx.reset();
+
+        assert!(ctx.keep_alive_backend);
+        assert!(ctx.keep_alive_frontend);
+        assert!(ctx.sticky_session_found.is_none());
+        assert!(ctx.method.is_none());
+        assert!(ctx.authority.is_none());
+        assert!(ctx.path.is_none());
+        assert!(ctx.status.is_none());
+        assert!(ctx.reason.is_none());
+        assert!(ctx.user_agent.is_none());
+    }
+
+    #[test]
+    fn test_reset_preserves_connection_state() {
+        let mut ctx = make_context();
+        ctx.closing = true;
+        ctx.cluster_id = Some("cluster-1".to_owned());
+        ctx.backend_id = Some("backend-1".to_owned());
+        ctx.sticky_session = Some("session-abc".to_owned());
+
+        let original_id = ctx.id;
+        let original_protocol = ctx.protocol;
+        let original_public_address = ctx.public_address;
+
+        ctx.reset();
+
+        // Connection-level state is preserved
+        assert!(ctx.closing);
+        assert_eq!(ctx.cluster_id.as_deref(), Some("cluster-1"));
+        assert_eq!(ctx.backend_id.as_deref(), Some("backend-1"));
+        assert_eq!(ctx.sticky_session.as_deref(), Some("session-abc"));
+        assert_eq!(ctx.id, original_id);
+        assert_eq!(ctx.protocol, original_protocol);
+        assert_eq!(ctx.public_address, original_public_address);
+    }
+
+    // ── traceparent / opentelemetry helpers ─────────────────────────────
+
+    #[cfg(feature = "opentelemetry")]
+    mod otel {
+        use super::super::*;
+
+        #[test]
+        fn test_parse_hex_valid() {
+            let (val, rest) = parse_hex::<4>(b"abcd1234").unwrap();
+            assert_eq!(&val, b"abcd");
+            assert_eq!(rest, b"1234");
+        }
+
+        #[test]
+        fn test_parse_hex_exact_length() {
+            let (val, rest) = parse_hex::<8>(b"01234567").unwrap();
+            assert_eq!(&val, b"01234567");
+            assert!(rest.is_empty());
+        }
+
+        #[test]
+        fn test_parse_hex_too_short() {
+            assert!(parse_hex::<4>(b"ab").is_none());
+        }
+
+        #[test]
+        fn test_parse_hex_rejects_non_hex() {
+            assert!(parse_hex::<4>(b"ghij").is_none());
+        }
+
+        #[test]
+        fn test_parse_hex_rejects_uppercase_is_ok() {
+            // Uppercase hex digits are valid
+            let (val, _) = parse_hex::<4>(b"ABCD").unwrap();
+            assert_eq!(&val, b"ABCD");
+        }
+
+        #[test]
+        fn test_skip_separator_valid() {
+            let rest = skip_separator(b"-hello").unwrap();
+            assert_eq!(rest, b"hello");
+        }
+
+        #[test]
+        fn test_skip_separator_wrong_char() {
+            assert!(skip_separator(b"+hello").is_none());
+        }
+
+        #[test]
+        fn test_skip_separator_empty() {
+            assert!(skip_separator(b"").is_none());
+        }
+
+        #[test]
+        fn test_build_traceparent_format() {
+            let trace_id: [u8; 32] = *b"4bf92f3577b34da6a3ce929d0e0e4736";
+            let parent_id: [u8; 16] = *b"00f067aa0ba902b7";
+
+            let result = build_traceparent(&trace_id, &parent_id);
+            assert_eq!(
+                &result,
+                b"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+            );
+        }
+
+        #[test]
+        fn test_build_traceparent_length() {
+            let trace_id = [b'a'; 32];
+            let parent_id = [b'b'; 16];
+            let result = build_traceparent(&trace_id, &parent_id);
+            // Format: "00-" (3) + trace_id (32) + "-" (1) + parent_id (16) + "-01" (3) = 55
+            assert_eq!(result.len(), 55);
+        }
+
+        #[test]
+        fn test_parse_traceparent_valid() {
+            let input = b"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+            let store = kawa::Store::Static(input);
+            let (trace_id, parent_id) = parse_traceparent(&store, input).unwrap();
+            assert_eq!(&trace_id, b"4bf92f3577b34da6a3ce929d0e0e4736");
+            assert_eq!(&parent_id, b"00f067aa0ba902b7");
+        }
+
+        #[test]
+        fn test_parse_traceparent_sampled_flag_zero() {
+            let input = b"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00";
+            let store = kawa::Store::Static(input);
+            let result = parse_traceparent(&store, input);
+            assert!(result.is_some());
+        }
+
+        #[test]
+        fn test_parse_traceparent_wrong_version() {
+            let input = b"01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+            let store = kawa::Store::Static(input);
+            assert!(parse_traceparent(&store, input).is_none());
+        }
+
+        #[test]
+        fn test_parse_traceparent_too_short() {
+            let input = b"00-4bf9";
+            let store = kawa::Store::Static(input);
+            assert!(parse_traceparent(&store, input).is_none());
+        }
+
+        #[test]
+        fn test_parse_traceparent_trailing_data() {
+            // Extra characters after the trace-flags should cause rejection
+            let input = b"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-extra";
+            let store = kawa::Store::Static(input);
+            assert!(parse_traceparent(&store, input).is_none());
+        }
+
+        #[test]
+        fn test_parse_traceparent_missing_separator() {
+            let input = b"004bf92f3577b34da6a3ce929d0e0e473600f067aa0ba902b701";
+            let store = kawa::Store::Static(input);
+            assert!(parse_traceparent(&store, input).is_none());
+        }
+
+        #[test]
+        fn test_parse_build_roundtrip() {
+            let trace_id: [u8; 32] = *b"4bf92f3577b34da6a3ce929d0e0e4736";
+            let parent_id: [u8; 16] = *b"00f067aa0ba902b7";
+
+            // Build a traceparent from known IDs
+            let built = build_traceparent(&trace_id, &parent_id);
+
+            // Verify that the built value matches the expected static string,
+            // then parse that static string back to confirm roundtrip.
+            let expected: &[u8] =
+                b"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+            assert_eq!(&built[..], expected);
+
+            let store = kawa::Store::Static(expected);
+            let (parsed_trace_id, parsed_parent_id) =
+                parse_traceparent(&store, expected).unwrap();
+
+            assert_eq!(parsed_trace_id, trace_id);
+            assert_eq!(parsed_parent_id, parent_id);
+        }
+    }
+}

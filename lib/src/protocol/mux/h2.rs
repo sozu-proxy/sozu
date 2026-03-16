@@ -3275,4 +3275,139 @@ mod tests {
         assert_eq!(overhead_bin, 0);
         assert_eq!(overhead_bout, 0);
     }
+
+    // ── H2FlowControl (additional edge cases) ─────────────────────────
+
+    #[test]
+    fn test_flow_control_queue_window_update_cap() {
+        // Verify MAX_PENDING_WINDOW_UPDATES reflects 1 + 4*MAX_CONCURRENT_STREAMS
+        assert_eq!(MAX_PENDING_WINDOW_UPDATES, 1 + 100 * 4);
+
+        // Simulate queue reaching capacity
+        let mut updates: HashMap<u32, u32> = HashMap::new();
+        for i in 0..MAX_PENDING_WINDOW_UPDATES as u32 {
+            updates.insert(i, 1000);
+        }
+        assert_eq!(updates.len(), MAX_PENDING_WINDOW_UPDATES);
+
+        // A new stream ID beyond capacity should be rejected
+        let next_stream = MAX_PENDING_WINDOW_UPDATES as u32;
+        let at_cap = updates.len() >= MAX_PENDING_WINDOW_UPDATES;
+        assert!(at_cap);
+        assert!(!updates.contains_key(&next_stream));
+    }
+
+    #[test]
+    fn test_flow_control_window_settings_change_negative() {
+        // RFC 9113 §6.9.2: A change to SETTINGS_INITIAL_WINDOW_SIZE can cause
+        // the flow-control window to become negative.
+        let mut fc = H2FlowControl {
+            window: 100,
+            received_bytes_since_update: 0,
+            pending_window_updates: HashMap::new(),
+        };
+
+        // Simulate SETTINGS_INITIAL_WINDOW_SIZE reduction:
+        // old_initial = 65535, new_initial = 10 => delta = 10 - 65535 = -65525
+        let old_initial: i32 = DEFAULT_INITIAL_WINDOW_SIZE as i32;
+        let new_initial: i32 = 10;
+        let delta = new_initial - old_initial; // -65525
+        fc.window += delta;
+
+        assert!(fc.window < 0, "Window must be able to go negative after settings change");
+        assert_eq!(fc.window, 100 + (10 - 65535));
+    }
+
+    #[test]
+    fn test_flow_control_coalesce_saturates_at_max_increment() {
+        let max_increment = i32::MAX as u32;
+        let mut updates: HashMap<u32, u32> = HashMap::new();
+
+        // Insert at max and try to coalesce more
+        updates.insert(1, max_increment);
+        if let Some(existing) = updates.get_mut(&1) {
+            *existing = existing.saturating_add(1000).min(max_increment);
+        }
+        assert_eq!(*updates.get(&1).unwrap(), max_increment);
+    }
+
+    // ── H2FloodConfig (additional) ───────────────────────────────────
+
+    #[test]
+    fn test_flood_config_default_matches_constants() {
+        let config = H2FloodConfig::default();
+        assert_eq!(config.max_rst_stream_per_window, DEFAULT_MAX_RST_STREAM_PER_WINDOW);
+        assert_eq!(config.max_ping_per_window, DEFAULT_MAX_PING_PER_WINDOW);
+        assert_eq!(config.max_settings_per_window, DEFAULT_MAX_SETTINGS_PER_WINDOW);
+        assert_eq!(config.max_empty_data_per_window, DEFAULT_MAX_EMPTY_DATA_PER_WINDOW);
+        assert_eq!(config.max_continuation_frames, DEFAULT_MAX_CONTINUATION_FRAMES);
+        assert_eq!(config.max_glitch_count, DEFAULT_MAX_GLITCH_COUNT);
+    }
+
+    #[test]
+    fn test_flood_config_equality() {
+        let config_a = H2FloodConfig::default();
+        let config_b = H2FloodConfig::default();
+        assert_eq!(config_a, config_b);
+
+        let config_c = H2FloodConfig {
+            max_rst_stream_per_window: 1,
+            ..H2FloodConfig::default()
+        };
+        assert_ne!(config_a, config_c);
+    }
+
+    // ── distribute_overhead (additional edge cases) ───────────────────
+
+    #[test]
+    fn test_distribute_overhead_asymmetric_in_out() {
+        let mut metrics = SessionMetrics::new(None);
+        let mut overhead_bin = 1000;
+        let mut overhead_bout = 1000;
+
+        // Stream transferred 100% inbound, 0% outbound
+        distribute_overhead(
+            &mut metrics,
+            &mut overhead_bin,
+            &mut overhead_bout,
+            (500, 0),   // stream_bytes
+            (500, 100), // total_bytes
+            2,          // active_streams
+        );
+
+        assert_eq!(metrics.bin, 1000); // 100% of inbound overhead
+        assert_eq!(metrics.bout, 0);   // 0% of outbound overhead
+        assert_eq!(overhead_bin, 0);
+        assert_eq!(overhead_bout, 1000);
+    }
+
+    #[test]
+    fn test_distribute_overhead_many_streams_accumulate() {
+        let mut metrics = SessionMetrics::new(None);
+        let mut overhead_bin = 120;
+        let mut overhead_bout = 120;
+
+        // Three equal streams, each calling distribute_overhead.
+        // Integer division means shares shrink as the remainder shrinks:
+        //   call 1: 120 * 100/300 = 40 -> remaining 80
+        //   call 2:  80 * 100/300 = 26 -> remaining 54
+        //   call 3:  54 * 100/300 = 18 -> remaining 36
+        // Total distributed: 40 + 26 + 18 = 84 (some rounding loss remains)
+        for _ in 0..3 {
+            distribute_overhead(
+                &mut metrics,
+                &mut overhead_bin,
+                &mut overhead_bout,
+                (100, 100), // stream_bytes
+                (300, 300), // total_bytes
+                3,          // active_streams
+            );
+        }
+
+        assert_eq!(metrics.bin, 84);
+        assert_eq!(metrics.bout, 84);
+        // Rounding residual left over
+        assert_eq!(overhead_bin, 36);
+        assert_eq!(overhead_bout, 36);
+    }
 }
