@@ -40,10 +40,10 @@ use tokio::net::TcpListener;
 
 use super::h2_utils::{
     H2_ERROR_ENHANCE_YOUR_CALM, H2_ERROR_FLOW_CONTROL_ERROR, H2_ERROR_FRAME_SIZE_ERROR,
-    H2_ERROR_REFUSED_STREAM, H2_FRAME_GOAWAY, H2Frame, contains_goaway, contains_goaway_with_error,
-    contains_rst_stream, extract_rst_streams, goaway_error_code, h2_handshake, parse_h2_frames,
-    raw_h2_connection, read_all_available, setup_h2_listener_only, setup_h2_test,
-    verify_sozu_alive,
+    H2_ERROR_REFUSED_STREAM, H2_FRAME_GOAWAY, H2Frame, collect_response_frames, contains_goaway,
+    contains_goaway_with_error, contains_rst_stream, extract_rst_streams, goaway_error_code,
+    h2_handshake, log_frames, parse_h2_frames, raw_h2_connection, read_all_available,
+    setup_h2_listener_only, setup_h2_test, verify_sozu_alive,
 };
 use crate::{
     mock::{
@@ -1451,12 +1451,11 @@ fn try_h2_ping_flood_triggers_goaway() -> State {
     }
     let _ = tls.flush();
 
-    // Read response — expect GOAWAY with ENHANCE_YOUR_CALM
-    thread::sleep(Duration::from_millis(500));
-    let response_data = read_all_available(&mut tls, Duration::from_secs(2));
-    let frames = parse_h2_frames(&response_data);
-
-    println!("H2 Ping flood - received {} frames", frames.len());
+    // Read response — expect GOAWAY with ENHANCE_YOUR_CALM.
+    // Use collect_response_frames with multiple attempts for CI resilience:
+    // slow runners may need extra time to process the flood and flush the GOAWAY.
+    let frames = collect_response_frames(&mut tls, 500, 8, 1000);
+    log_frames("H2 Ping flood", &frames);
 
     let got_enhance_your_calm = contains_goaway_with_error(&frames, H2_ERROR_ENHANCE_YOUR_CALM);
     if let Some(error_code) = goaway_error_code(&frames) {
@@ -1518,12 +1517,11 @@ fn try_h2_settings_flood_triggers_goaway() -> State {
     }
     let _ = tls.flush();
 
-    // Read response — expect GOAWAY with ENHANCE_YOUR_CALM
-    thread::sleep(Duration::from_millis(500));
-    let response_data = read_all_available(&mut tls, Duration::from_secs(2));
-    let frames = parse_h2_frames(&response_data);
-
-    println!("H2 Settings flood - received {} frames", frames.len());
+    // Read response — expect GOAWAY with ENHANCE_YOUR_CALM.
+    // Use collect_response_frames with multiple attempts for CI resilience:
+    // slow runners may need extra time to process the flood and flush the GOAWAY.
+    let frames = collect_response_frames(&mut tls, 500, 8, 1000);
+    log_frames("H2 Settings flood", &frames);
 
     let got_enhance_your_calm = contains_goaway_with_error(&frames, H2_ERROR_ENHANCE_YOUR_CALM);
     if let Some(error_code) = goaway_error_code(&frames) {
