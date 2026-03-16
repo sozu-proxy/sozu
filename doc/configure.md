@@ -345,6 +345,30 @@ The main process and the workers are responsible to send their states.
 We implement the [statsd](https://github.com/b/statsd_spec) protocol to send statistics.
 Any service that understands the `statsd` protocol can then gather metrics from Sōzu.
 
+### Architecture
+
+Metrics are collected via thread-local storage macros (`count!`, `gauge!`, `gauge_add!`,
+`time!`, `incr!`, `decr!`) and dispatched to two drains:
+
+- **Local drain**: Accumulates metrics in-memory with HDR histograms for latency percentiles.
+  Queried via the CLI (`sozu metrics get`).
+- **Network drain**: Sends metrics over UDP using the statsd protocol. Supports both plain
+  dotted format and InfluxDB-style tagged format.
+
+Metric types:
+
+| Type | Macro | StatsD suffix | Description |
+|------|-------|---------------|-------------|
+| Counter | `count!`, `incr!`, `decr!` | `\|c` | Monotonically increasing value, reset to 0 after each network send |
+| Gauge | `gauge!`, `gauge_add!` | `\|g` | Snapshot value (absolute or delta) |
+| Time | `time!` | `\|ms` | Latency in milliseconds, stored as HDR histogram locally |
+
+Metrics have three scopes:
+
+- **Proxy-level**: Global to the worker (no cluster or backend context)
+- **Cluster-level**: Tagged with a `cluster_id`
+- **Backend-level**: Tagged with both `cluster_id` and `backend_id`
+
 ### Configure metrics
 
 In your `config.toml`, you can define the address and port of your external service by adding:
@@ -358,100 +382,343 @@ address = "127.0.0.1:8125"
 # prefix = "sozu"
 ```
 
-Currently, we can't change the frequency of sending messages.
+Metrics are sent at most once per second per key (if updated). Cluster/backend metrics
+that have not been updated for 10 minutes are automatically dropped from the network drain.
+
+#### StatsD wire format
+
+**Untagged** (default, `tagged_metrics = false`):
+
+```
+sozu.WRK-00.http.requests:1|c
+sozu.WRK-00.cluster.my-cluster.http.errors:0|c
+sozu.WRK-00.cluster.my-cluster.backend.backend-1.backend_response_time:125|ms
+```
+
+**Tagged** (InfluxDB format, `tagged_metrics = true`):
+
+```
+sozu.http.requests,origin=WRK-00,version=1.1.0:1|c
+sozu.cluster.http.errors,origin=WRK-00,version=1.1.0,cluster_id=my-cluster:0|c
+sozu.backend.backend_response_time,origin=WRK-00,version=1.1.0,cluster_id=my-cluster,backend_id=backend-1:125|ms
+```
 
 ### Available metrics
 
 Sōzu emits the following metrics via statsd. All metrics are emitted by both HTTP/1.1
-and HTTP/2 code paths unless noted otherwise.
+and HTTP/2 code paths unless noted otherwise. The prefix (default `sozu`) is omitted
+from metric names below.
+
+#### Infrastructure
+
+| Metric | Type | Scope | Description |
+|--------|------|-------|-------------|
+| `panic` | counter | proxy | Worker thread panicked (logged before crash) |
+| `configuration.clusters` | gauge | proxy | Number of configured clusters |
+| `configuration.backends` | gauge | proxy | Number of configured backend servers |
+| `configuration.frontends` | gauge | proxy | Number of configured frontends |
+| `client.connections` | gauge | proxy | Active frontend connections |
+| `client.connections_percentage` | gauge | proxy | Percentage of `max_connections` in use |
+| `client.max_connections` | gauge | proxy | Configured maximum connections |
+| `slab.entries` | gauge | proxy | Session slab allocator slots used |
+| `buffer.number` | gauge | proxy | Buffers currently allocated from the buffer pool |
+| `zombies` | counter | proxy | Zombie sessions detected and removed |
+
+#### Accept queue
+
+| Metric | Type | Scope | Description |
+|--------|------|-------|-------------|
+| `accept_queue.connections` | gauge | proxy | Sockets waiting in the accept queue |
+| `accept_queue.backpressure` | gauge | proxy | `1` when max connections reached, `0` when accepting again |
+| `accept_queue.wait_time` | time | proxy | How long a socket waited in the accept queue (ms) |
+| `accept_queue.timeout` | counter | proxy | Sockets that timed out in the accept queue and were closed |
+
+#### Event loop
+
+| Metric | Type | Scope | Description |
+|--------|------|-------|-------------|
+| `epoll_time` | time | proxy | Time spent in `epoll_wait`/`kqueue` (ms) |
+| `event_loop_time` | time | proxy | Total event loop iteration time (ms) |
+
+#### Protocol state
+
+These gauges track how many sessions are in each protocol phase. A session
+transitions through phases (e.g., Expect → TLS Handshake → HTTPS → WSS).
+
+| Metric | Type | Scope | Description |
+|--------|------|-------|-------------|
+| `protocol.proxy.expect` | gauge | proxy | Sessions expecting a PROXY protocol header |
+| `protocol.proxy.send` | gauge | proxy | Sessions sending a PROXY protocol header to a backend |
+| `protocol.proxy.relay` | gauge | proxy | Sessions relaying a PROXY protocol header |
+| `protocol.tls.handshake` | gauge | proxy | Sessions in TLS handshake (HTTPS only) |
+| `protocol.http` | gauge | proxy | Active HTTP sessions |
+| `protocol.https` | gauge | proxy | Active HTTPS sessions |
+| `protocol.tcp` | gauge | proxy | Active TCP proxy sessions |
+| `protocol.ws` | gauge | proxy | Active WebSocket sessions (over HTTP) |
+| `protocol.wss` | gauge | proxy | Active WebSocket sessions (over HTTPS) |
+| `websocket.active_requests` | gauge | proxy | Active WebSocket requests (HTTP + HTTPS) |
 
 #### Request lifecycle
 
-| Metric | Type | Description |
-|--------|------|-------------|
-| `http.requests` | counter | Total HTTP requests received (incremented when headers are fully parsed) |
-| `http.active_requests` | gauge | Currently in-flight requests |
-| `http.e2e.http11` | counter | Completed HTTP/1.1 request/response cycles (mux path) |
-| `http.e2e.h2` | counter | Completed HTTP/2 request/response cycles |
-| `http.errors` | counter | General HTTP processing errors |
+| Metric | Type | Scope | Description |
+|--------|------|-------|-------------|
+| `http.requests` | counter | proxy, cluster, backend | Total HTTP requests received (incremented when headers are fully parsed) |
+| `http.active_requests` | gauge | proxy | Currently in-flight requests |
+| `http.e2e.http11` | counter | proxy | Completed HTTP/1.1 request/response cycles |
+| `http.e2e.h2` | counter | proxy | Completed HTTP/2 request/response cycles |
+| `http.errors` | counter | proxy | General HTTP processing errors |
+| `tcp.requests` | counter | proxy | TCP proxy connection requests |
 
 #### Byte counters
 
-| Metric | Type | Description |
-|--------|------|-------------|
-| `bytes_in` | counter | Bytes received from frontend clients |
-| `bytes_out` | counter | Bytes sent to frontend clients |
-| `back_bytes_in` | counter | Bytes received from backend servers |
-| `back_bytes_out` | counter | Bytes sent to backend servers |
+| Metric | Type | Scope | Description |
+|--------|------|-------|-------------|
+| `bytes_in` | counter | proxy, cluster, backend | Bytes received from frontend clients |
+| `bytes_out` | counter | proxy, cluster, backend | Bytes sent to frontend clients |
+| `back_bytes_in` | counter | proxy | Bytes received from backend servers |
+| `back_bytes_out` | counter | proxy | Bytes sent to backend servers |
 
-#### Parse errors
+#### Timing / latency
 
-| Metric | Type | Description |
-|--------|------|-------------|
-| `http.frontend_parse_errors` | counter | Frontend request parsing failures (malformed HTTP/1.1 or HPACK decode errors in HTTP/2) |
-| `http.backend_parse_errors` | counter | Backend response parsing failures |
+These are recorded as HDR histograms locally (queryable as percentiles: p50, p90, p99,
+p99.9, p99.99, p99.999, p100) and sent as `|ms` values over StatsD.
 
-#### Default answer / error responses
-
-These are incremented when Sōzu generates a default error response:
-
-| Metric | Type | Description |
-|--------|------|-------------|
-| `http.301.redirection` | counter | 301 Moved Permanently (HTTP→HTTPS redirect) |
-| `http.400.errors` | counter | 400 Bad Request |
-| `http.401.errors` | counter | 401 Unauthorized |
-| `http.404.errors` | counter | 404 Not Found (no matching cluster) |
-| `http.408.errors` | counter | 408 Request Timeout |
-| `http.413.errors` | counter | 413 Payload Too Large |
-| `http.502.errors` | counter | 502 Bad Gateway |
-| `http.503.errors` | counter | 503 Service Unavailable (no backends) |
-| `http.504.errors` | counter | 504 Gateway Timeout |
-| `http.507.errors` | counter | 507 Insufficient Storage (buffer full) |
+| Metric | Type | Scope | Description |
+|--------|------|-------|-------------|
+| `request_time` | time | proxy, cluster | Total request time: first byte received to last byte sent (ms) |
+| `service_time` | time | proxy, cluster | Internal processing time excluding backend I/O (ms) |
+| `backend_response_time` | time | cluster, backend | Time from backend connection to last response byte (ms) |
+| `backend_connection_time` | time | cluster, backend | TCP connection establishment time to backend (ms) |
+| `frontend_matching_time` | time | cluster | Cluster/frontend route matching time (ms) |
+| `regex_matching_time` | time | proxy | Regex evaluation time for path-based routing (ms) |
 
 #### Response status classes
 
-| Metric | Type | Description |
-|--------|------|-------------|
-| `http.status.1xx` | counter | 1xx informational responses |
-| `http.status.2xx` | counter | 2xx success responses |
-| `http.status.3xx` | counter | 3xx redirection responses |
-| `http.status.4xx` | counter | 4xx client error responses |
-| `http.status.5xx` | counter | 5xx server error responses |
-| `http.status.other` | counter | Non-standard status codes |
-| `http.status.none` | counter | Responses without a status code |
+Incremented per backend response (scope: cluster + backend for `1xx`–`5xx`):
+
+| Metric | Type | Scope | Description |
+|--------|------|-------|-------------|
+| `http.status.1xx` | counter | cluster, backend | 1xx informational responses |
+| `http.status.2xx` | counter | cluster, backend | 2xx success responses |
+| `http.status.3xx` | counter | cluster, backend | 3xx redirection responses |
+| `http.status.4xx` | counter | cluster, backend | 4xx client error responses |
+| `http.status.5xx` | counter | cluster, backend | 5xx server error responses |
+| `http.status.other` | counter | proxy | Non-standard status codes |
+| `http.status.none` | counter | proxy | Responses without a status code |
+
+#### Default answer / error responses
+
+Incremented when Sōzu generates a default error response instead of proxying:
+
+| Metric | Type | Scope | Description |
+|--------|------|-------|-------------|
+| `http.301.redirection` | counter | proxy | 301 Moved Permanently (HTTP→HTTPS redirect) |
+| `http.400.errors` | counter | proxy | 400 Bad Request (cannot parse hostname) |
+| `http.401.errors` | counter | proxy | 401 Unauthorized |
+| `http.404.errors` | counter | proxy | 404 Not Found (no matching cluster) |
+| `http.408.errors` | counter | proxy | 408 Request Timeout |
+| `http.413.errors` | counter | proxy | 413 Payload Too Large |
+| `http.502.errors` | counter | proxy | 502 Bad Gateway |
+| `http.503.errors` | counter | proxy | 503 Service Unavailable (no backends or circuit breaker triggered) |
+| `http.504.errors` | counter | proxy | 504 Gateway Timeout |
+| `http.507.errors` | counter | proxy | 507 Insufficient Storage (buffer full) |
+| `http.other.errors` | counter | proxy | Non-standard error response code (mux path only) |
+
+#### Parse errors
+
+| Metric | Type | Scope | Description |
+|--------|------|-------|-------------|
+| `http.frontend_parse_errors` | counter | proxy | Frontend request parsing failures (malformed HTTP/1.1 or HPACK decode errors in HTTP/2) |
+| `http.backend_parse_errors` | counter | proxy | Backend response parsing failures |
 
 #### Backend health
 
-| Metric | Type | Description |
-|--------|------|-------------|
-| `backend.up` | counter | Backend marked as healthy |
-| `backend.down` | counter | Backend marked as unhealthy |
-| `backend.connections.error` | counter | Backend connection failures |
+| Metric | Type | Scope | Description |
+|--------|------|-------|-------------|
+| `backend.connections` | gauge | proxy | Active backend connections |
+| `connections_per_backend` | gauge | cluster, backend | Per-backend connection count |
+| `backend.up` | counter | proxy | Backend marked as healthy (after successful connection) |
+| `backend.down` | counter | proxy | Backend marked as unhealthy (retry policy triggered) |
+| `backend.connections.error` | counter | proxy | Backend connection failures |
+
+#### Backend metrics (per cluster/backend)
+
+These metrics are recorded with `cluster_id` and `backend_id` labels via the
+`record_backend_metrics!` macro at the end of each request:
+
+| Metric | Type | Scope | Description |
+|--------|------|-------|-------------|
+| `requests` | counter | cluster, backend | Requests handled by this backend |
+| `bytes_in` | counter | cluster, backend | Bytes received from this backend |
+| `bytes_out` | counter | cluster, backend | Bytes sent to this backend |
+| `backend_response_time` | time | cluster, backend | Response time for this backend (ms) |
+| `backend_connection_time` | time | cluster, backend | Connection setup time for this backend (ms) |
 
 #### ALPN negotiation
 
-| Metric | Type | Description |
-|--------|------|-------------|
-| `http.alpn.h2` | counter | TLS connections where client negotiated HTTP/2 via ALPN |
-| `http.alpn.http11` | counter | TLS connections where client negotiated HTTP/1.1 via ALPN (or no ALPN) |
+| Metric | Type | Scope | Description |
+|--------|------|-------|-------------|
+| `http.alpn.h2` | counter | proxy | TLS connections where client negotiated HTTP/2 via ALPN |
+| `http.alpn.http11` | counter | proxy | TLS connections where client negotiated HTTP/1.1 via ALPN (or no ALPN) |
+
+#### TLS version and cipher suite
+
+Incremented once per TLS connection after the handshake completes.
+
+| Metric | Type | Scope | Description |
+|--------|------|-------|-------------|
+| `tls.version.SSLv2` | counter | proxy | Connections using SSLv2 |
+| `tls.version.SSLv3` | counter | proxy | Connections using SSLv3 |
+| `tls.version.TLSv1_0` | counter | proxy | Connections using TLS 1.0 |
+| `tls.version.TLSv1_1` | counter | proxy | Connections using TLS 1.1 |
+| `tls.version.TLSv1_2` | counter | proxy | Connections using TLS 1.2 |
+| `tls.version.TLSv1_3` | counter | proxy | Connections using TLS 1.3 |
+| `tls.version.DTLSv1_0` | counter | proxy | Connections using DTLS 1.0 |
+| `tls.version.DTLSv1_2` | counter | proxy | Connections using DTLS 1.2 |
+| `tls.version.DTLSv1_3` | counter | proxy | Connections using DTLS 1.3 |
+| `tls.version.Unknown` | counter | proxy | Unrecognized TLS version |
+| `tls.version.unimplemented` | counter | proxy | TLS version not yet handled in code |
+| `tls.default_cert_used` | counter | proxy | Fallback to default certificate (no SNI match) |
+
+Negotiated cipher suite (rustls):
+
+| Metric | Type | Scope |
+|--------|------|-------|
+| `tls.cipher.TLS13_AES_128_GCM_SHA256` | counter | proxy |
+| `tls.cipher.TLS13_AES_256_GCM_SHA384` | counter | proxy |
+| `tls.cipher.TLS13_CHACHA20_POLY1305_SHA256` | counter | proxy |
+| `tls.cipher.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256` | counter | proxy |
+| `tls.cipher.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384` | counter | proxy |
+| `tls.cipher.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256` | counter | proxy |
+| `tls.cipher.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256` | counter | proxy |
+| `tls.cipher.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384` | counter | proxy |
+| `tls.cipher.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256` | counter | proxy |
+| `tls.cipher.Unsupported` | counter | proxy |
 
 #### HTTP/2 specific
 
-| Metric | Type | Description |
-|--------|------|-------------|
-| `h2.headers_no_stream.error` | counter | HEADERS frame received with no matching stream (protocol error) |
+| Metric | Type | Scope | Description |
+|--------|------|-------|-------------|
+| `h2.active_streams` | gauge | proxy | Open HTTP/2 streams on a connection |
+| `h2.connection_window` | gauge | proxy | Connection-level flow control window size (bytes) |
+| `h2.pending_window_updates` | gauge | proxy | Pending WINDOW_UPDATE frames to send |
+| `h2.flow_control_stall` | counter | proxy | Converter stalled due to flow control |
+| `h2.close_with_active_streams` | counter | proxy | H2 connections closed while streams were still active |
+| `h2.window_update_dropped` | counter | proxy | WINDOW_UPDATE frames dropped (no matching stream) |
+| `h2.headers_no_stream.error` | counter | proxy | HEADERS frame received with no matching stream (protocol error) |
+
+#### Protocol upgrade failures
+
+Incremented when a session fails to transition between protocol phases:
+
+| Metric | Type | Scope | Description |
+|--------|------|-------|-------------|
+| `http.upgrade.expect.failed` | counter | proxy | HTTP: PROXY protocol expect → mux transition failed |
+| `http.upgrade.mux.failed` | counter | proxy | HTTP: mux protocol upgrade failed |
+| `http.upgrade.ws.failed` | counter | proxy | HTTP: WebSocket upgrade failed |
+| `https.upgrade.expect.failed` | counter | proxy | HTTPS: PROXY protocol expect → handshake transition failed |
+| `https.upgrade.handshake.failed` | counter | proxy | HTTPS: TLS handshake → mux transition failed |
+| `https.upgrade.mux.failed` | counter | proxy | HTTPS: mux protocol upgrade failed |
+| `https.upgrade.wss.failed` | counter | proxy | HTTPS: WebSocket over TLS upgrade failed |
+| `tcp.upgrade.pipe.failed` | counter | proxy | TCP: pipe protocol upgrade failed |
+| `tcp.upgrade.send.failed` | counter | proxy | TCP: PROXY protocol send transition failed |
+| `tcp.upgrade.relay.failed` | counter | proxy | TCP: PROXY protocol relay transition failed |
+| `tcp.upgrade.expect.failed` | counter | proxy | TCP: PROXY protocol expect transition failed |
+
+#### Socket and I/O errors
+
+| Metric | Type | Scope | Description |
+|--------|------|-------|-------------|
+| `socket.read.infinite_loop.error` | counter | proxy | TCP socket read loop safety breaker triggered |
+| `socket.write.infinite_loop.error` | counter | proxy | TCP socket write loop safety breaker triggered |
+| `tcp.read.error` | counter | proxy | TCP socket read error |
+| `tcp.write.error` | counter | proxy | TCP socket write error |
+| `tcp.infinite_loop.error` | counter | proxy | TCP session event loop safety breaker triggered |
+| `rustls.read.error` | counter | proxy | TLS read error |
+| `rustls.write.error` | counter | proxy | TLS write error |
+| `rustls.read.infinite_loop.error` | counter | proxy | TLS read loop safety breaker triggered |
+| `rustls.write.infinite_loop.error` | counter | proxy | TLS write loop safety breaker triggered |
 
 #### Other
 
-| Metric | Type | Description |
-|--------|------|-------------|
-| `http.infinite_loop.error` | counter | Event loop safety breaker triggered |
-| `unsent-access-logs` | counter | Access log entries that could not be sent |
+| Metric | Type | Scope | Description |
+|--------|------|-------|-------------|
+| `http.infinite_loop.error` | counter | proxy | HTTP event loop safety breaker triggered |
+| `http.failed_backend_matching` | counter | proxy | Frontend matched but no backend could be selected |
+| `http.early_response_close` | counter | proxy | Client closed before response was fully sent |
+| `http.trusting.x_proto` | counter | proxy | Request had an existing `X-Forwarded-Proto` header (trusted) |
+| `http.trusting.x_proto.diff` | counter | proxy | Trusted `X-Forwarded-Proto` differed from actual protocol |
+| `http.trusting.x_port` | counter | proxy | Request had an existing `X-Forwarded-Port` header (trusted) |
+| `http.trusting.x_port.diff` | counter | proxy | Trusted `X-Forwarded-Port` differed from actual port |
+| `pipe.errors` | counter | proxy | Pipe/WebSocket protocol errors |
+| `proxy_protocol.errors` | counter | proxy | PROXY protocol v1/v2 parsing errors |
+| `unsent-access-logs` | counter | proxy | Access log entries that could not be sent |
+| `access_logs.count` | counter | cluster, backend | Access log entries emitted per cluster/backend |
 
-### Example of externals services
+### Example of external services
 
 - [statsd](https://github.com/etsy/statsd)
 - [grad](https://github.com/geal/grad)
+
+## OpenTelemetry
+
+Sōzu supports [W3C Trace Context](https://www.w3.org/TR/trace-context/) propagation
+behind the `opentelemetry` compile-time feature flag.
+
+### Enabling
+
+Build Sōzu with the `opentelemetry` feature:
+
+```bash
+cargo build --release --features opentelemetry
+```
+
+Or in `Cargo.toml`:
+
+```toml
+[dependencies]
+sozu-lib = { path = "lib", features = ["opentelemetry"] }
+```
+
+### How it works
+
+When the `opentelemetry` feature is enabled, Sōzu acts as a **trace context propagator**
+for HTTP/1.1 requests:
+
+1. **Incoming request with `traceparent` header**: Sōzu parses the W3C traceparent
+   (format: `00-<trace_id>-<parent_id>-<flags>`), preserves the trace ID, generates
+   a new span ID for the Sōzu hop, and rewrites the header before forwarding to the backend.
+
+2. **Incoming request without `traceparent` header**: Sōzu generates a new random
+   trace ID and span ID, and injects a `traceparent` header into the request before
+   forwarding.
+
+3. **`tracestate` header**: Preserved if a valid `traceparent` is present. Elided if
+   no `traceparent` accompanies it (per W3C spec).
+
+4. **Access logs**: The trace context (trace ID, span ID, parent span ID) is included in
+   access log entries and in the protobuf `AccessLog` message, enabling correlation
+   between Sōzu access logs and distributed traces in your observability platform.
+
+### Access log fields
+
+When OpenTelemetry is enabled, access logs include:
+
+| Field | Format | Description |
+|-------|--------|-------------|
+| `trace_id` | 32 hex characters | W3C trace ID (propagated or generated) |
+| `span_id` | 16 hex characters | Sōzu-generated span ID for this hop |
+| `parent_span_id` | 16 hex characters or `-` | Parent span ID from incoming `traceparent`, if present |
+
+### Limitations
+
+- OpenTelemetry propagation currently works on **HTTP/1.1 requests only** (the kawa H1 editor
+  path). HTTP/2 requests have the trace context extracted from access log records but do not
+  yet rewrite `traceparent` on forwarded H2 frames.
+- Sōzu does **not** export traces via OTLP. It acts as a propagator only — trace context
+  flows through access logs and forwarded headers. Use your access log pipeline to ingest
+  traces into Jaeger, Tempo, or similar backends.
+- There is no runtime configuration for OpenTelemetry — it is a compile-time feature flag only.
 
 ## PROXY Protocol
 
