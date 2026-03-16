@@ -2105,7 +2105,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             .filter(|s| s.state.is_open() && s.metrics.start.is_some())
             .count();
         if active_count > 0 {
-            warn!("Session close with {} active stream(s)", active_count);
+            debug!("Session close with {} active stream(s)", active_count);
             for (idx, stream) in self
                 .context
                 .streams
@@ -2114,7 +2114,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 .filter(|(_, s)| s.state.is_open() && s.metrics.start.is_some())
             {
                 let elapsed = stream.metrics.service_time();
-                warn!(
+                debug!(
                     "  active stream[{}]: state={:?} service_time={:?} method={:?} path={:?} status={:?}",
                     idx,
                     stream.state,

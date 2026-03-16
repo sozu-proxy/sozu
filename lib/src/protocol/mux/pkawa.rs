@@ -728,8 +728,8 @@ mod tests {
 
     #[test]
     fn test_is_invalid_h2_header_empty_name() {
-        // Empty header name with empty value: no uppercase, not connection-specific, not TE
-        assert!(!is_invalid_h2_header(b"", b""));
+        // Empty header name is invalid per RFC 9113 §8.2.1 (field names MUST be non-empty)
+        assert!(is_invalid_h2_header(b"", b""));
     }
 
     #[test]
