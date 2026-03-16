@@ -3503,9 +3503,7 @@ fn try_h2_to_h1_chunked_encoding() -> State {
 
     match &result {
         Some((status, resp_body)) => {
-            println!(
-                "H2-to-H1 chunked - status: {status:?}, resp body: {resp_body}"
-            );
+            println!("H2-to-H1 chunked - status: {status:?}, resp body: {resp_body}");
             if !status.is_success() || !resp_body.contains("pong") {
                 return State::Fail;
             }
@@ -3579,7 +3577,10 @@ fn try_h2_to_h1_body_with_get() -> State {
                     return Some((status, String::new()));
                 }
             };
-            Some((status, String::from_utf8(body_bytes.to_vec()).unwrap_or_default()))
+            Some((
+                status,
+                String::from_utf8(body_bytes.to_vec()).unwrap_or_default(),
+            ))
         };
         match tokio::time::timeout(Duration::from_secs(10), fut).await {
             Ok(result) => result,
@@ -3661,8 +3662,8 @@ impl ContinueBackend {
         let req_count = requests_received.clone();
 
         let thread = thread::spawn(move || {
-            let listener = std::net::TcpListener::bind(address)
-                .expect("could not bind 100-continue backend");
+            let listener =
+                std::net::TcpListener::bind(address).expect("could not bind 100-continue backend");
             listener
                 .set_nonblocking(true)
                 .expect("could not set nonblocking");
@@ -3781,7 +3782,10 @@ fn try_h2_to_h1_100_continue() -> State {
                     return Some((status, String::new()));
                 }
             };
-            Some((status, String::from_utf8(body_bytes.to_vec()).unwrap_or_default()))
+            Some((
+                status,
+                String::from_utf8(body_bytes.to_vec()).unwrap_or_default(),
+            ))
         };
         match tokio::time::timeout(Duration::from_secs(10), fut).await {
             Ok(result) => result,
@@ -3880,7 +3884,10 @@ fn try_h2_to_h1_large_headers() -> State {
                     return Some((status, String::new()));
                 }
             };
-            Some((status, String::from_utf8(body_bytes.to_vec()).unwrap_or_default()))
+            Some((
+                status,
+                String::from_utf8(body_bytes.to_vec()).unwrap_or_default(),
+            ))
         };
         match tokio::time::timeout(Duration::from_secs(10), fut).await {
             Ok(result) => result,
@@ -3893,9 +3900,7 @@ fn try_h2_to_h1_large_headers() -> State {
 
     match &result {
         Some((status, body)) => {
-            println!(
-                "H2-to-H1 large headers - status: {status:?}, body: {body}"
-            );
+            println!("H2-to-H1 large headers - status: {status:?}, body: {body}");
             if !status.is_success() || !body.contains("pong") {
                 return State::Fail;
             }
@@ -4004,8 +4009,7 @@ fn test_h2_backend_connection_reuse_multiple() {
 /// an error (RST_STREAM, 502/503, or connection error) rather than hang
 /// indefinitely. Sozu must remain alive after the error.
 fn try_h2_backend_disconnect_clean_error() -> State {
-    let (mut worker, front_port, _front_address) =
-        setup_h2_listener_only("H2-BACKEND-DISCONNECT");
+    let (mut worker, front_port, _front_address) = setup_h2_listener_only("H2-BACKEND-DISCONNECT");
 
     let back_address = create_local_address();
     worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
@@ -4214,9 +4218,7 @@ fn try_h2_settings_change_mid_connection() -> State {
     let response_frames = parse_h2_frames(&data);
 
     let got_headers_response = response_frames.iter().any(|(t, _, _, _)| *t == 0x1);
-    println!(
-        "H2 SETTINGS change - got HEADERS response: {got_headers_response}"
-    );
+    println!("H2 SETTINGS change - got HEADERS response: {got_headers_response}");
 
     drop(tls);
 
@@ -4369,8 +4371,7 @@ fn try_h2_stream_priority_basic() -> State {
     worker.read_to_last();
 
     // Use a backend that delays slightly so priority can have an effect
-    let mut backend =
-        PerStreamDelayH2Backend::start(back_address, Duration::from_millis(100));
+    let mut backend = PerStreamDelayH2Backend::start(back_address, Duration::from_millis(100));
 
     let client = build_h2_client();
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -4401,10 +4402,7 @@ fn try_h2_stream_priority_basic() -> State {
                             .await
                             .map(|c| c.to_bytes())
                             .unwrap_or_default();
-                        Some((
-                            s,
-                            String::from_utf8(b.to_vec()).unwrap_or_default(),
-                        ))
+                        Some((s, String::from_utf8(b.to_vec()).unwrap_or_default()))
                     }
                     Err(_) => None,
                 };
@@ -4435,10 +4433,7 @@ fn try_h2_stream_priority_basic() -> State {
                             .await
                             .map(|c| c.to_bytes())
                             .unwrap_or_default();
-                        Some((
-                            s,
-                            String::from_utf8(b.to_vec()).unwrap_or_default(),
-                        ))
+                        Some((s, String::from_utf8(b.to_vec()).unwrap_or_default()))
                     }
                     Err(_) => None,
                 };
@@ -4477,9 +4472,7 @@ fn try_h2_stream_priority_basic() -> State {
     if success && resp_sent >= 6 {
         State::Success
     } else {
-        println!(
-            "H2 priority - success={success}, responses_sent={resp_sent}"
-        );
+        println!("H2 priority - success={success}, responses_sent={resp_sent}");
         State::Fail
     }
 }
@@ -4874,8 +4867,7 @@ fn try_h2_graceful_shutdown_completes_large_transfer() -> State {
     let front_port = provide_port();
     let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
     let (config, listeners, state) = Worker::empty_config();
-    let mut worker =
-        Worker::start_new_worker("H2-GRACEFUL-LARGE", config, &listeners, state);
+    let mut worker = Worker::start_new_worker("H2-GRACEFUL-LARGE", config, &listeners, state);
 
     worker.send_proxy_request_type(RequestType::AddHttpsListener(
         ListenerBuilder::new_https(front_address.clone())
@@ -4918,8 +4910,11 @@ fn try_h2_graceful_shutdown_completes_large_transfer() -> State {
 
     // Backend that delays 1s before responding with a 512KB body
     let body_size = 512 * 1024;
-    let mut delayed_backend =
-        DelayedH2Backend::start(back_address, Duration::from_millis(500), "X".repeat(body_size));
+    let mut delayed_backend = DelayedH2Backend::start(
+        back_address,
+        Duration::from_millis(500),
+        "X".repeat(body_size),
+    );
 
     let client = build_h2_client();
     let uri: hyper::Uri = format!("https://localhost:{front_port}/api/large")
@@ -4935,9 +4930,7 @@ fn try_h2_graceful_shutdown_completes_large_transfer() -> State {
     worker.soft_stop();
 
     // Wait for the request to complete
-    let result = request_handle
-        .join()
-        .expect("request thread panicked");
+    let result = request_handle.join().expect("request thread panicked");
 
     let transfer_ok = result.as_ref().is_some_and(|(status, body)| {
         println!(
@@ -4957,9 +4950,7 @@ fn try_h2_graceful_shutdown_completes_large_transfer() -> State {
     if transfer_ok {
         State::Success
     } else {
-        println!(
-            "H2 graceful shutdown - transfer_ok={transfer_ok}, worker_stop={success}"
-        );
+        println!("H2 graceful shutdown - transfer_ok={transfer_ok}, worker_stop={success}");
         State::Fail
     }
 }
@@ -5000,21 +4991,17 @@ fn try_h2_mixed_h1_h2_traffic() -> State {
 
     // Send H2 request
     let h2_result = resolve_request(&h2_client, h2_uri);
-    let h2_ok = h2_result
-        .as_ref()
-        .is_some_and(|(s, body)| {
-            println!("H2 mixed traffic - H2 response: status={s:?}, body={body}");
-            s.is_success() && body.contains("pong")
-        });
+    let h2_ok = h2_result.as_ref().is_some_and(|(s, body)| {
+        println!("H2 mixed traffic - H2 response: status={s:?}, body={body}");
+        s.is_success() && body.contains("pong")
+    });
 
     // Send H1 request
     let h1_result = resolve_request(&h1_client, h1_uri);
-    let h1_ok = h1_result
-        .as_ref()
-        .is_some_and(|(s, body)| {
-            println!("H2 mixed traffic - H1 response: status={s:?}, body={body}");
-            s.is_success() && body.contains("pong")
-        });
+    let h1_ok = h1_result.as_ref().is_some_and(|(s, body)| {
+        println!("H2 mixed traffic - H1 response: status={s:?}, body={body}");
+        s.is_success() && body.contains("pong")
+    });
 
     println!("H2 mixed traffic - H2 ok: {h2_ok}, H1 ok: {h1_ok}");
 
@@ -5046,9 +5033,7 @@ fn try_h2_mixed_h1_h2_traffic() -> State {
         }
     }
 
-    println!(
-        "H2 mixed traffic - H2 batch ok: {h2_batch_ok}, H1 batch ok: {h1_batch_ok}"
-    );
+    println!("H2 mixed traffic - H2 batch ok: {h2_batch_ok}, H1 batch ok: {h1_batch_ok}");
 
     worker.soft_stop();
     let success = worker.wait_for_server_stop();
@@ -5164,27 +5149,32 @@ fn try_h2_with_proxy_protocol_v2() -> State {
     // Connect raw TCP, send PP header, then upgrade to TLS with H2 ALPN
     let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
     let tcp = TcpStream::connect(front_addr).expect("could not connect");
-    tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    tcp.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+    tcp.set_nodelay(true)
+        .expect("set TCP_NODELAY on test socket");
+    // Use a short read timeout to prevent rustls StreamOwned::complete_io from
+    // blocking for seconds in read_tls after writes. The default 5s timeout
+    // causes the server's SETTINGS ACK timer to expire before the client's
+    // ACK actually reaches the server (complete_io writes then blocks in read).
+    tcp.set_read_timeout(Some(Duration::from_millis(500)))
+        .expect("set read timeout on test socket");
+    tcp.set_write_timeout(Some(Duration::from_secs(5)))
+        .expect("set write timeout on test socket");
 
     // Send PROXY protocol v2 header before TLS handshake
     let mut tcp = tcp;
-    tcp.write_all(&pp_v2_header).expect("could not send PP header");
+    tcp.write_all(&pp_v2_header)
+        .expect("could not send PP header");
     tcp.flush().expect("could not flush PP header");
 
     // Now establish TLS over this TCP connection
     let mut tls_config = rustls::ClientConfig::builder()
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(
-            crate::mock::https_client::Verifier,
-        ))
+        .with_custom_certificate_verifier(Arc::new(crate::mock::https_client::Verifier))
         .with_no_client_auth();
     tls_config.alpn_protocols = vec![b"h2".to_vec()];
 
-    let server_name =
-        rustls::pki_types::ServerName::try_from("localhost").unwrap();
-    let conn =
-        rustls::ClientConnection::new(Arc::new(tls_config), server_name.to_owned()).unwrap();
+    let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let conn = rustls::ClientConnection::new(Arc::new(tls_config), server_name.to_owned()).unwrap();
     let mut tls = rustls::StreamOwned::new(conn, tcp);
 
     // Perform H2 handshake
@@ -5226,9 +5216,7 @@ fn try_h2_with_proxy_protocol_v2() -> State {
     if success && still_alive && got_response {
         State::Success
     } else {
-        println!(
-            "H2 PP v2 - success={success}, alive={still_alive}, got_response={got_response}"
-        );
+        println!("H2 PP v2 - success={success}, alive={still_alive}, got_response={got_response}");
         State::Fail
     }
 }
@@ -5315,9 +5303,7 @@ fn try_h2_custom_error_page_rendering() -> State {
     let result = resolve_request(&client, uri);
     let (status_ok, body_ok) = match &result {
         Some((status, body)) => {
-            println!(
-                "H2 custom error - status: {status:?}, body: {body}"
-            );
+            println!("H2 custom error - status: {status:?}, body: {body}");
             // The response should be a 503 with our custom body
             let s_ok = *status == hyper::StatusCode::SERVICE_UNAVAILABLE;
             let b_ok = body.contains("Custom 503: Backend is down!!");
@@ -5331,9 +5317,7 @@ fn try_h2_custom_error_page_rendering() -> State {
         }
     };
 
-    println!(
-        "H2 custom error - status_ok={status_ok}, body_ok={body_ok}"
-    );
+    println!("H2 custom error - status_ok={status_ok}, body_ok={body_ok}");
 
     // Verify sozu is still alive
     thread::sleep(Duration::from_millis(200));
@@ -5477,11 +5461,8 @@ impl GoAwayAfterFirstH2Backend {
                         break;
                     }
 
-                    let accept = tokio::time::timeout(
-                        Duration::from_millis(50),
-                        listener.accept(),
-                    )
-                    .await;
+                    let accept =
+                        tokio::time::timeout(Duration::from_millis(50), listener.accept()).await;
 
                     let (stream, _) = match accept {
                         Ok(Ok(s)) => s,
@@ -5700,9 +5681,7 @@ fn try_h2_backend_max_concurrent_respected() -> State {
         .filter(|r| r.as_ref().is_some_and(|(s, _)| s.is_success()))
         .count();
 
-    println!(
-        "H2 max concurrent - {success_count}/5 requests succeeded (all_ok={all_ok})"
-    );
+    println!("H2 max concurrent - {success_count}/5 requests succeeded (all_ok={all_ok})");
 
     // Verify sozu is still alive
     thread::sleep(Duration::from_millis(200));
@@ -5767,11 +5746,8 @@ impl AbruptCloseH2Backend {
                         break;
                     }
 
-                    let accept = tokio::time::timeout(
-                        Duration::from_millis(50),
-                        listener.accept(),
-                    )
-                    .await;
+                    let accept =
+                        tokio::time::timeout(Duration::from_millis(50), listener.accept()).await;
 
                     let (stream, _) = match accept {
                         Ok(Ok(s)) => s,
@@ -5879,9 +5855,7 @@ fn try_h2_upstream_close_with_many_streams() -> State {
 
     // Count how many got responses (success or error)
     let responded = results.iter().filter(|r| r.is_some()).count();
-    println!(
-        "H2 upstream close - {responded}/10 requests got a response (success or error)"
-    );
+    println!("H2 upstream close - {responded}/10 requests got a response (success or error)");
 
     // The key assertion: sozu must NOT crash after a mass stream cleanup.
     thread::sleep(Duration::from_millis(500));
@@ -5898,9 +5872,7 @@ fn try_h2_upstream_close_with_many_streams() -> State {
     if success && still_alive {
         State::Success
     } else {
-        println!(
-            "H2 upstream close - success={success}, alive={still_alive}"
-        );
+        println!("H2 upstream close - success={success}, alive={still_alive}");
         State::Fail
     }
 }
@@ -6049,9 +6021,7 @@ fn try_h2_backend_early_response() -> State {
 
     if success && still_alive {
         if !received_response {
-            println!(
-                "H2 early response - no response received but sozu is alive (acceptable)"
-            );
+            println!("H2 early response - no response received but sozu is alive (acceptable)");
         }
         State::Success
     } else {
@@ -6271,10 +6241,10 @@ impl FloodingH2Backend {
                         // HEADERS frame: length=1, type=0x01, flags=0x04 (END_HEADERS),
                         // stream_id=1, payload=0x88 (:status 200)
                         response.extend_from_slice(&[
-                            0, 0, 1, // length = 1
+                            0, 0, 1,    // length = 1
                             0x01, // type = HEADERS
                             0x04, // flags = END_HEADERS
-                            0, 0, 0, 1, // stream_id = 1
+                            0, 0, 0, 1,    // stream_id = 1
                             0x88, // HPACK: :status 200
                         ]);
 
@@ -6310,10 +6280,9 @@ impl FloodingH2Backend {
                                 FloodFrameType::Ping => {
                                     // PING frame: length=8, type=0x06, flags=0, stream=0
                                     let mut payload = [0u8; 8];
-                                    payload[0..4]
-                                        .copy_from_slice(&(i as u32).to_be_bytes());
+                                    payload[0..4].copy_from_slice(&(i as u32).to_be_bytes());
                                     flood_batch.extend_from_slice(&[
-                                        0, 0, 8, // length = 8
+                                        0, 0, 8,    // length = 8
                                         0x06, // type = PING
                                         0,    // flags = 0 (not ACK)
                                         0, 0, 0, 0, // stream_id = 0
@@ -6324,7 +6293,7 @@ impl FloodingH2Backend {
                                     // SETTINGS frame with one setting:
                                     // MAX_CONCURRENT_STREAMS = 100
                                     flood_batch.extend_from_slice(&[
-                                        0, 0, 6, // length = 6
+                                        0, 0, 6,    // length = 6
                                         0x04, // type = SETTINGS
                                         0,    // flags = 0 (not ACK)
                                         0, 0, 0, 0, // stream_id = 0
@@ -6335,7 +6304,7 @@ impl FloodingH2Backend {
                                 FloodFrameType::WindowUpdate => {
                                     // WINDOW_UPDATE frame: increment=1, stream=0
                                     flood_batch.extend_from_slice(&[
-                                        0, 0, 4, // length = 4
+                                        0, 0, 4,    // length = 4
                                         0x08, // type = WINDOW_UPDATE
                                         0,    // flags = 0
                                         0, 0, 0, 0, // stream_id = 0
@@ -6345,18 +6314,14 @@ impl FloodingH2Backend {
                             }
                             // Send in batches of 50 to avoid overwhelming TCP buffers
                             if (i + 1) % 50 == 0 || i == flood_count - 1 {
-                                match tokio::io::AsyncWriteExt::write_all(
-                                    &mut stream,
-                                    &flood_batch,
-                                )
-                                .await
+                                match tokio::io::AsyncWriteExt::write_all(&mut stream, &flood_batch)
+                                    .await
                                 {
                                     Ok(()) => {
                                         frames_sent_inner
                                             .fetch_add(flood_batch.len(), Ordering::Relaxed);
                                         flood_batch.clear();
-                                        let _ =
-                                            tokio::io::AsyncWriteExt::flush(&mut stream).await;
+                                        let _ = tokio::io::AsyncWriteExt::flush(&mut stream).await;
                                     }
                                     Err(_) => break, // sozu closed the connection
                                 }
@@ -6407,8 +6372,7 @@ fn try_h2_upstream_ping_flood_detection() -> State {
     let front_port = provide_port();
     let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
     let (config, listeners, state) = Worker::empty_config();
-    let mut worker =
-        Worker::start_new_worker("H2-UPSTREAM-PING-FLOOD", config, &listeners, state);
+    let mut worker = Worker::start_new_worker("H2-UPSTREAM-PING-FLOOD", config, &listeners, state);
 
     worker.send_proxy_request_type(RequestType::AddHttpsListener(
         ListenerBuilder::new_https(front_address.clone())
@@ -6450,8 +6414,7 @@ fn try_h2_upstream_ping_flood_detection() -> State {
     worker.read_to_last();
 
     // Start the flooding backend (200 PINGs, threshold is 100)
-    let mut flooding_backend =
-        FloodingH2Backend::start(back_address, FloodFrameType::Ping, 200);
+    let mut flooding_backend = FloodingH2Backend::start(back_address, FloodFrameType::Ping, 200);
 
     let client = build_h2_client();
     let uri: hyper::Uri = format!("https://localhost:{front_port}/api")
@@ -6609,8 +6572,7 @@ fn try_h2_upstream_window_update_flood() -> State {
     let front_port = provide_port();
     let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
     let (config, listeners, state) = Worker::empty_config();
-    let mut worker =
-        Worker::start_new_worker("H2-UPSTREAM-WINUP-FLOOD", config, &listeners, state);
+    let mut worker = Worker::start_new_worker("H2-UPSTREAM-WINUP-FLOOD", config, &listeners, state);
 
     worker.send_proxy_request_type(RequestType::AddHttpsListener(
         ListenerBuilder::new_https(front_address.clone())
@@ -6752,9 +6714,7 @@ fn try_h2_outbound_flood_from_goaway() -> State {
     // (typically 1 or 2 for graceful shutdown: first GOAWAY with last_stream_id=MAX,
     // then a second with the actual last stream). It must NOT send 50 GOAWAYs.
     let goaway_bounded = goaway_count <= 3;
-    println!(
-        "H2 outbound GOAWAY flood - GOAWAY count bounded (<=3): {goaway_bounded}"
-    );
+    println!("H2 outbound GOAWAY flood - GOAWAY count bounded (<=3): {goaway_bounded}");
 
     drop(tls);
     thread::sleep(Duration::from_millis(200));

@@ -44,9 +44,22 @@ fn is_invalid_te_value(value: &[u8]) -> bool {
 /// - connection-specific header fields (RFC 9113 §8.2.2)
 /// - TE header with a value other than "trailers"
 fn is_invalid_h2_header(name: &[u8], value: &[u8]) -> bool {
-    has_uppercase_ascii(name)
+    name.is_empty()
+        || has_uppercase_ascii(name)
         || is_connection_specific_header(name)
         || (compare_no_case(name, b"te") && is_invalid_te_value(value))
+}
+
+/// Validate and set Content-Length, returning false if it conflicts with a prior value
+/// (RFC 9110 §8.6: multiple disagreeing Content-Length values are malformed).
+fn set_content_length(body_size: &mut BodySize, length: usize) -> bool {
+    match *body_size {
+        BodySize::Length(existing) if existing != length => false,
+        _ => {
+            *body_size = BodySize::Length(length);
+            true
+        }
+    }
 }
 
 /// Store a pseudo-header value into kawa storage.
@@ -217,7 +230,9 @@ where
                         if let Some(length) =
                             from_utf8(&v).ok().and_then(|v| v.parse::<usize>().ok())
                         {
-                            kawa.body_size = BodySize::Length(length);
+                            if !set_content_length(&mut kawa.body_size, length) {
+                                invalid_headers = true;
+                            }
                         } else {
                             invalid_headers = true;
                         }
@@ -315,7 +330,9 @@ where
                         if let Some(length) =
                             from_utf8(&v).ok().and_then(|v| v.parse::<usize>().ok())
                         {
-                            kawa.body_size = BodySize::Length(length);
+                            if !set_content_length(&mut kawa.body_size, length) {
+                                invalid_headers = true;
+                            }
                         } else {
                             invalid_headers = true;
                         }

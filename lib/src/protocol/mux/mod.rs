@@ -62,13 +62,8 @@ use crate::{
 };
 
 pub use crate::protocol::mux::{
-    h1::ConnectionH1,
-    h2::ConnectionH2,
-    h2::H2ByteAccounting,
-    h2::H2DrainState,
-    h2::H2FloodConfig,
-    h2::H2FlowControl,
-    parser::H2Error,
+    h1::ConnectionH1, h2::ConnectionH2, h2::H2ByteAccounting, h2::H2DrainState, h2::H2FloodConfig,
+    h2::H2FlowControl, parser::H2Error,
 };
 
 // ── Tuning Constants ─────────────────────────────────────────────────────────
@@ -497,7 +492,11 @@ impl<Front: SocketHandler> Connection<Front> {
     ) -> Option<Connection<Front>> {
         Some(Connection::H2(ConnectionH2::new(
             front_stream,
-            Position::Client(cluster_id, backend, BackendStatus::Connecting(Instant::now())),
+            Position::Client(
+                cluster_id,
+                backend,
+                BackendStatus::Connecting(Instant::now()),
+            ),
             pool,
             flood_config,
             timeout_container,
@@ -595,6 +594,13 @@ impl<Front: SocketHandler> Connection<Front> {
         match self {
             Connection::H1(_) => MuxResult::Continue,
             Connection::H2(c) => c.graceful_goaway(),
+        }
+    }
+
+    fn is_draining(&self) -> bool {
+        match self {
+            Connection::H1(_) => false,
+            Connection::H2(c) => c.drain.draining,
         }
     }
 
@@ -2202,19 +2208,28 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
     }
 
     fn shutting_down(&mut self) -> SessionIsToBeClosed {
-        // RFC 9113 §6.8: initiate graceful shutdown with double-GOAWAY pattern
-        match self.frontend.graceful_goaway() {
-            MuxResult::CloseSession => return true,
-            MuxResult::Continue => {
-                // graceful_goaway() queued a GOAWAY frame. Flush it directly
-                // since the event loop uses edge-triggered epoll and won't
-                // deliver a new WRITABLE event for an already-writable socket.
-                self.frontend.flush_zero_buffer();
-                if self.frontend.has_pending_write() {
-                    return false;
+        // RFC 9113 §6.8: initiate graceful shutdown with double-GOAWAY pattern.
+        // Only send the phase-1 GOAWAY once. Phase 2 (final GOAWAY with the real
+        // last_stream_id) is handled by finalize_write() when all streams drain.
+        // Calling graceful_goaway() again would send phase 2 prematurely and
+        // force-disconnect before in-flight streams complete.
+        if !self.frontend.is_draining() {
+            match self.frontend.graceful_goaway() {
+                MuxResult::CloseSession => return true,
+                MuxResult::Continue => {
+                    // graceful_goaway() queued a GOAWAY frame. Flush it directly
+                    // since the event loop uses edge-triggered epoll and won't
+                    // deliver a new WRITABLE event for an already-writable socket.
+                    self.frontend.flush_zero_buffer();
                 }
+                _ => {}
             }
-            _ => {}
+        } else {
+            trace!("shutting_down: already draining, skipping duplicate GOAWAY");
+        }
+        // Don't close while the frontend still has pending writes (GOAWAY, etc.)
+        if self.frontend.has_pending_write() {
+            return false;
         }
         let mut can_stop = true;
         for stream in &mut self.context.streams {

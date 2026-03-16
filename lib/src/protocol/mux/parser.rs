@@ -1042,7 +1042,13 @@ mod tests {
     }
 
     /// Build a complete raw frame (header + payload).
-    fn build_raw_frame(payload_len: u32, frame_type: u8, flags: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
+    fn build_raw_frame(
+        payload_len: u32,
+        frame_type: u8,
+        flags: u8,
+        stream_id: u32,
+        payload: &[u8],
+    ) -> Vec<u8> {
         let mut raw = build_frame_header(payload_len, frame_type, flags, stream_id);
         raw.extend_from_slice(payload);
         raw
@@ -1170,7 +1176,10 @@ mod tests {
         let raw = build_raw_frame(payload.len() as u32, 0, 0x08, 1, &payload);
         let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).unwrap();
         let result = frame_body(remaining, &header);
-        assert!(result.is_err(), "padding exceeding payload should be a protocol error");
+        assert!(
+            result.is_err(),
+            "padding exceeding payload should be a protocol error"
+        );
     }
 
     // ---- HEADERS frame parsing ----
@@ -1225,7 +1234,10 @@ mod tests {
                 assert_eq!(h.stream_id, 3);
                 let priority = h.priority.expect("should have priority");
                 match priority {
-                    PriorityPart::Rfc7540 { stream_dependency, weight } => {
+                    PriorityPart::Rfc7540 {
+                        stream_dependency,
+                        weight,
+                    } => {
                         assert!(!stream_dependency.exclusive);
                         assert_eq!(stream_dependency.stream_id, 1);
                         assert_eq!(weight, 15);
@@ -1255,7 +1267,10 @@ mod tests {
             Frame::Headers(h) => {
                 let priority = h.priority.expect("should have priority");
                 match priority {
-                    PriorityPart::Rfc7540 { stream_dependency, weight } => {
+                    PriorityPart::Rfc7540 {
+                        stream_dependency,
+                        weight,
+                    } => {
                         assert!(stream_dependency.exclusive, "exclusive bit should be set");
                         assert_eq!(stream_dependency.stream_id, 5);
                         assert_eq!(weight, 255);
@@ -1271,7 +1286,10 @@ mod tests {
     fn test_parse_headers_stream_id_zero_rejected() {
         let raw = build_raw_frame(2, 1, 0x04, 0, b"\x82\x86");
         let result = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE);
-        assert!(result.is_err(), "HEADERS with stream_id=0 should be rejected");
+        assert!(
+            result.is_err(),
+            "HEADERS with stream_id=0 should be rejected"
+        );
     }
 
     // ---- RST_STREAM frame parsing ----
@@ -1295,7 +1313,10 @@ mod tests {
     fn test_parse_rst_stream_stream_id_zero_rejected() {
         let raw = build_raw_frame(4, 3, 0, 0, &[0u8; 4]);
         let result = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE);
-        assert!(result.is_err(), "RST_STREAM with stream_id=0 should be rejected");
+        assert!(
+            result.is_err(),
+            "RST_STREAM with stream_id=0 should be rejected"
+        );
     }
 
     // ---- SETTINGS frame parsing ----
@@ -1356,7 +1377,10 @@ mod tests {
         let (_, f) = frame_body(remaining, &header).unwrap();
         match f {
             Frame::Ping(p) => {
-                assert_eq!(p.payload, ping_payload, "PING ACK must echo the exact payload");
+                assert_eq!(
+                    p.payload, ping_payload,
+                    "PING ACK must echo the exact payload"
+                );
                 assert!(p.ack);
             }
             other => panic!("expected Ping, got {:?}", other),
@@ -1408,7 +1432,10 @@ mod tests {
         let raw = build_raw_frame(3, 8, 0, 0, &[0u8; 3]);
         let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).unwrap();
         let result = frame_body(remaining, &header);
-        assert!(result.is_err(), "WINDOW_UPDATE with payload != 4 should fail");
+        assert!(
+            result.is_err(),
+            "WINDOW_UPDATE with payload != 4 should fail"
+        );
         match result {
             Err(Err::Failure(e)) => {
                 assert_eq!(e.kind, ParserErrorKind::H2(H2Error::FrameSizeError));
@@ -1467,8 +1494,14 @@ mod tests {
     #[test]
     fn test_h2_error_from_str() {
         assert_eq!("NO_ERROR".parse::<H2Error>(), Ok(H2Error::NoError));
-        assert_eq!("PROTOCOL_ERROR".parse::<H2Error>(), Ok(H2Error::ProtocolError));
-        assert_eq!("ENHANCE_YOUR_CALM".parse::<H2Error>(), Ok(H2Error::EnhanceYourCalm));
+        assert_eq!(
+            "PROTOCOL_ERROR".parse::<H2Error>(),
+            Ok(H2Error::ProtocolError)
+        );
+        assert_eq!(
+            "ENHANCE_YOUR_CALM".parse::<H2Error>(),
+            Ok(H2Error::EnhanceYourCalm)
+        );
         assert!("INVALID_ERROR".parse::<H2Error>().is_err());
     }
 
@@ -1493,7 +1526,9 @@ mod tests {
 
         for error in &errors {
             let s = error.as_str();
-            let parsed: H2Error = s.parse().unwrap_or_else(|_| panic!("failed to parse {}", s));
+            let parsed: H2Error = s
+                .parse()
+                .unwrap_or_else(|_| panic!("failed to parse {}", s));
             assert_eq!(*error, parsed, "roundtrip failed for {}", s);
         }
     }
@@ -1515,7 +1550,10 @@ mod tests {
             Frame::Priority(p) => {
                 assert_eq!(p.stream_id, 3);
                 match p.inner {
-                    PriorityPart::Rfc7540 { stream_dependency, weight } => {
+                    PriorityPart::Rfc7540 {
+                        stream_dependency,
+                        weight,
+                    } => {
                         assert!(!stream_dependency.exclusive);
                         assert_eq!(stream_dependency.stream_id, 1);
                         assert_eq!(weight, 15);
@@ -1532,6 +1570,9 @@ mod tests {
         let raw = build_raw_frame(4, 2, 0, 1, &[0u8; 4]);
         let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).unwrap();
         let result = frame_body(remaining, &header);
-        assert!(result.is_err(), "PRIORITY with wrong payload size should fail");
+        assert!(
+            result.is_err(),
+            "PRIORITY with wrong payload size should fail"
+        );
     }
 }

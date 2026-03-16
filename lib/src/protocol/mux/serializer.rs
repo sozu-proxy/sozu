@@ -166,8 +166,7 @@ mod tests {
     /// Helper: serialize a FrameHeader into a fresh 9-byte buffer and return the bytes written.
     fn serialize_header(header: &parser::FrameHeader) -> ([u8; 9], usize) {
         let mut buf = [0u8; 9];
-        let (_, sz) = gen_frame_header(&mut buf[..], header)
-            .expect("serialization should succeed");
+        let (_, sz) = gen_frame_header(&mut buf[..], header).expect("serialization should succeed");
         (buf, sz)
     }
 
@@ -470,7 +469,7 @@ mod tests {
     fn serialized_bytes_match_expected_layout() {
         // Verify the exact byte layout matches RFC 7540 section 4.1
         let header = parser::FrameHeader {
-            payload_len: 0x000102,   // 258
+            payload_len: 0x000102,                   // 258
             frame_type: parser::FrameType::Settings, // type = 4
             flags: 0xAB,
             stream_id: 0x0304_0506,

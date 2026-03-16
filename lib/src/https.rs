@@ -217,9 +217,9 @@ impl HttpsSession {
                     request_id,
                     self.peer_address,
                 );
-                handshake.frontend_readiness.event = readiness.event;
-                // Can we remove this? If not why?
-                // Add e2e test for proto-proxy upgrades
+                // Transfer both interest and event from the proxy protocol state,
+                // so the event loop properly monitors the socket after the transition.
+                handshake.frontend_readiness = readiness;
                 handshake.frontend_readiness.event.insert(Ready::READABLE);
 
                 gauge_add!("protocol.proxy.expect", -1);
@@ -299,7 +299,6 @@ impl HttpsSession {
                 )?
             }
         };
-        frontend.readiness_mut().event = handshake.frontend_readiness.event;
         // Ensure the upgraded connection can both read and write immediately.
         // With TLS 1.3 + NewSessionTicket, the upgrade may happen from writable()
         // where READABLE is no longer in the event (consumed by the prior readable()

@@ -2937,8 +2937,7 @@ fn try_h2_priority_flood() -> State {
         let priority = H2Frame::new(
             0x02, // PRIORITY frame type
             0,    // no flags
-            stream_id,
-            payload,
+            stream_id, payload,
         );
         batch.extend_from_slice(&priority.encode());
     }
