@@ -438,7 +438,7 @@ impl<Front: SocketHandler> Connection<Front> {
                 event: Ready::EMPTY,
             },
             requests: 0,
-            stream: 0,
+            stream: Some(0),
             timeout_container,
         })
     }
@@ -459,7 +459,7 @@ impl<Front: SocketHandler> Connection<Front> {
                 interest: Ready::WRITABLE | Ready::READABLE | Ready::HUP | Ready::ERROR,
                 event: Ready::EMPTY,
             },
-            stream: usize::MAX - 1,
+            stream: None,
             requests: 0,
             timeout_container,
         })
@@ -586,17 +586,15 @@ impl<Front: SocketHandler> Connection<Front> {
     {
         match self {
             Connection::H1(c) => {
-                if c.stream < context.streams.len() {
-                    let kawa = match c.position {
-                        Position::Client(..) => &context.streams[c.stream].back,
-                        Position::Server => &context.streams[c.stream].front,
-                    };
-                    kawa.storage.available_space() == 0
-                } else {
-                    // Stream is detached (sentinel value) — this is normal during
-                    // backend cleanup after end_stream(). No buffer pressure.
-                    false
-                }
+                let Some(stream_id) = c.stream else {
+                    // No stream assigned — no buffer pressure.
+                    return false;
+                };
+                let kawa = match c.position {
+                    Position::Client(..) => &context.streams[stream_id].back,
+                    Position::Server => &context.streams[stream_id].front,
+                };
+                kawa.storage.available_space() == 0
             }
             // H2 connections manage their own flow control via expect_read
             Connection::H2(_) => false,
