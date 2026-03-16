@@ -9,7 +9,7 @@ use crate::{
         StreamState, forcefully_terminate_answer, parser::H2Error, set_default_answer,
         update_readiness_after_read, update_readiness_after_write,
     },
-    socket::SocketHandler,
+    socket::{SocketHandler, SocketResult},
     timer::TimeoutContainer,
 };
 
@@ -41,6 +41,23 @@ impl<Front: SocketHandler> std::fmt::Debug for ConnectionH1<Front> {
 }
 
 impl<Front: SocketHandler> ConnectionH1<Front> {
+    /// Terminate a close-delimited kawa body by pushing END_STREAM flags.
+    /// Called when the backend closes the connection to signal end-of-body
+    /// (no Content-Length, no chunked encoding).
+    fn terminate_close_delimited(kawa: &mut super::GenericHttpStream, stream_id: GlobalStreamId) {
+        debug!(
+            "H1 close-delimited EOF on stream {}: terminating body",
+            stream_id
+        );
+        kawa.push_block(kawa::Block::Flags(kawa::Flags {
+            end_body: true,
+            end_chunk: false,
+            end_header: false,
+            end_stream: true,
+        }));
+        kawa.parsing_phase = kawa::ParsingPhase::Terminated;
+    }
+
     pub fn readable<E, L>(&mut self, context: &mut Context<L>, mut endpoint: E) -> MuxResult
     where
         E: Endpoint,
@@ -55,6 +72,17 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         }
         let parts = stream.split(&self.position);
         let kawa = parts.rbuffer;
+
+        // If the buffer has no space, don't attempt a read — socket_read with
+        // an empty buffer returns (0, Continue) which is indistinguishable from
+        // a real EOF. Remove READABLE from the event so the inner loop doesn't
+        // spin; the next epoll cycle will re-report it once the frontend drains
+        // the buffer.
+        if kawa.storage.available_space() == 0 {
+            self.readiness.event.remove(Ready::READABLE);
+            return MuxResult::Continue;
+        }
+
         let (size, status) = self.socket.socket_read(kawa.storage.space());
         context.debug.push(DebugEvent::StreamEvent(0, size));
         kawa.storage.fill(size);
@@ -69,6 +97,29 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             }
         }
         if update_readiness_after_read(size, status, &mut self.readiness) {
+            // size=0: the socket returned EOF (Closed) or WouldBlock.
+            // For a close-delimited backend response (no Content-Length, no
+            // chunked), a graceful EOF IS the end-of-body signal. Terminate
+            // the kawa so the H2 converter emits DATA with END_STREAM.
+            // SocketResult::Error (ECONNRESET etc.) is NOT treated as a valid
+            // close-delimiter — transport errors should produce 502, not a
+            // truncated response.
+            if status == SocketResult::Closed
+                && self.position.is_client()
+                && kawa.is_main_phase()
+                && !kawa.is_terminated()
+                && !parts.context.keep_alive_backend
+            {
+                Self::terminate_close_delimited(kawa, self.stream);
+                self.timeout_container.cancel();
+                self.readiness.interest.remove(Ready::READABLE);
+                if let StreamState::Linked(token) = stream.state {
+                    endpoint
+                        .readiness_mut(token)
+                        .interest
+                        .insert(Ready::WRITABLE);
+                }
+            }
             return MuxResult::Continue;
         }
 
@@ -94,6 +145,11 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             }
             return MuxResult::Continue;
         }
+        // Capture borrow-sensitive values after parsing but before the 1xx block
+        // accesses stream.state (which ends the split borrow from `parts`).
+        let is_keep_alive_backend = parts.context.keep_alive_backend;
+        let is_body_phase_after_parse = kawa.is_main_phase();
+
         // 1xx informational responses (100 Continue, 103 Early Hints): the H1
         // parser treats them as complete (Terminated + end_stream=true), but for
         // H2 frontends they must be forwarded WITHOUT END_STREAM so the real
@@ -176,6 +232,23 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                     .insert(Ready::WRITABLE);
             }
         }
+
+        // Close-delimited response: socket_read returned (size > 0, Closed) —
+        // the last data chunk arrived together with the EOF in a single read.
+        // After parsing the data above, terminate the kawa now so the H2
+        // converter emits END_STREAM on the last DATA frame.
+        if status == SocketResult::Closed
+            && self.position.is_client()
+            && is_body_phase_after_parse
+            && !is_keep_alive_backend
+            && !context.streams[self.stream].back.is_terminated()
+        {
+            let kawa = &mut context.streams[self.stream].back;
+            Self::terminate_close_delimited(kawa, self.stream);
+            self.timeout_container.cancel();
+            self.readiness.interest.remove(Ready::READABLE);
+        }
+
         MuxResult::Continue
     }
 
