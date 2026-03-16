@@ -1203,6 +1203,18 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 }
             }
         }
+        // Reclaim the converter's reusable buffers before any &mut self calls,
+        // since the converter borrows self.encoder.
+        self.converter_buf = converter.out;
+        self.lowercase_buf = converter.lowercase_buf;
+        self.shrink_converter_buffers();
+
+        self.remove_dead_streams(dead_streams);
+        self.finalize_write(socket_write, context)
+    }
+
+    /// Remove streams that completed their lifecycle from all tracking maps.
+    fn remove_dead_streams(&mut self, dead_streams: Vec<StreamId>) {
         for stream_id in dead_streams {
             if self.streams.remove(&stream_id).is_none() {
                 error!("dead stream_id {} missing from streams map", stream_id);
@@ -1210,17 +1222,27 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             self.rst_sent.remove(&stream_id);
             self.prioriser.remove(&stream_id);
         }
+    }
 
-        // Reclaim the converter's reusable buffers
-        self.converter_buf = converter.out;
-        self.lowercase_buf = converter.lowercase_buf;
+    /// Shrink reusable converter buffers when they grow beyond 16 KB to avoid
+    /// holding memory after a burst of large headers.
+    fn shrink_converter_buffers(&mut self) {
         if self.converter_buf.capacity() > 16_384 {
             self.converter_buf.shrink_to(4096);
         }
         if self.lowercase_buf.capacity() > 16_384 {
             self.lowercase_buf.shrink_to(4096);
         }
+    }
 
+    /// Post-write phase: check drain completion, flush TLS, and update readiness.
+    ///
+    /// Returns `MuxResult::Continue` in the normal case, or triggers a graceful
+    /// GOAWAY when draining and all streams have completed.
+    fn finalize_write<L>(&mut self, socket_write: bool, context: &mut Context<L>) -> MuxResult
+    where
+        L: ListenerHandler + L7ListenerHandler,
+    {
         // RFC 9113 §6.8: if draining and all streams have completed,
         // send the final GOAWAY with the actual last_stream_id
         if self.drain.draining && self.streams.is_empty() {
