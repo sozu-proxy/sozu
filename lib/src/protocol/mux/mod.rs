@@ -501,7 +501,7 @@ impl<Front: SocketHandler> Connection<Front> {
             flow_control: h2::H2FlowControl {
                 window: h2::DEFAULT_INITIAL_WINDOW_SIZE as i32,
                 received_bytes_since_update: 0,
-                pending_window_updates: Vec::new(),
+                pending_window_updates: HashMap::new(),
             },
             highest_peer_stream_id: 0,
             converter_buf: Vec::new(),
@@ -563,7 +563,7 @@ impl<Front: SocketHandler> Connection<Front> {
             flow_control: h2::H2FlowControl {
                 window: h2::DEFAULT_INITIAL_WINDOW_SIZE as i32,
                 received_bytes_since_update: 0,
-                pending_window_updates: Vec::new(),
+                pending_window_updates: HashMap::new(),
             },
             highest_peer_stream_id: 0,
             converter_buf: Vec::new(),

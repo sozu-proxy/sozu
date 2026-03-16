@@ -104,10 +104,11 @@ fn parse_rfc9218_priority(value: &[u8]) -> (u8, bool) {
             continue;
         }
         if token.len() >= 3 && token[0] == b'u' && token[1] == b'=' {
-            // Parse `u=N` where N is a single ASCII digit 0-7
-            if token[2].is_ascii_digit() {
-                let n = token[2] - b'0';
-                urgency = n.min(7);
+            // Parse `u=N` where N may be a multi-digit value (clamped to 0-7)
+            if let Ok(s) = std::str::from_utf8(&token[2..]) {
+                if let Ok(n) = s.parse::<u8>() {
+                    urgency = n.min(7);
+                }
             }
         } else if token == b"i" || token == b"i=?1" {
             incremental = true;
@@ -135,6 +136,8 @@ where
         return handle_trailer(kawa, input, end_stream, decoder);
     }
     kawa.push_block(Block::StatusLine);
+    // Track storage position before HPACK decoding for decoded size check
+    let storage_before_decode = kawa.storage.end;
     kawa.detached.status_line = match kawa.kind {
         Kind::Request => {
             let mut method = Store::Empty;
@@ -178,16 +181,14 @@ where
                     regular_headers = true;
                     // RFC 9113 §8.2.3: split combined cookie headers into individual pairs.
                     // Each cookie-pair separated by "; " becomes a separate cookie header.
-                    // Only the split pairs are written to storage (not the full combined value).
+                    // Use Store::Static for the key to avoid redundant buffer writes.
                     for cookie_pair in v.split(|&b| b == b';') {
                         let trimmed = trim_ows(cookie_pair);
                         if trimmed.is_empty() {
                             continue;
                         }
                         let pair_start = kawa.storage.end as u32;
-                        if kawa.storage.write_all(trimmed).is_err()
-                            || kawa.storage.write_all(&k).is_err()
-                        {
+                        if kawa.storage.write_all(trimmed).is_err() {
                             invalid_headers = true;
                             return;
                         }
@@ -196,12 +197,8 @@ where
                             start: pair_start,
                             len: pair_len,
                         });
-                        let pair_key = Store::Slice(Slice {
-                            start: pair_start + pair_len,
-                            len: len_key,
-                        });
                         kawa.push_block(Block::Header(Pair {
-                            key: pair_key,
+                            key: Store::Static(b"cookie"),
                             val: pair_val,
                         }));
                     }
@@ -351,6 +348,19 @@ where
             }
         }
     };
+
+    // Check decoded header size against MAX_HEADER_LIST_SIZE for defense-in-depth.
+    // The flood detector tracks accumulated size across CONTINUATION frames, but
+    // this check catches a single oversized header block after HPACK decompression.
+    let decoded_size = kawa.storage.end - storage_before_decode;
+    if decoded_size > crate::protocol::mux::h2::MAX_HEADER_LIST_SIZE as usize {
+        error!(
+            "HPACK decoded header size {} exceeds MAX_HEADER_LIST_SIZE {}",
+            decoded_size,
+            crate::protocol::mux::h2::MAX_HEADER_LIST_SIZE
+        );
+        return Err((H2Error::ProtocolError, false));
+    }
 
     // everything has been parsed
     kawa.storage.head = kawa.storage.end;
