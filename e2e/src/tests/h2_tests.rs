@@ -6124,7 +6124,7 @@ fn try_h2_hot_certificate_reload() -> State {
     worker.send_proxy_request_type(RequestType::ReplaceCertificate(ReplaceCertificate {
         address: front_address,
         new_certificate: new_certificate,
-        old_fingerprint: Vec::new(), // empty = replace default
+        old_fingerprint: String::new(), // empty = replace default
         new_expired_at: None,
     }));
     worker.read_to_last();
