@@ -12,9 +12,6 @@ const _: () = assert!(
     "sozu requires at least 32-bit pointers"
 );
 
-/// Sentinel token used when emitting GoAway — not routed to any real session.
-const GOAWAY_SENTINEL_TOKEN: mio::Token = mio::Token(usize::MAX);
-
 use rusty_ulid::Ulid;
 use sozu_command::ready::Ready;
 
@@ -70,7 +67,7 @@ const DEFAULT_MAX_EMPTY_DATA_PER_WINDOW: u32 = 100;
 /// Default maximum CONTINUATION frames per header block (CVE-2024-27316)
 const DEFAULT_MAX_CONTINUATION_FRAMES: u32 = 20;
 /// Maximum accumulated header block size across CONTINUATION frames (64KB)
-const MAX_HEADER_LIST_SIZE: u32 = 65536;
+pub(super) const MAX_HEADER_LIST_SIZE: u32 = 65536;
 /// Duration of the sliding window for rate-based flood counters
 const FLOOD_WINDOW_DURATION: std::time::Duration = std::time::Duration::from_secs(1);
 /// Default maximum general anomaly count before triggering ENHANCE_YOUR_CALM
@@ -366,6 +363,9 @@ pub struct Prioriser {
 /// RFC 9218 §4 default urgency value.
 const DEFAULT_URGENCY: u8 = 3;
 
+/// Maximum entries in the priority map to prevent flooding via PRIORITY frames.
+const MAX_PRIORITIES: usize = 4096;
+
 impl Prioriser {
     /// Record or update the priority for a stream.
     ///
@@ -373,6 +373,10 @@ impl Prioriser {
     /// signalling the caller should reset the stream with a protocol error.
     pub fn push_priority(&mut self, stream_id: StreamId, priority: parser::PriorityPart) -> bool {
         trace!("PRIORITY REQUEST FOR {}: {:?}", stream_id, priority);
+        // Cap the priority map to prevent flooding via PRIORITY frames
+        if !self.priorities.contains_key(&stream_id) && self.priorities.len() >= MAX_PRIORITIES {
+            return false;
+        }
         match priority {
             parser::PriorityPart::Rfc7540 {
                 stream_dependency,
@@ -418,8 +422,8 @@ pub struct H2FlowControl {
     pub window: i32,
     /// Bytes received since last connection-level WINDOW_UPDATE.
     pub received_bytes_since_update: u32,
-    /// Queued (stream_id, increment) pairs for WINDOW_UPDATE frames.
-    pub pending_window_updates: Vec<(u32, u32)>,
+    /// Queued stream_id -> accumulated increment for WINDOW_UPDATE frames (O(1) coalescing).
+    pub pending_window_updates: HashMap<u32, u32>,
 }
 
 /// Byte accounting for connection overhead attribution.
@@ -1096,8 +1100,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 }
                 kawa.prepare(&mut converter);
                 let consumed = window - converter.window;
-                *parts.window -= consumed;
-                self.flow_control.window -= consumed;
+                *parts.window = parts.window.saturating_sub(consumed);
+                self.flow_control.window = self.flow_control.window.saturating_sub(consumed);
             }
             context.debug.push(DebugEvent::S(
                 *stream_id,
@@ -1244,29 +1248,29 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             kawa.storage.clear();
             let buf = kawa.storage.space();
             let mut offset = 0;
-            // Track how many entries we successfully serialized so we only drain those.
+            // Track which entries we successfully serialized so we can remove them.
             // Each WINDOW_UPDATE frame is 13 bytes (9-byte header + 4-byte payload).
-            let mut written_count = 0;
-            for &(stream_id, increment) in &self.flow_control.pending_window_updates {
+            let mut written_ids = Vec::new();
+            for (&stream_id, &increment) in &self.flow_control.pending_window_updates {
                 if increment == 0 {
-                    written_count += 1;
+                    written_ids.push(stream_id);
                     continue;
                 }
                 match serializer::gen_window_update(&mut buf[offset..], stream_id, increment) {
                     Ok((_, size)) => {
                         offset += size;
-                        written_count += 1;
+                        written_ids.push(stream_id);
                     }
                     Err(_) => {
-                        // Buffer full — stop here, remaining entries stay in the vec
+                        // Buffer full — stop here, remaining entries stay in the map
                         break;
                     }
                 }
             }
             // Remove only the entries we successfully wrote (or skipped)
-            self.flow_control
-                .pending_window_updates
-                .drain(..written_count);
+            for id in written_ids {
+                self.flow_control.pending_window_updates.remove(&id);
+            }
             if offset > 0 {
                 kawa.storage.fill(offset);
                 if self.flush_zero_to_socket() {
@@ -1381,9 +1385,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 // Enlarge the connection-level receive window from 64KB to 1MB.
                 // The default 65 535-byte window is too small for high-throughput
                 // proxying and causes excessive WINDOW_UPDATE round-trips.
+                // Use additive increment rather than unconditional assignment to
+                // preserve any window changes that occurred during setup.
                 let increment = ENLARGED_CONNECTION_WINDOW - DEFAULT_INITIAL_WINDOW_SIZE;
                 self.queue_window_update(0, increment);
-                self.flow_control.window = ENLARGED_CONNECTION_WINDOW as i32;
+                self.flow_control.window += increment as i32;
                 self.expect_header();
                 // Keep WRITABLE so the queued WINDOW_UPDATE gets flushed.
                 MuxResult::Continue
@@ -1480,22 +1486,17 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// RFC 9113 §6.9.1: window size increment MUST be 1..2^31-1 (0x7FFFFFFF).
     fn queue_window_update(&mut self, stream_id: u32, increment: u32) {
         let max_increment = i32::MAX as u32;
-        if let Some(entry) = self
-            .flow_control
-            .pending_window_updates
-            .iter_mut()
-            .find(|(sid, _)| *sid == stream_id)
-        {
-            let old = entry.1;
-            entry.1 = entry.1.saturating_add(increment).min(max_increment);
+        if let Some(existing) = self.flow_control.pending_window_updates.get_mut(&stream_id) {
+            let old = *existing;
+            *existing = existing.saturating_add(increment).min(max_increment);
             trace!(
                 "WINDOW_UPDATE coalesced: stream={} old={} new={}",
-                stream_id, old, entry.1
+                stream_id, old, *existing
             );
         } else if self.flow_control.pending_window_updates.len() < MAX_PENDING_WINDOW_UPDATES {
             self.flow_control
                 .pending_window_updates
-                .push((stream_id, increment.min(max_increment)));
+                .insert(stream_id, increment.min(max_increment));
             trace!(
                 "WINDOW_UPDATE queued: stream={} increment={}",
                 stream_id,
@@ -1599,9 +1600,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 kawa.storage.fill(size);
                 // Stay in the current state so the connection can continue processing
                 // existing streams. The second GOAWAY will transition to GoAway state.
+                // Keep READABLE so in-flight request bodies can still be received
+                // during phase 1. Only remove READABLE in the second GOAWAY (goaway()).
                 self.expect_write = Some(H2StreamId::Zero);
                 self.readiness.interest.insert(Ready::WRITABLE);
-                self.readiness.interest.remove(Ready::READABLE);
                 MuxResult::Continue
             }
             Err(error) => {
@@ -2094,11 +2096,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 // the ServerSettings writable path, but the client needs to do
                 // it here after receiving the server's initial SETTINGS.
                 if self.position.is_client()
-                    && self.flow_control.window == DEFAULT_INITIAL_WINDOW_SIZE as i32
+                    && self.flow_control.window <= DEFAULT_INITIAL_WINDOW_SIZE as i32
                 {
                     let increment = ENLARGED_CONNECTION_WINDOW - DEFAULT_INITIAL_WINDOW_SIZE;
                     self.queue_window_update(0, increment);
-                    self.flow_control.window = ENLARGED_CONNECTION_WINDOW as i32;
+                    self.flow_control.window += increment as i32;
                 }
 
                 let kawa = &mut self.zero;
@@ -2186,18 +2188,25 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     let stream = &mut context.streams[*global_stream_id];
                     if stream.front.consumed {
                         // Request was already sent to this backend — we can't
-                        // replay it. Use the frontend's readiness (via endpoint)
+                        // replay it. Use the linked token's readiness (via endpoint)
                         // so the RST_STREAM reaches the client.
                         debug!(
                             "GOAWAY: stream {} already consumed, cannot retry",
                             stream_id
                         );
-                        let front_readiness = endpoint.readiness_mut(GOAWAY_SENTINEL_TOKEN);
-                        forcefully_terminate_answer(
-                            stream,
-                            front_readiness,
-                            H2Error::RefusedStream,
-                        );
+                        if let StreamState::Linked(token) = stream.state {
+                            let front_readiness = endpoint.readiness_mut(token);
+                            forcefully_terminate_answer(
+                                stream,
+                                front_readiness,
+                                H2Error::RefusedStream,
+                            );
+                        } else {
+                            warn!(
+                                "GOAWAY: stream {} consumed but not Linked, cannot notify frontend",
+                                stream_id
+                            );
+                        }
                     } else {
                         stream.state = StreamState::Link;
                     }
@@ -2277,7 +2286,15 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         if value > FLOW_CONTROL_MAX_WINDOW {
             return true;
         }
-        let delta = (value as i64 - self.peer_settings.settings_initial_window_size as i64) as i32;
+        let delta = match i32::try_from(
+            value as i64 - self.peer_settings.settings_initial_window_size as i64,
+        ) {
+            Ok(d) => d,
+            Err(_) => {
+                error!("initial window size delta overflow");
+                return true;
+            }
+        };
         let mut open_window = false;
         // Only update windows for streams owned by this connection
         for &global_stream_id in self.streams.values() {
