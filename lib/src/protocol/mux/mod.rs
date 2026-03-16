@@ -37,7 +37,7 @@ use sozu_command::{
 mod converter;
 mod h1;
 mod h2;
-mod parser;
+pub mod parser;
 mod pkawa;
 mod serializer;
 

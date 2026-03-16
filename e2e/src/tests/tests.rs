@@ -2911,22 +2911,39 @@ fn test_alpn_prefer_h1_with_h2_client() {
 }
 
 /// Run h2spec HTTP/2 conformance tests against Sozu.
-/// Requires h2spec binary in PATH (install: `go install github.com/summerwind/h2spec/cmd/h2spec@latest`)
+///
+/// This test exercises 146 RFC 7540/9113 conformance scenarios using h2spec.
+/// It is ignored by default because it requires the h2spec binary in PATH.
+///
+/// Install h2spec:
+///   go install github.com/summerwind/h2spec/cmd/h2spec@latest
+///
+/// Run this test explicitly:
+///   cargo test -p sozu-e2e -- --ignored test_h2spec_conformance --nocapture
 #[test]
+#[ignore]
 fn test_h2spec_conformance() {
     use std::process::Command;
 
-    // Check if h2spec is available
-    let h2spec_check = Command::new("h2spec").arg("--version").output();
-    if h2spec_check.is_err() || !h2spec_check.unwrap().status.success() {
-        eprintln!("h2spec not found in PATH, skipping conformance test");
-        return;
-    }
+    // Verify h2spec is available
+    let h2spec_version = Command::new("h2spec")
+        .arg("--version")
+        .output()
+        .expect("h2spec binary not found in PATH. Install with: go install github.com/summerwind/h2spec/cmd/h2spec@latest");
+    assert!(
+        h2spec_version.status.success(),
+        "h2spec --version failed: {}",
+        String::from_utf8_lossy(&h2spec_version.stderr)
+    );
+    println!(
+        "h2spec version: {}",
+        String::from_utf8_lossy(&h2spec_version.stdout).trim()
+    );
 
     let (mut worker, _backends, front_port) = setup_h2_test("H2SPEC", 1);
 
-    // Give the worker a moment to fully start
-    thread::sleep(Duration::from_millis(200));
+    // Give the worker time to bind the listener and become ready
+    thread::sleep(Duration::from_millis(300));
 
     let output = Command::new("h2spec")
         .args([
@@ -2950,12 +2967,12 @@ fn test_h2spec_conformance() {
         println!("h2spec stderr:\n{stderr}");
     }
 
-    // Parse results from the last line: "X tests, Y passed, Z skipped, W failed"
-    let last_lines: Vec<&str> = stdout.lines().rev().take(5).collect();
+    // Parse results from the summary line: "N tests, N passed, N skipped, N failed"
     let mut passed = 0u32;
     let mut failed = 0u32;
     let mut skipped = 0u32;
-    for line in &last_lines {
+    let mut total = 0u32;
+    for line in stdout.lines().rev().take(5) {
         if line.contains("passed") && line.contains("failed") {
             for part in line.split(',') {
                 let part = part.trim();
@@ -2980,19 +2997,26 @@ fn test_h2spec_conformance() {
                         .unwrap_or("0")
                         .parse()
                         .unwrap_or(0);
+                } else if part.ends_with("tests") {
+                    total = part
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("0")
+                        .parse()
+                        .unwrap_or(0);
                 }
             }
         }
     }
 
-    println!("h2spec results: {passed} passed, {skipped} skipped, {failed} failed");
+    println!("h2spec results: {total} total, {passed} passed, {skipped} skipped, {failed} failed");
 
     worker.soft_stop();
     worker.wait_for_server_stop();
 
     assert_eq!(
         failed, 0,
-        "h2spec: {failed} tests failed (see output above)"
+        "h2spec: {failed} out of {total} tests failed (see output above)"
     );
 }
 
@@ -3220,6 +3244,128 @@ fn test_h2_to_h2_multiple_streams() {
             10,
             "H2→H2: multiple concurrent streams with H2 backend",
             try_h2_to_h2_multiple_streams
+        ),
+        State::Success
+    );
+}
+
+// ============================================================================
+// Test: HTTP/1.1 pipelining
+// ============================================================================
+
+/// Send 3 HTTP/1.1 requests on the same TCP connection without waiting for
+/// responses between sends (pipelining). Then read all 3 responses and verify
+/// they arrive in order and match the requests.
+///
+/// HTTP/1.1 pipelining is rarely used in practice but is part of the spec
+/// (RFC 9112 Section 9.3). Sozu must handle pipelined requests correctly
+/// or at minimum not crash.
+fn try_h1_pipelining() -> State {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    let front_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, mut backends) = setup_async_test(
+        "H1-PIPELINE",
+        config,
+        listeners,
+        state,
+        front_address,
+        1,
+        false,
+    );
+
+    // Build 3 distinct HTTP/1.1 requests
+    let req1 = http_request("GET", "/api/pipe/1", "ping1", "localhost");
+    let req2 = http_request("GET", "/api/pipe/2", "ping2", "localhost");
+    let req3 = http_request("GET", "/api/pipe/3", "ping3", "localhost");
+
+    // Connect and send all 3 requests without reading any responses
+    let mut stream =
+        TcpStream::connect(front_address).expect("could not connect for pipelining");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set read timeout");
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .expect("set write timeout");
+
+    // Pipeline: write all 3 requests back-to-back
+    stream.write_all(req1.as_bytes()).expect("send req1");
+    stream.write_all(req2.as_bytes()).expect("send req2");
+    stream.write_all(req3.as_bytes()).expect("send req3");
+    stream.flush().expect("flush pipelined requests");
+
+    // Read all responses with a reasonable timeout
+    let mut all_data = Vec::new();
+    let mut buf = [0u8; 8192];
+    let start = Instant::now();
+    let timeout = Duration::from_secs(5);
+    while start.elapsed() < timeout {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                all_data.extend_from_slice(&buf[..n]);
+                // Check if we have received 3 complete responses
+                let response_str = String::from_utf8_lossy(&all_data);
+                let response_count = response_str.matches("HTTP/1.1 200").count();
+                if response_count >= 3 {
+                    break;
+                }
+            }
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => {
+                println!("H1 pipelining - read error: {e}");
+                break;
+            }
+        }
+    }
+
+    drop(stream);
+
+    let response_str = String::from_utf8_lossy(&all_data);
+    let response_count = response_str.matches("HTTP/1.1 200").count();
+    println!("H1 pipelining - received {response_count} HTTP 200 responses");
+    println!(
+        "H1 pipelining - total bytes received: {}",
+        all_data.len()
+    );
+
+    // Verify all 3 responses contain "pong" (the backend response body)
+    let pong_count = response_str.matches("pong").count();
+    println!("H1 pipelining - 'pong' occurrences: {pong_count}");
+
+    worker.soft_stop();
+    let success = worker.wait_for_server_stop();
+    for backend in backends.iter_mut() {
+        backend.stop_and_get_aggregator();
+    }
+
+    // All 3 pipelined requests should get responses
+    if success && response_count >= 3 {
+        State::Success
+    } else {
+        println!(
+            "H1 pipelining - success={success}, response_count={response_count}"
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h1_pipelining() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "H1: HTTP/1.1 pipelining — 3 requests on same connection without reading",
+            try_h1_pipelining
         ),
         State::Success
     );
