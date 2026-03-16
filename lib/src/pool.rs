@@ -310,3 +310,408 @@ impl Read for Checkout {
         Ok(len)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    /// Helper: create a Pool and return it directly.
+    fn create_test_pool(buffer_size: usize, max_count: usize) -> Pool {
+        Pool::with_capacity(max_count, max_count, buffer_size)
+    }
+
+    /// Helper: checkout a buffer and write initial content into it.
+    fn checkout_with_data(pool: &mut Pool, data: &[u8]) -> Checkout {
+        let mut buf = pool.checkout().expect("checkout should succeed");
+        let n = buf.write(data).expect("write should succeed");
+        assert_eq!(n, data.len(), "all bytes should be written");
+        buf
+    }
+
+    // -----------------------------------------------------------------------
+    // Pool checkout / checkin lifecycle
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_pool_checkout_returns_buffer() {
+        let mut pool = create_test_pool(1024, 2);
+        let buf = pool.checkout();
+        assert!(buf.is_some(), "first checkout from a fresh pool must succeed");
+        let buf = buf.unwrap();
+        assert_eq!(buf.capacity(), 1024);
+        assert_eq!(buf.available_data(), 0);
+        assert_eq!(buf.available_space(), 1024);
+    }
+
+    #[test]
+    fn test_pool_checkin_on_drop() {
+        let mut pool = create_test_pool(128, 1);
+        {
+            let _buf = pool.checkout().expect("checkout should succeed");
+            assert_eq!(pool.inner.used(), 1);
+        }
+        assert_eq!(pool.inner.used(), 0);
+        let buf2 = pool.checkout();
+        assert!(buf2.is_some(), "checkout after checkin should succeed");
+    }
+
+    #[test]
+    fn test_pool_auto_grow() {
+        let mut pool = Pool::with_capacity(1, 4, 256);
+        let _b1 = pool.checkout().expect("first checkout");
+        let _b2 = pool.checkout().expect("second checkout triggers growth");
+        let _b3 = pool.checkout().expect("third checkout");
+    }
+
+    // -----------------------------------------------------------------------
+    // Write / Read trait impls
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_checkout_write_and_read_data() {
+        let mut pool = create_test_pool(1024, 2);
+        let mut buf = pool.checkout().unwrap();
+
+        let payload = b"hello world";
+        let written = buf.write(payload).unwrap();
+        assert_eq!(written, payload.len());
+        assert_eq!(buf.available_data(), payload.len());
+        assert_eq!(buf.data(), payload);
+    }
+
+    #[test]
+    fn test_checkout_read_trait() {
+        let mut pool = create_test_pool(1024, 2);
+        let mut buf = checkout_with_data(&mut pool, b"hello");
+
+        let mut out = [0u8; 5];
+        let n = buf.read(&mut out).unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(&out, b"hello");
+    }
+
+    #[test]
+    fn test_consume_and_fill() {
+        let mut pool = create_test_pool(1024, 2);
+        let mut buf = checkout_with_data(&mut pool, b"abcdefghij");
+
+        let consumed = buf.consume(3);
+        assert_eq!(consumed, 3);
+        assert_eq!(buf.data(), b"defghij");
+        assert_eq!(buf.available_data(), 7);
+
+        let filled = buf.fill(0);
+        assert_eq!(filled, 0);
+    }
+
+    #[test]
+    fn test_empty() {
+        let mut pool = create_test_pool(64, 2);
+        let buf = pool.checkout().unwrap();
+        assert!(buf.empty(), "freshly checked-out buffer should be empty");
+    }
+
+    #[test]
+    fn test_reset() {
+        let mut pool = create_test_pool(1024, 2);
+        let mut buf = checkout_with_data(&mut pool, b"data");
+        assert!(!buf.empty());
+
+        buf.reset();
+        assert!(buf.empty());
+        assert_eq!(buf.available_data(), 0);
+    }
+
+    #[test]
+    fn test_sync() {
+        let mut pool = create_test_pool(1024, 2);
+        let mut buf = checkout_with_data(&mut pool, b"hello world");
+        buf.sync(5, 2);
+        assert_eq!(buf.available_data(), 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // shift() -- unsafe ptr::copy
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_shift_moves_data_to_start() {
+        let mut pool = create_test_pool(1024, 2);
+        let mut buf = checkout_with_data(&mut pool, b"hello world");
+
+        buf.inner.position = 5;
+        assert_eq!(buf.data(), b" world");
+
+        buf.shift();
+        assert_eq!(buf.inner.position, 0);
+        assert_eq!(buf.inner.end, 6);
+        assert_eq!(buf.data(), b" world");
+    }
+
+    #[test]
+    fn test_shift_noop_when_position_zero() {
+        let mut pool = create_test_pool(1024, 2);
+        let mut buf = checkout_with_data(&mut pool, b"hello");
+
+        assert_eq!(buf.inner.position, 0);
+        buf.shift();
+        assert_eq!(buf.data(), b"hello");
+        assert_eq!(buf.inner.position, 0);
+        assert_eq!(buf.inner.end, 5);
+    }
+
+    #[test]
+    fn test_consume_triggers_auto_shift() {
+        let mut pool = create_test_pool(256, 2);
+        let mut buf = pool.checkout().unwrap();
+        let capacity = buf.capacity();
+
+        let fill_count = capacity / 2 + 2;
+        let data: Vec<u8> = (0..fill_count as u8).collect();
+        let written = buf.write(&data).unwrap();
+        assert_eq!(written, fill_count);
+
+        let consume_count = capacity / 2 + 1;
+        buf.consume(consume_count);
+
+        assert_eq!(buf.inner.position, 0);
+        let remaining = fill_count - consume_count;
+        assert_eq!(buf.available_data(), remaining);
+    }
+
+    // -----------------------------------------------------------------------
+    // delete_slice() -- unsafe ptr::copy
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_delete_slice_middle() {
+        let mut pool = create_test_pool(1024, 2);
+        let mut buf = checkout_with_data(&mut pool, b"hello world!");
+
+        let result = buf.delete_slice(3, 5);
+        assert!(result.is_some());
+        assert_eq!(buf.data(), b"helrld!");
+    }
+
+    #[test]
+    fn test_delete_slice_from_start() {
+        let mut pool = create_test_pool(1024, 2);
+        let mut buf = checkout_with_data(&mut pool, b"hello world!");
+
+        let result = buf.delete_slice(0, 3);
+        assert!(result.is_some());
+        assert_eq!(buf.data(), b"lo world!");
+    }
+
+    #[test]
+    fn test_delete_slice_near_end() {
+        let mut pool = create_test_pool(1024, 2);
+        let mut buf = checkout_with_data(&mut pool, b"hello world!");
+
+        let result = buf.delete_slice(7, 4);
+        assert!(result.is_some());
+        assert_eq!(buf.data(), b"hello w!");
+    }
+
+    #[test]
+    fn test_delete_slice_out_of_bounds_returns_none() {
+        let mut pool = create_test_pool(1024, 2);
+        let mut buf = checkout_with_data(&mut pool, b"hello");
+
+        let result = buf.delete_slice(0, 5);
+        assert!(result.is_none());
+
+        let result = buf.delete_slice(3, 5);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_delete_slice_single_byte() {
+        let mut pool = create_test_pool(1024, 2);
+        let mut buf = checkout_with_data(&mut pool, b"abcd");
+
+        let result = buf.delete_slice(1, 1);
+        assert!(result.is_some());
+        assert_eq!(buf.data(), b"acd");
+    }
+
+    // -----------------------------------------------------------------------
+    // replace_slice() -- unsafe ptr::copy
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_replace_slice_same_size() {
+        let mut pool = create_test_pool(1024, 2);
+        let mut buf = checkout_with_data(&mut pool, b"hello world");
+
+        let result = buf.replace_slice(b"earth", 6, 5);
+        assert!(result.is_some());
+        assert_eq!(buf.data(), b"hello earth");
+    }
+
+    #[test]
+    fn test_replace_slice_shrink() {
+        let mut pool = create_test_pool(1024, 2);
+        let mut buf = checkout_with_data(&mut pool, b"hello world");
+
+        let result = buf.replace_slice(b"hi", 6, 5);
+        assert!(result.is_some());
+        assert_eq!(buf.data(), b"hello hi");
+    }
+
+    #[test]
+    fn test_replace_slice_grow() {
+        let mut pool = create_test_pool(1024, 2);
+        let mut buf = checkout_with_data(&mut pool, b"hello world");
+
+        let result = buf.replace_slice(b"universe", 6, 5);
+        assert!(result.is_some());
+        assert_eq!(buf.data(), b"hello universe");
+    }
+
+    #[test]
+    fn test_replace_slice_at_start() {
+        let mut pool = create_test_pool(1024, 2);
+        let mut buf = checkout_with_data(&mut pool, b"hello world");
+
+        let result = buf.replace_slice(b"hey", 0, 5);
+        assert!(result.is_some());
+        assert_eq!(buf.data(), b"hey world");
+    }
+
+    #[test]
+    fn test_replace_slice_out_of_bounds_returns_none() {
+        let mut pool = create_test_pool(1024, 2);
+        let mut buf = checkout_with_data(&mut pool, b"hello");
+
+        let result = buf.replace_slice(b"x", 4, 5);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_replace_slice_exceeds_data_bounds_returns_none() {
+        let mut pool = create_test_pool(256, 2);
+        let mut buf = checkout_with_data(&mut pool, b"hello");
+
+        let result = buf.replace_slice(b"xyz", 3, 5);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_replace_slice_replacement_exceeds_capacity_returns_none() {
+        let mut pool = create_test_pool(256, 2);
+        let mut buf = pool.checkout().unwrap();
+        let capacity = buf.capacity();
+
+        let data = vec![b'x'; capacity];
+        let written = buf.write(&data).unwrap();
+        assert_eq!(written, capacity);
+
+        buf.inner.position = capacity - 2;
+        assert_eq!(buf.available_data(), 2);
+
+        // position + start + data_len = (capacity-2) + 0 + 5 = capacity+3 > capacity
+        let result = buf.replace_slice(b"abcde", 0, 1);
+        assert!(result.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // insert_slice() -- unsafe ptr::copy
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_insert_slice_at_start() {
+        let mut pool = create_test_pool(1024, 2);
+        let mut buf = checkout_with_data(&mut pool, b"world");
+
+        let result = buf.insert_slice(b"hello ", 0);
+        assert!(result.is_some());
+        assert_eq!(buf.data(), b"hello world");
+    }
+
+    #[test]
+    fn test_insert_slice_in_middle() {
+        let mut pool = create_test_pool(1024, 2);
+        let mut buf = checkout_with_data(&mut pool, b"helo");
+
+        let result = buf.insert_slice(b"l", 2);
+        assert!(result.is_some());
+        assert_eq!(buf.data(), b"hello");
+    }
+
+    #[test]
+    fn test_insert_slice_at_end() {
+        let mut pool = create_test_pool(1024, 2);
+        let mut buf = checkout_with_data(&mut pool, b"hello");
+
+        let result = buf.insert_slice(b" world", 5);
+        assert!(result.is_some());
+        assert_eq!(buf.data(), b"hello world");
+    }
+
+    #[test]
+    fn test_insert_slice_exceeds_capacity_returns_none() {
+        let mut pool = create_test_pool(256, 2);
+        let mut buf = pool.checkout().unwrap();
+        let capacity = buf.capacity();
+
+        let data = vec![b'x'; capacity];
+        let written = buf.write(&data).unwrap();
+        assert_eq!(written, capacity);
+        assert_eq!(buf.available_space(), 0);
+
+        let result = buf.insert_slice(b"y", 0);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_insert_slice_beyond_data_returns_none() {
+        let mut pool = create_test_pool(1024, 2);
+        let mut buf = checkout_with_data(&mut pool, b"hello");
+
+        let result = buf.insert_slice(b"x", 6);
+        assert!(result.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Combined operations -- exercise multiple unsafe paths together
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_write_consume_shift_write_again() {
+        let mut pool = create_test_pool(32, 2);
+        let mut buf = checkout_with_data(&mut pool, b"first");
+
+        buf.consume(5);
+        assert_eq!(buf.available_data(), 0);
+
+        let n = buf.write(b"second").unwrap();
+        assert_eq!(n, 6);
+        assert_eq!(buf.data(), b"second");
+    }
+
+    #[test]
+    fn test_delete_then_insert() {
+        let mut pool = create_test_pool(1024, 2);
+        let mut buf = checkout_with_data(&mut pool, b"hello cruel world");
+
+        buf.delete_slice(6, 6);
+        assert_eq!(buf.data(), b"hello world");
+
+        buf.insert_slice(b"beautiful ", 6);
+        assert_eq!(buf.data(), b"hello beautiful world");
+    }
+
+    #[test]
+    fn test_multiple_replace_operations() {
+        let mut pool = create_test_pool(1024, 2);
+        let mut buf = checkout_with_data(&mut pool, b"aXbXc");
+
+        buf.replace_slice(b"12", 1, 1);
+        assert_eq!(buf.data(), b"a12bXc");
+
+        buf.replace_slice(b"34", 4, 1);
+        assert_eq!(buf.data(), b"a12b34c");
+    }
+}

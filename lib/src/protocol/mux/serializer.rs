@@ -157,3 +157,338 @@ pub fn gen_goaway(
         .map(|(buf, size)| (buf, (old_size + size as usize)))
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::mux::parser;
+
+    /// Helper: serialize a FrameHeader into a fresh 9-byte buffer and return the bytes written.
+    fn serialize_header(header: &parser::FrameHeader) -> ([u8; 9], usize) {
+        let mut buf = [0u8; 9];
+        let (_, sz) = gen_frame_header(&mut buf[..], header)
+            .expect("serialization should succeed");
+        (buf, sz)
+    }
+
+    /// Helper: parse a FrameHeader from a byte slice.
+    fn parse_header(buf: &[u8]) -> parser::FrameHeader {
+        let (remaining, header) =
+            parser::frame_header(buf, 16_777_215).expect("parsing should succeed");
+        assert!(remaining.is_empty(), "all bytes should be consumed");
+        header
+    }
+
+    #[test]
+    fn roundtrip_data_frame_header() {
+        let original = parser::FrameHeader {
+            payload_len: 100,
+            frame_type: parser::FrameType::Data,
+            flags: 0x1, // END_STREAM
+            stream_id: 1,
+        };
+
+        let (buf, sz) = serialize_header(&original);
+        assert_eq!(sz, 9, "frame header is always 9 bytes");
+
+        let parsed = parse_header(&buf);
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn roundtrip_headers_frame_header() {
+        let original = parser::FrameHeader {
+            payload_len: 256,
+            frame_type: parser::FrameType::Headers,
+            flags: 0x25, // END_STREAM | END_HEADERS | PRIORITY
+            stream_id: 3,
+        };
+
+        let (buf, sz) = serialize_header(&original);
+        assert_eq!(sz, 9);
+
+        let parsed = parse_header(&buf);
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn roundtrip_settings_frame_header() {
+        let original = parser::FrameHeader {
+            payload_len: 36,
+            frame_type: parser::FrameType::Settings,
+            flags: 0x0,
+            stream_id: 0,
+        };
+
+        let (buf, sz) = serialize_header(&original);
+        assert_eq!(sz, 9);
+
+        let parsed = parse_header(&buf);
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn roundtrip_settings_ack_header() {
+        let original = parser::FrameHeader {
+            payload_len: 0,
+            frame_type: parser::FrameType::Settings,
+            flags: 0x1, // ACK
+            stream_id: 0,
+        };
+
+        let (buf, sz) = serialize_header(&original);
+        assert_eq!(sz, 9);
+
+        let parsed = parse_header(&buf);
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn roundtrip_rst_stream_header() {
+        let original = parser::FrameHeader {
+            payload_len: 4,
+            frame_type: parser::FrameType::RstStream,
+            flags: 0x0,
+            stream_id: 7,
+        };
+
+        let (buf, sz) = serialize_header(&original);
+        assert_eq!(sz, 9);
+
+        let parsed = parse_header(&buf);
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn roundtrip_window_update_header() {
+        let original = parser::FrameHeader {
+            payload_len: 4,
+            frame_type: parser::FrameType::WindowUpdate,
+            flags: 0x0,
+            stream_id: 0,
+        };
+
+        let (buf, sz) = serialize_header(&original);
+        assert_eq!(sz, 9);
+
+        let parsed = parse_header(&buf);
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn roundtrip_window_update_stream_level() {
+        let original = parser::FrameHeader {
+            payload_len: 4,
+            frame_type: parser::FrameType::WindowUpdate,
+            flags: 0x0,
+            stream_id: 5,
+        };
+
+        let (buf, sz) = serialize_header(&original);
+        assert_eq!(sz, 9);
+
+        let parsed = parse_header(&buf);
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn roundtrip_ping_header() {
+        let original = parser::FrameHeader {
+            payload_len: 8,
+            frame_type: parser::FrameType::Ping,
+            flags: 0x1, // ACK
+            stream_id: 0,
+        };
+
+        let (buf, sz) = serialize_header(&original);
+        assert_eq!(sz, 9);
+
+        let parsed = parse_header(&buf);
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn roundtrip_goaway_header() {
+        let original = parser::FrameHeader {
+            payload_len: 8,
+            frame_type: parser::FrameType::GoAway,
+            flags: 0x0,
+            stream_id: 0,
+        };
+
+        let (buf, sz) = serialize_header(&original);
+        assert_eq!(sz, 9);
+
+        let parsed = parse_header(&buf);
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn roundtrip_continuation_header() {
+        let original = parser::FrameHeader {
+            payload_len: 128,
+            frame_type: parser::FrameType::Continuation,
+            flags: 0x4, // END_HEADERS
+            stream_id: 9,
+        };
+
+        let (buf, sz) = serialize_header(&original);
+        assert_eq!(sz, 9);
+
+        let parsed = parse_header(&buf);
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn roundtrip_all_frame_types() {
+        let frame_types = [
+            (parser::FrameType::Data, 0u8),
+            (parser::FrameType::Headers, 1),
+            (parser::FrameType::Priority, 2),
+            (parser::FrameType::RstStream, 3),
+            (parser::FrameType::Settings, 4),
+            (parser::FrameType::PushPromise, 5),
+            (parser::FrameType::Ping, 6),
+            (parser::FrameType::GoAway, 7),
+            (parser::FrameType::WindowUpdate, 8),
+            (parser::FrameType::Continuation, 9),
+        ];
+
+        for (ft, expected_byte) in &frame_types {
+            assert_eq!(
+                serialize_frame_type(ft),
+                *expected_byte,
+                "serialize_frame_type mismatch for {:?}",
+                ft
+            );
+
+            // Use stream_id that is valid for the frame type
+            let stream_id = match ft {
+                parser::FrameType::Settings
+                | parser::FrameType::Ping
+                | parser::FrameType::GoAway => 0,
+                _ => 1,
+            };
+
+            let header = parser::FrameHeader {
+                payload_len: 0,
+                frame_type: ft.to_owned(),
+                flags: 0,
+                stream_id,
+            };
+
+            let (buf, sz) = serialize_header(&header);
+            assert_eq!(sz, 9);
+
+            let parsed = parse_header(&buf);
+            assert_eq!(parsed.frame_type, *ft, "round-trip failed for {:?}", ft);
+        }
+    }
+
+    #[test]
+    fn roundtrip_large_payload_len() {
+        // payload_len is a u24 (max 16_777_215)
+        // Use a large value that is still within u24 but also within the max_frame_size
+        // we pass to parse_header (16_777_215).
+        let original = parser::FrameHeader {
+            payload_len: 16_777_215,
+            frame_type: parser::FrameType::Data,
+            flags: 0x0,
+            stream_id: 1,
+        };
+
+        let (buf, sz) = serialize_header(&original);
+        assert_eq!(sz, 9);
+
+        let parsed = parse_header(&buf);
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn roundtrip_zero_payload_len() {
+        let original = parser::FrameHeader {
+            payload_len: 0,
+            frame_type: parser::FrameType::Data,
+            flags: 0x0,
+            stream_id: 1,
+        };
+
+        let (buf, sz) = serialize_header(&original);
+        assert_eq!(sz, 9);
+
+        let parsed = parse_header(&buf);
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn roundtrip_max_stream_id() {
+        let original = parser::FrameHeader {
+            payload_len: 4,
+            frame_type: parser::FrameType::WindowUpdate,
+            flags: 0x0,
+            stream_id: 0x7FFF_FFFF,
+        };
+
+        let (buf, sz) = serialize_header(&original);
+        assert_eq!(sz, 9);
+
+        let parsed = parse_header(&buf);
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn roundtrip_all_flags_set() {
+        let original = parser::FrameHeader {
+            payload_len: 50,
+            frame_type: parser::FrameType::Headers,
+            flags: 0xFF,
+            stream_id: 1,
+        };
+
+        let (buf, sz) = serialize_header(&original);
+        assert_eq!(sz, 9);
+
+        let parsed = parse_header(&buf);
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn buffer_too_small_for_frame_header() {
+        let header = parser::FrameHeader {
+            payload_len: 10,
+            frame_type: parser::FrameType::Data,
+            flags: 0,
+            stream_id: 1,
+        };
+
+        let mut buf = [0u8; 8]; // 8 bytes, need 9
+        let result = gen_frame_header(&mut buf[..], &header);
+        assert!(result.is_err(), "should fail with buffer too small");
+    }
+
+    #[test]
+    fn serialized_bytes_match_expected_layout() {
+        // Verify the exact byte layout matches RFC 7540 section 4.1
+        let header = parser::FrameHeader {
+            payload_len: 0x000102,   // 258
+            frame_type: parser::FrameType::Settings, // type = 4
+            flags: 0xAB,
+            stream_id: 0x0304_0506,
+        };
+
+        let (buf, _) = serialize_header(&header);
+        // Length: 3 bytes big-endian
+        assert_eq!(buf[0], 0x00);
+        assert_eq!(buf[1], 0x01);
+        assert_eq!(buf[2], 0x02);
+        // Type: 1 byte
+        assert_eq!(buf[3], 0x04); // Settings
+        // Flags: 1 byte
+        assert_eq!(buf[4], 0xAB);
+        // Stream ID: 4 bytes big-endian
+        assert_eq!(buf[5], 0x03);
+        assert_eq!(buf[6], 0x04);
+        assert_eq!(buf[7], 0x05);
+        assert_eq!(buf[8], 0x06);
+    }
+}

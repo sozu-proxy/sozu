@@ -1023,4 +1023,515 @@ mod tests {
             other => panic!("expected Frame::WindowUpdate, got {other:?}"),
         }
     }
+
+    // ---- Helper: build a raw H2 frame (header + payload) ----
+
+    /// Build a raw H2 frame header (9 bytes) from explicit fields.
+    fn build_frame_header(payload_len: u32, frame_type: u8, flags: u8, stream_id: u32) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(9);
+        buf.push(((payload_len >> 16) & 0xFF) as u8);
+        buf.push(((payload_len >> 8) & 0xFF) as u8);
+        buf.push((payload_len & 0xFF) as u8);
+        buf.push(frame_type);
+        buf.push(flags);
+        buf.push(((stream_id >> 24) & 0xFF) as u8);
+        buf.push(((stream_id >> 16) & 0xFF) as u8);
+        buf.push(((stream_id >> 8) & 0xFF) as u8);
+        buf.push((stream_id & 0xFF) as u8);
+        buf
+    }
+
+    /// Build a complete raw frame (header + payload).
+    fn build_raw_frame(payload_len: u32, frame_type: u8, flags: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
+        let mut raw = build_frame_header(payload_len, frame_type, flags, stream_id);
+        raw.extend_from_slice(payload);
+        raw
+    }
+
+    // ---- Connection preface ----
+
+    #[test]
+    fn test_preface_valid() {
+        let input = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+        let (remaining, matched) = preface(input).expect("should parse preface");
+        assert!(remaining.is_empty());
+        assert_eq!(matched, input.as_slice());
+    }
+
+    #[test]
+    fn test_preface_invalid() {
+        let input = b"GET / HTTP/1.1\r\n";
+        let result = preface(input);
+        assert!(result.is_err(), "invalid preface should fail");
+    }
+
+    #[test]
+    fn test_preface_with_trailing_data() {
+        let mut input = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+        input.extend_from_slice(b"extra stuff");
+        let (remaining, _) = preface(&input).expect("should parse preface");
+        assert_eq!(remaining, b"extra stuff");
+    }
+
+    // ---- Frame header basic parsing ----
+
+    #[test]
+    fn test_frame_header_settings_basic() {
+        let raw = build_frame_header(0, 4, 0, 0);
+        let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).unwrap();
+        assert!(remaining.is_empty());
+        assert_eq!(header.payload_len, 0);
+        assert_eq!(header.frame_type, FrameType::Settings);
+        assert_eq!(header.flags, 0);
+        assert_eq!(header.stream_id, 0);
+    }
+
+    #[test]
+    fn test_frame_header_data_basic() {
+        let raw = build_frame_header(100, 0, 1, 1);
+        let (_, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).unwrap();
+        assert_eq!(header.payload_len, 100);
+        assert_eq!(header.frame_type, FrameType::Data);
+        assert_eq!(header.flags, 1);
+        assert_eq!(header.stream_id, 1);
+    }
+
+    #[test]
+    fn test_frame_header_stream_id_reserved_bit_masked() {
+        // stream_id with reserved bit set (0x80000001) should be masked to 1.
+        // Use a DATA frame (stream-specific) to avoid the stream_id=0 rejection.
+        let raw = build_frame_header(5, 0, 0, 0x80000001);
+        let (_, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).unwrap();
+        assert_eq!(header.stream_id, 1, "reserved MSB must be masked off");
+    }
+
+    // ---- DATA frame parsing ----
+
+    #[test]
+    fn test_parse_data_frame_end_stream() {
+        let payload = b"hello";
+        let raw = build_raw_frame(payload.len() as u32, 0, 0x01, 1, payload);
+        let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).unwrap();
+        let (_, f) = frame_body(remaining, &header).unwrap();
+        match f {
+            Frame::Data(d) => {
+                assert_eq!(d.stream_id, 1);
+                assert!(d.end_stream);
+            }
+            other => panic!("expected Data, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_data_frame_no_end_stream() {
+        let payload = b"data";
+        let raw = build_raw_frame(payload.len() as u32, 0, 0x00, 3, payload);
+        let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).unwrap();
+        let (_, f) = frame_body(remaining, &header).unwrap();
+        match f {
+            Frame::Data(d) => {
+                assert_eq!(d.stream_id, 3);
+                assert!(!d.end_stream);
+            }
+            other => panic!("expected Data, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_data_frame_with_padding() {
+        // PADDED flag (0x08), 2 bytes of padding
+        let pad_length: u8 = 2;
+        let actual_data = b"hello";
+        let total_payload = 1 + actual_data.len() + pad_length as usize;
+        let mut payload = Vec::new();
+        payload.push(pad_length);
+        payload.extend_from_slice(actual_data);
+        payload.extend_from_slice(&[0x00; 2]);
+
+        let raw = build_raw_frame(total_payload as u32, 0, 0x08, 1, &payload);
+        let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).unwrap();
+        let (_, f) = frame_body(remaining, &header).unwrap();
+        match f {
+            Frame::Data(d) => {
+                assert_eq!(d.stream_id, 1);
+                assert_eq!(d.payload.len as u32, actual_data.len() as u32);
+            }
+            other => panic!("expected Data, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_data_frame_padding_exceeds_payload() {
+        // pad_length claims more padding than remaining bytes
+        let mut payload = Vec::new();
+        payload.push(10); // pad_length = 10, but only 5 bytes remain
+        payload.extend_from_slice(b"hello");
+
+        let raw = build_raw_frame(payload.len() as u32, 0, 0x08, 1, &payload);
+        let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).unwrap();
+        let result = frame_body(remaining, &header);
+        assert!(result.is_err(), "padding exceeding payload should be a protocol error");
+    }
+
+    // ---- HEADERS frame parsing ----
+
+    #[test]
+    fn test_parse_headers_frame_basic() {
+        let hblock = b"\x82\x86";
+        let raw = build_raw_frame(hblock.len() as u32, 1, 0x04, 1, hblock);
+        let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).unwrap();
+        let (_, f) = frame_body(remaining, &header).unwrap();
+        match f {
+            Frame::Headers(h) => {
+                assert_eq!(h.stream_id, 1);
+                assert!(!h.end_stream);
+                assert!(h.end_headers);
+                assert!(h.priority.is_none());
+            }
+            other => panic!("expected Headers, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_headers_frame_end_stream_and_headers() {
+        let hblock = b"\x82";
+        let raw = build_raw_frame(hblock.len() as u32, 1, 0x05, 1, hblock);
+        let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).unwrap();
+        let (_, f) = frame_body(remaining, &header).unwrap();
+        match f {
+            Frame::Headers(h) => {
+                assert!(h.end_stream);
+                assert!(h.end_headers);
+            }
+            other => panic!("expected Headers, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_headers_frame_with_priority() {
+        let hblock = b"\x82";
+        let payload_len = 5 + hblock.len(); // 4 (stream dep) + 1 (weight) + hblock
+        let mut payload = Vec::new();
+        // Stream dependency: non-exclusive, stream_id=1
+        payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+        payload.push(15); // weight
+        payload.extend_from_slice(hblock);
+
+        let raw = build_raw_frame(payload_len as u32, 1, 0x24, 3, &payload);
+        let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).unwrap();
+        let (_, f) = frame_body(remaining, &header).unwrap();
+        match f {
+            Frame::Headers(h) => {
+                assert_eq!(h.stream_id, 3);
+                let priority = h.priority.expect("should have priority");
+                match priority {
+                    PriorityPart::Rfc7540 { stream_dependency, weight } => {
+                        assert!(!stream_dependency.exclusive);
+                        assert_eq!(stream_dependency.stream_id, 1);
+                        assert_eq!(weight, 15);
+                    }
+                    other => panic!("expected Rfc7540, got {:?}", other),
+                }
+            }
+            other => panic!("expected Headers, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_headers_frame_with_exclusive_priority() {
+        let hblock = b"\x82\x86";
+        let mut payload = Vec::new();
+        // Stream dependency: exclusive (bit 31 set), stream_id=5
+        let dep = 0x80000005u32;
+        payload.extend_from_slice(&dep.to_be_bytes());
+        payload.push(255); // weight
+        payload.extend_from_slice(hblock);
+
+        let payload_len = payload.len();
+        let raw = build_raw_frame(payload_len as u32, 1, 0x24, 3, &payload);
+        let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).unwrap();
+        let (_, f) = frame_body(remaining, &header).unwrap();
+        match f {
+            Frame::Headers(h) => {
+                let priority = h.priority.expect("should have priority");
+                match priority {
+                    PriorityPart::Rfc7540 { stream_dependency, weight } => {
+                        assert!(stream_dependency.exclusive, "exclusive bit should be set");
+                        assert_eq!(stream_dependency.stream_id, 5);
+                        assert_eq!(weight, 255);
+                    }
+                    other => panic!("expected Rfc7540, got {:?}", other),
+                }
+            }
+            other => panic!("expected Headers, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_headers_stream_id_zero_rejected() {
+        let raw = build_raw_frame(2, 1, 0x04, 0, b"\x82\x86");
+        let result = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE);
+        assert!(result.is_err(), "HEADERS with stream_id=0 should be rejected");
+    }
+
+    // ---- RST_STREAM frame parsing ----
+
+    #[test]
+    fn test_parse_rst_stream() {
+        let error_code = 0x00000008u32; // CANCEL
+        let raw = build_raw_frame(4, 3, 0, 1, &error_code.to_be_bytes());
+        let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).unwrap();
+        let (_, f) = frame_body(remaining, &header).unwrap();
+        match f {
+            Frame::RstStream(rst) => {
+                assert_eq!(rst.stream_id, 1);
+                assert_eq!(rst.error_code, 0x08);
+            }
+            other => panic!("expected RstStream, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_rst_stream_stream_id_zero_rejected() {
+        let raw = build_raw_frame(4, 3, 0, 0, &[0u8; 4]);
+        let result = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE);
+        assert!(result.is_err(), "RST_STREAM with stream_id=0 should be rejected");
+    }
+
+    // ---- SETTINGS frame parsing ----
+
+    #[test]
+    fn test_parse_settings_frame_with_values() {
+        let mut payload = Vec::new();
+        // SETTINGS_HEADER_TABLE_SIZE (0x1) = 4096
+        payload.extend_from_slice(&0x0001u16.to_be_bytes());
+        payload.extend_from_slice(&4096u32.to_be_bytes());
+        // SETTINGS_MAX_CONCURRENT_STREAMS (0x3) = 100
+        payload.extend_from_slice(&0x0003u16.to_be_bytes());
+        payload.extend_from_slice(&100u32.to_be_bytes());
+        // SETTINGS_INITIAL_WINDOW_SIZE (0x4) = 65535
+        payload.extend_from_slice(&0x0004u16.to_be_bytes());
+        payload.extend_from_slice(&65535u32.to_be_bytes());
+
+        let raw = build_raw_frame(payload.len() as u32, 4, 0x0, 0, &payload);
+        let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).unwrap();
+        let (_, f) = frame_body(remaining, &header).unwrap();
+        match f {
+            Frame::Settings(s) => {
+                assert!(!s.ack);
+                assert_eq!(s.settings.len(), 3);
+                assert_eq!(s.settings[0].identifier, 0x0001);
+                assert_eq!(s.settings[0].value, 4096);
+                assert_eq!(s.settings[1].identifier, 0x0003);
+                assert_eq!(s.settings[1].value, 100);
+                assert_eq!(s.settings[2].identifier, 0x0004);
+                assert_eq!(s.settings[2].value, 65535);
+            }
+            other => panic!("expected Settings, got {:?}", other),
+        }
+    }
+
+    // ---- PING frame parsing ----
+
+    #[test]
+    fn test_parse_ping_frame() {
+        let ping_payload = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let raw = build_raw_frame(8, 6, 0, 0, &ping_payload);
+        let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).unwrap();
+        let (_, f) = frame_body(remaining, &header).unwrap();
+        match f {
+            Frame::Ping(p) => {
+                assert_eq!(p.payload, ping_payload);
+                assert!(!p.ack);
+            }
+            other => panic!("expected Ping, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_ping_ack_preserves_payload() {
+        let ping_payload = [0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE];
+        let raw = build_raw_frame(8, 6, 0x01, 0, &ping_payload);
+        let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).unwrap();
+        let (_, f) = frame_body(remaining, &header).unwrap();
+        match f {
+            Frame::Ping(p) => {
+                assert_eq!(p.payload, ping_payload, "PING ACK must echo the exact payload");
+                assert!(p.ack);
+            }
+            other => panic!("expected Ping, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_ping_stream_id_nonzero_rejected() {
+        let raw = build_raw_frame(8, 6, 0, 1, &[0u8; 8]);
+        let result = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE);
+        assert!(result.is_err(), "PING with stream_id!=0 should be rejected");
+    }
+
+    // ---- WINDOW_UPDATE frame parsing ----
+
+    #[test]
+    fn test_parse_window_update_connection_level() {
+        let increment = 1000u32;
+        let raw = build_raw_frame(4, 8, 0, 0, &increment.to_be_bytes());
+        let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).unwrap();
+        let (_, f) = frame_body(remaining, &header).unwrap();
+        match f {
+            Frame::WindowUpdate(w) => {
+                assert_eq!(w.stream_id, 0);
+                assert_eq!(w.increment, 1000);
+            }
+            other => panic!("expected WindowUpdate, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_window_update_stream_level() {
+        let increment = 65535u32;
+        let raw = build_raw_frame(4, 8, 0, 5, &increment.to_be_bytes());
+        let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).unwrap();
+        let (_, f) = frame_body(remaining, &header).unwrap();
+        match f {
+            Frame::WindowUpdate(w) => {
+                assert_eq!(w.stream_id, 5);
+                // mux parser uses STREAM_ID_MASK (0x7FFFFFFF), so 65535 & 0x7FFFFFFF = 65535
+                assert_eq!(w.increment, 65535);
+            }
+            other => panic!("expected WindowUpdate, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_window_update_wrong_size() {
+        let raw = build_raw_frame(3, 8, 0, 0, &[0u8; 3]);
+        let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).unwrap();
+        let result = frame_body(remaining, &header);
+        assert!(result.is_err(), "WINDOW_UPDATE with payload != 4 should fail");
+        match result {
+            Err(Err::Failure(e)) => {
+                assert_eq!(e.kind, ParserErrorKind::H2(H2Error::FrameSizeError));
+            }
+            other => panic!("expected FrameSizeError, got {:?}", other),
+        }
+    }
+
+    // ---- Frame at max_frame_size boundary ----
+
+    #[test]
+    fn test_parse_frame_at_max_frame_size() {
+        let payload = vec![0u8; DEFAULT_MAX_FRAME_SIZE as usize];
+        let raw = build_raw_frame(DEFAULT_MAX_FRAME_SIZE, 0, 0x0, 1, &payload);
+        let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).unwrap();
+        let (_, f) = frame_body(remaining, &header).unwrap();
+        match f {
+            Frame::Data(d) => {
+                assert_eq!(d.payload.len as u32, DEFAULT_MAX_FRAME_SIZE);
+            }
+            other => panic!("expected Data, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_frame_with_custom_max_frame_size() {
+        let custom_max = 32768u32;
+        let payload = vec![0u8; 20000];
+        let raw = build_raw_frame(20000, 0, 0x0, 1, &payload);
+        let (remaining, header) = frame_header(&raw, custom_max).unwrap();
+        let (_, f) = frame_body(remaining, &header).unwrap();
+        match f {
+            Frame::Data(d) => {
+                assert_eq!(d.payload.len as u32, 20000);
+            }
+            other => panic!("expected Data, got {:?}", other),
+        }
+    }
+
+    // ---- H2Error conversions ----
+
+    #[test]
+    fn test_h2_error_try_from_valid() {
+        assert_eq!(H2Error::try_from(0x0), Ok(H2Error::NoError));
+        assert_eq!(H2Error::try_from(0x1), Ok(H2Error::ProtocolError));
+        assert_eq!(H2Error::try_from(0x6), Ok(H2Error::FrameSizeError));
+        assert_eq!(H2Error::try_from(0xd), Ok(H2Error::HTTP11Required));
+    }
+
+    #[test]
+    fn test_h2_error_try_from_invalid() {
+        assert_eq!(H2Error::try_from(0x0e), Err(0x0e));
+        assert_eq!(H2Error::try_from(0xFF), Err(0xFF));
+    }
+
+    #[test]
+    fn test_h2_error_from_str() {
+        assert_eq!("NO_ERROR".parse::<H2Error>(), Ok(H2Error::NoError));
+        assert_eq!("PROTOCOL_ERROR".parse::<H2Error>(), Ok(H2Error::ProtocolError));
+        assert_eq!("ENHANCE_YOUR_CALM".parse::<H2Error>(), Ok(H2Error::EnhanceYourCalm));
+        assert!("INVALID_ERROR".parse::<H2Error>().is_err());
+    }
+
+    #[test]
+    fn test_h2_error_as_str_roundtrip() {
+        let errors = [
+            H2Error::NoError,
+            H2Error::ProtocolError,
+            H2Error::InternalError,
+            H2Error::FlowControlError,
+            H2Error::SettingsTimeout,
+            H2Error::StreamClosed,
+            H2Error::FrameSizeError,
+            H2Error::RefusedStream,
+            H2Error::Cancel,
+            H2Error::CompressionError,
+            H2Error::ConnectError,
+            H2Error::EnhanceYourCalm,
+            H2Error::InadequateSecurity,
+            H2Error::HTTP11Required,
+        ];
+
+        for error in &errors {
+            let s = error.as_str();
+            let parsed: H2Error = s.parse().unwrap_or_else(|_| panic!("failed to parse {}", s));
+            assert_eq!(*error, parsed, "roundtrip failed for {}", s);
+        }
+    }
+
+    // ---- PRIORITY frame parsing ----
+
+    #[test]
+    fn test_parse_priority_frame() {
+        let mut payload = Vec::new();
+        // Stream dependency: non-exclusive, stream_id=1
+        payload.extend_from_slice(&0x00000001u32.to_be_bytes());
+        payload.push(15); // weight
+        assert_eq!(payload.len(), 5);
+
+        let raw = build_raw_frame(5, 2, 0, 3, &payload);
+        let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).unwrap();
+        let (_, f) = frame_body(remaining, &header).unwrap();
+        match f {
+            Frame::Priority(p) => {
+                assert_eq!(p.stream_id, 3);
+                match p.inner {
+                    PriorityPart::Rfc7540 { stream_dependency, weight } => {
+                        assert!(!stream_dependency.exclusive);
+                        assert_eq!(stream_dependency.stream_id, 1);
+                        assert_eq!(weight, 15);
+                    }
+                    other => panic!("expected Rfc7540, got {:?}", other),
+                }
+            }
+            other => panic!("expected Priority, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_priority_wrong_size_rejected() {
+        let raw = build_raw_frame(4, 2, 0, 1, &[0u8; 4]);
+        let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).unwrap();
+        let result = frame_body(remaining, &header);
+        assert!(result.is_err(), "PRIORITY with wrong payload size should fail");
+    }
 }
