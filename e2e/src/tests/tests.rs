@@ -3283,8 +3283,7 @@ fn try_h1_pipelining() -> State {
     let req3 = http_request("GET", "/api/pipe/3", "ping3", "localhost");
 
     // Connect and send all 3 requests without reading any responses
-    let mut stream =
-        TcpStream::connect(front_address).expect("could not connect for pipelining");
+    let mut stream = TcpStream::connect(front_address).expect("could not connect for pipelining");
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("set read timeout");
@@ -3333,10 +3332,7 @@ fn try_h1_pipelining() -> State {
     let response_str = String::from_utf8_lossy(&all_data);
     let response_count = response_str.matches("HTTP/1.1 200").count();
     println!("H1 pipelining - received {response_count} HTTP 200 responses");
-    println!(
-        "H1 pipelining - total bytes received: {}",
-        all_data.len()
-    );
+    println!("H1 pipelining - total bytes received: {}", all_data.len());
 
     // Verify all 3 responses contain "pong" (the backend response body)
     let pong_count = response_str.matches("pong").count();
@@ -3352,9 +3348,7 @@ fn try_h1_pipelining() -> State {
     if success && response_count >= 3 {
         State::Success
     } else {
-        println!(
-            "H1 pipelining - success={success}, response_count={response_count}"
-        );
+        println!("H1 pipelining - success={success}, response_count={response_count}");
         State::Fail
     }
 }

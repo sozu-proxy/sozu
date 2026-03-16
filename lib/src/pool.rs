@@ -337,7 +337,10 @@ mod tests {
     fn test_pool_checkout_returns_buffer() {
         let mut pool = create_test_pool(1024, 2);
         let buf = pool.checkout();
-        assert!(buf.is_some(), "first checkout from a fresh pool must succeed");
+        assert!(
+            buf.is_some(),
+            "first checkout from a fresh pool must succeed"
+        );
         let buf = buf.unwrap();
         assert_eq!(buf.capacity(), 1024);
         assert_eq!(buf.available_data(), 0);

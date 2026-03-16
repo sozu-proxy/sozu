@@ -94,7 +94,32 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             }
             return MuxResult::Continue;
         }
-        if kawa.is_terminated() {
+        // 1xx informational responses (100 Continue, 103 Early Hints): the H1
+        // parser treats them as complete (Terminated + end_stream=true), but for
+        // H2 frontends they must be forwarded WITHOUT END_STREAM so the real
+        // response can follow on the same stream. Also keep READABLE interest
+        // so the backend can send the final response.
+        let is_1xx_backend = if self.position.is_client() {
+            if let kawa::StatusLine::Response { code, .. } = &kawa.detached.status_line {
+                if (100..200).contains(code) {
+                    debug!("H1 backend: received {} informational response", code);
+                    for block in &mut kawa.blocks {
+                        if let kawa::Block::Flags(flags) = block {
+                            flags.end_stream = false;
+                            flags.end_body = false;
+                        }
+                    }
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if kawa.is_terminated() && !is_1xx_backend {
             self.timeout_container.cancel();
             self.readiness.interest.remove(Ready::READABLE);
         }
@@ -140,6 +165,17 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                     .insert(Ready::WRITABLE)
             }
         };
+        // 1xx informational: the 100 response skips main_phase (goes straight to
+        // Terminated), so the normal "set endpoint writable" above never fires.
+        // Trigger the frontend to write the 1xx response after all borrows end.
+        if is_1xx_backend {
+            if let StreamState::Linked(token) = stream.state {
+                endpoint
+                    .readiness_mut(token)
+                    .interest
+                    .insert(Ready::WRITABLE);
+            }
+        }
         MuxResult::Continue
     }
 
@@ -263,6 +299,36 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                         stream.front.clear();
                         // do not stream.front.storage.clear() because of H1 pipelining
                         stream.attempts = 0;
+                        // Transition back to Idle so buffered pipelined requests
+                        // trigger a phase transition on the next readable() call.
+                        stream.state = StreamState::Idle;
+                        // HTTP/1.1 pipelining: if there's still data in the frontend
+                        // storage (pipelined requests already read from the socket),
+                        // parse it now. We can't rely on a new READABLE event because
+                        // the socket buffer may be empty — all requests were already
+                        // read into kawa storage in the first socket_read.
+                        if !stream.front.storage.is_empty() {
+                            kawa::h1::parse(&mut stream.front, &mut stream.context);
+                            let is_error = stream.front.is_error();
+                            let is_main = stream.front.is_main_phase();
+                            let malformed = is_main
+                                && (stream.context.method.is_none()
+                                    || stream.context.authority.is_none()
+                                    || stream.context.path.is_none());
+                            if is_error || malformed {
+                                let answers_rc = context.listener.borrow().get_answers().clone();
+                                let answers = answers_rc.borrow();
+                                set_default_answer(stream, &mut self.readiness, 400, &answers);
+                            } else if is_main {
+                                self.requests += 1;
+                                incr!("http.requests");
+                                gauge_add!("http.active_requests", 1);
+                                stream.metrics.service_start();
+                                stream.request_counted = true;
+                                stream.state = StreamState::Link;
+                            }
+                            // else: incomplete parse, wait for more data via READABLE
+                        }
                     } else {
                         return MuxResult::CloseSession;
                     }

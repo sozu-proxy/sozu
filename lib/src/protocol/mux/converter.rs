@@ -513,10 +513,7 @@ mod tests {
             &mut kawa,
         );
         assert!(result);
-        assert!(
-            !conv.out.is_empty(),
-            "valid header should be HPACK encoded"
-        );
+        assert!(!conv.out.is_empty(), "valid header should be HPACK encoded");
     }
 
     // ── Header lowercasing ───────────────────────────────────────────────
@@ -561,7 +558,10 @@ mod tests {
             &mut kawa,
         );
         assert!(result);
-        assert!(conv.out.is_empty(), "elided header should produce no output");
+        assert!(
+            conv.out.is_empty(),
+            "elided header should produce no output"
+        );
     }
 
     // ── Invalid header name characters ──────────────────────────────────
@@ -621,10 +621,7 @@ mod tests {
         let mut kawa = make_kawa(&mut buf, Kind::Response);
 
         let data = Store::Static(b"hello world");
-        let result = conv.call(
-            Block::Chunk(Chunk { data }),
-            &mut kawa,
-        );
+        let result = conv.call(Block::Chunk(Chunk { data }), &mut kawa);
         assert!(result, "data within window should succeed");
         // Window should be decremented by data length
         assert_eq!(conv.window, 1000 - 11); // "hello world" = 11 bytes
@@ -641,10 +638,7 @@ mod tests {
         let mut kawa = make_kawa(&mut buf, Kind::Response);
 
         let data = Store::Static(b"hello");
-        let result = conv.call(
-            Block::Chunk(Chunk { data }),
-            &mut kawa,
-        );
+        let result = conv.call(Block::Chunk(Chunk { data }), &mut kawa);
         assert!(!result, "should stall when window is zero");
         // Data should be pushed back to blocks
         assert!(!kawa.blocks.is_empty());
@@ -659,10 +653,7 @@ mod tests {
         let mut kawa = make_kawa(&mut buf, Kind::Response);
 
         let data = Store::Static(b"hello");
-        let result = conv.call(
-            Block::Chunk(Chunk { data }),
-            &mut kawa,
-        );
+        let result = conv.call(Block::Chunk(Chunk { data }), &mut kawa);
         assert!(!result, "should stall when window is negative");
         assert!(!kawa.blocks.is_empty());
     }
@@ -676,10 +667,7 @@ mod tests {
         let mut kawa = make_kawa(&mut buf, Kind::Response);
 
         let data = Store::Static(b"hello world");
-        let _sent = conv.call(
-            Block::Chunk(Chunk { data }),
-            &mut kawa,
-        );
+        let _sent = conv.call(Block::Chunk(Chunk { data }), &mut kawa);
         // Should have sent 3 bytes (or returned false) with remainder in blocks
         assert!(conv.window <= 0);
         // The remaining bytes should be pushed back to kawa.blocks

@@ -909,6 +909,18 @@ impl Readiness {
     pub fn filter_interest(&self) -> Ready {
         self.event & self.interest
     }
+
+    /// Signal that the socket has buffered data to write (e.g., TLS internal
+    /// buffers) that won't generate a new epoll WRITABLE event.
+    pub fn signal_pending_write(&mut self) {
+        self.event.insert(Ready::WRITABLE);
+    }
+
+    /// Signal that the socket has buffered data to read (e.g., TLS plaintext
+    /// buffer after a 1xx clear) that won't generate a new epoll READABLE event.
+    pub fn signal_pending_read(&mut self) {
+        self.event.insert(Ready::READABLE);
+    }
 }
 
 pub fn display_ready(s: &mut [u8], readiness: Ready) {

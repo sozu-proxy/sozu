@@ -846,13 +846,11 @@ mod tests {
 
             // Verify that the built value matches the expected static string,
             // then parse that static string back to confirm roundtrip.
-            let expected: &[u8] =
-                b"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+            let expected: &[u8] = b"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
             assert_eq!(&built[..], expected);
 
             let store = kawa::Store::Static(expected);
-            let (parsed_trace_id, parsed_parent_id) =
-                parse_traceparent(&store, expected).unwrap();
+            let (parsed_trace_id, parsed_parent_id) = parse_traceparent(&store, expected).unwrap();
 
             assert_eq!(parsed_trace_id, trace_id);
             assert_eq!(parsed_parent_id, parent_id);
