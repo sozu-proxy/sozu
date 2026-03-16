@@ -159,6 +159,7 @@ where
             let mut scheme = Store::Empty;
             let mut invalid_headers = false;
             let mut regular_headers = false;
+            let mut cookies_added = false;
             let decode_status = decoder.decode_with_cb(input, |k, v| {
                 if is_invalid_h2_header(&k, &v) {
                     invalid_headers = true;
@@ -192,28 +193,50 @@ where
                     invalid_headers = true;
                 } else if compare_no_case(&k, b"cookie") {
                     regular_headers = true;
-                    // RFC 9113 §8.2.3: split combined cookie headers into individual pairs.
-                    // Each cookie-pair separated by "; " becomes a separate cookie header.
-                    // Use Store::Static for the key to avoid redundant buffer writes.
+                    // RFC 9113 §8.2.3: When converting H2 to H1, multiple cookie
+                    // header fields MUST be concatenated into a single octet string
+                    // using "; " as separator. We store each cookie-pair in the
+                    // detached jar (same as the H1 parser) so that:
+                    //  1. H1BlockConverter emits a single "Cookie: k1=v1; k2=v2" header
+                    //  2. H2BlockConverter re-encodes each as a separate HPACK header
+                    //  3. HttpContext::on_request_headers can find sticky session cookies
                     for cookie_pair in v.split(|&b| b == b';') {
                         let trimmed = trim_ows(cookie_pair);
                         if trimmed.is_empty() {
                             continue;
                         }
-                        let pair_start = kawa.storage.end as u32;
-                        if kawa.storage.write_all(trimmed).is_err() {
+                        // Split on first '=' to separate cookie name and value
+                        let (cookie_key, cookie_val) = match trimmed.iter().position(|&b| b == b'=')
+                        {
+                            Some(eq_pos) => (&trimmed[..eq_pos], &trimmed[eq_pos + 1..]),
+                            None => (trimmed, &b""[..]),
+                        };
+                        let key_start = kawa.storage.end as u32;
+                        if kawa.storage.write_all(cookie_key).is_err() {
                             invalid_headers = true;
                             return;
                         }
-                        let pair_len = trimmed.len() as u32;
-                        let pair_val = Store::Slice(Slice {
-                            start: pair_start,
-                            len: pair_len,
+                        let key_len = cookie_key.len() as u32;
+                        let val_start = kawa.storage.end as u32;
+                        if kawa.storage.write_all(cookie_val).is_err() {
+                            invalid_headers = true;
+                            return;
+                        }
+                        let val_len = cookie_val.len() as u32;
+                        if !cookies_added {
+                            kawa.push_block(Block::Cookies);
+                            cookies_added = true;
+                        }
+                        kawa.detached.jar.push_back(Pair {
+                            key: Store::Slice(Slice {
+                                start: key_start,
+                                len: key_len,
+                            }),
+                            val: Store::Slice(Slice {
+                                start: val_start,
+                                len: val_len,
+                            }),
                         });
-                        kawa.push_block(Block::Header(Pair {
-                            key: Store::Static(b"cookie"),
-                            val: pair_val,
-                        }));
                     }
                 } else {
                     regular_headers = true;
@@ -767,5 +790,185 @@ mod tests {
     fn test_trim_ows_preserves_internal_whitespace() {
         assert_eq!(trim_ows(b"  hello world  "), b"hello world");
         assert_eq!(trim_ows(b"\ta\tb\t"), b"a\tb");
+    }
+
+    // ── handle_header: cookie jar population ─────────────────────────────
+
+    /// Helper: HPACK-encode a set of headers and call `handle_header`, returning the kawa stream.
+    fn decode_request_headers(
+        pool: &mut crate::pool::Pool,
+        headers: &[(&[u8], &[u8])],
+        end_stream: bool,
+    ) -> GenericHttpStream {
+        let mut encoder = loona_hpack::Encoder::new();
+        let mut encoded = Vec::new();
+        for &(name, value) in headers {
+            encoder
+                .encode_header_into((name, value), &mut encoded)
+                .unwrap();
+        }
+
+        let mut decoder = loona_hpack::Decoder::new();
+        let mut prioriser = Prioriser::default();
+        let mut kawa = make_generic_kawa(pool, Kind::Request);
+
+        struct NoOpCallbacks;
+        impl kawa::h1::ParserCallbacks<crate::pool::Checkout> for NoOpCallbacks {
+            fn on_headers(&mut self, _kawa: &mut GenericHttpStream) {}
+        }
+        let mut callbacks = NoOpCallbacks;
+
+        let result = handle_header(
+            &mut decoder,
+            &mut prioriser,
+            1,
+            &mut kawa,
+            &encoded,
+            end_stream,
+            &mut callbacks,
+        );
+        assert!(result.is_ok(), "handle_header failed: {:?}", result.err());
+        kawa
+    }
+
+    #[test]
+    fn test_h2_cookies_stored_in_jar() {
+        // RFC 9113 §8.2.3: H2 cookies should be stored in detached.jar
+        // so H1 converter concatenates them into a single Cookie header.
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        let kawa = decode_request_headers(
+            &mut pool,
+            &[
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":path", b"/"),
+                (b":authority", b"example.com"),
+                (b"cookie", b"a=1; b=2; c=3"),
+            ],
+            true,
+        );
+
+        // All three cookies should be in the jar
+        assert_eq!(kawa.detached.jar.len(), 3);
+        let buf = kawa.storage.buffer();
+        assert_eq!(kawa.detached.jar[0].key.data(buf), b"a");
+        assert_eq!(kawa.detached.jar[0].val.data(buf), b"1");
+        assert_eq!(kawa.detached.jar[1].key.data(buf), b"b");
+        assert_eq!(kawa.detached.jar[1].val.data(buf), b"2");
+        assert_eq!(kawa.detached.jar[2].key.data(buf), b"c");
+        assert_eq!(kawa.detached.jar[2].val.data(buf), b"3");
+
+        // Should have exactly one Block::Cookies in the blocks
+        let cookie_blocks: Vec<_> = kawa
+            .blocks
+            .iter()
+            .filter(|b| matches!(b, Block::Cookies))
+            .collect();
+        assert_eq!(cookie_blocks.len(), 1);
+    }
+
+    #[test]
+    fn test_h2_multiple_cookie_headers_merged_in_jar() {
+        // Multiple separate cookie HPACK headers should all go to the same jar
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        let kawa = decode_request_headers(
+            &mut pool,
+            &[
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":path", b"/"),
+                (b":authority", b"example.com"),
+                (b"cookie", b"a=1"),
+                (b"cookie", b"b=2"),
+                (b"cookie", b"c=3"),
+            ],
+            true,
+        );
+
+        assert_eq!(kawa.detached.jar.len(), 3);
+        let buf = kawa.storage.buffer();
+        assert_eq!(kawa.detached.jar[0].key.data(buf), b"a");
+        assert_eq!(kawa.detached.jar[0].val.data(buf), b"1");
+        assert_eq!(kawa.detached.jar[1].key.data(buf), b"b");
+        assert_eq!(kawa.detached.jar[1].val.data(buf), b"2");
+        assert_eq!(kawa.detached.jar[2].key.data(buf), b"c");
+        assert_eq!(kawa.detached.jar[2].val.data(buf), b"3");
+
+        // Still only one Block::Cookies marker
+        let cookie_blocks: Vec<_> = kawa
+            .blocks
+            .iter()
+            .filter(|b| matches!(b, Block::Cookies))
+            .collect();
+        assert_eq!(cookie_blocks.len(), 1);
+    }
+
+    #[test]
+    fn test_h2_cookie_empty_value() {
+        // Cookie with empty value after '=' (e.g., intercom-session=)
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        let kawa = decode_request_headers(
+            &mut pool,
+            &[
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":path", b"/"),
+                (b":authority", b"example.com"),
+                (b"cookie", b"session=; PHPSESSID=abc123"),
+            ],
+            true,
+        );
+
+        assert_eq!(kawa.detached.jar.len(), 2);
+        let buf = kawa.storage.buffer();
+        assert_eq!(kawa.detached.jar[0].key.data(buf), b"session");
+        assert_eq!(kawa.detached.jar[0].val.data(buf), b"");
+        assert_eq!(kawa.detached.jar[1].key.data(buf), b"PHPSESSID");
+        assert_eq!(kawa.detached.jar[1].val.data(buf), b"abc123");
+    }
+
+    #[test]
+    fn test_h2_cookie_without_equals() {
+        // Cookie without '=' (bare name, no value)
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        let kawa = decode_request_headers(
+            &mut pool,
+            &[
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":path", b"/"),
+                (b":authority", b"example.com"),
+                (b"cookie", b"bare_name"),
+            ],
+            true,
+        );
+
+        assert_eq!(kawa.detached.jar.len(), 1);
+        let buf = kawa.storage.buffer();
+        assert_eq!(kawa.detached.jar[0].key.data(buf), b"bare_name");
+        assert_eq!(kawa.detached.jar[0].val.data(buf), b"");
+    }
+
+    #[test]
+    fn test_h2_cookie_value_with_equals() {
+        // Cookie value containing '=' (e.g., base64-encoded token)
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        let kawa = decode_request_headers(
+            &mut pool,
+            &[
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":path", b"/"),
+                (b":authority", b"example.com"),
+                (b"cookie", b"token=abc=def=="),
+            ],
+            true,
+        );
+
+        assert_eq!(kawa.detached.jar.len(), 1);
+        let buf = kawa.storage.buffer();
+        assert_eq!(kawa.detached.jar[0].key.data(buf), b"token");
+        // Split on FIRST '=' only, so value includes trailing '='
+        assert_eq!(kawa.detached.jar[0].val.data(buf), b"abc=def==");
     }
 }
