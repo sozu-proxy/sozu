@@ -30,12 +30,7 @@
 //! - Cookie header splitting (RFC 9113 §8.2.3)
 //! - H2->H1 POST body forwarding
 
-use std::{
-    io::{Read, Write},
-    net::SocketAddr,
-    thread,
-    time::Duration,
-};
+use std::{io::Write, net::SocketAddr, thread, time::Duration};
 
 use http_body_util::BodyExt;
 use sozu_command_lib::{
@@ -46,11 +41,12 @@ use sozu_command_lib::{
     },
 };
 
-use super::h2_tests::{
-    H2_ERROR_FRAME_SIZE_ERROR, H2_ERROR_PROTOCOL_ERROR, H2_FRAME_DATA, H2_FRAME_GOAWAY,
-    H2_FRAME_HEADERS, H2_FRAME_RST_STREAM, H2_FRAME_SETTINGS, H2Frame, contains_goaway,
-    contains_goaway_with_error, contains_rst_stream, h2_handshake, parse_h2_frames,
-    read_all_available, setup_h2_edge_test, tls_connect, verify_sozu_alive,
+use super::h2_utils::{
+    H2_ERROR_FRAME_SIZE_ERROR, H2_ERROR_PROTOCOL_ERROR, H2_FRAME_HEADERS, H2_FRAME_SETTINGS,
+    H2Frame, collect_response_frames, contains_goaway, contains_goaway_with_error,
+    contains_headers_response, contains_rst_stream, h2_handshake, log_frames, parse_h2_frames,
+    raw_h2_connection, read_all_available, rejected_with_goaway_or_rst, setup_h2_listener_only,
+    setup_h2_test, teardown,
 };
 use crate::{
     mock::{
@@ -61,93 +57,6 @@ use crate::{
     sozu::worker::Worker,
     tests::{State, repeat_until_error_or, tests::create_local_address},
 };
-
-// ============================================================================
-// Helpers
-// ============================================================================
-
-/// Collect response frames from the TLS stream with multiple read attempts.
-/// This is more reliable than a single read because sozu may need multiple
-/// event-loop ticks to process the malicious input and emit a response.
-fn collect_response_frames(
-    tls: &mut impl Read,
-    initial_delay_ms: u64,
-    attempts: usize,
-    read_timeout_ms: u64,
-) -> Vec<(u8, u8, u32, Vec<u8>)> {
-    thread::sleep(Duration::from_millis(initial_delay_ms));
-    let mut all_data = Vec::new();
-    for _ in 0..attempts {
-        let chunk = read_all_available(tls, Duration::from_millis(read_timeout_ms));
-        if !chunk.is_empty() {
-            all_data.extend_from_slice(&chunk);
-        }
-        if all_data.is_empty() {
-            thread::sleep(Duration::from_millis(100));
-        }
-    }
-    parse_h2_frames(&all_data)
-}
-
-/// Log parsed frames for debugging.
-fn log_frames(test_name: &str, frames: &[(u8, u8, u32, Vec<u8>)]) {
-    println!("{test_name} - received {} frames", frames.len());
-    for (i, (ft, fl, sid, payload)) in frames.iter().enumerate() {
-        if *ft == H2_FRAME_GOAWAY && payload.len() >= 8 {
-            let error_code = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
-            println!("  frame {i}: GOAWAY error_code=0x{error_code:x}");
-        } else if *ft == H2_FRAME_RST_STREAM && payload.len() >= 4 {
-            let error_code = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
-            println!("  frame {i}: RST_STREAM stream={sid} error_code=0x{error_code:x}");
-        } else {
-            println!(
-                "  frame {i}: type=0x{ft:02x} flags=0x{fl:02x} stream={sid} len={}",
-                payload.len()
-            );
-        }
-    }
-}
-
-/// Standard test teardown: drop TLS, verify sozu is alive, soft-stop worker.
-/// Returns true if both sozu-alive check and worker stop succeeded.
-fn teardown<T>(
-    tls: T,
-    front_port: u16,
-    mut worker: crate::sozu::worker::Worker,
-    mut backends: Vec<
-        crate::mock::async_backend::BackendHandle<crate::mock::aggregator::SimpleAggregator>,
-    >,
-) -> bool {
-    drop(tls);
-    thread::sleep(Duration::from_millis(200));
-    let still_alive = verify_sozu_alive(front_port);
-    println!("  sozu still alive: {still_alive}");
-
-    worker.soft_stop();
-    let success = worker.wait_for_server_stop();
-    for backend in backends.iter_mut() {
-        backend.stop_and_get_aggregator();
-    }
-    success && still_alive
-}
-
-/// Check if the response contains a GOAWAY or RST_STREAM indicating a protocol-level
-/// rejection. Many of these tests accept either response type since implementations
-/// may vary in whether they treat a violation as a stream error or connection error.
-fn rejected_with_goaway_or_rst(frames: &[(u8, u8, u32, Vec<u8>)]) -> bool {
-    contains_goaway(frames) || contains_rst_stream(frames)
-}
-
-/// Check if frames contain a HEADERS response (type 0x1) on any stream.
-fn contains_headers_response(frames: &[(u8, u8, u32, Vec<u8>)]) -> bool {
-    frames.iter().any(|(t, _, _, _)| *t == H2_FRAME_HEADERS)
-}
-
-/// Check if frames contain a DATA frame on any stream.
-#[allow(dead_code)]
-fn contains_data_frame(frames: &[(u8, u8, u32, Vec<u8>)]) -> bool {
-    frames.iter().any(|(t, _, _, _)| *t == H2_FRAME_DATA)
-}
 
 // ============================================================================
 // Test 1: HPACK bomb -- oversized header amplification via CONTINUATION flood
@@ -167,10 +76,10 @@ fn contains_data_frame(frames: &[(u8, u8, u32, Vec<u8>)]) -> bool {
 ///
 /// RFC 9113 Section 10.5.1 (Limits on Header Block Size)
 fn try_h2_hpack_bomb() -> State {
-    let (worker, backends, front_port) = setup_h2_edge_test("H2-SEC-HPACK-BOMB", 1);
+    let (worker, backends, front_port) = setup_h2_test("H2-SEC-HPACK-BOMB", 1);
 
     let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
-    let mut tls = tls_connect(front_addr);
+    let mut tls = raw_h2_connection(front_addr);
     h2_handshake(&mut tls);
 
     // Step 1: Send HEADERS on stream 1 WITHOUT END_HEADERS.
@@ -290,10 +199,10 @@ fn test_h2_hpack_bomb() {
 ///
 /// Sozu must respond with GOAWAY(PROTOCOL_ERROR).
 fn try_h2_headers_on_even_stream_id() -> State {
-    let (worker, backends, front_port) = setup_h2_edge_test("H2-SEC-EVEN-STREAM", 1);
+    let (worker, backends, front_port) = setup_h2_test("H2-SEC-EVEN-STREAM", 1);
 
     let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
-    let mut tls = tls_connect(front_addr);
+    let mut tls = raw_h2_connection(front_addr);
     h2_handshake(&mut tls);
 
     // HEADERS on stream 2 (even = server-push namespace, invalid from client).
@@ -350,10 +259,10 @@ fn test_h2_headers_on_even_stream_id() {
 /// HEADERS on stream 1 again. Sozu must reject the reuse with a connection
 /// error (GOAWAY with PROTOCOL_ERROR or STREAM_CLOSED).
 fn try_h2_stream_id_reuse_after_rst() -> State {
-    let (worker, backends, front_port) = setup_h2_edge_test("H2-SEC-STREAM-REUSE", 1);
+    let (worker, backends, front_port) = setup_h2_test("H2-SEC-STREAM-REUSE", 1);
 
     let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
-    let mut tls = tls_connect(front_addr);
+    let mut tls = raw_h2_connection(front_addr);
     h2_handshake(&mut tls);
 
     // Open stream 1 with HEADERS (END_HEADERS + END_STREAM).
@@ -424,10 +333,10 @@ fn test_h2_stream_id_reuse_after_goaway() {
 /// "idle" state (no HEADERS sent) MUST be treated as a connection error of
 /// type PROTOCOL_ERROR. Stream 3 is idle because we never sent HEADERS on it.
 fn try_h2_data_on_idle_stream() -> State {
-    let (worker, backends, front_port) = setup_h2_edge_test("H2-SEC-DATA-IDLE", 1);
+    let (worker, backends, front_port) = setup_h2_test("H2-SEC-DATA-IDLE", 1);
 
     let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
-    let mut tls = tls_connect(front_addr);
+    let mut tls = raw_h2_connection(front_addr);
     h2_handshake(&mut tls);
 
     // Send DATA on stream 3 without ever opening it with HEADERS.
@@ -477,10 +386,10 @@ fn test_h2_data_on_idle_stream() {
 ///
 /// We craft a raw SETTINGS frame with 7 bytes payload (not divisible by 6).
 fn try_h2_invalid_settings_frame_length() -> State {
-    let (worker, backends, front_port) = setup_h2_edge_test("H2-SEC-BAD-SETTINGS-LEN", 1);
+    let (worker, backends, front_port) = setup_h2_test("H2-SEC-BAD-SETTINGS-LEN", 1);
 
     let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
-    let mut tls = tls_connect(front_addr);
+    let mut tls = raw_h2_connection(front_addr);
     h2_handshake(&mut tls);
 
     // Craft a raw SETTINGS frame with 7-byte payload (invalid: not multiple of 6).
@@ -538,10 +447,10 @@ fn test_h2_invalid_settings_frame_length() {
 /// We connect via TLS (with ALPN h2) and send a corrupted preface instead of
 /// the standard "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".
 fn try_h2_connection_preface_corruption() -> State {
-    let (worker, backends, front_port) = setup_h2_edge_test("H2-SEC-BAD-PREFACE", 1);
+    let (worker, backends, front_port) = setup_h2_test("H2-SEC-BAD-PREFACE", 1);
 
     let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
-    let mut tls = tls_connect(front_addr);
+    let mut tls = raw_h2_connection(front_addr);
 
     // Send corrupted preface — correct start but wrong ending.
     let corrupted_preface = b"PRI * HTTP/2.0\r\n\r\nBROKEN\r\n";
@@ -614,10 +523,10 @@ fn test_h2_connection_preface_corruption() {
 ///
 /// We send HEADERS with only :method but no :path or :scheme.
 fn try_h2_missing_pseudo_headers() -> State {
-    let (worker, backends, front_port) = setup_h2_edge_test("H2-SEC-MISSING-PSEUDO", 1);
+    let (worker, backends, front_port) = setup_h2_test("H2-SEC-MISSING-PSEUDO", 1);
 
     let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
-    let mut tls = tls_connect(front_addr);
+    let mut tls = raw_h2_connection(front_addr);
     h2_handshake(&mut tls);
 
     // HPACK-encoded HEADERS with only :method GET — missing :path, :scheme, :authority.
@@ -680,10 +589,10 @@ fn test_h2_missing_pseudo_headers() {
 /// We send HEADERS with a properly-encoded request but include a custom header
 /// "X-Bad-Header" with uppercase characters using literal representation.
 fn try_h2_uppercase_header_name() -> State {
-    let (worker, backends, front_port) = setup_h2_edge_test("H2-SEC-UPPERCASE-HDR", 1);
+    let (worker, backends, front_port) = setup_h2_test("H2-SEC-UPPERCASE-HDR", 1);
 
     let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
-    let mut tls = tls_connect(front_addr);
+    let mut tls = raw_h2_connection(front_addr);
     h2_handshake(&mut tls);
 
     // Build HPACK header block with required pseudo-headers followed by
@@ -760,10 +669,10 @@ fn test_h2_uppercase_header_name() {
 ///
 /// Sozu must reject or normalize the conflicting headers.
 fn try_h2_desync_authority_host_conflict() -> State {
-    let (worker, backends, front_port) = setup_h2_edge_test("H2-SEC-DESYNC-AUTH", 1);
+    let (worker, backends, front_port) = setup_h2_test("H2-SEC-DESYNC-AUTH", 1);
 
     let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
-    let mut tls = tls_connect(front_addr);
+    let mut tls = raw_h2_connection(front_addr);
     h2_handshake(&mut tls);
 
     // Build HPACK header block with :authority=localhost AND host=evil.com
@@ -838,10 +747,10 @@ fn test_h2_desync_authority_host_conflict() {
 /// for non-CONNECT requests. A path like "evil.com/foo" or "*" without a
 /// leading slash is a smuggling vector in H2->H1 conversion.
 fn try_h2_desync_path_no_leading_slash() -> State {
-    let (worker, backends, front_port) = setup_h2_edge_test("H2-SEC-DESYNC-PATH", 1);
+    let (worker, backends, front_port) = setup_h2_test("H2-SEC-DESYNC-PATH", 1);
 
     let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
-    let mut tls = tls_connect(front_addr);
+    let mut tls = raw_h2_connection(front_addr);
     h2_handshake(&mut tls);
 
     // Build HPACK header block with :path that doesn't start with /
@@ -907,10 +816,10 @@ fn test_h2_desync_path_no_leading_slash() {
 /// the request as-is. The key safety property is that sozu does NOT crash
 /// and the fragment is stripped or forwarded transparently.
 fn try_h2_desync_path_with_fragment() -> State {
-    let (worker, backends, front_port) = setup_h2_edge_test("H2-SEC-DESYNC-FRAG", 1);
+    let (worker, backends, front_port) = setup_h2_test("H2-SEC-DESYNC-FRAG", 1);
 
     let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
-    let mut tls = tls_connect(front_addr);
+    let mut tls = raw_h2_connection(front_addr);
     h2_handshake(&mut tls);
 
     // :path = "/api#fragment"
@@ -981,10 +890,10 @@ fn test_h2_desync_path_with_fragment() {
 /// RFC 9113 Section 8.3: Each pseudo-header field MUST appear at most once.
 /// Duplicate pseudo-headers are malformed and must be rejected.
 fn try_h2_duplicate_pseudo_headers() -> State {
-    let (worker, backends, front_port) = setup_h2_edge_test("H2-SEC-DUP-PSEUDO", 1);
+    let (worker, backends, front_port) = setup_h2_test("H2-SEC-DUP-PSEUDO", 1);
 
     let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
-    let mut tls = tls_connect(front_addr);
+    let mut tls = raw_h2_connection(front_addr);
     h2_handshake(&mut tls);
 
     // Two :method pseudo-headers
@@ -1042,7 +951,7 @@ fn test_h2_duplicate_pseudo_headers() {
 ///
 /// (TE is allowed only with value "trailers", already tested separately.)
 fn try_h2_connection_specific_headers() -> State {
-    let (worker, backends, front_port) = setup_h2_edge_test("H2-SEC-CONN-HDRS", 1);
+    let (worker, backends, front_port) = setup_h2_test("H2-SEC-CONN-HDRS", 1);
 
     let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
 
@@ -1057,7 +966,7 @@ fn try_h2_connection_specific_headers() -> State {
     let mut all_rejected = true;
 
     for (name, value) in prohibited_headers {
-        let mut tls = tls_connect(front_addr);
+        let mut tls = raw_h2_connection(front_addr);
         h2_handshake(&mut tls);
 
         let mut header_block = vec![
@@ -1097,7 +1006,7 @@ fn try_h2_connection_specific_headers() -> State {
     }
 
     let infra_ok = teardown(
-        tls_connect(front_addr), // dummy connection for teardown
+        raw_h2_connection(front_addr), // dummy connection for teardown
         front_port,
         worker,
         backends,
@@ -1130,10 +1039,10 @@ fn test_h2_connection_specific_headers() {
 /// block before all regular header fields. A pseudo-header appearing after
 /// a regular header is malformed.
 fn try_h2_pseudo_headers_after_regular() -> State {
-    let (worker, backends, front_port) = setup_h2_edge_test("H2-SEC-PSEUDO-ORDER", 1);
+    let (worker, backends, front_port) = setup_h2_test("H2-SEC-PSEUDO-ORDER", 1);
 
     let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
-    let mut tls = tls_connect(front_addr);
+    let mut tls = raw_h2_connection(front_addr);
     h2_handshake(&mut tls);
 
     // Regular header BEFORE :path pseudo-header (wrong order)
@@ -1197,10 +1106,10 @@ fn test_h2_pseudo_headers_after_regular() {
 /// increasing. A client sending stream 5, then stream 3 (lower ID) is
 /// a protocol error.
 fn try_h2_stream_id_regression() -> State {
-    let (worker, backends, front_port) = setup_h2_edge_test("H2-SEC-STREAM-REGRESS", 1);
+    let (worker, backends, front_port) = setup_h2_test("H2-SEC-STREAM-REGRESS", 1);
 
     let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
-    let mut tls = tls_connect(front_addr);
+    let mut tls = raw_h2_connection(front_addr);
     h2_handshake(&mut tls);
 
     let header_block = vec![
@@ -1259,10 +1168,10 @@ fn test_h2_stream_id_regression() {
 /// RFC 9113 Section 6.4: RST_STREAM frames MUST be associated with a
 /// stream. RST_STREAM on stream 0 is a connection error (PROTOCOL_ERROR).
 fn try_h2_rst_stream_on_stream_zero() -> State {
-    let (worker, backends, front_port) = setup_h2_edge_test("H2-SEC-RST-ZERO", 1);
+    let (worker, backends, front_port) = setup_h2_test("H2-SEC-RST-ZERO", 1);
 
     let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
-    let mut tls = tls_connect(front_addr);
+    let mut tls = raw_h2_connection(front_addr);
     h2_handshake(&mut tls);
 
     // RST_STREAM on stream 0 (invalid)
@@ -1303,10 +1212,10 @@ fn test_h2_rst_stream_on_stream_zero() {
 /// RFC 9113 Section 6.8: GOAWAY frames MUST be sent on stream 0.
 /// Receiving a GOAWAY on a non-zero stream is a connection error.
 fn try_h2_goaway_on_nonzero_stream() -> State {
-    let (worker, backends, front_port) = setup_h2_edge_test("H2-SEC-GOAWAY-NONZERO", 1);
+    let (worker, backends, front_port) = setup_h2_test("H2-SEC-GOAWAY-NONZERO", 1);
 
     let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
-    let mut tls = tls_connect(front_addr);
+    let mut tls = raw_h2_connection(front_addr);
     h2_handshake(&mut tls);
 
     // Build a raw GOAWAY frame on stream 1 (invalid — must be stream 0)
@@ -1350,10 +1259,10 @@ fn test_h2_goaway_on_nonzero_stream() {
 /// can push. Receiving PUSH_PROMISE from a client is a connection error
 /// of type PROTOCOL_ERROR.
 fn try_h2_push_promise_from_client() -> State {
-    let (worker, backends, front_port) = setup_h2_edge_test("H2-SEC-PUSH-PROMISE", 1);
+    let (worker, backends, front_port) = setup_h2_test("H2-SEC-PUSH-PROMISE", 1);
 
     let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
-    let mut tls = tls_connect(front_addr);
+    let mut tls = raw_h2_connection(front_addr);
     h2_handshake(&mut tls);
 
     // PUSH_PROMISE frame (type 0x5) on stream 1
@@ -1406,7 +1315,7 @@ fn test_h2_push_promise_from_client() {
 /// malformed and must be rejected. This is a smuggling vector: the proxy
 /// might see CL=0 while the backend sees a different interpretation.
 fn try_h2_content_length_format_fuzzing() -> State {
-    let (worker, backends, front_port) = setup_h2_edge_test("H2-SEC-CL-FUZZ", 1);
+    let (worker, backends, front_port) = setup_h2_test("H2-SEC-CL-FUZZ", 1);
 
     let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
 
@@ -1422,7 +1331,7 @@ fn try_h2_content_length_format_fuzzing() -> State {
     let mut all_handled = true;
 
     for cl_value in malformed_cls {
-        let mut tls = tls_connect(front_addr);
+        let mut tls = raw_h2_connection(front_addr);
         h2_handshake(&mut tls);
 
         let mut header_block = vec![
@@ -1468,7 +1377,7 @@ fn try_h2_content_length_format_fuzzing() -> State {
         thread::sleep(Duration::from_millis(100));
     }
 
-    let infra_ok = teardown(tls_connect(front_addr), front_port, worker, backends);
+    let infra_ok = teardown(raw_h2_connection(front_addr), front_port, worker, backends);
 
     if infra_ok && all_handled {
         State::Success
@@ -1496,10 +1405,10 @@ fn test_h2_content_length_format_fuzzing() {
 /// RFC 9113 Section 6.7: Upon receiving a PING frame that is not a PING ACK,
 /// the endpoint MUST send a PING ACK with the same opaque data.
 fn try_h2_ping_pong_correctness() -> State {
-    let (worker, backends, front_port) = setup_h2_edge_test("H2-SEC-PING-PONG", 1);
+    let (worker, backends, front_port) = setup_h2_test("H2-SEC-PING-PONG", 1);
 
     let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
-    let mut tls = tls_connect(front_addr);
+    let mut tls = raw_h2_connection(front_addr);
     h2_handshake(&mut tls);
 
     // Send a PING with known opaque data
@@ -1549,7 +1458,7 @@ fn test_h2_ping_pong_correctness() {
 /// Pingora test_h2_head: verify that HEAD responses over H2 carry headers
 /// (including Content-Length) but NO body data.
 fn try_h2_head_request_no_body() -> State {
-    let (worker, backends, front_port) = setup_h2_edge_test("H2-SEC-HEAD", 1);
+    let (worker, backends, front_port) = setup_h2_test("H2-SEC-HEAD", 1);
 
     let client = build_h2_client();
     let uri: hyper::Uri = format!("https://localhost:{front_port}/api")
@@ -1632,7 +1541,7 @@ fn test_h2_head_request_no_body() {
 /// When all backends are unreachable, sozu must respond with a well-formed
 /// H2 error response (typically 502 Bad Gateway or 503 Service Unavailable).
 fn try_h2_error_response_no_backend() -> State {
-    use super::h2_tests::setup_h2_listener_only;
+    // setup_h2_listener_only is already imported from h2_utils at the top
 
     let (mut worker, front_port, _front_address) = setup_h2_listener_only("H2-SEC-NO-BACKEND");
 
@@ -1848,10 +1757,10 @@ fn test_h2_multi_cluster_routing() {
 /// separate `cookie` headers encoded via HPACK literal-without-indexing and
 /// verifies that sozu forwards the request successfully to the H1 backend.
 fn try_h2_cookie_splitting() -> State {
-    let (worker, backends, front_port) = setup_h2_edge_test("H2-SEC-COOKIE-SPLIT", 1);
+    let (worker, backends, front_port) = setup_h2_test("H2-SEC-COOKIE-SPLIT", 1);
 
     let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
-    let mut tls = tls_connect(front_addr);
+    let mut tls = raw_h2_connection(front_addr);
     h2_handshake(&mut tls);
 
     // Build HPACK-encoded header block with multiple cookie headers.
@@ -1936,7 +1845,7 @@ fn test_h2_cookie_splitting() {
 /// where the request body must be re-framed into an HTTP/1.1 chunked or
 /// content-length body.
 fn try_h2_post_body_forwarding() -> State {
-    let (worker, backends, front_port) = setup_h2_edge_test("H2-SEC-POST-BODY", 1);
+    let (worker, backends, front_port) = setup_h2_test("H2-SEC-POST-BODY", 1);
 
     let client = build_h2_client();
     let uri: hyper::Uri = format!("https://localhost:{front_port}/api")
@@ -1996,10 +1905,10 @@ fn test_h2_post_body_forwarding() {
 /// frames to close the stream. The trailer HEADERS frame carries END_STREAM
 /// and must not contain pseudo-headers.
 fn try_h2_trailer_forwarding() -> State {
-    let (worker, backends, front_port) = setup_h2_edge_test("H2-TRAILER-FWD", 1);
+    let (worker, backends, front_port) = setup_h2_test("H2-TRAILER-FWD", 1);
 
     let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
-    let mut tls = tls_connect(front_addr);
+    let mut tls = raw_h2_connection(front_addr);
     h2_handshake(&mut tls);
 
     // Step 1: Send HEADERS for POST on stream 1 (no END_STREAM, has END_HEADERS).
@@ -2086,10 +1995,10 @@ fn test_h2_trailer_forwarding() {
 /// Sozu should reject the stream with RST_STREAM or the connection with
 /// GOAWAY(PROTOCOL_ERROR), or at minimum not crash.
 fn try_h2_pseudo_header_in_trailer() -> State {
-    let (worker, backends, front_port) = setup_h2_edge_test("H2-PSEUDO-TRAILER", 1);
+    let (worker, backends, front_port) = setup_h2_test("H2-PSEUDO-TRAILER", 1);
 
     let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
-    let mut tls = tls_connect(front_addr);
+    let mut tls = raw_h2_connection(front_addr);
     h2_handshake(&mut tls);
 
     // Step 1: Send HEADERS for POST on stream 1 (no END_STREAM).
@@ -2174,10 +2083,10 @@ fn test_h2_pseudo_header_in_trailer() {
 /// stream 1 sends a GET with END_STREAM (half-closed local), reads the
 /// response, then stream 3 sends another GET to prove connection reuse.
 fn try_h2_half_closed_stream_response() -> State {
-    let (worker, backends, front_port) = setup_h2_edge_test("H2-HALF-CLOSED", 1);
+    let (worker, backends, front_port) = setup_h2_test("H2-HALF-CLOSED", 1);
 
     let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
-    let mut tls = tls_connect(front_addr);
+    let mut tls = raw_h2_connection(front_addr);
     h2_handshake(&mut tls);
 
     // Request 1 on stream 1: GET with END_STREAM (half-closed local immediately)
@@ -2262,10 +2171,10 @@ fn test_h2_half_closed_stream_response() {
 /// table size update. [...] A value of 0 effectively disables the use of the
 /// dynamic table."
 fn try_h2_hpack_table_size_zero() -> State {
-    let (worker, backends, front_port) = setup_h2_edge_test("H2-HPACK-TBL0", 1);
+    let (worker, backends, front_port) = setup_h2_test("H2-HPACK-TBL0", 1);
 
     let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
-    let mut tls = tls_connect(front_addr);
+    let mut tls = raw_h2_connection(front_addr);
     h2_handshake(&mut tls);
 
     // Step 1: Send SETTINGS with HEADER_TABLE_SIZE=0 (setting id=1, value=0).
@@ -2360,10 +2269,10 @@ fn test_h2_hpack_table_size_zero() {
 /// This exercises stream lifecycle management: each stream goes through
 /// open -> half-closed -> closed, and the connection must remain healthy.
 fn try_h2_connection_reuse_sequential() -> State {
-    let (worker, backends, front_port) = setup_h2_edge_test("H2-SEQ-REUSE", 1);
+    let (worker, backends, front_port) = setup_h2_test("H2-SEQ-REUSE", 1);
 
     let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
-    let mut tls = tls_connect(front_addr);
+    let mut tls = raw_h2_connection(front_addr);
     h2_handshake(&mut tls);
 
     let mut responses_received = 0;
