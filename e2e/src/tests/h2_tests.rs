@@ -6842,3 +6842,409 @@ fn test_h2_outbound_flood_from_rst_stream() {
         State::Success
     );
 }
+
+// ============================================================================
+// Test: Large H1 backend response forwarded via H2 (Content-Length)
+// ============================================================================
+
+/// Reproducer for large response body truncation when proxying H1→H2.
+/// The backend sends a large HTTP/1.1 response with Content-Length via a plain
+/// TCP connection. Sōzu must forward ALL bytes as H2 DATA frames with a final
+/// END_STREAM. This exercises:
+/// - kawa buffer cycling (response >> buffer_size)
+/// - H2 flow control window exhaustion and WINDOW_UPDATE recovery
+/// - H1→H2 block conversion under buffer pressure
+fn try_h2_large_h1_response_content_length() -> State {
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+    let (config, listeners, state) = Worker::empty_config();
+    let mut worker = Worker::start_new_worker("H2-LARGE-H1-CL", config, &listeners, state);
+
+    worker.send_proxy_request_type(RequestType::AddHttpsListener(
+        ListenerBuilder::new_https(front_address.clone())
+            .to_tls(None)
+            .unwrap(),
+    ));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        address: front_address.clone(),
+        proxy: ListenerType::Https.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        hostname: String::from("localhost"),
+        ..Worker::default_http_frontend("cluster_0", front_address.clone().into())
+    }));
+    let certificate_and_key = CertificateAndKey {
+        certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
+        key: String::from(include_str!("../../../lib/assets/local-key.pem")),
+        certificate_chain: vec![],
+        versions: vec![],
+        names: vec![],
+    };
+    worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+        address: front_address,
+        certificate: certificate_and_key,
+        expired_at: None,
+    }));
+
+    // 256 KB body — exceeds the default 16KB buffer (~16 buffer cycles)
+    // and the initial H2 stream window of 65535 bytes (~4 WINDOW_UPDATE rounds)
+    let body_size = 256 * 1024;
+    let body_content: String = (0..body_size)
+        .map(|i| (b'A' + (i % 26) as u8) as char)
+        .collect();
+
+    let back_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address,
+        None,
+    )));
+
+    // H1 backend: sends Content-Length response via http_ok_response
+    let mut backends = vec![AsyncBackend::spawn_detached_backend(
+        "LARGE_H1_CL".to_string(),
+        back_address,
+        SimpleAggregator::default(),
+        AsyncBackend::http_handler(body_content.clone()),
+    )];
+
+    worker.read_to_last();
+
+    let client = build_h2_client();
+    let uri: hyper::Uri = format!("https://localhost:{front_port}/api/large-h1")
+        .parse()
+        .unwrap();
+
+    let result = resolve_request(&client, uri);
+    let correct = result.as_ref().is_some_and(|(status, body)| {
+        println!(
+            "H2 large H1 CL response - status: {status:?}, body len: {} (expected {body_size})",
+            body.len()
+        );
+        if body.len() != body_size {
+            // Show where truncation occurred
+            println!(
+                "  TRUNCATED at byte {} (missing {} bytes)",
+                body.len(),
+                body_size - body.len()
+            );
+        }
+        status.is_success() && body.len() == body_size && *body == body_content
+    });
+
+    worker.soft_stop();
+    let success = worker.wait_for_server_stop();
+    for backend in backends.iter_mut() {
+        backend.stop_and_get_aggregator();
+    }
+    if success && correct {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_large_h1_response_content_length() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "H2: large H1 backend response (Content-Length) forwarded completely",
+            try_h2_large_h1_response_content_length
+        ),
+        State::Success
+    );
+}
+
+// ============================================================================
+// Test: Large H1 backend response with chunked transfer encoding
+// ============================================================================
+
+/// Same as above but the backend sends chunked transfer encoding instead of
+/// Content-Length. This exercises the H1 chunked parser → H2 DATA path and
+/// the end_stream flag emission after the final zero-chunk.
+fn try_h2_large_h1_response_chunked() -> State {
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+    let (config, listeners, state) = Worker::empty_config();
+    let mut worker = Worker::start_new_worker("H2-LARGE-H1-CHUNKED", config, &listeners, state);
+
+    worker.send_proxy_request_type(RequestType::AddHttpsListener(
+        ListenerBuilder::new_https(front_address.clone())
+            .to_tls(None)
+            .unwrap(),
+    ));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        address: front_address.clone(),
+        proxy: ListenerType::Https.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        hostname: String::from("localhost"),
+        ..Worker::default_http_frontend("cluster_0", front_address.clone().into())
+    }));
+    let certificate_and_key = CertificateAndKey {
+        certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
+        key: String::from(include_str!("../../../lib/assets/local-key.pem")),
+        certificate_chain: vec![],
+        versions: vec![],
+        names: vec![],
+    };
+    worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+        address: front_address,
+        certificate: certificate_and_key,
+        expired_at: None,
+    }));
+
+    // 256 KB body sent as chunked transfer encoding
+    let body_size = 256 * 1024;
+    let body_content: String = (0..body_size)
+        .map(|i| (b'A' + (i % 26) as u8) as char)
+        .collect();
+    let body_clone = body_content.clone();
+
+    let back_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address,
+        None,
+    )));
+
+    // Custom H1 backend: sends chunked transfer encoding
+    let chunked_handler: Box<
+        dyn Fn(&std::net::TcpStream, &str, SimpleAggregator) -> SimpleAggregator + Send + Sync,
+    > = Box::new(move |mut stream, backend_name, mut aggregator| {
+        let mut buf = [0u8; 4096];
+        match stream.read(&mut buf) {
+            Ok(0) => return aggregator,
+            Ok(n) => println!("{backend_name} received {n}"),
+            Err(_) => return aggregator,
+        }
+        aggregator.requests_received += 1;
+
+        // Build chunked HTTP/1.1 response with ~8KB chunks
+        let chunk_size = 8 * 1024;
+        let mut response = String::from(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nTransfer-Encoding: chunked\r\n\r\n",
+        );
+        let body_bytes = body_clone.as_bytes();
+        let mut offset = 0;
+        while offset < body_bytes.len() {
+            let end = std::cmp::min(offset + chunk_size, body_bytes.len());
+            let chunk = &body_bytes[offset..end];
+            response.push_str(&format!("{:x}\r\n", chunk.len()));
+            response.push_str(std::str::from_utf8(chunk).unwrap());
+            response.push_str("\r\n");
+            offset = end;
+        }
+        response.push_str("0\r\n\r\n");
+
+        match stream.write_all(response.as_bytes()) {
+            Ok(()) => aggregator.responses_sent += 1,
+            Err(e) => println!("{backend_name} write error: {e}"),
+        }
+        aggregator
+    });
+
+    let mut backends = vec![AsyncBackend::spawn_detached_backend(
+        "LARGE_H1_CHUNKED".to_string(),
+        back_address,
+        SimpleAggregator::default(),
+        chunked_handler,
+    )];
+
+    worker.read_to_last();
+
+    let client = build_h2_client();
+    let uri: hyper::Uri = format!("https://localhost:{front_port}/api/large-chunked")
+        .parse()
+        .unwrap();
+
+    let result = resolve_request(&client, uri);
+    let correct = result.as_ref().is_some_and(|(status, body)| {
+        println!(
+            "H2 large H1 chunked response - status: {status:?}, body len: {} (expected {body_size})",
+            body.len()
+        );
+        if body.len() != body_size {
+            println!(
+                "  TRUNCATED at byte {} (missing {} bytes)",
+                body.len(),
+                body_size - body.len()
+            );
+        }
+        status.is_success() && body.len() == body_size && *body == body_content
+    });
+
+    worker.soft_stop();
+    let success = worker.wait_for_server_stop();
+    for backend in backends.iter_mut() {
+        backend.stop_and_get_aggregator();
+    }
+    if success && correct {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_large_h1_response_chunked() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "H2: large H1 backend response (chunked) forwarded completely",
+            try_h2_large_h1_response_chunked
+        ),
+        State::Success
+    );
+}
+
+// ============================================================================
+// Test: Large H1 backend response with connection close (close-delimited)
+// ============================================================================
+
+/// The backend sends a large response WITHOUT Content-Length and WITHOUT
+/// chunked encoding, then closes the connection. Sōzu must detect the
+/// close-delimited body and emit DATA with END_STREAM.
+fn try_h2_large_h1_response_close_delimited() -> State {
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+    let (config, listeners, state) = Worker::empty_config();
+    let mut worker = Worker::start_new_worker("H2-LARGE-H1-CLOSE", config, &listeners, state);
+
+    worker.send_proxy_request_type(RequestType::AddHttpsListener(
+        ListenerBuilder::new_https(front_address.clone())
+            .to_tls(None)
+            .unwrap(),
+    ));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        address: front_address.clone(),
+        proxy: ListenerType::Https.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        hostname: String::from("localhost"),
+        ..Worker::default_http_frontend("cluster_0", front_address.clone().into())
+    }));
+    let certificate_and_key = CertificateAndKey {
+        certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
+        key: String::from(include_str!("../../../lib/assets/local-key.pem")),
+        certificate_chain: vec![],
+        versions: vec![],
+        names: vec![],
+    };
+    worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+        address: front_address,
+        certificate: certificate_and_key,
+        expired_at: None,
+    }));
+
+    // 256 KB body sent without Content-Length (close-delimited)
+    let body_size = 256 * 1024;
+    let body_content: String = (0..body_size)
+        .map(|i| (b'A' + (i % 26) as u8) as char)
+        .collect();
+    let body_clone = body_content.clone();
+
+    let back_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address,
+        None,
+    )));
+
+    // Custom H1 backend: close-delimited (Connection: close, no Content-Length).
+    // The handler must shut down the socket after writing so Sōzu sees the EOF.
+    let close_handler: Box<
+        dyn Fn(&std::net::TcpStream, &str, SimpleAggregator) -> SimpleAggregator + Send + Sync,
+    > = Box::new(move |mut stream, backend_name, mut aggregator| {
+        let mut buf = [0u8; 4096];
+        match stream.read(&mut buf) {
+            Ok(0) => return aggregator,
+            Ok(n) => println!("{backend_name} received {n}"),
+            Err(_) => return aggregator,
+        }
+        aggregator.requests_received += 1;
+
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nConnection: close\r\n\r\n{}",
+            body_clone
+        );
+        match stream.write_all(response.as_bytes()) {
+            Ok(()) => {
+                aggregator.responses_sent += 1;
+                // Send FIN to signal end-of-body for close-delimited
+                let _ = stream.shutdown(std::net::Shutdown::Write);
+            }
+            Err(e) => println!("{backend_name} write error: {e}"),
+        }
+        aggregator
+    });
+
+    let mut backends = vec![AsyncBackend::spawn_detached_backend(
+        "LARGE_H1_CLOSE".to_string(),
+        back_address,
+        SimpleAggregator::default(),
+        close_handler,
+    )];
+
+    worker.read_to_last();
+
+    let client = build_h2_client();
+    let uri: hyper::Uri = format!("https://localhost:{front_port}/api/large-close")
+        .parse()
+        .unwrap();
+
+    let result = resolve_request(&client, uri);
+    let correct = result.as_ref().is_some_and(|(status, body)| {
+        println!(
+            "H2 large H1 close-delimited - status: {status:?}, body len: {} (expected {body_size})",
+            body.len()
+        );
+        if body.len() != body_size {
+            println!(
+                "  TRUNCATED at byte {} (missing {} bytes)",
+                body.len(),
+                body_size - body.len()
+            );
+        }
+        status.is_success() && body.len() == body_size && *body == body_content
+    });
+
+    worker.soft_stop();
+    let success = worker.wait_for_server_stop();
+    for backend in backends.iter_mut() {
+        backend.stop_and_get_aggregator();
+    }
+    if success && correct {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_large_h1_response_close_delimited() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "H2: large H1 backend response (close-delimited) forwarded completely",
+            try_h2_large_h1_response_close_delimited
+        ),
+        State::Success
+    );
+}

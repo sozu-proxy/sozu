@@ -577,6 +577,35 @@ impl<Front: SocketHandler> Connection<Front> {
         }
     }
 
+    /// Returns true if this connection could not read because its stream's
+    /// kawa buffer was full. Used to prevent the dead-backend check from
+    /// closing a backend that still has data in the OS socket buffer.
+    fn has_buffer_pressure<L>(&self, context: &Context<L>) -> bool
+    where
+        L: ListenerHandler + L7ListenerHandler,
+    {
+        match self {
+            Connection::H1(c) => {
+                if c.stream < context.streams.len() {
+                    let kawa = match c.position {
+                        Position::Client(..) => &context.streams[c.stream].back,
+                        Position::Server => &context.streams[c.stream].front,
+                    };
+                    kawa.storage.available_space() == 0
+                } else {
+                    error!(
+                        "has_buffer_pressure: stream index {} out of bounds (len={})",
+                        c.stream,
+                        context.streams.len()
+                    );
+                    false
+                }
+            }
+            // H2 connections manage their own flow control via expect_read
+            Connection::H2(_) => false,
+        }
+    }
+
     /// Re-enable READABLE if this connection is parked waiting for buffer space
     /// and the target stream's buffer now has enough room. H1 connections never
     /// park on `expect_read`, so they always return `false`.
@@ -1585,8 +1614,10 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 let mut dead_backends = Vec::new();
                 for (token, client) in self.router.backends.iter_mut() {
                     let readiness = client.readiness_mut();
-                    let dead = readiness.filter_interest().is_hup()
-                        || readiness.filter_interest().is_error();
+                    // Check the raw event for HUP/ERROR — not filter_interest(),
+                    // because interest only contains READABLE|WRITABLE and would
+                    // always mask out HUP (0b01000) and ERROR (0b00100).
+                    let dead = readiness.event.is_hup() || readiness.event.is_error();
                     if dead {
                         trace!("Backend({:?}) -> {:?}", token, readiness);
                         readiness.event.remove(Ready::WRITABLE);
@@ -1682,7 +1713,10 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                         }
                     }
 
-                    if dead && !client.readiness().filter_interest().is_readable() {
+                    if dead
+                        && !client.readiness().filter_interest().is_readable()
+                        && !client.has_buffer_pressure(context)
+                    {
                         context
                             .debug
                             .push(DebugEvent::CH(*token, client.readiness().clone()));
