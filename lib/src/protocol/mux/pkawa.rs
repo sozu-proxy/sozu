@@ -468,3 +468,197 @@ pub fn handle_trailer(
     kawa.parsing_phase = ParsingPhase::Terminated;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── parse_rfc9218_priority ────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_rfc9218_priority_defaults() {
+        // Empty value -> RFC 9218 §4 defaults: urgency 3, incremental false
+        let (u, i) = parse_rfc9218_priority(b"");
+        assert_eq!(u, 3);
+        assert!(!i);
+    }
+
+    #[test]
+    fn test_parse_rfc9218_priority_urgency_only() {
+        assert_eq!(parse_rfc9218_priority(b"u=0"), (0, false));
+        assert_eq!(parse_rfc9218_priority(b"u=3"), (3, false));
+        assert_eq!(parse_rfc9218_priority(b"u=7"), (7, false));
+    }
+
+    #[test]
+    fn test_parse_rfc9218_priority_urgency_clamped() {
+        // Values > 7 are clamped to 7
+        assert_eq!(parse_rfc9218_priority(b"u=9"), (7, false));
+        assert_eq!(parse_rfc9218_priority(b"u=255"), (7, false));
+    }
+
+    #[test]
+    fn test_parse_rfc9218_priority_incremental_only() {
+        // Just "i" -> default urgency 3, incremental true
+        assert_eq!(parse_rfc9218_priority(b"i"), (3, true));
+    }
+
+    #[test]
+    fn test_parse_rfc9218_priority_incremental_boolean_form() {
+        assert_eq!(parse_rfc9218_priority(b"i=?1"), (3, true));
+        assert_eq!(parse_rfc9218_priority(b"i=?0"), (3, false));
+    }
+
+    #[test]
+    fn test_parse_rfc9218_priority_combined() {
+        assert_eq!(parse_rfc9218_priority(b"u=3, i"), (3, true));
+        assert_eq!(parse_rfc9218_priority(b"u=0, i"), (0, true));
+        assert_eq!(parse_rfc9218_priority(b"u=7, i=?1"), (7, true));
+        assert_eq!(parse_rfc9218_priority(b"u=5, i=?0"), (5, false));
+    }
+
+    #[test]
+    fn test_parse_rfc9218_priority_whitespace_tolerance() {
+        // OWS around tokens should be trimmed
+        assert_eq!(parse_rfc9218_priority(b"u=3,  i"), (3, true));
+        assert_eq!(parse_rfc9218_priority(b" u=3 , i "), (3, true));
+        assert_eq!(parse_rfc9218_priority(b"\tu=2\t,\ti\t"), (2, true));
+    }
+
+    #[test]
+    fn test_parse_rfc9218_priority_malformed_ignored() {
+        // Unknown tokens are silently ignored
+        assert_eq!(parse_rfc9218_priority(b"x=5"), (3, false));
+        assert_eq!(parse_rfc9218_priority(b"u=3, x=5"), (3, false));
+        // "u=" with non-numeric value: parse fails, urgency stays default
+        assert_eq!(parse_rfc9218_priority(b"u=abc"), (3, false));
+    }
+
+    #[test]
+    fn test_parse_rfc9218_priority_order_independent() {
+        // "i" before "u=N" should work
+        assert_eq!(parse_rfc9218_priority(b"i, u=1"), (1, true));
+    }
+
+    // ── is_connection_specific_header ─────────────────────────────────────
+
+    #[test]
+    fn test_is_connection_specific_header_positive() {
+        assert!(is_connection_specific_header(b"connection"));
+        assert!(is_connection_specific_header(b"Connection"));
+        assert!(is_connection_specific_header(b"proxy-connection"));
+        assert!(is_connection_specific_header(b"Proxy-Connection"));
+        assert!(is_connection_specific_header(b"transfer-encoding"));
+        assert!(is_connection_specific_header(b"Transfer-Encoding"));
+        assert!(is_connection_specific_header(b"upgrade"));
+        assert!(is_connection_specific_header(b"Upgrade"));
+        assert!(is_connection_specific_header(b"keep-alive"));
+        assert!(is_connection_specific_header(b"Keep-Alive"));
+    }
+
+    #[test]
+    fn test_is_connection_specific_header_negative() {
+        assert!(!is_connection_specific_header(b"content-type"));
+        assert!(!is_connection_specific_header(b"accept"));
+        assert!(!is_connection_specific_header(b"host"));
+        assert!(!is_connection_specific_header(b"te"));
+        assert!(!is_connection_specific_header(b"cookie"));
+        assert!(!is_connection_specific_header(b""));
+    }
+
+    // ── is_invalid_h2_header ─────────────────────────────────────────────
+
+    #[test]
+    fn test_is_invalid_h2_header_uppercase_name() {
+        assert!(is_invalid_h2_header(b"Content-Type", b"text/html"));
+        assert!(is_invalid_h2_header(b"X-Custom", b"value"));
+    }
+
+    #[test]
+    fn test_is_invalid_h2_header_connection_specific() {
+        assert!(is_invalid_h2_header(b"connection", b"close"));
+        assert!(is_invalid_h2_header(b"transfer-encoding", b"chunked"));
+        assert!(is_invalid_h2_header(b"upgrade", b"h2c"));
+        assert!(is_invalid_h2_header(b"keep-alive", b"timeout=5"));
+        assert!(is_invalid_h2_header(b"proxy-connection", b"keep-alive"));
+    }
+
+    #[test]
+    fn test_is_invalid_h2_header_te_trailers_ok() {
+        // TE: trailers is the only valid TE value in HTTP/2
+        assert!(!is_invalid_h2_header(b"te", b"trailers"));
+        assert!(!is_invalid_h2_header(b"te", b"Trailers")); // case insensitive
+    }
+
+    #[test]
+    fn test_is_invalid_h2_header_te_other_invalid() {
+        assert!(is_invalid_h2_header(b"te", b"gzip"));
+        assert!(is_invalid_h2_header(b"te", b"deflate"));
+        assert!(is_invalid_h2_header(b"te", b"chunked"));
+    }
+
+    #[test]
+    fn test_is_invalid_h2_header_valid() {
+        assert!(!is_invalid_h2_header(b"content-type", b"text/html"));
+        assert!(!is_invalid_h2_header(b"accept", b"*/*"));
+        assert!(!is_invalid_h2_header(b"x-custom", b"value"));
+    }
+
+    // ── has_uppercase_ascii ──────────────────────────────────────────────
+
+    #[test]
+    fn test_has_uppercase_ascii() {
+        assert!(has_uppercase_ascii(b"Content-Type"));
+        assert!(has_uppercase_ascii(b"X"));
+        assert!(!has_uppercase_ascii(b"content-type"));
+        assert!(!has_uppercase_ascii(b""));
+        assert!(!has_uppercase_ascii(b"123-header"));
+    }
+
+    // ── trim_ows ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_trim_ows() {
+        assert_eq!(trim_ows(b"  hello  "), b"hello");
+        assert_eq!(trim_ows(b"\thello\t"), b"hello");
+        assert_eq!(trim_ows(b" \t hello \t "), b"hello");
+        assert_eq!(trim_ows(b"hello"), b"hello");
+        assert_eq!(trim_ows(b""), b"" as &[u8]);
+        assert_eq!(trim_ows(b"   "), b"" as &[u8]);
+    }
+
+    // ── store_pseudo_header ──────────────────────────────────────────────
+
+    /// Create a `GenericHttpStream` backed by a pool `Checkout` for testing.
+    fn make_generic_kawa(pool: &mut crate::pool::Pool, kind: Kind) -> GenericHttpStream {
+        let checkout = pool.checkout().expect("pool checkout should succeed");
+        kawa::Kawa::new(kind, kawa::Buffer::new(checkout))
+    }
+
+    #[test]
+    fn test_store_pseudo_header_rejects_duplicate() {
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        let mut kawa = make_generic_kawa(&mut pool, Kind::Request);
+
+        // First store succeeds
+        let dest = Store::Empty;
+        let result = store_pseudo_header(&dest, false, &mut kawa, b"GET");
+        assert!(result.is_some());
+
+        // Second store with non-empty dest fails (duplicate pseudo-header)
+        let dest = result.unwrap();
+        let result = store_pseudo_header(&dest, false, &mut kawa, b"POST");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_store_pseudo_header_rejects_after_regular_headers() {
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        let mut kawa = make_generic_kawa(&mut pool, Kind::Request);
+
+        let dest = Store::Empty;
+        // regular_headers = true means regular headers have already appeared
+        let result = store_pseudo_header(&dest, true, &mut kawa, b"GET");
+        assert!(result.is_none());
+    }
+}
