@@ -29,6 +29,16 @@
 //! - Multi-cluster routing on same H2 connection
 //! - Cookie header splitting (RFC 9113 §8.2.3)
 //! - H2->H1 POST body forwarding
+//! - CL/TE conflict smuggling (CVE-2024-53008 pattern)
+//! - Empty Content-Length (CVE-2023-40225 pattern)
+//! - Content-Length integer overflow (CVE-2021-40346 pattern)
+//! - Multiple disagreeing Content-Length values (RFC 9110 §8.6)
+//! - CRLF injection in :authority (RFC 9113 §8.2.1)
+//! - Zero-length header name (RFC 9110 §5.1)
+//! - DATA flood with maximum padding (amplification attack)
+//! - PRIORITY frame flood (resource exhaustion)
+//! - HEADERS flood exceeding MAX_CONCURRENT_STREAMS (RFC 9113 §5.1.2)
+//! - CONTINUATION without preceding HEADERS (RFC 9113 §6.10)
 
 use std::{io::Write, net::SocketAddr, thread, time::Duration};
 
@@ -42,8 +52,9 @@ use sozu_command_lib::{
 };
 
 use super::h2_utils::{
-    H2_ERROR_FRAME_SIZE_ERROR, H2_ERROR_PROTOCOL_ERROR, H2_FRAME_HEADERS, H2_FRAME_SETTINGS,
-    H2Frame, collect_response_frames, contains_goaway, contains_goaway_with_error,
+    H2_ERROR_ENHANCE_YOUR_CALM, H2_ERROR_FRAME_SIZE_ERROR, H2_ERROR_PROTOCOL_ERROR,
+    H2_ERROR_REFUSED_STREAM, H2_FRAME_DATA, H2_FRAME_HEADERS, H2_FRAME_SETTINGS, H2Frame,
+    collect_response_frames, contains_goaway, contains_goaway_with_error,
     contains_headers_response, contains_rst_stream, h2_handshake, log_frames, parse_h2_frames,
     raw_h2_connection, read_all_available, rejected_with_goaway_or_rst, setup_h2_listener_only,
     setup_h2_test, teardown,
