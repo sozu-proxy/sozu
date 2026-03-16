@@ -56,7 +56,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         let parts = stream.split(&self.position);
         let kawa = parts.rbuffer;
         let (size, status) = self.socket.socket_read(kawa.storage.space());
-        context.debug.push(DebugEvent::I2(0, size));
+        context.debug.push(DebugEvent::StreamEvent(0, size));
         kawa.storage.fill(size);
         match self.position {
             Position::Client(..) => {
@@ -160,7 +160,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             return MuxResult::Continue;
         }
         let (size, status) = self.socket.socket_write_vectored(&bufs);
-        context.debug.push(DebugEvent::I2(1, size));
+        context.debug.push(DebugEvent::StreamEvent(1, size));
         kawa.consume(size);
         match self.position {
             Position::Client(..) => {

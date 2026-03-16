@@ -17,7 +17,7 @@
 
 use std::{
     cell::RefCell,
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     fmt::Debug,
     io::ErrorKind,
     net::{Shutdown, SocketAddr},
@@ -52,7 +52,7 @@ use crate::{
     protocol::{
         SessionState,
         http::{DefaultAnswer, answers::HttpAnswers, editor::HttpContext},
-        mux::h2::{H2FloodDetector, H2Settings, H2State, H2StreamId, Prioriser},
+        mux::h2::H2StreamId,
     },
     retry::RetryPolicy,
     router::Route,
@@ -68,7 +68,7 @@ pub use crate::protocol::mux::{
     h2::H2DrainState,
     h2::H2FloodConfig,
     h2::H2FlowControl,
-    parser::{H2Error, error_code_to_str},
+    parser::H2Error,
 };
 
 // ── Tuning Constants ─────────────────────────────────────────────────────────
@@ -124,6 +124,11 @@ pub fn fill_default_answer<T: kawa::AsBuffer>(kawa: &mut kawa::Kawa<T>, code: u1
     terminate_default_answer(kawa, true);
 }
 
+/// Terminate a default answer with optional `Connection: close` and `Cache-Control` headers.
+///
+/// Note: the `Connection: close` header is only valid for HTTP/1.1. For H2 streams,
+/// the H2 block converter (`is_connection_specific_header`) automatically strips it
+/// before serialization, so callers need not guard on the protocol version.
 pub fn terminate_default_answer<T: kawa::AsBuffer>(kawa: &mut kawa::Kawa<T>, close: bool) {
     if close {
         kawa.push_block(kawa::Block::Header(kawa::Pair {
@@ -310,8 +315,7 @@ fn forcefully_terminate_answer(stream: &mut Stream, readiness: &mut Readiness, e
     let kawa = &mut stream.back;
     kawa.out.clear();
     kawa.blocks.clear();
-    kawa.parsing_phase
-        .error(error_code_to_str(error as u32).into());
+    kawa.parsing_phase.error(error.as_str().into());
     stream.state = StreamState::Unlinked;
     readiness.interest.insert(Ready::WRITABLE);
 }
@@ -472,56 +476,17 @@ impl<Front: SocketHandler> Connection<Front> {
         timeout_container: TimeoutContainer,
         flood_config: h2::H2FloodConfig,
     ) -> Option<Connection<Front>> {
-        let buffer = pool
-            .upgrade()
-            .and_then(|pool| pool.borrow_mut().checkout())?;
-        let local_settings = H2Settings::default();
-        let mut decoder = loona_hpack::Decoder::new();
-        // RFC 7541 §4.2: enforce SETTINGS_HEADER_TABLE_SIZE as the upper bound
-        // for dynamic table size updates from the peer
-        decoder.set_max_allowed_table_size(local_settings.settings_header_table_size as usize);
-        Some(Connection::H2(ConnectionH2 {
-            decoder,
-            encoder: loona_hpack::Encoder::new(),
-            expect_read: Some((H2StreamId::Zero, h2::CLIENT_PREFACE_SIZE)),
-            expect_write: None,
-            last_stream_id: 0,
-            local_settings,
-            peer_settings: H2Settings::default(),
-            position: Position::Server,
-            prioriser: Prioriser::default(),
-            readiness: Readiness {
-                interest: Ready::READABLE | Ready::HUP | Ready::ERROR,
-                event: Ready::EMPTY,
-            },
-            socket: front_stream,
-            state: H2State::ClientPreface,
-            streams: HashMap::with_capacity(8),
+        Some(Connection::H2(ConnectionH2::new(
+            front_stream,
+            Position::Server,
+            pool,
+            flood_config,
             timeout_container,
-            flow_control: h2::H2FlowControl {
-                window: h2::DEFAULT_INITIAL_WINDOW_SIZE as i32,
-                received_bytes_since_update: 0,
-                pending_window_updates: HashMap::new(),
-            },
-            highest_peer_stream_id: 0,
-            converter_buf: Vec::new(),
-            lowercase_buf: Vec::new(),
-            drain: h2::H2DrainState {
-                draining: false,
-                peer_last_stream_id: None,
-            },
-            zero: kawa::Kawa::new(kawa::Kind::Request, kawa::Buffer::new(buffer)),
-            bytes: h2::H2ByteAccounting {
-                zero_bytes_read: 0,
-                overhead_bin: 0,
-                overhead_bout: 0,
-            },
-            flood_detector: H2FloodDetector::new(flood_config),
-            settings_sent_at: None,
-            pending_rst_streams: Vec::new(),
-            rst_sent: HashSet::new(),
-        }))
+            Some((H2StreamId::Zero, h2::CLIENT_PREFACE_SIZE)),
+            Ready::READABLE | Ready::HUP | Ready::ERROR,
+        )?))
     }
+
     pub fn new_h2_client(
         front_stream: Front,
         cluster_id: String,
@@ -530,59 +495,15 @@ impl<Front: SocketHandler> Connection<Front> {
         timeout_container: TimeoutContainer,
         flood_config: h2::H2FloodConfig,
     ) -> Option<Connection<Front>> {
-        let buffer = pool
-            .upgrade()
-            .and_then(|pool| pool.borrow_mut().checkout())?;
-        let local_settings = H2Settings::default();
-        let mut decoder = loona_hpack::Decoder::new();
-        // RFC 7541 §4.2: enforce SETTINGS_HEADER_TABLE_SIZE as the upper bound
-        // for dynamic table size updates from the peer
-        decoder.set_max_allowed_table_size(local_settings.settings_header_table_size as usize);
-        Some(Connection::H2(ConnectionH2 {
-            decoder,
-            encoder: loona_hpack::Encoder::new(),
-            expect_read: None,
-            expect_write: None,
-            last_stream_id: 0,
-            local_settings,
-            peer_settings: H2Settings::default(),
-            position: Position::Client(
-                cluster_id,
-                backend,
-                BackendStatus::Connecting(Instant::now()),
-            ),
-            prioriser: Prioriser::default(),
-            readiness: Readiness {
-                interest: Ready::WRITABLE | Ready::HUP | Ready::ERROR,
-                event: Ready::EMPTY,
-            },
-            socket: front_stream,
-            state: H2State::ClientPreface,
-            streams: HashMap::with_capacity(8),
+        Some(Connection::H2(ConnectionH2::new(
+            front_stream,
+            Position::Client(cluster_id, backend, BackendStatus::Connecting(Instant::now())),
+            pool,
+            flood_config,
             timeout_container,
-            flow_control: h2::H2FlowControl {
-                window: h2::DEFAULT_INITIAL_WINDOW_SIZE as i32,
-                received_bytes_since_update: 0,
-                pending_window_updates: HashMap::new(),
-            },
-            highest_peer_stream_id: 0,
-            converter_buf: Vec::new(),
-            lowercase_buf: Vec::new(),
-            drain: h2::H2DrainState {
-                draining: false,
-                peer_last_stream_id: None,
-            },
-            zero: kawa::Kawa::new(kawa::Kind::Request, kawa::Buffer::new(buffer)),
-            bytes: h2::H2ByteAccounting {
-                zero_bytes_read: 0,
-                overhead_bin: 0,
-                overhead_bout: 0,
-            },
-            flood_detector: H2FloodDetector::new(flood_config),
-            settings_sent_at: None,
-            pending_rst_streams: Vec::new(),
-            rst_sent: HashSet::new(),
-        }))
+            None,
+            Ready::WRITABLE | Ready::HUP | Ready::ERROR,
+        )?))
     }
 
     pub fn readiness(&self) -> &Readiness {
@@ -1583,9 +1504,9 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Mux<Front, L>
 #[derive(Debug)]
 pub enum DebugEvent {
     EV(Token, Ready),
-    R(usize),
-    L1,
-    L2(i32),
+    ReadyTimestamp(usize),
+    LoopStart,
+    LoopIteration(i32),
     SR(Token, MuxResult, Readiness),
     SW(Token, MuxResult, Readiness),
     CW(Token, MuxResult, Readiness),
@@ -1596,9 +1517,8 @@ pub enum DebugEvent {
     CH(Token, Readiness),
     S(u32, usize, ParsingPhase, usize, usize),
     Str(String),
-    I1(usize),
-    I2(usize, usize),
-    I3(usize, usize, usize),
+    StreamEvent(usize, usize),
+    SocketIO(usize, usize, usize),
 }
 
 impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHandler> SessionState
@@ -1626,7 +1546,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         }
 
         let start = Instant::now();
-        self.context.debug.push(DebugEvent::R(
+        self.context.debug.push(DebugEvent::ReadyTimestamp(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -1634,10 +1554,10 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         ));
         trace!("{:?}", start);
         loop {
-            self.context.debug.push(DebugEvent::L1);
+            self.context.debug.push(DebugEvent::LoopStart);
             loop {
                 let context = &mut self.context;
-                context.debug.push(DebugEvent::L2(counter));
+                context.debug.push(DebugEvent::LoopIteration(counter));
                 if self.frontend.readiness().filter_interest().is_readable() {
                     let res = self
                         .frontend
