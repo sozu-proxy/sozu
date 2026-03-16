@@ -2602,3 +2602,542 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         true
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── H2FloodDetector ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_flood_detector_no_flood_below_threshold() {
+        let config = H2FloodConfig::default();
+        let mut detector = H2FloodDetector::new(config);
+
+        // All counters at zero -> no flood
+        assert!(detector.check_flood().is_none());
+
+        // Increment each counter to exactly the threshold (not exceeding)
+        detector.rst_stream_count = config.max_rst_stream_per_window;
+        detector.ping_count = config.max_ping_per_window;
+        detector.settings_count = config.max_settings_per_window;
+        detector.empty_data_count = config.max_empty_data_per_window;
+        detector.continuation_count = config.max_continuation_frames;
+        detector.glitch_count = config.max_glitch_count;
+        // At threshold but not exceeding -> no flood
+        assert!(detector.check_flood().is_none());
+    }
+
+    #[test]
+    fn test_flood_detector_detects_rapid_reset() {
+        let config = H2FloodConfig::default();
+        let mut detector = H2FloodDetector::new(config);
+
+        detector.rst_stream_count = config.max_rst_stream_per_window + 1;
+        assert_eq!(detector.check_flood(), Some(H2Error::EnhanceYourCalm));
+    }
+
+    #[test]
+    fn test_flood_detector_detects_ping_flood() {
+        let config = H2FloodConfig::default();
+        let mut detector = H2FloodDetector::new(config);
+
+        detector.ping_count = config.max_ping_per_window + 1;
+        assert_eq!(detector.check_flood(), Some(H2Error::EnhanceYourCalm));
+    }
+
+    #[test]
+    fn test_flood_detector_detects_settings_flood() {
+        let config = H2FloodConfig::default();
+        let mut detector = H2FloodDetector::new(config);
+
+        detector.settings_count = config.max_settings_per_window + 1;
+        assert_eq!(detector.check_flood(), Some(H2Error::EnhanceYourCalm));
+    }
+
+    #[test]
+    fn test_flood_detector_detects_empty_data_flood() {
+        let config = H2FloodConfig::default();
+        let mut detector = H2FloodDetector::new(config);
+
+        detector.empty_data_count = config.max_empty_data_per_window + 1;
+        assert_eq!(detector.check_flood(), Some(H2Error::EnhanceYourCalm));
+    }
+
+    #[test]
+    fn test_flood_detector_detects_continuation_flood() {
+        let config = H2FloodConfig::default();
+        let mut detector = H2FloodDetector::new(config);
+
+        detector.continuation_count = config.max_continuation_frames + 1;
+        assert_eq!(detector.check_flood(), Some(H2Error::EnhanceYourCalm));
+    }
+
+    #[test]
+    fn test_flood_detector_detects_header_size_flood() {
+        let config = H2FloodConfig::default();
+        let mut detector = H2FloodDetector::new(config);
+
+        detector.accumulated_header_size = MAX_HEADER_LIST_SIZE + 1;
+        assert_eq!(detector.check_flood(), Some(H2Error::EnhanceYourCalm));
+    }
+
+    #[test]
+    fn test_flood_detector_detects_glitch_flood() {
+        let config = H2FloodConfig::default();
+        let mut detector = H2FloodDetector::new(config);
+
+        detector.glitch_count = config.max_glitch_count + 1;
+        assert_eq!(detector.check_flood(), Some(H2Error::EnhanceYourCalm));
+    }
+
+    #[test]
+    fn test_flood_detector_custom_thresholds() {
+        let config = H2FloodConfig {
+            max_rst_stream_per_window: 5,
+            max_ping_per_window: 10,
+            max_settings_per_window: 3,
+            max_empty_data_per_window: 8,
+            max_continuation_frames: 2,
+            max_glitch_count: 15,
+        };
+        let mut detector = H2FloodDetector::new(config);
+
+        // Below custom threshold -> no flood
+        detector.rst_stream_count = 5;
+        assert!(detector.check_flood().is_none());
+
+        // Above custom threshold -> flood
+        detector.rst_stream_count = 6;
+        assert_eq!(detector.check_flood(), Some(H2Error::EnhanceYourCalm));
+    }
+
+    #[test]
+    fn test_flood_detector_reset_continuation() {
+        let config = H2FloodConfig::default();
+        let mut detector = H2FloodDetector::new(config);
+
+        detector.continuation_count = 15;
+        detector.accumulated_header_size = 30000;
+
+        detector.reset_continuation();
+
+        assert_eq!(detector.continuation_count, 0);
+        assert_eq!(detector.accumulated_header_size, 0);
+    }
+
+    #[test]
+    fn test_flood_detector_half_decay_on_window_expiry() {
+        let config = H2FloodConfig::default();
+        let mut detector = H2FloodDetector::new(config);
+
+        detector.rst_stream_count = 80;
+        detector.ping_count = 60;
+        detector.settings_count = 40;
+        detector.empty_data_count = 20;
+        detector.glitch_count = 50;
+
+        // Force window expiry by setting window_start to the past
+        detector.window_start = Instant::now() - FLOOD_WINDOW_DURATION;
+
+        // check_flood calls maybe_reset_window which halves counters
+        let _ = detector.check_flood();
+
+        assert_eq!(detector.rst_stream_count, 40);
+        assert_eq!(detector.ping_count, 30);
+        assert_eq!(detector.settings_count, 20);
+        assert_eq!(detector.empty_data_count, 10);
+        assert_eq!(detector.glitch_count, 25);
+    }
+
+    #[test]
+    fn test_flood_detector_decay_prevents_flood() {
+        let config = H2FloodConfig {
+            max_rst_stream_per_window: 10,
+            ..H2FloodConfig::default()
+        };
+        let mut detector = H2FloodDetector::new(config);
+
+        // Set counter just above threshold
+        detector.rst_stream_count = 12;
+
+        // Without decay -> flood
+        assert_eq!(detector.check_flood(), Some(H2Error::EnhanceYourCalm));
+
+        // Reset and simulate window expiry
+        detector.rst_stream_count = 12;
+        detector.window_start = Instant::now() - FLOOD_WINDOW_DURATION;
+
+        // After decay: 12/2 = 6, which is below threshold 10 -> no flood
+        assert!(detector.check_flood().is_none());
+    }
+
+    #[test]
+    fn test_flood_detector_default_matches_new_default() {
+        let from_default = H2FloodDetector::default();
+        let from_new = H2FloodDetector::new(H2FloodConfig::default());
+
+        assert_eq!(from_default.rst_stream_count, from_new.rst_stream_count);
+        assert_eq!(from_default.ping_count, from_new.ping_count);
+        assert_eq!(from_default.settings_count, from_new.settings_count);
+        assert_eq!(from_default.empty_data_count, from_new.empty_data_count);
+        assert_eq!(
+            from_default.continuation_count,
+            from_new.continuation_count
+        );
+        assert_eq!(
+            from_default.accumulated_header_size,
+            from_new.accumulated_header_size
+        );
+        assert_eq!(from_default.glitch_count, from_new.glitch_count);
+        assert_eq!(from_default.config, from_new.config);
+    }
+
+    // ── Prioriser ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_prioriser_defaults_for_unknown_stream() {
+        let p = Prioriser::default();
+        // Unknown stream -> RFC 9218 defaults: urgency 3, incremental false
+        assert_eq!(p.get(&1), (3, false));
+        assert_eq!(p.get(&999), (3, false));
+    }
+
+    #[test]
+    fn test_prioriser_push_rfc9218_and_get() {
+        let mut p = Prioriser::default();
+
+        let invalid = p.push_priority(
+            1,
+            parser::PriorityPart::Rfc9218 {
+                urgency: 0,
+                incremental: true,
+            },
+        );
+        assert!(!invalid);
+        assert_eq!(p.get(&1), (0, true));
+
+        let invalid = p.push_priority(
+            3,
+            parser::PriorityPart::Rfc9218 {
+                urgency: 7,
+                incremental: false,
+            },
+        );
+        assert!(!invalid);
+        assert_eq!(p.get(&3), (7, false));
+    }
+
+    #[test]
+    fn test_prioriser_urgency_clamped_to_7() {
+        let mut p = Prioriser::default();
+
+        p.push_priority(
+            1,
+            parser::PriorityPart::Rfc9218 {
+                urgency: 255,
+                incremental: false,
+            },
+        );
+        assert_eq!(p.get(&1), (7, false));
+    }
+
+    #[test]
+    fn test_prioriser_update_priority() {
+        let mut p = Prioriser::default();
+
+        p.push_priority(
+            1,
+            parser::PriorityPart::Rfc9218 {
+                urgency: 3,
+                incremental: false,
+            },
+        );
+        assert_eq!(p.get(&1), (3, false));
+
+        // Update same stream
+        p.push_priority(
+            1,
+            parser::PriorityPart::Rfc9218 {
+                urgency: 1,
+                incremental: true,
+            },
+        );
+        assert_eq!(p.get(&1), (1, true));
+    }
+
+    #[test]
+    fn test_prioriser_remove() {
+        let mut p = Prioriser::default();
+
+        p.push_priority(
+            1,
+            parser::PriorityPart::Rfc9218 {
+                urgency: 0,
+                incremental: true,
+            },
+        );
+        assert_eq!(p.get(&1), (0, true));
+
+        p.remove(&1);
+        // After removal, falls back to defaults
+        assert_eq!(p.get(&1), (3, false));
+    }
+
+    #[test]
+    fn test_prioriser_rfc7540_self_dependency() {
+        let mut p = Prioriser::default();
+
+        // Self-dependency should return true (invalid)
+        let invalid = p.push_priority(
+            5,
+            parser::PriorityPart::Rfc7540 {
+                stream_dependency: parser::StreamDependency {
+                    exclusive: false,
+                    stream_id: 5, // same as stream_id
+                },
+                weight: 16,
+            },
+        );
+        assert!(invalid);
+    }
+
+    #[test]
+    fn test_prioriser_rfc7540_valid_dependency() {
+        let mut p = Prioriser::default();
+
+        // Non-self dependency is valid (but ignored for scheduling)
+        let invalid = p.push_priority(
+            5,
+            parser::PriorityPart::Rfc7540 {
+                stream_dependency: parser::StreamDependency {
+                    exclusive: false,
+                    stream_id: 3, // different stream
+                },
+                weight: 16,
+            },
+        );
+        assert!(!invalid);
+        // Still returns defaults since RFC 7540 priority is ignored
+        assert_eq!(p.get(&5), (3, false));
+    }
+
+    #[test]
+    fn test_prioriser_max_entries_cap() {
+        let mut p = Prioriser::default();
+
+        // Fill up to MAX_PRIORITIES
+        for i in 0..MAX_PRIORITIES as u32 {
+            let stream_id = i * 2 + 1; // odd stream IDs
+            p.push_priority(
+                stream_id,
+                parser::PriorityPart::Rfc9218 {
+                    urgency: (i % 8) as u8,
+                    incremental: false,
+                },
+            );
+        }
+
+        // Next insert for a new stream should be silently rejected
+        let next_id = (MAX_PRIORITIES as u32) * 2 + 1;
+        let invalid = p.push_priority(
+            next_id,
+            parser::PriorityPart::Rfc9218 {
+                urgency: 0,
+                incremental: true,
+            },
+        );
+        assert!(!invalid); // not a protocol error, just silently dropped
+        assert_eq!(p.get(&next_id), (3, false)); // defaults, not stored
+    }
+
+    #[test]
+    fn test_prioriser_update_existing_at_cap() {
+        let mut p = Prioriser::default();
+
+        // Fill to cap
+        for i in 0..MAX_PRIORITIES as u32 {
+            p.push_priority(
+                i * 2 + 1,
+                parser::PriorityPart::Rfc9218 {
+                    urgency: 3,
+                    incremental: false,
+                },
+            );
+        }
+
+        // Updating an existing entry should still work even at cap
+        p.push_priority(
+            1,
+            parser::PriorityPart::Rfc9218 {
+                urgency: 0,
+                incremental: true,
+            },
+        );
+        assert_eq!(p.get(&1), (0, true));
+    }
+
+    // ── H2FlowControl ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_flow_control_initial_state() {
+        let fc = H2FlowControl {
+            window: DEFAULT_INITIAL_WINDOW_SIZE as i32,
+            received_bytes_since_update: 0,
+            pending_window_updates: HashMap::new(),
+        };
+        assert_eq!(fc.window, 65535);
+        assert_eq!(fc.received_bytes_since_update, 0);
+        assert!(fc.pending_window_updates.is_empty());
+    }
+
+    #[test]
+    fn test_flow_control_window_update_coalescing() {
+        let mut updates: HashMap<u32, u32> = HashMap::new();
+
+        // First update for stream 1
+        updates.insert(1, 1000);
+        assert_eq!(*updates.get(&1).unwrap(), 1000);
+
+        // Coalesce second update for same stream
+        if let Some(existing) = updates.get_mut(&1) {
+            *existing = existing.saturating_add(500).min(i32::MAX as u32);
+        }
+        assert_eq!(*updates.get(&1).unwrap(), 1500);
+
+        // Different stream gets its own entry
+        updates.insert(3, 2000);
+        assert_eq!(updates.len(), 2);
+        assert_eq!(*updates.get(&3).unwrap(), 2000);
+    }
+
+    #[test]
+    fn test_flow_control_window_update_saturation() {
+        let mut updates: HashMap<u32, u32> = HashMap::new();
+
+        // Insert near max and coalesce — should saturate to i32::MAX
+        let max_increment = i32::MAX as u32;
+        updates.insert(1, max_increment - 100);
+        if let Some(existing) = updates.get_mut(&1) {
+            *existing = existing.saturating_add(200).min(max_increment);
+        }
+        assert_eq!(*updates.get(&1).unwrap(), max_increment);
+    }
+
+    #[test]
+    fn test_flow_control_connection_window_can_go_negative() {
+        // RFC 9113 §6.9.2: connection-level window can go negative
+        let mut fc = H2FlowControl {
+            window: 100,
+            received_bytes_since_update: 0,
+            pending_window_updates: HashMap::new(),
+        };
+
+        // Simulate consuming more than available
+        fc.window -= 200;
+        assert_eq!(fc.window, -100);
+    }
+
+    // ── H2FloodConfig ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_flood_config_default_values() {
+        let config = H2FloodConfig::default();
+        assert_eq!(config.max_rst_stream_per_window, 100);
+        assert_eq!(config.max_ping_per_window, 100);
+        assert_eq!(config.max_settings_per_window, 50);
+        assert_eq!(config.max_empty_data_per_window, 100);
+        assert_eq!(config.max_continuation_frames, 20);
+        assert_eq!(config.max_glitch_count, 100);
+    }
+
+    // ── distribute_overhead ─────────────────────────────────────────────
+
+    #[test]
+    fn test_distribute_overhead_proportional() {
+        let mut metrics = SessionMetrics::new(None);
+        let mut overhead_bin = 1000;
+        let mut overhead_bout = 500;
+
+        // Stream transferred 60% of total bytes
+        distribute_overhead(
+            &mut metrics,
+            &mut overhead_bin,
+            &mut overhead_bout,
+            (600, 300),  // stream_bytes
+            (1000, 500), // total_bytes
+            2,           // active_streams
+        );
+
+        assert_eq!(metrics.bin, 600); // 60% of 1000
+        assert_eq!(metrics.bout, 300); // 60% of 500
+        assert_eq!(overhead_bin, 400); // 1000 - 600
+        assert_eq!(overhead_bout, 200); // 500 - 300
+    }
+
+    #[test]
+    fn test_distribute_overhead_even_split_when_no_bytes() {
+        let mut metrics = SessionMetrics::new(None);
+        let mut overhead_bin = 100;
+        let mut overhead_bout = 200;
+
+        // No bytes transferred -> even distribution
+        distribute_overhead(
+            &mut metrics,
+            &mut overhead_bin,
+            &mut overhead_bout,
+            (0, 0), // stream_bytes
+            (0, 0), // total_bytes
+            4,      // active_streams
+        );
+
+        assert_eq!(metrics.bin, 25); // 100 / 4
+        assert_eq!(metrics.bout, 50); // 200 / 4
+        assert_eq!(overhead_bin, 75);
+        assert_eq!(overhead_bout, 150);
+    }
+
+    #[test]
+    fn test_distribute_overhead_clamps_to_remaining() {
+        let mut metrics = SessionMetrics::new(None);
+        let mut overhead_bin = 10;
+        let mut overhead_bout = 10;
+
+        // Stream claims 100% of bytes but overhead is small
+        distribute_overhead(
+            &mut metrics,
+            &mut overhead_bin,
+            &mut overhead_bout,
+            (1000, 1000), // stream_bytes
+            (1000, 1000), // total_bytes
+            1,            // active_streams
+        );
+
+        assert_eq!(metrics.bin, 10);
+        assert_eq!(metrics.bout, 10);
+        assert_eq!(overhead_bin, 0);
+        assert_eq!(overhead_bout, 0);
+    }
+
+    #[test]
+    fn test_distribute_overhead_zero_active_streams() {
+        let mut metrics = SessionMetrics::new(None);
+        let mut overhead_bin = 100;
+        let mut overhead_bout = 100;
+
+        // 0 active streams (edge case) — falls back to max(1)
+        distribute_overhead(
+            &mut metrics,
+            &mut overhead_bin,
+            &mut overhead_bout,
+            (0, 0),
+            (0, 0),
+            0,
+        );
+
+        assert_eq!(metrics.bin, 100); // 100 / max(0,1) = 100
+        assert_eq!(metrics.bout, 100);
+        assert_eq!(overhead_bin, 0);
+        assert_eq!(overhead_bout, 0);
+    }
+}
