@@ -9,7 +9,7 @@ use crate::protocol::{
     http::parser::compare_no_case,
     mux::{
         StreamId,
-        parser::{self, FrameHeader, FrameType, H2Error, str_to_error_code},
+        parser::{self, FrameHeader, FrameType, H2Error},
         pkawa::is_connection_specific_header,
         serializer::{gen_frame_header, gen_rst_stream},
     },
@@ -34,7 +34,7 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                 kind: ParsingErrorKind::Processing { message },
                 ..
             } => {
-                let error = str_to_error_code(message);
+                let error = message.parse::<H2Error>().unwrap_or(H2Error::InternalError);
                 let mut frame =
                     [0; parser::FRAME_HEADER_SIZE + parser::RST_STREAM_PAYLOAD_SIZE as usize];
                 if let Err(e) = gen_rst_stream(&mut frame, self.stream_id, error) {

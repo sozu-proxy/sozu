@@ -22,7 +22,7 @@ use crate::{
         Position, StreamId, StreamState, converter, forcefully_terminate_answer,
         parser::{
             self, Frame, FrameHeader, FrameType, H2Error, Headers, ParserError, ParserErrorKind,
-            WindowUpdate, error_code_to_str,
+            WindowUpdate,
         },
         pkawa, serializer, set_default_answer, update_readiness_after_read,
         update_readiness_after_write,
@@ -511,6 +511,70 @@ pub enum H2StreamId {
 }
 
 impl<Front: SocketHandler> ConnectionH2<Front> {
+    /// Shared constructor for both server and client H2 connections.
+    ///
+    /// Differences between server and client are captured by the caller-provided
+    /// `position`, `expect_read`, and `readiness_interest` parameters.
+    pub(super) fn new(
+        socket: Front,
+        position: super::Position,
+        pool: std::rc::Weak<std::cell::RefCell<crate::pool::Pool>>,
+        flood_config: H2FloodConfig,
+        timeout_container: crate::timer::TimeoutContainer,
+        expect_read: Option<(H2StreamId, usize)>,
+        readiness_interest: sozu_command::ready::Ready,
+    ) -> Option<Self> {
+        let buffer = pool
+            .upgrade()
+            .and_then(|pool| pool.borrow_mut().checkout())?;
+        let local_settings = H2Settings::default();
+        let mut decoder = loona_hpack::Decoder::new();
+        // RFC 7541 §4.2: enforce SETTINGS_HEADER_TABLE_SIZE as the upper bound
+        // for dynamic table size updates from the peer
+        decoder.set_max_allowed_table_size(local_settings.settings_header_table_size as usize);
+        Some(ConnectionH2 {
+            decoder,
+            encoder: loona_hpack::Encoder::new(),
+            expect_read,
+            expect_write: None,
+            last_stream_id: 0,
+            local_settings,
+            peer_settings: H2Settings::default(),
+            position,
+            prioriser: Prioriser::default(),
+            readiness: crate::Readiness {
+                interest: readiness_interest,
+                event: Ready::EMPTY,
+            },
+            socket,
+            state: H2State::ClientPreface,
+            streams: std::collections::HashMap::with_capacity(8),
+            timeout_container,
+            flow_control: H2FlowControl {
+                window: DEFAULT_INITIAL_WINDOW_SIZE as i32,
+                received_bytes_since_update: 0,
+                pending_window_updates: HashMap::new(),
+            },
+            highest_peer_stream_id: 0,
+            converter_buf: Vec::new(),
+            lowercase_buf: Vec::new(),
+            drain: H2DrainState {
+                draining: false,
+                peer_last_stream_id: None,
+            },
+            zero: kawa::Kawa::new(kawa::Kind::Request, kawa::Buffer::new(buffer)),
+            bytes: H2ByteAccounting {
+                zero_bytes_read: 0,
+                overhead_bin: 0,
+                overhead_bout: 0,
+            },
+            flood_detector: H2FloodDetector::new(flood_config),
+            settings_sent_at: None,
+            pending_rst_streams: Vec::new(),
+            rst_sent: std::collections::HashSet::new(),
+        })
+    }
+
     fn expect_header(&mut self) {
         self.state = H2State::Header;
         self.expect_read = Some((H2StreamId::Zero, 9));
@@ -804,7 +868,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     return MuxResult::Continue;
                 }
                 let (size, status) = self.socket.socket_read(&mut kawa.storage.space()[..amount]);
-                context.debug.push(DebugEvent::I3(0, did, size));
+                context.debug.push(DebugEvent::SocketIO(0, did, size));
                 kawa.storage.fill(size);
                 self.position.count_bytes_in_counter(size);
                 self.bytes.zero_bytes_read += size;
@@ -1000,7 +1064,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 let (size, status) = self.socket.socket_write_vectored(&bufs);
                 context
                     .debug
-                    .push(DebugEvent::I3(2, global_stream_id, size));
+                    .push(DebugEvent::SocketIO(2, global_stream_id, size));
                 kawa.consume(size);
                 self.position.count_bytes_out_counter(size);
                 self.position.count_bytes_out(parts.metrics, size);
@@ -1027,7 +1091,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                             );
                         } else {
                             self.distribute_overhead(&mut stream.metrics, byte_totals);
-                            context.debug.push(DebugEvent::I2(4, global_stream_id));
+                            context.debug.push(DebugEvent::StreamEvent(4, global_stream_id));
                             trace!("Recycle stream: {}", global_stream_id);
                             let token =
                                 Self::complete_server_stream(stream, context.listener.clone());
@@ -1116,7 +1180,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 let (size, status) = self.socket.socket_write_vectored(&bufs);
                 context
                     .debug
-                    .push(DebugEvent::I3(3, global_stream_id, size));
+                    .push(DebugEvent::SocketIO(3, global_stream_id, size));
                 kawa.consume(size);
                 self.position.count_bytes_out_counter(size);
                 self.position.count_bytes_out(parts.metrics, size);
@@ -1153,7 +1217,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                                 );
                             }
                             // mark stream as reusable
-                            context.debug.push(DebugEvent::I2(5, global_stream_id));
+                            context.debug.push(DebugEvent::StreamEvent(5, global_stream_id));
                             if context.debug.is_interesting() {
                                 warn!("{:?}", context.debug.events);
                                 context.debug.set_interesting(false);
@@ -2008,7 +2072,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 debug!(
                     "RstStream({} -> {})",
                     rst_stream.error_code,
-                    error_code_to_str(rst_stream.error_code)
+                    H2Error::try_from(rst_stream.error_code)
+                        .map_or("UNKNOWN_ERROR", |e| e.as_str())
                 );
                 // Compute totals before removing the stream from the map,
                 // so the removed stream's bytes are included in the total.
@@ -2155,17 +2220,17 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             }
             Frame::GoAway(goaway) => {
                 self.attribute_bytes_to_overhead();
+                let error_name = H2Error::try_from(goaway.error_code)
+                    .map_or("UNKNOWN_ERROR", |e| e.as_str());
                 if goaway.error_code == H2Error::NoError as u32 {
                     debug!(
-                        "Received GOAWAY: last_stream_id={}, error={}",
-                        goaway.last_stream_id,
-                        error_code_to_str(goaway.error_code)
+                        "Received GOAWAY: last_stream_id={}, error={}, debug_data={:?}",
+                        goaway.last_stream_id, error_name, goaway.additional_debug_data
                     );
                 } else {
                     error!(
-                        "Received GOAWAY: last_stream_id={}, error={}",
-                        goaway.last_stream_id,
-                        error_code_to_str(goaway.error_code)
+                        "Received GOAWAY: last_stream_id={}, error={}, debug_data={:?}",
+                        goaway.last_stream_id, error_name, goaway.additional_debug_data
                     );
                 }
                 // RFC 9113 §6.8: begin graceful drain.

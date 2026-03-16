@@ -75,58 +75,27 @@ pub enum FrameType {
     Continuation,
 }
 
-const NO_ERROR: u32 = 0x0;
-const PROTOCOL_ERROR: u32 = 0x1;
-const INTERNAL_ERROR: u32 = 0x2;
-const FLOW_CONTROL_ERROR: u32 = 0x3;
-const SETTINGS_TIMEOUT: u32 = 0x4;
-const STREAM_CLOSED: u32 = 0x5;
-const FRAME_SIZE_ERROR: u32 = 0x6;
-const REFUSED_STREAM: u32 = 0x7;
-const CANCEL: u32 = 0x8;
-const COMPRESSION_ERROR: u32 = 0x9;
-const CONNECT_ERROR: u32 = 0xa;
-const ENHANCE_YOUR_CALM: u32 = 0xb;
-const INADEQUATE_SECURITY: u32 = 0xc;
-const HTTP_1_1_REQUIRED: u32 = 0xd;
+impl std::str::FromStr for H2Error {
+    type Err = ();
 
-pub fn error_code_to_str(error_code: u32) -> &'static str {
-    match error_code {
-        NO_ERROR => "NO_ERROR",
-        PROTOCOL_ERROR => "PROTOCOL_ERROR",
-        INTERNAL_ERROR => "INTERNAL_ERROR",
-        FLOW_CONTROL_ERROR => "FLOW_CONTROL_ERROR",
-        SETTINGS_TIMEOUT => "SETTINGS_TIMEOUT",
-        STREAM_CLOSED => "STREAM_CLOSED",
-        FRAME_SIZE_ERROR => "FRAME_SIZE_ERROR",
-        REFUSED_STREAM => "REFUSED_STREAM",
-        CANCEL => "CANCEL",
-        COMPRESSION_ERROR => "COMPRESSION_ERROR",
-        CONNECT_ERROR => "CONNECT_ERROR",
-        ENHANCE_YOUR_CALM => "ENHANCE_YOUR_CALM",
-        INADEQUATE_SECURITY => "INADEQUATE_SECURITY",
-        HTTP_1_1_REQUIRED => "HTTP_1_1_REQUIRED",
-        _ => "UNKNOWN_ERROR",
-    }
-}
-
-pub fn str_to_error_code(str: &str) -> H2Error {
-    match str {
-        "NO_ERROR" => H2Error::NoError,
-        "PROTOCOL_ERROR" => H2Error::ProtocolError,
-        "INTERNAL_ERROR" => H2Error::InternalError,
-        "FLOW_CONTROL_ERROR" => H2Error::FlowControlError,
-        "SETTINGS_TIMEOUT" => H2Error::SettingsTimeout,
-        "STREAM_CLOSED" => H2Error::StreamClosed,
-        "FRAME_SIZE_ERROR" => H2Error::FrameSizeError,
-        "REFUSED_STREAM" => H2Error::RefusedStream,
-        "CANCEL" => H2Error::Cancel,
-        "COMPRESSION_ERROR" => H2Error::CompressionError,
-        "CONNECT_ERROR" => H2Error::ConnectError,
-        "ENHANCE_YOUR_CALM" => H2Error::EnhanceYourCalm,
-        "INADEQUATE_SECURITY" => H2Error::InadequateSecurity,
-        "HTTP_1_1_REQUIRED" => H2Error::HTTP11Required,
-        _ => H2Error::InternalError,
+    fn from_str(s: &str) -> Result<Self, ()> {
+        match s {
+            "NO_ERROR" => Ok(H2Error::NoError),
+            "PROTOCOL_ERROR" => Ok(H2Error::ProtocolError),
+            "INTERNAL_ERROR" => Ok(H2Error::InternalError),
+            "FLOW_CONTROL_ERROR" => Ok(H2Error::FlowControlError),
+            "SETTINGS_TIMEOUT" => Ok(H2Error::SettingsTimeout),
+            "STREAM_CLOSED" => Ok(H2Error::StreamClosed),
+            "FRAME_SIZE_ERROR" => Ok(H2Error::FrameSizeError),
+            "REFUSED_STREAM" => Ok(H2Error::RefusedStream),
+            "CANCEL" => Ok(H2Error::Cancel),
+            "COMPRESSION_ERROR" => Ok(H2Error::CompressionError),
+            "CONNECT_ERROR" => Ok(H2Error::ConnectError),
+            "ENHANCE_YOUR_CALM" => Ok(H2Error::EnhanceYourCalm),
+            "INADEQUATE_SECURITY" => Ok(H2Error::InadequateSecurity),
+            "HTTP_1_1_REQUIRED" => Ok(H2Error::HTTP11Required),
+            _ => Err(()),
+        }
     }
 }
 
@@ -143,7 +112,7 @@ pub enum ParserErrorKind {
     UnknownFrame(u32),
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(u32)]
 pub enum H2Error {
     NoError = 0x0,
@@ -162,9 +131,34 @@ pub enum H2Error {
     HTTP11Required = 0xd,
 }
 
-impl std::fmt::Display for H2Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
+impl TryFrom<u32> for H2Error {
+    type Error = u32;
+
+    fn try_from(code: u32) -> Result<Self, u32> {
+        match code {
+            0x0 => Ok(H2Error::NoError),
+            0x1 => Ok(H2Error::ProtocolError),
+            0x2 => Ok(H2Error::InternalError),
+            0x3 => Ok(H2Error::FlowControlError),
+            0x4 => Ok(H2Error::SettingsTimeout),
+            0x5 => Ok(H2Error::StreamClosed),
+            0x6 => Ok(H2Error::FrameSizeError),
+            0x7 => Ok(H2Error::RefusedStream),
+            0x8 => Ok(H2Error::Cancel),
+            0x9 => Ok(H2Error::CompressionError),
+            0xa => Ok(H2Error::ConnectError),
+            0xb => Ok(H2Error::EnhanceYourCalm),
+            0xc => Ok(H2Error::InadequateSecurity),
+            0xd => Ok(H2Error::HTTP11Required),
+            other => Err(other),
+        }
+    }
+}
+
+impl H2Error {
+    /// Returns the RFC 7540 §7 error name as a static string.
+    pub const fn as_str(&self) -> &'static str {
+        match self {
             H2Error::NoError => "NO_ERROR",
             H2Error::ProtocolError => "PROTOCOL_ERROR",
             H2Error::InternalError => "INTERNAL_ERROR",
@@ -179,7 +173,13 @@ impl std::fmt::Display for H2Error {
             H2Error::EnhanceYourCalm => "ENHANCE_YOUR_CALM",
             H2Error::InadequateSecurity => "INADEQUATE_SECURITY",
             H2Error::HTTP11Required => "HTTP_1_1_REQUIRED",
-        })
+        }
+    }
+}
+
+impl std::fmt::Display for H2Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -376,27 +376,48 @@ pub struct Data {
     pub end_stream: bool,
 }
 
+/// Parse the padding prefix from a frame payload per RFC 9113 §6.1.
+///
+/// If `FLAG_PADDED` is set in `flags`, reads the 1-byte pad length and validates
+/// it does not exceed the remaining data. Returns the content slice (after the
+/// pad-length byte) and the number of padding bytes to trim from the end.
+/// Returns `ProtocolError` when the pad length exceeds available data.
+fn strip_padding<'a>(
+    i: &'a [u8],
+    flags: u8,
+    error_input: &'a [u8],
+) -> IResult<&'a [u8], u8, ParserError<'a>> {
+    let (i, pad_length) = if flags & FLAG_PADDED != 0 {
+        let (i, pad_length) = be_u8(i)?;
+        (i, pad_length)
+    } else {
+        (i, 0)
+    };
+
+    if pad_length > 0 && i.len() <= pad_length as usize {
+        return Err(Err::Failure(ParserError::new_h2(
+            error_input,
+            H2Error::ProtocolError,
+        )));
+    }
+
+    Ok((i, pad_length))
+}
+
+/// Remove `pad_length` bytes of trailing padding from `i`, returning only
+/// the content portion.
+fn unpad(i: &[u8], pad_length: u8) -> &[u8] {
+    &i[..i.len() - pad_length as usize]
+}
+
 pub fn data_frame<'a>(
     input: &'a [u8],
     header: &FrameHeader,
 ) -> IResult<&'a [u8], Frame, ParserError<'a>> {
     let (remaining, i) = take(header.payload_len)(input)?;
 
-    let (i, pad_length) = if header.flags & FLAG_PADDED != 0 {
-        let (i, pad_length) = be_u8(i)?;
-        (i, Some(pad_length))
-    } else {
-        (i, None)
-    };
-
-    if pad_length.is_some_and(|p| i.len() <= p as usize) {
-        return Err(Err::Failure(ParserError::new_h2(
-            input,
-            H2Error::ProtocolError,
-        )));
-    }
-
-    let (_, payload) = take(i.len() - pad_length.unwrap_or(0) as usize)(i)?;
+    let (i, pad_length) = strip_padding(i, header.flags, input)?;
+    let payload = unpad(i, pad_length);
 
     Ok((
         remaining,
@@ -438,12 +459,7 @@ pub fn headers_frame<'a>(
 ) -> IResult<&'a [u8], Frame, ParserError<'a>> {
     let (remaining, i) = take(header.payload_len)(input)?;
 
-    let (i, pad_length) = if header.flags & FLAG_PADDED != 0 {
-        let (i, pad_length) = be_u8(i)?;
-        (i, Some(pad_length))
-    } else {
-        (i, None)
-    };
+    let (i, pad_length) = strip_padding(i, header.flags, input)?;
 
     let (i, priority) = if header.flags & FLAG_PRIORITY != 0 {
         let (i, stream_dependency) = stream_dependency(i)?;
@@ -459,14 +475,7 @@ pub fn headers_frame<'a>(
         (i, None)
     };
 
-    if pad_length.is_some_and(|p| i.len() <= p as usize) {
-        return Err(Err::Failure(ParserError::new_h2(
-            input,
-            H2Error::ProtocolError,
-        )));
-    }
-
-    let (_, header_block_fragment) = take(i.len() - pad_length.unwrap_or(0) as usize)(i)?;
+    let header_block_fragment = unpad(i, pad_length);
 
     Ok((
         remaining,
@@ -568,48 +577,18 @@ pub fn settings_frame<'a>(
     ))
 }
 
+/// PushPromise is always rejected with PROTOCOL_ERROR (sozu never enables
+/// server push). The parser still consumes the frame bytes for correctness.
 #[derive(Clone, Debug)]
-pub struct PushPromise {
-    pub _stream_id: u32,
-    pub _promised_stream_id: u32,
-    pub _header_block_fragment: Slice,
-    pub _end_headers: bool,
-}
+pub struct PushPromise;
 
 pub fn push_promise_frame<'a>(
     input: &'a [u8],
     header: &FrameHeader,
 ) -> IResult<&'a [u8], Frame, ParserError<'a>> {
-    let (remaining, i) = take(header.payload_len)(input)?;
-
-    let (i, pad_length) = if header.flags & FLAG_PADDED != 0 {
-        let (i, pad_length) = be_u8(i)?;
-        (i, Some(pad_length))
-    } else {
-        (i, None)
-    };
-
-    if pad_length.is_some_and(|p| i.len() <= p as usize) {
-        return Err(Err::Failure(ParserError::new_h2(
-            input,
-            H2Error::ProtocolError,
-        )));
-    }
-
-    let (i, raw_promised_stream_id) = be_u32(i)?;
-    // RFC 9113 §6.6: reserved bit must be masked
-    let promised_stream_id = raw_promised_stream_id & STREAM_ID_MASK;
-    let (_, header_block_fragment) = take(i.len() - pad_length.unwrap_or(0) as usize)(i)?;
-
-    Ok((
-        remaining,
-        Frame::PushPromise(PushPromise {
-            _stream_id: header.stream_id,
-            _promised_stream_id: promised_stream_id,
-            _header_block_fragment: Slice::new(input, header_block_fragment),
-            _end_headers: header.flags & FLAG_END_HEADERS != 0,
-        }),
-    ))
+    // Consume the entire frame payload without storing fields
+    let (remaining, _) = take(header.payload_len)(input)?;
+    Ok((remaining, Frame::PushPromise(PushPromise)))
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -637,7 +616,6 @@ pub fn ping_frame<'a>(
 pub struct GoAway {
     pub last_stream_id: u32,
     pub error_code: u32,
-    #[allow(dead_code)]
     pub additional_debug_data: Slice,
 }
 
@@ -690,26 +668,19 @@ pub fn window_update_frame<'a>(
     ))
 }
 
+/// Continuation frames are handled inline during HEADERS parsing and always
+/// rejected with PROTOCOL_ERROR when received standalone. The parser still
+/// consumes the frame bytes for correctness.
 #[derive(Clone, Debug)]
-pub struct Continuation {
-    pub _stream_id: u32,
-    pub _header_block_fragment: Slice,
-    pub _end_headers: bool,
-}
+pub struct Continuation;
 
 pub fn continuation_frame<'a>(
     input: &'a [u8],
     header: &FrameHeader,
 ) -> IResult<&'a [u8], Frame, ParserError<'a>> {
-    let (i, header_block_fragment) = take(header.payload_len)(input)?;
-    Ok((
-        i,
-        Frame::Continuation(Continuation {
-            _stream_id: header.stream_id,
-            _header_block_fragment: Slice::new(input, header_block_fragment),
-            _end_headers: header.flags & FLAG_END_HEADERS != 0,
-        }),
-    ))
+    // Consume the entire frame payload without storing fields
+    let (remaining, _) = take(header.payload_len)(input)?;
+    Ok((remaining, Frame::Continuation(Continuation)))
 }
 
 #[cfg(test)]
