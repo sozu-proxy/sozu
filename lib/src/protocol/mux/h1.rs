@@ -24,8 +24,9 @@ pub struct ConnectionH1<Front: SocketHandler> {
     pub readiness: Readiness,
     pub requests: usize,
     pub socket: Front,
-    /// note: a Server H1 will always reference stream 0, but a client can reference any stream
-    pub stream: GlobalStreamId,
+    /// Active stream index, or `None` when the connection has no assigned stream
+    /// (initial client state before `start_stream`, or after `end_stream` detaches).
+    pub stream: Option<GlobalStreamId>,
     pub timeout_container: TimeoutContainer,
 }
 
@@ -64,9 +65,13 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         L: ListenerHandler + L7ListenerHandler,
     {
         trace!("======= MUX H1 READABLE {:?}", self.position);
+        let Some(stream_id) = self.stream else {
+            error!("readable() called on H1 connection with no active stream");
+            return MuxResult::Continue;
+        };
         self.timeout_container.reset();
         let answers_rc = context.listener.borrow().get_answers().clone();
-        let stream = &mut context.streams[self.stream];
+        let stream = &mut context.streams[stream_id];
         if stream.metrics.start.is_none() {
             stream.metrics.start = Some(Instant::now());
         }
@@ -110,7 +115,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                 && !kawa.is_terminated()
                 && !parts.context.keep_alive_backend
             {
-                Self::terminate_close_delimited(kawa, self.stream);
+                Self::terminate_close_delimited(kawa, stream_id);
                 self.timeout_container.cancel();
                 self.readiness.interest.remove(Ready::READABLE);
                 if let StreamState::Linked(token) = stream.state {
@@ -133,7 +138,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                         error!("client stream in error is not in Linked state");
                         return MuxResult::CloseSession;
                     };
-                    let global_stream_id = self.stream;
+                    let global_stream_id = stream_id;
                     self.end_stream(global_stream_id, context);
                     endpoint.end_stream(token, global_stream_id, context);
                 }
@@ -241,10 +246,10 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             && self.position.is_client()
             && is_body_phase_after_parse
             && !is_keep_alive_backend
-            && !context.streams[self.stream].back.is_terminated()
+            && !context.streams[stream_id].back.is_terminated()
         {
-            let kawa = &mut context.streams[self.stream].back;
-            Self::terminate_close_delimited(kawa, self.stream);
+            let kawa = &mut context.streams[stream_id].back;
+            Self::terminate_close_delimited(kawa, stream_id);
             self.timeout_container.cancel();
             self.readiness.interest.remove(Ready::READABLE);
         }
@@ -258,8 +263,12 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         L: ListenerHandler + L7ListenerHandler,
     {
         trace!("======= MUX H1 WRITABLE {:?}", self.position);
+        let Some(stream_id) = self.stream else {
+            error!("writable() called on H1 connection with no active stream");
+            return MuxResult::Continue;
+        };
         self.timeout_container.reset();
-        let stream = &mut context.streams[self.stream];
+        let stream = &mut context.streams[stream_id];
         let parts = stream.split(&self.position);
         let kawa = parts.wbuffer;
         kawa.prepare(&mut kawa::h1::BlockConverter);
@@ -362,10 +371,10 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                     if stream.context.keep_alive_frontend {
                         self.timeout_container.reset();
                         if let StreamState::Linked(token) = old_state {
-                            endpoint.end_stream(token, self.stream, context);
+                            endpoint.end_stream(token, stream_id, context);
                         }
                         self.readiness.interest.insert(Ready::READABLE);
-                        let stream = &mut context.streams[self.stream];
+                        let stream = &mut context.streams[stream_id];
                         stream.context.reset();
                         stream.back.clear();
                         stream.back.storage.clear();
@@ -435,7 +444,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             }
             Position::Client(_, _, BackendStatus::Connecting(_))
             | Position::Client(_, _, BackendStatus::Connected) => {
-                debug!("BACKEND CLOSING FOR: {:?} {}", self.position, self.stream);
+                debug!("BACKEND CLOSING FOR: {:?} {:?}", self.position, self.stream);
             }
             Position::Server => {
                 trace!("H1 SENDING CLOSE NOTIFY");
@@ -444,21 +453,25 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                 return;
             }
         }
+        let Some(stream_id) = self.stream else {
+            error!("closing H1 client with no active stream");
+            return;
+        };
         // reconnection is handled by the server
-        let StreamState::Linked(token) = context.streams[self.stream].state else {
+        let StreamState::Linked(token) = context.streams[stream_id].state else {
             error!("closing H1 client is not in Linked state");
             return;
         };
-        endpoint.end_stream(token, self.stream, context)
+        endpoint.end_stream(token, stream_id, context)
     }
 
     pub fn end_stream<L>(&mut self, stream: GlobalStreamId, context: &mut Context<L>)
     where
         L: ListenerHandler + L7ListenerHandler,
     {
-        if stream != self.stream {
+        if self.stream != Some(stream) {
             error!(
-                "end_stream called with stream {} but expected {}",
+                "end_stream called with stream {} but expected {:?}",
                 stream, self.stream
             );
             return;
@@ -466,15 +479,15 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         let answers_rc = context.listener.borrow().get_answers().clone();
         let stream = &mut context.streams[stream];
         let stream_context = &mut stream.context;
-        trace!("end H1 stream {}: {:#?}", self.stream, stream_context);
+        trace!("end H1 stream {:?}: {:#?}", self.stream, stream_context);
         match &mut self.position {
             Position::Client(_, _, BackendStatus::Connecting(_)) => {
-                self.stream = usize::MAX;
+                self.stream = None;
                 self.readiness.interest.remove(Ready::ALL);
                 self.force_disconnect();
             }
             Position::Client(_, _, status @ BackendStatus::Connected) => {
-                self.stream = usize::MAX;
+                self.stream = None;
                 self.readiness.interest.remove(Ready::ALL);
                 // keep alive should probably be used only if the http context is fully reset
                 // in case end_stream occurs due to an error the connection state is probably
@@ -540,7 +553,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
     {
         trace!("start H1 stream {} {:?}", stream, self.readiness);
         self.readiness.interest.insert(Ready::ALL);
-        self.stream = stream;
+        self.stream = Some(stream);
         match &mut self.position {
             Position::Client(_, _, status @ BackendStatus::KeepAlive) => {
                 *status = BackendStatus::Connected;
