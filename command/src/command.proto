@@ -730,6 +730,8 @@ message ServerConfig {
     optional ServerMetricsConfig metrics = 15;
     required ProtobufAccessLogFormat access_log_format = 16;
     required bool log_colored = 17;
+    // maximum number of simultaneous connections per source IP (0 = unlimited)
+    required uint64 max_connections_per_ip = 18 [default = 0];
 }
 
 enum ProtobufAccessLogFormat {
