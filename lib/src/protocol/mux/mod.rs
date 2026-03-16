@@ -593,11 +593,8 @@ impl<Front: SocketHandler> Connection<Front> {
                     };
                     kawa.storage.available_space() == 0
                 } else {
-                    error!(
-                        "has_buffer_pressure: stream index {} out of bounds (len={})",
-                        c.stream,
-                        context.streams.len()
-                    );
+                    // Stream is detached (sentinel value) — this is normal during
+                    // backend cleanup after end_stream(). No buffer pressure.
                     false
                 }
             }

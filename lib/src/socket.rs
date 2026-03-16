@@ -219,13 +219,11 @@ impl SocketHandler for FrontRustls {
                     | ErrorKind::BrokenPipe => {
                         is_closed = true;
                     }
-                    // https://github.com/rustls/rustls/blob/main/rustls/src/conn.rs#L482-L500,
-                    ErrorKind::Other => {
-                        warn!(
-                            "rustls buffer is full, we will consume it, before processing new incoming packets, to mitigate this issue, you could try to increase the buffer size, {:?}",
-                            e
-                        );
-                    }
+                    // https://github.com/rustls/rustls/blob/main/rustls/src/conn.rs#L482-L500
+                    // rustls's 16 KB received_plaintext buffer is full — expected
+                    // under H2 where frame-at-a-time reads drain less than a full
+                    // TLS record. The outer loop will drain plaintext next iteration.
+                    ErrorKind::Other => {}
                     _ => {
                         error!("could not read TLS stream from socket: {:?}", e);
                         is_error = true;
