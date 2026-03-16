@@ -54,6 +54,18 @@ See milestone [`v1.1.0`](https://github.com/sozu-proxy/sozu/projects/3?card_filt
 
 - **Stream recycling dedup**: Replaced inlined `complete_server_stream` with static method call, removing duplicated stream cleanup logic, see [`21e7514d`](https://github.com/sozu-proxy/sozu/commit/21e7514d).
 
+- **1xx informational response handling (100 Continue, 103 Early Hints)**: Fixed the H2 write path to detect 1xx informational responses in both the resume and converter paths of `write_streams()`. Previously, the converter path recycled the stream after a 1xx response, killing it before the final 200 OK could arrive. Also strips END_STREAM/end_body flags on 1xx responses in the H1 backend so the H2 frontend doesn't close the stream prematurely, see [`9f414492`](https://github.com/sozu-proxy/sozu/commit/9f414492).
+
+- **Proxy Protocol v2 + H2 E2E test**: Fixed the test client's TCP read timeout (was 5s, causing rustls `complete_io` to block in `read_tls` and expire the server's SETTINGS ACK timer). Also added TCP_NODELAY, see [`9f414492`](https://github.com/sozu-proxy/sozu/commit/9f414492).
+
+- **H1 pipelining error handling**: Added parse error handling and header validation (method/authority/path) to the pipelining parse in `writable()`, preventing silent hangs on malformed pipelined requests, see [`9f414492`](https://github.com/sozu-proxy/sozu/commit/9f414492).
+
+- **Empty H2 header name rejection**: Moved empty header name check into `is_invalid_h2_header()` for defense-in-depth (RFC 9110 §5.1), see [`9f414492`](https://github.com/sozu-proxy/sozu/commit/9f414492).
+
+- **Edge-triggered epoll TLS flush safety**: Added `ensure_tls_flushed()` helper and `Readiness::signal_pending_write()`/`signal_pending_read()` methods to properly handle edge-triggered epoll with TLS buffering, see [`9f414492`](https://github.com/sozu-proxy/sozu/commit/9f414492).
+
+- **Proxy Protocol → TLS readiness transfer**: Fixed the PP → TLS upgrade to transfer the full `Readiness` struct (interest + event) instead of only the event, preventing lost interest bits, see [`9f414492`](https://github.com/sozu-proxy/sozu/commit/9f414492).
+
 ### Changelog
 
 #### 🌟 Added
@@ -75,6 +87,7 @@ See milestone [`v1.1.0`](https://github.com/sozu-proxy/sozu/projects/3?card_filt
 - [ [`21e7514d`](https://github.com/sozu-proxy/sozu/commit/21e7514d) ] HPACK sync + stream recycling dedup [`FlorentinDUBOIS`] (`2026-03-13`)
 - [ [`664bb659`](https://github.com/sozu-proxy/sozu/commit/664bb659) ] Round 2 review fixes [`FlorentinDUBOIS`] (`2026-03-13`)
 - [ [`025822cf`](https://github.com/sozu-proxy/sozu/commit/025822cf) ] Round 1 review findings [`FlorentinDUBOIS`] (`2026-03-13`)
+- [ [`9f414492`](https://github.com/sozu-proxy/sozu/commit/9f414492) ] Fix 1xx informational handling, proxy protocol v2 E2E, pipelining validation [`FlorentinDUBOIS`] (`2026-03-16`)
 
 #### ✍️ Changed
 
