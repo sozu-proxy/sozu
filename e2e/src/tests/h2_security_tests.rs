@@ -28,6 +28,7 @@
 //! - Error response when backend unreachable
 //! - Multi-cluster routing on same H2 connection
 //! - Cookie header splitting (RFC 9113 §8.2.3)
+//! - Cookie concatenation to single H1 header (RFC 9113 §8.2.3)
 //! - H2->H1 POST body forwarding
 //! - CL/TE conflict smuggling (CVE-2024-53008 pattern)
 //! - Empty Content-Length (CVE-2023-40225 pattern)
@@ -40,7 +41,16 @@
 //! - HEADERS flood exceeding MAX_CONCURRENT_STREAMS (RFC 9113 §5.1.2)
 //! - CONTINUATION without preceding HEADERS (RFC 9113 §6.10)
 
-use std::{io::Write, net::SocketAddr, thread, time::Duration};
+use std::{
+    io::{Read, Write},
+    net::SocketAddr,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+    time::Duration,
+};
 
 use http_body_util::BodyExt;
 use sozu_command_lib::{
@@ -57,7 +67,7 @@ use super::h2_utils::{
     collect_response_frames, contains_goaway, contains_goaway_with_error,
     contains_headers_response, contains_rst_stream, h2_handshake, log_frames, parse_h2_frames,
     raw_h2_connection, read_all_available, rejected_with_goaway_or_rst, setup_h2_listener_only,
-    setup_h2_test, teardown,
+    setup_h2_test, teardown, verify_sozu_alive,
 };
 use crate::{
     mock::{
@@ -1842,6 +1852,228 @@ fn test_h2_cookie_splitting() {
             3,
             "H2 compliance: cookie header splitting (RFC 9113 §8.2.3)",
             try_h2_cookie_splitting
+        ),
+        State::Success
+    );
+}
+
+// ============================================================================
+// Test 24b: Cookie concatenation verification (RFC 9113 §8.2.3)
+// ============================================================================
+
+/// A backend that captures the raw H1 request for inspection.
+struct CapturingBackend {
+    stop: Arc<AtomicBool>,
+    captured: Arc<Mutex<Option<String>>>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl CapturingBackend {
+    fn start(address: SocketAddr) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let captured = Arc::new(Mutex::new(None));
+        let stop_clone = stop.clone();
+        let captured_clone = captured.clone();
+
+        let thread = thread::spawn(move || {
+            let listener =
+                std::net::TcpListener::bind(address).expect("could not bind capturing backend");
+            listener
+                .set_nonblocking(true)
+                .expect("could not set nonblocking");
+
+            loop {
+                if stop_clone.load(Ordering::Relaxed) {
+                    break;
+                }
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                        let mut buf = [0u8; 4096];
+                        let n = match stream.read(&mut buf) {
+                            Ok(n) => n,
+                            Err(_) => continue,
+                        };
+
+                        let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                        *captured_clone.lock().unwrap() = Some(request);
+
+                        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+                        let _ = stream.write_all(response);
+                        let _ = stream.flush();
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => {}
+                }
+            }
+        });
+
+        Self {
+            stop,
+            captured,
+            thread: Some(thread),
+        }
+    }
+
+    fn get_captured_request(&self) -> Option<String> {
+        self.captured.lock().unwrap().clone()
+    }
+
+    fn stop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            thread::sleep(Duration::from_millis(100));
+            drop(thread);
+        }
+    }
+}
+
+impl Drop for CapturingBackend {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// RFC 9113 Section 8.2.3: When converting H2 to H1, multiple `cookie`
+/// header fields MUST be concatenated into a single `Cookie:` header using
+/// the "; " separator. This test verifies the backend receives a single
+/// properly concatenated Cookie header, not multiple individual ones.
+///
+/// This prevents session corruption on Apache + PHP backends where
+/// `apr_table_get("Cookie")` returns only the first header, losing
+/// subsequent cookies like PHPSESSID.
+fn try_h2_cookie_concatenation() -> State {
+    let (mut worker, front_port, _front_address) = setup_h2_listener_only("H2-SEC-COOKIE-CONCAT");
+
+    let back_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address,
+        None,
+    )));
+    worker.read_to_last();
+
+    let mut backend = CapturingBackend::start(back_address);
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake(&mut tls);
+
+    // Build HPACK header block with 3 separate cookie headers.
+    // This simulates what browsers send over H2 (RFC 9113 §8.2.3).
+    let mut header_block = vec![
+        0x82, // :method GET (static index 2)
+        0x84, // :path /  (static index 4)
+        0x87, // :scheme https (static index 7)
+        0x41, 0x09, // :authority, value length 9
+        b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't',
+    ];
+
+    // cookie: PHPSESSID=abc123 — literal without indexing (0x00)
+    header_block.push(0x00);
+    header_block.push(0x06); // name length 6
+    header_block.extend_from_slice(b"cookie");
+    header_block.push(0x10); // value length 16
+    header_block.extend_from_slice(b"PHPSESSID=abc123");
+
+    // cookie: intercom-id=xyz789
+    header_block.push(0x00);
+    header_block.push(0x06);
+    header_block.extend_from_slice(b"cookie");
+    header_block.push(0x12); // value length 18
+    header_block.extend_from_slice(b"intercom-id=xyz789");
+
+    // cookie: theme=dark
+    header_block.push(0x00);
+    header_block.push(0x06);
+    header_block.extend_from_slice(b"cookie");
+    header_block.push(0x0a); // value length 10
+    header_block.extend_from_slice(b"theme=dark");
+
+    // HEADERS with END_HEADERS + END_STREAM (GET request, no body)
+    let headers = H2Frame::headers(1, header_block, true, true);
+    tls.write_all(&headers.encode()).unwrap();
+    tls.flush().unwrap();
+
+    // Collect response frames
+    let frames = collect_response_frames(&mut tls, 500, 5, 500);
+    log_frames("Cookie concatenation", &frames);
+
+    let got_response_headers = frames
+        .iter()
+        .any(|(ft, _fl, sid, _payload)| *ft == H2_FRAME_HEADERS && *sid == 1);
+    let rejected = rejected_with_goaway_or_rst(&frames);
+
+    // Give Sozu time to forward to backend
+    thread::sleep(Duration::from_millis(300));
+    let captured = backend.get_captured_request();
+
+    println!("Cookie concatenation - got response: {got_response_headers}, rejected: {rejected}");
+    println!("Cookie concatenation - captured request: {captured:?}");
+
+    // Verify the backend received a SINGLE Cookie header with "; " separators
+    let cookie_ok = match &captured {
+        Some(req) => {
+            let cookie_lines: Vec<&str> = req
+                .lines()
+                .filter(|line| line.to_lowercase().starts_with("cookie:"))
+                .collect();
+            let single_cookie = cookie_lines.len() == 1;
+            let has_all_cookies = cookie_lines
+                .first()
+                .map(|line| {
+                    line.contains("PHPSESSID=abc123")
+                        && line.contains("intercom-id=xyz789")
+                        && line.contains("theme=dark")
+                })
+                .unwrap_or(false);
+            // Must use "; " separators, NOT ", "
+            let uses_semicolons = cookie_lines
+                .first()
+                .map(|line| !line.contains(", ") || line.contains("; "))
+                .unwrap_or(false);
+            if !single_cookie {
+                println!(
+                    "Cookie concatenation - FAIL: expected 1 Cookie header, got {}",
+                    cookie_lines.len()
+                );
+            }
+            if !has_all_cookies {
+                println!("Cookie concatenation - FAIL: missing cookies in header");
+            }
+            single_cookie && has_all_cookies && uses_semicolons
+        }
+        None => {
+            println!("Cookie concatenation - FAIL: no request captured by backend");
+            false
+        }
+    };
+
+    drop(tls);
+    thread::sleep(Duration::from_millis(200));
+    let still_alive = verify_sozu_alive(front_port);
+
+    backend.stop();
+    worker.soft_stop();
+    let _success = worker.wait_for_server_stop();
+
+    if still_alive && got_response_headers && !rejected && cookie_ok {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_cookie_concatenation() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 compliance: cookie concatenation to single H1 header (RFC 9113 §8.2.3)",
+            try_h2_cookie_concatenation
         ),
         State::Success
     );
