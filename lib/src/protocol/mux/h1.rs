@@ -28,6 +28,11 @@ pub struct ConnectionH1<Front: SocketHandler> {
     /// (initial client state before `start_stream`, or after `end_stream` detaches).
     pub stream: Option<GlobalStreamId>,
     pub timeout_container: TimeoutContainer,
+    /// Set when `readable` exits early because the kawa buffer was full.
+    /// Edge-triggered epoll will not re-fire READABLE for data already in the
+    /// kernel socket buffer, so the cross-readiness mechanism must re-arm it
+    /// via `try_resume_reading` once the peer drains the buffer.
+    pub parked_on_buffer_pressure: bool,
 }
 
 impl<Front: SocketHandler> std::fmt::Debug for ConnectionH1<Front> {
@@ -81,13 +86,16 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         // If the buffer has no space, don't attempt a read — socket_read with
         // an empty buffer returns (0, Continue) which is indistinguishable from
         // a real EOF. Remove READABLE from the event so the inner loop doesn't
-        // spin; the next epoll cycle will re-report it once the frontend drains
-        // the buffer.
+        // spin; `try_resume_reading` will re-arm it once the peer drains the
+        // buffer (edge-triggered epoll won't re-fire for data already in the
+        // kernel socket buffer).
         if kawa.storage.available_space() == 0 {
             self.readiness.event.remove(Ready::READABLE);
+            self.parked_on_buffer_pressure = true;
             return MuxResult::Continue;
         }
 
+        self.parked_on_buffer_pressure = false;
         let (size, status) = self.socket.socket_read(kawa.storage.space());
         context.debug.push(DebugEvent::StreamEvent(0, size));
         kawa.storage.fill(size);

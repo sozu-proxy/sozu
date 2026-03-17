@@ -402,6 +402,7 @@ impl<Front: SocketHandler> Connection<Front> {
             requests: 0,
             stream: Some(0),
             timeout_container,
+            parked_on_buffer_pressure: false,
         })
     }
     pub fn new_h1_client(
@@ -424,6 +425,7 @@ impl<Front: SocketHandler> Connection<Front> {
             stream: None,
             requests: 0,
             timeout_container,
+            parked_on_buffer_pressure: false,
         })
     }
 
@@ -564,14 +566,39 @@ impl<Front: SocketHandler> Connection<Front> {
     }
 
     /// Re-enable READABLE if this connection is parked waiting for buffer space
-    /// and the target stream's buffer now has enough room. H1 connections never
-    /// park on `expect_read`, so they always return `false`.
+    /// and the target stream's buffer now has enough room.
+    ///
+    /// For H1: checks the `parked_on_buffer_pressure` flag set when `readable`
+    /// exits early because the kawa buffer was full. Edge-triggered epoll will
+    /// not re-fire READABLE for data already in the kernel socket buffer, so
+    /// this is the only path that re-arms it after the peer drains space.
+    ///
+    /// For H2: checks the `expect_read` field tracking which stream and how
+    /// many bytes are needed.
     fn try_resume_reading<L>(&mut self, context: &Context<L>) -> bool
     where
         L: ListenerHandler + L7ListenerHandler,
     {
         match self {
-            Connection::H1(_) => false,
+            Connection::H1(c) => {
+                if !c.parked_on_buffer_pressure {
+                    return false;
+                }
+                let Some(stream_id) = c.stream else {
+                    return false;
+                };
+                let kawa = match c.position {
+                    Position::Client(..) => &context.streams[stream_id].back,
+                    Position::Server => &context.streams[stream_id].front,
+                };
+                if kawa.storage.available_space() > 0 {
+                    trace!("H1 try_resume_reading: re-arming READABLE");
+                    c.readiness.signal_pending_read();
+                    true
+                } else {
+                    false
+                }
+            }
             Connection::H2(c) => c.try_resume_reading(context),
         }
     }
@@ -1820,9 +1847,13 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                         MuxResult::CloseSession => return SessionResult::Close,
                         MuxResult::Upgrade => return SessionResult::Upgrade,
                     }
-                    // Cross-readiness: frontend wrote → wake parked backends
+                    // Cross-readiness: frontend wrote → wake parked backends.
+                    // If any backend resumes, invalidate the stale readiness
+                    // flag so the inner loop continues instead of breaking.
                     for (_token, backend) in self.router.backends.iter_mut() {
-                        backend.try_resume_reading(context);
+                        if backend.try_resume_reading(context) {
+                            all_backends_readiness_are_empty = false;
+                        }
                     }
                 }
 
