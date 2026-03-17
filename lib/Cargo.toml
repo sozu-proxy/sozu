@@ -34,6 +34,7 @@ hdrhistogram = { workspace = true }
 hex = { workspace = true }
 hpack = { workspace = true }
 idna = { workspace = true }
+itoa = { workspace = true }
 kawa = { workspace = true }
 libc = { workspace = true }
 memchr = { workspace = true }
@@ -54,10 +55,15 @@ time = { workspace = true }
 sozu-command-lib = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
 quickcheck = { workspace = true }
 rand = { workspace = true }
 serial_test = { workspace = true }
 tiny_http = { workspace = true }
+
+[[bench]]
+name = "header_formatting"
+harness = false
 
 [features]
 default = []

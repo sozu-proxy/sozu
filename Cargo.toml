@@ -15,6 +15,7 @@ hyper = "^1.8.1"
 hyper-rustls = { version = "^0.27.7", default-features = false }
 hyper-util = "^0.1"
 idna = "^1.1.0"
+itoa = "^1.0.17"
 jemallocator = "^0.5.4"
 kawa = { version = "^0.6.8", default-features = false }
 libc = "^0.2.182"
@@ -30,6 +31,7 @@ poule = "^0.3.2"
 prettytable-rs = { version = "^0.10.0", default-features = false }
 prost = "^0.14.3"
 prost-build = "^0.14.3"
+criterion = { version = "^0.5.1", features = ["html_reports"] }
 quickcheck = "^1.1.0"
 rand = "^0.10.0"
 regex = "^1.12.3"
