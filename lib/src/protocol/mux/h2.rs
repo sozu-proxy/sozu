@@ -1,6 +1,7 @@
 use std::{
     cmp::min,
     collections::{HashMap, HashSet},
+    io::Write as _,
     time::Instant,
 };
 
@@ -2102,9 +2103,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             // Emit chunk framing for chunked transfer encoding (H2→H1 path).
             // H2 converter ignores ChunkHeader and end_chunk Flags, so this is safe for H2→H2.
             if kawa.body_size == kawa::BodySize::Chunked && payload_len > 0 {
-                let hex_len = format!("{payload_len:x}");
+                let hex_len = {
+                    let mut buf = Vec::with_capacity(16);
+                    let _ = write!(buf, "{payload_len:x}");
+                    buf
+                };
                 kawa.push_block(kawa::Block::ChunkHeader(kawa::ChunkHeader {
-                    length: kawa::Store::from_string(hex_len),
+                    length: kawa::Store::from_vec(hex_len),
                 }));
             }
 
@@ -3649,5 +3654,40 @@ mod tests {
         // No rounding residual — last stream absorbed the remainder
         assert_eq!(overhead_bin, 0);
         assert_eq!(overhead_bout, 0);
+    }
+
+    // ── Hex chunk formatting ────────────────────────────────────────────
+
+    /// Verify that the Vec<u8> + write!() hex formatting used in
+    /// handle_data_frame produces output identical to format!("{:x}").
+    #[test]
+    fn test_hex_chunk_length_formatting() {
+        use std::io::Write as _;
+
+        let cases: &[(usize, &[u8])] = &[
+            (1, b"1"),
+            (15, b"f"),
+            (16, b"10"),
+            (255, b"ff"),
+            (256, b"100"),
+            (4096, b"1000"),
+            (65535, b"ffff"),
+            (65536, b"10000"),
+        ];
+
+        for &(payload_len, expected) in cases {
+            let mut buf = Vec::with_capacity(16);
+            let _ = write!(buf, "{payload_len:x}");
+            assert_eq!(
+                buf, expected,
+                "hex formatting mismatch for payload_len={payload_len}"
+            );
+        }
+
+        // usize::MAX tested separately to avoid temporary lifetime issue
+        let max_expected = format!("{:x}", usize::MAX);
+        let mut buf = Vec::with_capacity(16);
+        let _ = write!(buf, "{:x}", usize::MAX);
+        assert_eq!(buf, max_expected.as_bytes());
     }
 }

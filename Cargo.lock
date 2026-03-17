@@ -504,7 +504,7 @@ version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a1c3cc8e57274ec99de65301228b537f1e4eedc1b8e0f9411c6caac8ae7308f"
 dependencies = [
- "log 0.4.29",
+ "log",
  "regex",
 ]
 
@@ -515,7 +515,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b2daee4ea451f429a58296525ddf28b45a3b64f1acf6587e2067437bb11e218d"
 dependencies = [
  "env_filter",
- "log 0.4.29",
+ "log",
 ]
 
 [[package]]
@@ -775,15 +775,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
-name = "hpack"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1c68f61350ad23817dd207b035b5258d91ac5eaef69e96f906628aaed8854dda"
-dependencies = [
- "log 0.3.9",
-]
-
-[[package]]
 name = "http"
 version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -860,7 +851,7 @@ dependencies = [
  "http",
  "hyper",
  "hyper-util",
- "log 0.4.29",
+ "log",
  "rustls",
  "rustls-pki-types",
  "tokio",
@@ -1086,7 +1077,7 @@ version = "0.6.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "113ce3f8c163e6a7ef4efa50659b98cab3f325218e28a88dd5a2bebeeb55725d"
 dependencies = [
- "log 0.4.29",
+ "log",
  "nom",
 ]
 
@@ -1140,18 +1131,19 @@ dependencies = [
 
 [[package]]
 name = "log"
-version = "0.3.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e19e8d5c34a3e0e2223db8e060f9e8264aeeb5c5fc64a4ee9965c062211c024b"
-dependencies = [
- "log 0.4.29",
-]
-
-[[package]]
-name = "log"
 version = "0.4.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
+
+[[package]]
+name = "loona-hpack"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ce904bae9ecfd9b658b0be156ad278d4b2432f171472f1f0289aed75eed02a3"
+dependencies = [
+ "thiserror 1.0.69",
+ "tracing",
+]
 
 [[package]]
 name = "memchr"
@@ -1191,7 +1183,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a69bcab0ad47271a0234d9422b131806bf3968021e5dc9328caf2d4cd58557fc"
 dependencies = [
  "libc",
- "log 0.4.29",
+ "log",
  "wasi",
  "windows-sys 0.61.2",
 ]
@@ -1492,7 +1484,7 @@ checksum = "343d3bd7056eda839b03204e68deff7d1b13aba7af2b2fd16890697274262ee7"
 dependencies = [
  "heck",
  "itertools 0.14.0",
- "log 0.4.29",
+ "log",
  "multimap",
  "petgraph",
  "prettyplease",
@@ -1532,7 +1524,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "95c589f335db0f6aaa168a7cd27b1fc6920f5e1470c804f814d9cd6e62a0f70b"
 dependencies = [
  "env_logger",
- "log 0.4.29",
+ "log",
  "rand 0.10.0",
 ]
 
@@ -1709,7 +1701,7 @@ version = "0.23.37"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "758025cb5fccfd3bc2fd74708fd4682be41d99e5dff73c377c0646c6012c73a4"
 dependencies = [
- "log 0.4.29",
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
@@ -1860,7 +1852,7 @@ checksum = "911bd979bf1070a3f3aa7b691a3b3e9968f339ceeec89e08c280a8a22207a32f"
 dependencies = [
  "futures-executor",
  "futures-util",
- "log 0.4.29",
+ "log",
  "once_cell",
  "parking_lot",
  "scc",
@@ -1930,7 +1922,7 @@ dependencies = [
  "clap",
  "jemallocator",
  "libc",
- "log 0.4.29",
+ "log",
  "mio",
  "nix",
  "nom",
@@ -1952,7 +1944,7 @@ version = "1.1.1"
 dependencies = [
  "hex",
  "libc",
- "log 0.4.29",
+ "log",
  "memchr",
  "mio",
  "nix",
@@ -2001,11 +1993,11 @@ dependencies = [
  "criterion",
  "hdrhistogram",
  "hex",
- "hpack",
  "idna",
  "itoa",
  "kawa",
  "libc",
+ "loona-hpack",
  "memchr",
  "mio",
  "nom",
@@ -2191,7 +2183,7 @@ dependencies = [
  "ascii",
  "chunked_transfer",
  "httpdate",
- "log 0.4.29",
+ "log",
 ]
 
 [[package]]
@@ -2315,7 +2307,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100"
 dependencies = [
  "pin-project-lite",
+ "tracing-attributes",
  "tracing-core",
+]
+
+[[package]]
+name = "tracing-attributes"
+version = "0.1.31"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7490cfa5ec963746568740651ac6781f701c9c5ea257c58e057f3ba8cf69e8da"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -2713,7 +2717,7 @@ dependencies = [
  "anyhow",
  "bitflags",
  "indexmap",
- "log 0.4.29",
+ "log",
  "serde",
  "serde_derive",
  "serde_json",
@@ -2732,7 +2736,7 @@ dependencies = [
  "anyhow",
  "id-arena",
  "indexmap",
- "log 0.4.29",
+ "log",
  "semver",
  "serde",
  "serde_derive",
