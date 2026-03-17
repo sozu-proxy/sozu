@@ -1201,6 +1201,21 @@ pub mod testing {
         tcp::TcpProxy,
     };
 
+    use std::sync::atomic::{AtomicU16, Ordering};
+
+    /// Port counter for sozu listener addresses in lib tests.
+    /// Starts at 10000 to avoid collision with:
+    /// - Privileged ports (<1024)
+    /// - e2e suite (starts at 2000)
+    /// - Ephemeral port range (typically 32768+)
+    static PORT_PROVIDER: AtomicU16 = AtomicU16::new(10000);
+
+    /// Get a unique port for a sozu listener address.
+    /// Each call returns a different port, safe for parallel test execution.
+    pub fn provide_port() -> u16 {
+        PORT_PROVIDER.fetch_add(1, Ordering::SeqCst)
+    }
+
     /// Everything needed to create a Server
     pub struct ServerParts {
         pub event_loop: Poll,
