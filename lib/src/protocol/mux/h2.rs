@@ -1529,7 +1529,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 // preserve any window changes that occurred during setup.
                 let increment = ENLARGED_CONNECTION_WINDOW - DEFAULT_INITIAL_WINDOW_SIZE;
                 self.queue_window_update(0, increment);
-                self.flow_control.window += increment as i32;
+                // Do NOT increment flow_control.window here: sending our own
+                // WINDOW_UPDATE enlarges the peer's send allowance, not ours.
+                // Our send window is only updated by WINDOW_UPDATEs we receive
+                // from the peer (RFC 9113 §6.9).
                 self.expect_header();
                 // Keep WRITABLE so the queued WINDOW_UPDATE gets flushed.
                 MuxResult::Continue
@@ -2448,7 +2451,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         {
             let increment = ENLARGED_CONNECTION_WINDOW - DEFAULT_INITIAL_WINDOW_SIZE;
             self.queue_window_update(0, increment);
-            self.flow_control.window += increment as i32;
+            // Do NOT increment flow_control.window here: sending our own
+            // WINDOW_UPDATE enlarges the peer's send allowance, not ours.
+            // Our send window is only updated by WINDOW_UPDATEs we receive
+            // from the peer (RFC 9113 §6.9).
         }
 
         let kawa = &mut self.zero;
@@ -2627,6 +2633,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             if let Some(window) = self.flow_control.window.checked_add(increment) {
                 if self.flow_control.window <= 0 && window > 0 {
                     self.readiness.interest.insert(Ready::WRITABLE);
+                    self.readiness.signal_pending_write();
                 }
                 self.flow_control.window = window;
                 debug!(
@@ -2643,6 +2650,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             if let Some(window) = stream.window.checked_add(increment) {
                 if stream.window <= 0 && window > 0 {
                     self.readiness.interest.insert(Ready::WRITABLE);
+                    self.readiness.signal_pending_write();
                 }
                 stream.window = window;
                 debug!(
@@ -2703,6 +2711,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         );
         if open_window {
             self.readiness.interest.insert(Ready::WRITABLE);
+            self.readiness.signal_pending_write();
         }
         self.peer_settings.settings_initial_window_size = value;
         false
