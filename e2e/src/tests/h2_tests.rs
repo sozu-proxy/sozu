@@ -7440,3 +7440,148 @@ fn test_h2_large_h1_response_close_delimited() {
         State::Success
     );
 }
+
+// ============================================================================
+// Test: Large H1 response with restricted H2 flow control window
+// ============================================================================
+
+/// Regression test for H1 backend read starvation under H2 flow control
+/// pressure. A 2 MB response from an H1 backend must be forwarded
+/// completely through the H2 frontend without truncation.
+///
+/// Without the fix in `try_resume_reading` for H1 connections, the response
+/// is truncated because edge-triggered epoll never re-fires READABLE once
+/// the kawa buffer fills and the event is consumed.
+fn try_h2_large_response_flow_control_pressure() -> State {
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+    let (config, listeners, state) = Worker::empty_config();
+    let mut worker = Worker::start_new_worker("H2-FLOW-PRESSURE", config, &listeners, state);
+
+    worker.send_proxy_request_type(RequestType::AddHttpsListener(
+        ListenerBuilder::new_https(front_address.clone())
+            .to_tls(None)
+            .unwrap(),
+    ));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        address: front_address.clone(),
+        proxy: ListenerType::Https.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        hostname: String::from("localhost"),
+        ..Worker::default_http_frontend("cluster_0", front_address.clone().into())
+    }));
+    let certificate_and_key = CertificateAndKey {
+        certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
+        key: String::from(include_str!("../../../lib/assets/local-key.pem")),
+        certificate_chain: vec![],
+        versions: vec![],
+        names: vec![],
+    };
+    worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+        address: front_address,
+        certificate: certificate_and_key,
+        expired_at: None,
+    }));
+
+    // 2 MB body — large enough to require ~125 kawa buffer cycles (16 KB each)
+    // and multiple WINDOW_UPDATE round-trips.
+    let body_size = 2 * 1024 * 1024;
+    let body_content: String = (0..body_size)
+        .map(|i| (b'A' + (i % 26) as u8) as char)
+        .collect();
+    let body_clone = body_content.clone();
+
+    let back_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address,
+        None,
+    )));
+
+    let handler: Box<
+        dyn Fn(&std::net::TcpStream, &str, SimpleAggregator) -> SimpleAggregator + Send + Sync,
+    > = Box::new(move |mut stream, backend_name, mut aggregator| {
+        let mut buf = [0u8; 4096];
+        match stream.read(&mut buf) {
+            Ok(0) => return aggregator,
+            Ok(n) => println!("{backend_name} received {n}"),
+            Err(_) => return aggregator,
+        }
+        aggregator.requests_received += 1;
+
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+                 Content-Length: {}\r\n\r\n",
+            body_clone.len()
+        );
+        if stream.write_all(header.as_bytes()).is_err() {
+            return aggregator;
+        }
+        if stream.write_all(body_clone.as_bytes()).is_err() {
+            return aggregator;
+        }
+        aggregator.responses_sent += 1;
+        aggregator
+    });
+
+    let mut backends = vec![AsyncBackend::spawn_detached_backend(
+        "FLOW_PRESSURE".to_string(),
+        back_address,
+        SimpleAggregator::default(),
+        handler,
+    )];
+
+    worker.read_to_last();
+
+    // Use the hyper H2 client which manages flow control automatically.
+    let client = build_h2_client();
+    let uri: hyper::Uri = format!("https://localhost:{front_port}/api/flow-pressure")
+        .parse()
+        .unwrap();
+
+    let result = resolve_request(&client, uri);
+    let correct = result.as_ref().is_some_and(|(status, body)| {
+        println!(
+            "H2 flow control pressure - status: {status:?}, body len: {} (expected {body_size})",
+            body.len()
+        );
+        if body.len() != body_size {
+            println!(
+                "  TRUNCATED at byte {} (missing {} bytes)",
+                body.len(),
+                body_size - body.len()
+            );
+        }
+        status.is_success() && body.len() == body_size && *body == body_content
+    });
+
+    worker.soft_stop();
+    let success = worker.wait_for_server_stop();
+    for backend in backends.iter_mut() {
+        backend.stop_and_get_aggregator();
+    }
+
+    if success && correct {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_large_response_flow_control_pressure() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "H2: large H1 response under flow control pressure (buffer starvation regression)",
+            try_h2_large_response_flow_control_pressure
+        ),
+        State::Success
+    );
+}
