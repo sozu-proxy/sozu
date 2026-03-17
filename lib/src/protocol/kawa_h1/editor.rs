@@ -1,6 +1,7 @@
 use std::{
+    io::Write as _,
     net::{IpAddr, SocketAddr},
-    str::{from_utf8, from_utf8_unchecked},
+    str::from_utf8,
 };
 
 use rusty_ulid::Ulid;
@@ -63,6 +64,40 @@ fn build_traceparent(trace_id: &[u8; 32], parent_id: &[u8; 16]) -> [u8; 55] {
     buf[36..52].copy_from_slice(parent_id);
     buf[52..55].copy_from_slice(b"-01");
     buf
+}
+
+/// Write the ";for=..;by=.." portion of a Forwarded header into `buf`
+/// without heap-allocating a `String`.
+fn write_forwarded_for_by(buf: &mut Vec<u8>, peer_ip: IpAddr, peer_port: u16, public_ip: IpAddr) {
+    buf.extend_from_slice(b";for=\"");
+    let _ = write!(buf, "{peer_ip}");
+    buf.push(b':');
+    let mut port_buf = itoa::Buffer::new();
+    buf.extend_from_slice(port_buf.format(peer_port).as_bytes());
+    buf.extend_from_slice(b"\";by=");
+    match public_ip {
+        IpAddr::V4(_) => {
+            let _ = write!(buf, "{public_ip}");
+        }
+        IpAddr::V6(_) => {
+            buf.push(b'"');
+            let _ = write!(buf, "{public_ip}");
+            buf.push(b'"');
+        }
+    }
+}
+
+/// Write ", proto=<proto>;for=..;by=.." (the suffix appended to an existing Forwarded value).
+fn write_forwarded_suffix(
+    buf: &mut Vec<u8>,
+    proto: &str,
+    peer_ip: IpAddr,
+    peer_port: u16,
+    public_ip: IpAddr,
+) {
+    buf.extend_from_slice(b", proto=");
+    buf.extend_from_slice(proto.as_bytes());
+    write_forwarded_for_by(buf, peer_ip, peer_port, public_ip);
 }
 
 /// This is the container used to store and use information about the session from within a Kawa parser callback
@@ -207,7 +242,7 @@ impl HttpContext {
             let key = cookie.key.data(buf);
             if key == self.sticky_name.as_bytes() {
                 let val = cookie.val.data(buf);
-                self.sticky_session_found = from_utf8(val).ok().map(|val| val.to_string());
+                self.sticky_session_found = from_utf8(val).ok().map(ToOwned::to_owned);
                 cookie.elide();
             }
         }
@@ -258,7 +293,8 @@ impl HttpContext {
                         // header.val = kawa::Store::from_string(public_port.to_string());
                         incr!("http.trusting.x_port");
                         let val = header.val.data(buf);
-                        let expected = public_port.to_string();
+                        let mut port_buf = itoa::Buffer::new();
+                        let expected = port_buf.format(public_port);
                         if !compare_no_case(val, expected.as_bytes()) {
                             incr!("http.trusting.x_port.diff");
                             debug!(
@@ -327,46 +363,35 @@ impl HttpContext {
             let has_x_for = x_for.is_some();
             let has_forwarded = forwarded.is_some();
 
+            // Buffer for building header values — ownership is transferred to Store
+            // via `take`, so each header gets its own allocation.
+            let mut hdr_buf = Vec::with_capacity(128);
+
             if let Some(header) = x_for {
-                header.val = kawa::Store::from_string(format!("{}, {peer_ip}", unsafe {
-                    from_utf8_unchecked(header.val.data(buf))
-                }));
+                hdr_buf.extend_from_slice(header.val.data(buf));
+                let _ = write!(hdr_buf, ", {peer_ip}");
+                header.val = kawa::Store::from_vec(std::mem::take(&mut hdr_buf));
             }
             if let Some(header) = &mut forwarded {
-                let value = unsafe { from_utf8_unchecked(header.val.data(buf)) };
-                let new_value = match public_ip {
-                    IpAddr::V4(_) => {
-                        format!(
-                            "{value}, proto={proto};for=\"{peer_ip}:{peer_port}\";by={public_ip}"
-                        )
-                    }
-                    IpAddr::V6(_) => {
-                        format!(
-                            "{value}, proto={proto};for=\"{peer_ip}:{peer_port}\";by=\"{public_ip}\""
-                        )
-                    }
-                };
-                header.val = kawa::Store::from_string(new_value);
+                hdr_buf.extend_from_slice(header.val.data(buf));
+                write_forwarded_suffix(&mut hdr_buf, proto, peer_ip, peer_port, public_ip);
+                header.val = kawa::Store::from_vec(std::mem::take(&mut hdr_buf));
             }
 
             if !has_x_for {
+                let _ = write!(hdr_buf, "{peer_ip}");
                 request.push_block(kawa::Block::Header(kawa::Pair {
                     key: kawa::Store::Static(b"X-Forwarded-For"),
-                    val: kawa::Store::from_string(peer_ip.to_string()),
+                    val: kawa::Store::from_vec(std::mem::take(&mut hdr_buf)),
                 }));
             }
             if !has_forwarded {
-                let value = match public_ip {
-                    IpAddr::V4(_) => {
-                        format!("proto={proto};for=\"{peer_ip}:{peer_port}\";by={public_ip}")
-                    }
-                    IpAddr::V6(_) => {
-                        format!("proto={proto};for=\"{peer_ip}:{peer_port}\";by=\"{public_ip}\"")
-                    }
-                };
+                hdr_buf.extend_from_slice(b"proto=");
+                hdr_buf.extend_from_slice(proto.as_bytes());
+                write_forwarded_for_by(&mut hdr_buf, peer_ip, peer_port, public_ip);
                 request.push_block(kawa::Block::Header(kawa::Pair {
                     key: kawa::Store::Static(b"Forwarded"),
-                    val: kawa::Store::from_string(value),
+                    val: kawa::Store::from_vec(std::mem::take(&mut hdr_buf)),
                 }));
             }
         }
@@ -384,9 +409,11 @@ impl HttpContext {
         }
 
         if !has_x_port {
+            let mut port_buf = itoa::Buffer::new();
+            let port_str = port_buf.format(public_port);
             request.push_block(kawa::Block::Header(kawa::Pair {
                 key: kawa::Store::Static(b"X-Forwarded-Port"),
-                val: kawa::Store::from_string(public_port.to_string()),
+                val: kawa::Store::from_slice(port_str.as_bytes()),
             }));
         }
         if !has_x_proto {
@@ -456,12 +483,15 @@ impl HttpContext {
         // create a "Set-Cookie" header to update the sticky_name value
         if let Some(sticky_session) = &self.sticky_session {
             if self.sticky_session != self.sticky_session_found {
+                let mut cookie_buf =
+                    Vec::with_capacity(self.sticky_name.len() + 1 + sticky_session.len() + 8);
+                cookie_buf.extend_from_slice(self.sticky_name.as_bytes());
+                cookie_buf.push(b'=');
+                cookie_buf.extend_from_slice(sticky_session.as_bytes());
+                cookie_buf.extend_from_slice(b"; Path=/");
                 response.push_block(kawa::Block::Header(kawa::Pair {
                     key: kawa::Store::Static(b"Set-Cookie"),
-                    val: kawa::Store::from_string(format!(
-                        "{}={}; Path=/",
-                        self.sticky_name, sticky_session
-                    )),
+                    val: kawa::Store::from_vec(cookie_buf),
                 }));
             }
         }
