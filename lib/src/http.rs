@@ -1159,7 +1159,10 @@ mod tests {
     use crate::sozu_command::{
         channel::Channel,
         config::ListenerBuilder,
-        proto::command::{LoadBalancingParams, PathRule, RulePosition, WorkerRequest},
+        proto::command::{
+            LoadBalancingParams, PathRule, RulePosition, SoftStop, WorkerRequest,
+            request::RequestType,
+        },
         response::{Backend, HttpFrontend},
     };
 
@@ -1179,225 +1182,298 @@ mod tests {
     #[test]
     fn round_trip() {
         setup_test_logger!();
-        let barrier = Arc::new(Barrier::new(2));
-        start_server(1025, barrier.clone());
-        barrier.wait();
+        let front_port = crate::testing::provide_port();
+        let backend_server = Arc::new(
+            tiny_http::Server::http("127.0.0.1:0").expect("could not create tiny_http server"),
+        );
+        let backend_port = backend_server
+            .server_addr()
+            .to_ip()
+            .expect("tiny_http server should bind to IP address")
+            .port();
 
-        let config = ListenerBuilder::new_http(SocketAddress::new_v4(127, 0, 0, 1, 1024))
+        let barrier = Arc::new(Barrier::new(2));
+
+        let config = ListenerBuilder::new_http(SocketAddress::new_v4(127, 0, 0, 1, front_port))
             .to_http(None)
             .expect("could not create listener config");
 
         let (mut command, channel) =
             Channel::generate(1000, 10000).expect("should create a channel");
-        let _jg = thread::spawn(move || {
-            setup_test_logger!();
-            start_http_worker(config, channel, 10, 16384).expect("could not start the http server");
-        });
 
-        let front = RequestHttpFrontend {
-            cluster_id: Some(String::from("cluster_1")),
-            address: SocketAddress::new_v4(127, 0, 0, 1, 1024),
-            hostname: String::from("localhost"),
-            path: PathRule::prefix(String::from("/")),
-            ..Default::default()
-        };
-        command
-            .write_message(&WorkerRequest {
-                id: String::from("ID_ABCD"),
-                content: RequestType::AddHttpFrontend(front).into(),
-            })
-            .unwrap();
-        let backend = Backend {
-            cluster_id: String::from("cluster_1"),
-            backend_id: String::from("cluster_1-0"),
-            address: SocketAddress::new_v4(127, 0, 0, 1, 1025).into(),
-            load_balancing_parameters: Some(LoadBalancingParams::default()),
-            sticky_id: None,
-            backup: None,
-        };
-        command
-            .write_message(&WorkerRequest {
-                id: String::from("ID_EFGH"),
-                content: RequestType::AddBackend(backend.to_add_backend()).into(),
-            })
-            .unwrap();
+        thread::scope(|s| {
+            let backend_handle = backend_server.clone();
+            let barrier_clone = barrier.to_owned();
+            s.spawn(move || {
+                setup_test_logger!();
+                start_server(&backend_handle, barrier_clone);
+            });
+            barrier.wait();
 
-        println!("test received: {:?}", command.read_message());
-        println!("test received: {:?}", command.read_message());
+            s.spawn(move || {
+                setup_test_logger!();
+                start_http_worker(config, channel, 10, 16384)
+                    .expect("could not start the http server");
+            });
 
-        let mut client = TcpStream::connect(("127.0.0.1", 1024)).expect("could not connect");
+            let front = RequestHttpFrontend {
+                cluster_id: Some("cluster_1".to_owned()),
+                address: SocketAddress::new_v4(127, 0, 0, 1, front_port),
+                hostname: "localhost".to_owned(),
+                path: PathRule::prefix("/".to_owned()),
+                ..Default::default()
+            };
+            command
+                .write_message(&WorkerRequest {
+                    id: "ID_ABCD".to_owned(),
+                    content: RequestType::AddHttpFrontend(front).into(),
+                })
+                .expect("could not send AddHttpFrontend");
+            let backend = Backend {
+                cluster_id: "cluster_1".to_owned(),
+                backend_id: "cluster_1-0".to_owned(),
+                address: SocketAddress::new_v4(127, 0, 0, 1, backend_port).into(),
+                load_balancing_parameters: Some(LoadBalancingParams::default()),
+                sticky_id: None,
+                backup: None,
+            };
+            command
+                .write_message(&WorkerRequest {
+                    id: "ID_EFGH".to_owned(),
+                    content: RequestType::AddBackend(backend.to_add_backend()).into(),
+                })
+                .expect("could not send AddBackend");
 
-        // 5 seconds of timeout
-        client.set_read_timeout(Some(Duration::new(1, 0))).unwrap();
-        let w = client
-            .write(&b"GET / HTTP/1.1\r\nHost: localhost:1024\r\nConnection: Close\r\n\r\n"[..]);
-        println!("http client write: {w:?}");
+            println!("test received: {:?}", command.read_message());
+            println!("test received: {:?}", command.read_message());
 
-        barrier.wait();
-        let mut buffer = [0; 4096];
-        let mut index = 0;
+            let mut client =
+                TcpStream::connect(("127.0.0.1", front_port)).expect("could not connect to sozu");
 
-        loop {
-            assert!(index <= 191);
-            if index == 191 {
-                break;
-            }
+            client
+                .set_read_timeout(Some(Duration::new(1, 0)))
+                .expect("could not set read timeout");
+            let request = format!(
+                "GET / HTTP/1.1\r\nHost: localhost:{front_port}\r\nConnection: Close\r\n\r\n"
+            );
+            let w = client.write(request.as_bytes());
+            println!("http client write: {w:?}");
 
-            let r = client.read(&mut buffer[index..]);
-            println!("http client read: {r:?}");
-            match r {
-                Err(e) => assert!(false, "client request should not fail. Error: {e:?}"),
-                Ok(sz) => {
-                    index += sz;
+            barrier.wait();
+            let mut buffer = [0; 4096];
+            let mut index = 0;
+
+            // tiny_http responds with exactly 191 bytes for a "hello world" body
+            // (headers + body). This is deterministic for a given tiny_http version.
+            let expected_len = 191;
+
+            loop {
+                assert!(index <= expected_len);
+                if index == expected_len {
+                    break;
+                }
+
+                let r = client.read(&mut buffer[index..]);
+                println!("http client read: {r:?}");
+                match r {
+                    Err(e) => panic!("client request should not fail. Error: {e:?}"),
+                    Ok(sz) => {
+                        index += sz;
+                    }
                 }
             }
-        }
-        println!(
-            "Response: {}",
-            str::from_utf8(&buffer[..index]).expect("could not make string from buffer")
-        );
+            println!(
+                "Response: {}",
+                str::from_utf8(&buffer[..index]).expect("could not make string from buffer")
+            );
+
+            // Gracefully stop the sozu worker so the scoped thread can join
+            command
+                .write_message(&WorkerRequest {
+                    id: "ID_STOP".to_owned(),
+                    content: RequestType::SoftStop(SoftStop {}).into(),
+                })
+                .expect("could not send SoftStop");
+            // Unblock the backend server so its thread can exit
+            backend_server.unblock();
+        });
     }
 
     #[test]
     fn keep_alive() {
         setup_test_logger!();
-        let barrier = Arc::new(Barrier::new(2));
-        start_server(1028, barrier.clone());
-        barrier.wait();
+        let front_port = crate::testing::provide_port();
+        let backend_server = Arc::new(
+            tiny_http::Server::http("127.0.0.1:0").expect("could not create tiny_http server"),
+        );
+        let backend_port = backend_server
+            .server_addr()
+            .to_ip()
+            .expect("tiny_http server should bind to IP address")
+            .port();
 
-        let config = ListenerBuilder::new_http(SocketAddress::new_v4(127, 0, 0, 1, 1031))
+        let barrier = Arc::new(Barrier::new(2));
+
+        let config = ListenerBuilder::new_http(SocketAddress::new_v4(127, 0, 0, 1, front_port))
             .to_http(None)
             .expect("could not create listener config");
 
         let (mut command, channel) =
             Channel::generate(1000, 10000).expect("should create a channel");
 
-        let _jg = thread::spawn(move || {
-            setup_test_logger!();
-            start_http_worker(config, channel, 10, 16384).expect("could not start the http server");
-        });
-
-        let front = RequestHttpFrontend {
-            address: SocketAddress::new_v4(127, 0, 0, 1, 1031),
-            hostname: String::from("localhost"),
-            path: PathRule::prefix(String::from("/")),
-            cluster_id: Some(String::from("cluster_1")),
-            ..Default::default()
-        };
-        command
-            .write_message(&WorkerRequest {
-                id: String::from("ID_ABCD"),
-                content: RequestType::AddHttpFrontend(front).into(),
-            })
-            .unwrap();
-        let backend = Backend {
-            address: SocketAddress::new_v4(127, 0, 0, 1, 1028).into(),
-            backend_id: String::from("cluster_1-0"),
-            backup: None,
-            cluster_id: String::from("cluster_1"),
-            load_balancing_parameters: Some(LoadBalancingParams::default()),
-            sticky_id: None,
-        };
-        command
-            .write_message(&WorkerRequest {
-                id: String::from("ID_EFGH"),
-                content: RequestType::AddBackend(backend.to_add_backend()).into(),
-            })
-            .unwrap();
-
-        println!("test received: {:?}", command.read_message());
-        println!("test received: {:?}", command.read_message());
-
-        let mut client = TcpStream::connect(("127.0.0.1", 1031)).expect("could not connect");
-        // 5 seconds of timeout
-        client.set_read_timeout(Some(Duration::new(5, 0))).unwrap();
-
-        let w = client
-            .write(&b"GET / HTTP/1.1\r\nHost: localhost:1031\r\n\r\n"[..])
-            .unwrap();
-        println!("http client write: {w:?}");
-        barrier.wait();
-
-        let mut buffer = [0; 4096];
-        let mut index = 0;
-
-        loop {
-            assert!(index <= 191);
-            if index == 191 {
-                break;
-            }
-
-            let r = client.read(&mut buffer[index..]);
-            println!("http client read: {r:?}");
-            match r {
-                Err(e) => assert!(false, "client request should not fail. Error: {e:?}"),
-                Ok(sz) => {
-                    index += sz;
-                }
-            }
-        }
-
-        println!(
-            "Response: {}",
-            str::from_utf8(&buffer[..index]).expect("could not make string from buffer")
-        );
-
-        println!("first request ended, will send second one");
-        let w2 = client.write(&b"GET / HTTP/1.1\r\nHost: localhost:1031\r\n\r\n"[..]);
-        println!("http client write: {w2:?}");
-        barrier.wait();
-
-        let mut buffer2 = [0; 4096];
-        let mut index = 0;
-
-        loop {
-            assert!(index <= 191);
-            if index == 191 {
-                break;
-            }
-
-            let r2 = client.read(&mut buffer2[index..]);
-            println!("http client read: {r2:?}");
-            match r2 {
-                Err(e) => assert!(false, "client request should not fail. Error: {e:?}"),
-                Ok(sz) => {
-                    index += sz;
-                }
-            }
-        }
-        println!(
-            "Response: {}",
-            str::from_utf8(&buffer2[..index]).expect("could not make string from buffer")
-        );
-    }
-
-    use self::tiny_http::{Response, Server};
-
-    fn start_server(port: u16, barrier: Arc<Barrier>) {
-        thread::spawn(move || {
-            setup_test_logger!();
-            let server =
-                Server::http(&format!("127.0.0.1:{port}")).expect("could not create server");
-            info!("starting web server in port {}", port);
+        thread::scope(|s| {
+            let backend_handle = backend_server.clone();
+            let barrier_clone = barrier.to_owned();
+            s.spawn(move || {
+                setup_test_logger!();
+                start_server(&backend_handle, barrier_clone);
+            });
             barrier.wait();
 
-            for request in server.incoming_requests() {
-                info!(
-                    "backend web server got request -> method: {:?}, url: {:?}, headers: {:?}",
-                    request.method(),
-                    request.url(),
-                    request.headers()
-                );
+            s.spawn(move || {
+                setup_test_logger!();
+                start_http_worker(config, channel, 10, 16384)
+                    .expect("could not start the http server");
+            });
 
-                let response = Response::from_string("hello world");
-                request.respond(response).unwrap();
-                info!("backend web server sent response");
-                barrier.wait();
-                info!("server session stopped");
+            let front = RequestHttpFrontend {
+                address: SocketAddress::new_v4(127, 0, 0, 1, front_port),
+                hostname: "localhost".to_owned(),
+                path: PathRule::prefix("/".to_owned()),
+                cluster_id: Some("cluster_1".to_owned()),
+                ..Default::default()
+            };
+            command
+                .write_message(&WorkerRequest {
+                    id: "ID_ABCD".to_owned(),
+                    content: RequestType::AddHttpFrontend(front).into(),
+                })
+                .expect("could not send AddHttpFrontend");
+            let backend = Backend {
+                address: SocketAddress::new_v4(127, 0, 0, 1, backend_port).into(),
+                backend_id: "cluster_1-0".to_owned(),
+                backup: None,
+                cluster_id: "cluster_1".to_owned(),
+                load_balancing_parameters: Some(LoadBalancingParams::default()),
+                sticky_id: None,
+            };
+            command
+                .write_message(&WorkerRequest {
+                    id: "ID_EFGH".to_owned(),
+                    content: RequestType::AddBackend(backend.to_add_backend()).into(),
+                })
+                .expect("could not send AddBackend");
+
+            println!("test received: {:?}", command.read_message());
+            println!("test received: {:?}", command.read_message());
+
+            let mut client =
+                TcpStream::connect(("127.0.0.1", front_port)).expect("could not connect to sozu");
+            client
+                .set_read_timeout(Some(Duration::new(5, 0)))
+                .expect("could not set read timeout");
+
+            // tiny_http responds with exactly 191 bytes for a "hello world" body
+            // (headers + body). This is deterministic for a given tiny_http version.
+            let expected_len = 191;
+
+            let request = format!("GET / HTTP/1.1\r\nHost: localhost:{front_port}\r\n\r\n");
+            let w = client
+                .write(request.as_bytes())
+                .expect("could not write first request");
+            println!("http client write: {w:?}");
+            barrier.wait();
+
+            let mut buffer = [0; 4096];
+            let mut index = 0;
+
+            loop {
+                assert!(index <= expected_len);
+                if index == expected_len {
+                    break;
+                }
+
+                let r = client.read(&mut buffer[index..]);
+                println!("http client read: {r:?}");
+                match r {
+                    Err(e) => panic!("client request should not fail. Error: {e:?}"),
+                    Ok(sz) => {
+                        index += sz;
+                    }
+                }
             }
 
-            println!("server on port {port} closed");
+            println!(
+                "Response: {}",
+                str::from_utf8(&buffer[..index]).expect("could not make string from buffer")
+            );
+
+            println!("first request ended, will send second one");
+            let request2 = format!("GET / HTTP/1.1\r\nHost: localhost:{front_port}\r\n\r\n");
+            let w2 = client.write(request2.as_bytes());
+            println!("http client write: {w2:?}");
+            barrier.wait();
+
+            let mut buffer2 = [0; 4096];
+            let mut index = 0;
+
+            loop {
+                assert!(index <= expected_len);
+                if index == expected_len {
+                    break;
+                }
+
+                let r2 = client.read(&mut buffer2[index..]);
+                println!("http client read: {r2:?}");
+                match r2 {
+                    Err(e) => panic!("client request should not fail. Error: {e:?}"),
+                    Ok(sz) => {
+                        index += sz;
+                    }
+                }
+            }
+            println!(
+                "Response: {}",
+                str::from_utf8(&buffer2[..index]).expect("could not make string from buffer")
+            );
+
+            // Gracefully stop the sozu worker so the scoped thread can join
+            command
+                .write_message(&WorkerRequest {
+                    id: "ID_STOP".to_owned(),
+                    content: RequestType::SoftStop(SoftStop {}).into(),
+                })
+                .expect("could not send SoftStop");
+            // Unblock the backend server so its thread can exit
+            backend_server.unblock();
         });
+    }
+
+    use self::tiny_http::Response;
+
+    fn start_server(server: &tiny_http::Server, barrier: Arc<Barrier>) {
+        let addr = server.server_addr();
+        info!("starting web server on {:?}", addr);
+        barrier.wait();
+
+        for request in server.incoming_requests() {
+            info!(
+                "backend web server got request -> method: {:?}, url: {:?}, headers: {:?}",
+                request.method(),
+                request.url(),
+                request.headers()
+            );
+
+            let response = Response::from_string("hello world");
+            request
+                .respond(response)
+                .expect("could not respond to request");
+            info!("backend web server sent response");
+            barrier.wait();
+            info!("server session stopped");
+        }
+
+        println!("server on {addr:?} closed");
     }
 
     #[test]
