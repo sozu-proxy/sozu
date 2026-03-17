@@ -9,6 +9,7 @@ use crate::protocol::{
     http::parser::compare_no_case,
     mux::{
         StreamId,
+        h2::MAX_HEADER_LIST_SIZE,
         parser::{self, FrameHeader, FrameType, H2Error},
         pkawa::is_connection_specific_header,
         serializer::{gen_frame_header, gen_rst_stream},
@@ -24,6 +25,22 @@ pub struct H2BlockConverter<'a> {
     pub scheme: &'static [u8],
     /// Reusable buffer for lowercasing header keys, avoiding per-header allocation.
     pub lowercase_buf: Vec<u8>,
+}
+
+impl H2BlockConverter<'_> {
+    /// Check whether the HPACK output buffer has exceeded the maximum header
+    /// list size. Returns `false` (stop encoding) if the limit is reached.
+    fn check_header_capacity(&self) -> bool {
+        if self.out.len() > MAX_HEADER_LIST_SIZE as usize {
+            error!(
+                "HPACK output buffer ({} bytes) exceeds MAX_HEADER_LIST_SIZE ({}), stopping header encoding",
+                self.out.len(),
+                MAX_HEADER_LIST_SIZE
+            );
+            return false;
+        }
+        true
+    }
 }
 
 impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
@@ -72,11 +89,17 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                         error!("HPACK encoding of :method pseudo-header failed: {:?}", e);
                         return false;
                     }
+                    if !self.check_header_capacity() {
+                        return false;
+                    }
                     if let Err(e) = self
                         .encoder
                         .encode_header_into((b":authority", authority.data(buffer)), &mut self.out)
                     {
                         error!("HPACK encoding of :authority pseudo-header failed: {:?}", e);
+                        return false;
+                    }
+                    if !self.check_header_capacity() {
                         return false;
                     }
                     if let Err(e) = self
@@ -86,11 +109,17 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                         error!("HPACK encoding of :path pseudo-header failed: {:?}", e);
                         return false;
                     }
+                    if !self.check_header_capacity() {
+                        return false;
+                    }
                     if let Err(e) = self
                         .encoder
                         .encode_header_into((b":scheme", self.scheme), &mut self.out)
                     {
                         error!("HPACK encoding of :scheme pseudo-header failed: {:?}", e);
+                        return false;
+                    }
+                    if !self.check_header_capacity() {
                         return false;
                     }
                 }
@@ -100,6 +129,9 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                         .encode_header_into((b":status", status.data(buffer)), &mut self.out)
                     {
                         error!("HPACK encoding of :status pseudo-header failed: {:?}", e);
+                        return false;
+                    }
+                    if !self.check_header_capacity() {
                         return false;
                     }
                 }
@@ -124,6 +156,9 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                         .encode_header_into((b"cookie", &cookie), &mut self.out)
                     {
                         error!("HPACK encoding of cookie header failed: {:?}", e);
+                        return false;
+                    }
+                    if !self.check_header_capacity() {
                         return false;
                     }
                 }
@@ -159,6 +194,9 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                     .encode_header_into((&self.lowercase_buf, val.data(buffer)), &mut self.out)
                 {
                     error!("HPACK encoding of header failed: {:?}", e);
+                    return false;
+                }
+                if !self.check_header_capacity() {
                     return false;
                 }
             }

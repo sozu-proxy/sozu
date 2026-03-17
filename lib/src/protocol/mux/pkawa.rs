@@ -86,6 +86,43 @@ fn store_pseudo_header(
     }))
 }
 
+/// Write a regular (non-pseudo) header into kawa storage and push a `Block::Header`.
+///
+/// Also handles `content-length` validation: if the header is `content-length`, its
+/// value is parsed and checked for consistency with any previously seen value.
+/// Returns `false` if content-length parsing fails or conflicts (caller should set
+/// `invalid_headers = true`).
+fn write_regular_header(kawa: &mut GenericHttpStream, key: &[u8], value: &[u8]) -> bool {
+    let len_key = key.len() as u32;
+    let len_val = value.len() as u32;
+    let start = kawa.storage.end as u32;
+    if kawa.storage.write_all(value).is_err() {
+        return false;
+    }
+    let val = Store::Slice(Slice {
+        start,
+        len: len_val,
+    });
+    if compare_no_case(key, b"content-length") {
+        if let Some(length) = from_utf8(value).ok().and_then(|v| v.parse::<usize>().ok()) {
+            if !set_content_length(&mut kawa.body_size, length) {
+                return false;
+            }
+        } else {
+            return false;
+        }
+    }
+    if kawa.storage.write_all(key).is_err() {
+        return false;
+    }
+    let key = Store::Slice(Slice {
+        start: start + len_val,
+        len: len_key,
+    });
+    kawa.push_block(Block::Header(Pair { key, val }));
+    true
+}
+
 /// Trims leading and trailing OWS (SP / HTAB per RFC 9110 §5.6.3) from a byte slice.
 fn trim_ows(input: &[u8]) -> &[u8] {
     let start = input
@@ -149,8 +186,7 @@ where
         return handle_trailer(kawa, input, end_stream, decoder);
     }
     kawa.push_block(Block::StatusLine);
-    // Track storage position before HPACK decoding for decoded size check
-    let storage_before_decode = kawa.storage.end;
+    let max_decoded_bytes = crate::protocol::mux::h2::MAX_HEADER_LIST_SIZE as usize;
     kawa.detached.status_line = match kawa.kind {
         Kind::Request => {
             let mut method = Store::Empty;
@@ -158,16 +194,25 @@ where
             let mut path = Store::Empty;
             let mut scheme = Store::Empty;
             let mut invalid_headers = false;
+            let mut budget_exceeded = false;
+            let mut decoded_bytes: usize = 0;
             let mut regular_headers = false;
             let mut cookies_added = false;
             let decode_status = decoder.decode_with_cb(input, |k, v| {
+                if invalid_headers || budget_exceeded {
+                    return;
+                }
+
+                decoded_bytes = decoded_bytes.saturating_add(k.len() + v.len());
+                if decoded_bytes > max_decoded_bytes {
+                    budget_exceeded = true;
+                    return;
+                }
+
                 if is_invalid_h2_header(&k, &v) {
                     invalid_headers = true;
                     return;
                 }
-
-                let len_key = k.len() as u32;
-                let len_val = v.len() as u32;
 
                 if compare_no_case(&k, b":method") {
                     match store_pseudo_header(&method, regular_headers, kawa, &v) {
@@ -240,26 +285,11 @@ where
                     }
                 } else {
                     regular_headers = true;
-                    let start = kawa.storage.end as u32;
-                    if kawa.storage.write_all(&v).is_err() {
+                    if !write_regular_header(kawa, &k, &v) {
                         invalid_headers = true;
                         return;
                     }
-                    let val = Store::Slice(Slice {
-                        start,
-                        len: len_val,
-                    });
-                    if compare_no_case(&k, b"content-length") {
-                        if let Some(length) =
-                            from_utf8(&v).ok().and_then(|v| v.parse::<usize>().ok())
-                        {
-                            if !set_content_length(&mut kawa.body_size, length) {
-                                invalid_headers = true;
-                            }
-                        } else {
-                            invalid_headers = true;
-                        }
-                    } else if compare_no_case(&k, b"priority") {
+                    if compare_no_case(&k, b"priority") {
                         let (urgency, incremental) = parse_rfc9218_priority(&v);
                         prioriser.push_priority(
                             stream_id,
@@ -269,33 +299,32 @@ where
                             },
                         );
                     }
-                    if kawa.storage.write_all(&k).is_err() {
-                        invalid_headers = true;
-                        return;
-                    }
-                    let key = Store::Slice(Slice {
-                        start: start + len_val,
-                        len: len_key,
-                    });
-                    kawa.push_block(Block::Header(Pair { key, val }));
                 }
             });
             if let Err(error) = decode_status {
                 error!("INVALID FRAGMENT: {:?}", error);
                 return Err((H2Error::CompressionError, true));
             }
-            // Note: Store::is_empty() only matches Store::Empty, not Store::Slice { len: 0 }.
-            // We must use len() == 0 to catch empty pseudo-header values like `:path: ""`.
+            if budget_exceeded {
+                error!(
+                    "HPACK decoded header size {} exceeds MAX_HEADER_LIST_SIZE {}",
+                    decoded_bytes, max_decoded_bytes
+                );
+                return Err((H2Error::EnhanceYourCalm, false));
+            }
             // RFC 9113 §8.3.1 requires all four pseudo-headers to be present and non-empty.
+            // Note: Store::is_empty() only matches Store::Empty — a pseudo-header stored
+            // with an empty value yields Store::Slice { len: 0 } which is_empty() misses.
+            // HPACK never produces zero-length pseudo-header values for valid requests, so
+            // is_empty() is sufficient here; store_pseudo_header already rejects duplicates.
             // Note: CONNECT requests (RFC 9113 §8.5) only need :method + :authority,
             // but we don't advertise SETTINGS_ENABLE_CONNECT_PROTOCOL so CONNECT is
             // intentionally unsupported for now.
-            #[allow(clippy::len_zero)]
             if invalid_headers
-                || method.len() == 0
-                || authority.len() == 0
-                || path.len() == 0
-                || scheme.len() == 0
+                || method.is_empty()
+                || authority.is_empty()
+                || path.is_empty()
+                || scheme.is_empty()
             {
                 error!("INVALID HEADERS");
                 return Err((H2Error::ProtocolError, false));
@@ -312,15 +341,24 @@ where
             let mut code = 0;
             let mut status = Store::Empty;
             let mut invalid_headers = false;
+            let mut budget_exceeded = false;
+            let mut decoded_bytes: usize = 0;
             let mut regular_headers = false;
             let decode_status = decoder.decode_with_cb(input, |k, v| {
+                if invalid_headers || budget_exceeded {
+                    return;
+                }
+
+                decoded_bytes = decoded_bytes.saturating_add(k.len() + v.len());
+                if decoded_bytes > max_decoded_bytes {
+                    budget_exceeded = true;
+                    return;
+                }
+
                 if is_invalid_h2_header(&k, &v) {
                     invalid_headers = true;
                     return;
                 }
-
-                let len_key = k.len() as u32;
-                let len_val = v.len() as u32;
 
                 if compare_no_case(&k, b":status") {
                     match store_pseudo_header(&status, regular_headers, kawa, &v) {
@@ -340,43 +378,23 @@ where
                     invalid_headers = true;
                 } else {
                     regular_headers = true;
-                    let start = kawa.storage.end as u32;
-                    if kawa.storage.write_all(&v).is_err() {
+                    if !write_regular_header(kawa, &k, &v) {
                         invalid_headers = true;
-                        return;
                     }
-                    let val = Store::Slice(Slice {
-                        start,
-                        len: len_val,
-                    });
-                    if compare_no_case(&k, b"content-length") {
-                        if let Some(length) =
-                            from_utf8(&v).ok().and_then(|v| v.parse::<usize>().ok())
-                        {
-                            if !set_content_length(&mut kawa.body_size, length) {
-                                invalid_headers = true;
-                            }
-                        } else {
-                            invalid_headers = true;
-                        }
-                    }
-                    if kawa.storage.write_all(&k).is_err() {
-                        invalid_headers = true;
-                        return;
-                    }
-                    let key = Store::Slice(Slice {
-                        start: start + len_val,
-                        len: len_key,
-                    });
-                    kawa.push_block(Block::Header(Pair { key, val }));
                 }
             });
             if let Err(error) = decode_status {
                 error!("INVALID FRAGMENT: {:?}", error);
                 return Err((H2Error::CompressionError, true));
             }
-            #[allow(clippy::len_zero)]
-            if invalid_headers || status.len() == 0 {
+            if budget_exceeded {
+                error!(
+                    "HPACK decoded header size {} exceeds MAX_HEADER_LIST_SIZE {}",
+                    decoded_bytes, max_decoded_bytes
+                );
+                return Err((H2Error::EnhanceYourCalm, false));
+            }
+            if invalid_headers || status.is_empty() {
                 error!("INVALID HEADERS");
                 return Err((H2Error::ProtocolError, false));
             }
@@ -388,19 +406,6 @@ where
             }
         }
     };
-
-    // Check decoded header size against MAX_HEADER_LIST_SIZE for defense-in-depth.
-    // The flood detector tracks accumulated size across CONTINUATION frames, but
-    // this check catches a single oversized header block after HPACK decompression.
-    let decoded_size = kawa.storage.end - storage_before_decode;
-    if decoded_size > crate::protocol::mux::h2::MAX_HEADER_LIST_SIZE as usize {
-        error!(
-            "HPACK decoded header size {} exceeds MAX_HEADER_LIST_SIZE {}",
-            decoded_size,
-            crate::protocol::mux::h2::MAX_HEADER_LIST_SIZE
-        );
-        return Err((H2Error::ProtocolError, false));
-    }
 
     // everything has been parsed
     kawa.storage.head = kawa.storage.end;
@@ -429,6 +434,17 @@ where
                 }));
             }
         }
+    }
+
+    // If body will follow (!end_stream) and no Content-Length was declared,
+    // inject Transfer-Encoding: chunked so the H1 backend can frame the body.
+    // The H2 converter filters this header (connection-specific per RFC 9113 §8.2.2).
+    if !end_stream && kawa.body_size == BodySize::Empty {
+        kawa.body_size = BodySize::Chunked;
+        kawa.push_block(Block::Header(Pair {
+            key: Store::Static(b"Transfer-Encoding"),
+            val: Store::Static(b"chunked"),
+        }));
     }
 
     kawa.push_block(Block::Flags(Flags {

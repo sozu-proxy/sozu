@@ -3537,6 +3537,198 @@ fn test_h2_to_h1_chunked_encoding() {
     );
 }
 
+// ---- H2-to-H1 streaming body (no Content-Length) ----
+
+/// A backend that validates Transfer-Encoding: chunked and captures body content.
+/// Used to verify that sozu correctly injects chunked framing when forwarding
+/// H2 requests without Content-Length to H1 backends.
+struct ChunkedBodyValidationBackend {
+    stop: Arc<AtomicBool>,
+    had_transfer_encoding: Arc<AtomicBool>,
+    body_received: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl ChunkedBodyValidationBackend {
+    fn start(address: SocketAddr, needle: &'static [u8]) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let had_transfer_encoding = Arc::new(AtomicBool::new(false));
+        let body_received = Arc::new(AtomicBool::new(false));
+        let stop_clone = stop.to_owned();
+        let te_flag = had_transfer_encoding.to_owned();
+        let body_flag = body_received.to_owned();
+
+        let thread = thread::spawn(move || {
+            let listener = std::net::TcpListener::bind(address)
+                .expect("could not bind chunked-validation backend");
+            listener
+                .set_nonblocking(true)
+                .expect("could not set nonblocking");
+
+            loop {
+                if stop_clone.load(Ordering::Relaxed) {
+                    break;
+                }
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_read_timeout(Some(Duration::from_secs(3))).ok();
+                        stream.set_write_timeout(Some(Duration::from_secs(2))).ok();
+
+                        // Read all available data (headers + chunked body)
+                        let mut all_data = Vec::new();
+                        let mut buf = [0u8; 8192];
+                        loop {
+                            match stream.read(&mut buf) {
+                                Ok(0) => break,
+                                Ok(n) => all_data.extend_from_slice(&buf[..n]),
+                                Err(_) => break,
+                            }
+                        }
+
+                        let request = String::from_utf8_lossy(&all_data);
+                        println!(
+                            "ChunkedBodyValidation received {} bytes:\n{request}",
+                            all_data.len()
+                        );
+
+                        if request.contains("transfer-encoding: chunked")
+                            || request.contains("Transfer-Encoding: chunked")
+                        {
+                            te_flag.store(true, Ordering::Relaxed);
+                        }
+
+                        // Check if body payload content is present in raw data
+                        if all_data.windows(needle.len()).any(|w| w == needle) {
+                            body_flag.store(true, Ordering::Relaxed);
+                        }
+
+                        let response = "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nchunked-ok";
+                        let _ = stream.write_all(response.as_bytes());
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => {}
+                }
+            }
+        });
+
+        Self {
+            stop,
+            had_transfer_encoding,
+            body_received,
+            thread: Some(thread),
+        }
+    }
+
+    fn had_transfer_encoding(&self) -> bool {
+        self.had_transfer_encoding.load(Ordering::Relaxed)
+    }
+
+    fn body_received(&self) -> bool {
+        self.body_received.load(Ordering::Relaxed)
+    }
+
+    fn stop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Send an H2 POST request WITHOUT Content-Length (streaming body) through sozu
+/// to an H1 backend. Verify that sozu injects Transfer-Encoding: chunked and
+/// the body arrives correctly. This reproduces the Gotenberg bug where H2 clients
+/// piping from stdin would result in zero-length bodies at the H1 backend.
+fn try_h2_to_h1_streaming_body_no_content_length() -> State {
+    use crate::tests::h2_utils::*;
+
+    let (mut worker, front_port, _front_address) = setup_h2_listener_only("H2-STREAMING-NO-CL");
+
+    let back_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address,
+        None,
+    )));
+    worker.read_to_last();
+
+    // Body payload the backend must see
+    const BODY_NEEDLE: &[u8] = b"streaming-body-test-payload";
+    let mut backend = ChunkedBodyValidationBackend::start(back_address, BODY_NEEDLE);
+
+    // Open raw H2 connection
+    let addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(addr);
+    let _settings = h2_handshake(&mut tls);
+
+    // HPACK-encoded HEADERS: POST /api/stream, :scheme https, :authority localhost
+    // Deliberately NO content-length → triggers the chunked injection fix.
+    let header_block = vec![
+        0x83, // :method POST (static table index 3)
+        0x44, // :path (literal+indexing, name index 4)
+        0x0b, // value length = 11
+        b'/', b'a', b'p', b'i', b'/', b's', b't', b'r', b'e', b'a', b'm',
+        0x87, // :scheme https (static table index 7)
+        0x41, // :authority (literal+indexing, name index 1)
+        0x09, // value length = 9
+        b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't',
+    ];
+
+    // Send HEADERS without END_STREAM (body follows)
+    let headers = H2Frame::headers(1, header_block, true, false);
+    tls.write_all(&headers.encode()).unwrap();
+
+    // Send DATA with the body payload and END_STREAM
+    let data = H2Frame::data(1, BODY_NEEDLE.to_vec(), true);
+    tls.write_all(&data.encode()).unwrap();
+    tls.flush().unwrap();
+
+    // Collect response frames
+    let frames = collect_response_frames(&mut tls, 200, 10, 300);
+    log_frames("H2-STREAMING-NO-CL", &frames);
+
+    // Check we got a HEADERS response (200 OK) and not a GOAWAY/RST_STREAM
+    let got_headers_response = contains_headers_response(&frames);
+    let got_rejection = rejected_with_goaway_or_rst(&frames);
+
+    // Check backend validations
+    let te_ok = backend.had_transfer_encoding();
+    let body_ok = backend.body_received();
+
+    println!(
+        "H2-STREAMING-NO-CL: headers_resp={got_headers_response}, rejected={got_rejection}, \
+         transfer_encoding={te_ok}, body_received={body_ok}"
+    );
+
+    drop(tls);
+    thread::sleep(Duration::from_millis(200));
+
+    worker.soft_stop();
+    let success = worker.wait_for_server_stop();
+    backend.stop();
+
+    if success && got_headers_response && !got_rejection && te_ok && body_ok {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_to_h1_streaming_body_no_content_length() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "H2-to-H1: POST without Content-Length injects Transfer-Encoding: chunked",
+            try_h2_to_h1_streaming_body_no_content_length
+        ),
+        State::Success
+    );
+}
+
 // ---- H2-to-H1 GET with body ----
 
 /// RFC 9110 allows GET requests to carry a body. Send an H2 GET request with

@@ -91,16 +91,8 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         let (size, status) = self.socket.socket_read(kawa.storage.space());
         context.debug.push(DebugEvent::StreamEvent(0, size));
         kawa.storage.fill(size);
-        match self.position {
-            Position::Client(..) => {
-                count!("back_bytes_in", size as i64);
-                parts.metrics.backend_bin += size;
-            }
-            Position::Server => {
-                count!("bytes_in", size as i64);
-                parts.metrics.bin += size;
-            }
-        }
+        self.position.count_bytes_in_counter(size);
+        self.position.count_bytes_in(parts.metrics, size);
         if update_readiness_after_read(size, status, &mut self.readiness) {
             // size=0: the socket returned EOF (Closed) or WouldBlock.
             // For a close-delimited backend response (no Content-Length, no
@@ -280,16 +272,8 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         let (size, status) = self.socket.socket_write_vectored(&bufs);
         context.debug.push(DebugEvent::StreamEvent(1, size));
         kawa.consume(size);
-        match self.position {
-            Position::Client(..) => {
-                count!("back_bytes_out", size as i64);
-                parts.metrics.backend_bout += size;
-            }
-            Position::Server => {
-                count!("bytes_out", size as i64);
-                parts.metrics.bout += size;
-            }
-        }
+        self.position.count_bytes_out_counter(size);
+        self.position.count_bytes_out(parts.metrics, size);
         if update_readiness_after_write(size, status, &mut self.readiness)
             || self.socket.socket_wants_write()
         {
