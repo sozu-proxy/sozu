@@ -107,6 +107,28 @@ impl Default for H2FloodConfig {
     }
 }
 
+impl H2FloodConfig {
+    /// Create a validated config, clamping all thresholds to at least 1.
+    /// Zero thresholds would cause immediate flood detection on any frame.
+    pub fn new(
+        max_rst_stream_per_window: u32,
+        max_ping_per_window: u32,
+        max_settings_per_window: u32,
+        max_empty_data_per_window: u32,
+        max_continuation_frames: u32,
+        max_glitch_count: u32,
+    ) -> Self {
+        Self {
+            max_rst_stream_per_window: max_rst_stream_per_window.max(1),
+            max_ping_per_window: max_ping_per_window.max(1),
+            max_settings_per_window: max_settings_per_window.max(1),
+            max_empty_data_per_window: max_empty_data_per_window.max(1),
+            max_continuation_frames: max_continuation_frames.max(1),
+            max_glitch_count: max_glitch_count.max(1),
+        }
+    }
+}
+
 /// Maximum pending WINDOW_UPDATE entries before forcing a flush.
 /// Sized to cover connection-level + per-stream entries with headroom under load.
 const MAX_PENDING_WINDOW_UPDATES: usize = 1 + DEFAULT_MAX_CONCURRENT_STREAMS as usize * 4;
@@ -156,8 +178,13 @@ fn distribute_overhead(
     stream_bytes: (usize, usize),
     total_bytes: (usize, usize),
     active_streams: usize,
+    is_last_stream: bool,
 ) {
-    let share_in = if total_bytes.0 > 0 {
+    let share_in = if is_last_stream {
+        // Last stream gets all remaining overhead to avoid losing remainder bytes
+        // from integer division across earlier streams.
+        *overhead_bin
+    } else if total_bytes.0 > 0 {
         // Clamp to remaining overhead — integer division rounding across multiple
         // streams can cause accumulated shares to exceed the total.
         (*overhead_bin * stream_bytes.0 / total_bytes.0).min(*overhead_bin)
@@ -165,7 +192,9 @@ fn distribute_overhead(
         // No stream has transferred any inbound bytes — fall back to even split.
         *overhead_bin / active_streams.max(1)
     };
-    let share_out = if total_bytes.1 > 0 {
+    let share_out = if is_last_stream {
+        *overhead_bout
+    } else if total_bytes.1 > 0 {
         (*overhead_bout * stream_bytes.1 / total_bytes.1).min(*overhead_bout)
     } else {
         // No stream has transferred any outbound bytes — fall back to even split.
@@ -245,54 +274,43 @@ impl H2FloodDetector {
     pub fn check_flood(&mut self) -> Option<H2Error> {
         self.maybe_reset_window();
 
-        if self.rst_stream_count > self.config.max_rst_stream_per_window {
-            warn!(
-                "H2 flood detected: RST_STREAM count {} exceeds threshold {}",
-                self.rst_stream_count, self.config.max_rst_stream_per_window
-            );
-            return Some(H2Error::EnhanceYourCalm);
-        }
-        if self.ping_count > self.config.max_ping_per_window {
-            warn!(
-                "H2 flood detected: PING count {} exceeds threshold {}",
-                self.ping_count, self.config.max_ping_per_window
-            );
-            return Some(H2Error::EnhanceYourCalm);
-        }
-        if self.settings_count > self.config.max_settings_per_window {
-            warn!(
-                "H2 flood detected: SETTINGS count {} exceeds threshold {}",
-                self.settings_count, self.config.max_settings_per_window
-            );
-            return Some(H2Error::EnhanceYourCalm);
-        }
-        if self.empty_data_count > self.config.max_empty_data_per_window {
-            warn!(
-                "H2 flood detected: empty DATA count {} exceeds threshold {}",
-                self.empty_data_count, self.config.max_empty_data_per_window
-            );
-            return Some(H2Error::EnhanceYourCalm);
-        }
-        if self.continuation_count > self.config.max_continuation_frames {
-            warn!(
-                "H2 flood detected: CONTINUATION count {} exceeds threshold {}",
-                self.continuation_count, self.config.max_continuation_frames
-            );
-            return Some(H2Error::EnhanceYourCalm);
-        }
-        if self.accumulated_header_size > MAX_HEADER_LIST_SIZE {
-            warn!(
-                "H2 flood detected: accumulated header size {} exceeds threshold {}",
-                self.accumulated_header_size, MAX_HEADER_LIST_SIZE
-            );
-            return Some(H2Error::EnhanceYourCalm);
-        }
-        if self.glitch_count > self.config.max_glitch_count {
-            warn!(
-                "H2 flood detected: glitch count {} exceeds threshold {}",
-                self.glitch_count, self.config.max_glitch_count
-            );
-            return Some(H2Error::EnhanceYourCalm);
+        let checks: &[(&str, u32, u32)] = &[
+            (
+                "RST_STREAM",
+                self.rst_stream_count,
+                self.config.max_rst_stream_per_window,
+            ),
+            ("PING", self.ping_count, self.config.max_ping_per_window),
+            (
+                "SETTINGS",
+                self.settings_count,
+                self.config.max_settings_per_window,
+            ),
+            (
+                "empty DATA",
+                self.empty_data_count,
+                self.config.max_empty_data_per_window,
+            ),
+            (
+                "CONTINUATION",
+                self.continuation_count,
+                self.config.max_continuation_frames,
+            ),
+            (
+                "accumulated header size",
+                self.accumulated_header_size,
+                MAX_HEADER_LIST_SIZE,
+            ),
+            ("glitch", self.glitch_count, self.config.max_glitch_count),
+        ];
+        for &(name, count, threshold) in checks {
+            if count > threshold {
+                warn!(
+                    "H2 flood detected: {} count {} exceeds threshold {}",
+                    name, count, threshold
+                );
+                return Some(H2Error::EnhanceYourCalm);
+            }
         }
         None
     }
@@ -491,6 +509,9 @@ pub struct ConnectionH2<Front: SocketHandler> {
     /// Used to detect sustained misbehavior even when writable() drains the
     /// pending queue between readable() calls.
     pub total_rst_streams_queued: usize,
+    /// Reusable buffer for priority-sorted stream IDs in write_streams().
+    /// Cleared and reused each call to avoid per-frame allocation.
+    priorities_buf: Vec<StreamId>,
 }
 impl<Front: SocketHandler> std::fmt::Debug for ConnectionH2<Front> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -579,6 +600,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             pending_rst_streams: Vec::new(),
             rst_sent: std::collections::HashSet::new(),
             total_rst_streams_queued: 0,
+            priorities_buf: Vec::new(),
         })
     }
 
@@ -637,7 +659,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 } else {
                     if header.frame_type == FrameType::Headers
                         && self.position.is_server()
-                        && stream_id % 2 == 1
+                        && stream_id & 1 == 1
                         && stream_id >= self.last_stream_id
                     {
                         if self.streams.len()
@@ -648,21 +670,17 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                                 self.local_settings.settings_max_concurrent_streams,
                                 self.streams.len()
                             );
-                            // RFC 9113 §5.1.2: refuse with RST_STREAM, not GOAWAY.
-                            // Queue the RST_STREAM for the writable path to send
-                            // (can't write to kawa.storage here because we also
-                            // need to discard the HEADERS payload through it).
-                            self.pending_rst_streams
-                                .push((stream_id, H2Error::RefusedStream));
-                            self.total_rst_streams_queued += 1;
-                            self.readiness.interest.insert(Ready::WRITABLE);
-                            // Discard the HEADERS payload before reading the
-                            // next frame — otherwise the HPACK bytes would be
-                            // misinterpreted as a frame header.
-                            self.state = H2State::Discard;
-                            self.expect_read =
-                                Some((H2StreamId::Zero, header.payload_len as usize));
-                            return MuxResult::Continue;
+                            // RFC 9113 §6.8: update highest_peer_stream_id BEFORE
+                            // queueing RST_STREAM so GOAWAY reports the correct
+                            // last_stream_id if the connection closes later.
+                            if stream_id > self.highest_peer_stream_id {
+                                self.highest_peer_stream_id = stream_id;
+                            }
+                            return self.refuse_stream_and_discard(
+                                stream_id,
+                                H2Error::RefusedStream,
+                                header.payload_len,
+                            );
                         }
                         match self.create_stream(stream_id, context) {
                             Some(_) => {}
@@ -674,16 +692,17 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                                     "Could not create stream {}: buffer pool exhausted",
                                     stream_id
                                 );
-                                self.pending_rst_streams
-                                    .push((stream_id, H2Error::RefusedStream));
-                                self.total_rst_streams_queued += 1;
-                                self.readiness.interest.insert(Ready::WRITABLE);
-                                // Discard the HEADERS payload (same as
-                                // MAX_CONCURRENT_STREAMS path above).
-                                self.state = H2State::Discard;
-                                self.expect_read =
-                                    Some((H2StreamId::Zero, header.payload_len as usize));
-                                return MuxResult::Continue;
+                                // RFC 9113 §6.8: update highest_peer_stream_id BEFORE
+                                // queueing RST_STREAM so GOAWAY reports the correct
+                                // last_stream_id if the connection closes later.
+                                if stream_id > self.highest_peer_stream_id {
+                                    self.highest_peer_stream_id = stream_id;
+                                }
+                                return self.refuse_stream_and_discard(
+                                    stream_id,
+                                    H2Error::RefusedStream,
+                                    header.payload_len,
+                                );
                             }
                         }
                     } else if header.frame_type != FrameType::Priority {
@@ -1138,17 +1157,19 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             scheme,
             lowercase_buf: std::mem::take(&mut self.lowercase_buf),
         };
-        let mut priorities = self.streams.keys().collect::<Vec<_>>();
-        priorities.sort_by(|a, b| {
+        self.priorities_buf.clear();
+        self.priorities_buf.extend(self.streams.keys().copied());
+        self.priorities_buf.sort_by(|a, b| {
             let (ua, _) = self.prioriser.get(a);
             let (ub, _) = self.prioriser.get(b);
             ua.cmp(&ub).then_with(|| a.cmp(b))
         });
 
-        trace!("PRIORITIES: {:?}", priorities);
+        trace!("PRIORITIES: {:?}", self.priorities_buf);
         let mut socket_write = false;
-        'outer: for stream_id in priorities {
-            let Some(&global_stream_id) = self.streams.get(stream_id) else {
+        'outer: for idx in 0..self.priorities_buf.len() {
+            let stream_id = self.priorities_buf[idx];
+            let Some(&global_stream_id) = self.streams.get(&stream_id) else {
                 error!(
                     "stream_id {} from sorted keys missing in streams map",
                     stream_id
@@ -1161,16 +1182,16 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             let kawa = parts.wbuffer;
             if kawa.is_main_phase()
                 || (kawa.is_terminated() && !kawa.is_completed())
-                || (kawa.is_error() && !self.rst_sent.contains(stream_id))
+                || (kawa.is_error() && !self.rst_sent.contains(&stream_id))
             {
                 let window = min(*parts.window, self.flow_control.window);
                 converter.window = window;
-                converter.stream_id = *stream_id;
+                converter.stream_id = stream_id;
                 // Track RST_STREAM dedup: if kawa is in error state, the converter
                 // will generate a RST_STREAM frame. Mark it so we don't send a
                 // duplicate on the next writable cycle.
                 if kawa.is_error() {
-                    self.rst_sent.insert(*stream_id);
+                    self.rst_sent.insert(stream_id);
                 }
                 kawa.prepare(&mut converter);
                 let consumed = window - converter.window;
@@ -1178,7 +1199,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 self.flow_control.window = self.flow_control.window.saturating_sub(consumed);
             }
             context.debug.push(DebugEvent::S(
-                *stream_id,
+                stream_id,
                 global_stream_id,
                 kawa.parsing_phase,
                 kawa.blocks.len(),
@@ -1195,7 +1216,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 self.position.count_bytes_out_counter(size);
                 self.position.count_bytes_out(parts.metrics, size);
                 if update_readiness_after_write(size, status, &mut self.readiness) {
-                    self.expect_write = Some(H2StreamId::Other(*stream_id, global_stream_id));
+                    self.expect_write = Some(H2StreamId::Other(stream_id, global_stream_id));
                     break 'outer;
                 }
             }
@@ -1210,7 +1231,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     &self.streams,
                     stream,
                     global_stream_id,
-                    *stream_id,
+                    stream_id,
                     byte_totals,
                     &mut context.debug,
                     context.listener.clone(),
@@ -1569,6 +1590,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     stream_bytes,
                     byte_totals,
                     streams.len(),
+                    streams.len() == 1,
                 );
                 debug.push(DebugEvent::StreamEvent(4, global_stream_id));
                 trace!("Recycle stream: {}", global_stream_id);
@@ -1641,6 +1663,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             stream_bytes,
             totals,
             self.streams.len(),
+            self.streams.len() <= 1,
         );
     }
 
@@ -1714,6 +1737,37 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             }
         }
         false
+    }
+
+    /// Mark a stream's position-appropriate end-of-stream flag.
+    ///
+    /// Server reads from the front (client), so sets `front_received_end_of_stream`.
+    /// Client reads from the back (backend), so sets `back_received_end_of_stream`.
+    fn mark_end_of_stream(&self, stream: &mut crate::protocol::mux::Stream) {
+        if self.position.is_server() {
+            stream.front_received_end_of_stream = true;
+        } else {
+            stream.back_received_end_of_stream = true;
+        }
+    }
+
+    /// Refuse a newly-opened stream with RST_STREAM and discard its HEADERS payload.
+    ///
+    /// Used when MAX_CONCURRENT_STREAMS is exceeded or buffer pool is exhausted.
+    /// Queues the RST_STREAM for the writable path (can't write to kawa.storage
+    /// here because it is needed to discard the HEADERS payload).
+    fn refuse_stream_and_discard(
+        &mut self,
+        stream_id: StreamId,
+        error: H2Error,
+        payload_len: u32,
+    ) -> MuxResult {
+        self.pending_rst_streams.push((stream_id, error));
+        self.total_rst_streams_queued += 1;
+        self.readiness.interest.insert(Ready::WRITABLE);
+        self.state = H2State::Discard;
+        self.expect_read = Some((H2StreamId::Zero, payload_len as usize));
+        MuxResult::Continue
     }
 
     pub fn goaway(&mut self, error: H2Error) -> MuxResult {
@@ -1903,6 +1957,32 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         }
     }
 
+    /// RFC 9110 §8.6: Content-Length validation must be skipped for responses
+    /// where the body is absent by definition:
+    /// - Responses to HEAD requests (any status)
+    /// - 1xx informational responses
+    /// - 204 No Content
+    /// - 304 Not Modified
+    fn content_length_exempt(
+        &self,
+        context: &crate::protocol::kawa_h1::editor::HttpContext,
+    ) -> bool {
+        use crate::protocol::kawa_h1::parser::Method;
+        // HEAD method responses (only relevant when reading backend responses)
+        if self.position.is_client() {
+            if context.method == Some(Method::Head) {
+                return true;
+            }
+        }
+        // 1xx, 204, 304 status codes
+        if let Some(status) = context.status {
+            if (100..200).contains(&status) || status == 204 || status == 304 {
+                return true;
+            }
+        }
+        false
+    }
+
     fn handle_data_frame<E, L>(
         &mut self,
         data: parser::Data,
@@ -1941,6 +2021,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         let mut slice = data.payload;
         let stream = &mut context.streams[global_stream_id];
         let payload_len = slice.len();
+        let cl_exempt = self.content_length_exempt(&stream.context);
 
         // Extract declared content-length and update position-aware data counter
         let (data_received, declared_length) = {
@@ -1955,19 +2036,22 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         };
 
         // RFC 9113 §8.1.1: if Content-Length is present, total DATA payload
-        // must not exceed the declared length (check on every frame)
-        if let Some(expected) = declared_length {
-            if data_received > expected {
-                error!(
-                    "Content-Length mismatch: received {} > declared {}",
-                    data_received, expected
-                );
-                return self.reset_stream(
-                    global_stream_id,
-                    context,
-                    endpoint,
-                    H2Error::ProtocolError,
-                );
+        // must not exceed the declared length (check on every frame).
+        // RFC 9110 §8.6: skip for HEAD/1xx/204/304 responses (body absent by definition).
+        if !cl_exempt {
+            if let Some(expected) = declared_length {
+                if data_received > expected {
+                    error!(
+                        "Content-Length mismatch: received {} > declared {}",
+                        data_received, expected
+                    );
+                    return self.reset_stream(
+                        global_stream_id,
+                        context,
+                        endpoint,
+                        H2Error::ProtocolError,
+                    );
+                }
             }
         }
 
@@ -2009,47 +2093,62 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             kawa.storage.clear();
             if data.end_stream {
                 kawa.parsing_phase = kawa::ParsingPhase::Terminated;
-                if self.position.is_server() {
-                    stream.front_received_end_of_stream = true;
-                } else {
-                    stream.back_received_end_of_stream = true;
-                }
+                self.mark_end_of_stream(stream);
             }
         } else {
             slice.start += kawa.storage.head as u32;
             kawa.storage.head += payload_len;
+
+            // Emit chunk framing for chunked transfer encoding (H2→H1 path).
+            // H2 converter ignores ChunkHeader and end_chunk Flags, so this is safe for H2→H2.
+            if kawa.body_size == kawa::BodySize::Chunked && payload_len > 0 {
+                let hex_len = format!("{payload_len:x}");
+                kawa.push_block(kawa::Block::ChunkHeader(kawa::ChunkHeader {
+                    length: kawa::Store::from_string(hex_len),
+                }));
+            }
+
             kawa.push_block(kawa::Block::Chunk(kawa::Chunk {
                 data: kawa::Store::Slice(slice),
             }));
 
+            if kawa.body_size == kawa::BodySize::Chunked && payload_len > 0 {
+                kawa.push_block(kawa::Block::Flags(kawa::Flags {
+                    end_body: false,
+                    end_chunk: true,
+                    end_header: false,
+                    end_stream: false,
+                }));
+            }
+
             if data.end_stream {
-                // RFC 9113 §8.1.1: on end_stream, total DATA must equal Content-Length
-                if let Some(expected) = declared_length {
-                    if data_received != expected {
-                        error!(
-                            "Content-Length mismatch: received {} != declared {}",
-                            data_received, expected
-                        );
-                        return self.reset_stream(
-                            global_stream_id,
-                            context,
-                            endpoint,
-                            H2Error::ProtocolError,
-                        );
+                // RFC 9113 §8.1.1: on end_stream, total DATA must equal Content-Length.
+                // RFC 9110 §8.6: skip for HEAD/1xx/204/304 responses.
+                if !cl_exempt {
+                    if let Some(expected) = declared_length {
+                        if data_received != expected {
+                            error!(
+                                "Content-Length mismatch: received {} != declared {}",
+                                data_received, expected
+                            );
+                            return self.reset_stream(
+                                global_stream_id,
+                                context,
+                                endpoint,
+                                H2Error::ProtocolError,
+                            );
+                        }
                     }
                 }
+                let is_chunked = kawa.body_size == kawa::BodySize::Chunked;
                 kawa.push_block(kawa::Block::Flags(kawa::Flags {
                     end_body: true,
-                    end_chunk: false,
+                    end_chunk: is_chunked,
                     end_header: false,
                     end_stream: true,
                 }));
                 kawa.parsing_phase = kawa::ParsingPhase::Terminated;
-                if self.position.is_server() {
-                    stream.front_received_end_of_stream = true;
-                } else {
-                    stream.back_received_end_of_stream = true;
-                }
+                self.mark_end_of_stream(stream);
             }
             if let StreamState::Linked(token) = stream_state {
                 endpoint
@@ -2136,7 +2235,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         if headers.end_stream {
             // RFC 9113 §8.1.1: when END_STREAM arrives via trailers,
             // validate that total DATA received matches Content-Length.
-            if !was_initial {
+            // RFC 9110 §8.6: skip for HEAD/1xx/204/304 responses.
+            if !was_initial && !self.content_length_exempt(&stream.context) {
                 let parts = stream.split(&self.position);
                 if let kawa::BodySize::Length(expected) = parts.rbuffer.body_size {
                     if *parts.data_received != expected {
@@ -2153,11 +2253,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     }
                 }
             }
-            if self.position.is_server() {
-                stream.front_received_end_of_stream = true;
-            } else {
-                stream.back_received_end_of_stream = true;
-            }
+            self.mark_end_of_stream(stream);
         }
         if let StreamState::Linked(token) = stream.state {
             endpoint
@@ -2491,7 +2587,36 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         L: ListenerHandler + L7ListenerHandler,
     {
         let stream_id = wu.stream_id;
-        let increment = wu.increment as i32;
+        let increment = wu.increment;
+
+        // RFC 9113 §6.9: increment of 0 MUST be treated as an error.
+        // Connection-level (stream 0) -> connection error (GOAWAY).
+        // Stream-level -> stream error (RST_STREAM).
+        if increment == 0 {
+            if stream_id == 0 {
+                error!("WINDOW_UPDATE with zero increment on connection (stream 0)");
+                return self.goaway(H2Error::ProtocolError);
+            } else {
+                error!("WINDOW_UPDATE with zero increment on stream {}", stream_id);
+                if let Some(global_stream_id) = self.streams.get(&stream_id).copied() {
+                    return self.reset_stream(
+                        global_stream_id,
+                        context,
+                        endpoint,
+                        H2Error::ProtocolError,
+                    );
+                }
+                // Stream not in map (already closed) — treat as glitch
+                self.flood_detector.glitch_count += 1;
+                if let Some(error) = self.flood_detector.check_flood() {
+                    return self.goaway(error);
+                }
+                self.attribute_bytes_to_overhead();
+                return MuxResult::Continue;
+            }
+        }
+
+        let increment = increment as i32;
         if stream_id == 0 {
             self.attribute_bytes_to_overhead();
             if let Some(window) = self.flow_control.window.checked_add(increment) {
@@ -3249,7 +3374,7 @@ mod tests {
         let mut overhead_bin = 1000;
         let mut overhead_bout = 500;
 
-        // Stream transferred 60% of total bytes
+        // Stream transferred 60% of total bytes (not last stream)
         distribute_overhead(
             &mut metrics,
             &mut overhead_bin,
@@ -3257,6 +3382,7 @@ mod tests {
             (600, 300),  // stream_bytes
             (1000, 500), // total_bytes
             2,           // active_streams
+            false,       // is_last_stream
         );
 
         assert_eq!(metrics.bin, 600); // 60% of 1000
@@ -3271,7 +3397,7 @@ mod tests {
         let mut overhead_bin = 100;
         let mut overhead_bout = 200;
 
-        // No bytes transferred -> even distribution
+        // No bytes transferred -> even distribution (not last stream)
         distribute_overhead(
             &mut metrics,
             &mut overhead_bin,
@@ -3279,6 +3405,7 @@ mod tests {
             (0, 0), // stream_bytes
             (0, 0), // total_bytes
             4,      // active_streams
+            false,  // is_last_stream
         );
 
         assert_eq!(metrics.bin, 25); // 100 / 4
@@ -3293,7 +3420,7 @@ mod tests {
         let mut overhead_bin = 10;
         let mut overhead_bout = 10;
 
-        // Stream claims 100% of bytes but overhead is small
+        // Stream claims 100% of bytes but overhead is small (last stream)
         distribute_overhead(
             &mut metrics,
             &mut overhead_bin,
@@ -3301,6 +3428,7 @@ mod tests {
             (1000, 1000), // stream_bytes
             (1000, 1000), // total_bytes
             1,            // active_streams
+            true,         // is_last_stream
         );
 
         assert_eq!(metrics.bin, 10);
@@ -3315,7 +3443,7 @@ mod tests {
         let mut overhead_bin = 100;
         let mut overhead_bout = 100;
 
-        // 0 active streams (edge case) — falls back to max(1)
+        // 0 active streams (edge case) — last stream gets all remainder
         distribute_overhead(
             &mut metrics,
             &mut overhead_bin,
@@ -3323,12 +3451,51 @@ mod tests {
             (0, 0),
             (0, 0),
             0,
+            true,
         );
 
-        assert_eq!(metrics.bin, 100); // 100 / max(0,1) = 100
+        assert_eq!(metrics.bin, 100); // last stream gets all remaining
         assert_eq!(metrics.bout, 100);
         assert_eq!(overhead_bin, 0);
         assert_eq!(overhead_bout, 0);
+    }
+
+    #[test]
+    fn test_distribute_overhead_last_stream_gets_remainder() {
+        let mut metrics1 = SessionMetrics::new(None);
+        let mut metrics2 = SessionMetrics::new(None);
+        let mut overhead_bin = 120;
+        let mut overhead_bout = 120;
+
+        // First stream (not last): gets proportional share
+        distribute_overhead(
+            &mut metrics1,
+            &mut overhead_bin,
+            &mut overhead_bout,
+            (100, 100), // stream_bytes
+            (300, 300), // total_bytes
+            3,          // active_streams
+            false,      // is_last_stream
+        );
+
+        let remaining_bin = overhead_bin;
+        let remaining_bout = overhead_bout;
+
+        // Last stream: gets ALL remaining overhead (no rounding loss)
+        distribute_overhead(
+            &mut metrics2,
+            &mut overhead_bin,
+            &mut overhead_bout,
+            (100, 100), // stream_bytes
+            (300, 300), // total_bytes
+            3,          // active_streams
+            true,       // is_last_stream
+        );
+
+        assert_eq!(metrics2.bin, remaining_bin);
+        assert_eq!(metrics2.bout, remaining_bout);
+        assert_eq!(overhead_bin, 0, "no remainder bytes should be lost");
+        assert_eq!(overhead_bout, 0, "no remainder bytes should be lost");
     }
 
     // ── H2FlowControl (additional edge cases) ─────────────────────────
@@ -3435,7 +3602,7 @@ mod tests {
         let mut overhead_bin = 1000;
         let mut overhead_bout = 1000;
 
-        // Stream transferred 100% inbound, 0% outbound
+        // Stream transferred 100% inbound, 0% outbound (not last stream)
         distribute_overhead(
             &mut metrics,
             &mut overhead_bin,
@@ -3443,6 +3610,7 @@ mod tests {
             (500, 0),   // stream_bytes
             (500, 100), // total_bytes
             2,          // active_streams
+            false,      // is_last_stream
         );
 
         assert_eq!(metrics.bin, 1000); // 100% of inbound overhead
@@ -3458,12 +3626,13 @@ mod tests {
         let mut overhead_bout = 120;
 
         // Three equal streams, each calling distribute_overhead.
-        // Integer division means shares shrink as the remainder shrinks:
+        // With is_last_stream on the third call, the last stream gets all
+        // remaining overhead, so no rounding loss occurs.
         //   call 1: 120 * 100/300 = 40 -> remaining 80
         //   call 2:  80 * 100/300 = 26 -> remaining 54
-        //   call 3:  54 * 100/300 = 18 -> remaining 36
-        // Total distributed: 40 + 26 + 18 = 84 (some rounding loss remains)
-        for _ in 0..3 {
+        //   call 3: last stream gets all remaining = 54
+        // Total distributed: 40 + 26 + 54 = 120 (no loss)
+        for i in 0..3 {
             distribute_overhead(
                 &mut metrics,
                 &mut overhead_bin,
@@ -3471,13 +3640,14 @@ mod tests {
                 (100, 100), // stream_bytes
                 (300, 300), // total_bytes
                 3,          // active_streams
+                i == 2,     // is_last_stream on final call
             );
         }
 
-        assert_eq!(metrics.bin, 84);
-        assert_eq!(metrics.bout, 84);
-        // Rounding residual left over
-        assert_eq!(overhead_bin, 36);
-        assert_eq!(overhead_bout, 36);
+        assert_eq!(metrics.bin, 120);
+        assert_eq!(metrics.bout, 120);
+        // No rounding residual — last stream absorbed the remainder
+        assert_eq!(overhead_bin, 0);
+        assert_eq!(overhead_bout, 0);
     }
 }

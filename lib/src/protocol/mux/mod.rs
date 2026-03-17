@@ -17,7 +17,7 @@
 
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fmt::Debug,
     io::ErrorKind,
     net::{Shutdown, SocketAddr},
@@ -1092,10 +1092,21 @@ impl Stream {
     }
 }
 
-#[derive(Default)]
+/// Maximum number of debug events retained in the ring buffer.
+/// Oldest entries are dropped when this limit is reached.
+const DEBUG_HISTORY_CAPACITY: usize = 512;
+
 pub struct DebugHistory {
-    pub events: Vec<DebugEvent>,
+    pub events: VecDeque<DebugEvent>,
     pub is_interesting: bool,
+}
+impl Default for DebugHistory {
+    fn default() -> Self {
+        Self {
+            events: VecDeque::with_capacity(DEBUG_HISTORY_CAPACITY),
+            is_interesting: false,
+        }
+    }
 }
 impl DebugHistory {
     pub fn new() -> Self {
@@ -1104,10 +1115,10 @@ impl DebugHistory {
     pub fn push(&mut self, _event: DebugEvent) {
         #[cfg(debug_assertions)]
         {
-            if self.events.len() >= 10_000 {
-                self.events.drain(..5_000);
+            if self.events.len() >= DEBUG_HISTORY_CAPACITY {
+                self.events.pop_front();
             }
-            self.events.push(_event);
+            self.events.push_back(_event);
         }
     }
     pub fn set_interesting(&mut self, _interesting: bool) {
@@ -1162,38 +1173,64 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
     }
 
     pub fn create_stream(&mut self, request_id: Ulid, window: u32) -> Option<GlobalStreamId> {
-        let listener = self.listener.borrow();
-        let http_context = HttpContext::new(
-            request_id,
-            listener.protocol(),
-            self.public_address,
-            self.session_address,
-            listener.get_sticky_name().to_string(),
-        );
-        for (stream_id, stream) in self.streams.iter_mut().enumerate() {
-            if stream.state == StreamState::Recycle {
-                trace!("Reuse stream: {}", stream_id);
-                stream.state = StreamState::Idle;
-                stream.attempts = 0;
-                stream.front_received_end_of_stream = false;
-                stream.back_received_end_of_stream = false;
-                stream.front_data_received = 0;
-                stream.back_data_received = 0;
-                stream.request_counted = false;
-                stream.window = i32::try_from(window).unwrap_or(i32::MAX);
-                stream.context = http_context;
-                stream.back.clear();
-                stream.back.storage.clear();
-                stream.front.clear();
-                stream.front.storage.clear();
-                stream.metrics.reset();
-                stream.metrics.start = Some(Instant::now());
-                return Some(stream_id);
+        let http_context = {
+            let listener = self.listener.borrow();
+            HttpContext::new(
+                request_id,
+                listener.protocol(),
+                self.public_address,
+                self.session_address,
+                listener.get_sticky_name().to_string(),
+            )
+        };
+        let recycle_slot = self
+            .streams
+            .iter()
+            .position(|s| s.state == StreamState::Recycle);
+        if let Some(stream_id) = recycle_slot {
+            let stream = &mut self.streams[stream_id];
+            trace!("Reuse stream: {}", stream_id);
+            stream.state = StreamState::Idle;
+            stream.attempts = 0;
+            stream.front_received_end_of_stream = false;
+            stream.back_received_end_of_stream = false;
+            stream.front_data_received = 0;
+            stream.back_data_received = 0;
+            stream.request_counted = false;
+            stream.window = i32::try_from(window).unwrap_or(i32::MAX);
+            stream.context = http_context;
+            stream.back.clear();
+            stream.back.storage.clear();
+            stream.front.clear();
+            stream.front.storage.clear();
+            stream.metrics.reset();
+            stream.metrics.start = Some(Instant::now());
+            // After recycling a slot, check if the Vec has excessive trailing
+            // Recycle entries (more than 2x active streams of total capacity).
+            let active = self.active_len();
+            let total = self.streams.len();
+            if total > 1 && active > 0 && total > active * 2 {
+                self.shrink_trailing_recycle();
             }
+            return Some(stream_id);
         }
         self.streams
             .push(Stream::new(self.pool.clone(), http_context, window)?);
         Some(self.streams.len() - 1)
+    }
+
+    /// Remove consecutive `Recycle` entries from the end of the streams Vec.
+    ///
+    /// This prevents unbounded growth when H2 streams are created and recycled
+    /// over time, reclaiming memory from slots that are no longer needed.
+    pub fn shrink_trailing_recycle(&mut self) {
+        while self
+            .streams
+            .last()
+            .is_some_and(|s| s.state == StreamState::Recycle)
+        {
+            self.streams.pop();
+        }
     }
 }
 
@@ -1271,19 +1308,17 @@ impl Router {
         }
 
         /*
-        Current h2 connecting strategy:
+        H2 connecting strategy (least-loaded):
         - look at every backend connection
-        - reuse the first connected backend that belongs to the same cluster
-        - or, reuse the last connecting backend that belonds to the same cluster
-        - if no backend is to reuse, ask the router for a socket to the "next in line" backend for that cluster
+        - among connected backends for this cluster, pick the one with the fewest active streams
+        - fall back to a connecting backend if no connected one exists
+        - if no backend is to reuse, ask the router for a socket to the "next in line" backend
 
-        We may want to change to:
-        - ask the router the name of the "next in line" backend for that cluster
-        - if we already have a backend connected to this name, reuse it
-        - if not, create a new socket to it
+        H1 strategy: reuse the first KeepAlive backend for this cluster.
          */
 
         let mut reuse_token = None;
+        let mut best_h2_stream_count = usize::MAX;
         for (token, backend) in &self.backends {
             match (h2, backend.position()) {
                 (_, Position::Server) => {
@@ -1294,12 +1329,20 @@ impl Router {
 
                 (true, Position::Client(other_cluster_id, _, BackendStatus::Connected)) => {
                     if *other_cluster_id == cluster_id {
-                        reuse_token = Some(*token);
-                        break;
+                        // Pick the H2 connection with the fewest active streams
+                        let stream_count = match backend {
+                            Connection::H2(h2c) => h2c.streams.len(),
+                            Connection::H1(_) => 0,
+                        };
+                        if stream_count < best_h2_stream_count {
+                            best_h2_stream_count = stream_count;
+                            reuse_token = Some(*token);
+                        }
                     }
                 }
                 (true, Position::Client(other_cluster_id, _, BackendStatus::Connecting(_))) => {
-                    if *other_cluster_id == cluster_id {
+                    // Only use a connecting backend if no connected one was found
+                    if *other_cluster_id == cluster_id && best_h2_stream_count == usize::MAX {
                         reuse_token = Some(*token)
                     }
                 }
@@ -1626,6 +1669,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                 backend,
                                 BackendStatus::Connecting(start),
                             ) => {
+                                #[cfg(debug_assertions)]
                                 context
                                     .debug
                                     .push(DebugEvent::CCS(*token, cluster_id.clone()));

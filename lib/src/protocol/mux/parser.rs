@@ -651,13 +651,12 @@ pub fn window_update_frame<'a>(
     let (i, increment) = be_u32(input)?;
     let increment = increment & STREAM_ID_MASK;
 
-    // RFC 9113 §6.9: increment of 0 is PROTOCOL_ERROR (stream or connection error)
-    if increment == 0 {
-        return Err(Err::Failure(ParserError::new_h2(
-            input,
-            H2Error::ProtocolError,
-        )));
-    }
+    // NOTE: zero-increment validation is intentionally NOT performed here.
+    // RFC 9113 §6.9 requires different error handling depending on whether the
+    // WINDOW_UPDATE targets stream 0 (connection error) or a specific stream
+    // (stream error). That distinction requires the stream_id context, which is
+    // available in the H2 connection handler (handle_window_update_frame), not
+    // in the wire-level parser.
 
     Ok((
         i,
@@ -784,12 +783,14 @@ mod tests {
         }
     }
 
-    // ---- WINDOW_UPDATE with zero increment (must reject) ----
+    // ---- WINDOW_UPDATE with zero increment (parser accepts, handler differentiates) ----
 
-    /// RFC 9113 §6.9: a WINDOW_UPDATE with increment of 0 MUST be treated
-    /// as a connection error of type PROTOCOL_ERROR.
+    /// RFC 9113 §6.9: zero-increment WINDOW_UPDATE is now parsed successfully
+    /// by the wire parser. The connection vs stream error distinction is handled
+    /// in handle_window_update_frame, not in the parser.
     #[test]
-    fn test_window_update_zero_increment_rejected() {
+    fn test_window_update_zero_increment_parsed() {
+        // Connection-level (stream_id = 0) zero increment
         let input = [
             0x00, 0x00, 0x04, // payload_len = 4
             0x08, // type = WINDOW_UPDATE
@@ -801,13 +802,32 @@ mod tests {
         let (remaining, header) = frame_header(&input, DEFAULT_MAX_FRAME_SIZE).unwrap();
         assert_eq!(header.frame_type, FrameType::WindowUpdate);
 
-        let result = frame_body(remaining, &header);
-        assert!(result.is_err(), "zero increment must be rejected");
-        match result {
-            Err(nom::Err::Failure(e)) => {
-                assert_eq!(e.kind, ParserErrorKind::H2(H2Error::ProtocolError));
+        let (_, frame) = frame_body(remaining, &header).unwrap();
+        match frame {
+            Frame::WindowUpdate(wu) => {
+                assert_eq!(wu.stream_id, 0);
+                assert_eq!(wu.increment, 0);
             }
-            other => panic!("expected Failure(ProtocolError), got {other:?}"),
+            other => panic!("expected Frame::WindowUpdate, got {other:?}"),
+        }
+
+        // Stream-level (stream_id = 3) zero increment
+        let input2 = [
+            0x00, 0x00, 0x04, // payload_len = 4
+            0x08, // type = WINDOW_UPDATE
+            0x00, // flags = 0
+            0x00, 0x00, 0x00, 0x03, // stream_id = 3
+            0x00, 0x00, 0x00, 0x00, // increment = 0
+        ];
+
+        let (remaining2, header2) = frame_header(&input2, DEFAULT_MAX_FRAME_SIZE).unwrap();
+        let (_, frame2) = frame_body(remaining2, &header2).unwrap();
+        match frame2 {
+            Frame::WindowUpdate(wu) => {
+                assert_eq!(wu.stream_id, 3);
+                assert_eq!(wu.increment, 0);
+            }
+            other => panic!("expected Frame::WindowUpdate, got {other:?}"),
         }
     }
 
