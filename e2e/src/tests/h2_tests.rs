@@ -52,7 +52,7 @@ use crate::{
         h2_backend::H2Backend,
         https_client::{
             build_h2_client, build_https_client, resolve_concurrent_requests, resolve_post_request,
-            resolve_request,
+            resolve_request, resolve_request_timeout,
         },
     },
     sozu::worker::Worker,
@@ -7581,6 +7581,399 @@ fn test_h2_large_response_flow_control_pressure() {
             5,
             "H2: large H1 response under flow control pressure (buffer starvation regression)",
             try_h2_large_response_flow_control_pressure
+        ),
+        State::Success
+    );
+}
+
+fn try_h2_large_response_8mb_window_update_race() -> State {
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+    let (config, listeners, state) = Worker::empty_config();
+    let mut worker = Worker::start_new_worker("H2-8MB-RACE", config, &listeners, state);
+
+    let mut listener_builder = ListenerBuilder::new_https(front_address.clone());
+    listener_builder
+        .with_back_timeout(Some(120))
+        .with_front_timeout(Some(120));
+    worker.send_proxy_request_type(RequestType::AddHttpsListener(
+        listener_builder.to_tls(None).unwrap(),
+    ));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        address: front_address.clone(),
+        proxy: ListenerType::Https.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        hostname: String::from("localhost"),
+        ..Worker::default_http_frontend("cluster_0", front_address.clone().into())
+    }));
+    let certificate_and_key = CertificateAndKey {
+        certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
+        key: String::from(include_str!("../../../lib/assets/local-key.pem")),
+        certificate_chain: vec![],
+        versions: vec![],
+        names: vec![],
+    };
+    worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+        address: front_address,
+        certificate: certificate_and_key,
+        expired_at: None,
+    }));
+
+    // 8 MB body — large enough to overflow the TCP send buffer (~2-4 MB),
+    // forcing WouldBlock cycles that clear the WRITABLE event bit. This
+    // exercises the WINDOW_UPDATE → signal_pending_write path: without the
+    // fix, the session stalls after a WouldBlock + flow control stall combo.
+    let body_size = 8 * 1024 * 1024;
+    let body_content: String = (0..body_size)
+        .map(|i| (b'A' + (i % 26) as u8) as char)
+        .collect();
+    let body_clone = body_content.clone();
+
+    let back_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address,
+        None,
+    )));
+
+    let handler: Box<
+        dyn Fn(&std::net::TcpStream, &str, SimpleAggregator) -> SimpleAggregator + Send + Sync,
+    > = Box::new(move |mut stream, backend_name, mut aggregator| {
+        let mut buf = [0u8; 4096];
+        match stream.read(&mut buf) {
+            Ok(0) => return aggregator,
+            Ok(n) => println!("{backend_name} received {n}"),
+            Err(_) => return aggregator,
+        }
+        aggregator.requests_received += 1;
+
+        // Switch to blocking mode for the large body write_all.
+        // The nonblocking socket would return WouldBlock when the
+        // OS send buffer fills (~2-4 MB), truncating the response.
+        stream
+            .set_nonblocking(false)
+            .expect("could not set blocking on client");
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\n\
+                 Content-Length: {}\r\n\r\n",
+            body_clone.len()
+        );
+        if stream.write_all(header.as_bytes()).is_err() {
+            stream.set_nonblocking(true).ok();
+            return aggregator;
+        }
+        if stream.write_all(body_clone.as_bytes()).is_err() {
+            stream.set_nonblocking(true).ok();
+            return aggregator;
+        }
+        stream
+            .set_nonblocking(true)
+            .expect("could not set nonblocking on client");
+        aggregator.responses_sent += 1;
+        aggregator
+    });
+
+    let mut backends = vec![AsyncBackend::spawn_detached_backend(
+        "8MB_RACE".to_string(),
+        back_address,
+        SimpleAggregator::default(),
+        handler,
+    )];
+
+    worker.read_to_last();
+
+    // Use curl with -o /dev/null: we can't pipe 8 MB through stdout
+    // (the pipe buffer fills at 64 KB, blocking curl). Instead write to
+    // a temp file, verify size + content via curl stats + file read.
+    let tmp = format!("/tmp/sozu-e2e-8mb-{front_port}.bin");
+    let output = std::process::Command::new("curl")
+        .args([
+            "--http2",
+            "-s",
+            "-o", &tmp,
+            "-w", "%{http_code} %{size_download}",
+            "--insecure",
+            "--max-time", "60",
+            &format!("https://localhost:{front_port}/admin/strapi-large.js"),
+        ])
+        .output()
+        .expect("curl must be installed");
+
+    let stats = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stderr.is_empty() {
+        println!("curl stderr: {stderr}");
+    }
+    println!("curl stats: {stats}");
+
+    // Parse "200 8388608"
+    let parts: Vec<&str> = stats.split_whitespace().collect();
+    let status_ok = parts.first().map_or(false, |s| *s == "200");
+    let download_size: usize = parts
+        .get(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    println!(
+        "H2 8MB curl - status: {}, downloaded: {} (expected {body_size})",
+        parts.first().unwrap_or(&"?"),
+        download_size
+    );
+
+    // Verify actual file content matches
+    let file_content = std::fs::read(&tmp).unwrap_or_default();
+    let _ = std::fs::remove_file(&tmp);
+
+    let correct = status_ok
+        && file_content.len() == body_size
+        && file_content == body_content.as_bytes();
+
+    worker.soft_stop();
+    let success = worker.wait_for_server_stop();
+    for backend in backends.iter_mut() {
+        backend.stop_and_get_aggregator();
+    }
+
+    if success && correct {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_large_response_8mb_window_update_race() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "H2: 8 MB response under flow control pressure (WINDOW_UPDATE event-bit race)",
+            try_h2_large_response_8mb_window_update_race
+        ),
+        State::Success
+    );
+}
+
+fn try_h2_large_response_1gb_stress() -> State {
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+    let (config, listeners, state) = Worker::empty_config();
+    let mut worker = Worker::start_new_worker("H2-1GB-STRESS", config, &listeners, state);
+
+    let mut listener_builder = ListenerBuilder::new_https(front_address.clone());
+    listener_builder
+        .with_back_timeout(Some(600))
+        .with_front_timeout(Some(600));
+    worker.send_proxy_request_type(RequestType::AddHttpsListener(
+        listener_builder.to_tls(None).unwrap(),
+    ));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        address: front_address.clone(),
+        proxy: ListenerType::Https.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        hostname: String::from("localhost"),
+        ..Worker::default_http_frontend("cluster_0", front_address.clone().into())
+    }));
+    let certificate_and_key = CertificateAndKey {
+        certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
+        key: String::from(include_str!("../../../lib/assets/local-key.pem")),
+        certificate_chain: vec![],
+        versions: vec![],
+        names: vec![],
+    };
+    worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+        address: front_address,
+        certificate: certificate_and_key,
+        expired_at: None,
+    }));
+
+    // 1 GB body — streamed in 64 KB chunks from the backend to avoid
+    // holding the entire body in memory. Exercises sustained flow control
+    // pressure across thousands of WINDOW_UPDATE round-trips.
+    let body_size: usize = 1024 * 1024 * 1024;
+    let chunk_size: usize = 64 * 1024;
+
+    let back_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address,
+        None,
+    )));
+
+    let handler: Box<
+        dyn Fn(&std::net::TcpStream, &str, SimpleAggregator) -> SimpleAggregator + Send + Sync,
+    > = Box::new(move |mut stream, backend_name, mut aggregator| {
+        let mut buf = [0u8; 4096];
+        match stream.read(&mut buf) {
+            Ok(0) => return aggregator,
+            Ok(n) => println!("{backend_name} received {n}"),
+            Err(_) => return aggregator,
+        }
+        aggregator.requests_received += 1;
+
+        stream
+            .set_nonblocking(false)
+            .expect("could not set blocking on client");
+
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+                 Content-Length: {body_size}\r\n\r\n"
+        );
+        if stream.write_all(header.as_bytes()).is_err() {
+            stream.set_nonblocking(true).ok();
+            return aggregator;
+        }
+
+        // Stream the body in 64 KB chunks with deterministic content.
+        let mut chunk = vec![0u8; chunk_size];
+        let mut written = 0usize;
+        while written < body_size {
+            let remaining = body_size - written;
+            let len = remaining.min(chunk_size);
+            for i in 0..len {
+                chunk[i] = b'A' + ((written + i) % 26) as u8;
+            }
+            if stream.write_all(&chunk[..len]).is_err() {
+                println!("{backend_name} write error after {written} bytes");
+                stream.set_nonblocking(true).ok();
+                return aggregator;
+            }
+            written += len;
+        }
+
+        stream.set_nonblocking(true).ok();
+        println!("{backend_name} sent {written} bytes");
+        aggregator.responses_sent += 1;
+        aggregator
+    });
+
+    let mut backends = vec![AsyncBackend::spawn_detached_backend(
+        "1GB_STRESS".to_string(),
+        back_address,
+        SimpleAggregator::default(),
+        handler,
+    )];
+
+    worker.read_to_last();
+
+    let tmp = format!("/tmp/sozu-e2e-1gb-{front_port}.bin");
+    let output = std::process::Command::new("curl")
+        .args([
+            "--http2",
+            "-s",
+            "-o",
+            &tmp,
+            "-w",
+            "%{http_code} %{size_download}",
+            "--insecure",
+            "--max-time",
+            "600",
+            &format!("https://localhost:{front_port}/large-1gb-payload"),
+        ])
+        .output()
+        .expect("curl must be installed");
+
+    let stats = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stderr.is_empty() {
+        println!("curl stderr: {stderr}");
+    }
+    println!("curl stats: {stats}");
+
+    let parts: Vec<&str> = stats.split_whitespace().collect();
+    let status_ok = parts.first().map_or(false, |s| *s == "200");
+    let download_size: usize = parts
+        .get(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    println!(
+        "H2 1GB curl - status: {}, downloaded: {} (expected {body_size})",
+        parts.first().unwrap_or(&"?"),
+        download_size
+    );
+
+    // Verify file size matches (don't load 1 GB into memory for byte comparison).
+    let file_size = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0) as usize;
+
+    // Spot-check content at multiple offsets to catch corruption.
+    let content_ok = if file_size == body_size {
+        use std::io::{BufReader, Seek, SeekFrom};
+        let file = std::fs::File::open(&tmp).unwrap();
+        let mut reader = BufReader::new(file);
+        let offsets: &[usize] = &[
+            0,
+            1024 * 1024,              // 1 MB
+            100 * 1024 * 1024,         // 100 MB
+            512 * 1024 * 1024,         // 512 MB
+            body_size - 1024,          // last KB
+        ];
+        let mut check_buf = [0u8; 1024];
+        let mut ok = true;
+        for &offset in offsets {
+            if offset + check_buf.len() > body_size {
+                continue;
+            }
+            reader.seek(SeekFrom::Start(offset as u64)).unwrap();
+            reader.read_exact(&mut check_buf).unwrap();
+            for (i, &byte) in check_buf.iter().enumerate() {
+                let expected = b'A' + ((offset + i) % 26) as u8;
+                if byte != expected {
+                    println!(
+                        "Content mismatch at offset {}: got 0x{:02x}, expected 0x{:02x}",
+                        offset + i,
+                        byte,
+                        expected
+                    );
+                    ok = false;
+                    break;
+                }
+            }
+            if !ok {
+                break;
+            }
+        }
+        ok
+    } else {
+        false
+    };
+
+    let _ = std::fs::remove_file(&tmp);
+
+    let correct = status_ok && file_size == body_size && content_ok;
+
+    worker.soft_stop();
+    let success = worker.wait_for_server_stop();
+    for backend in backends.iter_mut() {
+        backend.stop_and_get_aggregator();
+    }
+
+    if success && correct {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+#[ignore] // Run manually: cargo test -p sozu-e2e -- test_h2_large_response_1gb_stress --ignored --nocapture
+fn test_h2_large_response_1gb_stress() {
+    assert_eq!(
+        repeat_until_error_or(
+            1,
+            "H2: 1 GB response stress test (sustained flow control + TLS write retry)",
+            try_h2_large_response_1gb_stress
         ),
         State::Success
     );

@@ -118,6 +118,14 @@ pub fn build_h2_or_h1_client() -> HttpsClient {
 /// Sends a GET request to the given URI using the provided client,
 /// awaits the response, returns the status code and body in case of success
 pub fn resolve_request(client: &HttpsClient, uri: hyper::Uri) -> Option<(StatusCode, String)> {
+    resolve_request_timeout(client, uri, Duration::from_secs(10))
+}
+
+pub fn resolve_request_timeout(
+    client: &HttpsClient,
+    uri: hyper::Uri,
+    timeout: Duration,
+) -> Option<(StatusCode, String)> {
     let rt = tokio::runtime::Runtime::new().expect("Could not create Runtime");
     rt.block_on(async {
         let fut = async {
@@ -140,10 +148,10 @@ pub fn resolve_request(client: &HttpsClient, uri: hyper::Uri) -> Option<(StatusC
             let body = String::from_utf8(body_bytes.to_vec()).expect("Invalid UTF-8 body");
             Some((status, body))
         };
-        match tokio::time::timeout(Duration::from_secs(10), fut).await {
+        match tokio::time::timeout(timeout, fut).await {
             Ok(result) => result,
             Err(_) => {
-                println!("resolve_request timed out after 10s");
+                println!("resolve_request timed out after {:?}", timeout);
                 None
             }
         }
