@@ -403,6 +403,7 @@ impl<Front: SocketHandler> Connection<Front> {
             stream: Some(0),
             timeout_container,
             parked_on_buffer_pressure: false,
+            close_notify_sent: false,
         })
     }
     pub fn new_h1_client(
@@ -426,6 +427,7 @@ impl<Front: SocketHandler> Connection<Front> {
             requests: 0,
             timeout_container,
             parked_on_buffer_pressure: false,
+            close_notify_sent: false,
         })
     }
 
@@ -619,8 +621,15 @@ impl<Front: SocketHandler> Connection<Front> {
 
     fn has_pending_write(&self) -> bool {
         match self {
-            Connection::H1(_) => false,
+            Connection::H1(c) => c.has_pending_write(),
             Connection::H2(c) => c.has_pending_write(),
+        }
+    }
+
+    fn initiate_close_notify(&mut self) -> bool {
+        match self {
+            Connection::H1(c) => c.initiate_close_notify(),
+            Connection::H2(c) => c.initiate_close_notify(),
         }
     }
 
@@ -1618,7 +1627,9 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         let mut counter = 0;
 
         if self.frontend.readiness().event.is_hup() && !self.frontend.has_pending_write() {
-            return SessionResult::Close;
+            if !self.frontend.initiate_close_notify() {
+                return SessionResult::Close;
+            }
         }
 
         // Start service timers on all active streams after the HUP check.

@@ -33,6 +33,8 @@ pub struct ConnectionH1<Front: SocketHandler> {
     /// kernel socket buffer, so the cross-readiness mechanism must re-arm it
     /// via `try_resume_reading` once the peer drains the buffer.
     pub parked_on_buffer_pressure: bool,
+    /// True once we've asked rustls to emit TLS close_notify for this frontend.
+    pub close_notify_sent: bool,
 }
 
 impl<Front: SocketHandler> std::fmt::Debug for ConnectionH1<Front> {
@@ -264,7 +266,10 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
     {
         trace!("======= MUX H1 WRITABLE {:?}", self.position);
         let Some(stream_id) = self.stream else {
-            error!("writable() called on H1 connection with no active stream");
+            if self.socket.socket_wants_write() {
+                let (size, status) = self.socket.socket_write_vectored(&[]);
+                let _ = update_readiness_after_write(size, status, &mut self.readiness);
+            }
             return MuxResult::Continue;
         };
         self.timeout_container.reset();
@@ -423,6 +428,28 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         }
     }
 
+    pub fn has_pending_write(&self) -> bool {
+        self.socket.socket_wants_write()
+    }
+
+    pub fn initiate_close_notify(&mut self) -> bool {
+        if !self.position.is_server() {
+            return false;
+        }
+        if !self.close_notify_sent {
+            trace!("H1 initiating CLOSE_NOTIFY");
+            self.socket.socket_close();
+            self.close_notify_sent = true;
+        }
+        if self.socket.socket_wants_write() {
+            self.readiness.interest.insert(Ready::WRITABLE);
+            self.readiness.signal_pending_write();
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn close<E, L>(&mut self, context: &mut Context<L>, mut endpoint: E)
     where
         E: Endpoint,
@@ -439,8 +466,11 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                 debug!("BACKEND CLOSING FOR: {:?} {:?}", self.position, self.stream);
             }
             Position::Server => {
-                trace!("H1 SENDING CLOSE NOTIFY");
-                self.socket.socket_close();
+                if !self.close_notify_sent {
+                    trace!("H1 SENDING CLOSE NOTIFY");
+                    self.socket.socket_close();
+                    self.close_notify_sent = true;
+                }
                 let _ = self.socket.socket_write_vectored(&[]);
                 return;
             }
