@@ -1595,6 +1595,21 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Mux<Front, L>
     }
 }
 
+impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHandler> Mux<Front, L> {
+    fn delay_close_for_frontend_flush(&mut self, reason: &'static str) -> bool {
+        let _ = self.frontend.initiate_close_notify();
+        if self.frontend.has_pending_write() {
+            let readiness = self.frontend.readiness_mut();
+            readiness.interest = Ready::WRITABLE | Ready::HUP | Ready::ERROR;
+            readiness.signal_pending_write();
+            warn!("Mux delaying close on {}: {:?}", reason, self.frontend);
+            true
+        } else {
+            false
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum DebugEvent {
     EV(Token, Ready),
@@ -1626,8 +1641,9 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
     ) -> SessionResult {
         let mut counter = 0;
 
-        if self.frontend.readiness().event.is_hup() && !self.frontend.has_pending_write() {
-            if !self.frontend.initiate_close_notify() {
+        if self.frontend.readiness().event.is_hup() {
+            if !self.delay_close_for_frontend_flush("frontend HUP") {
+                warn!("Mux closing on frontend HUP: {:?}", self.frontend);
                 return SessionResult::Close;
             }
         }
@@ -1652,26 +1668,33 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         loop {
             self.context.debug.push(DebugEvent::LoopStart);
             loop {
-                let context = &mut self.context;
-                context.debug.push(DebugEvent::LoopIteration(counter));
+                self.context.debug.push(DebugEvent::LoopIteration(counter));
                 if self.frontend.readiness().filter_interest().is_readable() {
-                    let res = self
-                        .frontend
-                        .readable(context, EndpointClient(&mut self.router));
-                    context.debug.push(DebugEvent::SR(
-                        self.frontend_token,
-                        res,
-                        self.frontend.readiness().clone(),
-                    ));
+                    let res = {
+                        let context = &mut self.context;
+                        let res = self
+                            .frontend
+                            .readable(context, EndpointClient(&mut self.router));
+                        context.debug.push(DebugEvent::SR(
+                            self.frontend_token,
+                            res,
+                            self.frontend.readiness().clone(),
+                        ));
+                        res
+                    };
                     match res {
                         MuxResult::Continue => {}
-                        MuxResult::CloseSession => return SessionResult::Close,
+                        MuxResult::CloseSession => {
+                            if !self.delay_close_for_frontend_flush("frontend readable") {
+                                warn!("Mux close from frontend readable: {:?}", self.frontend);
+                                return SessionResult::Close;
+                            }
+                        }
                         MuxResult::Upgrade => return SessionResult::Upgrade,
                     }
                 }
 
                 let mut all_backends_readiness_are_empty = true;
-                let context = &mut self.context;
                 let mut dead_backends = Vec::new();
                 for (token, client) in self.router.backends.iter_mut() {
                     let readiness = client.readiness_mut();
@@ -1693,7 +1716,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                 BackendStatus::Connecting(start),
                             ) => {
                                 #[cfg(debug_assertions)]
-                                context
+                                self.context
                                     .debug
                                     .push(DebugEvent::CCS(*token, cluster_id.clone()));
 
@@ -1721,7 +1744,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                 backend_borrow.set_connection_time(start.elapsed());
                                 backend_borrow.retry_policy.succeed();
 
-                                for stream in &mut context.streams {
+                                for stream in &mut self.context.streams {
                                     match stream.state {
                                         StreamState::Linked(back_token) if back_token == *token => {
                                             stream.metrics.backend_connected();
@@ -1746,40 +1769,65 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                 error!("backend connection cannot be in Server position");
                             }
                         }
-                        let res = client.writable(context, EndpointServer(&mut self.frontend));
-                        context
-                            .debug
-                            .push(DebugEvent::CW(*token, res, client.readiness().clone()));
+                        let res = {
+                            let context = &mut self.context;
+                            let res = client.writable(context, EndpointServer(&mut self.frontend));
+                            context.debug.push(DebugEvent::CW(
+                                *token,
+                                res,
+                                client.readiness().clone(),
+                            ));
+                            res
+                        };
                         match res {
                             MuxResult::Continue => {}
                             MuxResult::Upgrade => {
                                 error!("only frontend connections can trigger Upgrade");
                             }
-                            MuxResult::CloseSession => return SessionResult::Close,
+                            MuxResult::CloseSession => {
+                                warn!(
+                                    "Mux close from backend writable token={:?}: frontend={:?}",
+                                    token, self.frontend
+                                );
+                                return SessionResult::Close;
+                            }
                         }
                         // Cross-readiness: backend wrote → wake frontend reader
+                        let context = &mut self.context;
                         self.frontend.try_resume_reading(context);
                     }
 
                     if client.readiness().filter_interest().is_readable() {
-                        let res = client.readable(context, EndpointServer(&mut self.frontend));
-                        context
-                            .debug
-                            .push(DebugEvent::CR(*token, res, client.readiness().clone()));
+                        let res = {
+                            let context = &mut self.context;
+                            let res = client.readable(context, EndpointServer(&mut self.frontend));
+                            context.debug.push(DebugEvent::CR(
+                                *token,
+                                res,
+                                client.readiness().clone(),
+                            ));
+                            res
+                        };
                         match res {
                             MuxResult::Continue => {}
                             MuxResult::Upgrade => {
                                 error!("only frontend connections can trigger Upgrade (readable)");
                             }
-                            MuxResult::CloseSession => return SessionResult::Close,
+                            MuxResult::CloseSession => {
+                                warn!(
+                                    "Mux close from backend readable token={:?}: frontend={:?}",
+                                    token, self.frontend
+                                );
+                                return SessionResult::Close;
+                            }
                         }
                     }
 
                     if dead
                         && !client.readiness().filter_interest().is_readable()
-                        && !client.has_buffer_pressure(context)
+                        && !client.has_buffer_pressure(&self.context)
                     {
-                        context
+                        self.context
                             .debug
                             .push(DebugEvent::CH(*token, client.readiness().clone()));
                         trace!("Closing {:#?}", client);
@@ -1816,7 +1864,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                             }
                             Position::Client(_, backend, _) => {
                                 let mut backend_borrow = backend.borrow_mut();
-                                for stream in &mut context.streams {
+                                for stream in &mut self.context.streams {
                                     match stream.state {
                                         StreamState::Linked(back_token) if back_token == *token => {
                                             backend_borrow.active_requests =
@@ -1830,7 +1878,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                 error!("dead backend cannot be in Server position");
                             }
                         }
-                        client.close(context, EndpointServer(&mut self.frontend));
+                        client.close(&mut self.context, EndpointServer(&mut self.frontend));
                         dead_backends.push(*token);
                     }
 
@@ -1866,24 +1914,33 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                     trace!("BACKENDS: {:#?}", self.router.backends);
                 }
 
-                let context = &mut self.context;
                 if self.frontend.readiness().filter_interest().is_writable() {
-                    let res = self
-                        .frontend
-                        .writable(context, EndpointClient(&mut self.router));
-                    context.debug.push(DebugEvent::SW(
-                        self.frontend_token,
-                        res,
-                        self.frontend.readiness().clone(),
-                    ));
+                    let res = {
+                        let context = &mut self.context;
+                        let res = self
+                            .frontend
+                            .writable(context, EndpointClient(&mut self.router));
+                        context.debug.push(DebugEvent::SW(
+                            self.frontend_token,
+                            res,
+                            self.frontend.readiness().clone(),
+                        ));
+                        res
+                    };
                     match res {
                         MuxResult::Continue => {}
-                        MuxResult::CloseSession => return SessionResult::Close,
+                        MuxResult::CloseSession => {
+                            if !self.delay_close_for_frontend_flush("frontend writable") {
+                                warn!("Mux close from frontend writable: {:?}", self.frontend);
+                                return SessionResult::Close;
+                            }
+                        }
                         MuxResult::Upgrade => return SessionResult::Upgrade,
                     }
                     // Cross-readiness: frontend wrote → wake parked backends.
                     // If any backend resumes, invalidate the stale readiness
                     // flag so the inner loop continues instead of breaking.
+                    let context = &mut self.context;
                     for (_token, backend) in self.router.backends.iter_mut() {
                         if backend.try_resume_reading(context) {
                             all_backends_readiness_are_empty = false;
@@ -2164,6 +2221,33 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             return result;
         }
         if should_close {
+            if self.delay_close_for_frontend_flush("timeout") {
+                warn!(
+                    "Mux timeout delaying close for frontend flush: token={:?}, frontend={:?}",
+                    token, self.frontend
+                );
+                self.frontend.timeout_container().set(self.frontend_token);
+                return StateResult::Continue;
+            }
+            if front_is_h2 {
+                warn!(
+                    "Mux timeout returning CloseSession: token={:?}, frontend={:?}",
+                    token, self.frontend
+                );
+                for (idx, stream) in self.context.streams.iter().enumerate() {
+                    if stream.state != StreamState::Recycle {
+                        warn!(
+                            "  timeout stream[{}]: state={:?}, front_phase={:?}, back_phase={:?}, front_completed={}, back_completed={}",
+                            idx,
+                            stream.state,
+                            stream.front.parsing_phase,
+                            stream.back.parsing_phase,
+                            stream.front.is_completed(),
+                            stream.back.is_completed()
+                        );
+                    }
+                }
+            }
             StateResult::CloseSession
         } else {
             // Re-arm the frontend timeout. Without this, the timeout is consumed
@@ -2366,6 +2450,32 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                     can_stop = false;
                 }
                 _ => {}
+            }
+        }
+        if can_stop {
+            let active_h2_streams = self
+                .context
+                .streams
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.state != StreamState::Recycle)
+                .collect::<Vec<_>>();
+            if matches!(self.frontend, Connection::H2(_)) && !active_h2_streams.is_empty() {
+                warn!(
+                    "Mux shutting_down returning true with active H2 streams: {:?}",
+                    self.frontend
+                );
+                for (idx, stream) in active_h2_streams {
+                    warn!(
+                        "  shutdown stream[{}]: state={:?}, front_phase={:?}, back_phase={:?}, front_completed={}, back_completed={}",
+                        idx,
+                        stream.state,
+                        stream.front.parsing_phase,
+                        stream.back.parsing_phase,
+                        stream.front.is_completed(),
+                        stream.back.is_completed()
+                    );
+                }
             }
         }
         can_stop
