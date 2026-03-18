@@ -513,6 +513,8 @@ pub struct ConnectionH2<Front: SocketHandler> {
     /// Reusable buffer for priority-sorted stream IDs in write_streams().
     /// Cleared and reused each call to avoid per-frame allocation.
     priorities_buf: Vec<StreamId>,
+    /// True once we've asked rustls to emit TLS close_notify for this frontend.
+    close_notify_sent: bool,
 }
 impl<Front: SocketHandler> std::fmt::Debug for ConnectionH2<Front> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -602,7 +604,28 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             rst_sent: std::collections::HashSet::new(),
             total_rst_streams_queued: 0,
             priorities_buf: Vec::new(),
+            close_notify_sent: false,
         })
+    }
+
+    /// Start TLS close_notify on the frontend and keep the session alive until
+    /// rustls has flushed the generated records.
+    pub fn initiate_close_notify(&mut self) -> bool {
+        if !self.position.is_server() {
+            return false;
+        }
+        if !self.close_notify_sent {
+            trace!("H2 initiating CLOSE_NOTIFY");
+            self.socket.socket_close();
+            self.close_notify_sent = true;
+        }
+        if self.socket.socket_wants_write() {
+            self.readiness.interest = Ready::WRITABLE | Ready::HUP | Ready::ERROR;
+            self.ensure_tls_flushed();
+            true
+        } else {
+            false
+        }
     }
 
     fn expect_header(&mut self) {
@@ -2796,8 +2819,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             Position::Client(..) => {}
             Position::Server => {
                 let tls_pending_before = self.socket.socket_wants_write();
-                trace!("H2 SENDING CLOSE NOTIFY");
-                self.socket.socket_close();
+                if !self.close_notify_sent {
+                    trace!("H2 SENDING CLOSE NOTIFY");
+                    self.socket.socket_close();
+                    self.close_notify_sent = true;
+                }
                 // Drain the TLS buffer before the TCP socket is shut down.
                 // A single write attempt is insufficient when the TCP send
                 // buffer is full (likely during large response transfers).
