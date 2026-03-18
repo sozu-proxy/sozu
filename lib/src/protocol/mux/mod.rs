@@ -2100,14 +2100,27 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             return StateResult::Continue;
         }
         if should_write {
-            let result = match self
-                .frontend
-                .writable(&mut self.context, EndpointClient(&mut self.router))
-            {
-                MuxResult::Continue => StateResult::Continue,
-                MuxResult::Upgrade => StateResult::Upgrade,
-                MuxResult::CloseSession => StateResult::CloseSession,
-            };
+            // Drain as much pending data as possible before closing.
+            // A single writable() call is insufficient for large responses —
+            // the TLS buffer may need multiple flushes. Without this loop,
+            // the session is killed with unflushed TLS data, causing the
+            // client to receive a truncated TLS record ("decode error").
+            let mut result = StateResult::Continue;
+            for _ in 0..16 {
+                result = match self
+                    .frontend
+                    .writable(&mut self.context, EndpointClient(&mut self.router))
+                {
+                    MuxResult::Continue => StateResult::Continue,
+                    MuxResult::Upgrade => StateResult::Upgrade,
+                    MuxResult::CloseSession => StateResult::CloseSession,
+                };
+                if result != StateResult::Continue
+                    || !self.frontend.readiness_mut().interest.is_writable()
+                {
+                    break;
+                }
+            }
             // Re-arm the frontend timeout so the session doesn't become immortal.
             // The writable call may have partially flushed the response — we need
             // the timeout to fire again if the flush stalls.

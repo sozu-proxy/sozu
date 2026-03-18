@@ -7696,10 +7696,13 @@ fn try_h2_large_response_8mb_window_update_race() -> State {
         .args([
             "--http2",
             "-s",
-            "-o", &tmp,
-            "-w", "%{http_code} %{size_download}",
+            "-o",
+            &tmp,
+            "-w",
+            "%{http_code} %{size_download}",
             "--insecure",
-            "--max-time", "60",
+            "--max-time",
+            "60",
             &format!("https://localhost:{front_port}/admin/strapi-large.js"),
         ])
         .output()
@@ -7715,10 +7718,7 @@ fn try_h2_large_response_8mb_window_update_race() -> State {
     // Parse "200 8388608"
     let parts: Vec<&str> = stats.split_whitespace().collect();
     let status_ok = parts.first().map_or(false, |s| *s == "200");
-    let download_size: usize = parts
-        .get(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+    let download_size: usize = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
 
     println!(
         "H2 8MB curl - status: {}, downloaded: {} (expected {body_size})",
@@ -7730,9 +7730,8 @@ fn try_h2_large_response_8mb_window_update_race() -> State {
     let file_content = std::fs::read(&tmp).unwrap_or_default();
     let _ = std::fs::remove_file(&tmp);
 
-    let correct = status_ok
-        && file_content.len() == body_size
-        && file_content == body_content.as_bytes();
+    let correct =
+        status_ok && file_content.len() == body_size && file_content == body_content.as_bytes();
 
     worker.soft_stop();
     let success = worker.wait_for_server_stop();
@@ -7893,10 +7892,7 @@ fn try_h2_large_response_1gb_stress() -> State {
 
     let parts: Vec<&str> = stats.split_whitespace().collect();
     let status_ok = parts.first().map_or(false, |s| *s == "200");
-    let download_size: usize = parts
-        .get(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+    let download_size: usize = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
 
     println!(
         "H2 1GB curl - status: {}, downloaded: {} (expected {body_size})",
@@ -7914,10 +7910,10 @@ fn try_h2_large_response_1gb_stress() -> State {
         let mut reader = BufReader::new(file);
         let offsets: &[usize] = &[
             0,
-            1024 * 1024,              // 1 MB
-            100 * 1024 * 1024,         // 100 MB
-            512 * 1024 * 1024,         // 512 MB
-            body_size - 1024,          // last KB
+            1024 * 1024,       // 1 MB
+            100 * 1024 * 1024, // 100 MB
+            512 * 1024 * 1024, // 512 MB
+            body_size - 1024,  // last KB
         ];
         let mut check_buf = [0u8; 1024];
         let mut ok = true;

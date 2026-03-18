@@ -29,7 +29,7 @@ use crate::{
         pkawa, serializer, set_default_answer, update_readiness_after_read,
         update_readiness_after_write,
     },
-    socket::SocketHandler,
+    socket::{SocketHandler, SocketResult},
     timer::TimeoutContainer,
 };
 
@@ -2743,7 +2743,25 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             Position::Server => {
                 trace!("H2 SENDING CLOSE NOTIFY");
                 self.socket.socket_close();
-                let _ = self.socket.socket_write_vectored(&[]);
+                // Drain the TLS buffer before the TCP socket is shut down.
+                // A single write attempt is insufficient when the TCP send
+                // buffer is full (likely during large response transfers).
+                // Without this drain loop, shutdown(Both) in HttpsSession::close()
+                // kills the TCP connection with a partial TLS record in-flight,
+                // causing the client to see "TLS decode error / unexpected eof".
+                loop {
+                    let (size, status) = self.socket.socket_write_vectored(&[]);
+                    match status {
+                        SocketResult::WouldBlock | SocketResult::Error | SocketResult::Closed => {
+                            break;
+                        }
+                        SocketResult::Continue => {
+                            if size == 0 {
+                                break;
+                            }
+                        }
+                    }
+                }
                 return;
             }
         }
