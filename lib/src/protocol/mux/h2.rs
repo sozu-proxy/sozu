@@ -1001,6 +1001,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
 
                 self.state = H2State::ServerSettings;
                 self.expect_write = Some(H2StreamId::Zero);
+                self.readiness.signal_pending_write();
                 return self.handle_frame(settings, context, endpoint);
             }
             (H2State::ServerSettings, Position::Client(..)) => {
@@ -1475,6 +1476,16 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             return result;
         }
 
+        // Flush any pending TLS records before state-specific processing.
+        // This ensures response DATA frames that were accepted by rustls
+        // (via socket_write_vectored in write_streams) are pushed to the
+        // TCP socket even when the connection is in GoAway or Error state.
+        // Without this, the state-specific handlers may call force_disconnect()
+        // before the response data reaches the kernel's TCP send buffer.
+        if self.socket.socket_wants_write() {
+            self.socket.socket_write(&[]);
+        }
+
         match (&self.state, &self.position) {
             (H2State::Error, _)
             | (H2State::ClientPreface, Position::Server)
@@ -1490,7 +1501,24 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             // written in the preamble above; let the readable path consume
             // the remaining frame payload.
             (H2State::Discard, _) => MuxResult::Continue,
-            (H2State::GoAway, _) => self.force_disconnect(),
+            (H2State::GoAway, _) => {
+                // Flush any remaining TLS response data before disconnecting.
+                // The GoAway state only enters after control frames (our GOAWAY
+                // response) are flushed above, but response DATA frames may still
+                // be in rustls's TLS output buffer — accepted by socket_write_vectored
+                // during write_streams() but not yet flushed to TCP. Under TCP
+                // backpressure (HAProxy chain), this is the primary truncation vector.
+                if self.socket.socket_wants_write() {
+                    self.socket.socket_write(&[]);
+                    if self.socket.socket_wants_write() {
+                        // TLS data still pending (TCP backpressure) — don't disconnect
+                        // yet. Re-arm WRITABLE so the event loop retries the flush.
+                        self.ensure_tls_flushed();
+                        return MuxResult::Continue;
+                    }
+                }
+                self.force_disconnect()
+            }
             (H2State::ClientPreface, Position::Client(..)) => {
                 trace!("Preparing preface and settings");
                 let pri = serializer::H2_PRI.as_bytes();
@@ -1769,6 +1797,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         self.pending_rst_streams.push((stream_id, error));
         self.total_rst_streams_queued += 1;
         self.readiness.interest.insert(Ready::WRITABLE);
+        self.readiness.signal_pending_write();
         self.state = H2State::Discard;
         self.expect_read = Some((H2StreamId::Zero, payload_len as usize));
         MuxResult::Continue
@@ -1793,6 +1822,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 self.state = H2State::GoAway;
                 self.expect_write = Some(H2StreamId::Zero);
                 self.readiness.interest = Ready::WRITABLE | Ready::HUP | Ready::ERROR;
+                self.readiness.signal_pending_write();
                 MuxResult::Continue
             }
             Err(error) => {
@@ -1837,6 +1867,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 // during phase 1. Only remove READABLE in the second GOAWAY (goaway()).
                 self.expect_write = Some(H2StreamId::Zero);
                 self.readiness.interest.insert(Ready::WRITABLE);
+                self.readiness.signal_pending_write();
                 MuxResult::Continue
             }
             Err(error) => {
@@ -1846,11 +1877,18 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         }
     }
 
-    /// Returns `true` if there is data queued in the zero buffer waiting
-    /// to be flushed (e.g. a GOAWAY frame serialized but not yet written
-    /// to the socket).
+    /// Returns `true` if there is data queued waiting to be flushed:
+    /// - H2 control frames in the zero buffer (GOAWAY, SETTINGS ACK, etc.)
+    /// - A partially-written stream or control frame (`expect_write`)
+    /// - Encrypted TLS records in rustls's output buffer not yet flushed to TCP
+    ///
+    /// The TLS check is critical: `shutting_down()` uses this to prevent
+    /// premature session close while response DATA is still in rustls's
+    /// buffer (accepted by `socket_write_vectored` but not yet on the wire).
     pub fn has_pending_write(&self) -> bool {
-        self.expect_write.is_some() || !self.zero.storage.is_empty()
+        self.expect_write.is_some()
+            || !self.zero.storage.is_empty()
+            || self.socket.socket_wants_write()
     }
 
     /// Flush the zero buffer to the socket, counting bytes as connection overhead.
@@ -2474,6 +2512,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         self.readiness.interest.insert(Ready::WRITABLE);
         self.readiness.interest.remove(Ready::READABLE);
         self.expect_write = Some(H2StreamId::Zero);
+        self.readiness.signal_pending_write();
         MuxResult::Continue
     }
 
@@ -2508,6 +2547,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         self.readiness.interest.insert(Ready::WRITABLE);
         self.readiness.interest.remove(Ready::READABLE);
         self.expect_write = Some(H2StreamId::Zero);
+        self.readiness.signal_pending_write();
         MuxResult::Continue
     }
 
@@ -2725,7 +2765,21 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 self.readiness.event = Ready::HUP;
                 MuxResult::Continue
             }
-            Position::Server => MuxResult::CloseSession,
+            Position::Server => {
+                // Don't disconnect immediately if rustls still has buffered TLS
+                // records. Returning CloseSession here triggers shutdown(Write)
+                // which sends FIN — but any TLS records still in rustls's buffer
+                // (not yet flushed to the TCP send buffer) are lost, causing the
+                // client to see "TLS decode error / unexpected eof".
+                // Instead, keep WRITABLE interest and let the writable path flush.
+                if self.socket.socket_wants_write() {
+                    self.readiness.interest = Ready::WRITABLE | Ready::HUP | Ready::ERROR;
+                    self.ensure_tls_flushed();
+                    MuxResult::Continue
+                } else {
+                    MuxResult::CloseSession
+                }
+            }
         }
     }
 
@@ -2741,16 +2795,19 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             }
             Position::Client(..) => {}
             Position::Server => {
+                let tls_pending_before = self.socket.socket_wants_write();
                 trace!("H2 SENDING CLOSE NOTIFY");
                 self.socket.socket_close();
                 // Drain the TLS buffer before the TCP socket is shut down.
                 // A single write attempt is insufficient when the TCP send
                 // buffer is full (likely during large response transfers).
-                // Without this drain loop, shutdown(Both) in HttpsSession::close()
-                // kills the TCP connection with a partial TLS record in-flight,
-                // causing the client to see "TLS decode error / unexpected eof".
+                // Without this drain loop, shutdown(Write) in HttpsSession::close()
+                // can leave a partial TLS record in-flight, causing the client
+                // to see "TLS decode error / unexpected eof".
+                let mut drain_rounds = 0;
                 loop {
                     let (size, status) = self.socket.socket_write_vectored(&[]);
+                    drain_rounds += 1;
                     match status {
                         SocketResult::WouldBlock | SocketResult::Error | SocketResult::Closed => {
                             break;
@@ -2761,6 +2818,19 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                             }
                         }
                     }
+                }
+                let tls_pending_after = self.socket.socket_wants_write();
+                if tls_pending_after {
+                    error!(
+                        "TLS buffer NOT fully drained on close: \
+                         pending_before={}, pending_after={}, drain_rounds={}, \
+                         state={:?}, streams={}",
+                        tls_pending_before,
+                        tls_pending_after,
+                        drain_rounds,
+                        self.state,
+                        self.streams.len()
+                    );
                 }
                 return;
             }

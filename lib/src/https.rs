@@ -462,8 +462,14 @@ impl ProxySession for HttpsSession {
         // in case of https it should also send a close notify on the client before the socket is closed below
         self.state.close(self.proxy.clone(), &mut self.metrics);
 
+        // Shut down the write side only. shutdown(Both) includes SHUT_RD which
+        // discards unread data in the receive buffer (e.g. client's GOAWAY, ACKs).
+        // On Linux, close() after SHUT_RD with discarded receive data sends TCP RST
+        // instead of FIN, destroying any data still in the send buffer — including
+        // TLS records that the drain loop just flushed. Using SHUT_WR only sends
+        // FIN after all send buffer data is delivered, preserving the response.
         let front_socket = self.state.front_socket();
-        if let Err(e) = front_socket.shutdown(Shutdown::Both) {
+        if let Err(e) = front_socket.shutdown(Shutdown::Write) {
             // error 107 NotConnected can happen when was never fully connected, or was already disconnected due to error
             if e.kind() != ErrorKind::NotConnected {
                 error!(
