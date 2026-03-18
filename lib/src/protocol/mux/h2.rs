@@ -611,7 +611,12 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// Start TLS close_notify on the frontend and keep the session alive until
     /// rustls has flushed the generated records.
     pub fn initiate_close_notify(&mut self) -> bool {
-        if !self.position.is_server() {
+        if !self.position.is_server()
+            || matches!(
+                self.state,
+                H2State::ClientPreface | H2State::ClientSettings | H2State::ServerSettings
+            )
+        {
             return false;
         }
         if !self.close_notify_sent {
@@ -1102,7 +1107,6 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         L: ListenerHandler + L7ListenerHandler,
     {
         self.timeout_container.reset();
-        let mut dead_streams = Vec::new();
         // Pre-compute byte totals for proportional overhead distribution.
         let byte_totals = self.compute_stream_byte_totals(context);
 
@@ -1147,10 +1151,15 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     &mut context.debug,
                     context.listener.clone(),
                 ) {
+                    // Remove the recycled stream from the connection maps
+                    // before endpoint.end_stream() can trigger teardown.
+                    // Otherwise session close can observe a stale `Recycle`
+                    // entry in self.streams and mis-handle the connection as
+                    // if it still had an active H2 stream.
+                    self.remove_dead_stream(dead_id);
                     if let Some(token) = token {
                         endpoint.end_stream(token, global_stream_id, context);
                     }
-                    dead_streams.push(dead_id);
                 }
             }
         }
@@ -1171,6 +1180,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         } else {
             b"http"
         };
+        let mut completed_streams = Vec::new();
         let mut converter_buf = std::mem::take(&mut self.converter_buf);
         converter_buf.clear();
         let mut converter = converter::H2BlockConverter {
@@ -1261,20 +1271,28 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     &mut context.debug,
                     context.listener.clone(),
                 ) {
-                    if let Some(token) = token {
-                        endpoint.end_stream(token, global_stream_id, context);
-                    }
-                    dead_streams.push(dead_id);
+                    completed_streams.push((dead_id, global_stream_id, token));
                 }
             }
         }
         // Reclaim the converter's reusable buffers before any &mut self calls,
         // since the converter borrows self.encoder.
-        self.converter_buf = converter.out;
-        self.lowercase_buf = converter.lowercase_buf;
+        let converter_out = std::mem::take(&mut converter.out);
+        let lowercase_buf = std::mem::take(&mut converter.lowercase_buf);
+        drop(converter);
+        self.converter_buf = converter_out;
+        self.lowercase_buf = lowercase_buf;
         self.shrink_converter_buffers();
-
-        self.remove_dead_streams(dead_streams);
+        for (dead_id, global_stream_id, token) in completed_streams {
+            // The main write loop borrows self.encoder, so we can't mutate the
+            // H2 maps inline. Retire the recycled stream immediately after the
+            // converter borrow ends, before endpoint.end_stream() can trigger
+            // teardown and observe a stale `Recycle` entry in self.streams.
+            self.remove_dead_stream(dead_id);
+            if let Some(token) = token {
+                endpoint.end_stream(token, global_stream_id, context);
+            }
+        }
         self.finalize_write(socket_write, context)
     }
 
@@ -1311,14 +1329,12 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         }
     }
 
-    fn remove_dead_streams(&mut self, dead_streams: Vec<StreamId>) {
-        for stream_id in dead_streams {
-            if self.streams.remove(&stream_id).is_none() {
-                error!("dead stream_id {} missing from streams map", stream_id);
-            }
-            self.rst_sent.remove(&stream_id);
-            self.prioriser.remove(&stream_id);
+    fn remove_dead_stream(&mut self, stream_id: StreamId) {
+        if self.streams.remove(&stream_id).is_none() {
+            error!("dead stream_id {} missing from streams map", stream_id);
         }
+        self.rst_sent.remove(&stream_id);
+        self.prioriser.remove(&stream_id);
     }
 
     /// Shrink reusable converter buffers when they grow beyond 16 KB to avoid
@@ -1510,8 +1526,15 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         }
 
         match (&self.state, &self.position) {
+            (H2State::Error, Position::Server) => {
+                if self.socket.socket_wants_write() {
+                    self.ensure_tls_flushed();
+                    MuxResult::Continue
+                } else {
+                    MuxResult::CloseSession
+                }
+            }
             (H2State::Error, _)
-            | (H2State::ClientPreface, Position::Server)
             | (H2State::ClientSettings, Position::Server)
             | (H2State::ServerSettings, Position::Client(..)) => {
                 error!(
@@ -1520,6 +1543,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 );
                 self.force_disconnect()
             }
+            (H2State::ClientPreface, Position::Server) => MuxResult::Continue,
             // Discard state: pending data (e.g. RST_STREAM) was already
             // written in the preamble above; let the readable path consume
             // the remaining frame payload.
@@ -2786,6 +2810,14 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             Position::Client(_, _, status) => {
                 *status = BackendStatus::Disconnecting;
                 self.readiness.event = Ready::HUP;
+                warn!(
+                    "H2 force_disconnect client: state={:?}, streams={}, expect_write={:?}, wants_write={}, readiness={:?}",
+                    self.state,
+                    self.streams.len(),
+                    self.expect_write,
+                    self.socket.socket_wants_write(),
+                    self.readiness
+                );
                 MuxResult::Continue
             }
             Position::Server => {
@@ -2796,10 +2828,24 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 // client to see "TLS decode error / unexpected eof".
                 // Instead, keep WRITABLE interest and let the writable path flush.
                 if self.socket.socket_wants_write() {
+                    warn!(
+                        "H2 force_disconnect delaying close: state={:?}, streams={}, expect_write={:?}, wants_write=true, readiness={:?}",
+                        self.state,
+                        self.streams.len(),
+                        self.expect_write,
+                        self.readiness
+                    );
                     self.readiness.interest = Ready::WRITABLE | Ready::HUP | Ready::ERROR;
                     self.ensure_tls_flushed();
                     MuxResult::Continue
                 } else {
+                    warn!(
+                        "H2 force_disconnect closing session: state={:?}, streams={}, expect_write={:?}, wants_write=false, readiness={:?}",
+                        self.state,
+                        self.streams.len(),
+                        self.expect_write,
+                        self.readiness
+                    );
                     MuxResult::CloseSession
                 }
             }
@@ -2819,6 +2865,31 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             Position::Client(..) => {}
             Position::Server => {
                 let tls_pending_before = self.socket.socket_wants_write();
+                if self.streams.len() > 0 || matches!(self.state, H2State::Header) {
+                    warn!(
+                        "H2 close with active state: state={:?}, streams={}, expect_write={:?}, wants_write={}, readiness={:?}",
+                        self.state,
+                        self.streams.len(),
+                        self.expect_write,
+                        tls_pending_before,
+                        self.readiness
+                    );
+                    for (stream_id, global_stream_id) in &self.streams {
+                        let stream = &context.streams[*global_stream_id];
+                        warn!(
+                            "  close stream id={} gid={}: state={:?}, front_eos={}, back_eos={}, front_phase={:?}, back_phase={:?}, front_completed={}, back_completed={}",
+                            stream_id,
+                            global_stream_id,
+                            stream.state,
+                            stream.front_received_end_of_stream,
+                            stream.back_received_end_of_stream,
+                            stream.front.parsing_phase,
+                            stream.back.parsing_phase,
+                            stream.front.is_completed(),
+                            stream.back.is_completed()
+                        );
+                    }
+                }
                 if !self.close_notify_sent {
                     trace!("H2 SENDING CLOSE NOTIFY");
                     self.socket.socket_close();
@@ -2831,18 +2902,14 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 // can leave a partial TLS record in-flight, causing the client
                 // to see "TLS decode error / unexpected eof".
                 let mut drain_rounds = 0;
-                loop {
-                    let (size, status) = self.socket.socket_write_vectored(&[]);
+                while self.socket.socket_wants_write() && drain_rounds < 16 {
+                    let (_size, status) = self.socket.socket_write_vectored(&[]);
                     drain_rounds += 1;
                     match status {
                         SocketResult::WouldBlock | SocketResult::Error | SocketResult::Closed => {
                             break;
                         }
-                        SocketResult::Continue => {
-                            if size == 0 {
-                                break;
-                            }
-                        }
+                        SocketResult::Continue => {}
                     }
                 }
                 let tls_pending_after = self.socket.socket_wants_write();
@@ -2850,12 +2917,16 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     error!(
                         "TLS buffer NOT fully drained on close: \
                          pending_before={}, pending_after={}, drain_rounds={}, \
-                         state={:?}, streams={}",
+                         state={:?}, streams={}, expect_write={:?}, \
+                         close_notify_sent={}, readiness={:?}",
                         tls_pending_before,
                         tls_pending_after,
                         drain_rounds,
                         self.state,
-                        self.streams.len()
+                        self.streams.len(),
+                        self.expect_write,
+                        self.close_notify_sent,
+                        self.readiness
                     );
                 }
                 return;

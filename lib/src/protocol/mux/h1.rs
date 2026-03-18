@@ -49,6 +49,22 @@ impl<Front: SocketHandler> std::fmt::Debug for ConnectionH1<Front> {
 }
 
 impl<Front: SocketHandler> ConnectionH1<Front> {
+    fn defer_close_for_tls_flush(&mut self, reason: &'static str) -> MuxResult {
+        if self.initiate_close_notify() {
+            warn!(
+                "H1 writable delaying close after {}: stream={:?}, close_notify_sent={}, wants_write={}, readiness={:?}",
+                reason,
+                self.stream,
+                self.close_notify_sent,
+                self.socket.socket_wants_write(),
+                self.readiness
+            );
+            MuxResult::Continue
+        } else {
+            MuxResult::CloseSession
+        }
+    }
+
     /// Terminate a close-delimited kawa body by pushing END_STREAM flags.
     /// Called when the backend closes the connection to signal end-of-body
     /// (no Content-Length, no chunked encoding).
@@ -269,6 +285,9 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             if self.socket.socket_wants_write() {
                 let (size, status) = self.socket.socket_write_vectored(&[]);
                 let _ = update_readiness_after_write(size, status, &mut self.readiness);
+                if self.socket.socket_wants_write() {
+                    self.readiness.signal_pending_write();
+                }
             }
             return MuxResult::Continue;
         };
@@ -278,18 +297,25 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         let kawa = parts.wbuffer;
         kawa.prepare(&mut kawa::h1::BlockConverter);
         let bufs = kawa.as_io_slice();
-        if bufs.is_empty() && !self.socket.socket_wants_write() {
+        let can_finalize_server_close = matches!(self.position, Position::Server)
+            && kawa.is_terminated()
+            && kawa.is_completed();
+        if bufs.is_empty() && !self.socket.socket_wants_write() && !can_finalize_server_close {
             self.readiness.interest.remove(Ready::WRITABLE);
             return MuxResult::Continue;
         }
+        let tls_only_flush = bufs.is_empty();
         let (size, status) = self.socket.socket_write_vectored(&bufs);
         context.debug.push(DebugEvent::StreamEvent(1, size));
         kawa.consume(size);
         self.position.count_bytes_out_counter(size);
         self.position.count_bytes_out(parts.metrics, size);
-        if update_readiness_after_write(size, status, &mut self.readiness)
-            || self.socket.socket_wants_write()
-        {
+        let should_yield = update_readiness_after_write(size, status, &mut self.readiness);
+        if self.socket.socket_wants_write() {
+            self.readiness.signal_pending_write();
+            return MuxResult::Continue;
+        }
+        if !tls_only_flush && should_yield {
             return MuxResult::Continue;
         }
 
@@ -298,7 +324,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                 Position::Client(..) => self.readiness.interest.insert(Ready::READABLE),
                 Position::Server => {
                     if stream.context.closing {
-                        return MuxResult::CloseSession;
+                        return self.defer_close_for_tls_flush("closing-context");
                     }
                     let kawa = &mut stream.back;
                     match kawa.detached.status_line {
@@ -351,7 +377,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                                     Some("H1::EarlyHint"),
                                     context.listener.clone(),
                                 );
-                                return MuxResult::CloseSession;
+                                return self.defer_close_for_tls_flush("early-hint");
                             }
                         }
                         _ => {}
@@ -409,7 +435,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                             // else: incomplete parse, wait for more data via READABLE
                         }
                     } else {
-                        return MuxResult::CloseSession;
+                        return self.defer_close_for_tls_flush("response-complete");
                     }
                 }
             }
@@ -422,9 +448,31 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             Position::Client(_, _, status) => {
                 *status = BackendStatus::Disconnecting;
                 self.readiness.event = Ready::HUP;
+                warn!(
+                    "H1 force_disconnect client: stream={:?}, wants_write={}, readiness={:?}",
+                    self.stream,
+                    self.socket.socket_wants_write(),
+                    self.readiness
+                );
                 MuxResult::Continue
             }
-            Position::Server => MuxResult::CloseSession,
+            Position::Server => {
+                if self.socket.socket_wants_write() {
+                    warn!(
+                        "H1 force_disconnect delaying close: stream={:?}, wants_write=true, readiness={:?}",
+                        self.stream, self.readiness
+                    );
+                    self.readiness.interest = Ready::WRITABLE | Ready::HUP | Ready::ERROR;
+                    self.readiness.signal_pending_write();
+                    MuxResult::Continue
+                } else {
+                    warn!(
+                        "H1 force_disconnect closing session: stream={:?}, wants_write=false, readiness={:?}",
+                        self.stream, self.readiness
+                    );
+                    MuxResult::CloseSession
+                }
+            }
         }
     }
 
@@ -466,22 +514,48 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                 debug!("BACKEND CLOSING FOR: {:?} {:?}", self.position, self.stream);
             }
             Position::Server => {
+                let tls_pending_before = self.socket.socket_wants_write();
                 if !self.close_notify_sent {
                     trace!("H1 SENDING CLOSE NOTIFY");
                     self.socket.socket_close();
                     self.close_notify_sent = true;
                 }
-                let _ = self.socket.socket_write_vectored(&[]);
+                let mut drain_rounds = 0;
+                while self.socket.socket_wants_write() && drain_rounds < 16 {
+                    let (_size, status) = self.socket.socket_write_vectored(&[]);
+                    drain_rounds += 1;
+                    match status {
+                        SocketResult::WouldBlock | SocketResult::Error | SocketResult::Closed => {
+                            break;
+                        }
+                        SocketResult::Continue => {}
+                    }
+                }
+                let tls_pending_after = self.socket.socket_wants_write();
+                if tls_pending_after {
+                    error!(
+                        "H1 TLS buffer NOT fully drained on close: pending_before={}, pending_after={}, drain_rounds={}, stream={:?}, close_notify_sent={}, readiness={:?}",
+                        tls_pending_before,
+                        tls_pending_after,
+                        drain_rounds,
+                        self.stream,
+                        self.close_notify_sent,
+                        self.readiness
+                    );
+                }
                 return;
             }
         }
         let Some(stream_id) = self.stream else {
-            error!("closing H1 client with no active stream");
+            trace!("closing detached H1 client with no active stream");
             return;
         };
         // reconnection is handled by the server
         let StreamState::Linked(token) = context.streams[stream_id].state else {
-            error!("closing H1 client is not in Linked state");
+            trace!(
+                "closing detached H1 client in state {:?} on stream {}",
+                context.streams[stream_id].state, stream_id
+            );
             return;
         };
         endpoint.end_stream(token, stream_id, context)
