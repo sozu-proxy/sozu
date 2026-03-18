@@ -806,7 +806,10 @@ fn update_readiness_after_read(
     match status {
         SocketResult::Continue => {}
         SocketResult::Closed | SocketResult::Error => {
-            readiness.event.remove(Ready::ALL);
+            // Preserve pending WRITABLE/HUP/ERROR bits on half-close.
+            // The read side may be closed while we still need one last writable
+            // pass to flush queued H2 control frames or TLS close_notify.
+            readiness.event.remove(Ready::READABLE);
         }
         SocketResult::WouldBlock => {
             readiness.event.remove(Ready::READABLE);
@@ -840,6 +843,26 @@ fn update_readiness_after_write(
     } else {
         readiness.event.remove(Ready::WRITABLE);
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn update_readiness_after_read_closed_keeps_writable() {
+        let mut readiness = Readiness {
+            event: Ready::READABLE | Ready::WRITABLE | Ready::HUP,
+            interest: Ready::READABLE | Ready::WRITABLE | Ready::HUP,
+        };
+
+        let should_yield = update_readiness_after_read(17, SocketResult::Closed, &mut readiness);
+
+        assert!(!should_yield);
+        assert!(!readiness.event.is_readable());
+        assert!(readiness.event.is_writable());
+        assert!(readiness.event.is_hup());
     }
 }
 
@@ -1594,7 +1617,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
     ) -> SessionResult {
         let mut counter = 0;
 
-        if self.frontend.readiness().event.is_hup() {
+        if self.frontend.readiness().event.is_hup() && !self.frontend.has_pending_write() {
             return SessionResult::Close;
         }
 
