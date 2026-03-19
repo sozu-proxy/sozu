@@ -71,9 +71,6 @@ pub use crate::protocol::mux::{
 /// Maximum event loop iterations before forcefully closing a session.
 /// Prevents infinite loops from consuming the single-threaded worker.
 const MAX_LOOP_ITERATIONS: i32 = 10_000;
-/// Maximum time to wait for an H2 graceful drain before force-closing.
-const H2_GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
-
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Generic Http representation using the Kawa crate using the Checkout of Sozu as buffer
@@ -2513,19 +2510,6 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             }
         }
         if can_stop {
-            return true;
-        }
-
-        if let Connection::H2(c) = &self.frontend
-            && let Some(started_at) = c.drain.started_at
-            && started_at.elapsed() > H2_GRACEFUL_SHUTDOWN_TIMEOUT
-        {
-            warn!(
-                "H2 graceful shutdown exceeded {:?}, forcing close: state={:?}, streams={}",
-                H2_GRACEFUL_SHUTDOWN_TIMEOUT,
-                c.state,
-                c.streams.len()
-            );
             return true;
         }
 
