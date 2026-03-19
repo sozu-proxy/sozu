@@ -6194,7 +6194,9 @@ impl AbruptCloseH2Backend {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(thread) = self.thread.take() {
             thread::sleep(Duration::from_millis(100));
-            drop(thread);
+            if let Err(error) = thread.join() {
+                eprintln!("abrupt-close h2 backend thread join failed: {error:?}");
+            }
         }
     }
 }
