@@ -1115,6 +1115,17 @@ impl ListenerHandler for TcpListener {
             None => self.tags.remove(&key),
         };
     }
+
+    fn protocol(&self) -> Protocol {
+        Protocol::TCP
+    }
+
+    fn public_address(&self) -> SocketAddr {
+        self.config
+            .public_address
+            .map(|addr| addr.into())
+            .unwrap_or(self.address)
+    }
 }
 
 impl TcpListener {
@@ -1587,20 +1598,20 @@ mod tests {
             atomic::{AtomicBool, Ordering},
         },
         thread,
+        time::Duration,
     };
 
     use sozu_command::{
         channel::Channel,
         config::ListenerBuilder,
         proto::command::{
-            LoadBalancingParams, RequestTcpFrontend, SocketAddress, WorkerRequest, WorkerResponse,
-            request::RequestType,
+            LoadBalancingParams, RequestTcpFrontend, SocketAddress, SoftStop, WorkerRequest,
+            WorkerResponse, request::RequestType,
         },
     };
 
     use super::testing::start_tcp_worker;
     use crate::testing::*;
-    static TEST_FINISHED: AtomicBool = AtomicBool::new(false);
 
     /*
     #[test]
@@ -1619,106 +1630,147 @@ mod tests {
     fn round_trip() {
         setup_test_logger!();
         let barrier = Arc::new(Barrier::new(2));
-        start_server(barrier.clone());
-        let _tx = start_proxy().expect("Could not start proxy");
+        let test_finished = Arc::new(AtomicBool::new(false));
+
+        let front_port1 = provide_port();
+        let front_port2 = provide_port();
+
+        let backend_port = start_server(barrier.clone(), test_finished.clone());
+        let mut command =
+            start_proxy(backend_port, front_port1, front_port2).expect("Could not start proxy");
         barrier.wait();
 
-        let mut s1 = TcpStream::connect("127.0.0.1:1234").expect("could not connect");
-        let s3 = TcpStream::connect("127.0.0.1:1234").expect("could not connect");
-        let mut s2 = TcpStream::connect("127.0.0.1:1234").expect("could not connect");
+        thread::scope(|_s| {
+            let front_addr = format!("127.0.0.1:{front_port1}");
 
-        s1.write(&b"hello "[..])
-            .map_err(|e| {
-                TEST_FINISHED.store(true, Ordering::Relaxed);
-                e
-            })
-            .unwrap();
-        println!("s1 sent");
+            let mut s1 = TcpStream::connect(&front_addr).expect("could not connect");
+            s1.set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("could not set read timeout on s1");
 
-        s2.write(&b"pouet pouet"[..])
-            .map_err(|e| {
-                TEST_FINISHED.store(true, Ordering::Relaxed);
-                e
-            })
-            .unwrap();
+            let s3 = TcpStream::connect(&front_addr).expect("could not connect");
 
-        println!("s2 sent");
+            let mut s2 = TcpStream::connect(&front_addr).expect("could not connect");
+            s2.set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("could not set read timeout on s2");
 
-        let mut res = [0; 128];
-        s1.write(&b"coucou"[..])
-            .map_err(|e| {
-                TEST_FINISHED.store(true, Ordering::Relaxed);
-                e
-            })
-            .unwrap();
+            s1.write_all(b"hello ").expect("could not write to s1");
+            println!("s1 sent");
 
-        s3.shutdown(Shutdown::Both).unwrap();
-        let sz2 = s2
-            .read(&mut res[..])
-            .map_err(|e| {
-                TEST_FINISHED.store(true, Ordering::Relaxed);
-                e
-            })
-            .expect("could not read from socket");
-        println!("s2 received {:?}", str::from_utf8(&res[..sz2]));
-        assert_eq!(&res[..sz2], &b"pouet pouet"[..]);
+            s2.write_all(b"pouet pouet").expect("could not write to s2");
+            println!("s2 sent");
 
-        let sz1 = s1
-            .read(&mut res[..])
-            .map_err(|e| {
-                TEST_FINISHED.store(true, Ordering::Relaxed);
-                e
-            })
-            .expect("could not read from socket");
-        println!(
-            "s1 received again({}): {:?}",
-            sz1,
-            str::from_utf8(&res[..sz1])
-        );
-        assert_eq!(&res[..sz1], &b"hello coucou"[..]);
-        TEST_FINISHED.store(true, Ordering::Relaxed);
+            let mut res = [0; 128];
+            s1.write_all(b"coucou").expect("could not write to s1");
+
+            s3.shutdown(Shutdown::Both).expect("could not shutdown s3");
+
+            let sz2 = s2
+                .read(&mut res[..])
+                .expect("could not read from socket s2");
+            println!("s2 received {:?}", str::from_utf8(&res[..sz2]));
+            assert_eq!(&res[..sz2], &b"pouet pouet"[..]);
+
+            let sz1 = s1
+                .read(&mut res[..])
+                .expect("could not read from socket s1");
+            println!(
+                "s1 received again({}): {:?}",
+                sz1,
+                str::from_utf8(&res[..sz1])
+            );
+            assert_eq!(&res[..sz1], &b"hello coucou"[..]);
+
+            // Signal the echo server to stop
+            test_finished.store(true, Ordering::Relaxed);
+
+            // Send SoftStop to the sozu worker so server.run() exits cleanly
+            command
+                .write_message(&WorkerRequest {
+                    id: "ID_SOFTSTOP".to_owned(),
+                    content: RequestType::SoftStop(SoftStop {}).into(),
+                })
+                .expect("could not send SoftStop to sozu worker");
+        });
     }
 
-    fn start_server(barrier: Arc<Barrier>) {
-        let listener = TcpListener::bind("127.0.0.1:5678").expect("could not bind");
-        fn handle_client(stream: &mut TcpStream, id: u8) {
-            let mut buf = [0; 128];
-            let _response = b" END";
-            while let Ok(sz) = stream.read(&mut buf[..]) {
-                if sz > 0 {
-                    println!("ECHO[{}] got \"{:?}\"", id, str::from_utf8(&buf[..sz]));
-                    stream.write(&buf[..sz]).unwrap();
-                }
-                if TEST_FINISHED.load(Ordering::Relaxed) {
-                    println!("backend server stopping");
-                    break;
-                }
-            }
-        }
+    /// Start an echo server on an ephemeral port.
+    /// Returns the port the server is listening on.
+    fn start_server(barrier: Arc<Barrier>, test_finished: Arc<AtomicBool>) -> u16 {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("could not bind echo server listener");
+        let port = listener
+            .local_addr()
+            .expect("could not get echo server local address")
+            .port();
 
-        let mut count = 0;
+        listener
+            .set_nonblocking(true)
+            .expect("could not set echo server listener to non-blocking");
+
         thread::spawn(move || {
             barrier.wait();
-            for conn in listener.incoming() {
-                match conn {
-                    Ok(mut stream) => {
+            let mut count: u8 = 0;
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let finished = test_finished.clone();
                         thread::spawn(move || {
                             println!("got a new client: {count}");
-                            handle_client(&mut stream, count)
+                            stream
+                                .set_read_timeout(Some(Duration::from_secs(2)))
+                                .expect("could not set read timeout on echo client");
+                            let mut buf = [0; 128];
+                            loop {
+                                match stream.read(&mut buf[..]) {
+                                    Ok(0) => break,
+                                    Ok(sz) => {
+                                        println!(
+                                            "ECHO[{count}] got \"{:?}\"",
+                                            str::from_utf8(&buf[..sz])
+                                        );
+                                        stream
+                                            .write_all(&buf[..sz])
+                                            .expect("could not echo data back");
+                                    }
+                                    Err(ref e)
+                                        if e.kind() == std::io::ErrorKind::WouldBlock
+                                            || e.kind() == std::io::ErrorKind::TimedOut =>
+                                    {
+                                        if finished.load(Ordering::Relaxed) {
+                                            println!("backend server stopping (client handler)");
+                                            break;
+                                        }
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
                         });
+                        count = count.wrapping_add(1);
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if test_finished.load(Ordering::Relaxed) {
+                            println!("backend server stopping (accept loop)");
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(50));
                     }
                     Err(e) => {
                         println!("connection failed: {e:?}");
                     }
                 }
-                count += 1;
             }
         });
+
+        port
     }
 
-    /// used in tests only
-    pub fn start_proxy() -> anyhow::Result<Channel<WorkerRequest, WorkerResponse>> {
-        let config = ListenerBuilder::new_tcp(SocketAddress::new_v4(127, 0, 0, 1, 1234))
+    /// Start a sozu TCP proxy worker with the given backend and frontend ports.
+    fn start_proxy(
+        backend_port: u16,
+        front_port1: u16,
+        front_port2: u16,
+    ) -> anyhow::Result<Channel<WorkerRequest, WorkerResponse>> {
+        let config = ListenerBuilder::new_tcp(SocketAddress::new_v4(127, 0, 0, 1, front_port1))
             .to_tcp(None)
             .expect("could not create listener config");
 
@@ -1729,17 +1781,19 @@ mod tests {
             start_tcp_worker(config, 100, 16384, channel).expect("could not start the tcp server");
         });
 
-        command.blocking().unwrap();
+        command
+            .blocking()
+            .expect("could not set command channel to blocking");
         {
             let front = RequestTcpFrontend {
-                cluster_id: String::from("yolo"),
-                address: SocketAddress::new_v4(127, 0, 0, 1, 1234),
+                cluster_id: "yolo".to_owned(),
+                address: SocketAddress::new_v4(127, 0, 0, 1, front_port1),
                 ..Default::default()
             };
             let backend = sozu_command_lib::response::Backend {
-                cluster_id: String::from("yolo"),
-                backend_id: String::from("yolo-0"),
-                address: SocketAddress::new_v4(127, 0, 0, 1, 5678).into(),
+                cluster_id: "yolo".to_owned(),
+                backend_id: "yolo-0".to_owned(),
+                address: SocketAddress::new_v4(127, 0, 0, 1, backend_port).into(),
                 load_balancing_parameters: Some(LoadBalancingParams::default()),
                 sticky_id: None,
                 backup: None,
@@ -1747,46 +1801,45 @@ mod tests {
 
             command
                 .write_message(&WorkerRequest {
-                    id: String::from("ID_YOLO1"),
+                    id: "ID_YOLO1".to_owned(),
                     content: RequestType::AddTcpFrontend(front).into(),
                 })
-                .unwrap();
+                .expect("could not send AddTcpFrontend for front1");
             command
                 .write_message(&WorkerRequest {
-                    id: String::from("ID_YOLO2"),
+                    id: "ID_YOLO2".to_owned(),
                     content: RequestType::AddBackend(backend.to_add_backend()).into(),
                 })
-                .unwrap();
+                .expect("could not send AddBackend for front1");
         }
         {
             let front = RequestTcpFrontend {
-                cluster_id: String::from("yolo"),
-                address: SocketAddress::new_v4(127, 0, 0, 1, 1235),
+                cluster_id: "yolo".to_owned(),
+                address: SocketAddress::new_v4(127, 0, 0, 1, front_port2),
                 ..Default::default()
             };
             let backend = sozu_command::response::Backend {
-                cluster_id: String::from("yolo"),
-                backend_id: String::from("yolo-0"),
-                address: SocketAddress::new_v4(127, 0, 0, 1, 5678).into(),
+                cluster_id: "yolo".to_owned(),
+                backend_id: "yolo-0".to_owned(),
+                address: SocketAddress::new_v4(127, 0, 0, 1, backend_port).into(),
                 load_balancing_parameters: Some(LoadBalancingParams::default()),
                 sticky_id: None,
                 backup: None,
             };
             command
                 .write_message(&WorkerRequest {
-                    id: String::from("ID_YOLO3"),
+                    id: "ID_YOLO3".to_owned(),
                     content: RequestType::AddTcpFrontend(front).into(),
                 })
-                .unwrap();
+                .expect("could not send AddTcpFrontend for front2");
             command
                 .write_message(&WorkerRequest {
-                    id: String::from("ID_YOLO4"),
+                    id: "ID_YOLO4".to_owned(),
                     content: RequestType::AddBackend(backend.to_add_backend()).into(),
                 })
-                .unwrap();
+                .expect("could not send AddBackend for front2");
         }
 
-        // not sure why four times
         for _ in 0..4 {
             println!(
                 "read_message: {:?}",

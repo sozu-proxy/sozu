@@ -110,6 +110,10 @@ pub const DEFAULT_SIGNATURE_ALGORITHMS: [&str; 9] = [
 
 pub const DEFAULT_GROUPS_LIST: [&str; 4] = ["P-521", "P-384", "P-256", "x25519"];
 
+/// Default ALPN protocols advertised by HTTPS listeners.
+/// Both HTTP/2 and HTTP/1.1 are enabled, allowing clients to negotiate either.
+pub const DEFAULT_ALPN_PROTOCOLS: [&str; 2] = ["h2", "http/1.1"];
+
 /// maximum time of inactivity for a frontend socket (60 seconds)
 pub const DEFAULT_FRONT_TIMEOUT: u32 = 60;
 
@@ -233,6 +237,8 @@ pub enum ConfigError {
         expected: ListenerProtocol,
         found: Option<ListenerProtocol>,
     },
+    #[error("Invalid ALPN protocol '{0}'. Valid values: \"h2\", \"http/1.1\"")]
+    InvalidAlpnProtocol(String),
 }
 
 /// An HTTP, HTTPS or TCP listener as parsed from the `Listeners` section in the toml
@@ -275,6 +281,21 @@ pub struct ListenerBuilder {
     /// The ticket allow the client to resume a session. This protects the client
     /// agains session tracking. Defaults to 4.
     pub send_tls13_tickets: Option<u64>,
+    /// ALPN protocols to advertise during TLS handshake, in order of preference.
+    /// Valid values: "h2", "http/1.1". Defaults to ["h2", "http/1.1"].
+    pub alpn_protocols: Option<Vec<String>>,
+    /// H2 flood detection: max RST_STREAM frames per second window (CVE-2023-44487, CVE-2019-9514)
+    pub h2_max_rst_stream_per_window: Option<u32>,
+    /// H2 flood detection: max PING frames per second window (CVE-2019-9512)
+    pub h2_max_ping_per_window: Option<u32>,
+    /// H2 flood detection: max SETTINGS frames per second window (CVE-2019-9515)
+    pub h2_max_settings_per_window: Option<u32>,
+    /// H2 flood detection: max empty DATA frames per second window (CVE-2019-9518)
+    pub h2_max_empty_data_per_window: Option<u32>,
+    /// H2 flood detection: max CONTINUATION frames per header block (CVE-2024-27316)
+    pub h2_max_continuation_frames: Option<u32>,
+    /// H2 flood detection: max accumulated protocol anomalies before ENHANCE_YOUR_CALM
+    pub h2_max_glitch_count: Option<u32>,
 }
 
 pub fn default_sticky_name() -> String {
@@ -330,6 +351,13 @@ impl ListenerBuilder {
             send_tls13_tickets: None,
             sticky_name: DEFAULT_STICKY_NAME.to_string(),
             tls_versions: None,
+            alpn_protocols: None,
+            h2_max_rst_stream_per_window: None,
+            h2_max_ping_per_window: None,
+            h2_max_settings_per_window: None,
+            h2_max_empty_data_per_window: None,
+            h2_max_continuation_frames: None,
+            h2_max_glitch_count: None,
         }
     }
 
@@ -372,6 +400,11 @@ impl ListenerBuilder {
 
     pub fn with_cipher_suites(&mut self, cipher_suites: Option<Vec<String>>) -> &mut Self {
         self.cipher_suites = cipher_suites;
+        self
+    }
+
+    pub fn with_alpn_protocols(&mut self, alpn_protocols: Option<Vec<String>>) -> &mut Self {
+        self.alpn_protocols = alpn_protocols;
         self
     }
 
@@ -481,6 +514,12 @@ impl ListenerBuilder {
             connect_timeout: self.connect_timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT),
             request_timeout: self.request_timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT),
             http_answers,
+            h2_max_rst_stream_per_window: self.h2_max_rst_stream_per_window,
+            h2_max_ping_per_window: self.h2_max_ping_per_window,
+            h2_max_settings_per_window: self.h2_max_settings_per_window,
+            h2_max_empty_data_per_window: self.h2_max_empty_data_per_window,
+            h2_max_continuation_frames: self.h2_max_continuation_frames,
+            h2_max_glitch_count: self.h2_max_glitch_count,
             ..Default::default()
         };
 
@@ -516,6 +555,33 @@ impl ListenerBuilder {
             .collect();
 
         let groups_list: Vec<String> = DEFAULT_GROUPS_LIST.into_iter().map(String::from).collect();
+
+        let alpn_protocols: Vec<String> = match &self.alpn_protocols {
+            Some(protos) if !protos.is_empty() => {
+                for proto in protos {
+                    match proto.as_str() {
+                        "h2" | "http/1.1" => {}
+                        other => return Err(ConfigError::InvalidAlpnProtocol(other.to_owned())),
+                    }
+                }
+                if !protos.iter().any(|p| p == "http/1.1") {
+                    warn!(
+                        "ALPN protocols do not include 'http/1.1'. Clients without H2 support will fail TLS negotiation."
+                    );
+                }
+                // Deduplicate while preserving order
+                let mut seen = std::collections::HashSet::new();
+                protos
+                    .iter()
+                    .filter(|p| seen.insert(p.as_str()))
+                    .cloned()
+                    .collect()
+            }
+            _ => DEFAULT_ALPN_PROTOCOLS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        };
 
         let versions = match self.tls_versions {
             None => vec![TlsVersion::TlsV12 as i32, TlsVersion::TlsV13 as i32],
@@ -580,6 +646,13 @@ impl ListenerBuilder {
                 .send_tls13_tickets
                 .unwrap_or(DEFAULT_SEND_TLS_13_TICKETS),
             http_answers,
+            alpn_protocols,
+            h2_max_rst_stream_per_window: self.h2_max_rst_stream_per_window,
+            h2_max_ping_per_window: self.h2_max_ping_per_window,
+            h2_max_settings_per_window: self.h2_max_settings_per_window,
+            h2_max_empty_data_per_window: self.h2_max_empty_data_per_window,
+            h2_max_continuation_frames: self.h2_max_continuation_frames,
+            h2_max_glitch_count: self.h2_max_glitch_count,
         };
 
         Ok(https_listener_config)
@@ -788,6 +861,8 @@ pub struct FileClusterConfig {
     pub answer_503: Option<String>,
     #[serde(default)]
     pub load_metric: Option<LoadMetric>,
+    /// Use HTTP/2 for backend connections to this cluster
+    pub http2: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -883,6 +958,7 @@ impl FileClusterConfig {
                     load_balancing: self.load_balancing,
                     load_metric: self.load_metric,
                     answer_503,
+                    http2: self.http2,
                 }))
             }
         }
@@ -975,6 +1051,7 @@ pub struct HttpClusterConfig {
     pub load_balancing: LoadBalancingAlgorithms,
     pub load_metric: Option<LoadMetric>,
     pub answer_503: Option<String>,
+    pub http2: Option<bool>,
 }
 
 impl HttpClusterConfig {
@@ -988,6 +1065,7 @@ impl HttpClusterConfig {
                 load_balancing: self.load_balancing as i32,
                 answer_503: self.answer_503.clone(),
                 load_metric: self.load_metric.map(|s| s as i32),
+                http2: self.http2,
             })
             .into(),
         ];
@@ -1049,6 +1127,7 @@ impl TcpClusterConfig {
                 load_balancing: self.load_balancing as i32,
                 load_metric: self.load_metric.map(|s| s as i32),
                 answer_503: None,
+                http2: None,
             })
             .into(),
         ];
@@ -1827,9 +1906,18 @@ fn display_toml_error(file: &str, error: &toml::de::Error) {
 }
 
 impl ServerConfig {
-    /// size of the slab for the Session manager
+    /// Number of slab entries per connection. Set to 4 to accommodate H2 multiplexing
+    /// (1 frontend + up to 3 backend connections per frontend with stream multiplexing).
+    /// Previous value was 2 for H1-only operation.
+    const SLAB_ENTRIES_PER_CONNECTION: u64 = 4;
+
+    /// Size of the slab for the Session manager.
+    ///
+    /// With HTTP/2 multiplexing, each frontend session can have multiple backend
+    /// connections (one per cluster), so we allocate `SLAB_ENTRIES_PER_CONNECTION` (4)
+    /// entries per connection instead of the old H1-only multiplier of 2.
     pub fn slab_capacity(&self) -> u64 {
-        10 + 2 * self.max_connections
+        10 + Self::SLAB_ENTRIES_PER_CONNECTION * self.max_connections
     }
 }
 
@@ -2071,5 +2159,61 @@ mod tests {
             result.is_err(),
             "Should reject duplicate listener addresses"
         );
+    }
+
+    #[test]
+    fn alpn_protocols_default() {
+        let mut builder = ListenerBuilder::new_https(SocketAddress::new_v4(127, 0, 0, 1, 8443));
+        let config = builder.to_tls(None).expect("to_tls should succeed");
+        assert_eq!(config.alpn_protocols, vec!["h2", "http/1.1"]);
+    }
+
+    #[test]
+    fn alpn_protocols_custom() {
+        let mut builder = ListenerBuilder::new_https(SocketAddress::new_v4(127, 0, 0, 1, 8443));
+        builder.with_alpn_protocols(Some(vec!["http/1.1".to_owned()]));
+        let config = builder.to_tls(None).expect("to_tls should succeed");
+        assert_eq!(config.alpn_protocols, vec!["http/1.1"]);
+    }
+
+    #[test]
+    fn alpn_protocols_invalid_rejected() {
+        let mut builder = ListenerBuilder::new_https(SocketAddress::new_v4(127, 0, 0, 1, 8443));
+        builder.with_alpn_protocols(Some(vec!["h3".to_owned()]));
+        let result = builder.to_tls(None);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("h3"),
+            "error should mention the invalid protocol: {err}"
+        );
+    }
+
+    #[test]
+    fn alpn_protocols_empty_uses_default() {
+        let mut builder = ListenerBuilder::new_https(SocketAddress::new_v4(127, 0, 0, 1, 8443));
+        builder.with_alpn_protocols(Some(vec![]));
+        let config = builder.to_tls(None).expect("to_tls should succeed");
+        assert_eq!(config.alpn_protocols, vec!["h2", "http/1.1"]);
+    }
+
+    #[test]
+    fn alpn_protocols_deduplicated() {
+        let mut builder = ListenerBuilder::new_https(SocketAddress::new_v4(127, 0, 0, 1, 8443));
+        builder.with_alpn_protocols(Some(vec![
+            "h2".to_owned(),
+            "h2".to_owned(),
+            "http/1.1".to_owned(),
+        ]));
+        let config = builder.to_tls(None).expect("to_tls should succeed");
+        assert_eq!(config.alpn_protocols, vec!["h2", "http/1.1"]);
+    }
+
+    #[test]
+    fn alpn_protocols_order_preserved() {
+        let mut builder = ListenerBuilder::new_https(SocketAddress::new_v4(127, 0, 0, 1, 8443));
+        builder.with_alpn_protocols(Some(vec!["http/1.1".to_owned(), "h2".to_owned()]));
+        let config = builder.to_tls(None).expect("to_tls should succeed");
+        assert_eq!(config.alpn_protocols, vec!["http/1.1", "h2"]);
     }
 }

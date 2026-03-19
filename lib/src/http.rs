@@ -33,12 +33,12 @@ use crate::{
     backends::BackendMap,
     pool::Pool,
     protocol::{
-        Http, Pipe, SessionState,
+        Pipe, SessionState,
         http::{
-            ResponseStream,
             answers::HttpAnswers,
             parser::{Method, hostname_and_port},
         },
+        mux::{self, Mux, MuxClear},
         proxy_protocol::expect::ExpectProxyProtocol,
     },
     router::{Route, Router},
@@ -57,11 +57,11 @@ StateMachineBuilder! {
     /// The various Stages of an HTTP connection:
     ///
     /// 1. optional (ExpectProxyProtocol)
-    /// 2. HTTP
+    /// 2. HTTP (via Mux in H1 mode)
     /// 3. WebSocket (passthrough)
     enum HttpStateMachine impl SessionState {
         Expect(ExpectProxyProtocol<TcpStream>),
-        Http(Http<TcpStream, HttpListener>),
+        Mux(MuxClear),
         WebSocket(Pipe<TcpStream, HttpListener>),
     }
 }
@@ -70,7 +70,6 @@ StateMachineBuilder! {
 ///
 /// 1 session <=> 1 HTTP connection (client to sozu)
 pub struct HttpSession {
-    answers: Rc<RefCell<HttpAnswers>>,
     configured_backend_timeout: Duration,
     configured_connect_timeout: Duration,
     configured_frontend_timeout: Duration,
@@ -81,14 +80,12 @@ pub struct HttpSession {
     pool: Weak<RefCell<Pool>>,
     proxy: Rc<RefCell<HttpProxy>>,
     state: HttpStateMachine,
-    sticky_name: String,
     has_been_closed: bool,
 }
 
 impl HttpSession {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        answers: Rc<RefCell<HttpAnswers>>,
         configured_backend_timeout: Duration,
         configured_connect_timeout: Duration,
         configured_frontend_timeout: Duration,
@@ -99,7 +96,6 @@ impl HttpSession {
         proxy: Rc<RefCell<HttpProxy>>,
         public_address: SocketAddr,
         sock: TcpStream,
-        sticky_name: String,
         token: Token,
         wait_time: Duration,
     ) -> Result<Self, AcceptError> {
@@ -120,27 +116,28 @@ impl HttpSession {
             gauge_add!("protocol.http", 1);
             let session_address = sock.peer_addr().ok();
 
-            HttpStateMachine::Http(Http::new(
-                answers.clone(),
-                configured_backend_timeout,
-                configured_connect_timeout,
-                configured_frontend_timeout,
-                container_frontend_timeout,
-                sock,
-                token,
-                listener.clone(),
+            let frontend = mux::Connection::new_h1_server(sock, container_frontend_timeout);
+            let router = mux::Router::new(configured_backend_timeout, configured_connect_timeout);
+            let mut context = mux::Context::new(
                 pool.clone(),
-                Protocol::HTTP,
-                public_address,
-                request_id,
+                listener.clone(),
                 session_address,
-                sticky_name.clone(),
-            )?)
+                public_address,
+            );
+            context
+                .create_stream(request_id, 1 << 16)
+                .ok_or(AcceptError::BufferCapacityReached)?;
+            HttpStateMachine::Mux(Mux {
+                configured_frontend_timeout,
+                frontend_token: token,
+                frontend,
+                router,
+                context,
+            })
         };
 
         let metrics = SessionMetrics::new(Some(wait_time));
         Ok(HttpSession {
-            answers,
             configured_backend_timeout,
             configured_connect_timeout,
             configured_frontend_timeout,
@@ -152,14 +149,13 @@ impl HttpSession {
             pool,
             proxy,
             state,
-            sticky_name,
         })
     }
 
     pub fn upgrade(&mut self) -> SessionIsToBeClosed {
         debug!("HTTP::upgrade");
         let new_state = match self.state.take() {
-            HttpStateMachine::Http(http) => self.upgrade_http(http),
+            HttpStateMachine::Mux(mux) => self.upgrade_mux(mux),
             HttpStateMachine::Expect(expect) => self.upgrade_expect(expect),
             HttpStateMachine::WebSocket(ws) => self.upgrade_websocket(ws),
             HttpStateMachine::FailedUpgrade(_) => unreachable!(),
@@ -186,87 +182,132 @@ impl HttpSession {
             .map(|add| (add.destination(), add.source()))
         {
             Some((Some(public_address), Some(session_address))) => {
-                let mut http = Http::new(
-                    self.answers.clone(),
+                let frontend = mux::Connection::new_h1_server(
+                    expect.frontend,
+                    expect.container_frontend_timeout,
+                );
+                let router = mux::Router::new(
                     self.configured_backend_timeout,
                     self.configured_connect_timeout,
-                    self.configured_frontend_timeout,
-                    expect.container_frontend_timeout,
-                    expect.frontend,
-                    expect.frontend_token,
-                    self.listener.clone(),
+                );
+                let mut context = mux::Context::new(
                     self.pool.clone(),
-                    Protocol::HTTP,
-                    public_address,
-                    expect.request_id,
+                    self.listener.clone(),
                     Some(session_address),
-                    self.sticky_name.clone(),
-                )
-                .ok()?;
-                http.frontend_readiness.event = expect.frontend_readiness.event;
+                    public_address,
+                );
+                if context.create_stream(expect.request_id, 1 << 16).is_none() {
+                    error!("HTTP expect upgrade failed: could not create stream");
+                    return None;
+                }
+                let mut mux = Mux {
+                    configured_frontend_timeout: self.configured_frontend_timeout,
+                    frontend_token: self.frontend_token,
+                    frontend,
+                    router,
+                    context,
+                };
+                mux.frontend.readiness_mut().event = expect.frontend_readiness.event;
 
                 gauge_add!("protocol.proxy.expect", -1);
                 gauge_add!("protocol.http", 1);
-                Some(HttpStateMachine::Http(http))
+                Some(HttpStateMachine::Mux(mux))
             }
-            _ => None,
+            _ => {
+                debug!(
+                    "HTTP expect upgrade failed: bad header {:?}",
+                    expect.addresses
+                );
+                None
+            }
         }
     }
 
-    fn upgrade_http(&mut self, http: Http<TcpStream, HttpListener>) -> Option<HttpStateMachine> {
-        debug!("http switching to ws");
-        let front_token = self.frontend_token;
-        let back_token = match http.backend_token {
-            Some(back_token) => back_token,
-            None => {
-                warn!(
-                    "Could not upgrade http request on cluster '{:?}' ({:?}) using backend '{:?}' into websocket for request '{}'",
-                    http.context.cluster_id,
-                    self.frontend_token,
-                    http.context.backend_id,
-                    http.context.id
-                );
-                return None;
-            }
-        };
+    fn upgrade_mux(&mut self, mut mux: MuxClear) -> Option<HttpStateMachine> {
+        debug!("mux switching to ws");
+        let stream = mux
+            .context
+            .streams
+            .pop()
+            .expect("mux session must have at least one stream during upgrade");
+        // http.active_requests was already decremented by generate_access_log()
+        // in h1.rs before MuxResult::Upgrade was returned to us.
 
-        let ws_context = http.websocket_context();
-        let mut container_frontend_timeout = http.container_frontend_timeout;
-        let mut container_backend_timeout = http.container_backend_timeout;
+        let (frontend_readiness, frontend_socket, mut container_frontend_timeout) =
+            match mux.frontend {
+                mux::Connection::H1(mux::ConnectionH1 {
+                    readiness,
+                    socket,
+                    timeout_container,
+                    ..
+                }) => (readiness, socket, timeout_container),
+                mux::Connection::H2(_) => {
+                    error!("Only h1<->h1 connections can upgrade to websocket");
+                    return None;
+                }
+            };
+
+        let mux::StreamState::Linked(back_token) = stream.state else {
+            error!("Upgrading stream should be linked to a backend");
+            return None;
+        };
+        let backend = mux
+            .router
+            .backends
+            .remove(&back_token)
+            .expect("backend for back_token must exist during upgrade");
+        let (cluster_id, backend, backend_readiness, backend_socket, mut container_backend_timeout) =
+            match backend {
+                mux::Connection::H1(mux::ConnectionH1 {
+                    position:
+                        mux::Position::Client(cluster_id, backend, mux::BackendStatus::Connected),
+                    readiness,
+                    socket,
+                    timeout_container,
+                    ..
+                }) => (cluster_id, backend, readiness, socket, timeout_container),
+                mux::Connection::H1(_) => {
+                    error!("The backend disconnected just after upgrade, abort");
+                    return None;
+                }
+                mux::Connection::H2(_) => {
+                    error!("Only h1<->h1 connections can upgrade to websocket");
+                    return None;
+                }
+            };
+
+        let ws_context = stream.context.websocket_context();
+
         container_frontend_timeout.reset();
         container_backend_timeout.reset();
 
-        let backend_buffer = if let ResponseStream::BackendAnswer(kawa) = http.response_stream {
-            kawa.storage.buffer
-        } else {
-            return None;
-        };
-
+        let backend_id = backend.borrow().backend_id.clone();
         let mut pipe = Pipe::new(
-            backend_buffer,
-            http.context.backend_id,
-            http.backend_socket,
-            http.backend,
+            stream.back.storage.buffer,
+            Some(backend_id),
+            Some(backend_socket),
+            Some(backend),
             Some(container_backend_timeout),
             Some(container_frontend_timeout),
-            http.context.cluster_id,
-            http.request_stream.storage.buffer,
-            front_token,
-            http.frontend_socket,
+            Some(cluster_id),
+            stream.front.storage.buffer,
+            self.frontend_token,
+            frontend_socket,
             self.listener.clone(),
             Protocol::HTTP,
-            http.context.id,
-            http.context.session_address,
+            stream.context.id,
+            stream.context.session_address,
             ws_context,
         );
 
-        pipe.frontend_readiness.event = http.frontend_readiness.event;
-        pipe.backend_readiness.event = http.backend_readiness.event;
+        pipe.frontend_readiness.event = frontend_readiness.event;
+        pipe.backend_readiness.event = backend_readiness.event;
         pipe.set_back_token(back_token);
 
+        // http.active_requests was already decremented by generate_access_log()
+        // in h1.rs when the 101 response was written (before MuxResult::Upgrade).
         gauge_add!("protocol.http", -1);
         gauge_add!("protocol.ws", 1);
-        gauge_add!("http.active_requests", -1);
         gauge_add!("websocket.active_requests", 1);
         Some(HttpStateMachine::WebSocket(pipe))
     }
@@ -290,7 +331,7 @@ impl ProxySession for HttpSession {
         // Restore gauges
         match self.state.marker() {
             StateMarker::Expect => gauge_add!("protocol.proxy.expect", -1),
-            StateMarker::Http => gauge_add!("protocol.http", -1),
+            StateMarker::Mux => gauge_add!("protocol.http", -1),
             StateMarker::WebSocket => {
                 gauge_add!("protocol.ws", -1);
                 gauge_add!("websocket.active_requests", -1);
@@ -300,9 +341,15 @@ impl ProxySession for HttpSession {
         if self.state.failed() {
             match self.state.marker() {
                 StateMarker::Expect => incr!("http.upgrade.expect.failed"),
-                StateMarker::Http => incr!("http.upgrade.http.failed"),
+                StateMarker::Mux => incr!("http.upgrade.mux.failed"),
                 StateMarker::WebSocket => incr!("http.upgrade.ws.failed"),
             }
+            // FailedUpgrade means the socket was consumed by a failed upgrade
+            // attempt, so we can only close the state (no-op) and remove the
+            // session — cancel_timeouts / front_socket are unreachable.
+            self.state.close(self.proxy.clone(), &mut self.metrics);
+            self.proxy.borrow().remove_session(self.frontend_token);
+            self.has_been_closed = true;
             return;
         }
 
@@ -421,6 +468,17 @@ impl ListenerHandler for HttpListener {
             None => self.tags.remove(&key),
         };
     }
+
+    fn protocol(&self) -> Protocol {
+        Protocol::HTTP
+    }
+
+    fn public_address(&self) -> SocketAddr {
+        self.config
+            .public_address
+            .map(|addr| addr.into())
+            .unwrap_or(self.address)
+    }
 }
 
 impl L7ListenerHandler for HttpListener {
@@ -479,6 +537,40 @@ impl L7ListenerHandler for HttpListener {
         }
 
         Ok(route)
+    }
+
+    fn get_answers(&self) -> &Rc<RefCell<HttpAnswers>> {
+        &self.answers
+    }
+
+    fn get_h2_flood_config(&self) -> crate::protocol::mux::H2FloodConfig {
+        let defaults = crate::protocol::mux::H2FloodConfig::default();
+        crate::protocol::mux::H2FloodConfig {
+            max_rst_stream_per_window: self
+                .config
+                .h2_max_rst_stream_per_window
+                .unwrap_or(defaults.max_rst_stream_per_window),
+            max_ping_per_window: self
+                .config
+                .h2_max_ping_per_window
+                .unwrap_or(defaults.max_ping_per_window),
+            max_settings_per_window: self
+                .config
+                .h2_max_settings_per_window
+                .unwrap_or(defaults.max_settings_per_window),
+            max_empty_data_per_window: self
+                .config
+                .h2_max_empty_data_per_window
+                .unwrap_or(defaults.max_empty_data_per_window),
+            max_continuation_frames: self
+                .config
+                .h2_max_continuation_frames
+                .unwrap_or(defaults.max_continuation_frames),
+            max_glitch_count: self
+                .config
+                .h2_max_glitch_count
+                .unwrap_or(defaults.max_glitch_count),
+        }
     }
 }
 
@@ -920,7 +1012,6 @@ impl ProxyConfiguration for HttpProxy {
         };
 
         let session = HttpSession::new(
-            owned.answers.clone(),
             Duration::from_secs(owned.config.back_timeout as u64),
             Duration::from_secs(owned.config.connect_timeout as u64),
             Duration::from_secs(owned.config.front_timeout as u64),
@@ -931,7 +1022,6 @@ impl ProxyConfiguration for HttpProxy {
             proxy,
             public_address,
             frontend_sock,
-            owned.config.sticky_name.clone(),
             session_token,
             wait_time,
         )?;
@@ -1069,7 +1159,10 @@ mod tests {
     use crate::sozu_command::{
         channel::Channel,
         config::ListenerBuilder,
-        proto::command::{LoadBalancingParams, PathRule, RulePosition, WorkerRequest},
+        proto::command::{
+            LoadBalancingParams, PathRule, RulePosition, SoftStop, WorkerRequest,
+            request::RequestType,
+        },
         response::{Backend, HttpFrontend},
     };
 
@@ -1089,225 +1182,298 @@ mod tests {
     #[test]
     fn round_trip() {
         setup_test_logger!();
-        let barrier = Arc::new(Barrier::new(2));
-        start_server(1025, barrier.clone());
-        barrier.wait();
+        let front_port = crate::testing::provide_port();
+        let backend_server = Arc::new(
+            tiny_http::Server::http("127.0.0.1:0").expect("could not create tiny_http server"),
+        );
+        let backend_port = backend_server
+            .server_addr()
+            .to_ip()
+            .expect("tiny_http server should bind to IP address")
+            .port();
 
-        let config = ListenerBuilder::new_http(SocketAddress::new_v4(127, 0, 0, 1, 1024))
+        let barrier = Arc::new(Barrier::new(2));
+
+        let config = ListenerBuilder::new_http(SocketAddress::new_v4(127, 0, 0, 1, front_port))
             .to_http(None)
             .expect("could not create listener config");
 
         let (mut command, channel) =
             Channel::generate(1000, 10000).expect("should create a channel");
-        let _jg = thread::spawn(move || {
-            setup_test_logger!();
-            start_http_worker(config, channel, 10, 16384).expect("could not start the http server");
-        });
 
-        let front = RequestHttpFrontend {
-            cluster_id: Some(String::from("cluster_1")),
-            address: SocketAddress::new_v4(127, 0, 0, 1, 1024),
-            hostname: String::from("localhost"),
-            path: PathRule::prefix(String::from("/")),
-            ..Default::default()
-        };
-        command
-            .write_message(&WorkerRequest {
-                id: String::from("ID_ABCD"),
-                content: RequestType::AddHttpFrontend(front).into(),
-            })
-            .unwrap();
-        let backend = Backend {
-            cluster_id: String::from("cluster_1"),
-            backend_id: String::from("cluster_1-0"),
-            address: SocketAddress::new_v4(127, 0, 0, 1, 1025).into(),
-            load_balancing_parameters: Some(LoadBalancingParams::default()),
-            sticky_id: None,
-            backup: None,
-        };
-        command
-            .write_message(&WorkerRequest {
-                id: String::from("ID_EFGH"),
-                content: RequestType::AddBackend(backend.to_add_backend()).into(),
-            })
-            .unwrap();
+        thread::scope(|s| {
+            let backend_handle = backend_server.clone();
+            let barrier_clone = barrier.to_owned();
+            s.spawn(move || {
+                setup_test_logger!();
+                start_server(&backend_handle, barrier_clone);
+            });
+            barrier.wait();
 
-        println!("test received: {:?}", command.read_message());
-        println!("test received: {:?}", command.read_message());
+            s.spawn(move || {
+                setup_test_logger!();
+                start_http_worker(config, channel, 10, 16384)
+                    .expect("could not start the http server");
+            });
 
-        let mut client = TcpStream::connect(("127.0.0.1", 1024)).expect("could not connect");
+            let front = RequestHttpFrontend {
+                cluster_id: Some("cluster_1".to_owned()),
+                address: SocketAddress::new_v4(127, 0, 0, 1, front_port),
+                hostname: "localhost".to_owned(),
+                path: PathRule::prefix("/".to_owned()),
+                ..Default::default()
+            };
+            command
+                .write_message(&WorkerRequest {
+                    id: "ID_ABCD".to_owned(),
+                    content: RequestType::AddHttpFrontend(front).into(),
+                })
+                .expect("could not send AddHttpFrontend");
+            let backend = Backend {
+                cluster_id: "cluster_1".to_owned(),
+                backend_id: "cluster_1-0".to_owned(),
+                address: SocketAddress::new_v4(127, 0, 0, 1, backend_port).into(),
+                load_balancing_parameters: Some(LoadBalancingParams::default()),
+                sticky_id: None,
+                backup: None,
+            };
+            command
+                .write_message(&WorkerRequest {
+                    id: "ID_EFGH".to_owned(),
+                    content: RequestType::AddBackend(backend.to_add_backend()).into(),
+                })
+                .expect("could not send AddBackend");
 
-        // 5 seconds of timeout
-        client.set_read_timeout(Some(Duration::new(1, 0))).unwrap();
-        let w = client
-            .write(&b"GET / HTTP/1.1\r\nHost: localhost:1024\r\nConnection: Close\r\n\r\n"[..]);
-        println!("http client write: {w:?}");
+            println!("test received: {:?}", command.read_message());
+            println!("test received: {:?}", command.read_message());
 
-        barrier.wait();
-        let mut buffer = [0; 4096];
-        let mut index = 0;
+            let mut client =
+                TcpStream::connect(("127.0.0.1", front_port)).expect("could not connect to sozu");
 
-        loop {
-            assert!(index <= 191);
-            if index == 191 {
-                break;
-            }
+            client
+                .set_read_timeout(Some(Duration::new(1, 0)))
+                .expect("could not set read timeout");
+            let request = format!(
+                "GET / HTTP/1.1\r\nHost: localhost:{front_port}\r\nConnection: Close\r\n\r\n"
+            );
+            let w = client.write(request.as_bytes());
+            println!("http client write: {w:?}");
 
-            let r = client.read(&mut buffer[index..]);
-            println!("http client read: {r:?}");
-            match r {
-                Err(e) => assert!(false, "client request should not fail. Error: {e:?}"),
-                Ok(sz) => {
-                    index += sz;
+            barrier.wait();
+            let mut buffer = [0; 4096];
+            let mut index = 0;
+
+            // tiny_http responds with exactly 191 bytes for a "hello world" body
+            // (headers + body). This is deterministic for a given tiny_http version.
+            let expected_len = 191;
+
+            loop {
+                assert!(index <= expected_len);
+                if index == expected_len {
+                    break;
+                }
+
+                let r = client.read(&mut buffer[index..]);
+                println!("http client read: {r:?}");
+                match r {
+                    Err(e) => panic!("client request should not fail. Error: {e:?}"),
+                    Ok(sz) => {
+                        index += sz;
+                    }
                 }
             }
-        }
-        println!(
-            "Response: {}",
-            str::from_utf8(&buffer[..index]).expect("could not make string from buffer")
-        );
+            println!(
+                "Response: {}",
+                str::from_utf8(&buffer[..index]).expect("could not make string from buffer")
+            );
+
+            // Gracefully stop the sozu worker so the scoped thread can join
+            command
+                .write_message(&WorkerRequest {
+                    id: "ID_STOP".to_owned(),
+                    content: RequestType::SoftStop(SoftStop {}).into(),
+                })
+                .expect("could not send SoftStop");
+            // Unblock the backend server so its thread can exit
+            backend_server.unblock();
+        });
     }
 
     #[test]
     fn keep_alive() {
         setup_test_logger!();
-        let barrier = Arc::new(Barrier::new(2));
-        start_server(1028, barrier.clone());
-        barrier.wait();
+        let front_port = crate::testing::provide_port();
+        let backend_server = Arc::new(
+            tiny_http::Server::http("127.0.0.1:0").expect("could not create tiny_http server"),
+        );
+        let backend_port = backend_server
+            .server_addr()
+            .to_ip()
+            .expect("tiny_http server should bind to IP address")
+            .port();
 
-        let config = ListenerBuilder::new_http(SocketAddress::new_v4(127, 0, 0, 1, 1031))
+        let barrier = Arc::new(Barrier::new(2));
+
+        let config = ListenerBuilder::new_http(SocketAddress::new_v4(127, 0, 0, 1, front_port))
             .to_http(None)
             .expect("could not create listener config");
 
         let (mut command, channel) =
             Channel::generate(1000, 10000).expect("should create a channel");
 
-        let _jg = thread::spawn(move || {
-            setup_test_logger!();
-            start_http_worker(config, channel, 10, 16384).expect("could not start the http server");
-        });
-
-        let front = RequestHttpFrontend {
-            address: SocketAddress::new_v4(127, 0, 0, 1, 1031),
-            hostname: String::from("localhost"),
-            path: PathRule::prefix(String::from("/")),
-            cluster_id: Some(String::from("cluster_1")),
-            ..Default::default()
-        };
-        command
-            .write_message(&WorkerRequest {
-                id: String::from("ID_ABCD"),
-                content: RequestType::AddHttpFrontend(front).into(),
-            })
-            .unwrap();
-        let backend = Backend {
-            address: SocketAddress::new_v4(127, 0, 0, 1, 1028).into(),
-            backend_id: String::from("cluster_1-0"),
-            backup: None,
-            cluster_id: String::from("cluster_1"),
-            load_balancing_parameters: Some(LoadBalancingParams::default()),
-            sticky_id: None,
-        };
-        command
-            .write_message(&WorkerRequest {
-                id: String::from("ID_EFGH"),
-                content: RequestType::AddBackend(backend.to_add_backend()).into(),
-            })
-            .unwrap();
-
-        println!("test received: {:?}", command.read_message());
-        println!("test received: {:?}", command.read_message());
-
-        let mut client = TcpStream::connect(("127.0.0.1", 1031)).expect("could not connect");
-        // 5 seconds of timeout
-        client.set_read_timeout(Some(Duration::new(5, 0))).unwrap();
-
-        let w = client
-            .write(&b"GET / HTTP/1.1\r\nHost: localhost:1031\r\n\r\n"[..])
-            .unwrap();
-        println!("http client write: {w:?}");
-        barrier.wait();
-
-        let mut buffer = [0; 4096];
-        let mut index = 0;
-
-        loop {
-            assert!(index <= 191);
-            if index == 191 {
-                break;
-            }
-
-            let r = client.read(&mut buffer[index..]);
-            println!("http client read: {r:?}");
-            match r {
-                Err(e) => assert!(false, "client request should not fail. Error: {e:?}"),
-                Ok(sz) => {
-                    index += sz;
-                }
-            }
-        }
-
-        println!(
-            "Response: {}",
-            str::from_utf8(&buffer[..index]).expect("could not make string from buffer")
-        );
-
-        println!("first request ended, will send second one");
-        let w2 = client.write(&b"GET / HTTP/1.1\r\nHost: localhost:1031\r\n\r\n"[..]);
-        println!("http client write: {w2:?}");
-        barrier.wait();
-
-        let mut buffer2 = [0; 4096];
-        let mut index = 0;
-
-        loop {
-            assert!(index <= 191);
-            if index == 191 {
-                break;
-            }
-
-            let r2 = client.read(&mut buffer2[index..]);
-            println!("http client read: {r2:?}");
-            match r2 {
-                Err(e) => assert!(false, "client request should not fail. Error: {e:?}"),
-                Ok(sz) => {
-                    index += sz;
-                }
-            }
-        }
-        println!(
-            "Response: {}",
-            str::from_utf8(&buffer2[..index]).expect("could not make string from buffer")
-        );
-    }
-
-    use self::tiny_http::{Response, Server};
-
-    fn start_server(port: u16, barrier: Arc<Barrier>) {
-        thread::spawn(move || {
-            setup_test_logger!();
-            let server =
-                Server::http(&format!("127.0.0.1:{port}")).expect("could not create server");
-            info!("starting web server in port {}", port);
+        thread::scope(|s| {
+            let backend_handle = backend_server.clone();
+            let barrier_clone = barrier.to_owned();
+            s.spawn(move || {
+                setup_test_logger!();
+                start_server(&backend_handle, barrier_clone);
+            });
             barrier.wait();
 
-            for request in server.incoming_requests() {
-                info!(
-                    "backend web server got request -> method: {:?}, url: {:?}, headers: {:?}",
-                    request.method(),
-                    request.url(),
-                    request.headers()
-                );
+            s.spawn(move || {
+                setup_test_logger!();
+                start_http_worker(config, channel, 10, 16384)
+                    .expect("could not start the http server");
+            });
 
-                let response = Response::from_string("hello world");
-                request.respond(response).unwrap();
-                info!("backend web server sent response");
-                barrier.wait();
-                info!("server session stopped");
+            let front = RequestHttpFrontend {
+                address: SocketAddress::new_v4(127, 0, 0, 1, front_port),
+                hostname: "localhost".to_owned(),
+                path: PathRule::prefix("/".to_owned()),
+                cluster_id: Some("cluster_1".to_owned()),
+                ..Default::default()
+            };
+            command
+                .write_message(&WorkerRequest {
+                    id: "ID_ABCD".to_owned(),
+                    content: RequestType::AddHttpFrontend(front).into(),
+                })
+                .expect("could not send AddHttpFrontend");
+            let backend = Backend {
+                address: SocketAddress::new_v4(127, 0, 0, 1, backend_port).into(),
+                backend_id: "cluster_1-0".to_owned(),
+                backup: None,
+                cluster_id: "cluster_1".to_owned(),
+                load_balancing_parameters: Some(LoadBalancingParams::default()),
+                sticky_id: None,
+            };
+            command
+                .write_message(&WorkerRequest {
+                    id: "ID_EFGH".to_owned(),
+                    content: RequestType::AddBackend(backend.to_add_backend()).into(),
+                })
+                .expect("could not send AddBackend");
+
+            println!("test received: {:?}", command.read_message());
+            println!("test received: {:?}", command.read_message());
+
+            let mut client =
+                TcpStream::connect(("127.0.0.1", front_port)).expect("could not connect to sozu");
+            client
+                .set_read_timeout(Some(Duration::new(5, 0)))
+                .expect("could not set read timeout");
+
+            // tiny_http responds with exactly 191 bytes for a "hello world" body
+            // (headers + body). This is deterministic for a given tiny_http version.
+            let expected_len = 191;
+
+            let request = format!("GET / HTTP/1.1\r\nHost: localhost:{front_port}\r\n\r\n");
+            let w = client
+                .write(request.as_bytes())
+                .expect("could not write first request");
+            println!("http client write: {w:?}");
+            barrier.wait();
+
+            let mut buffer = [0; 4096];
+            let mut index = 0;
+
+            loop {
+                assert!(index <= expected_len);
+                if index == expected_len {
+                    break;
+                }
+
+                let r = client.read(&mut buffer[index..]);
+                println!("http client read: {r:?}");
+                match r {
+                    Err(e) => panic!("client request should not fail. Error: {e:?}"),
+                    Ok(sz) => {
+                        index += sz;
+                    }
+                }
             }
 
-            println!("server on port {port} closed");
+            println!(
+                "Response: {}",
+                str::from_utf8(&buffer[..index]).expect("could not make string from buffer")
+            );
+
+            println!("first request ended, will send second one");
+            let request2 = format!("GET / HTTP/1.1\r\nHost: localhost:{front_port}\r\n\r\n");
+            let w2 = client.write(request2.as_bytes());
+            println!("http client write: {w2:?}");
+            barrier.wait();
+
+            let mut buffer2 = [0; 4096];
+            let mut index = 0;
+
+            loop {
+                assert!(index <= expected_len);
+                if index == expected_len {
+                    break;
+                }
+
+                let r2 = client.read(&mut buffer2[index..]);
+                println!("http client read: {r2:?}");
+                match r2 {
+                    Err(e) => panic!("client request should not fail. Error: {e:?}"),
+                    Ok(sz) => {
+                        index += sz;
+                    }
+                }
+            }
+            println!(
+                "Response: {}",
+                str::from_utf8(&buffer2[..index]).expect("could not make string from buffer")
+            );
+
+            // Gracefully stop the sozu worker so the scoped thread can join
+            command
+                .write_message(&WorkerRequest {
+                    id: "ID_STOP".to_owned(),
+                    content: RequestType::SoftStop(SoftStop {}).into(),
+                })
+                .expect("could not send SoftStop");
+            // Unblock the backend server so its thread can exit
+            backend_server.unblock();
         });
+    }
+
+    use self::tiny_http::Response;
+
+    fn start_server(server: &tiny_http::Server, barrier: Arc<Barrier>) {
+        let addr = server.server_addr();
+        info!("starting web server on {:?}", addr);
+        barrier.wait();
+
+        for request in server.incoming_requests() {
+            info!(
+                "backend web server got request -> method: {:?}, url: {:?}, headers: {:?}",
+                request.method(),
+                request.url(),
+                request.headers()
+            );
+
+            let response = Response::from_string("hello world");
+            request
+                .respond(response)
+                .expect("could not respond to request");
+            info!("backend web server sent response");
+            barrier.wait();
+            info!("server session stopped");
+        }
+
+        println!("server on {addr:?} closed");
     }
 
     #[test]

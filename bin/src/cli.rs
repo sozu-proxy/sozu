@@ -298,6 +298,33 @@ pub enum ClusterCmd {
             help = "Configures the load balancing policy. Possible values are 'roundrobin', 'random' or 'leastconnections'"
         )]
         load_balancing_policy: LoadBalancingAlgorithms,
+        #[clap(
+            long = "http2",
+            help = "Use HTTP/2 for backend connections to this cluster"
+        )]
+        http2: bool,
+    },
+    #[clap(
+        name = "h2",
+        about = "Enable or disable HTTP/2 for backend connections"
+    )]
+    H2 {
+        #[clap(subcommand)]
+        cmd: ClusterH2Cmd,
+    },
+}
+
+#[derive(Subcommand, PartialEq, Eq, Clone, Debug)]
+pub enum ClusterH2Cmd {
+    #[clap(name = "enable", about = "Enable HTTP/2 for backend connections")]
+    Enable {
+        #[clap(short = 'i', long = "id", help = "cluster id")]
+        id: String,
+    },
+    #[clap(name = "disable", about = "Disable HTTP/2 for backend connections")]
+    Disable {
+        #[clap(short = 'i', long = "id", help = "cluster id")]
+        id: String,
     },
 }
 
