@@ -9,8 +9,11 @@
 
 use std::{
     io::{Read, Write},
-    net::{SocketAddr, TcpStream},
-    sync::Arc,
+    net::{SocketAddr, TcpListener, TcpStream},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -33,6 +36,88 @@ use crate::{
     sozu::worker::Worker,
     tests::{State, provide_port, repeat_until_error_or, tests::create_local_address},
 };
+
+struct BlockingHttpBackend {
+    stop: Arc<AtomicBool>,
+    requests_received: Arc<AtomicUsize>,
+    responses_sent: Arc<AtomicUsize>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl BlockingHttpBackend {
+    fn start(address: SocketAddr, body: String) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let requests_received = Arc::new(AtomicUsize::new(0));
+        let responses_sent = Arc::new(AtomicUsize::new(0));
+
+        let stop_clone = stop.clone();
+        let requests_clone = requests_received.clone();
+        let responses_clone = responses_sent.clone();
+
+        let thread = thread::spawn(move || {
+            let listener = TcpListener::bind(address).expect("could not bind blocking backend");
+            listener
+                .set_nonblocking(true)
+                .expect("could not set backend listener nonblocking");
+
+            while !stop_clone.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                        stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
+
+                        let mut buf = [0u8; 4096];
+                        let _ = stream.read(&mut buf);
+                        requests_clone.fetch_add(1, Ordering::Relaxed);
+
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        if stream.write_all(response.as_bytes()).is_ok() {
+                            let _ = stream.flush();
+                            responses_clone.fetch_add(1, Ordering::Relaxed);
+                        }
+                        break;
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Self {
+            stop,
+            requests_received,
+            responses_sent,
+            thread: Some(thread),
+        }
+    }
+
+    fn requests_received(&self) -> usize {
+        self.requests_received.load(Ordering::Relaxed)
+    }
+
+    fn responses_sent(&self) -> usize {
+        self.responses_sent.load(Ordering::Relaxed)
+    }
+
+    fn stop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for BlockingHttpBackend {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
 
 // ============================================================================
 // Test 1: SNI routing — two certificates, two clusters, correct routing
@@ -848,6 +933,160 @@ fn test_tls_connection_close_header() {
             10,
             "TLS: Connection: close header causes proper TLS teardown after response",
             try_tls_connection_close_header
+        ),
+        State::Success
+    );
+}
+
+/// Regression test for the TLS flush bug: a large HTTPS response on a
+/// `Connection: close` request must be fully delivered before the TLS session
+/// is torn down.
+fn try_tls_connection_close_large_response() -> State {
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+    let back_address = create_local_address();
+    let payload = "x".repeat(256 * 1024);
+
+    let (config, listeners, state) = Worker::empty_config();
+    let mut worker = Worker::start_new_worker("TLS-CONN-CLOSE-LARGE", config, &listeners, state);
+
+    worker.send_proxy_request_type(RequestType::AddHttpsListener(
+        ListenerBuilder::new_https(front_address.clone())
+            .to_tls(None)
+            .unwrap(),
+    ));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        address: front_address.clone(),
+        proxy: ListenerType::Https.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        hostname: "localhost".to_owned(),
+        ..Worker::default_http_frontend("cluster_0", front_address.clone().into())
+    }));
+
+    let certificate_and_key = CertificateAndKey {
+        certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
+        key: String::from(include_str!("../../../lib/assets/local-key.pem")),
+        certificate_chain: vec![],
+        versions: vec![],
+        names: vec![],
+    };
+    worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+        address: front_address,
+        certificate: certificate_and_key,
+        expired_at: None,
+    }));
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address,
+        None,
+    )));
+    worker.read_to_last();
+
+    let mut backend = BlockingHttpBackend::start(back_address, payload.clone());
+
+    let tls_config = {
+        let mut config = ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(Verifier))
+            .with_no_client_auth();
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        config
+    };
+
+    let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let conn = rustls::ClientConnection::new(Arc::new(tls_config), server_name.to_owned()).unwrap();
+
+    let addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let tcp = match TcpStream::connect_timeout(&addr, Duration::from_secs(5)) {
+        Ok(stream) => stream,
+        Err(e) => {
+            println!("Could not connect to sozu: {e}");
+            worker.soft_stop();
+            worker.wait_for_server_stop();
+            backend.stop();
+            return State::Fail;
+        }
+    };
+    tcp.set_read_timeout(Some(Duration::from_secs(10))).ok();
+    tcp.set_write_timeout(Some(Duration::from_secs(5))).ok();
+
+    let mut tls_stream = rustls::StreamOwned::new(conn, tcp);
+    let request = "GET /large HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    if let Err(e) = tls_stream.write_all(request.as_bytes()) {
+        println!("Could not send request: {e}");
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        backend.stop();
+        return State::Fail;
+    }
+    tls_stream.flush().ok();
+
+    let mut response_bytes = Vec::new();
+    let mut buf = [0u8; 8192];
+    let start = Instant::now();
+    loop {
+        match tls_stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => response_bytes.extend_from_slice(&buf[..n]),
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                if start.elapsed() > Duration::from_secs(15) {
+                    println!("Timed out waiting for large HTTPS response");
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => {
+                println!("Read error after response drain: {e}");
+                break;
+            }
+        }
+    }
+    drop(tls_stream);
+
+    let response = String::from_utf8_lossy(&response_bytes);
+    let (headers, body) = match response.split_once("\r\n\r\n") {
+        Some(parts) => parts,
+        None => {
+            println!("Missing HTTP header/body separator");
+            worker.soft_stop();
+            worker.wait_for_server_stop();
+            backend.stop();
+            return State::Fail;
+        }
+    };
+
+    let response_ok =
+        headers.contains("HTTP/1.1 200") && body.len() == payload.len() && body == payload;
+
+    worker.soft_stop();
+    let success = worker.wait_for_server_stop();
+    let requests_received = backend.requests_received();
+    let responses_sent = backend.responses_sent();
+    backend.stop();
+
+    if success && response_ok && requests_received == 1 && responses_sent == 1 {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_tls_connection_close_large_response() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "TLS regression: large Connection: close response is fully delivered before teardown",
+            try_tls_connection_close_large_response
         ),
         State::Success
     );

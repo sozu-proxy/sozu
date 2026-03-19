@@ -460,6 +460,8 @@ pub struct H2ByteAccounting {
 pub struct H2DrainState {
     /// True when we've sent GOAWAY and are draining.
     pub draining: bool,
+    /// Timestamp of the first graceful-drain transition.
+    pub started_at: Option<Instant>,
     /// Last stream ID from peer's GOAWAY (for retry decisions).
     pub peer_last_stream_id: Option<StreamId>,
 }
@@ -590,6 +592,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             lowercase_buf: Vec::new(),
             drain: H2DrainState {
                 draining: false,
+                started_at: None,
                 peer_last_stream_id: None,
             },
             zero: kawa::Kawa::new(kawa::Kind::Request, kawa::Buffer::new(buffer)),
@@ -780,6 +783,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                                         .push((header.stream_id, H2Error::StreamClosed));
                                     self.total_rst_streams_queued += 1;
                                     self.readiness.interest.insert(Ready::WRITABLE);
+                                    self.readiness.signal_pending_write();
                                 }
                                 _ => {
                                     // RFC 9113 §5.1: HEADERS or other frames on a
@@ -1787,6 +1791,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             // Ensure a writable event so the existing queue gets flushed,
             // freeing space for the dropped WINDOW_UPDATE on the next cycle.
             self.readiness.interest.insert(Ready::WRITABLE);
+            self.readiness.signal_pending_write();
         }
     }
 
@@ -1898,6 +1903,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // but does not yet know the cutoff. This gives in-flight requests a chance
         // to arrive before we commit to a final last_stream_id.
         self.drain.draining = true;
+        self.drain.started_at = Some(Instant::now());
         // Keep expect_read as-is: existing streams should continue reading
         // data during phase 1. Only phase 2 (goaway()) removes READABLE.
         let kawa = &mut self.zero;
@@ -1974,6 +1980,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             return;
         }
         self.expect_write = None;
+        if self.socket.socket_wants_write() {
+            let (_size, status) = self.socket.socket_write(&[]);
+            let _ = update_readiness_after_write(0, status, &mut self.readiness);
+        }
     }
 
     pub fn create_stream<L>(
@@ -2103,6 +2113,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 self.queue_window_update(0, increment);
                 self.flow_control.received_bytes_since_update = 0;
                 self.readiness.interest.insert(Ready::WRITABLE);
+                self.readiness.signal_pending_write();
             }
             self.attribute_bytes_to_overhead();
             return MuxResult::Continue;
@@ -2170,9 +2181,14 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             self.queue_window_update(data.stream_id, payload_u32);
         }
 
-        // If we have pending updates, ensure we get a writable event
+        // If we have pending updates, ensure we get a writable event.
+        // Must use signal_pending_write() — not just interest.insert() — because
+        // under edge-triggered epoll the WRITABLE event bit may have been consumed
+        // by a previous write cycle. Without the event bit set, filter_interest()
+        // returns 0 and the WINDOW_UPDATEs never get flushed, stalling the client.
         if !self.flow_control.pending_window_updates.is_empty() {
             self.readiness.interest.insert(Ready::WRITABLE);
+            self.readiness.signal_pending_write();
         }
 
         if is_unlinked {
@@ -2624,6 +2640,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         }
         // RFC 9113 §6.8: begin graceful drain.
         self.drain.draining = true;
+        self.drain.started_at.get_or_insert_with(Instant::now);
         self.drain.peer_last_stream_id = Some(goaway.last_stream_id);
 
         // Streams with ID > last_stream_id were NOT processed by the peer.
@@ -2810,7 +2827,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             Position::Client(_, _, status) => {
                 *status = BackendStatus::Disconnecting;
                 self.readiness.event = Ready::HUP;
-                warn!(
+                debug!(
                     "H2 force_disconnect client: state={:?}, streams={}, expect_write={:?}, wants_write={}, readiness={:?}",
                     self.state,
                     self.streams.len(),
@@ -2828,7 +2845,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 // client to see "TLS decode error / unexpected eof".
                 // Instead, keep WRITABLE interest and let the writable path flush.
                 if self.socket.socket_wants_write() {
-                    warn!(
+                    debug!(
                         "H2 force_disconnect delaying close: state={:?}, streams={}, expect_write={:?}, wants_write=true, readiness={:?}",
                         self.state,
                         self.streams.len(),
@@ -2839,7 +2856,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     self.ensure_tls_flushed();
                     MuxResult::Continue
                 } else {
-                    warn!(
+                    debug!(
                         "H2 force_disconnect closing session: state={:?}, streams={}, expect_write={:?}, wants_write=false, readiness={:?}",
                         self.state,
                         self.streams.len(),
@@ -2865,8 +2882,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             Position::Client(..) => {}
             Position::Server => {
                 let tls_pending_before = self.socket.socket_wants_write();
-                if self.streams.len() > 0 || matches!(self.state, H2State::Header) {
-                    warn!(
+                if !self.streams.is_empty() || tls_pending_before || self.expect_write.is_some() {
+                    debug!(
                         "H2 close with active state: state={:?}, streams={}, expect_write={:?}, wants_write={}, readiness={:?}",
                         self.state,
                         self.streams.len(),
@@ -2876,7 +2893,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     );
                     for (stream_id, global_stream_id) in &self.streams {
                         let stream = &context.streams[*global_stream_id];
-                        warn!(
+                        debug!(
                             "  close stream id={} gid={}: state={:?}, front_eos={}, back_eos={}, front_phase={:?}, back_phase={:?}, front_completed={}, back_completed={}",
                             stream_id,
                             global_stream_id,
@@ -3003,12 +3020,14 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                                     buf[..frame.len()].copy_from_slice(&frame);
                                     kawa.storage.fill(frame.len());
                                     self.readiness.interest.insert(Ready::WRITABLE);
+                                    self.readiness.signal_pending_write();
                                     self.rst_sent.insert(id);
                                 }
                             }
                         }
                         self.streams.remove(&id);
                         self.prioriser.remove(&id);
+                        context.streams[stream_gid].state = StreamState::Unlinked;
                         return;
                     }
                 }
@@ -3041,6 +3060,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                             stream.back.parsing_phase = kawa::ParsingPhase::Terminated;
                             stream.state = StreamState::Unlinked;
                             self.readiness.interest.insert(Ready::WRITABLE);
+                            self.readiness.signal_pending_write();
                         } else if !stream.back.is_terminated() {
                             #[cfg(debug_assertions)]
                             context
@@ -3060,6 +3080,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                             debug!("CLOSING H2 TERMINATED STREAM {} {:?}", stream_gid, stream);
                             stream.state = StreamState::Unlinked;
                             self.readiness.interest.insert(Ready::WRITABLE);
+                            self.readiness.signal_pending_write();
                         }
                         context.debug.set_interesting(true);
                     }
@@ -3116,6 +3137,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         };
         self.streams.insert(stream_id, stream);
         self.readiness.interest.insert(Ready::WRITABLE);
+        self.readiness.signal_pending_write();
         true
     }
 }

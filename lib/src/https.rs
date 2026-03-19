@@ -495,6 +495,13 @@ impl ProxySession for HttpsSession {
 
     fn timeout(&mut self, token: Token) -> SessionIsToBeClosed {
         let session_result = self.state.timeout(token, &mut self.metrics);
+        if session_result == StateResult::CloseSession {
+            debug!(
+                "HTTPS timeout requested close: token={:?}, marker={:?}",
+                token,
+                self.state.marker()
+            );
+        }
         session_result == StateResult::CloseSession
     }
 
@@ -528,6 +535,13 @@ impl ProxySession for HttpsSession {
                 true => true,
             },
         };
+        if to_be_closed {
+            debug!(
+                "HTTPS ready requested close: token={:?}, marker={:?}",
+                self.frontend_token,
+                self.state.marker()
+            );
+        }
 
         self.metrics.service_stop();
         to_be_closed

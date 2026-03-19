@@ -2,6 +2,7 @@ mod h2_security_tests;
 mod h2_tests;
 pub(crate) mod h2_utils;
 mod tests;
+mod tls_tests;
 
 use std::{
     io::stdin,

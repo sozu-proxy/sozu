@@ -52,7 +52,7 @@ use crate::{
         h2_backend::H2Backend,
         https_client::{
             build_h2_client, build_https_client, resolve_concurrent_requests, resolve_post_request,
-            resolve_request, resolve_request_timeout,
+            resolve_request,
         },
     },
     sozu::worker::Worker,
@@ -430,9 +430,8 @@ fn try_h2_continuation_wrong_stream_id() -> State {
 // Test 3: GoAway graceful drain
 // ============================================================================
 
-/// Test that when the client sends GoAway, in-flight requests on the connection
-/// complete before the connection fully closes. After GoAway, no new streams
-/// should be accepted on that connection.
+/// Test that a graceful shutdown on the HTTPS listener still lets an in-flight
+/// H2 request complete before the connection fully closes.
 fn try_h2_goaway_graceful_drain() -> State {
     let front_port = provide_port();
     let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
@@ -478,34 +477,61 @@ fn try_h2_goaway_graceful_drain() -> State {
     )));
     worker.read_to_last();
 
-    // Start a backend that delays responses by 500ms
-    let mut delayed_backend =
-        DelayedH2Backend::start(back_address, Duration::from_millis(500), "delayed-pong");
+    let response_body = "delayed-pong".repeat(16 * 1024);
 
-    // Use hyper H2 client: send a request, then verify it completes
-    // Even though we trigger a soft_stop (which sends GoAway), the in-flight
-    // request should finish.
-    let client = build_h2_client();
+    // Delay the backend so soft_stop() happens while the request is in flight.
+    let mut delayed_backend = DelayedH2Backend::start(
+        back_address,
+        Duration::from_millis(500),
+        response_body.clone(),
+    );
+
     let uri: hyper::Uri = format!("https://localhost:{front_port}/api")
         .parse()
         .unwrap();
+    let request_job = thread::spawn(move || {
+        let client = build_h2_client();
+        resolve_request(&client, uri)
+    });
 
-    // Send request — backend will delay 500ms before responding
-    let result = resolve_request(&client, uri);
+    let wait_start = Instant::now();
+    while delayed_backend.get_requests_received() == 0 {
+        if wait_start.elapsed() > Duration::from_secs(5) {
+            println!("H2 GoAway drain - request never reached backend");
+            worker.soft_stop();
+            let _ = worker.wait_for_server_stop();
+            delayed_backend.stop();
+            return State::Fail;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    worker.soft_stop();
+
+    let result = match request_job.join() {
+        Ok(result) => result,
+        Err(_) => {
+            delayed_backend.stop();
+            return State::Fail;
+        }
+    };
     let request_succeeded = result.is_some_and(|(status, body)| {
-        println!("H2 GoAway drain - status: {status:?}, body: {body}");
-        status.is_success()
+        println!(
+            "H2 GoAway drain - status: {status:?}, body_len={}",
+            body.len()
+        );
+        status.is_success() && body == response_body
     });
 
     if !request_succeeded {
         println!("H2 GoAway drain - request did not succeed");
     }
 
-    worker.soft_stop();
     let success = worker.wait_for_server_stop();
+    let responses_sent = delayed_backend.get_responses_sent();
     delayed_backend.stop();
 
-    if success && request_succeeded {
+    if success && request_succeeded && responses_sent == 1 {
         State::Success
     } else {
         State::Fail
@@ -5152,6 +5178,137 @@ fn test_h2_graceful_shutdown_completes_large_transfer() {
             5,
             "H2: graceful shutdown completes in-flight large transfer",
             try_h2_graceful_shutdown_completes_large_transfer
+        ),
+        State::Success
+    );
+}
+
+// ============================================================================
+// Test: Graceful shutdown timeout forces close on lingering clients
+// ============================================================================
+
+/// After soft_stop, sozu sends GOAWAY. Per RFC 9113 §6.8, GOAWAY is advisory —
+/// the client MAY keep the connection open. This test verifies that sozu
+/// force-closes the session after H2_GRACEFUL_SHUTDOWN_TIMEOUT (5s) even when
+/// the client intentionally ignores the GOAWAY and keeps the TCP connection alive.
+///
+/// Uses a raw TLS+H2 connection (not hyper) so the client doesn't auto-close on
+/// GOAWAY. A slow backend (30s delay) keeps the H2 stream in Linked state so
+/// `can_stop` stays false until the timeout fires.
+fn try_h2_graceful_shutdown_timeout_forces_close() -> State {
+    let (mut worker, front_port, _front_address) = setup_h2_listener_only("H2-SHUTDOWN-TIMEOUT");
+
+    // Backend that reads the request but delays 30s before responding.
+    // This keeps the H2 stream Linked during the shutdown window.
+    let back_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address,
+        None,
+    )));
+    let slow_backend = AsyncBackend::spawn_detached_backend(
+        "SLOW_BACKEND",
+        back_address,
+        SimpleAggregator::default(),
+        Box::new(|mut stream, backend_name, mut aggregator| {
+            let mut buf = [0u8; 4096];
+            match stream.read(&mut buf) {
+                Ok(0) => return aggregator,
+                Ok(n) => println!("{backend_name} received {n} bytes"),
+                Err(_) => return aggregator,
+            }
+            aggregator.requests_received += 1;
+            // Sleep 30s — far longer than the 5s graceful timeout.
+            // The request will never complete; sozu must force-close.
+            thread::sleep(Duration::from_secs(30));
+            aggregator
+        }),
+    );
+    worker.read_to_last();
+
+    let addr: SocketAddr = ([127, 0, 0, 1], front_port).into();
+
+    // Establish raw H2 connection and complete handshake
+    let mut tls = raw_h2_connection(addr);
+    h2_handshake(&mut tls);
+
+    // Send a GET request on stream 1 (HEADERS with END_STREAM + END_HEADERS)
+    let header_block = vec![
+        0x82, // :method GET (index 2)
+        0x84, // :path / (index 4)
+        0x86, // :scheme https (index 6)
+        0x41, 0x09, // :authority (literal, name index 1, value length 9)
+        b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't', // "localhost"
+    ];
+    let headers = H2Frame::headers(1, header_block, true, true);
+    tls.write_all(&headers.encode()).unwrap();
+    tls.flush().unwrap();
+
+    // Wait for the backend to receive the request (confirms the stream is Linked)
+    thread::sleep(Duration::from_millis(500));
+
+    // Trigger graceful shutdown while the stream is still Linked (backend sleeping)
+    worker.soft_stop();
+    let shutdown_start = Instant::now();
+
+    // Keep the TLS stream alive in a background thread — intentionally ignore GOAWAY.
+    // Read any data sozu sends to prevent TCP backpressure.
+    let tls_holder = thread::spawn(move || {
+        let _ = read_all_available(&mut tls, Duration::from_secs(15));
+        tls
+    });
+
+    let success = worker.wait_for_server_stop();
+    let shutdown_duration = shutdown_start.elapsed();
+
+    // Drop the TLS connection and clean up
+    if let Ok(tls) = tls_holder.join() {
+        drop(tls);
+    }
+    drop(slow_backend);
+
+    println!(
+        "H2 shutdown timeout - worker stopped in {:?}, success={}",
+        shutdown_duration, success
+    );
+
+    if !success {
+        println!("H2 shutdown timeout - worker did not stop cleanly");
+        return State::Fail;
+    }
+
+    // The worker should have stopped via the 5s graceful timeout, not the zombie checker.
+    // Allow up to 8s (5s timeout + server loop tick margin) — the zombie checker
+    // default interval is 30s, so hitting it would mean >30s.
+    if shutdown_duration > Duration::from_secs(8) {
+        println!(
+            "H2 shutdown timeout - took {:?}, expected ≤8s (5s timeout + margin). \
+             Likely fell through to zombie checker instead of graceful timeout.",
+            shutdown_duration
+        );
+        return State::Fail;
+    }
+    // Should take at least ~4s (the 5s timeout minus server tick jitter)
+    if shutdown_duration < Duration::from_secs(3) {
+        println!(
+            "H2 shutdown timeout - took only {:?}, expected ≥3s. \
+             Client may have closed before the timeout fired.",
+            shutdown_duration
+        );
+        return State::Fail;
+    }
+
+    State::Success
+}
+
+#[test]
+fn test_h2_graceful_shutdown_timeout_forces_close() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2: graceful shutdown timeout forces close on lingering client",
+            try_h2_graceful_shutdown_timeout_forces_close
         ),
         State::Success
     );
