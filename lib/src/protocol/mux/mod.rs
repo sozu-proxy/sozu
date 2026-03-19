@@ -71,6 +71,8 @@ pub use crate::protocol::mux::{
 /// Maximum event loop iterations before forcefully closing a session.
 /// Prevents infinite loops from consuming the single-threaded worker.
 const MAX_LOOP_ITERATIONS: i32 = 10_000;
+/// Maximum time to wait for an H2 graceful drain before force-closing.
+const H2_GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1000,6 +1002,19 @@ impl Stream {
             metrics: SessionMetrics::new(None),
         })
     }
+    /// Returns true when both front and back kawa buffers are in a terminal
+    /// or initial state with no pending data. Used during shutdown to skip
+    /// streams that have already completed their work.
+    pub fn is_quiesced(&self) -> bool {
+        let front_done =
+            (self.front.is_initial() || self.front.is_completed() || self.front.is_terminated())
+                && self.front.storage.is_empty();
+        let back_done =
+            (self.back.is_initial() || self.back.is_completed() || self.back.is_terminated())
+                && self.back.storage.is_empty();
+        front_done && back_done
+    }
+
     pub fn split(&mut self, position: &Position) -> StreamParts<'_> {
         match position {
             Position::Client(..) => StreamParts {
@@ -1602,7 +1617,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             let readiness = self.frontend.readiness_mut();
             readiness.interest = Ready::WRITABLE | Ready::HUP | Ready::ERROR;
             readiness.signal_pending_write();
-            warn!("Mux delaying close on {}: {:?}", reason, self.frontend);
+            debug!("Mux delaying close on {}: {:?}", reason, self.frontend);
             true
         } else {
             false
@@ -1643,7 +1658,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
 
         if self.frontend.readiness().event.is_hup() {
             if !self.delay_close_for_frontend_flush("frontend HUP") {
-                warn!("Mux closing on frontend HUP: {:?}", self.frontend);
+                debug!("Mux closing on frontend HUP: {:?}", self.frontend);
                 return SessionResult::Close;
             }
         }
@@ -1686,7 +1701,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                         MuxResult::Continue => {}
                         MuxResult::CloseSession => {
                             if !self.delay_close_for_frontend_flush("frontend readable") {
-                                warn!("Mux close from frontend readable: {:?}", self.frontend);
+                                debug!("Mux close from frontend readable: {:?}", self.frontend);
                                 return SessionResult::Close;
                             }
                         }
@@ -1696,6 +1711,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
 
                 let mut all_backends_readiness_are_empty = true;
                 let mut dead_backends = Vec::new();
+                let mut backend_close: Option<(&'static str, Token)> = None;
                 for (token, client) in self.router.backends.iter_mut() {
                     let readiness = client.readiness_mut();
                     // Check the raw event for HUP/ERROR — not filter_interest(),
@@ -1785,11 +1801,8 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                 error!("only frontend connections can trigger Upgrade");
                             }
                             MuxResult::CloseSession => {
-                                warn!(
-                                    "Mux close from backend writable token={:?}: frontend={:?}",
-                                    token, self.frontend
-                                );
-                                return SessionResult::Close;
+                                backend_close = Some(("backend writable", *token));
+                                break;
                             }
                         }
                         // Cross-readiness: backend wrote → wake frontend reader
@@ -1814,11 +1827,8 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                 error!("only frontend connections can trigger Upgrade (readable)");
                             }
                             MuxResult::CloseSession => {
-                                warn!(
-                                    "Mux close from backend readable token={:?}: frontend={:?}",
-                                    token, self.frontend
-                                );
-                                return SessionResult::Close;
+                                backend_close = Some(("backend readable", *token));
+                                break;
                             }
                         }
                     }
@@ -1886,6 +1896,16 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                         all_backends_readiness_are_empty = false;
                     }
                 }
+                if let Some((reason, token)) = backend_close {
+                    if !self.delay_close_for_frontend_flush(reason) {
+                        debug!(
+                            "Mux close from {} token={:?}: frontend={:?}",
+                            reason, token, self.frontend
+                        );
+                        return SessionResult::Close;
+                    }
+                    all_backends_readiness_are_empty = false;
+                }
                 if !dead_backends.is_empty() {
                     for token in &dead_backends {
                         let proxy_borrow = proxy.borrow();
@@ -1931,7 +1951,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                         MuxResult::Continue => {}
                         MuxResult::CloseSession => {
                             if !self.delay_close_for_frontend_flush("frontend writable") {
-                                warn!("Mux close from frontend writable: {:?}", self.frontend);
+                                debug!("Mux close from frontend writable: {:?}", self.frontend);
                                 return SessionResult::Close;
                             }
                         }
@@ -1957,6 +1977,15 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 counter += 1;
                 if counter >= MAX_LOOP_ITERATIONS {
                     incr!("http.infinite_loop.error");
+                    if self.frontend.has_pending_write() {
+                        debug!(
+                            "Mux loop budget exhausted while frontend flush pending: {:?}",
+                            self.frontend
+                        );
+                        self.frontend.readiness_mut().event.remove(Ready::WRITABLE);
+                        self.frontend.timeout_container().set(self.frontend_token);
+                        break;
+                    }
                     return SessionResult::Close;
                 }
             }
@@ -2222,7 +2251,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         }
         if should_close {
             if self.delay_close_for_frontend_flush("timeout") {
-                warn!(
+                debug!(
                     "Mux timeout delaying close for frontend flush: token={:?}, frontend={:?}",
                     token, self.frontend
                 );
@@ -2230,13 +2259,13 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 return StateResult::Continue;
             }
             if front_is_h2 {
-                warn!(
+                debug!(
                     "Mux timeout returning CloseSession: token={:?}, frontend={:?}",
                     token, self.frontend
                 );
                 for (idx, stream) in self.context.streams.iter().enumerate() {
                     if stream.state != StreamState::Recycle {
-                        warn!(
+                        debug!(
                             "  timeout stream[{}]: state={:?}, front_phase={:?}, back_phase={:?}, front_completed={}, back_completed={}",
                             idx,
                             stream.state,
@@ -2423,6 +2452,9 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             }
         } else {
             trace!("shutting_down: already draining, skipping duplicate GOAWAY");
+            // shut_down_sessions() runs outside ready(), so retry flushing any
+            // previously-buffered GOAWAY/TLS records on each pass.
+            self.frontend.flush_zero_buffer();
         }
         // Don't close while the frontend still has pending writes (GOAWAY, etc.)
         if self.frontend.has_pending_write() {
@@ -2435,15 +2467,9 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                     can_stop = false;
                 }
                 StreamState::Unlinked => {
-                    let front = &stream.front;
-                    let back = &stream.back;
-                    kawa::debug_kawa(front);
-                    kawa::debug_kawa(back);
-                    if front.is_initial()
-                        && front.storage.is_empty()
-                        && back.is_initial()
-                        && back.storage.is_empty()
-                    {
+                    kawa::debug_kawa(&stream.front);
+                    kawa::debug_kawa(&stream.back);
+                    if stream.is_quiesced() {
                         continue;
                     }
                     stream.context.closing = true;
@@ -2458,15 +2484,23 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 .streams
                 .iter()
                 .enumerate()
-                .filter(|(_, s)| s.state != StreamState::Recycle)
+                .filter(|(_, s)| {
+                    if s.state == StreamState::Recycle {
+                        return false;
+                    }
+                    if s.state == StreamState::Unlinked && s.is_quiesced() {
+                        return false;
+                    }
+                    true
+                })
                 .collect::<Vec<_>>();
             if matches!(self.frontend, Connection::H2(_)) && !active_h2_streams.is_empty() {
-                warn!(
+                debug!(
                     "Mux shutting_down returning true with active H2 streams: {:?}",
                     self.frontend
                 );
                 for (idx, stream) in active_h2_streams {
-                    warn!(
+                    debug!(
                         "  shutdown stream[{}]: state={:?}, front_phase={:?}, back_phase={:?}, front_completed={}, back_completed={}",
                         idx,
                         stream.state,
@@ -2478,6 +2512,23 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 }
             }
         }
-        can_stop
+        if can_stop {
+            return true;
+        }
+
+        if let Connection::H2(c) = &self.frontend
+            && let Some(started_at) = c.drain.started_at
+            && started_at.elapsed() > H2_GRACEFUL_SHUTDOWN_TIMEOUT
+        {
+            warn!(
+                "H2 graceful shutdown exceeded {:?}, forcing close: state={:?}, streams={}",
+                H2_GRACEFUL_SHUTDOWN_TIMEOUT,
+                c.state,
+                c.streams.len()
+            );
+            return true;
+        }
+
+        false
     }
 }

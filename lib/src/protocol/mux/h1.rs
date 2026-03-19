@@ -51,7 +51,7 @@ impl<Front: SocketHandler> std::fmt::Debug for ConnectionH1<Front> {
 impl<Front: SocketHandler> ConnectionH1<Front> {
     fn defer_close_for_tls_flush(&mut self, reason: &'static str) -> MuxResult {
         if self.initiate_close_notify() {
-            warn!(
+            trace!(
                 "H1 writable delaying close after {}: stream={:?}, close_notify_sent={}, wants_write={}, readiness={:?}",
                 reason,
                 self.stream,
@@ -448,7 +448,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             Position::Client(_, _, status) => {
                 *status = BackendStatus::Disconnecting;
                 self.readiness.event = Ready::HUP;
-                warn!(
+                debug!(
                     "H1 force_disconnect client: stream={:?}, wants_write={}, readiness={:?}",
                     self.stream,
                     self.socket.socket_wants_write(),
@@ -458,7 +458,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             }
             Position::Server => {
                 if self.socket.socket_wants_write() {
-                    warn!(
+                    debug!(
                         "H1 force_disconnect delaying close: stream={:?}, wants_write=true, readiness={:?}",
                         self.stream, self.readiness
                     );
@@ -466,7 +466,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                     self.readiness.signal_pending_write();
                     MuxResult::Continue
                 } else {
-                    warn!(
+                    debug!(
                         "H1 force_disconnect closing session: stream={:?}, wants_write=false, readiness={:?}",
                         self.stream, self.readiness
                     );
@@ -579,11 +579,13 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         match &mut self.position {
             Position::Client(_, _, BackendStatus::Connecting(_)) => {
                 self.stream = None;
+                stream.state = StreamState::Unlinked;
                 self.readiness.interest.remove(Ready::ALL);
                 self.force_disconnect();
             }
             Position::Client(_, _, status @ BackendStatus::Connected) => {
                 self.stream = None;
+                stream.state = StreamState::Unlinked;
                 self.readiness.interest.remove(Ready::ALL);
                 // keep alive should probably be used only if the http context is fully reset
                 // in case end_stream occurs due to an error the connection state is probably

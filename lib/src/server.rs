@@ -785,6 +785,11 @@ impl Server {
 
         for (_key, session) in &self.sessions.borrow().slab {
             if session.borrow_mut().shutting_down() {
+                debug!(
+                    "Server killing session from shutting_down: token={:?}, protocol={:?}",
+                    session.borrow().frontend_token(),
+                    session.borrow().protocol()
+                );
                 sessions_to_shut_down.insert(Token(session.borrow().frontend_token().0));
             }
         }
@@ -1645,6 +1650,10 @@ impl Server {
             let session = self.sessions.borrow_mut().slab[session_token].clone();
             session.borrow_mut().update_readiness(token, events);
             if session.borrow_mut().ready(session.clone()) {
+                debug!(
+                    "Server killing session from ready: token={:?}, protocol={:?}, events={:?}",
+                    token, protocol, events
+                );
                 self.kill_session(session);
             }
         }
@@ -1657,6 +1666,11 @@ impl Server {
         if self.sessions.borrow().slab.contains(session_token) {
             let session = self.sessions.borrow_mut().slab[session_token].clone();
             if session.borrow_mut().timeout(token) {
+                debug!(
+                    "Server killing session from timeout: token={:?}, protocol={:?}",
+                    token,
+                    session.borrow().protocol()
+                );
                 self.kill_session(session);
             }
         }
