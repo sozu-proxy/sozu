@@ -579,13 +579,17 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         match &mut self.position {
             Position::Client(_, _, BackendStatus::Connecting(_)) => {
                 self.stream = None;
-                stream.state = StreamState::Unlinked;
+                if stream.state != StreamState::Recycle {
+                    stream.state = StreamState::Unlinked;
+                }
                 self.readiness.interest.remove(Ready::ALL);
                 self.force_disconnect();
             }
             Position::Client(_, _, status @ BackendStatus::Connected) => {
                 self.stream = None;
-                stream.state = StreamState::Unlinked;
+                if stream.state != StreamState::Recycle {
+                    stream.state = StreamState::Unlinked;
+                }
                 self.readiness.interest.remove(Ready::ALL);
                 // keep alive should probably be used only if the http context is fully reset
                 // in case end_stream occurs due to an error the connection state is probably

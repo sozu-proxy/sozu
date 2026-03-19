@@ -460,8 +460,6 @@ pub struct H2ByteAccounting {
 pub struct H2DrainState {
     /// True when we've sent GOAWAY and are draining.
     pub draining: bool,
-    /// Timestamp of the first graceful-drain transition.
-    pub started_at: Option<Instant>,
     /// Last stream ID from peer's GOAWAY (for retry decisions).
     pub peer_last_stream_id: Option<StreamId>,
 }
@@ -592,7 +590,6 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             lowercase_buf: Vec::new(),
             drain: H2DrainState {
                 draining: false,
-                started_at: None,
                 peer_last_stream_id: None,
             },
             zero: kawa::Kawa::new(kawa::Kind::Request, kawa::Buffer::new(buffer)),
@@ -1464,7 +1461,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // Check lifetime total (not just pending queue length) because writable()
         // drains the queue between readable() calls, so the pending count alone
         // may never reach the cap even under sustained misbehavior.
-        if self.total_rst_streams_queued >= MAX_PENDING_RST_STREAMS {
+        if !matches!(self.state, H2State::GoAway | H2State::Error)
+            && self.total_rst_streams_queued >= MAX_PENDING_RST_STREAMS
+        {
             error!(
                 "total RST_STREAM count {} exceeds cap {}, sending GOAWAY(ENHANCE_YOUR_CALM)",
                 self.total_rst_streams_queued, MAX_PENDING_RST_STREAMS
@@ -1903,7 +1902,6 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // but does not yet know the cutoff. This gives in-flight requests a chance
         // to arrive before we commit to a final last_stream_id.
         self.drain.draining = true;
-        self.drain.started_at = Some(Instant::now());
         // Keep expect_read as-is: existing streams should continue reading
         // data during phase 1. Only phase 2 (goaway()) removes READABLE.
         let kawa = &mut self.zero;
@@ -2640,7 +2638,6 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         }
         // RFC 9113 §6.8: begin graceful drain.
         self.drain.draining = true;
-        self.drain.started_at.get_or_insert_with(Instant::now);
         self.drain.peer_last_stream_id = Some(goaway.last_stream_id);
 
         // Streams with ID > last_stream_id were NOT processed by the peer.
@@ -3027,7 +3024,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         }
                         self.streams.remove(&id);
                         self.prioriser.remove(&id);
-                        context.streams[stream_gid].state = StreamState::Unlinked;
+                        if context.streams[stream_gid].state != StreamState::Recycle {
+                            context.streams[stream_gid].state = StreamState::Unlinked;
+                        }
                         return;
                     }
                 }

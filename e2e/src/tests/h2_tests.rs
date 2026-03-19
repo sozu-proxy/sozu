@@ -5184,22 +5184,15 @@ fn test_h2_graceful_shutdown_completes_large_transfer() {
 }
 
 // ============================================================================
-// Test: Graceful shutdown timeout forces close on lingering clients
+// Test: Graceful shutdown waits for in-flight requests
 // ============================================================================
 
-/// After soft_stop, sozu sends GOAWAY. Per RFC 9113 §6.8, GOAWAY is advisory —
-/// the client MAY keep the connection open. This test verifies that sozu
-/// force-closes the session after H2_GRACEFUL_SHUTDOWN_TIMEOUT (5s) even when
-/// the client intentionally ignores the GOAWAY and keeps the TCP connection alive.
-///
-/// Uses a raw TLS+H2 connection (not hyper) so the client doesn't auto-close on
-/// GOAWAY. A slow backend (30s delay) keeps the H2 stream in Linked state so
-/// `can_stop` stays false until the timeout fires.
-fn try_h2_graceful_shutdown_timeout_forces_close() -> State {
-    let (mut worker, front_port, _front_address) = setup_h2_listener_only("H2-SHUTDOWN-TIMEOUT");
+/// `soft_stop` must stop accepting new H2 streams while still waiting for an
+/// already in-flight request to complete before the worker shuts down.
+fn try_h2_graceful_shutdown_waits_for_inflight_request() -> State {
+    let (mut worker, front_port, _front_address) =
+        setup_h2_listener_only("H2-GRACEFUL-WAITS-INFLIGHT");
 
-    // Backend that reads the request but delays 30s before responding.
-    // This keeps the H2 stream Linked during the shutdown window.
     let back_address = create_local_address();
     worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
         "cluster_0",
@@ -5207,113 +5200,154 @@ fn try_h2_graceful_shutdown_timeout_forces_close() -> State {
         back_address,
         None,
     )));
-    let slow_backend = AsyncBackend::spawn_detached_backend(
-        "SLOW_BACKEND",
+
+    let request_seen = Arc::new(AtomicBool::new(false));
+    let release_response = Arc::new(AtomicBool::new(false));
+    let request_seen_backend = request_seen.clone();
+    let release_response_backend = release_response.clone();
+    let mut backend = AsyncBackend::spawn_detached_backend(
+        "GRACEFUL_WAIT_BACKEND",
         back_address,
         SimpleAggregator::default(),
-        Box::new(|mut stream, backend_name, mut aggregator| {
+        Box::new(move |mut stream, backend_name, mut aggregator| {
             let mut buf = [0u8; 4096];
             match stream.read(&mut buf) {
                 Ok(0) => return aggregator,
-                Ok(n) => println!("{backend_name} received {n} bytes"),
+                Ok(n) => {
+                    println!("{backend_name} received {n} bytes");
+                    aggregator.requests_received += 1;
+                    request_seen_backend.store(true, Ordering::Relaxed);
+                }
                 Err(_) => return aggregator,
             }
-            aggregator.requests_received += 1;
-            // Sleep 30s — far longer than the 5s graceful timeout.
-            // The request will never complete; sozu must force-close.
-            thread::sleep(Duration::from_secs(30));
+
+            while !release_response_backend.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(10));
+            }
+
+            let response = b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\ngraceful-pong";
+            if stream.write_all(response).is_ok() {
+                let _ = stream.flush();
+                aggregator.responses_sent += 1;
+            }
             aggregator
         }),
     );
     worker.read_to_last();
 
-    let addr: SocketAddr = ([127, 0, 0, 1], front_port).into();
-
-    // Establish raw H2 connection and complete handshake
-    let mut tls = raw_h2_connection(addr);
-    h2_handshake(&mut tls);
-
-    // Send a GET request on stream 1 (HEADERS with END_STREAM + END_HEADERS)
-    let header_block = vec![
-        0x82, // :method GET (index 2)
-        0x84, // :path / (index 4)
-        0x86, // :scheme https (index 6)
-        0x41, 0x09, // :authority (literal, name index 1, value length 9)
-        b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't', // "localhost"
-    ];
-    let headers = H2Frame::headers(1, header_block, true, true);
-    tls.write_all(&headers.encode()).unwrap();
-    tls.flush().unwrap();
-
-    // Wait for the backend to receive the request (confirms the stream is Linked)
-    thread::sleep(Duration::from_millis(500));
-
-    // Trigger graceful shutdown while the stream is still Linked (backend sleeping)
-    worker.soft_stop();
-    let shutdown_start = Instant::now();
-
-    // Keep the TLS stream alive in a background thread — intentionally ignore GOAWAY.
-    // Read any data sozu sends to prevent TCP backpressure.
-    let tls_holder = thread::spawn(move || {
-        let _ = read_all_available(&mut tls, Duration::from_secs(15));
-        tls
+    let uri: hyper::Uri = format!("https://localhost:{front_port}/api")
+        .parse()
+        .unwrap();
+    let request_job = thread::spawn(move || {
+        let client = build_h2_client();
+        resolve_request(&client, uri)
     });
 
-    let success = worker.wait_for_server_stop();
-    let shutdown_duration = shutdown_start.elapsed();
-
-    // Drop the TLS connection and clean up
-    if let Ok(tls) = tls_holder.join() {
-        drop(tls);
-    }
-    drop(slow_backend);
-
-    println!(
-        "H2 shutdown timeout - worker stopped in {:?}, success={}",
-        shutdown_duration, success
-    );
-
-    if !success {
-        println!("H2 shutdown timeout - worker did not stop cleanly");
-        return State::Fail;
+    let wait_start = Instant::now();
+    while !request_seen.load(Ordering::Relaxed) {
+        if wait_start.elapsed() > Duration::from_secs(5) {
+            println!("H2 graceful wait - request never reached backend");
+            release_response.store(true, Ordering::Relaxed);
+            let _ = request_job.join();
+            worker.soft_stop();
+            let _ = worker.wait_for_server_stop();
+            let _ = backend.stop_and_get_aggregator();
+            return State::Fail;
+        }
+        thread::sleep(Duration::from_millis(10));
     }
 
-    // The worker should have stopped via the 5s graceful timeout, not the zombie checker.
-    // Allow up to 8s (5s timeout + server loop tick margin) — the zombie checker
-    // default interval is 30s, so hitting it would mean >30s.
-    if shutdown_duration > Duration::from_secs(8) {
+    worker.soft_stop();
+
+    let (stopped_tx, stopped_rx) = std::sync::mpsc::channel();
+    let wait_thread = thread::spawn(move || {
+        let success = worker.wait_for_server_stop();
+        let _ = stopped_tx.send(success);
+    });
+
+    match stopped_rx.recv_timeout(Duration::from_secs(1)) {
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        Ok(success) => {
+            println!(
+                "H2 graceful wait - worker stopped before in-flight request completed: success={success}"
+            );
+            release_response.store(true, Ordering::Relaxed);
+            let _ = request_job.join();
+            let _ = wait_thread.join();
+            let _ = backend.stop_and_get_aggregator();
+            return State::Fail;
+        }
+        Err(error) => {
+            println!("H2 graceful wait - failed waiting for worker stop state: {error:?}");
+            release_response.store(true, Ordering::Relaxed);
+            let _ = request_job.join();
+            let _ = wait_thread.join();
+            let _ = backend.stop_and_get_aggregator();
+            return State::Fail;
+        }
+    }
+
+    release_response.store(true, Ordering::Relaxed);
+
+    let request_result = match request_job.join() {
+        Ok(result) => result,
+        Err(_) => {
+            let _ = wait_thread.join();
+            let _ = backend.stop_and_get_aggregator();
+            return State::Fail;
+        }
+    };
+    let request_succeeded = request_result.is_some_and(|(status, body)| {
         println!(
-            "H2 shutdown timeout - took {:?}, expected ≤8s (5s timeout + margin). \
-             Likely fell through to zombie checker instead of graceful timeout.",
-            shutdown_duration
+            "H2 graceful wait - status: {status:?}, body_len={}",
+            body.len()
         );
-        return State::Fail;
-    }
-    // Should take at least ~4s (the 5s timeout minus server tick jitter)
-    if shutdown_duration < Duration::from_secs(3) {
-        println!(
-            "H2 shutdown timeout - took only {:?}, expected ≥3s. \
-             Client may have closed before the timeout fired.",
-            shutdown_duration
-        );
-        return State::Fail;
-    }
+        status.is_success() && body == "graceful-pong"
+    });
 
-    State::Success
+    let worker_stopped = match stopped_rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(success) => success,
+        Err(error) => {
+            println!("H2 graceful wait - worker did not stop after request completion: {error:?}");
+            let _ = wait_thread.join();
+            let _ = backend.stop_and_get_aggregator();
+            return State::Fail;
+        }
+    };
+
+    let _ = wait_thread.join();
+    let aggregator = backend
+        .stop_and_get_aggregator()
+        .expect("Could not get aggregator");
+
+    if worker_stopped
+        && request_succeeded
+        && aggregator.requests_received == 1
+        && aggregator.responses_sent == 1
+    {
+        State::Success
+    } else {
+        println!(
+            "H2 graceful wait - worker_stopped={worker_stopped}, request_succeeded={request_succeeded}, reqs={}, resps={}",
+            aggregator.requests_received, aggregator.responses_sent
+        );
+        State::Fail
+    }
 }
 
 #[test]
-fn test_h2_graceful_shutdown_timeout_forces_close() {
+fn test_h2_graceful_shutdown_waits_for_inflight_request() {
     assert_eq!(
         repeat_until_error_or(
             3,
-            "H2: graceful shutdown timeout forces close on lingering client",
-            try_h2_graceful_shutdown_timeout_forces_close
+            "H2: graceful shutdown waits for in-flight request completion",
+            try_h2_graceful_shutdown_waits_for_inflight_request
         ),
         State::Success
     );
 }
 
+// ============================================================================
 // ============================================================================
 // Test: Mixed H1/H2 traffic on same HTTPS listener
 // ============================================================================
