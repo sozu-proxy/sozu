@@ -1,5 +1,6 @@
 use std::{
-    net::SocketAddr,
+    io::{Read as _, Write as _},
+    net::{SocketAddr, TcpStream},
     thread,
     time::{Duration, Instant},
 };
@@ -2345,6 +2346,354 @@ fn test_upgrade_async() {
             10,
             "Upgrade: async backends with concurrent clients across worker upgrade",
             try_upgrade_async
+        ),
+        State::Success
+    );
+}
+
+// ---------------------------------------------------------------------------
+// X-Real-IP header tests
+// ---------------------------------------------------------------------------
+
+/// Helper: set up a worker with a custom HTTP listener (with X-Real-IP / proxy-protocol options),
+/// one cluster ("cluster_0"), one HTTP frontend, and one backend address.
+/// Returns the worker and the backend address.
+fn setup_x_real_ip_test(
+    name: &str,
+    send_x_real_ip: bool,
+    elide_x_real_ip: bool,
+    expect_proxy: bool,
+) -> (Worker, SocketAddr, SocketAddr) {
+    let front_address = create_local_address();
+    let back_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_config();
+    let mut worker = Worker::start_new_worker(name, config, &listeners, state);
+
+    let http_listener = {
+        let mut builder = ListenerBuilder::new_http(front_address.into());
+        builder.with_send_x_real_ip(send_x_real_ip);
+        builder.with_elide_x_real_ip(elide_x_real_ip);
+        builder.with_expect_proxy(expect_proxy);
+        builder
+            .to_http(None)
+            .expect("could not build HTTP listener")
+    };
+
+    worker.send_proxy_request_type(RequestType::AddHttpListener(http_listener));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        address: front_address.into(),
+        proxy: ListenerType::Http.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpFrontend(Worker::default_http_frontend(
+        "cluster_0",
+        front_address,
+    )));
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address,
+        None,
+    )));
+    worker.read_to_last();
+
+    (worker, front_address, back_address)
+}
+
+/// When `send_x_real_ip` is enabled, the backend must receive an `X-Real-IP` header
+/// whose value matches the TCP peer address (127.0.0.1 in the test harness).
+fn try_x_real_ip_send() -> State {
+    let (mut worker, front_address, back_address) =
+        setup_x_real_ip_test("X-REAL-IP-SEND", true, false, false);
+
+    let mut backend = SyncBackend::new("BACKEND_0", back_address, http_ok_response("pong"));
+    backend.connect();
+
+    let mut client = Client::new(
+        "client",
+        front_address,
+        http_request("GET", "/api", "ping", "localhost"),
+    );
+    client.connect();
+    client.send();
+
+    backend.accept(0);
+    let request = backend.receive(0);
+    println!("backend received request: {request:?}");
+
+    backend.send(0);
+    let response = client.receive();
+    println!("client received response: {response:?}");
+
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+
+    match request {
+        Some(req) => {
+            // The header must be present with the loopback address
+            if req.contains("X-Real-IP: 127.0.0.1") || req.contains("x-real-ip: 127.0.0.1") {
+                println!("X-Real-IP header found with correct value");
+                State::Success
+            } else {
+                println!("X-Real-IP header NOT found or has wrong value in:\n{req}");
+                State::Fail
+            }
+        }
+        None => {
+            println!("backend received no request");
+            State::Fail
+        }
+    }
+}
+
+/// When `elide_x_real_ip` is enabled, any client-provided X-Real-IP header must be stripped.
+fn try_x_real_ip_elide() -> State {
+    let (mut worker, front_address, back_address) =
+        setup_x_real_ip_test("X-REAL-IP-ELIDE", false, true, false);
+
+    let mut backend = SyncBackend::new("BACKEND_0", back_address, http_ok_response("pong"));
+    backend.connect();
+
+    // Craft a request that includes a spoofed X-Real-IP header
+    let request_with_spoofed_header = "\
+        GET /api HTTP/1.1\r\n\
+        Host: localhost\r\n\
+        Connection: keep-alive\r\n\
+        X-Real-IP: 1.2.3.4\r\n\
+        Content-Length: 4\r\n\
+        \r\n\
+        ping";
+
+    let mut client = Client::new("client", front_address, request_with_spoofed_header);
+    client.connect();
+    client.send();
+
+    backend.accept(0);
+    let request = backend.receive(0);
+    println!("backend received request: {request:?}");
+
+    backend.send(0);
+    let response = client.receive();
+    println!("client received response: {response:?}");
+
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+
+    match request {
+        Some(req) => {
+            // The spoofed header must have been removed
+            let lower = req.to_lowercase();
+            if lower.contains("x-real-ip") {
+                println!("X-Real-IP header was NOT elided from:\n{req}");
+                State::Fail
+            } else {
+                println!("X-Real-IP header correctly elided");
+                State::Success
+            }
+        }
+        None => {
+            println!("backend received no request");
+            State::Fail
+        }
+    }
+}
+
+/// When both `elide_x_real_ip` and `send_x_real_ip` are enabled:
+/// - The spoofed client-provided X-Real-IP must be stripped
+/// - A new X-Real-IP with the real client IP (127.0.0.1) must be injected
+fn try_x_real_ip_elide_and_send() -> State {
+    let (mut worker, front_address, back_address) =
+        setup_x_real_ip_test("X-REAL-IP-ELIDE-SEND", true, true, false);
+
+    let mut backend = SyncBackend::new("BACKEND_0", back_address, http_ok_response("pong"));
+    backend.connect();
+
+    // Craft a request that includes a spoofed X-Real-IP header
+    let request_with_spoofed_header = "\
+        GET /api HTTP/1.1\r\n\
+        Host: localhost\r\n\
+        Connection: keep-alive\r\n\
+        X-Real-IP: 1.2.3.4\r\n\
+        Content-Length: 4\r\n\
+        \r\n\
+        ping";
+
+    let mut client = Client::new("client", front_address, request_with_spoofed_header);
+    client.connect();
+    client.send();
+
+    backend.accept(0);
+    let request = backend.receive(0);
+    println!("backend received request: {request:?}");
+
+    backend.send(0);
+    let response = client.receive();
+    println!("client received response: {response:?}");
+
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+
+    match request {
+        Some(req) => {
+            let has_spoofed =
+                req.contains("X-Real-IP: 1.2.3.4") || req.contains("x-real-ip: 1.2.3.4");
+            let has_real =
+                req.contains("X-Real-IP: 127.0.0.1") || req.contains("x-real-ip: 127.0.0.1");
+
+            if has_spoofed {
+                println!("spoofed X-Real-IP: 1.2.3.4 was NOT removed from:\n{req}");
+                return State::Fail;
+            }
+            if !has_real {
+                println!("X-Real-IP: 127.0.0.1 was NOT injected in:\n{req}");
+                return State::Fail;
+            }
+            println!("spoofed header removed and real IP injected correctly");
+            State::Success
+        }
+        None => {
+            println!("backend received no request");
+            State::Fail
+        }
+    }
+}
+
+/// When `expect_proxy` + `send_x_real_ip` + `elide_x_real_ip` are all enabled,
+/// the X-Real-IP header must carry the source IP from the PROXY protocol v2 header
+/// (10.0.0.42), NOT the TCP peer address (127.0.0.1).
+fn try_x_real_ip_with_proxy_protocol() -> State {
+    let (mut worker, front_address, back_address) =
+        setup_x_real_ip_test("X-REAL-IP-PP", true, true, true);
+
+    let mut backend = SyncBackend::new("BACKEND_0", back_address, http_ok_response("pong"));
+    backend.connect();
+
+    // Build a PROXY protocol v2 header with source IP 10.0.0.42
+    let pp_src: SocketAddr = "10.0.0.42:12345".parse().unwrap();
+    let pp_dst: SocketAddr = format!("127.0.0.1:{}", front_address.port())
+        .parse()
+        .unwrap();
+    let pp_header = sozu_lib::protocol::proxy_protocol::header::HeaderV2::new(
+        sozu_lib::protocol::proxy_protocol::header::Command::Proxy,
+        pp_src,
+        pp_dst,
+    );
+    let pp_bytes = pp_header.into_bytes();
+
+    // Use a raw TcpStream: first send the PROXY protocol header, then the HTTP request
+    let http_payload = format!(
+        "GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 4\r\n\r\nping"
+    );
+
+    let mut stream = TcpStream::connect(front_address).expect("could not connect to sozu");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("could not set read timeout");
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .expect("could not set write timeout");
+
+    // Send PROXY protocol v2 header followed by the HTTP request
+    stream
+        .write_all(&pp_bytes)
+        .expect("could not write proxy protocol header");
+    stream
+        .write_all(http_payload.as_bytes())
+        .expect("could not write HTTP request");
+
+    backend.accept(0);
+    let request = backend.receive(0);
+    println!("backend received request: {request:?}");
+
+    backend.send(0);
+
+    // Read the HTTP response from sozu
+    let mut buf = [0u8; 4096];
+    match stream.read(&mut buf) {
+        Ok(n) => {
+            let response = std::str::from_utf8(&buf[..n]).unwrap_or("<non-utf8>");
+            println!("client received response: {response}");
+        }
+        Err(e) => println!("client read error: {e}"),
+    }
+
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+
+    match request {
+        Some(req) => {
+            let has_pp_source =
+                req.contains("X-Real-IP: 10.0.0.42") || req.contains("x-real-ip: 10.0.0.42");
+            let has_tcp_peer =
+                req.contains("X-Real-IP: 127.0.0.1") || req.contains("x-real-ip: 127.0.0.1");
+
+            if !has_pp_source {
+                println!("X-Real-IP: 10.0.0.42 was NOT found in:\n{req}");
+                return State::Fail;
+            }
+            if has_tcp_peer {
+                println!(
+                    "X-Real-IP: 127.0.0.1 should NOT be present (proxy-protocol source should override) in:\n{req}"
+                );
+                return State::Fail;
+            }
+            println!("X-Real-IP correctly uses proxy-protocol source IP 10.0.0.42");
+            State::Success
+        }
+        None => {
+            println!("backend received no request");
+            State::Fail
+        }
+    }
+}
+
+#[test]
+fn test_x_real_ip_send() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "X-Real-IP: send_x_real_ip injects the client IP header",
+            try_x_real_ip_send,
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_x_real_ip_elide() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "X-Real-IP: elide_x_real_ip strips spoofed client header",
+            try_x_real_ip_elide,
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_x_real_ip_elide_and_send() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "X-Real-IP: elide + send replaces spoofed header with real client IP",
+            try_x_real_ip_elide_and_send,
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_x_real_ip_with_proxy_protocol() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "X-Real-IP: proxy-protocol source IP is used instead of TCP peer",
+            try_x_real_ip_with_proxy_protocol,
         ),
         State::Success
     );

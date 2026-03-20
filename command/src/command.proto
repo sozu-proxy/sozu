@@ -130,6 +130,10 @@ message HttpListenerConfig {
     // wether the listener is actively listening on its socket
     required bool active = 11 [default = false];
     optional CustomHttpAnswers http_answers = 12;
+    // whether to remove any client-provided X-Real-IP header (anti-spoofing)
+    required bool elide_x_real_ip = 13 [default = false];
+    // whether to add the X-Real-IP header with the client's source IP address
+    required bool send_x_real_ip = 14 [default = false];
 }
 
 // details of an HTTPS listener
@@ -162,6 +166,10 @@ message HttpsListenerConfig {
     // agains session tracking. Defaults to 4.
     required uint64 send_tls13_tickets = 20;
     optional CustomHttpAnswers http_answers = 21;
+    // whether to remove any client-provided X-Real-IP header (anti-spoofing)
+    required bool elide_x_real_ip = 22 [default = false];
+    // whether to add the X-Real-IP header with the client's source IP address
+    required bool send_x_real_ip = 23 [default = false];
 }
 
 // details of an TCP listener
