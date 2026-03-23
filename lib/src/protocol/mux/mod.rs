@@ -1620,6 +1620,44 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             false
         }
     }
+
+    /// Drive the frontend writable path during shutdown, when the server is
+    /// polling `shutting_down()` outside the normal epoll readiness loop.
+    ///
+    /// This is required for H2 graceful shutdown: a response can already be
+    /// visible to the client while the frontend still needs one more writable
+    /// pass to retire the stream, emit the final GOAWAY, or flush TLS records.
+    fn flush_frontend_shutdown_writes(&mut self) -> SessionIsToBeClosed {
+        if !self.frontend.has_pending_write() {
+            return false;
+        }
+
+        self.frontend
+            .readiness_mut()
+            .interest
+            .insert(Ready::WRITABLE);
+
+        let mut iterations = 0;
+        loop {
+            match self
+                .frontend
+                .writable(&mut self.context, EndpointClient(&mut self.router))
+            {
+                MuxResult::Continue => {}
+                MuxResult::CloseSession | MuxResult::Upgrade => return true,
+            }
+
+            iterations += 1;
+            if iterations >= MAX_LOOP_ITERATIONS
+                || !self.frontend.has_pending_write()
+                || !self.frontend.readiness().interest.is_writable()
+            {
+                break;
+            }
+        }
+
+        false
+    }
 }
 
 #[derive(Debug)]
@@ -2452,6 +2490,9 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             // shut_down_sessions() runs outside ready(), so retry flushing any
             // previously-buffered GOAWAY/TLS records on each pass.
             self.frontend.flush_zero_buffer();
+        }
+        if self.flush_frontend_shutdown_writes() {
+            return true;
         }
         // Don't close while the frontend still has pending writes (GOAWAY, etc.)
         if self.frontend.has_pending_write() {
