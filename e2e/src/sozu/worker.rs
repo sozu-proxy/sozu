@@ -2,6 +2,7 @@ use std::{
     net::SocketAddr,
     os::unix::prelude::{AsRawFd, FromRawFd, IntoRawFd},
     thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 
 use mio::net::UnixStream;
@@ -286,12 +287,20 @@ impl Worker {
         self.send_proxy_request_type(RequestType::SoftStop(SoftStop {}));
     }
 
-    pub fn wait_for_server_stop(self) -> bool {
+    pub fn wait_for_server_stop(mut self) -> bool {
         let result = if self.server_job.is_finished() {
             println!("already finished...");
             true
         } else {
             println!("waiting...");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !self.server_job.is_finished() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            if !self.server_job.is_finished() {
+                println!("soft stop timed out, sending hard stop...");
+                self.hard_stop();
+            }
             match self.server_job.join() {
                 Ok(_) => {
                     println!("finished!");

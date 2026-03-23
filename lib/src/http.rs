@@ -133,6 +133,7 @@ impl HttpSession {
                 frontend,
                 router,
                 context,
+                shutdown_frontend_write_started_at: None,
             })
         };
 
@@ -206,6 +207,7 @@ impl HttpSession {
                     frontend,
                     router,
                     context,
+                    shutdown_frontend_write_started_at: None,
                 };
                 mux.frontend.readiness_mut().event = expect.frontend_readiness.event;
 

@@ -268,6 +268,7 @@ impl HttpsSession {
         let front_stream = FrontRustls {
             stream: handshake.stream,
             session: handshake.session,
+            peer_disconnected: false,
         };
 
         gauge_add!("protocol.tls.handshake", -1);
@@ -319,6 +320,7 @@ impl HttpsSession {
             frontend,
             context,
             router,
+            shutdown_frontend_write_started_at: None,
         }))
     }
 
