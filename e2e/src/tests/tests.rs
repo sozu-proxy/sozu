@@ -30,7 +30,10 @@ use crate::{
         sync_backend::Backend as SyncBackend,
     },
     sozu::worker::Worker,
-    tests::{State, provide_port, repeat_until_error_or, setup_async_test, setup_sync_test},
+    tests::{
+        State, provide_port, provide_unbound_port, repeat_until_error_or, setup_async_test,
+        setup_sync_test,
+    },
 };
 
 pub fn create_local_address() -> SocketAddr {
@@ -38,6 +41,14 @@ pub fn create_local_address() -> SocketAddr {
         .parse()
         .expect("could not parse front address");
     println!("created local address {}", address);
+    address
+}
+
+pub fn create_unbound_local_address() -> SocketAddr {
+    let address: SocketAddr = format!("127.0.0.1:{}", provide_unbound_port())
+        .parse()
+        .expect("could not parse unbound address");
+    println!("created unbound local address {}", address);
     address
 }
 
@@ -295,8 +306,8 @@ pub fn try_issue_810_panic(part2: bool) -> State {
 
     let back_address = create_local_address();
 
-    let (config, listeners, state) = Worker::empty_config();
-    let mut worker = Worker::start_new_worker("810-PANIC", config, &listeners, state);
+    let (config, listeners, state) = Worker::empty_tcp_config(front_address);
+    let mut worker = Worker::start_new_worker_owned("810-PANIC", config, listeners, state);
 
     worker.send_proxy_request_type(RequestType::AddTcpListener(
         ListenerBuilder::new_tcp(front_address.into())
@@ -358,8 +369,8 @@ pub fn try_tls_endpoint() -> State {
     let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
     let back_address = create_local_address();
 
-    let (config, listeners, state) = Worker::empty_config();
-    let mut worker = Worker::start_new_worker("TLS-ENDPOINT", config, &listeners, state);
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker = Worker::start_new_worker_owned("TLS-ENDPOINT", config, listeners, state);
 
     worker.send_proxy_request_type(RequestType::AddHttpsListener(
         ListenerBuilder::new_https(front_address.clone())
@@ -1091,8 +1102,8 @@ fn try_http_behaviors() -> State {
 
     let front_address: SocketAddr = create_local_address();
 
-    let (config, listeners, state) = Worker::empty_config();
-    let mut worker = Worker::start_new_worker("BEHAVE-WORKER", config, &listeners, state);
+    let (config, listeners, state) = Worker::empty_http_config(front_address);
+    let mut worker = Worker::start_new_worker_owned("BEHAVE-WORKER", config, listeners, state);
 
     let mut http_config = ListenerBuilder::new_http(front_address.into())
         .to_http(None)
@@ -1398,8 +1409,8 @@ fn try_http_behaviors() -> State {
 fn try_https_redirect() -> State {
     let front_address: SocketAddr = create_local_address();
 
-    let (config, listeners, state) = Worker::empty_config();
-    let mut worker = Worker::start_new_worker("BEHAVE-WORKER", config, &listeners, state);
+    let (config, listeners, state) = Worker::empty_http_config(front_address);
+    let mut worker = Worker::start_new_worker_owned("BEHAVE-WORKER", config, listeners, state);
 
     let mut http_config = ListenerBuilder::new_http(front_address.into())
         .to_http(None)
@@ -1970,8 +1981,8 @@ fn try_wildcard() -> State {
     use sozu_command_lib::proto::command::{PathRule, RulePosition};
     let front_address = create_local_address();
 
-    let (config, listeners, state) = Worker::empty_config();
-    let mut worker = Worker::start_new_worker("WLD_CRD", config, &listeners, state);
+    let (config, listeners, state) = Worker::empty_http_config(front_address);
+    let mut worker = Worker::start_new_worker_owned("WLD_CRD", config, listeners, state);
     worker.send_proxy_request(
         RequestType::AddHttpListener(
             ListenerBuilder::new_http(front_address.into())
@@ -2367,8 +2378,8 @@ fn setup_h2_test(
     let front_port = provide_port();
     let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
 
-    let (config, listeners, state) = Worker::empty_config();
-    let mut worker = Worker::start_new_worker(name, config, &listeners, state);
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker = Worker::start_new_worker_owned(name, config, listeners, state);
 
     worker.send_proxy_request_type(RequestType::AddHttpsListener(
         ListenerBuilder::new_https(front_address.clone())
@@ -2760,8 +2771,8 @@ fn setup_h2_test_with_alpn(
     let front_port = provide_port();
     let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
 
-    let (config, listeners, state) = Worker::empty_config();
-    let mut worker = Worker::start_new_worker(name, config, &listeners, state);
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker = Worker::start_new_worker_owned(name, config, listeners, state);
 
     let mut listener_builder = ListenerBuilder::new_https(front_address.clone());
     listener_builder.with_alpn_protocols(Some(alpn_protocols));
@@ -3035,8 +3046,12 @@ fn setup_h2_backend_test(
     let front_port = provide_port();
     let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
 
-    let (config, listeners, state) = Worker::empty_config();
-    let mut worker = Worker::start_new_worker(name, config, &listeners, state);
+    let (config, listeners, state) = if frontend_h2 {
+        Worker::empty_https_config(front_address.clone().into())
+    } else {
+        Worker::empty_http_config(front_address.clone().into())
+    };
+    let mut worker = Worker::start_new_worker_owned(name, config, listeners, state);
 
     if frontend_h2 {
         // HTTPS listener (supports H2 via ALPN)

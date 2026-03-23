@@ -492,8 +492,8 @@ pub(crate) fn setup_h2_test(
     let front_port = provide_port();
     let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
 
-    let (config, listeners, state) = Worker::empty_config();
-    let mut worker = Worker::start_new_worker(name, config, &listeners, state);
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker = Worker::start_new_worker_owned(name, config, listeners, state);
 
     worker.send_proxy_request_type(RequestType::AddHttpsListener(
         ListenerBuilder::new_https(front_address.clone())
@@ -553,8 +553,8 @@ pub(crate) fn setup_h2_listener_only(name: &str) -> (Worker, u16, SocketAddress)
     let front_port = provide_port();
     let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
 
-    let (config, listeners, state) = Worker::empty_config();
-    let mut worker = Worker::start_new_worker(name, config, &listeners, state);
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker = Worker::start_new_worker_owned(name, config, listeners, state);
 
     worker.send_proxy_request_type(RequestType::AddHttpsListener(
         ListenerBuilder::new_https(front_address.clone())

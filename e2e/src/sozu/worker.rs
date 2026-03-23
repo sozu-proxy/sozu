@@ -22,6 +22,9 @@ use sozu_command_lib as sozu_command;
 use sozu_lib as sozu;
 
 use crate::sozu::command_id::CommandID;
+use crate::port_registry::{
+    attach_reserved_http_listener, attach_reserved_https_listener, attach_reserved_tcp_listener,
+};
 
 /// Handle to a detached thread where a Sozu worker runs
 pub struct Worker {
@@ -55,11 +58,38 @@ impl Worker {
     }
 
     pub fn empty_config() -> (ServerConfig, Listeners, ConfigState) {
+        let config = FileConfig::default();
+        let config = Worker::into_config(config);
+        let state = ConfigState::new();
         let listeners = Listeners::default();
+        (config, listeners, state)
+    }
+
+    pub fn empty_config_with_listeners(
+        listeners: Listeners,
+    ) -> (ServerConfig, Listeners, ConfigState) {
         let config = FileConfig::default();
         let config = Worker::into_config(config);
         let state = ConfigState::new();
         (config, listeners, state)
+    }
+
+    pub fn empty_http_config(address: SocketAddr) -> (ServerConfig, Listeners, ConfigState) {
+        let mut listeners = Listeners::default();
+        attach_reserved_http_listener(&mut listeners, address);
+        Self::empty_config_with_listeners(listeners)
+    }
+
+    pub fn empty_https_config(address: SocketAddr) -> (ServerConfig, Listeners, ConfigState) {
+        let mut listeners = Listeners::default();
+        attach_reserved_https_listener(&mut listeners, address);
+        Self::empty_config_with_listeners(listeners)
+    }
+
+    pub fn empty_tcp_config(address: SocketAddr) -> (ServerConfig, Listeners, ConfigState) {
+        let mut listeners = Listeners::default();
+        attach_reserved_tcp_listener(&mut listeners, address);
+        Self::empty_config_with_listeners(listeners)
     }
 
     // TODO: this seems to be used nowhere. We may want to delete it.
@@ -156,6 +186,17 @@ impl Worker {
             command_id: CommandID::new(),
             server_job,
         }
+    }
+
+    pub fn start_new_worker_owned<S: Into<String>>(
+        name: S,
+        config: ServerConfig,
+        listeners: Listeners,
+        state: ConfigState,
+    ) -> Self {
+        let worker = Self::start_new_worker(name, config, &listeners, state);
+        listeners.close();
+        worker
     }
 
     pub fn upgrade<S: Into<String>>(&mut self, name: S) -> Self {

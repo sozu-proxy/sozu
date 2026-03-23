@@ -20,11 +20,12 @@ use sozu_command_lib::{
 use crate::{
     http_utils::http_ok_response,
     mock::{client::Client, sync_backend::Backend as SyncBackend},
+    port_registry::attach_reserved_http_listener,
     sozu::worker::Worker,
     tests::{State, repeat_until_error_or, setup_sync_test},
 };
 
-use super::tests::create_local_address;
+use super::tests::{create_local_address, create_unbound_local_address};
 
 const BUFFER_SIZE: usize = 4096;
 
@@ -88,8 +89,8 @@ fn setup_proxy_protocol_test(
     nb_backends: usize,
 ) -> (Worker, Vec<SocketAddr>, SocketAddr) {
     let front_address = create_local_address();
-    let (config, listeners, state) = Worker::empty_config();
-    let mut worker = Worker::start_new_worker(name, config, &listeners, state);
+    let (config, listeners, state) = Worker::empty_http_config(front_address);
+    let mut worker = Worker::start_new_worker_owned(name, config, listeners, state);
 
     worker.send_proxy_request(Request {
         request_type: Some(RequestType::AddHttpListener(
@@ -1220,10 +1221,11 @@ fn setup_short_timeout_test(
     file_config.back_timeout = Some(2);
     file_config.connect_timeout = Some(2);
     let config = Worker::into_config(file_config);
-    let listeners = sozu_command_lib::scm_socket::Listeners::default();
+    let mut listeners = sozu_command_lib::scm_socket::Listeners::default();
+    attach_reserved_http_listener(&mut listeners, front_address);
     let state = sozu_command_lib::state::ConfigState::new();
 
-    let mut worker = Worker::start_new_worker(name, config, &listeners, state);
+    let mut worker = Worker::start_new_worker_owned(name, config, listeners, state);
     worker.send_proxy_request(Request {
         request_type: Some(RequestType::AddHttpListener(
             ListenerBuilder::new_http(front_address.into())
@@ -1564,9 +1566,54 @@ fn test_100_continue_no_double_decrement() {
 
 fn try_backend_refused_no_error_inflation() -> State {
     let front_address = create_local_address();
-    let (mut worker, mut backends) = setup_short_timeout_test("BACKEND-REFUSED", front_address, 1);
-    let _backend = backends.pop().unwrap();
-    // Do NOT call backend.connect() — backend is unreachable
+    let mut file_config = FileConfig::default();
+    file_config.front_timeout = Some(2);
+    file_config.request_timeout = Some(2);
+    file_config.back_timeout = Some(2);
+    file_config.connect_timeout = Some(2);
+    let config = Worker::into_config(file_config);
+    let mut listeners = sozu_command_lib::scm_socket::Listeners::default();
+    attach_reserved_http_listener(&mut listeners, front_address);
+    let state = sozu_command_lib::state::ConfigState::new();
+
+    let mut worker = Worker::start_new_worker_owned("BACKEND-REFUSED", config, listeners, state);
+    worker.send_proxy_request(Request {
+        request_type: Some(RequestType::AddHttpListener(
+            ListenerBuilder::new_http(front_address.into())
+                .to_http(None)
+                .unwrap(),
+        )),
+    });
+    worker.send_proxy_request(Request {
+        request_type: Some(RequestType::ActivateListener(ActivateListener {
+            address: front_address.into(),
+            proxy: ListenerType::Http.into(),
+            from_scm: false,
+        })),
+    });
+    worker.send_proxy_request(Request {
+        request_type: Some(RequestType::AddCluster(Cluster {
+            ..Worker::default_cluster("cluster_0")
+        })),
+    });
+    worker.send_proxy_request(Request {
+        request_type: Some(RequestType::AddHttpFrontend(Worker::default_http_frontend(
+            "cluster_0",
+            front_address,
+        ))),
+    });
+
+    let dead_backend = create_unbound_local_address();
+    worker.send_proxy_request(
+        RequestType::AddBackend(Worker::default_backend(
+            "cluster_0",
+            "cluster_0-0",
+            dead_backend,
+            None,
+        ))
+        .into(),
+    );
+    worker.read_to_last();
 
     // Send requests that will get 503 (no backend available).
     // Before the fix, each session teardown would unconditionally mark
