@@ -36,8 +36,6 @@ use sozu_command_lib::{
         SocketAddress, request::RequestType,
     },
 };
-use tokio::net::TcpListener;
-
 use super::h2_utils::{
     H2_ERROR_ENHANCE_YOUR_CALM, H2_ERROR_FLOW_CONTROL_ERROR, H2_ERROR_FRAME_SIZE_ERROR,
     H2_ERROR_REFUSED_STREAM, H2_FRAME_GOAWAY, H2Frame, collect_response_frames, contains_goaway,
@@ -55,6 +53,7 @@ use crate::{
             resolve_request,
         },
     },
+    port_registry::{bind_std_listener, bind_tokio_listener},
     sozu::worker::Worker,
     tests::{State, provide_port, repeat_until_error_or, tests::create_local_address},
 };
@@ -79,8 +78,7 @@ impl DisconnectingBackend {
         let req_count = requests_received.clone();
 
         let thread = thread::spawn(move || {
-            let listener =
-                std::net::TcpListener::bind(address).expect("could not bind disconnecting backend");
+            let listener = bind_std_listener(address, "disconnecting backend");
             listener
                 .set_nonblocking(true)
                 .expect("could not set nonblocking");
@@ -152,8 +150,7 @@ impl ContentLengthMismatchBackend {
         let req_count = requests_received.clone();
 
         let thread = thread::spawn(move || {
-            let listener = std::net::TcpListener::bind(address)
-                .expect("could not bind content-length mismatch backend");
+            let listener = bind_std_listener(address, "content-length mismatch backend");
             listener
                 .set_nonblocking(true)
                 .expect("could not set nonblocking");
@@ -233,9 +230,7 @@ impl DelayedH2Backend {
         let thread = thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("could not create tokio runtime");
             rt.block_on(async move {
-                let listener = TcpListener::bind(address)
-                    .await
-                    .expect("could not bind delayed h2 backend");
+                let listener = bind_tokio_listener(address, "delayed h2 backend");
 
                 loop {
                     if stop_clone.load(Ordering::Relaxed) {
@@ -441,8 +436,8 @@ fn try_h2_goaway_graceful_drain() -> State {
     let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
     let back_address = create_local_address();
 
-    let (config, listeners, state) = Worker::empty_config();
-    let mut worker = Worker::start_new_worker("H2-GOAWAY-DRAIN", config, &listeners, state);
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker = Worker::start_new_worker_owned("H2-GOAWAY-DRAIN", config, listeners, state);
 
     worker.send_proxy_request_type(RequestType::AddHttpsListener(
         ListenerBuilder::new_https(front_address.clone())
@@ -1677,7 +1672,7 @@ impl LargeBodyH2Backend {
         let thread = thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async move {
-                let listener = TcpListener::bind(address).await.unwrap();
+                let listener = bind_tokio_listener(address, "large body h2 backend");
                 loop {
                     if stop_clone.load(Ordering::Relaxed) {
                         break;
@@ -1753,7 +1748,7 @@ impl GoAwayH2Backend {
         let thread = thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async move {
-                let listener = TcpListener::bind(address).await.unwrap();
+                let listener = bind_tokio_listener(address, "goaway h2 backend");
                 loop {
                     if stop_clone.load(Ordering::Relaxed) {
                         break;
@@ -1833,7 +1828,7 @@ impl PerStreamDelayH2Backend {
         let thread = thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async move {
-                let listener = TcpListener::bind(address).await.unwrap();
+                let listener = bind_tokio_listener(address, "per-stream delay h2 backend");
                 loop {
                     if stop_clone.load(Ordering::Relaxed) {
                         break;
@@ -1908,8 +1903,8 @@ impl Drop for PerStreamDelayH2Backend {
 fn try_h1_frontend_h2_backend() -> State {
     let front_port = provide_port();
     let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
-    let (config, listeners, state) = Worker::empty_config();
-    let mut worker = Worker::start_new_worker("H1-TO-H2", config, &listeners, state);
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker = Worker::start_new_worker_owned("H1-TO-H2", config, listeners, state);
 
     worker.send_proxy_request_type(RequestType::AddHttpsListener(
         ListenerBuilder::new_https(front_address.clone())
@@ -2001,8 +1996,8 @@ fn test_h1_frontend_h2_backend() {
 fn try_h2_goaway_retry_succeeds() -> State {
     let front_port = provide_port();
     let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
-    let (config, listeners, state) = Worker::empty_config();
-    let mut worker = Worker::start_new_worker("H2-GOAWAY-RETRY", config, &listeners, state);
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker = Worker::start_new_worker_owned("H2-GOAWAY-RETRY", config, listeners, state);
 
     worker.send_proxy_request_type(RequestType::AddHttpsListener(
         ListenerBuilder::new_https(front_address.clone())
@@ -2113,8 +2108,8 @@ fn test_h2_goaway_retry_succeeds() {
 fn try_h2_large_response_completes() -> State {
     let front_port = provide_port();
     let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
-    let (config, listeners, state) = Worker::empty_config();
-    let mut worker = Worker::start_new_worker("H2-LARGE-RESP", config, &listeners, state);
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker = Worker::start_new_worker_owned("H2-LARGE-RESP", config, listeners, state);
 
     worker.send_proxy_request_type(RequestType::AddHttpsListener(
         ListenerBuilder::new_https(front_address.clone())
@@ -2203,8 +2198,8 @@ fn try_h2_slow_stream_does_not_block_fast_stream() -> State {
 
     let front_port = provide_port();
     let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
-    let (config, listeners, state) = Worker::empty_config();
-    let mut worker = Worker::start_new_worker("H2-STREAM-INDEP", config, &listeners, state);
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker = Worker::start_new_worker_owned("H2-STREAM-INDEP", config, listeners, state);
 
     worker.send_proxy_request_type(RequestType::AddHttpsListener(
         ListenerBuilder::new_https(front_address.clone())
@@ -2467,7 +2462,7 @@ impl CancellableH2Backend {
         let thread = thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async move {
-                let listener = TcpListener::bind(address).await.unwrap();
+                let listener = bind_tokio_listener(address, "cancellable h2 backend");
                 loop {
                     if stop_clone.load(Ordering::Relaxed) {
                         break;
@@ -2537,8 +2532,8 @@ impl Drop for CancellableH2Backend {
 fn try_h2_rst_stream_per_stream_independence() -> State {
     let front_port = provide_port();
     let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
-    let (config, listeners, state) = Worker::empty_config();
-    let mut worker = Worker::start_new_worker("H2-RST-INDEP", config, &listeners, state);
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker = Worker::start_new_worker_owned("H2-RST-INDEP", config, listeners, state);
 
     worker.send_proxy_request_type(RequestType::AddHttpsListener(
         ListenerBuilder::new_https(front_address.clone())
@@ -2707,7 +2702,7 @@ impl NoSettingsAckBackend {
         let thread = thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async move {
-                let listener = TcpListener::bind(address).await.unwrap();
+                let listener = bind_tokio_listener(address, "settings-timeout backend");
                 loop {
                     if stop_clone.load(Ordering::Relaxed) {
                         break;
@@ -2784,8 +2779,9 @@ impl Drop for NoSettingsAckBackend {
 fn try_h2_settings_ack_timeout() -> State {
     let front_port = provide_port();
     let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
-    let (config, listeners, state) = Worker::empty_config();
-    let mut worker = Worker::start_new_worker("H2-SETTINGS-TIMEOUT", config, &listeners, state);
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker =
+        Worker::start_new_worker_owned("H2-SETTINGS-TIMEOUT", config, listeners, state);
 
     worker.send_proxy_request_type(RequestType::AddHttpsListener(
         ListenerBuilder::new_https(front_address.clone())
@@ -3024,8 +3020,7 @@ impl CloseDelimitedBackend {
         let resp_count = responses_sent.clone();
 
         let thread = thread::spawn(move || {
-            let listener = std::net::TcpListener::bind(address)
-                .expect("could not bind close-delimited backend");
+            let listener = bind_std_listener(address, "close-delimited backend");
             listener
                 .set_nonblocking(true)
                 .expect("could not set nonblocking");
@@ -3589,8 +3584,7 @@ impl ChunkedBodyValidationBackend {
         let body_flag = body_received.to_owned();
 
         let thread = thread::spawn(move || {
-            let listener = std::net::TcpListener::bind(address)
-                .expect("could not bind chunked-validation backend");
+            let listener = bind_std_listener(address, "chunked-validation backend");
             listener
                 .set_nonblocking(true)
                 .expect("could not set nonblocking");
@@ -3882,8 +3876,7 @@ impl ContinueBackend {
         let req_count = requests_received.clone();
 
         let thread = thread::spawn(move || {
-            let listener =
-                std::net::TcpListener::bind(address).expect("could not bind 100-continue backend");
+            let listener = bind_std_listener(address, "100-continue backend");
             listener
                 .set_nonblocking(true)
                 .expect("could not set nonblocking");
@@ -4548,8 +4541,8 @@ fn test_h2_connection_window_exhaustion_recovery() {
 fn try_h2_stream_priority_basic() -> State {
     let front_port = provide_port();
     let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
-    let (config, listeners, state) = Worker::empty_config();
-    let mut worker = Worker::start_new_worker("H2-PRIORITY", config, &listeners, state);
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker = Worker::start_new_worker_owned("H2-PRIORITY", config, listeners, state);
 
     worker.send_proxy_request_type(RequestType::AddHttpsListener(
         ListenerBuilder::new_https(front_address.clone())
@@ -5086,8 +5079,9 @@ fn test_h2_client_disconnect_mid_upload() {
 fn try_h2_graceful_shutdown_completes_large_transfer() -> State {
     let front_port = provide_port();
     let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
-    let (config, listeners, state) = Worker::empty_config();
-    let mut worker = Worker::start_new_worker("H2-GRACEFUL-LARGE", config, &listeners, state);
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker =
+        Worker::start_new_worker_owned("H2-GRACEFUL-LARGE", config, listeners, state);
 
     worker.send_proxy_request_type(RequestType::AddHttpsListener(
         ListenerBuilder::new_https(front_address.clone())
@@ -5463,8 +5457,8 @@ fn try_h2_with_proxy_protocol_v2() -> State {
     let front_port = provide_port();
     let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
 
-    let (config, listeners, state) = Worker::empty_config();
-    let mut worker = Worker::start_new_worker("H2-PP-V2", config, &listeners, state);
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker = Worker::start_new_worker_owned("H2-PP-V2", config, listeners, state);
 
     // Create HTTPS listener WITH proxy protocol enabled
     let mut listener_builder = ListenerBuilder::new_https(front_address.clone());
@@ -5631,8 +5625,8 @@ fn try_h2_custom_error_page_rendering() -> State {
     let front_port = provide_port();
     let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
 
-    let (config, listeners, state) = Worker::empty_config();
-    let mut worker = Worker::start_new_worker("H2-CUSTOM-ERR", config, &listeners, state);
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker = Worker::start_new_worker_owned("H2-CUSTOM-ERR", config, listeners, state);
 
     worker.send_proxy_request_type(RequestType::AddHttpsListener(
         ListenerBuilder::new_https(front_address.clone())
@@ -5837,9 +5831,7 @@ impl GoAwayAfterFirstH2Backend {
         let thread = thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("could not create tokio runtime");
             rt.block_on(async move {
-                let listener = tokio::net::TcpListener::bind(address)
-                    .await
-                    .expect("could not bind goaway h2 backend");
+                let listener = bind_tokio_listener(address, "goaway-after-first backend");
 
                 loop {
                     if stop_clone.load(Ordering::Relaxed) {
@@ -6122,9 +6114,7 @@ impl AbruptCloseH2Backend {
         let thread = thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("could not create tokio runtime");
             rt.block_on(async move {
-                let listener = tokio::net::TcpListener::bind(address)
-                    .await
-                    .expect("could not bind abrupt-close h2 backend");
+                let listener = bind_tokio_listener(address, "abrupt-close h2 backend");
 
                 loop {
                     if stop_clone.load(Ordering::Relaxed) {
@@ -6297,8 +6287,7 @@ impl EarlyResponseBackend {
         let req_count = requests_received.clone();
 
         let thread = thread::spawn(move || {
-            let listener = std::net::TcpListener::bind(address)
-                .expect("could not bind early-response backend");
+            let listener = bind_std_listener(address, "early-response backend");
             listener
                 .set_nonblocking(true)
                 .expect("could not set nonblocking");
@@ -6574,7 +6563,7 @@ impl FloodingH2Backend {
         let thread = thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async move {
-                let listener = TcpListener::bind(address).await.unwrap();
+                let listener = bind_tokio_listener(address, "flooding h2 backend");
                 loop {
                     if stop_clone.load(Ordering::Relaxed) {
                         break;
@@ -6758,8 +6747,9 @@ impl Drop for FloodingH2Backend {
 fn try_h2_upstream_ping_flood_detection() -> State {
     let front_port = provide_port();
     let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
-    let (config, listeners, state) = Worker::empty_config();
-    let mut worker = Worker::start_new_worker("H2-UPSTREAM-PING-FLOOD", config, &listeners, state);
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker =
+        Worker::start_new_worker_owned("H2-UPSTREAM-PING-FLOOD", config, listeners, state);
 
     worker.send_proxy_request_type(RequestType::AddHttpsListener(
         ListenerBuilder::new_https(front_address.clone())
@@ -6858,9 +6848,9 @@ fn test_h2_upstream_ping_flood_detection() {
 fn try_h2_upstream_settings_flood_detection() -> State {
     let front_port = provide_port();
     let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
-    let (config, listeners, state) = Worker::empty_config();
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
     let mut worker =
-        Worker::start_new_worker("H2-UPSTREAM-SETTINGS-FLOOD", config, &listeners, state);
+        Worker::start_new_worker_owned("H2-UPSTREAM-SETTINGS-FLOOD", config, listeners, state);
 
     worker.send_proxy_request_type(RequestType::AddHttpsListener(
         ListenerBuilder::new_https(front_address.clone())
@@ -6958,8 +6948,9 @@ fn test_h2_upstream_settings_flood_detection() {
 fn try_h2_upstream_window_update_flood() -> State {
     let front_port = provide_port();
     let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
-    let (config, listeners, state) = Worker::empty_config();
-    let mut worker = Worker::start_new_worker("H2-UPSTREAM-WINUP-FLOOD", config, &listeners, state);
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker =
+        Worker::start_new_worker_owned("H2-UPSTREAM-WINUP-FLOOD", config, listeners, state);
 
     worker.send_proxy_request_type(RequestType::AddHttpsListener(
         ListenerBuilder::new_https(front_address.clone())
@@ -7246,8 +7237,8 @@ fn test_h2_outbound_flood_from_rst_stream() {
 fn try_h2_large_h1_response_content_length() -> State {
     let front_port = provide_port();
     let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
-    let (config, listeners, state) = Worker::empty_config();
-    let mut worker = Worker::start_new_worker("H2-LARGE-H1-CL", config, &listeners, state);
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker = Worker::start_new_worker_owned("H2-LARGE-H1-CL", config, listeners, state);
 
     worker.send_proxy_request_type(RequestType::AddHttpsListener(
         ListenerBuilder::new_https(front_address.clone())
@@ -7360,8 +7351,9 @@ fn test_h2_large_h1_response_content_length() {
 fn try_h2_large_h1_response_chunked() -> State {
     let front_port = provide_port();
     let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
-    let (config, listeners, state) = Worker::empty_config();
-    let mut worker = Worker::start_new_worker("H2-LARGE-H1-CHUNKED", config, &listeners, state);
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker =
+        Worker::start_new_worker_owned("H2-LARGE-H1-CHUNKED", config, listeners, state);
 
     worker.send_proxy_request_type(RequestType::AddHttpsListener(
         ListenerBuilder::new_https(front_address.clone())
@@ -7508,8 +7500,9 @@ fn test_h2_large_h1_response_chunked() {
 fn try_h2_large_h1_response_close_delimited() -> State {
     let front_port = provide_port();
     let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
-    let (config, listeners, state) = Worker::empty_config();
-    let mut worker = Worker::start_new_worker("H2-LARGE-H1-CLOSE", config, &listeners, state);
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker =
+        Worker::start_new_worker_owned("H2-LARGE-H1-CLOSE", config, listeners, state);
 
     worker.send_proxy_request_type(RequestType::AddHttpsListener(
         ListenerBuilder::new_https(front_address.clone())
@@ -7652,8 +7645,9 @@ fn test_h2_large_h1_response_close_delimited() {
 fn try_h2_large_response_flow_control_pressure() -> State {
     let front_port = provide_port();
     let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
-    let (config, listeners, state) = Worker::empty_config();
-    let mut worker = Worker::start_new_worker("H2-FLOW-PRESSURE", config, &listeners, state);
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker =
+        Worker::start_new_worker_owned("H2-FLOW-PRESSURE", config, listeners, state);
 
     worker.send_proxy_request_type(RequestType::AddHttpsListener(
         ListenerBuilder::new_https(front_address.clone())
@@ -7786,8 +7780,8 @@ fn test_h2_large_response_flow_control_pressure() {
 fn try_h2_large_response_8mb_window_update_race() -> State {
     let front_port = provide_port();
     let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
-    let (config, listeners, state) = Worker::empty_config();
-    let mut worker = Worker::start_new_worker("H2-8MB-RACE", config, &listeners, state);
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker = Worker::start_new_worker_owned("H2-8MB-RACE", config, listeners, state);
 
     let mut listener_builder = ListenerBuilder::new_https(front_address.clone());
     listener_builder
@@ -7958,8 +7952,8 @@ fn test_h2_large_response_8mb_window_update_race() {
 fn try_h2_large_response_1gb_stress() -> State {
     let front_port = provide_port();
     let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
-    let (config, listeners, state) = Worker::empty_config();
-    let mut worker = Worker::start_new_worker("H2-1GB-STRESS", config, &listeners, state);
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker = Worker::start_new_worker_owned("H2-1GB-STRESS", config, listeners, state);
 
     let mut listener_builder = ListenerBuilder::new_https(front_address.clone());
     listener_builder

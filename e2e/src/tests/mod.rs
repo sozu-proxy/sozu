@@ -1,13 +1,15 @@
+mod h1_security_tests;
 mod h2_security_tests;
 mod h2_tests;
 pub(crate) mod h2_utils;
+mod mux_tests;
+mod tcp_tests;
 mod tests;
 mod tls_tests;
 
 use std::{
     io::stdin,
     net::SocketAddr,
-    sync::atomic::{AtomicU16, Ordering},
 };
 
 use sozu_command_lib::{
@@ -26,6 +28,10 @@ use crate::{
         aggregator::SimpleAggregator, async_backend::BackendHandle as AsyncBackend,
         sync_backend::Backend as SyncBackend,
     },
+    port_registry::{
+        attach_reserved_http_listener, provide_port as reserve_port,
+        provide_unbound_port as issue_unbound_port,
+    },
     sozu::worker::Worker,
 };
 
@@ -36,10 +42,12 @@ pub enum State {
     Undecided,
 }
 
-static PORT_PROVIDER: AtomicU16 = AtomicU16::new(2000);
-
 fn provide_port() -> u16 {
-    PORT_PROVIDER.fetch_add(1, Ordering::SeqCst)
+    reserve_port()
+}
+
+fn provide_unbound_port() -> u16 {
+    issue_unbound_port()
 }
 
 /// Setup a Sozu worker with
@@ -52,13 +60,16 @@ fn provide_port() -> u16 {
 pub fn setup_test<S: Into<String>>(
     name: S,
     config: ServerConfig,
-    listeners: Listeners,
+    mut listeners: Listeners,
     state: ConfigState,
     front_address: SocketAddr,
     nb_backends: usize,
     should_stick: bool,
 ) -> (Worker, Vec<SocketAddr>) {
-    let mut worker = Worker::start_new_worker(name, config, &listeners, state);
+    if listeners.http.is_empty() {
+        attach_reserved_http_listener(&mut listeners, front_address);
+    }
+    let mut worker = Worker::start_new_worker_owned(name, config, listeners, state);
 
     worker.send_proxy_request(Request {
         request_type: Some(RequestType::AddHttpListener(

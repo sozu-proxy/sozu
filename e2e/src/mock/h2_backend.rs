@@ -13,7 +13,9 @@ use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder as ServerBuilder,
 };
-use tokio::{net::TcpListener, runtime::Runtime};
+use tokio::runtime::Runtime;
+
+use crate::port_registry::bind_tokio_listener;
 
 /// An HTTP/2 mock backend that accepts cleartext H2 connections (h2c).
 ///
@@ -44,9 +46,7 @@ impl H2Backend {
         let thread = thread::spawn(move || {
             let rt = Runtime::new().expect("could not create tokio runtime");
             rt.block_on(async move {
-                let listener = TcpListener::bind(address)
-                    .await
-                    .expect("could not bind h2 backend");
+                let listener = bind_tokio_listener(address, "h2 backend");
 
                 loop {
                     if stop_clone.load(Ordering::Relaxed) {

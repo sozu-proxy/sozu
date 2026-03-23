@@ -22,11 +22,12 @@ use sozu_command_lib::{
 
 use crate::{
     mock::{client::Client, sync_backend::Backend as SyncBackend},
+    port_registry::bind_std_listener,
     sozu::worker::Worker,
     tests::{State, repeat_until_error_or},
 };
 
-use super::tests::create_local_address;
+use super::tests::{create_local_address, create_unbound_local_address};
 
 const BUFFER_SIZE: usize = 4096;
 
@@ -38,8 +39,8 @@ const BUFFER_SIZE: usize = 4096;
 /// the given number of backends. Returns (worker, backend_addresses).
 fn setup_tcp_test(name: &str, nb_backends: usize) -> (Worker, Vec<SocketAddr>, SocketAddr) {
     let front_address = create_local_address();
-    let (config, listeners, state) = Worker::empty_config();
-    let mut worker = Worker::start_new_worker(name, config, &listeners, state);
+    let (config, listeners, state) = Worker::empty_tcp_config(front_address);
+    let mut worker = Worker::start_new_worker_owned(name, config, listeners, state);
 
     worker.send_proxy_request_type(RequestType::AddTcpListener(
         ListenerBuilder::new_tcp(front_address.into())
@@ -81,8 +82,8 @@ fn setup_tcp_proxy_protocol_test(
     nb_backends: usize,
 ) -> (Worker, Vec<SocketAddr>, SocketAddr) {
     let front_address = create_local_address();
-    let (config, listeners, state) = Worker::empty_config();
-    let mut worker = Worker::start_new_worker(name, config, &listeners, state);
+    let (config, listeners, state) = Worker::empty_tcp_config(front_address);
+    let mut worker = Worker::start_new_worker_owned(name, config, listeners, state);
 
     worker.send_proxy_request_type(RequestType::AddTcpListener(
         ListenerBuilder::new_tcp(front_address.into())
@@ -251,7 +252,7 @@ fn try_tcp_proxy_large_payload() -> State {
     // a 1 MB response. We use a raw thread because the SyncBackend helper
     // is limited to a fixed BUFFER_SIZE per read.
     let backend_handle = thread::spawn(move || {
-        let listener = std::net::TcpListener::bind(back_address).expect("backend could not bind");
+        let listener = bind_std_listener(back_address, "tcp test backend");
         listener
             .set_nonblocking(false)
             .expect("could not set blocking");
@@ -486,10 +487,11 @@ fn test_tcp_proxy_half_close() {
 
 fn try_tcp_backend_connection_failure() -> State {
     let front_address = create_local_address();
-    let dead_backend_address = create_local_address();
+    let dead_backend_address = create_unbound_local_address();
 
-    let (config, listeners, state) = Worker::empty_config();
-    let mut worker = Worker::start_new_worker("TCP-DEADBACKEND", config, &listeners, state);
+    let (config, listeners, state) = Worker::empty_tcp_config(front_address);
+    let mut worker =
+        Worker::start_new_worker_owned("TCP-DEADBACKEND", config, listeners, state);
 
     worker.send_proxy_request_type(RequestType::AddTcpListener(
         ListenerBuilder::new_tcp(front_address.into())
@@ -585,7 +587,7 @@ fn try_tcp_proxy_protocol_v2() -> State {
     let back_address = backend_addrs[0];
 
     let backend_handle = thread::spawn(move || {
-        let listener = std::net::TcpListener::bind(back_address).expect("backend could not bind");
+        let listener = bind_std_listener(back_address, "tcp test backend");
         let (mut stream, _) = listener.accept().expect("backend accept failed");
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))

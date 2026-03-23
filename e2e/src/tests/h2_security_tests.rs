@@ -75,6 +75,7 @@ use crate::{
         async_backend::BackendHandle as AsyncBackend,
         https_client::{build_h2_client, resolve_post_request, resolve_request},
     },
+    port_registry::bind_std_listener,
     sozu::worker::Worker,
     tests::{State, repeat_until_error_or, tests::create_local_address},
 };
@@ -1630,8 +1631,9 @@ fn try_h2_multi_cluster_routing() -> State {
     let front_port = super::provide_port();
     let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
 
-    let (config, listeners, state) = Worker::empty_config();
-    let mut worker = Worker::start_new_worker("H2-MULTI-CLUSTER", config, &listeners, state);
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker =
+        Worker::start_new_worker_owned("H2-MULTI-CLUSTER", config, listeners, state);
 
     // Setup HTTPS listener
     worker.send_proxy_request_type(RequestType::AddHttpsListener(
@@ -1877,7 +1879,7 @@ impl CapturingBackend {
 
         let thread = thread::spawn(move || {
             let listener =
-                std::net::TcpListener::bind(address).expect("could not bind capturing backend");
+                bind_std_listener(address, "capturing backend");
             listener
                 .set_nonblocking(true)
                 .expect("could not set nonblocking");

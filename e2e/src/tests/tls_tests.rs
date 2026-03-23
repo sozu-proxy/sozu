@@ -9,7 +9,7 @@
 
 use std::{
     io::{Read, Write},
-    net::{SocketAddr, TcpListener, TcpStream},
+    net::{SocketAddr, TcpStream},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -33,6 +33,7 @@ use crate::{
         async_backend::BackendHandle as AsyncBackend,
         https_client::{Verifier, build_h2_client, build_https_client, resolve_request},
     },
+    port_registry::bind_std_listener,
     sozu::worker::Worker,
     tests::{State, provide_port, repeat_until_error_or, tests::create_local_address},
 };
@@ -55,7 +56,7 @@ impl BlockingHttpBackend {
         let responses_clone = responses_sent.clone();
 
         let thread = thread::spawn(move || {
-            let listener = TcpListener::bind(address).expect("could not bind blocking backend");
+            let listener = bind_std_listener(address, "blocking tls backend");
             listener
                 .set_nonblocking(true)
                 .expect("could not set backend listener nonblocking");
@@ -140,8 +141,8 @@ fn try_tls_sni_routing() -> State {
     let back_address_0 = create_local_address();
     let back_address_1 = create_local_address();
 
-    let (config, listeners, state) = Worker::empty_config();
-    let mut worker = Worker::start_new_worker("TLS-SNI-ROUTING", config, &listeners, state);
+    let (config, listeners, state) = Worker::empty_https_config(front_address.into());
+    let mut worker = Worker::start_new_worker_owned("TLS-SNI-ROUTING", config, listeners, state);
 
     // Add HTTPS listener
     worker.send_proxy_request_type(RequestType::AddHttpsListener(
@@ -306,8 +307,9 @@ fn try_tls_invalid_hostname() -> State {
     let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
     let back_address = create_local_address();
 
-    let (config, listeners, state) = Worker::empty_config();
-    let mut worker = Worker::start_new_worker("TLS-INVALID-HOSTNAME", config, &listeners, state);
+    let (config, listeners, state) = Worker::empty_https_config(front_address.into());
+    let mut worker =
+        Worker::start_new_worker_owned("TLS-INVALID-HOSTNAME", config, listeners, state);
 
     // HTTPS listener with certificate for "localhost" only
     worker.send_proxy_request_type(RequestType::AddHttpsListener(
@@ -447,8 +449,9 @@ fn try_tls_alpn_mismatch_recovery() -> State {
     let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
     let back_address = create_local_address();
 
-    let (config, listeners, state) = Worker::empty_config();
-    let mut worker = Worker::start_new_worker("TLS-ALPN-MISMATCH", config, &listeners, state);
+    let (config, listeners, state) = Worker::empty_https_config(front_address.into());
+    let mut worker =
+        Worker::start_new_worker_owned("TLS-ALPN-MISMATCH", config, listeners, state);
 
     // Listener with HTTP/1.1 only — no H2 support
     let mut listener_builder = ListenerBuilder::new_https(front_address.clone());
@@ -588,8 +591,9 @@ fn try_tls_handshake_timeout() -> State {
     let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
     let back_address = create_local_address();
 
-    let (config, listeners, state) = Worker::empty_config();
-    let mut worker = Worker::start_new_worker("TLS-HANDSHAKE-TIMEOUT", config, &listeners, state);
+    let (config, listeners, state) = Worker::empty_https_config(front_address.into());
+    let mut worker =
+        Worker::start_new_worker_owned("TLS-HANDSHAKE-TIMEOUT", config, listeners, state);
 
     worker.send_proxy_request_type(RequestType::AddHttpsListener(
         ListenerBuilder::new_https(front_address.clone())
@@ -760,8 +764,8 @@ fn try_tls_connection_close_header() -> State {
     let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
     let back_address = create_local_address();
 
-    let (config, listeners, state) = Worker::empty_config();
-    let mut worker = Worker::start_new_worker("TLS-CONN-CLOSE", config, &listeners, state);
+    let (config, listeners, state) = Worker::empty_https_config(front_address.into());
+    let mut worker = Worker::start_new_worker_owned("TLS-CONN-CLOSE", config, listeners, state);
 
     worker.send_proxy_request_type(RequestType::AddHttpsListener(
         ListenerBuilder::new_https(front_address.clone())
@@ -947,8 +951,9 @@ fn try_tls_connection_close_large_response() -> State {
     let back_address = create_local_address();
     let payload = "x".repeat(256 * 1024);
 
-    let (config, listeners, state) = Worker::empty_config();
-    let mut worker = Worker::start_new_worker("TLS-CONN-CLOSE-LARGE", config, &listeners, state);
+    let (config, listeners, state) = Worker::empty_https_config(front_address.into());
+    let mut worker =
+        Worker::start_new_worker_owned("TLS-CONN-CLOSE-LARGE", config, listeners, state);
 
     worker.send_proxy_request_type(RequestType::AddHttpsListener(
         ListenerBuilder::new_https(front_address.clone())

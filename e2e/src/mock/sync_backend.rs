@@ -10,6 +10,7 @@ use std::{
 use libc::setsockopt;
 
 use crate::BUFFER_SIZE;
+use crate::port_registry::bind_std_listener;
 
 /// A mock backend whose actions are all synchronous (accepting, receiving, responding...)
 /// this should help reproductibility by enforcing a strict order on those actions
@@ -44,7 +45,7 @@ impl Backend {
 
     /// Binds itself to its address, stores the yielded TCP listener
     pub fn connect(&mut self) {
-        let listener = TcpListener::bind(self.address).expect("could not bind");
+        let listener = bind_std_listener(self.address, "sync backend");
         let timeout = Duration::from_millis(100);
         let timeout = libc::timeval {
             tv_sec: 0,
