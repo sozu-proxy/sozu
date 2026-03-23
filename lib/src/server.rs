@@ -622,7 +622,7 @@ impl Server {
         let now = Instant::now();
         time!("event_loop_time", (now - self.loop_start).as_millis());
 
-        let timeout = match self.should_poll_at.as_ref() {
+        let mut timeout = match self.should_poll_at.as_ref() {
             None => self.poll_timeout,
             Some(i) => {
                 if *i <= now {
@@ -642,6 +642,14 @@ impl Server {
                 }
             }
         };
+
+        if self.shutting_down.is_some() {
+            let shutdown_tick = Duration::from_millis(100);
+            timeout = match timeout {
+                None => Some(shutdown_tick),
+                Some(current) => Some(current.min(shutdown_tick)),
+            };
+        }
 
         self.loop_start = now;
         timeout

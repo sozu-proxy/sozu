@@ -1599,6 +1599,7 @@ pub struct Mux<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> {
     pub frontend: Connection<Front>,
     pub router: Router,
     pub context: Context<L>,
+    pub(crate) shutdown_frontend_write_started_at: Option<Instant>,
 }
 
 impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Mux<Front, L> {
@@ -2469,6 +2470,8 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
     }
 
     fn shutting_down(&mut self) -> SessionIsToBeClosed {
+        const SHUTDOWN_FRONTEND_WRITE_GRACE: Duration = Duration::from_secs(5);
+
         // RFC 9113 §6.8: initiate graceful shutdown with double-GOAWAY pattern.
         // Only send the phase-1 GOAWAY once. Phase 2 (final GOAWAY with the real
         // last_stream_id) is handled by finalize_write() when all streams drain.
@@ -2494,10 +2497,6 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         if self.flush_frontend_shutdown_writes() {
             return true;
         }
-        // Don't close while the frontend still has pending writes (GOAWAY, etc.)
-        if self.frontend.has_pending_write() {
-            return false;
-        }
         let mut can_stop = true;
         for stream in &mut self.context.streams {
             match stream.state {
@@ -2516,6 +2515,30 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 _ => {}
             }
         }
+        // Don't wait forever once all streams are quiesced and only frontend TLS
+        // or GOAWAY bytes remain. Slow or malicious peers can otherwise keep the
+        // worker in shutdown indefinitely.
+        if self.frontend.has_pending_write() {
+            if can_stop {
+                let started_at = self
+                    .shutdown_frontend_write_started_at
+                    .get_or_insert_with(Instant::now);
+                if started_at.elapsed() >= SHUTDOWN_FRONTEND_WRITE_GRACE {
+                    warn!(
+                        "forcing close after {:?} of pending frontend shutdown writes: token={:?}, readiness={:?}, frontend={:?}",
+                        SHUTDOWN_FRONTEND_WRITE_GRACE,
+                        self.frontend_token,
+                        self.frontend.readiness(),
+                        self.frontend,
+                    );
+                    return true;
+                }
+            } else {
+                self.shutdown_frontend_write_started_at = None;
+            }
+            return false;
+        }
+        self.shutdown_frontend_write_started_at = None;
         if can_stop {
             let active_h2_streams = self
                 .context

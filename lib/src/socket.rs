@@ -171,6 +171,7 @@ impl SocketHandler for TcpStream {
 pub struct FrontRustls {
     pub stream: TcpStream,
     pub session: ServerConnection,
+    pub peer_disconnected: bool,
 }
 
 impl std::fmt::Debug for FrontRustls {
@@ -208,6 +209,7 @@ impl SocketHandler for FrontRustls {
                 Ok(0) => {
                     can_read = false;
                     is_closed = true;
+                    self.peer_disconnected = true;
                 }
                 Ok(_sz) => {}
                 Err(e) => match e.kind() {
@@ -218,6 +220,7 @@ impl SocketHandler for FrontRustls {
                     | ErrorKind::ConnectionAborted
                     | ErrorKind::BrokenPipe => {
                         is_closed = true;
+                        self.peer_disconnected = true;
                     }
                     // https://github.com/rustls/rustls/blob/main/rustls/src/conn.rs#L482-L500
                     // rustls's 16 KB received_plaintext buffer is full — expected
@@ -282,6 +285,10 @@ impl SocketHandler for FrontRustls {
     }
 
     fn socket_write(&mut self, buf: &[u8]) -> (usize, SocketResult) {
+        if self.peer_disconnected {
+            return (0, SocketResult::Closed);
+        }
+
         let mut buffered_size = 0usize;
         let mut can_write = true;
         let mut is_error = false;
@@ -509,7 +516,7 @@ impl SocketHandler for FrontRustls {
     }
 
     fn socket_wants_write(&self) -> bool {
-        self.session.wants_write()
+        !self.peer_disconnected && self.session.wants_write()
     }
 
     fn socket_ref(&self) -> &TcpStream {
