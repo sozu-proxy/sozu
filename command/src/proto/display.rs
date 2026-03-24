@@ -1043,15 +1043,12 @@ impl Display for HttpListenerConfig {
             &self.h2_max_continuation_frames,
             &self.h2_max_glitch_count,
         );
-        if let Some(v) = &self.h2_initial_connection_window {
-            table.add_row(row!["h2 initial connection window", v]);
-        }
-        if let Some(v) = &self.h2_max_concurrent_streams {
-            table.add_row(row!["h2 max concurrent streams", v]);
-        }
-        if let Some(v) = &self.h2_stream_shrink_ratio {
-            table.add_row(row!["h2 stream shrink ratio", v]);
-        }
+        add_h2_connection_rows(
+            &mut table,
+            &self.h2_initial_connection_window,
+            &self.h2_max_concurrent_streams,
+            &self.h2_stream_shrink_ratio,
+        );
         write!(f, "{table}")
     }
 }
@@ -1099,15 +1096,12 @@ impl Display for HttpsListenerConfig {
             &self.h2_max_continuation_frames,
             &self.h2_max_glitch_count,
         );
-        if let Some(v) = &self.h2_initial_connection_window {
-            table.add_row(row!["h2 initial connection window", v]);
-        }
-        if let Some(v) = &self.h2_max_concurrent_streams {
-            table.add_row(row!["h2 max concurrent streams", v]);
-        }
-        if let Some(v) = &self.h2_stream_shrink_ratio {
-            table.add_row(row!["h2 stream shrink ratio", v]);
-        }
+        add_h2_connection_rows(
+            &mut table,
+            &self.h2_initial_connection_window,
+            &self.h2_max_concurrent_streams,
+            &self.h2_stream_shrink_ratio,
+        );
         write!(f, "{table}")
     }
 }
@@ -1140,6 +1134,25 @@ fn add_h2_flood_rows(
     }
     if let Some(v) = max_glitch {
         table.add_row(row!["h2 max glitch count", v]);
+    }
+}
+
+/// Add H2 connection tuning rows to a display table.
+/// Only shows rows for values that have been explicitly configured.
+fn add_h2_connection_rows(
+    table: &mut Table,
+    window: &Option<u32>,
+    max_streams: &Option<u32>,
+    shrink_ratio: &Option<u32>,
+) {
+    if let Some(v) = window {
+        table.add_row(row!["h2 initial connection window", v]);
+    }
+    if let Some(v) = max_streams {
+        table.add_row(row!["h2 max concurrent streams", v]);
+    }
+    if let Some(v) = shrink_ratio {
+        table.add_row(row!["h2 stream shrink ratio", v]);
     }
 }
 

@@ -310,12 +310,12 @@ are used:
 
 | Parameter | Default | Protects against | CVE |
 |-----------|---------|-----------------|-----|
-| `h2_max_rst_stream_per_window` | 50 | Rapid Reset attack: client opens and immediately resets streams in a tight loop | CVE-2023-44487 |
-| `h2_max_ping_per_window` | 10 | Ping flood: client sends PING frames faster than the server can respond | |
-| `h2_max_settings_per_window` | 10 | Settings flood: client sends SETTINGS frames requiring ACKs, exhausting server resources | |
-| `h2_max_empty_data_per_window` | 50 | Empty DATA flood: client sends zero-length DATA frames to consume processing time | |
-| `h2_max_continuation_frames` | 50 | CONTINUATION flood: client sends many small CONTINUATION frames to exhaust header memory | CVE-2024-27316 |
-| `h2_max_glitch_count` | 10 | Cumulative protocol violations: total number of minor protocol errors before disconnection | |
+| `h2_max_rst_stream_per_window` | 100 | Rapid Reset attack: client opens and immediately resets streams in a tight loop | CVE-2023-44487 |
+| `h2_max_ping_per_window` | 100 | Ping flood: client sends PING frames faster than the server can respond | CVE-2019-9512 |
+| `h2_max_settings_per_window` | 50 | Settings flood: client sends SETTINGS frames requiring ACKs, exhausting server resources | CVE-2019-9515 |
+| `h2_max_empty_data_per_window` | 100 | Empty DATA flood: client sends zero-length DATA frames to consume processing time | CVE-2019-9518 |
+| `h2_max_continuation_frames` | 20 | CONTINUATION flood: client sends many small CONTINUATION frames to exhaust header memory | CVE-2024-27316 |
+| `h2_max_glitch_count` | 100 | Cumulative protocol violations: total number of minor protocol errors before disconnection | |
 
 _Configuration example:_
 
@@ -325,18 +325,42 @@ address = "0.0.0.0:443"
 protocol = "https"
 
 # H2 flood detection thresholds (optional, defaults shown)
-h2_max_rst_stream_per_window = 50     # Rapid Reset (CVE-2023-44487)
-h2_max_ping_per_window = 10           # Ping flood
-h2_max_settings_per_window = 10       # Settings flood
-h2_max_empty_data_per_window = 50     # Empty DATA flood
-h2_max_continuation_frames = 50       # CONTINUATION flood (CVE-2024-27316)
-h2_max_glitch_count = 10              # Cumulative protocol violations
+h2_max_rst_stream_per_window = 100    # Rapid Reset (CVE-2023-44487)
+h2_max_ping_per_window = 100          # Ping flood (CVE-2019-9512)
+h2_max_settings_per_window = 50       # Settings flood (CVE-2019-9515)
+h2_max_empty_data_per_window = 100    # Empty DATA flood (CVE-2019-9518)
+h2_max_continuation_frames = 20       # CONTINUATION flood (CVE-2024-27316)
+h2_max_glitch_count = 100             # Cumulative protocol violations
 ```
 
 > **Note:** When any threshold is exceeded, the connection is terminated with a
 > `GOAWAY` frame using the `ENHANCE_YOUR_CALM` error code (HTTP/2 error code 0xb).
 > The event is logged at `warn` level with the specific flood type that triggered
 > disconnection.
+
+#### H2 connection tuning
+
+Three additional H2 parameters control connection-level behavior. All are optional
+per-listener with safe compile-time defaults:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `h2_initial_connection_window` | 1048576 (1MB) | Connection-level receive window size in bytes (RFC 9113 §6.9.2). Clamped to [65535, 2^31-1]. |
+| `h2_max_concurrent_streams` | 100 | Maximum concurrent H2 streams the proxy accepts (`SETTINGS_MAX_CONCURRENT_STREAMS`). Minimum: 1. |
+| `h2_stream_shrink_ratio` | 2 | Shrink threshold ratio for recycled stream slots. The internal stream Vec is shrunk when `total_slots > active_streams * ratio`. Minimum: 2. |
+
+_Configuration example:_
+
+```toml
+[[listeners]]
+address = "0.0.0.0:443"
+protocol = "https"
+
+# H2 connection tuning (optional, defaults shown)
+h2_initial_connection_window = 1048576  # 1MB, min 65535, max 2147483647
+h2_max_concurrent_streams = 100         # min 1
+h2_stream_shrink_ratio = 2              # min 2
+```
 
 ## Metrics
 

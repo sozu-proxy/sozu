@@ -24,6 +24,10 @@ See milestone [`v1.1.0`](https://github.com/sozu-proxy/sozu/projects/3?card_filt
 
 - **30 H2 security e2e tests**: `e2e/src/tests/h2_security_tests.rs` covering desync vectors, connection-specific headers, Content-Length fuzzing, cookie splitting, trailer forwarding, pseudo-header in trailers, half-closed streams, HPACK table size zero, and connection reuse.
 
+- **Per-listener H2 connection tuning**: Three new optional config fields — `h2_initial_connection_window` (default 1MB), `h2_max_concurrent_streams` (default 100), `h2_stream_shrink_ratio` (default 2) — allow operators to tune connection-level flow control, stream concurrency, and memory reclamation per listener. Values are validated and clamped to safe bounds.
+
+- **Fuzz test harness**: `e2e/src/tests/fuzz_tests.rs` integrates `cargo-fuzz` targets (`fuzz_frame_parser`, `fuzz_hpack_decoder`) as `#[ignore]`d e2e tests. Run with `cargo test -p sozu-e2e -- --ignored fuzz` (requires nightly + cargo-fuzz).
+
 ### ✍️ Changed
 
 - **Slab capacity multiplier doubled to 4× per connection**: The internal slab allocator now reserves 4× the per-connection slot count (previously 2×) to accommodate the higher stream concurrency introduced by HTTP/2 multiplexing.
@@ -37,6 +41,8 @@ See milestone [`v1.1.0`](https://github.com/sozu-proxy/sozu/projects/3?card_filt
 - **readable()/writable() method extraction**: Large monolithic functions decomposed into `handle_header_state()`, `handle_continuation_header_state()`, and `write_streams()` private methods. `readable()` reduced from ~420 to ~213 lines, `writable()` from ~310 to ~75 lines, see [`fc606d23`](https://github.com/sozu-proxy/sozu/commit/fc606d23).
 
 ### ⛑️ Fixed
+
+- We fixed HTTP cleartext frontend socket shutdown using `Shutdown::Both` instead of `Shutdown::Write`. On Linux, `Shutdown::Both` discards unread receive-buffer data and can convert an otherwise clean close into a TCP RST. The HTTPS path already used `Shutdown::Write`.
 
 - We fixed an `http.active_requests` gauge underflow where idle-timeout teardown and malformed-request rejection paths decremented the counter without a prior increment, causing the gauge to wrap to `u64::MAX`, see [`9b6f9987`](https://github.com/sozu-proxy/sozu/commit/9b6f99871f2a74f120cceb13a3c3ffeab5525515).
 
