@@ -1,6 +1,6 @@
 use std::{
     io::{ErrorKind, Read, Write},
-    net::{SocketAddr, TcpListener, TcpStream},
+    net::{SocketAddr, TcpStream},
     str::from_utf8_unchecked,
     thread,
 };
@@ -11,6 +11,7 @@ use crate::{
     BUFFER_SIZE,
     http_utils::http_ok_response,
     mock::aggregator::{Aggregator, SimpleAggregator},
+    port_registry::bind_std_listener,
 };
 
 /// Handle to a detached thread where a Backend runs
@@ -35,7 +36,7 @@ impl<A: Aggregator + Send + Sync + 'static> BackendHandle<A> {
         let name = name.into();
         let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
         let (mut aggregator_tx, aggregator_rx) = mpsc::channel::<A>(1);
-        let listener = TcpListener::bind(address).expect("could not bind");
+        let listener = bind_std_listener(address, "async backend");
         let mut clients = Vec::new();
         let thread_name = name.to_owned();
 
@@ -116,8 +117,14 @@ impl BackendHandle<SimpleAggregator> {
             }
             aggregator.requests_received += 1;
             let response = http_ok_response(&content);
-            stream.write_all(response.as_bytes()).unwrap();
-            aggregator.responses_sent += 1;
+            match stream.write_all(response.as_bytes()) {
+                Ok(()) => {
+                    aggregator.responses_sent += 1;
+                }
+                Err(_) => {
+                    // Connection closed by proxy (e.g. after forwarding response)
+                }
+            }
             aggregator
         })
     }

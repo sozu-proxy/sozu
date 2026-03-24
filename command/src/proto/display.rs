@@ -56,9 +56,9 @@ impl Display for CertificateSummary {
 impl Display for QueryCertificatesFilters {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         if let Some(d) = self.domain.clone() {
-            write!(f, "domain:{}", d)
+            write!(f, "domain:{d}")
         } else if let Some(fp) = self.fingerprint.clone() {
-            write!(f, "domain:{}", fp)
+            write!(f, "domain:{fp}")
         } else {
             write!(f, "all certificates")
         }
@@ -582,13 +582,13 @@ pub fn print_listeners(listeners_list: &ListenersList) -> Result<(), DisplayErro
     println!("\nHTTP LISTENERS\n================");
 
     for (_, http_listener) in listeners_list.http_listeners.iter() {
-        println!("{}", http_listener);
+        println!("{http_listener}");
     }
 
     println!("\nHTTPS LISTENERS\n================");
 
     for (_, https_listener) in listeners_list.https_listeners.iter() {
-        println!("{}", https_listener);
+        println!("{https_listener}");
     }
 
     println!("\nTCP LISTENERS\n================");
@@ -868,7 +868,7 @@ fn print_responses_by_worker(
     json: bool,
 ) -> Result<(), DisplayError> {
     for (worker_id, content) in worker_responses.map.iter() {
-        println!("Worker {}", worker_id);
+        println!("Worker {worker_id}");
         content.display(json)?;
     }
 
@@ -920,7 +920,7 @@ fn print_certificates_by_address(list: &ListOfCertificatesByAddress) -> Result<(
         println!("\t{}:", certs.address);
 
         for summary in certs.certificate_summaries.iter() {
-            println!("\t\t{}", summary);
+            println!("\t\t{summary}");
         }
     }
     Ok(())
@@ -1034,7 +1034,22 @@ impl Display for HttpListenerConfig {
         table.add_row(row!["connect timeout", self.connect_timeout]);
         table.add_row(row!["request timeout", self.request_timeout]);
         table.add_row(row!["activated", self.active]);
-        write!(f, "{}", table)
+        add_h2_flood_rows(
+            &mut table,
+            &self.h2_max_rst_stream_per_window,
+            &self.h2_max_ping_per_window,
+            &self.h2_max_settings_per_window,
+            &self.h2_max_empty_data_per_window,
+            &self.h2_max_continuation_frames,
+            &self.h2_max_glitch_count,
+        );
+        add_h2_connection_rows(
+            &mut table,
+            &self.h2_initial_connection_window,
+            &self.h2_max_concurrent_streams,
+            &self.h2_stream_shrink_ratio,
+        );
+        write!(f, "{table}")
     }
 }
 
@@ -1060,6 +1075,10 @@ impl Display for HttpsListenerConfig {
             list_string_vec(&self.signature_algorithms),
         ]);
         table.add_row(row!["groups list", list_string_vec(&self.groups_list),]);
+        table.add_row(row![
+            "alpn protocols",
+            list_string_vec(&self.alpn_protocols),
+        ]);
         table.add_row(row!["key", format!("{:?}", self.key),]);
         table.add_row(row!["expect proxy", self.expect_proxy]);
         table.add_row(row!["sticky name", self.sticky_name]);
@@ -1068,7 +1087,72 @@ impl Display for HttpsListenerConfig {
         table.add_row(row!["connect timeout", self.connect_timeout]);
         table.add_row(row!["request timeout", self.request_timeout]);
         table.add_row(row!["activated", self.active]);
-        write!(f, "{}", table)
+        add_h2_flood_rows(
+            &mut table,
+            &self.h2_max_rst_stream_per_window,
+            &self.h2_max_ping_per_window,
+            &self.h2_max_settings_per_window,
+            &self.h2_max_empty_data_per_window,
+            &self.h2_max_continuation_frames,
+            &self.h2_max_glitch_count,
+        );
+        add_h2_connection_rows(
+            &mut table,
+            &self.h2_initial_connection_window,
+            &self.h2_max_concurrent_streams,
+            &self.h2_stream_shrink_ratio,
+        );
+        write!(f, "{table}")
+    }
+}
+
+/// Add H2 flood detection threshold rows to a display table.
+/// Only shows rows for values that have been explicitly configured.
+fn add_h2_flood_rows(
+    table: &mut Table,
+    max_rst_stream: &Option<u32>,
+    max_ping: &Option<u32>,
+    max_settings: &Option<u32>,
+    max_empty_data: &Option<u32>,
+    max_continuation: &Option<u32>,
+    max_glitch: &Option<u32>,
+) {
+    if let Some(v) = max_rst_stream {
+        table.add_row(row!["h2 max rst_stream/window", v]);
+    }
+    if let Some(v) = max_ping {
+        table.add_row(row!["h2 max ping/window", v]);
+    }
+    if let Some(v) = max_settings {
+        table.add_row(row!["h2 max settings/window", v]);
+    }
+    if let Some(v) = max_empty_data {
+        table.add_row(row!["h2 max empty_data/window", v]);
+    }
+    if let Some(v) = max_continuation {
+        table.add_row(row!["h2 max continuation frames", v]);
+    }
+    if let Some(v) = max_glitch {
+        table.add_row(row!["h2 max glitch count", v]);
+    }
+}
+
+/// Add H2 connection tuning rows to a display table.
+/// Only shows rows for values that have been explicitly configured.
+fn add_h2_connection_rows(
+    table: &mut Table,
+    window: &Option<u32>,
+    max_streams: &Option<u32>,
+    shrink_ratio: &Option<u32>,
+) {
+    if let Some(v) = window {
+        table.add_row(row!["h2 initial connection window", v]);
+    }
+    if let Some(v) = max_streams {
+        table.add_row(row!["h2 max concurrent streams", v]);
+    }
+    if let Some(v) = shrink_ratio {
+        table.add_row(row!["h2 stream shrink ratio", v]);
     }
 }
 

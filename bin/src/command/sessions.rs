@@ -25,6 +25,7 @@ pub struct ClientSession {
 
 /// The return type of the ready method
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum ClientResult {
     NothingToDo,
     NewRequest(Request),

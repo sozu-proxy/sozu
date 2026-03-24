@@ -262,8 +262,8 @@ impl Server {
         )));
         let backends = Rc::new(RefCell::new(BackendMap::new()));
 
-        //FIXME: we will use a few entries for the channel, metrics socket and the listeners
-        //FIXME: for HTTP/2, we will have more than 2 entries per session
+        // Note: slab_capacity uses 4x multiplier (up from 2x) to account for H2
+        // multiplexing where each session can have multiple backend connections.
         let sessions: Rc<RefCell<SessionManager>> = SessionManager::new(
             Slab::with_capacity(config.slab_capacity() as usize),
             config.max_connections as usize,
@@ -446,8 +446,7 @@ impl Server {
                 }
             } else {
                 panic!(
-                    "plz give me a status request first when I start, you sent me this instead: {:?}",
-                    msg
+                    "plz give me a status request first when I start, you sent me this instead: {msg:?}"
                 );
             }
             server.unblock_channel();
@@ -622,7 +621,7 @@ impl Server {
         let now = Instant::now();
         time!("event_loop_time", (now - self.loop_start).as_millis());
 
-        let timeout = match self.should_poll_at.as_ref() {
+        let mut timeout = match self.should_poll_at.as_ref() {
             None => self.poll_timeout,
             Some(i) => {
                 if *i <= now {
@@ -642,6 +641,14 @@ impl Server {
                 }
             }
         };
+
+        if self.shutting_down.is_some() {
+            let shutdown_tick = Duration::from_millis(100);
+            timeout = match timeout {
+                None => Some(shutdown_tick),
+                Some(current) => Some(current.min(shutdown_tick)),
+            };
+        }
 
         self.loop_start = now;
         timeout
@@ -784,8 +791,14 @@ impl Server {
         let mut sessions_to_shut_down = HashSet::new();
 
         for (_key, session) in &self.sessions.borrow().slab {
-            if session.borrow_mut().shutting_down() {
-                sessions_to_shut_down.insert(Token(session.borrow().frontend_token().0));
+            let mut session = session.borrow_mut();
+            if session.shutting_down() {
+                debug!(
+                    "Server killing session from shutting_down: token={:?}, protocol={:?}",
+                    session.frontend_token(),
+                    session.protocol()
+                );
+                sessions_to_shut_down.insert(Token(session.frontend_token().0));
             }
         }
         let _ = self.shut_down_sessions_by_frontend_tokens(sessions_to_shut_down);
@@ -870,7 +883,7 @@ impl Server {
                         break;
                     }
 
-                    if self.channel.back_buf.available_data() == 0 && queue.len() == 0 {
+                    if self.channel.back_buf.available_data() == 0 && queue.is_empty() {
                         break;
                     }
                 }
@@ -1210,7 +1223,7 @@ impl Server {
                     }
                     Err(activate_error) => worker_response_error(
                         req_id,
-                        format!("Could not activate HTTP listener: {}", activate_error),
+                        format!("Could not activate HTTP listener: {activate_error}"),
                     ),
                 }
             }
@@ -1232,7 +1245,7 @@ impl Server {
                     }
                     Err(activate_error) => worker_response_error(
                         req_id,
-                        format!("Could not activate HTTPS listener: {}", activate_error),
+                        format!("Could not activate HTTPS listener: {activate_error}"),
                     ),
                 }
             }
@@ -1251,7 +1264,7 @@ impl Server {
                     }
                     Err(activate_error) => worker_response_error(
                         req_id,
-                        format!("Could not activate TCP listener: {}", activate_error),
+                        format!("Could not activate TCP listener: {activate_error}"),
                     ),
                 }
             }
@@ -1368,8 +1381,7 @@ impl Server {
                         return worker_response_error(
                             req_id,
                             format!(
-                                "Could not deactivate TCP listener at address {:?}: {}",
-                                address, e
+                                "Could not deactivate TCP listener at address {address:?}: {e}"
                             ),
                         );
                     }
@@ -1645,6 +1657,10 @@ impl Server {
             let session = self.sessions.borrow_mut().slab[session_token].clone();
             session.borrow_mut().update_readiness(token, events);
             if session.borrow_mut().ready(session.clone()) {
+                debug!(
+                    "Server killing session from ready: token={:?}, protocol={:?}, events={:?}",
+                    token, protocol, events
+                );
                 self.kill_session(session);
             }
         }
@@ -1657,6 +1673,11 @@ impl Server {
         if self.sessions.borrow().slab.contains(session_token) {
             let session = self.sessions.borrow_mut().slab[session_token].clone();
             if session.borrow_mut().timeout(token) {
+                debug!(
+                    "Server killing session from timeout: token={:?}, protocol={:?}",
+                    token,
+                    session.borrow().protocol()
+                );
                 self.kill_session(session);
             }
         }

@@ -81,8 +81,7 @@ fn fixtures() -> Vec<Fixture> {
             public_ip: IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1)),
             public_port: 443,
             existing_x_forwarded_for: "2001:db8::99",
-            existing_forwarded:
-                "proto=https;for=\"2001:db8::99:12345\";by=\"fd00::1\"",
+            existing_forwarded: "proto=https;for=\"2001:db8::99:12345\";by=\"fd00::1\"",
             proto: "https",
             sticky_name: "SERVERID",
             sticky_session: "srv-backend-02-def456",
@@ -99,32 +98,24 @@ fn bench_x_forwarded_for(c: &mut Criterion) {
 
     for f in &fixtures() {
         // --- format!() baseline ---
-        group.bench_with_input(
-            BenchmarkId::new("format", f.name),
-            f,
-            |b, f| {
-                b.iter(|| {
-                    let value = f.existing_x_forwarded_for;
-                    let peer_ip = black_box(f.peer_ip);
-                    let result = format!("{value}, {peer_ip}");
-                    black_box(result.into_bytes().into_boxed_slice());
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("format", f.name), f, |b, f| {
+            b.iter(|| {
+                let value = f.existing_x_forwarded_for;
+                let peer_ip = black_box(f.peer_ip);
+                let result = format!("{value}, {peer_ip}");
+                black_box(result.into_bytes().into_boxed_slice());
+            });
+        });
 
         // --- Vec + write!() optimized ---
-        group.bench_with_input(
-            BenchmarkId::new("vec_write", f.name),
-            f,
-            |b, f| {
-                b.iter(|| {
-                    let mut buf = Vec::with_capacity(128);
-                    buf.extend_from_slice(black_box(f.existing_x_forwarded_for.as_bytes()));
-                    let _ = write!(buf, ", {}", black_box(f.peer_ip));
-                    black_box(buf.into_boxed_slice());
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("vec_write", f.name), f, |b, f| {
+            b.iter(|| {
+                let mut buf = Vec::with_capacity(128);
+                buf.extend_from_slice(black_box(f.existing_x_forwarded_for.as_bytes()));
+                let _ = write!(buf, ", {}", black_box(f.peer_ip));
+                black_box(buf.into_boxed_slice());
+            });
+        });
     }
 
     group.finish();
@@ -167,24 +158,20 @@ fn bench_forwarded(c: &mut Criterion) {
         );
 
         // --- Vec + write!() optimized ---
-        group.bench_with_input(
-            BenchmarkId::new("vec_write", f.name),
-            f,
-            |b, f| {
-                b.iter(|| {
-                    let mut buf = Vec::with_capacity(128);
-                    buf.extend_from_slice(black_box(f.existing_forwarded.as_bytes()));
-                    write_forwarded_suffix(
-                        &mut buf,
-                        black_box(f.proto),
-                        black_box(f.peer_ip),
-                        black_box(f.peer_port),
-                        black_box(f.public_ip),
-                    );
-                    black_box(buf.into_boxed_slice());
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("vec_write", f.name), f, |b, f| {
+            b.iter(|| {
+                let mut buf = Vec::with_capacity(128);
+                buf.extend_from_slice(black_box(f.existing_forwarded.as_bytes()));
+                write_forwarded_suffix(
+                    &mut buf,
+                    black_box(f.proto),
+                    black_box(f.peer_ip),
+                    black_box(f.peer_port),
+                    black_box(f.public_ip),
+                );
+                black_box(buf.into_boxed_slice());
+            });
+        });
     }
 
     group.finish();
@@ -199,31 +186,23 @@ fn bench_x_forwarded_port(c: &mut Criterion) {
 
     for f in &fixtures() {
         // --- to_string() baseline ---
-        group.bench_with_input(
-            BenchmarkId::new("to_string", f.name),
-            f,
-            |b, f| {
-                b.iter(|| {
-                    let port = black_box(f.public_port);
-                    let result = port.to_string();
-                    black_box(result.into_bytes().into_boxed_slice());
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("to_string", f.name), f, |b, f| {
+            b.iter(|| {
+                let port = black_box(f.public_port);
+                let result = port.to_string();
+                black_box(result.into_bytes().into_boxed_slice());
+            });
+        });
 
         // --- itoa::Buffer optimized ---
-        group.bench_with_input(
-            BenchmarkId::new("itoa", f.name),
-            f,
-            |b, f| {
-                b.iter(|| {
-                    let mut port_buf = itoa::Buffer::new();
-                    let port_str = port_buf.format(black_box(f.public_port));
-                    // from_slice copies into a new Box<[u8]>, matching Store::from_slice behavior
-                    black_box(port_str.as_bytes().to_vec().into_boxed_slice());
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("itoa", f.name), f, |b, f| {
+            b.iter(|| {
+                let mut port_buf = itoa::Buffer::new();
+                let port_str = port_buf.format(black_box(f.public_port));
+                // from_slice copies into a new Box<[u8]>, matching Store::from_slice behavior
+                black_box(port_str.as_bytes().to_vec().into_boxed_slice());
+            });
+        });
     }
 
     group.finish();
@@ -238,37 +217,28 @@ fn bench_set_cookie(c: &mut Criterion) {
 
     for f in &fixtures() {
         // --- format!() baseline ---
-        group.bench_with_input(
-            BenchmarkId::new("format", f.name),
-            f,
-            |b, f| {
-                b.iter(|| {
-                    let sticky_name = black_box(f.sticky_name);
-                    let sticky_session = black_box(f.sticky_session);
-                    let result = format!("{sticky_name}={sticky_session}; Path=/");
-                    black_box(result.into_bytes().into_boxed_slice());
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("format", f.name), f, |b, f| {
+            b.iter(|| {
+                let sticky_name = black_box(f.sticky_name);
+                let sticky_session = black_box(f.sticky_session);
+                let result = format!("{sticky_name}={sticky_session}; Path=/");
+                black_box(result.into_bytes().into_boxed_slice());
+            });
+        });
 
         // --- Vec + extend_from_slice optimized ---
-        group.bench_with_input(
-            BenchmarkId::new("vec_extend", f.name),
-            f,
-            |b, f| {
-                b.iter(|| {
-                    let sticky_name = black_box(f.sticky_name);
-                    let sticky_session = black_box(f.sticky_session);
-                    let mut buf =
-                        Vec::with_capacity(sticky_name.len() + 1 + sticky_session.len() + 8);
-                    buf.extend_from_slice(sticky_name.as_bytes());
-                    buf.push(b'=');
-                    buf.extend_from_slice(sticky_session.as_bytes());
-                    buf.extend_from_slice(b"; Path=/");
-                    black_box(buf.into_boxed_slice());
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("vec_extend", f.name), f, |b, f| {
+            b.iter(|| {
+                let sticky_name = black_box(f.sticky_name);
+                let sticky_session = black_box(f.sticky_session);
+                let mut buf = Vec::with_capacity(sticky_name.len() + 1 + sticky_session.len() + 8);
+                buf.extend_from_slice(sticky_name.as_bytes());
+                buf.push(b'=');
+                buf.extend_from_slice(sticky_session.as_bytes());
+                buf.extend_from_slice(b"; Path=/");
+                black_box(buf.into_boxed_slice());
+            });
+        });
     }
 
     group.finish();
@@ -327,52 +297,48 @@ fn bench_full_pipeline(c: &mut Criterion) {
         );
 
         // --- Vec + write!() + itoa optimized (simulates new on_request_headers) ---
-        group.bench_with_input(
-            BenchmarkId::new("vec_write", f.name),
-            f,
-            |b, f| {
-                b.iter(|| {
-                    let peer_ip = black_box(f.peer_ip);
-                    let peer_port = black_box(f.peer_port);
-                    let public_ip = black_box(f.public_ip);
-                    let public_port = black_box(f.public_port);
-                    let proto = black_box(f.proto);
-                    let existing_xff = black_box(f.existing_x_forwarded_for);
-                    let existing_fwd = black_box(f.existing_forwarded);
-                    let sticky_name = black_box(f.sticky_name);
-                    let sticky_session = black_box(f.sticky_session);
+        group.bench_with_input(BenchmarkId::new("vec_write", f.name), f, |b, f| {
+            b.iter(|| {
+                let peer_ip = black_box(f.peer_ip);
+                let peer_port = black_box(f.peer_port);
+                let public_ip = black_box(f.public_ip);
+                let public_port = black_box(f.public_port);
+                let proto = black_box(f.proto);
+                let existing_xff = black_box(f.existing_x_forwarded_for);
+                let existing_fwd = black_box(f.existing_forwarded);
+                let sticky_name = black_box(f.sticky_name);
+                let sticky_session = black_box(f.sticky_session);
 
-                    // Shared buffer, reused via take()
-                    let mut hdr_buf = Vec::with_capacity(128);
+                // Shared buffer, reused via take()
+                let mut hdr_buf = Vec::with_capacity(128);
 
-                    // X-Forwarded-For
-                    hdr_buf.extend_from_slice(existing_xff.as_bytes());
-                    let _ = write!(hdr_buf, ", {peer_ip}");
-                    let xff_store = std::mem::take(&mut hdr_buf).into_boxed_slice();
+                // X-Forwarded-For
+                hdr_buf.extend_from_slice(existing_xff.as_bytes());
+                let _ = write!(hdr_buf, ", {peer_ip}");
+                let xff_store = std::mem::take(&mut hdr_buf).into_boxed_slice();
 
-                    // Forwarded
-                    hdr_buf.extend_from_slice(existing_fwd.as_bytes());
-                    write_forwarded_suffix(&mut hdr_buf, proto, peer_ip, peer_port, public_ip);
-                    let fwd_store = std::mem::take(&mut hdr_buf).into_boxed_slice();
+                // Forwarded
+                hdr_buf.extend_from_slice(existing_fwd.as_bytes());
+                write_forwarded_suffix(&mut hdr_buf, proto, peer_ip, peer_port, public_ip);
+                let fwd_store = std::mem::take(&mut hdr_buf).into_boxed_slice();
 
-                    // X-Forwarded-Port
-                    let mut port_buf = itoa::Buffer::new();
-                    let port_str = port_buf.format(public_port);
-                    let port_store = port_str.as_bytes().to_vec().into_boxed_slice();
+                // X-Forwarded-Port
+                let mut port_buf = itoa::Buffer::new();
+                let port_str = port_buf.format(public_port);
+                let port_store = port_str.as_bytes().to_vec().into_boxed_slice();
 
-                    // Set-Cookie
-                    let mut cookie_buf =
-                        Vec::with_capacity(sticky_name.len() + 1 + sticky_session.len() + 8);
-                    cookie_buf.extend_from_slice(sticky_name.as_bytes());
-                    cookie_buf.push(b'=');
-                    cookie_buf.extend_from_slice(sticky_session.as_bytes());
-                    cookie_buf.extend_from_slice(b"; Path=/");
-                    let cookie_store = cookie_buf.into_boxed_slice();
+                // Set-Cookie
+                let mut cookie_buf =
+                    Vec::with_capacity(sticky_name.len() + 1 + sticky_session.len() + 8);
+                cookie_buf.extend_from_slice(sticky_name.as_bytes());
+                cookie_buf.push(b'=');
+                cookie_buf.extend_from_slice(sticky_session.as_bytes());
+                cookie_buf.extend_from_slice(b"; Path=/");
+                let cookie_store = cookie_buf.into_boxed_slice();
 
-                    black_box((xff_store, fwd_store, port_store, cookie_store));
-                });
-            },
-        );
+                black_box((xff_store, fwd_store, port_store, cookie_store));
+            });
+        });
     }
 
     group.finish();

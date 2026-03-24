@@ -306,10 +306,6 @@
 
 #[macro_use]
 extern crate sozu_command_lib as sozu_command;
-#[cfg(test)]
-#[macro_use]
-extern crate quickcheck;
-
 #[macro_use]
 pub mod util;
 #[macro_use]
@@ -349,7 +345,7 @@ use std::{
 use backends::BackendError;
 use hex::FromHexError;
 use mio::{Interest, Token, net::TcpStream};
-use protocol::http::{answers::TemplateError, parser::Method};
+use protocol::http::{answers::HttpAnswers, answers::TemplateError, parser::Method};
 use router::RouterError;
 use socket::ServerBindError;
 use sozu_command::{
@@ -455,6 +451,7 @@ macro_rules! StateMachineBuilder {
         }
 
         $(#[$($state_macros)*])*
+        #[allow(clippy::large_enum_variant)]
         pub enum $state_name {
             $(
                 $(#[$($variant_macros)*])*
@@ -530,6 +527,10 @@ pub trait ListenerHandler {
     }
 
     fn set_tags(&mut self, key: String, tags: Option<BTreeMap<String, String>>);
+
+    fn protocol(&self) -> Protocol;
+
+    fn public_address(&self) -> SocketAddr;
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -554,6 +555,21 @@ pub trait L7ListenerHandler {
         uri: &str,
         method: &Method,
     ) -> Result<Route, FrontendFromRequestError>;
+
+    /// retrieve the listener's configured HTTP answers (templates)
+    fn get_answers(&self) -> &Rc<RefCell<HttpAnswers>>;
+
+    /// H2 flood detection thresholds from the listener config.
+    /// Returns the default config when the listener does not provide custom values.
+    fn get_h2_flood_config(&self) -> protocol::mux::H2FloodConfig {
+        protocol::mux::H2FloodConfig::default()
+    }
+
+    /// H2 connection tuning from the listener config.
+    /// Returns the default config when the listener does not provide custom values.
+    fn get_h2_connection_config(&self) -> protocol::mux::H2ConnectionConfig {
+        protocol::mux::H2ConnectionConfig::default()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -588,6 +604,8 @@ pub enum BackendConnectionError {
     Backend(BackendError),
     #[error("failed to retrieve the cluster: {0}")]
     RetrieveClusterError(RetrieveClusterError),
+    #[error("maximum number of buffers reached")]
+    MaxBuffers,
 }
 
 /// used in kawa_h1 module for the Http session state
@@ -603,6 +621,8 @@ pub enum RetrieveClusterError {
     UnauthorizedRoute,
     #[error("{0}")]
     RetrieveFrontend(FrontendFromRequestError),
+    #[error("HTTPS redirect required")]
+    HttpsRedirect,
 }
 
 /// Used in sessions
@@ -665,7 +685,7 @@ pub enum ProxyError {
     },
     #[error("can not add frontend {front:?}: {error}")]
     WrongInputFrontend {
-        front: RequestHttpFrontend,
+        front: Box<RequestHttpFrontend>,
         error: String,
     },
     #[error("could not add frontend: {0}")]
@@ -891,6 +911,18 @@ impl Readiness {
     /// filters the readiness we actually want
     pub fn filter_interest(&self) -> Ready {
         self.event & self.interest
+    }
+
+    /// Signal that the socket has buffered data to write (e.g., TLS internal
+    /// buffers) that won't generate a new epoll WRITABLE event.
+    pub fn signal_pending_write(&mut self) {
+        self.event.insert(Ready::WRITABLE);
+    }
+
+    /// Signal that the socket has buffered data to read (e.g., TLS plaintext
+    /// buffer after a 1xx clear) that won't generate a new epoll READABLE event.
+    pub fn signal_pending_read(&mut self) {
+        self.event.insert(Ready::READABLE);
     }
 }
 
@@ -1133,7 +1165,7 @@ impl PeakEWMA {
             self.rtt = rtt;
         } else {
             // new_rtt = old_rtt * e^(-elapsed/decay) + observed_rtt * (1 - e^(-elapsed/decay))
-            let weight = (-1.0 * dur.as_nanos() as f64 / self.decay).exp();
+            let weight = (-(dur.as_nanos() as f64) / self.decay).exp();
             self.rtt = self.rtt * weight + rtt * (1.0 - weight);
         }
 
@@ -1171,6 +1203,21 @@ pub mod testing {
         server::{ListenSession, ProxyChannel, Server, SessionManager},
         tcp::TcpProxy,
     };
+
+    use std::sync::atomic::{AtomicU16, Ordering};
+
+    /// Port counter for sozu listener addresses in lib tests.
+    /// Starts at 10000 to avoid collision with:
+    /// - Privileged ports (<1024)
+    /// - e2e suite (starts at 2000)
+    /// - Ephemeral port range (typically 32768+)
+    static PORT_PROVIDER: AtomicU16 = AtomicU16::new(10000);
+
+    /// Get a unique port for a sozu listener address.
+    /// Each call returns a different port, safe for parallel test execution.
+    pub fn provide_port() -> u16 {
+        PORT_PROVIDER.fetch_add(1, Ordering::SeqCst)
+    }
 
     /// Everything needed to create a Server
     pub struct ServerParts {

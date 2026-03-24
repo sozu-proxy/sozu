@@ -106,7 +106,21 @@ impl<Front: SocketHandler> ExpectProxyProtocol<Front> {
             SocketResult::WouldBlock => {
                 self.frontend_readiness.event.remove(Ready::READABLE);
             }
-            SocketResult::Closed | SocketResult::Continue => {}
+            SocketResult::Closed => {
+                // Socket closed before any proxy-protocol bytes were received.
+                // This is the typical HAProxy bare TCP healthcheck pattern
+                // (SYN/ACK/FIN without send-proxy). Close immediately instead
+                // of waiting for request_timeout (default 10s), which would
+                // create zombie sessions consuming nb_connections quota.
+                if self.index == 0 {
+                    trace!(
+                        "[{:?}] proxy protocol: socket closed with 0 bytes, closing session",
+                        self.frontend_token
+                    );
+                    return SessionResult::Close;
+                }
+            }
+            SocketResult::Continue => {}
         }
 
         match parse_v2_header(&self.frontend_buffer[..self.index]) {
@@ -134,12 +148,12 @@ impl<Front: SocketHandler> ExpectProxyProtocol<Front> {
                     HeaderLen::Unix => {
                         if self.index == 232 {
                             error!(
-                                "[{:?}] front socket parse error, closing the connection",
+                                "[{:?}] proxy protocol header exceeds maximum size (232 bytes), closing",
                                 self.frontend_token
                             );
                             incr!("proxy_protocol.errors");
                             self.frontend_readiness.reset();
-                            return SessionResult::Continue;
+                            return SessionResult::Close;
                         }
                     }
                 };
@@ -381,7 +395,7 @@ mod expect_test {
             barrier.wait();
             match StdTcpStream::connect(next_middleware_addr) {
                 Ok(mut stream) => {
-                    stream.write(&proxy_protocol).unwrap();
+                    stream.write_all(&proxy_protocol).unwrap();
                 }
                 Err(e) => panic!("could not connect to the next middleware: {e}"),
             };

@@ -380,7 +380,7 @@ pub fn load_static_config(server: &mut Server, mut client: OptionalClient, path:
     let config_messages = match config.generate_config_messages() {
         Ok(messages) => messages,
         Err(config_err) => {
-            client.finish_failure(format!("could not generate new config: {}", config_err));
+            client.finish_failure(format!("could not generate new config: {config_err}"));
             return;
         }
     };
@@ -388,7 +388,7 @@ pub fn load_static_config(server: &mut Server, mut client: OptionalClient, path:
     for (request_index, message) in config_messages.into_iter().enumerate() {
         let request = message.content;
         if let Err(error) = server.state.dispatch(&request) {
-            client.return_processing(format!("Could not execute request on state: {:#}", error));
+            client.return_processing(format!("Could not execute request on state: {error:#}"));
             continue;
         }
 
@@ -492,7 +492,7 @@ impl GatheringTask for WorkerTask {
 
     fn on_finish(
         self: Box<Self>,
-        _server: &mut Server,
+        server: &mut Server,
         client: &mut OptionalClient,
         timed_out: bool,
     ) {
@@ -512,6 +512,8 @@ impl GatheringTask for WorkerTask {
         } else {
             client.finish_ok("Successfully applied request to all workers");
         }
+
+        server.update_counts();
     }
 }
 
@@ -701,7 +703,7 @@ pub fn load_state(server: &mut Server, mut client: OptionalClient, path: &str) {
                 }
             }
             Err(parse_error) => {
-                break Err(format!("saved state parse error: {:?}", parse_error));
+                break Err(format!("saved state parse error: {parse_error:?}"));
             }
         }
         buffer.consume(offset);
@@ -729,11 +731,12 @@ impl GatheringTask for LoadStateTask {
 
     fn on_finish(
         self: Box<Self>,
-        _server: &mut Server,
+        server: &mut Server,
         client: &mut OptionalClient,
         _timed_out: bool,
     ) {
         let DefaultGatherer { ok, errors, .. } = self.gatherer;
+        server.update_counts();
         if errors == 0 {
             client.finish_ok(format!(
                 "Successfully loaded state from path {}, {} ok messages, {} errors",

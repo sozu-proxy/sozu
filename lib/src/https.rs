@@ -35,7 +35,7 @@ use rustls::{
 use rusty_ulid::Ulid;
 use sozu_command::{
     certificate::Fingerprint,
-    config::DEFAULT_CIPHER_SUITES,
+    config::{DEFAULT_ALPN_PROTOCOLS, DEFAULT_CIPHER_SUITES},
     proto::command::{
         AddCertificate, CertificateSummary, CertificatesByAddress, Cluster, HttpsListenerConfig,
         ListOfCertificatesByAddress, ListenerType, RemoveCertificate, RemoveListener,
@@ -54,13 +54,10 @@ use crate::{
     backends::BackendMap,
     pool::Pool,
     protocol::{
-        Http, Pipe, SessionState,
-        h2::Http2,
-        http::{
-            ResponseStream,
-            answers::HttpAnswers,
-            parser::{Method, hostname_and_port},
-        },
+        Pipe, SessionState,
+        http::answers::HttpAnswers,
+        http::parser::{Method, hostname_and_port},
+        mux::{self, Mux, MuxTls},
         proxy_protocol::expect::ExpectProxyProtocol,
         rustls::TlsHandshake,
     },
@@ -72,32 +69,27 @@ use crate::{
     util::UnwrapLog,
 };
 
-// const SERVER_PROTOS: &[&str] = &["http/1.1", "h2"];
-const SERVER_PROTOS: &[&str] = &["http/1.1"];
-
 StateMachineBuilder! {
     /// The various Stages of an HTTPS connection:
     ///
     /// - optional (ExpectProxyProtocol)
     /// - TLS handshake
-    /// - HTTP or HTTP2
-    /// - WebSocket (passthrough), only from HTTP
+    /// - HTTP or HTTP2 (via Mux)
+    /// - WebSocket (passthrough), only from HTTP/1.1
     enum HttpsStateMachine impl SessionState {
         Expect(ExpectProxyProtocol<MioTcpStream>, ServerConnection),
         Handshake(TlsHandshake),
-        Http(Http<FrontRustls, HttpsListener>),
+        Mux(MuxTls),
         WebSocket(Pipe<FrontRustls, HttpsListener>),
-        Http2(Http2<FrontRustls>) -> todo!("H2"),
     }
 }
 
-pub enum AlpnProtocols {
+enum AlpnProtocol {
     H2,
     Http11,
 }
 
 pub struct HttpsSession {
-    answers: Rc<RefCell<HttpAnswers>>,
     configured_backend_timeout: Duration,
     configured_connect_timeout: Duration,
     configured_frontend_timeout: Duration,
@@ -111,13 +103,11 @@ pub struct HttpsSession {
     proxy: Rc<RefCell<HttpsProxy>>,
     public_address: StdSocketAddr,
     state: HttpsStateMachine,
-    sticky_name: String,
 }
 
 impl HttpsSession {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        answers: Rc<RefCell<HttpAnswers>>,
         configured_backend_timeout: Duration,
         configured_connect_timeout: Duration,
         configured_frontend_timeout: Duration,
@@ -129,7 +119,6 @@ impl HttpsSession {
         public_address: StdSocketAddr,
         rustls_details: ServerConnection,
         sock: MioTcpStream,
-        sticky_name: String,
         token: Token,
         wait_time: Duration,
     ) -> HttpsSession {
@@ -164,7 +153,6 @@ impl HttpsSession {
 
         let metrics = SessionMetrics::new(Some(wait_time));
         HttpsSession {
-            answers,
             configured_backend_timeout,
             configured_connect_timeout,
             configured_frontend_timeout,
@@ -178,7 +166,6 @@ impl HttpsSession {
             proxy,
             public_address,
             state,
-            sticky_name,
         }
     }
 
@@ -187,8 +174,7 @@ impl HttpsSession {
         let new_state = match self.state.take() {
             HttpsStateMachine::Expect(expect, ssl) => self.upgrade_expect(expect, ssl),
             HttpsStateMachine::Handshake(handshake) => self.upgrade_handshake(handshake),
-            HttpsStateMachine::Http(http) => self.upgrade_http(http),
-            HttpsStateMachine::Http2(_) => self.upgrade_http2(),
+            HttpsStateMachine::Mux(mux) => self.upgrade_mux(mux),
             HttpsStateMachine::WebSocket(wss) => self.upgrade_websocket(wss),
             HttpsStateMachine::FailedUpgrade(_) => unreachable!(),
         };
@@ -231,9 +217,9 @@ impl HttpsSession {
                     request_id,
                     self.peer_address,
                 );
-                handshake.frontend_readiness.event = readiness.event;
-                // Can we remove this? If not why?
-                // Add e2e test for proto-proxy upgrades
+                // Transfer both interest and event from the proxy protocol state,
+                // so the event loop properly monitors the socket after the transition.
+                handshake.frontend_readiness = readiness;
                 handshake.frontend_readiness.event.insert(Ready::READABLE);
 
                 gauge_add!("protocol.proxy.expect", -1);
@@ -253,12 +239,6 @@ impl HttpsSession {
     }
 
     fn upgrade_handshake(&mut self, handshake: TlsHandshake) -> Option<HttpsStateMachine> {
-        // Add 1st routing phase
-        // - get SNI
-        // - get ALPN
-        // - find corresponding listener
-        // - determine next protocol (tcps, https ,http2)
-
         let sni = handshake.session.server_name();
         let alpn = handshake.session.alpn_protocol();
         let alpn = alpn.and_then(|alpn| from_utf8(alpn).ok());
@@ -268,14 +248,14 @@ impl HttpsSession {
         );
 
         let alpn = match alpn {
-            Some("http/1.1") => AlpnProtocols::Http11,
-            Some("h2") => AlpnProtocols::H2,
+            Some("http/1.1") => AlpnProtocol::Http11,
+            Some("h2") => AlpnProtocol::H2,
             Some(other) => {
                 error!("Unsupported ALPN protocol: {}", other);
                 return None;
             }
-            // Some client don't fill in the ALPN protocol, in this case we default to Http/1.1
-            None => AlpnProtocols::Http11,
+            // Some clients don't fill in the ALPN protocol, in this case we default to Http/1.1
+            None => AlpnProtocol::Http11,
         };
 
         if let Some(version) = handshake.session.protocol_version() {
@@ -288,112 +268,150 @@ impl HttpsSession {
         let front_stream = FrontRustls {
             stream: handshake.stream,
             session: handshake.session,
+            peer_disconnected: false,
         };
 
         gauge_add!("protocol.tls.handshake", -1);
-        match alpn {
-            AlpnProtocols::Http11 => {
-                let mut http = Http::new(
-                    self.answers.clone(),
-                    self.configured_backend_timeout,
-                    self.configured_connect_timeout,
-                    self.configured_frontend_timeout,
+
+        let router = mux::Router::new(
+            self.configured_backend_timeout,
+            self.configured_connect_timeout,
+        );
+        let mut context = mux::Context::new(
+            self.pool.clone(),
+            self.listener.clone(),
+            self.peer_address,
+            self.public_address,
+        );
+        let mut frontend = match alpn {
+            AlpnProtocol::Http11 => {
+                incr!("http.alpn.http11");
+                context.create_stream(handshake.request_id, 1 << 16)?;
+                mux::Connection::new_h1_server(front_stream, handshake.container_frontend_timeout)
+            }
+            AlpnProtocol::H2 => {
+                incr!("http.alpn.h2");
+                let flood_config = self.listener.borrow().get_h2_flood_config();
+                let connection_config = self.listener.borrow().get_h2_connection_config();
+                mux::Connection::new_h2_server(
+                    front_stream,
+                    self.pool.clone(),
                     handshake.container_frontend_timeout,
-                    front_stream,
-                    self.frontend_token,
-                    self.listener.clone(),
-                    self.pool.clone(),
-                    Protocol::HTTPS,
-                    self.public_address,
-                    handshake.request_id,
-                    self.peer_address,
-                    self.sticky_name.clone(),
-                )
-                .ok()?;
-
-                http.frontend_readiness.event = handshake.frontend_readiness.event;
-
-                gauge_add!("protocol.https", 1);
-                Some(HttpsStateMachine::Http(http))
-            }
-            AlpnProtocols::H2 => {
-                let mut http = Http2::new(
-                    front_stream,
-                    self.frontend_token,
-                    self.pool.clone(),
-                    Some(self.public_address),
-                    None,
-                    self.sticky_name.clone(),
-                );
-
-                http.frontend.readiness.event = handshake.frontend_readiness.event;
-
-                gauge_add!("protocol.http2", 1);
-                Some(HttpsStateMachine::Http2(http))
-            }
-        }
-    }
-
-    fn upgrade_http(&self, http: Http<FrontRustls, HttpsListener>) -> Option<HttpsStateMachine> {
-        debug!("https switching to wss");
-        let front_token = self.frontend_token;
-        let back_token = match http.backend_token {
-            Some(back_token) => back_token,
-            None => {
-                warn!(
-                    "Could not upgrade https request on cluster '{:?}' ({:?}) using backend '{:?}' into secure websocket for request '{}'",
-                    http.context.cluster_id,
-                    self.frontend_token,
-                    http.context.backend_id,
-                    http.context.id
-                );
-                return None;
+                    flood_config,
+                    connection_config,
+                )?
             }
         };
+        // Ensure the upgraded connection can both read and write immediately.
+        // With TLS 1.3 + NewSessionTicket, the upgrade may happen from writable()
+        // where READABLE is no longer in the event (consumed by the prior readable()
+        // call). The HTTP/2 preface may already be in rustls's plaintext buffer
+        // (not on the TCP socket), so no new READABLE event from epoll will arrive.
+        // Without WRITABLE in the event, the H2 state machine cannot transition from
+        // reading the preface to writing SETTINGS, causing a deadlock with clients
+        // (like hyper) that wait for the server's SETTINGS before proceeding.
+        frontend
+            .readiness_mut()
+            .event
+            .insert(Ready::READABLE | Ready::WRITABLE);
 
-        let ws_context = http.websocket_context();
-        let mut container_frontend_timeout = http.container_frontend_timeout;
-        let mut container_backend_timeout = http.container_backend_timeout;
+        gauge_add!("protocol.https", 1);
+        Some(HttpsStateMachine::Mux(Mux {
+            configured_frontend_timeout: self.configured_frontend_timeout,
+            frontend_token: self.frontend_token,
+            frontend,
+            context,
+            router,
+        }))
+    }
+
+    fn upgrade_mux(&self, mut mux: MuxTls) -> Option<HttpsStateMachine> {
+        debug!("mux switching to wss");
+        let stream = mux
+            .context
+            .streams
+            .pop()
+            .expect("mux session must have at least one stream during upgrade");
+        // http.active_requests was already decremented by generate_access_log()
+        // in h1.rs before MuxResult::Upgrade was returned to us.
+
+        let (frontend_readiness, frontend_socket, mut container_frontend_timeout) =
+            match mux.frontend {
+                mux::Connection::H1(mux::ConnectionH1 {
+                    readiness,
+                    socket,
+                    timeout_container,
+                    ..
+                }) => (readiness, socket, timeout_container),
+                mux::Connection::H2(_) => {
+                    error!("Only h1<->h1 connections can upgrade to websocket");
+                    return None;
+                }
+            };
+
+        let mux::StreamState::Linked(back_token) = stream.state else {
+            error!("Upgrading stream should be linked to a backend");
+            return None;
+        };
+        let backend = mux
+            .router
+            .backends
+            .remove(&back_token)
+            .expect("backend for back_token must exist during upgrade");
+        let (cluster_id, backend, backend_readiness, backend_socket, mut container_backend_timeout) =
+            match backend {
+                mux::Connection::H1(mux::ConnectionH1 {
+                    position:
+                        mux::Position::Client(cluster_id, backend, mux::BackendStatus::Connected),
+                    readiness,
+                    socket,
+                    timeout_container,
+                    ..
+                }) => (cluster_id, backend, readiness, socket, timeout_container),
+                mux::Connection::H1(_) => {
+                    error!("The backend disconnected just after upgrade, abort");
+                    return None;
+                }
+                mux::Connection::H2(_) => {
+                    error!("Only h1<->h1 connections can upgrade to websocket");
+                    return None;
+                }
+            };
+
+        let ws_context = stream.context.websocket_context();
+
         container_frontend_timeout.reset();
         container_backend_timeout.reset();
 
-        let backend_buffer = if let ResponseStream::BackendAnswer(kawa) = http.response_stream {
-            kawa.storage.buffer
-        } else {
-            return None;
-        };
-
+        let backend_id = backend.borrow().backend_id.clone();
         let mut pipe = Pipe::new(
-            backend_buffer,
-            http.context.backend_id,
-            http.backend_socket,
-            http.backend,
+            stream.back.storage.buffer,
+            Some(backend_id),
+            Some(backend_socket),
+            Some(backend),
             Some(container_backend_timeout),
             Some(container_frontend_timeout),
-            http.context.cluster_id,
-            http.request_stream.storage.buffer,
-            front_token,
-            http.frontend_socket,
+            Some(cluster_id),
+            stream.front.storage.buffer,
+            self.frontend_token,
+            frontend_socket,
             self.listener.clone(),
-            Protocol::HTTP,
-            http.context.id,
-            http.context.session_address,
+            Protocol::HTTPS,
+            stream.context.id,
+            stream.context.session_address,
             ws_context,
         );
 
-        pipe.frontend_readiness.event = http.frontend_readiness.event;
-        pipe.backend_readiness.event = http.backend_readiness.event;
+        pipe.frontend_readiness.event = frontend_readiness.event;
+        pipe.backend_readiness.event = backend_readiness.event;
         pipe.set_back_token(back_token);
 
+        // http.active_requests was already decremented by generate_access_log()
+        // in h1.rs when the 101 response was written (before MuxResult::Upgrade).
         gauge_add!("protocol.https", -1);
         gauge_add!("protocol.wss", 1);
-        gauge_add!("http.active_requests", -1);
         gauge_add!("websocket.active_requests", 1);
         Some(HttpsStateMachine::WebSocket(pipe))
-    }
-
-    fn upgrade_http2(&self) -> Option<HttpsStateMachine> {
-        todo!()
     }
 
     fn upgrade_websocket(
@@ -419,22 +437,26 @@ impl ProxySession for HttpsSession {
         match self.state.marker() {
             StateMarker::Expect => gauge_add!("protocol.proxy.expect", -1),
             StateMarker::Handshake => gauge_add!("protocol.tls.handshake", -1),
-            StateMarker::Http => gauge_add!("protocol.https", -1),
+            StateMarker::Mux => gauge_add!("protocol.https", -1),
             StateMarker::WebSocket => {
                 gauge_add!("protocol.wss", -1);
                 gauge_add!("websocket.active_requests", -1);
             }
-            StateMarker::Http2 => gauge_add!("protocol.http2", -1),
         }
 
         if self.state.failed() {
             match self.state.marker() {
                 StateMarker::Expect => incr!("https.upgrade.expect.failed"),
                 StateMarker::Handshake => incr!("https.upgrade.handshake.failed"),
-                StateMarker::Http => incr!("https.upgrade.http.failed"),
+                StateMarker::Mux => incr!("https.upgrade.mux.failed"),
                 StateMarker::WebSocket => incr!("https.upgrade.wss.failed"),
-                StateMarker::Http2 => incr!("https.upgrade.http2.failed"),
             }
+            // FailedUpgrade means the socket was consumed by a failed upgrade
+            // attempt, so we can only close the state (no-op) and remove the
+            // session — cancel_timeouts / front_socket are unreachable.
+            self.state.close(self.proxy.clone(), &mut self.metrics);
+            self.proxy.borrow().remove_session(self.frontend_token);
+            self.has_been_closed = true;
             return;
         }
 
@@ -443,8 +465,14 @@ impl ProxySession for HttpsSession {
         // in case of https it should also send a close notify on the client before the socket is closed below
         self.state.close(self.proxy.clone(), &mut self.metrics);
 
+        // Shut down the write side only. shutdown(Both) includes SHUT_RD which
+        // discards unread data in the receive buffer (e.g. client's GOAWAY, ACKs).
+        // On Linux, close() after SHUT_RD with discarded receive data sends TCP RST
+        // instead of FIN, destroying any data still in the send buffer — including
+        // TLS records that the drain loop just flushed. Using SHUT_WR only sends
+        // FIN after all send buffer data is delivered, preserving the response.
         let front_socket = self.state.front_socket();
-        if let Err(e) = front_socket.shutdown(Shutdown::Both) {
+        if let Err(e) = front_socket.shutdown(Shutdown::Write) {
             // error 107 NotConnected can happen when was never fully connected, or was already disconnected due to error
             if e.kind() != ErrorKind::NotConnected {
                 error!(
@@ -470,6 +498,13 @@ impl ProxySession for HttpsSession {
 
     fn timeout(&mut self, token: Token) -> SessionIsToBeClosed {
         let session_result = self.state.timeout(token, &mut self.metrics);
+        if session_result == StateResult::CloseSession {
+            debug!(
+                "HTTPS timeout requested close: token={:?}, marker={:?}",
+                token,
+                self.state.marker()
+            );
+        }
         session_result == StateResult::CloseSession
     }
 
@@ -503,6 +538,13 @@ impl ProxySession for HttpsSession {
                 true => true,
             },
         };
+        if to_be_closed {
+            debug!(
+                "HTTPS ready requested close: token={:?}, marker={:?}",
+                self.frontend_token,
+                self.state.marker()
+            );
+        }
 
         self.metrics.service_stop();
         to_be_closed
@@ -557,6 +599,17 @@ impl ListenerHandler for HttpsListener {
             None => self.tags.remove(&key),
         };
     }
+
+    fn protocol(&self) -> Protocol {
+        Protocol::HTTPS
+    }
+
+    fn public_address(&self) -> StdSocketAddr {
+        self.config
+            .public_address
+            .map(|addr| addr.into())
+            .unwrap_or(self.address)
+    }
 }
 
 impl L7ListenerHandler for HttpsListener {
@@ -609,6 +662,48 @@ impl L7ListenerHandler for HttpsListener {
         }
 
         Ok(route)
+    }
+
+    fn get_answers(&self) -> &Rc<RefCell<HttpAnswers>> {
+        &self.answers
+    }
+
+    fn get_h2_flood_config(&self) -> crate::protocol::mux::H2FloodConfig {
+        let defaults = crate::protocol::mux::H2FloodConfig::default();
+        crate::protocol::mux::H2FloodConfig {
+            max_rst_stream_per_window: self
+                .config
+                .h2_max_rst_stream_per_window
+                .unwrap_or(defaults.max_rst_stream_per_window),
+            max_ping_per_window: self
+                .config
+                .h2_max_ping_per_window
+                .unwrap_or(defaults.max_ping_per_window),
+            max_settings_per_window: self
+                .config
+                .h2_max_settings_per_window
+                .unwrap_or(defaults.max_settings_per_window),
+            max_empty_data_per_window: self
+                .config
+                .h2_max_empty_data_per_window
+                .unwrap_or(defaults.max_empty_data_per_window),
+            max_continuation_frames: self
+                .config
+                .h2_max_continuation_frames
+                .unwrap_or(defaults.max_continuation_frames),
+            max_glitch_count: self
+                .config
+                .h2_max_glitch_count
+                .unwrap_or(defaults.max_glitch_count),
+        }
+    }
+
+    fn get_h2_connection_config(&self) -> crate::protocol::mux::H2ConnectionConfig {
+        crate::protocol::mux::H2ConnectionConfig::from_optional(
+            self.config.h2_initial_connection_window,
+            self.config.h2_max_concurrent_streams,
+            self.config.h2_stream_shrink_ratio,
+        )
     }
 }
 
@@ -730,11 +825,18 @@ impl HttpsListener {
             .with_cert_resolver(resolver);
         server_config.send_tls13_tickets = config.send_tls13_tickets as usize;
 
-        let mut protocols = SERVER_PROTOS
-            .iter()
-            .map(|proto| proto.as_bytes().to_vec())
-            .collect::<Vec<_>>();
-        server_config.alpn_protocols.append(&mut protocols);
+        server_config.alpn_protocols = if config.alpn_protocols.is_empty() {
+            DEFAULT_ALPN_PROTOCOLS
+                .iter()
+                .map(|p| p.as_bytes().to_vec())
+                .collect()
+        } else {
+            config
+                .alpn_protocols
+                .iter()
+                .map(|p| p.as_bytes().to_vec())
+                .collect()
+        };
 
         Ok(server_config)
     }
@@ -844,7 +946,7 @@ impl HttpsProxy {
         if !socket_errors.is_empty() {
             return Err(ProxyError::SoftStop {
                 proxy_protocol: "HTTPS".to_string(),
-                error: format!("Error deregistering listen sockets: {:?}", socket_errors),
+                error: format!("Error deregistering listen sockets: {socket_errors:?}"),
             });
         }
 
@@ -867,7 +969,7 @@ impl HttpsProxy {
         if !socket_errors.is_empty() {
             return Err(ProxyError::HardStop {
                 proxy_protocol: "HTTPS".to_string(),
-                error: format!("Error deregistering listen sockets: {:?}", socket_errors),
+                error: format!("Error deregistering listen sockets: {socket_errors:?}"),
             });
         }
 
@@ -1039,7 +1141,7 @@ impl HttpsProxy {
     ) -> Result<Option<ResponseContent>, ProxyError> {
         let front = front.clone().to_frontend().map_err(|request_error| {
             ProxyError::WrongInputFrontend {
-                front,
+                front: Box::new(front),
                 error: request_error.to_string(),
             }
         })?;
@@ -1064,7 +1166,7 @@ impl HttpsProxy {
     ) -> Result<Option<ResponseContent>, ProxyError> {
         let front = front.clone().to_frontend().map_err(|request_error| {
             ProxyError::WrongInputFrontend {
-                front,
+                front: Box::new(front),
                 error: request_error.to_string(),
             }
         })?;
@@ -1230,7 +1332,6 @@ impl ProxyConfiguration for HttpsProxy {
         };
 
         let session = Rc::new(RefCell::new(HttpsSession::new(
-            owned.answers.clone(),
             Duration::from_secs(owned.config.back_timeout as u64),
             Duration::from_secs(owned.config.connect_timeout as u64),
             Duration::from_secs(owned.config.front_timeout as u64),
@@ -1242,7 +1343,6 @@ impl ProxyConfiguration for HttpsProxy {
             public_address,
             rustls_details,
             frontend_sock,
-            owned.config.sticky_name.clone(),
             session_token,
             wait_time,
         )));
@@ -1584,7 +1684,7 @@ mod tests {
 
         let rustls_details = Arc::new(server_config);
 
-        let default_config = ListenerBuilder::new_https(address.clone())
+        let default_config = ListenerBuilder::new_https(address)
             .to_tls(None)
             .expect("Could not create default HTTPS listener config");
 

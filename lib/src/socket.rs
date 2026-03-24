@@ -171,6 +171,15 @@ impl SocketHandler for TcpStream {
 pub struct FrontRustls {
     pub stream: TcpStream,
     pub session: ServerConnection,
+    pub peer_disconnected: bool,
+}
+
+impl std::fmt::Debug for FrontRustls {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FrontRustls")
+            .field("stream", &self.stream)
+            .finish_non_exhaustive()
+    }
 }
 
 impl SocketHandler for FrontRustls {
@@ -200,6 +209,7 @@ impl SocketHandler for FrontRustls {
                 Ok(0) => {
                     can_read = false;
                     is_closed = true;
+                    self.peer_disconnected = true;
                 }
                 Ok(_sz) => {}
                 Err(e) => match e.kind() {
@@ -210,14 +220,13 @@ impl SocketHandler for FrontRustls {
                     | ErrorKind::ConnectionAborted
                     | ErrorKind::BrokenPipe => {
                         is_closed = true;
+                        self.peer_disconnected = true;
                     }
-                    // https://github.com/rustls/rustls/blob/main/rustls/src/conn.rs#L482-L500,
-                    ErrorKind::Other => {
-                        warn!(
-                            "rustls buffer is full, we will consume it, before processing new incoming packets, to mitigate this issue, you could try to increase the buffer size, {:?}",
-                            e
-                        );
-                    }
+                    // https://github.com/rustls/rustls/blob/main/rustls/src/conn.rs#L482-L500
+                    // rustls's 16 KB received_plaintext buffer is full — expected
+                    // under H2 where frame-at-a-time reads drain less than a full
+                    // TLS record. The outer loop will drain plaintext next iteration.
+                    ErrorKind::Other => {}
                     _ => {
                         error!("could not read TLS stream from socket: {:?}", e);
                         is_error = true;
@@ -262,6 +271,12 @@ impl SocketHandler for FrontRustls {
             (size, SocketResult::Error)
         } else if is_closed {
             (size, SocketResult::Closed)
+        } else if size == buf.len() {
+            // The full requested amount was read (possibly from the rustls
+            // plaintext buffer). Report Continue so the caller keeps
+            // READABLE in the readiness set — there may be more decrypted
+            // data available without a new mio event.
+            (size, SocketResult::Continue)
         } else if !can_read {
             (size, SocketResult::WouldBlock)
         } else {
@@ -270,6 +285,10 @@ impl SocketHandler for FrontRustls {
     }
 
     fn socket_write(&mut self, buf: &[u8]) -> (usize, SocketResult) {
+        if self.peer_disconnected {
+            return (0, SocketResult::Closed);
+        }
+
         let mut buffered_size = 0usize;
         let mut can_write = true;
         let mut is_error = false;
@@ -347,6 +366,39 @@ impl SocketHandler for FrontRustls {
             }
         }
 
+        // Flush any pending TLS records even if no application data was written.
+        // This handles the case where h2.rs calls socket_write(&[]) to flush
+        // buffered TLS data (e.g. NewSessionTicket, key updates). Without this,
+        // the main loop above exits immediately for empty buffers and write_tls
+        // is never called.
+        if !is_error && !is_closed && can_write && self.session.wants_write() {
+            loop {
+                match self.session.write_tls(&mut self.stream) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(e) => match e.kind() {
+                        ErrorKind::WouldBlock => {
+                            can_write = false;
+                            break;
+                        }
+                        ErrorKind::ConnectionReset
+                        | ErrorKind::ConnectionAborted
+                        | ErrorKind::BrokenPipe => {
+                            incr!("rustls.write.error");
+                            is_closed = true;
+                            break;
+                        }
+                        _ => {
+                            error!("could not flush TLS stream to socket: {:?}", e);
+                            incr!("rustls.write.error");
+                            is_error = true;
+                            break;
+                        }
+                    },
+                }
+            }
+        }
+
         if is_error {
             (buffered_size, SocketResult::Error)
         } else if is_closed {
@@ -364,48 +416,33 @@ impl SocketHandler for FrontRustls {
         let mut is_error = false;
         let mut is_closed = false;
 
-        match self.session.writer().write_vectored(bufs) {
-            Ok(0) => {} // zero byte written means that the Rustls buffers are full, we will try to write on the socket and try again
-            Ok(sz) => {
-                buffered_size += sz;
-            }
-            Err(e) => match e.kind() {
-                ErrorKind::WouldBlock => {
-                    // we don't need to do anything, the session will return false in wants_write?
-                    //error!("rustls socket_write wouldblock");
-                }
-                ErrorKind::ConnectionReset
-                | ErrorKind::ConnectionAborted
-                | ErrorKind::BrokenPipe => {
-                    //FIXME: this should probably not happen here
-                    incr!("rustls.write.error");
-                    is_closed = true;
-                }
-                _ => {
-                    error!("could not write data to TLS stream: {:?}", e);
-                    incr!("rustls.write.error");
-                    is_error = true;
-                }
-            },
-        }
-
+        // Outer retry loop: when rustls's plaintext buffer is full (write_vectored
+        // returns Ok(0)), flush TLS records to TCP then retry. Without this retry,
+        // returning (0, Continue) causes update_readiness_after_write to remove
+        // WRITABLE from the event set. Under edge-triggered epoll, if TCP never
+        // blocked, EPOLLOUT never re-fires and the connection stalls permanently.
+        // This mirrors the retry pattern in socket_write (lines 290-360).
         let mut counter = 0;
         loop {
             counter += 1;
             if counter > MAX_LOOP_ITERATIONS {
                 error!("MAX_LOOP_ITERATION reached in FrontRustls::socket_write_vectored");
                 incr!("rustls.write.infinite_loop.error");
+                break;
             }
-            match self.session.write_tls(&mut self.stream) {
-                Ok(0) => {
-                    break;
+
+            if !can_write | is_error | is_closed {
+                break;
+            }
+
+            let wrote_plaintext = match self.session.writer().write_vectored(bufs) {
+                Ok(0) => false, // rustls buffer full, flush TLS to TCP and retry
+                Ok(sz) => {
+                    buffered_size += sz;
+                    true
                 }
-                Ok(_sz) => {}
                 Err(e) => match e.kind() {
-                    ErrorKind::WouldBlock => {
-                        can_write = false;
-                        break;
-                    }
+                    ErrorKind::WouldBlock => false,
                     ErrorKind::ConnectionReset
                     | ErrorKind::ConnectionAborted
                     | ErrorKind::BrokenPipe => {
@@ -414,12 +451,52 @@ impl SocketHandler for FrontRustls {
                         break;
                     }
                     _ => {
-                        error!("could not write TLS stream to socket: {:?}", e);
+                        error!("could not write data to TLS stream: {:?}", e);
                         incr!("rustls.write.error");
                         is_error = true;
                         break;
                     }
                 },
+            };
+
+            let mut flushed_tls = false;
+            loop {
+                match self.session.write_tls(&mut self.stream) {
+                    Ok(0) => break,
+                    Ok(_sz) => {
+                        flushed_tls = true;
+                    }
+                    Err(e) => match e.kind() {
+                        ErrorKind::WouldBlock => {
+                            can_write = false;
+                            break;
+                        }
+                        ErrorKind::ConnectionReset
+                        | ErrorKind::ConnectionAborted
+                        | ErrorKind::BrokenPipe => {
+                            incr!("rustls.write.error");
+                            is_closed = true;
+                            break;
+                        }
+                        _ => {
+                            error!("could not write TLS stream to socket: {:?}", e);
+                            incr!("rustls.write.error");
+                            is_error = true;
+                            break;
+                        }
+                    },
+                }
+            }
+
+            // If we buffered application data, we're done for this call.
+            // The caller (write_streams) will call us again if there's more.
+            if buffered_size > 0 {
+                break;
+            }
+            // If write_vectored returned Ok(0) and write_tls had nothing to
+            // flush, we can't make progress — break to avoid spinning.
+            if !wrote_plaintext && !flushed_tls {
+                break;
             }
         }
 
@@ -439,7 +516,7 @@ impl SocketHandler for FrontRustls {
     }
 
     fn socket_wants_write(&self) -> bool {
-        self.session.wants_write()
+        !self.peer_disconnected && self.session.wants_write()
     }
 
     fn socket_ref(&self) -> &TcpStream {
@@ -646,7 +723,7 @@ pub mod stats {
         let fd = sock.as_raw_fd();
         let info = socket_info(fd);
         assert!(info.is_some());
-        println!("{:#?}", info);
+        println!("{info:#?}");
         println!(
             "rtt: {}",
             sozu_command::logging::LogDuration(socket_rtt(&sock))

@@ -77,7 +77,16 @@ impl AggregatedMetric {
                 *v1 = v2;
             }
             (&mut AggregatedMetric::Gauge(ref mut v1), MetricValue::GaugeAdd(v2)) => {
-                *v1 = (*v1 as i64 + v2) as usize;
+                let res = *v1 as i64 + v2;
+                *v1 = if res >= 0 {
+                    res as usize
+                } else {
+                    error!(
+                        "local drain metric {} underflow: previous value: {}, adding: {}",
+                        key, *v1, v2
+                    );
+                    0
+                };
             }
             (&mut AggregatedMetric::Count(ref mut v1), MetricValue::Count(v2)) => {
                 *v1 += v2;
@@ -87,9 +96,12 @@ impl AggregatedMetric {
                     error!("could not record time metric: {:?}", e.to_string());
                 }
             }
-            (s, m) => panic!(
-                "tried to update metric {key} of value {s:?} with an incompatible metric: {m:?}"
-            ),
+            (s, m) => {
+                error!(
+                    "tried to update metric {} of value {:?} with an incompatible metric: {:?}",
+                    key, s, m
+                );
+            }
         }
     }
 
@@ -183,7 +195,7 @@ impl MetricsMap {
 
                 // convert time metrics to a histogram format, on top of percentiles
                 if let AggregatedMetric::Time(hist) = metric {
-                    filtered.push((format!("{}_histogram", name), filter_histogram(hist)));
+                    filtered.push((format!("{name}_histogram"), filter_histogram(hist)));
                 }
                 filtered.into_iter()
             })
@@ -473,8 +485,7 @@ impl LocalDrain {
         }
 
         Err(MetricError::NoMetrics(format!(
-            "No metric for backend {}",
-            backend_id
+            "No metric for backend {backend_id}"
         )))
     }
 

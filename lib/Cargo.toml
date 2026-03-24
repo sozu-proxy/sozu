@@ -32,7 +32,7 @@ anyhow = { workspace = true }
 cookie-factory = { workspace = true }
 hdrhistogram = { workspace = true }
 hex = { workspace = true }
-hpack = { workspace = true }
+loona-hpack = { workspace = true }
 idna = { workspace = true }
 itoa = { workspace = true }
 kawa = { workspace = true }
@@ -73,9 +73,6 @@ opentelemetry = []
 simd = ["kawa/simd"]
 splice = []
 tolerant-http1-parser = ["kawa/tolerant-parsing"]
-
-[target.'cfg(target_arch = "x86_64")'.features]
-default = ["simd"]
 
 [badges]
 travis-ci = { repository = "sozu-proxy/sozu" }

@@ -130,6 +130,30 @@ message HttpListenerConfig {
     // wether the listener is actively listening on its socket
     required bool active = 11 [default = false];
     optional CustomHttpAnswers http_answers = 12;
+    // H2 flood detection thresholds (CVE mitigations).
+    // All are optional; when absent, built-in defaults are used.
+    // Maximum RST_STREAM frames per second window (CVE-2023-44487, CVE-2019-9514)
+    optional uint32 h2_max_rst_stream_per_window = 13;
+    // Maximum PING frames per second window (CVE-2019-9512)
+    optional uint32 h2_max_ping_per_window = 14;
+    // Maximum SETTINGS frames per second window (CVE-2019-9515)
+    optional uint32 h2_max_settings_per_window = 15;
+    // Maximum empty DATA frames per second window (CVE-2019-9518)
+    optional uint32 h2_max_empty_data_per_window = 16;
+    // Maximum CONTINUATION frames per header block (CVE-2024-27316)
+    optional uint32 h2_max_continuation_frames = 17;
+    // Maximum accumulated protocol anomalies before ENHANCE_YOUR_CALM
+    optional uint32 h2_max_glitch_count = 18;
+    // H2 connection tuning parameters.
+    // Connection-level receive window size in bytes (RFC 9113 §6.9.2).
+    // Default: 1048576 (1MB). The RFC default of 65535 is too small for proxying.
+    optional uint32 h2_initial_connection_window = 19;
+    // Maximum concurrent H2 streams the proxy accepts (SETTINGS_MAX_CONCURRENT_STREAMS).
+    // Default: 100.
+    optional uint32 h2_max_concurrent_streams = 20;
+    // Shrink threshold ratio for recycled stream slots. Vec is shrunk when
+    // total_slots > active_streams * ratio. Default: 2.
+    optional uint32 h2_stream_shrink_ratio = 21;
 }
 
 // details of an HTTPS listener
@@ -162,6 +186,33 @@ message HttpsListenerConfig {
     // agains session tracking. Defaults to 4.
     required uint64 send_tls13_tickets = 20;
     optional CustomHttpAnswers http_answers = 21;
+    // ALPN protocols to advertise during TLS handshake, in order of preference.
+    // Valid values: "h2", "http/1.1". Defaults to ["h2", "http/1.1"].
+    repeated string alpn_protocols = 22;
+    // H2 flood detection thresholds (CVE mitigations).
+    // All are optional; when absent, built-in defaults are used.
+    // Maximum RST_STREAM frames per second window (CVE-2023-44487, CVE-2019-9514)
+    optional uint32 h2_max_rst_stream_per_window = 23;
+    // Maximum PING frames per second window (CVE-2019-9512)
+    optional uint32 h2_max_ping_per_window = 24;
+    // Maximum SETTINGS frames per second window (CVE-2019-9515)
+    optional uint32 h2_max_settings_per_window = 25;
+    // Maximum empty DATA frames per second window (CVE-2019-9518)
+    optional uint32 h2_max_empty_data_per_window = 26;
+    // Maximum CONTINUATION frames per header block (CVE-2024-27316)
+    optional uint32 h2_max_continuation_frames = 27;
+    // Maximum accumulated protocol anomalies before ENHANCE_YOUR_CALM
+    optional uint32 h2_max_glitch_count = 28;
+    // H2 connection tuning parameters.
+    // Connection-level receive window size in bytes (RFC 9113 §6.9.2).
+    // Default: 1048576 (1MB). The RFC default of 65535 is too small for proxying.
+    optional uint32 h2_initial_connection_window = 29;
+    // Maximum concurrent H2 streams the proxy accepts (SETTINGS_MAX_CONCURRENT_STREAMS).
+    // Default: 100.
+    optional uint32 h2_max_concurrent_streams = 30;
+    // Shrink threshold ratio for recycled stream slots. Vec is shrunk when
+    // total_slots > active_streams * ratio. Default: 2.
+    optional uint32 h2_stream_shrink_ratio = 31;
 }
 
 // details of an TCP listener
@@ -376,6 +427,8 @@ message Cluster {
     required LoadBalancingAlgorithms load_balancing = 5 [default = ROUND_ROBIN];
     optional string answer_503 = 6;
     optional LoadMetric load_metric = 7;
+    // whether to use HTTP/2 for backend connections to this cluster
+    optional bool http2 = 8;
 }
 
 enum LoadBalancingAlgorithms {

@@ -17,6 +17,12 @@ First you need to create a new cluster with an id and a load balancing policy (r
 sozu --config /etc/sozu/config.toml cluster add --id <my_cluster_id> --load-balancing-policy roundrobin
 ```
 
+To create a cluster with HTTP/2 backend connections enabled:
+
+```bash
+sozu --config /etc/sozu/config.toml cluster add --id <my_cluster_id> --load-balancing-policy roundrobin --http2
+```
+
 It won't show anything but you can verify that the cluster has been added successfully by querying sozu:
 
 ```bash
@@ -56,6 +62,18 @@ Finally you have to create a frontend to allow sozu to send traffic from the lis
 ```bash
 sozu --config /etc/sozu/config.toml frontend https add --address 0.0.0.0:443 --hostname <my_cluster_hostname> id <my_cluster_id>
 ```
+
+## Enable or disable HTTP/2 for backend connections
+
+You can toggle HTTP/2 for backend connections on an existing cluster at runtime:
+
+```bash
+sozu --config /etc/sozu/config.toml cluster h2 enable --id <my_cluster_id>
+sozu --config /etc/sozu/config.toml cluster h2 disable --id <my_cluster_id>
+```
+
+This queries the current cluster configuration, updates the `http2` flag, and re-applies it
+to all workers without affecting other cluster settings.
 
 ## Check the status of sozu
 

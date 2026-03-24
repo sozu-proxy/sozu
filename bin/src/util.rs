@@ -117,6 +117,9 @@ pub fn get_config_file_path(args: &cli::Args) -> Result<&str, UtilError> {
 }
 
 #[cfg(target_os = "freebsd")]
+/// # Safety
+///
+/// Calls `sysctl` with raw pointers and reconstructs a `String` from the returned buffer.
 pub unsafe fn get_executable_path() -> Result<String, UtilError> {
     use libc::{CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, PATH_MAX};
     use libc::{c_void, sysctl};
@@ -148,6 +151,9 @@ pub unsafe fn get_executable_path() -> Result<String, UtilError> {
 }
 
 #[cfg(target_os = "linux")]
+/// # Safety
+///
+/// Reads the current executable path via `/proc/self/exe`, which is only valid for the current process.
 pub unsafe fn get_executable_path() -> Result<String, UtilError> {
     let path = read_link("/proc/self/exe")
         .map_err(|io_err| UtilError::Read("/proc/self/exe".to_string(), io_err))?;
@@ -173,6 +179,9 @@ unsafe extern "C" {
 }
 
 #[cfg(target_os = "macos")]
+/// # Safety
+///
+/// This is marked unsafe to keep the platform-specific API consistent with other implementations.
 pub unsafe fn get_executable_path() -> Result<String, UtilError> {
     let path = std::env::current_exe().map_err(|io_err| UtilError::CurrentExe(io_err))?;
 

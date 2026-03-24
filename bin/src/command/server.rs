@@ -876,3 +876,115 @@ impl Debug for Server {
             .finish()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sozu_command_lib::{
+        config::Config,
+        proto::command::{
+            AddBackend, Cluster, RequestHttpFrontend, RequestTcpFrontend, SocketAddress,
+            request::RequestType,
+        },
+    };
+    use sozu_lib::metrics::METRICS;
+
+    use sozu_command_lib::proto::command::{PathRule, RulePosition, filtered_metrics};
+
+    /// Helper to read a gauge value from the thread-local METRICS
+    fn read_gauge(key: &str) -> Option<u64> {
+        METRICS.with(|metrics| {
+            let mut m = metrics.borrow_mut();
+            let proxy_metrics = m.dump_local_proxy_metrics();
+            proxy_metrics.get(key).and_then(|fm| match &fm.inner {
+                Some(filtered_metrics::Inner::Gauge(v)) => Some(*v),
+                _ => None,
+            })
+        })
+    }
+
+    fn create_test_server() -> Server {
+        let dir = tempfile::tempdir().expect("Could not create temp dir");
+        let socket_path = dir.path().join("test.sock");
+        let unix_listener = UnixListener::bind(&socket_path).expect("Could not bind socket");
+        Server::new(unix_listener, Config::default(), "sozu".to_owned())
+            .expect("Could not create server")
+    }
+
+    #[test]
+    fn update_counts_reflects_state() {
+        let mut server = create_test_server();
+
+        // initially empty
+        server.update_counts();
+        assert_eq!(read_gauge("configuration.clusters"), Some(0));
+        assert_eq!(read_gauge("configuration.backends"), Some(0));
+        assert_eq!(read_gauge("configuration.frontends"), Some(0));
+
+        // add a cluster
+        server
+            .state
+            .dispatch(
+                &RequestType::AddCluster(Cluster {
+                    cluster_id: String::from("cluster_1"),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not add cluster");
+
+        // add backends
+        for i in 0..3 {
+            server
+                .state
+                .dispatch(
+                    &RequestType::AddBackend(AddBackend {
+                        cluster_id: String::from("cluster_1"),
+                        backend_id: format!("cluster_1-{i}"),
+                        address: SocketAddress::new_v4(127, 0, 0, 1, 1026 + i as u16),
+                        ..Default::default()
+                    })
+                    .into(),
+                )
+                .expect("Could not add backend");
+        }
+
+        // add an HTTP frontend
+        server
+            .state
+            .dispatch(
+                &RequestType::AddHttpFrontend(RequestHttpFrontend {
+                    cluster_id: Some(String::from("cluster_1")),
+                    hostname: String::from("example.com"),
+                    path: PathRule::prefix(String::from("/")),
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
+                    position: RulePosition::Tree.into(),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not add frontend");
+
+        // add a TCP frontend
+        server
+            .state
+            .dispatch(
+                &RequestType::AddTcpFrontend(RequestTcpFrontend {
+                    cluster_id: String::from("cluster_1"),
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 5432),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not add TCP frontend");
+
+        // gauges are still stale until update_counts() is called
+        assert_eq!(read_gauge("configuration.clusters"), Some(0));
+
+        // update_counts should refresh gauges
+        server.update_counts();
+        assert_eq!(read_gauge("configuration.clusters"), Some(1));
+        assert_eq!(read_gauge("configuration.backends"), Some(3));
+        assert_eq!(read_gauge("configuration.frontends"), Some(2));
+    }
+}
