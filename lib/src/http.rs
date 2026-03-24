@@ -358,7 +358,7 @@ impl ProxySession for HttpSession {
         self.state.close(self.proxy.clone(), &mut self.metrics);
 
         let front_socket = self.state.front_socket();
-        if let Err(e) = front_socket.shutdown(Shutdown::Both) {
+        if let Err(e) = front_socket.shutdown(Shutdown::Write) {
             // error 107 NotConnected can happen when was never fully connected, or was already disconnected due to error
             if e.kind() != ErrorKind::NotConnected {
                 error!(
@@ -571,6 +571,21 @@ impl L7ListenerHandler for HttpListener {
                 .h2_max_glitch_count
                 .unwrap_or(defaults.max_glitch_count),
         }
+    }
+
+    fn get_h2_connection_config(&self) -> crate::protocol::mux::H2ConnectionConfig {
+        let defaults = crate::protocol::mux::H2ConnectionConfig::default();
+        crate::protocol::mux::H2ConnectionConfig::new(
+            self.config
+                .h2_initial_connection_window
+                .unwrap_or(defaults.initial_connection_window),
+            self.config
+                .h2_max_concurrent_streams
+                .unwrap_or(defaults.max_concurrent_streams),
+            self.config
+                .h2_stream_shrink_ratio
+                .unwrap_or(defaults.stream_shrink_ratio),
+        )
     }
 }
 
