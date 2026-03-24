@@ -52,6 +52,19 @@ pub fn create_unbound_local_address() -> SocketAddr {
     address
 }
 
+fn receive_with_deadline(client: &mut Client, timeout: Duration) -> Option<String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(response) = client.receive() {
+            return Some(response);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 pub fn try_async(nb_backends: usize, nb_clients: usize, nb_requests: usize) -> State {
     let front_address = create_local_address();
 
@@ -472,7 +485,7 @@ pub fn try_upgrade() -> State {
     backend.accept(0);
     backend.receive(0);
     backend.send(0);
-    match client.receive() {
+    match receive_with_deadline(&mut client, Duration::from_secs(1)) {
         Some(msg) => println!("response: {msg}"),
         None => return State::Fail,
     }
@@ -482,7 +495,7 @@ pub fn try_upgrade() -> State {
     let mut new_worker = worker.upgrade("NEW_WORKER");
     thread::sleep(Duration::from_millis(100));
     backend.send(0);
-    match client.receive() {
+    match receive_with_deadline(&mut client, Duration::from_secs(1)) {
         Some(msg) => println!("response: {msg}"),
         None => return State::Fail,
     }
@@ -492,7 +505,7 @@ pub fn try_upgrade() -> State {
     backend.accept(1);
     backend.receive(1);
     backend.send(1);
-    match client.receive() {
+    match receive_with_deadline(&mut client, Duration::from_secs(1)) {
         Some(msg) => println!("response: {msg}"),
         None => return State::Fail,
     }
@@ -545,7 +558,7 @@ pub fn try_upgrade_in_flight_request() -> State {
     backend.accept(0);
     backend.receive(0);
     backend.send(0);
-    match client.receive() {
+    match receive_with_deadline(&mut client, Duration::from_secs(1)) {
         Some(msg) => println!("baseline response: {msg}"),
         None => return State::Fail,
     }
@@ -560,7 +573,7 @@ pub fn try_upgrade_in_flight_request() -> State {
 
     // Backend responds — old worker should still forward the in-flight response
     backend.send(0);
-    match client.receive() {
+    match receive_with_deadline(&mut client, Duration::from_secs(1)) {
         Some(msg) => println!("in-flight response after upgrade: {msg}"),
         None => return State::Fail,
     }
@@ -571,7 +584,7 @@ pub fn try_upgrade_in_flight_request() -> State {
     backend.accept(1);
     backend.receive(1);
     backend.send(1);
-    match client.receive() {
+    match receive_with_deadline(&mut client, Duration::from_secs(1)) {
         Some(msg) => println!("new worker response: {msg}"),
         None => return State::Fail,
     }
@@ -615,7 +628,7 @@ pub fn try_upgrade_new_connections_after() -> State {
     backend.accept(0);
     backend.receive(0);
     backend.send(0);
-    match client.receive() {
+    match receive_with_deadline(&mut client, Duration::from_secs(1)) {
         Some(msg) => println!("baseline response: {msg}"),
         None => return State::Fail,
     }
@@ -635,7 +648,7 @@ pub fn try_upgrade_new_connections_after() -> State {
     backend.accept(1);
     backend.receive(1);
     backend.send(1);
-    match new_client.receive() {
+    match receive_with_deadline(&mut new_client, Duration::from_secs(1)) {
         Some(msg) => println!("new client response from new worker: {msg}"),
         None => return State::Fail,
     }
@@ -645,7 +658,7 @@ pub fn try_upgrade_new_connections_after() -> State {
         new_client.send();
         backend.receive(1);
         backend.send(1);
-        match new_client.receive() {
+        match receive_with_deadline(&mut new_client, Duration::from_secs(1)) {
             Some(msg) => println!("keep-alive request {i} response: {msg}"),
             None => return State::Fail,
         }
@@ -662,10 +675,10 @@ pub fn try_upgrade_new_connections_after() -> State {
     backend.accept(2);
     backend.receive(2);
     backend.send(2);
-    match another_client.receive() {
-        Some(msg) => println!("another client response: {msg}"),
-        None => return State::Fail,
-    }
+        match receive_with_deadline(&mut another_client, Duration::from_secs(1)) {
+            Some(msg) => println!("another client response: {msg}"),
+            None => return State::Fail,
+        }
 
     new_worker.soft_stop();
     if !worker.wait_for_server_stop() {
@@ -722,7 +735,7 @@ pub fn try_upgrade_multiple_in_flight() -> State {
         backend.accept(i);
         backend.receive(i);
         backend.send(i);
-        match client.receive() {
+        match receive_with_deadline(client, Duration::from_secs(1)) {
             Some(msg) => println!("client{i} baseline: {msg}"),
             None => return State::Fail,
         }
@@ -748,7 +761,7 @@ pub fn try_upgrade_multiple_in_flight() -> State {
 
     // All 3 clients should receive their responses
     for (i, client) in clients.iter_mut().enumerate() {
-        match client.receive() {
+        match receive_with_deadline(client, Duration::from_secs(1)) {
             Some(msg) => println!("client{i} in-flight response: {msg}"),
             None => return State::Fail,
         }
@@ -760,7 +773,7 @@ pub fn try_upgrade_multiple_in_flight() -> State {
     backend.accept(3);
     backend.receive(3);
     backend.send(3);
-    match clients[0].receive() {
+    match receive_with_deadline(&mut clients[0], Duration::from_secs(1)) {
         Some(msg) => println!("client0 new worker response: {msg}"),
         None => return State::Fail,
     }

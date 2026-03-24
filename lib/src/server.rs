@@ -792,13 +792,14 @@ impl Server {
         let mut sessions_to_shut_down = HashSet::new();
 
         for (_key, session) in &self.sessions.borrow().slab {
-            if session.borrow_mut().shutting_down() {
+            let mut session = session.borrow_mut();
+            if session.shutting_down() {
                 debug!(
                     "Server killing session from shutting_down: token={:?}, protocol={:?}",
-                    session.borrow().frontend_token(),
-                    session.borrow().protocol()
+                    session.frontend_token(),
+                    session.protocol()
                 );
-                sessions_to_shut_down.insert(Token(session.borrow().frontend_token().0));
+                sessions_to_shut_down.insert(Token(session.frontend_token().0));
             }
         }
         let _ = self.shut_down_sessions_by_frontend_tokens(sessions_to_shut_down);
