@@ -152,6 +152,7 @@ pub fn fork_main_into_new_main(
 
 /// Called by the child of a main process fork.
 /// Starts new main process with upgrade data, notifies the old main process
+#[allow(dead_code)]
 pub fn begin_new_main_process(
     new_to_old_channel_fd: i32,
     upgrade_file_fd: i32,

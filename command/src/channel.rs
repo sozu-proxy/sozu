@@ -857,11 +857,10 @@ mod tests {
 
         assert!(result.is_err());
         let err = result.unwrap_err();
-        let err_msg = format!("{}", err);
+        let err_msg = format!("{err}");
         assert!(
             err_msg.contains("too large") || err_msg.contains("cannot grow"),
-            "unexpected error: {}",
-            err_msg
+            "unexpected error: {err_msg}"
         );
     }
 
@@ -883,8 +882,7 @@ mod tests {
         let grown_capacity = channel.back_buf.capacity();
         assert!(
             grown_capacity > 100,
-            "expected buffer growth, got capacity {}",
-            grown_capacity
+            "expected buffer growth, got capacity {grown_capacity}"
         );
 
         // Simulate full drain by consuming all data
@@ -918,17 +916,12 @@ mod tests {
         }
 
         let grown = channel.back_buf.capacity();
-        assert!(
-            grown > 32,
-            "expected buffer growth beyond 32, got {}",
-            grown
-        );
+        assert!(grown > 32, "expected buffer growth beyond 32, got {grown}");
         // doubling from 32 should yield a power-of-two-like size (64, 128, 256, ...)
         // rather than the exact needed amount
         assert!(
             grown.is_power_of_two() || grown == 10000,
-            "expected doubling growth pattern, got {}",
-            grown
+            "expected doubling growth pattern, got {grown}"
         );
     }
 }

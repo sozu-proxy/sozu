@@ -675,10 +675,10 @@ pub fn try_upgrade_new_connections_after() -> State {
     backend.accept(2);
     backend.receive(2);
     backend.send(2);
-        match receive_with_deadline(&mut another_client, Duration::from_secs(1)) {
-            Some(msg) => println!("another client response: {msg}"),
-            None => return State::Fail,
-        }
+    match receive_with_deadline(&mut another_client, Duration::from_secs(1)) {
+        Some(msg) => println!("another client response: {msg}"),
+        None => return State::Fail,
+    }
 
     new_worker.soft_stop();
     if !worker.wait_for_server_stop() {

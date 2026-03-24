@@ -380,7 +380,7 @@ pub fn load_static_config(server: &mut Server, mut client: OptionalClient, path:
     let config_messages = match config.generate_config_messages() {
         Ok(messages) => messages,
         Err(config_err) => {
-            client.finish_failure(format!("could not generate new config: {}", config_err));
+            client.finish_failure(format!("could not generate new config: {config_err}"));
             return;
         }
     };
@@ -388,7 +388,7 @@ pub fn load_static_config(server: &mut Server, mut client: OptionalClient, path:
     for (request_index, message) in config_messages.into_iter().enumerate() {
         let request = message.content;
         if let Err(error) = server.state.dispatch(&request) {
-            client.return_processing(format!("Could not execute request on state: {:#}", error));
+            client.return_processing(format!("Could not execute request on state: {error:#}"));
             continue;
         }
 
@@ -703,7 +703,7 @@ pub fn load_state(server: &mut Server, mut client: OptionalClient, path: &str) {
                 }
             }
             Err(parse_error) => {
-                break Err(format!("saved state parse error: {:?}", parse_error));
+                break Err(format!("saved state parse error: {parse_error:?}"));
             }
         }
         buffer.consume(offset);

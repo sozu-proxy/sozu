@@ -2149,10 +2149,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     ) -> bool {
         use crate::protocol::kawa_h1::parser::Method;
         // HEAD method responses (only relevant when reading backend responses)
-        if self.position.is_client() {
-            if context.method == Some(Method::Head) {
-                return true;
-            }
+        if self.position.is_client() && context.method == Some(Method::Head) {
+            return true;
         }
         // 1xx, 204, 304 status codes
         if let Some(status) = context.status {

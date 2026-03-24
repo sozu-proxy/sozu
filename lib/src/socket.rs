@@ -723,7 +723,7 @@ pub mod stats {
         let fd = sock.as_raw_fd();
         let info = socket_info(fd);
         assert!(info.is_some());
-        println!("{:#?}", info);
+        println!("{info:#?}");
         println!(
             "rtt: {}",
             sozu_command::logging::LogDuration(socket_rtt(&sock))

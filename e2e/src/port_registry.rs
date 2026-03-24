@@ -127,43 +127,45 @@ pub(crate) fn bind_std_listener(address: SocketAddr, context: &str) -> TcpListen
     })
 }
 
-pub(crate) fn bind_tokio_listener(
-    address: SocketAddr,
-    context: &str,
-) -> tokio::net::TcpListener {
+pub(crate) fn bind_tokio_listener(address: SocketAddr, context: &str) -> tokio::net::TcpListener {
     if let Some(listener) = take_reserved_listener(address) {
-        listener
-            .set_nonblocking(true)
-            .unwrap_or_else(|error| panic!("{context}: could not set nonblocking {address}: {error}"));
-        tokio::net::TcpListener::from_std(listener)
-            .unwrap_or_else(|error| panic!("{context}: could not adopt reserved listener {address}: {error}"))
+        listener.set_nonblocking(true).unwrap_or_else(|error| {
+            panic!("{context}: could not set nonblocking {address}: {error}")
+        });
+        tokio::net::TcpListener::from_std(listener).unwrap_or_else(|error| {
+            panic!("{context}: could not adopt reserved listener {address}: {error}")
+        })
     } else {
         let std_listener = TcpListener::bind(address)
             .unwrap_or_else(|error| panic!("{context}: could not bind {address}: {error}"));
-        std_listener
-            .set_nonblocking(true)
-            .unwrap_or_else(|error| panic!("{context}: could not set nonblocking {address}: {error}"));
-        tokio::net::TcpListener::from_std(std_listener)
-            .unwrap_or_else(|error| panic!("{context}: could not create tokio listener {address}: {error}"))
+        std_listener.set_nonblocking(true).unwrap_or_else(|error| {
+            panic!("{context}: could not set nonblocking {address}: {error}")
+        });
+        tokio::net::TcpListener::from_std(std_listener).unwrap_or_else(|error| {
+            panic!("{context}: could not create tokio listener {address}: {error}")
+        })
     }
 }
 
 pub(crate) fn attach_reserved_http_listener(listeners: &mut Listeners, address: SocketAddr) {
-    listeners
-        .http
-        .push((address, into_listener_fd(address, "http listener reservation")));
+    listeners.http.push((
+        address,
+        into_listener_fd(address, "http listener reservation"),
+    ));
 }
 
 pub(crate) fn attach_reserved_https_listener(listeners: &mut Listeners, address: SocketAddr) {
-    listeners
-        .tls
-        .push((address, into_listener_fd(address, "https listener reservation")));
+    listeners.tls.push((
+        address,
+        into_listener_fd(address, "https listener reservation"),
+    ));
 }
 
 pub(crate) fn attach_reserved_tcp_listener(listeners: &mut Listeners, address: SocketAddr) {
-    listeners
-        .tcp
-        .push((address, into_listener_fd(address, "tcp listener reservation")));
+    listeners.tcp.push((
+        address,
+        into_listener_fd(address, "tcp listener reservation"),
+    ));
 }
 
 fn into_listener_fd(address: SocketAddr, context: &str) -> RawFd {

@@ -395,7 +395,7 @@ mod expect_test {
             barrier.wait();
             match StdTcpStream::connect(next_middleware_addr) {
                 Ok(mut stream) => {
-                    stream.write(&proxy_protocol).unwrap();
+                    stream.write_all(&proxy_protocol).unwrap();
                 }
                 Err(e) => panic!("could not connect to the next middleware: {e}"),
             };

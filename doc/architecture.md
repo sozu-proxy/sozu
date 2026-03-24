@@ -292,18 +292,18 @@ inline at the start of `writable()`, avoiding extra event loop iterations.
 
 ```
 lib/src/protocol/mux/
-├── mod.rs          Mux session, Stream, Router, ready() loop, stream lifecycle (2325 lines)
-├── h1.rs           HTTP/1.1 connection (ConnectionH1) (421 lines)
+├── mod.rs          Mux session, Stream, Router, ready() loop, stream lifecycle (2605 lines)
+├── h1.rs           HTTP/1.1 connection (ConnectionH1) (675 lines)
 ├── h2.rs           HTTP/2 connection (ConnectionH2), state machine, flow control,
-│                   flood detection, RFC 9218 priorities, sub-structs (2513 lines)
-├── parser.rs       H2 binary frame parser (nom), wire format constants (1055 lines)
-├── serializer.rs   H2 frame serializer (cookie-factory), SETTINGS/GOAWAY/RST_STREAM (165 lines)
-├── converter.rs    Kawa → H2 frame converter (H2BlockConverter), HPACK encoding (297 lines)
+│                   flood detection, RFC 9218 priorities, shutdown handling (3994 lines)
+├── parser.rs       H2 binary frame parser (nom), wire format constants (1598 lines)
+├── serializer.rs   H2 frame serializer (cookie-factory), SETTINGS/GOAWAY/RST_STREAM (493 lines)
+├── converter.rs    Kawa → H2 frame converter (H2BlockConverter), HPACK encoding (823 lines)
 └── pkawa.rs        H2 → Kawa converter, HPACK decoding, pseudo-header validation,
-                    RFC 9218 priority header parsing (460 lines)
+                    RFC 9218 priority header parsing (990 lines)
 ```
 
-Total: 7236 lines of Rust across 7 modules.
+Total: 11178 lines of Rust across 7 modules.
 
 #### Key design decisions
 
@@ -320,6 +320,10 @@ Total: 7236 lines of Rust across 7 modules.
 - **GoAway drain**: When a GoAway frame is received, the connection enters `draining` mode.
   New streams are rejected, but existing streams complete normally. Streams above
   `peer_last_stream_id` are eligible for retry on a new connection.
+- **Actively driven graceful shutdown**: During worker drain, the mux layer forces
+  H2 readable and writable passes outside the normal epoll loop so it can observe
+  final peer EOF / END_STREAM events, flush GOAWAY and TLS records, and prune
+  stale stream mappings created by incomplete HEADERS blocks.
 - **H2 backend (h2c)**: Controlled by `cluster.http2` in protobuf config. Sōzu speaks
   cleartext H2 to backends. The `:scheme` pseudo-header is derived from the frontend
   listener protocol (HTTP or HTTPS), not the backend connection.

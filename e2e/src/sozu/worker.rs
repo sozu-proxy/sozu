@@ -21,10 +21,10 @@ use sozu_command::{
 use sozu_command_lib as sozu_command;
 use sozu_lib as sozu;
 
-use crate::sozu::command_id::CommandID;
 use crate::port_registry::{
     attach_reserved_http_listener, attach_reserved_https_listener, attach_reserved_tcp_listener,
 };
+use crate::sozu::command_id::CommandID;
 
 /// Handle to a detached thread where a Sozu worker runs
 pub struct Worker {

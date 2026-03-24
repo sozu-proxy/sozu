@@ -886,9 +886,8 @@ mod tests {
             AddBackend, Cluster, RequestHttpFrontend, RequestTcpFrontend, SocketAddress,
             request::RequestType,
         },
-        state::ConfigState,
     };
-    use sozu_lib::metrics::{METRICS, MetricValue};
+    use sozu_lib::metrics::METRICS;
 
     use sozu_command_lib::proto::command::{PathRule, RulePosition, filtered_metrics};
 

@@ -936,7 +936,7 @@ impl HttpsProxy {
         if !socket_errors.is_empty() {
             return Err(ProxyError::SoftStop {
                 proxy_protocol: "HTTPS".to_string(),
-                error: format!("Error deregistering listen sockets: {:?}", socket_errors),
+                error: format!("Error deregistering listen sockets: {socket_errors:?}"),
             });
         }
 
@@ -959,7 +959,7 @@ impl HttpsProxy {
         if !socket_errors.is_empty() {
             return Err(ProxyError::HardStop {
                 proxy_protocol: "HTTPS".to_string(),
-                error: format!("Error deregistering listen sockets: {:?}", socket_errors),
+                error: format!("Error deregistering listen sockets: {socket_errors:?}"),
             });
         }
 
@@ -1131,7 +1131,7 @@ impl HttpsProxy {
     ) -> Result<Option<ResponseContent>, ProxyError> {
         let front = front.clone().to_frontend().map_err(|request_error| {
             ProxyError::WrongInputFrontend {
-                front,
+                front: Box::new(front),
                 error: request_error.to_string(),
             }
         })?;
@@ -1156,7 +1156,7 @@ impl HttpsProxy {
     ) -> Result<Option<ResponseContent>, ProxyError> {
         let front = front.clone().to_frontend().map_err(|request_error| {
             ProxyError::WrongInputFrontend {
-                front,
+                front: Box::new(front),
                 error: request_error.to_string(),
             }
         })?;
@@ -1674,7 +1674,7 @@ mod tests {
 
         let rustls_details = Arc::new(server_config);
 
-        let default_config = ListenerBuilder::new_https(address.clone())
+        let default_config = ListenerBuilder::new_https(address)
             .to_tls(None)
             .expect("Could not create default HTTPS listener config");
 

@@ -357,8 +357,7 @@ mod tests {
             assert_eq!(
                 serialize_frame_type(ft),
                 *expected_byte,
-                "serialize_frame_type mismatch for {:?}",
-                ft
+                "serialize_frame_type mismatch for {ft:?}"
             );
 
             // Use stream_id that is valid for the frame type
@@ -380,7 +379,7 @@ mod tests {
             assert_eq!(sz, 9);
 
             let parsed = parse_header(&buf);
-            assert_eq!(parsed.frame_type, *ft, "round-trip failed for {:?}", ft);
+            assert_eq!(parsed.frame_type, *ft, "round-trip failed for {ft:?}");
         }
     }
 

@@ -404,6 +404,35 @@ Writes the zero buffer to the socket in a loop. Returns `true` if the socket
 stalled (WouldBlock), `false` when fully drained. Counts written bytes as
 `overhead_bout`. Clears the buffer after draining to reset positions.
 
+### Shutdown and close path
+
+The branch's final hardening work is concentrated in the shutdown path, where
+H2 stream state, GOAWAY sequencing, and rustls buffering interact:
+
+- `Mux::delay_close_for_frontend_flush()` turns an immediate session close into
+  a final writable phase when the frontend still has TLS data or GOAWAY bytes
+  buffered. On TLS frontends it first asks rustls to generate `close_notify`.
+- `Mux::drive_frontend_shutdown_io()` actively runs both `readable()` and
+  `writable()` during worker drain. This matters because graceful H2 shutdown
+  may require one more read to observe peer EOF / END_STREAM and one more write
+  to emit the final GOAWAY or flush buffered TLS records, even when epoll does
+  not deliver a fresh readiness edge.
+- `ConnectionH2::prune_inactive_streams_while_closing()` removes H2 stream-ID
+  mappings for streams that never became active before a connection-level close
+  (for example, partial or oversized HEADERS blocks that were abandoned during
+  GOAWAY). Without this pruning, shutdown can wait forever on idle entries that
+  no longer correspond to useful work.
+- `peer_gone_after_final_goaway()` is the terminal shutdown condition for the
+  frontend H2 connection. Once the final GOAWAY has been queued, all stream
+  mappings are gone, and the peer has already hung up, the remaining rustls
+  backlog is no longer deliverable and the session may close immediately.
+- `FrontRustls::peer_disconnected` suppresses new TLS writes after EOF/HUP so
+  the close path does not keep retrying application writes to a dead peer.
+- HTTPS uses `shutdown(Write)` rather than `shutdown(Both)`. On Linux,
+  `shutdown(Both)` discards unread receive-buffer data and can convert an
+  otherwise clean post-drain close into a TCP RST, truncating bytes that the
+  drain loop already flushed.
+
 ### complete_server_stream()
 
 Static helper that finalizes a server-side stream: increments `http.e2e.h2`
@@ -549,16 +578,16 @@ inflating memory for the lifetime of the connection.
 
 ### Test inventory
 
-131 e2e tests across 7 files:
+185 e2e tests across 7 files:
 
 | File | Count | Focus |
 |------|-------|-------|
-| `e2e/src/tests/tests.rs` | 33 | General HTTP proxying, keep-alive, routing |
-| `e2e/src/tests/h2_security_tests.rs` | 30 | Security edge cases: flood detection thresholds, rapid reset, CONTINUATION bombs, settings flood, empty DATA flood, glitch counting |
-| `e2e/src/tests/h2_tests.rs` | 29 | Protocol correctness: HEADERS, DATA, flow control, GOAWAY, stream lifecycle, priority, HPACK, concurrent streams, window updates |
+| `e2e/src/tests/tests.rs` | 40 | General HTTP proxying, keep-alive, routing, worker lifecycle |
+| `e2e/src/tests/h2_security_tests.rs` | 41 | Security edge cases: flood detection thresholds, rapid reset, CONTINUATION bombs, settings flood, empty DATA flood, glitch counting, malformed frame handling |
+| `e2e/src/tests/h2_tests.rs` | 64 | Protocol correctness: HEADERS, DATA, flow control, GOAWAY, stream lifecycle, priority, HPACK, concurrent streams, window updates, graceful shutdown, H2 backend behavior |
 | `e2e/src/tests/mux_tests.rs` | 21 | Cross-protocol scenarios: H1-to-H2 backend, H2-to-H1 backend, end-to-end H2, mixed protocol combinations |
 | `e2e/src/tests/h1_security_tests.rs` | 8 | H1-specific security (request smuggling, header injection) |
-| `e2e/src/tests/tls_tests.rs` | 5 | TLS handshake, ALPN negotiation, certificate handling |
+| `e2e/src/tests/tls_tests.rs` | 6 | TLS handshake, ALPN negotiation, certificate handling, close semantics |
 | `e2e/src/tests/tcp_tests.rs` | 5 | Raw TCP proxying |
 
 ### Test infrastructure
@@ -575,6 +604,18 @@ Tests use the `e2e` crate which provides:
 The implementation targets 145/145 h2spec test cases for RFC 9113 conformance.
 h2spec is an external conformance testing tool (https://github.com/summerwind/h2spec)
 that validates frame-level protocol correctness.
+
+### Shutdown-focused regression coverage
+
+Recent branch tests explicitly cover the shutdown hardening described above:
+
+- `test_h2_double_goaway_graceful_shutdown`
+- `test_h2_graceful_shutdown_completes_large_transfer`
+- `test_h2_graceful_shutdown_waits_for_inflight_request`
+
+Together they exercise the double-GOAWAY sequence, completion of in-flight
+large responses during worker drain, and the requirement that soft-stop waits
+for active requests instead of tearing sessions down early.
 
 ### Safety properties
 

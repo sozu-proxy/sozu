@@ -450,8 +450,7 @@ fn try_tls_alpn_mismatch_recovery() -> State {
     let back_address = create_local_address();
 
     let (config, listeners, state) = Worker::empty_https_config(front_address.into());
-    let mut worker =
-        Worker::start_new_worker_owned("TLS-ALPN-MISMATCH", config, listeners, state);
+    let mut worker = Worker::start_new_worker_owned("TLS-ALPN-MISMATCH", config, listeners, state);
 
     // Listener with HTTP/1.1 only — no H2 support
     let mut listener_builder = ListenerBuilder::new_https(front_address.clone());

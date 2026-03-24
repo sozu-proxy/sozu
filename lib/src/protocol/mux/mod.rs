@@ -1720,11 +1720,11 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
     ) -> SessionResult {
         let mut counter = 0;
 
-        if self.frontend.readiness().event.is_hup() {
-            if !self.delay_close_for_frontend_flush("frontend HUP") {
-                debug!("Mux closing on frontend HUP: {:?}", self.frontend);
-                return SessionResult::Close;
-            }
+        if self.frontend.readiness().event.is_hup()
+            && !self.delay_close_for_frontend_flush("frontend HUP")
+        {
+            debug!("Mux closing on frontend HUP: {:?}", self.frontend);
+            return SessionResult::Close;
         }
 
         // Start service timers on all active streams after the HUP check.
@@ -2536,7 +2536,10 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                     && stream.front.is_completed()
                 {
                     stream.front_received_end_of_stream = true;
-                    self.frontend.readiness_mut().interest.insert(Ready::WRITABLE);
+                    self.frontend
+                        .readiness_mut()
+                        .interest
+                        .insert(Ready::WRITABLE);
                     self.frontend.readiness_mut().signal_pending_write();
                 }
             }

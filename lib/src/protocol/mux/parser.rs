@@ -1048,17 +1048,17 @@ mod tests {
 
     /// Build a raw H2 frame header (9 bytes) from explicit fields.
     fn build_frame_header(payload_len: u32, frame_type: u8, flags: u8, stream_id: u32) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(9);
-        buf.push(((payload_len >> 16) & 0xFF) as u8);
-        buf.push(((payload_len >> 8) & 0xFF) as u8);
-        buf.push((payload_len & 0xFF) as u8);
-        buf.push(frame_type);
-        buf.push(flags);
-        buf.push(((stream_id >> 24) & 0xFF) as u8);
-        buf.push(((stream_id >> 16) & 0xFF) as u8);
-        buf.push(((stream_id >> 8) & 0xFF) as u8);
-        buf.push((stream_id & 0xFF) as u8);
-        buf
+        vec![
+            ((payload_len >> 16) & 0xFF) as u8,
+            ((payload_len >> 8) & 0xFF) as u8,
+            (payload_len & 0xFF) as u8,
+            frame_type,
+            flags,
+            ((stream_id >> 24) & 0xFF) as u8,
+            ((stream_id >> 16) & 0xFF) as u8,
+            ((stream_id >> 8) & 0xFF) as u8,
+            (stream_id & 0xFF) as u8,
+        ]
     }
 
     /// Build a complete raw frame (header + payload).
@@ -1144,7 +1144,7 @@ mod tests {
                 assert_eq!(d.stream_id, 1);
                 assert!(d.end_stream);
             }
-            other => panic!("expected Data, got {:?}", other),
+            other => panic!("expected Data, got {other:?}"),
         }
     }
 
@@ -1159,7 +1159,7 @@ mod tests {
                 assert_eq!(d.stream_id, 3);
                 assert!(!d.end_stream);
             }
-            other => panic!("expected Data, got {:?}", other),
+            other => panic!("expected Data, got {other:?}"),
         }
     }
 
@@ -1180,9 +1180,9 @@ mod tests {
         match f {
             Frame::Data(d) => {
                 assert_eq!(d.stream_id, 1);
-                assert_eq!(d.payload.len as u32, actual_data.len() as u32);
+                assert_eq!(d.payload.len, actual_data.len() as u32);
             }
-            other => panic!("expected Data, got {:?}", other),
+            other => panic!("expected Data, got {other:?}"),
         }
     }
 
@@ -1217,7 +1217,7 @@ mod tests {
                 assert!(h.end_headers);
                 assert!(h.priority.is_none());
             }
-            other => panic!("expected Headers, got {:?}", other),
+            other => panic!("expected Headers, got {other:?}"),
         }
     }
 
@@ -1232,7 +1232,7 @@ mod tests {
                 assert!(h.end_stream);
                 assert!(h.end_headers);
             }
-            other => panic!("expected Headers, got {:?}", other),
+            other => panic!("expected Headers, got {other:?}"),
         }
     }
 
@@ -1262,10 +1262,10 @@ mod tests {
                         assert_eq!(stream_dependency.stream_id, 1);
                         assert_eq!(weight, 15);
                     }
-                    other => panic!("expected Rfc7540, got {:?}", other),
+                    other => panic!("expected Rfc7540, got {other:?}"),
                 }
             }
-            other => panic!("expected Headers, got {:?}", other),
+            other => panic!("expected Headers, got {other:?}"),
         }
     }
 
@@ -1295,10 +1295,10 @@ mod tests {
                         assert_eq!(stream_dependency.stream_id, 5);
                         assert_eq!(weight, 255);
                     }
-                    other => panic!("expected Rfc7540, got {:?}", other),
+                    other => panic!("expected Rfc7540, got {other:?}"),
                 }
             }
-            other => panic!("expected Headers, got {:?}", other),
+            other => panic!("expected Headers, got {other:?}"),
         }
     }
 
@@ -1325,7 +1325,7 @@ mod tests {
                 assert_eq!(rst.stream_id, 1);
                 assert_eq!(rst.error_code, 0x08);
             }
-            other => panic!("expected RstStream, got {:?}", other),
+            other => panic!("expected RstStream, got {other:?}"),
         }
     }
 
@@ -1368,7 +1368,7 @@ mod tests {
                 assert_eq!(s.settings[2].identifier, 0x0004);
                 assert_eq!(s.settings[2].value, 65535);
             }
-            other => panic!("expected Settings, got {:?}", other),
+            other => panic!("expected Settings, got {other:?}"),
         }
     }
 
@@ -1385,7 +1385,7 @@ mod tests {
                 assert_eq!(p.payload, ping_payload);
                 assert!(!p.ack);
             }
-            other => panic!("expected Ping, got {:?}", other),
+            other => panic!("expected Ping, got {other:?}"),
         }
     }
 
@@ -1403,7 +1403,7 @@ mod tests {
                 );
                 assert!(p.ack);
             }
-            other => panic!("expected Ping, got {:?}", other),
+            other => panic!("expected Ping, got {other:?}"),
         }
     }
 
@@ -1427,7 +1427,7 @@ mod tests {
                 assert_eq!(w.stream_id, 0);
                 assert_eq!(w.increment, 1000);
             }
-            other => panic!("expected WindowUpdate, got {:?}", other),
+            other => panic!("expected WindowUpdate, got {other:?}"),
         }
     }
 
@@ -1443,7 +1443,7 @@ mod tests {
                 // mux parser uses STREAM_ID_MASK (0x7FFFFFFF), so 65535 & 0x7FFFFFFF = 65535
                 assert_eq!(w.increment, 65535);
             }
-            other => panic!("expected WindowUpdate, got {:?}", other),
+            other => panic!("expected WindowUpdate, got {other:?}"),
         }
     }
 
@@ -1460,7 +1460,7 @@ mod tests {
             Err(Err::Failure(e)) => {
                 assert_eq!(e.kind, ParserErrorKind::H2(H2Error::FrameSizeError));
             }
-            other => panic!("expected FrameSizeError, got {:?}", other),
+            other => panic!("expected FrameSizeError, got {other:?}"),
         }
     }
 
@@ -1474,9 +1474,9 @@ mod tests {
         let (_, f) = frame_body(remaining, &header).unwrap();
         match f {
             Frame::Data(d) => {
-                assert_eq!(d.payload.len as u32, DEFAULT_MAX_FRAME_SIZE);
+                assert_eq!(d.payload.len, DEFAULT_MAX_FRAME_SIZE);
             }
-            other => panic!("expected Data, got {:?}", other),
+            other => panic!("expected Data, got {other:?}"),
         }
     }
 
@@ -1489,9 +1489,9 @@ mod tests {
         let (_, f) = frame_body(remaining, &header).unwrap();
         match f {
             Frame::Data(d) => {
-                assert_eq!(d.payload.len as u32, 20000);
+                assert_eq!(d.payload.len, 20000);
             }
-            other => panic!("expected Data, got {:?}", other),
+            other => panic!("expected Data, got {other:?}"),
         }
     }
 
@@ -1546,10 +1546,8 @@ mod tests {
 
         for error in &errors {
             let s = error.as_str();
-            let parsed: H2Error = s
-                .parse()
-                .unwrap_or_else(|_| panic!("failed to parse {}", s));
-            assert_eq!(*error, parsed, "roundtrip failed for {}", s);
+            let parsed: H2Error = s.parse().unwrap_or_else(|_| panic!("failed to parse {s}"));
+            assert_eq!(*error, parsed, "roundtrip failed for {s}");
         }
     }
 
@@ -1578,10 +1576,10 @@ mod tests {
                         assert_eq!(stream_dependency.stream_id, 1);
                         assert_eq!(weight, 15);
                     }
-                    other => panic!("expected Rfc7540, got {:?}", other),
+                    other => panic!("expected Rfc7540, got {other:?}"),
                 }
             }
-            other => panic!("expected Priority, got {:?}", other),
+            other => panic!("expected Priority, got {other:?}"),
         }
     }
 

@@ -62,8 +62,7 @@ pub fn upgrade_worker(server: &mut Server, client: &mut ClientSession, old_worke
         Some(session) => session.token,
         None => {
             client.finish_failure(format!(
-                "Worker {} does not exist, or is stopping / stopped",
-                old_worker_id
+                "Worker {old_worker_id} does not exist, or is stopping / stopped"
             ));
             return;
         }
@@ -154,7 +153,7 @@ impl UpgradeWorkerTask {
         );
 
         // Stop the old worker
-        client.return_processing(format!("Soft stopping worker with id {}", old_worker_id));
+        client.return_processing(format!("Soft stopping worker with id {old_worker_id}"));
         server.scatter_on(
             RequestType::SoftStop(SoftStop {}).into(),
             finish_task,
@@ -209,8 +208,7 @@ impl GatheringTask for UpgradeWorkerTask {
             } => {
                 client.finish_ok(
                     format!(
-                        "Upgrade successful:\n- finished soft stop of worker {:?}\n- finished activation of new worker {:?}",
-                        old_worker_id, new_worker_id
+                        "Upgrade successful:\n- finished soft stop of worker {old_worker_id:?}\n- finished activation of new worker {new_worker_id:?}"
                     )
                 );
             }
@@ -241,16 +239,16 @@ impl Gatherer for UpgradeWorkerTask {
                     UpgradeWorkerProgress::RequestingListenSockets { .. } => {}
                     UpgradeWorkerProgress::StopOldActivateNew { .. } => {
                         client.return_processing(format!(
-                            "Worker {} answered OK to {}. {}",
-                            worker_id, message.id, message.message
+                            "Worker {worker_id} answered OK to {}. {}",
+                            message.id, message.message
                         ))
                     }
                 }
             }
             Ok(ResponseStatus::Failure) => self.errors += 1,
             Ok(ResponseStatus::Processing) => client.return_processing(format!(
-                "Worker {} is processing {}. {}",
-                worker_id, message.id, message.message
+                "Worker {worker_id} is processing {}. {}",
+                message.id, message.message
             )),
             Err(e) => warn!("error decoding response status: {}", e),
         }
@@ -323,8 +321,7 @@ pub fn upgrade_main(server: &mut Server, client: &mut ClientSession) {
             Ok(tuple) => tuple,
             Err(fork_error) => {
                 client.finish_failure(format!(
-                    "Could not start a new main process by forking: {}",
-                    fork_error
+                    "Could not start a new main process by forking: {fork_error}"
                 ));
                 return;
             }
@@ -341,8 +338,7 @@ pub fn upgrade_main(server: &mut Server, client: &mut ClientSession) {
         client.finish_failure("Upgrade of main process failed: no feedback from the new main");
     } else {
         client.finish_ok(format!(
-            "Upgrade successful, closing main process. New main process has pid {}",
-            new_main_pid
+            "Upgrade successful, closing main process. New main process has pid {new_main_pid}"
         ));
         server.run_state = ServerState::Stopping;
     }

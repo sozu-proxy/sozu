@@ -719,7 +719,7 @@ impl HttpProxy {
     pub fn add_http_frontend(&mut self, front: RequestHttpFrontend) -> Result<(), ProxyError> {
         let front = front.clone().to_frontend().map_err(|request_error| {
             ProxyError::WrongInputFrontend {
-                front,
+                front: Box::new(front),
                 error: request_error.to_string(),
             }
         })?;
@@ -744,7 +744,7 @@ impl HttpProxy {
     pub fn remove_http_frontend(&mut self, front: RequestHttpFrontend) -> Result<(), ProxyError> {
         let front = front.clone().to_frontend().map_err(|request_error| {
             ProxyError::WrongInputFrontend {
-                front,
+                front: Box::new(front),
                 error: request_error.to_string(),
             }
         })?;
@@ -784,7 +784,7 @@ impl HttpProxy {
         if !socket_errors.is_empty() {
             return Err(ProxyError::SoftStop {
                 proxy_protocol: "HTTP".to_string(),
-                error: format!("Error deregistering listen sockets: {:?}", socket_errors),
+                error: format!("Error deregistering listen sockets: {socket_errors:?}"),
             });
         }
 
@@ -807,7 +807,7 @@ impl HttpProxy {
         if !socket_errors.is_empty() {
             return Err(ProxyError::HardStop {
                 proxy_protocol: "HTTP".to_string(),
-                error: format!("Error deregistering listen sockets: {:?}", socket_errors),
+                error: format!("Error deregistering listen sockets: {socket_errors:?}"),
             });
         }
 
@@ -1533,7 +1533,7 @@ mod tests {
 
         let address = SocketAddress::new_v4(127, 0, 0, 1, 1030);
 
-        let default_config = ListenerBuilder::new_http(address.clone())
+        let default_config = ListenerBuilder::new_http(address)
             .to_http(None)
             .expect("Could not create default HTTP listener config");
 

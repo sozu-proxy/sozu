@@ -195,7 +195,7 @@ impl MetricsMap {
 
                 // convert time metrics to a histogram format, on top of percentiles
                 if let AggregatedMetric::Time(hist) = metric {
-                    filtered.push((format!("{}_histogram", name), filter_histogram(hist)));
+                    filtered.push((format!("{name}_histogram"), filter_histogram(hist)));
                 }
                 filtered.into_iter()
             })
@@ -485,8 +485,7 @@ impl LocalDrain {
         }
 
         Err(MetricError::NoMetrics(format!(
-            "No metric for backend {}",
-            backend_id
+            "No metric for backend {backend_id}"
         )))
     }
 
