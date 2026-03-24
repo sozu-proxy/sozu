@@ -219,16 +219,32 @@ and `HttpsListenerConfig` expose optional fields:
 
 ```protobuf
 // In HttpListenerConfig and HttpsListenerConfig:
+// Flood detection thresholds:
 optional uint32 h2_max_rst_stream_per_window = 13;
 optional uint32 h2_max_ping_per_window = 14;
 optional uint32 h2_max_settings_per_window = 15;
 optional uint32 h2_max_empty_data_per_window = 16;
 optional uint32 h2_max_continuation_frames = 17;
 optional uint32 h2_max_glitch_count = 18;
+// Connection tuning:
+optional uint32 h2_initial_connection_window = 19;
+optional uint32 h2_max_concurrent_streams = 20;
+optional uint32 h2_stream_shrink_ratio = 21;
 ```
 
-When absent (`None`), the built-in defaults from `H2FloodConfig::default()` apply.
-This allows operators to tune thresholds per listener based on traffic patterns.
+When absent (`None`), the built-in defaults apply:
+- Flood thresholds from `H2FloodConfig::default()`
+- Connection tuning from `H2ConnectionConfig::default()`
+
+`H2ConnectionConfig` controls connection-level parameters:
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `initial_connection_window` | 1048576 (1MB) | Connection receive window (RFC 9113 §6.9.2), clamped to [65535, 2^31-1] |
+| `max_concurrent_streams` | 100 | `SETTINGS_MAX_CONCURRENT_STREAMS`, also sizes the pending WINDOW_UPDATE cap |
+| `stream_shrink_ratio` | 2 | Stream Vec shrink threshold: `total > active * ratio`, minimum 2 |
+
+This allows operators to tune both security and performance per listener.
 
 ---
 

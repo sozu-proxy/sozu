@@ -574,17 +574,10 @@ impl L7ListenerHandler for HttpListener {
     }
 
     fn get_h2_connection_config(&self) -> crate::protocol::mux::H2ConnectionConfig {
-        let defaults = crate::protocol::mux::H2ConnectionConfig::default();
-        crate::protocol::mux::H2ConnectionConfig::new(
-            self.config
-                .h2_initial_connection_window
-                .unwrap_or(defaults.initial_connection_window),
-            self.config
-                .h2_max_concurrent_streams
-                .unwrap_or(defaults.max_concurrent_streams),
-            self.config
-                .h2_stream_shrink_ratio
-                .unwrap_or(defaults.stream_shrink_ratio),
+        crate::protocol::mux::H2ConnectionConfig::from_optional(
+            self.config.h2_initial_connection_window,
+            self.config.h2_max_concurrent_streams,
+            self.config.h2_stream_shrink_ratio,
         )
     }
 }

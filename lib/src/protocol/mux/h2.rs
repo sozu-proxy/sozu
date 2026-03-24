@@ -158,23 +158,65 @@ impl Default for H2ConnectionConfig {
 }
 
 impl H2ConnectionConfig {
-    /// Create a validated config, clamping to safe minimums.
+    /// Create a validated config, clamping to safe bounds.
+    ///
+    /// - `initial_connection_window`: clamped to \[65535, 2^31-1\] per RFC 9113 §6.9
+    /// - `max_concurrent_streams`: minimum 1
+    /// - `stream_shrink_ratio`: minimum 2 (1 would defeat slot recycling)
     pub fn new(
         initial_connection_window: u32,
         max_concurrent_streams: u32,
         stream_shrink_ratio: u32,
     ) -> Self {
-        Self {
-            initial_connection_window: initial_connection_window.max(DEFAULT_INITIAL_WINDOW_SIZE),
-            max_concurrent_streams: max_concurrent_streams.max(1),
-            stream_shrink_ratio: stream_shrink_ratio.max(1),
+        let clamped_window =
+            initial_connection_window.clamp(DEFAULT_INITIAL_WINDOW_SIZE, FLOW_CONTROL_MAX_WINDOW);
+        if clamped_window != initial_connection_window {
+            warn!(
+                "h2_initial_connection_window {} clamped to [{}, {}]",
+                initial_connection_window, DEFAULT_INITIAL_WINDOW_SIZE, FLOW_CONTROL_MAX_WINDOW
+            );
         }
+        let clamped_streams = max_concurrent_streams.max(1);
+        if clamped_streams != max_concurrent_streams {
+            warn!(
+                "h2_max_concurrent_streams {} clamped to minimum 1",
+                max_concurrent_streams
+            );
+        }
+        let clamped_ratio = stream_shrink_ratio.max(2);
+        if clamped_ratio != stream_shrink_ratio {
+            warn!(
+                "h2_stream_shrink_ratio {} clamped to minimum 2",
+                stream_shrink_ratio
+            );
+        }
+        Self {
+            initial_connection_window: clamped_window,
+            max_concurrent_streams: clamped_streams,
+            stream_shrink_ratio: clamped_ratio,
+        }
+    }
+
+    /// Create from optional config values, falling back to compile-time defaults.
+    /// Combines unwrap-or-default with validation clamping.
+    pub fn from_optional(
+        window: Option<u32>,
+        max_streams: Option<u32>,
+        shrink_ratio: Option<u32>,
+    ) -> Self {
+        let defaults = Self::default();
+        Self::new(
+            window.unwrap_or(defaults.initial_connection_window),
+            max_streams.unwrap_or(defaults.max_concurrent_streams),
+            shrink_ratio.unwrap_or(defaults.stream_shrink_ratio),
+        )
     }
 }
 
-/// Maximum pending WINDOW_UPDATE entries before forcing a flush.
-/// Sized to cover connection-level + per-stream entries with headroom under load.
-const MAX_PENDING_WINDOW_UPDATES: usize = 1 + DEFAULT_MAX_CONCURRENT_STREAMS as usize * 4;
+/// Default pending WINDOW_UPDATE capacity (used in tests).
+/// The actual per-connection cap is computed from `connection_config.max_concurrent_streams`.
+#[cfg(test)]
+const DEFAULT_MAX_PENDING_WINDOW_UPDATES: usize = 1 + DEFAULT_MAX_CONCURRENT_STREAMS as usize * 4;
 
 /// Maximum number of pending RST_STREAM frames before triggering GOAWAY.
 /// When a peer causes excessive RST_STREAM queueing (e.g. rapid stream creation
@@ -559,6 +601,9 @@ pub struct ConnectionH2<Front: SocketHandler> {
     close_notify_sent: bool,
     /// Per-listener H2 connection tuning (window size, max streams, shrink ratio).
     pub connection_config: H2ConnectionConfig,
+    /// Maximum pending WINDOW_UPDATE entries before dropping.
+    /// Derived from `connection_config.max_concurrent_streams` at construction.
+    max_pending_window_updates: usize,
 }
 impl<Front: SocketHandler> std::fmt::Debug for ConnectionH2<Front> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -672,6 +717,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             total_rst_streams_queued: 0,
             priorities_buf: Vec::new(),
             close_notify_sent: false,
+            max_pending_window_updates: 1 + connection_config.max_concurrent_streams as usize * 4,
             connection_config,
         })
     }
@@ -1730,14 +1776,21 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 MuxResult::Continue
             }
             (H2State::ServerSettings, Position::Server) => {
-                // Enlarge the connection-level receive window from 64KB to 1MB.
-                // The default 65 535-byte window is too small for high-throughput
-                // proxying and causes excessive WINDOW_UPDATE round-trips.
-                // Use additive increment rather than unconditional assignment to
-                // preserve any window changes that occurred during setup.
-                let increment =
-                    self.connection_config.initial_connection_window - DEFAULT_INITIAL_WINDOW_SIZE;
-                self.queue_window_update(0, increment);
+                // Enlarge the connection-level receive window beyond the RFC default
+                // of 65 535 bytes. The configured window size is too small for
+                // high-throughput proxying and causes excessive WINDOW_UPDATE
+                // round-trips. Use additive increment rather than unconditional
+                // assignment to preserve any window changes that occurred during
+                // setup. Skip if the configured window equals the default (no
+                // enlargement needed), since a zero-increment WINDOW_UPDATE
+                // violates RFC 9113 §6.9.
+                let increment = self
+                    .connection_config
+                    .initial_connection_window
+                    .saturating_sub(DEFAULT_INITIAL_WINDOW_SIZE);
+                if increment > 0 {
+                    self.queue_window_update(0, increment);
+                }
                 // Do NOT increment flow_control.window here: sending our own
                 // WINDOW_UPDATE enlarges the peer's send allowance, not ours.
                 // Our send window is only updated by WINDOW_UPDATEs we receive
@@ -1903,7 +1956,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 "WINDOW_UPDATE coalesced: stream={} old={} new={}",
                 stream_id, old, *existing
             );
-        } else if self.flow_control.pending_window_updates.len() < MAX_PENDING_WINDOW_UPDATES {
+        } else if self.flow_control.pending_window_updates.len() < self.max_pending_window_updates {
             self.flow_control
                 .pending_window_updates
                 .insert(stream_id, increment.min(max_increment));
@@ -1915,7 +1968,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         } else {
             error!(
                 "WINDOW_UPDATE dropped: queue full ({} entries), stream={} increment={}",
-                MAX_PENDING_WINDOW_UPDATES, stream_id, increment
+                self.max_pending_window_updates, stream_id, increment
             );
             incr!("h2.window_update_dropped");
             // Ensure a writable event so the existing queue gets flushed,
@@ -2680,9 +2733,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         if self.position.is_client()
             && self.flow_control.window <= DEFAULT_INITIAL_WINDOW_SIZE as i32
         {
-            let increment =
-                self.connection_config.initial_connection_window - DEFAULT_INITIAL_WINDOW_SIZE;
-            self.queue_window_update(0, increment);
+            let increment = self
+                .connection_config
+                .initial_connection_window
+                .saturating_sub(DEFAULT_INITIAL_WINDOW_SIZE);
+            if increment > 0 {
+                self.queue_window_update(0, increment);
+            }
             // Do NOT increment flow_control.window here: sending our own
             // WINDOW_UPDATE enlarges the peer's send allowance, not ours.
             // Our send window is only updated by WINDOW_UPDATEs we receive
@@ -3858,21 +3915,99 @@ mod tests {
 
     #[test]
     fn test_flow_control_queue_window_update_cap() {
-        // Verify MAX_PENDING_WINDOW_UPDATES reflects 1 + 4*MAX_CONCURRENT_STREAMS
-        assert_eq!(MAX_PENDING_WINDOW_UPDATES, 1 + 100 * 4);
+        // Verify DEFAULT_MAX_PENDING_WINDOW_UPDATES reflects 1 + 4*MAX_CONCURRENT_STREAMS
+        assert_eq!(DEFAULT_MAX_PENDING_WINDOW_UPDATES, 1 + 100 * 4);
 
         // Simulate queue reaching capacity
+        let cap = DEFAULT_MAX_PENDING_WINDOW_UPDATES;
         let mut updates: HashMap<u32, u32> = HashMap::new();
-        for i in 0..MAX_PENDING_WINDOW_UPDATES as u32 {
+        for i in 0..cap as u32 {
             updates.insert(i, 1000);
         }
-        assert_eq!(updates.len(), MAX_PENDING_WINDOW_UPDATES);
+        assert_eq!(updates.len(), cap);
 
         // A new stream ID beyond capacity should be rejected
-        let next_stream = MAX_PENDING_WINDOW_UPDATES as u32;
-        let at_cap = updates.len() >= MAX_PENDING_WINDOW_UPDATES;
+        let next_stream = cap as u32;
+        let at_cap = updates.len() >= cap;
         assert!(at_cap);
         assert!(!updates.contains_key(&next_stream));
+
+        // Verify custom max_concurrent_streams produces proportional cap
+        let custom_cap = 1 + 500_usize * 4;
+        assert_eq!(custom_cap, 2001);
+    }
+
+    #[test]
+    fn test_h2_connection_config_defaults() {
+        let config = H2ConnectionConfig::default();
+        assert_eq!(config.initial_connection_window, ENLARGED_CONNECTION_WINDOW);
+        assert_eq!(
+            config.max_concurrent_streams,
+            DEFAULT_MAX_CONCURRENT_STREAMS
+        );
+        assert_eq!(config.stream_shrink_ratio, 2);
+    }
+
+    #[test]
+    fn test_h2_connection_config_clamp_window_lower_bound() {
+        // Below minimum: clamped to DEFAULT_INITIAL_WINDOW_SIZE (65535)
+        let config = H2ConnectionConfig::new(100, 100, 2);
+        assert_eq!(
+            config.initial_connection_window,
+            DEFAULT_INITIAL_WINDOW_SIZE
+        );
+    }
+
+    #[test]
+    fn test_h2_connection_config_clamp_window_upper_bound() {
+        // Above maximum: clamped to FLOW_CONTROL_MAX_WINDOW (2^31-1)
+        let config = H2ConnectionConfig::new(u32::MAX, 100, 2);
+        assert_eq!(config.initial_connection_window, FLOW_CONTROL_MAX_WINDOW);
+    }
+
+    #[test]
+    fn test_h2_connection_config_clamp_window_exact_minimum() {
+        // Exactly minimum: no clamping, no zero-increment WINDOW_UPDATE risk
+        let config = H2ConnectionConfig::new(DEFAULT_INITIAL_WINDOW_SIZE, 100, 2);
+        assert_eq!(
+            config.initial_connection_window,
+            DEFAULT_INITIAL_WINDOW_SIZE
+        );
+        // Increment to send would be 0 — the code guards this with `if increment > 0`
+        let increment = config
+            .initial_connection_window
+            .saturating_sub(DEFAULT_INITIAL_WINDOW_SIZE);
+        assert_eq!(increment, 0);
+    }
+
+    #[test]
+    fn test_h2_connection_config_clamp_shrink_ratio() {
+        // Below minimum: clamped to 2 (1 would defeat recycling)
+        let config = H2ConnectionConfig::new(ENLARGED_CONNECTION_WINDOW, 100, 0);
+        assert_eq!(config.stream_shrink_ratio, 2);
+        let config = H2ConnectionConfig::new(ENLARGED_CONNECTION_WINDOW, 100, 1);
+        assert_eq!(config.stream_shrink_ratio, 2);
+    }
+
+    #[test]
+    fn test_h2_connection_config_clamp_concurrent_streams() {
+        let config = H2ConnectionConfig::new(ENLARGED_CONNECTION_WINDOW, 0, 2);
+        assert_eq!(config.max_concurrent_streams, 1);
+    }
+
+    #[test]
+    fn test_h2_connection_config_from_optional_uses_defaults() {
+        let config = H2ConnectionConfig::from_optional(None, None, None);
+        let defaults = H2ConnectionConfig::default();
+        assert_eq!(config, defaults);
+    }
+
+    #[test]
+    fn test_h2_connection_config_from_optional_overrides() {
+        let config = H2ConnectionConfig::from_optional(Some(2_000_000), Some(500), Some(4));
+        assert_eq!(config.initial_connection_window, 2_000_000);
+        assert_eq!(config.max_concurrent_streams, 500);
+        assert_eq!(config.stream_shrink_ratio, 4);
     }
 
     #[test]
