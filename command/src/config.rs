@@ -296,6 +296,12 @@ pub struct ListenerBuilder {
     pub h2_max_continuation_frames: Option<u32>,
     /// H2 flood detection: max accumulated protocol anomalies before ENHANCE_YOUR_CALM
     pub h2_max_glitch_count: Option<u32>,
+    /// H2 connection-level receive window size in bytes (RFC 9113 §6.9.2). Default: 1048576 (1MB).
+    pub h2_initial_connection_window: Option<u32>,
+    /// Maximum concurrent H2 streams (SETTINGS_MAX_CONCURRENT_STREAMS). Default: 100.
+    pub h2_max_concurrent_streams: Option<u32>,
+    /// Shrink threshold ratio for recycled stream slots. Default: 2.
+    pub h2_stream_shrink_ratio: Option<u32>,
 }
 
 pub fn default_sticky_name() -> String {
@@ -358,6 +364,9 @@ impl ListenerBuilder {
             h2_max_empty_data_per_window: None,
             h2_max_continuation_frames: None,
             h2_max_glitch_count: None,
+            h2_initial_connection_window: None,
+            h2_max_concurrent_streams: None,
+            h2_stream_shrink_ratio: None,
         }
     }
 
@@ -520,6 +529,9 @@ impl ListenerBuilder {
             h2_max_empty_data_per_window: self.h2_max_empty_data_per_window,
             h2_max_continuation_frames: self.h2_max_continuation_frames,
             h2_max_glitch_count: self.h2_max_glitch_count,
+            h2_initial_connection_window: self.h2_initial_connection_window,
+            h2_max_concurrent_streams: self.h2_max_concurrent_streams,
+            h2_stream_shrink_ratio: self.h2_stream_shrink_ratio,
             ..Default::default()
         };
 
@@ -653,6 +665,9 @@ impl ListenerBuilder {
             h2_max_empty_data_per_window: self.h2_max_empty_data_per_window,
             h2_max_continuation_frames: self.h2_max_continuation_frames,
             h2_max_glitch_count: self.h2_max_glitch_count,
+            h2_initial_connection_window: self.h2_initial_connection_window,
+            h2_max_concurrent_streams: self.h2_max_concurrent_streams,
+            h2_stream_shrink_ratio: self.h2_stream_shrink_ratio,
         };
 
         Ok(https_listener_config)

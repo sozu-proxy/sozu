@@ -62,8 +62,8 @@ use crate::{
 };
 
 pub use crate::protocol::mux::{
-    h1::ConnectionH1, h2::ConnectionH2, h2::H2ByteAccounting, h2::H2DrainState, h2::H2FloodConfig,
-    h2::H2FlowControl, parser::H2Error,
+    h1::ConnectionH1, h2::ConnectionH2, h2::H2ByteAccounting, h2::H2ConnectionConfig,
+    h2::H2DrainState, h2::H2FloodConfig, h2::H2FlowControl, parser::H2Error,
 };
 
 // ── Tuning Constants ─────────────────────────────────────────────────────────
@@ -435,12 +435,14 @@ impl<Front: SocketHandler> Connection<Front> {
         pool: Weak<RefCell<Pool>>,
         timeout_container: TimeoutContainer,
         flood_config: h2::H2FloodConfig,
+        connection_config: h2::H2ConnectionConfig,
     ) -> Option<Connection<Front>> {
         Some(Connection::H2(ConnectionH2::new(
             front_stream,
             Position::Server,
             pool,
             flood_config,
+            connection_config,
             timeout_container,
             Some((H2StreamId::Zero, h2::CLIENT_PREFACE_SIZE)),
             Ready::READABLE | Ready::HUP | Ready::ERROR,
@@ -454,6 +456,7 @@ impl<Front: SocketHandler> Connection<Front> {
         pool: Weak<RefCell<Pool>>,
         timeout_container: TimeoutContainer,
         flood_config: h2::H2FloodConfig,
+        connection_config: h2::H2ConnectionConfig,
     ) -> Option<Connection<Front>> {
         Some(Connection::H2(ConnectionH2::new(
             front_stream,
@@ -464,6 +467,7 @@ impl<Front: SocketHandler> Connection<Front> {
             ),
             pool,
             flood_config,
+            connection_config,
             timeout_container,
             None,
             Ready::WRITABLE | Ready::HUP | Ready::ERROR,
@@ -1179,6 +1183,9 @@ pub struct Context<L: ListenerHandler + L7ListenerHandler> {
     pub session_address: Option<SocketAddr>,
     pub public_address: SocketAddr,
     pub debug: DebugHistory,
+    /// Shrink threshold ratio for recycled stream slots.
+    /// Vec is shrunk when total_slots > active_streams * ratio.
+    pub h2_stream_shrink_ratio: usize,
 }
 
 impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
@@ -1188,6 +1195,10 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
         session_address: Option<SocketAddr>,
         public_address: SocketAddr,
     ) -> Self {
+        let h2_stream_shrink_ratio = listener
+            .borrow()
+            .get_h2_connection_config()
+            .stream_shrink_ratio as usize;
         Self {
             streams: Vec::new(),
             pool,
@@ -1195,6 +1206,7 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
             session_address,
             public_address,
             debug: DebugHistory::new(),
+            h2_stream_shrink_ratio,
         }
     }
 
@@ -1242,7 +1254,7 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
             // Recycle entries (more than 2x active streams of total capacity).
             let active = self.active_len();
             let total = self.streams.len();
-            if total > 1 && active > 0 && total > active * 2 {
+            if total > 1 && active > 0 && total > active * self.h2_stream_shrink_ratio {
                 self.shrink_trailing_recycle();
             }
             return Some(stream_id);
@@ -1441,6 +1453,7 @@ impl Router {
 
             let timeout_container = TimeoutContainer::new(self.configured_connect_timeout, token);
             let flood_config = context.listener.borrow().get_h2_flood_config();
+            let connection_config = context.listener.borrow().get_h2_connection_config();
             let connection = if h2 {
                 match Connection::new_h2_client(
                     socket,
@@ -1449,6 +1462,7 @@ impl Router {
                     context.pool.clone(),
                     timeout_container,
                     flood_config,
+                    connection_config,
                 ) {
                     Some(connection) => connection,
                     None => return Err(BackendConnectionError::MaxBuffers),

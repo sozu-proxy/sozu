@@ -292,11 +292,13 @@ impl HttpsSession {
             AlpnProtocol::H2 => {
                 incr!("http.alpn.h2");
                 let flood_config = self.listener.borrow().get_h2_flood_config();
+                let connection_config = self.listener.borrow().get_h2_connection_config();
                 mux::Connection::new_h2_server(
                     front_stream,
                     self.pool.clone(),
                     handshake.container_frontend_timeout,
                     flood_config,
+                    connection_config,
                 )?
             }
         };
@@ -694,6 +696,21 @@ impl L7ListenerHandler for HttpsListener {
                 .h2_max_glitch_count
                 .unwrap_or(defaults.max_glitch_count),
         }
+    }
+
+    fn get_h2_connection_config(&self) -> crate::protocol::mux::H2ConnectionConfig {
+        let defaults = crate::protocol::mux::H2ConnectionConfig::default();
+        crate::protocol::mux::H2ConnectionConfig::new(
+            self.config
+                .h2_initial_connection_window
+                .unwrap_or(defaults.initial_connection_window),
+            self.config
+                .h2_max_concurrent_streams
+                .unwrap_or(defaults.max_concurrent_streams),
+            self.config
+                .h2_stream_shrink_ratio
+                .unwrap_or(defaults.stream_shrink_ratio),
+        )
     }
 }
 

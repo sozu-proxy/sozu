@@ -1043,6 +1043,15 @@ impl Display for HttpListenerConfig {
             &self.h2_max_continuation_frames,
             &self.h2_max_glitch_count,
         );
+        if let Some(v) = &self.h2_initial_connection_window {
+            table.add_row(row!["h2 initial connection window", v]);
+        }
+        if let Some(v) = &self.h2_max_concurrent_streams {
+            table.add_row(row!["h2 max concurrent streams", v]);
+        }
+        if let Some(v) = &self.h2_stream_shrink_ratio {
+            table.add_row(row!["h2 stream shrink ratio", v]);
+        }
         write!(f, "{table}")
     }
 }
@@ -1090,6 +1099,15 @@ impl Display for HttpsListenerConfig {
             &self.h2_max_continuation_frames,
             &self.h2_max_glitch_count,
         );
+        if let Some(v) = &self.h2_initial_connection_window {
+            table.add_row(row!["h2 initial connection window", v]);
+        }
+        if let Some(v) = &self.h2_max_concurrent_streams {
+            table.add_row(row!["h2 max concurrent streams", v]);
+        }
+        if let Some(v) = &self.h2_stream_shrink_ratio {
+            table.add_row(row!["h2 stream shrink ratio", v]);
+        }
         write!(f, "{table}")
     }
 }

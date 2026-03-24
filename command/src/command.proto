@@ -144,6 +144,16 @@ message HttpListenerConfig {
     optional uint32 h2_max_continuation_frames = 17;
     // Maximum accumulated protocol anomalies before ENHANCE_YOUR_CALM
     optional uint32 h2_max_glitch_count = 18;
+    // H2 connection tuning parameters.
+    // Connection-level receive window size in bytes (RFC 9113 §6.9.2).
+    // Default: 1048576 (1MB). The RFC default of 65535 is too small for proxying.
+    optional uint32 h2_initial_connection_window = 19;
+    // Maximum concurrent H2 streams the proxy accepts (SETTINGS_MAX_CONCURRENT_STREAMS).
+    // Default: 100.
+    optional uint32 h2_max_concurrent_streams = 20;
+    // Shrink threshold ratio for recycled stream slots. Vec is shrunk when
+    // total_slots > active_streams * ratio. Default: 2.
+    optional uint32 h2_stream_shrink_ratio = 21;
 }
 
 // details of an HTTPS listener
@@ -193,6 +203,16 @@ message HttpsListenerConfig {
     optional uint32 h2_max_continuation_frames = 27;
     // Maximum accumulated protocol anomalies before ENHANCE_YOUR_CALM
     optional uint32 h2_max_glitch_count = 28;
+    // H2 connection tuning parameters.
+    // Connection-level receive window size in bytes (RFC 9113 §6.9.2).
+    // Default: 1048576 (1MB). The RFC default of 65535 is too small for proxying.
+    optional uint32 h2_initial_connection_window = 29;
+    // Maximum concurrent H2 streams the proxy accepts (SETTINGS_MAX_CONCURRENT_STREAMS).
+    // Default: 100.
+    optional uint32 h2_max_concurrent_streams = 30;
+    // Shrink threshold ratio for recycled stream slots. Vec is shrunk when
+    // total_slots > active_streams * ratio. Default: 2.
+    optional uint32 h2_stream_shrink_ratio = 31;
 }
 
 // details of an TCP listener

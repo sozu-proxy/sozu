@@ -130,6 +130,48 @@ impl H2FloodConfig {
     }
 }
 
+/// Default stream Vec shrink ratio: shrink when total > active * ratio.
+const DEFAULT_STREAM_SHRINK_RATIO: u32 = 2;
+
+/// Configurable H2 connection tuning parameters.
+///
+/// All values have safe defaults. When configured via listener config,
+/// absent values fall back to compile-time defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct H2ConnectionConfig {
+    /// Connection-level receive window size in bytes (RFC 9113 §6.9.2).
+    pub initial_connection_window: u32,
+    /// Maximum concurrent streams (SETTINGS_MAX_CONCURRENT_STREAMS).
+    pub max_concurrent_streams: u32,
+    /// Shrink threshold ratio for recycled stream slots.
+    pub stream_shrink_ratio: u32,
+}
+
+impl Default for H2ConnectionConfig {
+    fn default() -> Self {
+        Self {
+            initial_connection_window: ENLARGED_CONNECTION_WINDOW,
+            max_concurrent_streams: DEFAULT_MAX_CONCURRENT_STREAMS,
+            stream_shrink_ratio: DEFAULT_STREAM_SHRINK_RATIO,
+        }
+    }
+}
+
+impl H2ConnectionConfig {
+    /// Create a validated config, clamping to safe minimums.
+    pub fn new(
+        initial_connection_window: u32,
+        max_concurrent_streams: u32,
+        stream_shrink_ratio: u32,
+    ) -> Self {
+        Self {
+            initial_connection_window: initial_connection_window.max(DEFAULT_INITIAL_WINDOW_SIZE),
+            max_concurrent_streams: max_concurrent_streams.max(1),
+            stream_shrink_ratio: stream_shrink_ratio.max(1),
+        }
+    }
+}
+
 /// Maximum pending WINDOW_UPDATE entries before forcing a flush.
 /// Sized to cover connection-level + per-stream entries with headroom under load.
 const MAX_PENDING_WINDOW_UPDATES: usize = 1 + DEFAULT_MAX_CONCURRENT_STREAMS as usize * 4;
@@ -515,6 +557,8 @@ pub struct ConnectionH2<Front: SocketHandler> {
     priorities_buf: Vec<StreamId>,
     /// True once we've asked rustls to emit TLS close_notify for this frontend.
     close_notify_sent: bool,
+    /// Per-listener H2 connection tuning (window size, max streams, shrink ratio).
+    pub connection_config: H2ConnectionConfig,
 }
 impl<Front: SocketHandler> std::fmt::Debug for ConnectionH2<Front> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -563,11 +607,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     ///
     /// Differences between server and client are captured by the caller-provided
     /// `position`, `expect_read`, and `readiness_interest` parameters.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         socket: Front,
         position: super::Position,
         pool: std::rc::Weak<std::cell::RefCell<crate::pool::Pool>>,
         flood_config: H2FloodConfig,
+        connection_config: H2ConnectionConfig,
         timeout_container: crate::timer::TimeoutContainer,
         expect_read: Option<(H2StreamId, usize)>,
         readiness_interest: sozu_command::ready::Ready,
@@ -575,7 +621,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         let buffer = pool
             .upgrade()
             .and_then(|pool| pool.borrow_mut().checkout())?;
-        let local_settings = H2Settings::default();
+        let local_settings = H2Settings {
+            settings_max_concurrent_streams: connection_config.max_concurrent_streams,
+            ..H2Settings::default()
+        };
         let mut decoder = loona_hpack::Decoder::new();
         // RFC 7541 §4.2: enforce SETTINGS_HEADER_TABLE_SIZE as the upper bound
         // for dynamic table size updates from the peer
@@ -623,6 +672,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             total_rst_streams_queued: 0,
             priorities_buf: Vec::new(),
             close_notify_sent: false,
+            connection_config,
         })
     }
 
@@ -1685,7 +1735,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 // proxying and causes excessive WINDOW_UPDATE round-trips.
                 // Use additive increment rather than unconditional assignment to
                 // preserve any window changes that occurred during setup.
-                let increment = ENLARGED_CONNECTION_WINDOW - DEFAULT_INITIAL_WINDOW_SIZE;
+                let increment =
+                    self.connection_config.initial_connection_window - DEFAULT_INITIAL_WINDOW_SIZE;
                 self.queue_window_update(0, increment);
                 // Do NOT increment flow_control.window here: sending our own
                 // WINDOW_UPDATE enlarges the peer's send allowance, not ours.
@@ -2186,7 +2237,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             // permanently and eventually stalls the connection.
             let payload_len = data.payload.len() as u32;
             self.flow_control.received_bytes_since_update += payload_len;
-            let conn_threshold = ENLARGED_CONNECTION_WINDOW / 2;
+            let conn_threshold = self.connection_config.initial_connection_window / 2;
             if self.flow_control.received_bytes_since_update >= conn_threshold {
                 let increment = self.flow_control.received_bytes_since_update;
                 self.queue_window_update(0, increment);
@@ -2246,8 +2297,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // Track bytes received and queue WINDOW_UPDATE when threshold reached.
         let payload_u32 = payload_len as u32;
 
-        // Connection-level flow control (use enlarged window threshold)
-        let conn_threshold = ENLARGED_CONNECTION_WINDOW / 2;
+        // Connection-level flow control (use configured window threshold)
+        let conn_threshold = self.connection_config.initial_connection_window / 2;
         self.flow_control.received_bytes_since_update += payload_u32;
         if self.flow_control.received_bytes_since_update >= conn_threshold {
             let increment = self.flow_control.received_bytes_since_update;
@@ -2629,7 +2680,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         if self.position.is_client()
             && self.flow_control.window <= DEFAULT_INITIAL_WINDOW_SIZE as i32
         {
-            let increment = ENLARGED_CONNECTION_WINDOW - DEFAULT_INITIAL_WINDOW_SIZE;
+            let increment =
+                self.connection_config.initial_connection_window - DEFAULT_INITIAL_WINDOW_SIZE;
             self.queue_window_update(0, increment);
             // Do NOT increment flow_control.window here: sending our own
             // WINDOW_UPDATE enlarges the peer's send allowance, not ours.

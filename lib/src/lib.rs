@@ -564,6 +564,12 @@ pub trait L7ListenerHandler {
     fn get_h2_flood_config(&self) -> protocol::mux::H2FloodConfig {
         protocol::mux::H2FloodConfig::default()
     }
+
+    /// H2 connection tuning from the listener config.
+    /// Returns the default config when the listener does not provide custom values.
+    fn get_h2_connection_config(&self) -> protocol::mux::H2ConnectionConfig {
+        protocol::mux::H2ConnectionConfig::default()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
