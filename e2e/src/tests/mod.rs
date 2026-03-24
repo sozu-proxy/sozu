@@ -15,6 +15,7 @@
 #![allow(clippy::useless_format)]
 #![allow(clippy::useless_vec)]
 
+mod fuzz_tests;
 mod h1_security_tests;
 mod h2_security_tests;
 mod h2_tests;
