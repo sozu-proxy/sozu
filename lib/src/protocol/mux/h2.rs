@@ -541,6 +541,24 @@ pub enum H2StreamId {
 }
 
 impl<Front: SocketHandler> ConnectionH2<Front> {
+    fn frontend_hung_up_while_draining(&self) -> bool {
+        matches!(self.position, Position::Server)
+            && self.drain.draining
+            && (self.readiness.event.is_hup() || self.readiness.event.is_error())
+    }
+
+    /// Once the final GOAWAY has been queued and all streams/control frames are
+    /// gone, a peer-side HUP/ERR means any remaining rustls backlog is no
+    /// longer deliverable. Waiting on `socket_wants_write()` in that state can
+    /// deadlock shutdown forever because GOAWAY disables further frame reads.
+    fn peer_gone_after_final_goaway(&self) -> bool {
+        self.frontend_hung_up_while_draining()
+            && matches!(self.state, H2State::GoAway | H2State::Error)
+            && self.streams.is_empty()
+            && self.expect_write.is_none()
+            && self.zero.storage.is_empty()
+    }
+
     /// Shared constructor for both server and client H2 connections.
     ///
     /// Differences between server and client are captured by the caller-provided
@@ -887,6 +905,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         E: Endpoint,
         L: ListenerHandler + L7ListenerHandler,
     {
+        self.prune_inactive_streams_while_closing(context);
+
         // RFC 9113 §6.5: check if peer has timed out on SETTINGS ACK
         if let Some(sent_at) = self.settings_sent_at {
             if sent_at.elapsed() >= SETTINGS_ACK_TIMEOUT {
@@ -932,6 +952,16 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 self.position.count_bytes_in_counter(size);
                 self.bytes.zero_bytes_read += size;
                 if update_readiness_after_read(size, status, &mut self.readiness) {
+                    if matches!(self.position, Position::Server)
+                        && self.drain.draining
+                        && matches!(status, SocketResult::Closed | SocketResult::Error)
+                    {
+                        // During graceful drain, a frontend EOF/HUP means no
+                        // further frame headers or payload bytes can arrive.
+                        // Keeping expect_read here strands the connection in
+                        // Header/Frame forever even after the peer is gone.
+                        self.expect_read = None;
+                    }
                     return MuxResult::Continue;
                 } else if size == amount {
                     self.expect_read = None;
@@ -1338,6 +1368,44 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         self.prioriser.remove(&stream_id);
     }
 
+    /// Drop stream-id mappings for streams that never became active before a
+    /// connection-level close. This happens on incomplete/oversized header
+    /// blocks: the stream slot is created on the initial HEADERS frame, then a
+    /// GOAWAY closes the connection before the request is fully materialized.
+    fn prune_inactive_streams_while_closing<L>(&mut self, context: &mut Context<L>)
+    where
+        L: ListenerHandler + L7ListenerHandler,
+    {
+        if !self.drain.draining || !matches!(self.state, H2State::GoAway | H2State::Error) {
+            return;
+        }
+
+        let stale_streams = self
+            .streams
+            .iter()
+            .filter_map(|(&stream_id, &global_stream_id)| {
+                matches!(
+                    context.streams[global_stream_id].state,
+                    StreamState::Idle | StreamState::Recycle
+                )
+                .then_some((stream_id, global_stream_id))
+            })
+            .collect::<Vec<_>>();
+
+        for (stream_id, global_stream_id) in stale_streams {
+            let stream = &mut context.streams[global_stream_id];
+            if stream.state == StreamState::Idle {
+                stream.front.clear();
+                stream.front.storage.clear();
+                stream.back.clear();
+                stream.back.storage.clear();
+                stream.metrics.reset();
+                stream.state = StreamState::Recycle;
+            }
+            self.remove_dead_stream(stream_id);
+        }
+    }
+
     /// Shrink reusable converter buffers when they grow beyond 16 KB to avoid
     /// holding memory after a burst of large headers.
     fn shrink_converter_buffers(&mut self) {
@@ -1388,6 +1456,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// Returns `Some(result)` if the caller should return early (e.g. socket would
     /// block, GOAWAY triggered), or `None` if writable() should proceed normally.
     fn flush_pending_control_frames(&mut self) -> Option<MuxResult> {
+        if self.frontend_hung_up_while_draining() {
+            self.expect_write = None;
+            self.zero.storage.clear();
+            self.flow_control.pending_window_updates.clear();
+            self.pending_rst_streams.clear();
+        }
+
         // RFC 9113 §6.5: check if peer has timed out on SETTINGS ACK
         if let Some(sent_at) = self.settings_sent_at {
             if sent_at.elapsed() >= SETTINGS_ACK_TIMEOUT {
@@ -1514,6 +1589,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         E: Endpoint,
         L: ListenerHandler + L7ListenerHandler,
     {
+        self.prune_inactive_streams_while_closing(context);
+
         if let Some(result) = self.flush_pending_control_frames() {
             return result;
         }
@@ -1552,6 +1629,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             // the remaining frame payload.
             (H2State::Discard, _) => MuxResult::Continue,
             (H2State::GoAway, _) => {
+                if self.peer_gone_after_final_goaway() {
+                    return MuxResult::CloseSession;
+                }
                 // Flush any remaining TLS response data before disconnecting.
                 // The GoAway state only enters after control frames (our GOAWAY
                 // response) are flushed above, but response DATA frames may still
@@ -1937,6 +2017,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// premature session close while response DATA is still in rustls's
     /// buffer (accepted by `socket_write_vectored` but not yet on the wire).
     pub fn has_pending_write(&self) -> bool {
+        if self.peer_gone_after_final_goaway() {
+            return false;
+        }
         self.expect_write.is_some()
             || !self.zero.storage.is_empty()
             || self.socket.socket_wants_write()
@@ -2835,6 +2918,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 MuxResult::Continue
             }
             Position::Server => {
+                if self.peer_gone_after_final_goaway() {
+                    return MuxResult::CloseSession;
+                }
                 // Don't disconnect immediately if rustls still has buffered TLS
                 // records. Returning CloseSession here triggers shutdown(Write)
                 // which sends FIN — but any TLS records still in rustls's buffer

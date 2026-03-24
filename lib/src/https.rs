@@ -320,7 +320,6 @@ impl HttpsSession {
             frontend,
             context,
             router,
-            shutdown_frontend_write_started_at: None,
         }))
     }
 
