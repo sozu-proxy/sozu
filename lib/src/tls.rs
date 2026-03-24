@@ -479,11 +479,11 @@ mod tests {
         };
 
         let wildcard_example_org_fingerprint = resolver.add_certificate(&AddCertificate {
-            address: address.clone(),
+            address,
             certificate: wildcard_example_org,
             expired_at: Some(
                 (SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?
-                    + Duration::from_secs(1 * 365 * 24 * 3600))
+                    + Duration::from_secs(365 * 24 * 3600))
                 .as_secs() as i64,
             ),
         })?;
@@ -512,7 +512,6 @@ mod tests {
                     + Duration::from_secs(2 * 365 * 24 * 3600))
                 .as_secs() as i64,
             ),
-            ..Default::default()
         })?;
 
         let www_example_org = resolver
@@ -567,7 +566,7 @@ mod tests {
         };
 
         let fingerprint_2y = resolver.add_certificate(&AddCertificate {
-            address: address.clone(),
+            address,
             certificate: certificate_and_key_2y,
             expired_at: None,
         })?;
@@ -626,7 +625,7 @@ mod tests {
         };
 
         let fingerprint_1y_overriden = resolver.add_certificate(&AddCertificate {
-            address: address.clone(),
+            address,
             certificate: certificate_and_key_1y,
             expired_at: Some(
                 (SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?

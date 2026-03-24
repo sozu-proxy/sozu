@@ -79,6 +79,7 @@ pub enum WorkerError {
 }
 
 /// called within a worker process, this starts the actual proxy
+#[allow(dead_code)]
 pub fn begin_worker_process(
     worker_to_main_channel_fd: i32,
     worker_to_main_scm_fd: i32,

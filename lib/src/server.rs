@@ -446,8 +446,7 @@ impl Server {
                 }
             } else {
                 panic!(
-                    "plz give me a status request first when I start, you sent me this instead: {:?}",
-                    msg
+                    "plz give me a status request first when I start, you sent me this instead: {msg:?}"
                 );
             }
             server.unblock_channel();
@@ -884,7 +883,7 @@ impl Server {
                         break;
                     }
 
-                    if self.channel.back_buf.available_data() == 0 && queue.len() == 0 {
+                    if self.channel.back_buf.available_data() == 0 && queue.is_empty() {
                         break;
                     }
                 }
@@ -1224,7 +1223,7 @@ impl Server {
                     }
                     Err(activate_error) => worker_response_error(
                         req_id,
-                        format!("Could not activate HTTP listener: {}", activate_error),
+                        format!("Could not activate HTTP listener: {activate_error}"),
                     ),
                 }
             }
@@ -1246,7 +1245,7 @@ impl Server {
                     }
                     Err(activate_error) => worker_response_error(
                         req_id,
-                        format!("Could not activate HTTPS listener: {}", activate_error),
+                        format!("Could not activate HTTPS listener: {activate_error}"),
                     ),
                 }
             }
@@ -1265,7 +1264,7 @@ impl Server {
                     }
                     Err(activate_error) => worker_response_error(
                         req_id,
-                        format!("Could not activate TCP listener: {}", activate_error),
+                        format!("Could not activate TCP listener: {activate_error}"),
                     ),
                 }
             }
@@ -1382,8 +1381,7 @@ impl Server {
                         return worker_response_error(
                             req_id,
                             format!(
-                                "Could not deactivate TCP listener at address {:?}: {}",
-                                address, e
+                                "Could not deactivate TCP listener at address {address:?}: {e}"
                             ),
                         );
                     }

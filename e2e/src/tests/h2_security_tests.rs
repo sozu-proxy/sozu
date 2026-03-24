@@ -1632,8 +1632,7 @@ fn try_h2_multi_cluster_routing() -> State {
     let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
 
     let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
-    let mut worker =
-        Worker::start_new_worker_owned("H2-MULTI-CLUSTER", config, listeners, state);
+    let mut worker = Worker::start_new_worker_owned("H2-MULTI-CLUSTER", config, listeners, state);
 
     // Setup HTTPS listener
     worker.send_proxy_request_type(RequestType::AddHttpsListener(
@@ -1878,8 +1877,7 @@ impl CapturingBackend {
         let captured_clone = captured.clone();
 
         let thread = thread::spawn(move || {
-            let listener =
-                bind_std_listener(address, "capturing backend");
+            let listener = bind_std_listener(address, "capturing backend");
             listener
                 .set_nonblocking(true)
                 .expect("could not set nonblocking");

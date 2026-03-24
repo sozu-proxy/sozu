@@ -23,19 +23,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use http_body_util::{BodyExt, Full};
-use hyper::{Response, body::Bytes, service::service_fn};
-use hyper_util::{
-    rt::{TokioExecutor, TokioIo},
-    server::conn::auto::Builder as ServerBuilder,
-};
-use sozu_command_lib::{
-    config::ListenerBuilder,
-    proto::command::{
-        ActivateListener, AddCertificate, CertificateAndKey, ListenerType, RequestHttpFrontend,
-        SocketAddress, request::RequestType,
-    },
-};
 use super::h2_utils::{
     H2_ERROR_ENHANCE_YOUR_CALM, H2_ERROR_FLOW_CONTROL_ERROR, H2_ERROR_FRAME_SIZE_ERROR,
     H2_ERROR_REFUSED_STREAM, H2_FRAME_GOAWAY, H2Frame, collect_response_frames, contains_goaway,
@@ -56,6 +43,19 @@ use crate::{
     port_registry::{bind_std_listener, bind_tokio_listener},
     sozu::worker::Worker,
     tests::{State, provide_port, repeat_until_error_or, tests::create_local_address},
+};
+use http_body_util::{BodyExt, Full};
+use hyper::{Response, body::Bytes, service::service_fn};
+use hyper_util::{
+    rt::{TokioExecutor, TokioIo},
+    server::conn::auto::Builder as ServerBuilder,
+};
+use sozu_command_lib::{
+    config::ListenerBuilder,
+    proto::command::{
+        ActivateListener, AddCertificate, CertificateAndKey, ListenerType, RequestHttpFrontend,
+        SocketAddress, request::RequestType,
+    },
 };
 
 // ============================================================================
@@ -5080,8 +5080,7 @@ fn try_h2_graceful_shutdown_completes_large_transfer() -> State {
     let front_port = provide_port();
     let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
     let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
-    let mut worker =
-        Worker::start_new_worker_owned("H2-GRACEFUL-LARGE", config, listeners, state);
+    let mut worker = Worker::start_new_worker_owned("H2-GRACEFUL-LARGE", config, listeners, state);
 
     worker.send_proxy_request_type(RequestType::AddHttpsListener(
         ListenerBuilder::new_https(front_address.clone())
@@ -7501,8 +7500,7 @@ fn try_h2_large_h1_response_close_delimited() -> State {
     let front_port = provide_port();
     let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
     let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
-    let mut worker =
-        Worker::start_new_worker_owned("H2-LARGE-H1-CLOSE", config, listeners, state);
+    let mut worker = Worker::start_new_worker_owned("H2-LARGE-H1-CLOSE", config, listeners, state);
 
     worker.send_proxy_request_type(RequestType::AddHttpsListener(
         ListenerBuilder::new_https(front_address.clone())
@@ -7646,8 +7644,7 @@ fn try_h2_large_response_flow_control_pressure() -> State {
     let front_port = provide_port();
     let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
     let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
-    let mut worker =
-        Worker::start_new_worker_owned("H2-FLOW-PRESSURE", config, listeners, state);
+    let mut worker = Worker::start_new_worker_owned("H2-FLOW-PRESSURE", config, listeners, state);
 
     worker.send_proxy_request_type(RequestType::AddHttpsListener(
         ListenerBuilder::new_https(front_address.clone())

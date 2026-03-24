@@ -490,8 +490,7 @@ fn try_tcp_backend_connection_failure() -> State {
     let dead_backend_address = create_unbound_local_address();
 
     let (config, listeners, state) = Worker::empty_tcp_config(front_address);
-    let mut worker =
-        Worker::start_new_worker_owned("TCP-DEADBACKEND", config, listeners, state);
+    let mut worker = Worker::start_new_worker_owned("TCP-DEADBACKEND", config, listeners, state);
 
     worker.send_proxy_request_type(RequestType::AddTcpListener(
         ListenerBuilder::new_tcp(front_address.into())

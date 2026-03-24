@@ -464,7 +464,7 @@ impl ConfigState {
         if tcp_frontends.contains(&tcp_frontend) {
             return Err(StateError::Exists {
                 kind: ObjectKind::TcpFrontend,
-                id: format!("{:?}", tcp_frontend),
+                id: format!("{tcp_frontend:?}"),
             });
         }
 
@@ -481,7 +481,7 @@ impl ConfigState {
                 .get_mut(&front_to_remove.cluster_id)
                 .ok_or(StateError::NotFound {
                     kind: ObjectKind::TcpFrontend,
-                    id: format!("{:?}", front_to_remove),
+                    id: format!("{front_to_remove:?}"),
                 })?;
 
         let len = tcp_frontends.len();
@@ -2165,7 +2165,7 @@ mod tests {
             .dispatch(&RequestType::AddCertificate(add_certificate).into())
             .expect("Could not add certificate");
 
-        println!("state: {:#?}", state);
+        println!("state: {state:#?}");
 
         // let fingerprint: Fingerprint = serde_json::from_str(
         //     "\"ab2618b674e15243fd02a5618c66509e4840ba60e7d64cebec84cdbfeceee0c5\"",
@@ -2179,10 +2179,7 @@ mod tests {
             ),
         });
 
-        println!(
-            "found certificate: {:#?}",
-            certificates_found_by_fingerprint
-        );
+        println!("found certificate: {certificates_found_by_fingerprint:#?}");
 
         assert!(!certificates_found_by_fingerprint.is_empty());
 

@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::{
     io::{Error, ErrorKind},
     os::unix::io::AsRawFd,

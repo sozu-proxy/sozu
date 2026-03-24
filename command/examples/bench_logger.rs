@@ -53,13 +53,11 @@ fn main() {
         "n={n}, pre_generate={pre_generate}, target={target}, colored={colored}, filter={filter}"
     );
     if let Err(e) = setup_logging(&target, colored, None, None, None, &filter, "BENCH") {
-        println!("Could not setup logging: {}", e);
+        println!("Could not setup logging: {e}");
     }
 
     let mut pre_generated_log_iterator;
-    let mut log_iterator = std::iter::repeat(())
-        .take(n)
-        .map(|_| random_log_line(&mut rng));
+    let mut log_iterator = std::iter::repeat_n((), n).map(|_| random_log_line(&mut rng));
 
     let log_iterator = if pre_generate {
         // the pre generated iterator allocates all LogLines to avoid generating them on the fly

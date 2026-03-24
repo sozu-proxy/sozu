@@ -159,7 +159,7 @@ impl Router {
             }
         };
         if !success {
-            return Err(RouterError::AddRoute(format!("{:?}", front)));
+            return Err(RouterError::AddRoute(format!("{front:?}")));
         }
         Ok(())
     }
@@ -194,7 +194,7 @@ impl Router {
             }
         };
         if !remove_success {
-            return Err(RouterError::RemoveRoute(format!("{:?}", front)));
+            return Err(RouterError::RemoveRoute(format!("{front:?}")));
         }
         Ok(())
     }
@@ -463,7 +463,7 @@ impl DomainRule {
             DomainRule::Any => true,
             DomainRule::Wildcard(s) => {
                 let len_without_suffix = hostname.len() - s.len() + 1;
-                hostname.ends_with(s[1..].as_bytes())
+                hostname.ends_with(&s.as_bytes()[1..])
                     && !&hostname[..len_without_suffix].contains(&b'.')
             }
             DomainRule::Exact(s) => s.as_bytes() == hostname,

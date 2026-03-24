@@ -306,10 +306,6 @@
 
 #[macro_use]
 extern crate sozu_command_lib as sozu_command;
-#[cfg(test)]
-#[macro_use]
-extern crate quickcheck;
-
 #[macro_use]
 pub mod util;
 #[macro_use]
@@ -455,6 +451,7 @@ macro_rules! StateMachineBuilder {
         }
 
         $(#[$($state_macros)*])*
+        #[allow(clippy::large_enum_variant)]
         pub enum $state_name {
             $(
                 $(#[$($variant_macros)*])*
@@ -682,7 +679,7 @@ pub enum ProxyError {
     },
     #[error("can not add frontend {front:?}: {error}")]
     WrongInputFrontend {
-        front: RequestHttpFrontend,
+        front: Box<RequestHttpFrontend>,
         error: String,
     },
     #[error("could not add frontend: {0}")]
@@ -1162,7 +1159,7 @@ impl PeakEWMA {
             self.rtt = rtt;
         } else {
             // new_rtt = old_rtt * e^(-elapsed/decay) + observed_rtt * (1 - e^(-elapsed/decay))
-            let weight = (-1.0 * dur.as_nanos() as f64 / self.decay).exp();
+            let weight = (-(dur.as_nanos() as f64) / self.decay).exp();
             self.rtt = self.rtt * weight + rtt * (1.0 - weight);
         }
 

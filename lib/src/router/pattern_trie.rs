@@ -386,7 +386,7 @@ impl<V: Debug + Clone> TrieNode<V> {
     }
 
     pub fn print_recursive(&self, partial_key: &[u8], indent: u8) {
-        let raw_prefix: Vec<u8> = iter::repeat(b' ').take(2 * indent as usize).collect();
+        let raw_prefix: Vec<u8> = iter::repeat_n(b' ', 2 * indent as usize).collect();
         let prefix = str::from_utf8(&raw_prefix).unwrap();
 
         print!("{}{}: ", prefix, str::from_utf8(partial_key).unwrap());

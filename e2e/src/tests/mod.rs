@@ -1,3 +1,20 @@
+#![allow(clippy::clone_on_copy)]
+#![allow(clippy::explicit_counter_loop)]
+#![allow(clippy::field_reassign_with_default)]
+#![allow(clippy::manual_unwrap_or_default)]
+#![allow(clippy::module_inception)]
+#![allow(clippy::needless_borrows_for_generic_args)]
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::redundant_field_names)]
+#![allow(clippy::single_match)]
+#![allow(clippy::type_complexity)]
+#![allow(clippy::uninlined_format_args)]
+#![allow(clippy::unnecessary_cast)]
+#![allow(clippy::unnecessary_map_or)]
+#![allow(clippy::useless_conversion)]
+#![allow(clippy::useless_format)]
+#![allow(clippy::useless_vec)]
+
 mod h1_security_tests;
 mod h2_security_tests;
 mod h2_tests;
@@ -7,10 +24,7 @@ mod tcp_tests;
 mod tests;
 mod tls_tests;
 
-use std::{
-    io::stdin,
-    net::SocketAddr,
-};
+use std::{io::stdin, net::SocketAddr};
 
 use sozu_command_lib::{
     config::ListenerBuilder,

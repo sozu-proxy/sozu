@@ -151,7 +151,7 @@ pub fn resolve_request_timeout(
         match tokio::time::timeout(timeout, fut).await {
             Ok(result) => result,
             Err(_) => {
-                println!("resolve_request timed out after {:?}", timeout);
+                println!("resolve_request timed out after {timeout:?}");
                 None
             }
         }

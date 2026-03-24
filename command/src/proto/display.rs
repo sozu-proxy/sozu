@@ -56,9 +56,9 @@ impl Display for CertificateSummary {
 impl Display for QueryCertificatesFilters {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         if let Some(d) = self.domain.clone() {
-            write!(f, "domain:{}", d)
+            write!(f, "domain:{d}")
         } else if let Some(fp) = self.fingerprint.clone() {
-            write!(f, "domain:{}", fp)
+            write!(f, "domain:{fp}")
         } else {
             write!(f, "all certificates")
         }
@@ -582,13 +582,13 @@ pub fn print_listeners(listeners_list: &ListenersList) -> Result<(), DisplayErro
     println!("\nHTTP LISTENERS\n================");
 
     for (_, http_listener) in listeners_list.http_listeners.iter() {
-        println!("{}", http_listener);
+        println!("{http_listener}");
     }
 
     println!("\nHTTPS LISTENERS\n================");
 
     for (_, https_listener) in listeners_list.https_listeners.iter() {
-        println!("{}", https_listener);
+        println!("{https_listener}");
     }
 
     println!("\nTCP LISTENERS\n================");
@@ -868,7 +868,7 @@ fn print_responses_by_worker(
     json: bool,
 ) -> Result<(), DisplayError> {
     for (worker_id, content) in worker_responses.map.iter() {
-        println!("Worker {}", worker_id);
+        println!("Worker {worker_id}");
         content.display(json)?;
     }
 
@@ -920,7 +920,7 @@ fn print_certificates_by_address(list: &ListOfCertificatesByAddress) -> Result<(
         println!("\t{}:", certs.address);
 
         for summary in certs.certificate_summaries.iter() {
-            println!("\t\t{}", summary);
+            println!("\t\t{summary}");
         }
     }
     Ok(())
@@ -1043,7 +1043,7 @@ impl Display for HttpListenerConfig {
             &self.h2_max_continuation_frames,
             &self.h2_max_glitch_count,
         );
-        write!(f, "{}", table)
+        write!(f, "{table}")
     }
 }
 
@@ -1090,7 +1090,7 @@ impl Display for HttpsListenerConfig {
             &self.h2_max_continuation_frames,
             &self.h2_max_glitch_count,
         );
-        write!(f, "{}", table)
+        write!(f, "{table}")
     }
 }
 

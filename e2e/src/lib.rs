@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+#![allow(unexpected_cfgs)]
 
 mod http_utils;
 mod mock;
