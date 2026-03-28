@@ -38,6 +38,7 @@ Parameters in the global section allow you to define the global settings shared 
 | `connect_timeout`          | maximum time of inactivity for a request to connect                                 |                                          |
 | `request_timeout`          | maximum time of inactivity for a request                                            |                                          |
 | `zombie_check_interval`    | duration between checks for zombie sessions                                         |                                          |
+| `evict_on_queue_full`      | evict least recently active sessions when `max_connections` is reached to make room for new ones. Defaults to `false`: during DDoS, existing connections are more likely legitimate clients — rejecting new (likely malicious) connections is safer. Set to `true` only if overload comes from normal traffic spikes. | `true`, `false` (default: `false`) |
 | `activate_listeners`       | automatically start listeners                                                       |                                          |
 
 _Example:_
