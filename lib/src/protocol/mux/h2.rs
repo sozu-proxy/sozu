@@ -973,7 +973,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 }
                 // CVE-2024-27316: track CONTINUATION frame count and accumulated size
                 self.flood_detector.continuation_count += 1;
-                self.flood_detector.accumulated_header_size += payload_len;
+                self.flood_detector.accumulated_header_size = self
+                    .flood_detector
+                    .accumulated_header_size
+                    .saturating_add(payload_len);
                 if let Some(error) = self.flood_detector.check_flood() {
                     return self.goaway(error);
                 }
@@ -2235,7 +2238,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             Frame::WindowUpdate(wu) => self.handle_window_update_frame(wu, context, endpoint),
             Frame::Continuation(_) => {
                 self.attribute_bytes_to_overhead();
-                error!("CONTINUATION frames are handled inline during header parsing");
+                warn!("CONTINUATION frames are handled inline during header parsing");
                 self.goaway(H2Error::ProtocolError)
             }
         }

@@ -1373,8 +1373,8 @@ impl Router {
                 (_, Position::Client(_, _, BackendStatus::Disconnecting)) => {}
 
                 (true, Position::Client(other_cluster_id, _, BackendStatus::Connected)) => {
-                    if *other_cluster_id == cluster_id {
-                        // Pick the H2 connection with the fewest active streams
+                    if *other_cluster_id == cluster_id && !backend.is_draining() {
+                        // Pick the non-draining H2 connection with the fewest active streams
                         let stream_count = match backend {
                             Connection::H2(h2c) => h2c.streams.len(),
                             Connection::H1(_) => 0,
