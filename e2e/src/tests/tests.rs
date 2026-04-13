@@ -10,7 +10,8 @@ use sozu_command_lib::{
     logging::setup_default_logging,
     proto::command::{
         ActivateListener, AddCertificate, CertificateAndKey, Cluster, CustomHttpAnswers,
-        ListenerType, RemoveBackend, RequestHttpFrontend, SocketAddress, request::RequestType,
+        ListenerType, QueryMetricsOptions, RemoveBackend, RequestHttpFrontend, ResponseStatus,
+        SocketAddress, filtered_metrics, request::RequestType, response_content::ContentType,
     },
     scm_socket::Listeners,
     state::ConfigState,
@@ -63,6 +64,72 @@ fn receive_with_deadline(client: &mut Client, timeout: Duration) -> Option<Strin
         }
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[derive(Debug)]
+struct WorkerMetricSnapshot {
+    client_connections: u64,
+    zombies: i64,
+}
+
+fn query_worker_metrics(worker: &mut Worker) -> WorkerMetricSnapshot {
+    worker.send_proxy_request_type(RequestType::QueryMetrics(QueryMetricsOptions {
+        list: false,
+        cluster_ids: vec![],
+        backend_ids: vec![],
+        metric_names: vec!["client.connections".to_owned(), "zombies".to_owned()],
+        no_clusters: true,
+        workers: false,
+    }));
+    let response = worker
+        .read_proxy_response()
+        .expect("worker should respond to metrics query");
+    assert_eq!(response.id, worker.command_id.last);
+    assert_eq!(response.status, ResponseStatus::Ok as i32, "{response:?}");
+
+    let Some(content) = response.content.and_then(|content| content.content_type) else {
+        panic!("metrics query returned no content");
+    };
+    let ContentType::WorkerMetrics(metrics) = content else {
+        panic!("metrics query returned unexpected content: {content:?}");
+    };
+
+    let client_connections = match metrics
+        .proxy
+        .get("client.connections")
+        .and_then(|metric| metric.inner.as_ref())
+    {
+        Some(filtered_metrics::Inner::Gauge(value)) => *value,
+        other => panic!("client.connections should be a gauge, got {other:?}"),
+    };
+    let zombies = match metrics
+        .proxy
+        .get("zombies")
+        .and_then(|metric| metric.inner.as_ref())
+    {
+        Some(filtered_metrics::Inner::Count(value)) => *value,
+        None => 0,
+        other => panic!("zombies should be a count, got {other:?}"),
+    };
+
+    WorkerMetricSnapshot {
+        client_connections,
+        zombies,
+    }
+}
+
+fn wait_for_client_connections(
+    worker: &mut Worker,
+    expected: u64,
+    timeout: Duration,
+) -> WorkerMetricSnapshot {
+    let deadline = Instant::now() + timeout;
+    let mut snapshot = query_worker_metrics(worker);
+    while snapshot.client_connections != expected && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+        snapshot = query_worker_metrics(worker);
+    }
+    snapshot
 }
 
 pub fn try_async(nb_backends: usize, nb_clients: usize, nb_requests: usize) -> State {
@@ -261,6 +328,57 @@ pub fn try_backend_stop(nb_requests: usize, zombie: Option<u32>) -> State {
         State::Undecided
     } else {
         State::Success
+    }
+}
+
+pub fn try_h1_idle_connection_zombie_metric_increments() -> State {
+    let front_address = create_local_address();
+    let config = Worker::into_config(FileConfig {
+        zombie_check_interval: Some(3),
+        ..FileConfig::default()
+    });
+    let listeners = Listeners::default();
+    let state = ConfigState::new();
+    let (mut worker, _) = setup_async_test(
+        "H1-IDLE-ZOMBIE-METRICS",
+        config,
+        listeners,
+        state,
+        front_address,
+        0,
+        false,
+    );
+
+    let mut client = Client::new(
+        "idle-h1-client",
+        front_address,
+        http_request("GET", "/api", "ping", "localhost"),
+    );
+    client.connect();
+
+    let before = wait_for_client_connections(&mut worker, 1, Duration::from_secs(2));
+    println!("H1 idle zombie metrics before sweep: {before:?}");
+    if before.client_connections != 1 {
+        client.disconnect();
+        worker.soft_stop();
+        let _ = worker.wait_for_server_stop();
+        return State::Fail;
+    }
+
+    thread::sleep(Duration::from_millis(6_500));
+    let _wake_loop = query_worker_metrics(&mut worker);
+    thread::sleep(Duration::from_millis(200));
+    let after = query_worker_metrics(&mut worker);
+    println!("H1 idle zombie metrics after sweep: {after:?}");
+
+    client.disconnect();
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+
+    if stopped && after.client_connections == 0 && after.zombies > before.zombies {
+        State::Success
+    } else {
+        State::Fail
     }
 }
 
@@ -2170,6 +2288,18 @@ fn test_issue_808() {
     //     // if Fail, it means the zombie checker probably crashed
     //     State::Undecided
     // );
+}
+
+#[test]
+fn test_h1_idle_connection_zombie_metric_increments() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H1: idle connection reaped by zombie checker increments zombies metric",
+            try_h1_idle_connection_zombie_metric_increments
+        ),
+        State::Success
+    );
 }
 
 // https://github.com/sozu-proxy/sozu/issues/810
