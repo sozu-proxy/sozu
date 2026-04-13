@@ -40,7 +40,7 @@ use crate::{
             resolve_request,
         },
     },
-    port_registry::{bind_std_listener, bind_tokio_listener},
+    port_registry::{attach_reserved_https_listener, bind_std_listener, bind_tokio_listener},
     sozu::worker::Worker,
     tests::{State, provide_port, repeat_until_error_or, tests::create_local_address},
 };
@@ -51,11 +51,14 @@ use hyper_util::{
     server::conn::auto::Builder as ServerBuilder,
 };
 use sozu_command_lib::{
-    config::ListenerBuilder,
+    config::{FileConfig, ListenerBuilder},
     proto::command::{
-        ActivateListener, AddCertificate, CertificateAndKey, ListenerType, RequestHttpFrontend,
-        SocketAddress, request::RequestType,
+        ActivateListener, AddCertificate, CertificateAndKey, ListenerType, QueryMetricsOptions,
+        RequestHttpFrontend, ResponseStatus, SocketAddress, filtered_metrics, request::RequestType,
+        response_content::ContentType,
     },
+    scm_socket::Listeners,
+    state::ConfigState,
 };
 
 // ============================================================================
@@ -312,6 +315,108 @@ impl Drop for DelayedH2Backend {
     }
 }
 
+#[derive(Debug)]
+struct WorkerMetricSnapshot {
+    client_connections: u64,
+    zombies: i64,
+}
+
+fn setup_h2_listener_only_with_zombie_interval(
+    name: &str,
+    zombie_check_interval: u32,
+) -> (Worker, u16, SocketAddress) {
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+
+    let config = Worker::into_config(FileConfig {
+        zombie_check_interval: Some(zombie_check_interval),
+        ..FileConfig::default()
+    });
+    let mut listeners = Listeners::default();
+    attach_reserved_https_listener(&mut listeners, front_address.clone().into());
+    let mut worker = Worker::start_new_worker_owned(name, config, listeners, ConfigState::new());
+
+    worker.send_proxy_request_type(RequestType::AddHttpsListener(
+        ListenerBuilder::new_https(front_address.clone())
+            .to_tls(None)
+            .unwrap(),
+    ));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        address: front_address.clone(),
+        proxy: ListenerType::Https.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        hostname: String::from("localhost"),
+        ..Worker::default_http_frontend("cluster_0", front_address.clone().into())
+    }));
+
+    let certificate_and_key = CertificateAndKey {
+        certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
+        key: String::from(include_str!("../../../lib/assets/local-key.pem")),
+        certificate_chain: vec![],
+        versions: vec![],
+        names: vec![],
+    };
+    worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+        address: front_address.clone(),
+        certificate: certificate_and_key,
+        expired_at: None,
+    }));
+
+    worker.read_to_last();
+    (worker, front_port, front_address)
+}
+
+fn query_worker_metrics(worker: &mut Worker) -> WorkerMetricSnapshot {
+    worker.send_proxy_request_type(RequestType::QueryMetrics(QueryMetricsOptions {
+        list: false,
+        cluster_ids: vec![],
+        backend_ids: vec![],
+        metric_names: vec!["client.connections".to_owned(), "zombies".to_owned()],
+        no_clusters: true,
+        workers: false,
+    }));
+    let response = worker
+        .read_proxy_response()
+        .expect("worker should respond to metrics query");
+    assert_eq!(response.id, worker.command_id.last);
+    assert_eq!(response.status, ResponseStatus::Ok as i32, "{response:?}");
+
+    let Some(content) = response.content.and_then(|content| content.content_type) else {
+        panic!("metrics query returned no content");
+    };
+    let ContentType::WorkerMetrics(metrics) = content else {
+        panic!("metrics query returned unexpected content: {content:?}");
+    };
+
+    let client_connections = match metrics
+        .proxy
+        .get("client.connections")
+        .and_then(|metric| metric.inner.as_ref())
+    {
+        Some(filtered_metrics::Inner::Gauge(value)) => *value,
+        other => panic!("client.connections should be a gauge, got {other:?}"),
+    };
+    let zombies = match metrics
+        .proxy
+        .get("zombies")
+        .and_then(|metric| metric.inner.as_ref())
+    {
+        Some(filtered_metrics::Inner::Count(value)) => *value,
+        None => 0,
+        other => panic!("zombies should be a count, got {other:?}"),
+    };
+
+    WorkerMetricSnapshot {
+        client_connections,
+        zombies,
+    }
+}
+
 // ============================================================================
 // Test 1: Basic H2 request/response smoke test
 // ============================================================================
@@ -345,6 +450,56 @@ fn try_h2_basic_request_response() -> State {
     } else {
         State::Fail
     }
+}
+
+// ============================================================================
+// Test: idle H2 sessions reaped by the zombie checker are accounted
+// ============================================================================
+
+fn try_h2_idle_connection_zombie_metric_increments() -> State {
+    let (mut worker, front_port, _front_address) =
+        setup_h2_listener_only_with_zombie_interval("H2-IDLE-ZOMBIE-METRICS", 3);
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    let _server_settings = h2_handshake(&mut tls);
+
+    let before = query_worker_metrics(&mut worker);
+    println!("H2 idle zombie metrics before sweep: {before:?}");
+    if before.client_connections != 1 {
+        drop(tls);
+        worker.soft_stop();
+        let _ = worker.wait_for_server_stop();
+        return State::Fail;
+    }
+
+    thread::sleep(Duration::from_millis(6_500));
+    let _wake_loop = query_worker_metrics(&mut worker);
+    thread::sleep(Duration::from_millis(200));
+    let after = query_worker_metrics(&mut worker);
+    println!("H2 idle zombie metrics after sweep: {after:?}");
+
+    drop(tls);
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+
+    if stopped && after.client_connections == 0 && after.zombies > before.zombies {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_idle_connection_zombie_metric_increments() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2: idle connection reaped by zombie checker increments zombies metric",
+            try_h2_idle_connection_zombie_metric_increments
+        ),
+        State::Success
+    );
 }
 
 // ============================================================================
