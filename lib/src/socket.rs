@@ -411,6 +411,10 @@ impl SocketHandler for FrontRustls {
     }
 
     fn socket_write_vectored(&mut self, bufs: &[std::io::IoSlice]) -> (usize, SocketResult) {
+        if self.peer_disconnected {
+            return (0, SocketResult::Closed);
+        }
+
         let mut buffered_size = 0usize;
         let mut can_write = true;
         let mut is_error = false;
