@@ -386,6 +386,30 @@ pub enum Connection<Front: SocketHandler> {
     H2(ConnectionH2<Front>),
 }
 
+// Dispatches a method call or field access to the inner H1/H2 connection.
+// Used by trivial pass-through methods on Connection<Front> to avoid
+// repeating the two-arm match.
+macro_rules! forward {
+    ($self:expr, $method:ident ( $($args:tt)* )) => {
+        match $self {
+            Connection::H1(c) => c.$method($($args)*),
+            Connection::H2(c) => c.$method($($args)*),
+        }
+    };
+    (&$self:expr, $field:ident) => {
+        match $self {
+            Connection::H1(c) => &c.$field,
+            Connection::H2(c) => &c.$field,
+        }
+    };
+    (&mut $self:expr, $field:ident) => {
+        match $self {
+            Connection::H1(c) => &mut c.$field,
+            Connection::H2(c) => &mut c.$field,
+        }
+    };
+}
+
 impl<Front: SocketHandler> Connection<Front> {
     pub fn new_h1_server(
         front_stream: Front,
@@ -475,28 +499,16 @@ impl<Front: SocketHandler> Connection<Front> {
     }
 
     pub fn readiness(&self) -> &Readiness {
-        match self {
-            Connection::H1(c) => &c.readiness,
-            Connection::H2(c) => &c.readiness,
-        }
+        forward!(&self, readiness)
     }
     pub fn readiness_mut(&mut self) -> &mut Readiness {
-        match self {
-            Connection::H1(c) => &mut c.readiness,
-            Connection::H2(c) => &mut c.readiness,
-        }
+        forward!(&mut self, readiness)
     }
     pub fn position(&self) -> &Position {
-        match self {
-            Connection::H1(c) => &c.position,
-            Connection::H2(c) => &c.position,
-        }
+        forward!(&self, position)
     }
     pub fn position_mut(&mut self) -> &mut Position {
-        match self {
-            Connection::H1(c) => &mut c.position,
-            Connection::H2(c) => &mut c.position,
-        }
+        forward!(&mut self, position)
     }
     pub fn socket(&self) -> &TcpStream {
         match self {
@@ -511,10 +523,7 @@ impl<Front: SocketHandler> Connection<Front> {
         }
     }
     pub fn timeout_container(&mut self) -> &mut TimeoutContainer {
-        match self {
-            Connection::H1(c) => &mut c.timeout_container,
-            Connection::H2(c) => &mut c.timeout_container,
-        }
+        forward!(&mut self, timeout_container)
     }
 
     /// Returns connection-level byte overhead (bin, bout) for H2, (0, 0) for H1.
@@ -530,20 +539,14 @@ impl<Front: SocketHandler> Connection<Front> {
         E: Endpoint,
         L: ListenerHandler + L7ListenerHandler,
     {
-        match self {
-            Connection::H1(c) => c.readable(context, endpoint),
-            Connection::H2(c) => c.readable(context, endpoint),
-        }
+        forward!(self, readable(context, endpoint))
     }
     fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
     where
         E: Endpoint,
         L: ListenerHandler + L7ListenerHandler,
     {
-        match self {
-            Connection::H1(c) => c.writable(context, endpoint),
-            Connection::H2(c) => c.writable(context, endpoint),
-        }
+        forward!(self, writable(context, endpoint))
     }
 
     /// Returns true if this connection could not read because its stream's
@@ -623,17 +626,11 @@ impl<Front: SocketHandler> Connection<Front> {
     }
 
     fn has_pending_write(&self) -> bool {
-        match self {
-            Connection::H1(c) => c.has_pending_write(),
-            Connection::H2(c) => c.has_pending_write(),
-        }
+        forward!(self, has_pending_write())
     }
 
     fn initiate_close_notify(&mut self) -> bool {
-        match self {
-            Connection::H1(c) => c.initiate_close_notify(),
-            Connection::H2(c) => c.initiate_close_notify(),
-        }
+        forward!(self, initiate_close_notify())
     }
 
     fn flush_zero_buffer(&mut self) {
@@ -662,10 +659,7 @@ impl<Front: SocketHandler> Connection<Front> {
             }
             Position::Server => {}
         }
-        match self {
-            Connection::H1(c) => c.close(context, endpoint),
-            Connection::H2(c) => c.close(context, endpoint),
-        }
+        forward!(self, close(context, endpoint))
     }
 
     fn end_stream<L>(&mut self, stream: GlobalStreamId, context: &mut Context<L>)
@@ -677,10 +671,7 @@ impl<Front: SocketHandler> Connection<Front> {
             backend_borrow.active_requests = backend_borrow.active_requests.saturating_sub(1);
             trace!("connection end stream: {:#?}", backend_borrow);
         }
-        match self {
-            Connection::H1(c) => c.end_stream(stream, context),
-            Connection::H2(c) => c.end_stream(stream, context),
-        }
+        forward!(self, end_stream(stream, context))
     }
 
     fn start_stream<L>(&mut self, stream: GlobalStreamId, context: &mut Context<L>) -> bool
@@ -692,10 +683,7 @@ impl<Front: SocketHandler> Connection<Front> {
             backend_borrow.active_requests += 1;
             trace!("connection start stream: {:#?}", backend_borrow);
         }
-        let started = match self {
-            Connection::H1(c) => c.start_stream(stream, context),
-            Connection::H2(c) => c.start_stream(stream, context),
-        };
+        let started = forward!(self, start_stream(stream, context));
         if !started {
             // Undo active_requests increment on failure
             if let Position::Client(_, backend, BackendStatus::Connected) = self.position() {
