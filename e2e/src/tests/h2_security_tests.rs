@@ -40,6 +40,7 @@
 //! - PRIORITY frame flood (resource exhaustion)
 //! - HEADERS flood exceeding MAX_CONCURRENT_STREAMS (RFC 9113 §5.1.2)
 //! - CONTINUATION without preceding HEADERS (RFC 9113 §6.10)
+//! - Padded DATA frame body integrity + flow-control credit accounting (RFC 9113 §6.1, §6.9)
 
 use std::{
     io::{Read, Write},
@@ -3371,6 +3372,361 @@ fn test_h2_continuation_without_initial_headers() {
             5,
             "H2 security: CONTINUATION without HEADERS (RFC 9113 \u{00a7}6.10)",
             try_h2_continuation_without_initial_headers
+        ),
+        State::Success
+    );
+}
+
+// ============================================================================
+// Test 41: Padded DATA frame body integrity + credit accounting
+// (RFC 9113 \u{00a7}6.1 DATA frame, \u{00a7}6.9 WINDOW_UPDATE)
+// ============================================================================
+
+// H2 DATA frame PADDED flag (RFC 9113 \u{00a7}6.1). Not defined in h2_utils
+// (kept local to the only test that needs it).
+const H2_FLAG_PADDED: u8 = 0x08;
+
+/// Build a DATA frame payload with padding: `[pad_length:1][data][padding:pad_length]`.
+/// The resulting wire payload length is `1 + data.len() + pad_length`.
+fn padded_data_payload(data: &[u8], pad_length: u8) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(1 + data.len() + pad_length as usize);
+    payload.push(pad_length);
+    payload.extend_from_slice(data);
+    payload.extend(std::iter::repeat_n(0u8, pad_length as usize));
+    payload
+}
+
+/// Sum of stream-level WINDOW_UPDATE increments for a given stream.
+fn sum_stream_window_updates(frames: &[(u8, u8, u32, Vec<u8>)], stream_id: u32) -> u64 {
+    frames
+        .iter()
+        .filter(|(ft, _fl, sid, payload)| {
+            *ft == 0x08 /* WINDOW_UPDATE */ && *sid == stream_id && payload.len() == 4
+        })
+        .map(|(_, _, _, payload)| {
+            let increment =
+                u32::from_be_bytes([payload[0] & 0x7F, payload[1], payload[2], payload[3]]);
+            u64::from(increment)
+        })
+        .sum()
+}
+
+/// A backend that drains exactly one H1 request (headers + body) and captures
+/// it for later inspection. Unlike `CapturingBackend` (which reads only 4 KiB
+/// once), this one loops until the request body reaches the declared
+/// `Content-Length`, making body-size assertions reliable even if the proxy
+/// splits headers and body across TCP writes.
+struct BodyCapturingBackend {
+    stop: Arc<AtomicBool>,
+    captured: Arc<Mutex<Option<String>>>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl BodyCapturingBackend {
+    fn start(address: SocketAddr) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let captured = Arc::new(Mutex::new(None));
+        let stop_clone = stop.clone();
+        let captured_clone = captured.clone();
+
+        let thread = thread::spawn(move || {
+            let listener = bind_std_listener(address, "body-capturing backend");
+            listener
+                .set_nonblocking(true)
+                .expect("could not set nonblocking");
+
+            loop {
+                if stop_clone.load(Ordering::Relaxed) {
+                    break;
+                }
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                        let mut buf = vec![0u8; 8192];
+                        let mut total = Vec::new();
+                        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                        loop {
+                            if std::time::Instant::now() >= deadline {
+                                break;
+                            }
+                            match stream.read(&mut buf) {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    total.extend_from_slice(&buf[..n]);
+                                    // If we can locate headers + declared
+                                    // Content-Length, stop once body is complete.
+                                    if let Some(header_end) =
+                                        total.windows(4).position(|w| w == b"\r\n\r\n")
+                                    {
+                                        let body_start = header_end + 4;
+                                        let headers = String::from_utf8_lossy(&total[..header_end]);
+                                        let cl = headers
+                                            .lines()
+                                            .find(|l| {
+                                                l.to_ascii_lowercase()
+                                                    .starts_with("content-length:")
+                                            })
+                                            .and_then(|l| l.split(':').nth(1))
+                                            .and_then(|v| v.trim().parse::<usize>().ok());
+                                        if let Some(len) = cl {
+                                            if total.len() >= body_start + len {
+                                                break;
+                                            }
+                                        } else {
+                                            // No Content-Length: assume headers-only or
+                                            // chunked framing we cannot easily parse
+                                            // here; stop on idle timeout instead.
+                                        }
+                                    }
+                                }
+                                Err(ref e)
+                                    if e.kind() == std::io::ErrorKind::WouldBlock
+                                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                                {
+                                    thread::sleep(Duration::from_millis(10));
+                                }
+                                Err(_) => break,
+                            }
+                        }
+
+                        *captured_clone.lock().unwrap() =
+                            Some(String::from_utf8_lossy(&total).to_string());
+
+                        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+                        let _ = stream.write_all(response);
+                        let _ = stream.flush();
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => {}
+                }
+            }
+        });
+
+        Self {
+            stop,
+            captured,
+            thread: Some(thread),
+        }
+    }
+
+    fn get_captured(&self) -> Option<String> {
+        self.captured.lock().unwrap().clone()
+    }
+
+    fn stop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            thread::sleep(Duration::from_millis(100));
+            drop(thread);
+        }
+    }
+}
+
+impl Drop for BodyCapturingBackend {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// RFC 9113 \u{00a7}6.1: DATA frames MAY carry padding. Proxies MUST strip the
+/// padding (and pad-length byte) before forwarding the body, yet MUST credit
+/// the FULL wire payload (data + padding + pad-length byte) back to the peer
+/// via WINDOW_UPDATE. Crediting only the unpadded portion under-credits the
+/// peer and can stall the stream/connection under sustained padded DATA.
+///
+/// This test sends two DATA frames on stream 1, each with:
+///   * 100 bytes of body
+///   * 50 bytes of padding
+///   *   1 byte of pad-length prefix
+///   ------------------------------------
+///   * 151 bytes of wire payload (PADDED flag set, pad_length = 50)
+///
+/// Expected post-F2 behavior:
+///   1. Backend receives exactly 200 bytes of body (100 \u{00d7} 2), padding stripped.
+///   2. Stream 1 WINDOW_UPDATE credits from sozu to the client sum to 302
+///      (151 \u{00d7} 2), confirming the wire payload is credited, not the
+///      unpadded portion.
+///
+/// Pre-F2 behavior (expected to fail):
+///   * Stream 1 WINDOW_UPDATE credits sum to 200 (under-credited by the
+///     stripped pad-length byte + padding bytes), or body corruption occurs
+///     between frames.
+fn try_h2_padded_data_body_and_credit() -> State {
+    // Use the listener-only setup so we can attach our BodyCapturingBackend
+    // at a known address and inspect the forwarded H1 request.
+    let (mut worker, front_port, _front_address) = setup_h2_listener_only("H2-SEC-PADDED-DATA");
+
+    let back_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address,
+        None,
+    )));
+    worker.read_to_last();
+
+    let mut backend = BodyCapturingBackend::start(back_address);
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake(&mut tls);
+
+    // Build HPACK header block for a POST with Content-Length: 200.
+    // :method POST (static index 3)  -> 0x83
+    // :path /     (static index 4)   -> 0x84
+    // :scheme https (static index 7) -> 0x87
+    // :authority localhost           -> literal indexed (name idx 1)
+    // content-length: 200            -> literal without indexing, full name
+    let mut header_block = vec![
+        0x83, // :method POST
+        0x84, // :path /
+        0x87, // :scheme https
+        0x41, 0x09, // :authority, value length 9
+        b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't',
+    ];
+    // content-length: 200 (literal without indexing, full name)
+    header_block.push(0x00);
+    header_block.push(0x0e); // name length = 14
+    header_block.extend_from_slice(b"content-length");
+    header_block.push(0x03); // value length = 3
+    header_block.extend_from_slice(b"200");
+
+    // HEADERS with END_HEADERS (no END_STREAM — body follows).
+    let headers = H2Frame::headers(1, header_block, true, false);
+    tls.write_all(&headers.encode()).unwrap();
+    tls.flush().unwrap();
+
+    // Craft the padded DATA payload: 100 bytes of body + 50 bytes of padding
+    // + 1 pad-length byte = 151 bytes of wire payload per frame.
+    let data_part_1 = vec![b'A'; 100];
+    let data_part_2 = vec![b'B'; 100];
+    const PAD_LENGTH: u8 = 50;
+    let payload_1 = padded_data_payload(&data_part_1, PAD_LENGTH);
+    let payload_2 = padded_data_payload(&data_part_2, PAD_LENGTH);
+    assert_eq!(payload_1.len(), 151, "wire payload must be 151 bytes");
+    assert_eq!(payload_2.len(), 151, "wire payload must be 151 bytes");
+
+    // Two PADDED DATA frames, neither carries END_STREAM so sozu queues a
+    // stream-level WINDOW_UPDATE for each.
+    let data_1 = H2Frame::new(H2_FRAME_DATA, H2_FLAG_PADDED, 1, payload_1);
+    let data_2 = H2Frame::new(H2_FRAME_DATA, H2_FLAG_PADDED, 1, payload_2);
+    tls.write_all(&data_1.encode()).unwrap();
+    tls.write_all(&data_2.encode()).unwrap();
+    tls.flush().unwrap();
+
+    // Close the stream with an empty DATA frame carrying END_STREAM so the
+    // backend can complete the request. The empty frame has no wire payload
+    // and no stream WINDOW_UPDATE will be queued for it (end_stream=true).
+    let data_end = H2Frame::data(1, Vec::new(), true);
+    tls.write_all(&data_end.encode()).unwrap();
+    tls.flush().unwrap();
+
+    // Read all frames emitted by sozu during body forwarding + response.
+    let frames = collect_response_frames(&mut tls, 500, 6, 500);
+    log_frames("H2 padded DATA body + credit", &frames);
+
+    // Accounting assertion: stream-1 WINDOW_UPDATE credits must sum to 302
+    // (151 \u{00d7} 2), not 200 (the unpadded portion).
+    let stream_credits = sum_stream_window_updates(&frames, 1);
+    println!(
+        "H2 padded DATA - stream 1 WINDOW_UPDATE credit sum: {stream_credits} \
+         (expected 302 post-F2, 200 pre-F2)"
+    );
+
+    // Body assertion: backend must receive exactly 200 bytes (100 + 100),
+    // padding and pad-length prefix stripped.
+    thread::sleep(Duration::from_millis(300));
+    let captured = backend.get_captured();
+    let (body_len, body_matches) = match &captured {
+        Some(raw) => match raw.find("\r\n\r\n") {
+            Some(pos) => {
+                let body = &raw.as_bytes()[pos + 4..];
+                // The body may be chunked-encoded if sozu re-frames. Accept
+                // either a raw Content-Length body or a single chunk.
+                let unchunked: Vec<u8> = if body.windows(2).any(|w| w == b"\r\n") {
+                    // Try to decode a simple single-chunk H1 chunked body:
+                    // "<hex-size>\r\n<data>\r\n0\r\n\r\n".
+                    let mut out = Vec::new();
+                    let mut rest = body;
+                    while let Some(nl) = rest.windows(2).position(|w| w == b"\r\n") {
+                        let size_str = std::str::from_utf8(&rest[..nl]).unwrap_or("");
+                        let size = usize::from_str_radix(size_str.trim(), 16).unwrap_or(0);
+                        rest = &rest[nl + 2..];
+                        if size == 0 {
+                            break;
+                        }
+                        if rest.len() < size + 2 {
+                            break;
+                        }
+                        out.extend_from_slice(&rest[..size]);
+                        rest = &rest[size + 2..];
+                    }
+                    if out.is_empty() { body.to_vec() } else { out }
+                } else {
+                    body.to_vec()
+                };
+
+                let mut a_count = 0usize;
+                let mut b_count = 0usize;
+                for &c in &unchunked {
+                    match c {
+                        b'A' => a_count += 1,
+                        b'B' => b_count += 1,
+                        _ => {}
+                    }
+                }
+                let matches = a_count == 100 && b_count == 100;
+                (unchunked.len(), matches)
+            }
+            None => (0, false),
+        },
+        None => (0, false),
+    };
+    println!(
+        "H2 padded DATA - captured body length: {body_len}, 100xA+100xB match: {body_matches}"
+    );
+
+    // Response assertion: sozu must return a response (headers + possibly body)
+    // to confirm end-to-end forwarding completed. Any HEADERS frame on stream 1
+    // is sufficient.
+    let got_response = contains_headers_response(&frames);
+
+    // Teardown.
+    drop(tls);
+    thread::sleep(Duration::from_millis(200));
+    let still_alive = verify_sozu_alive(front_port);
+    backend.stop();
+    worker.soft_stop();
+    let stop_ok = worker.wait_for_server_stop();
+
+    // Success criteria (post-F2):
+    //   1. sozu stays alive,
+    //   2. backend receives 200 body bytes matching 100 A + 100 B,
+    //   3. stream-1 WINDOW_UPDATE credits sum to 302,
+    //   4. sozu responds on stream 1.
+    // Pre-F2 this fails on (3) (credits = 200) and may also fail on (2) if
+    // body re-framing between padded DATA frames is incorrect.
+    let credits_ok = stream_credits == 302;
+    if still_alive && stop_ok && body_matches && credits_ok && got_response {
+        State::Success
+    } else {
+        println!(
+            "H2 padded DATA - FAIL: still_alive={still_alive} stop_ok={stop_ok} \
+             body_matches={body_matches} credits_ok={credits_ok} got_response={got_response}"
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_padded_data_body_and_credit() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 compliance: padded DATA body integrity + full wire credit (RFC 9113 \u{00a7}6.1, \u{00a7}6.9)",
+            try_h2_padded_data_body_and_credit
         ),
         State::Success
     );
