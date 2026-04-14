@@ -639,26 +639,43 @@ impl<Front: SocketHandler> Connection<Front> {
         }
     }
 
+    fn pre_close_client_bookkeeping(&self) {
+        if let Position::Client(cluster_id, backend, _) = self.position() {
+            let mut backend_borrow = backend.borrow_mut();
+            backend_borrow.dec_connections();
+            gauge_add!("backend.connections", -1);
+            gauge_add!(
+                "connections_per_backend",
+                -1,
+                Some(cluster_id),
+                Some(&backend_borrow.backend_id)
+            );
+            trace!("connection close: {:#?}", backend_borrow);
+        }
+    }
+
+    fn pre_end_stream_client_bookkeeping(&self) {
+        if let Position::Client(_, backend, BackendStatus::Connected) = self.position() {
+            let mut backend_borrow = backend.borrow_mut();
+            backend_borrow.active_requests = backend_borrow.active_requests.saturating_sub(1);
+            trace!("connection end stream: {:#?}", backend_borrow);
+        }
+    }
+
+    fn pre_start_stream_client_bookkeeping(&self) {
+        if let Position::Client(_, backend, BackendStatus::Connected) = self.position() {
+            let mut backend_borrow = backend.borrow_mut();
+            backend_borrow.active_requests += 1;
+            trace!("connection start stream: {:#?}", backend_borrow);
+        }
+    }
+
     fn close<E, L>(&mut self, context: &mut Context<L>, endpoint: E)
     where
         E: Endpoint,
         L: ListenerHandler + L7ListenerHandler,
     {
-        match self.position() {
-            Position::Client(cluster_id, backend, _) => {
-                let mut backend_borrow = backend.borrow_mut();
-                backend_borrow.dec_connections();
-                gauge_add!("backend.connections", -1);
-                gauge_add!(
-                    "connections_per_backend",
-                    -1,
-                    Some(cluster_id),
-                    Some(&backend_borrow.backend_id)
-                );
-                trace!("connection close: {:#?}", backend_borrow);
-            }
-            Position::Server => {}
-        }
+        self.pre_close_client_bookkeeping();
         forward!(self, close(context, endpoint))
     }
 
@@ -666,11 +683,7 @@ impl<Front: SocketHandler> Connection<Front> {
     where
         L: ListenerHandler + L7ListenerHandler,
     {
-        if let Position::Client(_, backend, BackendStatus::Connected) = self.position() {
-            let mut backend_borrow = backend.borrow_mut();
-            backend_borrow.active_requests = backend_borrow.active_requests.saturating_sub(1);
-            trace!("connection end stream: {:#?}", backend_borrow);
-        }
+        self.pre_end_stream_client_bookkeeping();
         forward!(self, end_stream(stream, context))
     }
 
@@ -678,18 +691,11 @@ impl<Front: SocketHandler> Connection<Front> {
     where
         L: ListenerHandler + L7ListenerHandler,
     {
-        if let Position::Client(_, backend, BackendStatus::Connected) = self.position() {
-            let mut backend_borrow = backend.borrow_mut();
-            backend_borrow.active_requests += 1;
-            trace!("connection start stream: {:#?}", backend_borrow);
-        }
+        self.pre_start_stream_client_bookkeeping();
         let started = forward!(self, start_stream(stream, context));
         if !started {
             // Undo active_requests increment on failure
-            if let Position::Client(_, backend, BackendStatus::Connected) = self.position() {
-                let mut backend_borrow = backend.borrow_mut();
-                backend_borrow.active_requests = backend_borrow.active_requests.saturating_sub(1);
-            }
+            self.pre_end_stream_client_bookkeeping();
         }
         started
     }
