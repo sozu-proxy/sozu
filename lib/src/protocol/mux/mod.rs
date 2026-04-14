@@ -165,35 +165,26 @@ fn copy_default_answer_to_stream(
 /// placeholders. The 301 redirect is the only code that needs real context data
 /// and is therefore handled inline in [`set_default_answer`].
 fn default_answer_for_code(code: u16) -> DefaultAnswer {
-    /// Helper for the 400/502 parse-error shape: empty message, Error phase,
-    /// `"null"` for each parse-state field.
-    fn parse_error_answer_400() -> DefaultAnswer {
-        DefaultAnswer::Answer400 {
-            message: String::new(),
-            phase: kawa::ParsingPhaseMarker::Error,
-            successfully_parsed: "null".to_owned(),
-            partially_parsed: "null".to_owned(),
-            invalid: "null".to_owned(),
-        }
-    }
-    fn parse_error_answer_502() -> DefaultAnswer {
-        DefaultAnswer::Answer502 {
-            message: String::new(),
-            phase: kawa::ParsingPhaseMarker::Error,
-            successfully_parsed: "null".to_owned(),
-            partially_parsed: "null".to_owned(),
-            invalid: "null".to_owned(),
-        }
-    }
-
     match code {
-        400 => parse_error_answer_400(),
+        400 => DefaultAnswer::Answer400 {
+            message: String::new(),
+            phase: kawa::ParsingPhaseMarker::Error,
+            successfully_parsed: "null".to_owned(),
+            partially_parsed: "null".to_owned(),
+            invalid: "null".to_owned(),
+        },
         401 => DefaultAnswer::Answer401 {},
         404 => DefaultAnswer::Answer404 {},
         408 => DefaultAnswer::Answer408 {
             duration: String::new(),
         },
-        502 => parse_error_answer_502(),
+        502 => DefaultAnswer::Answer502 {
+            message: String::new(),
+            phase: kawa::ParsingPhaseMarker::Error,
+            successfully_parsed: "null".to_owned(),
+            partially_parsed: "null".to_owned(),
+            invalid: "null".to_owned(),
+        },
         503 => DefaultAnswer::Answer503 {
             message: String::new(),
         },
