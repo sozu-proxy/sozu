@@ -794,53 +794,46 @@ impl Endpoint for EndpointClient<'_> {
     }
 }
 
+/// Shared logic for half-close accounting: clear `bit` from `readiness.event` on
+/// socket errors/would-block, and return `true` (yield) when no bytes were
+/// transferred so the caller can park the half. Rationale for clearing only
+/// `bit` (not both halves) on `Closed`: the opposite half may still need one
+/// last pass to flush queued frames or the TLS close_notify.
+fn update_readiness(
+    size: usize,
+    status: SocketResult,
+    readiness: &mut Readiness,
+    bit: Ready,
+) -> bool {
+    trace!("  size={}, status={:?}", size, status);
+    match status {
+        SocketResult::Continue => {}
+        SocketResult::Closed | SocketResult::Error | SocketResult::WouldBlock => {
+            readiness.event.remove(bit);
+        }
+    }
+    if size > 0 {
+        false
+    } else {
+        readiness.event.remove(bit);
+        true
+    }
+}
+
 fn update_readiness_after_read(
     size: usize,
     status: SocketResult,
     readiness: &mut Readiness,
 ) -> bool {
-    trace!("  size={}, status={:?}", size, status);
-    match status {
-        SocketResult::Continue => {}
-        SocketResult::Closed | SocketResult::Error => {
-            // Preserve pending WRITABLE/HUP/ERROR bits on half-close.
-            // The read side may be closed while we still need one last writable
-            // pass to flush queued H2 control frames or TLS close_notify.
-            readiness.event.remove(Ready::READABLE);
-        }
-        SocketResult::WouldBlock => {
-            readiness.event.remove(Ready::READABLE);
-        }
-    }
-    if size > 0 {
-        false
-    } else {
-        readiness.event.remove(Ready::READABLE);
-        true
-    }
+    update_readiness(size, status, readiness, Ready::READABLE)
 }
+
 fn update_readiness_after_write(
     size: usize,
     status: SocketResult,
     readiness: &mut Readiness,
 ) -> bool {
-    trace!("  size={}, status={:?}", size, status);
-    match status {
-        SocketResult::Continue => {}
-        SocketResult::Closed | SocketResult::Error => {
-            // even if the socket closed there might be something left to read
-            readiness.event.remove(Ready::WRITABLE);
-        }
-        SocketResult::WouldBlock => {
-            readiness.event.remove(Ready::WRITABLE);
-        }
-    }
-    if size > 0 {
-        false
-    } else {
-        readiness.event.remove(Ready::WRITABLE);
-        true
-    }
+    update_readiness(size, status, readiness, Ready::WRITABLE)
 }
 
 #[cfg(test)]
