@@ -29,6 +29,10 @@ pub type Pipe = [c_int; 2];
 
 pub fn create_pipe() -> Option<Pipe> {
     let mut p: Pipe = [0; 2];
+    // SAFETY: `p` is a stack-allocated `[c_int; 2]`, so `p.as_mut_ptr()` is a
+    // valid, correctly-aligned, writable pointer to two contiguous `c_int`s,
+    // which matches pipe2's `int pipefd[2]` parameter. `pipe2` writes into the
+    // array and returns; it does not retain the pointer after return.
     unsafe {
         if pipe2(p.as_mut_ptr(), 0) == 0 {
             Some(p)
@@ -39,6 +43,13 @@ pub fn create_pipe() -> Option<Pipe> {
 }
 
 pub fn splice_in(stream: &dyn AsRawFd, pipe: Pipe) -> Option<usize> {
+    // SAFETY: `stream.as_raw_fd()` yields a descriptor borrowed for the
+    // duration of this call — the `&dyn AsRawFd` borrow keeps its owner alive
+    // across the syscall. `pipe[1]` is the write end of a pipe created via
+    // `create_pipe`; the caller is responsible for keeping it open. Both
+    // offset pointers are null (sequential read/write). `splice` only reads
+    // the fds during the syscall and does not retain any pointer after
+    // returning.
     unsafe {
         let res = splice(
             stream.as_raw_fd(),
@@ -67,6 +78,13 @@ pub fn splice_in(stream: &dyn AsRawFd, pipe: Pipe) -> Option<usize> {
 }
 
 pub fn splice_out(pipe: Pipe, stream: &dyn AsRawFd) -> Option<usize> {
+    // SAFETY: `pipe[0]` is the read end of a pipe created via `create_pipe`;
+    // the caller is responsible for keeping it open. `stream.as_raw_fd()`
+    // yields a descriptor borrowed for the duration of this call — the
+    // `&dyn AsRawFd` borrow keeps its owner alive across the syscall. Both
+    // offset pointers are null (sequential read/write). `splice` only reads
+    // the fds during the syscall and does not retain any pointer after
+    // returning.
     unsafe {
         let res = splice(
             pipe[0],
