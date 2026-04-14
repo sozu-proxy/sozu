@@ -980,6 +980,35 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 if let Some(error) = self.flood_detector.check_flood() {
                     return self.goaway(error);
                 }
+                // RFC 9113 §10.5.1: reject header blocks that cannot be
+                // buffered. Previously we silently removed READABLE interest
+                // when amount > available_space, stalling the connection.
+                // If the payload still fits in our zero buffer we can refuse
+                // just this stream (RST_STREAM + drain); if not, the
+                // connection can no longer decode header blocks safely and we
+                // escalate to GOAWAY(EnhanceYourCalm).
+                if self.flood_detector.accumulated_header_size > MAX_HEADER_LIST_SIZE {
+                    error!(
+                        "CONTINUATION accumulated header size {} exceeds {}",
+                        self.flood_detector.accumulated_header_size, MAX_HEADER_LIST_SIZE
+                    );
+                    if (payload_len as usize) > self.zero.storage.available_space() {
+                        return self.goaway(H2Error::EnhanceYourCalm);
+                    }
+                    return self.refuse_stream_and_discard(
+                        stream_id,
+                        H2Error::RefusedStream,
+                        payload_len,
+                    );
+                }
+                if (payload_len as usize) > self.zero.storage.available_space() {
+                    error!(
+                        "CONTINUATION payload {} exceeds buffer space {}",
+                        payload_len,
+                        self.zero.storage.available_space()
+                    );
+                    return self.goaway(H2Error::EnhanceYourCalm);
+                }
                 self.expect_read = Some((H2StreamId::Zero, payload_len as usize));
                 let mut headers = headers.clone();
                 headers.end_headers = flags & parser::FLAG_END_HEADERS != 0;
