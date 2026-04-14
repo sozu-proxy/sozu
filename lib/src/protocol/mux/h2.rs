@@ -1160,7 +1160,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 self.state = H2State::ServerSettings;
                 self.expect_write = Some(H2StreamId::Zero);
                 self.readiness.signal_pending_write();
-                return self.handle_frame(settings, context, endpoint);
+                return self.handle_frame(settings, 0, context, endpoint);
             }
             (H2State::ServerSettings, Position::Client(..)) => {
                 let i = kawa.storage.data();
@@ -1191,6 +1191,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             (H2State::Frame(header), _) => {
                 let i = kawa.storage.unparsed_data();
                 trace!("  data: {:?}", i);
+                let wire_payload_len = header.payload_len;
                 let frame = match parser::frame_body(i, header) {
                     Ok((_, frame)) => frame,
                     Err(error) => {
@@ -1207,7 +1208,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     }
                 }
                 self.expect_header();
-                return self.handle_frame(frame, context, endpoint);
+                return self.handle_frame(frame, wire_payload_len, context, endpoint);
             }
             (H2State::ContinuationFrame(headers), _) => {
                 kawa.storage.head = kawa.storage.end;
@@ -1215,7 +1216,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 trace!("  data: {:?}", i);
                 let headers = headers.clone();
                 self.expect_header();
-                return self.handle_frame(Frame::Headers(headers), context, endpoint);
+                return self.handle_frame(Frame::Headers(headers), 0, context, endpoint);
             }
         }
         MuxResult::Continue
@@ -2225,6 +2226,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     fn handle_frame<E, L>(
         &mut self,
         frame: Frame,
+        wire_payload_len: u32,
         context: &mut Context<L>,
         endpoint: E,
     ) -> MuxResult
@@ -2234,7 +2236,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     {
         trace!("{:#?}", frame);
         match frame {
-            Frame::Data(data) => self.handle_data_frame(data, context, endpoint),
+            Frame::Data(data) => self.handle_data_frame(data, wire_payload_len, context, endpoint),
             Frame::Headers(headers) => self.handle_headers_frame(headers, context, endpoint),
             Frame::PushPromise(_) => self.handle_push_promise_frame(),
             Frame::Priority(priority) => self.handle_priority_frame(priority, context, endpoint),
@@ -2280,6 +2282,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     fn handle_data_frame<E, L>(
         &mut self,
         data: parser::Data,
+        wire_payload_len: u32,
         context: &mut Context<L>,
         mut endpoint: E,
     ) -> MuxResult
@@ -2298,10 +2301,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             // The stream was terminated while data was expected,
             // probably due to automatic answer for invalid/unauthorized access.
             // RFC 9113 §6.9: we MUST still account for the DATA payload in
-            // connection-level flow control, otherwise the window shrinks
-            // permanently and eventually stalls the connection.
-            let payload_len = data.payload.len() as u32;
-            self.flow_control.received_bytes_since_update += payload_len;
+            // connection-level flow control using the full wire length
+            // (including pad-length byte and padding), otherwise the window
+            // shrinks permanently and eventually stalls the connection.
+            self.flow_control.received_bytes_since_update += wire_payload_len;
             let conn_threshold = self.connection_config.initial_connection_window / 2;
             if self.flow_control.received_bytes_since_update >= conn_threshold {
                 let increment = self.flow_control.received_bytes_since_update;
@@ -2315,13 +2318,18 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         };
         let mut slice = data.payload;
         let stream = &mut context.streams[global_stream_id];
-        let payload_len = slice.len();
+        // Unpadded application payload size — what is forwarded to the backend
+        // and counted against Content-Length.
+        let content_len = slice.len();
+        // Full wire-payload size (includes pad-length byte and padding).
+        // RFC 9113 §5.2: padding counts against flow-control windows.
+        let wire_len = wire_payload_len as usize;
         let cl_exempt = self.content_length_exempt(&stream.context);
 
         // Extract declared content-length and update position-aware data counter
         let (data_received, declared_length) = {
             let parts = stream.split(&self.position);
-            *parts.data_received += payload_len;
+            *parts.data_received += content_len;
             let total = *parts.data_received;
             let declared = match parts.rbuffer.body_size {
                 kawa::BodySize::Length(n) => Some(n),
@@ -2356,15 +2364,15 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         let is_unlinked = matches!(stream_state, StreamState::Unlinked);
         let parts = stream.split(&self.position);
         let kawa = parts.rbuffer;
-        self.position.count_bytes_in(parts.metrics, payload_len);
+        self.position.count_bytes_in(parts.metrics, content_len);
 
-        // RFC 9113 §6.9: Update flow control after consuming DATA.
-        // Track bytes received and queue WINDOW_UPDATE when threshold reached.
-        let payload_u32 = payload_len as u32;
+        // RFC 9113 §6.9 + §5.2: flow control is credited against the full wire
+        // payload length (including pad-length byte and padding), not just the
+        // application content. Otherwise the window shrinks permanently.
 
         // Connection-level flow control (use configured window threshold)
         let conn_threshold = self.connection_config.initial_connection_window / 2;
-        self.flow_control.received_bytes_since_update += payload_u32;
+        self.flow_control.received_bytes_since_update += wire_payload_len;
         if self.flow_control.received_bytes_since_update >= conn_threshold {
             let increment = self.flow_control.received_bytes_since_update;
             self.queue_window_update(0, increment);
@@ -2373,7 +2381,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
 
         // Stream-level flow control (only if stream is still open)
         if !data.end_stream {
-            self.queue_window_update(data.stream_id, payload_u32);
+            self.queue_window_update(data.stream_id, wire_payload_len);
         }
 
         // If we have pending updates, ensure we get a writable event.
@@ -2396,15 +2404,17 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 self.mark_end_of_stream(stream);
             }
         } else {
+            // Advance storage.head by the full wire payload length so the
+            // next frame doesn't read stale pad-length+padding bytes.
             slice.start += kawa.storage.head as u32;
-            kawa.storage.head += payload_len;
+            kawa.storage.head += wire_len;
 
             // Emit chunk framing for chunked transfer encoding (H2→H1 path).
             // H2 converter ignores ChunkHeader and end_chunk Flags, so this is safe for H2→H2.
-            if kawa.body_size == kawa::BodySize::Chunked && payload_len > 0 {
+            if kawa.body_size == kawa::BodySize::Chunked && content_len > 0 {
                 let hex_len = {
                     let mut buf = Vec::with_capacity(16);
-                    let _ = write!(buf, "{payload_len:x}");
+                    let _ = write!(buf, "{content_len:x}");
                     buf
                 };
                 kawa.push_block(kawa::Block::ChunkHeader(kawa::ChunkHeader {
@@ -2416,7 +2426,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 data: kawa::Store::Slice(slice),
             }));
 
-            if kawa.body_size == kawa::BodySize::Chunked && payload_len > 0 {
+            if kawa.body_size == kawa::BodySize::Chunked && content_len > 0 {
                 kawa.push_block(kawa::Block::Flags(kawa::Flags {
                     end_body: false,
                     end_chunk: true,
