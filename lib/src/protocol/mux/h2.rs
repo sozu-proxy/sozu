@@ -2926,6 +2926,14 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             }
             self.streams.remove(stream_id);
             self.prioriser.remove(stream_id);
+            // Both retry (!consumed) and terminated (consumed) paths remove the
+            // stream from self.streams without going through Connection::end_stream,
+            // so decrement Backend.active_requests here to keep load metrics honest.
+            if let Position::Client(_, backend, BackendStatus::Connected) = &self.position {
+                let mut backend_borrow = backend.borrow_mut();
+                backend_borrow.active_requests =
+                    backend_borrow.active_requests.saturating_sub(1);
+            }
         }
 
         // If no active streams remain, close immediately
