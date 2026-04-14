@@ -1989,6 +1989,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
 
     /// Queue a WINDOW_UPDATE, coalescing with any existing entry for the same stream_id.
     /// RFC 9113 §6.9.1: window size increment MUST be 1..2^31-1 (0x7FFFFFFF).
+    ///
+    /// Always signals pending write so callers don't have to remember the
+    /// edge-triggered epoll invariant (see memory feedback_epollet_signal_pending_write):
+    /// under ET epoll a queued WINDOW_UPDATE without a live WRITABLE event bit
+    /// is invisible to filter_interest() and will never get flushed.
     fn queue_window_update(&mut self, stream_id: u32, increment: u32) {
         let max_increment = i32::MAX as u32;
         if let Some(existing) = self.flow_control.pending_window_updates.get_mut(&stream_id) {
@@ -2013,11 +2018,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 self.max_pending_window_updates, stream_id, increment
             );
             incr!("h2.window_update_dropped");
-            // Ensure a writable event so the existing queue gets flushed,
-            // freeing space for the dropped WINDOW_UPDATE on the next cycle.
-            self.readiness.interest.insert(Ready::WRITABLE);
-            self.readiness.signal_pending_write();
         }
+        self.readiness.interest.insert(Ready::WRITABLE);
+        self.readiness.signal_pending_write();
     }
 
     /// Re-enable READABLE if this connection is parked waiting for buffer space
