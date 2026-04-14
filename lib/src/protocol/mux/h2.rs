@@ -33,6 +33,16 @@ use crate::{
     timer::TimeoutContainer,
 };
 
+/// Outcome of a single-stream write flush in write_streams.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlushOutcome {
+    /// All queued bytes were drained to the socket.
+    Drained,
+    /// The socket blocked before the queue was drained. The caller must
+    /// arrange to resume (set expect_write or return from write_streams).
+    Stalled,
+}
+
 // ── RFC 9113 §6.5.2 Settings Defaults ───────────────────────────────────────
 
 const DEFAULT_HEADER_TABLE_SIZE: u32 = 4096;
@@ -1277,23 +1287,27 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             let stream_state = stream.state;
             let parts = stream.split(&self.position);
             let kawa = parts.wbuffer;
-            while !kawa.out.is_empty() {
-                let bufs = kawa.as_io_slice();
-                let (size, status) = self.socket.socket_write_vectored(&bufs);
-                context
-                    .debug
-                    .push(DebugEvent::SocketIO(2, global_stream_id, size));
-                kawa.consume(size);
-                self.position.count_bytes_out_counter(size);
-                self.position.count_bytes_out(parts.metrics, size);
-                if let Some((read_stream, amount)) = self.expect_read {
-                    if write_stream == read_stream && kawa.storage.available_space() >= amount {
-                        self.readiness.interest.insert(Ready::READABLE);
-                    }
-                }
-                if update_readiness_after_write(size, status, &mut self.readiness) {
-                    return MuxResult::Continue;
-                }
+            // Resume path: if the same stream is parked waiting for buffer
+            // space (expect_read matches write_stream), pass the amount so
+            // flush_stream_out can re-enable READABLE as soon as we drain.
+            let cross_read_amount = match self.expect_read {
+                Some((read_stream, amount)) if write_stream == read_stream => Some(amount),
+                _ => None,
+            };
+            let outcome = Self::flush_stream_out(
+                &mut self.socket,
+                kawa,
+                parts.metrics,
+                &self.position,
+                &mut self.readiness,
+                &mut context.debug,
+                2,
+                global_stream_id,
+                None,
+                cross_read_amount,
+            );
+            if outcome == FlushOutcome::Stalled {
+                return MuxResult::Continue;
             }
             self.expect_write = None;
             if (kawa.is_terminated() || kawa.is_error())
@@ -1400,20 +1414,21 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 kawa.blocks.len(),
                 kawa.out.len(),
             ));
-            while !kawa.out.is_empty() {
-                socket_write = true;
-                let bufs = kawa.as_io_slice();
-                let (size, status) = self.socket.socket_write_vectored(&bufs);
-                context
-                    .debug
-                    .push(DebugEvent::SocketIO(3, global_stream_id, size));
-                kawa.consume(size);
-                self.position.count_bytes_out_counter(size);
-                self.position.count_bytes_out(parts.metrics, size);
-                if update_readiness_after_write(size, status, &mut self.readiness) {
-                    self.expect_write = Some(H2StreamId::Other(stream_id, global_stream_id));
-                    break 'outer;
-                }
+            let outcome = Self::flush_stream_out(
+                &mut self.socket,
+                kawa,
+                parts.metrics,
+                &self.position,
+                &mut self.readiness,
+                &mut context.debug,
+                3,
+                global_stream_id,
+                Some(&mut socket_write),
+                None,
+            );
+            if outcome == FlushOutcome::Stalled {
+                self.expect_write = Some(H2StreamId::Other(stream_id, global_stream_id));
+                break 'outer;
             }
             self.expect_write = None;
             if (kawa.is_terminated() || kawa.is_error())
@@ -1460,6 +1475,43 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// After forwarding a 1xx informational response (100 Continue, 103 Early Hints),
     /// reset the back buffer and re-enable backend readable so the final response
     /// can arrive on the same stream. Returns true if the response was 1xx.
+    #[allow(clippy::too_many_arguments)]
+    fn flush_stream_out(
+        socket: &mut Front,
+        kawa: &mut GenericHttpStream,
+        metrics: &mut SessionMetrics,
+        position: &Position,
+        readiness: &mut Readiness,
+        debug: &mut DebugHistory,
+        debug_site: usize,
+        global_stream_id: GlobalStreamId,
+        mut wrote: Option<&mut bool>,
+        cross_read_amount: Option<usize>,
+    ) -> FlushOutcome {
+        while !kawa.out.is_empty() {
+            if let Some(flag) = wrote.as_deref_mut() {
+                *flag = true;
+            }
+            let bufs = kawa.as_io_slice();
+            let (size, status) = socket.socket_write_vectored(&bufs);
+            debug.push(DebugEvent::SocketIO(debug_site, global_stream_id, size));
+            kawa.consume(size);
+            position.count_bytes_out_counter(size);
+            position.count_bytes_out(metrics, size);
+            if let Some(amount) = cross_read_amount {
+                // Resume path: same stream is parked waiting for buffer space.
+                // Re-enable READABLE once the write freed enough room.
+                if kawa.storage.available_space() >= amount {
+                    readiness.interest.insert(Ready::READABLE);
+                }
+            }
+            if update_readiness_after_write(size, status, readiness) {
+                return FlushOutcome::Stalled;
+            }
+        }
+        FlushOutcome::Drained
+    }
+
     fn handle_1xx_reset<E: Endpoint>(
         kawa: &mut GenericHttpStream,
         stream_state: StreamState,
