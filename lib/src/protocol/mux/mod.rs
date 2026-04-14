@@ -40,6 +40,7 @@ mod h2;
 pub mod parser;
 mod pkawa;
 mod serializer;
+mod shared;
 
 use crate::{
     BackendConnectionError, L7ListenerHandler, L7Proxy, ListenerHandler, Protocol, ProxySession,
