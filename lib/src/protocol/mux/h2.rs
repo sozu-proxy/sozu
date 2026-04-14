@@ -1839,6 +1839,15 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         match position {
             Position::Client(..) => None,
             Position::Server => {
+                // Already logged by a reset path; retire the stream after its RST is flushed.
+                if stream.metrics.start.is_none() {
+                    let state = std::mem::replace(&mut stream.state, StreamState::Recycle);
+                    return match state {
+                        StreamState::Linked(token) => Some((stream_id, Some(token))),
+                        _ => Some((stream_id, None)),
+                    };
+                }
+
                 // Don't recycle if the client hasn't sent END_STREAM yet —
                 // more DATA frames may arrive for this stream.
                 if !stream.front_received_end_of_stream {
@@ -3179,6 +3188,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             self.distribute_overhead(&mut stream.metrics, reset_byte_totals);
             stream.metrics.backend_stop();
             stream.generate_access_log(true, Some("H2::Reset"), context.listener.clone());
+            stream.metrics.reset();
         }
         MuxResult::Continue
     }

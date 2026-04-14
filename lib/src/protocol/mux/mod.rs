@@ -1375,10 +1375,10 @@ impl Router {
                 (true, Position::Client(other_cluster_id, _, BackendStatus::Connected)) => {
                     if *other_cluster_id == cluster_id && !backend.is_draining() {
                         // Pick the non-draining H2 connection with the fewest active streams
-                        let stream_count = match backend {
-                            Connection::H2(h2c) => h2c.streams.len(),
-                            Connection::H1(_) => 0,
+                        let Connection::H2(h2c) = backend else {
+                            continue;
                         };
+                        let stream_count = h2c.streams.len();
                         if stream_count < best_h2_stream_count {
                             best_h2_stream_count = stream_count;
                             reuse_token = Some(*token);
@@ -1387,12 +1387,15 @@ impl Router {
                 }
                 (true, Position::Client(other_cluster_id, _, BackendStatus::Connecting(_))) => {
                     // Only use a connecting backend if no connected one was found
-                    if *other_cluster_id == cluster_id && best_h2_stream_count == usize::MAX {
+                    if *other_cluster_id == cluster_id
+                        && best_h2_stream_count == usize::MAX
+                        && matches!(backend, Connection::H2(_))
+                    {
                         reuse_token = Some(*token)
                     }
                 }
                 (true, Position::Client(other_cluster_id, _, BackendStatus::KeepAlive)) => {
-                    if *other_cluster_id == cluster_id {
+                    if *other_cluster_id == cluster_id && matches!(backend, Connection::H2(_)) {
                         error!("ConnectionH2 unexpectedly behaves like H1 with KeepAlive");
                     }
                 }
