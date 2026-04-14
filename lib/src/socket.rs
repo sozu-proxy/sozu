@@ -415,23 +415,20 @@ impl SocketHandler for FrontRustls {
             return (0, SocketResult::Closed);
         }
 
+        let total_len: usize = bufs.iter().map(|b| b.len()).sum();
         let mut buffered_size = 0usize;
         let mut can_write = true;
         let mut is_error = false;
         let mut is_closed = false;
 
-        // Outer retry loop: when rustls's plaintext buffer is full (write_vectored
-        // returns Ok(0)), flush TLS records to TCP then retry. Without this retry,
-        // returning (0, Continue) causes update_readiness_after_write to remove
-        // WRITABLE from the event set. Under edge-triggered epoll, if TCP never
-        // blocked, EPOLLOUT never re-fires and the connection stalls permanently.
-        // This mirrors the retry pattern in socket_write (lines 290-360).
         let mut counter = 0;
         loop {
             counter += 1;
             if counter > MAX_LOOP_ITERATIONS {
                 error!("MAX_LOOP_ITERATION reached in FrontRustls::socket_write_vectored");
                 incr!("rustls.write.infinite_loop.error");
+            }
+            if buffered_size == total_len {
                 break;
             }
 
@@ -439,37 +436,43 @@ impl SocketHandler for FrontRustls {
                 break;
             }
 
-            let wrote_plaintext = match self.session.writer().write_vectored(bufs) {
-                Ok(0) => false, // rustls buffer full, flush TLS to TCP and retry
-                Ok(sz) => {
-                    buffered_size += sz;
-                    true
+            // rustls's Writer does not expose a "write from offset across slices"
+            // helper, so we only push plaintext on the first pass. Subsequent
+            // iterations only drain write_tls; the top-of-loop
+            // `buffered_size == total_len` guard lets us exit when rustls fully
+            // absorbed the slices, otherwise we rely on !can_write from
+            // write_tls to break out on backpressure.
+            if buffered_size == 0 {
+                match self.session.writer().write_vectored(bufs) {
+                    Ok(0) => {}
+                    Ok(sz) => {
+                        buffered_size += sz;
+                    }
+                    Err(e) => match e.kind() {
+                        ErrorKind::WouldBlock => {}
+                        ErrorKind::ConnectionReset
+                        | ErrorKind::ConnectionAborted
+                        | ErrorKind::BrokenPipe => {
+                            incr!("rustls.write.error");
+                            is_closed = true;
+                            break;
+                        }
+                        _ => {
+                            error!("could not write data to TLS stream: {:?}", e);
+                            incr!("rustls.write.error");
+                            is_error = true;
+                            break;
+                        }
+                    },
                 }
-                Err(e) => match e.kind() {
-                    ErrorKind::WouldBlock => false,
-                    ErrorKind::ConnectionReset
-                    | ErrorKind::ConnectionAborted
-                    | ErrorKind::BrokenPipe => {
-                        incr!("rustls.write.error");
-                        is_closed = true;
-                        break;
-                    }
-                    _ => {
-                        error!("could not write data to TLS stream: {:?}", e);
-                        incr!("rustls.write.error");
-                        is_error = true;
-                        break;
-                    }
-                },
-            };
+            }
 
-            let mut flushed_tls = false;
             loop {
                 match self.session.write_tls(&mut self.stream) {
-                    Ok(0) => break,
-                    Ok(_sz) => {
-                        flushed_tls = true;
+                    Ok(0) => {
+                        break;
                     }
+                    Ok(_sz) => {}
                     Err(e) => match e.kind() {
                         ErrorKind::WouldBlock => {
                             can_write = false;
@@ -491,16 +494,33 @@ impl SocketHandler for FrontRustls {
                     },
                 }
             }
+        }
 
-            // If we buffered application data, we're done for this call.
-            // The caller (write_streams) will call us again if there's more.
-            if buffered_size > 0 {
-                break;
-            }
-            // If write_vectored returned Ok(0) and write_tls had nothing to
-            // flush, we can't make progress — break to avoid spinning.
-            if !wrote_plaintext && !flushed_tls {
-                break;
+        if !is_error && !is_closed && can_write && self.session.wants_write() {
+            loop {
+                match self.session.write_tls(&mut self.stream) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(e) => match e.kind() {
+                        ErrorKind::WouldBlock => {
+                            can_write = false;
+                            break;
+                        }
+                        ErrorKind::ConnectionReset
+                        | ErrorKind::ConnectionAborted
+                        | ErrorKind::BrokenPipe => {
+                            incr!("rustls.write.error");
+                            is_closed = true;
+                            break;
+                        }
+                        _ => {
+                            error!("could not flush TLS stream to socket: {:?}", e);
+                            incr!("rustls.write.error");
+                            is_error = true;
+                            break;
+                        }
+                    },
+                }
             }
         }
 
