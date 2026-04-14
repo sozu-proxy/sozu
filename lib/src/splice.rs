@@ -1,32 +1,14 @@
-#![allow(dead_code)]
-
 use std::{
     io::{Error, ErrorKind},
     os::unix::io::AsRawFd,
     ptr,
 };
 
-use libc::{c_int, c_uint, off_t, size_t, ssize_t};
-
-const SPLICE_F_NONBLOCK: c_uint = 2;
-unsafe extern "C" {
-    //ssize_t splice(int fd_in, loff_t *off_in, int fd_out,
-    //                      loff_t *off_out, size_t len, unsigned int flags);
-    pub fn splice(
-        fd_in: c_int,
-        off_in: *const off_t,
-        fd_out: c_int,
-        off_out: *const off_t,
-        len: size_t,
-        flags: c_uint,
-    ) -> ssize_t;
-
-    //int pipe2(int pipefd[2], int flags);
-    pub fn pipe2(pipefd: *mut c_int, flags: c_int) -> c_int;
-}
+use libc::c_int;
 
 pub type Pipe = [c_int; 2];
 
+#[allow(dead_code)]
 pub fn create_pipe() -> Option<Pipe> {
     let mut p: Pipe = [0; 2];
     // SAFETY: `p` is a stack-allocated `[c_int; 2]`, so `p.as_mut_ptr()` is a
@@ -34,7 +16,7 @@ pub fn create_pipe() -> Option<Pipe> {
     // which matches pipe2's `int pipefd[2]` parameter. `pipe2` writes into the
     // array and returns; it does not retain the pointer after return.
     unsafe {
-        if pipe2(p.as_mut_ptr(), 0) == 0 {
+        if libc::pipe2(p.as_mut_ptr(), 0) == 0 {
             Some(p)
         } else {
             None
@@ -42,6 +24,7 @@ pub fn create_pipe() -> Option<Pipe> {
     }
 }
 
+#[allow(dead_code)]
 pub fn splice_in(stream: &dyn AsRawFd, pipe: Pipe) -> Option<usize> {
     // SAFETY: `stream.as_raw_fd()` yields a descriptor borrowed for the
     // duration of this call — the `&dyn AsRawFd` borrow keeps its owner alive
@@ -51,13 +34,13 @@ pub fn splice_in(stream: &dyn AsRawFd, pipe: Pipe) -> Option<usize> {
     // the fds during the syscall and does not retain any pointer after
     // returning.
     unsafe {
-        let res = splice(
+        let res = libc::splice(
             stream.as_raw_fd(),
-            ptr::null(),
+            ptr::null_mut(),
             pipe[1],
-            ptr::null(),
+            ptr::null_mut(),
             2048,
-            SPLICE_F_NONBLOCK,
+            libc::SPLICE_F_NONBLOCK,
         );
         if res == -1 {
             let err = Error::last_os_error().kind();
@@ -77,6 +60,7 @@ pub fn splice_in(stream: &dyn AsRawFd, pipe: Pipe) -> Option<usize> {
     }
 }
 
+#[allow(dead_code)]
 pub fn splice_out(pipe: Pipe, stream: &dyn AsRawFd) -> Option<usize> {
     // SAFETY: `pipe[0]` is the read end of a pipe created via `create_pipe`;
     // the caller is responsible for keeping it open. `stream.as_raw_fd()`
@@ -86,13 +70,13 @@ pub fn splice_out(pipe: Pipe, stream: &dyn AsRawFd) -> Option<usize> {
     // the fds during the syscall and does not retain any pointer after
     // returning.
     unsafe {
-        let res = splice(
+        let res = libc::splice(
             pipe[0],
-            ptr::null(),
+            ptr::null_mut(),
             stream.as_raw_fd(),
-            ptr::null(),
+            ptr::null_mut(),
             2048,
-            SPLICE_F_NONBLOCK,
+            libc::SPLICE_F_NONBLOCK,
         );
         if res == -1 {
             let err = Error::last_os_error().kind();
