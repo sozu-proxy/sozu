@@ -2698,7 +2698,16 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 endpoint.end_stream(token, stream_id, context);
             }
             let stream = &mut context.streams[stream_id];
-            match self.position {
+            match &self.position {
+                // Inbound RST_STREAM on the backend side terminates the in-flight
+                // request without going through Connection::end_stream (the normal
+                // place where Backend.active_requests is decremented), so do the
+                // bookkeeping explicitly here to avoid leaking load counters.
+                Position::Client(_, backend, BackendStatus::Connected) => {
+                    let mut backend_borrow = backend.borrow_mut();
+                    backend_borrow.active_requests =
+                        backend_borrow.active_requests.saturating_sub(1);
+                }
                 Position::Client(..) => {}
                 Position::Server => {
                     self.distribute_overhead(&mut stream.metrics, rst_byte_totals);
