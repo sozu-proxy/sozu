@@ -1379,6 +1379,11 @@ impl Router {
                             continue;
                         };
                         let stream_count = h2c.streams.len();
+                        if stream_count
+                            >= h2c.peer_settings.settings_max_concurrent_streams as usize
+                        {
+                            continue;
+                        }
                         if stream_count < best_h2_stream_count {
                             best_h2_stream_count = stream_count;
                             reuse_token = Some(*token);
