@@ -583,6 +583,18 @@ pub trait L7ListenerHandler {
     fn get_strict_sni_binding(&self) -> bool {
         true
     }
+
+    /// Per-stream idle timeout for H2 connections. An open stream that makes
+    /// no forward progress for this duration is cancelled (RST_STREAM / CANCEL).
+    /// Mitigates slow-multiplex Slowloris where a client keeps connection-level
+    /// activity high (resetting the connection idle timer on every frame) while
+    /// pinning streams for the full nominal connection timeout.
+    ///
+    /// Defaults to 30 seconds. Listeners return their configured value when
+    /// `h2_stream_idle_timeout_seconds` is present.
+    fn get_h2_stream_idle_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(30)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
