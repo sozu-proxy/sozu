@@ -1111,6 +1111,9 @@ impl Display for HttpsListenerConfig {
         if let Some(v) = self.strict_sni_binding {
             table.add_row(row!["strict sni binding", v]);
         }
+        if let Some(v) = self.disable_http11 {
+            table.add_row(row!["disable http/1.1", v]);
+        }
         write!(f, "{table}")
     }
 }
