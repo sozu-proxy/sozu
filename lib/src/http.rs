@@ -449,6 +449,27 @@ impl ProxySession for HttpSession {
 
 pub type Hostname = String;
 
+/// Cleartext HTTP/1.x listener.
+///
+/// # HTTP/2 over cleartext (h2c) is NOT supported
+///
+/// RFC 7540 §3.2 specified an `Upgrade: h2c` mechanism to negotiate HTTP/2
+/// over a cleartext TCP connection, with a companion prior-knowledge
+/// variant in §3.4. Both paths are intentionally absent from this listener:
+///
+/// - No `Upgrade: h2c` handler: the HTTP/1.1 state machine forwards
+///   `Upgrade` headers to the backend but never responds `101 Switching
+///   Protocols` with an HTTP/2 connection preface.
+/// - No prior-knowledge detection: the listener does not sniff the
+///   24-byte `PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n` magic string; a client
+///   that opens a TCP connection and immediately sends the preface will
+///   be interpreted as a malformed HTTP/1 request and rejected with 400.
+///
+/// RFC 9113 (the current HTTP/2 RFC, obsoleting 7540) formally deprecates
+/// the `Upgrade: h2c` mechanism. Clients that want HTTP/2 MUST use the
+/// TLS ALPN path (`HttpsListener`, selector `h2`) instead. This is
+/// consistent with the industry consensus (nginx, envoy, cloudflare) and
+/// removes an entire class of cleartext-preface smuggling primitives.
 pub struct HttpListener {
     active: bool,
     address: SocketAddr,
