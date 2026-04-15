@@ -623,6 +623,11 @@ pub enum RetrieveClusterError {
     RetrieveFrontend(FrontendFromRequestError),
     #[error("HTTPS redirect required")]
     HttpsRedirect,
+    /// The HTTP `:authority` / `Host` host does not match the TLS SNI that was
+    /// negotiated for this connection, which would cross the TLS trust boundary.
+    /// Maps to HTTP 421 Misdirected Request (RFC 9110 §15.5.20).
+    #[error("TLS SNI {sni:?} does not match HTTP authority {authority:?}")]
+    SniAuthorityMismatch { sni: String, authority: String },
 }
 
 /// Used in sessions
