@@ -3,4 +3,5 @@ pub mod async_backend;
 pub mod client;
 pub mod h2_backend;
 pub mod https_client;
+pub mod raw_h2_response_backend;
 pub mod sync_backend;
