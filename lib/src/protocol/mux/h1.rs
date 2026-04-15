@@ -7,7 +7,8 @@ use crate::{
     protocol::mux::{
         BackendStatus, Context, DebugEvent, Endpoint, GlobalStreamId, MuxResult, Position,
         StreamState, forcefully_terminate_answer, parser::H2Error, set_default_answer,
-        update_readiness_after_read, update_readiness_after_write,
+        shared::drain_tls_close_notify, update_readiness_after_read,
+        update_readiness_after_write,
     },
     socket::{SocketHandler, SocketResult},
     timer::TimeoutContainer,
@@ -515,23 +516,8 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             }
             Position::Server => {
                 let tls_pending_before = self.socket.socket_wants_write();
-                if !self.close_notify_sent {
-                    trace!("H1 SENDING CLOSE NOTIFY");
-                    self.socket.socket_close();
-                    self.close_notify_sent = true;
-                }
-                let mut drain_rounds = 0;
-                while self.socket.socket_wants_write() && drain_rounds < 16 {
-                    let (_size, status) = self.socket.socket_write_vectored(&[]);
-                    drain_rounds += 1;
-                    match status {
-                        SocketResult::WouldBlock | SocketResult::Error | SocketResult::Closed => {
-                            break;
-                        }
-                        SocketResult::Continue => {}
-                    }
-                }
-                let tls_pending_after = self.socket.socket_wants_write();
+                let (tls_pending_after, drain_rounds) =
+                    drain_tls_close_notify(&mut self.socket, &mut self.close_notify_sent);
                 if tls_pending_after {
                     error!(
                         "H1 TLS buffer NOT fully drained on close: pending_before={}, pending_after={}, drain_rounds={}, stream={:?}, close_notify_sent={}, readiness={:?}",
