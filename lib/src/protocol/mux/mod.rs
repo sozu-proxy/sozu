@@ -17,7 +17,7 @@
 
 use std::{
     cell::RefCell,
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     fmt::Debug,
     io::ErrorKind,
     net::{Shutdown, SocketAddr},
@@ -25,7 +25,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use kawa::ParsingPhase;
 use mio::{Interest, Token, net::TcpStream};
 use rusty_ulid::Ulid;
 use sozu_command::{
@@ -35,6 +34,7 @@ use sozu_command::{
 };
 
 mod converter;
+pub mod debug;
 mod h1;
 mod h2;
 pub mod parser;
@@ -63,8 +63,15 @@ use crate::{
 };
 
 pub use crate::protocol::mux::{
-    h1::ConnectionH1, h2::ConnectionH2, h2::H2ByteAccounting, h2::H2ConnectionConfig,
-    h2::H2DrainState, h2::H2FloodConfig, h2::H2FlowControl, parser::H2Error,
+    debug::{DebugEvent, DebugHistory},
+    h1::ConnectionH1,
+    h2::ConnectionH2,
+    h2::H2ByteAccounting,
+    h2::H2ConnectionConfig,
+    h2::H2DrainState,
+    h2::H2FloodConfig,
+    h2::H2FlowControl,
+    parser::H2Error,
 };
 
 // ── Tuning Constants ─────────────────────────────────────────────────────────
@@ -1108,53 +1115,6 @@ impl Stream {
     }
 }
 
-/// Maximum number of debug events retained in the ring buffer.
-/// Oldest entries are dropped when this limit is reached.
-const DEBUG_HISTORY_CAPACITY: usize = 512;
-
-pub struct DebugHistory {
-    pub events: VecDeque<DebugEvent>,
-    pub is_interesting: bool,
-}
-impl Default for DebugHistory {
-    fn default() -> Self {
-        Self {
-            events: VecDeque::with_capacity(DEBUG_HISTORY_CAPACITY),
-            is_interesting: false,
-        }
-    }
-}
-impl DebugHistory {
-    pub fn new() -> Self {
-        Self::default()
-    }
-    pub fn push(&mut self, _event: DebugEvent) {
-        #[cfg(debug_assertions)]
-        {
-            if self.events.len() >= DEBUG_HISTORY_CAPACITY {
-                self.events.pop_front();
-            }
-            self.events.push_back(_event);
-        }
-    }
-    pub fn set_interesting(&mut self, _interesting: bool) {
-        #[cfg(debug_assertions)]
-        {
-            self.is_interesting = _interesting;
-        }
-    }
-    pub fn is_interesting(&self) -> bool {
-        #[cfg(debug_assertions)]
-        {
-            self.is_interesting
-        }
-        #[cfg(not(debug_assertions))]
-        {
-            false
-        }
-    }
-}
-
 pub struct Context<L: ListenerHandler + L7ListenerHandler> {
     pub streams: Vec<Stream>,
     pub pool: Weak<RefCell<Pool>>,
@@ -1688,26 +1648,6 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         }
         false
     }
-}
-
-#[derive(Debug)]
-pub enum DebugEvent {
-    EV(Token, Ready),
-    ReadyTimestamp(usize),
-    LoopStart,
-    LoopIteration(i32),
-    SR(Token, MuxResult, Readiness),
-    SW(Token, MuxResult, Readiness),
-    CW(Token, MuxResult, Readiness),
-    CR(Token, MuxResult, Readiness),
-    CC(usize, StreamState),
-    CCS(Token, String),
-    CCF(usize, BackendConnectionError),
-    CH(Token, Readiness),
-    S(u32, usize, ParsingPhase, usize, usize),
-    Str(String),
-    StreamEvent(usize, usize),
-    SocketIO(usize, usize, usize),
 }
 
 impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHandler> SessionState
