@@ -19,6 +19,9 @@
 //!     (commit `5261dbe5`). Parser-level complement to the existing
 //!     `test_h2_push_promise_from_client` — asserts the specific error
 //!     code rather than just any GOAWAY.
+//!   * Standalone CONTINUATION without preceding HEADERS rejected with
+//!     GOAWAY(PROTOCOL_ERROR) (commit `4a798013`). Parser-level
+//!     complement to `test_h2_continuation_without_initial_headers`.
 
 use std::{io::Write, net::SocketAddr};
 
@@ -474,6 +477,57 @@ fn e2e_h2_parser_reject_push_promise_from_client() {
             5,
             "H2 parser: PUSH_PROMISE from client → GOAWAY(PROTOCOL_ERROR) (RFC 9113 \u{00a7}8.4)",
             try_h2_parser_reject_push_promise_from_client,
+        ),
+        State::Success,
+    );
+}
+
+// ============================================================================
+// Test 6: Standalone CONTINUATION → GOAWAY(PROTOCOL_ERROR)
+// ============================================================================
+
+/// Commit `4a798013` replaced a `debug_assert!(false)` with an explicit
+/// GOAWAY(PROTOCOL_ERROR) when a CONTINUATION arrives without a
+/// preceding HEADERS (or PUSH_PROMISE) with END_HEADERS clear. This
+/// test complements `test_h2_continuation_without_initial_headers` by
+/// asserting the specific error code rather than "any GOAWAY".
+fn try_h2_parser_reject_standalone_continuation() -> State {
+    let (worker, backends, front_port) = setup_h2_test("H2-PARSER-STANDALONE-CONT", 1);
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake(&mut tls);
+
+    let cont = H2Frame::continuation(1, minimal_get_headers_block(), true);
+    let write_ok = tls.write_all(&cont.encode()).is_ok() && tls.flush().is_ok();
+
+    let frames = collect_response_frames(&mut tls, 500, 5, 500);
+    log_frames("Standalone CONTINUATION rejected", &frames);
+
+    let got_protocol_error = contains_goaway_with_error(&frames, H2_ERROR_PROTOCOL_ERROR);
+    let got_any_goaway = contains_goaway(&frames);
+    println!(
+        "Standalone CONTINUATION - GOAWAY(PROTOCOL_ERROR): {got_protocol_error}, \
+         any GOAWAY: {got_any_goaway}"
+    );
+
+    let rejected = got_protocol_error || got_any_goaway || !write_ok;
+    let infra_ok = teardown(tls, front_port, worker, backends);
+    if infra_ok && rejected {
+        State::Success
+    } else {
+        println!("Standalone CONTINUATION - FAIL: rejected={rejected} infra_ok={infra_ok}");
+        State::Fail
+    }
+}
+
+#[test]
+fn e2e_h2_parser_reject_standalone_continuation() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "H2 parser: standalone CONTINUATION → GOAWAY(PROTOCOL_ERROR) (RFC 9113 \u{00a7}6.10)",
+            try_h2_parser_reject_standalone_continuation,
         ),
         State::Success,
     );
