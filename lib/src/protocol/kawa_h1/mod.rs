@@ -95,6 +95,11 @@ pub enum DefaultAnswer {
         phase: kawa::ParsingPhaseMarker,
         capacity: usize,
     },
+    /// RFC 9110 §15.5.20 — returned when the request's `:authority` / `Host`
+    /// host does not match the TLS SNI negotiated for this connection.
+    /// The peer may retry on a fresh TLS connection that negotiates an SNI
+    /// matching the authority.
+    Answer421 {},
     Answer502 {
         message: String,
         phase: kawa::ParsingPhaseMarker,
@@ -124,6 +129,7 @@ impl From<&DefaultAnswer> for u16 {
             DefaultAnswer::Answer404 { .. } => 404,
             DefaultAnswer::Answer408 { .. } => 408,
             DefaultAnswer::Answer413 { .. } => 413,
+            DefaultAnswer::Answer421 { .. } => 421,
             DefaultAnswer::Answer502 { .. } => 502,
             DefaultAnswer::Answer503 { .. } => 503,
             DefaultAnswer::Answer504 { .. } => 504,
@@ -998,6 +1004,11 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 ),
                 DefaultAnswer::Answer413 { .. } => incr!(
                     "http.413.errors",
+                    self.context.cluster_id.as_deref(),
+                    self.context.backend_id.as_deref()
+                ),
+                DefaultAnswer::Answer421 { .. } => incr!(
+                    "http.421.errors",
                     self.context.cluster_id.as_deref(),
                     self.context.backend_id.as_deref()
                 ),

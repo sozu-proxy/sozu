@@ -870,15 +870,12 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                 ) => {
                                     // RFC 9110 §15.5.20: 421 Misdirected Request is the
                                     // semantically correct status for an authority that
-                                    // does not belong to this TLS connection. Sozu does
-                                    // not currently ship a 421 answer template, so the
-                                    // closest existing refusal (401 Unauthorized) is
-                                    // used — still terminal, still sets keep_alive=false.
-                                    // The dedicated http.sni_authority_mismatch metric
-                                    // emitted in `route_from_request` is the durable
-                                    // signal for operators. Upgrading to a real 421
-                                    // template is tracked separately.
-                                    set_default_answer(stream, front_readiness, 401, &answers);
+                                    // does not belong to this TLS connection. The
+                                    // http.sni_authority_mismatch metric emitted in
+                                    // `route_from_request` remains the durable signal;
+                                    // the 421 body here is what a client sees and may
+                                    // retry on a fresh TLS connection with a matching SNI.
+                                    set_default_answer(stream, front_readiness, 421, &answers);
                                 }
                                 BE::RetrieveClusterError(RetrieveClusterError::HttpsRedirect) => {
                                     set_default_answer(stream, front_readiness, 301, &answers);

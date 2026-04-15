@@ -270,6 +270,8 @@ message CustomHttpAnswers {
     optional string answer_408 = 5;
     // PayloadTooLarge
     optional string answer_413 = 6;
+    // MisdirectedRequest (RFC 9110 §15.5.20, TLS SNI ↔ :authority mismatch)
+    optional string answer_421 = 11;
     // BadGateway
     optional string answer_502 = 7;
     // ServiceUnavailable
