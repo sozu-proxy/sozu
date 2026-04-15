@@ -569,8 +569,17 @@ const DEFAULT_URGENCY: u8 = 3;
 /// Maximum entries in the priority map to prevent flooding via PRIORITY frames.
 const MAX_PRIORITIES: usize = 4096;
 
+/// Small look-ahead window (in stream IDs) for PRIORITY frames that arrive
+/// slightly before the peer opens the corresponding stream. RFC 9218 allows
+/// PRIORITY to be sent for an idle stream that the peer intends to open
+/// soon. Past this budget we assume the ID will never be used and drop the
+/// entry, preventing flooding with far-future stream IDs.
+const PRIORITY_IDLE_LOOKAHEAD: u32 = 64;
+
 impl Prioriser {
-    /// Record or update the priority for a stream.
+    /// Record or update the priority for a stream that we know exists or are
+    /// currently processing (used from pkawa's header-handling path where the
+    /// owning stream's HEADERS frame is being decoded).
     ///
     /// Returns `true` if the priority is invalid (self-dependency for RFC 7540),
     /// signalling the caller should reset the stream with a protocol error.
@@ -599,6 +608,55 @@ impl Prioriser {
                 false
             }
         }
+    }
+
+    /// Record or update the priority for a stream ID that arrived via a
+    /// standalone PRIORITY frame.
+    ///
+    /// Pass 3 Medium #4: without this guard, a peer could send PRIORITY for
+    /// arbitrary stream IDs (e.g. 2^31 ever-increasing IDs) and pin up to
+    /// `MAX_PRIORITIES` entries of memory. Accept only:
+    /// - an ID that corresponds to a currently-open stream (`open_streams`);
+    /// - an idle ID slightly ahead of `last_stream_id` (within
+    ///   [`PRIORITY_IDLE_LOOKAHEAD`]), matching RFC 9218's "set priority for
+    ///   a stream about to be opened" pattern.
+    ///
+    /// IDs in the past that we do not currently track (already closed) and
+    /// IDs too far in the future are silently dropped. The `MAX_PRIORITIES`
+    /// ceiling is preserved as a defensive backstop if both filters are ever
+    /// circumvented.
+    ///
+    /// Returns the same value semantics as [`Self::push_priority`].
+    pub fn push_priority_guarded(
+        &mut self,
+        stream_id: StreamId,
+        priority: parser::PriorityPart,
+        last_stream_id: StreamId,
+        open_streams: &HashMap<StreamId, GlobalStreamId>,
+    ) -> bool {
+        if !self.is_acceptable(stream_id, last_stream_id, open_streams) {
+            trace!(
+                "PRIORITY dropped for unknown/far stream {} (last_stream_id={})",
+                stream_id, last_stream_id
+            );
+            return false;
+        }
+        self.push_priority(stream_id, priority)
+    }
+
+    fn is_acceptable(
+        &self,
+        stream_id: StreamId,
+        last_stream_id: StreamId,
+        open_streams: &HashMap<StreamId, GlobalStreamId>,
+    ) -> bool {
+        if open_streams.contains_key(&stream_id) {
+            return true;
+        }
+        // Idle stream ahead of the current counter: accept a small look-ahead.
+        // Past IDs that are NOT in `open_streams` are closed — drop them.
+        let upper = last_stream_id.saturating_add(PRIORITY_IDLE_LOOKAHEAD);
+        stream_id > last_stream_id && stream_id <= upper
     }
 
     /// Remove a stream's priority entry (called when the stream is recycled).
@@ -2918,10 +2976,16 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         } else {
             self.attribute_bytes_to_overhead();
         }
-        if self
-            .prioriser
-            .push_priority(priority.stream_id, priority.inner)
-        {
+        // Pass 3 Medium #4: standalone PRIORITY frames can arrive for any
+        // peer-chosen stream ID. Accept only currently-open streams and a
+        // small idle look-ahead window; everything else is dropped before
+        // it can feed memory into the priority map.
+        if self.prioriser.push_priority_guarded(
+            priority.stream_id,
+            priority.inner,
+            self.last_stream_id,
+            &self.streams,
+        ) {
             if let Some(global_stream_id) = self.streams.get(&priority.stream_id) {
                 return self.reset_stream(
                     *global_stream_id,
@@ -4121,6 +4185,99 @@ mod tests {
             },
         );
         assert_eq!(p.get(&1), (0, true));
+    }
+
+    #[test]
+    fn test_prioriser_guarded_accepts_open_stream() {
+        let mut p = Prioriser::default();
+        let mut open: HashMap<StreamId, GlobalStreamId> = HashMap::new();
+        open.insert(3, 0);
+        let invalid = p.push_priority_guarded(
+            3,
+            parser::PriorityPart::Rfc9218 {
+                urgency: 1,
+                incremental: false,
+            },
+            7,
+            &open,
+        );
+        assert!(!invalid);
+        assert_eq!(p.get(&3), (1, false));
+    }
+
+    #[test]
+    fn test_prioriser_guarded_accepts_idle_lookahead() {
+        let mut p = Prioriser::default();
+        let open: HashMap<StreamId, GlobalStreamId> = HashMap::new();
+        // Just ahead of last_stream_id, within PRIORITY_IDLE_LOOKAHEAD.
+        let invalid = p.push_priority_guarded(
+            105,
+            parser::PriorityPart::Rfc9218 {
+                urgency: 2,
+                incremental: true,
+            },
+            99,
+            &open,
+        );
+        assert!(!invalid);
+        assert_eq!(p.get(&105), (2, true));
+    }
+
+    #[test]
+    fn test_prioriser_guarded_drops_far_future_stream() {
+        let mut p = Prioriser::default();
+        let open: HashMap<StreamId, GlobalStreamId> = HashMap::new();
+        // Beyond the 64-slot lookahead window.
+        let invalid = p.push_priority_guarded(
+            1_000_001,
+            parser::PriorityPart::Rfc9218 {
+                urgency: 0,
+                incremental: false,
+            },
+            3,
+            &open,
+        );
+        assert!(!invalid); // not a protocol error, just dropped
+        // Default priority returned — no entry stored.
+        assert_eq!(p.get(&1_000_001), (DEFAULT_URGENCY, false));
+    }
+
+    #[test]
+    fn test_prioriser_guarded_drops_closed_past_stream() {
+        let mut p = Prioriser::default();
+        let open: HashMap<StreamId, GlobalStreamId> = HashMap::new();
+        // Past the counter and not open = already closed. Drop.
+        let invalid = p.push_priority_guarded(
+            3,
+            parser::PriorityPart::Rfc9218 {
+                urgency: 5,
+                incremental: false,
+            },
+            99,
+            &open,
+        );
+        assert!(!invalid);
+        assert_eq!(p.get(&3), (DEFAULT_URGENCY, false));
+    }
+
+    #[test]
+    fn test_prioriser_guarded_cannot_flood_with_far_ids() {
+        // Previously an attacker could pack MAX_PRIORITIES entries by picking
+        // far-future stream IDs. The guard rejects them before the cap helps.
+        let mut p = Prioriser::default();
+        let open: HashMap<StreamId, GlobalStreamId> = HashMap::new();
+        for delta in 10_000..(10_000 + MAX_PRIORITIES as u32) {
+            p.push_priority_guarded(
+                delta,
+                parser::PriorityPart::Rfc9218 {
+                    urgency: 0,
+                    incremental: false,
+                },
+                0,
+                &open,
+            );
+        }
+        assert_eq!(p.priorities.len(), 0);
     }
 
     // ── H2FlowControl ───────────────────────────────────────────────────
