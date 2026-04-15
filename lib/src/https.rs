@@ -261,15 +261,40 @@ impl HttpsSession {
             sni_owned, alpn
         );
 
+        // Reject clients that fail to negotiate `h2` when the listener is
+        // configured as H2-only: silently falling back to HTTP/1.1 would let a
+        // downgrade-capable peer bypass H2-specific protections advertised
+        // for this listener (Pass 5 Medium #4 of the security audit).
+        let disable_http11 = self.listener.borrow().is_http11_disabled();
         let alpn = match alpn {
-            Some("http/1.1") => AlpnProtocol::Http11,
+            Some("http/1.1") => {
+                if disable_http11 {
+                    incr!("https.alpn.rejected.http11_disabled");
+                    warn!(
+                        "rejecting TLS connection: listener is H2-only but client negotiated http/1.1"
+                    );
+                    return None;
+                }
+                AlpnProtocol::Http11
+            }
             Some("h2") => AlpnProtocol::H2,
             Some(other) => {
                 error!("Unsupported ALPN protocol: {}", other);
                 return None;
             }
-            // Some clients don't fill in the ALPN protocol, in this case we default to Http/1.1
-            None => AlpnProtocol::Http11,
+            // Some clients don't fill in the ALPN protocol. By default we
+            // downgrade to HTTP/1.1 to preserve compatibility; on an H2-only
+            // listener we instead drop the connection.
+            None => {
+                if disable_http11 {
+                    incr!("https.alpn.rejected.http11_disabled");
+                    warn!(
+                        "rejecting TLS connection: listener is H2-only but client did not negotiate ALPN"
+                    );
+                    return None;
+                }
+                AlpnProtocol::Http11
+            }
         };
 
         if let Some(version) = handshake.session.protocol_version() {
@@ -746,6 +771,15 @@ impl L7ListenerHandler for HttpsListener {
 }
 
 impl HttpsListener {
+    /// Whether this listener rejects clients that do not negotiate `h2`
+    /// via TLS ALPN (including those that omit ALPN). Reads the
+    /// `disable_http11` knob; defaults to `false` to preserve the
+    /// historical behavior where a missing ALPN silently downgrades
+    /// to HTTP/1.1.
+    pub fn is_http11_disabled(&self) -> bool {
+        self.config.disable_http11.unwrap_or(false)
+    }
+
     pub fn try_new(
         config: HttpsListenerConfig,
         token: Token,

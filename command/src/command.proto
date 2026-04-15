@@ -239,6 +239,12 @@ message HttpsListenerConfig {
     // TLS trust boundary, so leave enabled unless an operational need
     // requires cross-SNI routing. Default: true.
     optional bool strict_sni_binding = 35;
+    // When true, this listener only accepts HTTP/2 connections: clients
+    // that fail to negotiate `h2` via TLS ALPN (including those that
+    // omit ALPN altogether) are dropped at handshake instead of silently
+    // falling back to HTTP/1.1. Default: false — preserves the historical
+    // "ALPN missing defaults to h1" behavior.
+    optional bool disable_http11 = 36;
 }
 
 // details of an TCP listener

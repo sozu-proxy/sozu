@@ -321,6 +321,11 @@ pub struct ListenerBuilder {
     /// plaintext HTTP listeners never have an SNI to compare against.
     /// Default: true.
     pub strict_sni_binding: Option<bool>,
+    /// When true, this HTTPS listener only accepts HTTP/2 connections;
+    /// clients that do not negotiate `h2` via TLS ALPN (including those
+    /// that omit ALPN entirely) are dropped at handshake instead of
+    /// silently downgrading to HTTP/1.1. Default: false.
+    pub disable_http11: Option<bool>,
 }
 
 pub fn default_sticky_name() -> String {
@@ -391,6 +396,7 @@ impl ListenerBuilder {
             h2_max_rst_stream_abusive_lifetime: None,
             h2_max_header_list_size: None,
             strict_sni_binding: None,
+            disable_http11: None,
         }
     }
 
@@ -700,6 +706,7 @@ impl ListenerBuilder {
             h2_max_rst_stream_abusive_lifetime: self.h2_max_rst_stream_abusive_lifetime,
             h2_max_header_list_size: self.h2_max_header_list_size,
             strict_sni_binding: self.strict_sni_binding,
+            disable_http11: self.disable_http11,
         };
 
         Ok(https_listener_config)
