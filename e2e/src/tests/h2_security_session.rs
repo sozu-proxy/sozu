@@ -20,6 +20,11 @@
 //!   must still receive the complete response body from the backend;
 //!   the complementary RST sub-case merely checks sozu survives the
 //!   abrupt close without stalling.
+//! * FIX-22 (`8afba086`) — [`e2e_session_stream_id_exhaustion_graceful`]:
+//!   the [`ConnectionH2::__test_set_last_stream_id`] hook lives on a live
+//!   backend connection object that the E2E harness cannot reach through
+//!   the proxy-command surface; the full assertion is gated `#[ignore]`
+//!   with a smoke placeholder kept for future wiring.
 //!
 //! The `e2e-hooks` feature is forwarded to `sozu-lib` via
 //! `e2e/Cargo.toml` so the hooks compile in.
@@ -549,6 +554,68 @@ fn e2e_session_tls_client_fin_not_truncated() {
             3,
             "FIX-21: TLS client FIN before response completes; RST cleanup",
             try_e2e_session_tls_client_fin_not_truncated,
+        ),
+        State::Success,
+    );
+}
+
+// ============================================================================
+// FIX-22 — Stream-ID exhaustion graceful disconnect
+// ============================================================================
+//
+// The `ConnectionH2::__test_set_last_stream_id(u32)` hook is a method on a
+// live `ConnectionH2` instance owned by the sozu worker's session slab. The
+// E2E harness only has access to the proxy command surface — it cannot
+// reach into a specific backend connection to arm the hook. Extending the
+// command protocol to expose such a setter would contradict the security
+// posture of this recipe (no production-visible injection point).
+//
+// We therefore keep a narrow placeholder smoke that is `#[ignore]`d by
+// default. The full "backend transitions to Disconnecting" assertion is
+// deferred to a white-box unit test inside `lib/src/protocol/mux/h2.rs`.
+
+fn try_e2e_session_stream_id_exhaustion_graceful() -> State {
+    let (mut worker, mut backend, front_port) = setup_h2_backend_cluster("E2E-SESSION-FIX22");
+
+    // Smoke: a single H2 -> H2 request succeeds end-to-end. The full
+    // exhaustion assertion (backend transitions to `Disconnecting`,
+    // GOAWAY emitted, fresh connection routed) requires a white-box
+    // hook into the live `ConnectionH2` instance — see module docs.
+    let client = build_h2_client();
+    let uri: Uri = format!("https://localhost:{front_port}/api/smoke")
+        .parse()
+        .unwrap();
+    let resp = resolve_request(&client, uri);
+    println!("FIX-22 smoke request: {resp:?}");
+    let smoke_ok = resp
+        .as_ref()
+        .map(|(s, body)| s.is_success() && body.contains("fix18-pong"))
+        .unwrap_or(false);
+
+    let sozu_ok = verify_sozu_alive(front_port);
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+    let resp_sent = backend.get_responses_sent();
+    backend.stop();
+
+    if smoke_ok && sozu_ok && stopped && resp_sent >= 1 {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+#[ignore = "FIX-22 requires reaching a live ConnectionH2 mid-flight — infeasible via the proxy command surface; full assertion deferred to a white-box unit test in `lib/src/protocol/mux/h2.rs`. The `#[ignore]`d smoke is kept for future wiring."]
+fn e2e_session_stream_id_exhaustion_graceful() {
+    // NOTE: full exhaustion assertion requires a white-box unit test — see
+    // module docstring. This E2E is a narrow smoke that a single H2→H2
+    // request still succeeds under normal load.
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "FIX-22: stream-ID exhaustion smoke (full assertion left to unit tests)",
+            try_e2e_session_stream_id_exhaustion_graceful,
         ),
         State::Success,
     );
