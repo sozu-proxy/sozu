@@ -552,8 +552,13 @@ pub fn priority_frame<'a>(
     input: &'a [u8],
     header: &FrameHeader,
 ) -> IResult<&'a [u8], Frame, ParserError<'a>> {
-    let (i, stream_dependency) = stream_dependency(input)?;
-    let (i, weight) = be_u8(i)?;
+    // Size-check in `frame_header` already rejected mismatches, but use
+    // `take(header.payload_len)` to keep the fixed-size parsers structurally
+    // symmetric with variable-size ones: if the upstream length invariant is
+    // ever weakened we still consume exactly the declared payload and the
+    // inner parse fails cleanly instead of reading random trailing bytes.
+    let (i, data) = take(header.payload_len)(input)?;
+    let (_, (stream_dependency, weight)) = tuple((stream_dependency, be_u8))(data)?;
     Ok((
         i,
         Frame::Priority(Priority {
@@ -576,7 +581,12 @@ pub fn rst_stream_frame<'a>(
     input: &'a [u8],
     header: &FrameHeader,
 ) -> IResult<&'a [u8], Frame, ParserError<'a>> {
-    let (i, error_code) = be_u32(input)?;
+    // `take(header.payload_len)` keeps the fixed-size parsers symmetric with
+    // variable-size ones (see `priority_frame`). The framing layer already
+    // enforced `payload_len == RST_STREAM_PAYLOAD_SIZE == 4`, so this
+    // consumes exactly the 32-bit error-code field.
+    let (i, data) = take(header.payload_len)(input)?;
+    let (_, error_code) = be_u32(data)?;
     Ok((
         i,
         Frame::RstStream(RstStream {
@@ -673,7 +683,10 @@ pub fn ping_frame<'a>(
     input: &'a [u8],
     header: &FrameHeader,
 ) -> IResult<&'a [u8], Frame, ParserError<'a>> {
-    let (i, data) = take(8usize)(input)?;
+    // `take(header.payload_len)` (rather than `take(8usize)`) keeps the
+    // fixed-size parsers symmetric with variable-size ones. The framing
+    // layer already enforced `payload_len == PING_PAYLOAD_SIZE == 8`.
+    let (i, data) = take(header.payload_len)(input)?;
 
     let mut p = Ping {
         payload: [0; 8],
