@@ -252,6 +252,7 @@ where
     Ok(invalid_headers)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn handle_header<C>(
     decoder: &mut loona_hpack::Decoder<'static>,
     prioriser: &mut Prioriser,
@@ -260,6 +261,7 @@ pub fn handle_header<C>(
     input: &[u8],
     end_stream: bool,
     callbacks: &mut C,
+    max_header_list_size: u32,
 ) -> Result<(), (H2Error, bool)>
 where
     C: ParserCallbacks<Checkout>,
@@ -268,7 +270,7 @@ where
         return handle_trailer(kawa, input, end_stream, decoder);
     }
     kawa.push_block(Block::StatusLine);
-    let max_decoded_bytes = crate::protocol::mux::h2::MAX_HEADER_LIST_SIZE;
+    let max_decoded_bytes = max_header_list_size as usize;
     kawa.detached.status_line = match kawa.kind {
         Kind::Request => {
             let mut method = Store::Empty;
@@ -922,6 +924,7 @@ mod tests {
             &encoded,
             end_stream,
             &mut callbacks,
+            crate::protocol::mux::h2::MAX_HEADER_LIST_SIZE as u32,
         );
         assert!(result.is_ok(), "handle_header failed: {:?}", result.err());
         kawa
@@ -1137,6 +1140,7 @@ mod tests {
             &encoded,
             end_stream,
             &mut callbacks,
+            crate::protocol::mux::h2::MAX_HEADER_LIST_SIZE as u32,
         )
     }
 
@@ -1168,6 +1172,7 @@ mod tests {
             &encoded,
             end_stream,
             &mut callbacks,
+            crate::protocol::mux::h2::MAX_HEADER_LIST_SIZE as u32,
         )
     }
 

@@ -714,6 +714,18 @@ impl L7ListenerHandler for HttpsListener {
                 .config
                 .h2_max_glitch_count
                 .unwrap_or(defaults.max_glitch_count),
+            max_rst_stream_lifetime: self
+                .config
+                .h2_max_rst_stream_lifetime
+                .unwrap_or(defaults.max_rst_stream_lifetime),
+            max_rst_stream_abusive_lifetime: self
+                .config
+                .h2_max_rst_stream_abusive_lifetime
+                .unwrap_or(defaults.max_rst_stream_abusive_lifetime),
+            max_header_list_size: self
+                .config
+                .h2_max_header_list_size
+                .unwrap_or(defaults.max_header_list_size),
         }
     }
 

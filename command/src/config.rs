@@ -302,6 +302,16 @@ pub struct ListenerBuilder {
     pub h2_max_concurrent_streams: Option<u32>,
     /// Shrink threshold ratio for recycled stream slots. Default: 2.
     pub h2_stream_shrink_ratio: Option<u32>,
+    /// H2 flood detection: absolute lifetime cap on RST_STREAM frames
+    /// received on a single connection (CVE-2023-44487). Default: 10000.
+    pub h2_max_rst_stream_lifetime: Option<u64>,
+    /// H2 flood detection: lifetime cap on "abusive" (pre-response-start)
+    /// RST_STREAM frames (Rapid Reset signature, CVE-2023-44487). Default: 50.
+    pub h2_max_rst_stream_abusive_lifetime: Option<u64>,
+    /// H2 flood detection: maximum accumulated HPACK-decoded header list
+    /// size per request (SETTINGS_MAX_HEADER_LIST_SIZE, RFC 9113 §6.5.2).
+    /// Default: 65536.
+    pub h2_max_header_list_size: Option<u32>,
 }
 
 pub fn default_sticky_name() -> String {
@@ -367,6 +377,9 @@ impl ListenerBuilder {
             h2_initial_connection_window: None,
             h2_max_concurrent_streams: None,
             h2_stream_shrink_ratio: None,
+            h2_max_rst_stream_lifetime: None,
+            h2_max_rst_stream_abusive_lifetime: None,
+            h2_max_header_list_size: None,
         }
     }
 
@@ -532,6 +545,9 @@ impl ListenerBuilder {
             h2_initial_connection_window: self.h2_initial_connection_window,
             h2_max_concurrent_streams: self.h2_max_concurrent_streams,
             h2_stream_shrink_ratio: self.h2_stream_shrink_ratio,
+            h2_max_rst_stream_lifetime: self.h2_max_rst_stream_lifetime,
+            h2_max_rst_stream_abusive_lifetime: self.h2_max_rst_stream_abusive_lifetime,
+            h2_max_header_list_size: self.h2_max_header_list_size,
             ..Default::default()
         };
 
@@ -668,6 +684,9 @@ impl ListenerBuilder {
             h2_initial_connection_window: self.h2_initial_connection_window,
             h2_max_concurrent_streams: self.h2_max_concurrent_streams,
             h2_stream_shrink_ratio: self.h2_stream_shrink_ratio,
+            h2_max_rst_stream_lifetime: self.h2_max_rst_stream_lifetime,
+            h2_max_rst_stream_abusive_lifetime: self.h2_max_rst_stream_abusive_lifetime,
+            h2_max_header_list_size: self.h2_max_header_list_size,
         };
 
         Ok(https_listener_config)
