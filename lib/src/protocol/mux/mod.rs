@@ -233,27 +233,6 @@ fn update_readiness_after_write(
 ) -> bool {
     update_readiness(size, status, readiness, Ready::WRITABLE)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn update_readiness_after_read_closed_keeps_writable() {
-        let mut readiness = Readiness {
-            event: Ready::READABLE | Ready::WRITABLE | Ready::HUP,
-            interest: Ready::READABLE | Ready::WRITABLE | Ready::HUP,
-        };
-
-        let should_yield = update_readiness_after_read(17, SocketResult::Closed, &mut readiness);
-
-        assert!(!should_yield);
-        assert!(!readiness.event.is_readable());
-        assert!(readiness.event.is_writable());
-        assert!(readiness.event.is_hup());
-    }
-}
-
 pub struct Context<L: ListenerHandler + L7ListenerHandler> {
     pub streams: Vec<Stream>,
     pub pool: Weak<RefCell<Pool>>,
@@ -1385,5 +1364,25 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         }
 
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn update_readiness_after_read_closed_keeps_writable() {
+        let mut readiness = Readiness {
+            event: Ready::READABLE | Ready::WRITABLE | Ready::HUP,
+            interest: Ready::READABLE | Ready::WRITABLE | Ready::HUP,
+        };
+
+        let should_yield = update_readiness_after_read(17, SocketResult::Closed, &mut readiness);
+
+        assert!(!should_yield);
+        assert!(!readiness.event.is_readable());
+        assert!(readiness.event.is_writable());
+        assert!(readiness.event.is_hup());
     }
 }
