@@ -2659,6 +2659,17 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         }
     }
 
+    /// Test-only setter: jump `last_stream_id` close to [`STREAM_ID_MAX`] so
+    /// that the next call to [`Self::new_stream_id`] exhausts the 31-bit
+    /// space. FIX-22 ("Stream-ID exhaustion disconnects backend gracefully")
+    /// exercises the `None`-return branch — reaching it through normal API
+    /// usage would require issuing ~2³¹ requests, which is not tractable in
+    /// an E2E harness.
+    #[cfg(any(test, feature = "e2e-hooks"))]
+    pub fn __test_set_last_stream_id(&mut self, id: StreamId) {
+        self.last_stream_id = id;
+    }
+
     fn handle_frame<E, L>(
         &mut self,
         frame: Frame,
