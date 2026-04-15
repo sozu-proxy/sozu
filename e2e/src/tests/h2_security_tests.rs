@@ -3731,3 +3731,104 @@ fn test_h2_padded_data_body_and_credit() {
         State::Success
     );
 }
+
+// ============================================================================
+// Group 8C — Flow control / flood detection adversarial E2E tests
+// ============================================================================
+//
+// These tests cover Section 2 group 8C of the H2 security audit completion
+// recipe. Each test targets a specific fix commit:
+//
+// * `e2e_h2_flood_rapid_reset_abusive_lifetime` — commit `bdb3dc34`
+//   (Rapid Reset lifetime cap, CVE-2023-44487 variant).
+// * `e2e_h2_flow_per_stream_idle_timeout` — commit `69874f6e`
+//   (per-stream idle timeout, slow-multiplex Slowloris).
+// * `e2e_h2_flood_priority_map_cap` — commit `aac9d0b7`
+//   (PRIORITY map restricted to known streams).
+// * `e2e_h2_flood_settings_entries_cap` — commit `6c200656`
+//   (SETTINGS entries capped at 64 \u{2192} FRAME_SIZE_ERROR).
+// * `e2e_h2_flood_window_update_on_closed_stream` — commit `77b26265`
+//   (WINDOW_UPDATE on closed stream counted as glitch).
+
+/// Minimal header block reused across the 8C tests.
+///
+/// HPACK static-table encoding:
+///   * 0x82            : `:method GET`
+///   * 0x84            : `:path /`
+///   * 0x87            : `:scheme https`
+///   * 0x41 0x09 \"localhost\" : `:authority localhost`
+fn h2_basic_get_header_block() -> Vec<u8> {
+    vec![
+        0x82, 0x84, 0x87, 0x41, 0x09, b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't',
+    ]
+}
+
+// ----------------------------------------------------------------------------
+// FIX-11 (`bdb3dc34`) — Rapid Reset lifetime cap
+// ----------------------------------------------------------------------------
+
+/// Rapid Reset pre-response flood.
+///
+/// Opens N streams; each one immediately follows its `HEADERS(END_STREAM)`
+/// with a `RST_STREAM(CANCEL)` before the backend response has a chance to
+/// start. The per-window counter caps at 100 but half-decays, so the audit
+/// added two lifetime counters:
+///
+///   * `total_rst_received_lifetime` (`DEFAULT_MAX_RST_STREAM_LIFETIME = 10 000`),
+///   * `total_abusive_rst_received_lifetime` (`DEFAULT_MAX_RST_STREAM_ABUSIVE_LIFETIME = 50`).
+///
+/// At the 51st abusive RST Sozu must emit `GOAWAY(ENHANCE_YOUR_CALM)`.
+///
+/// Reference: audit Pass 3 High #1 (RFC 9113 \u{00a7}5.1, \u{00a7}6.4, CVE-2023-44487).
+fn try_h2_flood_rapid_reset_abusive_lifetime() -> State {
+    let (worker, backends, front_port) = setup_h2_test("H2-8C-RAPID-RESET", 1);
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake(&mut tls);
+
+    // Abusive budget is 50 — open 60 streams to ensure the 51st trips.
+    let header_block = h2_basic_get_header_block();
+    let mut write_ok = true;
+    for i in 0..60u32 {
+        let stream_id = i * 2 + 1; // odd client stream IDs
+        let headers = H2Frame::headers(stream_id, header_block.clone(), true, true);
+        let rst = H2Frame::rst_stream(stream_id, 0x8 /* CANCEL */);
+        let mut batch = headers.encode();
+        batch.extend_from_slice(&rst.encode());
+        if tls.write_all(&batch).is_err() || tls.flush().is_err() {
+            // Sozu can close the connection mid-burst once GOAWAY is emitted.
+            write_ok = false;
+            break;
+        }
+    }
+
+    let frames = collect_response_frames(&mut tls, 500, 5, 500);
+    log_frames("Rapid Reset abusive lifetime", &frames);
+
+    let got_enhance_calm = contains_goaway_with_error(&frames, H2_ERROR_ENHANCE_YOUR_CALM);
+    println!(
+        "Rapid Reset - write_ok={write_ok} ENHANCE_YOUR_CALM={got_enhance_calm} \
+         frames={}",
+        frames.len()
+    );
+
+    let infra_ok = teardown(tls, front_port, worker, backends);
+    if got_enhance_calm && infra_ok {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn e2e_h2_flood_rapid_reset_abusive_lifetime() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 flood: Rapid Reset abusive-pre-response lifetime cap (CVE-2023-44487)",
+            try_h2_flood_rapid_reset_abusive_lifetime
+        ),
+        State::Success
+    );
+}
