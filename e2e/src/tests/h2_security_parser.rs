@@ -13,6 +13,8 @@
 //!   * `strip_padding` off-by-one (commit `5261dbe5`): valid
 //!     `pad_length == payload_len - 1` accepted, overflowing variant
 //!     rejected.
+//!   * Unknown frame types silently ignored per RFC 9113 §5.5, including
+//!     the real RFC 9218 PRIORITY_UPDATE type `0x10` (commit `5261dbe5`).
 
 use std::{io::Write, net::SocketAddr};
 
@@ -288,6 +290,129 @@ fn e2e_h2_parser_reject_overflowing_padding() {
             5,
             "H2 parser: pad_length >= payload_len rejected (strip_padding overflow)",
             try_h2_parser_reject_overflowing_padding,
+        ),
+        State::Success,
+    );
+}
+
+// ============================================================================
+// Test 4a: Unknown frame type (0xFF) is silently ignored
+// ============================================================================
+
+/// RFC 9113 §5.5: endpoints MUST ignore and discard frames of unknown
+/// type. Before commit `5261dbe5` sozu returned a parser error; now the
+/// unknown frame is consumed and processing continues.
+///
+/// Send an unknown type interleaved between handshake and HEADERS; the
+/// subsequent HEADERS must still produce a response on stream 1.
+fn try_h2_parser_ignore_unknown_frame_type() -> State {
+    let (worker, backends, front_port) = setup_h2_test("H2-PARSER-UNKNOWN", 1);
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake(&mut tls);
+
+    // Unknown frame type 0xFF on stream 0 (valid for extension frames
+    // without stream semantics). 8-byte payload so the parser has to
+    // consume it rather than fall off the end of the wire buffer.
+    let unknown = H2Frame::new(
+        0xFF,
+        0,
+        0,
+        vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00, 0x00, 0x00],
+    );
+    tls.write_all(&unknown.encode()).unwrap();
+
+    let headers = H2Frame::headers(1, minimal_get_headers_block(), true, true);
+    tls.write_all(&headers.encode()).unwrap();
+    tls.flush().unwrap();
+
+    let frames = collect_response_frames(&mut tls, 500, 6, 500);
+    log_frames("Unknown frame type ignored", &frames);
+
+    let got_response = contains_headers_response(&frames);
+    let got_goaway = contains_goaway(&frames);
+
+    let infra_ok = teardown(tls, front_port, worker, backends);
+    if infra_ok && got_response && !got_goaway {
+        State::Success
+    } else {
+        println!(
+            "Unknown frame type - FAIL: got_response={got_response} \
+             got_goaway={got_goaway} infra_ok={infra_ok}"
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn e2e_h2_parser_ignore_unknown_frame_type() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "H2 parser: unknown frame type 0xFF silently ignored (RFC 9113 \u{00a7}5.5)",
+            try_h2_parser_ignore_unknown_frame_type,
+        ),
+        State::Success,
+    );
+}
+
+// ============================================================================
+// Test 4b: RFC 9218 PRIORITY_UPDATE (type 0x10) silently ignored
+// ============================================================================
+
+/// Real-world forward-compatibility check: RFC 9218 defines
+/// PRIORITY_UPDATE with frame type `0x10`. Sozu does not implement the
+/// extension, so it must treat it as unknown and skip it without
+/// affecting the rest of the connection.
+fn try_h2_parser_ignore_priority_update_frame() -> State {
+    let (worker, backends, front_port) = setup_h2_test("H2-PARSER-PRIO-UPDATE", 1);
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake(&mut tls);
+
+    // PRIORITY_UPDATE payload layout (RFC 9218 §7.1): 4 bytes prioritized
+    // stream id + a priority field value (ASCII, free-form). Payload
+    // contents are irrelevant here — the parser must simply skip
+    // `payload_len` bytes.
+    let priority_update = H2Frame::new(
+        0x10,
+        0,
+        0,
+        vec![0, 0, 0, 1, b'u', b'=', b'0'], // 7 bytes
+    );
+    tls.write_all(&priority_update.encode()).unwrap();
+
+    let headers = H2Frame::headers(1, minimal_get_headers_block(), true, true);
+    tls.write_all(&headers.encode()).unwrap();
+    tls.flush().unwrap();
+
+    let frames = collect_response_frames(&mut tls, 500, 6, 500);
+    log_frames("PRIORITY_UPDATE ignored", &frames);
+
+    let got_response = contains_headers_response(&frames);
+    let got_goaway = contains_goaway(&frames);
+
+    let infra_ok = teardown(tls, front_port, worker, backends);
+    if infra_ok && got_response && !got_goaway {
+        State::Success
+    } else {
+        println!(
+            "PRIORITY_UPDATE - FAIL: got_response={got_response} \
+             got_goaway={got_goaway} infra_ok={infra_ok}"
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn e2e_h2_parser_ignore_priority_update_frame() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "H2 parser: RFC 9218 PRIORITY_UPDATE (0x10) silently ignored",
+            try_h2_parser_ignore_priority_update_frame,
         ),
         State::Success,
     );
