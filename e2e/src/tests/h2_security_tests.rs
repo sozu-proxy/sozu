@@ -4085,3 +4085,53 @@ fn e2e_h2_flood_priority_map_cap() {
         State::Success
     );
 }
+
+// ----------------------------------------------------------------------------
+// FIX-14 (`6c200656`) — SETTINGS cap at 64 entries
+// ----------------------------------------------------------------------------
+
+/// SETTINGS with > 64 entries must be rejected with `GOAWAY(FRAME_SIZE_ERROR)`.
+///
+/// The parser now enforces `MAX_SETTINGS_ENTRIES = 64`; any frame whose
+/// `payload_len / 6 > 64` is refused before allocation. We craft a
+/// 100-entry SETTINGS (600-byte payload) and expect FRAME_SIZE_ERROR.
+///
+/// Reference: audit Pass 1 Low #7.
+fn try_h2_flood_settings_entries_cap() -> State {
+    let (worker, backends, front_port) = setup_h2_test("H2-8C-SETTINGS-CAP", 1);
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake(&mut tls);
+
+    // 100 copies of (SETTINGS_MAX_FRAME_SIZE, 16384) — valid individually but
+    // 100 > 64 must trip the parser's count guard.
+    let entries: Vec<(u16, u32)> = (0..100u32).map(|_| (0x5, 16384)).collect();
+    let oversized = H2Frame::settings(&entries);
+    let write_ok = tls.write_all(&oversized.encode()).is_ok() && tls.flush().is_ok();
+
+    let frames = collect_response_frames(&mut tls, 500, 3, 500);
+    log_frames("SETTINGS entries cap", &frames);
+
+    let got_frame_size_error = contains_goaway_with_error(&frames, H2_ERROR_FRAME_SIZE_ERROR);
+    println!("SETTINGS entries cap - write_ok={write_ok} FRAME_SIZE_ERROR={got_frame_size_error}");
+
+    let infra_ok = teardown(tls, front_port, worker, backends);
+    if got_frame_size_error && infra_ok {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn e2e_h2_flood_settings_entries_cap() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 flood: SETTINGS frame with > 64 entries \u{2192} FRAME_SIZE_ERROR",
+            try_h2_flood_settings_entries_cap
+        ),
+        State::Success
+    );
+}
