@@ -1108,6 +1108,9 @@ impl Display for HttpsListenerConfig {
             &self.h2_max_concurrent_streams,
             &self.h2_stream_shrink_ratio,
         );
+        if let Some(v) = self.strict_sni_binding {
+            table.add_row(row!["strict sni binding", v]);
+        }
         write!(f, "{table}")
     }
 }

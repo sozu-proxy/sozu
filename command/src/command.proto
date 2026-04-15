@@ -233,6 +233,12 @@ message HttpsListenerConfig {
     // Maximum accumulated HPACK-decoded header list size per request
     // (SETTINGS_MAX_HEADER_LIST_SIZE, RFC 9113 §6.5.2). Default: 65536.
     optional uint32 h2_max_header_list_size = 34;
+    // When true, every HTTP request served on this listener must have its
+    // `:authority` / `Host` host exact-match the TLS SNI that was negotiated
+    // at handshake (CWE-346 / CWE-444). Disabling this lifts the per-stream
+    // TLS trust boundary, so leave enabled unless an operational need
+    // requires cross-SNI routing. Default: true.
+    optional bool strict_sni_binding = 35;
 }
 
 // details of an TCP listener

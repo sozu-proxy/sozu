@@ -736,6 +736,13 @@ impl L7ListenerHandler for HttpsListener {
             self.config.h2_stream_shrink_ratio,
         )
     }
+
+    fn get_strict_sni_binding(&self) -> bool {
+        // Phase 1D enforced SNI↔:authority binding unconditionally; this
+        // listener knob preserves that behavior by default and lets
+        // operators opt out when cross-SNI routing is intentional.
+        self.config.strict_sni_binding.unwrap_or(true)
+    }
 }
 
 impl HttpsListener {

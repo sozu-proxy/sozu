@@ -326,17 +326,23 @@ impl Router {
         // crossing the TLS trust boundary (CWE-346 / CWE-444).
         //
         // Plaintext listeners bypass the check (SNI is always `None`).
-        if let Some(sni) = context.tls_server_name.as_deref() {
-            if !authority_matches_sni(host, sni) {
-                incr!("http.sni_authority_mismatch");
-                warn!(
-                    "rejecting request: TLS SNI {:?} does not match :authority {:?} (request_id={})",
-                    sni, host, context.id
-                );
-                return Err(RetrieveClusterError::SniAuthorityMismatch {
-                    sni: sni.to_owned(),
-                    authority: host.to_owned(),
-                });
+        // Operators may opt out per-listener via
+        // `HttpsListenerConfig::strict_sni_binding = false`; the flag is
+        // captured on `HttpContext` at stream creation to avoid a
+        // per-request listener borrow.
+        if context.strict_sni_binding {
+            if let Some(sni) = context.tls_server_name.as_deref() {
+                if !authority_matches_sni(host, sni) {
+                    incr!("http.sni_authority_mismatch");
+                    warn!(
+                        "rejecting request: TLS SNI {:?} does not match :authority {:?} (request_id={})",
+                        sni, host, context.id
+                    );
+                    return Err(RetrieveClusterError::SniAuthorityMismatch {
+                        sni: sni.to_owned(),
+                        authority: host.to_owned(),
+                    });
+                }
             }
         }
 

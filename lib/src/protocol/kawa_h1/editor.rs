@@ -162,6 +162,13 @@ pub struct HttpContext {
     /// `None` when the listener is plaintext HTTP or the client omitted SNI.
     /// Stored pre-lowercased and without a port for direct exact-match comparison.
     pub tls_server_name: Option<String>,
+    /// Whether the router must reject this request when `tls_server_name`
+    /// does not exact-match its authority (CWE-346 / CWE-444). Mirrors
+    /// `HttpsListenerConfig::strict_sni_binding`. Set from the mux
+    /// `Context` at stream creation time (see `Context::create_stream`).
+    /// Plaintext listeners still never hit the check because
+    /// `tls_server_name` is `None`.
+    pub strict_sni_binding: bool,
 }
 
 impl kawa::h1::ParserCallbacks<Checkout> for HttpContext {
@@ -209,6 +216,7 @@ impl HttpContext {
 
             backend_address: None,
             tls_server_name: None,
+            strict_sni_binding: true,
         }
     }
 

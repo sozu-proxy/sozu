@@ -570,6 +570,19 @@ pub trait L7ListenerHandler {
     fn get_h2_connection_config(&self) -> protocol::mux::H2ConnectionConfig {
         protocol::mux::H2ConnectionConfig::default()
     }
+
+    /// Whether requests must have their `:authority` / `Host` exact-match
+    /// the TLS SNI negotiated at handshake (CWE-346 / CWE-444).
+    ///
+    /// Defaults to `true` — the safe setting enforced by Phase 1D of the
+    /// security audit. Operators can opt out per-listener via
+    /// `HttpsListenerConfig::strict_sni_binding = false` when cross-SNI
+    /// routing is explicitly required. Plaintext HTTP listeners return the
+    /// default value; they never have an SNI to compare against, so the
+    /// routing-layer check short-circuits on `tls_server_name: None`.
+    fn get_strict_sni_binding(&self) -> bool {
+        true
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
