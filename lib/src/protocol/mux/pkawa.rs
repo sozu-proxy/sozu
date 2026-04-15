@@ -42,15 +42,30 @@ fn is_invalid_te_value(value: &[u8]) -> bool {
     !compare_no_case(value, b"trailers")
 }
 
+/// Returns true if the value contains any byte forbidden in HTTP field values
+/// (RFC 9110 §5.5 + RFC 9113 §8.2.1): NUL, CR, LF, DEL, and other C0 controls.
+/// HTAB (0x09) and visible ASCII (0x20..=0x7E) plus obs-text (0x80..=0xFF) are allowed.
+///
+/// Without this check, HPACK-decoded bytes containing `\r\n` flow verbatim through
+/// kawa's H1 serializer and reach backends as injected headers — request smuggling
+/// (CWE-93, CWE-444) on H2→H1 traffic.
+fn has_invalid_value_byte(value: &[u8]) -> bool {
+    value
+        .iter()
+        .any(|&b| matches!(b, 0x00..=0x08 | 0x0A..=0x1F | 0x7F))
+}
+
 /// Returns true if the header violates HTTP/2 field requirements (RFC 9113 §8.2):
 /// - uppercase ASCII characters in the name
 /// - connection-specific header fields (RFC 9113 §8.2.2)
 /// - TE header with a value other than "trailers"
+/// - field value containing NUL, CR, LF, DEL or other C0 controls (RFC 9110 §5.5)
 fn is_invalid_h2_header(name: &[u8], value: &[u8]) -> bool {
     name.is_empty()
         || has_uppercase_ascii(name)
         || is_connection_specific_header(name)
         || (compare_no_case(name, b"te") && is_invalid_te_value(value))
+        || has_invalid_value_byte(value)
 }
 
 /// Validate and set Content-Length, returning false if it conflicts with a prior value
@@ -68,15 +83,21 @@ fn set_content_length(body_size: &mut BodySize, length: usize) -> bool {
 /// Store a pseudo-header value into kawa storage.
 ///
 /// Returns `Some(Store::Slice)` on success, or `None` if the pseudo-header was
-/// already set (`dest` is non-empty), regular headers have already appeared, or
-/// the write to storage fails. Callers should set `invalid_headers = true` on `None`.
+/// already set (`dest` is non-empty), regular headers have already appeared,
+/// the value is empty, the value contains forbidden control bytes, or the
+/// write to storage fails. Callers should set `invalid_headers = true` on `None`.
+///
+/// Empty values are rejected because `Store::Slice { len: 0 }` is NOT
+/// `Store::is_empty()`, so the presence checks after the decode loop would
+/// silently accept a zero-length `:path` / `:method` / `:authority` / `:scheme`
+/// (RFC 9113 §8.3.1 — pseudo-header fields MUST NOT be empty for http/https).
 fn store_pseudo_header(
     dest: &Store,
     regular_headers: bool,
     kawa: &mut GenericHttpStream,
     value: &[u8],
 ) -> Option<Store> {
-    if !dest.is_empty() || regular_headers {
+    if !dest.is_empty() || regular_headers || value.is_empty() || has_invalid_value_byte(value) {
         return None;
     }
     let start = kawa.storage.end as u32;
@@ -107,6 +128,13 @@ fn write_regular_header(kawa: &mut GenericHttpStream, key: &[u8], value: &[u8]) 
         len: len_val,
     });
     if compare_no_case(key, b"content-length") {
+        // RFC 9110 §8.6: Content-Length is 1*DIGIT. `usize::from_str` would
+        // accept leading whitespace, a leading `+`, or trailing garbage — all
+        // of which create a parser-divergence vector against backends. Require
+        // every byte to be an ASCII digit before parsing.
+        if value.is_empty() || !value.iter().all(|b| b.is_ascii_digit()) {
+            return false;
+        }
         if let Some(length) = from_utf8(value).ok().and_then(|v| v.parse::<usize>().ok()) {
             if !set_content_length(&mut kawa.body_size, length) {
                 return false;
@@ -255,16 +283,42 @@ where
                 max_decoded_bytes,
                 |k, v, invalid_headers| {
                     if compare_no_case(&k, b":method") {
+                        // RFC 9110 §9: method is a token (non-empty). The
+                        // token-char check is enforced by has_invalid_value_byte
+                        // plus the absence of SP / delimiters in valid tokens;
+                        // CTLs — the smuggling vector — are rejected by
+                        // store_pseudo_header.
                         match store_pseudo_header(&method, regular_headers, kawa, &v) {
                             Some(s) => method = s,
                             None => *invalid_headers = true,
                         }
                     } else if compare_no_case(&k, b":scheme") {
+                        // RFC 9113 §8.3.1: the HPACK lowercase rule means a
+                        // valid :scheme arrives exactly as "http" or "https".
+                        // Anything else is a smuggling / SSRF vector.
+                        if v.as_ref() != b"http" && v.as_ref() != b"https" {
+                            *invalid_headers = true;
+                            return;
+                        }
                         match store_pseudo_header(&scheme, regular_headers, kawa, &v) {
                             Some(s) => scheme = s,
                             None => *invalid_headers = true,
                         }
                     } else if compare_no_case(&k, b":path") {
+                        // RFC 9112 §3.2 / RFC 9113 §8.3.1: :path must be the
+                        // request-target. For http/https URIs we accept
+                        // origin-form (starts with `/`) and — only when the
+                        // method is OPTIONS — asterisk-form (`*`).
+                        // (Empty :path is rejected by store_pseudo_header.)
+                        let is_asterisk = v.as_ref() == b"*";
+                        let starts_with_slash = v.first() == Some(&b'/');
+                        let method_is_options = method
+                            .data_opt(kawa.storage.buffer())
+                            .is_some_and(|m| m == b"OPTIONS");
+                        if !(starts_with_slash || (is_asterisk && method_is_options)) {
+                            *invalid_headers = true;
+                            return;
+                        }
                         match store_pseudo_header(&path, regular_headers, kawa, &v) {
                             Some(s) => path = s,
                             None => *invalid_headers = true,
@@ -296,6 +350,16 @@ where
                                     Some(eq_pos) => (&trimmed[..eq_pos], &trimmed[eq_pos + 1..]),
                                     None => (trimmed, &b""[..]),
                                 };
+                            // RFC 6265 §4.2.1 + RFC 9110 §5.5: cookie-name and
+                            // cookie-value must not contain CTLs. Without this
+                            // check, a crafted cookie can smuggle headers
+                            // through kawa's H1 serializer.
+                            if has_invalid_value_byte(cookie_key)
+                                || has_invalid_value_byte(cookie_val)
+                            {
+                                *invalid_headers = true;
+                                return;
+                            }
                             let key_start = kawa.storage.end as u32;
                             if kawa.storage.write_all(cookie_key).is_err() {
                                 *invalid_headers = true;
@@ -377,16 +441,20 @@ where
                 max_decoded_bytes,
                 |k, v, invalid_headers| {
                     if compare_no_case(&k, b":status") {
+                        // RFC 9113 §8.3.2 / RFC 9110 §15: :status is exactly
+                        // three ASCII digits. `u16::from_str` would accept
+                        // `+200`, ` 200`, `00200` etc., all of which diverge
+                        // from the backend's H1 parser.
+                        if v.len() != 3 || !v.iter().all(|b| b.is_ascii_digit()) {
+                            *invalid_headers = true;
+                            return;
+                        }
                         match store_pseudo_header(&status, regular_headers, kawa, &v) {
                             Some(s) => {
                                 status = s;
-                                if let Some(parsed_code) =
-                                    from_utf8(&v).ok().and_then(|v| v.parse::<u16>().ok())
-                                {
-                                    code = parsed_code;
-                                } else {
-                                    *invalid_headers = true;
-                                }
+                                code = (v[0] - b'0') as u16 * 100
+                                    + (v[1] - b'0') as u16 * 10
+                                    + (v[2] - b'0') as u16;
                             }
                             None => *invalid_headers = true,
                         }
@@ -491,6 +559,12 @@ pub fn handle_trailer(
         }
         // RFC 9113 §8.2: reject uppercase header names in HTTP/2
         if has_uppercase_ascii(&k) {
+            invalid_trailers = true;
+            return;
+        }
+        // RFC 9110 §5.5: reject NUL, CR, LF, DEL, and other C0 controls in
+        // trailer field values — same smuggling vector as the main header path.
+        if has_invalid_value_byte(&v) {
             invalid_trailers = true;
             return;
         }
@@ -969,6 +1043,378 @@ mod tests {
         let buf = kawa.storage.buffer();
         assert_eq!(kawa.detached.jar[0].key.data(buf), b"bare_name");
         assert_eq!(kawa.detached.jar[0].val.data(buf), b"");
+    }
+
+    // ── has_invalid_value_byte / CTL rejection ───────────────────────────
+
+    #[test]
+    fn test_has_invalid_value_byte_ctl_and_del() {
+        // RFC 9110 §5.5 / RFC 9113 §8.2.1: CR, LF, NUL, other C0 CTLs, DEL
+        // are forbidden in field values.
+        assert!(has_invalid_value_byte(b"a\rb"));
+        assert!(has_invalid_value_byte(b"a\nb"));
+        assert!(has_invalid_value_byte(b"a\r\nb"));
+        assert!(has_invalid_value_byte(b"a\x00b"));
+        assert!(has_invalid_value_byte(b"a\x01b"));
+        assert!(has_invalid_value_byte(b"a\x7fb"));
+        assert!(has_invalid_value_byte(b"a\x1fb"));
+    }
+
+    #[test]
+    fn test_has_invalid_value_byte_permits_tab_sp_vchar() {
+        // HTAB and visible ASCII (SP..=~) are permitted.
+        assert!(!has_invalid_value_byte(b"a\tb"));
+        assert!(!has_invalid_value_byte(b"a b"));
+        assert!(!has_invalid_value_byte(b"normal-value"));
+        // obs-text (0x80..=0xFF) is permitted by the value ABNF
+        assert!(!has_invalid_value_byte(&[0x80, 0xFF]));
+        // Empty slice is allowed by this helper (empty-check is done elsewhere)
+        assert!(!has_invalid_value_byte(b""));
+    }
+
+    #[test]
+    fn test_is_invalid_h2_header_rejects_ctl_in_value() {
+        assert!(is_invalid_h2_header(b"x-evil", b"a\r\nb"));
+        assert!(is_invalid_h2_header(b"x-evil", b"a\nb"));
+        assert!(is_invalid_h2_header(b"x-evil", b"a\rb"));
+        assert!(is_invalid_h2_header(b"x-evil", b"a\x00b"));
+        assert!(is_invalid_h2_header(b"x-evil", b"a\x7fb"));
+        assert!(is_invalid_h2_header(b"x-evil", b"a\x01b"));
+        assert!(!is_invalid_h2_header(b"x-evil", b"a\tb"));
+        assert!(!is_invalid_h2_header(b"x-evil", b"a b"));
+    }
+
+    // ── store_pseudo_header: empty & CTL rejection ────────────────────────
+
+    #[test]
+    fn test_store_pseudo_header_rejects_empty_value() {
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        let mut kawa = make_generic_kawa(&mut pool, Kind::Request);
+        // RFC 9113 §8.3.1: pseudo-header values MUST NOT be empty.
+        let result = store_pseudo_header(&Store::Empty, false, &mut kawa, b"");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_store_pseudo_header_rejects_ctl_in_value() {
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        let mut kawa = make_generic_kawa(&mut pool, Kind::Request);
+        let result = store_pseudo_header(&Store::Empty, false, &mut kawa, b"/foo\r\n");
+        assert!(result.is_none());
+        let result = store_pseudo_header(&Store::Empty, false, &mut kawa, b"a\x00b");
+        assert!(result.is_none());
+    }
+
+    // ── handle_header: request pseudo-header & CTL/smuggling rejection ────
+
+    /// HPACK-encode a header list and call `handle_header`, returning the
+    /// resulting `Result` so callers can assert on rejections.
+    fn try_decode_request_headers(
+        pool: &mut crate::pool::Pool,
+        headers: &[(&[u8], &[u8])],
+        end_stream: bool,
+    ) -> Result<(), (H2Error, bool)> {
+        let mut encoder = loona_hpack::Encoder::new();
+        let mut encoded = Vec::new();
+        for &(name, value) in headers {
+            encoder
+                .encode_header_into((name, value), &mut encoded)
+                .unwrap();
+        }
+        let mut decoder = loona_hpack::Decoder::new();
+        let mut prioriser = Prioriser::default();
+        let mut kawa = make_generic_kawa(pool, Kind::Request);
+        struct NoOpCallbacks;
+        impl kawa::h1::ParserCallbacks<crate::pool::Checkout> for NoOpCallbacks {
+            fn on_headers(&mut self, _kawa: &mut GenericHttpStream) {}
+        }
+        let mut callbacks = NoOpCallbacks;
+        handle_header(
+            &mut decoder,
+            &mut prioriser,
+            1,
+            &mut kawa,
+            &encoded,
+            end_stream,
+            &mut callbacks,
+        )
+    }
+
+    fn try_decode_response_headers(
+        pool: &mut crate::pool::Pool,
+        headers: &[(&[u8], &[u8])],
+        end_stream: bool,
+    ) -> Result<(), (H2Error, bool)> {
+        let mut encoder = loona_hpack::Encoder::new();
+        let mut encoded = Vec::new();
+        for &(name, value) in headers {
+            encoder
+                .encode_header_into((name, value), &mut encoded)
+                .unwrap();
+        }
+        let mut decoder = loona_hpack::Decoder::new();
+        let mut prioriser = Prioriser::default();
+        let mut kawa = make_generic_kawa(pool, Kind::Response);
+        struct NoOpCallbacks;
+        impl kawa::h1::ParserCallbacks<crate::pool::Checkout> for NoOpCallbacks {
+            fn on_headers(&mut self, _kawa: &mut GenericHttpStream) {}
+        }
+        let mut callbacks = NoOpCallbacks;
+        handle_header(
+            &mut decoder,
+            &mut prioriser,
+            1,
+            &mut kawa,
+            &encoded,
+            end_stream,
+            &mut callbacks,
+        )
+    }
+
+    #[test]
+    fn test_handle_header_rejects_crlf_in_regular_header_value() {
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        let err = try_decode_request_headers(
+            &mut pool,
+            &[
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":path", b"/"),
+                (b":authority", b"example.com"),
+                (b"x-evil", b"normal\r\nX-Smuggled: yes"),
+            ],
+            true,
+        );
+        assert!(err.is_err(), "CRLF-laden header value must be rejected");
+    }
+
+    #[test]
+    fn test_handle_header_rejects_empty_path() {
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        let err = try_decode_request_headers(
+            &mut pool,
+            &[
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":path", b""),
+                (b":authority", b"example.com"),
+            ],
+            true,
+        );
+        assert!(err.is_err(), "empty :path must be rejected");
+    }
+
+    #[test]
+    fn test_handle_header_rejects_non_origin_form_path() {
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        // absolute-form path (no leading `/`) must be rejected for non-OPTIONS
+        let err = try_decode_request_headers(
+            &mut pool,
+            &[
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":path", b"http://attacker/"),
+                (b":authority", b"example.com"),
+            ],
+            true,
+        );
+        assert!(err.is_err());
+
+        // bare `*` is only valid for OPTIONS
+        let err = try_decode_request_headers(
+            &mut pool,
+            &[
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":path", b"*"),
+                (b":authority", b"example.com"),
+            ],
+            true,
+        );
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_handle_header_accepts_options_asterisk() {
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        let ok = try_decode_request_headers(
+            &mut pool,
+            &[
+                (b":method", b"OPTIONS"),
+                (b":scheme", b"https"),
+                (b":path", b"*"),
+                (b":authority", b"example.com"),
+            ],
+            true,
+        );
+        assert!(ok.is_ok(), "OPTIONS * must be accepted, got {ok:?}");
+    }
+
+    #[test]
+    fn test_handle_header_rejects_bad_scheme() {
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        let err = try_decode_request_headers(
+            &mut pool,
+            &[
+                (b":method", b"GET"),
+                (b":scheme", b"javascript"),
+                (b":path", b"/"),
+                (b":authority", b"example.com"),
+            ],
+            true,
+        );
+        assert!(err.is_err());
+
+        let err = try_decode_request_headers(
+            &mut pool,
+            &[
+                (b":method", b"GET"),
+                (b":scheme", b"file"),
+                (b":path", b"/"),
+                (b":authority", b"example.com"),
+            ],
+            true,
+        );
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_handle_header_rejects_crlf_in_path_and_authority() {
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        let err = try_decode_request_headers(
+            &mut pool,
+            &[
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":path", b"/foo\r\nHost: attacker"),
+                (b":authority", b"example.com"),
+            ],
+            true,
+        );
+        assert!(err.is_err(), "CRLF in :path must be rejected");
+
+        let err = try_decode_request_headers(
+            &mut pool,
+            &[
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":path", b"/"),
+                (b":authority", b"example.com\r\nX: y"),
+            ],
+            true,
+        );
+        assert!(err.is_err(), "CRLF in :authority must be rejected");
+    }
+
+    #[test]
+    fn test_handle_header_rejects_bad_status() {
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        for bad in [&b"20"[..], b"abc", b"+200", b" 200", b"00200", b"2000"] {
+            let err = try_decode_response_headers(
+                &mut pool,
+                &[(b":status", bad), (b"content-type", b"text/html")],
+                true,
+            );
+            assert!(err.is_err(), ":status {bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn test_handle_header_rejects_ctl_in_cookie_value() {
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        let err = try_decode_request_headers(
+            &mut pool,
+            &[
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":path", b"/"),
+                (b":authority", b"example.com"),
+                (b"cookie", b"a=1\r\nX-Smuggled: yes"),
+            ],
+            true,
+        );
+        assert!(err.is_err(), "CRLF in cookie value must be rejected");
+    }
+
+    #[test]
+    fn test_handle_header_rejects_ctl_in_cookie_key() {
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        let err = try_decode_request_headers(
+            &mut pool,
+            &[
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":path", b"/"),
+                (b":authority", b"example.com"),
+                (b"cookie", b"a\rb=1"),
+            ],
+            true,
+        );
+        assert!(err.is_err(), "CR in cookie key must be rejected");
+    }
+
+    #[test]
+    fn test_handle_header_rejects_bad_content_length() {
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        // RFC 9110 §8.6: Content-Length is 1*DIGIT. Whitespace, sign, and
+        // trailing garbage must be rejected to avoid backend desync.
+        for bad in [&b" 42"[..], b"+42", b"42 ", b"-1", b"", b"0x10"] {
+            let err = try_decode_request_headers(
+                &mut pool,
+                &[
+                    (b":method", b"POST"),
+                    (b":scheme", b"https"),
+                    (b":path", b"/"),
+                    (b":authority", b"example.com"),
+                    (b"content-length", bad),
+                ],
+                true,
+            );
+            assert!(err.is_err(), "content-length {bad:?} must be rejected");
+        }
+
+        // Sanity: a clean digit string is accepted.
+        let ok = try_decode_request_headers(
+            &mut pool,
+            &[
+                (b":method", b"POST"),
+                (b":scheme", b"https"),
+                (b":path", b"/"),
+                (b":authority", b"example.com"),
+                (b"content-length", b"42"),
+            ],
+            false,
+        );
+        assert!(ok.is_ok(), "valid content-length must be accepted: {ok:?}");
+    }
+
+    // ── handle_trailer: CTL rejection ─────────────────────────────────────
+
+    #[test]
+    fn test_handle_trailer_rejects_ctl_in_value() {
+        use kawa::Buffer;
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        let checkout = pool.checkout().expect("checkout");
+        let mut kawa: GenericHttpStream = kawa::Kawa::new(Kind::Request, Buffer::new(checkout));
+        // Fake: move out of the initial phase so handle_header routes to
+        // handle_trailer. Easiest: push a StatusLine and move the head.
+        kawa.push_block(Block::StatusLine);
+        kawa.detached.status_line = StatusLine::Request {
+            version: Version::V20,
+            method: Store::Static(b"GET"),
+            uri: Store::Static(b"/"),
+            authority: Store::Static(b"example.com"),
+            path: Store::Static(b"/"),
+        };
+        // HPACK-encode a trailer with LF in the value.
+        let mut encoder = loona_hpack::Encoder::new();
+        let mut encoded = Vec::new();
+        encoder
+            .encode_header_into((&b"x-trailer"[..], &b"val\nsmuggled"[..]), &mut encoded)
+            .unwrap();
+        let mut decoder = loona_hpack::Decoder::new();
+        let err = handle_trailer(&mut kawa, &encoded, true, &mut decoder);
+        assert!(err.is_err(), "LF in trailer value must be rejected");
     }
 
     #[test]
