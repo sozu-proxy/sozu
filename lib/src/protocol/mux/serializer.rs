@@ -109,9 +109,8 @@ fn gen_control_frame<F>(
 where
     F: FnOnce(&mut [u8]) -> Result<(&mut [u8], u64), GenError>,
 {
-    gen_frame_header(buf, &header).and_then(|(buf, old_size)| {
-        payload(buf).map(|(buf, size)| (buf, old_size + size as usize))
-    })
+    gen_frame_header(buf, &header)
+        .and_then(|(buf, old_size)| payload(buf).map(|(buf, size)| (buf, old_size + size as usize)))
 }
 
 pub fn gen_rst_stream(

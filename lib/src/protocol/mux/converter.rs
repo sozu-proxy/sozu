@@ -177,8 +177,7 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                             is_connection_specific_header(key)
                         }
                         Some(b'h' | b'H') => {
-                            compare_no_case(key, b"host")
-                                || compare_no_case(key, b"http2-settings")
+                            compare_no_case(key, b"host") || compare_no_case(key, b"http2-settings")
                         }
                         Some(b't' | b'T') => {
                             is_connection_specific_header(key)
