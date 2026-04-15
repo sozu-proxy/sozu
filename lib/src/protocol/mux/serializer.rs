@@ -94,23 +94,41 @@ pub fn gen_settings<'a>(
     })
 }
 
+/// Serialize a fixed-payload control frame: write the 9-byte FrameHeader, then
+/// invoke `payload` to write the body, then return the combined byte count.
+///
+/// Centralising this avoids the `old_size + size as usize` arithmetic being
+/// repeated (and accidentally rewritten as `hsz + psz as usize`) at every call
+/// site. The caller is responsible for ensuring `header.payload_len` matches
+/// the bytes that `payload` will emit.
+fn gen_control_frame<F>(
+    buf: &mut [u8],
+    header: FrameHeader,
+    payload: F,
+) -> Result<(&mut [u8], usize), GenError>
+where
+    F: FnOnce(&mut [u8]) -> Result<(&mut [u8], u64), GenError>,
+{
+    gen_frame_header(buf, &header).and_then(|(buf, old_size)| {
+        payload(buf).map(|(buf, size)| (buf, old_size + size as usize))
+    })
+}
+
 pub fn gen_rst_stream(
     buf: &mut [u8],
     stream_id: u32,
     error_code: H2Error,
 ) -> Result<(&mut [u8], usize), GenError> {
-    gen_frame_header(
+    gen_control_frame(
         buf,
-        &FrameHeader {
+        FrameHeader {
             payload_len: parser::RST_STREAM_PAYLOAD_SIZE,
             frame_type: FrameType::RstStream,
             flags: 0,
             stream_id,
         },
+        |buf| r#gen(be_u32(error_code as u32), buf),
     )
-    .and_then(|(buf, old_size)| {
-        r#gen(be_u32(error_code as u32), buf).map(|(buf, size)| (buf, (old_size + size as usize)))
-    })
 }
 
 /// Serialize a WINDOW_UPDATE frame (RFC 9113 §6.9).
@@ -120,19 +138,16 @@ pub fn gen_window_update(
     stream_id: u32,
     increment: u32,
 ) -> Result<(&mut [u8], usize), GenError> {
-    gen_frame_header(
+    gen_control_frame(
         buf,
-        &FrameHeader {
+        FrameHeader {
             payload_len: parser::WINDOW_UPDATE_PAYLOAD_SIZE,
             frame_type: FrameType::WindowUpdate,
             flags: 0,
             stream_id,
         },
+        |buf| r#gen(be_u32(increment & parser::STREAM_ID_MASK), buf),
     )
-    .and_then(|(buf, old_size)| {
-        r#gen(be_u32(increment & parser::STREAM_ID_MASK), buf)
-            .map(|(buf, size)| (buf, (old_size + size as usize)))
-    })
 }
 
 pub fn gen_goaway(
@@ -140,22 +155,21 @@ pub fn gen_goaway(
     last_stream_id: u32,
     error_code: H2Error,
 ) -> Result<(&mut [u8], usize), GenError> {
-    gen_frame_header(
+    gen_control_frame(
         buf,
-        &FrameHeader {
+        FrameHeader {
             payload_len: parser::GOAWAY_PAYLOAD_SIZE,
             frame_type: FrameType::GoAway,
             flags: 0,
             stream_id: 0,
         },
+        |buf| {
+            r#gen(
+                tuple((be_u32(last_stream_id), be_u32(error_code as u32))),
+                buf,
+            )
+        },
     )
-    .and_then(|(buf, old_size)| {
-        r#gen(
-            tuple((be_u32(last_stream_id), be_u32(error_code as u32))),
-            buf,
-        )
-        .map(|(buf, size)| (buf, (old_size + size as usize)))
-    })
 }
 
 #[cfg(test)]
