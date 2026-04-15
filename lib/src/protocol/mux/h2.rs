@@ -70,6 +70,23 @@ pub(super) const CLIENT_PREFACE_SIZE: usize = 24 + parser::FRAME_HEADER_SIZE;
 
 /// Default maximum RST_STREAM frames per window (CVE-2023-44487 Rapid Reset + CVE-2019-9514)
 const DEFAULT_MAX_RST_STREAM_PER_WINDOW: u32 = 100;
+/// Hard lifetime cap on total RST_STREAM frames received on a single
+/// connection (CVE-2023-44487 Rapid Reset).
+///
+/// The per-window counter half-decays, which allows a patient attacker to
+/// sustain ~50 RST/sec indefinitely — each one costs the backend a request
+/// that will be cancelled before any response work is produced. A lifetime
+/// counter that never decays puts an absolute ceiling on that amplification
+/// per connection. 10 000 is generous for legitimate traffic (months of
+/// occasional client-side cancellations) but rapidly trips on the ~30/sec
+/// abusive pace reported in the CVE-2023-44487 advisory (~5 minutes).
+const MAX_LIFETIME_RST_RECEIVED: u64 = 10_000;
+/// Hard lifetime cap on RST_STREAM frames received BEFORE the corresponding
+/// backend response has started. These are the cheap-for-client /
+/// expensive-for-us resets that characterise Rapid Reset: the client pays
+/// one RST frame, we pay a round-trip to the backend plus request parsing.
+/// A much lower ceiling kills the attack well before 10 000 lifetime total.
+const MAX_LIFETIME_ABUSIVE_RST_RECEIVED: u64 = 50;
 /// Default maximum PING frames per window (CVE-2019-9512 Ping Flood)
 const DEFAULT_MAX_PING_PER_WINDOW: u32 = 100;
 /// Default maximum SETTINGS frames per window (CVE-2019-9515 Settings Flood)
@@ -313,6 +330,17 @@ fn distribute_overhead(
 pub struct H2FloodDetector {
     /// RST_STREAM frames received in current window (CVE-2023-44487 + CVE-2019-9514)
     pub(super) rst_stream_count: u32,
+    /// Lifetime RST_STREAM frames received on this connection.
+    ///
+    /// Never decays — provides an absolute ceiling that the half-decaying
+    /// per-window counter cannot, preventing a sustained ~50 RST/sec burst
+    /// from running forever.
+    pub(super) total_rst_received_lifetime: u64,
+    /// Lifetime RST_STREAM frames received that targeted a stream whose
+    /// backend response had not yet started. These are the "Rapid Reset"
+    /// signature — cheap for the attacker, expensive for the proxy — and
+    /// trip on a much lower ceiling than the generic lifetime counter.
+    pub(super) total_abusive_rst_received_lifetime: u64,
     /// PING frames received in current window (CVE-2019-9512)
     pub(super) ping_count: u32,
     /// SETTINGS frames received in current window (CVE-2019-9515)
@@ -341,6 +369,8 @@ impl H2FloodDetector {
     pub fn new(config: H2FloodConfig) -> Self {
         Self {
             rst_stream_count: 0,
+            total_rst_received_lifetime: 0,
+            total_abusive_rst_received_lifetime: 0,
             ping_count: 0,
             settings_count: 0,
             empty_data_count: 0,
@@ -350,6 +380,36 @@ impl H2FloodDetector {
             window_start: Instant::now(),
             config,
         }
+    }
+
+    /// Increment the lifetime RST_STREAM counters and return
+    /// `Some(EnhanceYourCalm)` if either the global or the abusive
+    /// (pre-response-start) lifetime cap has been exceeded.
+    ///
+    /// `response_started` indicates whether the backend response had already
+    /// begun when the RST arrived; `false` is the cheap-for-client /
+    /// expensive-for-us Rapid Reset signature (CVE-2023-44487).
+    pub fn record_rst_lifetime(&mut self, response_started: bool) -> Option<H2Error> {
+        self.total_rst_received_lifetime = self.total_rst_received_lifetime.saturating_add(1);
+        if !response_started {
+            self.total_abusive_rst_received_lifetime =
+                self.total_abusive_rst_received_lifetime.saturating_add(1);
+        }
+        if self.total_rst_received_lifetime > MAX_LIFETIME_RST_RECEIVED {
+            warn!(
+                "Rapid Reset: lifetime RST_STREAM count {} exceeds ceiling {}",
+                self.total_rst_received_lifetime, MAX_LIFETIME_RST_RECEIVED
+            );
+            return Some(H2Error::EnhanceYourCalm);
+        }
+        if self.total_abusive_rst_received_lifetime > MAX_LIFETIME_ABUSIVE_RST_RECEIVED {
+            warn!(
+                "Rapid Reset: lifetime pre-response RST_STREAM count {} exceeds ceiling {}",
+                self.total_abusive_rst_received_lifetime, MAX_LIFETIME_ABUSIVE_RST_RECEIVED
+            );
+            return Some(H2Error::EnhanceYourCalm);
+        }
+        None
     }
 
     /// Half-decay rate-based counters if the current window has expired.
@@ -820,6 +880,21 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         );
                         return self.goaway(H2Error::StreamClosed);
                     }
+                    // RFC 9113 §8.1: a second HEADERS frame on an open stream
+                    // is a trailer block and MUST carry END_STREAM. Any other
+                    // HEADERS on an open stream is a PROTOCOL_ERROR — this
+                    // closes the request-smuggling primitive where a peer
+                    // sends HEADERS, DATA, HEADERS (no END_STREAM) to chain
+                    // header blocks on the same stream ID.
+                    if header.frame_type == FrameType::Headers
+                        && header.flags & parser::FLAG_END_STREAM == 0
+                    {
+                        error!(
+                            "HEADERS without END_STREAM on open stream {}: trailers MUST carry END_STREAM",
+                            stream_id
+                        );
+                        return self.goaway(H2Error::ProtocolError);
+                    }
                     if header.frame_type == FrameType::Data {
                         H2StreamId::Other {
                             id: stream_id,
@@ -829,10 +904,17 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         H2StreamId::Zero
                     }
                 } else {
+                    // RFC 9113 §5.1.1: stream identifiers MUST be strictly
+                    // increasing. Tightened from `>=` to `>` so that a peer
+                    // cannot re-use `self.last_stream_id` (which would
+                    // conflict with our own server-pushed streams if we
+                    // ever enable push in the future). For the first
+                    // request on a fresh connection `last_stream_id == 0`
+                    // and any client-initiated odd stream still passes.
                     if header.frame_type == FrameType::Headers
                         && self.position.is_server()
                         && stream_id & 1 == 1
-                        && stream_id >= self.last_stream_id
+                        && stream_id > self.last_stream_id
                     {
                         if self.streams.len()
                             >= self.local_settings.settings_max_concurrent_streams as usize
@@ -2778,9 +2860,37 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         E: Endpoint,
         L: ListenerHandler + L7ListenerHandler,
     {
-        // CVE-2023-44487 Rapid Reset + CVE-2019-9514: track RST_STREAM rate
+        // CVE-2023-44487 Rapid Reset + CVE-2019-9514: track RST_STREAM rate.
         self.flood_detector.rst_stream_count += 1;
         if let Some(error) = self.flood_detector.check_flood() {
+            return self.goaway(error);
+        }
+        // Additional CVE-2023-44487 mitigation: lifetime cap on RST_STREAM
+        // frames received. The per-window counter above half-decays, so a
+        // patient client can keep ~50 RST/s forever; a never-decaying
+        // lifetime counter puts an absolute ceiling on that amplification.
+        // Streams whose backend response has not yet started count toward a
+        // much lower "abusive" ceiling — this is the signature Rapid Reset
+        // pattern where the attacker pays one RST frame and we pay a
+        // backend round-trip for each.
+        //
+        // "Response started" here means the Server has begun producing
+        // response bytes (backend kawa buffer past its initial phase). For
+        // the Client position the concept does not apply symmetrically
+        // (RSTs received from the backend are rare and benign), so we
+        // conservatively flag them as abusive too — lifetime cap still
+        // dominates in practice.
+        let response_started = match self.streams.get(&rst_stream.stream_id) {
+            Some(global_stream_id) => {
+                let stream = &context.streams[*global_stream_id];
+                !stream.back.is_initial()
+            }
+            // Stream already gone (e.g. closed, not yet registered) —
+            // treat as response-started to avoid over-counting benign
+            // races as abusive.
+            None => true,
+        };
+        if let Some(error) = self.flood_detector.record_rst_lifetime(response_started) {
             return self.goaway(error);
         }
         debug!(
@@ -3642,6 +3752,61 @@ mod tests {
 
         // After decay: 12/2 = 6, which is below threshold 10 -> no flood
         assert!(detector.check_flood().is_none());
+    }
+
+    #[test]
+    fn test_flood_detector_lifetime_rst_cap_triggers_enhance_your_calm() {
+        // CVE-2023-44487 Rapid Reset: a patient attacker that stays under
+        // the half-decaying per-window threshold must still be stopped by
+        // the lifetime cap. Simulate a response-started RST (no abusive
+        // counter bump) so only the lifetime ceiling is tested.
+        let mut detector = H2FloodDetector::default();
+        for _ in 0..MAX_LIFETIME_RST_RECEIVED {
+            assert!(detector.record_rst_lifetime(true).is_none());
+        }
+        assert_eq!(
+            detector.total_rst_received_lifetime,
+            MAX_LIFETIME_RST_RECEIVED
+        );
+        assert_eq!(detector.total_abusive_rst_received_lifetime, 0);
+        // Next RST crosses the ceiling.
+        assert_eq!(
+            detector.record_rst_lifetime(true),
+            Some(H2Error::EnhanceYourCalm)
+        );
+    }
+
+    #[test]
+    fn test_flood_detector_abusive_rst_cap_triggers_first() {
+        // Pre-response-start RSTs have a much lower ceiling; they trip
+        // well before the generic lifetime cap.
+        let mut detector = H2FloodDetector::default();
+        for _ in 0..MAX_LIFETIME_ABUSIVE_RST_RECEIVED {
+            assert!(detector.record_rst_lifetime(false).is_none());
+        }
+        assert_eq!(
+            detector.total_abusive_rst_received_lifetime,
+            MAX_LIFETIME_ABUSIVE_RST_RECEIVED
+        );
+        assert_eq!(
+            detector.record_rst_lifetime(false),
+            Some(H2Error::EnhanceYourCalm)
+        );
+    }
+
+    #[test]
+    fn test_flood_detector_response_started_rst_not_abusive() {
+        // When the backend response has begun, the RST is cheap for us
+        // too — it only bumps the generic lifetime counter.
+        let mut detector = H2FloodDetector::default();
+        for _ in 0..(MAX_LIFETIME_ABUSIVE_RST_RECEIVED + 100) {
+            assert!(detector.record_rst_lifetime(true).is_none());
+        }
+        assert_eq!(detector.total_abusive_rst_received_lifetime, 0);
+        assert_eq!(
+            detector.total_rst_received_lifetime,
+            MAX_LIFETIME_ABUSIVE_RST_RECEIVED + 100
+        );
     }
 
     #[test]
