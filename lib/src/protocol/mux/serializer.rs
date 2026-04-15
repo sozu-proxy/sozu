@@ -41,6 +41,9 @@ pub fn serialize_frame_type(f: &FrameType) -> u8 {
         FrameType::GoAway => 7,
         FrameType::WindowUpdate => 8,
         FrameType::Continuation => 9,
+        // FrameType::Unknown is a parser-only variant used to ignore
+        // extension frames per RFC 9113 §5.5; sozu never emits them.
+        FrameType::Unknown(t) => t,
     }
 }
 
