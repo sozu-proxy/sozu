@@ -2344,6 +2344,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             Frame::GoAway(goaway) => self.handle_goaway_frame(goaway, context, endpoint),
             Frame::WindowUpdate(wu) => self.handle_window_update_frame(wu, context, endpoint),
             Frame::Continuation(_) => {
+                debug_assert!(
+                    false,
+                    "CONTINUATION reached handle_frame; the inline header-parsing path should consume it"
+                );
                 self.attribute_bytes_to_overhead();
                 warn!("CONTINUATION frames are handled inline during header parsing");
                 self.goaway(H2Error::ProtocolError)
