@@ -1012,17 +1012,34 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         );
                         return self.goaway(H2Error::StreamClosed);
                     }
-                    // RFC 9113 §8.1: a second HEADERS frame on an open stream
-                    // is a trailer block and MUST carry END_STREAM. Any other
-                    // HEADERS on an open stream is a PROTOCOL_ERROR — this
-                    // closes the request-smuggling primitive where a peer
-                    // sends HEADERS, DATA, HEADERS (no END_STREAM) to chain
-                    // header blocks on the same stream ID.
+                    // RFC 9113 §8.1: a HEADERS frame received in the body
+                    // phase is a trailer block and MUST carry END_STREAM. This
+                    // closes the request-smuggling primitive where a peer sends
+                    // HEADERS, DATA, HEADERS (no END_STREAM) to chain header
+                    // blocks on the same stream ID.
+                    //
+                    // Discriminate from the read-side Kawa parsing phase rather
+                    // than stream existence: on Position::Client the stream is
+                    // created when we send the request to the backend, so the
+                    // initial backend response HEADERS legitimately arrives on
+                    // an existing stream. Similarly, 1xx→final transitions on
+                    // either side may yield multiple HEADERS frames before the
+                    // body begins (kawa clears back to initial / terminated on
+                    // 1xx; neither is main_phase). Only HEADERS arriving once
+                    // the read side has transitioned to Body/Chunks parsing —
+                    // i.e. after headers were fully consumed and body framing
+                    // is in progress — may be a trailer.
+                    let read_in_body = if self.position.is_server() {
+                        stream.front.is_main_phase()
+                    } else {
+                        stream.back.is_main_phase()
+                    };
                     if header.frame_type == FrameType::Headers
+                        && read_in_body
                         && header.flags & parser::FLAG_END_STREAM == 0
                     {
                         error!(
-                            "HEADERS without END_STREAM on open stream {}: trailers MUST carry END_STREAM",
+                            "HEADERS without END_STREAM on open stream {} in body phase: trailers MUST carry END_STREAM",
                             stream_id
                         );
                         return self.goaway(H2Error::ProtocolError);
