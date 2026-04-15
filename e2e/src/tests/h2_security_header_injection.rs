@@ -178,3 +178,187 @@ fn test_h2_cookie_value_nul_rejected() {
         State::Success
     );
 }
+
+// ============================================================================
+// FIX-6 — `host` vs `:authority` reconciliation
+// ============================================================================
+
+/// Helper: sozu listener + sync backend wired to `cluster_0`. Returns the
+/// running `Worker`, the `SyncBackend` (listening, ready to `accept`), and
+/// the HTTPS front-port.
+///
+/// Used by the two `host` / `:authority` cases and by FIX-3/FIX-4 tests
+/// that need to assert the backend received **nothing** after a malformed
+/// request — an `AsyncBackend` swallows the evidence behind its own
+/// accept loop.
+fn setup_h2_with_sync_backend(name: &str) -> (Worker, SyncBackend, u16) {
+    let (mut worker, front_port, _front_address) = setup_h2_listener_only(name);
+    let back_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address,
+        None,
+    )));
+    worker.read_to_last();
+    let mut backend = SyncBackend::new(
+        format!("{name}-BACK"),
+        back_address,
+        crate::http_utils::http_ok_response("pong0"),
+    );
+    backend.connect();
+    (worker, backend, front_port)
+}
+
+/// Case A — `:authority localhost` + literal `host evil.example.com`. This
+/// is the HAProxy CVE-2021-39240 desync vector: a permissive proxy picks
+/// one value for routing and the backend sees the other. FIX-6 makes sozu
+/// refuse the stream with PROTOCOL_ERROR before any TCP connection is
+/// initiated towards the backend.
+fn try_h2_host_authority_mismatch_rejected() -> State {
+    let (mut worker, mut backend, front_port) = setup_h2_with_sync_backend("H2-SEC-HOSTMISMATCH");
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake(&mut tls);
+
+    let mut block = request_prefix_localhost();
+    // Literal host header disagreeing with :authority.
+    push_literal(&mut block, b"host", b"evil.example.com");
+
+    let frame = H2Frame::headers(1, block, true, true);
+    tls.write_all(&frame.encode()).unwrap();
+    tls.flush().unwrap();
+
+    let frames = collect_response_frames(&mut tls, 500, 3, 500);
+    log_frames("host-vs-authority mismatch", &frames);
+
+    let rejected = rejected_with_goaway_or_rst(&frames) || contains_400_response(&frames);
+
+    // Prove sozu did NOT open a connection towards the sync backend.
+    let accepted = backend.accept(0);
+    println!("mismatch — backend accepted connection: {accepted}");
+    if accepted {
+        // sozu forwarded the request — smuggling vector. Drain and fail.
+        let _ = backend.receive(0);
+        backend.disconnect();
+        drop(tls);
+        worker.hard_stop();
+        let _ = worker.wait_for_server_stop();
+        return State::Fail;
+    }
+    backend.disconnect();
+
+    drop(tls);
+    thread::sleep(Duration::from_millis(100));
+    let still_alive = verify_sozu_alive(front_port);
+
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+    if rejected && !accepted && still_alive && stopped {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_host_authority_mismatch_rejected() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 security: :authority/host mismatch rejected (FIX-6 4b8fbd3a)",
+            try_h2_host_authority_mismatch_rejected
+        ),
+        State::Success
+    );
+}
+
+/// Case B — `:authority localhost` + literal `host LOCALHOST` (case
+/// difference only). RFC 9113 §8.3.1 permits the duplicate iff it
+/// identifies the same origin modulo ASCII case; kawa's H1 serializer must
+/// then emit exactly one `Host:` line so downstream parsers cannot
+/// disagree.
+fn try_h2_host_authority_match_deduplicated() -> State {
+    let (mut worker, mut backend, front_port) =
+        setup_h2_with_sync_backend("H2-SEC-HOSTMATCH-DEDUP");
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake(&mut tls);
+
+    let mut block = request_prefix_localhost();
+    // Matching host (case-normalized) — must be tolerated and deduplicated.
+    push_literal(&mut block, b"host", b"LOCALHOST");
+
+    let frame = H2Frame::headers(1, block, true, true);
+    tls.write_all(&frame.encode()).unwrap();
+    tls.flush().unwrap();
+
+    // Poll backend.accept up to 2 s — sozu needs a few epoll ticks to
+    // connect to the backend after decoding the HEADERS frame.
+    let accepted = (0..200).any(|_| {
+        if backend.accept(0) {
+            true
+        } else {
+            thread::sleep(Duration::from_millis(10));
+            false
+        }
+    });
+
+    let received = backend.receive(0).unwrap_or_default();
+    println!(
+        "match-dedup — backend accepted: {accepted}, received {} bytes",
+        received.len()
+    );
+    println!("match-dedup — raw request bytes:\n{received}");
+
+    // The H1-serialized request must contain exactly one `host:` line
+    // (case-insensitive). Counting both `host:` and `Host:` covers kawa's
+    // capitalization normalization.
+    let host_line_count = received.to_ascii_lowercase().matches("\r\nhost:").count();
+    // Also tolerate the case where the request starts with `Host:`
+    // (no preceding CRLF) — very unusual given kawa's serializer always
+    // emits GET / HTTP/1.1 first, but safer.
+    let start_host = received.to_ascii_lowercase().starts_with("host:");
+    let total_host = host_line_count + usize::from(start_host);
+    println!("match-dedup — host lines seen: {total_host}");
+
+    // Allow a 200 response (or any 2xx) back to the client.
+    backend.send(0);
+    let frames = collect_response_frames(&mut tls, 300, 2, 300);
+    log_frames("host-vs-authority match-dedup", &frames);
+    let has_response = frames
+        .iter()
+        .any(|(ft, _fl, sid, _p)| *ft == H2_FRAME_HEADERS && *sid == 1);
+
+    backend.disconnect();
+    drop(tls);
+    thread::sleep(Duration::from_millis(100));
+    let still_alive = verify_sozu_alive(front_port);
+
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+
+    if accepted && total_host == 1 && has_response && still_alive && stopped {
+        State::Success
+    } else {
+        println!(
+            "match-dedup FAIL — accepted={accepted} host_lines={total_host} \
+             response={has_response} alive={still_alive} stopped={stopped}"
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_host_authority_match_deduplicated() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 security: :authority/host match — exactly one Host line (FIX-6 4b8fbd3a)",
+            try_h2_host_authority_match_deduplicated
+        ),
+        State::Success
+    );
+}
