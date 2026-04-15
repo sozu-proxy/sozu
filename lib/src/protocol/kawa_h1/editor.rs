@@ -150,6 +150,18 @@ pub struct HttpContext {
     pub sticky_session: Option<String>,
     /// the address of the backend server
     pub backend_address: Option<SocketAddr>,
+    /// The TLS Server Name Indication (SNI) hostname negotiated at handshake.
+    ///
+    /// Populated for HTTPS listeners when the client sent an SNI extension (see
+    /// `https.rs::upgrade_handshake`). Used by the routing layer to enforce the
+    /// TLS trust boundary against the HTTP `:authority` / `Host` header — without
+    /// this check, an attacker holding a valid certificate for tenant A could
+    /// open TLS with SNI=A then send requests with `:authority=tenantB` and
+    /// reach tenant B's backend (CWE-346 / CWE-444).
+    ///
+    /// `None` when the listener is plaintext HTTP or the client omitted SNI.
+    /// Stored pre-lowercased and without a port for direct exact-match comparison.
+    pub tls_server_name: Option<String>,
 }
 
 impl kawa::h1::ParserCallbacks<Checkout> for HttpContext {
@@ -196,6 +208,7 @@ impl HttpContext {
             otel: Default::default(),
 
             backend_address: None,
+            tls_server_name: None,
         }
     }
 

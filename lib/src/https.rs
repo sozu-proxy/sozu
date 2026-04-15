@@ -239,12 +239,20 @@ impl HttpsSession {
     }
 
     fn upgrade_handshake(&mut self, handshake: TlsHandshake) -> Option<HttpsStateMachine> {
-        let sni = handshake.session.server_name();
+        // Capture the SNI as an owned, already-lowercased String so it outlives
+        // the `handshake.session` move below. Lowercasing here once avoids
+        // doing it on every route decision (RFC 9110 §4.2.3 says hostnames are
+        // case-insensitive); no port is ever part of an SNI value (RFC 6066
+        // §3 — `HostName` is a dns_name, no port).
+        let sni_owned: Option<String> = handshake
+            .session
+            .server_name()
+            .map(|s| s.to_ascii_lowercase());
         let alpn = handshake.session.alpn_protocol();
         let alpn = alpn.and_then(|alpn| from_utf8(alpn).ok());
         debug!(
             "Successful TLS Handshake with, received: {:?} {:?}",
-            sni, alpn
+            sni_owned, alpn
         );
 
         let alpn = match alpn {
@@ -283,6 +291,10 @@ impl HttpsSession {
             self.peer_address,
             self.public_address,
         );
+        // Bind the TLS SNI to this session so the routing layer can reject any
+        // H2 stream whose `:authority` crosses the TLS trust boundary (see
+        // `route_from_request`).
+        context.tls_server_name = sni_owned;
         let mut frontend = match alpn {
             AlpnProtocol::Http11 => {
                 incr!("http.alpn.http11");

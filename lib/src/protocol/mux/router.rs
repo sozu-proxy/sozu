@@ -317,6 +317,29 @@ impl Router {
             }
         };
 
+        // ── TLS SNI ↔ HTTP :authority binding ─────────────────────────────
+        // Reject any request whose authority hostname does not exact-match the
+        // SNI negotiated at TLS handshake. Without this check, an attacker
+        // holding a valid certificate for tenant A could open TLS with SNI=A
+        // (Sōzu serves cert A) then send an H2 stream with
+        // `:authority=tenantB.example.com` and reach tenant B's backend,
+        // crossing the TLS trust boundary (CWE-346 / CWE-444).
+        //
+        // Plaintext listeners bypass the check (SNI is always `None`).
+        if let Some(sni) = context.tls_server_name.as_deref() {
+            if !authority_matches_sni(host, sni) {
+                incr!("http.sni_authority_mismatch");
+                warn!(
+                    "rejecting request: TLS SNI {:?} does not match :authority {:?} (request_id={})",
+                    sni, host, context.id
+                );
+                return Err(RetrieveClusterError::SniAuthorityMismatch {
+                    sni: sni.to_owned(),
+                    authority: host.to_owned(),
+                });
+            }
+        }
+
         let route_result = listener.borrow().frontend_from_request(host, uri, method);
 
         let route = match route_result {
@@ -396,5 +419,96 @@ impl Router {
                 .borrow_mut()
                 .backend_from_cluster_id(cluster_id),
         }
+    }
+}
+
+/// Exact-match test between an HTTP `:authority` / `Host` value and a TLS SNI.
+///
+/// Matching rules:
+///   * The authority is stripped of its optional `:port` suffix. RFC 6066 §3
+///     forbids a port in the SNI extension, so the SNI is compared against
+///     the host component only.
+///   * The comparison is case-insensitive (RFC 9110 §4.2.3 — hosts are
+///     case-insensitive). The SNI is assumed to be already lowercased by
+///     the caller (see `https.rs::upgrade_handshake`); only the authority
+///     side needs on-the-fly `to_ascii_lowercase`.
+///   * No wildcard logic: if the operator serves a wildcard certificate,
+///     the SNI negotiated by the client is still the specific name that
+///     client sent, and the request `:authority` must equal that specific
+///     name exactly. This is the tightest possible TLS trust boundary.
+///
+/// The `:port` suffix is only stripped when the suffix is non-empty and
+/// entirely ASCII digits. This keeps bracketed IPv6 literals like `[::1]`
+/// intact: `rsplit_once(':')` would otherwise mis-split them.
+pub(crate) fn authority_matches_sni(authority: &str, sni_lowercased: &str) -> bool {
+    let host = match authority.rsplit_once(':') {
+        Some((h, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => h,
+        _ => authority,
+    };
+    if host.len() != sni_lowercased.len() {
+        return false;
+    }
+    host.as_bytes()
+        .iter()
+        .zip(sni_lowercased.as_bytes())
+        .all(|(a, b)| a.to_ascii_lowercase() == *b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::authority_matches_sni;
+
+    #[test]
+    fn match_exact() {
+        assert!(authority_matches_sni("example.com", "example.com"));
+    }
+
+    #[test]
+    fn match_different_case() {
+        assert!(authority_matches_sni("Example.COM", "example.com"));
+    }
+
+    #[test]
+    fn match_authority_with_port() {
+        assert!(authority_matches_sni("example.com:8443", "example.com"));
+    }
+
+    #[test]
+    fn reject_different_host() {
+        assert!(!authority_matches_sni(
+            "tenant-b.example.com",
+            "tenant-a.example.com"
+        ));
+    }
+
+    #[test]
+    fn reject_substring_attack() {
+        // Length check guards against an authority that is a prefix or
+        // suffix of the SNI (or vice versa).
+        assert!(!authority_matches_sni("example.co", "example.com"));
+        assert!(!authority_matches_sni("example.commons", "example.com"));
+    }
+
+    #[test]
+    fn reject_wildcard_not_expanded() {
+        // Wildcard cert selection happens at the cert-resolver layer; the SNI
+        // we see here is the concrete name the client sent. Do not silently
+        // accept `*.example.com` as matching `foo.example.com`.
+        assert!(!authority_matches_sni("foo.example.com", "*.example.com"));
+    }
+
+    #[test]
+    fn ipv6_bracketed_literal_with_port() {
+        // `[::1]:8443` must still match the SNI `[::1]`; only the trailing
+        // `:8443` is a port (all digits → stripped).
+        assert!(authority_matches_sni("[::1]:8443", "[::1]"));
+    }
+
+    #[test]
+    fn ipv6_bracketed_without_port() {
+        // The `:` characters inside the brackets must not be mistaken for a
+        // port separator: the tail after the last `:` is `1]`, not all
+        // digits, so it is NOT stripped and the whole string compares.
+        assert!(authority_matches_sni("[::1]", "[::1]"));
     }
 }

@@ -264,6 +264,13 @@ pub struct Context<L: ListenerHandler + L7ListenerHandler> {
     /// Shrink threshold ratio for recycled stream slots.
     /// Vec is shrunk when total_slots > active_streams * ratio.
     pub h2_stream_shrink_ratio: usize,
+    /// TLS SNI value negotiated at handshake, propagated to every
+    /// per-stream [`HttpContext`] so the routing layer can enforce
+    /// the SNI ↔ `:authority` binding on every H2 stream (and the
+    /// single H1 request). `None` for plaintext listeners or when
+    /// the client omitted the SNI extension. Stored pre-lowercased
+    /// and without a port for cheap exact-match comparison.
+    pub tls_server_name: Option<String>,
 }
 
 impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
@@ -285,6 +292,7 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
             public_address,
             debug: DebugHistory::new(),
             h2_stream_shrink_ratio,
+            tls_server_name: None,
         }
     }
 
@@ -298,13 +306,18 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
     pub fn create_stream(&mut self, request_id: Ulid, window: u32) -> Option<GlobalStreamId> {
         let http_context = {
             let listener = self.listener.borrow();
-            HttpContext::new(
+            let mut http_context = HttpContext::new(
                 request_id,
                 listener.protocol(),
                 self.public_address,
                 self.session_address,
                 listener.get_sticky_name().to_string(),
-            )
+            );
+            // Propagate the connection-scoped TLS SNI onto every per-stream
+            // HttpContext so `route_from_request` can enforce the SNI ↔
+            // `:authority` binding for each H2 stream independently.
+            http_context.tls_server_name = self.tls_server_name.clone();
+            http_context
         };
         let recycle_slot = self
             .streams
@@ -838,6 +851,21 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                 BE::RetrieveClusterError(
                                     RetrieveClusterError::UnauthorizedRoute,
                                 ) => {
+                                    set_default_answer(stream, front_readiness, 401, &answers);
+                                }
+                                BE::RetrieveClusterError(
+                                    RetrieveClusterError::SniAuthorityMismatch { .. },
+                                ) => {
+                                    // RFC 9110 §15.5.20: 421 Misdirected Request is the
+                                    // semantically correct status for an authority that
+                                    // does not belong to this TLS connection. Sozu does
+                                    // not currently ship a 421 answer template, so the
+                                    // closest existing refusal (401 Unauthorized) is
+                                    // used — still terminal, still sets keep_alive=false.
+                                    // The dedicated http.sni_authority_mismatch metric
+                                    // emitted in `route_from_request` is the durable
+                                    // signal for operators. Upgrading to a real 421
+                                    // template is tracked separately.
                                     set_default_answer(stream, front_readiness, 401, &answers);
                                 }
                                 BE::RetrieveClusterError(RetrieveClusterError::HttpsRedirect) => {
