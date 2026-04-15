@@ -11,6 +11,10 @@
 //!   stalled half-written TLS peers must not pin a worker — a well-formed
 //!   H2 client on the same listener still completes a request inside a
 //!   5-second budget.
+//! * FIX-20 (`2e6b0ef0`) — [`e2e_session_upgrade_backend_disconnect_no_panic`]:
+//!   an HTTP upgrade whose backend drops the connection before the 101
+//!   completes must not panic the worker — graceful error branch in
+//!   `upgrade_mux`.
 //!
 //! The `e2e-hooks` feature is forwarded to `sozu-lib` via
 //! `e2e/Cargo.toml` so the hooks compile in.
@@ -18,9 +22,10 @@
 use std::{
     io::{Read, Write},
     net::{SocketAddr, TcpStream},
+    os::fd::AsRawFd,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -38,10 +43,11 @@ use sozu_lib::protocol::mux::connection::test_hooks::__test_force_h2_client_fail
 
 use crate::{
     mock::{
+        client::Client,
         h2_backend::H2Backend,
         https_client::{build_h2_client, resolve_request, resolve_request_timeout},
     },
-    port_registry::provide_port,
+    port_registry::{bind_std_listener, provide_port},
     sozu::worker::Worker,
     tests::{
         State,
@@ -59,6 +65,33 @@ use crate::{
 /// cleanup land before follow-up assertions.
 fn pump_worker(_worker: &mut Worker) {
     thread::sleep(Duration::from_millis(200));
+}
+
+/// Enable `SO_LINGER(0)` on a raw TCP file descriptor so that closing the
+/// socket sends a RST instead of a graceful FIN. `TcpStream::set_linger` is
+/// still nightly-only, so we reach for `libc::setsockopt` directly.
+fn set_linger_zero(fd: libc::c_int) {
+    let linger = libc::linger {
+        l_onoff: 1,
+        l_linger: 0,
+    };
+    // Safety: `linger` is a valid `libc::linger`; `fd` must live for the
+    // duration of the call. The caller holds the owning handle.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_LINGER,
+            &linger as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::linger>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        eprintln!(
+            "set_linger_zero: setsockopt failed ({})",
+            std::io::Error::last_os_error(),
+        );
+    }
 }
 
 // ============================================================================
@@ -275,6 +308,138 @@ fn e2e_socket_bad_tls_peer_does_not_starve_others() {
             3,
             "FIX-19: stalled TLS peer does not starve a concurrent healthy H2 client",
             try_e2e_socket_bad_tls_peer_does_not_starve_others,
+        ),
+        State::Success,
+    );
+}
+
+// ============================================================================
+// FIX-20 — upgrade_mux graceful error on backend disconnect
+// ============================================================================
+
+/// TCP backend that accepts a connection, reads the upgrade request, and then
+/// closes the socket before finishing the 101 handshake — hitting the
+/// `upgrade_mux` error path that previously panicked.
+fn spawn_upgrade_dropping_backend(address: SocketAddr) -> (Arc<AtomicBool>, Arc<AtomicUsize>) {
+    let stop = Arc::new(AtomicBool::new(false));
+    let connections = Arc::new(AtomicUsize::new(0));
+    let stop_clone = stop.clone();
+    let conn_count = connections.clone();
+    thread::spawn(move || {
+        let listener = bind_std_listener(address, "upgrade-drop backend");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        loop {
+            if stop_clone.load(Ordering::Relaxed) {
+                break;
+            }
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_millis(200)))
+                        .ok();
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf);
+                    conn_count.fetch_add(1, Ordering::Relaxed);
+                    // Close immediately — no 101, no upgrade. Linger(0) so
+                    // sozu observes a RST, exercising the `upgrade_mux`
+                    // error branch.
+                    set_linger_zero(stream.as_raw_fd());
+                    drop(stream);
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(_) => {}
+            }
+        }
+    });
+    (stop, connections)
+}
+
+fn try_e2e_session_upgrade_backend_disconnect_no_panic() -> State {
+    let front_port = provide_port();
+    let front_address: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+
+    let (config, listeners, state) = Worker::empty_http_config(front_address.into());
+    let mut worker = Worker::start_new_worker_owned("E2E-SESSION-FIX20", config, listeners, state);
+
+    worker.send_proxy_request_type(RequestType::AddHttpListener(
+        ListenerBuilder::new_http(front_address.into())
+            .to_http(None)
+            .unwrap(),
+    ));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        address: front_address.into(),
+        proxy: ListenerType::Http.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpFrontend(Worker::default_http_frontend(
+        "cluster_0",
+        front_address,
+    )));
+
+    let back_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address,
+        None,
+    )));
+    worker.read_to_last();
+
+    let (backend_stop, conn_counter) = spawn_upgrade_dropping_backend(back_address);
+    thread::sleep(Duration::from_millis(150));
+
+    // Fire several upgrade attempts in parallel — panics are per-session, so
+    // we want reasonable coverage of the error path.
+    let mut handles = Vec::new();
+    for i in 0..5 {
+        let addr = front_address;
+        handles.push(thread::spawn(move || {
+            let req = format!(
+                "GET /ws{i} HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+            );
+            let mut client = Client::new(format!("fix20-{i}"), addr, req);
+            client.connect();
+            let _ = client.send();
+            let _ = client.receive();
+            client.disconnect();
+        }));
+    }
+    for h in handles {
+        let _ = h.join();
+    }
+
+    thread::sleep(Duration::from_millis(300));
+    let sozu_ok = verify_sozu_alive(front_port);
+    println!(
+        "FIX-20 upgrade: sozu_alive={sozu_ok} backend_connections={}",
+        conn_counter.load(Ordering::Relaxed),
+    );
+
+    backend_stop.store(true, Ordering::Relaxed);
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+
+    if sozu_ok && stopped {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn e2e_session_upgrade_backend_disconnect_no_panic() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "FIX-20: HTTP upgrade with backend disconnect does not panic",
+            try_e2e_session_upgrade_backend_disconnect_no_panic,
         ),
         State::Success,
     );
