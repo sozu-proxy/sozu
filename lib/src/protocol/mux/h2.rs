@@ -80,7 +80,7 @@ const DEFAULT_MAX_EMPTY_DATA_PER_WINDOW: u32 = 100;
 /// Default maximum CONTINUATION frames per header block (CVE-2024-27316)
 const DEFAULT_MAX_CONTINUATION_FRAMES: u32 = 20;
 /// Maximum accumulated header block size across CONTINUATION frames (64KB)
-pub(super) const MAX_HEADER_LIST_SIZE: u32 = 65536;
+pub(super) const MAX_HEADER_LIST_SIZE: usize = 65536;
 /// Duration of the sliding window for rate-based flood counters
 const FLOOD_WINDOW_DURATION: std::time::Duration = std::time::Duration::from_secs(1);
 /// Default maximum general anomaly count before triggering ENHANCE_YOUR_CALM
@@ -395,7 +395,7 @@ impl H2FloodDetector {
             (
                 "accumulated header size",
                 self.accumulated_header_size,
-                MAX_HEADER_LIST_SIZE,
+                MAX_HEADER_LIST_SIZE as u32,
             ),
             ("glitch", self.glitch_count, self.config.max_glitch_count),
         ];
@@ -454,7 +454,7 @@ impl Default for H2Settings {
             settings_max_concurrent_streams: DEFAULT_MAX_CONCURRENT_STREAMS,
             settings_initial_window_size: DEFAULT_INITIAL_WINDOW_SIZE,
             settings_max_frame_size: DEFAULT_MAX_FRAME_SIZE,
-            settings_max_header_list_size: MAX_HEADER_LIST_SIZE,
+            settings_max_header_list_size: MAX_HEADER_LIST_SIZE as u32,
             settings_enable_connect_protocol: false,
             settings_no_rfc7540_priorities: true,
         }
@@ -998,7 +998,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 // just this stream (RST_STREAM + drain); if not, the
                 // connection can no longer decode header blocks safely and we
                 // escalate to GOAWAY(EnhanceYourCalm).
-                if self.flood_detector.accumulated_header_size > MAX_HEADER_LIST_SIZE {
+                if self.flood_detector.accumulated_header_size > MAX_HEADER_LIST_SIZE as u32 {
                     error!(
                         "CONTINUATION accumulated header size {} exceeds {}",
                         self.flood_detector.accumulated_header_size, MAX_HEADER_LIST_SIZE
@@ -3506,7 +3506,7 @@ mod tests {
         let config = H2FloodConfig::default();
         let mut detector = H2FloodDetector::new(config);
 
-        detector.accumulated_header_size = MAX_HEADER_LIST_SIZE + 1;
+        detector.accumulated_header_size = MAX_HEADER_LIST_SIZE as u32 + 1;
         assert_eq!(detector.check_flood(), Some(H2Error::EnhanceYourCalm));
     }
 
