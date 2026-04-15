@@ -31,7 +31,7 @@ use sozu_command_lib::{
 
 use super::h2_utils::{
     H2_FRAME_HEADERS, H2Frame, collect_response_frames, h2_handshake, log_frames,
-    raw_h2_connection_with_sni,
+    raw_h2_connection_with_sni, teardown,
 };
 use crate::{
     http_utils::{http_ok_response, http_request},
@@ -496,6 +496,79 @@ fn e2e_h2_sni_plaintext_no_check() {
             3,
             "H2 SNI: plaintext listener bypasses the check (no SNI to enforce)",
             try_h2_sni_plaintext_no_check
+        ),
+        State::Success
+    );
+}
+
+// ============================================================================
+// Test 5: strict_sni_binding=false — mismatch is allowed
+// ============================================================================
+
+/// Operator opt-out: when the listener is configured with
+/// `strict_sni_binding=false` (commit `ac66dfc0`), a cross-tenant mismatch
+/// must be forwarded normally, with the mismatch counter untouched.
+fn try_h2_sni_authority_mismatch_allowed_when_strict_binding_disabled() -> State {
+    let (mut worker, mut foo, mut bar, front_port) =
+        setup_sni_two_tenant_listener("H2-SNI-STRICT-OFF", Some(false));
+
+    let before = read_counter(&mut worker, "http.sni_authority_mismatch");
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection_with_sni(front_addr, "foo.example.com");
+    h2_handshake(&mut tls);
+
+    let headers = build_request_headers(b"bar.example.com");
+    let frame = H2Frame::headers(1, headers, true, true);
+    tls.write_all(&frame.encode()).expect("write HEADERS");
+    tls.flush().expect("flush HEADERS");
+
+    let frames = collect_response_frames(&mut tls, 500, 4, 500);
+    log_frames("H2 SNI strict-off", &frames);
+
+    let got_ok = headers_ok_response(&frames);
+    let got_421 = headers_status_matches(&frames, b"421");
+
+    let after = read_counter(&mut worker, "http.sni_authority_mismatch");
+    let metric_stable = after == before;
+
+    let infra_ok = teardown(
+        tls,
+        front_port,
+        worker,
+        vec![
+            // Move the backends into teardown so it stops them in the same
+            // order as every other test in this module.
+        ],
+    );
+    let foo_agg = foo.stop_and_get_aggregator().unwrap_or_default();
+    let bar_agg = bar.stop_and_get_aggregator().unwrap_or_default();
+
+    if infra_ok
+        && got_ok
+        && !got_421
+        && metric_stable
+        && foo_agg.requests_received == 0
+        && bar_agg.requests_received == 1
+    {
+        State::Success
+    } else {
+        println!(
+            "strict-off FAIL: infra_ok={infra_ok} got_ok={got_ok} got_421={got_421} \
+             metric_stable={metric_stable} foo_reqs={} bar_reqs={}",
+            foo_agg.requests_received, bar_agg.requests_received
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn e2e_h2_sni_authority_mismatch_allowed_when_strict_binding_disabled() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 SNI: opt-out via strict_sni_binding=false forwards the mismatch",
+            try_h2_sni_authority_mismatch_allowed_when_strict_binding_disabled
         ),
         State::Success
     );
