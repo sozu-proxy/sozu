@@ -3393,6 +3393,15 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 "Ignoring window update on closed stream {}: {}",
                 stream_id, increment
             );
+            // Pass 3 Low #5: WINDOW_UPDATE on a closed stream is legal
+            // (RFC 9113 §6.9.1) but has no useful effect, so a peer that
+            // keeps sending them is wasting our cycles. Count it as a
+            // glitch so a flood contributes to `check_flood()` and can
+            // eventually trigger ENHANCE_YOUR_CALM.
+            self.flood_detector.glitch_count += 1;
+            if let Some(error) = self.flood_detector.check_flood() {
+                return self.goaway(error);
+            }
         }
         MuxResult::Continue
     }
