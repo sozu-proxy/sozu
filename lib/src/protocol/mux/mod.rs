@@ -271,6 +271,12 @@ pub struct Context<L: ListenerHandler + L7ListenerHandler> {
     /// the client omitted the SNI extension. Stored pre-lowercased
     /// and without a port for cheap exact-match comparison.
     pub tls_server_name: Option<String>,
+    /// Whether the routing layer must reject any request whose authority
+    /// host does not exact-match `tls_server_name` (CWE-346 / CWE-444).
+    /// Mirrors `HttpsListenerConfig::strict_sni_binding`; captured once
+    /// at `Context::new` so routing decisions on each stream avoid a
+    /// per-stream `listener.borrow()`.
+    pub strict_sni_binding: bool,
 }
 
 impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
@@ -284,6 +290,7 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
             .borrow()
             .get_h2_connection_config()
             .stream_shrink_ratio as usize;
+        let strict_sni_binding = listener.borrow().get_strict_sni_binding();
         Self {
             streams: Vec::new(),
             pool,
@@ -293,6 +300,7 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
             debug: DebugHistory::new(),
             h2_stream_shrink_ratio,
             tls_server_name: None,
+            strict_sni_binding,
         }
     }
 
@@ -317,6 +325,10 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
             // HttpContext so `route_from_request` can enforce the SNI ↔
             // `:authority` binding for each H2 stream independently.
             http_context.tls_server_name = self.tls_server_name.clone();
+            // Mirror the listener's strict_sni_binding flag onto each
+            // HttpContext so the routing layer can honor operator opt-outs
+            // without reaching back into the listener on every request.
+            http_context.strict_sni_binding = self.strict_sni_binding;
             http_context
         };
         let recycle_slot = self

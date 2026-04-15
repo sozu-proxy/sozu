@@ -312,6 +312,12 @@ pub struct ListenerBuilder {
     /// size per request (SETTINGS_MAX_HEADER_LIST_SIZE, RFC 9113 §6.5.2).
     /// Default: 65536.
     pub h2_max_header_list_size: Option<u32>,
+    /// When true, every HTTP request served on this listener must have its
+    /// `:authority` / `Host` host exact-match the TLS SNI negotiated at
+    /// handshake (CWE-346 / CWE-444). Applies to HTTPS listeners only;
+    /// plaintext HTTP listeners never have an SNI to compare against.
+    /// Default: true.
+    pub strict_sni_binding: Option<bool>,
 }
 
 pub fn default_sticky_name() -> String {
@@ -380,6 +386,7 @@ impl ListenerBuilder {
             h2_max_rst_stream_lifetime: None,
             h2_max_rst_stream_abusive_lifetime: None,
             h2_max_header_list_size: None,
+            strict_sni_binding: None,
         }
     }
 
@@ -687,6 +694,7 @@ impl ListenerBuilder {
             h2_max_rst_stream_lifetime: self.h2_max_rst_stream_lifetime,
             h2_max_rst_stream_abusive_lifetime: self.h2_max_rst_stream_abusive_lifetime,
             h2_max_header_list_size: self.h2_max_header_list_size,
+            strict_sni_binding: self.strict_sni_binding,
         };
 
         Ok(https_listener_config)
