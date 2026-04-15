@@ -3665,7 +3665,27 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         }
         trace!("start new H2 stream {} {:?}", stream, self.readiness);
         let Some(stream_id) = self.new_stream_id() else {
-            error!("Stream ID space exhausted, cannot open new stream");
+            // Pass 4 Medium #5: the client-initiated stream-ID space
+            // (31 bits, odd only) is exhausted. The backend is now useless
+            // for new requests — gracefully drain it. Without this
+            // transition, the Connection lingers in `Connected` state and
+            // every subsequent request returns 503 because `start_stream`
+            // keeps returning false.
+            match &mut self.position {
+                Position::Client(cluster_id, backend, status) => {
+                    let backend_addr = backend.borrow().address;
+                    let cluster = cluster_id.clone();
+                    info!(
+                        "H2 backend stream IDs exhausted (cluster={}, backend={:?}) — draining",
+                        cluster, backend_addr
+                    );
+                    *status = BackendStatus::Disconnecting;
+                }
+                Position::Server => {
+                    error!("H2 server stream IDs exhausted — sending graceful GOAWAY");
+                }
+            }
+            self.graceful_goaway();
             return false;
         };
         self.streams.insert(stream_id, stream);
