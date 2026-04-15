@@ -4135,3 +4135,67 @@ fn e2e_h2_flood_settings_entries_cap() {
         State::Success
     );
 }
+
+// ----------------------------------------------------------------------------
+// FIX-15 (`77b26265`) — WINDOW_UPDATE on closed stream counted as glitch
+// ----------------------------------------------------------------------------
+
+/// WINDOW_UPDATE on a closed stream is legal (RFC 9113 \u{00a7}6.9.1) but an
+/// attacker that floods them on a recently-closed stream burns CPU without
+/// doing useful work. The fix increments `glitch_count` for each such frame
+/// and funnels it through `check_flood()` — so at the default
+/// `max_glitch_count = 100` threshold Sozu must emit
+/// `GOAWAY(ENHANCE_YOUR_CALM)`.
+///
+/// Reference: audit Pass 3 Low #5.
+fn try_h2_flood_window_update_on_closed_stream() -> State {
+    let (worker, backends, front_port) = setup_h2_test("H2-8C-WU-CLOSED", 1);
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake(&mut tls);
+
+    // Complete a normal request on stream 1 so the stream reaches the
+    // closed state (both sides have END_STREAM).
+    let header_block = h2_basic_get_header_block();
+    let headers = H2Frame::headers(1, header_block, true, true);
+    tls.write_all(&headers.encode()).unwrap();
+    tls.flush().unwrap();
+
+    // Drain the response so the stream is fully closed on sozu's side.
+    let response = collect_response_frames(&mut tls, 500, 3, 500);
+    log_frames("WINDOW_UPDATE on closed - initial response", &response);
+
+    // Now spam 150 WINDOW_UPDATE frames for the closed stream 1. The default
+    // max_glitch_count is 100 — at the 101st frame sozu must ENHANCE_YOUR_CALM.
+    let mut batch = Vec::new();
+    for _ in 0..150u32 {
+        batch.extend_from_slice(&H2Frame::window_update(1, 1).encode());
+    }
+    let write_ok = tls.write_all(&batch).is_ok() && tls.flush().is_ok();
+
+    let frames = collect_response_frames(&mut tls, 500, 5, 500);
+    log_frames("WINDOW_UPDATE on closed - after flood", &frames);
+
+    let got_enhance_calm = contains_goaway_with_error(&frames, H2_ERROR_ENHANCE_YOUR_CALM);
+    println!("WINDOW_UPDATE on closed - write_ok={write_ok} ENHANCE_YOUR_CALM={got_enhance_calm}");
+
+    let infra_ok = teardown(tls, front_port, worker, backends);
+    if got_enhance_calm && infra_ok {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn e2e_h2_flood_window_update_on_closed_stream() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 flood: WINDOW_UPDATE on closed stream counted as glitch \u{2192} ENHANCE_YOUR_CALM",
+            try_h2_flood_window_update_on_closed_stream
+        ),
+        State::Success
+    );
+}
