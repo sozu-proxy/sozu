@@ -151,6 +151,7 @@ jobs:
         run: |
           openssl req -newkey rsa:2048 -nodes -keyout rsa-2048.key -out rsa-2048.csr -config rsa-2048.cnf
           openssl x509 -req -days 365 -in rsa-2048.csr -signkey rsa-2048.key -out rsa-2048.pem -extensions req_ext -extfile rsa-2048.cnf
+          openssl x509 -in rsa-2048.pem -noout -checkhost rsa-2048.sozu.io
           sudo cp rsa-2048.pem /usr/local/share/ca-certificates/rsa-2048.crt
           sudo update-ca-certificates
       
@@ -159,6 +160,7 @@ jobs:
         run: |
           openssl req -newkey rsa:4096 -nodes -keyout rsa-4096.key -out rsa-4096.csr -config rsa-4096.cnf
           openssl x509 -req -days 365 -in rsa-4096.csr -signkey rsa-4096.key -out rsa-4096.pem -extensions req_ext -extfile rsa-4096.cnf
+          openssl x509 -in rsa-4096.pem -noout -checkhost rsa-4096.sozu.io
           sudo cp rsa-4096.pem /usr/local/share/ca-certificates/rsa-4096.crt
           sudo update-ca-certificates
       
@@ -168,6 +170,7 @@ jobs:
           openssl ecparam -name prime256v1 -genkey -out ecdsa.key
           openssl req -new -key ecdsa.key -out ecdsa.csr -config ecdsa.cnf
           openssl x509 -req -days 365 -in ecdsa.csr -signkey ecdsa.key -out ecdsa.pem -extensions req_ext -extfile ecdsa.cnf
+          openssl x509 -in ecdsa.pem -noout -checkhost ecdsa.sozu.io
           sudo cp ecdsa.pem /usr/local/share/ca-certificates/ecdsa.crt
           sudo update-ca-certificates
 
