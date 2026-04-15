@@ -17,6 +17,7 @@
 
 mod fuzz_tests;
 mod h1_security_tests;
+mod h2_security_sni;
 mod h2_security_tests;
 mod h2_tests;
 pub(crate) mod h2_utils;
