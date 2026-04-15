@@ -15,13 +15,18 @@
 //!   an HTTP upgrade whose backend drops the connection before the 101
 //!   completes must not panic the worker — graceful error branch in
 //!   `upgrade_mux`.
+//! * FIX-21 (`350e05ac`) — [`e2e_session_tls_client_fin_not_truncated`]:
+//!   a TLS client that sends its request then half-closes the write side
+//!   must still receive the complete response body from the backend;
+//!   the complementary RST sub-case merely checks sozu survives the
+//!   abrupt close without stalling.
 //!
 //! The `e2e-hooks` feature is forwarded to `sozu-lib` via
 //! `e2e/Cargo.toml` so the hooks compile in.
 
 use std::{
     io::{Read, Write},
-    net::{SocketAddr, TcpStream},
+    net::{Shutdown, SocketAddr, TcpStream},
     os::fd::AsRawFd,
     sync::{
         Arc,
@@ -51,7 +56,10 @@ use crate::{
     sozu::worker::Worker,
     tests::{
         State,
-        h2_utils::{setup_h2_test, verify_sozu_alive},
+        h2_utils::{
+            H2Frame, h2_handshake, raw_h2_connection, read_all_available, setup_h2_test,
+            verify_sozu_alive,
+        },
         repeat_until_error_or,
         tests::create_local_address,
     },
@@ -92,6 +100,18 @@ fn set_linger_zero(fd: libc::c_int) {
             std::io::Error::last_os_error(),
         );
     }
+}
+
+/// Build the HPACK block for a minimal valid GET request on `authority`.
+fn minimal_get_headers(authority: &str) -> Vec<u8> {
+    // Static table indexes:
+    //   0x82 = :method GET
+    //   0x84 = :path /
+    //   0x87 = :scheme https
+    //   0x41 literal :authority with name in static index 1
+    let mut block = vec![0x82, 0x84, 0x87, 0x41, authority.len() as u8];
+    block.extend_from_slice(authority.as_bytes());
+    block
 }
 
 // ============================================================================
@@ -440,6 +460,95 @@ fn e2e_session_upgrade_backend_disconnect_no_panic() {
             3,
             "FIX-20: HTTP upgrade with backend disconnect does not panic",
             try_e2e_session_upgrade_backend_disconnect_no_panic,
+        ),
+        State::Success,
+    );
+}
+
+// ============================================================================
+// FIX-21 — peer FIN vs RST
+// ============================================================================
+
+fn try_e2e_session_tls_client_fin_not_truncated() -> State {
+    let (mut worker, mut backends, front_port) = setup_h2_test("E2E-SESSION-FIX21", 1);
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+
+    // Sub-case A: FIN path — shutdown write side after request, expect full
+    // response back.
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake(&mut tls);
+
+    let hdrs = minimal_get_headers("localhost");
+    let headers_frame = H2Frame::headers(1, hdrs, true, true);
+    let write_ok = tls.write_all(&headers_frame.encode()).is_ok() && tls.flush().is_ok();
+
+    // Let sozu route and forward the request to the backend *before* we
+    // close the write half — once TCP FIN lands, rustls cannot emit any
+    // further TLS records on this connection.
+    thread::sleep(Duration::from_millis(200));
+
+    // Send FIN on the underlying TCP write half. Sozu must still deliver
+    // the full backend response.
+    let _ = tls.sock.shutdown(Shutdown::Write);
+
+    // Drain the response for up to 3 s.
+    let mut data = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        let chunk = read_all_available(&mut tls, Duration::from_millis(250));
+        if chunk.is_empty() {
+            if !data.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        } else {
+            data.extend_from_slice(&chunk);
+        }
+    }
+    drop(tls);
+
+    // A correct sozu will have forwarded the request to the backend and the
+    // backend's "pong0" body will appear somewhere in the (decoded) response.
+    let fin_ok = write_ok && data.windows(5).any(|w| w == b"pong0");
+    println!(
+        "FIX-21 FIN: write_ok={write_ok} bytes_received={} found_pong={fin_ok}",
+        data.len()
+    );
+
+    // Sub-case B: RST path — abrupt close via SO_LINGER(0). The assertion is
+    // that sozu survives without stalling, NOT that the response arrives.
+    let mut tls2 = raw_h2_connection(front_addr);
+    h2_handshake(&mut tls2);
+    let headers_frame2 = H2Frame::headers(1, minimal_get_headers("localhost"), true, true);
+    let _ = tls2.write_all(&headers_frame2.encode());
+    let _ = tls2.flush();
+    set_linger_zero(tls2.sock.as_raw_fd());
+    // Dropping with linger(0) sends a RST.
+    drop(tls2);
+
+    thread::sleep(Duration::from_millis(400));
+    let sozu_ok = verify_sozu_alive(front_port);
+
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+    for b in backends.iter_mut() {
+        b.stop_and_get_aggregator();
+    }
+
+    if fin_ok && sozu_ok && stopped {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn e2e_session_tls_client_fin_not_truncated() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "FIX-21: TLS client FIN before response completes; RST cleanup",
+            try_e2e_session_tls_client_fin_not_truncated,
         ),
         State::Success,
     );
