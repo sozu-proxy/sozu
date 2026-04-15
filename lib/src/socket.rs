@@ -69,6 +69,7 @@ impl SocketHandler for TcpStream {
             if counter > MAX_LOOP_ITERATIONS {
                 error!("MAX_LOOP_ITERATION reached in TcpStream::socket_read");
                 incr!("socket.read.infinite_loop.error");
+                return (size, SocketResult::Error);
             }
             if size == buf.len() {
                 return (size, SocketResult::Continue);
@@ -98,6 +99,7 @@ impl SocketHandler for TcpStream {
             if counter > MAX_LOOP_ITERATIONS {
                 error!("MAX_LOOP_ITERATION reached in TcpStream::socket_write");
                 incr!("socket.write.infinite_loop.error");
+                return (size, SocketResult::Error);
             }
             if size == buf.len() {
                 return (size, SocketResult::Continue);
@@ -195,6 +197,8 @@ impl SocketHandler for FrontRustls {
             if counter > MAX_LOOP_ITERATIONS {
                 error!("MAX_LOOP_ITERATION reached in FrontRustls::socket_read");
                 incr!("rustls.read.infinite_loop.error");
+                is_error = true;
+                break;
             }
 
             if size == buf.len() {
@@ -300,6 +304,8 @@ impl SocketHandler for FrontRustls {
             if counter > MAX_LOOP_ITERATIONS {
                 error!("MAX_LOOP_ITERATION reached in FrontRustls::socket_write");
                 incr!("rustls.write.infinite_loop.error");
+                is_error = true;
+                break;
             }
             if buffered_size == buf.len() {
                 break;
@@ -427,6 +433,8 @@ impl SocketHandler for FrontRustls {
             if counter > MAX_LOOP_ITERATIONS {
                 error!("MAX_LOOP_ITERATION reached in FrontRustls::socket_write_vectored");
                 incr!("rustls.write.infinite_loop.error");
+                is_error = true;
+                break;
             }
             if buffered_size == total_len {
                 break;
