@@ -22,10 +22,7 @@ use crate::{
         BackendStatus, Context, DebugEvent, DebugHistory, Endpoint, GenericHttpStream,
         GlobalStreamId, MuxResult, Position, StreamId, StreamState, converter,
         forcefully_terminate_answer,
-        parser::{
-            self, Frame, FrameHeader, FrameType, H2Error, Headers, ParserError, ParserErrorKind,
-            WindowUpdate,
-        },
+        parser::{self, Frame, FrameHeader, FrameType, H2Error, Headers, WindowUpdate},
         pkawa, serializer, set_default_answer,
         shared::{EndStreamAction, drain_tls_close_notify, end_stream_decision},
         update_readiness_after_read, update_readiness_after_write,
@@ -791,7 +788,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 trace!("{:#?}", header);
                 self.zero.storage.clear();
                 let stream_id = header.stream_id;
-                let read_stream = if stream_id == 0 {
+                // RFC 9113 §5.5: unknown frame types MUST be ignored and discarded.
+                // Route unknown frames (and any stream_id == 0 control frame)
+                // through stream 0 (the connection-level buffer) so
+                // `handle_frame` can drop them without touching stream state.
+                let read_stream = if stream_id == 0
+                    || matches!(header.frame_type, FrameType::Unknown(_))
+                {
                     H2StreamId::Zero
                 } else if let Some(global_stream_id) = self.streams.get(&stream_id) {
                     let allowed_on_half_closed = header.frame_type == FrameType::WindowUpdate
@@ -945,13 +948,6 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 trace!("{} {:?} {:#?}", header.stream_id, stream_id, self.streams);
                 self.expect_read = Some((read_stream, header.payload_len as usize));
                 self.state = H2State::Frame(header);
-            }
-            Err(nom::Err::Failure(ParserError {
-                kind: ParserErrorKind::UnknownFrame(skip),
-                ..
-            })) => {
-                self.expect_read = Some((H2StreamId::Zero, skip as usize));
-                self.state = H2State::Discard;
             }
             Err(error) => {
                 let error = error_nom_to_h2(error);
@@ -2377,6 +2373,14 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 self.attribute_bytes_to_overhead();
                 warn!("CONTINUATION frames are handled inline during header parsing");
                 self.goaway(H2Error::ProtocolError)
+            }
+            // RFC 9113 §5.5: unknown frame types MUST be ignored and discarded.
+            // The parser already consumed the payload; attribute the bytes
+            // to connection-level overhead and continue.
+            Frame::Unknown(raw) => {
+                debug!("Ignoring unknown H2 frame type {}", raw);
+                self.attribute_bytes_to_overhead();
+                MuxResult::Continue
             }
         }
     }

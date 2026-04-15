@@ -73,6 +73,11 @@ pub enum FrameType {
     GoAway,
     WindowUpdate,
     Continuation,
+    /// Frame of unknown type per RFC 9113 §5.5. Implementations MUST ignore
+    /// and discard these frames so H2 extensions (e.g. RFC 9218
+    /// PRIORITY_UPDATE, frame type 0x10) do not break interoperability.
+    /// The associated `u8` is the raw type byte for diagnostics only.
+    Unknown(u8),
 }
 
 impl std::str::FromStr for H2Error {
@@ -109,7 +114,6 @@ pub struct ParserError<'a> {
 pub enum ParserErrorKind {
     Nom(ErrorKind),
     H2(H2Error),
-    UnknownFrame(u32),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -235,16 +239,15 @@ pub fn frame_header(input: &[u8], max_frame_size: u32) -> IResult<&[u8], FrameHe
     }
 
     let (i, t) = be_u8(i)?;
-    let Some(frame_type) = convert_frame_type(t) else {
-        return Err(Err::Failure(ParserError::new(
-            i,
-            ParserErrorKind::UnknownFrame(payload_len),
-        )));
-    };
+    let frame_type = convert_frame_type(t);
     let (i, flags) = be_u8(i)?;
     let (i, stream_id) = be_u32(i)?;
     let stream_id = stream_id & STREAM_ID_MASK;
 
+    // RFC 9113 §5.5: unknown frame types MUST be silently discarded. Skip
+    // stream-id parity validation for them — the spec places no constraints on
+    // the stream_id of extension frames, and the h2 state machine simply drops
+    // the payload bytes.
     let valid_stream_id = match frame_type {
         FrameType::Data
         | FrameType::Headers
@@ -253,7 +256,7 @@ pub fn frame_header(input: &[u8], max_frame_size: u32) -> IResult<&[u8], FrameHe
         | FrameType::PushPromise
         | FrameType::Continuation => stream_id != 0,
         FrameType::Settings | FrameType::Ping | FrameType::GoAway => stream_id == 0,
-        FrameType::WindowUpdate => true,
+        FrameType::WindowUpdate | FrameType::Unknown(_) => true,
     };
     if !valid_stream_id {
         error!("invalid stream_id: {}", stream_id);
@@ -271,20 +274,25 @@ pub fn frame_header(input: &[u8], max_frame_size: u32) -> IResult<&[u8], FrameHe
     ))
 }
 
-fn convert_frame_type(t: u8) -> Option<FrameType> {
+/// Map a raw H2 frame type byte to its [`FrameType`] variant.
+///
+/// Unknown types are mapped to [`FrameType::Unknown`] so the caller can skip
+/// the payload per RFC 9113 §5.5 ("Implementations MUST ignore and discard
+/// frames of unknown type").
+fn convert_frame_type(t: u8) -> FrameType {
     trace!("got frame type: {}", t);
     match t {
-        0 => Some(FrameType::Data),
-        1 => Some(FrameType::Headers),
-        2 => Some(FrameType::Priority),
-        3 => Some(FrameType::RstStream),
-        4 => Some(FrameType::Settings),
-        5 => Some(FrameType::PushPromise),
-        6 => Some(FrameType::Ping),
-        7 => Some(FrameType::GoAway),
-        8 => Some(FrameType::WindowUpdate),
-        9 => Some(FrameType::Continuation),
-        _ => None,
+        0 => FrameType::Data,
+        1 => FrameType::Headers,
+        2 => FrameType::Priority,
+        3 => FrameType::RstStream,
+        4 => FrameType::Settings,
+        5 => FrameType::PushPromise,
+        6 => FrameType::Ping,
+        7 => FrameType::GoAway,
+        8 => FrameType::WindowUpdate,
+        9 => FrameType::Continuation,
+        other => FrameType::Unknown(other),
     }
 }
 
@@ -300,6 +308,9 @@ pub enum Frame {
     GoAway(GoAway),
     WindowUpdate(WindowUpdate),
     Continuation(Continuation),
+    /// Unknown frame type (RFC 9113 §5.5) — payload already consumed, the
+    /// state machine MUST ignore it.
+    Unknown(u8),
 }
 
 pub fn frame_body<'a>(
@@ -354,7 +365,17 @@ pub fn frame_body<'a>(
             }
             ping_frame(i, header)?
         }
-        FrameType::GoAway => goaway_frame(i, header)?,
+        FrameType::GoAway => {
+            // RFC 9113 §6.8: GOAWAY payload is at least 8 bytes
+            // (last-stream-id + error-code). Additional debug data may follow.
+            if header.payload_len < GOAWAY_PAYLOAD_SIZE {
+                return Err(Err::Failure(ParserError::new_h2(
+                    i,
+                    H2Error::FrameSizeError,
+                )));
+            }
+            goaway_frame(i, header)?
+        }
         FrameType::WindowUpdate => {
             if header.payload_len != WINDOW_UPDATE_PAYLOAD_SIZE {
                 return Err(Err::Failure(ParserError::new_h2(
@@ -364,6 +385,8 @@ pub fn frame_body<'a>(
             }
             window_update_frame(i, header)?
         }
+        // RFC 9113 §5.5: silently consume unknown frame payloads.
+        FrameType::Unknown(_) => unknown_frame(i, header)?,
     };
 
     Ok(f)
@@ -382,6 +405,13 @@ pub struct Data {
 /// it does not exceed the remaining data. Returns the content slice (after the
 /// pad-length byte) and the number of padding bytes to trim from the end.
 /// Returns `ProtocolError` when the pad length exceeds available data.
+///
+/// RFC 9113 §6.1: "The Pad Length field MUST be less than the length of the
+/// frame payload". With a frame payload of length `N`, the valid pad_length
+/// range is `0..=N-1`. After reading the 1-byte pad-length field, the
+/// remaining slice has length `N-1`, so pad_length may be at most `N-1`,
+/// i.e. `pad_length <= i.len()`. Only values strictly greater than `i.len()`
+/// are invalid.
 fn strip_padding<'a>(
     i: &'a [u8],
     flags: u8,
@@ -394,7 +424,7 @@ fn strip_padding<'a>(
         (i, 0)
     };
 
-    if pad_length > 0 && i.len() <= pad_length as usize {
+    if (pad_length as usize) > i.len() {
         return Err(Err::Failure(ParserError::new_h2(
             error_input,
             H2Error::ProtocolError,
@@ -588,8 +618,14 @@ pub fn settings_frame<'a>(
     ))
 }
 
-/// PushPromise is always rejected with PROTOCOL_ERROR (sozu never enables
-/// server push). The parser still consumes the frame bytes for correctness.
+/// PushPromise is always rejected with PROTOCOL_ERROR at the wire layer.
+/// Sozu never announces `SETTINGS_ENABLE_PUSH=1`, and RFC 9113 §8.4 requires
+/// that a peer which has not enabled server push treat a received
+/// PUSH_PROMISE as a connection error of type PROTOCOL_ERROR. Rejecting in
+/// the parser is defence-in-depth: any future refactor of `mux/h2.rs` that
+/// forgets to call `handle_push_promise_frame` cannot silently accept push
+/// traffic. The struct is retained so the outer match in `h2.rs` still
+/// compiles, but `push_promise_frame` never constructs it.
 #[derive(Clone, Debug)]
 pub struct PushPromise;
 
@@ -597,9 +633,13 @@ pub fn push_promise_frame<'a>(
     input: &'a [u8],
     header: &FrameHeader,
 ) -> IResult<&'a [u8], Frame, ParserError<'a>> {
-    // Consume the entire frame payload without storing fields
-    let (remaining, _) = take(header.payload_len)(input)?;
-    Ok((remaining, Frame::PushPromise(PushPromise)))
+    // Consume the payload bytes first so the framing layer does not desync
+    // if the caller ever demoted the error, then reject.
+    let (_remaining, _payload) = take(header.payload_len)(input)?;
+    Err(Err::Failure(ParserError::new_h2(
+        input,
+        H2Error::ProtocolError,
+    )))
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -681,6 +721,10 @@ pub fn window_update_frame<'a>(
 /// Continuation frames are handled inline during HEADERS parsing and always
 /// rejected with PROTOCOL_ERROR when received standalone. The parser still
 /// consumes the frame bytes for correctness.
+///
+/// The wire-level parser does not track connection state (whether the
+/// previous frame was HEADERS/PUSH_PROMISE with END_HEADERS=0), so standalone
+/// CONTINUATION is rejected at the h2 state-machine layer, not here.
 #[derive(Clone, Debug)]
 pub struct Continuation;
 
@@ -691,6 +735,22 @@ pub fn continuation_frame<'a>(
     // Consume the entire frame payload without storing fields
     let (remaining, _) = take(header.payload_len)(input)?;
     Ok((remaining, Frame::Continuation(Continuation)))
+}
+
+/// Silently consume the payload of a frame whose type byte is not recognised,
+/// per RFC 9113 §5.5 ("Implementations MUST ignore and discard frames of
+/// unknown type"). This is how H2 extensions (e.g. RFC 9218 PRIORITY_UPDATE,
+/// type 0x10) remain interoperable with sozu.
+pub fn unknown_frame<'a>(
+    input: &'a [u8],
+    header: &FrameHeader,
+) -> IResult<&'a [u8], Frame, ParserError<'a>> {
+    let (remaining, _payload) = take(header.payload_len)(input)?;
+    let raw = match header.frame_type {
+        FrameType::Unknown(t) => t,
+        _ => 0,
+    };
+    Ok((remaining, Frame::Unknown(raw)))
 }
 
 #[cfg(test)]
@@ -848,32 +908,54 @@ mod tests {
         }
     }
 
-    // ---- Unknown frame type returns UnknownFrame error ----
+    // ---- Unknown frame type is silently discarded (RFC 9113 §5.5) ----
 
-    /// RFC 9113 §4.1: unknown frame types must not crash the parser. Our
-    /// parser returns `ParserErrorKind::UnknownFrame(payload_len)` so the
-    /// caller can skip the payload and continue.
+    /// RFC 9113 §5.5: "Implementations MUST ignore and discard frames of
+    /// unknown type". The parser maps unknown type bytes to
+    /// [`FrameType::Unknown`] and consumes the payload without erroring so
+    /// H2 extensions (e.g. RFC 9218 PRIORITY_UPDATE, type 0x10) stay
+    /// interoperable.
     #[test]
-    fn test_unknown_frame_type_returns_unknown_frame_error() {
+    fn test_unknown_frame_type_is_ignored() {
         let input = [
             0x00, 0x00, 0x04, // payload_len = 4
             0xFF, // type = unknown (255)
             0x00, // flags = 0
             0x00, 0x00, 0x00, 0x00, // stream_id = 0
+            0xde, 0xad, 0xbe, 0xef, // arbitrary payload bytes
         ];
 
-        let result = frame_header(&input, DEFAULT_MAX_FRAME_SIZE);
-        assert!(result.is_err(), "unknown frame type must be rejected");
-        match result {
-            Err(nom::Err::Failure(e)) => {
-                assert!(
-                    matches!(e.kind, ParserErrorKind::UnknownFrame(4)),
-                    "expected UnknownFrame(4), got {:?}",
-                    e.kind
-                );
-            }
-            other => panic!("expected Failure(UnknownFrame(4)), got {other:?}"),
+        let (remaining, header) = frame_header(&input, DEFAULT_MAX_FRAME_SIZE)
+            .expect("unknown frame header must parse cleanly");
+        assert!(matches!(header.frame_type, FrameType::Unknown(0xFF)));
+        assert_eq!(header.payload_len, 4);
+
+        let (after, frame) =
+            frame_body(remaining, &header).expect("unknown frame body must be consumed");
+        assert!(after.is_empty(), "payload bytes must be consumed");
+        match frame {
+            Frame::Unknown(0xFF) => {}
+            other => panic!("expected Frame::Unknown(0xFF), got {other:?}"),
         }
+    }
+
+    /// RFC 9218 PRIORITY_UPDATE (frame type 0x10) is the canonical example of
+    /// an H2 extension we must accept-and-ignore rather than kill the
+    /// connection over.
+    #[test]
+    fn test_priority_update_is_ignored() {
+        let input = [
+            0x00, 0x00, 0x00, // payload_len = 0
+            0x10, // type = PRIORITY_UPDATE (0x10)
+            0x00, // flags = 0
+            0x00, 0x00, 0x00, 0x00, // stream_id = 0
+        ];
+
+        let (remaining, header) = frame_header(&input, DEFAULT_MAX_FRAME_SIZE)
+            .expect("PRIORITY_UPDATE header must parse");
+        assert!(matches!(header.frame_type, FrameType::Unknown(0x10)));
+        let (_, frame) = frame_body(remaining, &header).expect("body must be consumed");
+        assert!(matches!(frame, Frame::Unknown(0x10)));
     }
 
     // ---- SETTINGS with odd payload size (not a multiple of 6) ----
@@ -1655,6 +1737,157 @@ mod tests {
         assert!(
             result.is_err(),
             "PADDED+PRIORITY HEADERS with oversized pad_length must error, not panic"
+        );
+    }
+
+    // ---- strip_padding boundary: pad_length == payload_len - 1 (all padding) ----
+
+    /// RFC 9113 §6.1: "The Pad Length field MUST be less than the length of
+    /// the frame payload". With payload_len = N, pad_length up to N-1 is
+    /// valid (content may be empty, the final byte is padding). The previous
+    /// `i.len() <= pad_length` check rejected the N-1 case; the fix changes
+    /// the comparison to `(pad_length as usize) > i.len()`.
+    #[test]
+    fn test_strip_padding_all_padding_accepted() {
+        // DATA frame: payload_len = 2, FLAG_PADDED, pad_length = 1.
+        // After consuming the pad-length byte, `i.len() = 1` and
+        // `pad_length = 1`, which is exactly the maximum valid value.
+        let input = [
+            0x00, 0x00, 0x02, // payload_len = 2
+            0x00, // type = DATA
+            0x08, // flags = PADDED
+            0x00, 0x00, 0x00, 0x01, // stream_id = 1
+            0x01, // pad_length
+            0x00, // padding byte
+        ];
+
+        let (remaining, header) =
+            frame_header(&input, DEFAULT_MAX_FRAME_SIZE).expect("frame header parses cleanly");
+        let (_, frame) =
+            frame_body(remaining, &header).expect("DATA with all-padding body must parse");
+        match frame {
+            Frame::Data(data) => {
+                assert_eq!(data.stream_id, 1);
+                // Content length is 0 (all of the post-pad-length-byte payload is padding).
+                assert_eq!(data.payload.len, 0);
+            }
+            other => panic!("expected Frame::Data, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_strip_padding_pad_length_equals_payload_len_rejected() {
+        // payload_len = 1, FLAG_PADDED, pad_length = 1 → invalid
+        // (the pad-length byte consumes one byte, leaving i.len()=0 but
+        // pad_length wants to strip 1 extra byte of trailing padding).
+        let input = [
+            0x00, 0x00, 0x01, // payload_len = 1
+            0x00, // type = DATA
+            0x08, // flags = PADDED
+            0x00, 0x00, 0x00, 0x01, // stream_id = 1
+            0x01, // pad_length (invalid: exceeds remaining body)
+        ];
+
+        let (remaining, header) =
+            frame_header(&input, DEFAULT_MAX_FRAME_SIZE).expect("frame header parses cleanly");
+        let result = frame_body(remaining, &header);
+        assert!(
+            matches!(
+                result,
+                Err(nom::Err::Failure(ParserError {
+                    kind: ParserErrorKind::H2(H2Error::ProtocolError),
+                    ..
+                }))
+            ),
+            "pad_length > remaining body must yield PROTOCOL_ERROR, got {result:?}"
+        );
+    }
+
+    // ---- GOAWAY payload-length validation ----
+
+    /// RFC 9113 §6.8: a GOAWAY frame payload is at least 8 bytes (4-byte
+    /// last-stream-id + 4-byte error-code). Shorter payloads MUST be treated
+    /// as FRAME_SIZE_ERROR.
+    #[test]
+    fn test_goaway_short_payload_rejected() {
+        let input = [
+            0x00, 0x00, 0x04, // payload_len = 4 (too short)
+            0x07, // type = GOAWAY
+            0x00, // flags = 0
+            0x00, 0x00, 0x00, 0x00, // stream_id = 0
+            0x00, 0x00, 0x00, 0x00, // partial payload (only last_stream_id)
+        ];
+
+        let (remaining, header) =
+            frame_header(&input, DEFAULT_MAX_FRAME_SIZE).expect("frame header parses cleanly");
+        assert_eq!(header.frame_type, FrameType::GoAway);
+        let result = frame_body(remaining, &header);
+        assert!(
+            matches!(
+                result,
+                Err(nom::Err::Failure(ParserError {
+                    kind: ParserErrorKind::H2(H2Error::FrameSizeError),
+                    ..
+                }))
+            ),
+            "GOAWAY with payload_len < 8 must yield FRAME_SIZE_ERROR, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_goaway_minimum_payload_accepted() {
+        let input = [
+            0x00, 0x00, 0x08, // payload_len = 8
+            0x07, // type = GOAWAY
+            0x00, // flags = 0
+            0x00, 0x00, 0x00, 0x00, // stream_id = 0
+            0x00, 0x00, 0x00, 0x0a, // last_stream_id = 10
+            0x00, 0x00, 0x00, 0x00, // error_code = NO_ERROR
+        ];
+
+        let (remaining, header) =
+            frame_header(&input, DEFAULT_MAX_FRAME_SIZE).expect("frame header parses cleanly");
+        let (_, frame) = frame_body(remaining, &header).expect("minimal GOAWAY must parse cleanly");
+        match frame {
+            Frame::GoAway(goaway) => {
+                assert_eq!(goaway.last_stream_id, 10);
+                assert_eq!(goaway.error_code, 0);
+            }
+            other => panic!("expected Frame::GoAway, got {other:?}"),
+        }
+    }
+
+    // ---- PUSH_PROMISE wire-level rejection ----
+
+    /// RFC 9113 §8.4: a peer that has not enabled server push MUST treat a
+    /// received PUSH_PROMISE as a connection error of type PROTOCOL_ERROR.
+    /// Sozu never advertises `SETTINGS_ENABLE_PUSH=1`, so we reject
+    /// PUSH_PROMISE at the wire layer for defence-in-depth — even if a
+    /// future refactor of `mux/h2.rs` forgets the explicit check.
+    #[test]
+    fn test_push_promise_rejected_at_wire_layer() {
+        let input = [
+            0x00, 0x00, 0x08, // payload_len = 8
+            0x05, // type = PUSH_PROMISE
+            0x04, // flags = END_HEADERS
+            0x00, 0x00, 0x00, 0x01, // stream_id = 1 (associated stream)
+            0x00, 0x00, 0x00, 0x02, // promised stream_id = 2
+            0x00, 0x00, 0x00, 0x00, // arbitrary header-block placeholder
+        ];
+
+        let (remaining, header) =
+            frame_header(&input, DEFAULT_MAX_FRAME_SIZE).expect("frame header parses cleanly");
+        assert_eq!(header.frame_type, FrameType::PushPromise);
+        let result = frame_body(remaining, &header);
+        assert!(
+            matches!(
+                result,
+                Err(nom::Err::Failure(ParserError {
+                    kind: ParserErrorKind::H2(H2Error::ProtocolError),
+                    ..
+                }))
+            ),
+            "PUSH_PROMISE must be rejected at wire layer with PROTOCOL_ERROR, got {result:?}"
         );
     }
 }
