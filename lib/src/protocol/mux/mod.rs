@@ -17,7 +17,6 @@
 
 use std::{
     cell::RefCell,
-    collections::HashMap,
     fmt::Debug,
     io::ErrorKind,
     net::{Shutdown, SocketAddr},
@@ -25,10 +24,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use mio::{Interest, Token, net::TcpStream};
+use mio::{Token, net::TcpStream};
 use rusty_ulid::Ulid;
 use sozu_command::{
-    proto::command::{Event, EventKind, ListenerType},
+    proto::command::{Event, EventKind},
     ready::Ready,
 };
 
@@ -39,6 +38,7 @@ mod h1;
 mod h2;
 pub mod parser;
 mod pkawa;
+pub mod router;
 mod serializer;
 mod shared;
 pub mod stream;
@@ -52,8 +52,7 @@ use crate::{
     pool::{Checkout, Pool},
     protocol::{SessionState, http::editor::HttpContext, mux::h2::H2StreamId},
     retry::RetryPolicy,
-    router::Route,
-    server::{CONN_RETRIES, push_event},
+    server::push_event,
     socket::{FrontRustls, SocketHandler, SocketResult},
     timer::TimeoutContainer,
 };
@@ -70,6 +69,7 @@ pub use crate::protocol::mux::{
     h2::H2FloodConfig,
     h2::H2FlowControl,
     parser::H2Error,
+    router::Router,
     stream::{Stream, StreamParts, StreamState},
 };
 
@@ -775,342 +775,6 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
             .is_some_and(|s| s.state == StreamState::Recycle)
         {
             self.streams.pop();
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct Router {
-    pub backends: HashMap<Token, Connection<TcpStream>>,
-    pub configured_backend_timeout: Duration,
-    pub configured_connect_timeout: Duration,
-    /// Fallback readiness used when a backend token is missing from the map.
-    /// This prevents panicking in the Endpoint trait methods that return references.
-    fallback_readiness: Readiness,
-}
-
-impl Router {
-    pub fn new(configured_backend_timeout: Duration, configured_connect_timeout: Duration) -> Self {
-        Self {
-            backends: HashMap::new(),
-            configured_backend_timeout,
-            configured_connect_timeout,
-            fallback_readiness: Readiness::new(),
-        }
-    }
-
-    fn connect<L: ListenerHandler + L7ListenerHandler>(
-        &mut self,
-        stream_id: GlobalStreamId,
-        context: &mut Context<L>,
-        session: Rc<RefCell<dyn ProxySession>>,
-        proxy: Rc<RefCell<dyn L7Proxy>>,
-    ) -> Result<(), BackendConnectionError> {
-        let stream = &mut context.streams[stream_id];
-        // when reused, a stream should be detached from its old connection, if not we could end
-        // with concurrent connections on a single endpoint
-        if !matches!(stream.state, StreamState::Link) {
-            error!(
-                "stream {} expected to be in Link state, got {:?}",
-                stream_id, stream.state
-            );
-            return Err(BackendConnectionError::MaxSessionsMemory);
-        }
-        #[cfg(debug_assertions)]
-        context
-            .debug
-            .push(DebugEvent::Str(stream.context.get_route()));
-        if stream.attempts >= CONN_RETRIES {
-            return Err(BackendConnectionError::MaxConnectionRetries(
-                stream.context.cluster_id.clone(),
-            ));
-        }
-        stream.attempts += 1;
-
-        let stream_context = &mut stream.context;
-        let cluster_id = self
-            .route_from_request(stream_context, &context.listener)
-            .map_err(BackendConnectionError::RetrieveClusterError)?;
-        stream_context.cluster_id = Some(cluster_id.to_owned());
-
-        let (frontend_should_stick, frontend_should_redirect_https, h2) = proxy
-            .borrow()
-            .clusters()
-            .get(&cluster_id)
-            .map(|cluster| {
-                (
-                    cluster.sticky_session,
-                    cluster.https_redirect,
-                    cluster.http2.unwrap_or(false),
-                )
-            })
-            .unwrap_or((false, false, false));
-
-        if frontend_should_redirect_https && matches!(proxy.borrow().kind(), ListenerType::Http) {
-            return Err(BackendConnectionError::RetrieveClusterError(
-                RetrieveClusterError::HttpsRedirect,
-            ));
-        }
-
-        /*
-        H2 connecting strategy (least-loaded):
-        - look at every backend connection
-        - among connected backends for this cluster, pick the one with the fewest active streams
-        - fall back to a connecting backend if no connected one exists
-        - if no backend is to reuse, ask the router for a socket to the "next in line" backend
-
-        H1 strategy: reuse the first KeepAlive backend for this cluster.
-         */
-
-        let mut reuse_token = None;
-        let mut best_h2_stream_count = usize::MAX;
-        for (token, backend) in &self.backends {
-            match (h2, backend.position()) {
-                (_, Position::Server) => {
-                    error!("Backend connection unexpectedly behaves like a server");
-                    continue;
-                }
-                (_, Position::Client(_, _, BackendStatus::Disconnecting)) => {}
-
-                (true, Position::Client(other_cluster_id, _, BackendStatus::Connected)) => {
-                    if *other_cluster_id == cluster_id && !backend.is_draining() {
-                        // Pick the non-draining H2 connection with the fewest active streams
-                        let Connection::H2(h2c) = backend else {
-                            continue;
-                        };
-                        let stream_count = h2c.streams.len();
-                        if stream_count
-                            >= h2c.peer_settings.settings_max_concurrent_streams as usize
-                        {
-                            continue;
-                        }
-                        if stream_count < best_h2_stream_count {
-                            best_h2_stream_count = stream_count;
-                            reuse_token = Some(*token);
-                        }
-                    }
-                }
-                (true, Position::Client(other_cluster_id, _, BackendStatus::Connecting(_))) => {
-                    // Only use a connecting backend if no connected one was found
-                    if *other_cluster_id == cluster_id
-                        && best_h2_stream_count == usize::MAX
-                        && matches!(backend, Connection::H2(_))
-                    {
-                        reuse_token = Some(*token)
-                    }
-                }
-                (true, Position::Client(other_cluster_id, _, BackendStatus::KeepAlive)) => {
-                    if *other_cluster_id == cluster_id && matches!(backend, Connection::H2(_)) {
-                        error!("ConnectionH2 unexpectedly behaves like H1 with KeepAlive");
-                    }
-                }
-
-                (false, Position::Client(old_cluster_id, _, BackendStatus::KeepAlive)) => {
-                    if *old_cluster_id == cluster_id {
-                        reuse_token = Some(*token);
-                        break;
-                    }
-                }
-                // can't bundle H1 streams together
-                (false, Position::Client(_, _, BackendStatus::Connected))
-                | (false, Position::Client(_, _, BackendStatus::Connecting(_))) => {}
-            }
-        }
-        trace!(
-            "connect: {} (stick={}, h2={}) -> (reuse={:?})",
-            cluster_id, frontend_should_stick, h2, reuse_token
-        );
-
-        let token = if let Some(token) = reuse_token {
-            trace!("reused backend: {:#?}", self.backends.get(&token));
-            token
-        } else {
-            let (mut socket, backend) = self.backend_from_request(
-                &cluster_id,
-                frontend_should_stick,
-                stream_context,
-                proxy.clone(),
-                &context.listener,
-            )?;
-            stream.metrics.backend_start();
-            stream.metrics.backend_id = stream.context.backend_id.to_owned();
-            gauge_add!("backend.connections", 1);
-            gauge_add!(
-                "connections_per_backend",
-                1,
-                Some(&cluster_id),
-                Some(&backend.borrow().backend_id)
-            );
-
-            if let Err(e) = socket.set_nodelay(true) {
-                error!(
-                    "error setting nodelay on back socket({:?}): {:?}",
-                    socket, e
-                );
-            }
-
-            let token = proxy.borrow().add_session(session);
-
-            if let Err(e) = proxy.borrow().register_socket(
-                &mut socket,
-                token,
-                Interest::READABLE | Interest::WRITABLE,
-            ) {
-                error!("error registering back socket({:?}): {:?}", socket, e);
-            }
-
-            let timeout_container = TimeoutContainer::new(self.configured_connect_timeout, token);
-            let flood_config = context.listener.borrow().get_h2_flood_config();
-            let connection_config = context.listener.borrow().get_h2_connection_config();
-            let connection = if h2 {
-                match Connection::new_h2_client(
-                    socket,
-                    cluster_id,
-                    backend,
-                    context.pool.clone(),
-                    timeout_container,
-                    flood_config,
-                    connection_config,
-                ) {
-                    Some(connection) => connection,
-                    None => return Err(BackendConnectionError::MaxBuffers),
-                }
-            } else {
-                Connection::new_h1_client(socket, cluster_id, backend, timeout_container)
-            };
-            self.backends.insert(token, connection);
-            token
-        };
-
-        // Link backend to stream, checking if the backend can accept it
-        let Some(backend_conn) = self.backends.get_mut(&token) else {
-            error!(
-                "just-inserted or reused backend token {:?} missing from backends map",
-                token
-            );
-            return Err(BackendConnectionError::MaxSessionsMemory);
-        };
-        let started = backend_conn.start_stream(stream_id, context);
-        if !started {
-            error!("Backend rejected stream start (max concurrent streams reached)");
-            return Err(BackendConnectionError::MaxSessionsMemory);
-        }
-        // Reborrow stream to set linked state
-        context.streams[stream_id].state = StreamState::Linked(token);
-
-        // For reused backends: set context fields and metrics lifecycle
-        if reuse_token.is_some() {
-            if let Some(backend_conn) = self.backends.get(&token) {
-                if let Position::Client(_, backend_ref, _) = backend_conn.position() {
-                    let backend = backend_ref.borrow();
-                    let stream = &mut context.streams[stream_id];
-                    stream.context.backend_id = Some(backend.backend_id.to_owned());
-                    stream.context.backend_address = Some(backend.address);
-                    stream.metrics.backend_id = Some(backend.backend_id.to_owned());
-                    stream.metrics.backend_start();
-                    stream.metrics.backend_connected();
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn route_from_request<L: ListenerHandler + L7ListenerHandler>(
-        &mut self,
-        context: &mut HttpContext,
-        listener: &Rc<RefCell<L>>,
-    ) -> Result<String, RetrieveClusterError> {
-        let (host, uri, method) = match context.extract_route() {
-            Ok(tuple) => tuple,
-            Err(cluster_error) => {
-                // we are past kawa parsing if it succeeded this can't fail
-                // if the request was malformed it was caught by kawa and we sent a 400
-                error!(
-                    "Malformed request in connect (should be caught at parsing) {:?}: {}",
-                    context, cluster_error
-                );
-                return Err(cluster_error);
-            }
-        };
-
-        let route_result = listener.borrow().frontend_from_request(host, uri, method);
-
-        let route = match route_result {
-            Ok(route) => route,
-            Err(frontend_error) => {
-                trace!("{}", frontend_error);
-                return Err(RetrieveClusterError::RetrieveFrontend(frontend_error));
-            }
-        };
-
-        let cluster_id = match route {
-            Route::ClusterId(id) => id,
-            Route::Deny => {
-                trace!("Route::Deny");
-                return Err(RetrieveClusterError::UnauthorizedRoute);
-            }
-        };
-
-        Ok(cluster_id)
-    }
-
-    pub fn backend_from_request<L: ListenerHandler + L7ListenerHandler>(
-        &mut self,
-        cluster_id: &str,
-        frontend_should_stick: bool,
-        context: &mut HttpContext,
-        proxy: Rc<RefCell<dyn L7Proxy>>,
-        listener: &Rc<RefCell<L>>,
-    ) -> Result<(TcpStream, Rc<RefCell<Backend>>), BackendConnectionError> {
-        let (backend, conn) = self
-            .get_backend_for_sticky_session(
-                cluster_id,
-                frontend_should_stick,
-                context.sticky_session_found.as_deref(),
-                proxy,
-            )
-            .map_err(|backend_error| {
-                trace!("{}", backend_error);
-                BackendConnectionError::Backend(backend_error)
-            })?;
-
-        if frontend_should_stick {
-            // update sticky name in case it changed I guess?
-            context.sticky_name = listener.borrow().get_sticky_name().to_string();
-
-            context.sticky_session = Some(
-                backend
-                    .borrow()
-                    .sticky_id
-                    .clone()
-                    .unwrap_or_else(|| backend.borrow().backend_id.to_owned()),
-            );
-        }
-
-        context.backend_id = Some(backend.borrow().backend_id.to_owned());
-        context.backend_address = Some(backend.borrow().address);
-
-        Ok((conn, backend))
-    }
-
-    fn get_backend_for_sticky_session(
-        &self,
-        cluster_id: &str,
-        frontend_should_stick: bool,
-        sticky_session: Option<&str>,
-        proxy: Rc<RefCell<dyn L7Proxy>>,
-    ) -> Result<(Rc<RefCell<Backend>>, TcpStream), BackendError> {
-        match (frontend_should_stick, sticky_session) {
-            (true, Some(sticky_session)) => proxy
-                .borrow()
-                .backends()
-                .borrow_mut()
-                .backend_from_sticky_session(cluster_id, sticky_session),
-            _ => proxy
-                .borrow()
-                .backends()
-                .borrow_mut()
-                .backend_from_cluster_id(cluster_id),
         }
     }
 }
