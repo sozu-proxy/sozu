@@ -405,9 +405,20 @@ fn strip_padding<'a>(
 }
 
 /// Remove `pad_length` bytes of trailing padding from `i`, returning only
-/// the content portion.
-fn unpad(i: &[u8], pad_length: u8) -> &[u8] {
-    &i[..i.len() - pad_length as usize]
+/// the content portion. Returns `ProtocolError` if the remaining input is
+/// shorter than the declared padding — this is reachable in `headers_frame`
+/// when PADDED and PRIORITY are both set and the 5-byte priority payload
+/// leaves fewer bytes than `pad_length`.
+fn unpad<'a>(
+    i: &'a [u8],
+    pad_length: u8,
+    error_input: &'a [u8],
+) -> Result<&'a [u8], Err<ParserError<'a>>> {
+    let content_len = i
+        .len()
+        .checked_sub(pad_length as usize)
+        .ok_or_else(|| Err::Failure(ParserError::new_h2(error_input, H2Error::ProtocolError)))?;
+    Ok(&i[..content_len])
 }
 
 pub fn data_frame<'a>(
@@ -417,7 +428,7 @@ pub fn data_frame<'a>(
     let (remaining, i) = take(header.payload_len)(input)?;
 
     let (i, pad_length) = strip_padding(i, header.flags, input)?;
-    let payload = unpad(i, pad_length);
+    let payload = unpad(i, pad_length, input)?;
 
     Ok((
         remaining,
@@ -475,7 +486,7 @@ pub fn headers_frame<'a>(
         (i, None)
     };
 
-    let header_block_fragment = unpad(i, pad_length);
+    let header_block_fragment = unpad(i, pad_length, input)?;
 
     Ok((
         remaining,
@@ -1623,6 +1634,27 @@ mod tests {
         assert!(
             result.is_err(),
             "PRIORITY with wrong payload size should fail"
+        );
+    }
+
+    // A HEADERS frame with PADDED+PRIORITY where the declared pad_length
+    // exceeds the bytes left after consuming the 5-byte priority payload
+    // must be rejected as PROTOCOL_ERROR instead of panicking on underflow.
+    // Regression for fuzz crash d7a34a0d: payload_len=6, pad_length=3 →
+    // 6 − 1 (pad_length byte) − 5 (priority) = 0 content bytes, yet the
+    // parser tried to strip 3 padding bytes from 0.
+    #[test]
+    fn test_headers_padded_priority_underflow_rejected() {
+        let raw: [u8; 16] = [
+            0x00, 0x00, 0x06, 0x01, 0xff, 0xff, 0xff, 0x00, 0x00, 0x03, 0x00, 0x64, 0x6d, 0x6d,
+            0x6d, 0x6d,
+        ];
+        let (remaining, header) =
+            frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).expect("frame header parses cleanly");
+        let result = frame_body(remaining, &header);
+        assert!(
+            result.is_err(),
+            "PADDED+PRIORITY HEADERS with oversized pad_length must error, not panic"
         );
     }
 }
