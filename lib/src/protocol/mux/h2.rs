@@ -1377,10 +1377,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         };
         self.priorities_buf.clear();
         self.priorities_buf.extend(self.streams.keys().copied());
-        self.priorities_buf.sort_by(|a, b| {
-            let (ua, _) = self.prioriser.get(a);
-            let (ub, _) = self.prioriser.get(b);
-            ua.cmp(&ub).then_with(|| a.cmp(b))
+        self.priorities_buf.sort_by_cached_key(|id| {
+            let (urgency, _) = self.prioriser.get(id);
+            (urgency, *id)
         });
 
         trace!("PRIORITIES: {:?}", self.priorities_buf);
