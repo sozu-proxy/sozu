@@ -1,0 +1,459 @@
+//! Protocol-agnostic frontend/backend connection wrapper.
+//!
+//! [`Connection`] is the H1/H2 dispatch enum used everywhere in the mux
+//! layer. Most of the methods are trivial pass-through forwarders to the
+//! underlying [`ConnectionH1`] or [`ConnectionH2`] implementation — the
+//! local `forward!` macro removes the boilerplate.
+//!
+//! The two `Endpoint` adaptors ([`EndpointServer`], [`EndpointClient`]) are
+//! also defined here: they let a connection call back into either the
+//! frontend connection or the backend [`Router`] map without knowing which
+//! direction it faces.
+
+use std::{
+    cell::RefCell,
+    fmt::Debug,
+    rc::{Rc, Weak},
+    time::Instant,
+};
+
+use mio::{Token, net::TcpStream};
+use sozu_command::ready::Ready;
+
+use super::{
+    BackendStatus, ConnectionH1, ConnectionH2, Context, Endpoint, GlobalStreamId, MuxResult,
+    Position, Router,
+    h2::{self, H2StreamId},
+};
+use crate::{
+    L7ListenerHandler, ListenerHandler, Readiness, backends::Backend, pool::Pool,
+    socket::SocketHandler, timer::TimeoutContainer,
+};
+
+#[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
+pub enum Connection<Front: SocketHandler> {
+    H1(ConnectionH1<Front>),
+    H2(ConnectionH2<Front>),
+}
+
+// Dispatches a method call or field access to the inner H1/H2 connection.
+// Used by trivial pass-through methods on Connection<Front> to avoid
+// repeating the two-arm match.
+macro_rules! forward {
+    ($self:expr, $method:ident ( $($args:tt)* )) => {
+        match $self {
+            Connection::H1(c) => c.$method($($args)*),
+            Connection::H2(c) => c.$method($($args)*),
+        }
+    };
+    (&$self:expr, $field:ident) => {
+        match $self {
+            Connection::H1(c) => &c.$field,
+            Connection::H2(c) => &c.$field,
+        }
+    };
+    (&mut $self:expr, $field:ident) => {
+        match $self {
+            Connection::H1(c) => &mut c.$field,
+            Connection::H2(c) => &mut c.$field,
+        }
+    };
+}
+
+impl<Front: SocketHandler> Connection<Front> {
+    pub fn new_h1_server(
+        front_stream: Front,
+        timeout_container: TimeoutContainer,
+    ) -> Connection<Front> {
+        Connection::H1(ConnectionH1 {
+            socket: front_stream,
+            position: Position::Server,
+            readiness: Readiness {
+                interest: Ready::READABLE | Ready::HUP | Ready::ERROR,
+                event: Ready::EMPTY,
+            },
+            requests: 0,
+            stream: Some(0),
+            timeout_container,
+            parked_on_buffer_pressure: false,
+            close_notify_sent: false,
+        })
+    }
+    pub fn new_h1_client(
+        front_stream: Front,
+        cluster_id: String,
+        backend: Rc<RefCell<Backend>>,
+        timeout_container: TimeoutContainer,
+    ) -> Connection<Front> {
+        Connection::H1(ConnectionH1 {
+            socket: front_stream,
+            position: Position::Client(
+                cluster_id,
+                backend,
+                BackendStatus::Connecting(Instant::now()),
+            ),
+            readiness: Readiness {
+                interest: Ready::WRITABLE | Ready::READABLE | Ready::HUP | Ready::ERROR,
+                event: Ready::EMPTY,
+            },
+            stream: None,
+            requests: 0,
+            timeout_container,
+            parked_on_buffer_pressure: false,
+            close_notify_sent: false,
+        })
+    }
+
+    pub fn new_h2_server(
+        front_stream: Front,
+        pool: Weak<RefCell<Pool>>,
+        timeout_container: TimeoutContainer,
+        flood_config: h2::H2FloodConfig,
+        connection_config: h2::H2ConnectionConfig,
+    ) -> Option<Connection<Front>> {
+        Some(Connection::H2(ConnectionH2::new(
+            front_stream,
+            Position::Server,
+            pool,
+            flood_config,
+            connection_config,
+            timeout_container,
+            Some((H2StreamId::Zero, h2::CLIENT_PREFACE_SIZE)),
+            Ready::READABLE | Ready::HUP | Ready::ERROR,
+        )?))
+    }
+
+    pub fn new_h2_client(
+        front_stream: Front,
+        cluster_id: String,
+        backend: Rc<RefCell<Backend>>,
+        pool: Weak<RefCell<Pool>>,
+        timeout_container: TimeoutContainer,
+        flood_config: h2::H2FloodConfig,
+        connection_config: h2::H2ConnectionConfig,
+    ) -> Option<Connection<Front>> {
+        Some(Connection::H2(ConnectionH2::new(
+            front_stream,
+            Position::Client(
+                cluster_id,
+                backend,
+                BackendStatus::Connecting(Instant::now()),
+            ),
+            pool,
+            flood_config,
+            connection_config,
+            timeout_container,
+            None,
+            Ready::WRITABLE | Ready::HUP | Ready::ERROR,
+        )?))
+    }
+
+    pub fn readiness(&self) -> &Readiness {
+        forward!(&self, readiness)
+    }
+    pub fn readiness_mut(&mut self) -> &mut Readiness {
+        forward!(&mut self, readiness)
+    }
+    pub fn position(&self) -> &Position {
+        forward!(&self, position)
+    }
+    pub fn position_mut(&mut self) -> &mut Position {
+        forward!(&mut self, position)
+    }
+    pub fn socket(&self) -> &TcpStream {
+        match self {
+            Connection::H1(c) => c.socket.socket_ref(),
+            Connection::H2(c) => c.socket.socket_ref(),
+        }
+    }
+    pub fn socket_mut(&mut self) -> &mut TcpStream {
+        match self {
+            Connection::H1(c) => c.socket.socket_mut(),
+            Connection::H2(c) => c.socket.socket_mut(),
+        }
+    }
+    pub fn timeout_container(&mut self) -> &mut TimeoutContainer {
+        forward!(&mut self, timeout_container)
+    }
+
+    /// Returns connection-level byte overhead (bin, bout) for H2, (0, 0) for H1.
+    pub fn overhead_bytes(&self) -> (usize, usize) {
+        match self {
+            Connection::H1(_) => (0, 0),
+            Connection::H2(c) => (c.bytes.overhead_bin, c.bytes.overhead_bout),
+        }
+    }
+
+    pub(super) fn readable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
+    where
+        E: Endpoint,
+        L: ListenerHandler + L7ListenerHandler,
+    {
+        forward!(self, readable(context, endpoint))
+    }
+    pub(super) fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
+    where
+        E: Endpoint,
+        L: ListenerHandler + L7ListenerHandler,
+    {
+        forward!(self, writable(context, endpoint))
+    }
+
+    /// Returns true if this connection could not read because its stream's
+    /// kawa buffer was full. Used to prevent the dead-backend check from
+    /// closing a backend that still has data in the OS socket buffer.
+    pub(super) fn has_buffer_pressure<L>(&self, context: &Context<L>) -> bool
+    where
+        L: ListenerHandler + L7ListenerHandler,
+    {
+        match self {
+            Connection::H1(c) => {
+                let Some(stream_id) = c.stream else {
+                    // No stream assigned — no buffer pressure.
+                    return false;
+                };
+                let kawa = match c.position {
+                    Position::Client(..) => &context.streams[stream_id].back,
+                    Position::Server => &context.streams[stream_id].front,
+                };
+                kawa.storage.available_space() == 0
+            }
+            // H2 connections manage their own flow control via expect_read
+            Connection::H2(_) => false,
+        }
+    }
+
+    /// Re-enable READABLE if this connection is parked waiting for buffer space
+    /// and the target stream's buffer now has enough room.
+    ///
+    /// For H1: checks the `parked_on_buffer_pressure` flag set when `readable`
+    /// exits early because the kawa buffer was full. Edge-triggered epoll will
+    /// not re-fire READABLE for data already in the kernel socket buffer, so
+    /// this is the only path that re-arms it after the peer drains space.
+    ///
+    /// For H2: checks the `expect_read` field tracking which stream and how
+    /// many bytes are needed.
+    pub(super) fn try_resume_reading<L>(&mut self, context: &Context<L>) -> bool
+    where
+        L: ListenerHandler + L7ListenerHandler,
+    {
+        match self {
+            Connection::H1(c) => {
+                if !c.parked_on_buffer_pressure {
+                    return false;
+                }
+                let Some(stream_id) = c.stream else {
+                    return false;
+                };
+                let kawa = match c.position {
+                    Position::Client(..) => &context.streams[stream_id].back,
+                    Position::Server => &context.streams[stream_id].front,
+                };
+                if kawa.storage.available_space() > 0 {
+                    trace!("H1 try_resume_reading: re-arming READABLE");
+                    c.readiness.signal_pending_read();
+                    true
+                } else {
+                    false
+                }
+            }
+            Connection::H2(c) => c.try_resume_reading(context),
+        }
+    }
+
+    pub(super) fn graceful_goaway(&mut self) -> MuxResult {
+        match self {
+            Connection::H1(_) => MuxResult::Continue,
+            Connection::H2(c) => c.graceful_goaway(),
+        }
+    }
+
+    pub(super) fn is_draining(&self) -> bool {
+        match self {
+            Connection::H1(_) => false,
+            Connection::H2(c) => c.drain.draining,
+        }
+    }
+
+    pub(super) fn has_pending_write(&self) -> bool {
+        forward!(self, has_pending_write())
+    }
+
+    pub(super) fn initiate_close_notify(&mut self) -> bool {
+        forward!(self, initiate_close_notify())
+    }
+
+    pub(super) fn flush_zero_buffer(&mut self) {
+        if let Connection::H2(c) = self {
+            c.flush_zero_buffer();
+        }
+    }
+
+    fn pre_close_client_bookkeeping(&self) {
+        if let Position::Client(cluster_id, backend, _) = self.position() {
+            let mut backend_borrow = backend.borrow_mut();
+            backend_borrow.dec_connections();
+            gauge_add!("backend.connections", -1);
+            gauge_add!(
+                "connections_per_backend",
+                -1,
+                Some(cluster_id),
+                Some(&backend_borrow.backend_id)
+            );
+            trace!("connection close: {:#?}", backend_borrow);
+        }
+    }
+
+    fn pre_end_stream_client_bookkeeping(&self) {
+        if let Position::Client(_, backend, BackendStatus::Connected) = self.position() {
+            let mut backend_borrow = backend.borrow_mut();
+            backend_borrow.active_requests = backend_borrow.active_requests.saturating_sub(1);
+            trace!("connection end stream: {:#?}", backend_borrow);
+        }
+    }
+
+    fn pre_start_stream_client_bookkeeping(&self) {
+        if let Position::Client(_, backend, BackendStatus::Connected) = self.position() {
+            let mut backend_borrow = backend.borrow_mut();
+            backend_borrow.active_requests += 1;
+            trace!("connection start stream: {:#?}", backend_borrow);
+        }
+    }
+
+    pub(super) fn close<E, L>(&mut self, context: &mut Context<L>, endpoint: E)
+    where
+        E: Endpoint,
+        L: ListenerHandler + L7ListenerHandler,
+    {
+        self.pre_close_client_bookkeeping();
+        forward!(self, close(context, endpoint))
+    }
+
+    pub(super) fn end_stream<L>(&mut self, stream: GlobalStreamId, context: &mut Context<L>)
+    where
+        L: ListenerHandler + L7ListenerHandler,
+    {
+        self.pre_end_stream_client_bookkeeping();
+        forward!(self, end_stream(stream, context))
+    }
+
+    pub(super) fn start_stream<L>(
+        &mut self,
+        stream: GlobalStreamId,
+        context: &mut Context<L>,
+    ) -> bool
+    where
+        L: ListenerHandler + L7ListenerHandler,
+    {
+        self.pre_start_stream_client_bookkeeping();
+        let started = forward!(self, start_stream(stream, context));
+        if !started {
+            // Undo active_requests increment on failure
+            self.pre_end_stream_client_bookkeeping();
+        }
+        started
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct EndpointServer<'a, Front: SocketHandler>(pub &'a mut Connection<Front>);
+#[derive(Debug)]
+pub(super) struct EndpointClient<'a>(pub &'a mut Router);
+
+// note: EndpointServer are used by client Connection, they do not know the frontend Token
+// they will use the Stream's Token which is their backend token
+impl<Front: SocketHandler + Debug> Endpoint for EndpointServer<'_, Front> {
+    fn readiness(&self, _token: Token) -> &Readiness {
+        self.0.readiness()
+    }
+    fn readiness_mut(&mut self, _token: Token) -> &mut Readiness {
+        self.0.readiness_mut()
+    }
+
+    fn end_stream<L>(&mut self, _token: Token, stream: GlobalStreamId, context: &mut Context<L>)
+    where
+        L: ListenerHandler + L7ListenerHandler,
+    {
+        // this may be used to forward H2<->H2 RstStream
+        // or to handle backend hup
+        self.0.end_stream(stream, context);
+    }
+
+    fn start_stream<L>(
+        &mut self,
+        _token: Token,
+        stream: GlobalStreamId,
+        context: &mut Context<L>,
+    ) -> bool
+    where
+        L: ListenerHandler + L7ListenerHandler,
+    {
+        // Forward stream start to the frontend connection.
+        // This is used when a backend H2 connection starts a new stream
+        // (e.g. for H2<->H2 proxying or PUSH_PROMISE forwarding).
+        self.0.start_stream(stream, context)
+    }
+}
+impl Endpoint for EndpointClient<'_> {
+    fn readiness(&self, token: Token) -> &Readiness {
+        match self.0.backends.get(&token) {
+            Some(backend) => backend.readiness(),
+            None => {
+                error!(
+                    "backend token {:?} missing from backends map (readiness)",
+                    token
+                );
+                &self.0.fallback_readiness
+            }
+        }
+    }
+    fn readiness_mut(&mut self, token: Token) -> &mut Readiness {
+        match self.0.backends.get_mut(&token) {
+            Some(backend) => backend.readiness_mut(),
+            None => {
+                error!(
+                    "backend token {:?} missing from backends map (readiness_mut)",
+                    token
+                );
+                &mut self.0.fallback_readiness
+            }
+        }
+    }
+
+    fn end_stream<L>(&mut self, token: Token, stream: GlobalStreamId, context: &mut Context<L>)
+    where
+        L: ListenerHandler + L7ListenerHandler,
+    {
+        match self.0.backends.get_mut(&token) {
+            Some(backend) => backend.end_stream(stream, context),
+            None => {
+                error!(
+                    "backend token {:?} missing from backends map (end_stream)",
+                    token
+                );
+            }
+        }
+    }
+
+    fn start_stream<L>(
+        &mut self,
+        token: Token,
+        stream: GlobalStreamId,
+        context: &mut Context<L>,
+    ) -> bool
+    where
+        L: ListenerHandler + L7ListenerHandler,
+    {
+        match self.0.backends.get_mut(&token) {
+            Some(backend) => backend.start_stream(stream, context),
+            None => {
+                error!(
+                    "backend token {:?} missing from backends map (start_stream)",
+                    token
+                );
+                false
+            }
+        }
+    }
+}
