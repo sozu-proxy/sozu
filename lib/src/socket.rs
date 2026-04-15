@@ -436,6 +436,17 @@ impl SocketHandler for FrontRustls {
         }
     }
 
+    /// Write a list of plaintext slices through the rustls session.
+    ///
+    /// Empty-buffer invariant: callers may legitimately pass `bufs.is_empty()`
+    /// or an all-empty slice to request a pure flush pass. In that case
+    /// `total_len == 0`, the top-of-loop `buffered_size == total_len` guard
+    /// fires immediately after `write_tls` drains any pending TLS records the
+    /// session still has buffered (e.g. the remainder of a record split by
+    /// the previous call, or `close_notify` output). This mirrors
+    /// [`Self::socket_write`]: both entry points must stay structurally
+    /// symmetric so that a zero-byte flush never early-returns without giving
+    /// rustls a chance to emit bytes.
     fn socket_write_vectored(&mut self, bufs: &[std::io::IoSlice]) -> (usize, SocketResult) {
         if self.peer_reset {
             return (0, SocketResult::Closed);
