@@ -1372,7 +1372,13 @@ fn try_http_behaviors() -> State {
             && response.ends_with(&expected_response_end)
     );
 
-    info!("server closes, expecting 503");
+    info!("server closes, expecting 502");
+    // Backend closed after consuming (part of) the request without producing
+    // any response: end_stream_decision normalises this to 502 Bad Gateway
+    // (see lib/src/protocol/mux/shared.rs::end_stream_decision — "no response
+    // is available and the request was already partially consumed" → 502).
+    // Previously Sozu returned 503 here; the H1 and H2 paths were aligned on
+    // 502 in bd4f4014 (h1) / cb80a595 (h2).
     // TODO: what if the client continue to use the closed stream
     client.connect();
     client.send();
@@ -1383,7 +1389,7 @@ fn try_http_behaviors() -> State {
     let response = client.receive();
     println!("request: {request:?}");
     println!("response: {response:?}");
-    assert_eq!(response, Some(immutable_answer(503)));
+    assert_eq!(response, Some(immutable_answer(502)));
     assert_eq!(client.receive(), None);
 
     worker.send_proxy_request_type(RequestType::RemoveBackend(RemoveBackend {
