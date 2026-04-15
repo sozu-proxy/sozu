@@ -158,7 +158,13 @@ impl HttpSession {
             HttpStateMachine::Mux(mux) => self.upgrade_mux(mux),
             HttpStateMachine::Expect(expect) => self.upgrade_expect(expect),
             HttpStateMachine::WebSocket(ws) => self.upgrade_websocket(ws),
-            HttpStateMachine::FailedUpgrade(_) => unreachable!(),
+            HttpStateMachine::FailedUpgrade(_) => {
+                // Reaching this arm means a prior upgrade already returned
+                // `None` and the session should have been closed. Fall back
+                // to closing cleanly instead of panicking the worker.
+                error!("HTTP::upgrade called on FailedUpgrade state; closing session");
+                None
+            }
         };
 
         match new_state {
@@ -225,11 +231,10 @@ impl HttpSession {
 
     fn upgrade_mux(&mut self, mut mux: MuxClear) -> Option<HttpStateMachine> {
         debug!("mux switching to ws");
-        let stream = mux
-            .context
-            .streams
-            .pop()
-            .expect("mux session must have at least one stream during upgrade");
+        let Some(stream) = mux.context.streams.pop() else {
+            error!("upgrade_mux: no stream attached to the mux session, closing");
+            return None;
+        };
         // http.active_requests was already decremented by generate_access_log()
         // in h1.rs before MuxResult::Upgrade was returned to us.
 
@@ -251,11 +256,13 @@ impl HttpSession {
             error!("Upgrading stream should be linked to a backend");
             return None;
         };
-        let backend = mux
-            .router
-            .backends
-            .remove(&back_token)
-            .expect("backend for back_token must exist during upgrade");
+        let Some(backend) = mux.router.backends.remove(&back_token) else {
+            error!(
+                "upgrade_mux: backend for token {:?} is missing (already disconnected?), closing",
+                back_token
+            );
+            return None;
+        };
         let (cluster_id, backend, backend_readiness, backend_socket, mut container_backend_timeout) =
             match backend {
                 mux::Connection::H1(mux::ConnectionH1 {
