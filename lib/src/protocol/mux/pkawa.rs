@@ -42,6 +42,28 @@ fn is_invalid_te_value(value: &[u8]) -> bool {
     !compare_no_case(value, b"trailers")
 }
 
+/// Strip the ``:port`` suffix (if any) from an ``authority``/``host`` value.
+///
+/// This does not validate that the remaining segment is a legal host — it is only
+/// used for the RFC 9113 §8.3.1 equivalence check between a literal ``host``
+/// header and the ``:authority`` pseudo-header when both are present.
+fn strip_port(value: &[u8]) -> &[u8] {
+    match value.iter().rposition(|&b| b == b':') {
+        Some(i) if value[i + 1..].iter().all(|b| b.is_ascii_digit()) => &value[..i],
+        _ => value,
+    }
+}
+
+/// Case-insensitively compare a literal ``host`` header value to an
+/// ``:authority`` pseudo-header value after stripping any trailing port.
+///
+/// RFC 9113 §8.3.1: when both are present they must identify the same origin,
+/// otherwise the request is malformed and must be rejected with PROTOCOL_ERROR
+/// to prevent request-smuggling via H2→H1 downconversion.
+fn host_matches_authority(host: &[u8], authority: &[u8]) -> bool {
+    compare_no_case(strip_port(host), strip_port(authority))
+}
+
 /// Returns true if the value contains any byte forbidden in HTTP field values
 /// (RFC 9110 §5.5 + RFC 9113 §8.2.1): NUL, CR, LF, DEL, and other C0 controls.
 /// HTAB (0x09) and visible ASCII (0x20..=0x7E) plus obs-text (0x80..=0xFF) are allowed.
@@ -279,6 +301,13 @@ where
             let mut scheme = Store::Empty;
             let mut regular_headers = false;
             let mut cookies_added = false;
+            // RFC 9113 §8.3.1: a literal ``host`` header may appear, but if it
+            // does it MUST identify the same origin as ``:authority``. We defer
+            // the comparison to after the decode loop (authority may arrive in
+            // any order) and drop the literal header so the H1 serializer emits
+            // exactly one ``Host:`` line from the authority pseudo-header.
+            let mut host_value: Option<Vec<u8>> = None;
+            let mut host_conflict = false;
             let invalid_headers = decode_headers_with_budget(
                 decoder,
                 input,
@@ -389,6 +418,25 @@ where
                                 }),
                             });
                         }
+                    } else if compare_no_case(&k, b"host") {
+                        // RFC 9113 §8.3.1: a literal ``host`` header is tolerated
+                        // but only if it matches ``:authority``. We buffer the
+                        // value here and reconcile after the decode loop — at
+                        // which point authority is known regardless of order.
+                        regular_headers = true;
+                        if has_invalid_value_byte(&v) {
+                            *invalid_headers = true;
+                            return;
+                        }
+                        match host_value {
+                            Some(ref existing) if existing.as_slice() != v.as_ref() => {
+                                // Multiple disagreeing ``host`` headers are
+                                // malformed (RFC 9110 §7.2 / §5.3.1) — reject.
+                                host_conflict = true;
+                            }
+                            Some(_) => {}
+                            None => host_value = Some(v.to_vec()),
+                        }
                     } else {
                         regular_headers = true;
                         if !write_regular_header(kawa, &k, &v) {
@@ -424,6 +472,23 @@ where
             {
                 error!("INVALID HEADERS");
                 return Err((H2Error::ProtocolError, false));
+            }
+            // RFC 9113 §8.3.1: if a literal ``host`` header appears, it must
+            // match ``:authority`` (modulo optional port) and be deduplicated
+            // so the H1 serializer emits exactly one ``Host:`` line. Mismatches
+            // are request-smuggling vectors and are rejected as PROTOCOL_ERROR.
+            if host_conflict {
+                error!("H2 host header: multiple disagreeing values");
+                return Err((H2Error::ProtocolError, false));
+            }
+            if let Some(ref host) = host_value {
+                let authority_bytes = authority.data_opt(kawa.storage.buffer()).unwrap_or(&[]);
+                if !host_matches_authority(host, authority_bytes) {
+                    error!("H2 host header does not match :authority");
+                    return Err((H2Error::ProtocolError, false));
+                }
+                // Match — drop it. kawa's H1 serializer emits Host: from
+                // :authority on its own.
             }
             StatusLine::Request {
                 version: Version::V20,
@@ -1443,5 +1508,135 @@ mod tests {
         assert_eq!(kawa.detached.jar[0].key.data(buf), b"token");
         // Split on FIRST '=' only, so value includes trailing '='
         assert_eq!(kawa.detached.jar[0].val.data(buf), b"abc=def==");
+    }
+
+    // ── host vs :authority reconciliation (RFC 9113 §8.3.1) ───────────
+
+    #[test]
+    fn test_strip_port_and_host_authority_match() {
+        assert_eq!(strip_port(b"example.com"), b"example.com");
+        assert_eq!(strip_port(b"example.com:8443"), b"example.com");
+        assert_eq!(strip_port(b"example.com:abc"), b"example.com:abc");
+        assert_eq!(strip_port(b"[::1]:8443"), b"[::1]");
+
+        assert!(host_matches_authority(b"Example.com", b"example.com"));
+        assert!(host_matches_authority(b"example.com:8443", b"example.com"));
+        assert!(host_matches_authority(b"example.com", b"example.com:443"));
+        assert!(host_matches_authority(
+            b"example.com:80",
+            b"example.com:443"
+        ));
+        assert!(!host_matches_authority(b"evil.com", b"example.com"));
+        assert!(!host_matches_authority(b"example.com.evil", b"example.com"));
+    }
+
+    #[test]
+    fn test_handle_header_host_matches_authority_is_deduplicated() {
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        let kawa = decode_request_headers(
+            &mut pool,
+            &[
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":path", b"/"),
+                (b":authority", b"example.com"),
+                (b"host", b"Example.com"),
+            ],
+            true,
+        );
+        // Literal ``host`` must not be emitted as a regular Header block —
+        // kawa's H1 converter serialises Host: from :authority on its own.
+        let buf = kawa.storage.buffer();
+        for block in kawa.blocks.iter() {
+            if let Block::Header(pair) = block {
+                assert!(
+                    !compare_no_case(pair.key.data(buf), b"host"),
+                    "literal host header must be dropped when it matches :authority"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_handle_header_host_mismatch_rejected() {
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        let err = try_decode_request_headers(
+            &mut pool,
+            &[
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":path", b"/"),
+                (b":authority", b"example.com"),
+                (b"host", b"evil.com"),
+            ],
+            true,
+        );
+        assert!(
+            matches!(err, Err((H2Error::ProtocolError, _))),
+            "host != :authority must yield PROTOCOL_ERROR, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_handle_header_multiple_disagreeing_host_rejected() {
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        let err = try_decode_request_headers(
+            &mut pool,
+            &[
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":path", b"/"),
+                (b":authority", b"example.com"),
+                (b"host", b"example.com"),
+                (b"host", b"evil.com"),
+            ],
+            true,
+        );
+        assert!(
+            matches!(err, Err((H2Error::ProtocolError, _))),
+            "disagreeing host headers must yield PROTOCOL_ERROR, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_handle_header_host_with_port_matches_authority() {
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        let kawa = decode_request_headers(
+            &mut pool,
+            &[
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":path", b"/"),
+                (b":authority", b"example.com"),
+                (b"host", b"example.com:8443"),
+            ],
+            true,
+        );
+        let buf = kawa.storage.buffer();
+        for block in kawa.blocks.iter() {
+            if let Block::Header(pair) = block {
+                assert!(
+                    !compare_no_case(pair.key.data(buf), b"host"),
+                    "literal host header must be dropped (port-stripped match)"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_handle_header_host_crlf_rejected() {
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        let err = try_decode_request_headers(
+            &mut pool,
+            &[
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":path", b"/"),
+                (b":authority", b"example.com"),
+                (b"host", b"example.com\r\nX-Smuggled: yes"),
+            ],
+            true,
+        );
+        assert!(err.is_err(), "CRLF in host header must be rejected");
     }
 }
