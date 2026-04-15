@@ -598,10 +598,31 @@ pub struct Setting {
     pub value: u32,
 }
 
+/// Maximum SETTINGS entries accepted in a single SETTINGS frame.
+///
+/// RFC 9113 §6.5 defines 7 identifiers and RFC 7540/9218/RFC 8441 add a
+/// handful more; a well-formed peer never sends more than a dozen. Capping
+/// at 64 leaves generous headroom for future extensions while bounding the
+/// per-frame allocation: without this cap a malicious peer could send a
+/// MAX_FRAME_SIZE payload (16 MiB) composed entirely of six-byte
+/// identifier/value pairs, forcing `settings_frame` to allocate ≈2.8M
+/// `Setting` entries per connection (audit Pass 1 Low #7).
+pub const MAX_SETTINGS_ENTRIES: usize = 64;
+
 pub fn settings_frame<'a>(
     input: &'a [u8],
     header: &FrameHeader,
 ) -> IResult<&'a [u8], Frame, ParserError<'a>> {
+    // Reject oversized SETTINGS before allocating. An entry is exactly 6
+    // bytes (RFC 9113 §6.5.1 — 16-bit identifier + 32-bit value), so the
+    // count is bounded by `payload_len / 6`.
+    if header.payload_len / SETTINGS_ENTRY_SIZE > MAX_SETTINGS_ENTRIES as u32 {
+        return Err(Err::Failure(ParserError::new_h2(
+            input,
+            H2Error::FrameSizeError,
+        )));
+    }
+
     let (i, data) = take(header.payload_len)(input)?;
 
     let (_, settings) = many0(map(
@@ -987,6 +1008,63 @@ mod tests {
             }
             other => panic!("expected Failure(FrameSizeError), got {other:?}"),
         }
+    }
+
+    /// Audit Pass 1 Low #7: cap the number of SETTINGS entries at 64 to
+    /// prevent a peer from forcing a multi-megabyte `Vec<Setting>` allocation
+    /// per connection via a MAX_FRAME_SIZE SETTINGS payload full of
+    /// identifier/value pairs. The first over-cap pair must be rejected.
+    #[test]
+    fn test_settings_frame_over_cap_rejected() {
+        // 65 entries * 6 bytes = 390 bytes payload — one past MAX_SETTINGS_ENTRIES.
+        let n_entries: u16 = (MAX_SETTINGS_ENTRIES as u16) + 1;
+        let payload_len = u32::from(n_entries) * SETTINGS_ENTRY_SIZE;
+        let mut input = Vec::with_capacity(9 + payload_len as usize);
+        input.extend_from_slice(&payload_len.to_be_bytes()[1..]); // 24-bit length
+        input.push(0x04); // SETTINGS
+        input.push(0x00); // flags
+        input.extend_from_slice(&[0, 0, 0, 0]); // stream_id = 0
+        for i in 0..n_entries {
+            input.extend_from_slice(&i.to_be_bytes()); // identifier
+            input.extend_from_slice(&0u32.to_be_bytes()); // value
+        }
+
+        let (remaining, header) =
+            frame_header(&input, 16_777_215).expect("frame header parses cleanly");
+        assert_eq!(header.frame_type, FrameType::Settings);
+
+        let result = frame_body(remaining, &header);
+        assert!(
+            result.is_err(),
+            "SETTINGS frame over MAX_SETTINGS_ENTRIES must be rejected"
+        );
+        match result {
+            Err(nom::Err::Failure(e)) => {
+                assert_eq!(e.kind, ParserErrorKind::H2(H2Error::FrameSizeError));
+            }
+            other => panic!("expected Failure(FrameSizeError), got {other:?}"),
+        }
+    }
+
+    /// Boundary: exactly MAX_SETTINGS_ENTRIES is still accepted.
+    #[test]
+    fn test_settings_frame_at_cap_accepted() {
+        let n_entries: u16 = MAX_SETTINGS_ENTRIES as u16;
+        let payload_len = u32::from(n_entries) * SETTINGS_ENTRY_SIZE;
+        let mut input = Vec::with_capacity(9 + payload_len as usize);
+        input.extend_from_slice(&payload_len.to_be_bytes()[1..]);
+        input.push(0x04);
+        input.push(0x00);
+        input.extend_from_slice(&[0, 0, 0, 0]);
+        for _ in 0..n_entries {
+            input.extend_from_slice(&0u16.to_be_bytes());
+            input.extend_from_slice(&0u32.to_be_bytes());
+        }
+
+        let (remaining, header) =
+            frame_header(&input, 16_777_215).expect("frame header parses cleanly");
+        let result = frame_body(remaining, &header);
+        assert!(result.is_ok(), "exactly MAX_SETTINGS_ENTRIES must parse");
     }
 
     // ---- RST_STREAM with wrong payload size ----
