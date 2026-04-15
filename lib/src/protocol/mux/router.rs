@@ -232,6 +232,7 @@ impl Router {
             let timeout_container = TimeoutContainer::new_empty(self.configured_connect_timeout);
             let flood_config = context.listener.borrow().get_h2_flood_config();
             let connection_config = context.listener.borrow().get_h2_connection_config();
+            let stream_idle_timeout = context.listener.borrow().get_h2_stream_idle_timeout();
             let backend_id_for_gauge = backend.borrow().backend_id.to_owned();
             let mut connection = if h2 {
                 match Connection::new_h2_client(
@@ -242,6 +243,7 @@ impl Router {
                     timeout_container,
                     flood_config,
                     connection_config,
+                    stream_idle_timeout,
                 ) {
                     Some(connection) => connection,
                     // pool exhaustion: socket already dropped by new_h2_client,

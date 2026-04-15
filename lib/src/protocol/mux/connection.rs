@@ -105,12 +105,14 @@ impl<Front: SocketHandler> Connection<Front> {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_h2_server(
         front_stream: Front,
         pool: Weak<RefCell<Pool>>,
         timeout_container: TimeoutContainer,
         flood_config: h2::H2FloodConfig,
         connection_config: h2::H2ConnectionConfig,
+        stream_idle_timeout: std::time::Duration,
     ) -> Option<Connection<Front>> {
         Some(Connection::H2(ConnectionH2::new(
             front_stream,
@@ -118,12 +120,14 @@ impl<Front: SocketHandler> Connection<Front> {
             pool,
             flood_config,
             connection_config,
+            stream_idle_timeout,
             timeout_container,
             Some((H2StreamId::Zero, h2::CLIENT_PREFACE_SIZE)),
             Ready::READABLE | Ready::HUP | Ready::ERROR,
         )?))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_h2_client(
         front_stream: Front,
         cluster_id: String,
@@ -132,6 +136,7 @@ impl<Front: SocketHandler> Connection<Front> {
         timeout_container: TimeoutContainer,
         flood_config: h2::H2FloodConfig,
         connection_config: h2::H2ConnectionConfig,
+        stream_idle_timeout: std::time::Duration,
     ) -> Option<Connection<Front>> {
         Some(Connection::H2(ConnectionH2::new(
             front_stream,
@@ -143,6 +148,7 @@ impl<Front: SocketHandler> Connection<Front> {
             pool,
             flood_config,
             connection_config,
+            stream_idle_timeout,
             timeout_container,
             None,
             Ready::WRITABLE | Ready::HUP | Ready::ERROR,

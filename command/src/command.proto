@@ -164,6 +164,13 @@ message HttpListenerConfig {
     // Maximum accumulated HPACK-decoded header list size per request
     // (SETTINGS_MAX_HEADER_LIST_SIZE, RFC 9113 §6.5.2). Default: 65536.
     optional uint32 h2_max_header_list_size = 24;
+    // Per-stream idle timeout, in seconds. An open H2 stream that makes no
+    // forward progress for this duration is cancelled (RST_STREAM / CANCEL)
+    // to defend against slow-multiplex Slowloris: a malicious client can
+    // otherwise keep connection-level activity high (any frame resets the
+    // connection idle timer) while pinning up to `h2_max_concurrent_streams`
+    // streams for the full nominal connection timeout. Default: 30.
+    optional uint32 h2_stream_idle_timeout_seconds = 25;
 }
 
 // details of an HTTPS listener
@@ -245,6 +252,13 @@ message HttpsListenerConfig {
     // falling back to HTTP/1.1. Default: false — preserves the historical
     // "ALPN missing defaults to h1" behavior.
     optional bool disable_http11 = 36;
+    // Per-stream idle timeout, in seconds. An open H2 stream that makes no
+    // forward progress for this duration is cancelled (RST_STREAM / CANCEL)
+    // to defend against slow-multiplex Slowloris: a malicious client can
+    // otherwise keep connection-level activity high (any frame resets the
+    // connection idle timer) while pinning up to `h2_max_concurrent_streams`
+    // streams for the full nominal connection timeout. Default: 30.
+    optional uint32 h2_stream_idle_timeout_seconds = 37;
 }
 
 // details of an TCP listener

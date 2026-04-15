@@ -336,12 +336,14 @@ impl HttpsSession {
                 incr!("http.alpn.h2");
                 let flood_config = self.listener.borrow().get_h2_flood_config();
                 let connection_config = self.listener.borrow().get_h2_connection_config();
+                let stream_idle_timeout = self.listener.borrow().get_h2_stream_idle_timeout();
                 mux::Connection::new_h2_server(
                     front_stream,
                     self.pool.clone(),
                     handshake.container_frontend_timeout,
                     flood_config,
                     connection_config,
+                    stream_idle_timeout,
                 )?
             }
         };
@@ -767,6 +769,13 @@ impl L7ListenerHandler for HttpsListener {
         // listener knob preserves that behavior by default and lets
         // operators opt out when cross-SNI routing is intentional.
         self.config.strict_sni_binding.unwrap_or(true)
+    }
+
+    fn get_h2_stream_idle_timeout(&self) -> std::time::Duration {
+        self.config
+            .h2_stream_idle_timeout_seconds
+            .map(|s| std::time::Duration::from_secs(u64::from(s.max(1))))
+            .unwrap_or_else(|| std::time::Duration::from_secs(30))
     }
 }
 

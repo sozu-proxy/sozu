@@ -704,6 +704,16 @@ pub struct ConnectionH2<Front: SocketHandler> {
     /// emitted by [`Self::gauge_connection_state`]. Stays `None` until the first
     /// emission, then suppresses redundant updates.
     last_gauge_snapshot: Option<(usize, usize, usize)>,
+    /// Per-stream wall-clock timestamp of stream creation. Used to cancel
+    /// streams that fail to make forward progress within
+    /// [`Self::stream_idle_timeout`] — mitigates slow-multiplex Slowloris:
+    /// connection-level idle timers reset on every frame, so a misbehaving
+    /// peer can otherwise pin up to `max_concurrent_streams` streams for the
+    /// full nominal connection timeout.
+    pub stream_opened_at: HashMap<StreamId, Instant>,
+    /// Per-stream idle cap. Streams older than this without completing the
+    /// request are RST_STREAM(CANCEL)'d by [`Self::cancel_timed_out_streams`].
+    pub stream_idle_timeout: std::time::Duration,
 }
 impl<Front: SocketHandler> std::fmt::Debug for ConnectionH2<Front> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -759,6 +769,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         pool: std::rc::Weak<std::cell::RefCell<crate::pool::Pool>>,
         flood_config: H2FloodConfig,
         connection_config: H2ConnectionConfig,
+        stream_idle_timeout: std::time::Duration,
         timeout_container: crate::timer::TimeoutContainer,
         expect_read: Option<(H2StreamId, usize)>,
         readiness_interest: sozu_command::ready::Ready,
@@ -820,6 +831,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             max_pending_window_updates: 1 + connection_config.max_concurrent_streams as usize * 4,
             connection_config,
             last_gauge_snapshot: None,
+            stream_opened_at: HashMap::new(),
+            stream_idle_timeout,
         })
     }
 
@@ -1162,6 +1175,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         L: ListenerHandler + L7ListenerHandler,
     {
         self.prune_inactive_streams_while_closing(context);
+        // Pass 4 Medium #3: per-stream idle guard. Slow-multiplex Slowloris
+        // sends one byte or a control frame per stream just often enough to
+        // reset the connection-level timer; per-stream deadlines catch it.
+        self.cancel_timed_out_streams();
 
         // RFC 9113 §6.5: check if peer has timed out on SETTINGS ACK
         if let Some(sent_at) = self.settings_sent_at {
@@ -1683,6 +1700,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             error!("dead stream_id {} missing from streams map", stream_id);
         }
         self.rst_sent.remove(&stream_id);
+        self.stream_opened_at.remove(&stream_id);
         self.prioriser.remove(&stream_id);
     }
 
@@ -2256,6 +2274,49 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         }
     }
 
+    /// Cancel streams that have been open longer than [`Self::stream_idle_timeout`].
+    ///
+    /// Mitigates slow-multiplex Slowloris (Pass 4 Medium #3): the connection-level
+    /// idle timer resets on every frame, so a peer sending periodic activity can
+    /// pin `max_concurrent_streams` slots for the full nominal connection timeout.
+    /// Per-stream deadlines guarantee each stream terminates within the configured
+    /// window regardless of connection-level liveness.
+    ///
+    /// Timed-out streams receive RST_STREAM(CANCEL). The outbound end-stream
+    /// bookkeeping (endpoint notification, metrics) flows through the normal
+    /// RST_STREAM serialization path in the writable() preamble.
+    pub fn cancel_timed_out_streams(&mut self) {
+        if self.streams.is_empty() || self.stream_opened_at.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let deadline = self.stream_idle_timeout;
+        let timed_out: Vec<StreamId> = self
+            .stream_opened_at
+            .iter()
+            .filter_map(|(&sid, &t)| {
+                (self.streams.contains_key(&sid)
+                    && !self.rst_sent.contains(&sid)
+                    && now.saturating_duration_since(t) > deadline)
+                    .then_some(sid)
+            })
+            .collect();
+        if timed_out.is_empty() {
+            return;
+        }
+        for sid in timed_out {
+            info!(
+                "H2 stream {} idle > {:?}, cancelling (slow-multiplex guard)",
+                sid, deadline
+            );
+            self.pending_rst_streams.push((sid, H2Error::Cancel));
+            self.total_rst_streams_queued += 1;
+            self.rst_sent.insert(sid);
+        }
+        self.readiness.interest.insert(Ready::WRITABLE);
+        self.readiness.signal_pending_write();
+    }
+
     /// Refuse a newly-opened stream with RST_STREAM and discard its HEADERS payload.
     ///
     /// Used when MAX_CONCURRENT_STREAMS is exceeded or buffer pool is exhausted.
@@ -2432,6 +2493,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         )?;
         self.last_stream_id = (stream_id + 2) & !1;
         self.streams.insert(stream_id, global_stream_id);
+        self.stream_opened_at.insert(stream_id, Instant::now());
         Some(global_stream_id)
     }
 
@@ -2928,6 +2990,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         let rst_byte_totals = self.compute_stream_byte_totals(context);
         if let Some(stream_id) = self.streams.remove(&rst_stream.stream_id) {
             self.prioriser.remove(&rst_stream.stream_id);
+            self.stream_opened_at.remove(&rst_stream.stream_id);
             let stream = &mut context.streams[stream_id];
             self.attribute_bytes_to_stream(&mut stream.metrics);
             if let StreamState::Linked(token) = stream.state {
@@ -3162,6 +3225,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             }
             self.streams.remove(stream_id);
             self.prioriser.remove(stream_id);
+            self.stream_opened_at.remove(stream_id);
             // Both retry (!consumed) and terminated (consumed) paths remove the
             // stream from self.streams without going through Connection::end_stream,
             // so decrement Backend.active_requests here to keep load metrics honest.
@@ -3503,6 +3567,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         }
                         self.streams.remove(&id);
                         self.prioriser.remove(&id);
+                        self.stream_opened_at.remove(&id);
                         if context.streams[stream_gid].state != StreamState::Recycle {
                             context.streams[stream_gid].state = StreamState::Unlinked;
                         }
@@ -3604,6 +3669,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             return false;
         };
         self.streams.insert(stream_id, stream);
+        self.stream_opened_at.insert(stream_id, Instant::now());
         self.readiness.interest.insert(Ready::WRITABLE);
         self.readiness.signal_pending_write();
         true

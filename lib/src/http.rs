@@ -599,6 +599,13 @@ impl L7ListenerHandler for HttpListener {
             self.config.h2_stream_shrink_ratio,
         )
     }
+
+    fn get_h2_stream_idle_timeout(&self) -> std::time::Duration {
+        self.config
+            .h2_stream_idle_timeout_seconds
+            .map(|s| std::time::Duration::from_secs(u64::from(s.max(1))))
+            .unwrap_or_else(|| std::time::Duration::from_secs(30))
+    }
 }
 
 pub struct HttpProxy {
