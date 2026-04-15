@@ -154,6 +154,16 @@ message HttpListenerConfig {
     // Shrink threshold ratio for recycled stream slots. Vec is shrunk when
     // total_slots > active_streams * ratio. Default: 2.
     optional uint32 h2_stream_shrink_ratio = 21;
+    // Absolute lifetime cap on RST_STREAM frames received on a single H2
+    // connection (CVE-2023-44487). Default: 10000.
+    optional uint64 h2_max_rst_stream_lifetime = 22;
+    // Lifetime cap on "abusive" (pre-response-start) RST_STREAM frames
+    // received on a single H2 connection — the Rapid Reset signature.
+    // Default: 50.
+    optional uint64 h2_max_rst_stream_abusive_lifetime = 23;
+    // Maximum accumulated HPACK-decoded header list size per request
+    // (SETTINGS_MAX_HEADER_LIST_SIZE, RFC 9113 §6.5.2). Default: 65536.
+    optional uint32 h2_max_header_list_size = 24;
 }
 
 // details of an HTTPS listener
@@ -213,6 +223,16 @@ message HttpsListenerConfig {
     // Shrink threshold ratio for recycled stream slots. Vec is shrunk when
     // total_slots > active_streams * ratio. Default: 2.
     optional uint32 h2_stream_shrink_ratio = 31;
+    // Absolute lifetime cap on RST_STREAM frames received on a single H2
+    // connection (CVE-2023-44487). Default: 10000.
+    optional uint64 h2_max_rst_stream_lifetime = 32;
+    // Lifetime cap on "abusive" (pre-response-start) RST_STREAM frames
+    // received on a single H2 connection — the Rapid Reset signature.
+    // Default: 50.
+    optional uint64 h2_max_rst_stream_abusive_lifetime = 33;
+    // Maximum accumulated HPACK-decoded header list size per request
+    // (SETTINGS_MAX_HEADER_LIST_SIZE, RFC 9113 §6.5.2). Default: 65536.
+    optional uint32 h2_max_header_list_size = 34;
 }
 
 // details of an TCP listener

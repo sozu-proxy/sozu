@@ -1042,6 +1042,9 @@ impl Display for HttpListenerConfig {
             &self.h2_max_empty_data_per_window,
             &self.h2_max_continuation_frames,
             &self.h2_max_glitch_count,
+            &self.h2_max_rst_stream_lifetime,
+            &self.h2_max_rst_stream_abusive_lifetime,
+            &self.h2_max_header_list_size,
         );
         add_h2_connection_rows(
             &mut table,
@@ -1095,6 +1098,9 @@ impl Display for HttpsListenerConfig {
             &self.h2_max_empty_data_per_window,
             &self.h2_max_continuation_frames,
             &self.h2_max_glitch_count,
+            &self.h2_max_rst_stream_lifetime,
+            &self.h2_max_rst_stream_abusive_lifetime,
+            &self.h2_max_header_list_size,
         );
         add_h2_connection_rows(
             &mut table,
@@ -1108,6 +1114,7 @@ impl Display for HttpsListenerConfig {
 
 /// Add H2 flood detection threshold rows to a display table.
 /// Only shows rows for values that have been explicitly configured.
+#[allow(clippy::too_many_arguments)]
 fn add_h2_flood_rows(
     table: &mut Table,
     max_rst_stream: &Option<u32>,
@@ -1116,6 +1123,9 @@ fn add_h2_flood_rows(
     max_empty_data: &Option<u32>,
     max_continuation: &Option<u32>,
     max_glitch: &Option<u32>,
+    max_rst_stream_lifetime: &Option<u64>,
+    max_rst_stream_abusive_lifetime: &Option<u64>,
+    max_header_list_size: &Option<u32>,
 ) {
     if let Some(v) = max_rst_stream {
         table.add_row(row!["h2 max rst_stream/window", v]);
@@ -1134,6 +1144,15 @@ fn add_h2_flood_rows(
     }
     if let Some(v) = max_glitch {
         table.add_row(row!["h2 max glitch count", v]);
+    }
+    if let Some(v) = max_rst_stream_lifetime {
+        table.add_row(row!["h2 max rst_stream lifetime", v]);
+    }
+    if let Some(v) = max_rst_stream_abusive_lifetime {
+        table.add_row(row!["h2 max rst_stream abusive lifetime", v]);
+    }
+    if let Some(v) = max_header_list_size {
+        table.add_row(row!["h2 max header list size", v]);
     }
 }
 

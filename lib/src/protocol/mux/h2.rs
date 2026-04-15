@@ -80,13 +80,13 @@ const DEFAULT_MAX_RST_STREAM_PER_WINDOW: u32 = 100;
 /// per connection. 10 000 is generous for legitimate traffic (months of
 /// occasional client-side cancellations) but rapidly trips on the ~30/sec
 /// abusive pace reported in the CVE-2023-44487 advisory (~5 minutes).
-const MAX_LIFETIME_RST_RECEIVED: u64 = 10_000;
+pub(super) const DEFAULT_MAX_RST_STREAM_LIFETIME: u64 = 10_000;
 /// Hard lifetime cap on RST_STREAM frames received BEFORE the corresponding
 /// backend response has started. These are the cheap-for-client /
 /// expensive-for-us resets that characterise Rapid Reset: the client pays
 /// one RST frame, we pay a round-trip to the backend plus request parsing.
 /// A much lower ceiling kills the attack well before 10 000 lifetime total.
-const MAX_LIFETIME_ABUSIVE_RST_RECEIVED: u64 = 50;
+pub(super) const DEFAULT_MAX_RST_STREAM_ABUSIVE_LIFETIME: u64 = 50;
 /// Default maximum PING frames per window (CVE-2019-9512 Ping Flood)
 const DEFAULT_MAX_PING_PER_WINDOW: u32 = 100;
 /// Default maximum SETTINGS frames per window (CVE-2019-9515 Settings Flood)
@@ -120,6 +120,16 @@ pub struct H2FloodConfig {
     pub max_continuation_frames: u32,
     /// Maximum accumulated protocol anomalies before ENHANCE_YOUR_CALM
     pub max_glitch_count: u32,
+    /// Absolute lifetime cap on RST_STREAM frames received on a single
+    /// connection (CVE-2023-44487). Never decays — provides a ceiling the
+    /// per-window counter cannot.
+    pub max_rst_stream_lifetime: u64,
+    /// Lifetime cap on "abusive" (pre-response-start) RST_STREAM frames —
+    /// the Rapid Reset signature (CVE-2023-44487).
+    pub max_rst_stream_abusive_lifetime: u64,
+    /// Maximum accumulated HPACK-decoded header list size per request
+    /// (SETTINGS_MAX_HEADER_LIST_SIZE, RFC 9113 §6.5.2).
+    pub max_header_list_size: u32,
 }
 
 impl Default for H2FloodConfig {
@@ -131,6 +141,9 @@ impl Default for H2FloodConfig {
             max_empty_data_per_window: DEFAULT_MAX_EMPTY_DATA_PER_WINDOW,
             max_continuation_frames: DEFAULT_MAX_CONTINUATION_FRAMES,
             max_glitch_count: DEFAULT_MAX_GLITCH_COUNT,
+            max_rst_stream_lifetime: DEFAULT_MAX_RST_STREAM_LIFETIME,
+            max_rst_stream_abusive_lifetime: DEFAULT_MAX_RST_STREAM_ABUSIVE_LIFETIME,
+            max_header_list_size: MAX_HEADER_LIST_SIZE as u32,
         }
     }
 }
@@ -138,6 +151,7 @@ impl Default for H2FloodConfig {
 impl H2FloodConfig {
     /// Create a validated config, clamping all thresholds to at least 1.
     /// Zero thresholds would cause immediate flood detection on any frame.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         max_rst_stream_per_window: u32,
         max_ping_per_window: u32,
@@ -145,6 +159,9 @@ impl H2FloodConfig {
         max_empty_data_per_window: u32,
         max_continuation_frames: u32,
         max_glitch_count: u32,
+        max_rst_stream_lifetime: u64,
+        max_rst_stream_abusive_lifetime: u64,
+        max_header_list_size: u32,
     ) -> Self {
         Self {
             max_rst_stream_per_window: max_rst_stream_per_window.max(1),
@@ -153,6 +170,9 @@ impl H2FloodConfig {
             max_empty_data_per_window: max_empty_data_per_window.max(1),
             max_continuation_frames: max_continuation_frames.max(1),
             max_glitch_count: max_glitch_count.max(1),
+            max_rst_stream_lifetime: max_rst_stream_lifetime.max(1),
+            max_rst_stream_abusive_lifetime: max_rst_stream_abusive_lifetime.max(1),
+            max_header_list_size: max_header_list_size.max(1),
         }
     }
 }
@@ -395,17 +415,18 @@ impl H2FloodDetector {
             self.total_abusive_rst_received_lifetime =
                 self.total_abusive_rst_received_lifetime.saturating_add(1);
         }
-        if self.total_rst_received_lifetime > MAX_LIFETIME_RST_RECEIVED {
+        if self.total_rst_received_lifetime > self.config.max_rst_stream_lifetime {
             warn!(
                 "Rapid Reset: lifetime RST_STREAM count {} exceeds ceiling {}",
-                self.total_rst_received_lifetime, MAX_LIFETIME_RST_RECEIVED
+                self.total_rst_received_lifetime, self.config.max_rst_stream_lifetime
             );
             return Some(H2Error::EnhanceYourCalm);
         }
-        if self.total_abusive_rst_received_lifetime > MAX_LIFETIME_ABUSIVE_RST_RECEIVED {
+        if self.total_abusive_rst_received_lifetime > self.config.max_rst_stream_abusive_lifetime {
             warn!(
                 "Rapid Reset: lifetime pre-response RST_STREAM count {} exceeds ceiling {}",
-                self.total_abusive_rst_received_lifetime, MAX_LIFETIME_ABUSIVE_RST_RECEIVED
+                self.total_abusive_rst_received_lifetime,
+                self.config.max_rst_stream_abusive_lifetime
             );
             return Some(H2Error::EnhanceYourCalm);
         }
@@ -472,7 +493,7 @@ impl H2FloodDetector {
             flag(
                 "accumulated header size",
                 self.accumulated_header_size,
-                MAX_HEADER_LIST_SIZE as u32,
+                self.config.max_header_list_size,
             )
         })
         .or_else(|| flag("glitch", self.glitch_count, self.config.max_glitch_count))
@@ -1091,10 +1112,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 // just this stream (RST_STREAM + drain); if not, the
                 // connection can no longer decode header blocks safely and we
                 // escalate to GOAWAY(EnhanceYourCalm).
-                if self.flood_detector.accumulated_header_size > MAX_HEADER_LIST_SIZE as u32 {
+                if self.flood_detector.accumulated_header_size
+                    > self.flood_detector.config.max_header_list_size
+                {
                     error!(
                         "CONTINUATION accumulated header size {} exceeds {}",
-                        self.flood_detector.accumulated_header_size, MAX_HEADER_LIST_SIZE
+                        self.flood_detector.accumulated_header_size,
+                        self.flood_detector.config.max_header_list_size
                     );
                     if (payload_len as usize) > self.zero.storage.available_space() {
                         return self.goaway(H2Error::EnhanceYourCalm);
@@ -2744,6 +2768,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             buffer,
             headers.end_stream,
             parts.context,
+            self.flood_detector.config.max_header_list_size,
         );
         kawa.storage.clear();
         if let Err((error, global)) = status {
@@ -3682,6 +3707,7 @@ mod tests {
             max_empty_data_per_window: 8,
             max_continuation_frames: 2,
             max_glitch_count: 15,
+            ..H2FloodConfig::default()
         };
         let mut detector = H2FloodDetector::new(config);
 
@@ -3761,12 +3787,12 @@ mod tests {
         // the lifetime cap. Simulate a response-started RST (no abusive
         // counter bump) so only the lifetime ceiling is tested.
         let mut detector = H2FloodDetector::default();
-        for _ in 0..MAX_LIFETIME_RST_RECEIVED {
+        for _ in 0..DEFAULT_MAX_RST_STREAM_LIFETIME {
             assert!(detector.record_rst_lifetime(true).is_none());
         }
         assert_eq!(
             detector.total_rst_received_lifetime,
-            MAX_LIFETIME_RST_RECEIVED
+            DEFAULT_MAX_RST_STREAM_LIFETIME
         );
         assert_eq!(detector.total_abusive_rst_received_lifetime, 0);
         // Next RST crosses the ceiling.
@@ -3781,12 +3807,12 @@ mod tests {
         // Pre-response-start RSTs have a much lower ceiling; they trip
         // well before the generic lifetime cap.
         let mut detector = H2FloodDetector::default();
-        for _ in 0..MAX_LIFETIME_ABUSIVE_RST_RECEIVED {
+        for _ in 0..DEFAULT_MAX_RST_STREAM_ABUSIVE_LIFETIME {
             assert!(detector.record_rst_lifetime(false).is_none());
         }
         assert_eq!(
             detector.total_abusive_rst_received_lifetime,
-            MAX_LIFETIME_ABUSIVE_RST_RECEIVED
+            DEFAULT_MAX_RST_STREAM_ABUSIVE_LIFETIME
         );
         assert_eq!(
             detector.record_rst_lifetime(false),
@@ -3799,13 +3825,13 @@ mod tests {
         // When the backend response has begun, the RST is cheap for us
         // too — it only bumps the generic lifetime counter.
         let mut detector = H2FloodDetector::default();
-        for _ in 0..(MAX_LIFETIME_ABUSIVE_RST_RECEIVED + 100) {
+        for _ in 0..(DEFAULT_MAX_RST_STREAM_ABUSIVE_LIFETIME + 100) {
             assert!(detector.record_rst_lifetime(true).is_none());
         }
         assert_eq!(detector.total_abusive_rst_received_lifetime, 0);
         assert_eq!(
             detector.total_rst_received_lifetime,
-            MAX_LIFETIME_ABUSIVE_RST_RECEIVED + 100
+            DEFAULT_MAX_RST_STREAM_ABUSIVE_LIFETIME + 100
         );
     }
 
@@ -4083,6 +4109,9 @@ mod tests {
         assert_eq!(config.max_empty_data_per_window, 100);
         assert_eq!(config.max_continuation_frames, 20);
         assert_eq!(config.max_glitch_count, 100);
+        assert_eq!(config.max_rst_stream_lifetime, 10_000);
+        assert_eq!(config.max_rst_stream_abusive_lifetime, 50);
+        assert_eq!(config.max_header_list_size, MAX_HEADER_LIST_SIZE as u32);
     }
 
     // ── distribute_overhead ─────────────────────────────────────────────
