@@ -308,6 +308,7 @@ impl HttpsSession {
             stream: handshake.stream,
             session: handshake.session,
             peer_disconnected: false,
+            peer_reset: false,
         };
 
         gauge_add!("protocol.tls.handshake", -1);

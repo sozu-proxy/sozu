@@ -173,7 +173,13 @@ impl SocketHandler for TcpStream {
 pub struct FrontRustls {
     pub stream: TcpStream,
     pub session: ServerConnection,
+    /// Peer sent a graceful FIN on the read side (`read()` returned `Ok(0)`).
+    /// We can no longer receive plaintext, but may still have rustls-buffered
+    /// records to flush on the write side — do NOT abort pending writes.
     pub peer_disconnected: bool,
+    /// Peer reset the connection (RST/ConnectionAborted/BrokenPipe). The TCP
+    /// channel is dead; further writes are pointless and should short-circuit.
+    pub peer_reset: bool,
 }
 
 impl std::fmt::Debug for FrontRustls {
@@ -211,6 +217,9 @@ impl SocketHandler for FrontRustls {
 
             match self.session.read_tls(&mut self.stream) {
                 Ok(0) => {
+                    // Graceful FIN on the read side: peer closed its write
+                    // half. Keep `peer_reset` unset so outbound writes can
+                    // still flush rustls's buffered records (half-close).
                     can_read = false;
                     is_closed = true;
                     self.peer_disconnected = true;
@@ -223,8 +232,14 @@ impl SocketHandler for FrontRustls {
                     ErrorKind::ConnectionReset
                     | ErrorKind::ConnectionAborted
                     | ErrorKind::BrokenPipe => {
+                        // Full RST/abort: the TCP channel is dead. Mark
+                        // `peer_reset` so writes short-circuit (nothing can
+                        // reach the peer anymore) but still set
+                        // `peer_disconnected` for back-compatible read-side
+                        // logic.
                         is_closed = true;
                         self.peer_disconnected = true;
+                        self.peer_reset = true;
                     }
                     // https://github.com/rustls/rustls/blob/main/rustls/src/conn.rs#L482-L500
                     // rustls's 16 KB received_plaintext buffer is full — expected
@@ -289,7 +304,9 @@ impl SocketHandler for FrontRustls {
     }
 
     fn socket_write(&mut self, buf: &[u8]) -> (usize, SocketResult) {
-        if self.peer_disconnected {
+        // Abort only on a true RST — a FIN on the read side still permits
+        // flushing rustls's plaintext buffer (TLS half-close).
+        if self.peer_reset {
             return (0, SocketResult::Closed);
         }
 
@@ -331,6 +348,7 @@ impl SocketHandler for FrontRustls {
                         //FIXME: this should probably not happen here
                         incr!("rustls.write.error");
                         is_closed = true;
+                        self.peer_reset = true;
                         break;
                     }
                     _ => {
@@ -359,6 +377,7 @@ impl SocketHandler for FrontRustls {
                         | ErrorKind::BrokenPipe => {
                             incr!("rustls.write.error");
                             is_closed = true;
+                            self.peer_reset = true;
                             break;
                         }
                         _ => {
@@ -392,6 +411,7 @@ impl SocketHandler for FrontRustls {
                         | ErrorKind::BrokenPipe => {
                             incr!("rustls.write.error");
                             is_closed = true;
+                            self.peer_reset = true;
                             break;
                         }
                         _ => {
@@ -417,7 +437,7 @@ impl SocketHandler for FrontRustls {
     }
 
     fn socket_write_vectored(&mut self, bufs: &[std::io::IoSlice]) -> (usize, SocketResult) {
-        if self.peer_disconnected {
+        if self.peer_reset {
             return (0, SocketResult::Closed);
         }
 
@@ -463,6 +483,7 @@ impl SocketHandler for FrontRustls {
                         | ErrorKind::BrokenPipe => {
                             incr!("rustls.write.error");
                             is_closed = true;
+                            self.peer_reset = true;
                             break;
                         }
                         _ => {
@@ -491,6 +512,7 @@ impl SocketHandler for FrontRustls {
                         | ErrorKind::BrokenPipe => {
                             incr!("rustls.write.error");
                             is_closed = true;
+                            self.peer_reset = true;
                             break;
                         }
                         _ => {
@@ -519,6 +541,7 @@ impl SocketHandler for FrontRustls {
                         | ErrorKind::BrokenPipe => {
                             incr!("rustls.write.error");
                             is_closed = true;
+                            self.peer_reset = true;
                             break;
                         }
                         _ => {
@@ -548,7 +571,9 @@ impl SocketHandler for FrontRustls {
     }
 
     fn socket_wants_write(&self) -> bool {
-        !self.peer_disconnected && self.session.wants_write()
+        // Only a true RST stops us wanting to write — a peer FIN still
+        // allows flushing TLS plaintext buffered in rustls (half-close).
+        !self.peer_reset && self.session.wants_write()
     }
 
     fn socket_ref(&self) -> &TcpStream {
