@@ -1197,6 +1197,9 @@ impl CustomHttpAnswers {
             if let Some(a) = &answers.answer_413 {
                 rows.push(row!("413", a));
             }
+            if let Some(a) = &answers.answer_421 {
+                rows.push(row!("421", a));
+            }
             if let Some(a) = &answers.answer_502 {
                 rows.push(row!("502", a));
             }

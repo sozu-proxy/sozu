@@ -309,6 +309,8 @@ pub struct ListenerAnswers {
     pub answer_408: Template,
     /// PayloadTooLarge
     pub answer_413: Template,
+    /// MisdirectedRequest (RFC 9110 §15.5.20)
+    pub answer_421: Template,
     /// BadGateway
     pub answer_502: Template,
     /// ServiceUnavailable
@@ -492,6 +494,29 @@ Sozu-Id: %REQUEST_ID\r
 }
 </pre>
 <p>Request needed more than %CAPACITY bytes to fit. Parser stopped at phase: %PHASE. %MESSAGE</p>
+<footer>This is an automatic answer by Sōzu.</footer></body></html>",
+    )
+}
+
+fn default_421() -> String {
+    String::from(
+        "\
+HTTP/1.1 421 Misdirected Request\r
+Cache-Control: no-cache\r
+Connection: close\r
+Sozu-Id: %REQUEST_ID\r
+\r
+<html><head><meta charset='utf-8'><head><body>
+<style>pre{background:#EEE;padding:10px;border:1px solid #AAA;border-radius: 5px;}</style>
+<h1>421 Misdirected Request</h1>
+<pre>
+{
+    \"status_code\": 421,
+    \"route\": \"%ROUTE\",
+    \"request_id\": \"%REQUEST_ID\"
+}
+</pre>
+<p>The request's authority does not match the TLS SNI negotiated for this connection. Retry on a fresh TLS connection that matches the target authority.</p>
 <footer>This is an automatic answer by Sōzu.</footer></body></html>",
     )
 }
@@ -753,6 +778,11 @@ impl HttpAnswers {
                 answer,
                 &[length, route, request_id, capacity, message, phase],
             ),
+            421 => Template::new(
+                421,
+                answer,
+                &[length, route, request_id]
+            ),
             502 => Template::new(
                 502,
                 answer,
@@ -816,6 +846,12 @@ impl HttpAnswers {
                     conf.as_ref()
                         .and_then(|c| c.answer_413.clone())
                         .unwrap_or(default_413()),
+                )?,
+                answer_421: Self::template(
+                    421,
+                    conf.as_ref()
+                        .and_then(|c| c.answer_421.clone())
+                        .unwrap_or(default_421()),
                 )?,
                 answer_502: Self::template(
                     502,
@@ -923,6 +959,11 @@ impl HttpAnswers {
                 ];
                 variables_once = vec![message.into()];
                 &self.listener_answers.answer_413
+            }
+            DefaultAnswer::Answer421 {} => {
+                variables = vec![route.into(), request_id.into()];
+                variables_once = vec![];
+                &self.listener_answers.answer_421
             }
             DefaultAnswer::Answer502 {
                 message,

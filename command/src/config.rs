@@ -254,6 +254,9 @@ pub struct ListenerBuilder {
     pub answer_404: Option<String>,
     pub answer_408: Option<String>,
     pub answer_413: Option<String>,
+    /// RFC 9110 §15.5.20 — returned when the request's `:authority` / `Host`
+    /// host does not match the TLS SNI negotiated for this connection.
+    pub answer_421: Option<String>,
     pub answer_502: Option<String>,
     pub answer_503: Option<String>,
     pub answer_504: Option<String>,
@@ -353,6 +356,7 @@ impl ListenerBuilder {
             answer_404: None,
             answer_408: None,
             answer_413: None,
+            answer_421: None,
             answer_502: None,
             answer_503: None,
             answer_504: None,
@@ -502,6 +506,7 @@ impl ListenerBuilder {
             answer_404: read_http_answer_file(&self.answer_404)?,
             answer_408: read_http_answer_file(&self.answer_408)?,
             answer_413: read_http_answer_file(&self.answer_413)?,
+            answer_421: read_http_answer_file(&self.answer_421)?,
             answer_502: read_http_answer_file(&self.answer_502)?,
             answer_503: read_http_answer_file(&self.answer_503)?,
             answer_504: read_http_answer_file(&self.answer_504)?,

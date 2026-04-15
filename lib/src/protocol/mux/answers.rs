@@ -107,6 +107,7 @@ fn default_answer_for_code(code: u16) -> DefaultAnswer {
         408 => DefaultAnswer::Answer408 {
             duration: String::new(),
         },
+        421 => DefaultAnswer::Answer421 {},
         502 => DefaultAnswer::Answer502 {
             message: String::new(),
             phase: kawa::ParsingPhaseMarker::Error,
@@ -147,6 +148,7 @@ pub(crate) fn set_default_answer(
         404 => "http.404.errors",
         408 => "http.408.errors",
         413 => "http.413.errors",
+        421 => "http.421.errors",
         502 => "http.502.errors",
         503 => "http.503.errors",
         504 => "http.504.errors",
