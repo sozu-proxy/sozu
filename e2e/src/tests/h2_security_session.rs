@@ -1,18 +1,30 @@
 //! End-to-end adversarial tests for Group 8E — session, socket and
 //! connection-lifecycle hardening.
 //!
-//! Recipes landing in this module follow (one per commit). This first
-//! commit lands the shared harness plus:
+//! Recipes landing in this module follow (one per commit):
 //!
 //! * FIX-18 (`ba0f177c`) — [`e2e_session_router_connect_failure_no_leak`]:
 //!   arm the `new_h2_client` failure-injection hook so `Router::connect`
 //!   bails out, and assert sozu returns a non-success status, the backend
 //!   is never invoked, and the worker still performs a clean soft-stop.
+//! * FIX-19 (`1f84f86e`) — [`e2e_socket_bad_tls_peer_does_not_starve_others`]:
+//!   stalled half-written TLS peers must not pin a worker — a well-formed
+//!   H2 client on the same listener still completes a request inside a
+//!   5-second budget.
 //!
 //! The `e2e-hooks` feature is forwarded to `sozu-lib` via
 //! `e2e/Cargo.toml` so the hooks compile in.
 
-use std::{thread, time::Duration};
+use std::{
+    io::{Read, Write},
+    net::{SocketAddr, TcpStream},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+    time::{Duration, Instant},
+};
 
 use hyper::Uri;
 use sozu_command_lib::{
@@ -27,12 +39,15 @@ use sozu_lib::protocol::mux::connection::test_hooks::__test_force_h2_client_fail
 use crate::{
     mock::{
         h2_backend::H2Backend,
-        https_client::{build_h2_client, resolve_request_timeout},
+        https_client::{build_h2_client, resolve_request, resolve_request_timeout},
     },
     port_registry::provide_port,
     sozu::worker::Worker,
     tests::{
-        State, h2_utils::verify_sozu_alive, repeat_until_error_or, tests::create_local_address,
+        State,
+        h2_utils::{setup_h2_test, verify_sozu_alive},
+        repeat_until_error_or,
+        tests::create_local_address,
     },
 };
 
@@ -164,6 +179,102 @@ fn e2e_session_router_connect_failure_no_leak() {
             3,
             "FIX-18: Router::connect rollback on forced backend failure",
             try_e2e_session_router_connect_failure_no_leak,
+        ),
+        State::Success,
+    );
+}
+
+// ============================================================================
+// FIX-19 — Socket MAX_LOOP_ITERATIONS DoS
+// ============================================================================
+
+/// Thread that opens a raw TCP connection, writes a single garbage byte, then
+/// sleeps forever. The goal is to keep a session half-created in sozu's event
+/// loop (rustls mid-handshake) and ensure this does not pin the worker.
+fn spawn_stalled_tls_peer(addr: SocketAddr, stop: Arc<AtomicBool>) -> thread::JoinHandle<()> {
+    thread::spawn(move || match TcpStream::connect(addr) {
+        Ok(mut sock) => {
+            let _ = sock.set_read_timeout(Some(Duration::from_millis(100)));
+            let _ = sock.set_write_timeout(Some(Duration::from_millis(100)));
+            // Write a single byte of junk — insufficient for rustls to
+            // complete its ClientHello, so sozu sees progress but no
+            // usable frames.
+            let _ = sock.write_all(&[0x16]);
+            let _ = sock.flush();
+
+            while !stop.load(Ordering::Relaxed) {
+                // Drain anything sozu might send (alerts) so the socket
+                // stays open; ignore errors.
+                let mut buf = [0u8; 64];
+                let _ = sock.read(&mut buf);
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+        Err(e) => {
+            eprintln!("stalled TLS peer: connect failed: {e}");
+        }
+    })
+}
+
+fn try_e2e_socket_bad_tls_peer_does_not_starve_others() -> State {
+    let (mut worker, mut backends, front_port) = setup_h2_test("E2E-SOCKET-FIX19", 1);
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut stallers = Vec::new();
+    // 3 concurrent stalled peers should be enough to trigger the old
+    // infinite-loop path if the fix is reverted.
+    for _ in 0..3 {
+        stallers.push(spawn_stalled_tls_peer(front_addr, stop.clone()));
+    }
+
+    // Let the stallers register.
+    thread::sleep(Duration::from_millis(200));
+
+    // Healthy client: must complete within 5 s.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let client = build_h2_client();
+    let uri: Uri = format!("https://localhost:{front_port}/api/healthy")
+        .parse()
+        .unwrap();
+
+    let healthy_result = resolve_request(&client, uri);
+    let elapsed = Instant::now();
+    let within_budget = elapsed <= deadline;
+    println!("FIX-19 healthy result: {healthy_result:?} within_budget={within_budget}");
+
+    // Stop stallers.
+    stop.store(true, Ordering::Relaxed);
+    for handle in stallers {
+        let _ = handle.join();
+    }
+
+    let sozu_ok = verify_sozu_alive(front_port);
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+    for backend in backends.iter_mut() {
+        backend.stop_and_get_aggregator();
+    }
+
+    let ok = healthy_result
+        .as_ref()
+        .map(|(s, body)| s.is_success() && body.contains("pong"))
+        .unwrap_or(false);
+
+    if ok && within_budget && sozu_ok && stopped {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn e2e_socket_bad_tls_peer_does_not_starve_others() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "FIX-19: stalled TLS peer does not starve a concurrent healthy H2 client",
+            try_e2e_socket_bad_tls_peer_does_not_starve_others,
         ),
         State::Success,
     );
