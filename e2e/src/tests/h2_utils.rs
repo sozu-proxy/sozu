@@ -367,13 +367,20 @@ pub(crate) fn contains_rst_stream_with_error(
 // TLS connection helper (T-4)
 // ============================================================================
 
-/// Create a raw TLS connection with H2 ALPN to the given address.
+/// Create a raw TLS connection with H2 ALPN to the given address using
+/// `sni` as the TLS SNI server name.
 ///
 /// Returns a `rustls::StreamOwned` that can be used for raw frame I/O.
-/// The connection uses a permissive certificate verifier (accepts self-signed)
-/// and sets 2-second read/write timeouts.
-pub(crate) fn raw_h2_connection(
+/// The connection uses a permissive certificate verifier (accepts
+/// self-signed) and sets 2-second read/write timeouts.
+///
+/// Separating the SNI from the TCP address lets SNI-focused tests
+/// (FIX-7 / FIX-8 / FIX-9 / FIX-10) exercise virtual-host routing and
+/// `strict_sni_binding` without having to rewrite `/etc/hosts` or build
+/// the rustls config by hand each time.
+pub(crate) fn raw_h2_connection_with_sni(
     addr: SocketAddr,
+    sni: &str,
 ) -> rustls::StreamOwned<rustls::ClientConnection, TcpStream> {
     let config = ClientConfig::builder()
         .dangerous()
@@ -383,8 +390,9 @@ pub(crate) fn raw_h2_connection(
     let mut config = config;
     config.alpn_protocols = vec![b"h2".to_vec()];
 
-    let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
-    let conn = rustls::ClientConnection::new(Arc::new(config), server_name.to_owned()).unwrap();
+    let server_name =
+        rustls::pki_types::ServerName::try_from(sni.to_owned()).expect("invalid SNI host name");
+    let conn = rustls::ClientConnection::new(Arc::new(config), server_name).unwrap();
 
     let tcp = TcpStream::connect(addr).expect("could not connect to sozu");
     tcp.set_read_timeout(Some(Duration::from_secs(2)))
@@ -393,6 +401,17 @@ pub(crate) fn raw_h2_connection(
         .expect("set write timeout");
 
     rustls::StreamOwned::new(conn, tcp)
+}
+
+/// Create a raw TLS connection with H2 ALPN to the given address using
+/// `localhost` as SNI — the default for every existing non-SNI test.
+///
+/// Kept as a thin wrapper around [`raw_h2_connection_with_sni`] so the
+/// 40+ existing call sites do not need editing.
+pub(crate) fn raw_h2_connection(
+    addr: SocketAddr,
+) -> rustls::StreamOwned<rustls::ClientConnection, TcpStream> {
+    raw_h2_connection_with_sni(addr, "localhost")
 }
 
 // ============================================================================
