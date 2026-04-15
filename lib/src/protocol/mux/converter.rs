@@ -31,7 +31,7 @@ impl H2BlockConverter<'_> {
     /// Check whether the HPACK output buffer has exceeded the maximum header
     /// list size. Returns `false` (stop encoding) if the limit is reached.
     fn check_header_capacity(&self) -> bool {
-        if self.out.len() > MAX_HEADER_LIST_SIZE as usize {
+        if self.out.len() > MAX_HEADER_LIST_SIZE {
             error!(
                 "HPACK output buffer ({} bytes) exceeds MAX_HEADER_LIST_SIZE ({}), stopping header encoding",
                 self.out.len(),
