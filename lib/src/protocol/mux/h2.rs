@@ -642,7 +642,7 @@ impl<Front: SocketHandler> std::fmt::Debug for ConnectionH2<Front> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum H2StreamId {
     Zero,
-    Other(StreamId, GlobalStreamId),
+    Other { id: StreamId, gid: GlobalStreamId },
 }
 
 impl<Front: SocketHandler> ConnectionH2<Front> {
@@ -811,7 +811,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         return self.goaway(H2Error::StreamClosed);
                     }
                     if header.frame_type == FrameType::Data {
-                        H2StreamId::Other(stream_id, *global_stream_id)
+                        H2StreamId::Other {
+                            id: stream_id,
+                            gid: *global_stream_id,
+                        }
                     } else {
                         H2StreamId::Zero
                     }
@@ -1072,7 +1075,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         let (stream_id, kawa) = if let Some((stream_id, amount)) = self.expect_read {
             let (kawa, did) = match stream_id {
                 H2StreamId::Zero => (&mut self.zero, usize::MAX),
-                H2StreamId::Other(_, global_stream_id) => {
+                H2StreamId::Other { gid: global_stream_id, .. } => {
                     // Reading DATA frame payload for an application stream.
                     // This is real application activity — reset the timeout.
                     self.timeout_container.reset();
@@ -1286,8 +1289,12 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // Pre-compute byte totals for proportional overhead distribution.
         let byte_totals = self.compute_stream_byte_totals(context);
 
-        if let Some(write_stream @ H2StreamId::Other(stream_id, global_stream_id)) =
-            self.expect_write
+        if let Some(
+            write_stream @ H2StreamId::Other {
+                id: stream_id,
+                gid: global_stream_id,
+            },
+        ) = self.expect_write
         {
             let stream = &mut context.streams[global_stream_id];
             let stream_state = stream.state;
@@ -1432,7 +1439,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 None,
             );
             if outcome == FlushOutcome::Stalled {
-                self.expect_write = Some(H2StreamId::Other(stream_id, global_stream_id));
+                self.expect_write = Some(H2StreamId::Other {
+                    id: stream_id,
+                    gid: global_stream_id,
+                });
                 break 'outer;
             }
             self.expect_write = None;
@@ -2091,7 +2101,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     where
         L: ListenerHandler + L7ListenerHandler,
     {
-        if let Some((H2StreamId::Other(_, global_stream_id), amount)) = self.expect_read {
+        if let Some((H2StreamId::Other { gid: global_stream_id, .. }, amount)) = self.expect_read {
             let stream = &context.streams[global_stream_id];
             let kawa = match self.position {
                 Position::Client(..) => &stream.back,
