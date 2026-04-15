@@ -172,12 +172,23 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                 {
                     let key = key.data(buffer);
                     let val = val.data(buffer);
-                    if is_connection_specific_header(key)
-                        || compare_no_case(key, b"host")
-                        || compare_no_case(key, b"http2-settings")
-                        || (compare_no_case(key, b"te") && !compare_no_case(val, b"trailers"))
-                        || compare_no_case(key, b"trailer")
-                    {
+                    let skip = match key.first() {
+                        Some(b'c' | b'C' | b'p' | b'P' | b'u' | b'U' | b'k' | b'K') => {
+                            is_connection_specific_header(key)
+                        }
+                        Some(b'h' | b'H') => {
+                            compare_no_case(key, b"host")
+                                || compare_no_case(key, b"http2-settings")
+                        }
+                        Some(b't' | b'T') => {
+                            is_connection_specific_header(key)
+                                || compare_no_case(key, b"trailer")
+                                || (compare_no_case(key, b"te")
+                                    && !compare_no_case(val, b"trailers"))
+                        }
+                        _ => false,
+                    };
+                    if skip {
                         return true;
                     }
                 }
