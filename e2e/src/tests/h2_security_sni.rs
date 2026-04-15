@@ -323,3 +323,80 @@ fn e2e_h2_sni_authority_mismatch_blocked() {
         State::Success
     );
 }
+
+// ============================================================================
+// Test 3: Wildcard :authority is NOT expanded
+// ============================================================================
+
+/// RFC 9110 §7.2: `:authority` is a concrete host, never a pattern. Ensure
+/// the SNI check does not accidentally treat `*.example.com` as "matches any
+/// foo.example.com SNI" — wildcard-looking authority values must be
+/// rejected exactly like any other non-matching hostname.
+fn try_h2_sni_wildcard_authority_not_expanded() -> State {
+    let (mut worker, mut foo, mut bar, front_port) =
+        setup_sni_two_tenant_listener("H2-SNI-WILDCARD", None);
+
+    let before = read_counter(&mut worker, "http.sni_authority_mismatch");
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection_with_sni(front_addr, "foo.example.com");
+    h2_handshake(&mut tls);
+
+    let headers = build_request_headers(b"*.example.com");
+    let frame = H2Frame::headers(1, headers, true, true);
+    tls.write_all(&frame.encode()).expect("write HEADERS");
+    tls.flush().expect("flush HEADERS");
+
+    let frames = collect_response_frames(&mut tls, 500, 4, 500);
+    log_frames("H2 SNI wildcard authority", &frames);
+
+    // Either a 421 is synthesised (mismatch branch) or the frontend lookup
+    // fails and sozu returns 404 — both prove the wildcard is NOT expanded
+    // into a trust-bypass for foo.example.com.
+    let got_421 = headers_status_matches(&frames, b"421");
+    let got_404 = headers_status_matches(&frames, b"404");
+    let rejected = got_421 || got_404;
+
+    let after = read_counter(&mut worker, "http.sni_authority_mismatch");
+    let mismatch_bumped = (after - before) >= 1;
+
+    drop(tls);
+    thread::sleep(Duration::from_millis(200));
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+
+    let foo_agg = foo.stop_and_get_aggregator().unwrap_or_default();
+    let bar_agg = bar.stop_and_get_aggregator().unwrap_or_default();
+
+    let no_backend_touched = foo_agg.requests_received == 0 && bar_agg.requests_received == 0;
+    if stopped && rejected && no_backend_touched {
+        // When 421 is the rejection, the mismatch counter must be bumped;
+        // when 404 is returned, the mismatch branch did not run (the
+        // wildcard simply didn't match any frontend) — both outcomes are
+        // acceptable as long as the wildcard was not expanded.
+        if got_421 && !mismatch_bumped {
+            println!("wildcard FAIL: 421 without metric bump");
+            return State::Fail;
+        }
+        State::Success
+    } else {
+        println!(
+            "wildcard FAIL: stopped={stopped} got_421={got_421} got_404={got_404} \
+             foo_reqs={} bar_reqs={}",
+            foo_agg.requests_received, bar_agg.requests_received
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn e2e_h2_sni_wildcard_authority_not_expanded() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 SNI: wildcard :authority not expanded into a trust bypass",
+            try_h2_sni_wildcard_authority_not_expanded
+        ),
+        State::Success
+    );
+}
