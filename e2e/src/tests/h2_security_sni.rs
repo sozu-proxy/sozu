@@ -34,7 +34,11 @@ use super::h2_utils::{
     raw_h2_connection_with_sni,
 };
 use crate::{
-    mock::{aggregator::SimpleAggregator, async_backend::BackendHandle as AsyncBackend},
+    http_utils::{http_ok_response, http_request},
+    mock::{
+        aggregator::SimpleAggregator, async_backend::BackendHandle as AsyncBackend, client::Client,
+        sync_backend::Backend as SyncBackend,
+    },
     sozu::worker::Worker,
     tests::{State, repeat_until_error_or, tests::create_local_address},
 };
@@ -396,6 +400,102 @@ fn e2e_h2_sni_wildcard_authority_not_expanded() {
             3,
             "H2 SNI: wildcard :authority not expanded into a trust bypass",
             try_h2_sni_wildcard_authority_not_expanded
+        ),
+        State::Success
+    );
+}
+
+// ============================================================================
+// Test 4: Plaintext HTTP/1.1 listener — no SNI to check
+// ============================================================================
+
+/// Plaintext listeners never see an SNI, so the strict-binding check is a
+/// no-op there. A classic cross-`Host` request must be routed normally, with
+/// the mismatch metric untouched. This documents the scope of the fix (TLS
+/// only) and guards against an over-eager enforcement that would break
+/// plaintext virtual hosting.
+fn try_h2_sni_plaintext_no_check() -> State {
+    let front_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_http_config(front_address);
+    let mut worker = Worker::start_new_worker_owned("H2-SNI-PLAINTEXT", config, listeners, state);
+
+    worker.send_proxy_request_type(RequestType::AddHttpListener(
+        ListenerBuilder::new_http(front_address.into())
+            .to_http(None)
+            .expect("build http listener"),
+    ));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        address: front_address.into(),
+        proxy: ListenerType::Http.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "bar-cluster",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpFrontend(RequestHttpFrontend {
+        hostname: String::from("bar.example.com"),
+        ..Worker::default_http_frontend("bar-cluster", front_address)
+    }));
+
+    let bar_addr = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "bar-cluster",
+        "bar-0".to_owned(),
+        bar_addr,
+        None,
+    )));
+    let mut bar_backend = SyncBackend::new(
+        "BAR".to_owned(),
+        bar_addr,
+        http_ok_response("pong-bar".to_owned()),
+    );
+    bar_backend.connect();
+
+    worker.read_to_last();
+
+    let before = read_counter(&mut worker, "http.sni_authority_mismatch");
+
+    // Plaintext HTTP/1.1 client, `Host: bar.example.com` — no SNI in play,
+    // the listener must forward to bar-cluster.
+    let mut client = Client::new(
+        "h2-sni-plaintext",
+        front_address,
+        http_request("GET", "/", "", "bar.example.com"),
+    );
+    client.connect();
+    client.send();
+    bar_backend.accept(0);
+    let _ = bar_backend.receive(0);
+    bar_backend.send(0);
+    let response = client.receive().unwrap_or_default();
+
+    let after = read_counter(&mut worker, "http.sni_authority_mismatch");
+    let metric_stable = after == before;
+
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+
+    let got_200 = response.contains("200 OK") && response.contains("pong-bar");
+
+    if stopped && got_200 && metric_stable {
+        State::Success
+    } else {
+        println!(
+            "plaintext FAIL: stopped={stopped} got_200={got_200} metric_before={before} \
+             metric_after={after} response={response:?}"
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn e2e_h2_sni_plaintext_no_check() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 SNI: plaintext listener bypasses the check (no SNI to enforce)",
+            try_h2_sni_plaintext_no_check
         ),
         State::Success
     );
