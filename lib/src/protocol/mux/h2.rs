@@ -27,7 +27,7 @@ use crate::{
             WindowUpdate,
         },
         pkawa, serializer, set_default_answer,
-        shared::drain_tls_close_notify,
+        shared::{EndStreamAction, drain_tls_close_notify, end_stream_decision},
         update_readiness_after_read, update_readiness_after_write,
     },
     socket::{SocketHandler, SocketResult},
@@ -3338,64 +3338,54 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             Position::Server => {
                 let answers_rc = context.listener.borrow().get_answers().clone();
                 let stream = &mut context.streams[stream_gid];
-                match (stream.front.consumed, stream.back.is_main_phase()) {
-                    (_, true) => {
-                        // front might not have been consumed (in case of PushPromise)
-                        // we have a "forwardable" answer from the back
-                        // if the answer is not terminated we send an RstStream to properly clean the stream
-                        // if it is terminated, we finish the transfer, the backend is not necessary anymore
-                        if !stream.context.keep_alive_backend && !stream.back.is_terminated() {
-                            // Close-delimited response: the backend closed the
-                            // connection to signal end-of-body (no Content-Length).
-                            // Mark the kawa as terminated so the H2 converter
-                            // emits DATA with END_STREAM instead of RST_STREAM.
-                            debug!("CLOSE DELIMITED H2 STREAM {} {:?}", stream_gid, stream);
-                            stream.back.push_block(kawa::Block::Flags(kawa::Flags {
-                                end_body: true,
-                                end_chunk: false,
-                                end_header: false,
-                                end_stream: true,
-                            }));
-                            stream.back.parsing_phase = kawa::ParsingPhase::Terminated;
-                            stream.state = StreamState::Unlinked;
-                            self.readiness.interest.insert(Ready::WRITABLE);
-                            self.readiness.signal_pending_write();
-                        } else if !stream.back.is_terminated() {
-                            #[cfg(debug_assertions)]
-                            context
-                                .debug
-                                .push(DebugEvent::Str(format!("Close unterminated {stream_gid}")));
-                            debug!("CLOSING H2 UNTERMINATED STREAM {} {:?}", stream_gid, stream);
-                            forcefully_terminate_answer(
-                                stream,
-                                &mut self.readiness,
-                                H2Error::InternalError,
-                            );
-                        } else {
-                            #[cfg(debug_assertions)]
-                            context
-                                .debug
-                                .push(DebugEvent::Str(format!("Close terminated {stream_gid}")));
-                            debug!("CLOSING H2 TERMINATED STREAM {} {:?}", stream_gid, stream);
-                            stream.state = StreamState::Unlinked;
-                            self.readiness.interest.insert(Ready::WRITABLE);
-                            self.readiness.signal_pending_write();
-                        }
+                match end_stream_decision(stream) {
+                    EndStreamAction::ForwardTerminated => {
+                        #[cfg(debug_assertions)]
+                        context
+                            .debug
+                            .push(DebugEvent::Str(format!("Close terminated {stream_gid}")));
+                        debug!("CLOSING H2 TERMINATED STREAM {} {:?}", stream_gid, stream);
+                        stream.state = StreamState::Unlinked;
+                        self.readiness.interest.insert(Ready::WRITABLE);
+                        self.readiness.signal_pending_write();
                         context.debug.set_interesting(true);
                     }
-                    (true, false) => {
-                        // we do not have an answer, but the request has already been partially consumed
-                        // so we can't retry, send a 502 bad gateway instead
-                        // note: it might be possible to send a RstStream with an adequate error code
+                    EndStreamAction::CloseDelimited => {
+                        debug!("CLOSE DELIMITED H2 STREAM {} {:?}", stream_gid, stream);
+                        stream.back.push_block(kawa::Block::Flags(kawa::Flags {
+                            end_body: true,
+                            end_chunk: false,
+                            end_header: false,
+                            end_stream: true,
+                        }));
+                        stream.back.parsing_phase = kawa::ParsingPhase::Terminated;
+                        stream.state = StreamState::Unlinked;
+                        self.readiness.interest.insert(Ready::WRITABLE);
+                        self.readiness.signal_pending_write();
+                        context.debug.set_interesting(true);
+                    }
+                    EndStreamAction::ForwardUnterminated => {
+                        #[cfg(debug_assertions)]
+                        context
+                            .debug
+                            .push(DebugEvent::Str(format!("Close unterminated {stream_gid}")));
+                        debug!("CLOSING H2 UNTERMINATED STREAM {} {:?}", stream_gid, stream);
+                        forcefully_terminate_answer(
+                            stream,
+                            &mut self.readiness,
+                            H2Error::InternalError,
+                        );
+                        context.debug.set_interesting(true);
+                    }
+                    EndStreamAction::SendDefault(status) => {
                         #[cfg(debug_assertions)]
                         context.debug.push(DebugEvent::Str(format!(
-                            "Can't retry, send 502 on {stream_gid}"
+                            "Can't retry, send {status} on {stream_gid}"
                         )));
                         let answers = answers_rc.borrow();
-                        set_default_answer(stream, &mut self.readiness, 502, &answers);
+                        set_default_answer(stream, &mut self.readiness, status, &answers);
                     }
-                    (false, false) => {
-                        // we do not have an answer, but the request is untouched so we can retry
+                    EndStreamAction::Reconnect => {
                         debug!("H2 RECONNECT");
                         #[cfg(debug_assertions)]
                         context
