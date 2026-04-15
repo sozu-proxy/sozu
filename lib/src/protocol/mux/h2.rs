@@ -102,6 +102,15 @@ const FLOOD_WINDOW_DURATION: std::time::Duration = std::time::Duration::from_sec
 /// Default maximum general anomaly count before triggering ENHANCE_YOUR_CALM
 const DEFAULT_MAX_GLITCH_COUNT: u32 = 100;
 
+/// RFC 9113 §5.1.2: threshold of `REFUSED_STREAM` emissions per
+/// [`BACKPRESSURE_WINDOW_DURATION`] that triggers back-pressure — at this
+/// point we halve the advertised `SETTINGS_MAX_CONCURRENT_STREAMS` so the
+/// peer throttles its request rate instead of paying the RST round-trip for
+/// every new stream.
+const BACKPRESSURE_REFUSAL_THRESHOLD: u32 = 50;
+/// Sliding window used to detect refusal bursts for SETTINGS back-pressure.
+const BACKPRESSURE_WINDOW_DURATION: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Configurable thresholds for H2 flood detection.
 ///
 /// All values have safe defaults matching the compile-time constants.
@@ -772,6 +781,20 @@ pub struct ConnectionH2<Front: SocketHandler> {
     /// Per-stream idle cap. Streams older than this without completing the
     /// request are RST_STREAM(CANCEL)'d by [`Self::cancel_timed_out_streams`].
     pub stream_idle_timeout: std::time::Duration,
+    /// RFC 9113 §5.1.2 back-pressure: count of stream refusals
+    /// (REFUSED_STREAM emitted via [`Self::refuse_stream_and_discard`]) within
+    /// the current back-pressure window. When the count exceeds
+    /// [`BACKPRESSURE_REFUSAL_THRESHOLD`] inside one
+    /// [`BACKPRESSURE_WINDOW_DURATION`] we halve the advertised
+    /// `SETTINGS_MAX_CONCURRENT_STREAMS` to signal the peer to slow down.
+    refuse_count_window: u32,
+    /// Start timestamp for the current back-pressure window.
+    refuse_window_start: Instant,
+    /// Set once we have halved `local_settings.settings_max_concurrent_streams`
+    /// in response to a refusal burst. Prevents the cap from collapsing to 0
+    /// on sustained abuse — a single halving per connection is sufficient to
+    /// signal back-pressure; further bursts trigger `EnhanceYourCalm`.
+    mcs_backpressure_applied: bool,
 }
 impl<Front: SocketHandler> std::fmt::Debug for ConnectionH2<Front> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -891,6 +914,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             last_gauge_snapshot: None,
             stream_opened_at: HashMap::new(),
             stream_idle_timeout,
+            refuse_count_window: 0,
+            refuse_window_start: Instant::now(),
+            mcs_backpressure_applied: false,
         })
     }
 
@@ -2394,6 +2420,12 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// Used when MAX_CONCURRENT_STREAMS is exceeded or buffer pool is exhausted.
     /// Queues the RST_STREAM for the writable path (can't write to kawa.storage
     /// here because it is needed to discard the HEADERS payload).
+    ///
+    /// Also applies SETTINGS back-pressure per RFC 9113 §5.1.2: if refusals
+    /// burst past [`BACKPRESSURE_REFUSAL_THRESHOLD`] within
+    /// [`BACKPRESSURE_WINDOW_DURATION`], the advertised
+    /// `SETTINGS_MAX_CONCURRENT_STREAMS` is halved via
+    /// [`Self::apply_mcs_backpressure`].
     fn refuse_stream_and_discard(
         &mut self,
         stream_id: StreamId,
@@ -2406,7 +2438,53 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         self.readiness.signal_pending_write();
         self.state = H2State::Discard;
         self.expect_read = Some((H2StreamId::Zero, payload_len as usize));
+        self.record_refusal_for_backpressure();
         MuxResult::Continue
+    }
+
+    /// RFC 9113 §5.1.2 SETTINGS back-pressure bookkeeping.
+    ///
+    /// Increments the refusal counter for the current back-pressure window
+    /// and, when the burst threshold is crossed, halves the advertised
+    /// `SETTINGS_MAX_CONCURRENT_STREAMS`. Further halving attempts in the
+    /// same connection are suppressed by [`Self::mcs_backpressure_applied`]
+    /// so sustained abuse does not collapse the cap to zero — callers can
+    /// still promote the situation to `EnhanceYourCalm` via the flood
+    /// detector.
+    fn record_refusal_for_backpressure(&mut self) {
+        if self.refuse_window_start.elapsed() >= BACKPRESSURE_WINDOW_DURATION {
+            self.refuse_count_window = 0;
+            self.refuse_window_start = Instant::now();
+        }
+        self.refuse_count_window = self.refuse_count_window.saturating_add(1);
+        if !self.mcs_backpressure_applied
+            && self.refuse_count_window >= BACKPRESSURE_REFUSAL_THRESHOLD
+        {
+            self.apply_mcs_backpressure();
+        }
+    }
+
+    /// Halve the advertised `SETTINGS_MAX_CONCURRENT_STREAMS` and mark the
+    /// back-pressure state as applied. The new value takes effect locally
+    /// immediately — subsequent stream-open checks in `handle_header_state`
+    /// compare `self.streams.len()` against this reduced cap, so the peer
+    /// starts receiving `REFUSED_STREAM` earlier. A full SETTINGS re-send on
+    /// the wire is deferred until we have a mid-connection SETTINGS queue
+    /// (the existing path in `handle_preface_state` only fires during the
+    /// handshake); this is noted in the task log as a minimal first step.
+    fn apply_mcs_backpressure(&mut self) {
+        let previous = self.local_settings.settings_max_concurrent_streams;
+        let reduced = (previous / 2).max(1);
+        warn!(
+            "H2 SETTINGS back-pressure: refusals={} in {}s — halving \
+             SETTINGS_MAX_CONCURRENT_STREAMS {} -> {}",
+            self.refuse_count_window,
+            BACKPRESSURE_WINDOW_DURATION.as_secs(),
+            previous,
+            reduced,
+        );
+        self.local_settings.settings_max_concurrent_streams = reduced;
+        self.mcs_backpressure_applied = true;
     }
 
     pub fn goaway(&mut self, error: H2Error) -> MuxResult {
