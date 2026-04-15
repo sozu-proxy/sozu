@@ -165,85 +165,20 @@ impl Router {
             cluster_id, frontend_should_stick, h2, reuse_token
         );
 
-        let token = if let Some(token) = reuse_token {
+        if let Some(token) = reuse_token {
             trace!("reused backend: {:#?}", self.backends.get(&token));
-            token
-        } else {
-            let (mut socket, backend) = self.backend_from_request(
-                &cluster_id,
-                frontend_should_stick,
-                stream_context,
-                proxy.clone(),
-                &context.listener,
-            )?;
-            stream.metrics.backend_start();
-            stream.metrics.backend_id = stream.context.backend_id.to_owned();
-            gauge_add!("backend.connections", 1);
-            gauge_add!(
-                "connections_per_backend",
-                1,
-                Some(&cluster_id),
-                Some(&backend.borrow().backend_id)
-            );
-
-            if let Err(e) = socket.set_nodelay(true) {
-                error!(
-                    "error setting nodelay on back socket({:?}): {:?}",
-                    socket, e
-                );
-            }
-
-            let token = proxy.borrow().add_session(session);
-
-            if let Err(e) = proxy.borrow().register_socket(
-                &mut socket,
-                token,
-                Interest::READABLE | Interest::WRITABLE,
-            ) {
-                error!("error registering back socket({:?}): {:?}", socket, e);
-            }
-
-            let timeout_container = TimeoutContainer::new(self.configured_connect_timeout, token);
-            let flood_config = context.listener.borrow().get_h2_flood_config();
-            let connection_config = context.listener.borrow().get_h2_connection_config();
-            let connection = if h2 {
-                match Connection::new_h2_client(
-                    socket,
-                    cluster_id,
-                    backend,
-                    context.pool.clone(),
-                    timeout_container,
-                    flood_config,
-                    connection_config,
-                ) {
-                    Some(connection) => connection,
-                    None => return Err(BackendConnectionError::MaxBuffers),
-                }
-            } else {
-                Connection::new_h1_client(socket, cluster_id, backend, timeout_container)
+            // Link backend to stream for the reused connection path. We check
+            // that the backend can accept a new stream before committing any
+            // per-stream state.
+            let Some(backend_conn) = self.backends.get_mut(&token) else {
+                error!("reused backend token {:?} missing from backends map", token);
+                return Err(BackendConnectionError::MaxSessionsMemory);
             };
-            self.backends.insert(token, connection);
-            token
-        };
-
-        // Link backend to stream, checking if the backend can accept it
-        let Some(backend_conn) = self.backends.get_mut(&token) else {
-            error!(
-                "just-inserted or reused backend token {:?} missing from backends map",
-                token
-            );
-            return Err(BackendConnectionError::MaxSessionsMemory);
-        };
-        let started = backend_conn.start_stream(stream_id, context);
-        if !started {
-            error!("Backend rejected stream start (max concurrent streams reached)");
-            return Err(BackendConnectionError::MaxSessionsMemory);
-        }
-        // Reborrow stream to set linked state
-        context.streams[stream_id].state = StreamState::Linked(token);
-
-        // For reused backends: set context fields and metrics lifecycle
-        if reuse_token.is_some() {
+            if !backend_conn.start_stream(stream_id, context) {
+                error!("Backend rejected stream start (max concurrent streams reached)");
+                return Err(BackendConnectionError::MaxSessionsMemory);
+            }
+            // For reused backends: set context fields and metrics lifecycle
             if let Some(backend_conn) = self.backends.get(&token) {
                 if let Position::Client(_, backend_ref, _) = backend_conn.position() {
                     let backend = backend_ref.borrow();
@@ -255,7 +190,112 @@ impl Router {
                     stream.metrics.backend_connected();
                 }
             }
+            context.streams[stream_id].state = StreamState::Linked(token);
+            return Ok(());
         }
+
+        // New-backend path: fall through.
+        let token = {
+            //
+            // SECURITY (CWE-400): defer every stateful side-effect
+            // (backend.connections / connections_per_backend gauges, slab
+            // add_session, mio register_socket, self.backends.insert,
+            // stream.metrics.backend_start) until AFTER `new_h2_client` AND
+            // `start_stream` have both succeeded. If either fails we must
+            // return Err without leaking a slab entry, an epoll registration,
+            // a gauge counter, or a router-map entry.
+            //
+            // The TcpStream lives on the stack here and is moved into the
+            // Connection by `new_h2_client`/`new_h1_client`; on failure the
+            // Connection (or the raw TcpStream, for the pool-exhaustion
+            // branch that drops inside `new_h2_client`) is dropped, closing
+            // the fd. No token is ever allocated, so there is nothing to
+            // roll back.
+            let (socket, backend) = self.backend_from_request(
+                &cluster_id,
+                frontend_should_stick,
+                stream_context,
+                proxy.clone(),
+                &context.listener,
+            )?;
+
+            if let Err(e) = socket.set_nodelay(true) {
+                error!(
+                    "error setting nodelay on back socket({:?}): {:?}",
+                    socket, e
+                );
+            }
+
+            // Build an un-armed timeout: we can't call `TimeoutContainer::new`
+            // yet because that requires the slab token, and we only allocate
+            // the token on the happy path. `.set(token)` below arms it.
+            let timeout_container = TimeoutContainer::new_empty(self.configured_connect_timeout);
+            let flood_config = context.listener.borrow().get_h2_flood_config();
+            let connection_config = context.listener.borrow().get_h2_connection_config();
+            let backend_id_for_gauge = backend.borrow().backend_id.to_owned();
+            let mut connection = if h2 {
+                match Connection::new_h2_client(
+                    socket,
+                    cluster_id.to_owned(),
+                    backend,
+                    context.pool.clone(),
+                    timeout_container,
+                    flood_config,
+                    connection_config,
+                ) {
+                    Some(connection) => connection,
+                    // pool exhaustion: socket already dropped by new_h2_client,
+                    // no side-effects were committed.
+                    None => return Err(BackendConnectionError::MaxBuffers),
+                }
+            } else {
+                Connection::new_h1_client(socket, cluster_id.to_owned(), backend, timeout_container)
+            };
+
+            // Check the backend can accept a new stream BEFORE committing any
+            // registry state. `start_stream` increments `active_requests` via
+            // `pre_start_stream_client_bookkeeping` and undoes it itself on
+            // failure (see `Connection::start_stream`), so dropping the
+            // connection on a false return leaves backend accounting clean.
+            if !connection.start_stream(stream_id, context) {
+                error!("Backend rejected stream start (max concurrent streams reached)");
+                // `connection` (socket + timeout_container) drops here.
+                return Err(BackendConnectionError::MaxSessionsMemory);
+            }
+
+            // --- Happy path: commit side-effects in one atomic-ish block ---
+            let stream = &mut context.streams[stream_id];
+            stream.metrics.backend_start();
+            stream.metrics.backend_id = stream.context.backend_id.to_owned();
+            gauge_add!("backend.connections", 1);
+            gauge_add!(
+                "connections_per_backend",
+                1,
+                Some(&cluster_id),
+                Some(&backend_id_for_gauge)
+            );
+
+            let token = proxy.borrow().add_session(session);
+
+            {
+                let socket_ref = connection.socket_mut();
+                if let Err(e) = proxy.borrow().register_socket(
+                    socket_ref,
+                    token,
+                    Interest::READABLE | Interest::WRITABLE,
+                ) {
+                    error!("error registering back socket: {:?}", e);
+                }
+            }
+
+            // Arm the connect timeout now that we own a real token.
+            connection.timeout_container().set(token);
+
+            self.backends.insert(token, connection);
+            token
+        };
+
+        context.streams[stream_id].state = StreamState::Linked(token);
         Ok(())
     }
 
