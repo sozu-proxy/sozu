@@ -26,8 +26,9 @@ use crate::{
             self, Frame, FrameHeader, FrameType, H2Error, Headers, ParserError, ParserErrorKind,
             WindowUpdate,
         },
-        pkawa, serializer, set_default_answer, update_readiness_after_read,
-        update_readiness_after_write,
+        pkawa, serializer, set_default_answer,
+        shared::drain_tls_close_notify,
+        update_readiness_after_read, update_readiness_after_write,
     },
     socket::{SocketHandler, SocketResult},
     timer::TimeoutContainer,
@@ -3222,27 +3223,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 }
                 if !self.close_notify_sent {
                     trace!("H2 SENDING CLOSE NOTIFY");
-                    self.socket.socket_close();
-                    self.close_notify_sent = true;
                 }
-                // Drain the TLS buffer before the TCP socket is shut down.
-                // A single write attempt is insufficient when the TCP send
-                // buffer is full (likely during large response transfers).
-                // Without this drain loop, shutdown(Write) in HttpsSession::close()
-                // can leave a partial TLS record in-flight, causing the client
-                // to see "TLS decode error / unexpected eof".
-                let mut drain_rounds = 0;
-                while self.socket.socket_wants_write() && drain_rounds < 16 {
-                    let (_size, status) = self.socket.socket_write_vectored(&[]);
-                    drain_rounds += 1;
-                    match status {
-                        SocketResult::WouldBlock | SocketResult::Error | SocketResult::Closed => {
-                            break;
-                        }
-                        SocketResult::Continue => {}
-                    }
-                }
-                let tls_pending_after = self.socket.socket_wants_write();
+                let (tls_pending_after, drain_rounds) =
+                    drain_tls_close_notify(&mut self.socket, &mut self.close_notify_sent);
                 if tls_pending_after {
                     error!(
                         "TLS buffer NOT fully drained on close: \
