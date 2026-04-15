@@ -240,7 +240,7 @@ where
         return handle_trailer(kawa, input, end_stream, decoder);
     }
     kawa.push_block(Block::StatusLine);
-    let max_decoded_bytes = crate::protocol::mux::h2::MAX_HEADER_LIST_SIZE as usize;
+    let max_decoded_bytes = crate::protocol::mux::h2::MAX_HEADER_LIST_SIZE;
     kawa.detached.status_line = match kawa.kind {
         Kind::Request => {
             let mut method = Store::Empty;
