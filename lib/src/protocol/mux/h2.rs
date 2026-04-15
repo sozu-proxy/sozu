@@ -440,7 +440,7 @@ pub enum H2State {
     Discard,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct H2Settings {
     pub settings_header_table_size: u32,
     pub settings_enable_push: bool,
