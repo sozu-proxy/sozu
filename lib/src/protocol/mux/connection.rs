@@ -138,6 +138,17 @@ impl<Front: SocketHandler> Connection<Front> {
         connection_config: h2::H2ConnectionConfig,
         stream_idle_timeout: std::time::Duration,
     ) -> Option<Connection<Front>> {
+        // Test-only injection point: when set via
+        // [`__test_force_h2_client_failure`], pretend the pool was exhausted
+        // and return `None`. This mirrors the buffer-pool-exhaustion branch
+        // inside [`ConnectionH2::new`] deterministically so E2E tests can
+        // exercise `Router::connect`'s rollback path (FIX-18) without having
+        // to starve the pool in-process.
+        #[cfg(any(test, feature = "e2e-hooks"))]
+        if test_hooks::FORCE_NEW_H2_CLIENT_FAILURE.swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return None;
+        }
         Some(Connection::H2(ConnectionH2::new(
             front_stream,
             Position::Client(
@@ -461,5 +472,31 @@ impl Endpoint for EndpointClient<'_> {
                 false
             }
         }
+    }
+}
+
+/// Test-only injection hooks for the mux layer.
+///
+/// These are compiled **only** when running `cargo test` (or with
+/// `cfg(test)` enabled); downstream code must not rely on them. They exist
+/// so end-to-end tests can drive hard-to-reach code paths — buffer-pool
+/// exhaustion during backend attach, stream-ID exhaustion — without
+/// having to reproduce the underlying resource starvation in-process.
+#[cfg(any(test, feature = "e2e-hooks"))]
+pub mod test_hooks {
+    use std::sync::atomic::AtomicBool;
+
+    /// When `true`, the next call to [`super::Connection::new_h2_client`]
+    /// returns `None` as if the buffer pool were exhausted. The flag is
+    /// consumed (reset to `false`) by that call so each opt-in is scoped
+    /// to exactly one attempted backend attach.
+    pub static FORCE_NEW_H2_CLIENT_FAILURE: AtomicBool = AtomicBool::new(false);
+
+    /// Arm or disarm the `new_h2_client` failure injection. Returns the
+    /// previous value so tests can stack-save/restore if they run in
+    /// parallel (`cargo test` defaults to serial for this crate because
+    /// of global registries, but keep the API honest).
+    pub fn __test_force_h2_client_failure(on: bool) -> bool {
+        FORCE_NEW_H2_CLIENT_FAILURE.swap(on, std::sync::atomic::Ordering::SeqCst)
     }
 }

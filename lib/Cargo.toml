@@ -67,6 +67,13 @@ harness = false
 
 [features]
 default = []
+# Exposes `#[cfg(any(test, feature = "e2e-hooks"))]` test-injection APIs in
+# the mux layer (`Connection::new_h2_client` pool-failure injection,
+# `ConnectionH2::__test_set_last_stream_id`). Consumed by the `sozu-e2e`
+# crate so integration tests can drive FIX-18 / FIX-22 recipes without
+# starving the buffer pool or issuing 2³¹ real requests. Must NOT be
+# enabled in production builds.
+e2e-hooks = []
 logs-debug = []
 logs-trace = []
 opentelemetry = []
