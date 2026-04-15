@@ -370,45 +370,53 @@ impl H2FloodDetector {
     pub fn check_flood(&mut self) -> Option<H2Error> {
         self.maybe_reset_window();
 
-        let checks: &[(&str, u32, u32)] = &[
-            (
-                "RST_STREAM",
-                self.rst_stream_count,
-                self.config.max_rst_stream_per_window,
-            ),
-            ("PING", self.ping_count, self.config.max_ping_per_window),
-            (
-                "SETTINGS",
-                self.settings_count,
-                self.config.max_settings_per_window,
-            ),
-            (
-                "empty DATA",
-                self.empty_data_count,
-                self.config.max_empty_data_per_window,
-            ),
-            (
-                "CONTINUATION",
-                self.continuation_count,
-                self.config.max_continuation_frames,
-            ),
-            (
-                "accumulated header size",
-                self.accumulated_header_size,
-                MAX_HEADER_LIST_SIZE as u32,
-            ),
-            ("glitch", self.glitch_count, self.config.max_glitch_count),
-        ];
-        for &(name, count, threshold) in checks {
+        fn flag(name: &str, count: u32, threshold: u32) -> Option<H2Error> {
             if count > threshold {
                 warn!(
                     "H2 flood detected: {} count {} exceeds threshold {}",
                     name, count, threshold
                 );
-                return Some(H2Error::EnhanceYourCalm);
+                Some(H2Error::EnhanceYourCalm)
+            } else {
+                None
             }
         }
-        None
+
+        flag(
+            "RST_STREAM",
+            self.rst_stream_count,
+            self.config.max_rst_stream_per_window,
+        )
+        .or_else(|| flag("PING", self.ping_count, self.config.max_ping_per_window))
+        .or_else(|| {
+            flag(
+                "SETTINGS",
+                self.settings_count,
+                self.config.max_settings_per_window,
+            )
+        })
+        .or_else(|| {
+            flag(
+                "empty DATA",
+                self.empty_data_count,
+                self.config.max_empty_data_per_window,
+            )
+        })
+        .or_else(|| {
+            flag(
+                "CONTINUATION",
+                self.continuation_count,
+                self.config.max_continuation_frames,
+            )
+        })
+        .or_else(|| {
+            flag(
+                "accumulated header size",
+                self.accumulated_header_size,
+                MAX_HEADER_LIST_SIZE as u32,
+            )
+        })
+        .or_else(|| flag("glitch", self.glitch_count, self.config.max_glitch_count))
     }
 
     /// Reset CONTINUATION-specific counters when a header block is complete.
