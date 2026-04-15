@@ -620,6 +620,10 @@ pub struct ConnectionH2<Front: SocketHandler> {
     /// Maximum pending WINDOW_UPDATE entries before dropping.
     /// Derived from `connection_config.max_concurrent_streams` at construction.
     max_pending_window_updates: usize,
+    /// Last `(connection_window, active_streams, pending_window_updates)` snapshot
+    /// emitted by [`Self::gauge_connection_state`]. Stays `None` until the first
+    /// emission, then suppresses redundant updates.
+    last_gauge_snapshot: Option<(usize, usize, usize)>,
 }
 impl<Front: SocketHandler> std::fmt::Debug for ConnectionH2<Front> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -735,6 +739,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             close_notify_sent: false,
             max_pending_window_updates: 1 + connection_config.max_concurrent_streams as usize * 4,
             connection_config,
+            last_gauge_snapshot: None,
         })
     }
 
@@ -1270,6 +1275,25 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         MuxResult::Continue
     }
 
+    /// Emit the H2 connection-level gauges, but only when the snapshot
+    /// actually changed since the last call. Called from the write hot path,
+    /// so suppressing redundant updates avoids a syscall storm under
+    /// steady-state traffic.
+    fn gauge_connection_state(&mut self) {
+        let snapshot = (
+            self.flow_control.window.max(0) as usize,
+            self.streams.len(),
+            self.flow_control.pending_window_updates.len(),
+        );
+        if self.last_gauge_snapshot == Some(snapshot) {
+            return;
+        }
+        gauge!("h2.connection_window", snapshot.0);
+        gauge!("h2.active_streams", snapshot.1);
+        gauge!("h2.pending_window_updates", snapshot.2);
+        self.last_gauge_snapshot = Some(snapshot);
+    }
+
     /// Write application data (request/response bodies, headers) across all
     /// active streams, respecting priority ordering and flow control.
     ///
@@ -1351,16 +1375,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             }
         }
 
-        // H2 flow control observability
-        gauge!(
-            "h2.connection_window",
-            self.flow_control.window.max(0) as usize
-        );
-        gauge!("h2.active_streams", self.streams.len());
-        gauge!(
-            "h2.pending_window_updates",
-            self.flow_control.pending_window_updates.len()
-        );
+        self.gauge_connection_state();
 
         let scheme: &'static [u8] = if context.listener.borrow().protocol() == Protocol::HTTPS {
             b"https"
