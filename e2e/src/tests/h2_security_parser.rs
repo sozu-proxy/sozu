@@ -22,6 +22,10 @@
 //!   * Standalone CONTINUATION without preceding HEADERS rejected with
 //!     GOAWAY(PROTOCOL_ERROR) (commit `4a798013`). Parser-level
 //!     complement to `test_h2_continuation_without_initial_headers`.
+//!   * Serializer masks the reserved R-bit on every outbound frame
+//!     header and on GOAWAY last-stream-id (commit `7e69b763`). Passive
+//!     observation over a session that naturally generates SETTINGS,
+//!     HEADERS, WINDOW_UPDATE and GOAWAY.
 
 use std::{io::Write, net::SocketAddr};
 
@@ -29,7 +33,8 @@ use super::h2_utils::{
     H2_ERROR_FRAME_SIZE_ERROR, H2_ERROR_PROTOCOL_ERROR, H2_FRAME_DATA, H2_FRAME_GOAWAY, H2Frame,
     collect_response_frames, contains_goaway, contains_goaway_with_error,
     contains_headers_response, contains_rst_stream, goaway_error_code, h2_handshake, log_frames,
-    raw_h2_connection, rejected_with_goaway_or_rst, setup_h2_test, teardown,
+    parse_h2_frames, raw_h2_connection, read_all_available, rejected_with_goaway_or_rst,
+    setup_h2_test, teardown,
 };
 use crate::tests::{State, repeat_until_error_or};
 
@@ -528,6 +533,114 @@ fn e2e_h2_parser_reject_standalone_continuation() {
             5,
             "H2 parser: standalone CONTINUATION → GOAWAY(PROTOCOL_ERROR) (RFC 9113 \u{00a7}6.10)",
             try_h2_parser_reject_standalone_continuation,
+        ),
+        State::Success,
+    );
+}
+
+// ============================================================================
+// Test 7: Serializer masks the reserved R-bit on stream IDs
+// ============================================================================
+
+/// Walk the raw stream of bytes returned by sozu and yield every frame
+/// header's stream-id byte zero (bits 0-7 of the 4-byte id) so we can
+/// inspect the reserved R-bit without `parse_h2_frames` masking it.
+fn raw_frame_stream_id_high_bytes(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while pos + 9 <= data.len() {
+        let length =
+            ((data[pos] as u32) << 16) | ((data[pos + 1] as u32) << 8) | (data[pos + 2] as u32);
+        out.push(data[pos + 5]);
+        let payload_end = pos + 9 + length as usize;
+        if payload_end > data.len() {
+            break;
+        }
+        pos = payload_end;
+    }
+    out
+}
+
+/// RFC 9113 §4.1 reserves the high bit of every 32-bit stream-id field;
+/// §6.8 says the same about GOAWAY's last-stream-id. Commit `7e69b763`
+/// tightened `gen_frame_header` and `gen_goaway` so callers that leak
+/// the reserved bit cannot corrupt the wire.
+///
+/// This test drives sozu through a session that provokes many distinct
+/// outbound frames (SETTINGS, SETTINGS ACK, HEADERS response,
+/// WINDOW_UPDATE and finally GOAWAY) and asserts the high bit of byte
+/// 5 of every frame header is zero, plus — for the GOAWAY — that
+/// payload[0]'s high bit is zero. Parsing is done on the raw bytes so
+/// `parse_h2_frames`'s own masking does not hide a leak.
+fn try_h2_parser_serializer_masks_reserved_bit() -> State {
+    let (worker, backends, front_port) = setup_h2_test("H2-PARSER-RESERVED-BIT", 1);
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake(&mut tls);
+
+    // Happy request → sozu emits SETTINGS/SETTINGS-ACK during handshake,
+    // then HEADERS + optional DATA + WINDOW_UPDATE.
+    let headers = H2Frame::headers(1, minimal_get_headers_block(), true, true);
+    tls.write_all(&headers.encode()).unwrap();
+    tls.flush().unwrap();
+
+    // Drain everything sozu sends for the normal response.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let mut raw = read_all_available(&mut tls, std::time::Duration::from_millis(800));
+
+    // Now trigger a GOAWAY: PUSH_PROMISE from client is guaranteed to
+    // produce GOAWAY(PROTOCOL_ERROR) with last-stream-id set to the
+    // highest processed stream, exercising the goaway serializer path.
+    let mut bad_payload = Vec::new();
+    bad_payload.extend_from_slice(&3u32.to_be_bytes());
+    bad_payload.extend_from_slice(&minimal_get_headers_block());
+    let push_promise = H2Frame::new(0x5, 0x4, 1, bad_payload);
+    let _ = tls.write_all(&push_promise.encode());
+    let _ = tls.flush();
+
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    raw.extend(read_all_available(
+        &mut tls,
+        std::time::Duration::from_millis(800),
+    ));
+
+    // Inspect every frame-header stream-id high byte.
+    let high_bytes = raw_frame_stream_id_high_bytes(&raw);
+    let leaked_header = high_bytes.iter().any(|b| *b & 0x80 != 0);
+
+    // Inspect GOAWAY payload[0] for reserved-bit leakage on last_stream_id.
+    let parsed = parse_h2_frames(&raw);
+    let leaked_goaway_payload = parsed.iter().any(|(ft, _, _, payload)| {
+        *ft == H2_FRAME_GOAWAY && payload.len() >= 8 && (payload[0] & 0x80) != 0
+    });
+
+    println!(
+        "Reserved-bit mask - frames_inspected={} leaked_header={leaked_header} \
+         leaked_goaway_payload={leaked_goaway_payload}",
+        high_bytes.len()
+    );
+
+    let infra_ok = teardown(tls, front_port, worker, backends);
+    if infra_ok && !high_bytes.is_empty() && !leaked_header && !leaked_goaway_payload {
+        State::Success
+    } else {
+        println!(
+            "Reserved-bit mask - FAIL: frames={} leaked_header={leaked_header} \
+             leaked_goaway_payload={leaked_goaway_payload} infra_ok={infra_ok}",
+            high_bytes.len()
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn e2e_h2_parser_serializer_masks_reserved_bit() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 serializer: reserved R-bit masked on every outbound stream-id (RFC 9113 \u{00a7}4.1)",
+            try_h2_parser_serializer_masks_reserved_bit,
         ),
         State::Success,
     );
