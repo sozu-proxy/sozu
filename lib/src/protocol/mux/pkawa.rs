@@ -580,6 +580,17 @@ where
     // If body will follow (!end_stream) and no Content-Length was declared,
     // inject Transfer-Encoding: chunked so the H1 backend can frame the body.
     // The H2 converter filters this header (connection-specific per RFC 9113 §8.2.2).
+    //
+    // Note on H2→H1 trailers (RFC 9110 §6.5): when the H2 peer declares a
+    // Content-Length (`body_size == BodySize::Length(_)`) and later sends a
+    // trailer HEADERS frame, the H1 backend cannot receive those trailers —
+    // HTTP/1.1 only carries trailers with chunked transfer-coding. In that
+    // case the trailers are silently dropped by `handle_trailer`'s caller
+    // (no Transfer-Encoding can be retro-fitted once the request line and
+    // headers have already gone out on the wire). Peers that require
+    // trailer delivery should omit Content-Length; the branch below then
+    // upgrades the framing to chunked and H2BlockConverter on the back side
+    // passes the trailer block through intact.
     if !end_stream && kawa.body_size == BodySize::Empty {
         kawa.body_size = BodySize::Chunked;
         kawa.push_block(Block::Header(Pair {
@@ -1638,5 +1649,67 @@ mod tests {
             true,
         );
         assert!(err.is_err(), "CRLF in host header must be rejected");
+    }
+
+    // ── H2→H1 trailer / Transfer-Encoding invariants ──────────────────────
+
+    /// H2 request without END_STREAM and without Content-Length MUST gain
+    /// `Transfer-Encoding: chunked` so the H1 backend can frame the body
+    /// and any subsequent trailer HEADERS frame.
+    #[test]
+    fn test_h2_to_h1_body_without_content_length_forces_chunked() {
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        let kawa = decode_request_headers(
+            &mut pool,
+            &[
+                (b":method", b"POST"),
+                (b":scheme", b"https"),
+                (b":path", b"/upload"),
+                (b":authority", b"example.com"),
+            ],
+            false, // body follows
+        );
+        assert_eq!(kawa.body_size, BodySize::Chunked);
+        let buf = kawa.storage.buffer();
+        let has_te_chunked = kawa.blocks.iter().any(|b| {
+            matches!(b, Block::Header(Pair { key, val })
+                if key.data(buf).eq_ignore_ascii_case(b"Transfer-Encoding")
+                    && val.data(buf).eq_ignore_ascii_case(b"chunked"))
+        });
+        assert!(
+            has_te_chunked,
+            "H2→H1 chunked body must emit Transfer-Encoding: chunked for trailer support"
+        );
+    }
+
+    /// H2 request declaring Content-Length keeps the Length framing: the
+    /// H1 backend cannot receive trailers in this case (RFC 9110 §6.5 —
+    /// trailers require chunked transfer-coding), and we document that
+    /// the caller must drop trailers rather than retro-fit Transfer-Encoding
+    /// once the request headers have already gone out on the wire.
+    #[test]
+    fn test_h2_to_h1_body_with_content_length_keeps_length_framing() {
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        let kawa = decode_request_headers(
+            &mut pool,
+            &[
+                (b":method", b"POST"),
+                (b":scheme", b"https"),
+                (b":path", b"/upload"),
+                (b":authority", b"example.com"),
+                (b"content-length", b"42"),
+            ],
+            false,
+        );
+        assert_eq!(kawa.body_size, BodySize::Length(42));
+        let buf = kawa.storage.buffer();
+        let has_te = kawa.blocks.iter().any(|b| {
+            matches!(b, Block::Header(Pair { key, .. })
+                if key.data(buf).eq_ignore_ascii_case(b"Transfer-Encoding"))
+        });
+        assert!(
+            !has_te,
+            "Transfer-Encoding must not be retro-fitted when Content-Length was declared"
+        );
     }
 }
