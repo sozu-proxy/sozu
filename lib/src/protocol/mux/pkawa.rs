@@ -26,11 +26,14 @@ fn has_uppercase_ascii(name: &[u8]) -> bool {
 /// Returns true if the header name is a connection-specific header field
 /// that MUST NOT appear in HTTP/2 (RFC 9113 section 8.2.2).
 pub(super) fn is_connection_specific_header(name: &[u8]) -> bool {
-    compare_no_case(name, b"connection")
-        || compare_no_case(name, b"proxy-connection")
-        || compare_no_case(name, b"transfer-encoding")
-        || compare_no_case(name, b"upgrade")
-        || compare_no_case(name, b"keep-alive")
+    match name.first() {
+        Some(b'c' | b'C') => compare_no_case(name, b"connection"),
+        Some(b'p' | b'P') => compare_no_case(name, b"proxy-connection"),
+        Some(b't' | b'T') => compare_no_case(name, b"transfer-encoding"),
+        Some(b'u' | b'U') => compare_no_case(name, b"upgrade"),
+        Some(b'k' | b'K') => compare_no_case(name, b"keep-alive"),
+        _ => false,
+    }
 }
 
 /// Returns true if the TE header has a value other than "trailers".
