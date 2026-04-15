@@ -706,7 +706,7 @@ mod tests {
             0x00, 0x03, 0x00, 0x00, 0x00, 0x64,
         ];
 
-        let (remaining, header) = frame_header(&input, DEFAULT_MAX_FRAME_SIZE).unwrap();
+        let (remaining, header) = frame_header(&input, DEFAULT_MAX_FRAME_SIZE).expect("frame header parses cleanly");
         assert_eq!(header.frame_type, FrameType::Settings);
         assert_eq!(header.flags & FLAG_ACK, FLAG_ACK);
         assert_eq!(header.payload_len, 6);
@@ -738,11 +738,11 @@ mod tests {
             0x00, 0x00, 0x00, 0x00, // stream_id = 0
         ];
 
-        let (remaining, header) = frame_header(&input, DEFAULT_MAX_FRAME_SIZE).unwrap();
+        let (remaining, header) = frame_header(&input, DEFAULT_MAX_FRAME_SIZE).expect("frame header parses cleanly");
         assert_eq!(header.frame_type, FrameType::Settings);
         assert_eq!(header.flags & FLAG_ACK, FLAG_ACK);
 
-        let (_, frame) = frame_body(remaining, &header).unwrap();
+        let (_, frame) = frame_body(remaining, &header).expect("frame body parses cleanly");
         match frame {
             Frame::Settings(settings) => {
                 assert!(settings.ack, "ACK flag must be set");
@@ -769,11 +769,11 @@ mod tests {
             0x7F, 0xFF, 0xFF, 0xFF, // increment = 2^31-1
         ];
 
-        let (remaining, header) = frame_header(&input, DEFAULT_MAX_FRAME_SIZE).unwrap();
+        let (remaining, header) = frame_header(&input, DEFAULT_MAX_FRAME_SIZE).expect("frame header parses cleanly");
         assert_eq!(header.frame_type, FrameType::WindowUpdate);
         assert_eq!(header.stream_id, 1);
 
-        let (_, frame) = frame_body(remaining, &header).unwrap();
+        let (_, frame) = frame_body(remaining, &header).expect("frame body parses cleanly");
         match frame {
             Frame::WindowUpdate(wu) => {
                 assert_eq!(wu.increment, 0x7FFFFFFF);
@@ -799,10 +799,10 @@ mod tests {
             0x00, 0x00, 0x00, 0x00, // increment = 0
         ];
 
-        let (remaining, header) = frame_header(&input, DEFAULT_MAX_FRAME_SIZE).unwrap();
+        let (remaining, header) = frame_header(&input, DEFAULT_MAX_FRAME_SIZE).expect("frame header parses cleanly");
         assert_eq!(header.frame_type, FrameType::WindowUpdate);
 
-        let (_, frame) = frame_body(remaining, &header).unwrap();
+        let (_, frame) = frame_body(remaining, &header).expect("frame body parses cleanly");
         match frame {
             Frame::WindowUpdate(wu) => {
                 assert_eq!(wu.stream_id, 0);
@@ -820,8 +820,8 @@ mod tests {
             0x00, 0x00, 0x00, 0x00, // increment = 0
         ];
 
-        let (remaining2, header2) = frame_header(&input2, DEFAULT_MAX_FRAME_SIZE).unwrap();
-        let (_, frame2) = frame_body(remaining2, &header2).unwrap();
+        let (remaining2, header2) = frame_header(&input2, DEFAULT_MAX_FRAME_SIZE).expect("frame header parses cleanly");
+        let (_, frame2) = frame_body(remaining2, &header2).expect("second frame body parses cleanly");
         match frame2 {
             Frame::WindowUpdate(wu) => {
                 assert_eq!(wu.stream_id, 3);
@@ -873,7 +873,7 @@ mod tests {
             0x00, 0x03, 0x00, 0x00, 0x00, // 5 bytes of incomplete setting
         ];
 
-        let (remaining, header) = frame_header(&input, DEFAULT_MAX_FRAME_SIZE).unwrap();
+        let (remaining, header) = frame_header(&input, DEFAULT_MAX_FRAME_SIZE).expect("frame header parses cleanly");
         assert_eq!(header.frame_type, FrameType::Settings);
 
         let result = frame_body(remaining, &header);
@@ -903,7 +903,7 @@ mod tests {
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 8 bytes
         ];
 
-        let (remaining, header) = frame_header(&input, DEFAULT_MAX_FRAME_SIZE).unwrap();
+        let (remaining, header) = frame_header(&input, DEFAULT_MAX_FRAME_SIZE).expect("frame header parses cleanly");
         assert_eq!(header.frame_type, FrameType::RstStream);
 
         let result = frame_body(remaining, &header);
@@ -932,7 +932,7 @@ mod tests {
             0x01, 0x02, 0x03, 0x04, // only 4 bytes
         ];
 
-        let (remaining, header) = frame_header(&input, DEFAULT_MAX_FRAME_SIZE).unwrap();
+        let (remaining, header) = frame_header(&input, DEFAULT_MAX_FRAME_SIZE).expect("frame header parses cleanly");
         assert_eq!(header.frame_type, FrameType::Ping);
 
         let result = frame_body(remaining, &header);
@@ -1031,8 +1031,8 @@ mod tests {
             0x80, 0x00, 0x00, 0x01, // increment with reserved bit set = 1
         ];
 
-        let (remaining, header) = frame_header(&input, DEFAULT_MAX_FRAME_SIZE).unwrap();
-        let (_, frame) = frame_body(remaining, &header).unwrap();
+        let (remaining, header) = frame_header(&input, DEFAULT_MAX_FRAME_SIZE).expect("frame header parses cleanly");
+        let (_, frame) = frame_body(remaining, &header).expect("frame body parses cleanly");
         match frame {
             Frame::WindowUpdate(wu) => {
                 assert_eq!(
@@ -1104,7 +1104,7 @@ mod tests {
     #[test]
     fn test_frame_header_settings_basic() {
         let raw = build_frame_header(0, 4, 0, 0);
-        let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).unwrap();
+        let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).expect("frame header parses cleanly");
         assert!(remaining.is_empty());
         assert_eq!(header.payload_len, 0);
         assert_eq!(header.frame_type, FrameType::Settings);
@@ -1115,7 +1115,7 @@ mod tests {
     #[test]
     fn test_frame_header_data_basic() {
         let raw = build_frame_header(100, 0, 1, 1);
-        let (_, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).unwrap();
+        let (_, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).expect("frame header parses cleanly");
         assert_eq!(header.payload_len, 100);
         assert_eq!(header.frame_type, FrameType::Data);
         assert_eq!(header.flags, 1);
@@ -1127,7 +1127,7 @@ mod tests {
         // stream_id with reserved bit set (0x80000001) should be masked to 1.
         // Use a DATA frame (stream-specific) to avoid the stream_id=0 rejection.
         let raw = build_frame_header(5, 0, 0, 0x80000001);
-        let (_, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).unwrap();
+        let (_, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).expect("frame header parses cleanly");
         assert_eq!(header.stream_id, 1, "reserved MSB must be masked off");
     }
 
@@ -1137,8 +1137,8 @@ mod tests {
     fn test_parse_data_frame_end_stream() {
         let payload = b"hello";
         let raw = build_raw_frame(payload.len() as u32, 0, 0x01, 1, payload);
-        let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).unwrap();
-        let (_, f) = frame_body(remaining, &header).unwrap();
+        let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).expect("frame header parses cleanly");
+        let (_, f) = frame_body(remaining, &header).expect("frame body parses cleanly");
         match f {
             Frame::Data(d) => {
                 assert_eq!(d.stream_id, 1);
@@ -1152,8 +1152,8 @@ mod tests {
     fn test_parse_data_frame_no_end_stream() {
         let payload = b"data";
         let raw = build_raw_frame(payload.len() as u32, 0, 0x00, 3, payload);
-        let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).unwrap();
-        let (_, f) = frame_body(remaining, &header).unwrap();
+        let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).expect("frame header parses cleanly");
+        let (_, f) = frame_body(remaining, &header).expect("frame body parses cleanly");
         match f {
             Frame::Data(d) => {
                 assert_eq!(d.stream_id, 3);
@@ -1175,8 +1175,8 @@ mod tests {
         payload.extend_from_slice(&[0x00; 2]);
 
         let raw = build_raw_frame(total_payload as u32, 0, 0x08, 1, &payload);
-        let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).unwrap();
-        let (_, f) = frame_body(remaining, &header).unwrap();
+        let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).expect("frame header parses cleanly");
+        let (_, f) = frame_body(remaining, &header).expect("frame body parses cleanly");
         match f {
             Frame::Data(d) => {
                 assert_eq!(d.stream_id, 1);
@@ -1194,7 +1194,7 @@ mod tests {
         payload.extend_from_slice(b"hello");
 
         let raw = build_raw_frame(payload.len() as u32, 0, 0x08, 1, &payload);
-        let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).unwrap();
+        let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).expect("frame header parses cleanly");
         let result = frame_body(remaining, &header);
         assert!(
             result.is_err(),
@@ -1208,8 +1208,8 @@ mod tests {
     fn test_parse_headers_frame_basic() {
         let hblock = b"\x82\x86";
         let raw = build_raw_frame(hblock.len() as u32, 1, 0x04, 1, hblock);
-        let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).unwrap();
-        let (_, f) = frame_body(remaining, &header).unwrap();
+        let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).expect("frame header parses cleanly");
+        let (_, f) = frame_body(remaining, &header).expect("frame body parses cleanly");
         match f {
             Frame::Headers(h) => {
                 assert_eq!(h.stream_id, 1);
@@ -1225,8 +1225,8 @@ mod tests {
     fn test_parse_headers_frame_end_stream_and_headers() {
         let hblock = b"\x82";
         let raw = build_raw_frame(hblock.len() as u32, 1, 0x05, 1, hblock);
-        let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).unwrap();
-        let (_, f) = frame_body(remaining, &header).unwrap();
+        let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).expect("frame header parses cleanly");
+        let (_, f) = frame_body(remaining, &header).expect("frame body parses cleanly");
         match f {
             Frame::Headers(h) => {
                 assert!(h.end_stream);
@@ -1247,8 +1247,8 @@ mod tests {
         payload.extend_from_slice(hblock);
 
         let raw = build_raw_frame(payload_len as u32, 1, 0x24, 3, &payload);
-        let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).unwrap();
-        let (_, f) = frame_body(remaining, &header).unwrap();
+        let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).expect("frame header parses cleanly");
+        let (_, f) = frame_body(remaining, &header).expect("frame body parses cleanly");
         match f {
             Frame::Headers(h) => {
                 assert_eq!(h.stream_id, 3);
@@ -1281,8 +1281,8 @@ mod tests {
 
         let payload_len = payload.len();
         let raw = build_raw_frame(payload_len as u32, 1, 0x24, 3, &payload);
-        let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).unwrap();
-        let (_, f) = frame_body(remaining, &header).unwrap();
+        let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).expect("frame header parses cleanly");
+        let (_, f) = frame_body(remaining, &header).expect("frame body parses cleanly");
         match f {
             Frame::Headers(h) => {
                 let priority = h.priority.expect("should have priority");
@@ -1318,8 +1318,8 @@ mod tests {
     fn test_parse_rst_stream() {
         let error_code = 0x00000008u32; // CANCEL
         let raw = build_raw_frame(4, 3, 0, 1, &error_code.to_be_bytes());
-        let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).unwrap();
-        let (_, f) = frame_body(remaining, &header).unwrap();
+        let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).expect("frame header parses cleanly");
+        let (_, f) = frame_body(remaining, &header).expect("frame body parses cleanly");
         match f {
             Frame::RstStream(rst) => {
                 assert_eq!(rst.stream_id, 1);
@@ -1355,8 +1355,8 @@ mod tests {
         payload.extend_from_slice(&65535u32.to_be_bytes());
 
         let raw = build_raw_frame(payload.len() as u32, 4, 0x0, 0, &payload);
-        let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).unwrap();
-        let (_, f) = frame_body(remaining, &header).unwrap();
+        let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).expect("frame header parses cleanly");
+        let (_, f) = frame_body(remaining, &header).expect("frame body parses cleanly");
         match f {
             Frame::Settings(s) => {
                 assert!(!s.ack);
@@ -1378,8 +1378,8 @@ mod tests {
     fn test_parse_ping_frame() {
         let ping_payload = [1u8, 2, 3, 4, 5, 6, 7, 8];
         let raw = build_raw_frame(8, 6, 0, 0, &ping_payload);
-        let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).unwrap();
-        let (_, f) = frame_body(remaining, &header).unwrap();
+        let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).expect("frame header parses cleanly");
+        let (_, f) = frame_body(remaining, &header).expect("frame body parses cleanly");
         match f {
             Frame::Ping(p) => {
                 assert_eq!(p.payload, ping_payload);
@@ -1393,8 +1393,8 @@ mod tests {
     fn test_parse_ping_ack_preserves_payload() {
         let ping_payload = [0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE];
         let raw = build_raw_frame(8, 6, 0x01, 0, &ping_payload);
-        let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).unwrap();
-        let (_, f) = frame_body(remaining, &header).unwrap();
+        let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).expect("frame header parses cleanly");
+        let (_, f) = frame_body(remaining, &header).expect("frame body parses cleanly");
         match f {
             Frame::Ping(p) => {
                 assert_eq!(
@@ -1420,8 +1420,8 @@ mod tests {
     fn test_parse_window_update_connection_level() {
         let increment = 1000u32;
         let raw = build_raw_frame(4, 8, 0, 0, &increment.to_be_bytes());
-        let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).unwrap();
-        let (_, f) = frame_body(remaining, &header).unwrap();
+        let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).expect("frame header parses cleanly");
+        let (_, f) = frame_body(remaining, &header).expect("frame body parses cleanly");
         match f {
             Frame::WindowUpdate(w) => {
                 assert_eq!(w.stream_id, 0);
@@ -1435,8 +1435,8 @@ mod tests {
     fn test_parse_window_update_stream_level() {
         let increment = 65535u32;
         let raw = build_raw_frame(4, 8, 0, 5, &increment.to_be_bytes());
-        let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).unwrap();
-        let (_, f) = frame_body(remaining, &header).unwrap();
+        let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).expect("frame header parses cleanly");
+        let (_, f) = frame_body(remaining, &header).expect("frame body parses cleanly");
         match f {
             Frame::WindowUpdate(w) => {
                 assert_eq!(w.stream_id, 5);
@@ -1450,7 +1450,7 @@ mod tests {
     #[test]
     fn test_parse_window_update_wrong_size() {
         let raw = build_raw_frame(3, 8, 0, 0, &[0u8; 3]);
-        let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).unwrap();
+        let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).expect("frame header parses cleanly");
         let result = frame_body(remaining, &header);
         assert!(
             result.is_err(),
@@ -1470,8 +1470,8 @@ mod tests {
     fn test_parse_frame_at_max_frame_size() {
         let payload = vec![0u8; DEFAULT_MAX_FRAME_SIZE as usize];
         let raw = build_raw_frame(DEFAULT_MAX_FRAME_SIZE, 0, 0x0, 1, &payload);
-        let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).unwrap();
-        let (_, f) = frame_body(remaining, &header).unwrap();
+        let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).expect("frame header parses cleanly");
+        let (_, f) = frame_body(remaining, &header).expect("frame body parses cleanly");
         match f {
             Frame::Data(d) => {
                 assert_eq!(d.payload.len, DEFAULT_MAX_FRAME_SIZE);
@@ -1485,8 +1485,8 @@ mod tests {
         let custom_max = 32768u32;
         let payload = vec![0u8; 20000];
         let raw = build_raw_frame(20000, 0, 0x0, 1, &payload);
-        let (remaining, header) = frame_header(&raw, custom_max).unwrap();
-        let (_, f) = frame_body(remaining, &header).unwrap();
+        let (remaining, header) = frame_header(&raw, custom_max).expect("frame header parses with custom max");
+        let (_, f) = frame_body(remaining, &header).expect("frame body parses cleanly");
         match f {
             Frame::Data(d) => {
                 assert_eq!(d.payload.len, 20000);
@@ -1562,8 +1562,8 @@ mod tests {
         assert_eq!(payload.len(), 5);
 
         let raw = build_raw_frame(5, 2, 0, 3, &payload);
-        let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).unwrap();
-        let (_, f) = frame_body(remaining, &header).unwrap();
+        let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).expect("frame header parses cleanly");
+        let (_, f) = frame_body(remaining, &header).expect("frame body parses cleanly");
         match f {
             Frame::Priority(p) => {
                 assert_eq!(p.stream_id, 3);
@@ -1586,7 +1586,7 @@ mod tests {
     #[test]
     fn test_parse_priority_wrong_size_rejected() {
         let raw = build_raw_frame(4, 2, 0, 1, &[0u8; 4]);
-        let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).unwrap();
+        let (remaining, header) = frame_header(&raw, DEFAULT_MAX_FRAME_SIZE).expect("frame header parses cleanly");
         let result = frame_body(remaining, &header);
         assert!(
             result.is_err(),
