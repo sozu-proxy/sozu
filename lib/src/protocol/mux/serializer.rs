@@ -19,11 +19,17 @@ pub fn gen_frame_header<'a>(
     buf: &'a mut [u8],
     frame: &FrameHeader,
 ) -> Result<(&'a mut [u8], usize), GenError> {
+    // RFC 9113 §4.1: the high-order bit of any stream identifier on the
+    // wire is reserved and MUST be zero. Masking with
+    // `parser::STREAM_ID_MASK` defends against a rogue caller handing us
+    // a `StreamId`-typed `u32` with the reserved R-bit set, which would
+    // otherwise leak verbatim into the frame header and risk peer rejection
+    // or misrouting.
     let serializer = tuple((
         be_u24(frame.payload_len),
         be_u8(serialize_frame_type(&frame.frame_type)),
         be_u8(frame.flags),
-        be_u32(frame.stream_id),
+        be_u32(frame.stream_id & parser::STREAM_ID_MASK),
     ));
 
     r#gen(serializer, buf).map(|(buf, size)| (buf, size as usize))
@@ -167,7 +173,13 @@ pub fn gen_goaway(
         },
         |buf| {
             r#gen(
-                tuple((be_u32(last_stream_id), be_u32(error_code as u32))),
+                tuple((
+                    // RFC 9113 §6.8: Last-Stream-ID is a 31-bit field; mask
+                    // the reserved R-bit defensively to mirror the frame-
+                    // header masking in `gen_frame_header`.
+                    be_u32(last_stream_id & parser::STREAM_ID_MASK),
+                    be_u32(error_code as u32),
+                )),
                 buf,
             )
         },
@@ -504,5 +516,37 @@ mod tests {
         assert_eq!(buf[6], 0x04);
         assert_eq!(buf[7], 0x05);
         assert_eq!(buf[8], 0x06);
+    }
+
+    #[test]
+    fn gen_frame_header_masks_reserved_bit() {
+        // Simulate a rogue caller passing a stream ID with the reserved
+        // R-bit set. It must not leak onto the wire.
+        let original = parser::FrameHeader {
+            payload_len: 0,
+            frame_type: parser::FrameType::Ping,
+            flags: 0,
+            stream_id: 0xFFFF_FFFF,
+        };
+
+        let (buf, sz) = serialize_header(&original);
+        assert_eq!(sz, 9);
+        // R-bit MUST be zero — top byte's high bit is 0.
+        assert_eq!(buf[5] & 0x80, 0);
+        // Remaining 31 bits preserved.
+        let stream_id = u32::from_be_bytes([buf[5], buf[6], buf[7], buf[8]]);
+        assert_eq!(stream_id, 0x7FFF_FFFF);
+    }
+
+    #[test]
+    fn gen_goaway_masks_reserved_bit_in_last_stream_id() {
+        let mut buf = [0u8; 17]; // 9-byte header + 8-byte payload
+        let (_, sz) = gen_goaway(&mut buf[..], 0xFFFF_FFFF, H2Error::ProtocolError)
+            .expect("serialization should succeed");
+        assert_eq!(sz, 17);
+        // last_stream_id occupies bytes 9..13; high bit must be zero.
+        assert_eq!(buf[9] & 0x80, 0);
+        let last_stream_id = u32::from_be_bytes([buf[9], buf[10], buf[11], buf[12]]);
+        assert_eq!(last_stream_id, 0x7FFF_FFFF);
     }
 }
