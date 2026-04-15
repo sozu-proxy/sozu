@@ -197,6 +197,28 @@ impl H2Frame {
         Self::new(H2_FRAME_DATA, 0, stream_id, payload)
     }
 
+    /// Build a PRIORITY frame (RFC 9113 §6.3).
+    ///
+    /// Payload layout (5 bytes):
+    ///   * bit 0    -- `exclusive` dependency flag
+    ///   * bits 1-31 -- 31-bit `stream_dependency`
+    ///   * byte 5    -- `weight` (peer's declared value + 1 on the wire)
+    ///
+    /// Type=0x2, flags=0x0, always on a non-zero `stream_id`.
+    pub(crate) fn priority(stream_id: u32, dep: u32, weight: u8, exclusive: bool) -> Self {
+        let mut payload = Vec::with_capacity(5);
+        let mut dep_bytes = (dep & 0x7FFF_FFFF).to_be_bytes();
+        if exclusive {
+            dep_bytes[0] |= 0x80;
+        }
+        payload.extend_from_slice(&dep_bytes);
+        payload.push(weight);
+        // PRIORITY is frame type 0x2 (not one of the named constants above
+        // because the production parser accepts it but tests rarely need it
+        // otherwise).
+        Self::new(0x2, 0, stream_id, payload)
+    }
+
     /// Build a RST_STREAM frame with the given error code.
     pub(crate) fn rst_stream(stream_id: u32, error_code: u32) -> Self {
         Self::new(
