@@ -1,4 +1,4 @@
-use std::{io::Write, str::from_utf8};
+use std::{borrow::Cow, io::Write, str::from_utf8};
 
 use kawa::{
     Block, BodySize, Flags, Kind, Pair, ParsingPhase, StatusLine, Store, Version,
@@ -170,6 +170,57 @@ fn parse_rfc9218_priority(value: &[u8]) -> (u8, bool) {
     (urgency, incremental)
 }
 
+/// Run the HPACK decoder while tracking the cumulative decoded header-list size
+/// against `max_decoded_bytes` (RFC 9113 §6.5.2 SETTINGS_MAX_HEADER_LIST_SIZE).
+///
+/// `per_header` is invoked for every successfully decoded `(name, value)` pair
+/// that fits within the budget; it may set its `&mut bool` argument to mark the
+/// stream as carrying invalid headers, in which case subsequent pairs are still
+/// decoded (to keep HPACK dynamic-table state in sync) but skipped.
+///
+/// Returns the final value of the `invalid_headers` flag so the caller can
+/// combine it with kind-specific validity checks (e.g. mandatory pseudo-headers).
+fn decode_headers_with_budget<F>(
+    decoder: &mut loona_hpack::Decoder<'static>,
+    input: &[u8],
+    max_decoded_bytes: usize,
+    mut per_header: F,
+) -> Result<bool, (H2Error, bool)>
+where
+    F: FnMut(Cow<[u8]>, Cow<[u8]>, &mut bool),
+{
+    let mut invalid_headers = false;
+    let mut budget_exceeded = false;
+    let mut decoded_bytes: usize = 0;
+    let decode_status = decoder.decode_with_cb(input, |k, v| {
+        if invalid_headers || budget_exceeded {
+            return;
+        }
+        decoded_bytes = decoded_bytes.saturating_add(k.len() + v.len());
+        if decoded_bytes > max_decoded_bytes {
+            budget_exceeded = true;
+            return;
+        }
+        if is_invalid_h2_header(&k, &v) {
+            invalid_headers = true;
+            return;
+        }
+        per_header(k, v, &mut invalid_headers);
+    });
+    if let Err(error) = decode_status {
+        error!("INVALID FRAGMENT: {:?}", error);
+        return Err((H2Error::CompressionError, true));
+    }
+    if budget_exceeded {
+        error!(
+            "HPACK decoded header size {} exceeds MAX_HEADER_LIST_SIZE {}",
+            decoded_bytes, max_decoded_bytes
+        );
+        return Err((H2Error::EnhanceYourCalm, false));
+    }
+    Ok(invalid_headers)
+}
+
 pub fn handle_header<C>(
     decoder: &mut loona_hpack::Decoder<'static>,
     prioriser: &mut Prioriser,
@@ -193,125 +244,101 @@ where
             let mut authority = Store::Empty;
             let mut path = Store::Empty;
             let mut scheme = Store::Empty;
-            let mut invalid_headers = false;
-            let mut budget_exceeded = false;
-            let mut decoded_bytes: usize = 0;
             let mut regular_headers = false;
             let mut cookies_added = false;
-            let decode_status = decoder.decode_with_cb(input, |k, v| {
-                if invalid_headers || budget_exceeded {
-                    return;
-                }
-
-                decoded_bytes = decoded_bytes.saturating_add(k.len() + v.len());
-                if decoded_bytes > max_decoded_bytes {
-                    budget_exceeded = true;
-                    return;
-                }
-
-                if is_invalid_h2_header(&k, &v) {
-                    invalid_headers = true;
-                    return;
-                }
-
-                if compare_no_case(&k, b":method") {
-                    match store_pseudo_header(&method, regular_headers, kawa, &v) {
-                        Some(s) => method = s,
-                        None => invalid_headers = true,
-                    }
-                } else if compare_no_case(&k, b":scheme") {
-                    match store_pseudo_header(&scheme, regular_headers, kawa, &v) {
-                        Some(s) => scheme = s,
-                        None => invalid_headers = true,
-                    }
-                } else if compare_no_case(&k, b":path") {
-                    match store_pseudo_header(&path, regular_headers, kawa, &v) {
-                        Some(s) => path = s,
-                        None => invalid_headers = true,
-                    }
-                } else if compare_no_case(&k, b":authority") {
-                    match store_pseudo_header(&authority, regular_headers, kawa, &v) {
-                        Some(s) => authority = s,
-                        None => invalid_headers = true,
-                    }
-                } else if k.starts_with(b":") {
-                    invalid_headers = true;
-                } else if compare_no_case(&k, b"cookie") {
-                    regular_headers = true;
-                    // RFC 9113 §8.2.3: When converting H2 to H1, multiple cookie
-                    // header fields MUST be concatenated into a single octet string
-                    // using "; " as separator. We store each cookie-pair in the
-                    // detached jar (same as the H1 parser) so that:
-                    //  1. H1BlockConverter emits a single "Cookie: k1=v1; k2=v2" header
-                    //  2. H2BlockConverter re-encodes each as a separate HPACK header
-                    //  3. HttpContext::on_request_headers can find sticky session cookies
-                    for cookie_pair in v.split(|&b| b == b';') {
-                        let trimmed = trim_ows(cookie_pair);
-                        if trimmed.is_empty() {
-                            continue;
+            let invalid_headers = decode_headers_with_budget(
+                decoder,
+                input,
+                max_decoded_bytes,
+                |k, v, invalid_headers| {
+                    if compare_no_case(&k, b":method") {
+                        match store_pseudo_header(&method, regular_headers, kawa, &v) {
+                            Some(s) => method = s,
+                            None => *invalid_headers = true,
                         }
-                        // Split on first '=' to separate cookie name and value
-                        let (cookie_key, cookie_val) = match trimmed.iter().position(|&b| b == b'=')
-                        {
-                            Some(eq_pos) => (&trimmed[..eq_pos], &trimmed[eq_pos + 1..]),
-                            None => (trimmed, &b""[..]),
-                        };
-                        let key_start = kawa.storage.end as u32;
-                        if kawa.storage.write_all(cookie_key).is_err() {
-                            invalid_headers = true;
+                    } else if compare_no_case(&k, b":scheme") {
+                        match store_pseudo_header(&scheme, regular_headers, kawa, &v) {
+                            Some(s) => scheme = s,
+                            None => *invalid_headers = true,
+                        }
+                    } else if compare_no_case(&k, b":path") {
+                        match store_pseudo_header(&path, regular_headers, kawa, &v) {
+                            Some(s) => path = s,
+                            None => *invalid_headers = true,
+                        }
+                    } else if compare_no_case(&k, b":authority") {
+                        match store_pseudo_header(&authority, regular_headers, kawa, &v) {
+                            Some(s) => authority = s,
+                            None => *invalid_headers = true,
+                        }
+                    } else if k.starts_with(b":") {
+                        *invalid_headers = true;
+                    } else if compare_no_case(&k, b"cookie") {
+                        regular_headers = true;
+                        // RFC 9113 §8.2.3: When converting H2 to H1, multiple cookie
+                        // header fields MUST be concatenated into a single octet string
+                        // using "; " as separator. We store each cookie-pair in the
+                        // detached jar (same as the H1 parser) so that:
+                        //  1. H1BlockConverter emits a single "Cookie: k1=v1; k2=v2" header
+                        //  2. H2BlockConverter re-encodes each as a separate HPACK header
+                        //  3. HttpContext::on_request_headers can find sticky session cookies
+                        for cookie_pair in v.split(|&b| b == b';') {
+                            let trimmed = trim_ows(cookie_pair);
+                            if trimmed.is_empty() {
+                                continue;
+                            }
+                            // Split on first '=' to separate cookie name and value
+                            let (cookie_key, cookie_val) =
+                                match trimmed.iter().position(|&b| b == b'=') {
+                                    Some(eq_pos) => (&trimmed[..eq_pos], &trimmed[eq_pos + 1..]),
+                                    None => (trimmed, &b""[..]),
+                                };
+                            let key_start = kawa.storage.end as u32;
+                            if kawa.storage.write_all(cookie_key).is_err() {
+                                *invalid_headers = true;
+                                return;
+                            }
+                            let key_len = cookie_key.len() as u32;
+                            let val_start = kawa.storage.end as u32;
+                            if kawa.storage.write_all(cookie_val).is_err() {
+                                *invalid_headers = true;
+                                return;
+                            }
+                            let val_len = cookie_val.len() as u32;
+                            if !cookies_added {
+                                kawa.push_block(Block::Cookies);
+                                cookies_added = true;
+                            }
+                            kawa.detached.jar.push_back(Pair {
+                                key: Store::Slice(Slice {
+                                    start: key_start,
+                                    len: key_len,
+                                }),
+                                val: Store::Slice(Slice {
+                                    start: val_start,
+                                    len: val_len,
+                                }),
+                            });
+                        }
+                    } else {
+                        regular_headers = true;
+                        if !write_regular_header(kawa, &k, &v) {
+                            *invalid_headers = true;
                             return;
                         }
-                        let key_len = cookie_key.len() as u32;
-                        let val_start = kawa.storage.end as u32;
-                        if kawa.storage.write_all(cookie_val).is_err() {
-                            invalid_headers = true;
-                            return;
+                        if compare_no_case(&k, b"priority") {
+                            let (urgency, incremental) = parse_rfc9218_priority(&v);
+                            prioriser.push_priority(
+                                stream_id,
+                                PriorityPart::Rfc9218 {
+                                    urgency,
+                                    incremental,
+                                },
+                            );
                         }
-                        let val_len = cookie_val.len() as u32;
-                        if !cookies_added {
-                            kawa.push_block(Block::Cookies);
-                            cookies_added = true;
-                        }
-                        kawa.detached.jar.push_back(Pair {
-                            key: Store::Slice(Slice {
-                                start: key_start,
-                                len: key_len,
-                            }),
-                            val: Store::Slice(Slice {
-                                start: val_start,
-                                len: val_len,
-                            }),
-                        });
                     }
-                } else {
-                    regular_headers = true;
-                    if !write_regular_header(kawa, &k, &v) {
-                        invalid_headers = true;
-                        return;
-                    }
-                    if compare_no_case(&k, b"priority") {
-                        let (urgency, incremental) = parse_rfc9218_priority(&v);
-                        prioriser.push_priority(
-                            stream_id,
-                            PriorityPart::Rfc9218 {
-                                urgency,
-                                incremental,
-                            },
-                        );
-                    }
-                }
-            });
-            if let Err(error) = decode_status {
-                error!("INVALID FRAGMENT: {:?}", error);
-                return Err((H2Error::CompressionError, true));
-            }
-            if budget_exceeded {
-                error!(
-                    "HPACK decoded header size {} exceeds MAX_HEADER_LIST_SIZE {}",
-                    decoded_bytes, max_decoded_bytes
-                );
-                return Err((H2Error::EnhanceYourCalm, false));
-            }
+                },
+            )?;
             // RFC 9113 §8.3.1 requires all four pseudo-headers to be present and non-empty.
             // Note: Store::is_empty() only matches Store::Empty — a pseudo-header stored
             // with an empty value yields Store::Slice { len: 0 } which is_empty() misses.
@@ -340,60 +367,36 @@ where
         Kind::Response => {
             let mut code = 0;
             let mut status = Store::Empty;
-            let mut invalid_headers = false;
-            let mut budget_exceeded = false;
-            let mut decoded_bytes: usize = 0;
             let mut regular_headers = false;
-            let decode_status = decoder.decode_with_cb(input, |k, v| {
-                if invalid_headers || budget_exceeded {
-                    return;
-                }
-
-                decoded_bytes = decoded_bytes.saturating_add(k.len() + v.len());
-                if decoded_bytes > max_decoded_bytes {
-                    budget_exceeded = true;
-                    return;
-                }
-
-                if is_invalid_h2_header(&k, &v) {
-                    invalid_headers = true;
-                    return;
-                }
-
-                if compare_no_case(&k, b":status") {
-                    match store_pseudo_header(&status, regular_headers, kawa, &v) {
-                        Some(s) => {
-                            status = s;
-                            if let Some(parsed_code) =
-                                from_utf8(&v).ok().and_then(|v| v.parse::<u16>().ok())
-                            {
-                                code = parsed_code;
-                            } else {
-                                invalid_headers = true;
+            let invalid_headers = decode_headers_with_budget(
+                decoder,
+                input,
+                max_decoded_bytes,
+                |k, v, invalid_headers| {
+                    if compare_no_case(&k, b":status") {
+                        match store_pseudo_header(&status, regular_headers, kawa, &v) {
+                            Some(s) => {
+                                status = s;
+                                if let Some(parsed_code) =
+                                    from_utf8(&v).ok().and_then(|v| v.parse::<u16>().ok())
+                                {
+                                    code = parsed_code;
+                                } else {
+                                    *invalid_headers = true;
+                                }
                             }
+                            None => *invalid_headers = true,
                         }
-                        None => invalid_headers = true,
+                    } else if k.starts_with(b":") {
+                        *invalid_headers = true;
+                    } else {
+                        regular_headers = true;
+                        if !write_regular_header(kawa, &k, &v) {
+                            *invalid_headers = true;
+                        }
                     }
-                } else if k.starts_with(b":") {
-                    invalid_headers = true;
-                } else {
-                    regular_headers = true;
-                    if !write_regular_header(kawa, &k, &v) {
-                        invalid_headers = true;
-                    }
-                }
-            });
-            if let Err(error) = decode_status {
-                error!("INVALID FRAGMENT: {:?}", error);
-                return Err((H2Error::CompressionError, true));
-            }
-            if budget_exceeded {
-                error!(
-                    "HPACK decoded header size {} exceeds MAX_HEADER_LIST_SIZE {}",
-                    decoded_bytes, max_decoded_bytes
-                );
-                return Err((H2Error::EnhanceYourCalm, false));
-            }
+                },
+            )?;
             if invalid_headers || status.is_empty() {
                 error!("INVALID HEADERS");
                 return Err((H2Error::ProtocolError, false));
