@@ -57,6 +57,8 @@ const MAX_MAX_FRAME_SIZE: u32 = 1 << 24; // 16777216 (exclusive upper bound)
 
 // RFC 9113 §6.9: maximum flow control window size (2^31 - 1)
 const FLOW_CONTROL_MAX_WINDOW: u32 = (1 << 31) - 1;
+// RFC 9113 §5.1.1: stream identifiers are 31-bit unsigned integers (2^31 - 1).
+const STREAM_ID_MAX: u32 = 0x7FFF_FFFF;
 
 /// Enlarged connection-level receive window (1 MB).
 /// The RFC 9113 default is 65 535 bytes, which is too small for high-throughput
@@ -1080,7 +1082,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         let (stream_id, kawa) = if let Some((stream_id, amount)) = self.expect_read {
             let (kawa, did) = match stream_id {
                 H2StreamId::Zero => (&mut self.zero, usize::MAX),
-                H2StreamId::Other { gid: global_stream_id, .. } => {
+                H2StreamId::Other {
+                    gid: global_stream_id,
+                    ..
+                } => {
                     // Reading DATA frame payload for an application stream.
                     // This is real application activity — reset the timeout.
                     self.timeout_container.reset();
@@ -2116,7 +2121,14 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     where
         L: ListenerHandler + L7ListenerHandler,
     {
-        if let Some((H2StreamId::Other { gid: global_stream_id, .. }, amount)) = self.expect_read {
+        if let Some((
+            H2StreamId::Other {
+                gid: global_stream_id,
+                ..
+            },
+            amount,
+        )) = self.expect_read
+        {
             let stream = &context.streams[global_stream_id];
             let kawa = match self.position {
                 Position::Client(..) => &stream.back,
@@ -2216,8 +2228,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         kawa.storage.clear();
         debug!("GOAWAY (graceful, phase 1): last_stream_id=0x7FFFFFFF");
 
-        const MAX_STREAM_ID: u32 = 0x7FFF_FFFF;
-        match serializer::gen_goaway(kawa.storage.space(), MAX_STREAM_ID, H2Error::NoError) {
+        match serializer::gen_goaway(kawa.storage.space(), STREAM_ID_MAX, H2Error::NoError) {
             Ok((_, size)) => {
                 kawa.storage.fill(size);
                 // Stay in the current state so the connection can continue processing
@@ -2324,7 +2335,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
 
     pub fn new_stream_id(&mut self) -> Option<StreamId> {
         let next = self.last_stream_id.checked_add(2)?;
-        if next > FLOW_CONTROL_MAX_WINDOW {
+        if next > STREAM_ID_MAX {
             return None;
         }
         self.last_stream_id = next;
@@ -3017,8 +3028,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             // so decrement Backend.active_requests here to keep load metrics honest.
             if let Position::Client(_, backend, BackendStatus::Connected) = &self.position {
                 let mut backend_borrow = backend.borrow_mut();
-                backend_borrow.active_requests =
-                    backend_borrow.active_requests.saturating_sub(1);
+                backend_borrow.active_requests = backend_borrow.active_requests.saturating_sub(1);
             }
         }
 
