@@ -1574,11 +1574,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             .streams
             .iter()
             .filter_map(|(&stream_id, &global_stream_id)| {
-                matches!(
-                    context.streams[global_stream_id].state,
-                    StreamState::Idle | StreamState::Recycle
-                )
-                .then_some((stream_id, global_stream_id))
+                (!context.streams[global_stream_id].state.is_open())
+                    .then_some((stream_id, global_stream_id))
             })
             .collect::<Vec<_>>();
 
