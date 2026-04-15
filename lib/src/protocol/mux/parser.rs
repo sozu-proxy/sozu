@@ -739,13 +739,13 @@ pub fn window_update_frame<'a>(
     ))
 }
 
-/// Continuation frames are handled inline during HEADERS parsing and always
-/// rejected with PROTOCOL_ERROR when received standalone. The parser still
-/// consumes the frame bytes for correctness.
-///
-/// The wire-level parser does not track connection state (whether the
-/// previous frame was HEADERS/PUSH_PROMISE with END_HEADERS=0), so standalone
-/// CONTINUATION is rejected at the h2 state-machine layer, not here.
+/// Continuation frames are handled inline during HEADERS parsing. The
+/// wire-level parser does not track connection state (whether the previous
+/// frame was HEADERS/PUSH_PROMISE with END_HEADERS=0), so standalone
+/// CONTINUATION is rejected at the h2 state-machine layer
+/// (`handle_header_state`): when a CONTINUATION frame header is observed
+/// while the state is `H2State::Header` (i.e. no header block is in
+/// progress) we emit GOAWAY(PROTOCOL_ERROR) per RFC 9113 §6.10.
 #[derive(Clone, Debug)]
 pub struct Continuation;
 

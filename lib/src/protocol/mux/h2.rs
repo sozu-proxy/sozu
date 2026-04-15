@@ -940,6 +940,20 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 trace!("{:#?}", header);
                 self.zero.storage.clear();
                 let stream_id = header.stream_id;
+                // RFC 9113 §6.10: CONTINUATION frames MUST be preceded by a
+                // HEADERS or PUSH_PROMISE frame without END_HEADERS. When we
+                // reach `handle_header_state`, we are between frames and no
+                // header block is in progress (otherwise the state would be
+                // `H2State::ContinuationHeader`). A CONTINUATION frame arriving
+                // here is therefore standalone and MUST be treated as a
+                // connection error of type PROTOCOL_ERROR.
+                if header.frame_type == FrameType::Continuation {
+                    error!(
+                        "standalone CONTINUATION frame on stream {} without preceding HEADERS",
+                        stream_id
+                    );
+                    return self.goaway(H2Error::ProtocolError);
+                }
                 // RFC 9113 §5.5: unknown frame types MUST be ignored and discarded.
                 // Route unknown frames (and any stream_id == 0 control frame)
                 // through stream 0 (the connection-level buffer) so
@@ -2592,10 +2606,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             Frame::GoAway(goaway) => self.handle_goaway_frame(goaway, context, endpoint),
             Frame::WindowUpdate(wu) => self.handle_window_update_frame(wu, context, endpoint),
             Frame::Continuation(_) => {
-                debug_assert!(
-                    false,
-                    "CONTINUATION reached handle_frame; the inline header-parsing path should consume it"
-                );
+                // Unreachable: standalone CONTINUATION is rejected in
+                // `handle_header_state` (RFC 9113 §6.10) and in-block
+                // CONTINUATION is consumed by the inline header-parsing
+                // path. Keep a defensive fallback that returns
+                // PROTOCOL_ERROR rather than panicking in debug builds.
                 self.attribute_bytes_to_overhead();
                 warn!("CONTINUATION frames are handled inline during header parsing");
                 self.goaway(H2Error::ProtocolError)
