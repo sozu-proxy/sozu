@@ -7,8 +7,8 @@ use crate::{
     protocol::mux::{
         BackendStatus, Context, DebugEvent, Endpoint, GlobalStreamId, MuxResult, Position,
         StreamState, forcefully_terminate_answer, parser::H2Error, set_default_answer,
-        shared::drain_tls_close_notify, update_readiness_after_read,
-        update_readiness_after_write,
+        shared::{EndStreamAction, drain_tls_close_notify, end_stream_decision},
+        update_readiness_after_read, update_readiness_after_write,
     },
     socket::{SocketHandler, SocketResult},
     timer::TimeoutContainer,
@@ -590,46 +590,32 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             | Position::Client(_, _, BackendStatus::Disconnecting) => {
                 error!("end_stream called on KeepAlive or Disconnecting H1 client");
             }
-            Position::Server => match (stream.front.consumed, stream.back.is_main_phase()) {
-                (true, true) => {
-                    // we have a "forwardable" answer from the back
-                    // if the answer is not terminated we send an RstStream to properly clean the stream
-                    // if it is terminated, we finish the transfer, the backend is not necessary anymore
-                    if !stream.context.keep_alive_backend {
-                        debug!("CLOSE DELIMITED");
-                        stream.state = StreamState::Unlinked;
-                        self.readiness.interest.insert(Ready::WRITABLE);
-                    } else if !stream.back.is_terminated() {
-                        forcefully_terminate_answer(
-                            stream,
-                            &mut self.readiness,
-                            H2Error::InternalError,
-                        );
-                    } else {
-                        stream.state = StreamState::Unlinked;
-                        self.readiness.interest.insert(Ready::WRITABLE);
-                    }
+            Position::Server => match end_stream_decision(stream) {
+                EndStreamAction::ForwardTerminated => {
+                    debug!("CLOSING H1 TERMINATED STREAM");
+                    stream.state = StreamState::Unlinked;
+                    self.readiness.interest.insert(Ready::WRITABLE);
                 }
-                (true, false) => {
-                    // we do not have an answer, but the request has already been partially consumed
-                    // so we can't retry
+                EndStreamAction::CloseDelimited => {
+                    debug!("CLOSE DELIMITED");
+                    stream.state = StreamState::Unlinked;
+                    self.readiness.interest.insert(Ready::WRITABLE);
+                }
+                EndStreamAction::ForwardUnterminated => {
+                    debug!("CLOSING H1 UNTERMINATED STREAM");
+                    forcefully_terminate_answer(
+                        stream,
+                        &mut self.readiness,
+                        H2Error::InternalError,
+                    );
+                }
+                EndStreamAction::SendDefault(status) => {
                     let answers = answers_rc.borrow();
-                    if stream.back.is_error() {
-                        // The backend sent an invalid response → 502 Bad Gateway
-                        set_default_answer(stream, &mut self.readiness, 502, &answers);
-                    } else {
-                        // The backend closed without sending a response → 503 Service Unavailable
-                        // (matches kawa_h1: "Backend closed after consuming part of the request")
-                        set_default_answer(stream, &mut self.readiness, 503, &answers);
-                    }
+                    set_default_answer(stream, &mut self.readiness, status, &answers);
                 }
-                (false, false) => {
-                    // we do not have an answer, but the request is untouched so we can retry
+                EndStreamAction::Reconnect => {
                     debug!("H1 RECONNECT");
                     stream.state = StreamState::Link;
-                }
-                (false, true) => {
-                    error!("backend response in main phase but request not yet consumed");
                 }
             },
         }
