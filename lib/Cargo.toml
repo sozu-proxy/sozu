@@ -65,6 +65,10 @@ tiny_http = { workspace = true }
 name = "header_formatting"
 harness = false
 
+[[bench]]
+name = "h2_scheduling"
+harness = false
+
 [features]
 default = []
 # Exposes `#[cfg(any(test, feature = "e2e-hooks"))]` test-injection APIs in
