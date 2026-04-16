@@ -1045,6 +1045,7 @@ impl Display for HttpListenerConfig {
             &self.h2_max_rst_stream_lifetime,
             &self.h2_max_rst_stream_abusive_lifetime,
             &self.h2_max_header_list_size,
+            &self.h2_max_header_table_size,
         );
         add_h2_connection_rows(
             &mut table,
@@ -1104,6 +1105,7 @@ impl Display for HttpsListenerConfig {
             &self.h2_max_rst_stream_lifetime,
             &self.h2_max_rst_stream_abusive_lifetime,
             &self.h2_max_header_list_size,
+            &self.h2_max_header_table_size,
         );
         add_h2_connection_rows(
             &mut table,
@@ -1138,6 +1140,7 @@ fn add_h2_flood_rows(
     max_rst_stream_lifetime: &Option<u64>,
     max_rst_stream_abusive_lifetime: &Option<u64>,
     max_header_list_size: &Option<u32>,
+    max_header_table_size: &Option<u32>,
 ) {
     if let Some(v) = max_rst_stream {
         table.add_row(row!["h2 max rst_stream/window", v]);
@@ -1165,6 +1168,9 @@ fn add_h2_flood_rows(
     }
     if let Some(v) = max_header_list_size {
         table.add_row(row!["h2 max header list size", v]);
+    }
+    if let Some(v) = max_header_table_size {
+        table.add_row(row!["h2 max header table size", v]);
     }
 }
 
