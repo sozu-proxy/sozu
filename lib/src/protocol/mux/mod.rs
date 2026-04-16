@@ -17,6 +17,7 @@
 
 use std::{
     cell::RefCell,
+    collections::{HashMap, VecDeque},
     fmt::Debug,
     io::ErrorKind,
     net::{Shutdown, SocketAddr},
@@ -235,6 +236,13 @@ fn update_readiness_after_write(
 }
 pub struct Context<L: ListenerHandler + L7ListenerHandler> {
     pub streams: Vec<Stream>,
+    /// Streams whose state is `StreamState::Link` and need backend connection.
+    /// Replaces the O(n) scan of `streams` in the ready loop.
+    pub pending_links: VecDeque<GlobalStreamId>,
+    /// Reverse index: backend token -> global stream IDs currently in
+    /// `StreamState::Linked(token)`. Eliminates O(n) scans of `streams`
+    /// when handling backend connect/disconnect/timeout/close events.
+    pub backend_streams: HashMap<Token, Vec<GlobalStreamId>>,
     pub pool: Weak<RefCell<Pool>>,
     pub listener: Rc<RefCell<L>>,
     pub session_address: Option<SocketAddr>,
@@ -272,6 +280,8 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
         let strict_sni_binding = listener.borrow().get_strict_sni_binding();
         Self {
             streams: Vec::new(),
+            pending_links: VecDeque::new(),
+            backend_streams: HashMap::new(),
             pool,
             listener,
             session_address,
@@ -288,6 +298,31 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
             .iter()
             .filter(|s| !matches!(s.state, StreamState::Recycle))
             .count()
+    }
+
+    /// Register a stream as linked to a backend token in the reverse index.
+    pub fn link_stream(&mut self, stream_id: GlobalStreamId, token: Token) {
+        self.streams[stream_id].state = StreamState::Linked(token);
+        self.backend_streams
+            .entry(token)
+            .or_default()
+            .push(stream_id);
+    }
+
+    /// Remove a stream from the backend reverse index if it is currently
+    /// `Linked`. Returns the backend token if one was removed.
+    pub fn unlink_stream(&mut self, stream_id: GlobalStreamId) -> Option<Token> {
+        if let StreamState::Linked(token) = self.streams[stream_id].state {
+            if let Some(ids) = self.backend_streams.get_mut(&token) {
+                ids.retain(|&id| id != stream_id);
+                if ids.is_empty() {
+                    self.backend_streams.remove(&token);
+                }
+            }
+            Some(token)
+        } else {
+            None
+        }
     }
 
     pub fn create_stream(&mut self, request_id: Ulid, window: u32) -> Option<GlobalStreamId> {
@@ -811,78 +846,84 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             let context = &mut self.context;
             let answers_rc = context.listener.borrow().get_answers().clone();
             let mut dirty = false;
-            for stream_id in 0..context.streams.len() {
-                if context.streams[stream_id].state == StreamState::Link {
-                    // Before the first request triggers a stream Link, the frontend timeout is set
-                    // to a shorter request_timeout, here we switch to the longer nominal timeout
-                    self.frontend
-                        .timeout_container()
-                        .set_duration(self.configured_frontend_timeout);
-                    let front_readiness = self.frontend.readiness_mut();
-                    dirty = true;
-                    match self
-                        .router
-                        .connect(stream_id, context, session.clone(), proxy.clone())
-                    {
-                        Ok(_) => {
-                            let state = context.streams[stream_id].state;
-                            context.debug.push(DebugEvent::CC(stream_id, state));
-                        }
-                        Err(error) => {
-                            trace!("Connection error: {}", error);
-                            let stream = &mut context.streams[stream_id];
-                            let answers = answers_rc.borrow();
-                            use BackendConnectionError as BE;
-                            match error {
-                                BE::Backend(BackendError::NoBackendForCluster(_))
-                                | BE::MaxConnectionRetries(_)
-                                | BE::MaxSessionsMemory
-                                | BE::MaxBuffers => {
-                                    set_default_answer(stream, front_readiness, 503, &answers);
-                                }
-                                BE::RetrieveClusterError(
-                                    RetrieveClusterError::RetrieveFrontend(_),
-                                ) => {
-                                    set_default_answer(stream, front_readiness, 404, &answers);
-                                }
-                                BE::RetrieveClusterError(
-                                    RetrieveClusterError::UnauthorizedRoute,
-                                ) => {
-                                    set_default_answer(stream, front_readiness, 401, &answers);
-                                }
-                                BE::RetrieveClusterError(
-                                    RetrieveClusterError::SniAuthorityMismatch { .. },
-                                ) => {
-                                    // RFC 9110 §15.5.20: 421 Misdirected Request is the
-                                    // semantically correct status for an authority that
-                                    // does not belong to this TLS connection. The
-                                    // http.sni_authority_mismatch metric emitted in
-                                    // `route_from_request` remains the durable signal;
-                                    // the 421 body here is what a client sees and may
-                                    // retry on a fresh TLS connection with a matching SNI.
-                                    set_default_answer(stream, front_readiness, 421, &answers);
-                                }
-                                BE::RetrieveClusterError(RetrieveClusterError::HttpsRedirect) => {
-                                    set_default_answer(stream, front_readiness, 301, &answers);
-                                }
-
-                                BE::Backend(_) => {}
-                                BE::RetrieveClusterError(ref other) => {
-                                    error!("unexpected RetrieveClusterError variant: {:?}", other);
-                                    set_default_answer(stream, front_readiness, 503, &answers);
-                                }
-                                // TCP specific error
-                                BE::NotFound(ref msg) => {
-                                    error!(
-                                        "NotFound is TCP-specific, not reachable in mux: {:?}",
-                                        msg
-                                    );
-                                    set_default_answer(stream, front_readiness, 503, &answers);
-                                }
-                            }
-                            context.debug.push(DebugEvent::CCF(stream_id, error));
-                        }
+            while let Some(stream_id) = context.pending_links.pop_front() {
+                let Some(stream) = context.streams.get(stream_id) else {
+                    continue;
+                };
+                if stream.state != StreamState::Link {
+                    continue;
+                }
+                // Before the first request triggers a stream Link, the frontend timeout is set
+                // to a shorter request_timeout, here we switch to the longer nominal timeout
+                self.frontend
+                    .timeout_container()
+                    .set_duration(self.configured_frontend_timeout);
+                let front_readiness = self.frontend.readiness_mut();
+                dirty = true;
+                match self
+                    .router
+                    .connect(stream_id, context, session.clone(), proxy.clone())
+                {
+                    Ok(_) => {
+                        let state = context.streams[stream_id].state;
+                        context.debug.push(DebugEvent::CC(stream_id, state));
                     }
+                    Err(error) => {
+                        trace!("Connection error: {}", error);
+                        let stream = &mut context.streams[stream_id];
+                        let answers = answers_rc.borrow();
+                        use BackendConnectionError as BE;
+                        match error {
+                            BE::Backend(BackendError::NoBackendForCluster(_))
+                            | BE::MaxConnectionRetries(_)
+                            | BE::MaxSessionsMemory
+                            | BE::MaxBuffers => {
+                                set_default_answer(stream, front_readiness, 503, &answers);
+                            }
+                            BE::RetrieveClusterError(RetrieveClusterError::RetrieveFrontend(_)) => {
+                                set_default_answer(stream, front_readiness, 404, &answers);
+                            }
+                            BE::RetrieveClusterError(RetrieveClusterError::UnauthorizedRoute) => {
+                                set_default_answer(stream, front_readiness, 401, &answers);
+                            }
+                            BE::RetrieveClusterError(
+                                RetrieveClusterError::SniAuthorityMismatch { .. },
+                            ) => {
+                                // RFC 9110 §15.5.20: 421 Misdirected Request is the
+                                // semantically correct status for an authority that
+                                // does not belong to this TLS connection. The
+                                // http.sni_authority_mismatch metric emitted in
+                                // `route_from_request` remains the durable signal;
+                                // the 421 body here is what a client sees and may
+                                // retry on a fresh TLS connection with a matching SNI.
+                                set_default_answer(stream, front_readiness, 421, &answers);
+                            }
+                            BE::RetrieveClusterError(RetrieveClusterError::HttpsRedirect) => {
+                                set_default_answer(stream, front_readiness, 301, &answers);
+                            }
+
+                            BE::Backend(_) => {}
+                            BE::RetrieveClusterError(ref other) => {
+                                error!("unexpected RetrieveClusterError variant: {:?}", other);
+                                set_default_answer(stream, front_readiness, 503, &answers);
+                            }
+                            // TCP specific error
+                            BE::NotFound(ref msg) => {
+                                error!("NotFound is TCP-specific, not reachable in mux: {:?}", msg);
+                                set_default_answer(stream, front_readiness, 503, &answers);
+                            }
+                        }
+                        context.debug.push(DebugEvent::CCF(stream_id, error));
+                    }
+                }
+                // Re-enqueue if the stream is still in Link state (e.g. BE::Backend(_)
+                // does nothing, so the stream needs to be retried on the next outer pass)
+                if context
+                    .streams
+                    .get(stream_id)
+                    .is_some_and(|s| s.state == StreamState::Link)
+                {
+                    context.pending_links.push_back(stream_id);
                 }
             }
             if !dirty {

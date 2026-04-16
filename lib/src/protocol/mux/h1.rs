@@ -238,7 +238,8 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                 parts.metrics.service_start();
                 // Set request_counted after the last use of `parts` to satisfy the borrow checker
                 stream.request_counted = true;
-                stream.state = StreamState::Link
+                stream.state = StreamState::Link;
+                context.pending_links.push_back(stream_id);
             }
             if let StreamState::Linked(token) = stream.state {
                 endpoint
@@ -434,6 +435,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                                 stream.metrics.service_start();
                                 stream.request_counted = true;
                                 stream.state = StreamState::Link;
+                                context.pending_links.push_back(stream_id);
                             }
                             // else: incomplete parse, wait for more data via READABLE
                         }
@@ -561,7 +563,8 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             return;
         }
         let answers_rc = context.listener.borrow().get_answers().clone();
-        let stream = &mut context.streams[stream];
+        let stream_id = stream;
+        let stream = &mut context.streams[stream_id];
         let stream_context = &mut stream.context;
         trace!("end H1 stream {:?}: {:#?}", self.stream, stream_context);
         match &mut self.position {
@@ -618,6 +621,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                 EndStreamAction::Reconnect => {
                     debug!("H1 RECONNECT");
                     stream.state = StreamState::Link;
+                    context.pending_links.push_back(stream_id);
                 }
             },
         }
