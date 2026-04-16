@@ -1298,7 +1298,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         MuxResult::Continue
     }
 
-    pub fn readable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
+    pub fn readable<E, L>(&mut self, context: &mut Context<L>, mut endpoint: E) -> MuxResult
     where
         E: Endpoint,
         L: ListenerHandler + L7ListenerHandler,
@@ -1307,7 +1307,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // Pass 4 Medium #3: per-stream idle guard. Slow-multiplex Slowloris
         // sends one byte or a control frame per stream just often enough to
         // reset the connection-level timer; per-stream deadlines catch it.
-        self.cancel_timed_out_streams();
+        self.cancel_timed_out_streams(context, &mut endpoint);
 
         // RFC 9113 §6.5: check if peer has timed out on SETTINGS ACK
         if let Some(sent_at) = self.settings_sent_at {
@@ -2457,10 +2457,14 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// Per-stream deadlines guarantee each stream terminates within the configured
     /// window regardless of connection-level liveness.
     ///
-    /// Timed-out streams receive RST_STREAM(CANCEL). The outbound end-stream
-    /// bookkeeping (endpoint notification, metrics) flows through the normal
-    /// RST_STREAM serialization path in the writable() preamble.
-    pub fn cancel_timed_out_streams(&mut self) {
+    /// Timed-out streams receive RST_STREAM(CANCEL) and are immediately removed
+    /// from the streams map so they no longer count against MAX_CONCURRENT_STREAMS.
+    /// Backend endpoints are notified and metrics are finalized.
+    pub fn cancel_timed_out_streams<E, L>(&mut self, context: &mut Context<L>, endpoint: &mut E)
+    where
+        E: Endpoint,
+        L: ListenerHandler + L7ListenerHandler,
+    {
         if self.streams.is_empty() || self.stream_opened_at.is_empty() {
             return;
         }
@@ -2487,6 +2491,51 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             self.pending_rst_streams.push((sid, H2Error::Cancel));
             self.total_rst_streams_queued += 1;
             self.rst_sent.insert(sid);
+
+            // Remove from streams map and recycle the context stream so the slot
+            // no longer counts against MAX_CONCURRENT_STREAMS.
+            // Compute totals per-stream before remove (matches RST_STREAM handler).
+            let byte_totals = self.compute_stream_byte_totals(context);
+            if let Some(global_stream_id) = self.streams.remove(&sid) {
+                self.prioriser.remove(&sid);
+                self.stream_opened_at.remove(&sid);
+                {
+                    let stream = &mut context.streams[global_stream_id];
+                    self.attribute_bytes_to_stream(&mut stream.metrics);
+                }
+                // Check if stream is linked to a backend — borrow must be scoped
+                // so end_stream can take &mut context.
+                let linked_token = {
+                    let stream = &context.streams[global_stream_id];
+                    if let StreamState::Linked(token) = stream.state {
+                        Some(token)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(token) = linked_token {
+                    endpoint.end_stream(token, global_stream_id, context);
+                }
+                let stream = &mut context.streams[global_stream_id];
+                match &self.position {
+                    Position::Client(_, backend, BackendStatus::Connected) => {
+                        let mut backend_borrow = backend.borrow_mut();
+                        backend_borrow.active_requests =
+                            backend_borrow.active_requests.saturating_sub(1);
+                    }
+                    Position::Client(..) => {}
+                    Position::Server => {
+                        self.distribute_overhead(&mut stream.metrics, byte_totals);
+                        stream.metrics.backend_stop();
+                        stream.generate_access_log(
+                            true,
+                            Some("H2::IdleTimeout"),
+                            context.listener.clone(),
+                        );
+                        stream.state = StreamState::Recycle;
+                    }
+                }
+            }
         }
         self.readiness.interest.insert(Ready::WRITABLE);
         self.readiness.signal_pending_write();

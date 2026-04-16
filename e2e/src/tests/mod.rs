@@ -17,6 +17,7 @@
 
 mod fuzz_tests;
 mod h1_security_tests;
+mod h2_correctness_tests;
 mod h2_security_header_injection;
 mod h2_security_parser;
 mod h2_security_session;
