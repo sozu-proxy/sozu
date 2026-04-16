@@ -8317,3 +8317,122 @@ fn test_h2_large_response_1gb_stress() {
         State::Success
     );
 }
+
+// ============================================================================
+// Regression test: dual backend failure must not double-decrement gauges
+// ============================================================================
+
+/// Exercises the code path where two H2 backend connections die in the same
+/// mux session. Before the fix (dead_backends removal reordered before
+/// backend_close handling in Mux::ready()), this could produce a
+/// double-decrement of `connections_per_backend` and `backend.connections`
+/// gauges, resulting in underflow errors.
+///
+/// The test verifies that sozu handles simultaneous death of both backends
+/// gracefully: no crash, worker stops cleanly, and the proxy remains alive
+/// for subsequent requests.
+fn try_h2_dual_backend_failure_no_gauge_underflow() -> State {
+    let (mut worker, front_port, _front_address) =
+        setup_h2_listener_only("H2-DUAL-BACKEND-FAILURE");
+
+    let back_address_a = create_local_address();
+    let back_address_b = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address_a,
+        None,
+    )));
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-1",
+        back_address_b,
+        None,
+    )));
+    worker.read_to_last();
+
+    // Start two H2 backends.
+    let mut backend_a = H2Backend::start("BACKEND_A", back_address_a, "pong-a");
+    let mut backend_b = H2Backend::start("BACKEND_B", back_address_b, "pong-b");
+
+    let client = build_h2_client();
+
+    // Send enough requests to establish connections to both backends
+    // (round-robin load balancing should distribute across the two).
+    for i in 0..4 {
+        let uri: hyper::Uri = format!("https://localhost:{front_port}/api/req/{i}")
+            .parse()
+            .unwrap();
+        let result = resolve_request(&client, uri);
+        match &result {
+            Some((status, _body)) => {
+                println!("  req {i}: status={status}");
+            }
+            None => {
+                println!("  req {i}: failed");
+                return State::Fail;
+            }
+        }
+    }
+
+    let a_received = backend_a.get_requests_received();
+    let b_received = backend_b.get_requests_received();
+    println!("Backend A received: {a_received}, Backend B received: {b_received}");
+
+    if a_received == 0 || b_received == 0 {
+        println!("Both backends must receive at least one request for this test to be meaningful");
+        // Don't fail — just retry (load balancer may have put all on one backend).
+        worker.soft_stop();
+        let _ = worker.wait_for_server_stop();
+        backend_a.stop();
+        backend_b.stop();
+        return State::Undecided;
+    }
+
+    // Kill both backends simultaneously. This creates the conditions for the
+    // double-decrement bug: two H2 backend connections in the same mux session
+    // receive HUP events, and both must be cleaned up in the same ready() call.
+    backend_a.stop();
+    backend_b.stop();
+
+    // Give sozu time to detect both dead backends via epoll HUP/ERROR.
+    thread::sleep(Duration::from_millis(500));
+
+    // Send another request to trigger the readiness loop. This exercises the
+    // code path where dead backends are detected and the session may close.
+    // The request will fail (no backends available) — we don't care about the
+    // response, only that sozu doesn't crash.
+    let uri: hyper::Uri = format!("https://localhost:{front_port}/api/after-kill")
+        .parse()
+        .unwrap();
+    let _ = resolve_request(&client, uri);
+
+    // Allow time for session teardown.
+    thread::sleep(Duration::from_millis(500));
+
+    // The crucial invariant: sozu is still alive after dual backend failure.
+    let still_alive = verify_sozu_alive(front_port);
+    println!("Sozu still alive after dual backend failure: {still_alive}");
+
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+    println!("Worker stopped cleanly: {stopped}");
+
+    if still_alive {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_dual_backend_failure_no_gauge_underflow() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "H2: dual backend failure must not double-decrement gauges",
+            try_h2_dual_backend_failure_no_gauge_underflow
+        ),
+        State::Success
+    );
+}

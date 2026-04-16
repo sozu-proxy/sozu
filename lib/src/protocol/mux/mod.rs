@@ -708,16 +708,12 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                         all_backends_readiness_are_empty = false;
                     }
                 }
-                if let Some((reason, token)) = backend_close {
-                    if !self.delay_close_for_frontend_flush(reason) {
-                        debug!(
-                            "Mux close from {} token={:?}: frontend={:?}",
-                            reason, token, self.frontend
-                        );
-                        return SessionResult::Close;
-                    }
-                    all_backends_readiness_are_empty = false;
-                }
+                // Remove dead backends from the map BEFORE handling
+                // backend_close. client.close() already decremented
+                // connections_per_backend / backend.connections gauges in
+                // the loop above; if we return SessionResult::Close before
+                // removing them, Mux::close() would decrement again
+                // (double-decrement → gauge underflow).
                 if !dead_backends.is_empty() {
                     for token in &dead_backends {
                         let proxy_borrow = proxy.borrow();
@@ -744,6 +740,16 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                     }
                     trace!("FRONTEND: {:#?}", self.frontend);
                     trace!("BACKENDS: {:#?}", self.router.backends);
+                }
+                if let Some((reason, token)) = backend_close {
+                    if !self.delay_close_for_frontend_flush(reason) {
+                        debug!(
+                            "Mux close from {} token={:?}: frontend={:?}",
+                            reason, token, self.frontend
+                        );
+                        return SessionResult::Close;
+                    }
+                    all_backends_readiness_are_empty = false;
                 }
 
                 if self.frontend.readiness().filter_interest().is_writable() {
