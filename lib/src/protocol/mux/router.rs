@@ -190,7 +190,7 @@ impl Router {
                     stream.metrics.backend_connected();
                 }
             }
-            context.streams[stream_id].state = StreamState::Linked(token);
+            context.link_stream(stream_id, token);
             return Ok(());
         }
 
@@ -297,7 +297,7 @@ impl Router {
             token
         };
 
-        context.streams[stream_id].state = StreamState::Linked(token);
+        context.link_stream(stream_id, token);
         Ok(())
     }
 

@@ -313,12 +313,7 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
     /// `Linked`. Returns the backend token if one was removed.
     pub fn unlink_stream(&mut self, stream_id: GlobalStreamId) -> Option<Token> {
         if let StreamState::Linked(token) = self.streams[stream_id].state {
-            if let Some(ids) = self.backend_streams.get_mut(&token) {
-                ids.retain(|&id| id != stream_id);
-                if ids.is_empty() {
-                    self.backend_streams.remove(&token);
-                }
-            }
+            remove_backend_stream(&mut self.backend_streams, token, stream_id);
             Some(token)
         } else {
             None
@@ -392,6 +387,22 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
             .is_some_and(|s| s.state == StreamState::Recycle)
         {
             self.streams.pop();
+        }
+    }
+}
+
+/// Remove `stream_id` from the backend-token reverse index for `token`.
+/// Free function to allow split borrows when `context.streams` is already
+/// mutably borrowed (preventing a `Context::unlink_stream` call).
+pub(super) fn remove_backend_stream(
+    index: &mut HashMap<Token, Vec<GlobalStreamId>>,
+    token: Token,
+    stream_id: GlobalStreamId,
+) {
+    if let Some(ids) = index.get_mut(&token) {
+        ids.retain(|&id| id != stream_id);
+        if ids.is_empty() {
+            index.remove(&token);
         }
     }
 }
@@ -607,13 +618,10 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                 backend_borrow.set_connection_time(start.elapsed());
                                 backend_borrow.retry_policy.succeed();
 
-                                for stream in &mut self.context.streams {
-                                    match stream.state {
-                                        StreamState::Linked(back_token) if back_token == *token => {
-                                            stream.metrics.backend_connected();
-                                            backend_borrow.active_requests += 1;
-                                        }
-                                        _ => {}
+                                if let Some(ids) = self.context.backend_streams.get(token) {
+                                    for &stream_id in ids {
+                                        self.context.streams[stream_id].metrics.backend_connected();
+                                        backend_borrow.active_requests += 1;
                                     }
                                 }
                                 trace!("connection success: {:#?}", backend_borrow);
@@ -721,15 +729,13 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                             }
                             Position::Client(_, backend, _) => {
                                 let mut backend_borrow = backend.borrow_mut();
-                                for stream in &mut self.context.streams {
-                                    match stream.state {
-                                        StreamState::Linked(back_token) if back_token == *token => {
-                                            backend_borrow.active_requests =
-                                                backend_borrow.active_requests.saturating_sub(1);
-                                        }
-                                        _ => {}
-                                    }
-                                }
+                                let count = self
+                                    .context
+                                    .backend_streams
+                                    .get(token)
+                                    .map_or(0, |ids| ids.len());
+                                backend_borrow.active_requests =
+                                    backend_borrow.active_requests.saturating_sub(count);
                             }
                             Position::Server => {
                                 error!("dead backend cannot be in Server position");
@@ -939,6 +945,38 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             }
         }
 
+        #[cfg(debug_assertions)]
+        {
+            // Verify backend_streams index matches actual stream states.
+            let mut expected: HashMap<Token, Vec<GlobalStreamId>> = HashMap::new();
+            for (id, stream) in self.context.streams.iter().enumerate() {
+                if let StreamState::Linked(token) = stream.state {
+                    expected.entry(token).or_default().push(id);
+                }
+            }
+            assert_eq!(
+                expected.len(),
+                self.context.backend_streams.len(),
+                "backend_streams index key count mismatch: expected={:?}, actual={:?}",
+                expected,
+                self.context.backend_streams
+            );
+            for (token, mut expected_ids) in expected {
+                let mut actual_ids = self
+                    .context
+                    .backend_streams
+                    .get(&token)
+                    .cloned()
+                    .unwrap_or_default();
+                expected_ids.sort();
+                actual_ids.sort();
+                assert_eq!(
+                    expected_ids, actual_ids,
+                    "backend_streams index mismatch for token {token:?}",
+                );
+            }
+        }
+
         SessionResult::Continue
     }
 
@@ -965,14 +1003,15 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             trace!("MuxState::timeout_frontend({:#?})", self.frontend);
             self.frontend.timeout_container().triggered();
             let front_readiness = self.frontend.readiness_mut();
-            for stream in &mut self.context.streams {
-                match stream.state {
+            for stream_id in 0..self.context.streams.len() {
+                match self.context.streams[stream_id].state {
                     StreamState::Idle => {
                         // In h1 an Idle stream is always the first request, so we can send a 408
                         // In h2 an Idle stream doesn't necessarily hold a request yet,
                         // in most cases it was just reserved, so we can just ignore them.
                         if !front_is_h2 {
                             let answers = answers_rc.borrow();
+                            let stream = &mut self.context.streams[stream_id];
                             set_default_answer(stream, front_readiness, 408, &answers);
                             should_write = true;
                         }
@@ -981,6 +1020,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                         // This is an unusual case, as we have both a complete request and no
                         // available backend yet. For now, we answer with 503
                         let answers = answers_rc.borrow();
+                        let stream = &mut self.context.streams[stream_id];
                         set_default_answer(stream, front_readiness, 503, &answers);
                         should_write = true;
                     }
@@ -988,18 +1028,24 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                         // The frontend timed out while a stream is linked to a backend.
                         // The backend timeout should handle this, but in case the backend
                         // is also stalled, send a 504 and terminate the stream.
-                        if !stream.back.consumed {
+                        if !self.context.streams[stream_id].back.consumed {
+                            self.context.unlink_stream(stream_id);
                             let answers = answers_rc.borrow();
+                            let stream = &mut self.context.streams[stream_id];
                             set_default_answer(stream, front_readiness, 504, &answers);
                             should_write = true;
-                        } else if stream.back.is_completed() {
+                        } else if self.context.streams[stream_id].back.is_completed() {
                             // Response fully proxied, stream can be closed
-                        } else if stream.back.is_terminated() || stream.back.is_error() {
+                        } else if self.context.streams[stream_id].back.is_terminated()
+                            || self.context.streams[stream_id].back.is_error()
+                        {
                             // Response is terminated/error but not fully written to frontend.
                             // Keep the session alive briefly to flush remaining data.
                             should_close = false;
                         } else {
                             // Partial response in progress — forcefully terminate
+                            self.context.unlink_stream(stream_id);
+                            let stream = &mut self.context.streams[stream_id];
                             forcefully_terminate_answer(
                                 stream,
                                 front_readiness,
@@ -1014,7 +1060,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                         // A stream Unlinked already has a response and its backend closed.
                         // In case it hasn't finished proxying we wait. Otherwise it is a stream
                         // kept alive for a new request, which can be killed.
-                        if !stream.back.is_completed() {
+                        if !self.context.streams[stream_id].back.is_completed() {
                             should_close = false;
                         }
                     }
@@ -1048,37 +1094,37 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             trace!("MuxState::timeout_backend({:#?})", backend);
             backend.timeout_container().triggered();
             let front_readiness = self.frontend.readiness_mut();
-            for stream_id in 0..self.context.streams.len() {
-                let stream = &mut self.context.streams[stream_id];
-                if let StreamState::Linked(back_token) = stream.state {
-                    if token == back_token {
-                        // This stream is linked to the backend that timedout
-                        if stream.back.is_terminated() || stream.back.is_error() {
-                            trace!(
-                                "Stream terminated or in error, do nothing, just wait a bit more"
-                            );
-                            // Nothing to do, simply wait for the remaining bytes to be proxied
-                            if !stream.back.is_completed() {
-                                should_close = false;
-                            }
-                        } else if !stream.back.consumed {
-                            // The response has not started yet
-                            trace!("Stream still waiting for response, send 504");
-                            let answers = answers_rc.borrow();
-                            set_default_answer(stream, front_readiness, 504, &answers);
-                            should_write = true;
-                        } else {
-                            trace!("Stream waiting for end of response, forcefully terminate it");
-                            forcefully_terminate_answer(
-                                stream,
-                                front_readiness,
-                                H2Error::InternalError,
-                            );
-                            should_write = true;
-                        }
-                        backend.end_stream(stream_id, &mut self.context);
+            let linked_ids: Vec<GlobalStreamId> = self
+                .context
+                .backend_streams
+                .get(&token)
+                .map_or_else(Vec::new, |ids| ids.to_owned());
+            for stream_id in linked_ids {
+                // This stream is linked to the backend that timedout
+                if self.context.streams[stream_id].back.is_terminated()
+                    || self.context.streams[stream_id].back.is_error()
+                {
+                    trace!("Stream terminated or in error, do nothing, just wait a bit more");
+                    // Nothing to do, simply wait for the remaining bytes to be proxied
+                    if !self.context.streams[stream_id].back.is_completed() {
+                        should_close = false;
                     }
+                } else if !self.context.streams[stream_id].back.consumed {
+                    // The response has not started yet
+                    trace!("Stream still waiting for response, send 504");
+                    self.context.unlink_stream(stream_id);
+                    let answers = answers_rc.borrow();
+                    let stream = &mut self.context.streams[stream_id];
+                    set_default_answer(stream, front_readiness, 504, &answers);
+                    should_write = true;
+                } else {
+                    trace!("Stream waiting for end of response, forcefully terminate it");
+                    self.context.unlink_stream(stream_id);
+                    let stream = &mut self.context.streams[stream_id];
+                    forcefully_terminate_answer(stream, front_readiness, H2Error::InternalError);
+                    should_write = true;
                 }
+                backend.end_stream(stream_id, &mut self.context);
             }
             // Re-arm the backend timeout if the session stays alive (draining streams).
             // Without this, the timeout is consumed and the session becomes immortal
@@ -1255,6 +1301,8 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 stream.state = StreamState::Recycle;
             }
         }
+        // Session teardown: all streams recycled, clear the reverse index.
+        self.context.backend_streams.clear();
 
         self.frontend
             .close(&mut self.context, EndpointClient(&mut self.router));
@@ -1286,15 +1334,13 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                         Some(cluster_id),
                         Some(&backend_borrow.backend_id)
                     );
-                    for stream in &mut self.context.streams {
-                        match stream.state {
-                            StreamState::Linked(back_token) if back_token == *token => {
-                                backend_borrow.active_requests =
-                                    backend_borrow.active_requests.saturating_sub(1);
-                            }
-                            _ => {}
-                        }
-                    }
+                    let count = self
+                        .context
+                        .backend_streams
+                        .get(token)
+                        .map_or(0, |ids| ids.len());
+                    backend_borrow.active_requests =
+                        backend_borrow.active_requests.saturating_sub(count);
                     trace!("connection (session) closed: {:#?}", backend_borrow);
                 }
                 Position::Server => {
