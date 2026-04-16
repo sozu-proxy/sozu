@@ -19,8 +19,46 @@ use crate::{
 
 /// Returns true if the header name contains any uppercase ASCII letter (A-Z).
 /// RFC 9113 section 8.2 requires all header field names to be lowercase in HTTP/2.
+#[cfg(test)]
 fn has_uppercase_ascii(name: &[u8]) -> bool {
     name.iter().any(|b| b.is_ascii_uppercase())
+}
+
+/// Returns true if the byte is a valid HTTP token character (tchar per RFC 9110 §5.6.2).
+/// ```text
+/// tchar = "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-" / "." /
+///         DIGIT / "^" / "_" / "`" / ALPHA / "|" / "~"
+/// ```
+fn is_tchar(b: u8) -> bool {
+    matches!(
+        b,
+        b'!' | b'#'
+            | b'$'
+            | b'%'
+            | b'&'
+            | b'\''
+            | b'*'
+            | b'+'
+            | b'-'
+            | b'.'
+            | b'0'..=b'9'
+            | b'A'..=b'Z'
+            | b'^'
+            | b'_'
+            | b'`'
+            | b'a'..=b'z'
+            | b'|'
+            | b'~'
+    )
+}
+
+/// Returns true if the header name contains any byte that is not a valid
+/// lowercase HTTP token character. In HTTP/2, field names must be lowercase
+/// tokens (RFC 9113 §8.2, RFC 9110 §5.6.2). Non-token bytes — CTLs (`\r\n`),
+/// space, and separators like `:` — flow verbatim through H1 serialization
+/// and enable request smuggling (CWE-93, CWE-444).
+fn has_invalid_name_byte(name: &[u8]) -> bool {
+    name.iter().any(|&b| b.is_ascii_uppercase() || !is_tchar(b))
 }
 
 /// Returns true if the header name is a connection-specific header field
@@ -78,13 +116,17 @@ fn has_invalid_value_byte(value: &[u8]) -> bool {
 }
 
 /// Returns true if the header violates HTTP/2 field requirements (RFC 9113 §8.2):
-/// - uppercase ASCII characters in the name
+/// - empty name
+/// - non-token or uppercase bytes in the name (CTLs, separators, space — CWE-93)
 /// - connection-specific header fields (RFC 9113 §8.2.2)
 /// - TE header with a value other than "trailers"
 /// - field value containing NUL, CR, LF, DEL or other C0 controls (RFC 9110 §5.5)
 fn is_invalid_h2_header(name: &[u8], value: &[u8]) -> bool {
     name.is_empty()
-        || has_uppercase_ascii(name)
+        // Pseudo-header names (`:method`, etc.) are validated by the caller
+        // against the known set; unknown pseudo-headers are rejected there.
+        // Only regular header names need lowercase-token validation.
+        || (name[0] != b':' && has_invalid_name_byte(name))
         || is_connection_specific_header(name)
         || (compare_no_case(name, b"te") && is_invalid_te_value(value))
         || has_invalid_value_byte(value)
@@ -314,11 +356,14 @@ where
                 max_decoded_bytes,
                 |k, v, invalid_headers| {
                     if compare_no_case(&k, b":method") {
-                        // RFC 9110 §9: method is a token (non-empty). The
-                        // token-char check is enforced by has_invalid_value_byte
-                        // plus the absence of SP / delimiters in valid tokens;
-                        // CTLs — the smuggling vector — are rejected by
-                        // store_pseudo_header.
+                        // RFC 9110 §9: method = token. Validate every byte is
+                        // a tchar — spaces, delimiters, and CTLs in the method
+                        // reach the H1 request line and can smuggle extra path
+                        // segments or headers to backends.
+                        if !v.iter().all(|&b| is_tchar(b)) {
+                            *invalid_headers = true;
+                            return;
+                        }
                         match store_pseudo_header(&method, regular_headers, kawa, &v) {
                             Some(s) => method = s,
                             None => *invalid_headers = true,
@@ -635,14 +680,12 @@ pub fn handle_trailer(
             invalid_trailers = true;
             return;
         }
-        // RFC 9113 §8.2: reject uppercase header names in HTTP/2
-        if has_uppercase_ascii(&k) {
-            invalid_trailers = true;
-            return;
-        }
-        // RFC 9110 §5.5: reject NUL, CR, LF, DEL, and other C0 controls in
-        // trailer field values — same smuggling vector as the main header path.
-        if has_invalid_value_byte(&v) {
+        // Reuse the same validation policy as the main header path: reject
+        // invalid name bytes (CTLs, separators, uppercase), connection-specific
+        // fields (RFC 9113 §8.2.2), invalid TE values, and forbidden value
+        // bytes (RFC 9110 §5.5). Without this, crafted trailer names can
+        // smuggle H1 lines through kawa's serializer.
+        if is_invalid_h2_header(&k, &v) {
             invalid_trailers = true;
             return;
         }
