@@ -276,45 +276,69 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                 let sent_end_stream = if end_header {
                     let payload = std::mem::take(&mut self.out);
                     let mut header = [0; parser::FRAME_HEADER_SIZE];
-                    let chunks = payload.chunks(self.max_frame_size);
-                    let n_chunks = chunks.len();
-                    for (i, chunk) in chunks.enumerate() {
-                        let mut flags = 0u8;
-                        if i == 0 && end_stream {
+                    if payload.is_empty() {
+                        false
+                    } else if payload.len() <= self.max_frame_size {
+                        let mut flags = parser::FLAG_END_HEADERS;
+                        if end_stream {
                             flags |= parser::FLAG_END_STREAM;
                         }
-                        if i + 1 == n_chunks {
-                            flags |= parser::FLAG_END_HEADERS;
-                        }
-                        if i == 0 {
-                            if let Err(e) = gen_frame_header(
-                                &mut header,
-                                &FrameHeader {
-                                    payload_len: chunk.len() as u32,
-                                    frame_type: FrameType::Headers,
-                                    flags,
-                                    stream_id: self.stream_id,
-                                },
-                            ) {
-                                error!("failed to serialize HEADERS frame header: {:?}", e);
-                                return false;
-                            }
-                        } else if let Err(e) = gen_frame_header(
+                        if let Err(e) = gen_frame_header(
                             &mut header,
                             &FrameHeader {
-                                payload_len: chunk.len() as u32,
-                                frame_type: FrameType::Continuation,
+                                payload_len: payload.len() as u32,
+                                frame_type: FrameType::Headers,
                                 flags,
                                 stream_id: self.stream_id,
                             },
                         ) {
-                            error!("failed to serialize CONTINUATION frame header: {:?}", e);
+                            error!("failed to serialize HEADERS frame header: {:?}", e);
                             return false;
                         }
                         kawa.push_out(Store::from_slice(&header));
-                        kawa.push_out(Store::from_slice(chunk));
+                        kawa.push_out(Store::from_vec(payload));
+                        true
+                    } else {
+                        let chunks = payload.chunks(self.max_frame_size);
+                        let n_chunks = chunks.len();
+                        for (i, chunk) in chunks.enumerate() {
+                            let mut flags = 0u8;
+                            if i == 0 && end_stream {
+                                flags |= parser::FLAG_END_STREAM;
+                            }
+                            if i + 1 == n_chunks {
+                                flags |= parser::FLAG_END_HEADERS;
+                            }
+                            if i == 0 {
+                                if let Err(e) = gen_frame_header(
+                                    &mut header,
+                                    &FrameHeader {
+                                        payload_len: chunk.len() as u32,
+                                        frame_type: FrameType::Headers,
+                                        flags,
+                                        stream_id: self.stream_id,
+                                    },
+                                ) {
+                                    error!("failed to serialize HEADERS frame header: {:?}", e);
+                                    return false;
+                                }
+                            } else if let Err(e) = gen_frame_header(
+                                &mut header,
+                                &FrameHeader {
+                                    payload_len: chunk.len() as u32,
+                                    frame_type: FrameType::Continuation,
+                                    flags,
+                                    stream_id: self.stream_id,
+                                },
+                            ) {
+                                error!("failed to serialize CONTINUATION frame header: {:?}", e);
+                                return false;
+                            }
+                            kawa.push_out(Store::from_slice(&header));
+                            kawa.push_out(Store::from_slice(chunk));
+                        }
+                        true
                     }
-                    n_chunks > 0
                 } else {
                     false
                 };
