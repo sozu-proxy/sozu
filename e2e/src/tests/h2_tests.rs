@@ -25,10 +25,11 @@ use std::{
 
 use super::h2_utils::{
     H2_ERROR_ENHANCE_YOUR_CALM, H2_ERROR_FLOW_CONTROL_ERROR, H2_ERROR_FRAME_SIZE_ERROR,
-    H2_ERROR_REFUSED_STREAM, H2_FRAME_GOAWAY, H2Frame, collect_response_frames, contains_goaway,
-    contains_goaway_with_error, contains_rst_stream, extract_rst_streams, goaway_error_code,
-    h2_handshake, log_frames, parse_h2_frames, raw_h2_connection, read_all_available,
-    setup_h2_listener_only, setup_h2_test, verify_sozu_alive,
+    H2_ERROR_REFUSED_STREAM, H2_FLAG_END_STREAM, H2_FRAME_GOAWAY, H2Frame, collect_response_frames,
+    contains_goaway, contains_goaway_with_error, contains_rst_stream, extract_rst_streams,
+    goaway_error_code, h2_handshake, log_frames, parse_h2_frames, raw_h2_connection,
+    raw_h2_connection_with_sni, read_all_available, setup_h2_listener_only, setup_h2_test,
+    verify_sozu_alive,
 };
 use crate::{
     mock::{
@@ -71,6 +72,36 @@ struct DisconnectingBackend {
     stop: Arc<AtomicBool>,
     requests_received: Arc<AtomicUsize>,
     thread: Option<thread::JoinHandle<()>>,
+}
+
+fn minimal_h2_get_headers(authority: &str) -> Vec<u8> {
+    let mut block = vec![
+        0x82, // :method GET
+        0x84, // :path /
+        0x87, // :scheme https
+        0x41, // :authority literal with static name index 1
+        authority.len() as u8,
+    ];
+    block.extend_from_slice(authority.as_bytes());
+    block
+}
+
+fn h2_headers_status_matches(frames: &[(u8, u8, u32, Vec<u8>)], code: &[u8]) -> bool {
+    frames.iter().any(|(ft, _flags, _sid, payload)| {
+        *ft == 0x1 && payload.windows(code.len()).any(|window| window == code)
+    })
+}
+
+fn h2_payload_matches(frames: &[(u8, u8, u32, Vec<u8>)], needle: &[u8]) -> bool {
+    frames
+        .iter()
+        .any(|(_ft, _flags, _sid, payload)| payload.windows(needle.len()).any(|w| w == needle))
+}
+
+fn h2_stream_has_end_stream(frames: &[(u8, u8, u32, Vec<u8>)], stream_id: u32) -> bool {
+    frames
+        .iter()
+        .any(|(_ft, flags, sid, _payload)| *sid == stream_id && (*flags & H2_FLAG_END_STREAM) != 0)
 }
 
 impl DisconnectingBackend {
@@ -5886,6 +5917,60 @@ fn test_h2_custom_error_page_rendering() {
             5,
             "H2: custom 503 error page rendering when no backend available",
             try_h2_custom_error_page_rendering
+        ),
+        State::Success
+    );
+}
+
+fn try_h2_default_answer_terminates_stream() -> State {
+    let (mut worker, front_port, _front_address) =
+        setup_h2_listener_only("H2-DEFAULT-ANSWER-END-STREAM");
+    worker.read_to_last();
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection_with_sni(front_addr, "unknown.example");
+    h2_handshake(&mut tls);
+    tls.sock
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .expect("set read timeout");
+
+    let headers = H2Frame::headers(1, minimal_h2_get_headers("unknown.example"), true, true);
+    tls.write_all(&headers.encode()).unwrap();
+    tls.flush().unwrap();
+
+    let frames = collect_response_frames(&mut tls, 100, 4, 50);
+    log_frames("H2 default answer end stream", &frames);
+
+    let got_404 = h2_headers_status_matches(&frames, b"404")
+        || h2_payload_matches(&frames, br#""status_code": 404"#);
+    let got_end_stream = h2_stream_has_end_stream(&frames, 1);
+    let got_goaway = contains_goaway(&frames);
+
+    drop(tls);
+    thread::sleep(Duration::from_millis(200));
+    let still_alive = verify_sozu_alive(front_port);
+
+    worker.soft_stop();
+    let success = worker.wait_for_server_stop();
+
+    if success && still_alive && got_404 && got_end_stream && got_goaway {
+        State::Success
+    } else {
+        println!(
+            "H2 default answer end stream - success={success}, alive={still_alive}, \
+             got_404={got_404}, got_end_stream={got_end_stream}, got_goaway={got_goaway}"
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_default_answer_terminates_stream() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "H2: default answer terminates response stream and drains connection",
+            try_h2_default_answer_terminates_stream
         ),
         State::Success
     );

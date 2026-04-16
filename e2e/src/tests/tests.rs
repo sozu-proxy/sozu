@@ -1,4 +1,5 @@
 use std::{
+    io::{ErrorKind, Read},
     net::SocketAddr,
     thread,
     time::{Duration, Instant},
@@ -63,6 +64,19 @@ fn receive_with_deadline(client: &mut Client, timeout: Duration) -> Option<Strin
             return None;
         }
         thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn assert_client_eof(client: &mut Client) {
+    let stream = client.stream.as_mut().expect("client should be connected");
+    let mut buf = [0; 1];
+    match stream.read(&mut buf) {
+        Ok(0) => {}
+        Ok(n) => panic!("expected frontend connection to close, read {n} byte(s) instead"),
+        Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+            panic!("expected frontend connection to close, read timed out")
+        }
+        Err(e) => panic!("expected frontend connection to close, got read error: {e}"),
     }
 }
 
@@ -1543,6 +1557,45 @@ fn try_http_behaviors() -> State {
     State::Success
 }
 
+fn try_builtin_404_default_answer_closes_connection() -> State {
+    let front_address: SocketAddr = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_http_config(front_address);
+    let mut worker = Worker::start_new_worker_owned("DEFAULT-404-WORKER", config, listeners, state);
+
+    let http_config = ListenerBuilder::new_http(front_address.into())
+        .to_http(None)
+        .unwrap();
+
+    worker.send_proxy_request_type(RequestType::AddHttpListener(http_config));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        address: front_address.into(),
+        proxy: ListenerType::Http.into(),
+        from_scm: false,
+    }));
+    worker.read_to_last();
+
+    let mut client = Client::new(
+        "client",
+        front_address,
+        http_request("GET", "/", "ping", "unknown.example"),
+    );
+    client.connect();
+    client.send();
+
+    let response = receive_with_deadline(&mut client, Duration::from_millis(500))
+        .expect("client should receive built-in 404 default answer");
+    println!("response: {response:?}");
+    assert!(response.starts_with("HTTP/1.1 404 Not Found\r\n"));
+    assert!(response.contains("<h1>404 Not Found</h1>"));
+    assert_client_eof(&mut client);
+
+    worker.hard_stop();
+    let success = worker.wait_for_server_stop();
+
+    if success { State::Success } else { State::Fail }
+}
+
 fn try_https_redirect() -> State {
     let front_address: SocketAddr = create_local_address();
 
@@ -2362,6 +2415,18 @@ fn test_tls_endpoint() {
 fn test_http_behaviors() {
     assert_eq!(
         repeat_until_error_or(10, "HTTP stack", try_http_behaviors),
+        State::Success
+    );
+}
+
+#[test]
+fn test_builtin_404_default_answer_closes_connection() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "HTTP: built-in 404 default answer closes connection",
+            try_builtin_404_default_answer_closes_connection
+        ),
         State::Success
     );
 }
