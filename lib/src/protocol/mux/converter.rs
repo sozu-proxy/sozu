@@ -25,6 +25,8 @@ pub struct H2BlockConverter<'a> {
     pub scheme: &'static [u8],
     /// Reusable buffer for lowercasing header keys, avoiding per-header allocation.
     pub lowercase_buf: Vec<u8>,
+    /// Reusable buffer for assembling cookie values, avoiding per-cookie allocation.
+    pub cookie_buf: Vec<u8>,
 }
 
 impl H2BlockConverter<'_> {
@@ -150,10 +152,13 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                     .drain(..)
                     .filter(|cookie| !cookie.is_elided())
                 {
-                    let cookie = [cookie.key.data(buffer), b"=", cookie.val.data(buffer)].concat();
+                    self.cookie_buf.clear();
+                    self.cookie_buf.extend_from_slice(cookie.key.data(buffer));
+                    self.cookie_buf.push(b'=');
+                    self.cookie_buf.extend_from_slice(cookie.val.data(buffer));
                     if let Err(e) = self
                         .encoder
-                        .encode_header_into((b"cookie", &cookie), &mut self.out)
+                        .encode_header_into((b"cookie", &self.cookie_buf), &mut self.out)
                     {
                         error!("HPACK encoding of cookie header failed: {:?}", e);
                         return false;
