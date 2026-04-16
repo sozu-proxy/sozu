@@ -610,6 +610,10 @@ impl L7ListenerHandler for HttpListener {
                 .config
                 .h2_max_header_list_size
                 .unwrap_or(defaults.max_header_list_size),
+            max_header_table_size: self
+                .config
+                .h2_max_header_table_size
+                .unwrap_or(defaults.max_header_table_size),
         }
     }
 

@@ -171,6 +171,10 @@ message HttpListenerConfig {
     // connection idle timer) while pinning up to `h2_max_concurrent_streams`
     // streams for the full nominal connection timeout. Default: 30.
     optional uint32 h2_stream_idle_timeout_seconds = 25;
+    // Maximum HPACK dynamic table size (SETTINGS_HEADER_TABLE_SIZE) accepted
+    // from the peer. Caps the peer-advertised value to prevent unbounded
+    // HPACK encoder memory growth. Default: 65536.
+    optional uint32 h2_max_header_table_size = 26;
 }
 
 // details of an HTTPS listener
@@ -259,6 +263,10 @@ message HttpsListenerConfig {
     // connection idle timer) while pinning up to `h2_max_concurrent_streams`
     // streams for the full nominal connection timeout. Default: 30.
     optional uint32 h2_stream_idle_timeout_seconds = 37;
+    // Maximum HPACK dynamic table size (SETTINGS_HEADER_TABLE_SIZE) accepted
+    // from the peer. Caps the peer-advertised value to prevent unbounded
+    // HPACK encoder memory growth. Default: 65536.
+    optional uint32 h2_max_header_table_size = 38;
 }
 
 // details of an TCP listener
