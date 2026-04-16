@@ -908,7 +908,10 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                 set_default_answer(stream, front_readiness, 301, &answers);
                             }
 
-                            BE::Backend(_) => {}
+                            BE::Backend(ref e) => {
+                                error!("backend connection error: {}", e);
+                                set_default_answer(stream, front_readiness, 503, &answers);
+                            }
                             BE::RetrieveClusterError(ref other) => {
                                 error!("unexpected RetrieveClusterError variant: {:?}", other);
                                 set_default_answer(stream, front_readiness, 503, &answers);
@@ -922,15 +925,8 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                         context.debug.push(DebugEvent::CCF(stream_id, error));
                     }
                 }
-                // Re-enqueue if the stream is still in Link state (e.g. BE::Backend(_)
-                // does nothing, so the stream needs to be retried on the next outer pass)
-                if context
-                    .streams
-                    .get(stream_id)
-                    .is_some_and(|s| s.state == StreamState::Link)
-                {
-                    context.pending_links.push_back(stream_id);
-                }
+                // All routing error arms now set a default answer, transitioning
+                // the stream out of Link state. No re-enqueue needed.
             }
             if !dirty {
                 break;
