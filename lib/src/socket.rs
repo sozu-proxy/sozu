@@ -476,11 +476,9 @@ impl SocketHandler for FrontRustls {
             }
 
             // rustls's Writer does not expose a "write from offset across slices"
-            // helper, so we only push plaintext on the first pass. Subsequent
-            // iterations only drain write_tls; the top-of-loop
-            // `buffered_size == total_len` guard lets us exit when rustls fully
-            // absorbed the slices, otherwise we rely on !can_write from
-            // write_tls to break out on backpressure.
+            // helper, so we push plaintext once and then drain via write_tls.
+            // If rustls only partially absorbs the slices, we break and return
+            // the partial count so the caller can advance its buffers and retry.
             if buffered_size == 0 {
                 match self.session.writer().write_vectored(bufs) {
                     Ok(0) => {}
@@ -505,6 +503,40 @@ impl SocketHandler for FrontRustls {
                         }
                     },
                 }
+            }
+
+            // Plaintext was partially absorbed — we cannot re-call write_vectored
+            // because the IoSlice pointers have not been advanced. Drain whatever
+            // rustls buffered to the socket, then return the partial count so the
+            // caller can consume and retry with adjusted slices.
+            if buffered_size > 0 && buffered_size < total_len {
+                loop {
+                    match self.session.write_tls(&mut self.stream) {
+                        Ok(0) => break,
+                        Ok(_) => {}
+                        Err(e) => match e.kind() {
+                            ErrorKind::WouldBlock => {
+                                can_write = false;
+                                break;
+                            }
+                            ErrorKind::ConnectionReset
+                            | ErrorKind::ConnectionAborted
+                            | ErrorKind::BrokenPipe => {
+                                incr!("rustls.write.error");
+                                is_closed = true;
+                                self.peer_reset = true;
+                                break;
+                            }
+                            _ => {
+                                error!("could not write TLS stream to socket: {:?}", e);
+                                incr!("rustls.write.error");
+                                is_error = true;
+                                break;
+                            }
+                        },
+                    }
+                }
+                break;
             }
 
             loop {
