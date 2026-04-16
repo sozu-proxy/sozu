@@ -305,8 +305,9 @@ an excessive number of certain frame types within a rolling window, Sozu termina
 the connection with a `GOAWAY(ENHANCE_YOUR_CALM)` frame. This protects against
 several known HTTP/2 denial-of-service vectors.
 
-Six thresholds are configurable per-listener. When omitted, compile-time defaults
-are used:
+Six per-window thresholds are configurable per-listener. When omitted, compile-time
+defaults are used (see also [RST_STREAM lifetime caps](#h2-rst_stream-lifetime-caps)
+for connection-lifetime counters):
 
 | Parameter | Default | Protects against | CVE |
 |-----------|---------|-----------------|-----|
@@ -340,7 +341,7 @@ h2_max_glitch_count = 100             # Cumulative protocol violations
 
 #### H2 connection tuning
 
-Three additional H2 parameters control connection-level behavior. All are optional
+Additional H2 parameters control connection-level behavior. All are optional
 per-listener with safe compile-time defaults:
 
 | Parameter | Default | Description |
@@ -348,6 +349,9 @@ per-listener with safe compile-time defaults:
 | `h2_initial_connection_window` | 1048576 (1MB) | Connection-level receive window size in bytes (RFC 9113 §6.9.2). Clamped to [65535, 2^31-1]. |
 | `h2_max_concurrent_streams` | 100 | Maximum concurrent H2 streams the proxy accepts (`SETTINGS_MAX_CONCURRENT_STREAMS`). Minimum: 1. |
 | `h2_stream_shrink_ratio` | 2 | Shrink threshold ratio for recycled stream slots. The internal stream Vec is shrunk when `total_slots > active_streams * ratio`. Minimum: 2. |
+| `h2_max_header_list_size` | 65536 | Maximum accumulated HPACK-decoded header list size per request (`SETTINGS_MAX_HEADER_LIST_SIZE`, RFC 9113 §6.5.2). |
+| `h2_stream_idle_timeout_seconds` | 30 | Per-stream idle timeout in seconds. An open H2 stream that makes no forward progress for this duration is cancelled (`RST_STREAM` / `CANCEL`) to defend against slow-multiplex Slowloris. |
+| `h2_max_header_table_size` | 65536 | Maximum HPACK dynamic table size (`SETTINGS_HEADER_TABLE_SIZE`) accepted from the peer. Caps the peer-advertised value to prevent unbounded HPACK encoder memory growth. |
 
 _Configuration example:_
 
@@ -360,6 +364,50 @@ protocol = "https"
 h2_initial_connection_window = 1048576  # 1MB, min 65535, max 2147483647
 h2_max_concurrent_streams = 100         # min 1
 h2_stream_shrink_ratio = 2              # min 2
+h2_max_header_list_size = 65536         # HPACK decoded header budget
+h2_stream_idle_timeout_seconds = 30     # per-stream idle timeout
+h2_max_header_table_size = 65536        # HPACK dynamic table size cap
+```
+
+#### H2 RST_STREAM lifetime caps
+
+In addition to the per-window `h2_max_rst_stream_per_window` threshold, two lifetime
+counters limit the total number of RST_STREAM frames a single connection may receive.
+These provide a second line of defense against Rapid Reset attacks (CVE-2023-44487)
+that stay just below the per-window threshold.
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `h2_max_rst_stream_lifetime` | 10000 | Absolute lifetime cap on RST_STREAM frames per connection. |
+| `h2_max_rst_stream_abusive_lifetime` | 50 | Lifetime cap on "abusive" RST_STREAM frames (resets sent before a response starts — the Rapid Reset signature). |
+
+_Configuration example:_
+
+```toml
+[[listeners]]
+address = "0.0.0.0:443"
+protocol = "https"
+
+h2_max_rst_stream_lifetime = 10000
+h2_max_rst_stream_abusive_lifetime = 50
+```
+
+#### Security and protocol settings
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `strict_sni_binding` | true | Every HTTP request must have its `:authority` / `Host` exact-match the TLS SNI negotiated at handshake (CWE-346 / CWE-444). Applies to HTTPS listeners only; plaintext listeners never have an SNI to compare against. |
+| `disable_http11` | false | Only accept HTTP/2 connections; clients that do not negotiate `h2` via TLS ALPN (including those that omit ALPN entirely) are dropped at handshake instead of silently downgrading to HTTP/1.1. |
+
+_Configuration example:_
+
+```toml
+[[listeners]]
+address = "0.0.0.0:443"
+protocol = "https"
+
+strict_sni_binding = true   # reject host/SNI mismatch (default)
+disable_http11 = false      # allow HTTP/1.1 fallback (default)
 ```
 
 ## Metrics

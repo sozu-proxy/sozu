@@ -315,6 +315,10 @@ pub struct ListenerBuilder {
     /// size per request (SETTINGS_MAX_HEADER_LIST_SIZE, RFC 9113 §6.5.2).
     /// Default: 65536.
     pub h2_max_header_list_size: Option<u32>,
+    /// Maximum HPACK dynamic table size (SETTINGS_HEADER_TABLE_SIZE) accepted
+    /// from the peer. Caps the value the peer advertises in SETTINGS frames to
+    /// prevent unbounded HPACK encoder memory growth. Default: 65536.
+    pub h2_max_header_table_size: Option<u32>,
     /// Per-stream idle timeout, in seconds. An open H2 stream that makes no
     /// forward progress for this duration is cancelled (RST_STREAM / CANCEL)
     /// to defend against slow-multiplex Slowloris. Default: 30.
@@ -399,6 +403,7 @@ impl ListenerBuilder {
             h2_max_rst_stream_lifetime: None,
             h2_max_rst_stream_abusive_lifetime: None,
             h2_max_header_list_size: None,
+            h2_max_header_table_size: None,
             h2_stream_idle_timeout_seconds: None,
             strict_sni_binding: None,
             disable_http11: None,
@@ -571,6 +576,7 @@ impl ListenerBuilder {
             h2_max_rst_stream_lifetime: self.h2_max_rst_stream_lifetime,
             h2_max_rst_stream_abusive_lifetime: self.h2_max_rst_stream_abusive_lifetime,
             h2_max_header_list_size: self.h2_max_header_list_size,
+            h2_max_header_table_size: self.h2_max_header_table_size,
             h2_stream_idle_timeout_seconds: self.h2_stream_idle_timeout_seconds,
             ..Default::default()
         };
@@ -711,6 +717,7 @@ impl ListenerBuilder {
             h2_max_rst_stream_lifetime: self.h2_max_rst_stream_lifetime,
             h2_max_rst_stream_abusive_lifetime: self.h2_max_rst_stream_abusive_lifetime,
             h2_max_header_list_size: self.h2_max_header_list_size,
+            h2_max_header_table_size: self.h2_max_header_table_size,
             strict_sni_binding: self.strict_sni_binding,
             disable_http11: self.disable_http11,
             h2_stream_idle_timeout_seconds: self.h2_stream_idle_timeout_seconds,
