@@ -1297,8 +1297,6 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 stream.state = StreamState::Recycle;
             }
         }
-        // Session teardown: all streams recycled, clear the reverse index.
-        self.context.backend_streams.clear();
 
         self.frontend
             .close(&mut self.context, EndpointClient(&mut self.router));
@@ -1344,6 +1342,9 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 }
             }
         }
+        // Clear the reverse index after all backends have decremented their
+        // active_requests counters (which depend on the index for stream counts).
+        self.context.backend_streams.clear();
     }
 
     fn shutting_down(&mut self) -> SessionIsToBeClosed {

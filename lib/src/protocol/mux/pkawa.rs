@@ -603,6 +603,24 @@ where
     callbacks.on_headers(kawa);
 
     if end_stream {
+        // RFC 9113 §8.1.1: when END_STREAM is set on HEADERS, no DATA frames
+        // follow, so the payload length is 0. A non-zero Content-Length is a
+        // stream error (PROTOCOL_ERROR). Body-exempt responses (1xx, 204, 304)
+        // are excluded — they may carry Content-Length per RFC 9110 §8.6.
+        if let BodySize::Length(n) = kawa.body_size {
+            let body_exempt = matches!(kawa.kind, Kind::Response)
+                && matches!(
+                    kawa.detached.status_line,
+                    StatusLine::Response { code, .. } if (100..200).contains(&code) || code == 204 || code == 304
+                );
+            if n > 0 && !body_exempt {
+                error!(
+                    "END_STREAM with non-zero Content-Length: {} (RFC 9113 §8.1.1)",
+                    n
+                );
+                return Err((H2Error::ProtocolError, false));
+            }
+        }
         if let BodySize::Empty = kawa.body_size {
             // RFC 9110 §8.6: Do not inject Content-Length: 0 for responses where
             // message body is forbidden (1xx, 204, 304). Only inject for requests
