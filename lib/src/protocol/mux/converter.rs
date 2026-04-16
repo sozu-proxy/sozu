@@ -388,6 +388,7 @@ mod tests {
             out: Vec::new(),
             scheme: b"https",
             lowercase_buf: Vec::new(),
+            cookie_buf: Vec::new(),
         }
     }
 
