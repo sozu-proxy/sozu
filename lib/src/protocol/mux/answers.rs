@@ -87,6 +87,28 @@ fn copy_default_answer_to_stream(
     kawa.body_size = rendered.body_size;
 }
 
+fn ensure_default_answer_end_stream(kawa: &mut GenericHttpStream) {
+    let has_end_stream = kawa.blocks.iter().any(|block| {
+        matches!(
+            block,
+            kawa::Block::Flags(kawa::Flags {
+                end_stream: true,
+                ..
+            })
+        )
+    });
+
+    if !has_end_stream {
+        kawa.push_block(kawa::Block::Flags(kawa::Flags {
+            end_body: false,
+            end_chunk: false,
+            end_header: false,
+            end_stream: true,
+        }));
+    }
+    kawa.parsing_phase = kawa::ParsingPhase::Terminated;
+}
+
 /// Build a `DefaultAnswer` variant for the given status code with placeholder fields.
 ///
 /// The mux layer does not have HTTP/1.1 parse state, so error-detail fields
@@ -181,6 +203,7 @@ pub(crate) fn set_default_answer(
 
     let rendered = answers.get(answer, request_id, cluster_id, backend_id, route);
     copy_default_answer_to_stream(rendered, kawa);
+    ensure_default_answer_end_stream(kawa);
 
     context.status = Some(code);
     stream.state = StreamState::Unlinked;

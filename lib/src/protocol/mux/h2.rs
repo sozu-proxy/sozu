@@ -1704,6 +1704,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 && kawa.is_completed()
                 && !Self::handle_1xx_reset(kawa, stream_state, &mut endpoint)
             {
+                let close_frontend =
+                    matches!(self.position, Position::Server) && !parts.context.keep_alive_frontend;
                 if let Some((dead_id, token)) = Self::try_recycle_server_stream(
                     &self.position,
                     &mut self.bytes,
@@ -1715,7 +1717,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     &mut context.debug,
                     context.listener.clone(),
                 ) {
-                    completed_streams.push((dead_id, global_stream_id, token));
+                    completed_streams.push((dead_id, global_stream_id, token, close_frontend));
                 }
             }
         }
@@ -1727,15 +1729,24 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         self.converter_buf = converter_out;
         self.lowercase_buf = lowercase_buf;
         self.shrink_converter_buffers();
-        for (dead_id, global_stream_id, token) in completed_streams {
+        let mut close_frontend_after_completed_stream = false;
+        for (dead_id, global_stream_id, token, close_frontend) in completed_streams {
             // The main write loop borrows self.encoder, so we can't mutate the
             // H2 maps inline. Retire the recycled stream immediately after the
             // converter borrow ends, before endpoint.end_stream() can trigger
             // teardown and observe a stale `Recycle` entry in self.streams.
             self.remove_dead_stream(dead_id);
+            close_frontend_after_completed_stream |= close_frontend;
             if let Some(token) = token {
                 endpoint.end_stream(token, global_stream_id, context);
             }
+        }
+        if close_frontend_after_completed_stream && !self.drain.draining {
+            return if self.streams.is_empty() {
+                self.goaway(H2Error::NoError)
+            } else {
+                self.graceful_goaway()
+            };
         }
         self.finalize_write(socket_write, context)
     }
