@@ -1795,12 +1795,12 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     kawa::OutBlock::Delimiter => break,
                     kawa::OutBlock::Store(store) => {
                         let data = store.data(buffer);
-                        // SAFETY: the IoSlice references are used only for the
-                        // socket_write_vectored call below and cleared at the
-                        // top of each iteration. The backing kawa storage
-                        // buffer outlives this entire function call, and
-                        // consume() only pops entries from `kawa.out` without
-                        // invalidating the underlying storage.
+                        // SAFETY: the IoSlice references point into kawa's
+                        // storage buffer. They are used only for the
+                        // socket_write_vectored call below and cleared
+                        // immediately after, before kawa.consume() which may
+                        // relocate the buffer via ptr::copy (shift). No
+                        // dangling 'static refs exist during consume().
                         let data: &'static [u8] =
                             unsafe { std::slice::from_raw_parts(data.as_ptr(), data.len()) };
                         io_slices.push(IoSlice::new(data));
@@ -1808,6 +1808,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 }
             }
             let (size, status) = socket.socket_write_vectored(io_slices);
+            io_slices.clear();
             debug.push(DebugEvent::SocketIO(debug_site, global_stream_id, size));
             kawa.consume(size);
             position.count_bytes_out_counter(size);
