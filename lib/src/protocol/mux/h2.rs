@@ -734,6 +734,8 @@ pub struct ConnectionH2<Front: SocketHandler> {
     pub converter_buf: Vec<u8>,
     /// Reusable buffer for lowercasing header keys in the H2 block converter.
     pub lowercase_buf: Vec<u8>,
+    /// Reusable buffer for assembling cookie values in the H2 block converter.
+    pub cookie_buf: Vec<u8>,
     /// Connection draining state for graceful shutdown.
     pub drain: H2DrainState,
     pub zero: GenericHttpStream,
@@ -892,6 +894,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             highest_peer_stream_id: 0,
             converter_buf: Vec::new(),
             lowercase_buf: Vec::new(),
+            cookie_buf: Vec::new(),
             drain: H2DrainState {
                 draining: false,
                 peer_last_stream_id: None,
@@ -1632,6 +1635,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             out: converter_buf,
             scheme,
             lowercase_buf: std::mem::take(&mut self.lowercase_buf),
+            cookie_buf: std::mem::take(&mut self.cookie_buf),
         };
         self.priorities_buf.clear();
         self.priorities_buf.extend(self.streams.keys().copied());
@@ -1725,9 +1729,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // since the converter borrows self.encoder.
         let converter_out = std::mem::take(&mut converter.out);
         let lowercase_buf = std::mem::take(&mut converter.lowercase_buf);
+        let cookie_buf = std::mem::take(&mut converter.cookie_buf);
         drop(converter);
         self.converter_buf = converter_out;
         self.lowercase_buf = lowercase_buf;
+        self.cookie_buf = cookie_buf;
         self.shrink_converter_buffers();
         let mut close_frontend_after_completed_stream = false;
         for (dead_id, global_stream_id, token, close_frontend) in completed_streams {
@@ -1873,6 +1879,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         }
         if self.lowercase_buf.capacity() > 16_384 {
             self.lowercase_buf.shrink_to(4096);
+        }
+        if self.cookie_buf.capacity() > 16_384 {
+            self.cookie_buf.shrink_to(4096);
         }
     }
 
