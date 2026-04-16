@@ -1,7 +1,7 @@
 use std::{
     cmp::min,
     collections::{HashMap, HashSet},
-    io::Write as _,
+    io::{IoSlice, Write as _},
     time::Instant,
 };
 
@@ -1554,6 +1554,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         self.timeout_container.reset();
         // Pre-compute byte totals for proportional overhead distribution.
         let byte_totals = self.compute_stream_byte_totals(context);
+        let mut io_slices: Vec<IoSlice<'static>> = Vec::new();
 
         if let Some(
             write_stream @ H2StreamId::Other {
@@ -1584,6 +1585,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 global_stream_id,
                 None,
                 cross_read_amount,
+                &mut io_slices,
             );
             if outcome == FlushOutcome::Stalled {
                 return MuxResult::Continue;
@@ -1700,6 +1702,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 global_stream_id,
                 Some(&mut socket_write),
                 None,
+                &mut io_slices,
             );
             if outcome == FlushOutcome::Stalled {
                 self.expect_write = Some(H2StreamId::Other {
@@ -1779,13 +1782,32 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         global_stream_id: GlobalStreamId,
         mut wrote: Option<&mut bool>,
         cross_read_amount: Option<usize>,
+        io_slices: &mut Vec<IoSlice<'static>>,
     ) -> FlushOutcome {
         while !kawa.out.is_empty() {
             if let Some(flag) = wrote.as_deref_mut() {
                 *flag = true;
             }
-            let bufs = kawa.as_io_slice();
-            let (size, status) = socket.socket_write_vectored(&bufs);
+            io_slices.clear();
+            let buffer = kawa.storage.buffer();
+            for block in kawa.out.iter() {
+                match block {
+                    kawa::OutBlock::Delimiter => break,
+                    kawa::OutBlock::Store(store) => {
+                        let data = store.data(buffer);
+                        // SAFETY: the IoSlice references are used only for the
+                        // socket_write_vectored call below and cleared at the
+                        // top of each iteration. The backing kawa storage
+                        // buffer outlives this entire function call, and
+                        // consume() only pops entries from `kawa.out` without
+                        // invalidating the underlying storage.
+                        let data: &'static [u8] =
+                            unsafe { std::slice::from_raw_parts(data.as_ptr(), data.len()) };
+                        io_slices.push(IoSlice::new(data));
+                    }
+                }
+            }
+            let (size, status) = socket.socket_write_vectored(io_slices);
             debug.push(DebugEvent::SocketIO(debug_site, global_stream_id, size));
             kawa.consume(size);
             position.count_bytes_out_counter(size);

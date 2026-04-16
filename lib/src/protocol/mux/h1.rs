@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::{io::IoSlice, time::Instant};
 
 use sozu_command::ready::Ready;
 
@@ -300,16 +300,24 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         let parts = stream.split(&self.position);
         let kawa = parts.wbuffer;
         kawa.prepare(&mut kawa::h1::BlockConverter);
-        let bufs = kawa.as_io_slice();
+        let mut io_slices = Vec::new();
+        for block in kawa.out.iter() {
+            match block {
+                kawa::OutBlock::Delimiter => break,
+                kawa::OutBlock::Store(store) => {
+                    io_slices.push(IoSlice::new(store.data(kawa.storage.buffer())));
+                }
+            }
+        }
         let can_finalize_server_close = matches!(self.position, Position::Server)
             && kawa.is_terminated()
             && kawa.is_completed();
-        if bufs.is_empty() && !self.socket.socket_wants_write() && !can_finalize_server_close {
+        if io_slices.is_empty() && !self.socket.socket_wants_write() && !can_finalize_server_close {
             self.readiness.interest.remove(Ready::WRITABLE);
             return MuxResult::Continue;
         }
-        let tls_only_flush = bufs.is_empty();
-        let (size, status) = self.socket.socket_write_vectored(&bufs);
+        let tls_only_flush = io_slices.is_empty();
+        let (size, status) = self.socket.socket_write_vectored(&io_slices);
         context.debug.push(DebugEvent::StreamEvent(1, size));
         kawa.consume(size);
         self.position.count_bytes_out_counter(size);
