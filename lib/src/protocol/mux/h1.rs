@@ -8,7 +8,7 @@ use crate::{
         BackendStatus, Context, DebugEvent, Endpoint, GlobalStreamId, MuxResult, Position,
         StreamState, forcefully_terminate_answer,
         parser::H2Error,
-        set_default_answer,
+        remove_backend_stream, set_default_answer,
         shared::{EndStreamAction, drain_tls_close_notify, end_stream_decision},
         update_readiness_after_read, update_readiness_after_write,
     },
@@ -395,6 +395,9 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                     );
                     stream.metrics.reset();
                     let old_state = std::mem::replace(&mut stream.state, StreamState::Unlinked);
+                    if let StreamState::Linked(token) = old_state {
+                        remove_backend_stream(&mut context.backend_streams, token, stream_id);
+                    }
                     if stream.context.keep_alive_frontend {
                         self.timeout_container.reset();
                         if let StreamState::Linked(token) = old_state {
@@ -562,6 +565,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             );
             return;
         }
+        context.unlink_stream(stream);
         let answers_rc = context.listener.borrow().get_answers().clone();
         let stream_id = stream;
         let stream = &mut context.streams[stream_id];

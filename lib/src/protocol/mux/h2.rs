@@ -23,7 +23,7 @@ use crate::{
         GlobalStreamId, MuxResult, Position, StreamId, StreamState, converter,
         forcefully_terminate_answer,
         parser::{self, Frame, FrameHeader, FrameType, H2Error, Headers, WindowUpdate},
-        pkawa, serializer, set_default_answer,
+        pkawa, remove_backend_stream, serializer, set_default_answer,
         shared::{EndStreamAction, drain_tls_close_notify, end_stream_decision},
         update_readiness_after_read, update_readiness_after_write,
     },
@@ -1611,6 +1611,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     // if it still had an active H2 stream.
                     self.remove_dead_stream(dead_id);
                     if let Some(token) = token {
+                        remove_backend_stream(
+                            &mut context.backend_streams,
+                            token,
+                            global_stream_id,
+                        );
                         endpoint.end_stream(token, global_stream_id, context);
                     }
                 }
@@ -1744,6 +1749,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             self.remove_dead_stream(dead_id);
             close_frontend_after_completed_stream |= close_frontend;
             if let Some(token) = token {
+                remove_backend_stream(&mut context.backend_streams, token, global_stream_id);
                 endpoint.end_stream(token, global_stream_id, context);
             }
         }
@@ -3408,6 +3414,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             }
         }
         for (stream_id, global_stream_id) in &retry_streams {
+            // Remove from reverse index before transitioning away from Linked.
+            if let StreamState::Linked(token) = context.streams[*global_stream_id].state {
+                remove_backend_stream(&mut context.backend_streams, token, *global_stream_id);
+            }
             let stream = &mut context.streams[*global_stream_id];
             if stream.front.consumed {
                 // Request was already sent to this backend — we can't
@@ -3726,6 +3736,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     {
         // Compute totals before taking mutable borrows on the target stream.
         let reset_byte_totals = self.compute_stream_byte_totals(context);
+        context.unlink_stream(stream_id);
         let stream = &mut context.streams[stream_id];
         trace!("reset H2 stream {}: {:#?}", stream_id, stream.context);
         let old_state = std::mem::replace(&mut stream.state, StreamState::Unlinked);
@@ -3750,6 +3761,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     where
         L: ListenerHandler + L7ListenerHandler,
     {
+        context.unlink_stream(stream_gid);
         let stream_context = &mut context.streams[stream_gid].context;
         trace!("end H2 stream {}: {:#?}", stream_gid, stream_context);
         match self.position {
