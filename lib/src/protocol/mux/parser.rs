@@ -733,7 +733,11 @@ pub fn window_update_frame<'a>(
     input: &'a [u8],
     header: &FrameHeader,
 ) -> IResult<&'a [u8], Frame, ParserError<'a>> {
-    let (i, increment) = be_u32(input)?;
+    // Scope input to payload_len like other fixed-size parsers (rst_stream_frame,
+    // ping_frame). The caller enforces payload_len == 4; the take() ensures a
+    // future relaxation doesn't desynchronize the frame stream.
+    let (i, data) = take(header.payload_len)(input)?;
+    let (_, increment) = be_u32(data)?;
     let increment = increment & STREAM_ID_MASK;
 
     // NOTE: zero-increment validation is intentionally NOT performed here.

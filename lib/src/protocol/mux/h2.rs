@@ -97,6 +97,10 @@ const DEFAULT_MAX_EMPTY_DATA_PER_WINDOW: u32 = 100;
 const DEFAULT_MAX_CONTINUATION_FRAMES: u32 = 20;
 /// Maximum accumulated header block size across CONTINUATION frames (64KB)
 pub(super) const MAX_HEADER_LIST_SIZE: usize = 65536;
+/// Default maximum HPACK dynamic table size (SETTINGS_HEADER_TABLE_SIZE)
+/// accepted from the peer. 64 KB is well above the RFC default of 4 KB
+/// while preventing a malicious peer from advertising up to 4 GB.
+const DEFAULT_MAX_HEADER_TABLE_SIZE: u32 = 65536;
 /// Duration of the sliding window for rate-based flood counters
 const FLOOD_WINDOW_DURATION: std::time::Duration = std::time::Duration::from_secs(1);
 /// Default maximum general anomaly count before triggering ENHANCE_YOUR_CALM
@@ -139,6 +143,10 @@ pub struct H2FloodConfig {
     /// Maximum accumulated HPACK-decoded header list size per request
     /// (SETTINGS_MAX_HEADER_LIST_SIZE, RFC 9113 §6.5.2).
     pub max_header_list_size: u32,
+    /// Maximum HPACK dynamic table size (SETTINGS_HEADER_TABLE_SIZE) accepted
+    /// from the peer. Caps the value the peer advertises in SETTINGS frames to
+    /// prevent unbounded HPACK encoder memory growth.
+    pub max_header_table_size: u32,
 }
 
 impl Default for H2FloodConfig {
@@ -153,6 +161,7 @@ impl Default for H2FloodConfig {
             max_rst_stream_lifetime: DEFAULT_MAX_RST_STREAM_LIFETIME,
             max_rst_stream_abusive_lifetime: DEFAULT_MAX_RST_STREAM_ABUSIVE_LIFETIME,
             max_header_list_size: MAX_HEADER_LIST_SIZE as u32,
+            max_header_table_size: DEFAULT_MAX_HEADER_TABLE_SIZE,
         }
     }
 }
@@ -171,6 +180,7 @@ impl H2FloodConfig {
         max_rst_stream_lifetime: u64,
         max_rst_stream_abusive_lifetime: u64,
         max_header_list_size: u32,
+        max_header_table_size: u32,
     ) -> Self {
         Self {
             max_rst_stream_per_window: max_rst_stream_per_window.max(1),
@@ -182,6 +192,7 @@ impl H2FloodConfig {
             max_rst_stream_lifetime: max_rst_stream_lifetime.max(1),
             max_rst_stream_abusive_lifetime: max_rst_stream_abusive_lifetime.max(1),
             max_header_list_size: max_header_list_size.max(1),
+            max_header_table_size: max_header_table_size.max(1),
         }
     }
 }
@@ -3299,9 +3310,12 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             #[rustfmt::skip]
             match setting.identifier {
                 parser::SETTINGS_HEADER_TABLE_SIZE => {
-                    self.peer_settings.settings_header_table_size = v;
-                    // Propagate peer's table size to our HPACK encoder
-                    self.encoder.set_max_table_size(v as usize);
+                    // Cap to the configured maximum — a malicious peer can
+                    // advertise up to 4 GB to inflate HPACK encoder memory.
+                    let cap = self.flood_detector.config.max_header_table_size;
+                    let capped = v.min(cap);
+                    self.peer_settings.settings_header_table_size = capped;
+                    self.encoder.set_max_table_size(capped as usize);
                 },
                 parser::SETTINGS_ENABLE_PUSH       => { self.peer_settings.settings_enable_push = v == 1;             is_error |= v > 1 },
                 parser::SETTINGS_MAX_CONCURRENT_STREAMS => { self.peer_settings.settings_max_concurrent_streams = v },
@@ -3525,7 +3539,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             }
         }
 
-        let increment = increment as i32;
+        // The parser masks the reserved bit (STREAM_ID_MASK), so increment <=
+        // 2^31-1 and try_from always succeeds. Use try_from rather than `as` to
+        // guard against a future parser change that drops the mask.
+        let increment = i32::try_from(increment).unwrap_or(i32::MAX);
         if stream_id == 0 {
             self.attribute_bytes_to_overhead();
             if let Some(window) = self.flow_control.window.checked_add(increment) {
