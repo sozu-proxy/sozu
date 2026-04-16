@@ -67,6 +67,8 @@ pub(crate) const H2_FLAG_END_HEADERS: u8 = 0x4;
 // H2 error codes (RFC 9113 Section 7)
 // ============================================================================
 
+/// NO_ERROR (0x0)
+pub(crate) const H2_ERROR_NO_ERROR: u32 = 0x0;
 /// PROTOCOL_ERROR (0x1)
 pub(crate) const H2_ERROR_PROTOCOL_ERROR: u32 = 0x1;
 /// FLOW_CONTROL_ERROR (0x3)
@@ -779,7 +781,19 @@ pub(crate) fn assert_settings_ack_received(frames: &[(u8, u8, u32, Vec<u8>)]) {
 /// Check if the response contains a GOAWAY or RST_STREAM indicating a
 /// protocol-level rejection.
 pub(crate) fn rejected_with_goaway_or_rst(frames: &[(u8, u8, u32, Vec<u8>)]) -> bool {
-    contains_goaway(frames) || contains_rst_stream(frames)
+    contains_rst_stream(frames)
+        || frames.iter().any(|(t, _, _, payload)| {
+            if *t != H2_FRAME_GOAWAY {
+                return false;
+            }
+
+            if payload.len() < 8 {
+                return true;
+            }
+
+            u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]])
+                != H2_ERROR_NO_ERROR
+        })
 }
 
 /// Check if frames contain a HEADERS response (type 0x1) on any stream.
