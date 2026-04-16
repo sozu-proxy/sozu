@@ -3080,6 +3080,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             stream.metrics.service_start();
             stream.request_counted = true;
             stream.state = StreamState::Link;
+            context.pending_links.push_back(global_stream_id);
         }
         MuxResult::Continue
     }
@@ -3427,6 +3428,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 }
             } else {
                 stream.state = StreamState::Link;
+                context.pending_links.push_back(*global_stream_id);
             }
             self.streams.remove(stream_id);
             self.prioriser.remove(stream_id);
@@ -3849,7 +3851,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         context
                             .debug
                             .push(DebugEvent::Str(format!("Retry {stream_gid}")));
-                        stream.state = StreamState::Link
+                        stream.state = StreamState::Link;
+                        context.pending_links.push_back(stream_gid);
                     }
                 }
             }
