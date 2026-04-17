@@ -304,20 +304,22 @@ impl HttpsSession {
             incr!(rustls_ciphersuite_str(cipher));
         };
 
+        gauge_add!("protocol.tls.handshake", -1);
+
+        let session_ulid = rusty_ulid::Ulid::generate();
         let front_stream = FrontRustls {
             stream: handshake.stream,
             session: handshake.session,
             peer_disconnected: false,
             peer_reset: false,
+            session_ulid,
         };
-
-        gauge_add!("protocol.tls.handshake", -1);
-
         let router = mux::Router::new(
             self.configured_backend_timeout,
             self.configured_connect_timeout,
         );
         let mut context = mux::Context::new(
+            session_ulid,
             self.pool.clone(),
             self.listener.clone(),
             self.peer_address,
@@ -331,7 +333,11 @@ impl HttpsSession {
             AlpnProtocol::Http11 => {
                 incr!("http.alpn.http11");
                 context.create_stream(handshake.request_id, 1 << 16)?;
-                mux::Connection::new_h1_server(front_stream, handshake.container_frontend_timeout)
+                mux::Connection::new_h1_server(
+                    session_ulid,
+                    front_stream,
+                    handshake.container_frontend_timeout,
+                )
             }
             AlpnProtocol::H2 => {
                 incr!("http.alpn.h2");
@@ -339,6 +345,7 @@ impl HttpsSession {
                 let connection_config = self.listener.borrow().get_h2_connection_config();
                 let stream_idle_timeout = self.listener.borrow().get_h2_stream_idle_timeout();
                 mux::Connection::new_h2_server(
+                    session_ulid,
                     front_stream,
                     self.pool.clone(),
                     handshake.container_frontend_timeout,
@@ -368,7 +375,7 @@ impl HttpsSession {
             frontend,
             context,
             router,
-            session_ulid: rusty_ulid::Ulid::generate(),
+            session_ulid,
         }))
     }
 
@@ -432,6 +439,9 @@ impl HttpsSession {
         container_backend_timeout.reset();
 
         let backend_id = backend.borrow().backend_id.clone();
+        // Unwrap the `SessionTcpStream` that the mux put around every backend
+        // TCP socket — `Pipe::backend_socket` is typed `Option<TcpStream>`.
+        let backend_socket = backend_socket.stream;
         let mut pipe = Pipe::new(
             stream.back.storage.buffer,
             Some(backend_id),
@@ -445,6 +455,7 @@ impl HttpsSession {
             frontend_socket,
             self.listener.clone(),
             Protocol::HTTPS,
+            stream.context.session_id,
             stream.context.id,
             stream.context.session_address,
             ws_context,

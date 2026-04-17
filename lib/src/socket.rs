@@ -5,6 +5,7 @@ use std::{
 
 use mio::net::{TcpListener, TcpStream};
 use rustls::{ProtocolVersion, ServerConnection};
+use rusty_ulid::Ulid;
 use socket2::{Domain, Protocol, Socket, Type};
 use sozu_command::config::MAX_LOOP_ITERATIONS;
 
@@ -58,95 +59,160 @@ pub trait SocketHandler {
     fn protocol(&self) -> TransportProtocol;
     fn read_error(&self);
     fn write_error(&self);
+    /// Returns the owning connection's session ULID when known. Used by error
+    /// paths in the SocketHandler implementation to emit the
+    /// `[<session_ulid> - - -]` prefix expected by the rest of the mux stack.
+    /// Returns `None` for contextless implementations (e.g. raw `mio::TcpStream`).
+    fn session_ulid(&self) -> Option<Ulid> {
+        None
+    }
 }
 
-impl SocketHandler for TcpStream {
-    fn socket_read(&mut self, buf: &mut [u8]) -> (usize, SocketResult) {
-        let mut size = 0usize;
-        let mut counter = 0;
-        loop {
-            counter += 1;
-            if counter > MAX_LOOP_ITERATIONS {
-                error!("MAX_LOOP_ITERATION reached in TcpStream::socket_read");
-                incr!("socket.read.infinite_loop.error");
-                return (size, SocketResult::Error);
-            }
-            if size == buf.len() {
-                return (size, SocketResult::Continue);
-            }
-            match self.read(&mut buf[size..]) {
-                Ok(0) => return (size, SocketResult::Closed),
-                Ok(sz) => size += sz,
-                Err(e) => match e.kind() {
-                    ErrorKind::WouldBlock => return (size, SocketResult::WouldBlock),
-                    ErrorKind::ConnectionReset
-                    | ErrorKind::ConnectionAborted
-                    | ErrorKind::BrokenPipe => return (size, SocketResult::Closed),
-                    _ => {
-                        error!("SOCKET\tsocket_read error={:?}", e);
-                        return (size, SocketResult::Error);
-                    }
-                },
-            }
-        }
+/// Format a `[<session_ulid> - - -]` prefix used by socket-layer error logs
+/// so they can be correlated with the owning session. When `ulid` is `None`
+/// emits `[- - - -]` so the column layout stays stable across session-less
+/// plumbing (legacy raw TcpStream paths).
+pub(crate) fn socket_log_prefix(ulid: Option<Ulid>) -> String {
+    match ulid {
+        Some(ulid) => format!("[{ulid} - - -]"),
+        None => "[- - - -]".to_owned(),
     }
+}
 
-    fn socket_write(&mut self, buf: &[u8]) -> (usize, SocketResult) {
-        let mut size = 0usize;
-        let mut counter = 0;
-        loop {
-            counter += 1;
-            if counter > MAX_LOOP_ITERATIONS {
-                error!("MAX_LOOP_ITERATION reached in TcpStream::socket_write");
-                incr!("socket.write.infinite_loop.error");
-                return (size, SocketResult::Error);
-            }
-            if size == buf.len() {
-                return (size, SocketResult::Continue);
-            }
-            match self.write(&buf[size..]) {
-                Ok(0) => return (size, SocketResult::Continue),
-                Ok(sz) => size += sz,
-                Err(e) => match e.kind() {
-                    ErrorKind::WouldBlock => return (size, SocketResult::WouldBlock),
-                    ErrorKind::ConnectionReset
-                    | ErrorKind::ConnectionAborted
-                    | ErrorKind::BrokenPipe
-                    | ErrorKind::ConnectionRefused => {
-                        incr!("tcp.write.error");
-                        return (size, SocketResult::Closed);
-                    }
-                    _ => {
-                        //FIXME: timeout and other common errors should be sent up
-                        error!("SOCKET\tsocket_write error={:?}", e);
-                        incr!("tcp.write.error");
-                        return (size, SocketResult::Error);
-                    }
-                },
-            }
+/// Shared read/write/vectored-write logic used by both
+/// [`impl SocketHandler for TcpStream`] and
+/// [`impl SocketHandler for SessionTcpStream`]. Extracts the read/write loop
+/// so both impls log SOCKET errors with the bracket prefix
+/// `[session_ulid - - -]` when a session is known, and `[- - - -]` otherwise.
+fn tcp_socket_read(
+    stream: &mut TcpStream,
+    buf: &mut [u8],
+    session_ulid: Option<Ulid>,
+) -> (usize, SocketResult) {
+    let mut size = 0usize;
+    let mut counter = 0;
+    loop {
+        counter += 1;
+        if counter > MAX_LOOP_ITERATIONS {
+            error!(
+                "{} SOCKET\tMAX_LOOP_ITERATION reached in TcpStream::socket_read",
+                socket_log_prefix(session_ulid)
+            );
+            incr!("socket.read.infinite_loop.error");
+            return (size, SocketResult::Error);
         }
-    }
-
-    fn socket_write_vectored(&mut self, bufs: &[std::io::IoSlice]) -> (usize, SocketResult) {
-        match self.write_vectored(bufs) {
-            Ok(sz) => (sz, SocketResult::Continue),
+        if size == buf.len() {
+            return (size, SocketResult::Continue);
+        }
+        match stream.read(&mut buf[size..]) {
+            Ok(0) => return (size, SocketResult::Closed),
+            Ok(sz) => size += sz,
             Err(e) => match e.kind() {
-                ErrorKind::WouldBlock => (0, SocketResult::WouldBlock),
+                ErrorKind::WouldBlock => return (size, SocketResult::WouldBlock),
+                ErrorKind::ConnectionReset
+                | ErrorKind::ConnectionAborted
+                | ErrorKind::BrokenPipe => return (size, SocketResult::Closed),
+                _ => {
+                    error!(
+                        "{} SOCKET\tsocket_read error={:?}",
+                        socket_log_prefix(session_ulid),
+                        e
+                    );
+                    return (size, SocketResult::Error);
+                }
+            },
+        }
+    }
+}
+
+fn tcp_socket_write(
+    stream: &mut TcpStream,
+    buf: &[u8],
+    session_ulid: Option<Ulid>,
+) -> (usize, SocketResult) {
+    let mut size = 0usize;
+    let mut counter = 0;
+    loop {
+        counter += 1;
+        if counter > MAX_LOOP_ITERATIONS {
+            error!(
+                "{} SOCKET\tMAX_LOOP_ITERATION reached in TcpStream::socket_write",
+                socket_log_prefix(session_ulid)
+            );
+            incr!("socket.write.infinite_loop.error");
+            return (size, SocketResult::Error);
+        }
+        if size == buf.len() {
+            return (size, SocketResult::Continue);
+        }
+        match stream.write(&buf[size..]) {
+            Ok(0) => return (size, SocketResult::Continue),
+            Ok(sz) => size += sz,
+            Err(e) => match e.kind() {
+                ErrorKind::WouldBlock => return (size, SocketResult::WouldBlock),
                 ErrorKind::ConnectionReset
                 | ErrorKind::ConnectionAborted
                 | ErrorKind::BrokenPipe
                 | ErrorKind::ConnectionRefused => {
                     incr!("tcp.write.error");
-                    (0, SocketResult::Closed)
+                    return (size, SocketResult::Closed);
                 }
                 _ => {
                     //FIXME: timeout and other common errors should be sent up
-                    error!("SOCKET\tsocket_write error={:?}", e);
+                    error!(
+                        "{} SOCKET\tsocket_write error={:?}",
+                        socket_log_prefix(session_ulid),
+                        e
+                    );
                     incr!("tcp.write.error");
-                    (0, SocketResult::Error)
+                    return (size, SocketResult::Error);
                 }
             },
         }
+    }
+}
+
+fn tcp_socket_write_vectored(
+    stream: &mut TcpStream,
+    bufs: &[std::io::IoSlice],
+    session_ulid: Option<Ulid>,
+) -> (usize, SocketResult) {
+    match stream.write_vectored(bufs) {
+        Ok(sz) => (sz, SocketResult::Continue),
+        Err(e) => match e.kind() {
+            ErrorKind::WouldBlock => (0, SocketResult::WouldBlock),
+            ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::BrokenPipe
+            | ErrorKind::ConnectionRefused => {
+                incr!("tcp.write.error");
+                (0, SocketResult::Closed)
+            }
+            _ => {
+                //FIXME: timeout and other common errors should be sent up
+                error!(
+                    "{} SOCKET\tsocket_write error={:?}",
+                    socket_log_prefix(session_ulid),
+                    e
+                );
+                incr!("tcp.write.error");
+                (0, SocketResult::Error)
+            }
+        },
+    }
+}
+
+impl SocketHandler for TcpStream {
+    fn socket_read(&mut self, buf: &mut [u8]) -> (usize, SocketResult) {
+        tcp_socket_read(self, buf, None)
+    }
+
+    fn socket_write(&mut self, buf: &[u8]) -> (usize, SocketResult) {
+        tcp_socket_write(self, buf, None)
+    }
+
+    fn socket_write_vectored(&mut self, bufs: &[std::io::IoSlice]) -> (usize, SocketResult) {
+        tcp_socket_write_vectored(self, bufs, None)
     }
 
     fn socket_ref(&self) -> &TcpStream {
@@ -170,6 +236,67 @@ impl SocketHandler for TcpStream {
     }
 }
 
+/// [`TcpStream`] wrapped with the owning session's ULID. Exists so plain-TCP
+/// frontends and backends inside the mux stack can prefix SOCKET-layer error
+/// logs with `[<session_ulid> - - -]`, matching what TLS-wrapped frontends
+/// already do via [`FrontRustls::session_ulid`].
+///
+/// The inner [`TcpStream`] is exposed directly so mio registration sites can
+/// borrow it as-is; the outer type only participates in the [`SocketHandler`]
+/// trait dispatch.
+#[derive(Debug)]
+pub struct SessionTcpStream {
+    pub stream: TcpStream,
+    pub session_ulid: Ulid,
+}
+
+impl SessionTcpStream {
+    pub fn new(stream: TcpStream, session_ulid: Ulid) -> Self {
+        Self {
+            stream,
+            session_ulid,
+        }
+    }
+}
+
+impl SocketHandler for SessionTcpStream {
+    fn socket_read(&mut self, buf: &mut [u8]) -> (usize, SocketResult) {
+        tcp_socket_read(&mut self.stream, buf, Some(self.session_ulid))
+    }
+
+    fn socket_write(&mut self, buf: &[u8]) -> (usize, SocketResult) {
+        tcp_socket_write(&mut self.stream, buf, Some(self.session_ulid))
+    }
+
+    fn socket_write_vectored(&mut self, bufs: &[std::io::IoSlice]) -> (usize, SocketResult) {
+        tcp_socket_write_vectored(&mut self.stream, bufs, Some(self.session_ulid))
+    }
+
+    fn socket_ref(&self) -> &TcpStream {
+        &self.stream
+    }
+
+    fn socket_mut(&mut self) -> &mut TcpStream {
+        &mut self.stream
+    }
+
+    fn protocol(&self) -> TransportProtocol {
+        TransportProtocol::Tcp
+    }
+
+    fn read_error(&self) {
+        incr!("tcp.read.error");
+    }
+
+    fn write_error(&self) {
+        incr!("tcp.write.error");
+    }
+
+    fn session_ulid(&self) -> Option<Ulid> {
+        Some(self.session_ulid)
+    }
+}
+
 pub struct FrontRustls {
     pub stream: TcpStream,
     pub session: ServerConnection,
@@ -180,6 +307,9 @@ pub struct FrontRustls {
     /// Peer reset the connection (RST/ConnectionAborted/BrokenPipe). The TCP
     /// channel is dead; further writes are pointless and should short-circuit.
     pub peer_reset: bool,
+    /// Connection/session ULID propagated from the enclosing mux session.
+    /// Rendered into SOCKET-layer error logs via [`Self::session_ulid`].
+    pub session_ulid: Ulid,
 }
 
 impl std::fmt::Debug for FrontRustls {
@@ -201,7 +331,10 @@ impl SocketHandler for FrontRustls {
         loop {
             counter += 1;
             if counter > MAX_LOOP_ITERATIONS {
-                error!("MAX_LOOP_ITERATION reached in FrontRustls::socket_read");
+                error!(
+                    "{} SOCKET\tMAX_LOOP_ITERATION reached in FrontRustls::socket_read",
+                    socket_log_prefix(Some(self.session_ulid))
+                );
                 incr!("rustls.read.infinite_loop.error");
                 is_error = true;
                 break;
@@ -319,7 +452,10 @@ impl SocketHandler for FrontRustls {
         loop {
             counter += 1;
             if counter > MAX_LOOP_ITERATIONS {
-                error!("MAX_LOOP_ITERATION reached in FrontRustls::socket_write");
+                error!(
+                    "{} SOCKET\tMAX_LOOP_ITERATION reached in FrontRustls::socket_write",
+                    socket_log_prefix(Some(self.session_ulid))
+                );
                 incr!("rustls.write.infinite_loop.error");
                 is_error = true;
                 break;
@@ -462,7 +598,10 @@ impl SocketHandler for FrontRustls {
         loop {
             counter += 1;
             if counter > MAX_LOOP_ITERATIONS {
-                error!("MAX_LOOP_ITERATION reached in FrontRustls::socket_write_vectored");
+                error!(
+                    "{} SOCKET\tMAX_LOOP_ITERATION reached in FrontRustls::socket_write_vectored",
+                    socket_log_prefix(Some(self.session_ulid))
+                );
                 incr!("rustls.write.infinite_loop.error");
                 is_error = true;
                 break;
@@ -648,6 +787,10 @@ impl SocketHandler for FrontRustls {
 
     fn write_error(&self) {
         incr!("rustls.write.error");
+    }
+
+    fn session_ulid(&self) -> Option<Ulid> {
+        Some(self.session_ulid)
     }
 }
 

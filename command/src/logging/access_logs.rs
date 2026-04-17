@@ -59,9 +59,19 @@ impl<T> DuplicateOwnership for &[T] {
 pub struct LogMessage<'a>(pub Option<&'a str>);
 pub struct LogDuration(pub Option<Duration>);
 
+/// Prefix block attached to every log line. Rendered as
+/// `[<session_id> <request_id_or_-> <cluster_id_or_-> <backend_id_or_->]`
+/// so operators can grep a full TCP/TLS session (`session_id`) or drill
+/// into one HTTP exchange (`request_id`).
+///
+/// - `session_id` is generated once per mio-accepted socket and survives
+///   protocol upgrades (expect-proxy, TLS handshake, H1↔H2 multiplexing).
+/// - `request_id` is per-request: distinct for each H2 stream, and
+///   regenerated on each H1 keep-alive exchange.
 #[derive(Debug)]
 pub struct LogContext<'a> {
-    pub request_id: Ulid,
+    pub session_id: Ulid,
+    pub request_id: Option<Ulid>,
     pub cluster_id: Option<&'a str>,
     pub backend_id: Option<&'a str>,
 }
@@ -193,7 +203,12 @@ impl RequestRecord<'_> {
                 },
                 message: self.message.duplicate(),
                 protocol: self.protocol.duplicate(),
-                request_id: self.context.request_id.into(),
+                request_id: self
+                    .context
+                    .request_id
+                    .unwrap_or(self.context.session_id)
+                    .into(),
+                session_id: Some(self.context.session_id.into()),
                 response_time: self.response_time.map(|t| t.as_micros() as u64),
                 server_rtt: self.server_rtt.map(|t| t.as_micros() as u64),
                 service_time: self.service_time.as_micros() as u64,

@@ -101,10 +101,14 @@ impl fmt::Display for LogDuration {
 
 impl fmt::Display for LogContext<'_> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "[{} ", self.session_id)?;
+        match self.request_id {
+            Some(id) => write!(f, "{id}")?,
+            None => f.write_str("-")?,
+        }
         write!(
             f,
-            "[{} {} {}]",
-            self.request_id,
+            " {} {}]",
             self.cluster_id.unwrap_or("-"),
             self.backend_id.unwrap_or("-")
         )
@@ -164,4 +168,56 @@ fn prepare_user_agent(user_agent: &str) -> String {
         .replace(' ', "_")
         .replace('[', "{")
         .replace(']', "}")
+}
+
+#[cfg(test)]
+mod tests {
+    use rusty_ulid::Ulid;
+
+    use crate::logging::LogContext;
+
+    #[test]
+    fn log_context_display_all_fields_present() {
+        let session = Ulid::from(0x01_23_45_67_89_AB_CD_EF_FE_DC_BA_98_76_54_32_10_u128);
+        let request = Ulid::from(0x01_23_45_67_89_AB_CD_EF_FE_DC_BA_98_76_54_32_11_u128);
+        let ctx = LogContext {
+            session_id: session,
+            request_id: Some(request),
+            cluster_id: Some("cluster-abc"),
+            backend_id: Some("backend-1"),
+        };
+        let rendered = format!("{ctx}");
+        assert_eq!(
+            rendered,
+            format!("[{session} {request} cluster-abc backend-1]")
+        );
+    }
+
+    #[test]
+    fn log_context_display_dashes_when_missing() {
+        let session = Ulid::from(0xABCDu128);
+        let ctx = LogContext {
+            session_id: session,
+            request_id: None,
+            cluster_id: None,
+            backend_id: None,
+        };
+        assert_eq!(format!("{ctx}"), format!("[{session} - - -]"));
+    }
+
+    #[test]
+    fn log_context_display_partial() {
+        let session = Ulid::from(0x42u128);
+        let request = Ulid::from(0x43u128);
+        let ctx = LogContext {
+            session_id: session,
+            request_id: Some(request),
+            cluster_id: None,
+            backend_id: Some("backend-2"),
+        };
+        assert_eq!(
+            format!("{ctx}"),
+            format!("[{session} {request} - backend-2]")
+        );
+    }
 }

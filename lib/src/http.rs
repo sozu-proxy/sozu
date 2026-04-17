@@ -62,7 +62,7 @@ StateMachineBuilder! {
     enum HttpStateMachine impl SessionState {
         Expect(ExpectProxyProtocol<TcpStream>),
         Mux(MuxClear),
-        WebSocket(Pipe<TcpStream, HttpListener>),
+        WebSocket(Pipe<crate::socket::SessionTcpStream, HttpListener>),
     }
 }
 
@@ -115,10 +115,14 @@ impl HttpSession {
         } else {
             gauge_add!("protocol.http", 1);
             let session_address = sock.peer_addr().ok();
+            let session_ulid = rusty_ulid::Ulid::generate();
+            let sock = crate::socket::SessionTcpStream::new(sock, session_ulid);
 
-            let frontend = mux::Connection::new_h1_server(sock, container_frontend_timeout);
+            let frontend =
+                mux::Connection::new_h1_server(session_ulid, sock, container_frontend_timeout);
             let router = mux::Router::new(configured_backend_timeout, configured_connect_timeout);
             let mut context = mux::Context::new(
+                session_ulid,
                 pool.clone(),
                 listener.clone(),
                 session_address,
@@ -133,7 +137,7 @@ impl HttpSession {
                 frontend,
                 router,
                 context,
-                session_ulid: rusty_ulid::Ulid::generate(),
+                session_ulid,
             })
         };
 
@@ -189,8 +193,10 @@ impl HttpSession {
             .map(|add| (add.destination(), add.source()))
         {
             Some((Some(public_address), Some(session_address))) => {
+                let session_ulid = rusty_ulid::Ulid::generate();
                 let frontend = mux::Connection::new_h1_server(
-                    expect.frontend,
+                    session_ulid,
+                    crate::socket::SessionTcpStream::new(expect.frontend, session_ulid),
                     expect.container_frontend_timeout,
                 );
                 let router = mux::Router::new(
@@ -198,6 +204,7 @@ impl HttpSession {
                     self.configured_connect_timeout,
                 );
                 let mut context = mux::Context::new(
+                    session_ulid,
                     self.pool.clone(),
                     self.listener.clone(),
                     Some(session_address),
@@ -213,7 +220,7 @@ impl HttpSession {
                     frontend,
                     router,
                     context,
-                    session_ulid: rusty_ulid::Ulid::generate(),
+                    session_ulid,
                 };
                 mux.frontend.readiness_mut().event = expect.frontend_readiness.event;
 
@@ -291,6 +298,11 @@ impl HttpSession {
         container_backend_timeout.reset();
 
         let backend_id = backend.borrow().backend_id.clone();
+        // `Pipe::backend_socket` is typed `Option<TcpStream>` (raw, pre-mux).
+        // The mux wraps every backend TCP socket in `SessionTcpStream` so
+        // SOCKET-layer errors carry the session ULID; unwrap back to the
+        // plain `TcpStream` here to feed Pipe's legacy shape.
+        let backend_socket = backend_socket.stream;
         let mut pipe = Pipe::new(
             stream.back.storage.buffer,
             Some(backend_id),
@@ -304,6 +316,7 @@ impl HttpSession {
             frontend_socket,
             self.listener.clone(),
             Protocol::HTTP,
+            stream.context.session_id,
             stream.context.id,
             stream.context.session_address,
             ws_context,
@@ -321,7 +334,10 @@ impl HttpSession {
         Some(HttpStateMachine::WebSocket(pipe))
     }
 
-    fn upgrade_websocket(&self, ws: Pipe<TcpStream, HttpListener>) -> Option<HttpStateMachine> {
+    fn upgrade_websocket(
+        &self,
+        ws: Pipe<crate::socket::SessionTcpStream, HttpListener>,
+    ) -> Option<HttpStateMachine> {
         // what do we do here?
         error!("Upgrade called on WS, this should not happen");
         Some(HttpStateMachine::WebSocket(ws))

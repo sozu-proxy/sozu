@@ -224,6 +224,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         pool: Weak<RefCell<Pool>>,
         protocol: Protocol,
         public_address: SocketAddr,
+        session_id: Ulid,
         request_id: Ulid,
         session_address: Option<SocketAddr>,
         sticky_name: String,
@@ -269,6 +270,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 kawa::Buffer::new(back_buffer),
             )),
             context: HttpContext::new(
+                session_id,
                 request_id,
                 protocol,
                 public_address,
