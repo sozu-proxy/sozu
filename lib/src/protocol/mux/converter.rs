@@ -204,6 +204,17 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                     error!("H1->H2 header name contains invalid characters, skipping");
                     return true; // skip this header, continue with next
                 }
+                // RFC 9113 §8.2.1 / RFC 9110 §5.5: reject header values with
+                // NUL, CR, LF, or other C0 controls. Without this, a compromised
+                // backend can inject bytes that poison the HPACK dynamic table.
+                let val_bytes = val.data(buffer);
+                if val_bytes
+                    .iter()
+                    .any(|&b| matches!(b, 0x00..=0x08 | 0x0A..=0x1F | 0x7F))
+                {
+                    error!("H1->H2 header value contains invalid characters, skipping");
+                    return true;
+                }
                 if let Err(e) = self
                     .encoder
                     .encode_header_into((&self.lowercase_buf, val.data(buffer)), &mut self.out)

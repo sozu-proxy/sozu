@@ -86,8 +86,27 @@ fn is_invalid_te_value(value: &[u8]) -> bool {
 /// used for the RFC 9113 §8.3.1 equivalence check between a literal ``host``
 /// header and the ``:authority`` pseudo-header when both are present.
 fn strip_port(value: &[u8]) -> &[u8] {
+    // Do not strip port from IPv6 literals (e.g., [::1]:8080)
+    if value.contains(&b'[') {
+        // Bracketed IPv6: look for "]:port"
+        return match value.iter().rposition(|&b| b == b']') {
+            Some(bracket) => {
+                if value.get(bracket + 1) == Some(&b':')
+                    && bracket + 2 < value.len()
+                    && value[bracket + 2..].iter().all(|b| b.is_ascii_digit())
+                {
+                    &value[..bracket + 1]
+                } else {
+                    value
+                }
+            }
+            None => value,
+        };
+    }
     match value.iter().rposition(|&b| b == b':') {
-        Some(i) if value[i + 1..].iter().all(|b| b.is_ascii_digit()) => &value[..i],
+        Some(i) if i + 1 < value.len() && value[i + 1..].iter().all(|b| b.is_ascii_digit()) => {
+            &value[..i]
+        }
         _ => value,
     }
 }
@@ -100,6 +119,13 @@ fn strip_port(value: &[u8]) -> &[u8] {
 /// to prevent request-smuggling via H2→H1 downconversion.
 fn host_matches_authority(host: &[u8], authority: &[u8]) -> bool {
     compare_no_case(strip_port(host), strip_port(authority))
+}
+
+/// Like `has_invalid_value_byte` but also rejects HTAB (0x09), which is
+/// allowed in regular header values (RFC 9110 §5.5) but not in pseudo-header
+/// values that end up in the H1 request-line (RFC 9112 §3).
+fn has_invalid_pseudo_value_byte(value: &[u8]) -> bool {
+    value.iter().any(|&b| matches!(b, 0x00..=0x1F | 0x7F))
 }
 
 /// Returns true if the value contains any byte forbidden in HTTP field values
@@ -161,7 +187,11 @@ fn store_pseudo_header(
     kawa: &mut GenericHttpStream,
     value: &[u8],
 ) -> Option<Store> {
-    if !dest.is_empty() || regular_headers || value.is_empty() || has_invalid_value_byte(value) {
+    if !dest.is_empty()
+        || regular_headers
+        || value.is_empty()
+        || has_invalid_pseudo_value_byte(value)
+    {
         return None;
     }
     let start = kawa.storage.end as u32;
@@ -331,7 +361,7 @@ where
     C: ParserCallbacks<Checkout>,
 {
     if !kawa.is_initial() {
-        return handle_trailer(kawa, input, end_stream, decoder);
+        return handle_trailer(kawa, input, end_stream, decoder, max_header_list_size);
     }
     kawa.push_block(Block::StatusLine);
     let max_decoded_bytes = max_header_list_size as usize;
@@ -381,17 +411,9 @@ where
                             None => *invalid_headers = true,
                         }
                     } else if compare_no_case(&k, b":path") {
-                        // RFC 9112 §3.2 / RFC 9113 §8.3.1: :path must be the
-                        // request-target. For http/https URIs we accept
-                        // origin-form (starts with `/`) and — only when the
-                        // method is OPTIONS — asterisk-form (`*`).
-                        // (Empty :path is rejected by store_pseudo_header.)
-                        let is_asterisk = v.as_ref() == b"*";
-                        let starts_with_slash = v.first() == Some(&b'/');
-                        let method_is_options = method
-                            .data_opt(kawa.storage.buffer())
-                            .is_some_and(|m| m == b"OPTIONS");
-                        if !(starts_with_slash || (is_asterisk && method_is_options)) {
+                        // RFC 9112 §3.2: fragment identifiers (`#`) are
+                        // prohibited in request-targets.
+                        if v.contains(&b'#') {
                             *invalid_headers = true;
                             return;
                         }
@@ -501,6 +523,21 @@ where
                     }
                 },
             )?;
+            // Post-decode :path form validation (deferred because :method may
+            // arrive after :path in HPACK — RFC 9113 does not mandate ordering).
+            // RFC 9112 §3.2 / RFC 9113 §8.3.1: for http/https URIs we accept
+            // origin-form (starts with `/`) and — only when the method is
+            // OPTIONS — asterisk-form (`*`).
+            if let Some(path_data) = path.data_opt(kawa.storage.buffer()) {
+                let is_asterisk = path_data == b"*";
+                let starts_with_slash = path_data.first() == Some(&b'/');
+                let method_is_options = method
+                    .data_opt(kawa.storage.buffer())
+                    .is_some_and(|m| m == b"OPTIONS");
+                if !(starts_with_slash || (is_asterisk && method_is_options)) {
+                    return Err((H2Error::ProtocolError, false));
+                }
+            }
             // RFC 9113 §8.3.1 requires all four pseudo-headers to be present and non-empty.
             // Note: Store::is_empty() only matches Store::Empty — a pseudo-header stored
             // with an empty value yields Store::Slice { len: 0 } which is_empty() misses.
@@ -687,12 +724,24 @@ pub fn handle_trailer(
     input: &[u8],
     end_stream: bool,
     decoder: &mut loona_hpack::Decoder<'static>,
+    max_header_list_size: u32,
 ) -> Result<(), (H2Error, bool)> {
     if !end_stream {
         return Err((H2Error::ProtocolError, false));
     }
     let mut invalid_trailers = false;
+    let mut budget_exceeded = false;
+    let mut decoded_bytes: usize = 0;
+    let max_decoded = max_header_list_size as usize;
     let decode_status = decoder.decode_with_cb(input, |k, v| {
+        if invalid_trailers || budget_exceeded {
+            return;
+        }
+        decoded_bytes = decoded_bytes.saturating_add(k.len() + v.len());
+        if decoded_bytes > max_decoded {
+            budget_exceeded = true;
+            return;
+        }
         // RFC 9113 §8.1: Trailers MUST NOT contain pseudo-header fields.
         if k.starts_with(b":") {
             invalid_trailers = true;
@@ -728,6 +777,13 @@ pub fn handle_trailer(
     if let Err(error) = decode_status {
         error!("INVALID FRAGMENT: {:?}", error);
         return Err((H2Error::CompressionError, true));
+    }
+    if budget_exceeded {
+        error!(
+            "HPACK decoded trailer size {} exceeds MAX_HEADER_LIST_SIZE {}",
+            decoded_bytes, max_decoded
+        );
+        return Err((H2Error::EnhanceYourCalm, false));
     }
     if invalid_trailers {
         error!("INVALID TRAILERS");
@@ -1555,7 +1611,13 @@ mod tests {
             .encode_header_into((&b"x-trailer"[..], &b"val\nsmuggled"[..]), &mut encoded)
             .unwrap();
         let mut decoder = loona_hpack::Decoder::new();
-        let err = handle_trailer(&mut kawa, &encoded, true, &mut decoder);
+        let err = handle_trailer(
+            &mut kawa,
+            &encoded,
+            true,
+            &mut decoder,
+            crate::protocol::mux::h2::MAX_HEADER_LIST_SIZE as u32,
+        );
         assert!(err.is_err(), "LF in trailer value must be rejected");
     }
 
@@ -1589,7 +1651,12 @@ mod tests {
         assert_eq!(strip_port(b"example.com"), b"example.com");
         assert_eq!(strip_port(b"example.com:8443"), b"example.com");
         assert_eq!(strip_port(b"example.com:abc"), b"example.com:abc");
+        // IPv6 bracketed literals
         assert_eq!(strip_port(b"[::1]:8443"), b"[::1]");
+        assert_eq!(strip_port(b"[::1]"), b"[::1]");
+        assert_eq!(strip_port(b"[::1]:"), b"[::1]:");
+        // Trailing colon with empty port must NOT strip (not a valid port)
+        assert_eq!(strip_port(b"example.com:"), b"example.com:");
 
         assert!(host_matches_authority(b"Example.com", b"example.com"));
         assert!(host_matches_authority(b"example.com:8443", b"example.com"));
