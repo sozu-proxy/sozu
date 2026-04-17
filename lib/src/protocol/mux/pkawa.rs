@@ -112,13 +112,27 @@ fn strip_port(value: &[u8]) -> &[u8] {
 }
 
 /// Case-insensitively compare a literal ``host`` header value to an
-/// ``:authority`` pseudo-header value after stripping any trailing port.
+/// ``:authority`` pseudo-header value, respecting port semantics.
 ///
-/// RFC 9113 §8.3.1: when both are present they must identify the same origin,
-/// otherwise the request is malformed and must be rejected with PROTOCOL_ERROR
-/// to prevent request-smuggling via H2→H1 downconversion.
+/// RFC 9113 §8.3.1: when both are present they must identify the same origin.
+/// Per RFC 6454 §5, different explicit ports mean different origins.
+/// When only one side carries a port (implicit default), compare hostnames only.
 fn host_matches_authority(host: &[u8], authority: &[u8]) -> bool {
-    compare_no_case(strip_port(host), strip_port(authority))
+    // Fast path: exact case-insensitive match (covers identical port or both absent)
+    if compare_no_case(host, authority) {
+        return true;
+    }
+    // If both have explicit ports but differ, the origins differ.
+    let host_stripped = strip_port(host);
+    let auth_stripped = strip_port(authority);
+    let host_has_port = host_stripped.len() != host.len();
+    let auth_has_port = auth_stripped.len() != authority.len();
+    if host_has_port && auth_has_port {
+        // Both have explicit ports but the full values differ → different origins.
+        return false;
+    }
+    // One side has a port, the other doesn't (implicit default) → compare hostnames.
+    compare_no_case(host_stripped, auth_stripped)
 }
 
 /// Like `has_invalid_value_byte` but also rejects HTAB (0x09), which is
@@ -1658,10 +1672,19 @@ mod tests {
         // Trailing colon with empty port must NOT strip (not a valid port)
         assert_eq!(strip_port(b"example.com:"), b"example.com:");
 
+        // Both without port
+        assert!(host_matches_authority(b"example.com", b"example.com"));
+        // Case insensitive, same port
+        assert!(host_matches_authority(b"Example.COM:80", b"example.com:80"));
+        // Case insensitive, no port
         assert!(host_matches_authority(b"Example.com", b"example.com"));
-        assert!(host_matches_authority(b"example.com:8443", b"example.com"));
+        // Same explicit port
+        assert!(host_matches_authority(b"example.com:80", b"example.com:80"));
+        // One has port, one implicit
+        assert!(host_matches_authority(b"example.com:80", b"example.com"));
         assert!(host_matches_authority(b"example.com", b"example.com:443"));
-        assert!(host_matches_authority(
+        // Different explicit ports → different origins (RFC 6454 §5)
+        assert!(!host_matches_authority(
             b"example.com:80",
             b"example.com:443"
         ));

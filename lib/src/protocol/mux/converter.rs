@@ -232,7 +232,9 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
             Block::Chunk(Chunk { data }) => {
                 let mut header = [0; parser::FRAME_HEADER_SIZE];
                 let payload_len = data.len();
-                let (data, payload_len, can_continue) = if self.window >= payload_len as i32
+                let payload_fits_window =
+                    i32::try_from(payload_len).is_ok_and(|pl| self.window >= pl);
+                let (data, payload_len, can_continue) = if payload_fits_window
                     && self.max_frame_size >= payload_len
                 {
                     // the window is wide enough to send the entire chunk
@@ -247,7 +249,7 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                     (
                         before,
                         payload_len as u32,
-                        self.max_frame_size < self.window as usize,
+                        self.max_frame_size < self.window.max(0) as usize,
                     )
                 } else {
                     // the window can't take any more bytes, return the chunk to the blocks
@@ -261,7 +263,7 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                     kawa.blocks.push_front(Block::Chunk(Chunk { data }));
                     return false;
                 };
-                self.window -= payload_len as i32;
+                self.window -= i32::try_from(payload_len).unwrap_or(i32::MAX);
                 if let Err(e) = gen_frame_header(
                     &mut header,
                     &FrameHeader {
