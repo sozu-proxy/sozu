@@ -1731,7 +1731,9 @@ fn try_h2_settings_flood_triggers_goaway() -> State {
     // Read response — expect GOAWAY with ENHANCE_YOUR_CALM.
     // Use collect_response_frames with multiple attempts for CI resilience:
     // slow runners may need extra time to process the flood and flush the GOAWAY.
-    let frames = collect_response_frames(&mut tls, 500, 8, 1000);
+    // Wider margins than the sister ping-flood test: observed intermittent
+    // zero-frame reads under load on GitHub Actions stable runners.
+    let frames = collect_response_frames(&mut tls, 1000, 10, 2000);
     log_frames("H2 Settings flood", &frames);
 
     let got_enhance_your_calm = contains_goaway_with_error(&frames, H2_ERROR_ENHANCE_YOUR_CALM);
