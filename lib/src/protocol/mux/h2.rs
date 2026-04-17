@@ -89,8 +89,16 @@ pub(super) const DEFAULT_MAX_RST_STREAM_LIFETIME: u64 = 10_000;
 pub(super) const DEFAULT_MAX_RST_STREAM_ABUSIVE_LIFETIME: u64 = 50;
 /// Default maximum PING frames per window (CVE-2019-9512 Ping Flood)
 const DEFAULT_MAX_PING_PER_WINDOW: u32 = 100;
+/// Absolute lifetime cap on PING frames received on a single connection.
+/// Mirrors DEFAULT_MAX_RST_STREAM_LIFETIME — generous for legitimate
+/// keep-alives but trips on sustained low-rate abuse (CVE-2019-9512).
+const DEFAULT_MAX_PING_LIFETIME: u32 = 10_000;
 /// Default maximum SETTINGS frames per window (CVE-2019-9515 Settings Flood)
 const DEFAULT_MAX_SETTINGS_PER_WINDOW: u32 = 50;
+/// Absolute lifetime cap on SETTINGS frames received on a single connection.
+/// Mirrors DEFAULT_MAX_RST_STREAM_LIFETIME — generous for legitimate
+/// renegotiations but trips on sustained low-rate abuse (CVE-2019-9515).
+const DEFAULT_MAX_SETTINGS_LIFETIME: u32 = 10_000;
 /// Default maximum empty DATA frames per window (CVE-2019-9518 Empty Frames)
 const DEFAULT_MAX_EMPTY_DATA_PER_WINDOW: u32 = 100;
 /// Default maximum CONTINUATION frames per header block (CVE-2024-27316)
@@ -392,8 +400,18 @@ pub struct H2FloodDetector {
     pub(super) total_abusive_rst_received_lifetime: u64,
     /// PING frames received in current window (CVE-2019-9512)
     pub(super) ping_count: u32,
+    /// Lifetime PING frames received on this connection.
+    ///
+    /// Never decays — provides an absolute ceiling that the half-decaying
+    /// per-window counter cannot, preventing sustained low-rate PING abuse.
+    pub(super) total_ping_received_lifetime: u32,
     /// SETTINGS frames received in current window (CVE-2019-9515)
     pub(super) settings_count: u32,
+    /// Lifetime SETTINGS frames received on this connection.
+    ///
+    /// Never decays — provides an absolute ceiling that the half-decaying
+    /// per-window counter cannot, preventing sustained low-rate SETTINGS abuse.
+    pub(super) total_settings_received_lifetime: u32,
     /// Empty DATA frames received in current window (CVE-2019-9518)
     pub(super) empty_data_count: u32,
     /// CONTINUATION frames received for current header block (CVE-2024-27316)
@@ -421,7 +439,9 @@ impl H2FloodDetector {
             total_rst_received_lifetime: 0,
             total_abusive_rst_received_lifetime: 0,
             ping_count: 0,
+            total_ping_received_lifetime: 0,
             settings_count: 0,
+            total_settings_received_lifetime: 0,
             empty_data_count: 0,
             continuation_count: 0,
             accumulated_header_size: 0,
@@ -499,9 +519,23 @@ impl H2FloodDetector {
         .or_else(|| flag("PING", self.ping_count, self.config.max_ping_per_window))
         .or_else(|| {
             flag(
+                "PING lifetime",
+                self.total_ping_received_lifetime,
+                DEFAULT_MAX_PING_LIFETIME,
+            )
+        })
+        .or_else(|| {
+            flag(
                 "SETTINGS",
                 self.settings_count,
                 self.config.max_settings_per_window,
+            )
+        })
+        .or_else(|| {
+            flag(
+                "SETTINGS lifetime",
+                self.total_settings_received_lifetime,
+                DEFAULT_MAX_SETTINGS_LIFETIME,
             )
         })
         .or_else(|| {
@@ -1301,7 +1335,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 self.expect_read = Some((H2StreamId::Zero, payload_len as usize));
                 let mut headers = headers.clone();
                 headers.end_headers = flags & parser::FLAG_END_HEADERS != 0;
-                headers.header_block_fragment.len += payload_len;
+                headers.header_block_fragment.len = headers
+                    .header_block_fragment
+                    .len
+                    .saturating_add(payload_len);
                 self.state = H2State::ContinuationFrame(headers);
             }
             Err(error) => {
@@ -3034,7 +3071,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         } else {
             // Advance storage.head by the full wire payload length so the
             // next frame doesn't read stale pad-length+padding bytes.
-            slice.start += kawa.storage.head as u32;
+            slice.start = slice.start.saturating_add(kawa.storage.head as u32);
             kawa.storage.head += wire_len;
 
             // Emit chunk framing for chunked transfer encoding (H2→H1 path).
@@ -3408,6 +3445,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         }
         // CVE-2019-9515: track SETTINGS frame rate
         self.flood_detector.settings_count += 1;
+        self.flood_detector.total_settings_received_lifetime = self
+            .flood_detector
+            .total_settings_received_lifetime
+            .saturating_add(1);
         if let Some(error) = self.flood_detector.check_flood() {
             return self.goaway(error);
         }
@@ -3489,6 +3530,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         }
         // CVE-2019-9512: track non-ACK PING frame rate
         self.flood_detector.ping_count += 1;
+        self.flood_detector.total_ping_received_lifetime = self
+            .flood_detector
+            .total_ping_received_lifetime
+            .saturating_add(1);
         if let Some(error) = self.flood_detector.check_flood() {
             return self.goaway(error);
         }
