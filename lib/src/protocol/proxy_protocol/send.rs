@@ -176,6 +176,7 @@ impl<Front: SocketHandler> SendProxyProtocol<Front> {
             listener,
             Protocol::TCP,
             self.request_id,
+            self.request_id,
             addr,
             WebSocketContext::Tcp,
         );

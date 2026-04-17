@@ -1,5 +1,6 @@
 use std::{io::IoSlice, time::Instant};
 
+use rusty_ulid::Ulid;
 use sozu_command::{logging::is_logger_colored, ready::Ready};
 
 use crate::{
@@ -46,12 +47,53 @@ macro_rules! log_context {
             ("", "", "", "", "")
         };
         format!(
-            "{open}MUX-H1{reset}\t{cyan}Session{reset}({gray}peer{reset}={white}{peer:?}{reset}, {gray}position{reset}={white}{position:?}{reset}, {gray}stream{reset}={white}{stream:?}{reset}, {gray}requests{reset}={white}{requests}{reset}, {gray}parked{reset}={white}{parked}{reset}, {gray}close_notify{reset}={white}{close_notify}{reset}, {gray}readiness{reset}={white}{readiness}{reset})\t >>>",
+            "[{ulid} - - -]\t{open}MUX-H1{reset}\t{cyan}Session{reset}({gray}peer{reset}={white}{peer:?}{reset}, {gray}position{reset}={white}{position:?}{reset}, {gray}stream{reset}={white}{stream:?}{reset}, {gray}requests{reset}={white}{requests}{reset}, {gray}parked{reset}={white}{parked}{reset}, {gray}close_notify{reset}={white}{close_notify}{reset}, {gray}readiness{reset}={white}{readiness}{reset})\t >>>",
             open = open,
             reset = reset,
             cyan = cyan,
             gray = gray,
             white = white,
+            ulid = $self.session_ulid,
+            peer = $self.socket.socket_ref().peer_addr().ok(),
+            position = $self.position,
+            stream = $self.stream,
+            requests = $self.requests,
+            parked = $self.parked_on_buffer_pressure,
+            close_notify = $self.close_notify_sent,
+            readiness = $self.readiness,
+        )
+    }};
+}
+
+/// Per-stream variant of [`log_context!`] used when a `HttpContext` is in
+/// scope. Fills the `request_id` slot of the bracket so the log line can be
+/// grepped by the specific request that triggered it.
+#[allow(unused_macros)]
+macro_rules! log_context_stream {
+    ($self:expr, $http_context:expr) => {{
+        let colored = is_logger_colored();
+        let (open, reset, cyan, gray, white) = if colored {
+            (
+                "\x1b[1;34m",
+                "\x1b[0m",
+                "\x1b[36m",
+                "\x1b[90m",
+                "\x1b[97m",
+            )
+        } else {
+            ("", "", "", "", "")
+        };
+        format!(
+            "[{ulid} {req} {cluster} {backend}]\t{open}MUX-H1{reset}\t{cyan}Session{reset}({gray}peer{reset}={white}{peer:?}{reset}, {gray}position{reset}={white}{position:?}{reset}, {gray}stream{reset}={white}{stream:?}{reset}, {gray}requests{reset}={white}{requests}{reset}, {gray}parked{reset}={white}{parked}{reset}, {gray}close_notify{reset}={white}{close_notify}{reset}, {gray}readiness{reset}={white}{readiness}{reset})\t >>>",
+            open = open,
+            reset = reset,
+            cyan = cyan,
+            gray = gray,
+            white = white,
+            ulid = $self.session_ulid,
+            req = $http_context.id,
+            cluster = $http_context.cluster_id.as_deref().unwrap_or("-"),
+            backend = $http_context.backend_id.as_deref().unwrap_or("-"),
             peer = $self.socket.socket_ref().peer_addr().ok(),
             position = $self.position,
             stream = $self.stream,
@@ -99,6 +141,10 @@ pub struct ConnectionH1<Front: SocketHandler> {
     pub parked_on_buffer_pressure: bool,
     /// True once we've asked rustls to emit TLS close_notify for this frontend.
     pub close_notify_sent: bool,
+    /// Connection/session ULID propagated from the parent [`Mux`]. Used to
+    /// stamp the session slot of the `[session req cluster backend]` log
+    /// prefix emitted by the local `log_context!` macro.
+    pub session_ulid: Ulid,
 }
 
 impl<Front: SocketHandler> std::fmt::Debug for ConnectionH1<Front> {

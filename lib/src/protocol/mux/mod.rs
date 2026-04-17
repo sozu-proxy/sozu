@@ -61,7 +61,7 @@ macro_rules! log_context {
             ("", "", "", "", "")
         };
         format!(
-            "{open}MUX{reset}\t{gray}[{reset}{white}{ulid}{reset}{gray}]{reset}\t{cyan}Session{reset}({gray}frontend{reset}={white}{frontend}{reset}, {gray}peer{reset}={white}{peer:?}{reset}, {gray}streams{reset}={white}{streams}{reset}, {gray}backends{reset}={white}{backends}{reset}, {gray}pending_links{reset}={white}{pending_links}{reset}, {gray}readiness{reset}={white}{readiness}{reset})\t >>>",
+            "[{ulid} - - -]\t{open}MUX{reset}\t{gray}[{reset}{white}{ulid}{reset}{gray}]{reset}\t{cyan}Session{reset}({gray}frontend{reset}={white}{frontend}{reset}, {gray}peer{reset}={white}{peer:?}{reset}, {gray}streams{reset}={white}{streams}{reset}, {gray}backends{reset}={white}{backends}{reset}, {gray}pending_links{reset}={white}{pending_links}{reset}, {gray}readiness{reset}={white}{readiness}{reset})\t >>>",
             open = open,
             reset = reset,
             cyan = cyan,
@@ -99,7 +99,7 @@ macro_rules! log_context_lite {
             ("", "", "", "", "")
         };
         format!(
-            "{open}MUX{reset}\t{gray}[{reset}{white}{ulid}{reset}{gray}]{reset}\t{cyan}Session{reset}({gray}frontend{reset}={white}{frontend}{reset}, {gray}peer{reset}={white}{peer:?}{reset}, {gray}readiness{reset}={white}{readiness}{reset})\t >>>",
+            "[{ulid} - - -]\t{open}MUX{reset}\t{gray}[{reset}{white}{ulid}{reset}{gray}]{reset}\t{cyan}Session{reset}({gray}frontend{reset}={white}{frontend}{reset}, {gray}peer{reset}={white}{peer:?}{reset}, {gray}readiness{reset}={white}{readiness}{reset})\t >>>",
             open = open,
             reset = reset,
             cyan = cyan,
@@ -150,7 +150,7 @@ use crate::{
     protocol::{SessionState, http::editor::HttpContext},
     retry::RetryPolicy,
     server::push_event,
-    socket::{FrontRustls, SocketHandler, SocketResult},
+    socket::{FrontRustls, SessionTcpStream, SocketHandler, SocketResult},
 };
 
 pub(crate) use crate::protocol::mux::answers::{forcefully_terminate_answer, set_default_answer};
@@ -182,7 +182,7 @@ const MAX_LOOP_ITERATIONS: i32 = 10_000;
 type GenericHttpStream = kawa::Kawa<Checkout>;
 type StreamId = u32;
 type GlobalStreamId = usize;
-pub type MuxClear = Mux<TcpStream, HttpListener>;
+pub type MuxClear = Mux<SessionTcpStream, HttpListener>;
 pub type MuxTls = Mux<FrontRustls, HttpsListener>;
 
 pub enum Position {
@@ -345,6 +345,11 @@ pub struct Context<L: ListenerHandler + L7ListenerHandler> {
     pub backend_streams: HashMap<Token, Vec<GlobalStreamId>>,
     pub pool: Weak<RefCell<Pool>>,
     pub listener: Rc<RefCell<L>>,
+    /// Connection/session ULID — mirrors `Mux.session_ulid`. Stored here so
+    /// per-stream `HttpContext` construction in [`Self::create_stream`] can
+    /// stamp the session slot of the log-context bracket without reaching
+    /// back into the parent [`Mux`].
+    pub session_ulid: Ulid,
     pub session_address: Option<SocketAddr>,
     pub public_address: SocketAddr,
     pub debug: DebugHistory,
@@ -368,6 +373,7 @@ pub struct Context<L: ListenerHandler + L7ListenerHandler> {
 
 impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
     pub fn new(
+        session_ulid: Ulid,
         pool: Weak<RefCell<Pool>>,
         listener: Rc<RefCell<L>>,
         session_address: Option<SocketAddr>,
@@ -384,6 +390,7 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
             backend_streams: HashMap::new(),
             pool,
             listener,
+            session_ulid,
             session_address,
             public_address,
             debug: DebugHistory::new(),
@@ -424,6 +431,7 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
         let http_context = {
             let listener = self.listener.borrow();
             let mut http_context = HttpContext::new(
+                self.session_ulid,
                 request_id,
                 listener.protocol(),
                 self.public_address,

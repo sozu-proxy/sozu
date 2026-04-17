@@ -66,12 +66,56 @@ macro_rules! log_context {
             ("", "", "", "", "")
         };
         format!(
-            "{open}MUX-H2{reset}\t{cyan}Session{reset}({gray}peer{reset}={white}{peer:?}{reset}, {gray}position{reset}={white}{position:?}{reset}, {gray}state{reset}={white}{state:?}{reset}, {gray}streams{reset}={white}{streams}{reset}, {gray}last_peer_id{reset}={white}{last_peer_id}{reset}, {gray}window{reset}={white}{window}{reset}, {gray}draining{reset}={white}{draining}{reset}, {gray}readiness{reset}={white}{readiness}{reset})\t >>>",
+            "[{ulid} - - -]\t{open}MUX-H2{reset}\t{cyan}Session{reset}({gray}peer{reset}={white}{peer:?}{reset}, {gray}position{reset}={white}{position:?}{reset}, {gray}state{reset}={white}{state:?}{reset}, {gray}streams{reset}={white}{streams}{reset}, {gray}last_peer_id{reset}={white}{last_peer_id}{reset}, {gray}window{reset}={white}{window}{reset}, {gray}draining{reset}={white}{draining}{reset}, {gray}readiness{reset}={white}{readiness}{reset})\t >>>",
             open = open,
             reset = reset,
             cyan = cyan,
             gray = gray,
             white = white,
+            ulid = $self.session_ulid,
+            peer = $self.socket.socket_ref().peer_addr().ok(),
+            position = $self.position,
+            state = $self.state,
+            streams = $self.streams.len(),
+            last_peer_id = $self.highest_peer_stream_id,
+            window = $self.flow_control.window,
+            draining = $self.drain.draining,
+            readiness = $self.readiness,
+        )
+    }};
+}
+
+/// Per-stream variant of [`log_context!`] used when a [`Stream`]'s
+/// [`HttpContext`](crate::protocol::kawa_h1::editor::HttpContext) is in
+/// scope. Populates the `request_id`, `cluster_id` and `backend_id` slots of
+/// the bracket so the log line can be filtered by the specific H2 stream it
+/// belongs to.
+#[allow(unused_macros)]
+macro_rules! log_context_stream {
+    ($self:expr, $http_context:expr) => {{
+        let colored = is_logger_colored();
+        let (open, reset, cyan, gray, white) = if colored {
+            (
+                "\x1b[1;36m",
+                "\x1b[0m",
+                "\x1b[36m",
+                "\x1b[90m",
+                "\x1b[97m",
+            )
+        } else {
+            ("", "", "", "", "")
+        };
+        format!(
+            "[{ulid} {req} {cluster} {backend}]\t{open}MUX-H2{reset}\t{cyan}Session{reset}({gray}peer{reset}={white}{peer:?}{reset}, {gray}position{reset}={white}{position:?}{reset}, {gray}state{reset}={white}{state:?}{reset}, {gray}streams{reset}={white}{streams}{reset}, {gray}last_peer_id{reset}={white}{last_peer_id}{reset}, {gray}window{reset}={white}{window}{reset}, {gray}draining{reset}={white}{draining}{reset}, {gray}readiness{reset}={white}{readiness}{reset})\t >>>",
+            open = open,
+            reset = reset,
+            cyan = cyan,
+            gray = gray,
+            white = white,
+            ulid = $self.session_ulid,
+            req = $http_context.id,
+            cluster = $http_context.cluster_id.as_deref().unwrap_or("-"),
+            backend = $http_context.backend_id.as_deref().unwrap_or("-"),
             peer = $self.socket.socket_ref().peer_addr().ok(),
             position = $self.position,
             state = $self.state,
@@ -927,6 +971,11 @@ pub struct H2DrainState {
 }
 
 pub struct ConnectionH2<Front: SocketHandler> {
+    /// Connection/session ULID propagated from the parent [`Mux`]. Used to
+    /// stamp the session slot of the `[session req cluster backend]` log
+    /// prefix emitted by this module's `log_context!` / `log_context_stream!`
+    /// macros.
+    pub session_ulid: Ulid,
     pub decoder: loona_hpack::Decoder<'static>,
     pub encoder: loona_hpack::Encoder<'static>,
     pub expect_read: Option<(H2StreamId, usize)>,
@@ -1066,6 +1115,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// `position`, `expect_read`, and `readiness_interest` parameters.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
+        session_ulid: Ulid,
         socket: Front,
         position: super::Position,
         pool: std::rc::Weak<std::cell::RefCell<crate::pool::Pool>>,
@@ -1088,6 +1138,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // for dynamic table size updates from the peer
         decoder.set_max_allowed_table_size(local_settings.settings_header_table_size as usize);
         Some(ConnectionH2 {
+            session_ulid,
             decoder,
             encoder: loona_hpack::Encoder::new(),
             expect_read,

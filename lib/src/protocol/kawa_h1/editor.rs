@@ -133,6 +133,11 @@ pub struct HttpContext {
     // ========== Read only
     /// signals wether Kawa should write a "Connection" header with a "close" value (request and response)
     pub closing: bool,
+    /// Connection/session ULID — stable across all requests multiplexed on this
+    /// TCP or TLS connection. Used as the first slot in the legacy log-context
+    /// bracket `[session req cluster backend]` and emitted into
+    /// `ProtobufAccessLog.session_id`.
+    pub session_id: Ulid,
     /// the value of the custom header, named "Sozu-Id", that Kawa should write (request and response)
     pub id: Ulid,
     pub backend_id: Option<String>,
@@ -183,6 +188,7 @@ impl kawa::h1::ParserCallbacks<Checkout> for HttpContext {
 impl HttpContext {
     /// Creates a new instance
     pub fn new(
+        session_id: Ulid,
         request_id: Ulid,
         protocol: Protocol,
         public_address: SocketAddr,
@@ -190,6 +196,7 @@ impl HttpContext {
         sticky_name: String,
     ) -> Self {
         Self {
+            session_id,
             id: request_id,
             backend_id: None,
             cluster_id: None,
@@ -579,7 +586,8 @@ impl HttpContext {
 
     pub fn log_context(&self) -> LogContext<'_> {
         LogContext {
-            request_id: self.id,
+            session_id: self.session_id,
+            request_id: Some(self.id),
             cluster_id: self.cluster_id.as_deref(),
             backend_id: self.backend_id.as_deref(),
         }
@@ -594,6 +602,7 @@ mod tests {
     /// Helper to create a minimal HttpContext for testing.
     fn make_context() -> HttpContext {
         HttpContext::new(
+            Ulid::generate(),
             Ulid::generate(),
             Protocol::HTTP,
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
