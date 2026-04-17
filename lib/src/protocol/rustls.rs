@@ -3,7 +3,10 @@ use std::{cell::RefCell, io::ErrorKind, net::SocketAddr, rc::Rc};
 use mio::{Token, net::TcpStream};
 use rustls::ServerConnection;
 use rusty_ulid::Ulid;
-use sozu_command::{config::MAX_LOOP_ITERATIONS, logging::LogContext};
+use sozu_command::{
+    config::MAX_LOOP_ITERATIONS,
+    logging::{LogContext, is_logger_colored},
+};
 
 use crate::{
     Readiness, Ready, SessionMetrics, SessionResult, StateResult, protocol::SessionState,
@@ -11,25 +14,45 @@ use crate::{
 };
 
 /// This macro is defined uniquely in this module to help the tracking of tls
-/// issues inside Sōzu
+/// issues inside Sōzu. When the logger emits to a TTY the protocol label is
+/// bright-cyan/bold, the `Session` keyword is plain cyan, attribute keys are
+/// gray and values are bright white. ANSI codes are skipped when output goes
+/// to a file or otherwise non-colored sink.
 macro_rules! log_context {
-    ($self:expr) => {
+    ($self:expr) => {{
+        let colored = is_logger_colored();
+        let (open, reset, cyan, gray, white) = if colored {
+            (
+                "\x1b[1;36m",
+                "\x1b[0m",
+                "\x1b[36m",
+                "\x1b[90m",
+                "\x1b[97m",
+            )
+        } else {
+            ("", "", "", "", "")
+        };
         format!(
-            "RUSTLS\t{}\tSession(sni={:?}, source={:?}, frontend={}, readiness={})\t >>>",
-            $self.log_context(),
-            $self
+            "{open}RUSTLS{reset}\t{gray}{ctx}{reset}\t{cyan}Session{reset}({gray}sni{reset}={white}{sni:?}{reset}, {gray}source{reset}={white}{source:?}{reset}, {gray}frontend{reset}={white}{frontend}{reset}, {gray}readiness{reset}={white}{readiness}{reset})\t >>>",
+            open = open,
+            reset = reset,
+            cyan = cyan,
+            gray = gray,
+            white = white,
+            ctx = $self.log_context(),
+            sni = $self
                 .session
                 .server_name()
                 .map(|addr| addr.to_string())
                 .unwrap_or_else(|| "<none>".to_string()),
-            $self
+            source = $self
                 .peer_address
                 .map(|addr| addr.to_string())
                 .unwrap_or_else(|| "<none>".to_string()),
-            $self.frontend_token.0,
-            $self.frontend_readiness
+            frontend = $self.frontend_token.0,
+            readiness = $self.frontend_readiness,
         )
-    };
+    }};
 }
 
 pub enum TlsState {

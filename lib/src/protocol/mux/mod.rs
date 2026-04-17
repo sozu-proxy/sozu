@@ -28,9 +28,104 @@ use std::{
 use mio::{Token, net::TcpStream};
 use rusty_ulid::Ulid;
 use sozu_command::{
+    logging::is_logger_colored,
     proto::command::{Event, EventKind},
     ready::Ready,
 };
+
+/// Protocol label + session descriptor used as a prefix on every [`Mux`] log
+/// line. Matches the RUSTLS log-context convention:
+/// `MUX\t[<ulid>]\tSession(...)\t >>>`. When [`is_logger_colored`] is `true`
+/// the label is wrapped in bright-magenta/bold ANSI, the ULID is bracketed
+/// in dim text and the session detail block is dimmed.
+///
+/// Fields included in the session block:
+/// - `frontend` — mio token of the frontend socket
+/// - `peer` — peer address (or `None` if the socket is gone)
+/// - `streams` — number of streams currently held by the [`Context`]
+/// - `backends` — number of backend connections in the [`Router`]
+/// - `pending_links` — streams waiting to be linked to a backend
+/// - `readiness` — frontend mio readiness snapshot
+macro_rules! log_context {
+    ($self:expr) => {{
+        let colored = is_logger_colored();
+        let (open, reset, cyan, gray, white) = if colored {
+            (
+                "\x1b[1;35m",
+                "\x1b[0m",
+                "\x1b[36m",
+                "\x1b[90m",
+                "\x1b[97m",
+            )
+        } else {
+            ("", "", "", "", "")
+        };
+        format!(
+            "{open}MUX{reset}\t{gray}[{reset}{white}{ulid}{reset}{gray}]{reset}\t{cyan}Session{reset}({gray}frontend{reset}={white}{frontend}{reset}, {gray}peer{reset}={white}{peer:?}{reset}, {gray}streams{reset}={white}{streams}{reset}, {gray}backends{reset}={white}{backends}{reset}, {gray}pending_links{reset}={white}{pending_links}{reset}, {gray}readiness{reset}={white}{readiness}{reset})\t >>>",
+            open = open,
+            reset = reset,
+            cyan = cyan,
+            gray = gray,
+            white = white,
+            ulid = $self.session_ulid,
+            frontend = $self.frontend_token.0,
+            peer = $self.frontend.socket().peer_addr().ok(),
+            streams = $self.context.streams.len(),
+            backends = $self.router.backends.len(),
+            pending_links = $self.context.pending_links.len(),
+            readiness = $self.frontend.readiness(),
+        )
+    }};
+}
+
+/// Lighter variant of [`log_context!`] that omits the
+/// `streams`/`backends`/`pending_links` counts. Used at sites where the
+/// borrow checker forbids reading `self.router.backends` or
+/// `self.context.streams` (e.g. inside a method that already holds a mutable
+/// borrow on one of them). The ULID and frontend snapshot still carry enough
+/// context to correlate the line back to the rest of the session.
+macro_rules! log_context_lite {
+    ($self:expr) => {{
+        let colored = is_logger_colored();
+        let (open, reset, cyan, gray, white) = if colored {
+            (
+                "\x1b[1;35m",
+                "\x1b[0m",
+                "\x1b[36m",
+                "\x1b[90m",
+                "\x1b[97m",
+            )
+        } else {
+            ("", "", "", "", "")
+        };
+        format!(
+            "{open}MUX{reset}\t{gray}[{reset}{white}{ulid}{reset}{gray}]{reset}\t{cyan}Session{reset}({gray}frontend{reset}={white}{frontend}{reset}, {gray}peer{reset}={white}{peer:?}{reset}, {gray}readiness{reset}={white}{readiness}{reset})\t >>>",
+            open = open,
+            reset = reset,
+            cyan = cyan,
+            gray = gray,
+            white = white,
+            ulid = $self.session_ulid,
+            frontend = $self.frontend_token.0,
+            peer = $self.frontend.socket().peer_addr().ok(),
+            readiness = $self.frontend.readiness(),
+        )
+    }};
+}
+
+/// Module-level prefix for logs emitted from free functions where no [`Mux`]
+/// is in scope. Honours the colored flag.
+macro_rules! log_module_context {
+    () => {{
+        let colored = is_logger_colored();
+        let (open, reset) = if colored {
+            ("\x1b[1;35m", "\x1b[0m")
+        } else {
+            ("", "")
+        };
+        format!("{open}MUX{reset}\t >>>", open = open, reset = reset)
+    }};
+}
 
 pub mod answers;
 pub mod connection;
@@ -204,7 +299,12 @@ fn update_readiness(
     readiness: &mut Readiness,
     bit: Ready,
 ) -> bool {
-    trace!("  size={}, status={:?}", size, status);
+    trace!(
+        "{}   size={}, status={:?}",
+        log_module_context!(),
+        size,
+        status
+    );
     match status {
         SocketResult::Continue => {}
         SocketResult::Closed | SocketResult::Error | SocketResult::WouldBlock => {
@@ -346,7 +446,7 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
             .position(|s| s.state == StreamState::Recycle);
         if let Some(stream_id) = recycle_slot {
             let stream = &mut self.streams[stream_id];
-            trace!("Reuse stream: {}", stream_id);
+            trace!("{} Reuse stream: {}", log_module_context!(), stream_id);
             stream.state = StreamState::Idle;
             stream.attempts = 0;
             stream.front_received_end_of_stream = false;
@@ -413,6 +513,11 @@ pub struct Mux<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> {
     pub frontend: Connection<Front>,
     pub router: Router,
     pub context: Context<L>,
+    /// Per-session correlation ID generated at construction time. Included in
+    /// every log line emitted from this module so all events for a single
+    /// frontend connection can be reassembled (independent of the ephemeral
+    /// per-stream request id used by access logs).
+    pub session_ulid: Ulid,
 }
 
 impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Mux<Front, L> {
@@ -428,7 +533,12 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             let readiness = self.frontend.readiness_mut();
             readiness.interest = Ready::WRITABLE | Ready::HUP | Ready::ERROR;
             readiness.signal_pending_write();
-            debug!("Mux delaying close on {}: {:?}", reason, self.frontend);
+            debug!(
+                "{} Mux delaying close on {}: {:?}",
+                log_context!(self),
+                reason,
+                self.frontend
+            );
             true
         } else {
             false
@@ -517,7 +627,11 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         if self.frontend.readiness().event.is_hup()
             && !self.delay_close_for_frontend_flush("frontend HUP")
         {
-            debug!("Mux closing on frontend HUP: {:?}", self.frontend);
+            debug!(
+                "{} Mux closing on frontend HUP: {:?}",
+                log_context!(self),
+                self.frontend
+            );
             return SessionResult::Close;
         }
 
@@ -537,7 +651,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 .unwrap_or_default()
                 .as_millis() as usize,
         ));
-        trace!("{:?}", start);
+        trace!("{} {:?}", log_context!(self), start);
         loop {
             self.context.debug.push(DebugEvent::LoopStart);
             loop {
@@ -559,7 +673,11 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                         MuxResult::Continue => {}
                         MuxResult::CloseSession => {
                             if !self.delay_close_for_frontend_flush("frontend readable") {
-                                debug!("Mux close from frontend readable: {:?}", self.frontend);
+                                debug!(
+                                    "{} Mux close from frontend readable: {:?}",
+                                    log_context!(self),
+                                    self.frontend
+                                );
                                 return SessionResult::Close;
                             }
                         }
@@ -577,7 +695,12 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                     // always mask out HUP (0b01000) and ERROR (0b00100).
                     let dead = readiness.event.is_hup() || readiness.event.is_error();
                     if dead {
-                        trace!("Backend({:?}) -> {:?}", token, readiness);
+                        trace!(
+                            "{} Backend({:?}) -> {:?}",
+                            log_context_lite!(self),
+                            token,
+                            readiness
+                        );
                         readiness.event.remove(Ready::WRITABLE);
                     }
 
@@ -597,8 +720,10 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                 let mut backend_borrow = backend.borrow_mut();
                                 if backend_borrow.retry_policy.is_down() {
                                     info!(
-                                        "backend server {} at {} is up",
-                                        backend_borrow.backend_id, backend_borrow.address
+                                        "{} backend server {} at {} is up",
+                                        log_context_lite!(self),
+                                        backend_borrow.backend_id,
+                                        backend_borrow.address
                                     );
                                     incr!(
                                         "backend.up",
@@ -624,7 +749,11 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                         backend_borrow.active_requests += 1;
                                     }
                                 }
-                                trace!("connection success: {:#?}", backend_borrow);
+                                trace!(
+                                    "{} connection success: {:#?}",
+                                    log_context_lite!(self),
+                                    backend_borrow
+                                );
                                 drop(backend_borrow);
                                 *position = Position::Client(
                                     std::mem::take(cluster_id),
@@ -637,7 +766,10 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                             }
                             Position::Client(..) => {}
                             Position::Server => {
-                                error!("backend connection cannot be in Server position");
+                                error!(
+                                    "{} backend connection cannot be in Server position",
+                                    log_context_lite!(self)
+                                );
                             }
                         }
                         let res = {
@@ -653,7 +785,10 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                         match res {
                             MuxResult::Continue => {}
                             MuxResult::Upgrade => {
-                                error!("only frontend connections can trigger Upgrade");
+                                error!(
+                                    "{} only frontend connections can trigger Upgrade",
+                                    log_context_lite!(self)
+                                );
                             }
                             MuxResult::CloseSession => {
                                 backend_close = Some(("backend writable", *token));
@@ -679,7 +814,10 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                         match res {
                             MuxResult::Continue => {}
                             MuxResult::Upgrade => {
-                                error!("only frontend connections can trigger Upgrade (readable)");
+                                error!(
+                                    "{} only frontend connections can trigger Upgrade (readable)",
+                                    log_context_lite!(self)
+                                );
                             }
                             MuxResult::CloseSession => {
                                 backend_close = Some(("backend readable", *token));
@@ -695,7 +833,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                         self.context
                             .debug
                             .push(DebugEvent::CH(*token, client.readiness().clone()));
-                        trace!("Closing {:#?}", client);
+                        trace!("{} Closing {:#?}", log_context_lite!(self), client);
                         match client.position() {
                             Position::Client(cluster_id, backend, BackendStatus::Connecting(_)) => {
                                 let mut backend_borrow = backend.borrow_mut();
@@ -710,8 +848,10 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                 );
                                 if !already_unavailable && backend_borrow.retry_policy.is_down() {
                                     error!(
-                                        "backend server {} at {} is down",
-                                        backend_borrow.backend_id, backend_borrow.address
+                                        "{} backend server {} at {} is down",
+                                        log_context_lite!(self),
+                                        backend_borrow.backend_id,
+                                        backend_borrow.address
                                     );
                                     incr!(
                                         "backend.down",
@@ -725,7 +865,11 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                         cluster_id: Some(cluster_id.to_owned()),
                                     });
                                 }
-                                trace!("connection fail: {:#?}", backend_borrow);
+                                trace!(
+                                    "{} connection fail: {:#?}",
+                                    log_context_lite!(self),
+                                    backend_borrow
+                                );
                             }
                             Position::Client(_, backend, _) => {
                                 let mut backend_borrow = backend.borrow_mut();
@@ -738,7 +882,10 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                     backend_borrow.active_requests.saturating_sub(count);
                             }
                             Position::Server => {
-                                error!("dead backend cannot be in Server position");
+                                error!(
+                                    "{} dead backend cannot be in Server position",
+                                    log_context_lite!(self)
+                                );
                             }
                         }
                         client.close(&mut self.context, EndpointServer(&mut self.frontend));
@@ -762,31 +909,49 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                             client.timeout_container().cancel();
                             let socket = client.socket_mut();
                             if let Err(e) = proxy_borrow.deregister_socket(socket) {
-                                error!("error deregistering back socket({:?}): {:?}", socket, e);
+                                error!(
+                                    "{} error deregistering back socket({:?}): {:?}",
+                                    log_context!(self),
+                                    socket,
+                                    e
+                                );
                             }
                             if let Err(e) = socket.shutdown(Shutdown::Write) {
                                 if e.kind() != ErrorKind::NotConnected {
                                     error!(
-                                        "error shutting down back socket({:?}): {:?}",
-                                        socket, e
+                                        "{} error shutting down back socket({:?}): {:?}",
+                                        log_context!(self),
+                                        socket,
+                                        e
                                     );
                                 }
                             }
                         } else {
-                            error!("session {:?} has no backend!", token);
+                            error!("{} session {:?} has no backend!", log_context!(self), token);
                         }
                         if !proxy_borrow.remove_session(*token) {
-                            error!("session {:?} was already removed!", token);
+                            error!(
+                                "{} session {:?} was already removed!",
+                                log_context!(self),
+                                token
+                            );
                         }
                     }
-                    trace!("FRONTEND: {:#?}", self.frontend);
-                    trace!("BACKENDS: {:#?}", self.router.backends);
+                    trace!("{} FRONTEND: {:#?}", log_context!(self), self.frontend);
+                    trace!(
+                        "{} BACKENDS: {:#?}",
+                        log_context!(self),
+                        self.router.backends
+                    );
                 }
                 if let Some((reason, token)) = backend_close {
                     if !self.delay_close_for_frontend_flush(reason) {
                         debug!(
-                            "Mux close from {} token={:?}: frontend={:?}",
-                            reason, token, self.frontend
+                            "{} Mux close from {} token={:?}: frontend={:?}",
+                            log_context!(self),
+                            reason,
+                            token,
+                            self.frontend
                         );
                         return SessionResult::Close;
                     }
@@ -810,7 +975,11 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                         MuxResult::Continue => {}
                         MuxResult::CloseSession => {
                             if !self.delay_close_for_frontend_flush("frontend writable") {
-                                debug!("Mux close from frontend writable: {:?}", self.frontend);
+                                debug!(
+                                    "{} Mux close from frontend writable: {:?}",
+                                    log_context!(self),
+                                    self.frontend
+                                );
                                 return SessionResult::Close;
                             }
                         }
@@ -838,7 +1007,8 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                     incr!("http.infinite_loop.error");
                     if self.frontend.has_pending_write() {
                         debug!(
-                            "Mux loop budget exhausted while frontend flush pending: {:?}",
+                            "{} Mux loop budget exhausted while frontend flush pending: {:?}",
+                            log_context!(self),
                             self.frontend
                         );
                         self.frontend.readiness_mut().event.remove(Ready::WRITABLE);
@@ -875,7 +1045,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                         context.debug.push(DebugEvent::CC(stream_id, state));
                     }
                     Err(error) => {
-                        trace!("Connection error: {}", error);
+                        trace!("{} Connection error: {}", log_module_context!(), error);
                         let stream = &mut context.streams[stream_id];
                         let answers = answers_rc.borrow();
                         use BackendConnectionError as BE;
@@ -909,16 +1079,24 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                             }
 
                             BE::Backend(ref e) => {
-                                error!("backend connection error: {}", e);
+                                error!("{} backend connection error: {}", log_module_context!(), e);
                                 set_default_answer(stream, front_readiness, 503, &answers);
                             }
                             BE::RetrieveClusterError(ref other) => {
-                                error!("unexpected RetrieveClusterError variant: {:?}", other);
+                                error!(
+                                    "{} unexpected RetrieveClusterError variant: {:?}",
+                                    log_module_context!(),
+                                    other
+                                );
                                 set_default_answer(stream, front_readiness, 503, &answers);
                             }
                             // TCP specific error
                             BE::NotFound(ref msg) => {
-                                error!("NotFound is TCP-specific, not reachable in mux: {:?}", msg);
+                                error!(
+                                    "{} NotFound is TCP-specific, not reachable in mux: {:?}",
+                                    log_module_context!(),
+                                    msg
+                                );
                                 set_default_answer(stream, front_readiness, 503, &answers);
                             }
                         }
@@ -977,7 +1155,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
     }
 
     fn update_readiness(&mut self, token: Token, events: Ready) {
-        trace!("EVENTS: {:?} on {:?}", events, token);
+        trace!("{} EVENTS: {:?} on {:?}", log_context!(self), events, token);
         self.context.debug.push(DebugEvent::EV(token, events));
         if token == self.frontend_token {
             self.frontend.readiness_mut().event |= events;
@@ -987,7 +1165,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
     }
 
     fn timeout(&mut self, token: Token, _metrics: &mut SessionMetrics) -> StateResult {
-        trace!("MuxState::timeout({:?})", token);
+        trace!("{} MuxState::timeout({:?})", log_context!(self), token);
         let front_is_h2 = match self.frontend {
             Connection::H1(_) => false,
             Connection::H2(_) => true,
@@ -996,7 +1174,11 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         let mut should_close = true;
         let mut should_write = false;
         if self.frontend_token == token {
-            trace!("MuxState::timeout_frontend({:#?})", self.frontend);
+            trace!(
+                "{} MuxState::timeout_frontend({:#?})",
+                log_context!(self),
+                self.frontend
+            );
             self.frontend.timeout_container().triggered();
             let front_readiness = self.frontend.readiness_mut();
             for stream_id in 0..self.context.streams.len() {
@@ -1087,7 +1269,11 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 }
             }
         } else if let Some(backend) = self.router.backends.get_mut(&token) {
-            trace!("MuxState::timeout_backend({:#?})", backend);
+            trace!(
+                "{} MuxState::timeout_backend({:#?})",
+                log_context_lite!(self),
+                backend
+            );
             backend.timeout_container().triggered();
             let front_readiness = self.frontend.readiness_mut();
             let linked_ids: Vec<GlobalStreamId> = self
@@ -1100,21 +1286,30 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 if self.context.streams[stream_id].back.is_terminated()
                     || self.context.streams[stream_id].back.is_error()
                 {
-                    trace!("Stream terminated or in error, do nothing, just wait a bit more");
+                    trace!(
+                        "{} Stream terminated or in error, do nothing, just wait a bit more",
+                        log_module_context!()
+                    );
                     // Nothing to do, simply wait for the remaining bytes to be proxied
                     if !self.context.streams[stream_id].back.is_completed() {
                         should_close = false;
                     }
                 } else if !self.context.streams[stream_id].back.consumed {
                     // The response has not started yet
-                    trace!("Stream still waiting for response, send 504");
+                    trace!(
+                        "{} Stream still waiting for response, send 504",
+                        log_module_context!()
+                    );
                     self.context.unlink_stream(stream_id);
                     let answers = answers_rc.borrow();
                     let stream = &mut self.context.streams[stream_id];
                     set_default_answer(stream, front_readiness, 504, &answers);
                     should_write = true;
                 } else {
-                    trace!("Stream waiting for end of response, forcefully terminate it");
+                    trace!(
+                        "{} Stream waiting for end of response, forcefully terminate it",
+                        log_module_context!()
+                    );
                     self.context.unlink_stream(stream_id);
                     let stream = &mut self.context.streams[stream_id];
                     forcefully_terminate_answer(stream, front_readiness, H2Error::InternalError);
@@ -1165,21 +1360,26 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         if should_close {
             if self.delay_close_for_frontend_flush("timeout") {
                 debug!(
-                    "Mux timeout delaying close for frontend flush: token={:?}, frontend={:?}",
-                    token, self.frontend
+                    "{} Mux timeout delaying close for frontend flush: token={:?}, frontend={:?}",
+                    log_context!(self),
+                    token,
+                    self.frontend
                 );
                 self.frontend.timeout_container().set(self.frontend_token);
                 return StateResult::Continue;
             }
             if front_is_h2 {
                 debug!(
-                    "Mux timeout returning CloseSession: token={:?}, frontend={:?}",
-                    token, self.frontend
+                    "{} Mux timeout returning CloseSession: token={:?}, frontend={:?}",
+                    log_context!(self),
+                    token,
+                    self.frontend
                 );
                 for (idx, stream) in self.context.streams.iter().enumerate() {
                     if stream.state != StreamState::Recycle {
                         debug!(
-                            "  timeout stream[{}]: state={:?}, front_phase={:?}, back_phase={:?}, front_completed={}, back_completed={}",
+                            "{}   timeout stream[{}]: state={:?}, front_phase={:?}, back_phase={:?}, front_completed={}, back_completed={}",
+                            log_context!(self),
                             idx,
                             stream.state,
                             stream.front.parsing_phase,
@@ -1201,7 +1401,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
     }
 
     fn cancel_timeouts(&mut self) {
-        trace!("MuxState::cancel_timeouts");
+        trace!("{} MuxState::cancel_timeouts", log_context!(self));
         self.frontend.timeout_container().cancel();
         for backend in self.router.backends.values_mut() {
             backend.timeout_container().cancel();
@@ -1221,7 +1421,8 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         );
         for (backend_token, backend) in &self.router.backends {
             error!(
-                "\t\ttoken: {:?}\treadiness: {:?}",
+                "{} \t\ttoken: {:?}\treadiness: {:?}",
+                log_context!(self),
                 backend_token,
                 backend.readiness()
             )
@@ -1230,11 +1431,15 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
 
     fn close(&mut self, proxy: Rc<RefCell<dyn L7Proxy>>, _metrics: &mut SessionMetrics) {
         if self.context.debug.is_interesting() {
-            warn!("{:?}", self.context.debug.events);
+            warn!("{} {:?}", log_context!(self), self.context.debug.events);
         }
-        debug!("MUX CLOSE");
-        trace!("FRONTEND: {:#?}", self.frontend);
-        trace!("BACKENDS: {:#?}", self.router.backends);
+        debug!("{} MUX CLOSE", log_context!(self));
+        trace!("{} FRONTEND: {:#?}", log_context!(self), self.frontend);
+        trace!(
+            "{} BACKENDS: {:#?}",
+            log_context!(self),
+            self.router.backends
+        );
 
         // Log active streams at session teardown for timeout diagnosis
         let active_count = self
@@ -1244,7 +1449,11 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             .filter(|s| s.state.is_open() && s.metrics.start.is_some())
             .count();
         if active_count > 0 {
-            debug!("Session close with {} active stream(s)", active_count);
+            debug!(
+                "{} Session close with {} active stream(s)",
+                log_context!(self),
+                active_count
+            );
             for (idx, stream) in self
                 .context
                 .streams
@@ -1254,7 +1463,8 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             {
                 let elapsed = stream.metrics.service_time();
                 debug!(
-                    "  active stream[{}]: state={:?} service_time={:?} method={:?} path={:?} status={:?}",
+                    "{}   active stream[{}]: state={:?} service_time={:?} method={:?} path={:?} status={:?}",
+                    log_context!(self),
                     idx,
                     stream.state,
                     elapsed,
@@ -1306,15 +1516,29 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             client.timeout_container().cancel();
             let socket = client.socket_mut();
             if let Err(e) = proxy_borrow.deregister_socket(socket) {
-                error!("error deregistering back socket({:?}): {:?}", socket, e);
+                error!(
+                    "{} error deregistering back socket({:?}): {:?}",
+                    log_context_lite!(self),
+                    socket,
+                    e
+                );
             }
             if let Err(e) = socket.shutdown(Shutdown::Write) {
                 if e.kind() != ErrorKind::NotConnected {
-                    error!("error shutting down back socket({:?}): {:?}", socket, e);
+                    error!(
+                        "{} error shutting down back socket({:?}): {:?}",
+                        log_context_lite!(self),
+                        socket,
+                        e
+                    );
                 }
             }
             if !proxy_borrow.remove_session(*token) {
-                error!("session {:?} was already removed!", token);
+                error!(
+                    "{} session {:?} was already removed!",
+                    log_context_lite!(self),
+                    token
+                );
             }
 
             match client.position() {
@@ -1335,10 +1559,17 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                         .map_or(0, |ids| ids.len());
                     backend_borrow.active_requests =
                         backend_borrow.active_requests.saturating_sub(count);
-                    trace!("connection (session) closed: {:#?}", backend_borrow);
+                    trace!(
+                        "{} connection (session) closed: {:#?}",
+                        log_context_lite!(self),
+                        backend_borrow
+                    );
                 }
                 Position::Server => {
-                    error!("close_backend called on Server position");
+                    error!(
+                        "{} close_backend called on Server position",
+                        log_context_lite!(self)
+                    );
                 }
             }
         }
@@ -1365,7 +1596,10 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 _ => {}
             }
         } else {
-            trace!("shutting_down: already draining, skipping duplicate GOAWAY");
+            trace!(
+                "{} shutting_down: already draining, skipping duplicate GOAWAY",
+                log_context!(self)
+            );
             // shut_down_sessions() runs outside ready(), so retry flushing any
             // previously-buffered GOAWAY/TLS records on each pass.
             self.frontend.flush_zero_buffer();
@@ -1433,12 +1667,14 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 .collect::<Vec<_>>();
             if matches!(self.frontend, Connection::H2(_)) && !active_h2_streams.is_empty() {
                 debug!(
-                    "Mux shutting_down returning true with active H2 streams: {:?}",
+                    "{} Mux shutting_down returning true with active H2 streams: {:?}",
+                    log_context!(self),
                     self.frontend
                 );
                 for (idx, stream) in active_h2_streams {
                     debug!(
-                        "  shutdown stream[{}]: state={:?}, front_phase={:?}, back_phase={:?}, front_completed={}, back_completed={}",
+                        "{}   shutdown stream[{}]: state={:?}, front_phase={:?}, back_phase={:?}, front_completed={}, back_completed={}",
+                        log_context!(self),
                         idx,
                         stream.state,
                         stream.front.parsing_phase,
