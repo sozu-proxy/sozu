@@ -34,7 +34,7 @@ use crate::{
 /// Protocol label + session descriptor used as a prefix on every
 /// [`ConnectionH2`] log line. Matches the RUSTLS log-context convention:
 /// `MUX-H2\tSession(...)\t >>>`. When [`is_logger_colored`] is `true` the
-/// label is wrapped in bright-cyan/bold ANSI and the session detail is dim.
+/// label is wrapped in bright-yellow/bold ANSI and the session detail is dim.
 ///
 /// Fields included in the session block (chosen to surface the most common
 /// H2 troubleshooting axes — flow stall, leaked stream, draining state,
@@ -56,7 +56,7 @@ macro_rules! log_context {
         let colored = is_logger_colored();
         let (open, reset, cyan, gray, white) = if colored {
             (
-                "\x1b[1;36m",
+                "\x1b[1;33m",
                 "\x1b[0m",
                 "\x1b[36m",
                 "\x1b[90m",
@@ -96,7 +96,7 @@ macro_rules! log_context_stream {
         let colored = is_logger_colored();
         let (open, reset, cyan, gray, white) = if colored {
             (
-                "\x1b[1;36m",
+                "\x1b[1;33m",
                 "\x1b[0m",
                 "\x1b[36m",
                 "\x1b[90m",
@@ -136,7 +136,7 @@ macro_rules! log_module_context {
     () => {{
         let colored = is_logger_colored();
         let (open, reset) = if colored {
-            ("\x1b[1;36m", "\x1b[0m")
+            ("\x1b[1;33m", "\x1b[0m")
         } else {
             ("", "")
         };

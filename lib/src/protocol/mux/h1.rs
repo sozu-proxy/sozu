@@ -19,7 +19,7 @@ use crate::{
 
 /// Prefix applied to every [`ConnectionH1`] log line. Matches the RUSTLS
 /// log-context convention (`MUX-H1\tSession(...)\t >>>`). When the logger is
-/// in colored mode the label is bright-blue/bold and the session detail is
+/// in colored mode the label is bright-yellow/bold and the session detail is
 /// dim.
 ///
 /// Fields included in the session block (chosen to surface the most common
@@ -37,7 +37,7 @@ macro_rules! log_context {
         let colored = is_logger_colored();
         let (open, reset, cyan, gray, white) = if colored {
             (
-                "\x1b[1;34m",
+                "\x1b[1;33m",
                 "\x1b[0m",
                 "\x1b[36m",
                 "\x1b[90m",
@@ -74,7 +74,7 @@ macro_rules! log_context_stream {
         let colored = is_logger_colored();
         let (open, reset, cyan, gray, white) = if colored {
             (
-                "\x1b[1;34m",
+                "\x1b[1;33m",
                 "\x1b[0m",
                 "\x1b[36m",
                 "\x1b[90m",
@@ -111,7 +111,7 @@ macro_rules! log_module_context {
     () => {{
         let colored = is_logger_colored();
         let (open, reset) = if colored {
-            ("\x1b[1;34m", "\x1b[0m")
+            ("\x1b[1;33m", "\x1b[0m")
         } else {
             ("", "")
         };
