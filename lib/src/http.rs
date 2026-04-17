@@ -133,6 +133,7 @@ impl HttpSession {
                 frontend,
                 router,
                 context,
+                session_ulid: rusty_ulid::Ulid::generate(),
             })
         };
 
@@ -212,6 +213,7 @@ impl HttpSession {
                     frontend,
                     router,
                     context,
+                    session_ulid: rusty_ulid::Ulid::generate(),
                 };
                 mux.frontend.readiness_mut().event = expect.frontend_readiness.event;
 

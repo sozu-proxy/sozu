@@ -4,7 +4,7 @@ use mio::{Token, net::TcpStream};
 use rusty_ulid::Ulid;
 use sozu_command::{
     config::MAX_LOOP_ITERATIONS,
-    logging::{EndpointRecord, LogContext},
+    logging::{EndpointRecord, LogContext, is_logger_colored},
 };
 
 use crate::{
@@ -17,20 +17,39 @@ use crate::{
     timer::TimeoutContainer,
 };
 
-/// This macro is defined uniquely in this module to help the tracking of pipelining
-/// issues inside Sōzu
+/// This macro is defined uniquely in this module to help the tracking of
+/// pipelining issues inside Sōzu. Colored output uses bright-green/bold for
+/// the protocol label, plain cyan for the `Session` keyword, gray for keys
+/// and bright white for values.
 macro_rules! log_context {
-    ($self:expr) => {
+    ($self:expr) => {{
+        let colored = is_logger_colored();
+        let (open, reset, cyan, gray, white) = if colored {
+            (
+                "\x1b[1;32m",
+                "\x1b[0m",
+                "\x1b[36m",
+                "\x1b[90m",
+                "\x1b[97m",
+            )
+        } else {
+            ("", "", "", "", "")
+        };
         format!(
-            "PIPE\t{}\tSession(address={}, frontend={}, readiness={}, backend={}, readiness={})\t >>>",
-            $self.log_context(),
-            $self.session_address.map(|addr| addr.to_string()).unwrap_or_else(|| "<none>".to_string()),
-            $self.frontend_token.0,
-            $self.frontend_readiness,
-            $self.backend_token.map(|token| token.0.to_string()).unwrap_or_else(|| "<none>".to_string()),
-            $self.backend_readiness,
+            "{open}PIPE{reset}\t{gray}{ctx}{reset}\t{cyan}Session{reset}({gray}address{reset}={white}{address}{reset}, {gray}frontend{reset}={white}{frontend}{reset}, {gray}frontend_readiness{reset}={white}{frontend_readiness}{reset}, {gray}backend{reset}={white}{backend}{reset}, {gray}backend_readiness{reset}={white}{backend_readiness}{reset})\t >>>",
+            open = open,
+            reset = reset,
+            cyan = cyan,
+            gray = gray,
+            white = white,
+            ctx = $self.log_context(),
+            address = $self.session_address.map(|addr| addr.to_string()).unwrap_or_else(|| "<none>".to_string()),
+            frontend = $self.frontend_token.0,
+            frontend_readiness = $self.frontend_readiness,
+            backend = $self.backend_token.map(|token| token.0.to_string()).unwrap_or_else(|| "<none>".to_string()),
+            backend_readiness = $self.backend_readiness,
         )
-    };
+    }};
 }
 
 #[derive(PartialEq, Eq)]

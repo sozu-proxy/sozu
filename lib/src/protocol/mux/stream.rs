@@ -12,12 +12,28 @@ use std::{
 };
 
 use mio::Token;
+use sozu_command::logging::is_logger_colored;
 
 use super::{GenericHttpStream, Position};
 use crate::{
     L7ListenerHandler, ListenerHandler, Protocol, SessionMetrics, pool::Pool,
     protocol::http::editor::HttpContext,
 };
+
+/// Module-level prefix used on every log line emitted from the stream module.
+/// Streams have no direct peer reference so a single `MUX-STREAM` label is
+/// used, colored bright white/bold when the logger supports ANSI.
+macro_rules! log_module_context {
+    () => {{
+        let colored = is_logger_colored();
+        let (open, reset) = if colored {
+            ("\x1b[1;37m", "\x1b[0m")
+        } else {
+            ("", "")
+        };
+        format!("{open}MUX-STREAM{reset}\t >>>", open = open, reset = reset)
+    }};
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamState {
@@ -200,7 +216,8 @@ impl Stream {
             Protocol::HTTPS => "https",
             other => {
                 error!(
-                    "mux streams only handle HTTP or HTTPS protocols, got {:?}",
+                    "{} mux streams only handle HTTP or HTTPS protocols, got {:?}",
+                    log_module_context!(),
                     other
                 );
                 "unknown"

@@ -10,6 +10,22 @@ use nom::{
     number::complete::{be_u8, be_u16, be_u24, be_u32},
     sequence::tuple,
 };
+use sozu_command::logging::is_logger_colored;
+
+/// Module-level prefix for nom-based H2 frame parser diagnostics. The parser
+/// has no session in scope, so a dim `MUX-PARSER` label is used, colored when
+/// the logger supports ANSI.
+macro_rules! log_module_context {
+    () => {{
+        let colored = is_logger_colored();
+        let (open, reset) = if colored {
+            ("\x1b[2;36m", "\x1b[0m")
+        } else {
+            ("", "")
+        };
+        format!("{open}MUX-PARSER{reset}\t >>>", open = open, reset = reset)
+    }};
+}
 
 // ── RFC 9113 Wire Format Constants ──────────────────────────────────────────
 
@@ -259,7 +275,7 @@ pub fn frame_header(input: &[u8], max_frame_size: u32) -> IResult<&[u8], FrameHe
         FrameType::WindowUpdate | FrameType::Unknown(_) => true,
     };
     if !valid_stream_id {
-        error!("invalid stream_id: {}", stream_id);
+        error!("{} invalid stream_id: {}", log_module_context!(), stream_id);
         return Err(Err::Failure(ParserError::new_h2(i, H2Error::ProtocolError)));
     }
 
@@ -280,7 +296,7 @@ pub fn frame_header(input: &[u8], max_frame_size: u32) -> IResult<&[u8], FrameHe
 /// the payload per RFC 9113 §5.5 ("Implementations MUST ignore and discard
 /// frames of unknown type").
 fn convert_frame_type(t: u8) -> FrameType {
-    trace!("got frame type: {}", t);
+    trace!("{} got frame type: {}", log_module_context!(), t);
     match t {
         0 => FrameType::Data,
         1 => FrameType::Headers,

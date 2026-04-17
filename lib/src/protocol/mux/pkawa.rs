@@ -4,6 +4,7 @@ use kawa::{
     Block, BodySize, Flags, Kind, Pair, ParsingPhase, StatusLine, Store, Version,
     h1::ParserCallbacks, repr::Slice,
 };
+use sozu_command::logging::is_logger_colored;
 
 use crate::{
     pool::Checkout,
@@ -16,6 +17,22 @@ use crate::{
         },
     },
 };
+
+/// Module-level prefix used on every log line emitted from the pkawa H2
+/// converter. Pkawa operates on raw HPACK blocks without direct session
+/// context, so a single dim `MUX-PKAWA` label is used, colored when the
+/// logger supports ANSI.
+macro_rules! log_module_context {
+    () => {{
+        let colored = is_logger_colored();
+        let (open, reset) = if colored {
+            ("\x1b[2;36m", "\x1b[0m")
+        } else {
+            ("", "")
+        };
+        format!("{open}MUX-PKAWA{reset}\t >>>", open = open, reset = reset)
+    }};
+}
 
 /// Returns true if the header name contains any uppercase ASCII letter (A-Z).
 /// RFC 9113 section 8.2 requires all header field names to be lowercase in HTTP/2.
@@ -347,13 +364,15 @@ where
         per_header(k, v, &mut invalid_headers);
     });
     if let Err(error) = decode_status {
-        error!("INVALID FRAGMENT: {:?}", error);
+        error!("{} INVALID FRAGMENT: {:?}", log_module_context!(), error);
         return Err((H2Error::CompressionError, true));
     }
     if budget_exceeded {
         error!(
-            "HPACK decoded header size {} exceeds MAX_HEADER_LIST_SIZE {}",
-            decoded_bytes, max_decoded_bytes
+            "{} HPACK decoded header size {} exceeds MAX_HEADER_LIST_SIZE {}",
+            log_module_context!(),
+            decoded_bytes,
+            max_decoded_bytes
         );
         return Err((H2Error::EnhanceYourCalm, false));
     }
@@ -566,7 +585,7 @@ where
                 || path.is_empty()
                 || scheme.is_empty()
             {
-                error!("INVALID HEADERS");
+                error!("{} INVALID HEADERS", log_module_context!());
                 return Err((H2Error::ProtocolError, false));
             }
             // RFC 9113 §8.3.1: if a literal ``host`` header appears, it must
@@ -574,13 +593,19 @@ where
             // so the H1 serializer emits exactly one ``Host:`` line. Mismatches
             // are request-smuggling vectors and are rejected as PROTOCOL_ERROR.
             if host_conflict {
-                error!("H2 host header: multiple disagreeing values");
+                error!(
+                    "{} H2 host header: multiple disagreeing values",
+                    log_module_context!()
+                );
                 return Err((H2Error::ProtocolError, false));
             }
             if let Some(ref host) = host_value {
                 let authority_bytes = authority.data_opt(kawa.storage.buffer()).unwrap_or(&[]);
                 if !host_matches_authority(host, authority_bytes) {
-                    error!("H2 host header does not match :authority");
+                    error!(
+                        "{} H2 host header does not match :authority",
+                        log_module_context!()
+                    );
                     return Err((H2Error::ProtocolError, false));
                 }
                 // Match — drop it. kawa's H1 serializer emits Host: from
@@ -632,7 +657,7 @@ where
                 },
             )?;
             if invalid_headers || status.is_empty() {
-                error!("INVALID HEADERS");
+                error!("{} INVALID HEADERS", log_module_context!());
                 return Err((H2Error::ProtocolError, false));
             }
             StatusLine::Response {
@@ -647,8 +672,11 @@ where
     // everything has been parsed
     kawa.storage.head = kawa.storage.end;
     debug!(
-        "index: {}/{}/{}",
-        kawa.storage.start, kawa.storage.head, kawa.storage.end
+        "{} index: {}/{}/{}",
+        log_module_context!(),
+        kawa.storage.start,
+        kawa.storage.head,
+        kawa.storage.end
     );
 
     callbacks.on_headers(kawa);
@@ -666,7 +694,8 @@ where
                 );
             if n > 0 && !body_exempt {
                 error!(
-                    "END_STREAM with non-zero Content-Length: {} (RFC 9113 §8.1.1)",
+                    "{} END_STREAM with non-zero Content-Length: {} (RFC 9113 §8.1.1)",
+                    log_module_context!(),
                     n
                 );
                 return Err((H2Error::ProtocolError, false));
@@ -789,18 +818,20 @@ pub fn handle_trailer(
     });
 
     if let Err(error) = decode_status {
-        error!("INVALID FRAGMENT: {:?}", error);
+        error!("{} INVALID FRAGMENT: {:?}", log_module_context!(), error);
         return Err((H2Error::CompressionError, true));
     }
     if budget_exceeded {
         error!(
-            "HPACK decoded trailer size {} exceeds MAX_HEADER_LIST_SIZE {}",
-            decoded_bytes, max_decoded
+            "{} HPACK decoded trailer size {} exceeds MAX_HEADER_LIST_SIZE {}",
+            log_module_context!(),
+            decoded_bytes,
+            max_decoded
         );
         return Err((H2Error::EnhanceYourCalm, false));
     }
     if invalid_trailers {
-        error!("INVALID TRAILERS");
+        error!("{} INVALID TRAILERS", log_module_context!());
         return Err((H2Error::ProtocolError, false));
     }
 

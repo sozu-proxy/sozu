@@ -14,7 +14,7 @@ const _: () = assert!(
 );
 
 use rusty_ulid::Ulid;
-use sozu_command::ready::Ready;
+use sozu_command::{logging::is_logger_colored, ready::Ready};
 
 use crate::{
     L7ListenerHandler, ListenerHandler, Protocol, Readiness, SessionMetrics,
@@ -30,6 +30,75 @@ use crate::{
     socket::{SocketHandler, SocketResult},
     timer::TimeoutContainer,
 };
+
+/// Protocol label + session descriptor used as a prefix on every
+/// [`ConnectionH2`] log line. Matches the RUSTLS log-context convention:
+/// `MUX-H2\tSession(...)\t >>>`. When [`is_logger_colored`] is `true` the
+/// label is wrapped in bright-cyan/bold ANSI and the session detail is dim.
+///
+/// Fields included in the session block (chosen to surface the most common
+/// H2 troubleshooting axes — flow stall, leaked stream, draining state,
+/// peer-side gap):
+/// - `peer` — peer address (or `None` if the socket is gone)
+/// - `position` — `Server` / `Client(...)` orientation
+/// - `state` — current [`H2State`]
+/// - `streams` — number of in-flight streams on this connection
+/// - `last_peer_id` — `highest_peer_stream_id` (gap to the peer's view)
+/// - `window` — connection-level send window (RFC 9113 §6.9)
+/// - `draining` — set after the first GOAWAY of a graceful shutdown
+/// - `readiness` — connection-level mio readiness snapshot
+///
+/// Computed lazily on each callsite — the helper only materialises when the
+/// log level is enabled, so uncolored hot paths keep a single thread-local
+/// read (the colored check) and one `format!` allocation.
+macro_rules! log_context {
+    ($self:expr) => {{
+        let colored = is_logger_colored();
+        let (open, reset, cyan, gray, white) = if colored {
+            (
+                "\x1b[1;36m",
+                "\x1b[0m",
+                "\x1b[36m",
+                "\x1b[90m",
+                "\x1b[97m",
+            )
+        } else {
+            ("", "", "", "", "")
+        };
+        format!(
+            "{open}MUX-H2{reset}\t{cyan}Session{reset}({gray}peer{reset}={white}{peer:?}{reset}, {gray}position{reset}={white}{position:?}{reset}, {gray}state{reset}={white}{state:?}{reset}, {gray}streams{reset}={white}{streams}{reset}, {gray}last_peer_id{reset}={white}{last_peer_id}{reset}, {gray}window{reset}={white}{window}{reset}, {gray}draining{reset}={white}{draining}{reset}, {gray}readiness{reset}={white}{readiness}{reset})\t >>>",
+            open = open,
+            reset = reset,
+            cyan = cyan,
+            gray = gray,
+            white = white,
+            peer = $self.socket.socket_ref().peer_addr().ok(),
+            position = $self.position,
+            state = $self.state,
+            streams = $self.streams.len(),
+            last_peer_id = $self.highest_peer_stream_id,
+            window = $self.flow_control.window,
+            draining = $self.drain.draining,
+            readiness = $self.readiness,
+        )
+    }};
+}
+
+/// Module-level prefix without session context, for logs emitted from
+/// free functions, `H2ConnectionConfig` validation and other sites where no
+/// `ConnectionH2` is in scope. Keeps the `MUX-H2` label consistent with
+/// connection logs and honours the colored flag.
+macro_rules! log_module_context {
+    () => {{
+        let colored = is_logger_colored();
+        let (open, reset) = if colored {
+            ("\x1b[1;36m", "\x1b[0m")
+        } else {
+            ("", "")
+        };
+        format!("{open}MUX-H2{reset}\t >>>", open = open, reset = reset)
+    }};
+}
 
 /// Outcome of a single-stream write flush in write_streams.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -247,30 +316,37 @@ impl H2ConnectionConfig {
             initial_connection_window.clamp(DEFAULT_INITIAL_WINDOW_SIZE, FLOW_CONTROL_MAX_WINDOW);
         if clamped_window != initial_connection_window {
             warn!(
-                "h2_initial_connection_window {} clamped to [{}, {}]",
-                initial_connection_window, DEFAULT_INITIAL_WINDOW_SIZE, FLOW_CONTROL_MAX_WINDOW
+                "{} h2_initial_connection_window {} clamped to [{}, {}]",
+                log_module_context!(),
+                initial_connection_window,
+                DEFAULT_INITIAL_WINDOW_SIZE,
+                FLOW_CONTROL_MAX_WINDOW
             );
         }
         const MAX_SAFE_CONCURRENT_STREAMS: u32 = 10_000;
         let clamped_streams = max_concurrent_streams.clamp(1, MAX_SAFE_CONCURRENT_STREAMS);
         if max_concurrent_streams > MAX_SAFE_CONCURRENT_STREAMS {
             error!(
-                "h2_max_concurrent_streams={} exceeds safe limit, clamped to {}",
-                max_concurrent_streams, MAX_SAFE_CONCURRENT_STREAMS
+                "{} h2_max_concurrent_streams={} exceeds safe limit, clamped to {}",
+                log_module_context!(),
+                max_concurrent_streams,
+                MAX_SAFE_CONCURRENT_STREAMS
             );
         }
         if clamped_streams != max_concurrent_streams
             && max_concurrent_streams <= MAX_SAFE_CONCURRENT_STREAMS
         {
             warn!(
-                "h2_max_concurrent_streams {} clamped to minimum 1",
+                "{} h2_max_concurrent_streams {} clamped to minimum 1",
+                log_module_context!(),
                 max_concurrent_streams
             );
         }
         let clamped_ratio = stream_shrink_ratio.max(2);
         if clamped_ratio != stream_shrink_ratio {
             warn!(
-                "h2_stream_shrink_ratio {} clamped to minimum 2",
+                "{} h2_stream_shrink_ratio {} clamped to minimum 2",
+                log_module_context!(),
                 stream_shrink_ratio
             );
         }
@@ -375,11 +451,30 @@ fn distribute_overhead(
     *overhead_bout -= share_out;
 }
 
+/// Detail of a flood-threshold violation returned by
+/// [`H2FloodDetector::check_flood`] and [`H2FloodDetector::record_rst_lifetime`].
+///
+/// Carrying `(reason, count, threshold)` lets the caller emit a session-scoped
+/// log line with full context — the detector itself is connection-agnostic and
+/// never logs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct H2FloodViolation {
+    /// HTTP/2 error code to emit on the GOAWAY.
+    pub error: H2Error,
+    /// Human-readable name of the counter that tripped (e.g. `"RST_STREAM"`).
+    pub reason: &'static str,
+    /// Observed counter value at the moment of detection.
+    pub count: u64,
+    /// Configured ceiling that was crossed.
+    pub threshold: u64,
+}
+
 /// Tracks per-connection frame rates to detect and mitigate H2 flood attacks.
 ///
 /// Monitors RST_STREAM (CVE-2023-44487), PING (CVE-2019-9512), SETTINGS (CVE-2019-9515),
 /// empty DATA (CVE-2019-9518), and CONTINUATION (CVE-2024-27316) flood patterns.
-/// When any counter exceeds its threshold, `check_flood()` returns `EnhanceYourCalm`.
+/// When any counter exceeds its threshold, `check_flood()` returns the violation
+/// detail so callers can log with connection context before sending GOAWAY.
 ///
 /// Thresholds are configurable via [`H2FloodConfig`], with safe defaults matching
 /// the original compile-time constants.
@@ -451,33 +546,34 @@ impl H2FloodDetector {
         }
     }
 
-    /// Increment the lifetime RST_STREAM counters and return
-    /// `Some(EnhanceYourCalm)` if either the global or the abusive
+    /// Increment the lifetime RST_STREAM counters and return a
+    /// [`H2FloodViolation`] if either the global or the abusive
     /// (pre-response-start) lifetime cap has been exceeded.
     ///
     /// `response_started` indicates whether the backend response had already
     /// begun when the RST arrived; `false` is the cheap-for-client /
     /// expensive-for-us Rapid Reset signature (CVE-2023-44487).
-    pub fn record_rst_lifetime(&mut self, response_started: bool) -> Option<H2Error> {
+    pub fn record_rst_lifetime(&mut self, response_started: bool) -> Option<H2FloodViolation> {
         self.total_rst_received_lifetime = self.total_rst_received_lifetime.saturating_add(1);
         if !response_started {
             self.total_abusive_rst_received_lifetime =
                 self.total_abusive_rst_received_lifetime.saturating_add(1);
         }
         if self.total_rst_received_lifetime > self.config.max_rst_stream_lifetime {
-            warn!(
-                "Rapid Reset: lifetime RST_STREAM count {} exceeds ceiling {}",
-                self.total_rst_received_lifetime, self.config.max_rst_stream_lifetime
-            );
-            return Some(H2Error::EnhanceYourCalm);
+            return Some(H2FloodViolation {
+                error: H2Error::EnhanceYourCalm,
+                reason: "Rapid Reset: lifetime RST_STREAM",
+                count: self.total_rst_received_lifetime,
+                threshold: self.config.max_rst_stream_lifetime,
+            });
         }
         if self.total_abusive_rst_received_lifetime > self.config.max_rst_stream_abusive_lifetime {
-            warn!(
-                "Rapid Reset: lifetime pre-response RST_STREAM count {} exceeds ceiling {}",
-                self.total_abusive_rst_received_lifetime,
-                self.config.max_rst_stream_abusive_lifetime
-            );
-            return Some(H2Error::EnhanceYourCalm);
+            return Some(H2FloodViolation {
+                error: H2Error::EnhanceYourCalm,
+                reason: "Rapid Reset: lifetime pre-response RST_STREAM",
+                count: self.total_abusive_rst_received_lifetime,
+                threshold: self.config.max_rst_stream_abusive_lifetime,
+            });
         }
         None
     }
@@ -495,17 +591,20 @@ impl H2FloodDetector {
         }
     }
 
-    /// Check all flood counters. Returns `Some(EnhanceYourCalm)` if any threshold is exceeded.
-    pub fn check_flood(&mut self) -> Option<H2Error> {
+    /// Check all flood counters. Returns a [`H2FloodViolation`] when a threshold
+    /// is exceeded; the caller is responsible for logging with session context
+    /// and escalating to GOAWAY.
+    pub fn check_flood(&mut self) -> Option<H2FloodViolation> {
         self.maybe_reset_window();
 
-        fn flag(name: &str, count: u32, threshold: u32) -> Option<H2Error> {
+        fn flag(reason: &'static str, count: u32, threshold: u32) -> Option<H2FloodViolation> {
             if count > threshold {
-                warn!(
-                    "H2 flood detected: {} count {} exceeds threshold {}",
-                    name, count, threshold
-                );
-                Some(H2Error::EnhanceYourCalm)
+                Some(H2FloodViolation {
+                    error: H2Error::EnhanceYourCalm,
+                    reason,
+                    count: count as u64,
+                    threshold: threshold as u64,
+                })
             } else {
                 None
             }
@@ -647,7 +746,12 @@ impl Prioriser {
     /// Returns `true` if the priority is invalid (self-dependency for RFC 7540),
     /// signalling the caller should reset the stream with a protocol error.
     pub fn push_priority(&mut self, stream_id: StreamId, priority: parser::PriorityPart) -> bool {
-        trace!("PRIORITY REQUEST FOR {}: {:?}", stream_id, priority);
+        trace!(
+            "{} PRIORITY REQUEST FOR {}: {:?}",
+            log_module_context!(),
+            stream_id,
+            priority
+        );
         // Cap the priority map to prevent flooding via PRIORITY frames
         if !self.priorities.contains_key(&stream_id) && self.priorities.len() >= MAX_PRIORITIES {
             return false;
@@ -699,8 +803,10 @@ impl Prioriser {
     ) -> bool {
         if !self.is_acceptable(stream_id, last_stream_id, open_streams) {
             trace!(
-                "PRIORITY dropped for unknown/far stream {} (last_stream_id={})",
-                stream_id, last_stream_id
+                "{} PRIORITY dropped for unknown/far stream {} (last_stream_id={})",
+                log_module_context!(),
+                stream_id,
+                last_stream_id
             );
             return false;
         }
@@ -993,7 +1099,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             return false;
         }
         if !self.close_notify_sent {
-            trace!("H2 initiating CLOSE_NOTIFY");
+            trace!("{} H2 initiating CLOSE_NOTIFY", log_context!(self));
             self.socket.socket_close();
             self.close_notify_sent = true;
         }
@@ -1021,10 +1127,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         L: ListenerHandler + L7ListenerHandler,
     {
         let i = self.zero.storage.data();
-        trace!("  header: {:?}", i);
+        trace!("{}   header: {:?}", log_context!(self), i);
         match parser::frame_header(i, self.local_settings.settings_max_frame_size) {
             Ok((_, header)) => {
-                trace!("{:#?}", header);
+                trace!("{} {:#?}", log_context!(self), header);
                 self.zero.storage.clear();
                 let stream_id = header.stream_id;
                 // RFC 9113 §6.10: CONTINUATION frames MUST be preceded by a
@@ -1036,7 +1142,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 // connection error of type PROTOCOL_ERROR.
                 if header.frame_type == FrameType::Continuation {
                     error!(
-                        "standalone CONTINUATION frame on stream {} without preceding HEADERS",
+                        "{} standalone CONTINUATION frame on stream {} without preceding HEADERS",
+                        log_context!(self),
                         stream_id
                     );
                     return self.goaway(H2Error::ProtocolError);
@@ -1063,13 +1170,18 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         stream.back_received_end_of_stream
                     };
                     trace!(
-                        "REQUESTING EXISTING STREAM {}: {}/{:?}",
-                        stream_id, received_eos, stream.state
+                        "{} REQUESTING EXISTING STREAM {}: {}/{:?}",
+                        log_context!(self),
+                        stream_id,
+                        received_eos,
+                        stream.state
                     );
                     if !allowed_on_half_closed && (received_eos || !stream.state.is_open()) {
                         error!(
-                            "CANNOT RECEIVE {:?} ON THIS STREAM {:?}",
-                            header.frame_type, stream.state
+                            "{} CANNOT RECEIVE {:?} ON THIS STREAM {:?}",
+                            log_context!(self),
+                            header.frame_type,
+                            stream.state
                         );
                         return self.goaway(H2Error::StreamClosed);
                     }
@@ -1100,7 +1212,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         && header.flags & parser::FLAG_END_STREAM == 0
                     {
                         error!(
-                            "HEADERS without END_STREAM on open stream {} in body phase: trailers MUST carry END_STREAM",
+                            "{} HEADERS without END_STREAM on open stream {} in body phase: trailers MUST carry END_STREAM",
+                            log_context!(self),
                             stream_id
                         );
                         return self.goaway(H2Error::ProtocolError);
@@ -1130,7 +1243,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                             >= self.local_settings.settings_max_concurrent_streams as usize
                         {
                             error!(
-                                "MAX CONCURRENT STREAMS: limit={}, current={}",
+                                "{} MAX CONCURRENT STREAMS: limit={}, current={}",
+                                log_context!(self),
                                 self.local_settings.settings_max_concurrent_streams,
                                 self.streams.len()
                             );
@@ -1153,7 +1267,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                                 // this stream but keep the connection alive so
                                 // existing streams can complete and free buffers.
                                 error!(
-                                    "Could not create stream {}: buffer pool exhausted",
+                                    "{} Could not create stream {}: buffer pool exhausted",
+                                    log_context!(self),
                                     stream_id
                                 );
                                 // RFC 9113 §6.8: update highest_peer_stream_id BEFORE
@@ -1188,12 +1303,14 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                                     // on a closed stream can arrive due to race
                                     // conditions and should be consumed/discarded.
                                     debug!(
-                                        "Ignoring {:?} on closed stream {}",
-                                        header.frame_type, header.stream_id
+                                        "{} Ignoring {:?} on closed stream {}",
+                                        log_context!(self),
+                                        header.frame_type,
+                                        header.stream_id
                                     );
                                     self.flood_detector.glitch_count += 1;
-                                    if let Some(error) = self.flood_detector.check_flood() {
-                                        return self.goaway(error);
+                                    if let Some(violation) = self.flood_detector.check_flood() {
+                                        return self.handle_flood_violation(violation);
                                     }
                                 }
                                 FrameType::Data => {
@@ -1204,12 +1321,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                                     // still routed through stream 0 so handle_frame
                                     // can do connection-level flow control accounting.
                                     debug!(
-                                        "DATA on closed stream {}, sending RST_STREAM(STREAM_CLOSED)",
+                                        "{} DATA on closed stream {}, sending RST_STREAM(STREAM_CLOSED)",
+                                        log_context!(self),
                                         header.stream_id
                                     );
                                     self.flood_detector.glitch_count += 1;
-                                    if let Some(error) = self.flood_detector.check_flood() {
-                                        return self.goaway(error);
+                                    if let Some(violation) = self.flood_detector.check_flood() {
+                                        return self.handle_flood_violation(violation);
                                     }
                                     self.pending_rst_streams
                                         .push((header.stream_id, H2Error::StreamClosed));
@@ -1221,29 +1339,39 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                                     // RFC 9113 §5.1: HEADERS or other frames on a
                                     // closed stream → connection error STREAM_CLOSED.
                                     error!(
-                                        "Received {:?} on closed stream {}, sending GOAWAY(STREAM_CLOSED)",
-                                        header.frame_type, header.stream_id
+                                        "{} Received {:?} on closed stream {}, sending GOAWAY(STREAM_CLOSED)",
+                                        log_context!(self),
+                                        header.frame_type,
+                                        header.stream_id
                                     );
                                     return self.goaway(H2Error::StreamClosed);
                                 }
                             }
                         } else {
                             error!(
-                                "Received {:?} on idle stream {}, sending GOAWAY(PROTOCOL_ERROR)",
-                                header.frame_type, header.stream_id
+                                "{} Received {:?} on idle stream {}, sending GOAWAY(PROTOCOL_ERROR)",
+                                log_context!(self),
+                                header.frame_type,
+                                header.stream_id
                             );
                             return self.goaway(H2Error::ProtocolError);
                         }
                     }
                     H2StreamId::Zero
                 };
-                trace!("{} {:?} {:#?}", header.stream_id, stream_id, self.streams);
+                trace!(
+                    "{} {} {:?} {:#?}",
+                    log_context!(self),
+                    header.stream_id,
+                    stream_id,
+                    self.streams
+                );
                 self.expect_read = Some((read_stream, header.payload_len as usize));
                 self.state = H2State::Frame(header);
             }
             Err(error) => {
                 let error = error_nom_to_h2(error);
-                error!("COULD NOT PARSE FRAME HEADER");
+                error!("{} COULD NOT PARSE FRAME HEADER", log_context!(self));
                 return self.goaway(error);
             }
         };
@@ -1259,7 +1387,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// conflicts).
     fn handle_continuation_header_state(&mut self, headers: &Headers) -> MuxResult {
         let i = self.zero.storage.unparsed_data();
-        trace!("  continuation header: {:?}", i);
+        trace!("{}   continuation header: {:?}", log_context!(self), i);
         match parser::frame_header(i, self.local_settings.settings_max_frame_size) {
             Ok((
                 _,
@@ -1272,7 +1400,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             )) => {
                 if self.zero.storage.end < 9 {
                     error!(
-                        "CONTINUATION header: storage.end ({}) too small to remove frame header",
+                        "{} CONTINUATION header: storage.end ({}) too small to remove frame header",
+                        log_context!(self),
                         self.zero.storage.end
                     );
                     return self.goaway(H2Error::InternalError);
@@ -1280,8 +1409,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 self.zero.storage.end -= 9;
                 if stream_id != headers.stream_id {
                     error!(
-                        "CONTINUATION stream_id {} does not match HEADERS stream_id {}",
-                        stream_id, headers.stream_id
+                        "{} CONTINUATION stream_id {} does not match HEADERS stream_id {}",
+                        log_context!(self),
+                        stream_id,
+                        headers.stream_id
                     );
                     return self.goaway(H2Error::ProtocolError);
                 }
@@ -1291,8 +1422,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     .flood_detector
                     .accumulated_header_size
                     .saturating_add(payload_len);
-                if let Some(error) = self.flood_detector.check_flood() {
-                    return self.goaway(error);
+                if let Some(violation) = self.flood_detector.check_flood() {
+                    return self.handle_flood_violation(violation);
                 }
                 // RFC 9113 §10.5.1: reject header blocks that cannot be
                 // buffered. Previously we silently removed READABLE interest
@@ -1305,7 +1436,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     > self.flood_detector.config.max_header_list_size
                 {
                     error!(
-                        "CONTINUATION accumulated header size {} exceeds {}",
+                        "{} CONTINUATION accumulated header size {} exceeds {}",
+                        log_context!(self),
                         self.flood_detector.accumulated_header_size,
                         self.flood_detector.config.max_header_list_size
                     );
@@ -1326,7 +1458,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 }
                 if (payload_len as usize) > self.zero.storage.available_space() {
                     error!(
-                        "CONTINUATION payload {} exceeds buffer space {}",
+                        "{} CONTINUATION payload {} exceeds buffer space {}",
+                        log_context!(self),
                         payload_len,
                         self.zero.storage.available_space()
                     );
@@ -1343,11 +1476,15 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             }
             Err(error) => {
                 let error = error_nom_to_h2(error);
-                error!("COULD NOT PARSE CONTINUATION HEADER");
+                error!("{} COULD NOT PARSE CONTINUATION HEADER", log_context!(self));
                 return self.goaway(error);
             }
             other => {
-                error!("UNEXPECTED {:?} WHILE PARSING CONTINUATION HEADER", other);
+                error!(
+                    "{} UNEXPECTED {:?} WHILE PARSING CONTINUATION HEADER",
+                    log_context!(self),
+                    other
+                );
                 return self.goaway(H2Error::ProtocolError);
             }
         };
@@ -1369,7 +1506,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         if let Some(sent_at) = self.settings_sent_at {
             if sent_at.elapsed() >= SETTINGS_ACK_TIMEOUT {
                 error!(
-                    "SETTINGS ACK timeout: peer did not acknowledge within {:?}",
+                    "{} SETTINGS ACK timeout: peer did not acknowledge within {:?}",
+                    log_context!(self),
                     SETTINGS_ACK_TIMEOUT
                 );
                 return self.goaway(H2Error::SettingsTimeout);
@@ -1401,7 +1539,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     )
                 }
             };
-            trace!("{:?}({:?}, {})", self.state, stream_id, amount);
+            trace!(
+                "{} {:?}({:?}, {})",
+                log_context!(self),
+                self.state,
+                stream_id,
+                amount
+            );
             if amount > 0 {
                 if amount > kawa.storage.available_space() {
                     self.readiness.interest.remove(Ready::READABLE);
@@ -1433,7 +1577,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     {
                         let i = kawa.storage.data();
                         if !b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".starts_with(i) {
-                            debug!("EARLY INVALID PREFACE: {:?}", i);
+                            debug!("{} EARLY INVALID PREFACE: {:?}", log_context!(self), i);
                             return self.force_disconnect();
                         }
                     }
@@ -1454,14 +1598,16 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             | (H2State::ClientPreface, Position::Client(..))
             | (H2State::ClientSettings, Position::Client(..)) => {
                 error!(
-                    "Unexpected combination: (Readable, {:?}, {:?})",
-                    self.state, self.position
+                    "{} Unexpected combination: (Readable, {:?}, {:?})",
+                    log_context!(self),
+                    self.state,
+                    self.position
                 );
                 return self.force_disconnect();
             }
             (H2State::Discard, _) => {
                 let _i = kawa.storage.data();
-                trace!("DISCARDING: {:?}", _i);
+                trace!("{} DISCARDING: {:?}", log_context!(self), _i);
                 kawa.storage.clear();
                 self.attribute_bytes_to_overhead();
                 self.expect_header();
@@ -1514,7 +1660,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         self.settings_sent_at = Some(Instant::now());
                     }
                     Err(error) => {
-                        error!("Could not serialize SettingsFrame: {:?}", error);
+                        error!(
+                            "{} Could not serialize SettingsFrame: {:?}",
+                            log_context!(self),
+                            error
+                        );
                         return self.force_disconnect();
                     }
                 };
@@ -1552,13 +1702,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             }
             (H2State::Frame(header), _) => {
                 let i = kawa.storage.unparsed_data();
-                trace!("  data: {:?}", i);
+                trace!("{}   data: {:?}", log_context!(self), i);
                 let wire_payload_len = header.payload_len;
                 let frame = match parser::frame_body(i, header) {
                     Ok((_, frame)) => frame,
                     Err(error) => {
                         let error = error_nom_to_h2(error);
-                        error!("COULD NOT PARSE FRAME BODY");
+                        error!("{} COULD NOT PARSE FRAME BODY", log_context!(self));
                         return self.goaway(error);
                     }
                 };
@@ -1575,7 +1725,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             (H2State::ContinuationFrame(headers), _) => {
                 kawa.storage.head = kawa.storage.end;
                 let i = kawa.storage.data();
-                trace!("  data: {:?}", i);
+                trace!("{}   data: {:?}", log_context!(self), i);
                 let headers = headers.clone();
                 self.expect_header();
                 return self.handle_frame(Frame::Headers(headers), 0, context, endpoint);
@@ -1718,13 +1868,18 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             (urgency, *id)
         });
 
-        trace!("PRIORITIES: {:?}", self.priorities_buf);
+        trace!(
+            "{} PRIORITIES: {:?}",
+            log_context!(self),
+            self.priorities_buf
+        );
         let mut socket_write = false;
         'outer: for idx in 0..self.priorities_buf.len() {
             let stream_id = self.priorities_buf[idx];
             let Some(&global_stream_id) = self.streams.get(&stream_id) else {
                 error!(
-                    "stream_id {} from sorted keys missing in streams map",
+                    "{} stream_id {} from sorted keys missing in streams map",
+                    log_context!(self),
                     stream_id
                 );
                 continue;
@@ -1910,7 +2065,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         if !is_1xx {
             return false;
         }
-        debug!("H2 write_streams: 1xx informational forwarded, resetting back buffer");
+        debug!(
+            "{} H2 write_streams: 1xx informational forwarded, resetting back buffer",
+            log_module_context!()
+        );
         kawa.clear();
         if let StreamState::Linked(token) = stream_state {
             let readiness = endpoint.readiness_mut(token);
@@ -1929,7 +2087,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
 
     fn remove_dead_stream(&mut self, stream_id: StreamId) {
         if self.streams.remove(&stream_id).is_none() {
-            error!("dead stream_id {} missing from streams map", stream_id);
+            error!(
+                "{} dead stream_id {} missing from streams map",
+                log_context!(self),
+                stream_id
+            );
         }
         self.rst_sent.remove(&stream_id);
         self.stream_last_activity_at.remove(&stream_id);
@@ -2035,7 +2197,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         if let Some(sent_at) = self.settings_sent_at {
             if sent_at.elapsed() >= SETTINGS_ACK_TIMEOUT {
                 error!(
-                    "SETTINGS ACK timeout: peer did not acknowledge within {:?}",
+                    "{} SETTINGS ACK timeout: peer did not acknowledge within {:?}",
+                    log_context!(self),
                     SETTINGS_ACK_TIMEOUT
                 );
                 return Some(self.goaway(H2Error::SettingsTimeout));
@@ -2108,8 +2271,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             && self.total_rst_streams_queued >= MAX_PENDING_RST_STREAMS
         {
             error!(
-                "total RST_STREAM count {} exceeds cap {}, sending GOAWAY(ENHANCE_YOUR_CALM)",
-                self.total_rst_streams_queued, MAX_PENDING_RST_STREAMS
+                "{} total RST_STREAM count {} exceeds cap {}, sending GOAWAY(ENHANCE_YOUR_CALM)",
+                log_context!(self),
+                self.total_rst_streams_queued,
+                MAX_PENDING_RST_STREAMS
             );
             return Some(self.goaway(H2Error::EnhanceYourCalm));
         }
@@ -2186,8 +2351,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             | (H2State::ClientSettings, Position::Server)
             | (H2State::ServerSettings, Position::Client(..)) => {
                 error!(
-                    "Unexpected combination: (Writable, {:?}, {:?})",
-                    self.state, self.position
+                    "{} Unexpected combination: (Writable, {:?}, {:?})",
+                    log_context!(self),
+                    self.state,
+                    self.position
                 );
                 self.force_disconnect()
             }
@@ -2218,7 +2385,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 self.force_disconnect()
             }
             (H2State::ClientPreface, Position::Client(..)) => {
-                trace!("Preparing preface and settings");
+                trace!("{} Preparing preface and settings", log_context!(self));
                 let pri = serializer::H2_PRI.as_bytes();
                 let kawa = &mut self.zero;
 
@@ -2231,7 +2398,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         self.settings_sent_at = Some(Instant::now());
                     }
                     Err(error) => {
-                        error!("Could not serialize SettingsFrame: {:?}", error);
+                        error!(
+                            "{} Could not serialize SettingsFrame: {:?}",
+                            log_context!(self),
+                            error
+                        );
                         return self.force_disconnect();
                     }
                 };
@@ -2241,7 +2412,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 MuxResult::Continue
             }
             (H2State::ClientSettings, Position::Client(..)) => {
-                trace!("Sent preface and settings");
+                trace!("{} Sent preface and settings", log_context!(self));
                 self.state = H2State::ServerSettings;
                 self.expect_read = Some((H2StreamId::Zero, 9));
                 self.readiness.interest.remove(Ready::WRITABLE);
@@ -2321,7 +2492,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 // more DATA frames may arrive for this stream.
                 if !stream.front_received_end_of_stream {
                     trace!(
-                        "Defer recycle stream {}: client still sending",
+                        "{} Defer recycle stream {}: client still sending",
+                        log_module_context!(),
                         global_stream_id
                     );
                     return None;
@@ -2340,7 +2512,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     streams.len() == 1,
                 );
                 debug.push(DebugEvent::StreamEvent(4, global_stream_id));
-                trace!("Recycle stream: {}", global_stream_id);
+                trace!(
+                    "{} Recycle stream: {}",
+                    log_module_context!(),
+                    global_stream_id
+                );
                 let token = Self::complete_server_stream(stream, listener);
                 Some((stream_id, token))
             }
@@ -2439,22 +2615,29 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             let old = *existing;
             *existing = existing.saturating_add(increment).min(max_increment);
             trace!(
-                "WINDOW_UPDATE coalesced: stream={} old={} new={}",
-                stream_id, old, *existing
+                "{} WINDOW_UPDATE coalesced: stream={} old={} new={}",
+                log_context!(self),
+                stream_id,
+                old,
+                *existing
             );
         } else if self.flow_control.pending_window_updates.len() < self.max_pending_window_updates {
             self.flow_control
                 .pending_window_updates
                 .insert(stream_id, increment.min(max_increment));
             trace!(
-                "WINDOW_UPDATE queued: stream={} increment={}",
+                "{} WINDOW_UPDATE queued: stream={} increment={}",
+                log_context!(self),
                 stream_id,
                 increment.min(max_increment)
             );
         } else {
             error!(
-                "WINDOW_UPDATE dropped: queue full ({} entries), stream={} increment={}",
-                self.max_pending_window_updates, stream_id, increment
+                "{} WINDOW_UPDATE dropped: queue full ({} entries), stream={} increment={}",
+                log_context!(self),
+                self.max_pending_window_updates,
+                stream_id,
+                increment
             );
             incr!("h2.window_update_dropped");
         }
@@ -2549,8 +2732,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         }
         for sid in timed_out {
             info!(
-                "H2 stream {} idle > {:?}, cancelling (slow-multiplex guard)",
-                sid, deadline
+                "{} H2 stream {} idle > {:?}, cancelling (slow-multiplex guard)",
+                log_context!(self),
+                sid,
+                deadline
             );
             self.pending_rst_streams.push((sid, H2Error::Cancel));
             // Do NOT increment total_rst_streams_queued here: proxy-initiated
@@ -2679,6 +2864,23 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         self.mcs_backpressure_applied = true;
     }
 
+    /// Log a flood violation with full session context and emit the GOAWAY.
+    ///
+    /// Centralises the "flood detected" reporting so every site that observes a
+    /// [`H2FloodViolation`] gets the same session-scoped log line, matching the
+    /// RUSTLS log-context convention.
+    pub fn handle_flood_violation(&mut self, violation: H2FloodViolation) -> MuxResult {
+        warn!(
+            "{} {} H2 flood detected: {} count {} exceeds threshold {}",
+            log_context!(self),
+            log_context!(self),
+            violation.reason,
+            violation.count,
+            violation.threshold,
+        );
+        self.goaway(violation.error)
+    }
+
     pub fn goaway(&mut self, error: H2Error) -> MuxResult {
         self.state = H2State::Error;
         self.drain.draining = true;
@@ -2686,9 +2888,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         let kawa = &mut self.zero;
         kawa.storage.clear();
         if matches!(error, H2Error::NoError) {
-            debug!("GOAWAY: {:?}", error);
+            debug!("{} GOAWAY: {:?}", log_context!(self), error);
         } else {
-            error!("GOAWAY: {:?}", error);
+            error!("{} GOAWAY: {:?}", log_context!(self), error);
         }
 
         // RFC 9113 §6.8: last_stream_id is the highest peer-initiated stream we processed
@@ -2702,7 +2904,12 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 MuxResult::Continue
             }
             Err(error) => {
-                error!("Could not serialize GoAwayFrame: {:?}", error);
+                error!(
+                    "{} {} Could not serialize GoAwayFrame: {:?}",
+                    log_context!(self),
+                    log_context!(self),
+                    error
+                );
                 self.force_disconnect()
             }
         }
@@ -2731,7 +2938,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // data during phase 1. Only phase 2 (goaway()) removes READABLE.
         let kawa = &mut self.zero;
         kawa.storage.clear();
-        debug!("GOAWAY (graceful, phase 1): last_stream_id=0x7FFFFFFF");
+        debug!(
+            "{} GOAWAY (graceful, phase 1): last_stream_id=0x7FFFFFFF",
+            log_context!(self)
+        );
 
         match serializer::gen_goaway(kawa.storage.space(), STREAM_ID_MAX, H2Error::NoError) {
             Ok((_, size)) => {
@@ -2746,7 +2956,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 MuxResult::Continue
             }
             Err(error) => {
-                error!("Could not serialize graceful GoAwayFrame: {:?}", error);
+                error!(
+                    "{} Could not serialize graceful GoAwayFrame: {:?}",
+                    log_context!(self),
+                    error
+                );
                 self.force_disconnect()
             }
         }
@@ -2779,7 +2993,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             let (size, status) = self.socket.socket_write(self.zero.storage.data());
             #[cfg(debug_assertions)]
             trace!(
-                "flush_zero_to_socket: written={}, status={:?}, wants_write={}",
+                "{} flush_zero_to_socket: written={}, status={:?}, wants_write={}",
+                log_context!(self),
                 size,
                 status,
                 self.socket.socket_wants_write()
@@ -2821,7 +3036,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     {
         // RFC 9113 §6.8: reject new streams on a draining connection
         if self.drain.draining {
-            error!("Rejecting new stream {} on draining connection", stream_id);
+            error!(
+                "{} Rejecting new stream {} on draining connection",
+                log_context!(self),
+                stream_id
+            );
             return None;
         }
         // Track the highest peer-initiated stream ID for GoAway frames
@@ -2874,7 +3093,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         E: Endpoint,
         L: ListenerHandler + L7ListenerHandler,
     {
-        trace!("{:#?}", frame);
+        trace!("{} {:#?}", log_context!(self), frame);
         match frame {
             Frame::Data(data) => self.handle_data_frame(data, wire_payload_len, context, endpoint),
             Frame::Headers(headers) => self.handle_headers_frame(headers, context, endpoint),
@@ -2894,14 +3113,21 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 // path. Keep a defensive fallback that returns
                 // PROTOCOL_ERROR rather than panicking in debug builds.
                 self.attribute_bytes_to_overhead();
-                warn!("CONTINUATION frames are handled inline during header parsing");
+                warn!(
+                    "{} CONTINUATION frames are handled inline during header parsing",
+                    log_context!(self)
+                );
                 self.goaway(H2Error::ProtocolError)
             }
             // RFC 9113 §5.5: unknown frame types MUST be ignored and discarded.
             // The parser already consumed the payload; attribute the bytes
             // to connection-level overhead and continue.
             Frame::Unknown(raw) => {
-                debug!("Ignoring unknown H2 frame type {}", raw);
+                debug!(
+                    "{} Ignoring unknown H2 frame type {}",
+                    log_context!(self),
+                    raw
+                );
                 self.attribute_bytes_to_overhead();
                 MuxResult::Continue
             }
@@ -2946,8 +3172,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // CVE-2019-9518: track empty DATA frames (no payload, no END_STREAM)
         if data.payload.is_empty() && !data.end_stream {
             self.flood_detector.empty_data_count += 1;
-            if let Some(error) = self.flood_detector.check_flood() {
-                return self.goaway(error);
+            if let Some(violation) = self.flood_detector.check_flood() {
+                return self.handle_flood_violation(violation);
             }
         }
         let Some(global_stream_id) = self.streams.get(&data.stream_id).copied() else {
@@ -2998,8 +3224,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             if let Some(expected) = declared_length {
                 if data_received > expected {
                     error!(
-                        "Content-Length mismatch: received {} > declared {}",
-                        data_received, expected
+                        "{} Content-Length mismatch: received {} > declared {}",
+                        log_context!(self),
+                        data_received,
+                        expected
                     );
                     let result = self.reset_stream(
                         global_stream_id,
@@ -3107,8 +3335,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     if let Some(expected) = declared_length {
                         if data_received != expected {
                             error!(
-                                "Content-Length mismatch: received {} != declared {}",
-                                data_received, expected
+                                "{} Content-Length mismatch: received {} != declared {}",
+                                log_context!(self),
+                                data_received,
+                                expected
                             );
                             let result = self.reset_stream(
                                 global_stream_id,
@@ -3163,7 +3393,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 self.flood_detector.accumulated_header_size = headers.header_block_fragment.len;
             }
             debug!(
-                "FRAGMENT: stream_id={}, len={}",
+                "{} FRAGMENT: stream_id={}, len={}",
+                log_context!(self),
                 headers.stream_id,
                 self.zero.storage.data().len()
             );
@@ -3175,7 +3406,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // can this fail?
         let stream_id = headers.stream_id;
         let Some(global_stream_id) = self.streams.get(&stream_id).copied() else {
-            error!("Handling Headers frame with no attached stream {:#?}", self);
+            error!(
+                "{} Handling Headers frame with no attached stream {:#?}",
+                log_context!(self),
+                self
+            );
             incr!("h2.headers_no_stream.error");
             self.attribute_bytes_to_overhead();
             return self.force_disconnect();
@@ -3220,7 +3455,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 Position::Server => incr!("http.frontend_parse_errors"),
             }
             if global {
-                error!("GOT GLOBAL ERROR WHILE PROCESSING HEADERS");
+                error!(
+                    "{} GOT GLOBAL ERROR WHILE PROCESSING HEADERS",
+                    log_context!(self)
+                );
                 return self.goaway(error);
             } else {
                 let result = self.reset_stream(global_stream_id, context, endpoint, error);
@@ -3237,8 +3475,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 if let kawa::BodySize::Length(expected) = parts.rbuffer.body_size {
                     if *parts.data_received != expected {
                         error!(
-                            "Content-Length mismatch on trailers: received {} != declared {}",
-                            *parts.data_received, expected
+                            "{} Content-Length mismatch on trailers: received {} != declared {}",
+                            log_context!(self),
+                            *parts.data_received,
+                            expected
                         );
                         let result = self.reset_stream(
                             global_stream_id,
@@ -3277,12 +3517,15 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             Position::Client(..) => {
                 // RFC 9113 §8.4: Server push is deprecated. Sozu never sends
                 // SETTINGS_ENABLE_PUSH=1, so receiving PUSH_PROMISE is a protocol error.
-                error!("Received PUSH_PROMISE but server push is not supported");
+                error!(
+                    "{} Received PUSH_PROMISE but server push is not supported",
+                    log_context!(self)
+                );
                 self.goaway(H2Error::ProtocolError)
             }
             Position::Server => {
                 // Clients must never send PUSH_PROMISE (RFC 9113 §8.4)
-                error!("Received PUSH_PROMISE from client");
+                error!("{} Received PUSH_PROMISE from client", log_context!(self));
                 self.goaway(H2Error::ProtocolError)
             }
         }
@@ -3320,7 +3563,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 self.remove_dead_stream(priority.stream_id);
                 return result;
             } else {
-                error!("INVALID PRIORITY RECEIVED ON INVALID STREAM");
+                error!(
+                    "{} INVALID PRIORITY RECEIVED ON INVALID STREAM",
+                    log_context!(self)
+                );
                 return self.goaway(H2Error::ProtocolError);
             }
         }
@@ -3339,8 +3585,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     {
         // CVE-2023-44487 Rapid Reset + CVE-2019-9514: track RST_STREAM rate.
         self.flood_detector.rst_stream_count += 1;
-        if let Some(error) = self.flood_detector.check_flood() {
-            return self.goaway(error);
+        if let Some(violation) = self.flood_detector.check_flood() {
+            return self.handle_flood_violation(violation);
         }
         // Additional CVE-2023-44487 mitigation: lifetime cap on RST_STREAM
         // frames received. The per-window counter above half-decays, so a
@@ -3367,11 +3613,12 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             // races as abusive.
             None => true,
         };
-        if let Some(error) = self.flood_detector.record_rst_lifetime(response_started) {
-            return self.goaway(error);
+        if let Some(violation) = self.flood_detector.record_rst_lifetime(response_started) {
+            return self.handle_flood_violation(violation);
         }
         debug!(
-            "RstStream({} -> {})",
+            "{} RstStream({} -> {})",
+            log_context!(self),
             rst_stream.error_code,
             H2Error::try_from(rst_stream.error_code).map_or("UNKNOWN_ERROR", |e| e.as_str())
         );
@@ -3429,7 +3676,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         if settings.ack {
             // RFC 9113 §6.5: SETTINGS ACK must have empty payload
             if !settings.settings.is_empty() {
-                error!("SETTINGS ACK with non-empty payload");
+                error!("{} SETTINGS ACK with non-empty payload", log_context!(self));
                 return self.goaway(H2Error::FrameSizeError);
             }
             // RFC 9113 §6.5: peer acknowledged our SETTINGS — clear timeout
@@ -3449,8 +3696,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             .flood_detector
             .total_settings_received_lifetime
             .saturating_add(1);
-        if let Some(error) = self.flood_detector.check_flood() {
-            return self.goaway(error);
+        if let Some(violation) = self.flood_detector.check_flood() {
+            return self.handle_flood_violation(violation);
         }
         for setting in settings.settings {
             let v = setting.value;
@@ -3475,7 +3722,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 other => { warn!("Unknown setting_id: {}, we MUST ignore this", other); self.flood_detector.glitch_count += 1 },
             };
             if is_error {
-                error!("INVALID SETTING");
+                error!("{} INVALID SETTING", log_context!(self));
                 return self.goaway(H2Error::ProtocolError);
             }
         }
@@ -3507,7 +3754,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         let buf = kawa.storage.space();
         if buf.len() < ack.len() {
             error!(
-                "No space in zero buffer for SETTINGS ACK ({} available, {} needed)",
+                "{} No space in zero buffer for SETTINGS ACK ({} available, {} needed)",
+                log_context!(self),
                 buf.len(),
                 ack.len()
             );
@@ -3534,15 +3782,16 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             .flood_detector
             .total_ping_received_lifetime
             .saturating_add(1);
-        if let Some(error) = self.flood_detector.check_flood() {
-            return self.goaway(error);
+        if let Some(violation) = self.flood_detector.check_flood() {
+            return self.handle_flood_violation(violation);
         }
         self.attribute_bytes_to_overhead();
         let kawa = &mut self.zero;
         let ping_response_size = serializer::PING_ACKNOWLEDGEMENT_HEADER.len() + 8;
         if kawa.storage.space().len() < ping_response_size {
             error!(
-                "No space in zero buffer for PING response ({} available, {} needed)",
+                "{} No space in zero buffer for PING response ({} available, {} needed)",
+                log_context!(self),
                 kawa.storage.space().len(),
                 ping_response_size
             );
@@ -3551,7 +3800,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         match serializer::gen_ping_acknowledgement(kawa.storage.space(), &ping.payload) {
             Ok((_, size)) => kawa.storage.fill(size),
             Err(error) => {
-                error!("Could not serialize PingFrame: {:?}", error);
+                error!(
+                    "{} Could not serialize PingFrame: {:?}",
+                    log_context!(self),
+                    error
+                );
                 return self.force_disconnect();
             }
         };
@@ -3577,13 +3830,19 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             H2Error::try_from(goaway.error_code).map_or("UNKNOWN_ERROR", |e| e.as_str());
         if goaway.error_code == H2Error::NoError as u32 {
             debug!(
-                "Received GOAWAY: last_stream_id={}, error={}, debug_data={:?}",
-                goaway.last_stream_id, error_name, goaway.additional_debug_data
+                "{} Received GOAWAY: last_stream_id={}, error={}, debug_data={:?}",
+                log_context!(self),
+                goaway.last_stream_id,
+                error_name,
+                goaway.additional_debug_data
             );
         } else {
             error!(
-                "Received GOAWAY: last_stream_id={}, error={}, debug_data={:?}",
-                goaway.last_stream_id, error_name, goaway.additional_debug_data
+                "{} Received GOAWAY: last_stream_id={}, error={}, debug_data={:?}",
+                log_context!(self),
+                goaway.last_stream_id,
+                error_name,
+                goaway.additional_debug_data
             );
         }
         // RFC 9113 §6.8: begin graceful drain.
@@ -3613,7 +3872,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 // replay it. Use the linked token's readiness (via endpoint)
                 // so the RST_STREAM reaches the client.
                 debug!(
-                    "GOAWAY: stream {} already consumed, cannot retry",
+                    "{} GOAWAY: stream {} already consumed, cannot retry",
+                    log_context!(self),
                     stream_id
                 );
                 if let StreamState::Linked(token) = stream.state {
@@ -3621,7 +3881,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     forcefully_terminate_answer(stream, front_readiness, H2Error::RefusedStream);
                 } else {
                     warn!(
-                        "GOAWAY: stream {} consumed but not Linked, cannot notify frontend",
+                        "{} GOAWAY: stream {} consumed but not Linked, cannot notify frontend",
+                        log_context!(self),
                         stream_id
                     );
                 }
@@ -3669,10 +3930,17 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // Stream-level -> stream error (RST_STREAM).
         if increment == 0 {
             if stream_id == 0 {
-                error!("WINDOW_UPDATE with zero increment on connection (stream 0)");
+                error!(
+                    "{} WINDOW_UPDATE with zero increment on connection (stream 0)",
+                    log_context!(self)
+                );
                 return self.goaway(H2Error::ProtocolError);
             } else {
-                error!("WINDOW_UPDATE with zero increment on stream {}", stream_id);
+                error!(
+                    "{} WINDOW_UPDATE with zero increment on stream {}",
+                    log_context!(self),
+                    stream_id
+                );
                 if let Some(global_stream_id) = self.streams.get(&stream_id).copied() {
                     let result = self.reset_stream(
                         global_stream_id,
@@ -3685,8 +3953,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 }
                 // Stream not in map (already closed) — treat as glitch
                 self.flood_detector.glitch_count += 1;
-                if let Some(error) = self.flood_detector.check_flood() {
-                    return self.goaway(error);
+                if let Some(violation) = self.flood_detector.check_flood() {
+                    return self.handle_flood_violation(violation);
                 }
                 self.attribute_bytes_to_overhead();
                 return MuxResult::Continue;
@@ -3706,11 +3974,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 }
                 self.flow_control.window = window;
                 debug!(
-                    "WINDOW_UPDATE received: stream=0 increment={} new_connection_window={}",
-                    increment, self.flow_control.window
+                    "{} WINDOW_UPDATE received: stream=0 increment={} new_connection_window={}",
+                    log_context!(self),
+                    increment,
+                    self.flow_control.window
                 );
             } else {
-                error!("INVALID WINDOW INCREMENT");
+                error!("{} INVALID WINDOW INCREMENT", log_context!(self));
                 return self.goaway(H2Error::FlowControlError);
             }
         } else if let Some(global_stream_id) = self.streams.get(&stream_id).copied() {
@@ -3723,8 +3993,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 }
                 stream.window = window;
                 debug!(
-                    "WINDOW_UPDATE received: stream={} increment={} new_stream_window={}",
-                    stream_id, increment, stream.window
+                    "{} WINDOW_UPDATE received: stream={} increment={} new_stream_window={}",
+                    log_context!(self),
+                    stream_id,
+                    increment,
+                    stream.window
                 );
             } else {
                 let result = self.reset_stream(
@@ -3739,8 +4012,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         } else {
             self.attribute_bytes_to_overhead();
             trace!(
-                "Ignoring window update on closed stream {}: {}",
-                stream_id, increment
+                "{} Ignoring window update on closed stream {}: {}",
+                log_context!(self),
+                stream_id,
+                increment
             );
             // Pass 3 Low #5: WINDOW_UPDATE on a closed stream is legal
             // (RFC 9113 §6.9.1) but has no useful effect, so a peer that
@@ -3748,8 +4023,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             // glitch so a flood contributes to `check_flood()` and can
             // eventually trigger ENHANCE_YOUR_CALM.
             self.flood_detector.glitch_count += 1;
-            if let Some(error) = self.flood_detector.check_flood() {
-                return self.goaway(error);
+            if let Some(violation) = self.flood_detector.check_flood() {
+                return self.handle_flood_violation(violation);
             }
         }
         MuxResult::Continue
@@ -3767,7 +4042,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         ) {
             Ok(d) => d,
             Err(_) => {
-                error!("initial window size delta overflow");
+                error!("{} initial window size delta overflow", log_context!(self));
                 return true;
             }
         };
@@ -3786,8 +4061,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             }
         }
         trace!(
-            "UPDATE INIT WINDOW: {} {} {:?}",
-            delta, open_window, self.readiness
+            "{} UPDATE INIT WINDOW: {} {} {:?}",
+            log_context!(self),
+            delta,
+            open_window,
+            self.readiness
         );
         if open_window {
             self.readiness.interest.insert(Ready::WRITABLE);
@@ -3804,7 +4082,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 *status = BackendStatus::Disconnecting;
                 self.readiness.event = Ready::HUP;
                 debug!(
-                    "H2 force_disconnect client: state={:?}, streams={}, expect_write={:?}, wants_write={}, readiness={:?}",
+                    "{} H2 force_disconnect client: state={:?}, streams={}, expect_write={:?}, wants_write={}, readiness={:?}",
+                    log_context!(self),
                     self.state,
                     self.streams.len(),
                     self.expect_write,
@@ -3825,7 +4104,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 // Instead, keep WRITABLE interest and let the writable path flush.
                 if self.socket.socket_wants_write() {
                     debug!(
-                        "H2 force_disconnect delaying close: state={:?}, streams={}, expect_write={:?}, wants_write=true, readiness={:?}",
+                        "{} H2 force_disconnect delaying close: state={:?}, streams={}, expect_write={:?}, wants_write=true, readiness={:?}",
+                        log_context!(self),
                         self.state,
                         self.streams.len(),
                         self.expect_write,
@@ -3836,7 +4116,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     MuxResult::Continue
                 } else {
                     debug!(
-                        "H2 force_disconnect closing session: state={:?}, streams={}, expect_write={:?}, wants_write=false, readiness={:?}",
+                        "{} H2 force_disconnect closing session: state={:?}, streams={}, expect_write={:?}, wants_write=false, readiness={:?}",
+                        log_context!(self),
                         self.state,
                         self.streams.len(),
                         self.expect_write,
@@ -3855,7 +4136,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     {
         match self.position {
             Position::Client(_, _, BackendStatus::KeepAlive) => {
-                error!("H2 connections do not use KeepAlive backend status");
+                error!(
+                    "{} H2 connections do not use KeepAlive backend status",
+                    log_context!(self)
+                );
                 return;
             }
             Position::Client(..) => {}
@@ -3863,7 +4147,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 let tls_pending_before = self.socket.socket_wants_write();
                 if !self.streams.is_empty() || tls_pending_before || self.expect_write.is_some() {
                     debug!(
-                        "H2 close with active state: state={:?}, streams={}, expect_write={:?}, wants_write={}, readiness={:?}",
+                        "{} H2 close with active state: state={:?}, streams={}, expect_write={:?}, wants_write={}, readiness={:?}",
+                        log_context!(self),
                         self.state,
                         self.streams.len(),
                         self.expect_write,
@@ -3873,7 +4158,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     for (stream_id, global_stream_id) in &self.streams {
                         let stream = &context.streams[*global_stream_id];
                         debug!(
-                            "  close stream id={} gid={}: state={:?}, front_eos={}, back_eos={}, front_phase={:?}, back_phase={:?}, front_completed={}, back_completed={}",
+                            "{}   close stream id={} gid={}: state={:?}, front_eos={}, back_eos={}, front_phase={:?}, back_phase={:?}, front_completed={}, back_completed={}",
+                            log_context!(self),
                             stream_id,
                             global_stream_id,
                             stream.state,
@@ -3887,7 +4173,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     }
                 }
                 if !self.close_notify_sent {
-                    trace!("H2 SENDING CLOSE NOTIFY");
+                    trace!("{} H2 SENDING CLOSE NOTIFY", log_context!(self));
                 }
                 let (tls_pending_after, drain_rounds) =
                     drain_tls_close_notify(&mut self.socket, &mut self.close_notify_sent);
@@ -3912,7 +4198,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         }
         // reconnection is handled by the server for each stream separately
         for global_stream_id in self.streams.values() {
-            trace!("end stream: {}", global_stream_id);
+            trace!("{} end stream: {}", log_context!(self), global_stream_id);
             if let StreamState::Linked(token) = context.streams[*global_stream_id].state {
                 endpoint.end_stream(token, *global_stream_id, context);
             }
@@ -3934,7 +4220,12 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         let reset_byte_totals = self.compute_stream_byte_totals(context);
         context.unlink_stream(stream_id);
         let stream = &mut context.streams[stream_id];
-        trace!("reset H2 stream {}: {:#?}", stream_id, stream.context);
+        trace!(
+            "{} reset H2 stream {}: {:#?}",
+            log_context!(self),
+            stream_id,
+            stream.context
+        );
         let old_state = std::mem::replace(&mut stream.state, StreamState::Unlinked);
         forcefully_terminate_answer(stream, &mut self.readiness, error);
         if let StreamState::Linked(token) = old_state {
@@ -3959,7 +4250,12 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     {
         context.unlink_stream(stream_gid);
         let stream_context = &mut context.streams[stream_gid].context;
-        trace!("end H2 stream {}: {:#?}", stream_gid, stream_context);
+        trace!(
+            "{} end H2 stream {}: {:#?}",
+            log_context!(self),
+            stream_gid,
+            stream_context
+        );
         match self.position {
             Position::Client(..) => {
                 for (stream_id, global_stream_id) in &self.streams {
@@ -3999,7 +4295,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     }
                 }
                 error!(
-                    "end_stream called for unknown global_stream_id {}",
+                    "{} end_stream called for unknown global_stream_id {}",
+                    log_context!(self),
                     stream_gid
                 );
             }
@@ -4012,14 +4309,24 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         context
                             .debug
                             .push(DebugEvent::Str(format!("Close terminated {stream_gid}")));
-                        debug!("CLOSING H2 TERMINATED STREAM {} {:?}", stream_gid, stream);
+                        debug!(
+                            "{} CLOSING H2 TERMINATED STREAM {} {:?}",
+                            log_context!(self),
+                            stream_gid,
+                            stream
+                        );
                         stream.state = StreamState::Unlinked;
                         self.readiness.interest.insert(Ready::WRITABLE);
                         self.readiness.signal_pending_write();
                         context.debug.set_interesting(true);
                     }
                     EndStreamAction::CloseDelimited => {
-                        debug!("CLOSE DELIMITED H2 STREAM {} {:?}", stream_gid, stream);
+                        debug!(
+                            "{} CLOSE DELIMITED H2 STREAM {} {:?}",
+                            log_context!(self),
+                            stream_gid,
+                            stream
+                        );
                         stream.back.push_block(kawa::Block::Flags(kawa::Flags {
                             end_body: true,
                             end_chunk: false,
@@ -4037,7 +4344,12 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         context
                             .debug
                             .push(DebugEvent::Str(format!("Close unterminated {stream_gid}")));
-                        debug!("CLOSING H2 UNTERMINATED STREAM {} {:?}", stream_gid, stream);
+                        debug!(
+                            "{} CLOSING H2 UNTERMINATED STREAM {} {:?}",
+                            log_context!(self),
+                            stream_gid,
+                            stream
+                        );
                         forcefully_terminate_answer(
                             stream,
                             &mut self.readiness,
@@ -4054,7 +4366,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         set_default_answer(stream, &mut self.readiness, status, &answers);
                     }
                     EndStreamAction::Reconnect => {
-                        debug!("H2 RECONNECT");
+                        debug!("{} H2 RECONNECT", log_context!(self));
                         #[cfg(debug_assertions)]
                         context
                             .debug
@@ -4074,7 +4386,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // RFC 9113 §6.8: reject new streams on a draining connection
         if self.drain.draining {
             error!(
-                "Cannot open new stream on draining connection (stream {})",
+                "{} Cannot open new stream on draining connection (stream {})",
+                log_context!(self),
                 stream
             );
             return false;
@@ -4082,13 +4395,19 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // RFC 9113 §5.1.2: respect peer's max concurrent streams limit
         if self.streams.len() >= self.peer_settings.settings_max_concurrent_streams as usize {
             error!(
-                "Cannot open new stream: active={} >= peer max_concurrent_streams={}",
+                "{} Cannot open new stream: active={} >= peer max_concurrent_streams={}",
+                log_context!(self),
                 self.streams.len(),
                 self.peer_settings.settings_max_concurrent_streams
             );
             return false;
         }
-        trace!("start new H2 stream {} {:?}", stream, self.readiness);
+        trace!(
+            "{} start new H2 stream {} {:?}",
+            log_context!(self),
+            stream,
+            self.readiness
+        );
         let Some(stream_id) = self.new_stream_id() else {
             // Pass 4 Medium #5: the client-initiated stream-ID space
             // (31 bits, odd only) is exhausted. The backend is now useless
@@ -4096,18 +4415,22 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             // transition, the Connection lingers in `Connected` state and
             // every subsequent request returns 503 because `start_stream`
             // keeps returning false.
+            let context = log_context!(self);
             match &mut self.position {
                 Position::Client(cluster_id, backend, status) => {
                     let backend_addr = backend.borrow().address;
                     let cluster = cluster_id.clone();
                     info!(
-                        "H2 backend stream IDs exhausted (cluster={}, backend={:?}) — draining",
-                        cluster, backend_addr
+                        "{} H2 backend stream IDs exhausted (cluster={}, backend={:?}) — draining",
+                        context, cluster, backend_addr
                     );
                     *status = BackendStatus::Disconnecting;
                 }
                 Position::Server => {
-                    error!("H2 server stream IDs exhausted — sending graceful GOAWAY");
+                    error!(
+                        "{} H2 server stream IDs exhausted — sending graceful GOAWAY",
+                        context
+                    );
                 }
             }
             self.graceful_goaway();
@@ -4153,7 +4476,13 @@ mod tests {
         let mut detector = H2FloodDetector::new(config);
 
         detector.rst_stream_count = config.max_rst_stream_per_window + 1;
-        assert_eq!(detector.check_flood(), Some(H2Error::EnhanceYourCalm));
+        assert!(matches!(
+            detector.check_flood(),
+            Some(H2FloodViolation {
+                error: H2Error::EnhanceYourCalm,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -4162,7 +4491,13 @@ mod tests {
         let mut detector = H2FloodDetector::new(config);
 
         detector.ping_count = config.max_ping_per_window + 1;
-        assert_eq!(detector.check_flood(), Some(H2Error::EnhanceYourCalm));
+        assert!(matches!(
+            detector.check_flood(),
+            Some(H2FloodViolation {
+                error: H2Error::EnhanceYourCalm,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -4171,7 +4506,13 @@ mod tests {
         let mut detector = H2FloodDetector::new(config);
 
         detector.settings_count = config.max_settings_per_window + 1;
-        assert_eq!(detector.check_flood(), Some(H2Error::EnhanceYourCalm));
+        assert!(matches!(
+            detector.check_flood(),
+            Some(H2FloodViolation {
+                error: H2Error::EnhanceYourCalm,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -4180,7 +4521,13 @@ mod tests {
         let mut detector = H2FloodDetector::new(config);
 
         detector.empty_data_count = config.max_empty_data_per_window + 1;
-        assert_eq!(detector.check_flood(), Some(H2Error::EnhanceYourCalm));
+        assert!(matches!(
+            detector.check_flood(),
+            Some(H2FloodViolation {
+                error: H2Error::EnhanceYourCalm,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -4189,7 +4536,13 @@ mod tests {
         let mut detector = H2FloodDetector::new(config);
 
         detector.continuation_count = config.max_continuation_frames + 1;
-        assert_eq!(detector.check_flood(), Some(H2Error::EnhanceYourCalm));
+        assert!(matches!(
+            detector.check_flood(),
+            Some(H2FloodViolation {
+                error: H2Error::EnhanceYourCalm,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -4198,7 +4551,13 @@ mod tests {
         let mut detector = H2FloodDetector::new(config);
 
         detector.accumulated_header_size = MAX_HEADER_LIST_SIZE as u32 + 1;
-        assert_eq!(detector.check_flood(), Some(H2Error::EnhanceYourCalm));
+        assert!(matches!(
+            detector.check_flood(),
+            Some(H2FloodViolation {
+                error: H2Error::EnhanceYourCalm,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -4207,7 +4566,13 @@ mod tests {
         let mut detector = H2FloodDetector::new(config);
 
         detector.glitch_count = config.max_glitch_count + 1;
-        assert_eq!(detector.check_flood(), Some(H2Error::EnhanceYourCalm));
+        assert!(matches!(
+            detector.check_flood(),
+            Some(H2FloodViolation {
+                error: H2Error::EnhanceYourCalm,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -4229,7 +4594,13 @@ mod tests {
 
         // Above custom threshold -> flood
         detector.rst_stream_count = 6;
-        assert_eq!(detector.check_flood(), Some(H2Error::EnhanceYourCalm));
+        assert!(matches!(
+            detector.check_flood(),
+            Some(H2FloodViolation {
+                error: H2Error::EnhanceYourCalm,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -4282,7 +4653,13 @@ mod tests {
         detector.rst_stream_count = 12;
 
         // Without decay -> flood
-        assert_eq!(detector.check_flood(), Some(H2Error::EnhanceYourCalm));
+        assert!(matches!(
+            detector.check_flood(),
+            Some(H2FloodViolation {
+                error: H2Error::EnhanceYourCalm,
+                ..
+            })
+        ));
 
         // Reset and simulate window expiry
         detector.rst_stream_count = 12;
@@ -4308,10 +4685,13 @@ mod tests {
         );
         assert_eq!(detector.total_abusive_rst_received_lifetime, 0);
         // Next RST crosses the ceiling.
-        assert_eq!(
+        assert!(matches!(
             detector.record_rst_lifetime(true),
-            Some(H2Error::EnhanceYourCalm)
-        );
+            Some(H2FloodViolation {
+                error: H2Error::EnhanceYourCalm,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -4326,10 +4706,13 @@ mod tests {
             detector.total_abusive_rst_received_lifetime,
             DEFAULT_MAX_RST_STREAM_ABUSIVE_LIFETIME
         );
-        assert_eq!(
+        assert!(matches!(
             detector.record_rst_lifetime(false),
-            Some(H2Error::EnhanceYourCalm)
-        );
+            Some(H2FloodViolation {
+                error: H2Error::EnhanceYourCalm,
+                ..
+            })
+        ));
     }
 
     #[test]
