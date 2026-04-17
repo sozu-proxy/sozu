@@ -56,6 +56,35 @@ buffer_size = 16384
 activate_listeners = true
 ```
 
+#### Privacy note on logs and retention
+
+`log_target` at `debug`/`trace` emits per-connection context on every protocol
+log line, including:
+
+- peer IP (client source address)
+- SNI (TLS hostname the client requested) on TLS listeners
+- a per-session ULID generated at connection accept
+- mio frontend token and cluster/backend identifiers
+
+Each of these is an identifier under most data-protection regimes (GDPR, CNIL
+guidance on proxy logs). Keep production workers at `log_level = "info"` or
+tighter unless debugging; access logs (`access_logs_target`) carry the same
+fields in a shape meant for long-term retention and should be the durable
+store.
+
+Retention of the live log stream depends on the sink:
+
+- `stdout`: inherited from the surrounding process supervisor (journald, the
+  init system, the container runtime). On Clever Cloud ADCs the journald cap
+  is size-bounded at ~4 GB — time coverage varies with traffic.
+- `tcp://` / `udp://`: forwarded to the remote collector; retention becomes
+  the collector's responsibility. Confirm DPA coverage before routing logs
+  to a third party.
+
+If logs egress beyond Clever Cloud infrastructure, the per-session ULID plus
+peer IP plus SNI combination is a durable cross-system correlator — treat it
+accordingly in your privacy impact assessment.
+
 ### Listeners
 
 The _listener_ section describes a set of listening sockets accepting client connections.
