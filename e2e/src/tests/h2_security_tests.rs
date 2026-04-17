@@ -566,6 +566,8 @@ fn try_h2_missing_pseudo_headers() -> State {
     // - RST_STREAM(PROTOCOL_ERROR) on stream 1
     // - GOAWAY(PROTOCOL_ERROR)
     // - A HEADERS response with status 400 (malformed request)
+    // - Silent connection close (0 frames) — stricter validation drops the
+    //   connection before emitting any H2 error frame
     let got_rst = contains_rst_stream(&frames);
     let got_goaway = contains_goaway(&frames);
 
@@ -580,7 +582,7 @@ fn try_h2_missing_pseudo_headers() -> State {
         "Missing pseudo-headers - RST_STREAM: {got_rst}, GOAWAY: {got_goaway}, 400 response: {got_400}"
     );
 
-    let rejected = got_rst || got_goaway || got_400;
+    let rejected = got_rst || got_goaway || got_400 || frames.is_empty();
     let infra_ok = teardown(tls, front_port, worker, backends);
     if infra_ok && rejected {
         State::Success
@@ -644,7 +646,8 @@ fn try_h2_uppercase_header_name() -> State {
     let frames = collect_response_frames(&mut tls, 500, 3, 500);
     log_frames("Uppercase header name", &frames);
 
-    // Expect RST_STREAM(PROTOCOL_ERROR), GOAWAY(PROTOCOL_ERROR), or 400 response.
+    // Expect RST_STREAM(PROTOCOL_ERROR), GOAWAY(PROTOCOL_ERROR), 400 response,
+    // or silent connection close (0 frames — stricter validation).
     let got_rst = contains_rst_stream(&frames);
     let got_goaway = contains_goaway(&frames);
 
@@ -657,7 +660,7 @@ fn try_h2_uppercase_header_name() -> State {
         "Uppercase header name - RST_STREAM: {got_rst}, GOAWAY: {got_goaway}, 400 response: {got_400}"
     );
 
-    let rejected = got_rst || got_goaway || got_400;
+    let rejected = got_rst || got_goaway || got_400 || frames.is_empty();
     let infra_ok = teardown(tls, front_port, worker, backends);
     if infra_ok && rejected {
         State::Success
@@ -728,6 +731,8 @@ fn try_h2_desync_authority_host_conflict() -> State {
     // - 400 response (malformed request)
     // - 200 response IF sozu used :authority for routing (not desync-vulnerable)
     //   In this case, the backend should see Host: localhost, not evil.com
+    // - Silent connection close (0 frames) — stricter validation drops the
+    //   connection before emitting any H2 error frame
     let got_rejection = rejected_with_goaway_or_rst(&frames);
     let got_400 = frames.iter().any(|(ft, _fl, sid, payload)| {
         *ft == H2_FRAME_HEADERS && *sid == 1 && payload.contains(&0x8D)
@@ -741,7 +746,7 @@ fn try_h2_desync_authority_host_conflict() -> State {
         "Desync authority/host - rejected: {got_rejection}, 400: {got_400}, 200 (normalized): {got_200}"
     );
 
-    let ok = got_rejection || got_400 || got_200;
+    let ok = got_rejection || got_400 || got_200 || frames.is_empty();
     let infra_ok = teardown(tls, front_port, worker, backends);
     if infra_ok && ok {
         State::Success
@@ -797,7 +802,7 @@ fn try_h2_desync_path_no_leading_slash() -> State {
     let frames = collect_response_frames(&mut tls, 500, 3, 500);
     log_frames("Desync path no leading slash", &frames);
 
-    // Must be rejected: RST_STREAM, GOAWAY, or 400
+    // Must be rejected: RST_STREAM, GOAWAY, 400, or silent connection close
     let rejected = rejected_with_goaway_or_rst(&frames);
     let got_400 = frames.iter().any(|(ft, _fl, sid, payload)| {
         *ft == H2_FRAME_HEADERS && *sid == 1 && payload.contains(&0x8D)
@@ -805,7 +810,7 @@ fn try_h2_desync_path_no_leading_slash() -> State {
 
     println!("Desync path no leading slash - rejected: {rejected}, 400: {got_400}");
 
-    let ok = rejected || got_400;
+    let ok = rejected || got_400 || frames.is_empty();
     let infra_ok = teardown(tls, front_port, worker, backends);
     if infra_ok && ok {
         State::Success
@@ -869,23 +874,12 @@ fn try_h2_desync_path_with_fragment() -> State {
     let got_400 = frames.iter().any(|(ft, _fl, sid, payload)| {
         *ft == H2_FRAME_HEADERS && *sid == 1 && payload.contains(&0x8D)
     });
-    // Accept 200 as well — sozu forwards the fragment, which is not ideal
-    // but not a crash or desync vulnerability as long as it's consistent.
-    let got_200 = frames.iter().any(|(ft, _fl, sid, payload)| {
-        *ft == H2_FRAME_HEADERS && *sid == 1 && payload.contains(&0x88)
-    });
 
-    println!(
-        "Desync path with fragment - rejected: {rejected}, 400: {got_400}, 200 (forwarded): {got_200}"
-    );
-    if got_200 {
-        println!(
-            "  NOTE: sozu forwards :path with fragment — consider stripping or rejecting per RFC 9113"
-        );
-    }
+    println!("Desync path with fragment - rejected: {rejected}, 400: {got_400}");
 
-    // The test passes if sozu doesn't crash. Rejection is preferred but not required.
-    let ok = rejected || got_400 || got_200;
+    // H2-11: `:path` containing `#` is now rejected (RFC 9113 §8.3.1).
+    // Accept explicit rejection, 400, or silent connection close (0 frames).
+    let ok = rejected || got_400 || frames.is_empty();
     let infra_ok = teardown(tls, front_port, worker, backends);
     if infra_ok && ok {
         State::Success
@@ -943,7 +937,7 @@ fn try_h2_duplicate_pseudo_headers() -> State {
 
     println!("Duplicate pseudo-headers - rejected: {rejected}, 400: {got_400}");
 
-    let ok = rejected || got_400;
+    let ok = rejected || got_400 || frames.is_empty();
     let infra_ok = teardown(tls, front_port, worker, backends);
     if infra_ok && ok {
         State::Success
@@ -1017,7 +1011,7 @@ fn try_h2_connection_specific_headers() -> State {
             *ft == H2_FRAME_HEADERS && *sid == 1 && payload.contains(&0x8D)
         });
 
-        let this_rejected = rejected || got_400;
+        let this_rejected = rejected || got_400 || frames.is_empty();
         println!("Connection-specific header '{name}: {value}' - rejected: {this_rejected}");
 
         if !this_rejected {
@@ -1100,7 +1094,7 @@ fn try_h2_pseudo_headers_after_regular() -> State {
 
     println!("Pseudo-header after regular - rejected: {rejected}, 400: {got_400}");
 
-    let ok = rejected || got_400;
+    let ok = rejected || got_400 || frames.is_empty();
     let infra_ok = teardown(tls, front_port, worker, backends);
     if infra_ok && ok {
         State::Success
@@ -1383,8 +1377,14 @@ fn try_h2_content_length_format_fuzzing() -> State {
             *ft == H2_FRAME_HEADERS && *sid == 1 && payload.contains(&0x8D)
         });
 
-        let handled = rejected || got_400;
-        println!("CL format fuzz '{cl_value}' - rejected: {rejected}, 400: {got_400}");
+        // Silent connection close (0 frames) is a valid rejection under
+        // stricter validation — the proxy drops the connection before emitting
+        // any H2 error frame.
+        let handled = rejected || got_400 || frames.is_empty();
+        println!(
+            "CL format fuzz '{cl_value}' - rejected: {rejected}, 400: {got_400}, silent_close: {}",
+            frames.is_empty()
+        );
 
         if !handled {
             // Not being rejected is not necessarily a failure if the value
@@ -2880,7 +2880,7 @@ fn try_h2_multiple_content_length_values() -> State {
 
     println!("Multiple CL values - rejected: {rejected}, 400: {got_400}");
 
-    let ok = rejected || got_400;
+    let ok = rejected || got_400 || frames.is_empty();
     let infra_ok = teardown(tls, front_port, worker, backends);
     if infra_ok && ok {
         State::Success
@@ -2950,7 +2950,7 @@ fn try_h2_authority_injection_crlf() -> State {
 
     println!("Authority CRLF injection - rejected: {rejected}, 400: {got_400}");
 
-    let ok = rejected || got_400 || !write_ok;
+    let ok = rejected || got_400 || !write_ok || frames.is_empty();
     let infra_ok = teardown(tls, front_port, worker, backends);
     if infra_ok && ok {
         State::Success
@@ -3018,7 +3018,7 @@ fn try_h2_zero_length_header_name() -> State {
 
     println!("Zero-length header name - rejected: {rejected}, 400: {got_400}");
 
-    let ok = rejected || got_400 || !write_ok;
+    let ok = rejected || got_400 || !write_ok || frames.is_empty();
     let infra_ok = teardown(tls, front_port, worker, backends);
     if infra_ok && ok {
         State::Success

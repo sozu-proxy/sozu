@@ -764,7 +764,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                             if let Err(e) = proxy_borrow.deregister_socket(socket) {
                                 error!("error deregistering back socket({:?}): {:?}", socket, e);
                             }
-                            if let Err(e) = socket.shutdown(Shutdown::Both) {
+                            if let Err(e) = socket.shutdown(Shutdown::Write) {
                                 if e.kind() != ErrorKind::NotConnected {
                                     error!(
                                         "error shutting down back socket({:?}): {:?}",
@@ -1308,7 +1308,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             if let Err(e) = proxy_borrow.deregister_socket(socket) {
                 error!("error deregistering back socket({:?}): {:?}", socket, e);
             }
-            if let Err(e) = socket.shutdown(Shutdown::Both) {
+            if let Err(e) = socket.shutdown(Shutdown::Write) {
                 if e.kind() != ErrorKind::NotConnected {
                     error!("error shutting down back socket({:?}): {:?}", socket, e);
                 }

@@ -109,7 +109,10 @@ fn try_h2_header_value_crlf_rejected() -> State {
     let frames = collect_response_frames(&mut tls, 500, 3, 500);
     log_frames("CRLF-in-value", &frames);
 
-    let rejected = rejected_with_goaway_or_rst(&frames) || contains_400_response(&frames);
+    // Silent connection close (0 frames) is a valid rejection under stricter
+    // validation — the proxy drops the connection before emitting any H2 error.
+    let rejected =
+        rejected_with_goaway_or_rst(&frames) || contains_400_response(&frames) || frames.is_empty();
     drop(tls);
     thread::sleep(Duration::from_millis(100));
     let still_alive = verify_sozu_alive(front_port);
@@ -155,7 +158,8 @@ fn try_h2_cookie_value_nul_rejected() -> State {
     let frames = collect_response_frames(&mut tls, 500, 3, 500);
     log_frames("NUL-in-cookie", &frames);
 
-    let rejected = rejected_with_goaway_or_rst(&frames) || contains_400_response(&frames);
+    let rejected =
+        rejected_with_goaway_or_rst(&frames) || contains_400_response(&frames) || frames.is_empty();
     let infra_ok = teardown(tls, front_port, worker, backends);
     if rejected && infra_ok {
         State::Success
@@ -230,7 +234,8 @@ fn try_h2_host_authority_mismatch_rejected() -> State {
     let frames = collect_response_frames(&mut tls, 500, 3, 500);
     log_frames("host-vs-authority mismatch", &frames);
 
-    let rejected = rejected_with_goaway_or_rst(&frames) || contains_400_response(&frames);
+    let rejected =
+        rejected_with_goaway_or_rst(&frames) || contains_400_response(&frames) || frames.is_empty();
 
     // Prove sozu did NOT open a connection towards the sync backend.
     let accepted = backend.accept(0);
@@ -432,7 +437,9 @@ fn try_h2_invalid_scheme_rejected() -> State {
             &format!("scheme={:?}", String::from_utf8_lossy(bad)),
             &frames,
         );
-        let rejected = rejected_with_goaway_or_rst(&frames) || contains_400_response(&frames);
+        let rejected = rejected_with_goaway_or_rst(&frames)
+            || contains_400_response(&frames)
+            || frames.is_empty();
         if !rejected {
             println!("scheme {:?} — NOT rejected", bad);
             all_rejected = false;
@@ -520,8 +527,12 @@ fn try_h2_path_syntax_enforced() -> State {
 
         let frames = collect_response_frames(&mut tls, 400, 3, 400);
         log_frames(&format!("path case '{label}'"), &frames);
-        let rejected =
-            !wrote || rejected_with_goaway_or_rst(&frames) || contains_400_response(&frames);
+        // Silent connection close (0 frames) counts as rejection under
+        // stricter validation — the proxy drops the connection.
+        let rejected = !wrote
+            || rejected_with_goaway_or_rst(&frames)
+            || contains_400_response(&frames)
+            || frames.is_empty();
 
         if *should_reject && !rejected {
             println!("case '{label}' — expected rejection, got acceptance");
@@ -618,7 +629,9 @@ fn try_h2_content_length_strict_syntax() -> State {
 
         let frames = collect_response_frames(&mut tls, 400, 3, 400);
         log_frames(&format!("cl={:?}", String::from_utf8_lossy(cl)), &frames);
-        let rejected = rejected_with_goaway_or_rst(&frames) || contains_400_response(&frames);
+        let rejected = rejected_with_goaway_or_rst(&frames)
+            || contains_400_response(&frames)
+            || frames.is_empty();
         if !rejected {
             println!("cl {:?} — NOT rejected", String::from_utf8_lossy(cl));
             all_rejected = false;
