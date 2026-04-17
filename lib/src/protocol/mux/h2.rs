@@ -2871,8 +2871,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// RUSTLS log-context convention.
     pub fn handle_flood_violation(&mut self, violation: H2FloodViolation) -> MuxResult {
         warn!(
-            "{} {} H2 flood detected: {} count {} exceeds threshold {}",
-            log_context!(self),
+            "{} H2 flood detected: {} count {} exceeds threshold {}",
             log_context!(self),
             violation.reason,
             violation.count,
@@ -2905,8 +2904,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             }
             Err(error) => {
                 error!(
-                    "{} {} Could not serialize GoAwayFrame: {:?}",
-                    log_context!(self),
+                    "{} Could not serialize GoAwayFrame: {:?}",
                     log_context!(self),
                     error
                 );
