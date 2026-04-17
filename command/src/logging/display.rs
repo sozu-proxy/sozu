@@ -20,7 +20,7 @@ impl LogLevel {
             (LogLevel::Error, false, true) => "\x1b[;31;1mERROR",
             (LogLevel::Warn, false, true) => "\x1b[;33;1mWARN ",
             (LogLevel::Info, false, true) => "\x1b[;32;1mINFO ",
-            (LogLevel::Debug, false, true) => "\x1b[;34mDEBUG",
+            (LogLevel::Debug, false, true) => "\x1b[;36mDEBUG",
             (LogLevel::Trace, false, true) => "\x1b[;90mTRACE",
 
             (LogLevel::Error, true, false) => "ERROR-ACCESS",

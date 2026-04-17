@@ -78,7 +78,7 @@ macro_rules! log_context {
             ("", "", "", "", "")
         };
         format!(
-            "{open}TCP{reset}\t{gray}{ctx}{reset}\t{cyan}Session{reset}({gray}frontend{reset}={white}{frontend}{reset}, {gray}backend{reset}={white}{backend}{reset})\t >>>",
+            "{gray}{ctx}{reset}\t{open}TCP{reset}\t{cyan}Session{reset}({gray}frontend{reset}={white}{frontend}{reset}, {gray}backend{reset}={white}{backend}{reset})\t >>>",
             open = open,
             reset = reset,
             cyan = cyan,

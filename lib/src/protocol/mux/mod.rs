@@ -35,9 +35,9 @@ use sozu_command::{
 
 /// Protocol label + session descriptor used as a prefix on every [`Mux`] log
 /// line. Matches the RUSTLS log-context convention:
-/// `MUX\t[<ulid>]\tSession(...)\t >>>`. When [`is_logger_colored`] is `true`
-/// the label is wrapped in bright-magenta/bold ANSI, the ULID is bracketed
-/// in dim text and the session detail block is dimmed.
+/// `[<ulid> - - -]\tMUX\tSession(...)\t >>>`. When [`is_logger_colored`] is
+/// `true` the label is wrapped in bright-yellow/bold ANSI and the session
+/// detail block is dimmed.
 ///
 /// Fields included in the session block:
 /// - `frontend` — mio token of the frontend socket
@@ -51,7 +51,7 @@ macro_rules! log_context {
         let colored = is_logger_colored();
         let (open, reset, cyan, gray, white) = if colored {
             (
-                "\x1b[1;35m",
+                "\x1b[1;33m",
                 "\x1b[0m",
                 "\x1b[36m",
                 "\x1b[90m",
@@ -61,7 +61,7 @@ macro_rules! log_context {
             ("", "", "", "", "")
         };
         format!(
-            "[{ulid} - - -]\t{open}MUX{reset}\t{gray}[{reset}{white}{ulid}{reset}{gray}]{reset}\t{cyan}Session{reset}({gray}frontend{reset}={white}{frontend}{reset}, {gray}peer{reset}={white}{peer:?}{reset}, {gray}streams{reset}={white}{streams}{reset}, {gray}backends{reset}={white}{backends}{reset}, {gray}pending_links{reset}={white}{pending_links}{reset}, {gray}readiness{reset}={white}{readiness}{reset})\t >>>",
+            "[{ulid} - - -]\t{open}MUX{reset}\t{cyan}Session{reset}({gray}frontend{reset}={white}{frontend}{reset}, {gray}peer{reset}={white}{peer:?}{reset}, {gray}streams{reset}={white}{streams}{reset}, {gray}backends{reset}={white}{backends}{reset}, {gray}pending_links{reset}={white}{pending_links}{reset}, {gray}readiness{reset}={white}{readiness}{reset})\t >>>",
             open = open,
             reset = reset,
             cyan = cyan,
@@ -89,7 +89,7 @@ macro_rules! log_context_lite {
         let colored = is_logger_colored();
         let (open, reset, cyan, gray, white) = if colored {
             (
-                "\x1b[1;35m",
+                "\x1b[1;33m",
                 "\x1b[0m",
                 "\x1b[36m",
                 "\x1b[90m",
@@ -99,7 +99,7 @@ macro_rules! log_context_lite {
             ("", "", "", "", "")
         };
         format!(
-            "[{ulid} - - -]\t{open}MUX{reset}\t{gray}[{reset}{white}{ulid}{reset}{gray}]{reset}\t{cyan}Session{reset}({gray}frontend{reset}={white}{frontend}{reset}, {gray}peer{reset}={white}{peer:?}{reset}, {gray}readiness{reset}={white}{readiness}{reset})\t >>>",
+            "[{ulid} - - -]\t{open}MUX{reset}\t{cyan}Session{reset}({gray}frontend{reset}={white}{frontend}{reset}, {gray}peer{reset}={white}{peer:?}{reset}, {gray}readiness{reset}={white}{readiness}{reset})\t >>>",
             open = open,
             reset = reset,
             cyan = cyan,
@@ -119,7 +119,7 @@ macro_rules! log_module_context {
     () => {{
         let colored = is_logger_colored();
         let (open, reset) = if colored {
-            ("\x1b[1;35m", "\x1b[0m")
+            ("\x1b[1;33m", "\x1b[0m")
         } else {
             ("", "")
         };

@@ -18,15 +18,16 @@ use crate::{
 };
 
 /// This macro is defined uniquely in this module to help the tracking of
-/// pipelining issues inside Sōzu. Colored output uses bright-green/bold for
+/// pipelining issues inside Sōzu. Colored output uses bright-yellow/bold for
 /// the protocol label, plain cyan for the `Session` keyword, gray for keys
-/// and bright white for values.
+/// and bright white for values. The `[ulid - - -]` context comes first to
+/// stay aligned with `MUX-*` and `SOCKET` log lines.
 macro_rules! log_context {
     ($self:expr) => {{
         let colored = is_logger_colored();
         let (open, reset, cyan, gray, white) = if colored {
             (
-                "\x1b[1;32m",
+                "\x1b[1;33m",
                 "\x1b[0m",
                 "\x1b[36m",
                 "\x1b[90m",
@@ -36,7 +37,7 @@ macro_rules! log_context {
             ("", "", "", "", "")
         };
         format!(
-            "{open}PIPE{reset}\t{gray}{ctx}{reset}\t{cyan}Session{reset}({gray}address{reset}={white}{address}{reset}, {gray}frontend{reset}={white}{frontend}{reset}, {gray}frontend_readiness{reset}={white}{frontend_readiness}{reset}, {gray}backend{reset}={white}{backend}{reset}, {gray}backend_readiness{reset}={white}{backend_readiness}{reset})\t >>>",
+            "{gray}{ctx}{reset}\t{open}PIPE{reset}\t{cyan}Session{reset}({gray}address{reset}={white}{address}{reset}, {gray}frontend{reset}={white}{frontend}{reset}, {gray}frontend_readiness{reset}={white}{frontend_readiness}{reset}, {gray}backend{reset}={white}{backend}{reset}, {gray}backend_readiness{reset}={white}{backend_readiness}{reset})\t >>>",
             open = open,
             reset = reset,
             cyan = cyan,

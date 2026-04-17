@@ -15,15 +15,16 @@ use crate::{
 
 /// This macro is defined uniquely in this module to help the tracking of tls
 /// issues inside Sōzu. When the logger emits to a TTY the protocol label is
-/// bright-cyan/bold, the `Session` keyword is plain cyan, attribute keys are
+/// bright-yellow/bold, the `Session` keyword is plain cyan, attribute keys are
 /// gray and values are bright white. ANSI codes are skipped when output goes
-/// to a file or otherwise non-colored sink.
+/// to a file or otherwise non-colored sink. The `[ulid - - -]` context prefix
+/// comes first to keep column alignment with `MUX-*` and `SOCKET` logs.
 macro_rules! log_context {
     ($self:expr) => {{
         let colored = is_logger_colored();
         let (open, reset, cyan, gray, white) = if colored {
             (
-                "\x1b[1;36m",
+                "\x1b[1;33m",
                 "\x1b[0m",
                 "\x1b[36m",
                 "\x1b[90m",
@@ -33,7 +34,7 @@ macro_rules! log_context {
             ("", "", "", "", "")
         };
         format!(
-            "{open}RUSTLS{reset}\t{gray}{ctx}{reset}\t{cyan}Session{reset}({gray}sni{reset}={white}{sni:?}{reset}, {gray}source{reset}={white}{source:?}{reset}, {gray}frontend{reset}={white}{frontend}{reset}, {gray}readiness{reset}={white}{readiness}{reset})\t >>>",
+            "{gray}{ctx}{reset}\t{open}RUSTLS{reset}\t{cyan}Session{reset}({gray}sni{reset}={white}{sni:?}{reset}, {gray}source{reset}={white}{source:?}{reset}, {gray}frontend{reset}={white}{frontend}{reset}, {gray}readiness{reset}={white}{readiness}{reset})\t >>>",
             open = open,
             reset = reset,
             cyan = cyan,
