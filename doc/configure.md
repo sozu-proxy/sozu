@@ -350,7 +350,7 @@ per-listener with safe compile-time defaults:
 | `h2_max_concurrent_streams` | 100 | Maximum concurrent H2 streams the proxy accepts (`SETTINGS_MAX_CONCURRENT_STREAMS`). Minimum: 1. |
 | `h2_stream_shrink_ratio` | 2 | Shrink threshold ratio for recycled stream slots. The internal stream Vec is shrunk when `total_slots > active_streams * ratio`. Minimum: 2. |
 | `h2_max_header_list_size` | 65536 | Maximum accumulated HPACK-decoded header list size per request (`SETTINGS_MAX_HEADER_LIST_SIZE`, RFC 9113 §6.5.2). |
-| `h2_stream_idle_timeout_seconds` | 30 | Per-stream idle timeout in seconds. An open H2 stream that makes no forward progress for this duration is cancelled (`RST_STREAM` / `CANCEL`) to defend against slow-multiplex Slowloris. |
+| `h2_stream_idle_timeout_seconds` | 30 | Per-stream idle timeout in seconds. An open H2 stream that receives no meaningful application data (non-empty DATA or HEADERS) for this duration is cancelled (`RST_STREAM` / `CANCEL`) to defend against slow-multiplex Slowloris. Active uploads that trickle DATA frames reset the timer on each frame. |
 | `h2_max_header_table_size` | 65536 | Maximum HPACK dynamic table size (`SETTINGS_HEADER_TABLE_SIZE`) accepted from the peer. Caps the peer-advertised value to prevent unbounded HPACK encoder memory growth. |
 
 _Configuration example:_
