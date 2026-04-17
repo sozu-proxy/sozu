@@ -76,7 +76,7 @@ impl ClientSession {
 impl MessageClient for ClientSession {
     fn finish_ok<T: Into<String>>(&mut self, message: T) {
         let message = message.into();
-        info!("{}", message);
+        debug!("{}", message);
         self.send(Response {
             status: ResponseStatus::Ok.into(),
             message,
@@ -86,7 +86,7 @@ impl MessageClient for ClientSession {
 
     fn finish_ok_with_content<T: Into<String>>(&mut self, content: ResponseContent, message: T) {
         let message = message.into();
-        info!("{}", message);
+        debug!("{}", message);
         self.send(Response {
             status: ResponseStatus::Ok.into(),
             message,
@@ -106,7 +106,7 @@ impl MessageClient for ClientSession {
 
     fn return_processing<S: Into<String>>(&mut self, message: S) {
         let message = message.into();
-        info!("{}", message);
+        debug!("{}", message);
         self.send(Response {
             status: ResponseStatus::Processing.into(),
             message,
@@ -120,7 +120,7 @@ impl MessageClient for ClientSession {
         content: ResponseContent,
     ) {
         let message = message.into();
-        info!("{}", message);
+        debug!("{}", message);
         self.send(Response {
             status: ResponseStatus::Processing.into(),
             message,
@@ -134,14 +134,14 @@ pub type OptionalClient<'a> = Option<&'a mut ClientSession>;
 impl MessageClient for OptionalClient<'_> {
     fn finish_ok<T: Into<String>>(&mut self, message: T) {
         match self {
-            None => info!("{}", message.into()),
+            None => debug!("{}", message.into()),
             Some(client) => client.finish_ok(message),
         }
     }
 
     fn finish_ok_with_content<T: Into<String>>(&mut self, content: ResponseContent, message: T) {
         match self {
-            None => info!("{}", message.into()),
+            None => debug!("{}", message.into()),
             Some(client) => client.finish_ok_with_content(content, message),
         }
     }
@@ -155,7 +155,7 @@ impl MessageClient for OptionalClient<'_> {
 
     fn return_processing<T: Into<String>>(&mut self, message: T) {
         match self {
-            None => info!("{}", message.into()),
+            None => debug!("{}", message.into()),
             Some(client) => client.return_processing(message),
         }
     }
@@ -166,7 +166,7 @@ impl MessageClient for OptionalClient<'_> {
         content: ResponseContent,
     ) {
         match self {
-            None => info!("{}", message.into()),
+            None => debug!("{}", message.into()),
             Some(client) => client.return_processing_with_content(message, content),
         }
     }
