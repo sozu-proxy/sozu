@@ -1,6 +1,6 @@
 use std::{io::IoSlice, time::Instant};
 
-use sozu_command::ready::Ready;
+use sozu_command::{logging::is_logger_colored, ready::Ready};
 
 use crate::{
     L7ListenerHandler, ListenerHandler, Readiness,
@@ -15,6 +15,67 @@ use crate::{
     socket::{SocketHandler, SocketResult},
     timer::TimeoutContainer,
 };
+
+/// Prefix applied to every [`ConnectionH1`] log line. Matches the RUSTLS
+/// log-context convention (`MUX-H1\tSession(...)\t >>>`). When the logger is
+/// in colored mode the label is bright-blue/bold and the session detail is
+/// dim.
+///
+/// Fields included in the session block (chosen to surface the most common
+/// H1 troubleshooting axes — keep-alive churn, stream pinning, buffer-pressure
+/// stall and graceful TLS shutdown):
+/// - `peer` — peer address (or `None` if the socket is gone)
+/// - `position` — `Server` / `Client(...)` orientation
+/// - `stream` — currently active [`GlobalStreamId`] (or `none`)
+/// - `requests` — request count served on this connection (keep-alive)
+/// - `parked` — set when the kawa buffer is full and `READABLE` is suspended
+/// - `close_notify` — TLS `close_notify` send state
+/// - `readiness` — connection-level mio readiness snapshot
+macro_rules! log_context {
+    ($self:expr) => {{
+        let colored = is_logger_colored();
+        let (open, reset, cyan, gray, white) = if colored {
+            (
+                "\x1b[1;34m",
+                "\x1b[0m",
+                "\x1b[36m",
+                "\x1b[90m",
+                "\x1b[97m",
+            )
+        } else {
+            ("", "", "", "", "")
+        };
+        format!(
+            "{open}MUX-H1{reset}\t{cyan}Session{reset}({gray}peer{reset}={white}{peer:?}{reset}, {gray}position{reset}={white}{position:?}{reset}, {gray}stream{reset}={white}{stream:?}{reset}, {gray}requests{reset}={white}{requests}{reset}, {gray}parked{reset}={white}{parked}{reset}, {gray}close_notify{reset}={white}{close_notify}{reset}, {gray}readiness{reset}={white}{readiness}{reset})\t >>>",
+            open = open,
+            reset = reset,
+            cyan = cyan,
+            gray = gray,
+            white = white,
+            peer = $self.socket.socket_ref().peer_addr().ok(),
+            position = $self.position,
+            stream = $self.stream,
+            requests = $self.requests,
+            parked = $self.parked_on_buffer_pressure,
+            close_notify = $self.close_notify_sent,
+            readiness = $self.readiness,
+        )
+    }};
+}
+
+/// Module-level prefix for logs without a [`ConnectionH1`] in scope. Honours
+/// the colored flag.
+macro_rules! log_module_context {
+    () => {{
+        let colored = is_logger_colored();
+        let (open, reset) = if colored {
+            ("\x1b[1;34m", "\x1b[0m")
+        } else {
+            ("", "")
+        };
+        format!("{open}MUX-H1{reset}\t >>>", open = open, reset = reset)
+    }};
+}
 
 /// HTTP/1.1 connection handler within the mux layer.
 ///
@@ -55,7 +116,8 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
     fn defer_close_for_tls_flush(&mut self, reason: &'static str) -> MuxResult {
         if self.initiate_close_notify() {
             trace!(
-                "H1 writable delaying close after {}: stream={:?}, close_notify_sent={}, wants_write={}, readiness={:?}",
+                "{} H1 writable delaying close after {}: stream={:?}, close_notify_sent={}, wants_write={}, readiness={:?}",
+                log_context!(self),
                 reason,
                 self.stream,
                 self.close_notify_sent,
@@ -73,7 +135,8 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
     /// (no Content-Length, no chunked encoding).
     fn terminate_close_delimited(kawa: &mut super::GenericHttpStream, stream_id: GlobalStreamId) {
         debug!(
-            "H1 close-delimited EOF on stream {}: terminating body",
+            "{} H1 close-delimited EOF on stream {}: terminating body",
+            log_module_context!(),
             stream_id
         );
         kawa.push_block(kawa::Block::Flags(kawa::Flags {
@@ -90,9 +153,16 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         E: Endpoint,
         L: ListenerHandler + L7ListenerHandler,
     {
-        trace!("======= MUX H1 READABLE {:?}", self.position);
+        trace!(
+            "{} ======= MUX H1 READABLE {:?}",
+            log_context!(self),
+            self.position
+        );
         let Some(stream_id) = self.stream else {
-            error!("readable() called on H1 connection with no active stream");
+            error!(
+                "{} readable() called on H1 connection with no active stream",
+                log_context!(self)
+            );
             return MuxResult::Continue;
         };
         self.timeout_container.reset();
@@ -156,7 +226,10 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                 Position::Client(..) => {
                     incr!("http.backend_parse_errors");
                     let StreamState::Linked(token) = stream.state else {
-                        error!("client stream in error is not in Linked state");
+                        error!(
+                            "{} client stream in error is not in Linked state",
+                            log_context!(self)
+                        );
                         return MuxResult::CloseSession;
                     };
                     let global_stream_id = stream_id;
@@ -184,7 +257,11 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         let is_1xx_backend = if self.position.is_client() {
             if let kawa::StatusLine::Response { code, .. } = &kawa.detached.status_line {
                 if (100..200).contains(code) {
-                    debug!("H1 backend: received {} informational response", code);
+                    debug!(
+                        "{} H1 backend: received {} informational response",
+                        log_context!(self),
+                        code
+                    );
                     for block in &mut kawa.blocks {
                         if let kawa::Block::Flags(flags) = block {
                             flags.end_stream = false;
@@ -217,14 +294,15 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                     } = kawa.detached.status_line
                     {
                         error!(
-                            "Unexpected malformed request: HTTP/1.0 from {:?} with {:?} {:?} {:?}",
+                            "{} Unexpected malformed request: HTTP/1.0 from {:?} with {:?} {:?} {:?}",
+                            log_context!(self),
                             parts.context.session_address,
                             parts.context.method,
                             parts.context.authority,
                             parts.context.path
                         );
                     } else {
-                        error!("Unexpected malformed request");
+                        error!("{} Unexpected malformed request", log_context!(self));
                         kawa::debug_kawa(kawa);
                     }
                     let answers = answers_rc.borrow();
@@ -232,7 +310,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                     return MuxResult::Continue;
                 }
                 self.requests += 1;
-                trace!("REQUESTS: {}", self.requests);
+                trace!("{} REQUESTS: {}", log_context!(self), self.requests);
                 incr!("http.requests");
                 gauge_add!("http.active_requests", 1);
                 parts.metrics.service_start();
@@ -284,7 +362,11 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         E: Endpoint,
         L: ListenerHandler + L7ListenerHandler,
     {
-        trace!("======= MUX H1 WRITABLE {:?}", self.position);
+        trace!(
+            "{} ======= MUX H1 WRITABLE {:?}",
+            log_context!(self),
+            self.position
+        );
         let Some(stream_id) = self.stream else {
             if self.socket.socket_wants_write() {
                 let (size, status) = self.socket.socket_write_vectored(&[]);
@@ -341,7 +423,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                     let kawa = &mut stream.back;
                     match kawa.detached.status_line {
                         kawa::StatusLine::Response { code: 101, .. } => {
-                            debug!("============== HANDLE UPGRADE!");
+                            debug!("{} ============== HANDLE UPGRADE!", log_context!(self));
                             stream.metrics.backend_stop();
                             stream.generate_access_log(
                                 false,
@@ -351,7 +433,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                             return MuxResult::Upgrade;
                         }
                         kawa::StatusLine::Response { code: 100, .. } => {
-                            debug!("============== HANDLE CONTINUE!");
+                            debug!("{} ============== HANDLE CONTINUE!", log_context!(self));
                             // After a 100 Continue, we expect the client to continue
                             // with its request body. Do NOT call generate_access_log
                             // here — the final response will emit the access log.
@@ -369,7 +451,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                             return MuxResult::Continue;
                         }
                         kawa::StatusLine::Response { code: 103, .. } => {
-                            debug!("============== HANDLE EARLY HINT!");
+                            debug!("{} ============== HANDLE EARLY HINT!", log_context!(self));
                             // Do NOT call generate_access_log for 103 Early Hints.
                             // The final response will emit the access log.
                             // Calling it here would double-decrement http.active_requests.
@@ -465,7 +547,8 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                 *status = BackendStatus::Disconnecting;
                 self.readiness.event = Ready::HUP;
                 debug!(
-                    "H1 force_disconnect client: stream={:?}, wants_write={}, readiness={:?}",
+                    "{} H1 force_disconnect client: stream={:?}, wants_write={}, readiness={:?}",
+                    log_context!(self),
                     self.stream,
                     self.socket.socket_wants_write(),
                     self.readiness
@@ -475,16 +558,20 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             Position::Server => {
                 if self.socket.socket_wants_write() {
                     debug!(
-                        "H1 force_disconnect delaying close: stream={:?}, wants_write=true, readiness={:?}",
-                        self.stream, self.readiness
+                        "{} H1 force_disconnect delaying close: stream={:?}, wants_write=true, readiness={:?}",
+                        log_context!(self),
+                        self.stream,
+                        self.readiness
                     );
                     self.readiness.interest = Ready::WRITABLE | Ready::HUP | Ready::ERROR;
                     self.readiness.signal_pending_write();
                     MuxResult::Continue
                 } else {
                     debug!(
-                        "H1 force_disconnect closing session: stream={:?}, wants_write=false, readiness={:?}",
-                        self.stream, self.readiness
+                        "{} H1 force_disconnect closing session: stream={:?}, wants_write=false, readiness={:?}",
+                        log_context!(self),
+                        self.stream,
+                        self.readiness
                     );
                     MuxResult::CloseSession
                 }
@@ -501,7 +588,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             return false;
         }
         if !self.close_notify_sent {
-            trace!("H1 initiating CLOSE_NOTIFY");
+            trace!("{} H1 initiating CLOSE_NOTIFY", log_context!(self));
             self.socket.socket_close();
             self.close_notify_sent = true;
         }
@@ -522,12 +609,17 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         match self.position {
             Position::Client(_, _, BackendStatus::KeepAlive)
             | Position::Client(_, _, BackendStatus::Disconnecting) => {
-                trace!("close detached client ConnectionH1");
+                trace!("{} close detached client ConnectionH1", log_context!(self));
                 return;
             }
             Position::Client(_, _, BackendStatus::Connecting(_))
             | Position::Client(_, _, BackendStatus::Connected) => {
-                debug!("BACKEND CLOSING FOR: {:?} {:?}", self.position, self.stream);
+                debug!(
+                    "{} BACKEND CLOSING FOR: {:?} {:?}",
+                    log_context!(self),
+                    self.position,
+                    self.stream
+                );
             }
             Position::Server => {
                 let tls_pending_before = self.socket.socket_wants_write();
@@ -535,7 +627,8 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                     drain_tls_close_notify(&mut self.socket, &mut self.close_notify_sent);
                 if tls_pending_after {
                     error!(
-                        "H1 TLS buffer NOT fully drained on close: pending_before={}, pending_after={}, drain_rounds={}, stream={:?}, close_notify_sent={}, readiness={:?}",
+                        "{} H1 TLS buffer NOT fully drained on close: pending_before={}, pending_after={}, drain_rounds={}, stream={:?}, close_notify_sent={}, readiness={:?}",
+                        log_context!(self),
                         tls_pending_before,
                         tls_pending_after,
                         drain_rounds,
@@ -548,14 +641,19 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             }
         }
         let Some(stream_id) = self.stream else {
-            trace!("closing detached H1 client with no active stream");
+            trace!(
+                "{} closing detached H1 client with no active stream",
+                log_context!(self)
+            );
             return;
         };
         // reconnection is handled by the server
         let StreamState::Linked(token) = context.streams[stream_id].state else {
             trace!(
-                "closing detached H1 client in state {:?} on stream {}",
-                context.streams[stream_id].state, stream_id
+                "{} closing detached H1 client in state {:?} on stream {}",
+                log_context!(self),
+                context.streams[stream_id].state,
+                stream_id
             );
             return;
         };
@@ -568,8 +666,10 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
     {
         if self.stream != Some(stream) {
             error!(
-                "end_stream called with stream {} but expected {:?}",
-                stream, self.stream
+                "{} end_stream called with stream {} but expected {:?}",
+                log_context!(self),
+                stream,
+                self.stream
             );
             return;
         }
@@ -578,7 +678,12 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         let stream_id = stream;
         let stream = &mut context.streams[stream_id];
         let stream_context = &mut stream.context;
-        trace!("end H1 stream {:?}: {:#?}", self.stream, stream_context);
+        trace!(
+            "{} end H1 stream {:?}: {:#?}",
+            log_context!(self),
+            self.stream,
+            stream_context
+        );
         match &mut self.position {
             Position::Client(_, _, BackendStatus::Connecting(_)) => {
                 self.stream = None;
@@ -605,21 +710,24 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             }
             Position::Client(_, _, BackendStatus::KeepAlive)
             | Position::Client(_, _, BackendStatus::Disconnecting) => {
-                error!("end_stream called on KeepAlive or Disconnecting H1 client");
+                error!(
+                    "{} end_stream called on KeepAlive or Disconnecting H1 client",
+                    log_context!(self)
+                );
             }
             Position::Server => match end_stream_decision(stream) {
                 EndStreamAction::ForwardTerminated => {
-                    debug!("CLOSING H1 TERMINATED STREAM");
+                    debug!("{} CLOSING H1 TERMINATED STREAM", log_context!(self));
                     stream.state = StreamState::Unlinked;
                     self.readiness.interest.insert(Ready::WRITABLE);
                 }
                 EndStreamAction::CloseDelimited => {
-                    debug!("CLOSE DELIMITED");
+                    debug!("{} CLOSE DELIMITED", log_context!(self));
                     stream.state = StreamState::Unlinked;
                     self.readiness.interest.insert(Ready::WRITABLE);
                 }
                 EndStreamAction::ForwardUnterminated => {
-                    debug!("CLOSING H1 UNTERMINATED STREAM");
+                    debug!("{} CLOSING H1 UNTERMINATED STREAM", log_context!(self));
                     forcefully_terminate_answer(
                         stream,
                         &mut self.readiness,
@@ -631,7 +739,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                     set_default_answer(stream, &mut self.readiness, status, &answers);
                 }
                 EndStreamAction::Reconnect => {
-                    debug!("H1 RECONNECT");
+                    debug!("{} H1 RECONNECT", log_context!(self));
                     stream.state = StreamState::Link;
                     context.pending_links.push_back(stream_id);
                 }
@@ -643,7 +751,12 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
     where
         L: ListenerHandler + L7ListenerHandler,
     {
-        trace!("start H1 stream {} {:?}", stream, self.readiness);
+        trace!(
+            "{} start H1 stream {} {:?}",
+            log_context!(self),
+            stream,
+            self.readiness
+        );
         self.readiness.interest.insert(Ready::ALL);
         self.stream = Some(stream);
         match &mut self.position {
@@ -651,12 +764,18 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                 *status = BackendStatus::Connected;
             }
             Position::Client(_, _, BackendStatus::Disconnecting) => {
-                error!("start_stream called on Disconnecting H1 client");
+                error!(
+                    "{} start_stream called on Disconnecting H1 client",
+                    log_context!(self)
+                );
                 return false;
             }
             Position::Client(_, _, _) => {}
             Position::Server => {
-                error!("start_stream must not be called on H1 server connection");
+                error!(
+                    "{} start_stream must not be called on H1 server connection",
+                    log_context!(self)
+                );
                 return false;
             }
         }

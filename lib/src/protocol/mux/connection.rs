@@ -18,7 +18,7 @@ use std::{
 };
 
 use mio::{Token, net::TcpStream};
-use sozu_command::ready::Ready;
+use sozu_command::{logging::is_logger_colored, ready::Ready};
 
 use super::{
     BackendStatus, ConnectionH1, ConnectionH2, Context, Endpoint, GlobalStreamId, MuxResult,
@@ -29,6 +29,23 @@ use crate::{
     L7ListenerHandler, ListenerHandler, Readiness, backends::Backend, pool::Pool,
     socket::SocketHandler, timer::TimeoutContainer,
 };
+
+/// Module-level prefix used on every log line emitted from this module.
+/// Produces a bright-white/bold `MUX-CONN` label when the logger is in colored
+/// mode. Session-specific context cannot be derived here because most log
+/// sites are inside `Endpoint` adapter methods that only see the backend/
+/// frontend maps, not the wrapping [`Connection`].
+macro_rules! log_module_context {
+    () => {{
+        let colored = is_logger_colored();
+        let (open, reset) = if colored {
+            ("\x1b[1;37m", "\x1b[0m")
+        } else {
+            ("", "")
+        };
+        format!("{open}MUX-CONN{reset}\t >>>", open = open, reset = reset)
+    }};
+}
 
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
@@ -268,7 +285,10 @@ impl<Front: SocketHandler> Connection<Front> {
                     Position::Server => &context.streams[stream_id].front,
                 };
                 if kawa.storage.available_space() > 0 {
-                    trace!("H1 try_resume_reading: re-arming READABLE");
+                    trace!(
+                        "{} H1 try_resume_reading: re-arming READABLE",
+                        log_module_context!()
+                    );
                     c.readiness.signal_pending_read();
                     true
                 } else {
@@ -318,7 +338,11 @@ impl<Front: SocketHandler> Connection<Front> {
                 Some(cluster_id),
                 Some(&backend_borrow.backend_id)
             );
-            trace!("connection close: {:#?}", backend_borrow);
+            trace!(
+                "{} connection close: {:#?}",
+                log_module_context!(),
+                backend_borrow
+            );
         }
     }
 
@@ -326,7 +350,11 @@ impl<Front: SocketHandler> Connection<Front> {
         if let Position::Client(_, backend, BackendStatus::Connected) = self.position() {
             let mut backend_borrow = backend.borrow_mut();
             backend_borrow.active_requests = backend_borrow.active_requests.saturating_sub(1);
-            trace!("connection end stream: {:#?}", backend_borrow);
+            trace!(
+                "{} connection end stream: {:#?}",
+                log_module_context!(),
+                backend_borrow
+            );
         }
     }
 
@@ -334,7 +362,11 @@ impl<Front: SocketHandler> Connection<Front> {
         if let Position::Client(_, backend, BackendStatus::Connected) = self.position() {
             let mut backend_borrow = backend.borrow_mut();
             backend_borrow.active_requests += 1;
-            trace!("connection start stream: {:#?}", backend_borrow);
+            trace!(
+                "{} connection start stream: {:#?}",
+                log_module_context!(),
+                backend_borrow
+            );
         }
     }
 
@@ -418,7 +450,8 @@ impl Endpoint for EndpointClient<'_> {
             Some(backend) => backend.readiness(),
             None => {
                 error!(
-                    "backend token {:?} missing from backends map (readiness)",
+                    "{} backend token {:?} missing from backends map (readiness)",
+                    log_module_context!(),
                     token
                 );
                 &self.0.fallback_readiness
@@ -430,7 +463,8 @@ impl Endpoint for EndpointClient<'_> {
             Some(backend) => backend.readiness_mut(),
             None => {
                 error!(
-                    "backend token {:?} missing from backends map (readiness_mut)",
+                    "{} backend token {:?} missing from backends map (readiness_mut)",
+                    log_module_context!(),
                     token
                 );
                 &mut self.0.fallback_readiness
@@ -446,7 +480,8 @@ impl Endpoint for EndpointClient<'_> {
             Some(backend) => backend.end_stream(stream, context),
             None => {
                 error!(
-                    "backend token {:?} missing from backends map (end_stream)",
+                    "{} backend token {:?} missing from backends map (end_stream)",
+                    log_module_context!(),
                     token
                 );
             }
@@ -466,7 +501,8 @@ impl Endpoint for EndpointClient<'_> {
             Some(backend) => backend.start_stream(stream, context),
             None => {
                 error!(
-                    "backend token {:?} missing from backends map (start_stream)",
+                    "{} backend token {:?} missing from backends map (start_stream)",
+                    log_module_context!(),
                     token
                 );
                 false

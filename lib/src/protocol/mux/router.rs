@@ -8,7 +8,7 @@
 use std::{cell::RefCell, collections::HashMap, rc::Rc, time::Duration};
 
 use mio::{Interest, Token, net::TcpStream};
-use sozu_command::proto::command::ListenerType;
+use sozu_command::{logging::is_logger_colored, proto::command::ListenerType};
 
 use super::{
     BackendStatus, Connection, Context, DebugEvent, GlobalStreamId, Position, StreamState,
@@ -22,6 +22,22 @@ use crate::{
     server::CONN_RETRIES,
     timer::TimeoutContainer,
 };
+
+/// Module-level prefix used on every log line emitted from the router. The
+/// router has no direct view of a frontend session so a single dim
+/// `MUX-ROUTER` label is used, colored yellow/bold when the logger supports
+/// ANSI.
+macro_rules! log_module_context {
+    () => {{
+        let colored = is_logger_colored();
+        let (open, reset) = if colored {
+            ("\x1b[1;33m", "\x1b[0m")
+        } else {
+            ("", "")
+        };
+        format!("{open}MUX-ROUTER{reset}\t >>>", open = open, reset = reset)
+    }};
+}
 
 #[derive(Debug)]
 pub struct Router {
@@ -55,8 +71,10 @@ impl Router {
         // with concurrent connections on a single endpoint
         if !matches!(stream.state, StreamState::Link) {
             error!(
-                "stream {} expected to be in Link state, got {:?}",
-                stream_id, stream.state
+                "{} stream {} expected to be in Link state, got {:?}",
+                log_module_context!(),
+                stream_id,
+                stream.state
             );
             return Err(BackendConnectionError::MaxSessionsMemory);
         }
@@ -111,7 +129,10 @@ impl Router {
         for (token, backend) in &self.backends {
             match (h2, backend.position()) {
                 (_, Position::Server) => {
-                    error!("Backend connection unexpectedly behaves like a server");
+                    error!(
+                        "{} Backend connection unexpectedly behaves like a server",
+                        log_module_context!()
+                    );
                     continue;
                 }
                 (_, Position::Client(_, _, BackendStatus::Disconnecting)) => {}
@@ -145,7 +166,10 @@ impl Router {
                 }
                 (true, Position::Client(other_cluster_id, _, BackendStatus::KeepAlive)) => {
                     if *other_cluster_id == cluster_id && matches!(backend, Connection::H2(_)) {
-                        error!("ConnectionH2 unexpectedly behaves like H1 with KeepAlive");
+                        error!(
+                            "{} ConnectionH2 unexpectedly behaves like H1 with KeepAlive",
+                            log_module_context!()
+                        );
                     }
                 }
 
@@ -161,21 +185,36 @@ impl Router {
             }
         }
         trace!(
-            "connect: {} (stick={}, h2={}) -> (reuse={:?})",
-            cluster_id, frontend_should_stick, h2, reuse_token
+            "{} connect: {} (stick={}, h2={}) -> (reuse={:?})",
+            log_module_context!(),
+            cluster_id,
+            frontend_should_stick,
+            h2,
+            reuse_token
         );
 
         if let Some(token) = reuse_token {
-            trace!("reused backend: {:#?}", self.backends.get(&token));
+            trace!(
+                "{} reused backend: {:#?}",
+                log_module_context!(),
+                self.backends.get(&token)
+            );
             // Link backend to stream for the reused connection path. We check
             // that the backend can accept a new stream before committing any
             // per-stream state.
             let Some(backend_conn) = self.backends.get_mut(&token) else {
-                error!("reused backend token {:?} missing from backends map", token);
+                error!(
+                    "{} reused backend token {:?} missing from backends map",
+                    log_module_context!(),
+                    token
+                );
                 return Err(BackendConnectionError::MaxSessionsMemory);
             };
             if !backend_conn.start_stream(stream_id, context) {
-                error!("Backend rejected stream start (max concurrent streams reached)");
+                error!(
+                    "{} Backend rejected stream start (max concurrent streams reached)",
+                    log_module_context!()
+                );
                 return Err(BackendConnectionError::MaxSessionsMemory);
             }
             // For reused backends: set context fields and metrics lifecycle
@@ -221,8 +260,10 @@ impl Router {
 
             if let Err(e) = socket.set_nodelay(true) {
                 error!(
-                    "error setting nodelay on back socket({:?}): {:?}",
-                    socket, e
+                    "{} error setting nodelay on back socket({:?}): {:?}",
+                    log_module_context!(),
+                    socket,
+                    e
                 );
             }
 
@@ -260,7 +301,10 @@ impl Router {
             // failure (see `Connection::start_stream`), so dropping the
             // connection on a false return leaves backend accounting clean.
             if !connection.start_stream(stream_id, context) {
-                error!("Backend rejected stream start (max concurrent streams reached)");
+                error!(
+                    "{} Backend rejected stream start (max concurrent streams reached)",
+                    log_module_context!()
+                );
                 // `connection` (socket + timeout_container) drops here.
                 return Err(BackendConnectionError::MaxSessionsMemory);
             }
@@ -286,7 +330,11 @@ impl Router {
                     token,
                     Interest::READABLE | Interest::WRITABLE,
                 ) {
-                    error!("error registering back socket: {:?}", e);
+                    error!(
+                        "{} error registering back socket: {:?}",
+                        log_module_context!(),
+                        e
+                    );
                 }
             }
 
@@ -312,8 +360,10 @@ impl Router {
                 // we are past kawa parsing if it succeeded this can't fail
                 // if the request was malformed it was caught by kawa and we sent a 400
                 error!(
-                    "Malformed request in connect (should be caught at parsing) {:?}: {}",
-                    context, cluster_error
+                    "{} Malformed request in connect (should be caught at parsing) {:?}: {}",
+                    log_module_context!(),
+                    context,
+                    cluster_error
                 );
                 return Err(cluster_error);
             }
@@ -337,8 +387,11 @@ impl Router {
                 if !authority_matches_sni(host, sni) {
                     incr!("http.sni_authority_mismatch");
                     warn!(
-                        "rejecting request: TLS SNI {:?} does not match :authority {:?} (request_id={})",
-                        sni, host, context.id
+                        "{} rejecting request: TLS SNI {:?} does not match :authority {:?} (request_id={})",
+                        log_module_context!(),
+                        sni,
+                        host,
+                        context.id
                     );
                     return Err(RetrieveClusterError::SniAuthorityMismatch {
                         sni: sni.to_owned(),
@@ -353,7 +406,7 @@ impl Router {
         let route = match route_result {
             Ok(route) => route,
             Err(frontend_error) => {
-                trace!("{}", frontend_error);
+                trace!("{} {}", log_module_context!(), frontend_error);
                 return Err(RetrieveClusterError::RetrieveFrontend(frontend_error));
             }
         };
@@ -361,7 +414,7 @@ impl Router {
         let cluster_id = match route {
             Route::ClusterId(id) => id,
             Route::Deny => {
-                trace!("Route::Deny");
+                trace!("{} Route::Deny", log_module_context!());
                 return Err(RetrieveClusterError::UnauthorizedRoute);
             }
         };
@@ -385,7 +438,7 @@ impl Router {
                 proxy,
             )
             .map_err(|backend_error| {
-                trace!("{}", backend_error);
+                trace!("{} {}", log_module_context!(), backend_error);
                 BackendConnectionError::Backend(backend_error)
             })?;
 

@@ -17,7 +17,7 @@ use rusty_ulid::Ulid;
 use sozu_command::{
     ObjectKind,
     config::MAX_LOOP_ITERATIONS,
-    logging::{EndpointRecord, LogContext},
+    logging::{EndpointRecord, LogContext, is_logger_colored},
     proto::command::request::RequestType,
 };
 
@@ -64,17 +64,34 @@ StateMachineBuilder! {
 /// This macro is defined uniquely in this module to help the tracking of kawa h1
 /// issues inside Sōzu
 macro_rules! log_context {
-    ($self:expr) => {
+    ($self:expr) => {{
+        let colored = is_logger_colored();
+        let (open, reset, cyan, gray, white) = if colored {
+            (
+                "\x1b[1;33m",
+                "\x1b[0m",
+                "\x1b[36m",
+                "\x1b[90m",
+                "\x1b[97m",
+            )
+        } else {
+            ("", "", "", "", "")
+        };
         format!(
-            "TCP\t{}\tSession(frontend={}, backend={})\t >>>",
-            $self.log_context(),
-            $self.frontend_token.0,
-            $self
+            "{open}TCP{reset}\t{gray}{ctx}{reset}\t{cyan}Session{reset}({gray}frontend{reset}={white}{frontend}{reset}, {gray}backend{reset}={white}{backend}{reset})\t >>>",
+            open = open,
+            reset = reset,
+            cyan = cyan,
+            gray = gray,
+            white = white,
+            ctx = $self.log_context(),
+            frontend = $self.frontend_token.0,
+            backend = $self
                 .backend_token
                 .map(|token| token.0.to_string())
                 .unwrap_or_else(|| "<none>".to_string()),
         )
-    };
+    }};
 }
 
 pub struct TcpSession {

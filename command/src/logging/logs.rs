@@ -25,6 +25,18 @@ thread_local! {
   pub static LOGGER: RefCell<Logger> = RefCell::new(Logger::new());
 }
 
+/// Returns `true` when the thread-local [`Logger`] is configured to emit colored
+/// output. Safe to call outside an active log emission; when the logger is
+/// already borrowed (e.g. mid-emission) this falls back to `false`.
+pub fn is_logger_colored() -> bool {
+    LOGGER.with(|logger| {
+        logger
+            .try_borrow()
+            .map(|logger| logger.is_colored())
+            .unwrap_or(false)
+    })
+}
+
 // TODO: check if this error is critical:
 //     could not register compat logger: SetLoggerError(())
 // The CompatLogger may need a variable that tells wether it has been initiated already
@@ -175,6 +187,11 @@ impl Logger {
 
     pub fn split(&mut self) -> (i32, &str, &mut InnerLogger) {
         (self.pid, &self.tag, &mut self.inner)
+    }
+
+    /// Returns `true` when the logger emits colored output on its main backend.
+    pub fn is_colored(&self) -> bool {
+        self.inner.colored
     }
 }
 

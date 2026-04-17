@@ -368,6 +368,7 @@ impl HttpsSession {
             frontend,
             context,
             router,
+            session_ulid: rusty_ulid::Ulid::generate(),
         }))
     }
 

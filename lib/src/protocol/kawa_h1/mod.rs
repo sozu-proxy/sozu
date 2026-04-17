@@ -40,25 +40,46 @@ use crate::{
     router::Route,
     server::{CONN_RETRIES, push_event},
     socket::{SocketHandler, SocketResult, TransportProtocol, stats::socket_rtt},
-    sozu_command::{logging::LogContext, ready::Ready},
+    sozu_command::{
+        logging::{LogContext, is_logger_colored},
+        ready::Ready,
+    },
     timer::TimeoutContainer,
 };
 
-/// This macro is defined uniquely in this module to help the tracking of kawa h1
-/// issues inside Sōzu
+/// This macro is defined uniquely in this module to help the tracking of
+/// kawa h1 issues inside Sōzu. Colored output: bright-blue/bold protocol
+/// label, plain cyan `Session` keyword, gray keys, bright white values.
 macro_rules! log_context {
-    ($self:expr) => {
+    ($self:expr) => {{
+        let colored = is_logger_colored();
+        let (open, reset, cyan, gray, white) = if colored {
+            (
+                "\x1b[1;34m",
+                "\x1b[0m",
+                "\x1b[36m",
+                "\x1b[90m",
+                "\x1b[97m",
+            )
+        } else {
+            ("", "", "", "", "")
+        };
         format!(
-            "KAWA-H1\t{}\tSession(public={}, session={}, frontend={}, readiness={}, backend={}, readiness={})\t >>>",
-            $self.context.log_context(),
-            $self.context.public_address.to_string(),
-            $self.context.session_address.map(|addr| addr.to_string()).unwrap_or_else(|| "<none>".to_string()),
-            $self.frontend_token.0,
-            $self.frontend_readiness,
-            $self.backend_token.map(|token| token.0.to_string()).unwrap_or_else(|| "<none>".to_string()),
-            $self.backend_readiness,
+            "{open}KAWA-H1{reset}\t{gray}{ctx}{reset}\t{cyan}Session{reset}({gray}public{reset}={white}{public}{reset}, {gray}session{reset}={white}{session}{reset}, {gray}frontend{reset}={white}{frontend}{reset}, {gray}frontend_readiness{reset}={white}{frontend_readiness}{reset}, {gray}backend{reset}={white}{backend}{reset}, {gray}backend_readiness{reset}={white}{backend_readiness}{reset})\t >>>",
+            open = open,
+            reset = reset,
+            cyan = cyan,
+            gray = gray,
+            white = white,
+            ctx = $self.context.log_context(),
+            public = $self.context.public_address.to_string(),
+            session = $self.context.session_address.map(|addr| addr.to_string()).unwrap_or_else(|| "<none>".to_string()),
+            frontend = $self.frontend_token.0,
+            frontend_readiness = $self.frontend_readiness,
+            backend = $self.backend_token.map(|token| token.0.to_string()).unwrap_or_else(|| "<none>".to_string()),
+            backend_readiness = $self.backend_readiness,
         )
-    };
+    }};
 }
 
 /// Generic Http representation using the Kawa crate using the Checkout of Sozu as buffer

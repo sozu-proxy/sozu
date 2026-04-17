@@ -4,6 +4,7 @@ use kawa::{
     AsBuffer, Block, BlockConverter, Chunk, Flags, Kawa, Pair, ParsingErrorKind, ParsingPhase,
     StatusLine, Store,
 };
+use sozu_command::logging::is_logger_colored;
 
 use crate::protocol::{
     http::parser::compare_no_case,
@@ -15,6 +16,22 @@ use crate::protocol::{
         serializer::{gen_frame_header, gen_rst_stream},
     },
 };
+
+/// Module-level prefix used on every log line emitted from the H2 kawa
+/// converter. Free-standing converter functions have no session in scope so
+/// the single `MUX-CONV` label is used, dimmed cyan when the logger supports
+/// ANSI.
+macro_rules! log_module_context {
+    () => {{
+        let colored = is_logger_colored();
+        let (open, reset) = if colored {
+            ("\x1b[2;36m", "\x1b[0m")
+        } else {
+            ("", "")
+        };
+        format!("{open}MUX-CONV{reset}\t >>>", open = open, reset = reset)
+    }};
+}
 
 pub struct H2BlockConverter<'a> {
     pub max_frame_size: usize,
@@ -35,7 +52,8 @@ impl H2BlockConverter<'_> {
     fn check_header_capacity(&self) -> bool {
         if self.out.len() > MAX_HEADER_LIST_SIZE {
             error!(
-                "HPACK output buffer ({} bytes) exceeds MAX_HEADER_LIST_SIZE ({}), stopping header encoding",
+                "{} HPACK output buffer ({} bytes) exceeds MAX_HEADER_LIST_SIZE ({}), stopping header encoding",
+                log_module_context!(),
                 self.out.len(),
                 MAX_HEADER_LIST_SIZE
             );
@@ -57,7 +75,11 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                 let mut frame =
                     [0; parser::FRAME_HEADER_SIZE + parser::RST_STREAM_PAYLOAD_SIZE as usize];
                 if let Err(e) = gen_rst_stream(&mut frame, self.stream_id, error) {
-                    error!("failed to serialize RST_STREAM frame: {:?}", e);
+                    error!(
+                        "{} failed to serialize RST_STREAM frame: {:?}",
+                        log_module_context!(),
+                        e
+                    );
                     return;
                 }
                 kawa.push_out(Store::from_slice(&frame));
@@ -66,7 +88,11 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                 let mut frame =
                     [0; parser::FRAME_HEADER_SIZE + parser::RST_STREAM_PAYLOAD_SIZE as usize];
                 if let Err(e) = gen_rst_stream(&mut frame, self.stream_id, H2Error::InternalError) {
-                    error!("failed to serialize RST_STREAM frame: {:?}", e);
+                    error!(
+                        "{} failed to serialize RST_STREAM frame: {:?}",
+                        log_module_context!(),
+                        e
+                    );
                     return;
                 }
                 kawa.push_out(Store::from_slice(&frame));
@@ -88,7 +114,11 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                         .encoder
                         .encode_header_into((b":method", method.data(buffer)), &mut self.out)
                     {
-                        error!("HPACK encoding of :method pseudo-header failed: {:?}", e);
+                        error!(
+                            "{} HPACK encoding of :method pseudo-header failed: {:?}",
+                            log_module_context!(),
+                            e
+                        );
                         return false;
                     }
                     if !self.check_header_capacity() {
@@ -98,7 +128,11 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                         .encoder
                         .encode_header_into((b":authority", authority.data(buffer)), &mut self.out)
                     {
-                        error!("HPACK encoding of :authority pseudo-header failed: {:?}", e);
+                        error!(
+                            "{} HPACK encoding of :authority pseudo-header failed: {:?}",
+                            log_module_context!(),
+                            e
+                        );
                         return false;
                     }
                     if !self.check_header_capacity() {
@@ -108,7 +142,11 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                         .encoder
                         .encode_header_into((b":path", path.data(buffer)), &mut self.out)
                     {
-                        error!("HPACK encoding of :path pseudo-header failed: {:?}", e);
+                        error!(
+                            "{} HPACK encoding of :path pseudo-header failed: {:?}",
+                            log_module_context!(),
+                            e
+                        );
                         return false;
                     }
                     if !self.check_header_capacity() {
@@ -118,7 +156,11 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                         .encoder
                         .encode_header_into((b":scheme", self.scheme), &mut self.out)
                     {
-                        error!("HPACK encoding of :scheme pseudo-header failed: {:?}", e);
+                        error!(
+                            "{} HPACK encoding of :scheme pseudo-header failed: {:?}",
+                            log_module_context!(),
+                            e
+                        );
                         return false;
                     }
                     if !self.check_header_capacity() {
@@ -130,7 +172,11 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                         .encoder
                         .encode_header_into((b":status", status.data(buffer)), &mut self.out)
                     {
-                        error!("HPACK encoding of :status pseudo-header failed: {:?}", e);
+                        error!(
+                            "{} HPACK encoding of :status pseudo-header failed: {:?}",
+                            log_module_context!(),
+                            e
+                        );
                         return false;
                     }
                     if !self.check_header_capacity() {
@@ -138,7 +184,10 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                     }
                 }
                 StatusLine::Unknown => {
-                    error!("status line must be Request or Response before H2 conversion");
+                    error!(
+                        "{} status line must be Request or Response before H2 conversion",
+                        log_module_context!()
+                    );
                     return false;
                 }
             },
@@ -160,7 +209,11 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                         .encoder
                         .encode_header_into((b"cookie", &self.cookie_buf), &mut self.out)
                     {
-                        error!("HPACK encoding of cookie header failed: {:?}", e);
+                        error!(
+                            "{} HPACK encoding of cookie header failed: {:?}",
+                            log_module_context!(),
+                            e
+                        );
                         return false;
                     }
                     if !self.check_header_capacity() {
@@ -201,7 +254,10 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                 self.lowercase_buf.make_ascii_lowercase();
                 // RFC 9113 §8.2: reject header names with control chars or high bytes
                 if self.lowercase_buf.iter().any(|&b| b <= 0x20 || b >= 0x7f) {
-                    error!("H1->H2 header name contains invalid characters, skipping");
+                    error!(
+                        "{} H1->H2 header name contains invalid characters, skipping",
+                        log_module_context!()
+                    );
                     return true; // skip this header, continue with next
                 }
                 // RFC 9113 §8.2.1 / RFC 9110 §5.5: reject header values with
@@ -212,14 +268,21 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                     .iter()
                     .any(|&b| matches!(b, 0x00..=0x08 | 0x0A..=0x1F | 0x7F))
                 {
-                    error!("H1->H2 header value contains invalid characters, skipping");
+                    error!(
+                        "{} H1->H2 header value contains invalid characters, skipping",
+                        log_module_context!()
+                    );
                     return true;
                 }
                 if let Err(e) = self
                     .encoder
                     .encode_header_into((&self.lowercase_buf, val.data(buffer)), &mut self.out)
                 {
-                    error!("HPACK encoding of header failed: {:?}", e);
+                    error!(
+                        "{} HPACK encoding of header failed: {:?}",
+                        log_module_context!(),
+                        e
+                    );
                     return false;
                 }
                 if !self.check_header_capacity() {
@@ -254,7 +317,8 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                 } else {
                     // the window can't take any more bytes, return the chunk to the blocks
                     trace!(
-                        "H2 flow control stall: stream={} connection_window={} pending_bytes={}",
+                        "{} H2 flow control stall: stream={} connection_window={} pending_bytes={}",
+                        log_module_context!(),
                         self.stream_id,
                         self.window,
                         data.len()
@@ -273,7 +337,11 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                         stream_id: self.stream_id,
                     },
                 ) {
-                    error!("failed to serialize DATA frame header: {:?}", e);
+                    error!(
+                        "{} failed to serialize DATA frame header: {:?}",
+                        log_module_context!(),
+                        e
+                    );
                     return false;
                 }
                 kawa.push_out(Store::from_slice(&header));
@@ -305,7 +373,11 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                                 stream_id: self.stream_id,
                             },
                         ) {
-                            error!("failed to serialize HEADERS frame header: {:?}", e);
+                            error!(
+                                "{} failed to serialize HEADERS frame header: {:?}",
+                                log_module_context!(),
+                                e
+                            );
                             return false;
                         }
                         kawa.push_out(Store::from_slice(&header));
@@ -332,7 +404,11 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                                         stream_id: self.stream_id,
                                     },
                                 ) {
-                                    error!("failed to serialize HEADERS frame header: {:?}", e);
+                                    error!(
+                                        "{} failed to serialize HEADERS frame header: {:?}",
+                                        log_module_context!(),
+                                        e
+                                    );
                                     return false;
                                 }
                             } else if let Err(e) = gen_frame_header(
@@ -344,7 +420,11 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                                     stream_id: self.stream_id,
                                 },
                             ) {
-                                error!("failed to serialize CONTINUATION frame header: {:?}", e);
+                                error!(
+                                    "{} failed to serialize CONTINUATION frame header: {:?}",
+                                    log_module_context!(),
+                                    e
+                                );
                                 return false;
                             }
                             kawa.push_out(Store::from_slice(&header));
@@ -366,7 +446,11 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                             stream_id: self.stream_id,
                         },
                     ) {
-                        error!("failed to serialize empty DATA frame header: {:?}", e);
+                        error!(
+                            "{} failed to serialize empty DATA frame header: {:?}",
+                            log_module_context!(),
+                            e
+                        );
                         return false;
                     }
                     kawa.push_out(Store::from_slice(&header));
@@ -378,7 +462,8 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
     fn finalize(&mut self, _kawa: &mut Kawa<T>) {
         if !self.out.is_empty() {
             error!(
-                "H2BlockConverter finalize: out buffer not empty ({} bytes remaining), clearing",
+                "{} H2BlockConverter finalize: out buffer not empty ({} bytes remaining), clearing",
+                log_module_context!(),
                 self.out.len()
             );
             self.out.clear();
