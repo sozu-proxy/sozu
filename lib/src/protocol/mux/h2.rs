@@ -156,6 +156,23 @@ pub(super) const DEFAULT_MAX_RST_STREAM_LIFETIME: u64 = 10_000;
 /// one RST frame, we pay a round-trip to the backend plus request parsing.
 /// A much lower ceiling kills the attack well before 10 000 lifetime total.
 pub(super) const DEFAULT_MAX_RST_STREAM_ABUSIVE_LIFETIME: u64 = 50;
+/// Absolute lifetime cap on **server-emitted** RST_STREAM frames on a single
+/// connection (CVE-2025-8671 — "MadeYouReset"). Distinct from
+/// [`DEFAULT_MAX_RST_STREAM_LIFETIME`] which caps *received* RSTs
+/// (CVE-2023-44487 Rapid Reset).
+///
+/// MadeYouReset has the server talk itself into flooding: the attacker sends
+/// legitimate-looking frames that force the server to emit RST_STREAM (content
+/// -length mismatch, header parse error, rejected priority, zero-increment
+/// `WINDOW_UPDATE` on an open stream, …). Each forced RST costs the server a
+/// header-decode, kawa buffer setup and frame serialisation; uncapped, it
+/// becomes the same class of DoS as Rapid Reset but with a flipped emission
+/// direction.
+///
+/// 500 is conservative: legitimate traffic very rarely triggers a
+/// server-initiated RST (aside from graceful `NoError` cancels which are not
+/// counted), so crossing 500 on a single connection is a strong abuse signal.
+pub(super) const DEFAULT_MAX_RST_STREAM_EMITTED_LIFETIME: u64 = 500;
 /// Default maximum PING frames per window (CVE-2019-9512 Ping Flood)
 const DEFAULT_MAX_PING_PER_WINDOW: u32 = 100;
 /// Absolute lifetime cap on PING frames received on a single connection.
@@ -217,6 +234,10 @@ pub struct H2FloodConfig {
     /// Lifetime cap on "abusive" (pre-response-start) RST_STREAM frames —
     /// the Rapid Reset signature (CVE-2023-44487).
     pub max_rst_stream_abusive_lifetime: u64,
+    /// Absolute lifetime cap on **server-emitted** RST_STREAM frames for this
+    /// connection (CVE-2025-8671 "MadeYouReset"). Only non-`NoError` resets
+    /// count — graceful cancels are exempt.
+    pub max_rst_stream_emitted_lifetime: u64,
     /// Maximum accumulated HPACK-decoded header list size per request
     /// (SETTINGS_MAX_HEADER_LIST_SIZE, RFC 9113 §6.5.2).
     pub max_header_list_size: u32,
@@ -237,6 +258,7 @@ impl Default for H2FloodConfig {
             max_glitch_count: DEFAULT_MAX_GLITCH_COUNT,
             max_rst_stream_lifetime: DEFAULT_MAX_RST_STREAM_LIFETIME,
             max_rst_stream_abusive_lifetime: DEFAULT_MAX_RST_STREAM_ABUSIVE_LIFETIME,
+            max_rst_stream_emitted_lifetime: DEFAULT_MAX_RST_STREAM_EMITTED_LIFETIME,
             max_header_list_size: MAX_HEADER_LIST_SIZE as u32,
             max_header_table_size: DEFAULT_MAX_HEADER_TABLE_SIZE,
         }
@@ -256,6 +278,7 @@ impl H2FloodConfig {
         max_glitch_count: u32,
         max_rst_stream_lifetime: u64,
         max_rst_stream_abusive_lifetime: u64,
+        max_rst_stream_emitted_lifetime: u64,
         max_header_list_size: u32,
         max_header_table_size: u32,
     ) -> Self {
@@ -268,6 +291,7 @@ impl H2FloodConfig {
             max_glitch_count: max_glitch_count.max(1),
             max_rst_stream_lifetime: max_rst_stream_lifetime.max(1),
             max_rst_stream_abusive_lifetime: max_rst_stream_abusive_lifetime.max(1),
+            max_rst_stream_emitted_lifetime: max_rst_stream_emitted_lifetime.max(1),
             max_header_list_size: max_header_list_size.max(1),
             max_header_table_size: max_header_table_size.max(1),
         }
@@ -493,6 +517,15 @@ pub struct H2FloodDetector {
     /// signature — cheap for the attacker, expensive for the proxy — and
     /// trip on a much lower ceiling than the generic lifetime counter.
     pub(super) total_abusive_rst_received_lifetime: u64,
+    /// Lifetime RST_STREAM frames **emitted by the server** on this
+    /// connection (CVE-2025-8671 "MadeYouReset" mitigation). Incremented
+    /// inside [`ConnectionH2::reset_stream`] whenever a non-`NoError` reset
+    /// is triggered by an attacker-crafted frame (content-length mismatch,
+    /// header parse error, priority rejection, zero-increment WINDOW_UPDATE
+    /// on an open stream). Never decays — provides an absolute ceiling that
+    /// short-circuits patient-attacker patterns that stay under any windowed
+    /// counter.
+    pub(super) total_rst_streams_emitted_lifetime: u64,
     /// PING frames received in current window (CVE-2019-9512)
     pub(super) ping_count: u32,
     /// Lifetime PING frames received on this connection.
@@ -533,6 +566,7 @@ impl H2FloodDetector {
             rst_stream_count: 0,
             total_rst_received_lifetime: 0,
             total_abusive_rst_received_lifetime: 0,
+            total_rst_streams_emitted_lifetime: 0,
             ping_count: 0,
             total_ping_received_lifetime: 0,
             settings_count: 0,
@@ -573,6 +607,27 @@ impl H2FloodDetector {
                 reason: "Rapid Reset: lifetime pre-response RST_STREAM",
                 count: self.total_abusive_rst_received_lifetime,
                 threshold: self.config.max_rst_stream_abusive_lifetime,
+            });
+        }
+        None
+    }
+
+    /// Increment the lifetime **server-emitted** RST_STREAM counter and
+    /// return a [`H2FloodViolation`] once the configured ceiling is exceeded.
+    ///
+    /// Call sites are the error paths inside [`ConnectionH2::reset_stream`]
+    /// where an attacker-crafted frame coerces the server into emitting a
+    /// RST_STREAM (CVE-2025-8671 "MadeYouReset"). Only non-`NoError` resets
+    /// are reported — callers must exclude graceful cancels.
+    pub fn record_rst_emitted(&mut self) -> Option<H2FloodViolation> {
+        self.total_rst_streams_emitted_lifetime =
+            self.total_rst_streams_emitted_lifetime.saturating_add(1);
+        if self.total_rst_streams_emitted_lifetime > self.config.max_rst_stream_emitted_lifetime {
+            return Some(H2FloodViolation {
+                error: H2Error::EnhanceYourCalm,
+                reason: "MadeYouReset: lifetime server-emitted RST_STREAM",
+                count: self.total_rst_streams_emitted_lifetime,
+                threshold: self.config.max_rst_stream_emitted_lifetime,
             });
         }
         None
@@ -4239,6 +4294,15 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             stream.generate_access_log(true, Some("H2::Reset"), context.listener.clone());
             stream.metrics.reset();
         }
+        // CVE-2025-8671 MadeYouReset: cap the total number of RST_STREAM frames
+        // we emit on this connection. Graceful `NoError` cancels (e.g. stream
+        // recycle, propagated client-side cancel) are exempt; only error-path
+        // resets — driven by attacker-crafted frames — feed the counter.
+        if !matches!(error, H2Error::NoError) {
+            if let Some(violation) = self.flood_detector.record_rst_emitted() {
+                return self.handle_flood_violation(violation);
+            }
+        }
         MuxResult::Continue
     }
 
@@ -4711,6 +4775,61 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn test_flood_detector_emitted_rst_below_threshold_is_clean() {
+        // Server may legitimately RST some streams (protocol errors,
+        // client-side abuse caught by other mitigations). Staying at the
+        // threshold must not trip the ceiling.
+        let mut detector = H2FloodDetector::default();
+        for _ in 0..DEFAULT_MAX_RST_STREAM_EMITTED_LIFETIME {
+            assert!(detector.record_rst_emitted().is_none());
+        }
+        assert_eq!(
+            detector.total_rst_streams_emitted_lifetime,
+            DEFAULT_MAX_RST_STREAM_EMITTED_LIFETIME
+        );
+    }
+
+    #[test]
+    fn test_flood_detector_emitted_rst_cap_triggers_made_you_reset() {
+        // CVE-2025-8671 MadeYouReset: unbounded server-emitted RST_STREAM is
+        // a DoS vector equivalent to Rapid Reset with the emission direction
+        // flipped. Crossing the ceiling must surface a EnhanceYourCalm
+        // violation so the caller can GOAWAY.
+        let mut detector = H2FloodDetector::default();
+        for _ in 0..DEFAULT_MAX_RST_STREAM_EMITTED_LIFETIME {
+            assert!(detector.record_rst_emitted().is_none());
+        }
+        let violation = detector
+            .record_rst_emitted()
+            .expect("emitting past the cap should produce a violation");
+        assert!(matches!(
+            violation,
+            H2FloodViolation {
+                error: H2Error::EnhanceYourCalm,
+                reason: "MadeYouReset: lifetime server-emitted RST_STREAM",
+                ..
+            }
+        ));
+        assert_eq!(violation.count, DEFAULT_MAX_RST_STREAM_EMITTED_LIFETIME + 1);
+        assert_eq!(violation.threshold, DEFAULT_MAX_RST_STREAM_EMITTED_LIFETIME);
+    }
+
+    #[test]
+    fn test_flood_detector_emitted_rst_counter_does_not_decay() {
+        // Unlike the windowed rst_stream_count, the emitted lifetime counter
+        // is strictly monotonic — a patient attacker cannot reset it by
+        // waiting out a window. maybe_reset_window must NOT touch it.
+        let mut detector = H2FloodDetector::default();
+        for _ in 0..10 {
+            detector.record_rst_emitted();
+        }
+        detector.window_start = Instant::now() - FLOOD_WINDOW_DURATION;
+        // Force a window reset through check_flood.
+        let _ = detector.check_flood();
+        assert_eq!(detector.total_rst_streams_emitted_lifetime, 10);
     }
 
     #[test]
