@@ -321,12 +321,10 @@ impl ResolvesServerCert for MutexCertificateResolver {
         let server_name = client_hello.server_name();
         let sigschemes = client_hello.signature_schemes();
 
-        if server_name.is_none() {
+        let Some(name) = server_name else {
             error!("cannot look up certificate: no SNI from session");
             return None;
-        }
-
-        let name: &str = server_name.unwrap();
+        };
         trace!(
             "trying to resolve name: {:?} for signature scheme: {:?}",
             name, sigschemes
