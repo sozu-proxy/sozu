@@ -308,6 +308,13 @@ cipher_list = [
 # h2_max_concurrent_streams = 100         # min 1
 # h2_stream_shrink_ratio = 2              # min 2
 
+# H2 RST_STREAM lifetime caps. See `doc/configure.md` for the full flood-detection
+# surface; these three catch patient-attacker patterns that stay under the
+# per-window counters.
+# h2_max_rst_stream_lifetime = 10000          # received RST ceiling (CVE-2023-44487)
+# h2_max_rst_stream_abusive_lifetime = 50     # received pre-response RST (Rapid Reset)
+# h2_max_rst_stream_emitted_lifetime = 500    # server-emitted RST (CVE-2025-8671 MadeYouReset)
+
 # Number of TLS 1.3 tickets to send to a client when establishing a connection.
 # The tickets allow the client to resume a session. This protects the client
 # agains session tracking. Increases the number of getrandom syscalls,

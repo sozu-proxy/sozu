@@ -311,6 +311,10 @@ pub struct ListenerBuilder {
     /// H2 flood detection: lifetime cap on "abusive" (pre-response-start)
     /// RST_STREAM frames (Rapid Reset signature, CVE-2023-44487). Default: 50.
     pub h2_max_rst_stream_abusive_lifetime: Option<u64>,
+    /// H2 flood detection: absolute lifetime cap on **server-emitted**
+    /// RST_STREAM frames (CVE-2025-8671 "MadeYouReset"). Only non-`NoError`
+    /// resets count — graceful cancels are exempt. Default: 500.
+    pub h2_max_rst_stream_emitted_lifetime: Option<u64>,
     /// H2 flood detection: maximum accumulated HPACK-decoded header list
     /// size per request (SETTINGS_MAX_HEADER_LIST_SIZE, RFC 9113 §6.5.2).
     /// Default: 65536.
@@ -402,6 +406,7 @@ impl ListenerBuilder {
             h2_stream_shrink_ratio: None,
             h2_max_rst_stream_lifetime: None,
             h2_max_rst_stream_abusive_lifetime: None,
+            h2_max_rst_stream_emitted_lifetime: None,
             h2_max_header_list_size: None,
             h2_max_header_table_size: None,
             h2_stream_idle_timeout_seconds: None,
@@ -575,6 +580,7 @@ impl ListenerBuilder {
             h2_stream_shrink_ratio: self.h2_stream_shrink_ratio,
             h2_max_rst_stream_lifetime: self.h2_max_rst_stream_lifetime,
             h2_max_rst_stream_abusive_lifetime: self.h2_max_rst_stream_abusive_lifetime,
+            h2_max_rst_stream_emitted_lifetime: self.h2_max_rst_stream_emitted_lifetime,
             h2_max_header_list_size: self.h2_max_header_list_size,
             h2_max_header_table_size: self.h2_max_header_table_size,
             h2_stream_idle_timeout_seconds: self.h2_stream_idle_timeout_seconds,
@@ -716,6 +722,7 @@ impl ListenerBuilder {
             h2_stream_shrink_ratio: self.h2_stream_shrink_ratio,
             h2_max_rst_stream_lifetime: self.h2_max_rst_stream_lifetime,
             h2_max_rst_stream_abusive_lifetime: self.h2_max_rst_stream_abusive_lifetime,
+            h2_max_rst_stream_emitted_lifetime: self.h2_max_rst_stream_emitted_lifetime,
             h2_max_header_list_size: self.h2_max_header_list_size,
             h2_max_header_table_size: self.h2_max_header_table_size,
             strict_sni_binding: self.strict_sni_binding,
