@@ -19,14 +19,20 @@ Parameters in the global section allow you to define the global settings shared 
 | parameter                  | description                                                                         | possible values                          |
 |----------------------------|:------------------------------------------------------------------------------------|------------------------------------------|
 | `saved_state`              | path from which sozu tries to load its state at startup                             |                                          |
+| `automatic_state_save`     | if `saved_state` is set, persists state to it whenever a command changes routing. Defaults to `false` | `true`, `false`              |
 | `log_level`                | possible values are                                                                 | `debug`, `trace`, `error`, `warn`, `info`|
 | `log_target`               | possible values are                                                                 | `stdout, tcp or udp address`             |
+| `log_colored`              | emit ANSI colour codes on the main log stream. Only honoured when `log_target` is `stdout` (tcp / udp / file sinks ignore this flag). Defaults to `false` | `true`, `false` |
 | `access_logs_target`        | possible values are (if activated, sends access logs to a separate target)          | `stdout`, `tcp` or `udp address`         |
+| `access_logs_format`       | wire format of access logs. Defaults to `ascii`                                     | `ascii`, `protobuf`                      |
+| `access_logs_colored`      | emit ANSI colour codes on access logs. Only honoured when the access-log target is `stdout`. If unset, inherits `log_colored`. Defaults to `false` | `true`, `false` |
 | `command_socket`           | path to the unix socket command                  |                                          |
 | `command_buffer_size`      | size, in bytes, of the buffer used by the main process to handle commands.          |                                          |
 | `max_command_buffer_size`  | maximum size of the buffer used by the main process to handle commands.             |                                          |
 | `worker_count`             | number of workers                                                                   |                                          |
 | `worker_automatic_restart` | if activated, workers that panicked or crashed are restarted (activated by default) |                                          |
+| `worker_timeout`           | maximum time (in seconds) the main process waits for a worker reply before marking it `NotAnswering`. Defaults to `10`                                   | seconds |
+| `disable_cluster_metrics`  | if `true`, per-cluster metrics are not registered. Defaults to `false` (cluster metrics enabled)                                                        | `true`, `false` |
 | `handle_process_affinity`  | bind workers to cpu cores.                                                          |                                          |
 | `max_connections`          | maximum number of simultaneous / opened connections                                 |                                          |
 | `max_buffers`              | maximum number of buffers use to proxying                                           |                                          |
@@ -35,7 +41,9 @@ Parameters in the global section allow you to define the global settings shared 
 | `ctl_command_timeout`      | maximum time the command line will wait for a command to complete                            |                                          |
 | `pid_file_path`            | stores the pid in a specific file location                                          |                                          |
 | `front_timeout`            | maximum time of inactivity for a front socket                                       |                                          |
+| `back_timeout`             | maximum time of inactivity for a backend socket (seconds). Defaults to `30`. Can be overridden per listener.                                            | seconds |
 | `connect_timeout`          | maximum time of inactivity for a request to connect                                 |                                          |
+| `accept_queue_timeout`     | maximum time (in seconds) a TCP connection stays in sozu's accept queue before being dropped. Defaults to `60`.                                         | seconds |
 | `request_timeout`          | maximum time of inactivity for a request                                            |                                          |
 | `zombie_check_interval`    | duration between checks for zombie sessions                                         |                                          |
 | `activate_listeners`       | automatically start listeners                                                       |                                          |

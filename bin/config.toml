@@ -31,6 +31,11 @@ log_level = "info"
 # to_stdout
 log_target = "stdout"
 
+# enable ANSI colour codes on the main log stream. Only honoured when
+# log_target is "stdout"; TCP / UDP / file sinks ignore this flag.
+# Defaults to false.
+# log_colored = true
+
 # optional different target for access logs (IP addresses, domains, URI, HTTP status, etc)
 # It supports the same options as log_target
 # access_logs_target = "file:///var/logs/sozu-access.log"
@@ -39,6 +44,10 @@ log_target = "stdout"
 # - ascii
 # - protobuf (defined in [sozu_command_lib::proto::command::ProtobufAccessLog])
 # access_logs_format = "ascii"
+
+# enable ANSI colour codes on access logs. Only honoured when the access-log
+# target is "stdout". If unset, inherits log_colored. Defaults to false.
+# access_logs_colored = true
 
 # path to the unix socket file used to send commands to sozu
 # default value points to "sozu.sock" file in the current directory
@@ -131,6 +140,11 @@ buffer_size = 16393
 # sozu verifies regularly if there are such zombie sessions, logs their state
 # and removes them
 # zombie_check_interval = 1800
+
+# maximum time (in seconds) a TCP connection stays in sozu's accept queue
+# before being dropped. Raising this helps absorb accept-queue bursts at the
+# cost of slower rejection of overloaded listeners. Defaults to 60.
+# accept_queue_timeout = 60
 
 # by default, all listeners start a TCP listen socket o startup
 # if set to false, this option will prevent them from listening. You can then add
