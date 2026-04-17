@@ -7,7 +7,7 @@ use mio::net::{TcpListener, TcpStream};
 use rustls::{ProtocolVersion, ServerConnection};
 use rusty_ulid::Ulid;
 use socket2::{Domain, Protocol, Socket, Type};
-use sozu_command::config::MAX_LOOP_ITERATIONS;
+use sozu_command::{config::MAX_LOOP_ITERATIONS, logging::is_logger_colored};
 
 #[derive(thiserror::Error, Debug)]
 pub enum ServerBindError {
@@ -68,14 +68,21 @@ pub trait SocketHandler {
     }
 }
 
-/// Format a `[<session_ulid> - - -]` prefix used by socket-layer error logs
-/// so they can be correlated with the owning session. When `ulid` is `None`
-/// emits `[- - - -]` so the column layout stays stable across session-less
-/// plumbing (legacy raw TcpStream paths).
+/// Format the `[<session_ulid> - - -]\tSOCKET` prefix used by socket-layer
+/// error logs so they can be correlated with the owning session and stay
+/// column-aligned with `MUX-*`, `RUSTLS` and other tagged log lines. When
+/// `ulid` is `None` emits `[- - - -]` so the column layout stays stable
+/// across session-less plumbing (legacy raw TcpStream paths). The `SOCKET`
+/// label is rendered bright-yellow/bold on colored sinks.
 pub(crate) fn socket_log_prefix(ulid: Option<Ulid>) -> String {
+    let (open, reset) = if is_logger_colored() {
+        ("\x1b[1;33m", "\x1b[0m")
+    } else {
+        ("", "")
+    };
     match ulid {
-        Some(ulid) => format!("[{ulid} - - -]"),
-        None => "[- - - -]".to_owned(),
+        Some(ulid) => format!("[{ulid} - - -]\t{open}SOCKET{reset}"),
+        None => format!("[- - - -]\t{open}SOCKET{reset}"),
     }
 }
 
@@ -95,7 +102,7 @@ fn tcp_socket_read(
         counter += 1;
         if counter > MAX_LOOP_ITERATIONS {
             error!(
-                "{} SOCKET\tMAX_LOOP_ITERATION reached in TcpStream::socket_read",
+                "{}\tMAX_LOOP_ITERATION reached in TcpStream::socket_read",
                 socket_log_prefix(session_ulid)
             );
             incr!("socket.read.infinite_loop.error");
@@ -114,7 +121,7 @@ fn tcp_socket_read(
                 | ErrorKind::BrokenPipe => return (size, SocketResult::Closed),
                 _ => {
                     error!(
-                        "{} SOCKET\tsocket_read error={:?}",
+                        "{}\tsocket_read error={:?}",
                         socket_log_prefix(session_ulid),
                         e
                     );
@@ -136,7 +143,7 @@ fn tcp_socket_write(
         counter += 1;
         if counter > MAX_LOOP_ITERATIONS {
             error!(
-                "{} SOCKET\tMAX_LOOP_ITERATION reached in TcpStream::socket_write",
+                "{}\tMAX_LOOP_ITERATION reached in TcpStream::socket_write",
                 socket_log_prefix(session_ulid)
             );
             incr!("socket.write.infinite_loop.error");
@@ -160,7 +167,7 @@ fn tcp_socket_write(
                 _ => {
                     //FIXME: timeout and other common errors should be sent up
                     error!(
-                        "{} SOCKET\tsocket_write error={:?}",
+                        "{}\tsocket_write error={:?}",
                         socket_log_prefix(session_ulid),
                         e
                     );
@@ -191,7 +198,7 @@ fn tcp_socket_write_vectored(
             _ => {
                 //FIXME: timeout and other common errors should be sent up
                 error!(
-                    "{} SOCKET\tsocket_write error={:?}",
+                    "{}\tsocket_write error={:?}",
                     socket_log_prefix(session_ulid),
                     e
                 );
@@ -332,7 +339,7 @@ impl SocketHandler for FrontRustls {
             counter += 1;
             if counter > MAX_LOOP_ITERATIONS {
                 error!(
-                    "{} SOCKET\tMAX_LOOP_ITERATION reached in FrontRustls::socket_read",
+                    "{}\tMAX_LOOP_ITERATION reached in FrontRustls::socket_read",
                     socket_log_prefix(Some(self.session_ulid))
                 );
                 incr!("rustls.read.infinite_loop.error");
@@ -453,7 +460,7 @@ impl SocketHandler for FrontRustls {
             counter += 1;
             if counter > MAX_LOOP_ITERATIONS {
                 error!(
-                    "{} SOCKET\tMAX_LOOP_ITERATION reached in FrontRustls::socket_write",
+                    "{}\tMAX_LOOP_ITERATION reached in FrontRustls::socket_write",
                     socket_log_prefix(Some(self.session_ulid))
                 );
                 incr!("rustls.write.infinite_loop.error");
@@ -599,7 +606,7 @@ impl SocketHandler for FrontRustls {
             counter += 1;
             if counter > MAX_LOOP_ITERATIONS {
                 error!(
-                    "{} SOCKET\tMAX_LOOP_ITERATION reached in FrontRustls::socket_write_vectored",
+                    "{}\tMAX_LOOP_ITERATION reached in FrontRustls::socket_write_vectored",
                     socket_log_prefix(Some(self.session_ulid))
                 );
                 incr!("rustls.write.infinite_loop.error");
