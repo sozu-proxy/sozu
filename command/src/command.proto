@@ -161,6 +161,14 @@ message HttpListenerConfig {
     // received on a single H2 connection — the Rapid Reset signature.
     // Default: 50.
     optional uint64 h2_max_rst_stream_abusive_lifetime = 23;
+    // Absolute lifetime cap on RST_STREAM frames **emitted by the server**
+    // on a single H2 connection (CVE-2025-8671 "MadeYouReset"). Covers the
+    // emission-direction-flipped sibling of Rapid Reset, where an attacker
+    // sends legitimate-looking frames (Content-Length mismatch, header parse
+    // error, rejected priority, zero-increment WINDOW_UPDATE on an open
+    // stream) that coerce the server into emitting RST_STREAM. Graceful
+    // `NoError` cancels are exempt. Default: 500.
+    optional uint64 h2_max_rst_stream_emitted_lifetime = 27;
     // Maximum accumulated HPACK-decoded header list size per request
     // (SETTINGS_MAX_HEADER_LIST_SIZE, RFC 9113 §6.5.2). Default: 65536.
     optional uint32 h2_max_header_list_size = 24;
@@ -242,6 +250,14 @@ message HttpsListenerConfig {
     // received on a single H2 connection — the Rapid Reset signature.
     // Default: 50.
     optional uint64 h2_max_rst_stream_abusive_lifetime = 33;
+    // Absolute lifetime cap on RST_STREAM frames **emitted by the server**
+    // on a single H2 connection (CVE-2025-8671 "MadeYouReset"). Covers the
+    // emission-direction-flipped sibling of Rapid Reset, where an attacker
+    // sends legitimate-looking frames (Content-Length mismatch, header parse
+    // error, rejected priority, zero-increment WINDOW_UPDATE on an open
+    // stream) that coerce the server into emitting RST_STREAM. Graceful
+    // `NoError` cancels are exempt. Default: 500.
+    optional uint64 h2_max_rst_stream_emitted_lifetime = 39;
     // Maximum accumulated HPACK-decoded header list size per request
     // (SETTINGS_MAX_HEADER_LIST_SIZE, RFC 9113 §6.5.2). Default: 65536.
     optional uint32 h2_max_header_list_size = 34;

@@ -408,15 +408,17 @@ h2_max_header_table_size = 65536        # HPACK dynamic table size cap
 
 #### H2 RST_STREAM lifetime caps
 
-In addition to the per-window `h2_max_rst_stream_per_window` threshold, two lifetime
-counters limit the total number of RST_STREAM frames a single connection may receive.
-These provide a second line of defense against Rapid Reset attacks (CVE-2023-44487)
-that stay just below the per-window threshold.
+In addition to the per-window `h2_max_rst_stream_per_window` threshold, three
+lifetime counters limit the total number of RST_STREAM frames associated with
+a single connection — two on the **received** side (Rapid Reset, CVE-2023-44487)
+and one on the **emitted** side (MadeYouReset, CVE-2025-8671). Together they
+catch patient-attacker patterns that stay just below the per-window threshold.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `h2_max_rst_stream_lifetime` | 10000 | Absolute lifetime cap on RST_STREAM frames per connection. |
-| `h2_max_rst_stream_abusive_lifetime` | 50 | Lifetime cap on "abusive" RST_STREAM frames (resets sent before a response starts — the Rapid Reset signature). |
+| `h2_max_rst_stream_lifetime` | 10000 | Absolute lifetime cap on RST_STREAM frames **received** on this connection. |
+| `h2_max_rst_stream_abusive_lifetime` | 50 | Lifetime cap on "abusive" **received** RST_STREAM frames — resets sent by the peer before a response starts, the Rapid Reset signature (CVE-2023-44487). |
+| `h2_max_rst_stream_emitted_lifetime` | 500 | Absolute lifetime cap on RST_STREAM frames **emitted by the server** (CVE-2025-8671 "MadeYouReset"). Increments on every non-`NoError` reset triggered by an attacker-crafted frame (Content-Length mismatch, header parse error, rejected priority, zero-increment `WINDOW_UPDATE` on an open stream). Graceful `NoError` cancels (stream recycle, propagated client cancel) are exempt. Crossing the threshold emits `GOAWAY(EnhanceYourCalm)`. |
 
 _Configuration example:_
 
@@ -427,6 +429,7 @@ protocol = "https"
 
 h2_max_rst_stream_lifetime = 10000
 h2_max_rst_stream_abusive_lifetime = 50
+h2_max_rst_stream_emitted_lifetime = 500
 ```
 
 #### Security and protocol settings
