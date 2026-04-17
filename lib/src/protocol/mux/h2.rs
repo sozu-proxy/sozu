@@ -243,8 +243,17 @@ impl H2ConnectionConfig {
                 initial_connection_window, DEFAULT_INITIAL_WINDOW_SIZE, FLOW_CONTROL_MAX_WINDOW
             );
         }
-        let clamped_streams = max_concurrent_streams.max(1);
-        if clamped_streams != max_concurrent_streams {
+        const MAX_SAFE_CONCURRENT_STREAMS: u32 = 10_000;
+        let clamped_streams = max_concurrent_streams.clamp(1, MAX_SAFE_CONCURRENT_STREAMS);
+        if max_concurrent_streams > MAX_SAFE_CONCURRENT_STREAMS {
+            error!(
+                "h2_max_concurrent_streams={} exceeds safe limit, clamped to {}",
+                max_concurrent_streams, MAX_SAFE_CONCURRENT_STREAMS
+            );
+        }
+        if clamped_streams != max_concurrent_streams
+            && max_concurrent_streams <= MAX_SAFE_CONCURRENT_STREAMS
+        {
             warn!(
                 "h2_max_concurrent_streams {} clamped to minimum 1",
                 max_concurrent_streams
@@ -784,15 +793,19 @@ pub struct ConnectionH2<Front: SocketHandler> {
     /// emitted by [`Self::gauge_connection_state`]. Stays `None` until the first
     /// emission, then suppresses redundant updates.
     last_gauge_snapshot: Option<(usize, usize, usize)>,
-    /// Per-stream wall-clock timestamp of stream creation. Used to cancel
-    /// streams that fail to make forward progress within
-    /// [`Self::stream_idle_timeout`] — mitigates slow-multiplex Slowloris:
-    /// connection-level idle timers reset on every frame, so a misbehaving
-    /// peer can otherwise pin up to `max_concurrent_streams` streams for the
-    /// full nominal connection timeout.
-    pub stream_opened_at: HashMap<StreamId, Instant>,
-    /// Per-stream idle cap. Streams older than this without completing the
-    /// request are RST_STREAM(CANCEL)'d by [`Self::cancel_timed_out_streams`].
+    /// Per-stream wall-clock timestamp of last meaningful activity (DATA or
+    /// HEADERS frame receipt). Used to cancel streams that make no forward
+    /// progress within [`Self::stream_idle_timeout`] — mitigates slow-multiplex
+    /// Slowloris: connection-level idle timers reset on every frame, so a
+    /// misbehaving peer can otherwise pin up to `max_concurrent_streams` slots
+    /// for the full nominal connection timeout.
+    ///
+    /// Initialized when the stream is created and refreshed on each non-empty
+    /// inbound DATA frame and on HEADERS for an existing stream (trailers).
+    /// Empty DATA frames (CVE-2019-9518 vector) do NOT refresh the timer.
+    pub stream_last_activity_at: HashMap<StreamId, Instant>,
+    /// Per-stream idle cap. Streams with no activity for longer than this are
+    /// RST_STREAM(CANCEL)'d by [`Self::cancel_timed_out_streams`].
     pub stream_idle_timeout: std::time::Duration,
     /// RFC 9113 §5.1.2 back-pressure: count of stream refusals
     /// (REFUSED_STREAM emitted via [`Self::refuse_stream_and_discard`]) within
@@ -926,7 +939,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             max_pending_window_updates: 1 + connection_config.max_concurrent_streams as usize * 4,
             connection_config,
             last_gauge_snapshot: None,
-            stream_opened_at: HashMap::new(),
+            stream_last_activity_at: HashMap::new(),
             stream_idle_timeout,
             refuse_count_window: 0,
             refuse_window_start: Instant::now(),
@@ -1264,6 +1277,12 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     );
                     if (payload_len as usize) > self.zero.storage.available_space() {
                         return self.goaway(H2Error::EnhanceYourCalm);
+                    }
+                    // Remove the already-created stream slot before refusing,
+                    // so it does not leak against MAX_CONCURRENT_STREAMS.
+                    if let Some(_global_id) = self.streams.remove(&stream_id) {
+                        self.stream_last_activity_at.remove(&stream_id);
+                        self.prioriser.remove(&stream_id);
                     }
                     return self.refuse_stream_and_discard(
                         stream_id,
@@ -1820,6 +1839,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             }
             let (size, status) = socket.socket_write_vectored(io_slices);
             io_slices.clear();
+            debug_assert!(
+                io_slices.is_empty(),
+                "IoSlice refs must be cleared before consume"
+            );
             debug.push(DebugEvent::SocketIO(debug_site, global_stream_id, size));
             kawa.consume(size);
             position.count_bytes_out_counter(size);
@@ -1872,7 +1895,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             error!("dead stream_id {} missing from streams map", stream_id);
         }
         self.rst_sent.remove(&stream_id);
-        self.stream_opened_at.remove(&stream_id);
+        self.stream_last_activity_at.remove(&stream_id);
         self.prioriser.remove(&stream_id);
     }
 
@@ -2449,13 +2472,17 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         }
     }
 
-    /// Cancel streams that have been open longer than [`Self::stream_idle_timeout`].
+    /// Cancel streams that have been idle longer than [`Self::stream_idle_timeout`].
+    ///
+    /// A stream is considered idle when no meaningful application data (non-empty
+    /// DATA frames or HEADERS) has been received since the last activity timestamp
+    /// in [`Self::stream_last_activity_at`].
     ///
     /// Mitigates slow-multiplex Slowloris (Pass 4 Medium #3): the connection-level
-    /// idle timer resets on every frame, so a peer sending periodic activity can
-    /// pin `max_concurrent_streams` slots for the full nominal connection timeout.
-    /// Per-stream deadlines guarantee each stream terminates within the configured
-    /// window regardless of connection-level liveness.
+    /// idle timer resets on every frame, so a peer sending periodic control frames
+    /// can pin `max_concurrent_streams` slots for the full nominal connection timeout.
+    /// Per-stream idle deadlines guarantee each stream terminates if it stops making
+    /// forward progress, regardless of connection-level liveness.
     ///
     /// Timed-out streams receive RST_STREAM(CANCEL) and are immediately removed
     /// from the streams map so they no longer count against MAX_CONCURRENT_STREAMS.
@@ -2465,13 +2492,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         E: Endpoint,
         L: ListenerHandler + L7ListenerHandler,
     {
-        if self.streams.is_empty() || self.stream_opened_at.is_empty() {
+        if self.streams.is_empty() || self.stream_last_activity_at.is_empty() {
             return;
         }
         let now = Instant::now();
         let deadline = self.stream_idle_timeout;
         let timed_out: Vec<StreamId> = self
-            .stream_opened_at
+            .stream_last_activity_at
             .iter()
             .filter_map(|(&sid, &t)| {
                 (self.streams.contains_key(&sid)
@@ -2489,7 +2516,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 sid, deadline
             );
             self.pending_rst_streams.push((sid, H2Error::Cancel));
-            self.total_rst_streams_queued += 1;
+            // Do NOT increment total_rst_streams_queued here: proxy-initiated
+            // timeout cancellations are not peer-triggered and must not count
+            // against the lifetime RST budget (CVE-2023-44487 Rapid Reset).
             self.rst_sent.insert(sid);
 
             // Remove from streams map and recycle the context stream so the slot
@@ -2498,7 +2527,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             let byte_totals = self.compute_stream_byte_totals(context);
             if let Some(global_stream_id) = self.streams.remove(&sid) {
                 self.prioriser.remove(&sid);
-                self.stream_opened_at.remove(&sid);
+                self.stream_last_activity_at.remove(&sid);
                 {
                     let stream = &mut context.streams[global_stream_id];
                     self.attribute_bytes_to_stream(&mut stream.metrics);
@@ -2769,7 +2798,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         )?;
         self.last_stream_id = (stream_id + 2) & !1;
         self.streams.insert(stream_id, global_stream_id);
-        self.stream_opened_at.insert(stream_id, Instant::now());
+        self.stream_last_activity_at
+            .insert(stream_id, Instant::now());
         Some(global_stream_id)
     }
 
@@ -2934,12 +2964,14 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         "Content-Length mismatch: received {} > declared {}",
                         data_received, expected
                     );
-                    return self.reset_stream(
+                    let result = self.reset_stream(
                         global_stream_id,
                         context,
                         endpoint,
                         H2Error::ProtocolError,
                     );
+                    self.remove_dead_stream(data.stream_id);
+                    return result;
                 }
             }
         }
@@ -2978,6 +3010,16 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         if !self.flow_control.pending_window_updates.is_empty() {
             self.readiness.interest.insert(Ready::WRITABLE);
             self.readiness.signal_pending_write();
+        }
+
+        // Refresh per-stream idle timer on non-empty DATA.
+        // Empty DATA frames (CVE-2019-9518 vector) must NOT reset the timer,
+        // otherwise an attacker can keep a stream alive indefinitely with
+        // zero-length frames while pinning a MAX_CONCURRENT_STREAMS slot.
+        if content_len > 0 {
+            if let Some(t) = self.stream_last_activity_at.get_mut(&data.stream_id) {
+                *t = Instant::now();
+            }
         }
 
         if is_unlinked {
@@ -3031,12 +3073,14 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                                 "Content-Length mismatch: received {} != declared {}",
                                 data_received, expected
                             );
-                            return self.reset_stream(
+                            let result = self.reset_stream(
                                 global_stream_id,
                                 context,
                                 endpoint,
                                 H2Error::ProtocolError,
                             );
+                            self.remove_dead_stream(data.stream_id);
+                            return result;
                         }
                     }
                 }
@@ -3081,7 +3125,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             if self.flood_detector.continuation_count == 0 {
                 self.flood_detector.accumulated_header_size = headers.header_block_fragment.len;
             }
-            debug!("FRAGMENT: {:?}", self.zero.storage.data());
+            debug!(
+                "FRAGMENT: stream_id={}, len={}",
+                headers.stream_id,
+                self.zero.storage.data().len()
+            );
             self.state = H2State::ContinuationHeader(headers);
             return MuxResult::Continue;
         }
@@ -3096,9 +3144,17 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             return self.force_disconnect();
         };
 
+        // Refresh per-stream idle timer on HEADERS (response headers or trailers
+        // on an existing stream). Initial HEADERS that create the stream already
+        // set the timestamp in create_stream().
+        if let Some(t) = self.stream_last_activity_at.get_mut(&stream_id) {
+            *t = Instant::now();
+        }
+
         if let Some(priority) = &headers.priority {
             if self.prioriser.push_priority(stream_id, priority.clone()) {
                 self.reset_stream(global_stream_id, context, endpoint, H2Error::ProtocolError);
+                self.remove_dead_stream(stream_id);
                 return MuxResult::Continue;
             }
         }
@@ -3130,7 +3186,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 error!("GOT GLOBAL ERROR WHILE PROCESSING HEADERS");
                 return self.goaway(error);
             } else {
-                return self.reset_stream(global_stream_id, context, endpoint, error);
+                let result = self.reset_stream(global_stream_id, context, endpoint, error);
+                self.remove_dead_stream(stream_id);
+                return result;
             }
         }
         if headers.end_stream {
@@ -3145,12 +3203,14 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                             "Content-Length mismatch on trailers: received {} != declared {}",
                             *parts.data_received, expected
                         );
-                        return self.reset_stream(
+                        let result = self.reset_stream(
                             global_stream_id,
                             context,
                             endpoint,
                             H2Error::ProtocolError,
                         );
+                        self.remove_dead_stream(stream_id);
+                        return result;
                     }
                 }
             }
@@ -3217,13 +3277,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             self.last_stream_id,
             &self.streams,
         ) {
-            if let Some(global_stream_id) = self.streams.get(&priority.stream_id) {
-                return self.reset_stream(
-                    *global_stream_id,
-                    context,
-                    endpoint,
-                    H2Error::ProtocolError,
-                );
+            if let Some(global_stream_id) = self.streams.get(&priority.stream_id).copied() {
+                let result =
+                    self.reset_stream(global_stream_id, context, endpoint, H2Error::ProtocolError);
+                self.remove_dead_stream(priority.stream_id);
+                return result;
             } else {
                 error!("INVALID PRIORITY RECEIVED ON INVALID STREAM");
                 return self.goaway(H2Error::ProtocolError);
@@ -3285,7 +3343,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         let rst_byte_totals = self.compute_stream_byte_totals(context);
         if let Some(stream_id) = self.streams.remove(&rst_stream.stream_id) {
             self.prioriser.remove(&rst_stream.stream_id);
-            self.stream_opened_at.remove(&rst_stream.stream_id);
+            self.stream_last_activity_at.remove(&rst_stream.stream_id);
             let stream = &mut context.streams[stream_id];
             self.attribute_bytes_to_stream(&mut stream.metrics);
             if let StreamState::Linked(token) = stream.state {
@@ -3528,7 +3586,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             }
             self.streams.remove(stream_id);
             self.prioriser.remove(stream_id);
-            self.stream_opened_at.remove(stream_id);
+            self.stream_last_activity_at.remove(stream_id);
             // Both retry (!consumed) and terminated (consumed) paths remove the
             // stream from self.streams without going through Connection::end_stream,
             // so decrement Backend.active_requests here to keep load metrics honest.
@@ -3571,12 +3629,14 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             } else {
                 error!("WINDOW_UPDATE with zero increment on stream {}", stream_id);
                 if let Some(global_stream_id) = self.streams.get(&stream_id).copied() {
-                    return self.reset_stream(
+                    let result = self.reset_stream(
                         global_stream_id,
                         context,
                         endpoint,
                         H2Error::ProtocolError,
                     );
+                    self.remove_dead_stream(stream_id);
+                    return result;
                 }
                 // Stream not in map (already closed) — treat as glitch
                 self.flood_detector.glitch_count += 1;
@@ -3622,12 +3682,14 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     stream_id, increment, stream.window
                 );
             } else {
-                return self.reset_stream(
+                let result = self.reset_stream(
                     global_stream_id,
                     context,
                     endpoint,
                     H2Error::FlowControlError,
                 );
+                self.remove_dead_stream(stream_id);
+                return result;
             }
         } else {
             self.attribute_bytes_to_overhead();
@@ -3884,7 +3946,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         }
                         self.streams.remove(&id);
                         self.prioriser.remove(&id);
-                        self.stream_opened_at.remove(&id);
+                        self.stream_last_activity_at.remove(&id);
                         if context.streams[stream_gid].state != StreamState::Recycle {
                             context.streams[stream_gid].state = StreamState::Unlinked;
                         }
@@ -4007,7 +4069,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             return false;
         };
         self.streams.insert(stream_id, stream);
-        self.stream_opened_at.insert(stream_id, Instant::now());
+        self.stream_last_activity_at
+            .insert(stream_id, Instant::now());
         self.readiness.interest.insert(Ready::WRITABLE);
         self.readiness.signal_pending_write();
         true
