@@ -96,6 +96,9 @@ pub struct Pipe<Front: SocketHandler, L: ListenerHandler> {
     frontend: Front,
     listener: Rc<RefCell<L>>,
     protocol: Protocol,
+    /// Connection/session ULID inherited from the parent mux or handshake.
+    /// Emitted in the first slot of the legacy log-context bracket.
+    session_id: Ulid,
     request_id: Ulid,
     session_address: Option<SocketAddr>,
     websocket_context: WebSocketContext,
@@ -124,6 +127,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         frontend: Front,
         listener: Rc<RefCell<L>>,
         protocol: Protocol,
+        session_id: Ulid,
         request_id: Ulid,
         session_address: Option<SocketAddr>,
         websocket_context: WebSocketContext,
@@ -159,6 +163,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             frontend,
             listener,
             protocol,
+            session_id,
             request_id,
             session_address,
             websocket_context,
@@ -658,7 +663,8 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
 
     pub fn log_context(&self) -> LogContext<'_> {
         LogContext {
-            request_id: self.request_id,
+            session_id: self.session_id,
+            request_id: Some(self.request_id),
             cluster_id: self.cluster_id.as_deref(),
             backend_id: self.backend_id.as_deref(),
         }

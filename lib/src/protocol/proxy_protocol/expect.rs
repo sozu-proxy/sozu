@@ -200,6 +200,7 @@ impl<Front: SocketHandler> ExpectProxyProtocol<Front> {
             listener,
             Protocol::TCP,
             self.request_id,
+            self.request_id,
             addr,
             WebSocketContext::Tcp,
         );
@@ -215,7 +216,8 @@ impl<Front: SocketHandler> ExpectProxyProtocol<Front> {
 
     pub fn log_context(&self) -> LogContext<'_> {
         LogContext {
-            request_id: self.request_id,
+            session_id: self.request_id,
+            request_id: None,
             cluster_id: None,
             backend_id: None,
         }

@@ -197,6 +197,7 @@ impl<Front: SocketHandler> RelayProxyProtocol<Front> {
             listener,
             Protocol::TCP,
             self.request_id,
+            self.request_id,
             addr,
             WebSocketContext::Tcp,
         );

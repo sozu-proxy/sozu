@@ -194,6 +194,7 @@ impl TcpSession {
                     listener.clone(),
                     Protocol::TCP,
                     request_id,
+                    request_id,
                     frontend_address,
                     WebSocketContext::Tcp,
                 );
@@ -276,7 +277,8 @@ impl TcpSession {
 
     fn log_context(&self) -> LogContext<'_> {
         LogContext {
-            request_id: self.request_id,
+            session_id: self.request_id,
+            request_id: Some(self.request_id),
             cluster_id: self.cluster_id.as_deref(),
             backend_id: self.backend_id.as_deref(),
         }

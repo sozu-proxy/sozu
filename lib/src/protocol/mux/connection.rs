@@ -18,6 +18,7 @@ use std::{
 };
 
 use mio::{Token, net::TcpStream};
+use rusty_ulid::Ulid;
 use sozu_command::{logging::is_logger_colored, ready::Ready};
 
 use super::{
@@ -80,6 +81,7 @@ macro_rules! forward {
 
 impl<Front: SocketHandler> Connection<Front> {
     pub fn new_h1_server(
+        session_ulid: Ulid,
         front_stream: Front,
         timeout_container: TimeoutContainer,
     ) -> Connection<Front> {
@@ -95,9 +97,11 @@ impl<Front: SocketHandler> Connection<Front> {
             timeout_container,
             parked_on_buffer_pressure: false,
             close_notify_sent: false,
+            session_ulid,
         })
     }
     pub fn new_h1_client(
+        session_ulid: Ulid,
         front_stream: Front,
         cluster_id: String,
         backend: Rc<RefCell<Backend>>,
@@ -119,11 +123,13 @@ impl<Front: SocketHandler> Connection<Front> {
             timeout_container,
             parked_on_buffer_pressure: false,
             close_notify_sent: false,
+            session_ulid,
         })
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn new_h2_server(
+        session_ulid: Ulid,
         front_stream: Front,
         pool: Weak<RefCell<Pool>>,
         timeout_container: TimeoutContainer,
@@ -132,6 +138,7 @@ impl<Front: SocketHandler> Connection<Front> {
         stream_idle_timeout: std::time::Duration,
     ) -> Option<Connection<Front>> {
         Some(Connection::H2(ConnectionH2::new(
+            session_ulid,
             front_stream,
             Position::Server,
             pool,
@@ -146,6 +153,7 @@ impl<Front: SocketHandler> Connection<Front> {
 
     #[allow(clippy::too_many_arguments)]
     pub fn new_h2_client(
+        session_ulid: Ulid,
         front_stream: Front,
         cluster_id: String,
         backend: Rc<RefCell<Backend>>,
@@ -167,6 +175,7 @@ impl<Front: SocketHandler> Connection<Front> {
             return None;
         }
         Some(Connection::H2(ConnectionH2::new(
+            session_ulid,
             front_stream,
             Position::Client(
                 cluster_id,

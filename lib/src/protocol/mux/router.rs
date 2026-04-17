@@ -20,6 +20,7 @@ use crate::{
     protocol::http::editor::HttpContext,
     router::Route,
     server::CONN_RETRIES,
+    socket::SessionTcpStream,
     timer::TimeoutContainer,
 };
 
@@ -41,7 +42,7 @@ macro_rules! log_module_context {
 
 #[derive(Debug)]
 pub struct Router {
-    pub backends: HashMap<Token, Connection<TcpStream>>,
+    pub backends: HashMap<Token, Connection<SessionTcpStream>>,
     pub configured_backend_timeout: Duration,
     pub configured_connect_timeout: Duration,
     /// Fallback readiness used when a backend token is missing from the map.
@@ -267,6 +268,8 @@ impl Router {
                 );
             }
 
+            let socket = SessionTcpStream::new(socket, context.session_ulid);
+
             // Build an un-armed timeout: we can't call `TimeoutContainer::new`
             // yet because that requires the slab token, and we only allocate
             // the token on the happy path. `.set(token)` below arms it.
@@ -277,6 +280,7 @@ impl Router {
             let backend_id_for_gauge = backend.borrow().backend_id.to_owned();
             let mut connection = if h2 {
                 match Connection::new_h2_client(
+                    context.session_ulid,
                     socket,
                     cluster_id.to_owned(),
                     backend,
@@ -292,7 +296,13 @@ impl Router {
                     None => return Err(BackendConnectionError::MaxBuffers),
                 }
             } else {
-                Connection::new_h1_client(socket, cluster_id.to_owned(), backend, timeout_container)
+                Connection::new_h1_client(
+                    context.session_ulid,
+                    socket,
+                    cluster_id.to_owned(),
+                    backend,
+                    timeout_container,
+                )
             };
 
             // Check the backend can accept a new stream BEFORE committing any

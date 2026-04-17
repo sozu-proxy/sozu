@@ -930,6 +930,10 @@ message ProtobufAccessLog {
     optional uint64 response_time = 21;
     // OpenTelemetry tracing information
     optional OpenTelemetry otel = 22;
+    // connection/session ULID — stable across all requests multiplexed on the
+    // same TCP or TLS connection. Distinct from `request_id`, which is set
+    // per-request (one per H2 stream, one per H1 keep-alive exchange).
+    optional Uint128 session_id = 23;
 }
 
 message ProtobufEndpoint {
