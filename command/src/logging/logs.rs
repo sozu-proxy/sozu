@@ -1,5 +1,5 @@
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     cmp, env,
     fmt::Arguments,
     fs::{File, OpenOptions},
@@ -23,18 +23,20 @@ use crate::{
 
 thread_local! {
   pub static LOGGER: RefCell<Logger> = RefCell::new(Logger::new());
+  /// Side-channel mirror of [`InnerLogger::colored`]. Read by
+  /// [`is_logger_colored`] without borrowing the [`LOGGER`] cell, so macros
+  /// like `log_context!` can consult it while the logger is already held
+  /// mutably by the enclosing `error!`/`info!`/... emission.
+  static LOGGER_COLORED: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Returns `true` when the thread-local [`Logger`] is configured to emit colored
-/// output. Safe to call outside an active log emission; when the logger is
-/// already borrowed (e.g. mid-emission) this falls back to `false`.
+/// output. Safe to call from inside an `error!`/`info!`/… argument list — the
+/// flag is mirrored into a dedicated [`Cell`] at [`Logger::init`] time so we
+/// never re-borrow the main logger cell (which is already held mutably while
+/// the outer log macro is formatting its arguments).
 pub fn is_logger_colored() -> bool {
-    LOGGER.with(|logger| {
-        logger
-            .try_borrow()
-            .map(|logger| logger.is_colored())
-            .unwrap_or(false)
-    })
+    LOGGER_COLORED.with(|c| c.get())
 }
 
 // TODO: check if this error is critical:
@@ -157,6 +159,11 @@ impl Logger {
                     LoggerBackend::Stdout(_) => colored,
                     _ => false,
                 };
+                // Mirror into the side-channel cell so `is_logger_colored()`
+                // can be called from inside log-macro argument formatters
+                // without re-borrowing the main `LOGGER` cell (it is held
+                // mutably here and by every subsequent `error!`/`info!`/...).
+                LOGGER_COLORED.with(|c| c.set(logger.colored));
                 logger.access_colored = match (&access_backend, &backend) {
                     (Some(LoggerBackend::Stdout(_)), _) | (None, LoggerBackend::Stdout(_)) => {
                         access_colored.unwrap_or(colored)
