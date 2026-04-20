@@ -301,6 +301,17 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         self.log_request(metrics, true, Some(message));
     }
 
+    /// Access-log wrapper for benign idle-timeout tear-downs.
+    ///
+    /// Unlike `log_request_error`, this path logs at `debug!` and skips the
+    /// state dump — an idle pipe hitting its front/back_timeout is expected
+    /// behaviour (e.g. a WebSocket with no keepalive) and should not pollute
+    /// the error stream.
+    pub fn log_request_timeout(&self, metrics: &SessionMetrics, message: &str) {
+        debug!("{} pipe timeout: {}", log_context!(self), message);
+        self.log_request(metrics, true, Some(message));
+    }
+
     /// Wether the session should be kept open, depending on endpoints status
     /// and buffer usage (both in memory and in kernel)
     pub fn check_connections(&self) -> bool {
@@ -802,7 +813,7 @@ impl<Front: SocketHandler, L: ListenerHandler> SessionState for Pipe<Front, L> {
     fn timeout(&mut self, token: Token, metrics: &mut SessionMetrics) -> StateResult {
         //info!("got timeout for token: {:?}", token);
         if self.frontend_token == token {
-            self.log_request_error(metrics, "frontend socket timeout");
+            self.log_request_timeout(metrics, "frontend socket timeout");
             if let Some(timeout) = self.container_frontend_timeout.as_mut() {
                 timeout.triggered()
             }
@@ -815,7 +826,7 @@ impl<Front: SocketHandler, L: ListenerHandler> SessionState for Pipe<Front, L> {
                 timeout.triggered()
             }
 
-            self.log_request_error(metrics, "backend socket timeout");
+            self.log_request_timeout(metrics, "backend socket timeout");
             return StateResult::CloseSession;
         }
 
