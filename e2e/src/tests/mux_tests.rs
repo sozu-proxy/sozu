@@ -150,31 +150,17 @@ fn raw_connect(addr: SocketAddr) -> TcpStream {
     stream
 }
 
-/// Read from a raw TCP stream, returning the data as a String.
+/// Drain the stream; tolerates TCP segmentation.
 ///
-/// Loops until a short read / timeout / EOF so callers that inspect the
-/// response via `.contains(...)` don't flake when it arrives in
-/// multiple TCP segments.
+/// Thin wrapper around [`super::h2_utils::read_all_available`]: accumulates
+/// until EOF / short read / 500 ms global deadline, returning `None` when
+/// nothing arrived.
 fn raw_read(stream: &mut TcpStream) -> Option<String> {
-    let mut all_data = Vec::new();
-    let mut buf = [0u8; BUFFER_SIZE];
-    loop {
-        match stream.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => all_data.extend_from_slice(&buf[..n]),
-            Err(ref e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                break
-            }
-            Err(_) => break,
-        }
-    }
-    if all_data.is_empty() {
+    let data = super::h2_utils::read_all_available(stream, Duration::from_millis(500));
+    if data.is_empty() {
         None
     } else {
-        Some(String::from_utf8_lossy(&all_data).to_string())
+        Some(String::from_utf8_lossy(&data).to_string())
     }
 }
 
