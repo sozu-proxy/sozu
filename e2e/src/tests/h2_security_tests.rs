@@ -1889,14 +1889,44 @@ impl CapturingBackend {
                 }
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                        stream
+                            .set_read_timeout(Some(Duration::from_millis(200)))
+                            .ok();
+                        // Loop-read the request so callers that inspect
+                        // `captured_clone` via `.contains(...)` don't flake
+                        // when the request straddles multiple TCP segments.
+                        let mut request_bytes = Vec::new();
                         let mut buf = [0u8; 4096];
-                        let n = match stream.read(&mut buf) {
-                            Ok(n) => n,
-                            Err(_) => continue,
-                        };
+                        let deadline = std::time::Instant::now()
+                            + std::time::Duration::from_secs(2);
+                        loop {
+                            match stream.read(&mut buf) {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    request_bytes.extend_from_slice(&buf[..n]);
+                                    // Stop once headers are complete — Content-Length
+                                    // body is not inspected by this mock.
+                                    if request_bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+                                        break;
+                                    }
+                                }
+                                Err(ref e)
+                                    if e.kind() == std::io::ErrorKind::WouldBlock
+                                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                                {
+                                    if std::time::Instant::now() >= deadline {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        if request_bytes.is_empty() {
+                            continue;
+                        }
 
-                        let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                        let request = String::from_utf8_lossy(&request_bytes).to_string();
                         *captured_clone.lock().unwrap() = Some(request);
 
                         let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
