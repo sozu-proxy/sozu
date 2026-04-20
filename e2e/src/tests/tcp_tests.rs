@@ -9,10 +9,10 @@
 /// - Backend connection failure resilience
 /// - Proxy protocol V2 with TCP listeners
 use std::{
-    io::{Read, Write},
+    io::{ErrorKind, Read, Write},
     net::{Shutdown, SocketAddr, TcpStream},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use sozu_command_lib::{
@@ -589,28 +589,45 @@ fn try_tcp_proxy_protocol_v2() -> State {
         let listener = bind_std_listener(back_address, "tcp test backend");
         let (mut stream, _) = listener.accept().expect("backend accept failed");
         stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
+            .set_read_timeout(Some(Duration::from_millis(200)))
             .expect("set read timeout");
         stream
             .set_write_timeout(Some(Duration::from_secs(2)))
             .expect("set write timeout");
 
-        // Read all forwarded data
+        // The client writes the PP header and payload in two separate
+        // `write_all` calls; under load they can arrive as distinct TCP
+        // segments, so a single `read` may return only the 28-byte PP
+        // header. Loop-read with a deadline until the expected passthrough
+        // total (44 bytes) is collected — or we give up gracefully, in
+        // which case the caller will render a diagnostic.
+        const EXPECTED_TOTAL: usize = 44; // 28-byte PP v2 header + 16-byte payload
+        let deadline = Instant::now() + Duration::from_secs(2);
         let mut buf = [0u8; BUFFER_SIZE];
-        let received = match stream.read(&mut buf) {
-            Ok(0) => {
-                println!("Backend: received EOF");
-                Vec::new()
+        let mut received: Vec<u8> = Vec::with_capacity(EXPECTED_TOTAL);
+        while received.len() < EXPECTED_TOTAL && Instant::now() < deadline {
+            match stream.read(&mut buf) {
+                Ok(0) => {
+                    println!("Backend: received EOF after {} bytes", received.len());
+                    break;
+                }
+                Ok(n) => {
+                    received.extend_from_slice(&buf[..n]);
+                    println!(
+                        "Backend: read {n} bytes (total {} / {EXPECTED_TOTAL})",
+                        received.len()
+                    );
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
+                    // Per-read timeout; keep looping until the global deadline.
+                    continue;
+                }
+                Err(e) => {
+                    println!("Backend: read error: {e}");
+                    break;
+                }
             }
-            Ok(n) => {
-                println!("Backend: received {n} bytes");
-                buf[..n].to_vec()
-            }
-            Err(e) => {
-                println!("Backend: read error: {e}");
-                Vec::new()
-            }
-        };
+        }
 
         // Send a response
         let response = b"ppv2-tcp-response";
