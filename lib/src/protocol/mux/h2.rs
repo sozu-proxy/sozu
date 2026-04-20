@@ -39,7 +39,7 @@ use crate::{
 ///
 /// Fields included in the session block (chosen to surface the most common
 /// H2 troubleshooting axes — flow stall, leaked stream, draining state,
-/// peer-side gap):
+/// peer-side gap, reset-flood exposure):
 /// - `peer` — peer address (or `None` if the socket is gone)
 /// - `position` — `Server` / `Client(...)` orientation
 /// - `state` — current [`H2State`]
@@ -47,6 +47,8 @@ use crate::{
 /// - `last_peer_id` — `highest_peer_stream_id` (gap to the peer's view)
 /// - `window` — connection-level send window (RFC 9113 §6.9)
 /// - `draining` — set after the first GOAWAY of a graceful shutdown
+/// - `total_rst_streams_emitted_lifetime` — MadeYouReset counter (CVE-2025-8671)
+/// - `total_rst_received_lifetime` — Rapid Reset counter (CVE-2023-44487)
 /// - `readiness` — connection-level mio readiness snapshot
 ///
 /// Computed lazily on each callsite — the helper only materialises when the
@@ -67,7 +69,7 @@ macro_rules! log_context {
             ("", "", "", "", "")
         };
         format!(
-            "[{ulid} - - -]\t{open}MUX-H2{reset}\t{grey}Session{reset}({gray}peer{reset}={white}{peer:?}{reset}, {gray}position{reset}={white}{position:?}{reset}, {gray}state{reset}={white}{state:?}{reset}, {gray}streams{reset}={white}{streams}{reset}, {gray}last_peer_id{reset}={white}{last_peer_id}{reset}, {gray}window{reset}={white}{window}{reset}, {gray}draining{reset}={white}{draining}{reset}, {gray}readiness{reset}={white}{readiness}{reset})\t >>>",
+            "[{ulid} - - -]\t{open}MUX-H2{reset}\t{grey}Session{reset}({gray}peer{reset}={white}{peer:?}{reset}, {gray}position{reset}={white}{position:?}{reset}, {gray}state{reset}={white}{state:?}{reset}, {gray}streams{reset}={white}{streams}{reset}, {gray}last_peer_id{reset}={white}{last_peer_id}{reset}, {gray}window{reset}={white}{window}{reset}, {gray}draining{reset}={white}{draining}{reset}, {gray}total_rst_streams_emitted_lifetime{reset}={white}{total_rst_streams_emitted_lifetime}{reset}, {gray}total_rst_received_lifetime{reset}={white}{total_rst_received_lifetime}{reset}, {gray}readiness{reset}={white}{readiness}{reset})\t >>>",
             open = open,
             reset = reset,
             grey = grey,
@@ -81,6 +83,8 @@ macro_rules! log_context {
             last_peer_id = $self.highest_peer_stream_id,
             window = $self.flow_control.window,
             draining = $self.drain.draining,
+            total_rst_streams_emitted_lifetime = $self.flood_detector.total_rst_streams_emitted_lifetime,
+            total_rst_received_lifetime = $self.flood_detector.total_rst_received_lifetime,
             readiness = $self.readiness,
         )
     }};
@@ -107,7 +111,7 @@ macro_rules! log_context_stream {
             ("", "", "", "", "")
         };
         format!(
-            "[{ulid} {req} {cluster} {backend}]\t{open}MUX-H2{reset}\t{grey}Session{reset}({gray}peer{reset}={white}{peer:?}{reset}, {gray}position{reset}={white}{position:?}{reset}, {gray}state{reset}={white}{state:?}{reset}, {gray}streams{reset}={white}{streams}{reset}, {gray}last_peer_id{reset}={white}{last_peer_id}{reset}, {gray}window{reset}={white}{window}{reset}, {gray}draining{reset}={white}{draining}{reset}, {gray}readiness{reset}={white}{readiness}{reset})\t >>>",
+            "[{ulid} {req} {cluster} {backend}]\t{open}MUX-H2{reset}\t{grey}Session{reset}({gray}peer{reset}={white}{peer:?}{reset}, {gray}position{reset}={white}{position:?}{reset}, {gray}state{reset}={white}{state:?}{reset}, {gray}streams{reset}={white}{streams}{reset}, {gray}last_peer_id{reset}={white}{last_peer_id}{reset}, {gray}window{reset}={white}{window}{reset}, {gray}draining{reset}={white}{draining}{reset}, {gray}total_rst_streams_emitted_lifetime{reset}={white}{total_rst_streams_emitted_lifetime}{reset}, {gray}total_rst_received_lifetime{reset}={white}{total_rst_received_lifetime}{reset}, {gray}readiness{reset}={white}{readiness}{reset})\t >>>",
             open = open,
             reset = reset,
             grey = grey,
@@ -124,6 +128,8 @@ macro_rules! log_context_stream {
             last_peer_id = $self.highest_peer_stream_id,
             window = $self.flow_control.window,
             draining = $self.drain.draining,
+            total_rst_streams_emitted_lifetime = $self.flood_detector.total_rst_streams_emitted_lifetime,
+            total_rst_received_lifetime = $self.flood_detector.total_rst_received_lifetime,
             readiness = $self.readiness,
         )
     }};

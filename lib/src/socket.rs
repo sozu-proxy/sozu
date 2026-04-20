@@ -96,7 +96,7 @@ macro_rules! log_socket_context {
             None => "-".to_string(),
         };
         format!(
-            "{open}SOCKET{reset}\t[{ulid} - - -]\t{grey}Session{reset}({gray}peer{reset}={white}{peer:?}{reset}, {gray}protocol{reset}={white}{protocol:?}{reset})\t >>>",
+            "{open}SOCKET{reset}\t[{ulid} - - -]\t{grey}Session{reset}({gray}peer{reset}={white}{peer:?}{reset}, {gray}rtt{reset}={white}{rtt:?}{reset}, {gray}protocol{reset}={white}{protocol:?}{reset})\t >>>",
             open = open,
             reset = reset,
             grey = grey,
@@ -104,6 +104,7 @@ macro_rules! log_socket_context {
             white = white,
             ulid = ulid,
             peer = $self.socket_ref().peer_addr().ok(),
+            rtt = crate::socket::stats::socket_rtt($self.socket_ref()),
             protocol = $self.protocol(),
         )
     }};
