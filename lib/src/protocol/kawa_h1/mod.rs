@@ -52,8 +52,20 @@ use crate::{
 /// label (uniform across every protocol), light grey `Session` keyword, gray
 /// keys, bright white values. The `[ulid - - -]` context comes first to stay
 /// aligned with `MUX-*` and `SOCKET` log lines.
+///
+/// Two invocation forms:
+/// - `log_context!(self)` — reads the response parsing phase via
+///   [`Http::response_parsing_phase`]. Use when no `&mut self.response_stream`
+///   borrow is currently live.
+/// - `log_context!(self, response_phase)` — caller supplies an already-resolved
+///   `Option<kawa::ParsingPhase>`. Use when a mutable borrow of
+///   `self.response_stream` (or its `BackendAnswer` inner) is live — pass
+///   `Some(inner.parsing_phase)` through the existing mutable reference.
 macro_rules! log_context {
-    ($self:expr) => {{
+    ($self:expr) => {
+        log_context!($self, $self.response_parsing_phase())
+    };
+    ($self:expr, $response_phase:expr) => {{
         let colored = is_logger_colored();
         let (open, reset, grey, gray, white) = if colored {
             (
@@ -67,7 +79,7 @@ macro_rules! log_context {
             ("", "", "", "", "")
         };
         format!(
-            "{gray}{ctx}{reset}\t{open}KAWA-H1{reset}\t{grey}Session{reset}({gray}public{reset}={white}{public}{reset}, {gray}session{reset}={white}{session}{reset}, {gray}frontend{reset}={white}{frontend}{reset}, {gray}frontend_readiness{reset}={white}{frontend_readiness}{reset}, {gray}backend{reset}={white}{backend}{reset}, {gray}backend_readiness{reset}={white}{backend_readiness}{reset})\t >>>",
+            "{gray}{ctx}{reset}\t{open}KAWA-H1{reset}\t{grey}Session{reset}({gray}public{reset}={white}{public}{reset}, {gray}session{reset}={white}{session}{reset}, {gray}frontend{reset}={white}{frontend}{reset}, {gray}request_parsing_phase{reset}={white}{request_parsing_phase:?}{reset}, {gray}response_parsing_phase{reset}={white}{response_parsing_phase:?}{reset}, {gray}frontend_readiness{reset}={white}{frontend_readiness}{reset}, {gray}backend{reset}={white}{backend}{reset}, {gray}backend_readiness{reset}={white}{backend_readiness}{reset})\t >>>",
             open = open,
             reset = reset,
             grey = grey,
@@ -77,6 +89,8 @@ macro_rules! log_context {
             public = $self.context.public_address.to_string(),
             session = $self.context.session_address.map(|addr| addr.to_string()).unwrap_or_else(|| "<none>".to_string()),
             frontend = $self.frontend_token.0,
+            request_parsing_phase = $self.request_stream.parsing_phase,
+            response_parsing_phase = $response_phase,
             frontend_readiness = $self.frontend_readiness,
             backend = $self.backend_token.map(|token| token.0.to_string()).unwrap_or_else(|| "<none>".to_string()),
             backend_readiness = $self.backend_readiness,
@@ -317,11 +331,12 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
         // Print the left-over response buffer output to track in which case it
         // may happens
+        let response_phase = response_stream.parsing_phase;
         let response_storage = &mut response_stream.storage;
         if !response_storage.is_empty() {
             warn!(
                 "{} Leftover fragment from response: {}",
-                log_context!(self),
+                log_context!(self, Some(response_phase)),
                 parser::view(
                     response_storage.used(),
                     16,
@@ -381,7 +396,11 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             .frontend_socket
             .socket_read(self.request_stream.storage.space());
 
-        debug!("{} Read {} bytes", log_context!(self), size);
+        debug!(
+            "{} Read {} bytes",
+            log_context!(self, Some(response_stream.parsing_phase)),
+            size
+        );
 
         if size > 0 {
             self.request_stream.storage.fill(size);
@@ -423,7 +442,10 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             SocketResult::Continue => {}
         };
 
-        trace!("{} ============== readable_parse", log_context!(self));
+        trace!(
+            "{} ============== readable_parse",
+            log_context!(self, Some(response_stream.parsing_phase))
+        );
         let was_initial = self.request_stream.is_initial();
         let was_not_proxying = !self.request_stream.is_main_phase();
 
@@ -444,7 +466,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             incr!("http.frontend_parse_errors");
             warn!(
                 "{} Parsing request error in {:?}: {}",
-                log_context!(self),
+                log_context!(self, Some(response_stream.parsing_phase)),
                 marker,
                 match kind {
                     kawa::ParsingErrorKind::Consuming { index } => {
@@ -513,7 +535,11 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
         let (size, socket_state) = self.frontend_socket.socket_write_vectored(&bufs);
 
-        debug!("{} Wrote {} bytes", log_context!(self), size);
+        debug!(
+            "{} Wrote {} bytes",
+            log_context!(self, Some(response_stream.parsing_phase)),
+            size
+        );
 
         if size > 0 {
             response_stream.consume(size);
@@ -559,14 +585,20 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                     return StateResult::Upgrade;
                 }
                 kawa::StatusLine::Response { code: 100, .. } => {
-                    trace!("{} ============== HANDLE CONTINUE!", log_context!(self));
+                    trace!(
+                        "{} ============== HANDLE CONTINUE!",
+                        log_context!(self, Some(response_stream.parsing_phase))
+                    );
                     response_stream.clear();
                     self.log_request_success(metrics);
                     return StateResult::Continue;
                 }
                 kawa::StatusLine::Response { code: 103, .. } => {
                     self.backend_readiness.event.insert(Ready::READABLE);
-                    trace!("{} ============== HANDLE EARLY HINT!", log_context!(self));
+                    trace!(
+                        "{} ============== HANDLE EARLY HINT!",
+                        log_context!(self, Some(response_stream.parsing_phase))
+                    );
                     response_stream.clear();
                     self.log_request_success(metrics);
                     return StateResult::Continue;
@@ -790,7 +822,11 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         }
 
         let (size, socket_state) = backend_socket.socket_read(response_stream.storage.space());
-        debug!("{} Read {} bytes", log_context!(self), size);
+        debug!(
+            "{} Read {} bytes",
+            log_context!(self, Some(response_stream.parsing_phase)),
+            size
+        );
 
         if size > 0 {
             response_stream.storage.fill(size);
@@ -833,7 +869,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
         trace!(
             "{} ============== backend_readable_parse",
-            log_context!(self)
+            log_context!(self, Some(response_stream.parsing_phase))
         );
         kawa::h1::parse(response_stream, &mut self.context);
         // kawa::debug_kawa(&self.response_stream);
@@ -842,7 +878,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             incr!("http.backend_parse_errors");
             warn!(
                 "{} Parsing response error in {:?}: {}",
-                log_context!(self),
+                log_context!(self, Some(response_stream.parsing_phase)),
                 marker,
                 match kind {
                     kawa::ParsingErrorKind::Consuming { index } => {
@@ -896,6 +932,16 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             path: self.context.path.as_deref(),
             reason: self.context.reason.as_deref(),
             status: self.context.status,
+        }
+    }
+
+    /// Returns the kawa `ParsingPhase` of the response side, if a backend answer
+    /// has been accepted. Used by `log_context!` to surface H1 wedged-response
+    /// states without poking inside the `ResponseStream` enum at every log site.
+    fn response_parsing_phase(&self) -> Option<kawa::ParsingPhase> {
+        match &self.response_stream {
+            ResponseStream::BackendAnswer(inner) => Some(inner.parsing_phase),
+            _ => None,
         }
     }
 
@@ -1643,12 +1689,12 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             (_, false) => {
                 error!(
                     "{} Backend closed before session is over",
-                    log_context!(self),
+                    log_context!(self, Some(response_stream.parsing_phase)),
                 );
 
                 trace!(
                     "{} Backend hang-up, setting the parsing phase of the response stream to terminated, this also takes care of responses that lack length information.",
-                    log_context!(self)
+                    log_context!(self, Some(response_stream.parsing_phase))
                 );
 
                 response_stream.parsing_phase = kawa::ParsingPhase::Terminated;

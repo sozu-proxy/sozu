@@ -35,7 +35,7 @@ macro_rules! log_context {
             ("", "", "", "", "")
         };
         format!(
-            "{gray}{ctx}{reset}\t{open}RUSTLS{reset}\t{grey}Session{reset}({gray}sni{reset}={white}{sni:?}{reset}, {gray}source{reset}={white}{source:?}{reset}, {gray}frontend{reset}={white}{frontend}{reset}, {gray}readiness{reset}={white}{readiness}{reset})\t >>>",
+            "{gray}{ctx}{reset}\t{open}RUSTLS{reset}\t{grey}Session{reset}({gray}sni{reset}={white}{sni:?}{reset}, {gray}alpn{reset}={white}{alpn}{reset}, {gray}version{reset}={white}{version:?}{reset}, {gray}source{reset}={white}{source:?}{reset}, {gray}frontend{reset}={white}{frontend}{reset}, {gray}readiness{reset}={white}{readiness}{reset})\t >>>",
             open = open,
             reset = reset,
             grey = grey,
@@ -47,6 +47,12 @@ macro_rules! log_context {
                 .server_name()
                 .map(|addr| addr.to_string())
                 .unwrap_or_else(|| "<none>".to_string()),
+            alpn = $self
+                .session
+                .alpn_protocol()
+                .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+                .unwrap_or_else(|| "<none>".to_string()),
+            version = $self.session.protocol_version(),
             source = $self
                 .peer_address
                 .map(|addr| addr.to_string())
