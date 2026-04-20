@@ -1,7 +1,7 @@
 use std::{cell::RefCell, io::ErrorKind, net::SocketAddr, rc::Rc};
 
 use mio::{Token, net::TcpStream};
-use rustls::ServerConnection;
+use rustls::{Error as RustlsError, ServerConnection};
 use rusty_ulid::Ulid;
 use sozu_command::{
     config::MAX_LOOP_ITERATIONS,
@@ -141,11 +141,7 @@ impl TlsHandshake {
                 }
 
                 if let Err(e) = self.session.process_new_packets() {
-                    error!(
-                        "{} Could not perform handshake: {:?}",
-                        log_context!(self),
-                        e
-                    );
+                    self.log_handshake_error(&e);
                     return SessionResult::Close;
                 }
             }
@@ -206,11 +202,7 @@ impl TlsHandshake {
                 }
 
                 if let Err(e) = self.session.process_new_packets() {
-                    error!(
-                        "{} Could not perform handshake: {:?}",
-                        log_context!(self),
-                        e
-                    );
+                    self.log_handshake_error(&e);
                     return SessionResult::Close;
                 }
             }
@@ -251,6 +243,48 @@ impl TlsHandshake {
 
     pub fn front_socket(&self) -> &TcpStream {
         &self.stream
+    }
+
+    /// Tiered logging for TLS handshake errors surfaced by `process_new_packets`.
+    ///
+    /// - `AlertReceived(_)`: remote peer rejected our cert/config (e.g. old
+    ///   CA bundle, scanner, cert-pinning client). Not actionable per-connection
+    ///   on a public endpoint, so log at `debug!`.
+    /// - Peer protocol violations (`PeerIncompatible`, `PeerMisbehaved`,
+    ///   `InvalidMessage`, inappropriate message / handshake message,
+    ///   oversized record, ALPN mismatch, bad client cert, `DecryptError`,
+    ///   `NoCertificatesPresented`): occasionally useful to spot buggy
+    ///   clients or stale roots, so log at `warn!`.
+    /// - Everything else (local/config/provider failures like `EncryptError`,
+    ///   `General`, `Other`, CRL issues, missing entropy): genuine server-side
+    ///   problems, stay at `error!`.
+    fn log_handshake_error(&self, err: &RustlsError) {
+        match err {
+            RustlsError::AlertReceived(_) => debug!(
+                "{} Could not perform handshake: {:?}",
+                log_context!(self),
+                err
+            ),
+            RustlsError::PeerIncompatible(_)
+            | RustlsError::PeerMisbehaved(_)
+            | RustlsError::InvalidMessage(_)
+            | RustlsError::InappropriateMessage { .. }
+            | RustlsError::InappropriateHandshakeMessage { .. }
+            | RustlsError::PeerSentOversizedRecord
+            | RustlsError::NoApplicationProtocol
+            | RustlsError::InvalidCertificate(_)
+            | RustlsError::DecryptError
+            | RustlsError::NoCertificatesPresented => warn!(
+                "{} Could not perform handshake: {:?}",
+                log_context!(self),
+                err
+            ),
+            _ => error!(
+                "{} Could not perform handshake: {:?}",
+                log_context!(self),
+                err
+            ),
+        }
     }
 }
 
