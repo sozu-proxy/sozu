@@ -9,10 +9,10 @@
 /// - Backend connection failure resilience
 /// - Proxy protocol V2 with TCP listeners
 use std::{
-    io::{ErrorKind, Read, Write},
+    io::{Read, Write},
     net::{Shutdown, SocketAddr, TcpStream},
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use sozu_command_lib::{
@@ -595,39 +595,16 @@ fn try_tcp_proxy_protocol_v2() -> State {
             .set_write_timeout(Some(Duration::from_secs(2)))
             .expect("set write timeout");
 
-        // The client writes the PP header and payload in two separate
-        // `write_all` calls; under load they can arrive as distinct TCP
-        // segments, so a single `read` may return only the 28-byte PP
-        // header. Loop-read with a deadline until the expected passthrough
-        // total (44 bytes) is collected — or we give up gracefully, in
-        // which case the caller will render a diagnostic.
-        const EXPECTED_TOTAL: usize = 44; // 28-byte PP v2 header + 16-byte payload
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let mut buf = [0u8; BUFFER_SIZE];
-        let mut received: Vec<u8> = Vec::with_capacity(EXPECTED_TOTAL);
-        while received.len() < EXPECTED_TOTAL && Instant::now() < deadline {
-            match stream.read(&mut buf) {
-                Ok(0) => {
-                    println!("Backend: received EOF after {} bytes", received.len());
-                    break;
-                }
-                Ok(n) => {
-                    received.extend_from_slice(&buf[..n]);
-                    println!(
-                        "Backend: read {n} bytes (total {} / {EXPECTED_TOTAL})",
-                        received.len()
-                    );
-                }
-                Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
-                    // Per-read timeout; keep looping until the global deadline.
-                    continue;
-                }
-                Err(e) => {
-                    println!("Backend: read error: {e}");
-                    break;
-                }
-            }
-        }
+        // Client splits the PP header (28 bytes) and payload (16 bytes) into
+        // two `write_all` calls; TCP segmentation can deliver them as two
+        // reads. Loop until the full 44 bytes or deadline.
+        const EXPECTED_TOTAL: usize = 44;
+        let received =
+            super::h2_utils::read_at_least(&mut stream, EXPECTED_TOTAL, Duration::from_secs(2));
+        println!(
+            "Backend: received {} bytes (expected {EXPECTED_TOTAL})",
+            received.len()
+        );
 
         // Send a response
         let response = b"ppv2-tcp-response";
