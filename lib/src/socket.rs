@@ -59,38 +59,84 @@ pub trait SocketHandler {
     fn protocol(&self) -> TransportProtocol;
     fn read_error(&self);
     fn write_error(&self);
-    /// Returns the owning connection's session ULID when known. Used by error
-    /// paths in the SocketHandler implementation to emit the
-    /// `[<session_ulid> - - -]` prefix expected by the rest of the mux stack.
-    /// Returns `None` for contextless implementations (e.g. raw `mio::TcpStream`).
+    /// Returns the owning connection's session ULID when known. Used by
+    /// [`log_socket_context!`] to render the `[<session_ulid> - - -]` segment
+    /// of the socket-layer log prefix, matching the format used by the
+    /// rest of the mux stack. Returns `None` for contextless implementations
+    /// (e.g. raw `mio::TcpStream`); the macro renders `-` in the ULID slot.
     fn session_ulid(&self) -> Option<Ulid> {
         None
     }
 }
 
-/// Format the `[<session_ulid> - - -]\tSOCKET` prefix used by socket-layer
-/// error logs so they can be correlated with the owning session and stay
-/// column-aligned with `MUX-*`, `RUSTLS` and other tagged log lines. When
-/// `ulid` is `None` emits `[- - - -]` so the column layout stays stable
-/// across session-less plumbing (legacy raw TcpStream paths). The `SOCKET`
-/// label is rendered bright-yellow/bold on colored sinks.
-pub(crate) fn socket_log_prefix(ulid: Option<Ulid>) -> String {
-    let (open, reset) = if is_logger_colored() {
-        ("\x1b[1;33m", "\x1b[0m")
+/// Format the socket-layer log prefix `SOCKET\t[<session_ulid_or_->]\tSession(
+/// peer=..., protocol=...)\t >>>` for a [`SocketHandler`] impl that has `self`
+/// in scope. When `$self.session_ulid()` returns `None` (e.g. the raw
+/// [`TcpStream`] impl that carries no session context) the ULID slot is
+/// rendered as `-` so the column layout stays stable across sessionless
+/// plumbing. Colour scheme matches the rest of the mux log-context macros:
+/// `SOCKET` bold bright-white, `Session` light grey, keys gray, values
+/// bright white.
+macro_rules! log_socket_context {
+    ($self:expr) => {{
+        let colored = is_logger_colored();
+        let (open, reset, grey, gray, white) = if colored {
+            (
+                "\x1b[1;97m",
+                "\x1b[0m",
+                "\x1b[37m",
+                "\x1b[90m",
+                "\x1b[97m",
+            )
+        } else {
+            ("", "", "", "", "")
+        };
+        let ulid = match $self.session_ulid() {
+            Some(ulid) => ulid.to_string(),
+            None => "-".to_string(),
+        };
+        format!(
+            "{open}SOCKET{reset}\t[{ulid} - - -]\t{grey}Session{reset}({gray}peer{reset}={white}{peer:?}{reset}, {gray}protocol{reset}={white}{protocol:?}{reset})\t >>>",
+            open = open,
+            reset = reset,
+            grey = grey,
+            gray = gray,
+            white = white,
+            ulid = ulid,
+            peer = $self.socket_ref().peer_addr().ok(),
+            protocol = $self.protocol(),
+        )
+    }};
+}
+
+/// Module-level socket log prefix used from free functions (e.g. the shared
+/// `tcp_socket_*` helpers) where `self` is not in scope but the caller can
+/// still thread a session `Ulid` through as a parameter. When the ULID is
+/// `None` the slot is rendered as `-`, matching the column layout of
+/// [`log_socket_context!`]. Colour scheme identical to [`log_socket_context!`].
+///
+/// Takes an `Option<Ulid>` so raw `mio::TcpStream` callers (which have no
+/// session identity) can still funnel through the same helpers.
+fn log_socket_module_prefix(session_ulid: Option<Ulid>) -> String {
+    let colored = is_logger_colored();
+    let (open, reset, gray) = if colored {
+        ("\x1b[1;97m", "\x1b[0m", "\x1b[90m")
     } else {
-        ("", "")
+        ("", "", "")
     };
-    match ulid {
-        Some(ulid) => format!("[{ulid} - - -]\t{open}SOCKET{reset}"),
-        None => format!("[- - - -]\t{open}SOCKET{reset}"),
-    }
+    let ulid = match session_ulid {
+        Some(ulid) => ulid.to_string(),
+        None => "-".to_string(),
+    };
+    format!("{open}SOCKET{reset}\t{gray}[{ulid} - - -]{reset}\t >>>")
 }
 
 /// Shared read/write/vectored-write logic used by both
 /// [`impl SocketHandler for TcpStream`] and
-/// [`impl SocketHandler for SessionTcpStream`]. Extracts the read/write loop
-/// so both impls log SOCKET errors with the bracket prefix
-/// `[session_ulid - - -]` when a session is known, and `[- - - -]` otherwise.
+/// [`impl SocketHandler for SessionTcpStream`]. Free-function entry point:
+/// `self` is out of scope here, so error logs use the
+/// [`log_socket_module_context!`] no-session variant. Session context is
+/// still available in the dispatching `SocketHandler` impl logs below.
 fn tcp_socket_read(
     stream: &mut TcpStream,
     buf: &mut [u8],
@@ -102,8 +148,8 @@ fn tcp_socket_read(
         counter += 1;
         if counter > MAX_LOOP_ITERATIONS {
             error!(
-                "{}\tMAX_LOOP_ITERATION reached in TcpStream::socket_read",
-                socket_log_prefix(session_ulid)
+                "{} MAX_LOOP_ITERATION reached in TcpStream::socket_read",
+                log_socket_module_prefix(session_ulid)
             );
             incr!("socket.read.infinite_loop.error");
             return (size, SocketResult::Error);
@@ -121,8 +167,8 @@ fn tcp_socket_read(
                 | ErrorKind::BrokenPipe => return (size, SocketResult::Closed),
                 _ => {
                     error!(
-                        "{}\tsocket_read error={:?}",
-                        socket_log_prefix(session_ulid),
+                        "{} socket_read error={:?}",
+                        log_socket_module_prefix(session_ulid),
                         e
                     );
                     return (size, SocketResult::Error);
@@ -143,8 +189,8 @@ fn tcp_socket_write(
         counter += 1;
         if counter > MAX_LOOP_ITERATIONS {
             error!(
-                "{}\tMAX_LOOP_ITERATION reached in TcpStream::socket_write",
-                socket_log_prefix(session_ulid)
+                "{} MAX_LOOP_ITERATION reached in TcpStream::socket_write",
+                log_socket_module_prefix(session_ulid)
             );
             incr!("socket.write.infinite_loop.error");
             return (size, SocketResult::Error);
@@ -167,8 +213,8 @@ fn tcp_socket_write(
                 _ => {
                     //FIXME: timeout and other common errors should be sent up
                     error!(
-                        "{}\tsocket_write error={:?}",
-                        socket_log_prefix(session_ulid),
+                        "{} socket_write error={:?}",
+                        log_socket_module_prefix(session_ulid),
                         e
                     );
                     incr!("tcp.write.error");
@@ -198,8 +244,8 @@ fn tcp_socket_write_vectored(
             _ => {
                 //FIXME: timeout and other common errors should be sent up
                 error!(
-                    "{}\tsocket_write error={:?}",
-                    socket_log_prefix(session_ulid),
+                    "{} socket_write error={:?}",
+                    log_socket_module_prefix(session_ulid),
                     e
                 );
                 incr!("tcp.write.error");
@@ -339,8 +385,8 @@ impl SocketHandler for FrontRustls {
             counter += 1;
             if counter > MAX_LOOP_ITERATIONS {
                 error!(
-                    "{}\tMAX_LOOP_ITERATION reached in FrontRustls::socket_read",
-                    socket_log_prefix(Some(self.session_ulid))
+                    "{} MAX_LOOP_ITERATION reached in FrontRustls::socket_read",
+                    log_socket_context!(self)
                 );
                 incr!("rustls.read.infinite_loop.error");
                 is_error = true;
@@ -387,7 +433,11 @@ impl SocketHandler for FrontRustls {
                     // TLS record. The outer loop will drain plaintext next iteration.
                     ErrorKind::Other => {}
                     _ => {
-                        error!("could not read TLS stream from socket: {:?}", e);
+                        error!(
+                            "{} could not read TLS stream from socket: {:?}",
+                            log_socket_context!(self),
+                            e
+                        );
                         is_error = true;
                         break;
                     }
@@ -395,7 +445,11 @@ impl SocketHandler for FrontRustls {
             }
 
             if let Err(e) = self.session.process_new_packets() {
-                error!("could not process read TLS packets: {:?}", e);
+                error!(
+                    "{} could not process read TLS packets: {:?}",
+                    log_socket_context!(self),
+                    e
+                );
                 is_error = true;
                 break;
             }
@@ -417,7 +471,11 @@ impl SocketHandler for FrontRustls {
                             break;
                         }
                         _ => {
-                            error!("could not read data from TLS stream: {:?}", e);
+                            error!(
+                                "{} could not read data from TLS stream: {:?}",
+                                log_socket_context!(self),
+                                e
+                            );
                             is_error = true;
                             break;
                         }
@@ -460,8 +518,8 @@ impl SocketHandler for FrontRustls {
             counter += 1;
             if counter > MAX_LOOP_ITERATIONS {
                 error!(
-                    "{}\tMAX_LOOP_ITERATION reached in FrontRustls::socket_write",
-                    socket_log_prefix(Some(self.session_ulid))
+                    "{} MAX_LOOP_ITERATION reached in FrontRustls::socket_write",
+                    log_socket_context!(self)
                 );
                 incr!("rustls.write.infinite_loop.error");
                 is_error = true;
@@ -495,7 +553,11 @@ impl SocketHandler for FrontRustls {
                         break;
                     }
                     _ => {
-                        error!("could not write data to TLS stream: {:?}", e);
+                        error!(
+                            "{} could not write data to TLS stream: {:?}",
+                            log_socket_context!(self),
+                            e
+                        );
                         incr!("rustls.write.error");
                         is_error = true;
                         break;
@@ -524,7 +586,11 @@ impl SocketHandler for FrontRustls {
                             break;
                         }
                         _ => {
-                            error!("could not write TLS stream to socket: {:?}", e);
+                            error!(
+                                "{} could not write TLS stream to socket: {:?}",
+                                log_socket_context!(self),
+                                e
+                            );
                             incr!("rustls.write.error");
                             is_error = true;
                             break;
@@ -558,7 +624,11 @@ impl SocketHandler for FrontRustls {
                             break;
                         }
                         _ => {
-                            error!("could not flush TLS stream to socket: {:?}", e);
+                            error!(
+                                "{} could not flush TLS stream to socket: {:?}",
+                                log_socket_context!(self),
+                                e
+                            );
                             incr!("rustls.write.error");
                             is_error = true;
                             break;
@@ -606,8 +676,8 @@ impl SocketHandler for FrontRustls {
             counter += 1;
             if counter > MAX_LOOP_ITERATIONS {
                 error!(
-                    "{}\tMAX_LOOP_ITERATION reached in FrontRustls::socket_write_vectored",
-                    socket_log_prefix(Some(self.session_ulid))
+                    "{} MAX_LOOP_ITERATION reached in FrontRustls::socket_write_vectored",
+                    log_socket_context!(self)
                 );
                 incr!("rustls.write.infinite_loop.error");
                 is_error = true;
@@ -642,7 +712,11 @@ impl SocketHandler for FrontRustls {
                             break;
                         }
                         _ => {
-                            error!("could not write data to TLS stream: {:?}", e);
+                            error!(
+                                "{} could not write data to TLS stream: {:?}",
+                                log_socket_context!(self),
+                                e
+                            );
                             incr!("rustls.write.error");
                             is_error = true;
                             break;
@@ -674,7 +748,11 @@ impl SocketHandler for FrontRustls {
                                 break;
                             }
                             _ => {
-                                error!("could not write TLS stream to socket: {:?}", e);
+                                error!(
+                                    "{} could not write TLS stream to socket: {:?}",
+                                    log_socket_context!(self),
+                                    e
+                                );
                                 incr!("rustls.write.error");
                                 is_error = true;
                                 break;
@@ -705,7 +783,11 @@ impl SocketHandler for FrontRustls {
                             break;
                         }
                         _ => {
-                            error!("could not write TLS stream to socket: {:?}", e);
+                            error!(
+                                "{} could not write TLS stream to socket: {:?}",
+                                log_socket_context!(self),
+                                e
+                            );
                             incr!("rustls.write.error");
                             is_error = true;
                             break;
@@ -734,7 +816,11 @@ impl SocketHandler for FrontRustls {
                             break;
                         }
                         _ => {
-                            error!("could not flush TLS stream to socket: {:?}", e);
+                            error!(
+                                "{} could not flush TLS stream to socket: {:?}",
+                                log_socket_context!(self),
+                                e
+                            );
                             incr!("rustls.write.error");
                             is_error = true;
                             break;
