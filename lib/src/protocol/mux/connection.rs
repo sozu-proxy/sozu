@@ -32,15 +32,16 @@ use crate::{
 };
 
 /// Module-level prefix used on every log line emitted from this module.
-/// Produces a bright-white/bold `MUX-CONN` label when the logger is in colored
-/// mode. Session-specific context cannot be derived here because most log
-/// sites are inside `Endpoint` adapter methods that only see the backend/
-/// frontend maps, not the wrapping [`Connection`].
+/// Produces a bold bright-white `MUX-CONN` label (uniform across every
+/// protocol) when the logger is in colored mode. Session-specific context
+/// cannot be derived here because most log sites are inside `Endpoint` adapter
+/// methods that only see the backend/frontend maps, not the wrapping
+/// [`Connection`].
 macro_rules! log_module_context {
     () => {{
         let colored = is_logger_colored();
         let (open, reset) = if colored {
-            ("\x1b[1;37m", "\x1b[0m")
+            ("\x1b[1;97m", "\x1b[0m")
         } else {
             ("", "")
         };

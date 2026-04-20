@@ -13,13 +13,14 @@ use nom::{
 use sozu_command::logging::is_logger_colored;
 
 /// Module-level prefix for nom-based H2 frame parser diagnostics. The parser
-/// has no session in scope, so a dim `MUX-PARSER` label is used, colored when
-/// the logger supports ANSI.
+/// has no session in scope, so a single `MUX-PARSER` label is used, colored
+/// bold bright-white (uniform across every protocol) when the logger supports
+/// ANSI.
 macro_rules! log_module_context {
     () => {{
         let colored = is_logger_colored();
         let (open, reset) = if colored {
-            ("\x1b[2;36m", "\x1b[0m")
+            ("\x1b[1;97m", "\x1b[0m")
         } else {
             ("", "")
         };

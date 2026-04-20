@@ -15,18 +15,19 @@ use crate::{
 
 /// This macro is defined uniquely in this module to help the tracking of tls
 /// issues inside Sōzu. When the logger emits to a TTY the protocol label is
-/// bright-yellow/bold, the `Session` keyword is plain cyan, attribute keys are
-/// gray and values are bright white. ANSI codes are skipped when output goes
-/// to a file or otherwise non-colored sink. The `[ulid - - -]` context prefix
-/// comes first to keep column alignment with `MUX-*` and `SOCKET` logs.
+/// bold bright-white (uniform across every protocol), the `Session` keyword is
+/// light grey, attribute keys are gray and values are bright white. ANSI codes
+/// are skipped when output goes to a file or otherwise non-colored sink. The
+/// `[ulid - - -]` context prefix comes first to keep column alignment with
+/// `MUX-*` and `SOCKET` logs.
 macro_rules! log_context {
     ($self:expr) => {{
         let colored = is_logger_colored();
-        let (open, reset, cyan, gray, white) = if colored {
+        let (open, reset, grey, gray, white) = if colored {
             (
-                "\x1b[1;33m",
+                "\x1b[1;97m",
                 "\x1b[0m",
-                "\x1b[36m",
+                "\x1b[37m",
                 "\x1b[90m",
                 "\x1b[97m",
             )
@@ -34,10 +35,10 @@ macro_rules! log_context {
             ("", "", "", "", "")
         };
         format!(
-            "{gray}{ctx}{reset}\t{open}RUSTLS{reset}\t{cyan}Session{reset}({gray}sni{reset}={white}{sni:?}{reset}, {gray}source{reset}={white}{source:?}{reset}, {gray}frontend{reset}={white}{frontend}{reset}, {gray}readiness{reset}={white}{readiness}{reset})\t >>>",
+            "{gray}{ctx}{reset}\t{open}RUSTLS{reset}\t{grey}Session{reset}({gray}sni{reset}={white}{sni:?}{reset}, {gray}source{reset}={white}{source:?}{reset}, {gray}frontend{reset}={white}{frontend}{reset}, {gray}readiness{reset}={white}{readiness}{reset})\t >>>",
             open = open,
             reset = reset,
-            cyan = cyan,
+            grey = grey,
             gray = gray,
             white = white,
             ctx = $self.log_context(),
