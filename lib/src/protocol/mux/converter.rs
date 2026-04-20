@@ -19,13 +19,13 @@ use crate::protocol::{
 
 /// Module-level prefix used on every log line emitted from the H2 kawa
 /// converter. Free-standing converter functions have no session in scope so
-/// the single `MUX-CONV` label is used, dimmed cyan when the logger supports
-/// ANSI.
+/// the single `MUX-CONV` label is used, colored bold bright-white (uniform
+/// across every protocol) when the logger supports ANSI.
 macro_rules! log_module_context {
     () => {{
         let colored = is_logger_colored();
         let (open, reset) = if colored {
-            ("\x1b[2;36m", "\x1b[0m")
+            ("\x1b[1;97m", "\x1b[0m")
         } else {
             ("", "")
         };
