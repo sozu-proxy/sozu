@@ -4079,34 +4079,10 @@ impl ContinueBackend {
                             .set_read_timeout(Some(Duration::from_millis(200)))
                             .ok();
                         stream.set_write_timeout(Some(Duration::from_secs(2))).ok();
-                        // Loop-read the request headers so the `Expect:
-                        // 100-continue` detection below is reliable even if
-                        // the headers straddle multiple TCP segments.
-                        let mut request_bytes = Vec::new();
-                        let mut buf = [0u8; 4096];
-                        let deadline = std::time::Instant::now()
-                            + std::time::Duration::from_secs(2);
-                        loop {
-                            match stream.read(&mut buf) {
-                                Ok(0) => break,
-                                Ok(n) => {
-                                    request_bytes.extend_from_slice(&buf[..n]);
-                                    if request_bytes.windows(4).any(|w| w == b"\r\n\r\n") {
-                                        break;
-                                    }
-                                }
-                                Err(ref e)
-                                    if e.kind() == std::io::ErrorKind::WouldBlock
-                                        || e.kind() == std::io::ErrorKind::TimedOut =>
-                                {
-                                    if std::time::Instant::now() >= deadline {
-                                        break;
-                                    }
-                                    continue;
-                                }
-                                Err(_) => break,
-                            }
-                        }
+                        let request_bytes = super::h2_utils::read_until_header_end(
+                            &mut stream,
+                            Duration::from_secs(2),
+                        );
                         if request_bytes.is_empty() {
                             continue;
                         }
@@ -4121,7 +4097,8 @@ impl ContinueBackend {
                             let _ = stream.flush();
                             // Small delay to simulate real server behavior
                             thread::sleep(Duration::from_millis(50));
-                            // Read the body that follows
+                            // Drain the body that follows
+                            let mut buf = [0u8; 4096];
                             let _ = stream.read(&mut buf);
                         }
 

@@ -261,6 +261,16 @@ impl H2Frame {
 // Frame I/O helpers
 // ============================================================================
 
+/// HTTP/1.x header-block terminator. Shared across the mock backends
+/// that loop-read until headers are complete.
+pub(crate) const HTTP_HEADER_END: &[u8] = b"\r\n\r\n";
+
+/// Upper bound on how many bytes the loop-read helpers will accumulate
+/// before bailing out. Protects mock backends against a misbehaving peer
+/// that dribbles bytes forever without ever closing or emitting
+/// `\r\n\r\n`.
+const LOOP_READ_MAX_BYTES: usize = 64 * 1024;
+
 /// Read raw bytes from a stream, tolerating timeouts.
 pub(crate) fn read_all_available(stream: &mut impl Read, timeout: Duration) -> Vec<u8> {
     let mut buf = vec![0u8; 65536];
@@ -270,6 +280,85 @@ pub(crate) fn read_all_available(stream: &mut impl Read, timeout: Duration) -> V
         match stream.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => result.extend_from_slice(&buf[..n]),
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                if start.elapsed() >= timeout {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            Err(_) => break,
+        }
+    }
+    result
+}
+
+/// Read until `target_len` bytes have been accumulated, EOF, or the
+/// global `timeout` elapses. Used by mock backends that expect a
+/// fixed-size payload (e.g. PROXY-protocol v2 header + known-size body)
+/// and need to tolerate TCP segmentation across the sender's
+/// `write_all` boundaries.
+pub(crate) fn read_at_least(
+    stream: &mut impl Read,
+    target_len: usize,
+    timeout: Duration,
+) -> Vec<u8> {
+    let mut result = Vec::with_capacity(target_len);
+    let mut buf = [0u8; 4096];
+    let start = std::time::Instant::now();
+    while result.len() < target_len {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => result.extend_from_slice(&buf[..n]),
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                if start.elapsed() >= timeout {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            Err(_) => break,
+        }
+    }
+    result
+}
+
+/// Read until an HTTP header block terminator (`\r\n\r\n`) is
+/// observed, EOF, or the global `timeout` elapses. Capped at
+/// [`LOOP_READ_MAX_BYTES`] to guard against a peer that never emits the
+/// terminator. Used by HTTP/1 mock backends that need the full header
+/// block before branching on `Expect:`/`Transfer-Encoding:`/etc.
+pub(crate) fn read_until_header_end(stream: &mut impl Read, timeout: Duration) -> Vec<u8> {
+    let mut result = Vec::with_capacity(4096);
+    let mut buf = [0u8; 4096];
+    let start = std::time::Instant::now();
+    loop {
+        // Cheap terminator scan: only inspect the tail, not the whole
+        // accumulated buffer. `HTTP_HEADER_END` is 4 bytes so we need
+        // to look at the last `new_bytes + 3` bytes of `result` after
+        // each read to catch terminators straddling segment
+        // boundaries.
+        if result.len() > LOOP_READ_MAX_BYTES {
+            break;
+        }
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                let tail_start = result.len().saturating_sub(HTTP_HEADER_END.len() - 1);
+                result.extend_from_slice(&buf[..n]);
+                if result[tail_start..]
+                    .windows(HTTP_HEADER_END.len())
+                    .any(|w| w == HTTP_HEADER_END)
+                {
+                    break;
+                }
+            }
             Err(ref e)
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut =>
