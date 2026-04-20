@@ -16,6 +16,15 @@
 //! * [`test_h2_idle_stream_no_data_cancelled`]: A POST stream that sends no
 //!   DATA (only connection-level PINGs) is RST_STREAM(CANCEL)'d after the idle
 //!   timeout, proving the Slowloris guard remains effective.
+//! * [`test_h2_stranded_expect_write_survives_cancellation`]: When a stream is
+//!   cancelled by the per-stream idle timer while the write path is parked on
+//!   that stream's [`expect_write`], opening a new stream recycles the slot and
+//!   may shrink the context streams Vec — the stranded [`expect_write`] must
+//!   not panic on the next `writable()` call (h2.rs:1896 OOB regression).
+//! * [`test_h2_stranded_expect_write_peer_rst_survives_cancellation`][] — same
+//!   invariant as above but triggered via **peer-initiated RST_STREAM**; the
+//!   `handle_rst_stream_frame` eviction path must also invalidate any cached
+//!   `expect_write`/`expect_read` referencing the evicted gid.
 
 use std::{
     io::Write,
@@ -650,6 +659,379 @@ fn test_h2_idle_stream_no_data_cancelled() {
             3,
             "H2 correctness: idle stream with no DATA is cancelled after timeout",
             try_h2_idle_stream_no_data_cancelled
+        ),
+        State::Success
+    );
+}
+
+// ============================================================================
+// Test 7: Stranded `expect_write` survives per-stream idle cancellation
+// ============================================================================
+
+/// Regression for the OOB panic at `h2.rs:1896`:
+/// `index out of bounds: the len is 1 but the index is 1`.
+///
+/// Reproduction sequence (precise ordering matters):
+///
+/// 1. Open **stream 1** (GET) asking a backend that returns a large body.
+///    The client intentionally stops reading from the TLS/TCP socket so the
+///    kernel send buffer and TLS write queue fill, and sozu's write path
+///    stalls mid-frame — parking `self.expect_write = Some(H2StreamId::Other
+///    { id: 1, gid: G })` at `h2.rs:2043`.
+/// 2. Per-stream idle timer fires (>2 s): `cancel_timed_out_streams`
+///    (`h2.rs:2823`) evicts stream 1. `self.streams.remove(&1)` is called
+///    and `context.streams[G].state` is set to `Recycle`, but
+///    `expect_write` still references gid `G`.
+/// 3. Fresh HEADERS opens **stream 3** → `Context::create_stream`
+///    (`mod.rs:430`) finds the `Recycle` slot at `G`, reuses it, then runs
+///    `shrink_trailing_recycle` (`mod.rs:491`). If the recycled slot is the
+///    last element (common in the 1-active-stream case), the shrink may
+///    reduce `context.streams.len()` — leaving the stranded `expect_write`
+///    pointing past the end of the Vec.
+/// 4. Next `writable()` → `write_streams` (`h2.rs:1879`) dereferences
+///    `context.streams[global_stream_id]` at `h2.rs:1896` → OOB panic.
+///
+/// The fix (see `remove_dead_stream` and the idle-cancellation path) must
+/// clear `expect_write` / `expect_read` whenever the referenced gid is
+/// evicted. With the fix applied, this test's worker stays alive through
+/// the full sequence.
+///
+/// **Trade-off notice**: reliably wedging sozu's write path inside a
+/// single e2e run is timing-dependent — H2 INITIAL_WINDOW_SIZE caps a
+/// single response at 64 KiB, rustls has its own write queue, and the
+/// kernel TCP send buffer absorbs another ~64 KiB. So rather than trying
+/// to force the exact panic signature, this test asserts the **indirect
+/// invariant**: "worker survives a burst of idle-cancelled streams
+/// followed immediately by fresh stream creation that triggers recycle +
+/// trailing-Recycle shrink". Any regression that re-introduces a stranded
+/// `expect_write`/`expect_read` referencing a popped gid would panic on
+/// the next `writable()` tick and kill the worker thread, failing
+/// `verify_sozu_alive`.
+fn try_h2_stranded_expect_write_survives_cancellation() -> State {
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker = Worker::start_new_worker_owned("H2-COR-STRANDED-EW", config, listeners, state);
+
+    // Short per-stream idle deadline so the timer fires well within the
+    // test budget.
+    let mut listener_config = ListenerBuilder::new_https(front_address.clone())
+        .to_tls(None)
+        .unwrap();
+    listener_config.h2_stream_idle_timeout_seconds = Some(2);
+
+    worker.send_proxy_request_type(RequestType::AddHttpsListener(listener_config));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        address: front_address.clone(),
+        proxy: ListenerType::Https.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        hostname: String::from("localhost"),
+        ..Worker::default_http_frontend("cluster_0", front_address.clone().into())
+    }));
+
+    let certificate_and_key = CertificateAndKey {
+        certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
+        key: String::from(include_str!("../../../lib/assets/local-key.pem")),
+        certificate_chain: vec![],
+        versions: vec![],
+        names: vec![],
+    };
+    worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+        address: front_address,
+        certificate: certificate_and_key,
+        expired_at: None,
+    }));
+
+    let back_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0".to_owned(),
+        back_address,
+        None,
+    )));
+    // Large enough response body that the converter is likely to fragment it
+    // across frames — makes the stalled-write path more likely while the
+    // client is not reading.
+    let large_body: String = "x".repeat(256 * 1024);
+    let backend = AsyncBackend::spawn_detached_backend(
+        "BACKEND_0".to_owned(),
+        back_address,
+        SimpleAggregator::default(),
+        AsyncBackend::http_handler(large_body),
+    );
+    worker.read_to_last();
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake(&mut tls);
+
+    let get_headers = vec![
+        0x82, // :method GET
+        0x84, // :path /
+        0x87, // :scheme https
+        0x41, 0x09, // :authority localhost
+        b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't',
+    ];
+
+    // Open stream 1 (GET), don't read the response. Sozu starts emitting
+    // H2 DATA, may or may not park `expect_write` depending on buffer
+    // sizes — either way the per-stream idle timer will fire next.
+    let h1 = H2Frame::headers(1, get_headers.clone(), true, true);
+    tls.write_all(&h1.encode()).unwrap();
+    tls.flush().unwrap();
+
+    // Wait past the 2 s per-stream idle deadline.
+    thread::sleep(Duration::from_millis(2_400));
+
+    // Wake the readable path so `cancel_timed_out_streams` runs. This
+    // evicts stream 1 and (pre-fix) leaves `expect_write` stranded if it
+    // had parked on stream 1's gid.
+    let ping = H2Frame::ping([0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8]);
+    let _ = tls.write_all(&ping.encode());
+    let _ = tls.flush();
+    thread::sleep(Duration::from_millis(200));
+
+    // Open stream 3 — this is the `Context::create_stream` call that
+    // recycles the just-evicted slot and may pop the trailing Recycle
+    // entry, shrinking `context.streams`. If `expect_write` was still
+    // pointing at the old gid, the next `writable()` tick panics.
+    let h3 = H2Frame::headers(3, get_headers.clone(), true, true);
+    let write3_ok = tls.write_all(&h3.encode()).is_ok() && tls.flush().is_ok();
+    println!("stream 3 write: {write3_ok}");
+
+    // Resume reading: drain any queued frames so sozu runs `writable()`
+    // again — the panic (if any) fires here.
+    let _ = collect_response_frames(&mut tls, 200, 6, 400);
+
+    // Burst three more idle-cancel + new-stream cycles back-to-back to
+    // widen the race window. Each iteration: open a stream, wait past the
+    // idle deadline, open another — exercising the evict-then-shrink path
+    // with different gids.
+    let mut next_sid: u32 = 5;
+    for _ in 0..3 {
+        let hs = H2Frame::headers(next_sid, get_headers.clone(), true, true);
+        let _ = tls.write_all(&hs.encode());
+        let _ = tls.flush();
+        next_sid += 2;
+
+        thread::sleep(Duration::from_millis(2_300));
+        let _ = tls.write_all(&ping.encode());
+        let _ = tls.flush();
+        thread::sleep(Duration::from_millis(100));
+
+        let hn = H2Frame::headers(next_sid, get_headers.clone(), true, true);
+        let _ = tls.write_all(&hn.encode());
+        let _ = tls.flush();
+        next_sid += 2;
+
+        let _ = collect_response_frames(&mut tls, 150, 4, 300);
+    }
+
+    drop(tls);
+    thread::sleep(Duration::from_millis(200));
+
+    // Primary assertion: the worker must still be accepting connections.
+    // A panic inside `write_streams` would tear down the worker thread.
+    let still_alive = verify_sozu_alive(front_port);
+    println!("stranded expect_write - sozu alive: {still_alive}");
+
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+    let mut backends = vec![backend];
+    for backend in backends.iter_mut() {
+        backend.stop_and_get_aggregator();
+    }
+
+    if still_alive && stopped {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_stranded_expect_write_survives_cancellation() {
+    assert_eq!(
+        repeat_until_error_or(
+            2,
+            "H2 correctness: stranded expect_write survives per-stream idle cancellation",
+            try_h2_stranded_expect_write_survives_cancellation
+        ),
+        State::Success
+    );
+}
+
+// ============================================================================
+// Test 8: Stranded expect_write via peer-initiated RST_STREAM — covers the
+//        `handle_rst_stream_frame` eviction path at h2.rs:3752
+// ============================================================================
+
+/// Sibling to [`test_h2_stranded_expect_write_survives_cancellation`] — same
+/// invariant, different eviction trigger. Where the original test uses the
+/// per-stream idle timer to evict a stream whose gid may still be cached in
+/// `self.expect_write`, this test drives the **peer-initiated RST_STREAM**
+/// path in `handle_rst_stream_frame` (`lib/src/protocol/mux/h2.rs:3752`),
+/// which was previously an inline `self.streams.remove(...)` that did not
+/// go through `remove_dead_stream` and therefore did not clear
+/// `expect_write`/`expect_read`.
+///
+/// Reproduction shape:
+///
+/// 1. Client opens a GET stream `victim` to a backend returning a large
+///    body — sozu begins emitting HEADERS + DATA on the frontend.
+/// 2. Before the response fully flushes, the client sends RST_STREAM
+///    (error=CANCEL) for `victim`. `handle_rst_stream_frame` evicts the
+///    stream from `self.streams`, transitions `context.streams[gid].state`
+///    to `Recycle`, and (with the fix) invalidates
+///    `expect_write`/`expect_read` if they referenced `gid`.
+/// 3. Client opens a new GET stream — `Context::create_stream`
+///    (`mod.rs:430`) reuses the recycled slot, then runs
+///    `shrink_trailing_recycle` (`mod.rs:491`), potentially shrinking
+///    `context.streams.len()`.
+/// 4. Client drains — sozu runs `writable()`. With the fix, no OOB index.
+///    Without the fix (pre-refactor of site 3752), the stranded gid in
+///    `expect_write` would panic at `h2.rs:1896`.
+///
+/// As with the idle-cancel test, the exact panic conditions depend on
+/// timing (rustls buffering, H2 INITIAL_WINDOW_SIZE, kernel TCP send
+/// buffer), so the primary assertion is the indirect "worker survives
+/// N peer-RST + new-stream cycles" invariant via `verify_sozu_alive`.
+fn try_h2_stranded_expect_write_peer_rst_survives() -> State {
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker = Worker::start_new_worker_owned("H2-COR-RST-EW", config, listeners, state);
+
+    let listener_config = ListenerBuilder::new_https(front_address.clone())
+        .to_tls(None)
+        .unwrap();
+    worker.send_proxy_request_type(RequestType::AddHttpsListener(listener_config));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        address: front_address.clone(),
+        proxy: ListenerType::Https.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        hostname: String::from("localhost"),
+        ..Worker::default_http_frontend("cluster_0", front_address.clone().into())
+    }));
+
+    let certificate_and_key = CertificateAndKey {
+        certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
+        key: String::from(include_str!("../../../lib/assets/local-key.pem")),
+        certificate_chain: vec![],
+        versions: vec![],
+        names: vec![],
+    };
+    worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+        address: front_address,
+        certificate: certificate_and_key,
+        expired_at: None,
+    }));
+
+    let back_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0".to_owned(),
+        back_address,
+        None,
+    )));
+    // Large body so sozu is likely to emit multiple DATA frames before the
+    // peer RST arrives — maximises the chance of parking expect_write.
+    let large_body: String = "x".repeat(256 * 1024);
+    let backend = AsyncBackend::spawn_detached_backend(
+        "BACKEND_0".to_owned(),
+        back_address,
+        SimpleAggregator::default(),
+        AsyncBackend::http_handler(large_body),
+    );
+    worker.read_to_last();
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake(&mut tls);
+
+    let get_headers = vec![
+        0x82, // :method GET
+        0x84, // :path /
+        0x87, // :scheme https
+        0x41, 0x09, // :authority localhost
+        b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't',
+    ];
+
+    // Four iterations, each: open victim stream → give sozu time to park a
+    // partial write → peer RST the victim → open a fresh stream → drain.
+    let mut next_sid: u32 = 1;
+    for _ in 0..4 {
+        let victim = next_sid;
+        let h_victim = H2Frame::headers(victim, get_headers.clone(), true, true);
+        tls.write_all(&h_victim.encode()).unwrap();
+        tls.flush().unwrap();
+        next_sid += 2;
+
+        // Let sozu start responding. HEADERS + first DATA frame should be
+        // in flight, and expect_write may be parked if the buffer fills.
+        thread::sleep(Duration::from_millis(150));
+
+        // Peer-initiated RST_STREAM(CANCEL = 0x8). Exercises
+        // handle_rst_stream_frame (h2.rs:3752), which now routes through
+        // remove_dead_stream and must clear expect_write/expect_read if
+        // they reference the evicted gid.
+        let rst = H2Frame::rst_stream(victim, 0x8);
+        let _ = tls.write_all(&rst.encode());
+        let _ = tls.flush();
+        thread::sleep(Duration::from_millis(80));
+
+        // Fresh stream: drives Context::create_stream → recycle +
+        // shrink_trailing_recycle. A stranded expect_write would panic
+        // at h2.rs:1896 on the next writable() tick.
+        let fresh = next_sid;
+        let h_fresh = H2Frame::headers(fresh, get_headers.clone(), true, true);
+        let _ = tls.write_all(&h_fresh.encode());
+        let _ = tls.flush();
+        next_sid += 2;
+
+        // Drain — forces writable() to run, revealing any panic.
+        let _ = collect_response_frames(&mut tls, 200, 8, 400);
+    }
+
+    drop(tls);
+    thread::sleep(Duration::from_millis(200));
+
+    let still_alive = verify_sozu_alive(front_port);
+    println!("stranded expect_write peer RST - sozu alive: {still_alive}");
+
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+    let mut backends = vec![backend];
+    for backend in backends.iter_mut() {
+        backend.stop_and_get_aggregator();
+    }
+
+    if still_alive && stopped {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_stranded_expect_write_peer_rst_survives_cancellation() {
+    assert_eq!(
+        repeat_until_error_or(
+            2,
+            "H2 correctness: stranded expect_write survives peer-initiated RST_STREAM",
+            try_h2_stranded_expect_write_peer_rst_survives
         ),
         State::Success
     );
