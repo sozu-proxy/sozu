@@ -69,14 +69,15 @@ pub trait SocketHandler {
     }
 }
 
-/// Format the socket-layer log prefix `SOCKET\t[<session_ulid_or_->]\tSession(
+/// Format the socket-layer log prefix `[<session_ulid_or_->]\tSOCKET\tSession(
 /// peer=..., protocol=...)\t >>>` for a [`SocketHandler`] impl that has `self`
 /// in scope. When `$self.session_ulid()` returns `None` (e.g. the raw
 /// [`TcpStream`] impl that carries no session context) the ULID slot is
 /// rendered as `-` so the column layout stays stable across sessionless
-/// plumbing. Colour scheme matches the rest of the mux log-context macros:
-/// `SOCKET` bold bright-white, `Session` light grey, keys gray, values
-/// bright white.
+/// plumbing. The `[ulid - - -]` context comes first to stay aligned with
+/// `MUX-*`, `PIPE` and `RUSTLS` log lines. Colour scheme matches the rest of
+/// the mux log-context macros: `SOCKET` bold bright-white, `Session` light
+/// grey, keys gray, values bright white.
 macro_rules! log_socket_context {
     ($self:expr) => {{
         let colored = is_logger_colored();
@@ -96,7 +97,7 @@ macro_rules! log_socket_context {
             None => "-".to_string(),
         };
         format!(
-            "{open}SOCKET{reset}\t[{ulid} - - -]\t{grey}Session{reset}({gray}peer{reset}={white}{peer:?}{reset}, {gray}rtt{reset}={white}{rtt:?}{reset}, {gray}protocol{reset}={white}{protocol:?}{reset})\t >>>",
+            "[{ulid} - - -]\t{open}SOCKET{reset}\t{grey}Session{reset}({gray}peer{reset}={white}{peer:?}{reset}, {gray}rtt{reset}={white}{rtt:?}{reset}, {gray}protocol{reset}={white}{protocol:?}{reset})\t >>>",
             open = open,
             reset = reset,
             grey = grey,
@@ -129,7 +130,7 @@ fn log_socket_module_prefix(session_ulid: Option<Ulid>) -> String {
         Some(ulid) => ulid.to_string(),
         None => "-".to_string(),
     };
-    format!("{open}SOCKET{reset}\t{gray}[{ulid} - - -]{reset}\t >>>")
+    format!("{gray}[{ulid} - - -]{reset}\t{open}SOCKET{reset}\t >>>")
 }
 
 /// Shared read/write/vectored-write logic used by both
