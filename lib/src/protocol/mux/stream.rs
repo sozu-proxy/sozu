@@ -22,12 +22,13 @@ use crate::{
 
 /// Module-level prefix used on every log line emitted from the stream module.
 /// Streams have no direct peer reference so a single `MUX-STREAM` label is
-/// used, colored bright white/bold when the logger supports ANSI.
+/// used, colored bold bright-white (uniform across every protocol) when the
+/// logger supports ANSI.
 macro_rules! log_module_context {
     () => {{
         let colored = is_logger_colored();
         let (open, reset) = if colored {
-            ("\x1b[1;37m", "\x1b[0m")
+            ("\x1b[1;97m", "\x1b[0m")
         } else {
             ("", "")
         };

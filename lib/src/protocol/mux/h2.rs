@@ -34,7 +34,8 @@ use crate::{
 /// Protocol label + session descriptor used as a prefix on every
 /// [`ConnectionH2`] log line. Matches the RUSTLS log-context convention:
 /// `MUX-H2\tSession(...)\t >>>`. When [`is_logger_colored`] is `true` the
-/// label is wrapped in bright-yellow/bold ANSI and the session detail is dim.
+/// label is wrapped in bold bright-white ANSI (uniform across every protocol)
+/// and the session detail is rendered in light grey.
 ///
 /// Fields included in the session block (chosen to surface the most common
 /// H2 troubleshooting axes — flow stall, leaked stream, draining state,
@@ -54,11 +55,11 @@ use crate::{
 macro_rules! log_context {
     ($self:expr) => {{
         let colored = is_logger_colored();
-        let (open, reset, cyan, gray, white) = if colored {
+        let (open, reset, grey, gray, white) = if colored {
             (
-                "\x1b[1;33m",
+                "\x1b[1;97m",
                 "\x1b[0m",
-                "\x1b[36m",
+                "\x1b[37m",
                 "\x1b[90m",
                 "\x1b[97m",
             )
@@ -66,10 +67,10 @@ macro_rules! log_context {
             ("", "", "", "", "")
         };
         format!(
-            "[{ulid} - - -]\t{open}MUX-H2{reset}\t{cyan}Session{reset}({gray}peer{reset}={white}{peer:?}{reset}, {gray}position{reset}={white}{position:?}{reset}, {gray}state{reset}={white}{state:?}{reset}, {gray}streams{reset}={white}{streams}{reset}, {gray}last_peer_id{reset}={white}{last_peer_id}{reset}, {gray}window{reset}={white}{window}{reset}, {gray}draining{reset}={white}{draining}{reset}, {gray}readiness{reset}={white}{readiness}{reset})\t >>>",
+            "[{ulid} - - -]\t{open}MUX-H2{reset}\t{grey}Session{reset}({gray}peer{reset}={white}{peer:?}{reset}, {gray}position{reset}={white}{position:?}{reset}, {gray}state{reset}={white}{state:?}{reset}, {gray}streams{reset}={white}{streams}{reset}, {gray}last_peer_id{reset}={white}{last_peer_id}{reset}, {gray}window{reset}={white}{window}{reset}, {gray}draining{reset}={white}{draining}{reset}, {gray}readiness{reset}={white}{readiness}{reset})\t >>>",
             open = open,
             reset = reset,
-            cyan = cyan,
+            grey = grey,
             gray = gray,
             white = white,
             ulid = $self.session_ulid,
@@ -94,11 +95,11 @@ macro_rules! log_context {
 macro_rules! log_context_stream {
     ($self:expr, $http_context:expr) => {{
         let colored = is_logger_colored();
-        let (open, reset, cyan, gray, white) = if colored {
+        let (open, reset, grey, gray, white) = if colored {
             (
-                "\x1b[1;33m",
+                "\x1b[1;97m",
                 "\x1b[0m",
-                "\x1b[36m",
+                "\x1b[37m",
                 "\x1b[90m",
                 "\x1b[97m",
             )
@@ -106,10 +107,10 @@ macro_rules! log_context_stream {
             ("", "", "", "", "")
         };
         format!(
-            "[{ulid} {req} {cluster} {backend}]\t{open}MUX-H2{reset}\t{cyan}Session{reset}({gray}peer{reset}={white}{peer:?}{reset}, {gray}position{reset}={white}{position:?}{reset}, {gray}state{reset}={white}{state:?}{reset}, {gray}streams{reset}={white}{streams}{reset}, {gray}last_peer_id{reset}={white}{last_peer_id}{reset}, {gray}window{reset}={white}{window}{reset}, {gray}draining{reset}={white}{draining}{reset}, {gray}readiness{reset}={white}{readiness}{reset})\t >>>",
+            "[{ulid} {req} {cluster} {backend}]\t{open}MUX-H2{reset}\t{grey}Session{reset}({gray}peer{reset}={white}{peer:?}{reset}, {gray}position{reset}={white}{position:?}{reset}, {gray}state{reset}={white}{state:?}{reset}, {gray}streams{reset}={white}{streams}{reset}, {gray}last_peer_id{reset}={white}{last_peer_id}{reset}, {gray}window{reset}={white}{window}{reset}, {gray}draining{reset}={white}{draining}{reset}, {gray}readiness{reset}={white}{readiness}{reset})\t >>>",
             open = open,
             reset = reset,
-            cyan = cyan,
+            grey = grey,
             gray = gray,
             white = white,
             ulid = $self.session_ulid,
@@ -136,7 +137,7 @@ macro_rules! log_module_context {
     () => {{
         let colored = is_logger_colored();
         let (open, reset) = if colored {
-            ("\x1b[1;33m", "\x1b[0m")
+            ("\x1b[1;97m", "\x1b[0m")
         } else {
             ("", "")
         };

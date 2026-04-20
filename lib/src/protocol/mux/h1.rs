@@ -19,8 +19,8 @@ use crate::{
 
 /// Prefix applied to every [`ConnectionH1`] log line. Matches the RUSTLS
 /// log-context convention (`MUX-H1\tSession(...)\t >>>`). When the logger is
-/// in colored mode the label is bright-yellow/bold and the session detail is
-/// dim.
+/// in colored mode the label is bold bright-white (uniform across every
+/// protocol) and the session detail is rendered in light grey.
 ///
 /// Fields included in the session block (chosen to surface the most common
 /// H1 troubleshooting axes — keep-alive churn, stream pinning, buffer-pressure
@@ -35,11 +35,11 @@ use crate::{
 macro_rules! log_context {
     ($self:expr) => {{
         let colored = is_logger_colored();
-        let (open, reset, cyan, gray, white) = if colored {
+        let (open, reset, grey, gray, white) = if colored {
             (
-                "\x1b[1;33m",
+                "\x1b[1;97m",
                 "\x1b[0m",
-                "\x1b[36m",
+                "\x1b[37m",
                 "\x1b[90m",
                 "\x1b[97m",
             )
@@ -47,10 +47,10 @@ macro_rules! log_context {
             ("", "", "", "", "")
         };
         format!(
-            "[{ulid} - - -]\t{open}MUX-H1{reset}\t{cyan}Session{reset}({gray}peer{reset}={white}{peer:?}{reset}, {gray}position{reset}={white}{position:?}{reset}, {gray}stream{reset}={white}{stream:?}{reset}, {gray}requests{reset}={white}{requests}{reset}, {gray}parked{reset}={white}{parked}{reset}, {gray}close_notify{reset}={white}{close_notify}{reset}, {gray}readiness{reset}={white}{readiness}{reset})\t >>>",
+            "[{ulid} - - -]\t{open}MUX-H1{reset}\t{grey}Session{reset}({gray}peer{reset}={white}{peer:?}{reset}, {gray}position{reset}={white}{position:?}{reset}, {gray}stream{reset}={white}{stream:?}{reset}, {gray}requests{reset}={white}{requests}{reset}, {gray}parked{reset}={white}{parked}{reset}, {gray}close_notify{reset}={white}{close_notify}{reset}, {gray}readiness{reset}={white}{readiness}{reset})\t >>>",
             open = open,
             reset = reset,
-            cyan = cyan,
+            grey = grey,
             gray = gray,
             white = white,
             ulid = $self.session_ulid,
@@ -72,11 +72,11 @@ macro_rules! log_context {
 macro_rules! log_context_stream {
     ($self:expr, $http_context:expr) => {{
         let colored = is_logger_colored();
-        let (open, reset, cyan, gray, white) = if colored {
+        let (open, reset, grey, gray, white) = if colored {
             (
-                "\x1b[1;33m",
+                "\x1b[1;97m",
                 "\x1b[0m",
-                "\x1b[36m",
+                "\x1b[37m",
                 "\x1b[90m",
                 "\x1b[97m",
             )
@@ -84,10 +84,10 @@ macro_rules! log_context_stream {
             ("", "", "", "", "")
         };
         format!(
-            "[{ulid} {req} {cluster} {backend}]\t{open}MUX-H1{reset}\t{cyan}Session{reset}({gray}peer{reset}={white}{peer:?}{reset}, {gray}position{reset}={white}{position:?}{reset}, {gray}stream{reset}={white}{stream:?}{reset}, {gray}requests{reset}={white}{requests}{reset}, {gray}parked{reset}={white}{parked}{reset}, {gray}close_notify{reset}={white}{close_notify}{reset}, {gray}readiness{reset}={white}{readiness}{reset})\t >>>",
+            "[{ulid} {req} {cluster} {backend}]\t{open}MUX-H1{reset}\t{grey}Session{reset}({gray}peer{reset}={white}{peer:?}{reset}, {gray}position{reset}={white}{position:?}{reset}, {gray}stream{reset}={white}{stream:?}{reset}, {gray}requests{reset}={white}{requests}{reset}, {gray}parked{reset}={white}{parked}{reset}, {gray}close_notify{reset}={white}{close_notify}{reset}, {gray}readiness{reset}={white}{readiness}{reset})\t >>>",
             open = open,
             reset = reset,
-            cyan = cyan,
+            grey = grey,
             gray = gray,
             white = white,
             ulid = $self.session_ulid,
@@ -111,7 +111,7 @@ macro_rules! log_module_context {
     () => {{
         let colored = is_logger_colored();
         let (open, reset) = if colored {
-            ("\x1b[1;33m", "\x1b[0m")
+            ("\x1b[1;97m", "\x1b[0m")
         } else {
             ("", "")
         };

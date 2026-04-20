@@ -20,13 +20,13 @@ use crate::{
 
 /// Module-level prefix used on every log line emitted from the pkawa H2
 /// converter. Pkawa operates on raw HPACK blocks without direct session
-/// context, so a single dim `MUX-PKAWA` label is used, colored when the
-/// logger supports ANSI.
+/// context, so a single `MUX-PKAWA` label is used, colored bold bright-white
+/// (uniform across every protocol) when the logger supports ANSI.
 macro_rules! log_module_context {
     () => {{
         let colored = is_logger_colored();
         let (open, reset) = if colored {
-            ("\x1b[2;36m", "\x1b[0m")
+            ("\x1b[1;97m", "\x1b[0m")
         } else {
             ("", "")
         };

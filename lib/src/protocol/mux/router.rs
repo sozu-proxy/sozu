@@ -25,14 +25,14 @@ use crate::{
 };
 
 /// Module-level prefix used on every log line emitted from the router. The
-/// router has no direct view of a frontend session so a single dim
-/// `MUX-ROUTER` label is used, colored yellow/bold when the logger supports
-/// ANSI.
+/// router has no direct view of a frontend session so a single `MUX-ROUTER`
+/// label is used, colored bold bright-white (uniform across every protocol)
+/// when the logger supports ANSI.
 macro_rules! log_module_context {
     () => {{
         let colored = is_logger_colored();
         let (open, reset) = if colored {
-            ("\x1b[1;33m", "\x1b[0m")
+            ("\x1b[1;97m", "\x1b[0m")
         } else {
             ("", "")
         };

@@ -62,15 +62,17 @@ StateMachineBuilder! {
 }
 
 /// This macro is defined uniquely in this module to help the tracking of kawa h1
-/// issues inside Sōzu
+/// issues inside Sōzu. Colored output uses the unified log-context scheme:
+/// bold bright-white protocol label, light-grey `Session` keyword, gray keys
+/// and bright-white values.
 macro_rules! log_context {
     ($self:expr) => {{
         let colored = is_logger_colored();
-        let (open, reset, cyan, gray, white) = if colored {
+        let (open, reset, grey, gray, white) = if colored {
             (
-                "\x1b[1;33m",
+                "\x1b[1;97m",
                 "\x1b[0m",
-                "\x1b[36m",
+                "\x1b[37m",
                 "\x1b[90m",
                 "\x1b[97m",
             )
@@ -78,10 +80,10 @@ macro_rules! log_context {
             ("", "", "", "", "")
         };
         format!(
-            "{gray}{ctx}{reset}\t{open}TCP{reset}\t{cyan}Session{reset}({gray}frontend{reset}={white}{frontend}{reset}, {gray}backend{reset}={white}{backend}{reset})\t >>>",
+            "{gray}{ctx}{reset}\t{open}TCP{reset}\t{grey}Session{reset}({gray}frontend{reset}={white}{frontend}{reset}, {gray}backend{reset}={white}{backend}{reset})\t >>>",
             open = open,
             reset = reset,
-            cyan = cyan,
+            grey = grey,
             gray = gray,
             white = white,
             ctx = $self.log_context(),
