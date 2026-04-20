@@ -1558,10 +1558,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         return self.goaway(H2Error::EnhanceYourCalm);
                     }
                     // Remove the already-created stream slot before refusing,
-                    // so it does not leak against MAX_CONCURRENT_STREAMS.
-                    if let Some(_global_id) = self.streams.remove(&stream_id) {
-                        self.stream_last_activity_at.remove(&stream_id);
-                        self.prioriser.remove(&stream_id);
+                    // so it does not leak against MAX_CONCURRENT_STREAMS. Route
+                    // through `remove_dead_stream` so the expect_write/read
+                    // invariant (§LIFECYCLE.md 5.4) holds on this path too.
+                    if let Some(global_stream_id) = self.streams.get(&stream_id).copied() {
+                        self.remove_dead_stream(stream_id, global_stream_id);
                     }
                     return self.refuse_stream_and_discard(
                         stream_id,
@@ -1941,7 +1942,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     // Otherwise session close can observe a stale `Recycle`
                     // entry in self.streams and mis-handle the connection as
                     // if it still had an active H2 stream.
-                    self.remove_dead_stream(dead_id);
+                    self.remove_dead_stream(dead_id, global_stream_id);
                     if let Some(token) = token {
                         remove_backend_stream(
                             &mut context.backend_streams,
@@ -2084,7 +2085,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             // H2 maps inline. Retire the recycled stream immediately after the
             // converter borrow ends, before endpoint.end_stream() can trigger
             // teardown and observe a stale `Recycle` entry in self.streams.
-            self.remove_dead_stream(dead_id);
+            self.remove_dead_stream(dead_id, global_stream_id);
             close_frontend_after_completed_stream |= close_frontend;
             if let Some(token) = token {
                 remove_backend_stream(&mut context.backend_streams, token, global_stream_id);
@@ -2198,7 +2199,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         }
     }
 
-    fn remove_dead_stream(&mut self, stream_id: StreamId) {
+    fn remove_dead_stream(&mut self, stream_id: StreamId, global_stream_id: GlobalStreamId) {
         if self.streams.remove(&stream_id).is_none() {
             error!(
                 "{} dead stream_id {} missing from streams map",
@@ -2209,6 +2210,18 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         self.rst_sent.remove(&stream_id);
         self.stream_last_activity_at.remove(&stream_id);
         self.prioriser.remove(&stream_id);
+        // Invariant: expect_write/expect_read must not reference a gid whose
+        // context slot may be popped by shrink_trailing_recycle after eviction.
+        if matches!(self.expect_write, Some(H2StreamId::Other { gid, .. }) if gid == global_stream_id)
+        {
+            self.expect_write = None;
+        }
+        if matches!(
+            self.expect_read,
+            Some((H2StreamId::Other { gid, .. }, _)) if gid == global_stream_id
+        ) {
+            self.expect_read = None;
+        }
     }
 
     /// Drop stream-id mappings for streams that never became active before a
@@ -2242,7 +2255,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 stream.metrics.reset();
                 stream.state = StreamState::Recycle;
             }
-            self.remove_dead_stream(stream_id);
+            self.remove_dead_stream(stream_id, global_stream_id);
         }
     }
 
@@ -2860,9 +2873,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             // no longer counts against MAX_CONCURRENT_STREAMS.
             // Compute totals per-stream before remove (matches RST_STREAM handler).
             let byte_totals = self.compute_stream_byte_totals(context);
-            if let Some(global_stream_id) = self.streams.remove(&sid) {
-                self.prioriser.remove(&sid);
-                self.stream_last_activity_at.remove(&sid);
+            if let Some(global_stream_id) = self.streams.get(&sid).copied() {
                 {
                     let stream = &mut context.streams[global_stream_id];
                     self.attribute_bytes_to_stream(&mut stream.metrics);
@@ -2899,6 +2910,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         stream.state = StreamState::Recycle;
                     }
                 }
+                // Retire sid from streams/prioriser/stream_last_activity_at and
+                // invalidate expect_write/expect_read if they reference this gid.
+                self.remove_dead_stream(sid, global_stream_id);
             }
         }
         self.readiness.interest.insert(Ready::WRITABLE);
@@ -3346,7 +3360,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         endpoint,
                         H2Error::ProtocolError,
                     );
-                    self.remove_dead_stream(data.stream_id);
+                    self.remove_dead_stream(data.stream_id, global_stream_id);
                     return result;
                 }
             }
@@ -3457,7 +3471,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                                 endpoint,
                                 H2Error::ProtocolError,
                             );
-                            self.remove_dead_stream(data.stream_id);
+                            self.remove_dead_stream(data.stream_id, global_stream_id);
                             return result;
                         }
                     }
@@ -3537,7 +3551,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         if let Some(priority) = &headers.priority {
             if self.prioriser.push_priority(stream_id, priority.clone()) {
                 self.reset_stream(global_stream_id, context, endpoint, H2Error::ProtocolError);
-                self.remove_dead_stream(stream_id);
+                self.remove_dead_stream(stream_id, global_stream_id);
                 return MuxResult::Continue;
             }
         }
@@ -3573,7 +3587,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 return self.goaway(error);
             } else {
                 let result = self.reset_stream(global_stream_id, context, endpoint, error);
-                self.remove_dead_stream(stream_id);
+                self.remove_dead_stream(stream_id, global_stream_id);
                 return result;
             }
         }
@@ -3597,7 +3611,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                             endpoint,
                             H2Error::ProtocolError,
                         );
-                        self.remove_dead_stream(stream_id);
+                        self.remove_dead_stream(stream_id, global_stream_id);
                         return result;
                     }
                 }
@@ -3671,7 +3685,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             if let Some(global_stream_id) = self.streams.get(&priority.stream_id).copied() {
                 let result =
                     self.reset_stream(global_stream_id, context, endpoint, H2Error::ProtocolError);
-                self.remove_dead_stream(priority.stream_id);
+                self.remove_dead_stream(priority.stream_id, global_stream_id);
                 return result;
             } else {
                 error!(
@@ -3736,15 +3750,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // Compute totals before removing the stream from the map,
         // so the removed stream's bytes are included in the total.
         let rst_byte_totals = self.compute_stream_byte_totals(context);
-        if let Some(stream_id) = self.streams.remove(&rst_stream.stream_id) {
-            self.prioriser.remove(&rst_stream.stream_id);
-            self.stream_last_activity_at.remove(&rst_stream.stream_id);
-            let stream = &mut context.streams[stream_id];
+        if let Some(global_stream_id) = self.streams.get(&rst_stream.stream_id).copied() {
+            let stream = &mut context.streams[global_stream_id];
             self.attribute_bytes_to_stream(&mut stream.metrics);
             if let StreamState::Linked(token) = stream.state {
-                endpoint.end_stream(token, stream_id, context);
+                endpoint.end_stream(token, global_stream_id, context);
             }
-            let stream = &mut context.streams[stream_id];
+            let stream = &mut context.streams[global_stream_id];
             match &self.position {
                 // Inbound RST_STREAM on the backend side terminates the in-flight
                 // request without going through Connection::end_stream (the normal
@@ -3770,6 +3782,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     stream.state = StreamState::Recycle;
                 }
             }
+            // Retire from streams/prioriser/stream_last_activity_at and
+            // invalidate expect_write/expect_read if they reference this gid.
+            self.remove_dead_stream(rst_stream.stream_id, global_stream_id);
         } else {
             self.attribute_bytes_to_overhead();
         }
@@ -4001,9 +4016,6 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 stream.state = StreamState::Link;
                 context.pending_links.push_back(*global_stream_id);
             }
-            self.streams.remove(stream_id);
-            self.prioriser.remove(stream_id);
-            self.stream_last_activity_at.remove(stream_id);
             // Both retry (!consumed) and terminated (consumed) paths remove the
             // stream from self.streams without going through Connection::end_stream,
             // so decrement Backend.active_requests here to keep load metrics honest.
@@ -4011,6 +4023,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 let mut backend_borrow = backend.borrow_mut();
                 backend_borrow.active_requests = backend_borrow.active_requests.saturating_sub(1);
             }
+            // Retire from streams/prioriser/stream_last_activity_at and
+            // invalidate expect_write/expect_read if they reference this gid.
+            self.remove_dead_stream(*stream_id, *global_stream_id);
         }
 
         // If no active streams remain, close immediately
@@ -4059,7 +4074,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         endpoint,
                         H2Error::ProtocolError,
                     );
-                    self.remove_dead_stream(stream_id);
+                    self.remove_dead_stream(stream_id, global_stream_id);
                     return result;
                 }
                 // Stream not in map (already closed) — treat as glitch
@@ -4117,7 +4132,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     endpoint,
                     H2Error::FlowControlError,
                 );
-                self.remove_dead_stream(stream_id);
+                self.remove_dead_stream(stream_id, global_stream_id);
                 return result;
             }
         } else {
@@ -4378,41 +4393,46 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         );
         match self.position {
             Position::Client(..) => {
-                for (stream_id, global_stream_id) in &self.streams {
-                    if *global_stream_id == stream_gid {
-                        let id = *stream_id;
-                        // Only send RST_STREAM if the stream hasn't fully completed.
-                        // If both request and response are terminated, the stream is
-                        // already in "closed" state (RFC 9113 §5.1) — sending RST_STREAM
-                        // on a closed stream would be a protocol error that could cause
-                        // the H2 peer to close the entire connection.
-                        let stream = &context.streams[stream_gid];
-                        let fully_completed =
-                            stream.back_received_end_of_stream && stream.front.is_terminated();
-                        if !fully_completed && !self.rst_sent.contains(&id) {
-                            let kawa = &mut self.zero;
-                            let mut frame = [0; 13];
-                            if let Ok((_, _size)) =
-                                serializer::gen_rst_stream(&mut frame, id, H2Error::Cancel)
-                            {
-                                let buf = kawa.storage.space();
-                                if buf.len() >= frame.len() {
-                                    buf[..frame.len()].copy_from_slice(&frame);
-                                    kawa.storage.fill(frame.len());
-                                    self.readiness.interest.insert(Ready::WRITABLE);
-                                    self.readiness.signal_pending_write();
-                                    self.rst_sent.insert(id);
-                                }
+                // Resolve the wire StreamId for this gid up front so the
+                // subsequent cleanup does not hold an iterator borrow on
+                // `self.streams` while also mutating it.
+                let wire_stream_id = self
+                    .streams
+                    .iter()
+                    .find_map(|(&sid, &gid)| (gid == stream_gid).then_some(sid));
+                if let Some(id) = wire_stream_id {
+                    // Only send RST_STREAM if the stream hasn't fully completed.
+                    // If both request and response are terminated, the stream is
+                    // already in "closed" state (RFC 9113 §5.1) — sending RST_STREAM
+                    // on a closed stream would be a protocol error that could cause
+                    // the H2 peer to close the entire connection.
+                    let stream = &context.streams[stream_gid];
+                    let fully_completed =
+                        stream.back_received_end_of_stream && stream.front.is_terminated();
+                    if !fully_completed && !self.rst_sent.contains(&id) {
+                        let kawa = &mut self.zero;
+                        let mut frame = [0; 13];
+                        if let Ok((_, _size)) =
+                            serializer::gen_rst_stream(&mut frame, id, H2Error::Cancel)
+                        {
+                            let buf = kawa.storage.space();
+                            if buf.len() >= frame.len() {
+                                buf[..frame.len()].copy_from_slice(&frame);
+                                kawa.storage.fill(frame.len());
+                                self.readiness.interest.insert(Ready::WRITABLE);
+                                self.readiness.signal_pending_write();
+                                self.rst_sent.insert(id);
                             }
                         }
-                        self.streams.remove(&id);
-                        self.prioriser.remove(&id);
-                        self.stream_last_activity_at.remove(&id);
-                        if context.streams[stream_gid].state != StreamState::Recycle {
-                            context.streams[stream_gid].state = StreamState::Unlinked;
-                        }
-                        return;
                     }
+                    // Retire the stream and invalidate expect_write/expect_read
+                    // if they still reference this gid — the slot may be popped
+                    // by `shrink_trailing_recycle` on the next create_stream.
+                    self.remove_dead_stream(id, stream_gid);
+                    if context.streams[stream_gid].state != StreamState::Recycle {
+                        context.streams[stream_gid].state = StreamState::Unlinked;
+                    }
+                    return;
                 }
                 error!(
                     "{} end_stream called for unknown global_stream_id {}",
