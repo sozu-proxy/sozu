@@ -4075,16 +4075,44 @@ impl ContinueBackend {
                 }
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                        stream
+                            .set_read_timeout(Some(Duration::from_millis(200)))
+                            .ok();
                         stream.set_write_timeout(Some(Duration::from_secs(2))).ok();
+                        // Loop-read the request headers so the `Expect:
+                        // 100-continue` detection below is reliable even if
+                        // the headers straddle multiple TCP segments.
+                        let mut request_bytes = Vec::new();
                         let mut buf = [0u8; 4096];
-                        let n = match stream.read(&mut buf) {
-                            Ok(n) => n,
-                            Err(_) => continue,
-                        };
+                        let deadline = std::time::Instant::now()
+                            + std::time::Duration::from_secs(2);
+                        loop {
+                            match stream.read(&mut buf) {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    request_bytes.extend_from_slice(&buf[..n]);
+                                    if request_bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+                                        break;
+                                    }
+                                }
+                                Err(ref e)
+                                    if e.kind() == std::io::ErrorKind::WouldBlock
+                                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                                {
+                                    if std::time::Instant::now() >= deadline {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        if request_bytes.is_empty() {
+                            continue;
+                        }
                         req_count.fetch_add(1, Ordering::Relaxed);
 
-                        let request = String::from_utf8_lossy(&buf[..n]);
+                        let request = String::from_utf8_lossy(&request_bytes);
                         if request.contains("Expect: 100-continue")
                             || request.contains("expect: 100-continue")
                         {
