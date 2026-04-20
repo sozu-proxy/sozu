@@ -1718,13 +1718,22 @@ fn try_h2_settings_flood_triggers_goaway() -> State {
     let mut tls = raw_h2_connection(front_addr);
     h2_handshake(&mut tls);
 
-    // Send 100 SETTINGS frames rapidly (each with a valid setting)
+    // Send 100 SETTINGS frames rapidly (each with a valid setting), tracking
+    // how many writes actually succeeded. Under a known CI flake class the
+    // first post-handshake write errors and the silent `break` below used
+    // to swallow the signal entirely — `writes_ok` now surfaces the split
+    // so a future flake is diagnosable at a glance.
+    let mut writes_ok: usize = 0;
     for _i in 0..100u32 {
         // SETTINGS_MAX_CONCURRENT_STREAMS = 100 (a valid, harmless setting)
         let settings = H2Frame::settings(&[(0x3, 100)]);
-        if tls.write_all(&settings.encode()).is_err() {
+        if let Err(e) = tls.write_all(&settings.encode()) {
+            println!(
+                "H2 Settings flood - write_all failed after {writes_ok} successful writes: {e}",
+            );
             break;
         }
+        writes_ok += 1;
     }
     let _ = tls.flush();
 
@@ -1740,7 +1749,22 @@ fn try_h2_settings_flood_triggers_goaway() -> State {
     if let Some(error_code) = goaway_error_code(&frames) {
         println!("H2 Settings flood - GOAWAY error_code=0x{error_code:x}");
     }
-    println!("H2 Settings flood - got ENHANCE_YOUR_CALM: {got_enhance_your_calm}");
+    println!(
+        "H2 Settings flood - wrote {writes_ok}/100 SETTINGS, got ENHANCE_YOUR_CALM: \
+         {got_enhance_your_calm}"
+    );
+
+    // Anomaly signal: if we wrote at least one SETTINGS frame but received
+    // zero response frames, this is NOT a "test couldn't even get off the
+    // ground" scenario — sozu genuinely did not respond. Flag it clearly so
+    // a future CI failure distinguishes "write never reached sozu" from
+    // "sozu accepted the frames but dropped silently".
+    if frames.is_empty() && writes_ok > 0 {
+        println!(
+            "H2 Settings flood - ANOMALY: wrote {writes_ok} SETTINGS but received 0 response \
+             frames — possible sozu bug, investigate handshake/flush path"
+        );
+    }
 
     drop(tls);
 
