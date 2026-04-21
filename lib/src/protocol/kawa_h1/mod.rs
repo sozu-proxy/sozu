@@ -1011,6 +1011,11 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             bytes_out: metrics.bout,
             user_agent: self.context.user_agent.as_deref(),
             x_request_id: self.context.x_request_id.as_deref(),
+            tls_version: self.context.tls_version,
+            tls_cipher: self.context.tls_cipher,
+            tls_sni: self.context.tls_server_name.as_deref(),
+            tls_alpn: self.context.tls_alpn,
+            xff_chain: self.context.xff_chain.as_deref(),
             #[cfg(feature = "opentelemetry")]
             otel: self.context.otel.as_ref(),
             #[cfg(not(feature = "opentelemetry"))]
