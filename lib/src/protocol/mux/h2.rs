@@ -1049,8 +1049,14 @@ pub struct ConnectionH2<Front: SocketHandler> {
     /// Derived from `connection_config.max_concurrent_streams` at construction.
     max_pending_window_updates: usize,
     /// Last `(connection_window, active_streams, pending_window_updates)` snapshot
-    /// emitted by [`Self::gauge_connection_state`]. Stays `None` until the first
-    /// emission, then suppresses redundant updates.
+    /// emitted by [`Self::gauge_connection_state`]. The snapshot represents this
+    /// connection's *contribution* to the three `h2.connection.*` aggregate
+    /// gauges; each call emits the signed delta against this snapshot via
+    /// [`gauge_add!`] so the gauge sums across connections.
+    ///
+    /// Stays `None` until the first emission. [`Drop`] applies the negative of
+    /// this snapshot so the connection's contribution is always rebalanced to
+    /// zero on teardown — independent of which close path runs.
     last_gauge_snapshot: Option<(usize, usize, usize)>,
     /// Per-stream wall-clock timestamp of last meaningful activity (DATA or
     /// HEADERS frame receipt). Used to cancel streams that make no forward
@@ -1096,6 +1102,23 @@ impl<Front: SocketHandler> std::fmt::Debug for ConnectionH2<Front> {
             .field("window", &self.flow_control.window)
             .field("total_rst_streams_queued", &self.total_rst_streams_queued)
             .finish()
+    }
+}
+
+/// Symmetric tear-down for the three `h2.connection.*` aggregate gauges:
+/// whatever positive contribution this connection made via
+/// [`ConnectionH2::gauge_connection_state`] is subtracted back out when the
+/// connection is dropped.
+///
+/// Using `Drop` (rather than wiring decrements into every close path —
+/// `graceful_goaway`, `force_disconnect`, `handle_goaway_frame`, `Mux::close`,
+/// stream-id exhaustion, panic-unwind) is what guarantees the gauge is
+/// arithmetically symmetric regardless of which path teardown took. Past
+/// underflow incidents (commits a650ad69, d2f01ed4) have all been
+/// missing-decrement bugs that `Drop` makes structurally impossible.
+impl<Front: SocketHandler> Drop for ConnectionH2<Front> {
+    fn drop(&mut self) {
+        self.release_connection_gauges();
     }
 }
 
@@ -1857,10 +1880,28 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         MuxResult::Continue
     }
 
-    /// Emit the H2 connection-level gauges, but only when the snapshot
-    /// actually changed since the last call. Called from the write hot path,
-    /// so suppressing redundant updates avoids a syscall storm under
-    /// steady-state traffic.
+    /// Update the H2 connection-level *aggregate* gauges with this connection's
+    /// current contribution, expressed as a signed delta against the last
+    /// snapshot we emitted.
+    ///
+    /// The three metrics are emitted via [`gauge_add!`] (lifecycle deltas) so
+    /// that the dashboard sees the **sum across all live H2 connections**:
+    ///
+    /// - `h2.connection.window_bytes` — sum of available connection-level
+    ///   send-window bytes. Negative per-connection windows clamp to 0 so the
+    ///   aggregate represents only available capacity, not deficit.
+    /// - `h2.connection.active_streams` — sum of in-flight streams across
+    ///   every H2 connection.
+    /// - `h2.connection.pending_window_updates` — sum of queued (un-flushed)
+    ///   per-stream WINDOW_UPDATE entries across every H2 connection.
+    ///
+    /// Called from the write hot path; emits nothing when the snapshot is
+    /// unchanged so the steady state stays cheap. The paired decrement for
+    /// every increment is provided by [`Drop`], which subtracts the final
+    /// snapshot when the connection is dropped — keeping the aggregate
+    /// arithmetically symmetric independent of which close path runs
+    /// (`graceful_goaway`, `force_disconnect`, `handle_goaway_frame`,
+    /// `Mux::close`, panic-unwind, …).
     fn gauge_connection_state(&mut self) {
         let snapshot = (
             self.flow_control.window.max(0) as usize,
@@ -1870,10 +1911,42 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         if self.last_gauge_snapshot == Some(snapshot) {
             return;
         }
-        gauge!("h2.connection_window", snapshot.0);
-        gauge!("h2.active_streams", snapshot.1);
-        gauge!("h2.pending_window_updates", snapshot.2);
+        let prev = self.last_gauge_snapshot.unwrap_or((0, 0, 0));
+        // Diff in i64 — usize cannot represent the negative side of the delta.
+        let dw = snapshot.0 as i64 - prev.0 as i64;
+        let ds = snapshot.1 as i64 - prev.1 as i64;
+        let du = snapshot.2 as i64 - prev.2 as i64;
+        if dw != 0 {
+            gauge_add!("h2.connection.window_bytes", dw);
+        }
+        if ds != 0 {
+            gauge_add!("h2.connection.active_streams", ds);
+        }
+        if du != 0 {
+            gauge_add!("h2.connection.pending_window_updates", du);
+        }
         self.last_gauge_snapshot = Some(snapshot);
+    }
+
+    /// Subtract this connection's contribution from the three aggregate
+    /// `h2.connection.*` gauges. Idempotent: clears `last_gauge_snapshot` so a
+    /// second call (or a [`Drop`] on top of an explicit reset) is a no-op.
+    ///
+    /// Pairs with every prior call to [`Self::gauge_connection_state`]; called
+    /// from [`Drop`] so the symmetry is guaranteed regardless of the close
+    /// path.
+    fn release_connection_gauges(&mut self) {
+        if let Some((w, s, u)) = self.last_gauge_snapshot.take() {
+            if w != 0 {
+                gauge_add!("h2.connection.window_bytes", -(w as i64));
+            }
+            if s != 0 {
+                gauge_add!("h2.connection.active_streams", -(s as i64));
+            }
+            if u != 0 {
+                gauge_add!("h2.connection.pending_window_updates", -(u as i64));
+            }
+        }
     }
 
     /// Write application data (request/response bodies, headers) across all
