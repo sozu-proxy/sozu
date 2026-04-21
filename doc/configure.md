@@ -771,6 +771,36 @@ Codes the wire delivers but RFC 9113 does not define are bucketed under
 | `h2.rst_stream.received.<code>` | counter | proxy | RST_STREAM received from peer. Same code suffixes plus `unknown_error`. |
 | `h2.rst_stream.received.pre_response_start` | counter | proxy | Subset of `h2.rst_stream.received.*` where the RST arrived before the backend started answering. The canonical Rapid Reset signature (CVE-2023-44487). Emitted alongside the per-code counter, not instead of, so a Rapid Reset attack surfaces both as a `cancel` rate spike and as the pre-response signal. |
 
+#### HTTP/2 header validation (HPACK rejections)
+
+Counters emitted whenever the HPACK decoder in the H2→H1 converter
+rejects a header. `h2.headers.rejected.total` is bumped on every reject;
+a per-reason counter is bumped alongside so `total == sum(per_reason)`.
+Rejection is silent on the wire (the mux either RSTs the stream or
+treats the request as malformed) — this counter family is the only
+externally visible signal for request-smuggling probes, HPACK fuzzing,
+and H2-specific protocol abuse.
+
+| Metric | Type | Scope | Description |
+|---|---|---|---|
+| `h2.headers.rejected.total` | counter | proxy | Aggregate count of all HPACK rejections |
+| `h2.headers.rejected.invalid_name_byte` | counter | proxy | Header name with uppercase / CTL / separator / space byte (CWE-93) |
+| `h2.headers.rejected.connection_specific_header` | counter | proxy | `connection`, `proxy-connection`, `transfer-encoding`, `upgrade`, `keep-alive` (RFC 9113 §8.2.2) |
+| `h2.headers.rejected.te_not_trailers` | counter | proxy | `te` with value other than `trailers` (RFC 9113 §8.2.2) |
+| `h2.headers.rejected.crlf_in_value` | counter | proxy | CR or LF in a header value — request-smuggling vector (CWE-444) |
+| `h2.headers.rejected.nul_in_value` | counter | proxy | NUL byte in a header value |
+| `h2.headers.rejected.oversized_pseudo_value` | counter | proxy | Pseudo-header value exceeded storage cap |
+| `h2.headers.rejected.cl_te_conflict` | counter | proxy | Content-Length declared alongside a Transfer-Encoding — classic smuggling vector |
+| `h2.headers.rejected.duplicate_cl` | counter | proxy | Multiple disagreeing Content-Length values (RFC 9110 §8.6) |
+| `h2.headers.rejected.duplicate_pseudo` | counter | proxy | Same pseudo-header appeared twice |
+| `h2.headers.rejected.pseudo_after_regular` | counter | proxy | Pseudo-header appeared after a regular header (RFC 9113 §8.3) |
+| `h2.headers.rejected.unknown_pseudo` | counter | proxy | Unknown `:` -prefixed pseudo-header |
+| `h2.headers.rejected.empty_pseudo` | counter | proxy | Pseudo-header value was empty (RFC 9113 §8.3.1) |
+| `h2.headers.rejected.invalid_method` | counter | proxy | `:method` value was not a valid RFC 9110 §9 token |
+| `h2.headers.rejected.invalid_scheme` | counter | proxy | `:scheme` was not `http` or `https` |
+| `h2.headers.rejected.invalid_path` | counter | proxy | `:path` contained a `#` fragment (not allowed on the wire) |
+| `h2.headers.rejected.invalid_status` | counter | proxy | Response `:status` was not three ASCII digits |
+
 #### HTTP/2 flood mitigations
 
 Incremented once per connection at the moment the H2 flood detector trips its
