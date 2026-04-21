@@ -218,6 +218,12 @@ impl Router {
         );
 
         if let Some(token) = reuse_token {
+            // Pool reuse: an existing backend connection (H2 multiplex slot or
+            // H1 keep-alive socket) is being reattached to this stream. Pair
+            // with `backend.pool.miss` below — together they describe the
+            // pool's hit/miss ratio. Counted before any commit so the metric
+            // is consistent with the trace log.
+            incr!("backend.pool.hit");
             trace!(
                 "{} reused backend: {:#?}",
                 log_module_context!(stream_context),
@@ -263,6 +269,17 @@ impl Router {
         }
 
         // New-backend path: fall through.
+        //
+        // Pool miss: no reusable connection was found (no live H2 multiplex
+        // slot for this cluster, no H1 keep-alive socket). A fresh TCP dial
+        // and full backend handshake will follow. Pair with `backend.pool.hit`
+        // above. The metric is incremented BEFORE `backend_from_request` so
+        // the count includes attempts that fail at backend selection
+        // (BackendError::NoBackendForCluster, etc.) — every miss is a slot
+        // we did not save. The dial itself may still fail
+        // (BackendConnectionError::*), in which case `backend.pool.size` is
+        // never bumped (see the gauge below) but the miss is already counted.
+        incr!("backend.pool.miss");
         let token = {
             //
             // SECURITY (CWE-400): defer every stateful side-effect
@@ -358,6 +375,13 @@ impl Router {
             stream.metrics.backend_start();
             stream.metrics.backend_id = stream.context.backend_id.to_owned();
             gauge_add!("backend.connections", 1);
+            // `backend.pool.size` mirrors `backend.connections` exactly: one
+            // entry per `Router::backends` token. The `-1` partner lives in
+            // `connection.rs::pre_close_client_bookkeeping` (graceful close)
+            // and `mod.rs::close_backend` (session teardown). Symmetric
+            // pairing with both decrement sites is the only defence against
+            // the gauge underflow class of bug fixed by a650ad69 / d2f01ed4.
+            gauge_add!("backend.pool.size", 1);
             gauge_add!(
                 "connections_per_backend",
                 1,

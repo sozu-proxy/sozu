@@ -1983,6 +1983,12 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             scheme,
             lowercase_buf: std::mem::take(&mut self.lowercase_buf),
             cookie_buf: std::mem::take(&mut self.cookie_buf),
+            // When this connection is a backend client we are writing
+            // toward the upstream backend — flow-control stalls in that
+            // direction are scoped to `backend.flow_control.paused` (in
+            // addition to the existing direction-agnostic
+            // `h2.flow_control_stall`).
+            position_is_client: self.position.is_client(),
         };
         self.priorities_buf.clear();
         self.priorities_buf.extend(self.streams.keys().copied());

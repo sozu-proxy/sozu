@@ -655,6 +655,27 @@ Incremented when Sōzu generates a default error response instead of proxying:
 | `backend.down` | counter | proxy | Backend marked as unhealthy (retry policy triggered) |
 | `backend.connections.error` | counter | proxy | Backend connection failures |
 
+#### Backend pool
+
+H2 mux reuses backend connections via `Router::backends: HashMap<Token, Connection>`
+(`lib/src/protocol/mux/router.rs`). There is no separate pool abstraction: the map
+is the pool. Reuse picks an existing non-draining H2 multiplex slot (below
+`SETTINGS_MAX_CONCURRENT_STREAMS`) or an H1 keep-alive socket; misses dial a fresh
+backend socket.
+
+| Metric | Type | Scope | Description |
+|--------|------|-------|-------------|
+| `backend.pool.hit` | counter | proxy | Request attached to an existing backend connection (H2 multiplex slot or H1 keep-alive). |
+| `backend.pool.miss` | counter | proxy | No reusable connection found; a fresh dial starts. Incremented before `backend_from_request`, so failed selections still count. Dial may still fail — in that case `backend.pool.size` is not bumped. |
+| `backend.pool.size` | gauge | proxy | Live mux router entries. `+1` at `router.rs::connect` new-dial commit; `-1` at `connection.rs::pre_close_client_bookkeeping` and `mod.rs::close_backend`. Mirrors the `backend.connections` site set in mux exactly, so gauge symmetry follows from `backend.connections` correctness. Non-mux H1/TCP paths are NOT counted here. |
+| `backend.flow_control.paused` | counter | proxy | Direction-scoped counterpart of `h2.flow_control_stall`: emitted only when the converter stalls while writing toward an upstream backend (`Position::Client`) because the backend's HTTP/2 receive window is empty. |
+
+Intentionally **not** emitted in this slice (no corresponding lifecycle exists):
+
+* `backend.pool.idle_closed` — mux has no connection-level idle eviction. The H2 `stream_idle_timeout` cancels individual streams (slow-multiplex guard), not pool entries.
+* `backend.pool.overflow` — `Router::backends` is unbounded. The only new-connection refusal is HTTP/2 buffer-pool exhaustion (`MaxBuffers`), unrelated to pool sizing.
+* `backend.flow_control.resumed` — the converter has no "resumed" boundary; the next writable cycle just succeeds when the backend ACKs window updates. Plumbing an explicit marker through `flush_stream_out` was deferred.
+
 #### Backend metrics (per cluster/backend)
 
 These metrics are recorded with `cluster_id` and `backend_id` labels via the
