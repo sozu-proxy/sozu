@@ -186,9 +186,34 @@ fn tcp_socket_read(
             Ok(sz) => size += sz,
             Err(e) => match e.kind() {
                 ErrorKind::WouldBlock => return (size, SocketResult::WouldBlock),
+                // Treat `ConnectionRefused` as a closed socket, mirroring the
+                // write path. On Linux a failed asynchronous `connect()`
+                // surfaces as `ECONNREFUSED` on the first read; it is
+                // operationally identical to any other benign peer-initiated
+                // close and does not warrant a log line on every backend
+                // that happens to be down.
                 ErrorKind::ConnectionReset
                 | ErrorKind::ConnectionAborted
-                | ErrorKind::BrokenPipe => return (size, SocketResult::Closed),
+                | ErrorKind::BrokenPipe
+                | ErrorKind::ConnectionRefused => return (size, SocketResult::Closed),
+                // Noisy-expected transport failures: backend unreachable,
+                // TCP_USER_TIMEOUT expiry, post-close reads. Keep a log line
+                // so operators can still trend the rate, but `warn!` — this
+                // is reality-at-scale, not a sozu invariant break.
+                ErrorKind::HostUnreachable
+                | ErrorKind::NetworkUnreachable
+                | ErrorKind::TimedOut
+                | ErrorKind::NotConnected => {
+                    warn!(
+                        "{} socket_read error={:?}",
+                        log_socket_module_prefix(stream, session_ulid),
+                        e
+                    );
+                    return (size, SocketResult::Error);
+                }
+                // Genuinely loud variants (`PermissionDenied`, `AddrNotAvailable`,
+                // `InvalidInput`/`Data`, …) and the unknown catch-all stay at
+                // `error!` so operators keep paging on real misconfig.
                 _ => {
                     error!(
                         "{} socket_read error={:?}",
@@ -234,6 +259,22 @@ fn tcp_socket_write(
                     incr!("tcp.write.error");
                     return (size, SocketResult::Closed);
                 }
+                // Noisy-expected transport failures (see `tcp_socket_read`
+                // for rationale). Log at `warn!` and still bump the
+                // `tcp.write.error` counter so rate-based dashboards stay
+                // accurate.
+                ErrorKind::HostUnreachable
+                | ErrorKind::NetworkUnreachable
+                | ErrorKind::TimedOut
+                | ErrorKind::NotConnected => {
+                    warn!(
+                        "{} socket_write error={:?}",
+                        log_socket_module_prefix(stream, session_ulid),
+                        e
+                    );
+                    incr!("tcp.write.error");
+                    return (size, SocketResult::Error);
+                }
                 _ => {
                     //FIXME: timeout and other common errors should be sent up
                     error!(
@@ -264,6 +305,20 @@ fn tcp_socket_write_vectored(
             | ErrorKind::ConnectionRefused => {
                 incr!("tcp.write.error");
                 (0, SocketResult::Closed)
+            }
+            // Noisy-expected transport failures (see `tcp_socket_read` for
+            // rationale). Same tiering as the scalar write path.
+            ErrorKind::HostUnreachable
+            | ErrorKind::NetworkUnreachable
+            | ErrorKind::TimedOut
+            | ErrorKind::NotConnected => {
+                warn!(
+                    "{} socket_write error={:?}",
+                    log_socket_module_prefix(stream, session_ulid),
+                    e
+                );
+                incr!("tcp.write.error");
+                (0, SocketResult::Error)
             }
             _ => {
                 //FIXME: timeout and other common errors should be sent up
