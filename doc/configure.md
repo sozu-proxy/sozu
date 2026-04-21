@@ -546,6 +546,21 @@ from metric names below.
 | `accept_queue.backpressure` | gauge | proxy | `1` when max connections reached, `0` when accepting again |
 | `accept_queue.wait_time` | time | proxy | How long a socket waited in the accept queue (ms) |
 | `accept_queue.timeout` | counter | proxy | Sockets that timed out in the accept queue and were closed |
+| `accept_queue.saturated_seconds` | counter | proxy | Incremented at 1 Hz while `SessionManager::can_accept` is `false`. Distinguishes "queue spent N seconds at max" from "queue briefly hit max" — the binary `accept_queue.backpressure` gauge collapses that duration |
+| `listener.accepted.total` | counter | proxy | Sockets accepted by the worker, all listeners combined |
+| `listener.accepted.tcp` | counter | proxy | Sockets accepted on TCP listeners |
+| `listener.accepted.http` | counter | proxy | Sockets accepted on HTTP listeners |
+| `listener.accepted.https` | counter | proxy | Sockets accepted on HTTPS listeners |
+| `listener.connection_capped` | counter | proxy | Sockets refused by `create_sessions` because `SessionManager::check_limits` returned `false` (max connections reached or slab at capacity) |
+| `client.connect.per_source.bucket_000` … `bucket_255` | counter | proxy | Per-accept counter bucketed by masked source subnet. Source IPs are masked to /24 (IPv4) or /48 (IPv6) and hashed (`DefaultHasher`) into 256 fixed buckets. The bucket noise is intentional: `incr!` requires `&'static str` keys, and a per-IP counter would be unbounded under SYN flood (OWASP A05, NIST SP 800-92). Operators wanting per-IP attribution should pair these counters with structured access logs or a downstream rate-limiter |
+
+The accept-loop telemetry above does **not** label by listener address.
+`incr!` requires `&'static str` keys, and listener addresses can be added or
+removed at runtime via the control plane — labelling by address would either
+require runtime `Box::leak` of unbounded strings or a fixed bucket cap. We
+chose the per-protocol breakdown (3 keys + aggregate) instead. Operators
+needing per-listener-address attribution should run distinct workers per
+listener or correlate via access logs.
 
 #### Event loop
 
