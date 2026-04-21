@@ -4368,7 +4368,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         L: ListenerHandler + L7ListenerHandler,
     {
         context.unlink_stream(stream_gid);
-        let stream_context = &mut context.streams[stream_gid].context;
+        let stream_context = context.http_context(stream_gid);
         trace!(
             "{} end H2 stream {}: {:#?}",
             log_context!(self),
