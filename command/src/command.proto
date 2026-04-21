@@ -664,6 +664,26 @@ enum EventKind {
     BACKEND_UP = 1;
     NO_AVAILABLE_BACKENDS = 2;
     REMOVED_BACKEND_HAS_NO_CONNECTIONS = 3;
+    // Control-plane mutation events (audit trail).
+    // Emitted by the main process to clients subscribed via SubscribeEvents.
+    // The Event.cluster_id / backend_id / address fields are populated when
+    // they are meaningful for the verb (e.g. address for listener verbs,
+    // cluster_id for cluster/frontend verbs). Backend events keep their
+    // historical numeric tags 0..3.
+    CLUSTER_ADDED = 4;
+    CLUSTER_REMOVED = 5;
+    FRONTEND_ADDED = 6;
+    FRONTEND_REMOVED = 7;
+    CERTIFICATE_ADDED = 8;
+    CERTIFICATE_REMOVED = 9;
+    CERTIFICATE_REPLACED = 10;
+    LISTENER_ACTIVATED = 11;
+    LISTENER_DEACTIVATED = 12;
+    CONFIGURATION_RELOADED = 13;
+    WORKER_KILLED = 14;
+    WORKER_RELAUNCHED = 15;
+    LOGGING_LEVEL_CHANGED = 16;
+    METRICS_CONFIGURED = 17;
 }
 
 message ClusterHashes {
