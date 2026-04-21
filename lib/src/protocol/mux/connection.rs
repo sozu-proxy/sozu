@@ -19,7 +19,7 @@ use std::{
 
 use mio::{Token, net::TcpStream};
 use rusty_ulid::Ulid;
-use sozu_command::{logging::is_logger_colored, ready::Ready};
+use sozu_command::{logging::ansi_palette, ready::Ready};
 
 use super::{
     BackendStatus, ConnectionH1, ConnectionH2, Context, Endpoint, GlobalStreamId, MuxResult,
@@ -39,12 +39,7 @@ use crate::{
 /// [`Connection`].
 macro_rules! log_module_context {
     () => {{
-        let colored = is_logger_colored();
-        let (open, reset) = if colored {
-            ("\x1b[1;97m", "\x1b[0m")
-        } else {
-            ("", "")
-        };
+        let (open, reset, _, _, _) = ansi_palette();
         format!("{open}MUX-CONN{reset}\t >>>", open = open, reset = reset)
     }};
 }

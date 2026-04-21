@@ -4,7 +4,7 @@ use mio::{Token, net::TcpStream};
 use rusty_ulid::Ulid;
 use sozu_command::{
     config::MAX_LOOP_ITERATIONS,
-    logging::{EndpointRecord, LogContext, is_logger_colored},
+    logging::{EndpointRecord, LogContext, ansi_palette},
 };
 
 use crate::{
@@ -25,18 +25,7 @@ use crate::{
 /// `SOCKET` log lines.
 macro_rules! log_context {
     ($self:expr) => {{
-        let colored = is_logger_colored();
-        let (open, reset, grey, gray, white) = if colored {
-            (
-                "\x1b[1;97m",
-                "\x1b[0m",
-                "\x1b[37m",
-                "\x1b[90m",
-                "\x1b[97m",
-            )
-        } else {
-            ("", "", "", "", "")
-        };
+        let (open, reset, grey, gray, white) = ansi_palette();
         format!(
             "{gray}{ctx}{reset}\t{open}PIPE{reset}\t{grey}Session{reset}({gray}address{reset}={white}{address}{reset}, {gray}frontend{reset}={white}{frontend}{reset}, {gray}frontend_readiness{reset}={white}{frontend_readiness}{reset}, {gray}frontend_status{reset}={white}{frontend_status:?}{reset}, {gray}backend{reset}={white}{backend}{reset}, {gray}backend_status{reset}={white}{backend_status:?}{reset}, {gray}backend_readiness{reset}={white}{backend_readiness}{reset})\t >>>",
             open = open,
