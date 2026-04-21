@@ -343,6 +343,22 @@ pub struct Context<L: ListenerHandler + L7ListenerHandler> {
     /// at `Context::new` so routing decisions on each stream avoid a
     /// per-stream `listener.borrow()`.
     pub strict_sni_binding: bool,
+    /// Negotiated TLS protocol version short-form (e.g. `"TLSv1.3"`).
+    /// Captured once at handshake completion in `https.rs` and propagated
+    /// to every per-stream [`HttpContext`] so the access log can record it
+    /// without reaching back into the rustls session per request. `None`
+    /// for plaintext listeners.
+    pub tls_version: Option<&'static str>,
+    /// Negotiated TLS cipher suite short-form (e.g.
+    /// `"TLS_AES_128_GCM_SHA256"`). Captured once at handshake completion
+    /// and propagated to every per-stream [`HttpContext`]. `None` for
+    /// plaintext listeners.
+    pub tls_cipher: Option<&'static str>,
+    /// Negotiated ALPN protocol short-form (e.g. `"h2"`, `"http/1.1"`).
+    /// Captured once at handshake completion and propagated to every
+    /// per-stream [`HttpContext`]. `None` for plaintext listeners or when
+    /// no ALPN was negotiated.
+    pub tls_alpn: Option<&'static str>,
 }
 
 impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
@@ -371,6 +387,9 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
             h2_stream_shrink_ratio,
             tls_server_name: None,
             strict_sni_binding,
+            tls_version: None,
+            tls_cipher: None,
+            tls_alpn: None,
         }
     }
 
@@ -440,6 +459,14 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
             // HttpContext so the routing layer can honor operator opt-outs
             // without reaching back into the listener on every request.
             http_context.strict_sni_binding = self.strict_sni_binding;
+            // Propagate the connection-scoped TLS metadata onto every
+            // per-stream HttpContext so the access log can record it without
+            // touching the rustls session on every request. These are
+            // `&'static str` borrows from the rustls label tables — copy is
+            // a pointer move.
+            http_context.tls_version = self.tls_version;
+            http_context.tls_cipher = self.tls_cipher;
+            http_context.tls_alpn = self.tls_alpn;
             http_context
         };
         let recycle_slot = self
