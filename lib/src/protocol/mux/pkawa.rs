@@ -229,29 +229,37 @@ pub(super) enum RejectReason {
     EmptyPseudo,
 }
 
-impl RejectReason {
-    /// Stable, lowercase, snake-case label embedded into the metric key.
-    /// MUST stay in sync with the table in `doc/configure.md`.
-    pub(super) fn as_label(self) -> &'static str {
-        match self {
-            RejectReason::InvalidNameByte => "invalid_name_byte",
-            RejectReason::ConnectionSpecificHeader => "connection_specific_header",
-            RejectReason::TeNotTrailers => "te_not_trailers",
-            RejectReason::CrlfInValue => "crlf_in_value",
-            RejectReason::NulInValue => "nul_in_value",
-            RejectReason::OversizedPseudoValue => "oversized_pseudo_value",
-            RejectReason::InvalidMethod => "invalid_method",
-            RejectReason::InvalidScheme => "invalid_scheme",
-            RejectReason::InvalidPath => "invalid_path",
-            RejectReason::InvalidStatus => "invalid_status",
-            RejectReason::ClTeConflict => "cl_te_conflict",
-            RejectReason::DuplicateCl => "duplicate_cl",
-            RejectReason::DuplicatePseudo => "duplicate_pseudo",
-            RejectReason::PseudoAfterRegular => "pseudo_after_regular",
-            RejectReason::UnknownPseudo => "unknown_pseudo",
-            RejectReason::EmptyPseudo => "empty_pseudo",
+/// Compile-time mapping from `(prefix, RejectReason)` to a static metric key.
+///
+/// Same `concat!`-based pattern as `h2_error_metric_key!` in `mux/h2.rs`:
+/// the literal is materialised at compile time so the statsd drain can store
+/// it as `&'static str` without a per-rejection allocation. Adding a new
+/// `RejectReason` variant fails the build inside this match — the metric
+/// breakdown stays in lock-step with the bounded enum (and with
+/// `doc/configure.md`'s HTTP/2 header validation table).
+macro_rules! reject_metric_key {
+    ($prefix:literal, $reason:expr) => {
+        match $reason {
+            RejectReason::InvalidNameByte => concat!($prefix, ".invalid_name_byte"),
+            RejectReason::ConnectionSpecificHeader => {
+                concat!($prefix, ".connection_specific_header")
+            }
+            RejectReason::TeNotTrailers => concat!($prefix, ".te_not_trailers"),
+            RejectReason::CrlfInValue => concat!($prefix, ".crlf_in_value"),
+            RejectReason::NulInValue => concat!($prefix, ".nul_in_value"),
+            RejectReason::OversizedPseudoValue => concat!($prefix, ".oversized_pseudo_value"),
+            RejectReason::InvalidMethod => concat!($prefix, ".invalid_method"),
+            RejectReason::InvalidScheme => concat!($prefix, ".invalid_scheme"),
+            RejectReason::InvalidPath => concat!($prefix, ".invalid_path"),
+            RejectReason::InvalidStatus => concat!($prefix, ".invalid_status"),
+            RejectReason::ClTeConflict => concat!($prefix, ".cl_te_conflict"),
+            RejectReason::DuplicateCl => concat!($prefix, ".duplicate_cl"),
+            RejectReason::DuplicatePseudo => concat!($prefix, ".duplicate_pseudo"),
+            RejectReason::PseudoAfterRegular => concat!($prefix, ".pseudo_after_regular"),
+            RejectReason::UnknownPseudo => concat!($prefix, ".unknown_pseudo"),
+            RejectReason::EmptyPseudo => concat!($prefix, ".empty_pseudo"),
         }
-    }
+    };
 }
 
 /// Increment the per-reason counter `h2.headers.rejected.<reason>` and the
@@ -262,26 +270,7 @@ impl RejectReason {
 /// reconcile when a single request piles up several rejections.
 fn metric_reject(reason: RejectReason) {
     incr!("h2.headers.rejected.total");
-    let key = match reason {
-        RejectReason::InvalidNameByte => "h2.headers.rejected.invalid_name_byte",
-        RejectReason::ConnectionSpecificHeader => "h2.headers.rejected.connection_specific_header",
-        RejectReason::TeNotTrailers => "h2.headers.rejected.te_not_trailers",
-        RejectReason::CrlfInValue => "h2.headers.rejected.crlf_in_value",
-        RejectReason::NulInValue => "h2.headers.rejected.nul_in_value",
-        RejectReason::OversizedPseudoValue => "h2.headers.rejected.oversized_pseudo_value",
-        RejectReason::InvalidMethod => "h2.headers.rejected.invalid_method",
-        RejectReason::InvalidScheme => "h2.headers.rejected.invalid_scheme",
-        RejectReason::InvalidPath => "h2.headers.rejected.invalid_path",
-        RejectReason::InvalidStatus => "h2.headers.rejected.invalid_status",
-        RejectReason::ClTeConflict => "h2.headers.rejected.cl_te_conflict",
-        RejectReason::DuplicateCl => "h2.headers.rejected.duplicate_cl",
-        RejectReason::DuplicatePseudo => "h2.headers.rejected.duplicate_pseudo",
-        RejectReason::PseudoAfterRegular => "h2.headers.rejected.pseudo_after_regular",
-        RejectReason::UnknownPseudo => "h2.headers.rejected.unknown_pseudo",
-        RejectReason::EmptyPseudo => "h2.headers.rejected.empty_pseudo",
-    };
-    incr!(key);
-    let _ = reason.as_label(); // keep the label table reachable for tests.
+    incr!(reject_metric_key!("h2.headers.rejected", reason));
 }
 
 /// Classify a header rejected by `is_invalid_h2_header`. Splits the original

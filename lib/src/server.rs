@@ -1616,11 +1616,22 @@ impl Server {
         // runtime by the control plane. Operators wanting per-listener
         // attribution should correlate with the listener-protocol breakdown
         // below.
+        //
+        // Non-listen protocols reach this code only on an invariant break
+        // upstream (`ready()` dispatched a non-listen `Protocol` to
+        // `accept()`). Log and return rather than panicking — defense in
+        // depth on the accept path, which is process-fatal if it aborts.
         let (proto_key, accepted_protocol) = match protocol {
             Protocol::TCPListen => ("listener.accepted.tcp", Protocol::TCPListen),
             Protocol::HTTPListen => ("listener.accepted.http", Protocol::HTTPListen),
             Protocol::HTTPSListen => ("listener.accepted.https", Protocol::HTTPSListen),
-            _ => panic!("should not call accept() on a HTTP, HTTPS or TCP session"),
+            other => {
+                warn!(
+                    "accept() called with non-listen protocol {:?} on token {:?}; skipping",
+                    other, token
+                );
+                return;
+            }
         };
 
         loop {
@@ -1628,7 +1639,13 @@ impl Server {
                 Protocol::TCPListen => self.tcp.borrow_mut().accept(token),
                 Protocol::HTTPListen => self.http.borrow_mut().accept(token),
                 Protocol::HTTPSListen => self.https.borrow_mut().accept(token),
-                _ => unreachable!(),
+                // The outer match populates `accepted_protocol` only with the
+                // three listen variants and returns early otherwise — this
+                // arm is structurally unreachable.
+                other => unreachable!(
+                    "accept dispatch reached non-listen protocol {:?} after outer guard",
+                    other
+                ),
             };
             match result {
                 Ok(sock) => {
