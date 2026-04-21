@@ -934,6 +934,11 @@ message ProtobufAccessLog {
     // same TCP or TLS connection. Distinct from `request_id`, which is set
     // per-request (one per H2 stream, one per H1 keep-alive exchange).
     optional Uint128 session_id = 23;
+    // Value of the `x-request-id` header as forwarded to the backend —
+    // either preserved verbatim from the client/upstream LB, or derived from
+    // the request ULID when the client did not supply one. Universal
+    // correlation key for end-to-end tracing across Envoy/HAProxy/Sōzu hops.
+    optional string x_request_id = 24;
 }
 
 message ProtobufEndpoint {

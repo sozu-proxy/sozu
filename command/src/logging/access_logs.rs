@@ -144,6 +144,11 @@ pub struct RequestRecord<'a> {
     pub client_rtt: Option<Duration>,
     pub server_rtt: Option<Duration>,
     pub user_agent: Option<&'a str>,
+    /// Value of the `x-request-id` header forwarded to the backend. Preserved
+    /// verbatim when the client supplied one; otherwise derived from the
+    /// request ULID (`context.request_id`). Used by downstream observability
+    /// pipelines as a universal correlation key.
+    pub x_request_id: Option<&'a str>,
     pub service_time: Duration,
     /// time from connecting to the backend until the end of the response
     pub response_time: Option<Duration>,
@@ -218,6 +223,7 @@ impl RequestRecord<'_> {
                     .map(|tags| tags.tags.duplicate())
                     .unwrap_or_default(),
                 user_agent: self.user_agent.duplicate(),
+                x_request_id: self.x_request_id.duplicate(),
                 tag: self.tag.duplicate(),
                 time: self.precise_time.into(),
                 request_time: Some(self.request_time.as_micros() as u64),

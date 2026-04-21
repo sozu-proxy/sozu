@@ -237,6 +237,7 @@ impl TcpSession {
             client_rtt: socket_rtt(self.state.front_socket()),
             server_rtt: None,
             user_agent: None,
+            x_request_id: None,
             service_time: self.metrics.service_time(),
             response_time: self.metrics.backend_response_time(),
             request_time: self.metrics.request_time(),

@@ -832,6 +832,22 @@ and H2-specific protocol abuse.
 | `h2.headers.rejected.invalid_path` | counter | proxy | `:path` contained a `#` fragment (not allowed on the wire) |
 | `h2.headers.rejected.invalid_status` | counter | proxy | Response `:status` was not three ASCII digits |
 
+#### Request-ID propagation
+
+Sōzu preserves or generates an `x-request-id` header on every H1 request
+and every H2 stream (both paths share the same H1 editor callback via
+`pkawa.rs`). The value also lands on the access log's
+`x_request_id` field — same value Sōzu forwarded to the backend, end to
+end.
+
+| Metric | Type | Scope | Description |
+|---|---|---|---|
+| `http.x_request_id.propagated` | counter | proxy | Request already carried an `x-request-id` header; Sōzu preserved it verbatim |
+| `http.x_request_id.generated` | counter | proxy | Request had no `x-request-id`; Sōzu generated one from the request ULID and injected it before forwarding |
+
+The `x_request_id` access-log field (wire tag `ProtobufAccessLog.x_request_id` #24)
+carries whichever value was sent to the backend.
+
 #### HTTP/2 flood mitigations
 
 Incremented once per connection at the moment the H2 flood detector trips its
