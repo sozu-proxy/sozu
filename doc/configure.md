@@ -533,6 +533,8 @@ from metric names below.
 | `client.connections_percentage` | gauge | proxy | Percentage of `max_connections` in use |
 | `client.max_connections` | gauge | proxy | Configured maximum connections |
 | `slab.entries` | gauge | proxy | Session slab allocator slots used |
+| `process.uptime_seconds` | gauge | proxy | Seconds since the worker started. Captured once in `Server::new`; never reset on hot upgrade (the new worker starts its own counter) |
+| `server.live` | gauge | proxy | `1` while the worker accepts traffic, `0` once a graceful shutdown is requested. Mirrors Envoy `server.live` semantics — L4 health checks (HAProxy / cloud LBs) can poll this gauge to drain a worker before the OS-level termination signal lands |
 | `buffer.number` | gauge | proxy | Buffers currently allocated from the buffer pool |
 | `zombies` | counter | proxy | Zombie sessions detected and removed |
 
@@ -544,6 +546,21 @@ from metric names below.
 | `accept_queue.backpressure` | gauge | proxy | `1` when max connections reached, `0` when accepting again |
 | `accept_queue.wait_time` | time | proxy | How long a socket waited in the accept queue (ms) |
 | `accept_queue.timeout` | counter | proxy | Sockets that timed out in the accept queue and were closed |
+| `accept_queue.saturated_seconds` | counter | proxy | Incremented at 1 Hz while `SessionManager::can_accept` is `false`. Distinguishes "queue spent N seconds at max" from "queue briefly hit max" — the binary `accept_queue.backpressure` gauge collapses that duration |
+| `listener.accepted.total` | counter | proxy | Sockets accepted by the worker, all listeners combined |
+| `listener.accepted.tcp` | counter | proxy | Sockets accepted on TCP listeners |
+| `listener.accepted.http` | counter | proxy | Sockets accepted on HTTP listeners |
+| `listener.accepted.https` | counter | proxy | Sockets accepted on HTTPS listeners |
+| `listener.connection_capped` | counter | proxy | Sockets refused by `create_sessions` because `SessionManager::check_limits` returned `false` (max connections reached or slab at capacity) |
+| `client.connect.per_source.bucket_000` … `bucket_255` | counter | proxy | Per-accept counter bucketed by masked source subnet. Source IPs are masked to /24 (IPv4) or /48 (IPv6) and hashed (`DefaultHasher`) into 256 fixed buckets. The bucket noise is intentional: `incr!` requires `&'static str` keys, and a per-IP counter would be unbounded under SYN flood (OWASP A05, NIST SP 800-92). Operators wanting per-IP attribution should pair these counters with structured access logs or a downstream rate-limiter |
+
+The accept-loop telemetry above does **not** label by listener address.
+`incr!` requires `&'static str` keys, and listener addresses can be added or
+removed at runtime via the control plane — labelling by address would either
+require runtime `Box::leak` of unbounded strings or a fixed bucket cap. We
+chose the per-protocol breakdown (3 keys + aggregate) instead. Operators
+needing per-listener-address attribution should run distinct workers per
+listener or correlate via access logs.
 
 #### Event loop
 
@@ -653,6 +670,27 @@ Incremented when Sōzu generates a default error response instead of proxying:
 | `backend.down` | counter | proxy | Backend marked as unhealthy (retry policy triggered) |
 | `backend.connections.error` | counter | proxy | Backend connection failures |
 
+#### Backend pool
+
+H2 mux reuses backend connections via `Router::backends: HashMap<Token, Connection>`
+(`lib/src/protocol/mux/router.rs`). There is no separate pool abstraction: the map
+is the pool. Reuse picks an existing non-draining H2 multiplex slot (below
+`SETTINGS_MAX_CONCURRENT_STREAMS`) or an H1 keep-alive socket; misses dial a fresh
+backend socket.
+
+| Metric | Type | Scope | Description |
+|--------|------|-------|-------------|
+| `backend.pool.hit` | counter | proxy | Request attached to an existing backend connection (H2 multiplex slot or H1 keep-alive). |
+| `backend.pool.miss` | counter | proxy | No reusable connection found; a fresh dial starts. Incremented before `backend_from_request`, so failed selections still count. Dial may still fail — in that case `backend.pool.size` is not bumped. |
+| `backend.pool.size` | gauge | proxy | Live mux router entries. `+1` at `router.rs::connect` new-dial commit; `-1` at `connection.rs::pre_close_client_bookkeeping` and `mod.rs::close_backend`. Mirrors the `backend.connections` site set in mux exactly, so gauge symmetry follows from `backend.connections` correctness. Non-mux H1/TCP paths are NOT counted here. |
+| `backend.flow_control.paused` | counter | proxy | Direction-scoped counterpart of `h2.flow_control_stall`: emitted only when the converter stalls while writing toward an upstream backend (`Position::Client`) because the backend's HTTP/2 receive window is empty. |
+
+Intentionally **not** emitted in this slice (no corresponding lifecycle exists):
+
+* `backend.pool.idle_closed` — mux has no connection-level idle eviction. The H2 `stream_idle_timeout` cancels individual streams (slow-multiplex guard), not pool entries.
+* `backend.pool.overflow` — `Router::backends` is unbounded. The only new-connection refusal is HTTP/2 buffer-pool exhaustion (`MaxBuffers`), unrelated to pool sizing.
+* `backend.flow_control.resumed` — the converter has no "resumed" boundary; the next writable cycle just succeeds when the backend ACKs window updates. Plumbing an explicit marker through `flush_stream_out` was deferred.
+
 #### Backend metrics (per cluster/backend)
 
 These metrics are recorded with `cluster_id` and `backend_id` labels via the
@@ -672,6 +710,7 @@ These metrics are recorded with `cluster_id` and `backend_id` labels via the
 |--------|------|-------|-------------|
 | `http.alpn.h2` | counter | proxy | TLS connections where client negotiated HTTP/2 via ALPN |
 | `http.alpn.http11` | counter | proxy | TLS connections where client negotiated HTTP/1.1 via ALPN (or no ALPN) |
+| `https.alpn.rejected.http11_disabled` | counter | proxy | TLS connection refused on an H2-only listener because the peer offered `http/1.1` or no ALPN value |
 
 #### TLS version and cipher suite
 
@@ -707,17 +746,203 @@ Negotiated cipher suite (rustls):
 | `tls.cipher.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256` | counter | proxy |
 | `tls.cipher.Unsupported` | counter | proxy |
 
+#### TLS handshake telemetry
+
+Emitted by the rustls handshake driver at `lib/src/protocol/rustls.rs`.
+Failure counters sit next to the tiered log emission in `log_handshake_error`
+so every `warn!`/`error!`/`debug!` about a broken handshake also bumps the
+matching counter. The histogram is recorded at the moment the handshake
+transitions out of `is_handshaking()` (both through the `readable` and
+`writable` exit paths).
+
+| Metric | Type | Scope | Description |
+|--------|------|-------|-------------|
+| `tls.handshake.failed.alert_received` | counter | proxy | Remote peer sent a fatal TLS alert (`RustlsError::AlertReceived`). Typical causes: cert-pinning client, stale CA bundle, scanner. Logged at `debug!`. |
+| `tls.handshake.failed.peer_incompatible` | counter | proxy | Peer advertised a version/feature mix we cannot negotiate (`PeerIncompatible`). Logged at `warn!`. |
+| `tls.handshake.failed.peer_misbehaved` | counter | proxy | Peer deviated from the TLS state machine (`PeerMisbehaved`). Logged at `warn!`. |
+| `tls.handshake.failed.invalid_message` | counter | proxy | Wire-level record parse failure (`InvalidMessage`). Logged at `warn!`. |
+| `tls.handshake.failed.inappropriate_message` | counter | proxy | Peer sent a record type that was valid on the wire but not allowed in the current phase (`InappropriateMessage`). Logged at `warn!`. |
+| `tls.handshake.failed.inappropriate_handshake_message` | counter | proxy | Peer sent a handshake sub-type the state machine did not expect (`InappropriateHandshakeMessage`). Logged at `warn!`. |
+| `tls.handshake.failed.oversized_record` | counter | proxy | Peer sent a record larger than the RFC 8446 §5.1 cap (`PeerSentOversizedRecord`). Logged at `warn!`. |
+| `tls.handshake.failed.no_alpn` | counter | proxy | ALPN negotiation failed (`NoApplicationProtocol`) — e.g. peer offered only protocols the listener does not serve. Logged at `warn!`. |
+| `tls.handshake.failed.invalid_certificate` | counter | proxy | Peer-supplied certificate failed verification (`InvalidCertificate`). Logged at `warn!`. Only relevant when mTLS is enabled. |
+| `tls.handshake.failed.decrypt_error` | counter | proxy | Record failed to decrypt (`DecryptError`) — almost always an attack or a broken middlebox. Logged at `warn!`. |
+| `tls.handshake.failed.no_certificates_present` | counter | proxy | mTLS: peer sent an empty Certificate message (`NoCertificatesPresented`). Logged at `warn!`. |
+| `tls.handshake.failed.other` | counter | proxy | Catch-all for local/config/provider failures (`General`, `Other`, `EncryptError`, `FailedToGetRandomBytes`, CRL errors, future rustls variants). Logged at `error!` — these indicate a server-side problem, not a bad client. |
+| `tls.handshake_ms` | time | proxy | Wall-clock duration in milliseconds from the first TLS byte observed on the socket to the handshake leaving `is_handshaking()`. Histogram — not a counter — so alert rules should use quantiles. |
+
+#### TLS certificate expiration
+
+| Metric | Type | Scope | Description |
+|--------|------|-------|-------------|
+| `tls.cert.min_expires_at_seconds` | gauge | proxy | Unix-seconds timestamp of the soonest-expiring certificate currently loaded in the `CertificateResolver`. Recomputed on every add/remove/replace at `lib/src/tls.rs`. Aggregate only — per-SNI granularity is intentionally omitted because statsd has no label support and the resolver can hold tens of thousands of names; operators query per-cert detail through the command API. Already-expired certificates clamp to `0`, which dashboards should interpret as the "rotate now" alert condition. |
+
 #### HTTP/2 specific
 
 | Metric | Type | Scope | Description |
 |--------|------|-------|-------------|
-| `h2.active_streams` | gauge | proxy | Open HTTP/2 streams on a connection |
-| `h2.connection_window` | gauge | proxy | Connection-level flow control window size (bytes) |
-| `h2.pending_window_updates` | gauge | proxy | Pending WINDOW_UPDATE frames to send |
+| `h2.connection.active_streams` | gauge | proxy | **Aggregate** count of open HTTP/2 streams across every live H2 connection on the worker. Emitted as a [`gauge_add!`] lifecycle delta from `ConnectionH2::gauge_connection_state`; the per-connection contribution is subtracted on connection drop, so the value sums correctly under multi-connection load. |
+| `h2.connection.window_bytes` | gauge | proxy | **Aggregate** sum of available connection-level flow-control window bytes across every live H2 connection. Negative per-connection windows clamp to 0 — the aggregate measures available capacity, not deficit. Lifecycle-delta semantics as above. |
+| `h2.connection.pending_window_updates` | gauge | proxy | **Aggregate** number of queued (un-flushed) per-stream WINDOW_UPDATE entries across every live H2 connection. Lifecycle-delta semantics as above. |
+
+> **Migration note (renamed metrics).** The three keys above replace the
+> earlier `h2.connection_window`, `h2.active_streams`, and
+> `h2.pending_window_updates` gauges. The old keys had **per-connection
+> snapshot** semantics implemented via absolute `gauge!`: under concurrent
+> load every H2 connection clobbered the previous one's value, so the
+> dashboard saw the last writer rather than the aggregate. The new keys
+> emit lifecycle deltas via `gauge_add!`, so the value is the **sum across
+> all live H2 connections** on the worker. Update dashboards and alerts
+> accordingly — the new values typically rise into the hundreds or
+> thousands under load instead of cycling 0…N.
+
 | `h2.flow_control_stall` | counter | proxy | Converter stalled due to flow control |
 | `h2.close_with_active_streams` | counter | proxy | H2 connections closed while streams were still active |
-| `h2.window_update_dropped` | counter | proxy | WINDOW_UPDATE frames dropped (no matching stream) |
+| `h2.window_update_dropped` | counter | proxy | WINDOW_UPDATE frame dropped because the per-connection pending-update queue was already at capacity |
 | `h2.headers_no_stream.error` | counter | proxy | HEADERS frame received with no matching stream (protocol error) |
+
+#### TLS / SNI binding
+
+| Metric | Type | Scope | Description |
+|--------|------|-------|-------------|
+| `http.sni_authority_mismatch` | counter | proxy | Request rejected because its `:authority` (HTTP/2) or `Host` header (HTTP/1.1) crossed the TLS SNI boundary negotiated for the connection. Defence against cross-tenant frontend confusion (CWE-346). Increment site: `lib/src/protocol/mux/router.rs`. |
+
+#### HTTP/2 frame counters
+
+Per-frame-type counters split by direction. Receive side counts every H2
+frame the parser hands to `handle_frame` — single chokepoint, so adding a
+new H2 frame type fails the build inside the metric helper. Send side
+covers the control frames Sozu emits; HEADERS and DATA tx flow through
+the H2 block converter and are not yet broken out per type (tracked as
+follow-up — pair with `back_bytes_out` for the byte view today).
+
+| Metric | Type | Scope | Description |
+|---|---|---|---|
+| `h2.frames.rx.data` | counter | proxy | DATA frames received |
+| `h2.frames.rx.headers` | counter | proxy | HEADERS frames received |
+| `h2.frames.rx.push_promise` | counter | proxy | PUSH_PROMISE frames received (always rejected; see `h2.goaway.sent.protocol_error`) |
+| `h2.frames.rx.priority` | counter | proxy | RFC 7540 PRIORITY frames received |
+| `h2.frames.rx.rst_stream` | counter | proxy | RST_STREAM frames received (paired with `h2.rst_stream.received.<code>` for per-error breakdown) |
+| `h2.frames.rx.settings` | counter | proxy | SETTINGS frames received (both peer-settings and ACKs) |
+| `h2.frames.rx.ping` | counter | proxy | PING frames received (both probes and ACKs) |
+| `h2.frames.rx.goaway` | counter | proxy | GOAWAY frames received (paired with `h2.goaway.received.<code>`) |
+| `h2.frames.rx.window_update` | counter | proxy | WINDOW_UPDATE frames received |
+| `h2.frames.rx.continuation` | counter | proxy | Reachable only via the defensive fallback path (RFC 9113 §6.10 standalone CONTINUATION) — the inline header parser absorbs CONTINUATION during HEADERS decoding, so under normal conditions this stays at zero |
+| `h2.frames.rx.unknown` | counter | proxy | Unknown frame type ignored per RFC 9113 §5.5. A non-zero rate is the early-warning signal for a peer trying H2 extensions |
+| `h2.frames.tx.settings` | counter | proxy | SETTINGS frames emitted (initial + later updates) |
+| `h2.frames.tx.window_update` | counter | proxy | WINDOW_UPDATE frames emitted (per-frame in the queued-update flush loop) |
+| `h2.frames.tx.rst_stream` | counter | proxy | RST_STREAM frames emitted (across both the queued flush loop and the end-stream cancel path) |
+| `h2.frames.tx.goaway` | counter | proxy | GOAWAY frames emitted (one per phase of `graceful_goaway`, plus error-path `goaway`) |
+| `h2.frames.tx.ping_ack` | counter | proxy | PING ACK frames emitted in response to peer probes |
+
+#### HTTP/2 GOAWAY and RST_STREAM by error code
+
+Counters split by direction (sent vs received) and RFC 9113 §7 error code.
+Every variant in the H2Error enum gets its own counter so SOC dashboards can
+distinguish a sustained `protocol_error` (parser issue / fuzzer) from
+`enhance_your_calm` (flood-detector trip) from `no_error` (graceful drain).
+Codes the wire delivers but RFC 9113 does not define are bucketed under
+`unknown_error` to keep cardinality bounded.
+
+| Metric pattern | Type | Scope | Description |
+|---|---|---|---|
+| `h2.goaway.sent.<code>` | counter | proxy | GOAWAY emitted by Sozu. `<code>` ∈ `no_error`, `protocol_error`, `internal_error`, `flow_control_error`, `settings_timeout`, `stream_closed`, `frame_size_error`, `refused_stream`, `cancel`, `compression_error`, `connect_error`, `enhance_your_calm`, `inadequate_security`, `http_1_1_required`. The graceful drain (`graceful_goaway`) emits two `no_error` increments per connection — one per phase. |
+| `h2.goaway.received.<code>` | counter | proxy | GOAWAY received from peer. Same code suffixes as sent, plus `unknown_error` for codes outside RFC 9113 §7. Useful on backend H2 connections to detect upstreams under pressure (`enhance_your_calm`) or with bugs (`internal_error`). |
+| `h2.rst_stream.sent.<code>` | counter | proxy | RST_STREAM emitted by Sozu. Same code suffixes. The `no_error` and `cancel` increments are graceful (stream recycle, propagated client cancel); the rest are server-side defences against attacker-crafted frames. |
+| `h2.rst_stream.received.<code>` | counter | proxy | RST_STREAM received from peer. Same code suffixes plus `unknown_error`. |
+| `h2.rst_stream.received.pre_response_start` | counter | proxy | Subset of `h2.rst_stream.received.*` where the RST arrived before the backend started answering. The canonical Rapid Reset signature (CVE-2023-44487). Emitted alongside the per-code counter, not instead of, so a Rapid Reset attack surfaces both as a `cancel` rate spike and as the pre-response signal. |
+
+#### HTTP/2 header validation (HPACK rejections)
+
+Counters emitted whenever the HPACK decoder in the H2→H1 converter
+rejects a header. `h2.headers.rejected.total` is bumped on every reject;
+a per-reason counter is bumped alongside so `total == sum(per_reason)`.
+Rejection is silent on the wire (the mux either RSTs the stream or
+treats the request as malformed) — this counter family is the only
+externally visible signal for request-smuggling probes, HPACK fuzzing,
+and H2-specific protocol abuse.
+
+| Metric | Type | Scope | Description |
+|---|---|---|---|
+| `h2.headers.rejected.total` | counter | proxy | Aggregate count of all HPACK rejections |
+| `h2.headers.rejected.invalid_name_byte` | counter | proxy | Header name with uppercase / CTL / separator / space byte (CWE-93) |
+| `h2.headers.rejected.connection_specific_header` | counter | proxy | `connection`, `proxy-connection`, `transfer-encoding`, `upgrade`, `keep-alive` (RFC 9113 §8.2.2) |
+| `h2.headers.rejected.te_not_trailers` | counter | proxy | `te` with value other than `trailers` (RFC 9113 §8.2.2) |
+| `h2.headers.rejected.crlf_in_value` | counter | proxy | CR or LF in a header value — request-smuggling vector (CWE-444) |
+| `h2.headers.rejected.nul_in_value` | counter | proxy | NUL byte in a header value |
+| `h2.headers.rejected.oversized_pseudo_value` | counter | proxy | Pseudo-header value exceeded storage cap |
+| `h2.headers.rejected.cl_te_conflict` | counter | proxy | Content-Length declared alongside a Transfer-Encoding — classic smuggling vector |
+| `h2.headers.rejected.duplicate_cl` | counter | proxy | Multiple disagreeing Content-Length values (RFC 9110 §8.6) |
+| `h2.headers.rejected.duplicate_pseudo` | counter | proxy | Same pseudo-header appeared twice |
+| `h2.headers.rejected.pseudo_after_regular` | counter | proxy | Pseudo-header appeared after a regular header (RFC 9113 §8.3) |
+| `h2.headers.rejected.unknown_pseudo` | counter | proxy | Unknown `:` -prefixed pseudo-header |
+| `h2.headers.rejected.empty_pseudo` | counter | proxy | Pseudo-header value was empty (RFC 9113 §8.3.1) |
+| `h2.headers.rejected.invalid_method` | counter | proxy | `:method` value was not a valid RFC 9110 §9 token |
+| `h2.headers.rejected.invalid_scheme` | counter | proxy | `:scheme` was not `http` or `https` |
+| `h2.headers.rejected.invalid_path` | counter | proxy | `:path` contained a `#` fragment (not allowed on the wire) |
+| `h2.headers.rejected.invalid_status` | counter | proxy | Response `:status` was not three ASCII digits |
+
+#### Request-ID propagation
+
+Sōzu preserves or generates an `x-request-id` header on every H1 request
+and every H2 stream (both paths share the same H1 editor callback via
+`pkawa.rs`). The value also lands on the access log's
+`x_request_id` field — same value Sōzu forwarded to the backend, end to
+end.
+
+| Metric | Type | Scope | Description |
+|---|---|---|---|
+| `http.x_request_id.propagated` | counter | proxy | Request already carried an `x-request-id` header; Sōzu preserved it verbatim |
+| `http.x_request_id.generated` | counter | proxy | Request had no `x-request-id`; Sōzu generated one from the request ULID and injected it before forwarding |
+
+The `x_request_id` access-log field (wire tag `ProtobufAccessLog.x_request_id` #24)
+carries whichever value was sent to the backend.
+
+#### TLS handshake metadata on access logs
+
+Five additional access-log fields surface the negotiated TLS metadata and
+the upstream-attested forwarded chain. They are wire-compatible appends to
+`ProtobufAccessLog` (tags 25–29) and are populated end-to-end on H1 and H2
+mux paths, plus the WSS post-upgrade pipe. Pure plaintext paths (HTTP, WS,
+TCP) emit `None` for all five.
+
+| Field | Wire tag | Source | Notes |
+|---|---|---|---|
+| `tls_version` | `ProtobufAccessLog.tls_version` #25 | `rustls_version_label(handshake.session.protocol_version())` | Short form (e.g. `TLSv1.3`). Captured once at handshake completion in `lib/src/https.rs::upgrade_handshake`. `None` when rustls reports an unknown variant. |
+| `tls_cipher` | `ProtobufAccessLog.tls_cipher` #26 | `rustls_ciphersuite_label(handshake.session.negotiated_cipher_suite())` | Short form (e.g. `TLS_AES_128_GCM_SHA256`). `None` when rustls reports an unsupported cipher. |
+| `tls_sni` | `ProtobufAccessLog.tls_sni` #27 | `handshake.session.server_name()` | Pre-lowercased, no port. Same value the routing layer uses to enforce the SNI ↔ `:authority` binding. `None` when the client omitted SNI. |
+| `tls_alpn` | `ProtobufAccessLog.tls_alpn` #28 | ALPN negotiation in `upgrade_handshake` | `h2`, `http/1.1`, or `None` when no ALPN was negotiated. |
+| `xff_chain` | `ProtobufAccessLog.xff_chain` #29 | Verbatim `X-Forwarded-For` header value | Snapshotted in `editor.rs::on_request_headers` *before* Sōzu appends its own peer hop, so the log records the upstream-attested chain (e.g. `203.0.113.5, 198.51.100.10`). `None` when the request has no `X-Forwarded-For` header. |
+
+TLS fields are connection-scoped: they are stamped once on the mux
+`Context` at handshake time and propagated to every per-stream
+`HttpContext` via `Context::create_stream`, so an H2 connection
+multiplexing N streams pays the cost once. The labels are `&'static str`
+borrows into rustls's static label tables — no per-request allocation.
+
+#### HTTP/2 flood mitigations
+
+Incremented once per connection at the moment the H2 flood detector trips its
+threshold and the proxy escalates to `GOAWAY(ENHANCE_YOUR_CALM)`. Every CVE
+mitigation in the H2 family (Rapid Reset, MadeYouReset, the CONTINUATION /
+PING / SETTINGS / empty-DATA flood family, oversized header lists, and the
+generic `glitch` budget) routes through `ConnectionH2::handle_flood_violation`,
+which emits both the contextual log line and the per-kind counter below.
+
+| Metric | Type | Scope | Description |
+|--------|------|-------|-------------|
+| `h2.flood.violation.rst_stream_window` | counter | proxy | Per-window RST_STREAM rate ceiling exceeded. Generic stream-cancel storm signal — usually a misbehaving client, sometimes Rapid Reset. |
+| `h2.flood.violation.rst_stream_lifetime` | counter | proxy | Lifetime received-RST ceiling exceeded. Catches a patient Rapid Reset attacker that stays under the windowed cap (CVE-2023-44487). |
+| `h2.flood.violation.rst_stream_pre_response_lifetime` | counter | proxy | Lifetime received-RST ceiling exceeded for streams that the backend had not yet started answering. The canonical Rapid Reset signature (CVE-2023-44487). |
+| `h2.flood.violation.rst_stream_emitted_lifetime` | counter | proxy | Lifetime server-emitted RST ceiling exceeded. MadeYouReset mitigation (CVE-2025-8671) — peer kept feeding the server crafted frames that forced it to reset streams. |
+| `h2.flood.violation.ping_window` | counter | proxy | Per-window PING flood (CVE-2019-9512). |
+| `h2.flood.violation.ping_lifetime` | counter | proxy | Lifetime PING ceiling exceeded — catches sustained low-rate PING abuse that stays under the windowed cap. |
+| `h2.flood.violation.settings_window` | counter | proxy | Per-window SETTINGS flood (CVE-2019-9515). |
+| `h2.flood.violation.settings_lifetime` | counter | proxy | Lifetime SETTINGS ceiling exceeded. |
+| `h2.flood.violation.empty_data_window` | counter | proxy | Per-window flood of empty DATA frames (CVE-2019-9518). |
+| `h2.flood.violation.continuation_per_block` | counter | proxy | Single header block split across more CONTINUATION frames than the configured cap (CVE-2024-27316). |
+| `h2.flood.violation.header_size_per_block` | counter | proxy | Single header block accumulated more bytes than the configured cap (CVE-2024-27316 sibling — header overflow). |
+| `h2.flood.violation.glitch_window` | counter | proxy | Generic anomaly budget exceeded (unknown SETTINGS, WINDOW_UPDATE on closed stream, other low-severity protocol drift). |
 
 #### Protocol upgrade failures
 
@@ -772,10 +997,13 @@ Incremented when a session fails to transition between protocol phases:
 - [statsd](https://github.com/etsy/statsd)
 - [grad](https://github.com/geal/grad)
 
-## OpenTelemetry
+## OpenTelemetry (traceparent passthrough)
 
-Sōzu supports [W3C Trace Context](https://www.w3.org/TR/trace-context/) propagation
-behind the `opentelemetry` compile-time feature flag.
+The `opentelemetry` compile-time feature flag enables **W3C Trace Context passthrough**:
+Sōzu parses, generates, and forwards `traceparent` headers across the proxy hop, and
+records the trace identifiers in its access logs. The feature name is historic — the
+implementation is intentionally a propagator only. There is no OpenTelemetry SDK
+dependency, no span lifecycle, and no OTLP exporter. See "Out of scope" below.
 
 ### Enabling
 
@@ -795,7 +1023,10 @@ sozu-lib = { path = "lib", features = ["opentelemetry"] }
 ### How it works
 
 When the `opentelemetry` feature is enabled, Sōzu acts as a **trace context propagator**
-for HTTP/1.1 requests:
+for both HTTP/1.1 and HTTP/2 frontends. The kawa H1 editor (`lib/src/protocol/kawa_h1/editor.rs`)
+runs on every request, including those decoded from HPACK on the H2 mux path
+(`lib/src/protocol/mux/pkawa.rs` calls back into the same editor). On the wire the H2
+backend leg re-encodes the rewritten `traceparent` via `H2BlockConverter`.
 
 1. **Incoming request with `traceparent` header**: Sōzu parses the W3C traceparent
    (format: `00-<trace_id>-<parent_id>-<flags>`), preserves the trace ID, generates
@@ -822,15 +1053,22 @@ When OpenTelemetry is enabled, access logs include:
 | `span_id` | 16 hex characters | Sōzu-generated span ID for this hop |
 | `parent_span_id` | 16 hex characters or `-` | Parent span ID from incoming `traceparent`, if present |
 
-### Limitations
+### Out of scope
 
-- OpenTelemetry propagation currently works on **HTTP/1.1 requests only** (the kawa H1 editor
-  path). HTTP/2 requests have the trace context extracted from access log records but do not
-  yet rewrite `traceparent` on forwarded H2 frames.
-- Sōzu does **not** export traces via OTLP. It acts as a propagator only — trace context
-  flows through access logs and forwarded headers. Use your access log pipeline to ingest
-  traces into Jaeger, Tempo, or similar backends.
-- There is no runtime configuration for OpenTelemetry — it is a compile-time feature flag only.
+The `opentelemetry` feature is intentionally narrow. It does NOT:
+
+- Pull `opentelemetry`, `opentelemetry-sdk`, `opentelemetry-otlp`, or `tracing-opentelemetry`
+  as dependencies. The feature gate (`lib/Cargo.toml`) wires no extra crates.
+- Emit spans. There is no `Span::start`/`Span::end`, no in-process exporter, no OTLP/gRPC
+  client. Use your access log pipeline to feed Jaeger, Tempo, Honeycomb, or Datadog with
+  the per-request trace identifiers.
+- Honour the sampled-flag bit of incoming `traceparent`. Today the rewritten header is
+  always emitted with `-01` (sampled). Downstream backends that respect the sampled flag
+  will see every request as sampled.
+- Provide runtime configuration. The feature is selected at compile time only.
+
+A real span model and an OTLP exporter are tracked separately and would land as their own
+feature flag rather than expanding the scope of `opentelemetry`.
 
 ## PROXY Protocol
 

@@ -126,6 +126,17 @@ pub struct HttpContext {
     pub reason: Option<String>,
     // ---------- Additional optional data
     pub user_agent: Option<String>,
+    /// Value of the `x-request-id` header observed (if propagated from the
+    /// client/upstream LB) or generated (from `self.id`). Universal correlation
+    /// header — populated unconditionally by `on_request_headers` so the access
+    /// log can record the exact value forwarded to the backend.
+    pub x_request_id: Option<String>,
+    /// Verbatim value of the client-supplied `X-Forwarded-For` header as
+    /// observed before Sōzu appended its own hop. Captured here, not at
+    /// request edit time, so the access log records the upstream-attested
+    /// chain even when Sōzu also appends its own peer to the forwarded
+    /// header. `None` if the request had no `X-Forwarded-For` header.
+    pub xff_chain: Option<String>,
 
     #[cfg(feature = "opentelemetry")]
     pub otel: Option<sozu_command::logging::OpenTelemetry>,
@@ -174,6 +185,19 @@ pub struct HttpContext {
     /// Plaintext listeners still never hit the check because
     /// `tls_server_name` is `None`.
     pub strict_sni_binding: bool,
+    /// Negotiated TLS protocol version as a short label (e.g. `"TLSv1.3"`).
+    /// Captured from `rustls_version_label` at handshake completion and
+    /// propagated from the mux `Context`. `None` for plaintext listeners.
+    pub tls_version: Option<&'static str>,
+    /// Negotiated TLS cipher suite as a short label (e.g.
+    /// `"TLS_AES_128_GCM_SHA256"`). Captured from `rustls_ciphersuite_label`
+    /// at handshake completion and propagated from the mux `Context`. `None`
+    /// for plaintext listeners.
+    pub tls_cipher: Option<&'static str>,
+    /// Negotiated ALPN protocol (e.g. `"h2"`, `"http/1.1"`). Captured from
+    /// rustls at handshake completion and propagated from the mux `Context`.
+    /// `None` for plaintext listeners or when no ALPN was negotiated.
+    pub tls_alpn: Option<&'static str>,
 }
 
 impl kawa::h1::ParserCallbacks<Checkout> for HttpContext {
@@ -217,6 +241,8 @@ impl HttpContext {
             status: None,
             reason: None,
             user_agent: None,
+            x_request_id: None,
+            xff_chain: None,
 
             #[cfg(feature = "opentelemetry")]
             otel: Default::default(),
@@ -224,12 +250,15 @@ impl HttpContext {
             backend_address: None,
             tls_server_name: None,
             strict_sni_binding: true,
+            tls_version: None,
+            tls_cipher: None,
+            tls_alpn: None,
         }
     }
 
     /// Callback for request:
     ///
-    /// - edit headers (connection, forwarded, sticky cookie, sozu-id)
+    /// - edit headers (connection, forwarded, sticky cookie, sozu-id, x-request-id)
     /// - save information:
     ///   - method
     ///   - authority
@@ -237,6 +266,7 @@ impl HttpContext {
     ///   - front keep-alive
     ///   - sticky cookie
     ///   - user-agent
+    ///   - x-request-id (preserved if present, else derived from `self.id`)
     fn on_request_headers(&mut self, request: &mut GenericHttpStream) {
         let buf = request.storage.mut_buffer();
 
@@ -294,6 +324,7 @@ impl HttpContext {
         let mut forwarded = None;
         let mut has_x_port = false;
         let mut has_x_proto = false;
+        let mut has_x_request_id = false;
         let mut has_connection = false;
         #[cfg(feature = "opentelemetry")]
         let mut traceparent: Option<&mut kawa::Pair> = None;
@@ -338,11 +369,31 @@ impl HttpContext {
                             );
                         }
                     } else if compare_no_case(key, b"X-Forwarded-For") {
+                        // Snapshot the upstream-attested chain before we
+                        // potentially append our own peer below — the access
+                        // log records the value the client/upstream LB
+                        // forwarded, not the rewritten value Sōzu emits.
+                        self.xff_chain = header
+                            .val
+                            .data_opt(buf)
+                            .and_then(|data| from_utf8(data).ok())
+                            .map(ToOwned::to_owned);
                         x_for = Some(header);
                     } else if compare_no_case(key, b"Forwarded") {
                         forwarded = Some(header);
                     } else if compare_no_case(key, b"User-Agent") {
                         self.user_agent = header
+                            .val
+                            .data_opt(buf)
+                            .and_then(|data| from_utf8(data).ok())
+                            .map(ToOwned::to_owned);
+                    } else if compare_no_case(key, b"X-Request-Id") {
+                        // RFC: not standardized, but the de-facto correlation
+                        // header used by Envoy/HAProxy/most LBs. Preserve the
+                        // client-supplied value verbatim — overwriting it
+                        // breaks end-to-end request tracing.
+                        has_x_request_id = true;
+                        self.x_request_id = header
                             .val
                             .data_opt(buf)
                             .and_then(|data| from_utf8(data).ok())
@@ -464,6 +515,24 @@ impl HttpContext {
                 val: kawa::Store::Static(b"close"),
             }));
         }
+        // Inject "X-Request-Id" derived from the request ULID when the client
+        // (or upstream LB) did not already supply one. When already present,
+        // the header is left untouched in the block list — preserving the
+        // client-supplied value end-to-end is the whole point of this header.
+        // Either way, `self.x_request_id` is populated so the access log
+        // records the exact value forwarded to the backend.
+        if has_x_request_id {
+            incr!("http.x_request_id.propagated");
+        } else {
+            let value = self.id.to_string();
+            request.push_block(kawa::Block::Header(kawa::Pair {
+                key: kawa::Store::Static(b"X-Request-Id"),
+                val: kawa::Store::from_string(value.clone()),
+            }));
+            self.x_request_id = Some(value);
+            incr!("http.x_request_id.generated");
+        }
+
         // Create a custom "Sozu-Id" header
         request.push_block(kawa::Block::Header(kawa::Pair {
             key: kawa::Store::Static(b"Sozu-Id"),
@@ -548,6 +617,12 @@ impl HttpContext {
         self.status = None;
         self.reason = None;
         self.user_agent = None;
+        self.x_request_id = None;
+        self.xff_chain = None;
+        // Note: tls_server_name, tls_version, tls_cipher, tls_alpn,
+        // strict_sni_binding are connection-scoped — set once at handshake
+        // completion and reused across every keep-alive request, so reset()
+        // intentionally leaves them in place.
     }
 
     pub fn extract_route(&self) -> Result<(&str, &str, &Method), RetrieveClusterError> {
@@ -708,6 +783,8 @@ mod tests {
         ctx.status = Some(200);
         ctx.reason = Some("OK".to_owned());
         ctx.user_agent = Some("curl/7.81".to_owned());
+        ctx.x_request_id = Some("client-xrid-123".to_owned());
+        ctx.xff_chain = Some("203.0.113.5, 198.51.100.10".to_owned());
 
         ctx.reset();
 
@@ -720,6 +797,29 @@ mod tests {
         assert!(ctx.status.is_none());
         assert!(ctx.reason.is_none());
         assert!(ctx.user_agent.is_none());
+        assert!(ctx.x_request_id.is_none());
+        assert!(ctx.xff_chain.is_none());
+    }
+
+    #[test]
+    fn test_reset_preserves_tls_metadata() {
+        // TLS metadata is connection-scoped (set once at handshake, reused
+        // across every keep-alive request) — reset() must leave it intact
+        // so the access log of the second request still carries it.
+        let mut ctx = make_context();
+        ctx.tls_server_name = Some("example.com".to_owned());
+        ctx.tls_version = Some("TLSv1.3");
+        ctx.tls_cipher = Some("TLS_AES_128_GCM_SHA256");
+        ctx.tls_alpn = Some("h2");
+        ctx.strict_sni_binding = false;
+
+        ctx.reset();
+
+        assert_eq!(ctx.tls_server_name.as_deref(), Some("example.com"));
+        assert_eq!(ctx.tls_version, Some("TLSv1.3"));
+        assert_eq!(ctx.tls_cipher, Some("TLS_AES_128_GCM_SHA256"));
+        assert_eq!(ctx.tls_alpn, Some("h2"));
+        assert!(!ctx.strict_sni_binding);
     }
 
     #[test]

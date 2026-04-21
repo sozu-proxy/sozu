@@ -664,6 +664,26 @@ enum EventKind {
     BACKEND_UP = 1;
     NO_AVAILABLE_BACKENDS = 2;
     REMOVED_BACKEND_HAS_NO_CONNECTIONS = 3;
+    // Control-plane mutation events (audit trail).
+    // Emitted by the main process to clients subscribed via SubscribeEvents.
+    // The Event.cluster_id / backend_id / address fields are populated when
+    // they are meaningful for the verb (e.g. address for listener verbs,
+    // cluster_id for cluster/frontend verbs). Backend events keep their
+    // historical numeric tags 0..3.
+    CLUSTER_ADDED = 4;
+    CLUSTER_REMOVED = 5;
+    FRONTEND_ADDED = 6;
+    FRONTEND_REMOVED = 7;
+    CERTIFICATE_ADDED = 8;
+    CERTIFICATE_REMOVED = 9;
+    CERTIFICATE_REPLACED = 10;
+    LISTENER_ACTIVATED = 11;
+    LISTENER_DEACTIVATED = 12;
+    CONFIGURATION_RELOADED = 13;
+    WORKER_KILLED = 14;
+    WORKER_RELAUNCHED = 15;
+    LOGGING_LEVEL_CHANGED = 16;
+    METRICS_CONFIGURED = 17;
 }
 
 message ClusterHashes {
@@ -830,11 +850,31 @@ message WorkerResponse {
     optional ResponseContent content = 4;
 }
 
+// label-cardinality knob for the metrics drain.
+// Mirrors HAProxy's `process|frontend|backend|server` extra-counters opt-in:
+// a higher level enables more granular labels (and thus more keys), letting
+// operators bound the StatsD keyspace explicitly.
+//
+// Each level is a SUPERSET of the previous one.
+enum MetricDetail {
+    // proxy-only counters (legacy default before opt-in landed)
+    DETAIL_PROCESS = 0;
+    // adds per-listener (frontend) breakdown for accept/connection counters
+    DETAIL_FRONTEND = 1;
+    // adds per-cluster aggregation (current default)
+    DETAIL_CLUSTER = 2;
+    // adds per-backend aggregation (cluster + backend, highest cardinality)
+    DETAIL_BACKEND = 3;
+}
+
 // intended to workers
 message ServerMetricsConfig {
     required string address = 1;
     required bool tagged_metrics = 2;
     optional string prefix = 3;
+    // optional in proto: workers built before this field default to
+    // DETAIL_CLUSTER on the lib side to preserve historical behaviour.
+    optional MetricDetail detail = 4;
 }
 
 // Used by a worker to start its server loop.
@@ -934,6 +974,32 @@ message ProtobufAccessLog {
     // same TCP or TLS connection. Distinct from `request_id`, which is set
     // per-request (one per H2 stream, one per H1 keep-alive exchange).
     optional Uint128 session_id = 23;
+    // Value of the `x-request-id` header as forwarded to the backend —
+    // either preserved verbatim from the client/upstream LB, or derived from
+    // the request ULID when the client did not supply one. Universal
+    // correlation key for end-to-end tracing across Envoy/HAProxy/Sōzu hops.
+    optional string x_request_id = 24;
+    // Negotiated TLS protocol version, short-form (e.g. "TLSv1.3"). Captured
+    // once at handshake completion. `None` for plaintext listeners or when
+    // the rustls version label is unknown to Sōzu.
+    optional string tls_version = 25;
+    // Negotiated TLS cipher suite, short-form (e.g.
+    // "TLS_AES_128_GCM_SHA256"). Captured once at handshake completion.
+    // `None` for plaintext listeners or when the rustls cipher label is
+    // unknown to Sōzu.
+    optional string tls_cipher = 26;
+    // TLS Server Name Indication (SNI) sent by the client at handshake.
+    // Stored pre-lowercased without a port. `None` for plaintext listeners
+    // or when the client omitted the SNI extension.
+    optional string tls_sni = 27;
+    // Negotiated ALPN protocol, short-form (e.g. "h2", "http/1.1"). `None`
+    // for plaintext listeners or when no ALPN was negotiated.
+    optional string tls_alpn = 28;
+    // Verbatim value of the client-supplied `X-Forwarded-For` header as
+    // observed before Sōzu appended its own hop. Comma-separated chain of
+    // proxy hops (e.g. `"203.0.113.5, 198.51.100.10"`). `None` if no
+    // upstream proxy supplied the header.
+    optional string xff_chain = 29;
 }
 
 message ProtobufEndpoint {

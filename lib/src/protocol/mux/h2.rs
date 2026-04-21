@@ -511,6 +511,11 @@ pub struct H2FloodViolation {
     pub error: H2Error,
     /// Human-readable name of the counter that tripped (e.g. `"RST_STREAM"`).
     pub reason: &'static str,
+    /// Statsd metric key emitted by [`ConnectionH2::handle_flood_violation`].
+    /// Carried alongside `reason` so a single field maps to both the log line
+    /// and the dashboard counter — adding a new violation kind requires
+    /// choosing both at the construction site, preventing drift.
+    pub metric_key: &'static str,
     /// Observed counter value at the moment of detection.
     pub count: u64,
     /// Configured ceiling that was crossed.
@@ -621,6 +626,7 @@ impl H2FloodDetector {
             return Some(H2FloodViolation {
                 error: H2Error::EnhanceYourCalm,
                 reason: "Rapid Reset: lifetime RST_STREAM",
+                metric_key: "h2.flood.violation.rst_stream_lifetime",
                 count: self.total_rst_received_lifetime,
                 threshold: self.config.max_rst_stream_lifetime,
             });
@@ -629,6 +635,7 @@ impl H2FloodDetector {
             return Some(H2FloodViolation {
                 error: H2Error::EnhanceYourCalm,
                 reason: "Rapid Reset: lifetime pre-response RST_STREAM",
+                metric_key: "h2.flood.violation.rst_stream_pre_response_lifetime",
                 count: self.total_abusive_rst_received_lifetime,
                 threshold: self.config.max_rst_stream_abusive_lifetime,
             });
@@ -650,6 +657,7 @@ impl H2FloodDetector {
             return Some(H2FloodViolation {
                 error: H2Error::EnhanceYourCalm,
                 reason: "MadeYouReset: lifetime server-emitted RST_STREAM",
+                metric_key: "h2.flood.violation.rst_stream_emitted_lifetime",
                 count: self.total_rst_streams_emitted_lifetime,
                 threshold: self.config.max_rst_stream_emitted_lifetime,
             });
@@ -676,11 +684,17 @@ impl H2FloodDetector {
     pub fn check_flood(&mut self) -> Option<H2FloodViolation> {
         self.maybe_reset_window();
 
-        fn flag(reason: &'static str, count: u32, threshold: u32) -> Option<H2FloodViolation> {
+        fn flag(
+            reason: &'static str,
+            metric_key: &'static str,
+            count: u32,
+            threshold: u32,
+        ) -> Option<H2FloodViolation> {
             if count > threshold {
                 Some(H2FloodViolation {
                     error: H2Error::EnhanceYourCalm,
                     reason,
+                    metric_key,
                     count: count as u64,
                     threshold: threshold as u64,
                 })
@@ -691,13 +705,22 @@ impl H2FloodDetector {
 
         flag(
             "RST_STREAM",
+            "h2.flood.violation.rst_stream_window",
             self.rst_stream_count,
             self.config.max_rst_stream_per_window,
         )
-        .or_else(|| flag("PING", self.ping_count, self.config.max_ping_per_window))
+        .or_else(|| {
+            flag(
+                "PING",
+                "h2.flood.violation.ping_window",
+                self.ping_count,
+                self.config.max_ping_per_window,
+            )
+        })
         .or_else(|| {
             flag(
                 "PING lifetime",
+                "h2.flood.violation.ping_lifetime",
                 self.total_ping_received_lifetime,
                 DEFAULT_MAX_PING_LIFETIME,
             )
@@ -705,6 +728,7 @@ impl H2FloodDetector {
         .or_else(|| {
             flag(
                 "SETTINGS",
+                "h2.flood.violation.settings_window",
                 self.settings_count,
                 self.config.max_settings_per_window,
             )
@@ -712,6 +736,7 @@ impl H2FloodDetector {
         .or_else(|| {
             flag(
                 "SETTINGS lifetime",
+                "h2.flood.violation.settings_lifetime",
                 self.total_settings_received_lifetime,
                 DEFAULT_MAX_SETTINGS_LIFETIME,
             )
@@ -719,6 +744,7 @@ impl H2FloodDetector {
         .or_else(|| {
             flag(
                 "empty DATA",
+                "h2.flood.violation.empty_data_window",
                 self.empty_data_count,
                 self.config.max_empty_data_per_window,
             )
@@ -726,6 +752,7 @@ impl H2FloodDetector {
         .or_else(|| {
             flag(
                 "CONTINUATION",
+                "h2.flood.violation.continuation_per_block",
                 self.continuation_count,
                 self.config.max_continuation_frames,
             )
@@ -733,11 +760,19 @@ impl H2FloodDetector {
         .or_else(|| {
             flag(
                 "accumulated header size",
+                "h2.flood.violation.header_size_per_block",
                 self.accumulated_header_size,
                 self.config.max_header_list_size,
             )
         })
-        .or_else(|| flag("glitch", self.glitch_count, self.config.max_glitch_count))
+        .or_else(|| {
+            flag(
+                "glitch",
+                "h2.flood.violation.glitch_window",
+                self.glitch_count,
+                self.config.max_glitch_count,
+            )
+        })
     }
 
     /// Reset CONTINUATION-specific counters when a header block is complete.
@@ -1014,8 +1049,14 @@ pub struct ConnectionH2<Front: SocketHandler> {
     /// Derived from `connection_config.max_concurrent_streams` at construction.
     max_pending_window_updates: usize,
     /// Last `(connection_window, active_streams, pending_window_updates)` snapshot
-    /// emitted by [`Self::gauge_connection_state`]. Stays `None` until the first
-    /// emission, then suppresses redundant updates.
+    /// emitted by [`Self::gauge_connection_state`]. The snapshot represents this
+    /// connection's *contribution* to the three `h2.connection.*` aggregate
+    /// gauges; each call emits the signed delta against this snapshot via
+    /// [`gauge_add!`] so the gauge sums across connections.
+    ///
+    /// Stays `None` until the first emission. [`Drop`] applies the negative of
+    /// this snapshot so the connection's contribution is always rebalanced to
+    /// zero on teardown — independent of which close path runs.
     last_gauge_snapshot: Option<(usize, usize, usize)>,
     /// Per-stream wall-clock timestamp of last meaningful activity (DATA or
     /// HEADERS frame receipt). Used to cancel streams that make no forward
@@ -1061,6 +1102,23 @@ impl<Front: SocketHandler> std::fmt::Debug for ConnectionH2<Front> {
             .field("window", &self.flow_control.window)
             .field("total_rst_streams_queued", &self.total_rst_streams_queued)
             .finish()
+    }
+}
+
+/// Symmetric tear-down for the three `h2.connection.*` aggregate gauges:
+/// whatever positive contribution this connection made via
+/// [`ConnectionH2::gauge_connection_state`] is subtracted back out when the
+/// connection is dropped.
+///
+/// Using `Drop` (rather than wiring decrements into every close path —
+/// `graceful_goaway`, `force_disconnect`, `handle_goaway_frame`, `Mux::close`,
+/// stream-id exhaustion, panic-unwind) is what guarantees the gauge is
+/// arithmetically symmetric regardless of which path teardown took. Past
+/// underflow incidents (commits a650ad69, d2f01ed4) have all been
+/// missing-decrement bugs that `Drop` makes structurally impossible.
+impl<Front: SocketHandler> Drop for ConnectionH2<Front> {
+    fn drop(&mut self) {
+        self.release_connection_gauges();
     }
 }
 
@@ -1743,6 +1801,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 match serializer::gen_settings(kawa.storage.space(), &self.local_settings) {
                     Ok((_, size)) => {
                         kawa.storage.fill(size);
+                        incr!("h2.frames.tx.settings");
                         // RFC 9113 §6.5: start tracking SETTINGS ACK timeout
                         self.settings_sent_at = Some(Instant::now());
                     }
@@ -1821,10 +1880,28 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         MuxResult::Continue
     }
 
-    /// Emit the H2 connection-level gauges, but only when the snapshot
-    /// actually changed since the last call. Called from the write hot path,
-    /// so suppressing redundant updates avoids a syscall storm under
-    /// steady-state traffic.
+    /// Update the H2 connection-level *aggregate* gauges with this connection's
+    /// current contribution, expressed as a signed delta against the last
+    /// snapshot we emitted.
+    ///
+    /// The three metrics are emitted via [`gauge_add!`] (lifecycle deltas) so
+    /// that the dashboard sees the **sum across all live H2 connections**:
+    ///
+    /// - `h2.connection.window_bytes` — sum of available connection-level
+    ///   send-window bytes. Negative per-connection windows clamp to 0 so the
+    ///   aggregate represents only available capacity, not deficit.
+    /// - `h2.connection.active_streams` — sum of in-flight streams across
+    ///   every H2 connection.
+    /// - `h2.connection.pending_window_updates` — sum of queued (un-flushed)
+    ///   per-stream WINDOW_UPDATE entries across every H2 connection.
+    ///
+    /// Called from the write hot path; emits nothing when the snapshot is
+    /// unchanged so the steady state stays cheap. The paired decrement for
+    /// every increment is provided by [`Drop`], which subtracts the final
+    /// snapshot when the connection is dropped — keeping the aggregate
+    /// arithmetically symmetric independent of which close path runs
+    /// (`graceful_goaway`, `force_disconnect`, `handle_goaway_frame`,
+    /// `Mux::close`, panic-unwind, …).
     fn gauge_connection_state(&mut self) {
         let snapshot = (
             self.flow_control.window.max(0) as usize,
@@ -1834,10 +1911,42 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         if self.last_gauge_snapshot == Some(snapshot) {
             return;
         }
-        gauge!("h2.connection_window", snapshot.0);
-        gauge!("h2.active_streams", snapshot.1);
-        gauge!("h2.pending_window_updates", snapshot.2);
+        let prev = self.last_gauge_snapshot.unwrap_or((0, 0, 0));
+        // Diff in i64 — usize cannot represent the negative side of the delta.
+        let dw = snapshot.0 as i64 - prev.0 as i64;
+        let ds = snapshot.1 as i64 - prev.1 as i64;
+        let du = snapshot.2 as i64 - prev.2 as i64;
+        if dw != 0 {
+            gauge_add!("h2.connection.window_bytes", dw);
+        }
+        if ds != 0 {
+            gauge_add!("h2.connection.active_streams", ds);
+        }
+        if du != 0 {
+            gauge_add!("h2.connection.pending_window_updates", du);
+        }
         self.last_gauge_snapshot = Some(snapshot);
+    }
+
+    /// Subtract this connection's contribution from the three aggregate
+    /// `h2.connection.*` gauges. Idempotent: clears `last_gauge_snapshot` so a
+    /// second call (or a [`Drop`] on top of an explicit reset) is a no-op.
+    ///
+    /// Pairs with every prior call to [`Self::gauge_connection_state`]; called
+    /// from [`Drop`] so the symmetry is guaranteed regardless of the close
+    /// path.
+    fn release_connection_gauges(&mut self) {
+        if let Some((w, s, u)) = self.last_gauge_snapshot.take() {
+            if w != 0 {
+                gauge_add!("h2.connection.window_bytes", -(w as i64));
+            }
+            if s != 0 {
+                gauge_add!("h2.connection.active_streams", -(s as i64));
+            }
+            if u != 0 {
+                gauge_add!("h2.connection.pending_window_updates", -(u as i64));
+            }
+        }
     }
 
     /// Write application data (request/response bodies, headers) across all
@@ -1947,6 +2056,12 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             scheme,
             lowercase_buf: std::mem::take(&mut self.lowercase_buf),
             cookie_buf: std::mem::take(&mut self.cookie_buf),
+            // When this connection is a backend client we are writing
+            // toward the upstream backend — flow-control stalls in that
+            // direction are scoped to `backend.flow_control.paused` (in
+            // addition to the existing direction-agnostic
+            // `h2.flow_control_stall`).
+            position_is_client: self.position.is_client(),
         };
         self.priorities_buf.clear();
         self.priorities_buf.extend(self.streams.keys().copied());
@@ -2338,6 +2453,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     Ok((_, size)) => {
                         offset += size;
                         written_ids.push(stream_id);
+                        incr!("h2.frames.tx.window_update");
                     }
                     Err(_) => {
                         // Buffer full — stop here, remaining entries stay in the map
@@ -2395,6 +2511,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     Ok((_, _)) => {
                         offset += frame_size;
                         written_count += 1;
+                        incr!("h2.frames.tx.rst_stream");
                     }
                     Err(_) => break,
                 }
@@ -2493,6 +2610,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 match serializer::gen_settings(kawa.storage.space(), &self.local_settings) {
                     Ok((_, size)) => {
                         kawa.storage.fill(size);
+                        incr!("h2.frames.tx.settings");
                         // RFC 9113 §6.5: start tracking SETTINGS ACK timeout
                         self.settings_sent_at = Some(Instant::now());
                     }
@@ -2968,8 +3086,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     ///
     /// Centralises the "flood detected" reporting so every site that observes a
     /// [`H2FloodViolation`] gets the same session-scoped log line, matching the
-    /// RUSTLS log-context convention.
+    /// RUSTLS log-context convention. Also emits the per-kind statsd counter
+    /// (`h2.flood.violation.<kind>`) so SOC dashboards can window the trip
+    /// rate without parsing logs — every CVE-mitigation in the H2 family
+    /// (Rapid Reset, MadeYouReset, CONTINUATION/PING/SETTINGS floods, header
+    /// overflow, glitch) funnels through this site.
     pub fn handle_flood_violation(&mut self, violation: H2FloodViolation) -> MuxResult {
+        count!(violation.metric_key, 1);
         warn!(
             "{} H2 flood detected: {} count {} exceeds threshold {}",
             log_context!(self),
@@ -2979,7 +3102,90 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         );
         self.goaway(violation.error)
     }
+}
 
+/// Compile-time mapping from `(prefix, H2Error)` to a static metric key.
+///
+/// Materialises a `&'static str` literal via `concat!`, so the metric key
+/// never crosses through a heap allocation and the statsd drain can store it
+/// as `&'static str`. Adding a new `H2Error` variant fails the build here —
+/// the metric breakdown stays in lock-step with RFC 9113 §7 codes.
+///
+/// Used for the per-error-code counters emitted around GOAWAY and RST_STREAM
+/// in either direction (see `metric_for_goaway_sent` etc. below).
+macro_rules! h2_error_metric_key {
+    ($prefix:literal, $error:expr) => {
+        match $error {
+            H2Error::NoError => concat!($prefix, ".no_error"),
+            H2Error::ProtocolError => concat!($prefix, ".protocol_error"),
+            H2Error::InternalError => concat!($prefix, ".internal_error"),
+            H2Error::FlowControlError => concat!($prefix, ".flow_control_error"),
+            H2Error::SettingsTimeout => concat!($prefix, ".settings_timeout"),
+            H2Error::StreamClosed => concat!($prefix, ".stream_closed"),
+            H2Error::FrameSizeError => concat!($prefix, ".frame_size_error"),
+            H2Error::RefusedStream => concat!($prefix, ".refused_stream"),
+            H2Error::Cancel => concat!($prefix, ".cancel"),
+            H2Error::CompressionError => concat!($prefix, ".compression_error"),
+            H2Error::ConnectError => concat!($prefix, ".connect_error"),
+            H2Error::EnhanceYourCalm => concat!($prefix, ".enhance_your_calm"),
+            H2Error::InadequateSecurity => concat!($prefix, ".inadequate_security"),
+            H2Error::HTTP11Required => concat!($prefix, ".http_1_1_required"),
+        }
+    };
+}
+
+/// Static metric key for an outbound GOAWAY. Same call shape as the other three
+/// helpers below — keeps the call sites uniform.
+fn metric_for_goaway_sent(error: H2Error) -> &'static str {
+    h2_error_metric_key!("h2.goaway.sent", error)
+}
+
+/// Static metric key for an inbound GOAWAY by raw wire error code. Codes
+/// outside RFC 9113 §7 fall into the dedicated `…unknown_error` bucket so the
+/// breakdown stays bounded and operators can still spot non-standard peers.
+fn metric_for_goaway_received(error_code: u32) -> &'static str {
+    H2Error::try_from(error_code)
+        .map(|e| h2_error_metric_key!("h2.goaway.received", e))
+        .unwrap_or("h2.goaway.received.unknown_error")
+}
+
+/// Static metric key for an outbound RST_STREAM. Mirrors
+/// [`metric_for_goaway_sent`] under a separate namespace so RST and GOAWAY
+/// rates can be alerted on independently.
+fn metric_for_rst_stream_sent(error: H2Error) -> &'static str {
+    h2_error_metric_key!("h2.rst_stream.sent", error)
+}
+
+/// Static metric key for an inbound RST_STREAM by raw wire error code. Same
+/// `…unknown_error` fallback as [`metric_for_goaway_received`].
+fn metric_for_rst_stream_received(error_code: u32) -> &'static str {
+    H2Error::try_from(error_code)
+        .map(|e| h2_error_metric_key!("h2.rst_stream.received", e))
+        .unwrap_or("h2.rst_stream.received.unknown_error")
+}
+
+/// Static metric key for an inbound H2 frame by RFC 9113 §6 frame type.
+/// Emitted at the `handle_frame` dispatch — single chokepoint that any
+/// new H2 frame type must traverse, so adding a `Frame::*` variant fails
+/// the build here. Counts are per-frame, not per-byte; pair with
+/// `bytes_in` for traffic-mix dashboards.
+fn h2_frame_rx_metric_key(frame: &Frame) -> &'static str {
+    match frame {
+        Frame::Data(_) => "h2.frames.rx.data",
+        Frame::Headers(_) => "h2.frames.rx.headers",
+        Frame::PushPromise(_) => "h2.frames.rx.push_promise",
+        Frame::Priority(_) => "h2.frames.rx.priority",
+        Frame::RstStream(_) => "h2.frames.rx.rst_stream",
+        Frame::Settings(_) => "h2.frames.rx.settings",
+        Frame::Ping(_) => "h2.frames.rx.ping",
+        Frame::GoAway(_) => "h2.frames.rx.goaway",
+        Frame::WindowUpdate(_) => "h2.frames.rx.window_update",
+        Frame::Continuation(_) => "h2.frames.rx.continuation",
+        Frame::Unknown(_) => "h2.frames.rx.unknown",
+    }
+}
+
+impl<Front: SocketHandler> ConnectionH2<Front> {
     pub fn goaway(&mut self, error: H2Error) -> MuxResult {
         self.state = H2State::Error;
         self.drain.draining = true;
@@ -2998,11 +3204,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             H2Error::InternalError => error!("{} GOAWAY: {:?}", log_context!(self), error),
             _ => warn!("{} GOAWAY: {:?}", log_context!(self), error),
         }
+        count!(metric_for_goaway_sent(error), 1);
 
         // RFC 9113 §6.8: last_stream_id is the highest peer-initiated stream we processed
         match serializer::gen_goaway(kawa.storage.space(), self.highest_peer_stream_id, error) {
             Ok((_, size)) => {
                 kawa.storage.fill(size);
+                incr!("h2.frames.tx.goaway");
                 self.state = H2State::GoAway;
                 self.expect_write = Some(H2StreamId::Zero);
                 self.readiness.interest = Ready::WRITABLE | Ready::HUP | Ready::ERROR;
@@ -3047,10 +3255,17 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             "{} GOAWAY (graceful, phase 1): last_stream_id=0x7FFFFFFF",
             log_context!(self)
         );
+        // Phase 1 sends a NO_ERROR GOAWAY on the wire — count it under the
+        // same per-code key as phase 2. The downstream alert that wants to
+        // distinguish drain from termination compares against the
+        // `h2.goaway.sent.no_error` rate (drain) vs the other variants
+        // (termination on error).
+        count!(metric_for_goaway_sent(H2Error::NoError), 1);
 
         match serializer::gen_goaway(kawa.storage.space(), STREAM_ID_MAX, H2Error::NoError) {
             Ok((_, size)) => {
                 kawa.storage.fill(size);
+                incr!("h2.frames.tx.goaway");
                 // Stay in the current state so the connection can continue processing
                 // existing streams. The second GOAWAY will transition to GoAway state.
                 // Keep READABLE so in-flight request bodies can still be received
@@ -3199,6 +3414,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         L: ListenerHandler + L7ListenerHandler,
     {
         trace!("{} {:#?}", log_context!(self), frame);
+        // Per-frame-type RX counter. Single chokepoint covers every H2 frame
+        // type — adding a new `Frame::*` variant fails the build inside the
+        // helper, keeping the metric breakdown in lock-step with RFC 9113 §6.
+        count!(h2_frame_rx_metric_key(&frame), 1);
         match frame {
             Frame::Data(data) => self.handle_data_frame(data, wire_payload_len, context, endpoint),
             Frame::Headers(headers) => self.handle_headers_frame(headers, context, endpoint),
@@ -3688,6 +3907,12 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         E: Endpoint,
         L: ListenerHandler + L7ListenerHandler,
     {
+        // Per-error-code counter for the inbound RST. Emitted before the
+        // flood-detector trip check so even a connection that gets terminated
+        // by `handle_flood_violation` shows up in the per-code breakdown
+        // (the dedicated `h2.flood.violation.rst_stream_*` series tracks the
+        // mitigation event itself).
+        count!(metric_for_rst_stream_received(rst_stream.error_code), 1);
         // CVE-2023-44487 Rapid Reset + CVE-2019-9514: track RST_STREAM rate.
         self.flood_detector.rst_stream_count += 1;
         if let Some(violation) = self.flood_detector.check_flood() {
@@ -3720,6 +3945,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         };
         if let Some(violation) = self.flood_detector.record_rst_lifetime(response_started) {
             return self.handle_flood_violation(violation);
+        }
+        // Rapid Reset signature (CVE-2023-44487): a RST that arrives before the
+        // backend has begun answering. Emitted alongside the per-code counter
+        // so the SOC can alert on the rate of pre-response RSTs without
+        // having to differentiate by error code.
+        if !response_started {
+            count!("h2.rst_stream.received.pre_response_start", 1);
         }
         debug!(
             "{} RstStream({} -> {})",
@@ -3904,7 +4136,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             return self.force_disconnect();
         }
         match serializer::gen_ping_acknowledgement(kawa.storage.space(), &ping.payload) {
-            Ok((_, size)) => kawa.storage.fill(size),
+            Ok((_, size)) => {
+                kawa.storage.fill(size);
+                incr!("h2.frames.tx.ping_ack");
+            }
             Err(error) => {
                 error!(
                     "{} Could not serialize PingFrame: {:?}",
@@ -3955,6 +4190,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 goaway.additional_debug_data
             );
         }
+        count!(metric_for_goaway_received(goaway.error_code), 1);
         // RFC 9113 §6.8: begin graceful drain.
         self.drain.draining = true;
         self.drain.peer_last_stream_id = Some(goaway.last_stream_id);
@@ -4351,6 +4587,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             stream.generate_access_log(true, Some("H2::Reset"), context.listener.clone());
             stream.metrics.reset();
         }
+        // Per-error-code counter for the outbound RST. Emitted regardless of
+        // `error` (including the graceful-cancel `NoError` path) so dashboards
+        // can split benign cancels from defensive resets without consulting
+        // the flood-detector keys.
+        count!(metric_for_rst_stream_sent(error), 1);
         // CVE-2025-8671 MadeYouReset: cap the total number of RST_STREAM frames
         // we emit on this connection. Graceful `NoError` cancels (e.g. stream
         // recycle, propagated client-side cancel) are exempt; only error-path
@@ -4403,6 +4644,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                             if buf.len() >= frame.len() {
                                 buf[..frame.len()].copy_from_slice(&frame);
                                 kawa.storage.fill(frame.len());
+                                incr!("h2.frames.tx.rst_stream");
+                                count!(metric_for_rst_stream_sent(H2Error::Cancel), 1);
                                 self.readiness.interest.insert(Ready::WRITABLE);
                                 self.readiness.signal_pending_write();
                                 self.rst_sent.insert(id);
@@ -4892,6 +5135,183 @@ mod tests {
         // Force a window reset through check_flood.
         let _ = detector.check_flood();
         assert_eq!(detector.total_rst_streams_emitted_lifetime, 10);
+    }
+
+    /// Every violation kind must carry a metric_key under the agreed
+    /// `h2.flood.violation.*` namespace, and the keys must be unique. The
+    /// statsd counter at `handle_flood_violation` reads `violation.metric_key`
+    /// directly — drift between the construction site and the metric name
+    /// would silently lose alerting on a CVE mitigation.
+    #[test]
+    fn test_flood_violation_metric_keys_are_unique_and_namespaced() {
+        // Helper: run `record_rst_lifetime` until it trips, returning the metric_key.
+        fn key_from_rst_lifetime(response_started: bool) -> &'static str {
+            let mut detector = H2FloodDetector::default();
+            loop {
+                if let Some(v) = detector.record_rst_lifetime(response_started) {
+                    return v.metric_key;
+                }
+            }
+        }
+
+        // Helper: run `record_rst_emitted` until it trips, returning the metric_key.
+        fn key_from_rst_emitted() -> &'static str {
+            let mut detector = H2FloodDetector::default();
+            loop {
+                if let Some(v) = detector.record_rst_emitted() {
+                    return v.metric_key;
+                }
+            }
+        }
+
+        // Helper: drive a single `check_flood` counter past its threshold.
+        fn key_from_check_flood(setup: impl FnOnce(&mut H2FloodDetector)) -> &'static str {
+            let mut detector = H2FloodDetector::default();
+            setup(&mut detector);
+            detector
+                .check_flood()
+                .expect("setup should always trip a flood")
+                .metric_key
+        }
+
+        let keys: [&'static str; 12] = [
+            // Lifetime methods on the detector itself.
+            key_from_rst_lifetime(true),
+            key_from_rst_lifetime(false),
+            key_from_rst_emitted(),
+            // `check_flood` arms.
+            key_from_check_flood(|d| d.rst_stream_count = u32::MAX),
+            key_from_check_flood(|d| d.ping_count = u32::MAX),
+            key_from_check_flood(|d| d.total_ping_received_lifetime = u32::MAX),
+            key_from_check_flood(|d| d.settings_count = u32::MAX),
+            key_from_check_flood(|d| d.total_settings_received_lifetime = u32::MAX),
+            key_from_check_flood(|d| d.empty_data_count = u32::MAX),
+            key_from_check_flood(|d| d.continuation_count = u32::MAX),
+            key_from_check_flood(|d| d.accumulated_header_size = u32::MAX),
+            key_from_check_flood(|d| d.glitch_count = u32::MAX),
+        ];
+
+        for key in keys {
+            assert!(
+                key.starts_with("h2.flood.violation."),
+                "metric key {key} is missing the h2.flood.violation. prefix",
+            );
+        }
+        let mut deduped = keys.to_vec();
+        deduped.sort_unstable();
+        deduped.dedup();
+        assert_eq!(
+            deduped.len(),
+            keys.len(),
+            "metric keys must be unique across violation kinds; collisions: {keys:?}",
+        );
+    }
+
+    /// All four `metric_for_*` helpers must yield distinct, namespaced keys for
+    /// every RFC 9113 §7 error code. The macro behind them uses `concat!`, so a
+    /// new H2Error variant fails the build inside the macro — but a typo in
+    /// the helper prefix would silently land. Walk every (direction × kind)
+    /// pair and dedupe the set.
+    /// `h2_frame_rx_metric_key` must yield a distinct `&'static str` per
+    /// `Frame::*` variant. The single dispatch site in `handle_frame` reads
+    /// from this helper, so a typo or duplicate would silently clobber the
+    /// frame-mix dashboard. Asserting the literal set lets us compare against
+    /// `doc/configure.md` and the RFC 9113 §6 frame catalogue without
+    /// reconstructing every Frame variant in the test.
+    #[test]
+    fn test_h2_frame_rx_metric_keys_are_unique_and_namespaced() {
+        // Update this list whenever a new Frame variant is added — the helper
+        // match is also exhaustive, so the build will already break there
+        // before anyone notices the test missing a key.
+        let expected: [&'static str; 11] = [
+            "h2.frames.rx.data",
+            "h2.frames.rx.headers",
+            "h2.frames.rx.push_promise",
+            "h2.frames.rx.priority",
+            "h2.frames.rx.rst_stream",
+            "h2.frames.rx.settings",
+            "h2.frames.rx.ping",
+            "h2.frames.rx.goaway",
+            "h2.frames.rx.window_update",
+            "h2.frames.rx.continuation",
+            "h2.frames.rx.unknown",
+        ];
+
+        for key in expected {
+            assert!(
+                key.starts_with("h2.frames.rx."),
+                "metric key {key} is missing the h2.frames.rx. prefix",
+            );
+        }
+        let mut deduped = expected.to_vec();
+        deduped.sort_unstable();
+        deduped.dedup();
+        assert_eq!(
+            deduped.len(),
+            expected.len(),
+            "frame-rx metric keys must be unique; collisions in: {expected:?}",
+        );
+
+        // Spot-check the helper for the one variant we can construct without
+        // borrowing into a frame body — `Frame::Unknown(u8)` is just a tag.
+        assert_eq!(
+            h2_frame_rx_metric_key(&Frame::Unknown(42)),
+            "h2.frames.rx.unknown",
+        );
+    }
+
+    #[test]
+    fn test_per_error_code_metric_keys_are_unique_and_namespaced() {
+        const ALL_ERRORS: [H2Error; 14] = [
+            H2Error::NoError,
+            H2Error::ProtocolError,
+            H2Error::InternalError,
+            H2Error::FlowControlError,
+            H2Error::SettingsTimeout,
+            H2Error::StreamClosed,
+            H2Error::FrameSizeError,
+            H2Error::RefusedStream,
+            H2Error::Cancel,
+            H2Error::CompressionError,
+            H2Error::ConnectError,
+            H2Error::EnhanceYourCalm,
+            H2Error::InadequateSecurity,
+            H2Error::HTTP11Required,
+        ];
+
+        let mut keys: Vec<&'static str> = Vec::new();
+        for error in ALL_ERRORS {
+            let code = error as u32;
+            keys.push(metric_for_goaway_sent(error));
+            keys.push(metric_for_goaway_received(code));
+            keys.push(metric_for_rst_stream_sent(error));
+            keys.push(metric_for_rst_stream_received(code));
+        }
+        // …plus the four `unknown_error` fallbacks for codes outside RFC 9113 §7.
+        let unknown_code = 0xff;
+        assert!(H2Error::try_from(unknown_code).is_err());
+        keys.push(metric_for_goaway_received(unknown_code));
+        keys.push(metric_for_rst_stream_received(unknown_code));
+        // …and the dedicated Rapid Reset signature counter.
+        keys.push("h2.rst_stream.received.pre_response_start");
+
+        for key in &keys {
+            assert!(
+                key.starts_with("h2.goaway.sent.")
+                    || key.starts_with("h2.goaway.received.")
+                    || key.starts_with("h2.rst_stream.sent.")
+                    || key.starts_with("h2.rst_stream.received."),
+                "metric key {key} does not match a known per-error-code namespace",
+            );
+        }
+        let mut deduped = keys.clone();
+        deduped.sort_unstable();
+        deduped.dedup();
+        assert_eq!(
+            deduped.len(),
+            keys.len(),
+            "per-error-code metric keys must be unique; collisions in: {keys:?}",
+        );
     }
 
     #[test]

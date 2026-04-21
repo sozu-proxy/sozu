@@ -21,6 +21,10 @@ pub struct ClientSession {
     pub channel: Channel<Response, Request>,
     pub id: ClientId,
     pub token: Token,
+    /// UID of the peer process on the unix socket, captured via `SO_PEERCRED`
+    /// at accept time. `None` if the peer credentials could not be read
+    /// (e.g. non-Linux build or the syscall failed).
+    pub actor_uid: Option<u32>,
 }
 
 /// The return type of the ready method
@@ -33,9 +37,28 @@ pub enum ClientResult {
 }
 
 impl ClientSession {
-    pub fn new(mut channel: Channel<Response, Request>, id: ClientId, token: Token) -> Self {
+    pub fn new(
+        mut channel: Channel<Response, Request>,
+        id: ClientId,
+        token: Token,
+        actor_uid: Option<u32>,
+    ) -> Self {
         channel.interest = Ready::READABLE | Ready::ERROR | Ready::HUP;
-        Self { channel, id, token }
+        Self {
+            channel,
+            id,
+            token,
+            actor_uid,
+        }
+    }
+
+    /// Render the captured peer UID for audit logs. Returns the literal
+    /// `"unknown"` when the value is missing so log lines stay structured.
+    pub fn actor_uid_display(&self) -> String {
+        match self.actor_uid {
+            Some(uid) => uid.to_string(),
+            None => String::from("unknown"),
+        }
     }
 
     /// queue a response for the client (the event loop does the send)

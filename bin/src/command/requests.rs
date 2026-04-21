@@ -8,6 +8,7 @@ use std::{
 
 use mio::Token;
 use nom::{HexDisplay, Offset};
+use rusty_ulid::Ulid;
 use sozu_command_lib::{
     buffer::fixed::Buffer,
     config::Config,
@@ -15,10 +16,10 @@ use sozu_command_lib::{
     parser::parse_several_requests,
     proto::command::{
         AggregatedMetrics, AvailableMetrics, CertificatesWithFingerprints, ClusterHashes,
-        ClusterInformations, FrontendFilters, HardStop, QueryCertificatesFilters,
-        QueryMetricsOptions, Request, ResponseContent, ResponseStatus, RunState, SoftStop, Status,
-        WorkerInfo, WorkerInfos, WorkerRequest, WorkerResponses, request::RequestType,
-        response_content::ContentType,
+        ClusterInformations, Event, EventKind, FrontendFilters, HardStop, MetricsConfiguration,
+        QueryCertificatesFilters, QueryMetricsOptions, Request, ResponseContent, ResponseStatus,
+        RunState, SoftStop, Status, WorkerInfo, WorkerInfos, WorkerRequest, WorkerResponses,
+        request::RequestType, response_content::ContentType,
     },
 };
 use sozu_lib::metrics::METRICS;
@@ -31,6 +32,19 @@ use crate::command::{
     sessions::{ClientSession, OptionalClient},
     upgrade::{upgrade_main, upgrade_worker},
 };
+
+/// Pair a verb tag with its `config.<verb>` counter key in a single place so
+/// the two strings cannot drift. Both must be string literals because the
+/// metric drain stores `&'static str` keys.
+///
+/// Defined at the top of the module so that in-file macros expand before any
+/// call site (Rust `macro_rules!` macros are textually scoped — definition
+/// must precede use within a module).
+macro_rules! audit_verb {
+    ($verb:literal) => {
+        ($verb, concat!("config.", $verb))
+    };
+}
 
 impl Server {
     pub fn handle_client_request(&mut self, client: &mut ClientSession, request: Request) {
@@ -239,6 +253,16 @@ fn set_logging_level(server: &mut Server, client: &mut ClientSession, logging_fi
     debug!("Changing main process log level to {}", logging_filter);
     let (directives, errors) = logging::parse_logging_spec(&logging_filter);
     if !errors.is_empty() {
+        let (verb, counter) = audit_verb!("logging_level_changed");
+        audit_emit_inline(
+            server,
+            client,
+            EventKind::LoggingLevelChanged,
+            verb,
+            counter,
+            format!("logging:{logging_filter}"),
+            AuditResult::Err,
+        );
         client.finish_failure(format!(
             "Error parsing logging filter:\n- {}",
             errors
@@ -260,6 +284,17 @@ fn set_logging_level(server: &mut Server, client: &mut ClientSession, logging_fi
     debug!(
         "Logging level now: {}",
         env::var("RUST_LOG").unwrap_or("could get RUST_LOG from env".to_string())
+    );
+
+    let (verb, counter) = audit_verb!("logging_level_changed");
+    audit_emit_inline(
+        server,
+        client,
+        EventKind::LoggingLevelChanged,
+        verb,
+        counter,
+        format!("logging:{logging_filter}"),
+        AuditResult::Ok,
     );
 
     worker_request(server, client, RequestType::Logging(logging_filter));
@@ -377,9 +412,25 @@ pub fn load_static_config(server: &mut Server, mut client: OptionalClient, path:
         config.config_path
     ));
 
+    let audit_target = format!("config:{}", config.config_path);
+
     let config_messages = match config.generate_config_messages() {
         Ok(messages) => messages,
         Err(config_err) => {
+            // Only attribute the audit event when a client triggered the
+            // reload — at startup (`client == None`) there is no actor.
+            if let Some(client_ref) = client.as_deref() {
+                let (verb, counter) = audit_verb!("configuration_reloaded");
+                audit_emit_inline(
+                    server,
+                    client_ref,
+                    EventKind::ConfigurationReloaded,
+                    verb,
+                    counter,
+                    audit_target.clone(),
+                    AuditResult::Err,
+                );
+            }
             client.finish_failure(format!("could not generate new config: {config_err}"));
             return;
         }
@@ -399,6 +450,19 @@ pub fn load_static_config(server: &mut Server, mut client: OptionalClient, path:
         }
 
         server.scatter_on(request, task_id, request_index, None);
+    }
+
+    if let Some(client_ref) = client.as_deref() {
+        let (verb, counter) = audit_verb!("configuration_reloaded");
+        audit_emit_inline(
+            server,
+            client_ref,
+            EventKind::ConfigurationReloaded,
+            verb,
+            counter,
+            audit_target,
+            AuditResult::Ok,
+        );
     }
 }
 
@@ -447,6 +511,278 @@ impl GatheringTask for LoadStaticConfigTask {
 }
 
 // =========================================================
+// Audit trail (control-plane mutations)
+
+/// Outcome of a control-plane mutation, formatted into the structured
+/// `[AUDIT]` log line.
+#[derive(Clone, Copy)]
+enum AuditResult {
+    Ok,
+    Err,
+}
+
+impl AuditResult {
+    fn as_str(self) -> &'static str {
+        match self {
+            AuditResult::Ok => "ok",
+            AuditResult::Err => "err",
+        }
+    }
+}
+
+/// A control-plane mutation, broken down into the pieces the audit trail
+/// needs (event kind, verb name for the log, the matching counter key, and
+/// the optional target identifiers populated on the emitted [Event]).
+struct AuditEntry {
+    kind: EventKind,
+    /// Stable verb tag rendered into the `[AUDIT]` log line. Always a static
+    /// string.
+    verb: &'static str,
+    /// Pre-built `config.<verb>` counter key. Stored as a `&'static str` so
+    /// `count!` can route it through statsd without a verb→key dispatch
+    /// table — the construction sites pair `verb` and `counter` at a single
+    /// site, eliminating drift.
+    counter: &'static str,
+    cluster_id: Option<String>,
+    backend_id: Option<String>,
+    address: Option<sozu_command_lib::proto::command::SocketAddress>,
+    /// Free-form target descriptor for the audit log, e.g. `"address:127.0.0.1:8080"`
+    /// or `"cluster:my-cluster"`. Captures whichever identifier is meaningful
+    /// for the verb.
+    target: String,
+}
+
+/// Build the [AuditEntry] for a control-plane request, or `None` for
+/// non-mutating verbs (the caller skips them — they have no audit footprint).
+fn audit_entry_for(request: &RequestType) -> Option<AuditEntry> {
+    match request {
+        RequestType::AddCluster(cluster) => {
+            let (verb, counter) = audit_verb!("cluster_added");
+            Some(AuditEntry {
+                kind: EventKind::ClusterAdded,
+                verb,
+                counter,
+                target: format!("cluster:{}", cluster.cluster_id),
+                cluster_id: Some(cluster.cluster_id.to_owned()),
+                backend_id: None,
+                address: None,
+            })
+        }
+        RequestType::RemoveCluster(cluster_id) => {
+            let (verb, counter) = audit_verb!("cluster_removed");
+            Some(AuditEntry {
+                kind: EventKind::ClusterRemoved,
+                verb,
+                counter,
+                target: format!("cluster:{cluster_id}"),
+                cluster_id: Some(cluster_id.to_owned()),
+                backend_id: None,
+                address: None,
+            })
+        }
+        RequestType::AddHttpFrontend(frontend) => {
+            let (verb, counter) = audit_verb!("http_frontend_added");
+            Some(AuditEntry {
+                kind: EventKind::FrontendAdded,
+                verb,
+                counter,
+                target: format!("frontend:http:{}:{}", frontend.hostname, frontend.address),
+                cluster_id: frontend.cluster_id.clone(),
+                backend_id: None,
+                address: Some(frontend.address),
+            })
+        }
+        RequestType::AddHttpsFrontend(frontend) => {
+            let (verb, counter) = audit_verb!("https_frontend_added");
+            Some(AuditEntry {
+                kind: EventKind::FrontendAdded,
+                verb,
+                counter,
+                target: format!("frontend:https:{}:{}", frontend.hostname, frontend.address),
+                cluster_id: frontend.cluster_id.clone(),
+                backend_id: None,
+                address: Some(frontend.address),
+            })
+        }
+        RequestType::AddTcpFrontend(frontend) => {
+            let (verb, counter) = audit_verb!("tcp_frontend_added");
+            Some(AuditEntry {
+                kind: EventKind::FrontendAdded,
+                verb,
+                counter,
+                target: format!("frontend:tcp:{}:{}", frontend.cluster_id, frontend.address),
+                cluster_id: Some(frontend.cluster_id.to_owned()),
+                backend_id: None,
+                address: Some(frontend.address),
+            })
+        }
+        RequestType::RemoveHttpFrontend(frontend) => {
+            let (verb, counter) = audit_verb!("http_frontend_removed");
+            Some(AuditEntry {
+                kind: EventKind::FrontendRemoved,
+                verb,
+                counter,
+                target: format!("frontend:http:{}:{}", frontend.hostname, frontend.address),
+                cluster_id: frontend.cluster_id.clone(),
+                backend_id: None,
+                address: Some(frontend.address),
+            })
+        }
+        RequestType::RemoveHttpsFrontend(frontend) => {
+            let (verb, counter) = audit_verb!("https_frontend_removed");
+            Some(AuditEntry {
+                kind: EventKind::FrontendRemoved,
+                verb,
+                counter,
+                target: format!("frontend:https:{}:{}", frontend.hostname, frontend.address),
+                cluster_id: frontend.cluster_id.clone(),
+                backend_id: None,
+                address: Some(frontend.address),
+            })
+        }
+        RequestType::RemoveTcpFrontend(frontend) => {
+            let (verb, counter) = audit_verb!("tcp_frontend_removed");
+            Some(AuditEntry {
+                kind: EventKind::FrontendRemoved,
+                verb,
+                counter,
+                target: format!("frontend:tcp:{}:{}", frontend.cluster_id, frontend.address),
+                cluster_id: Some(frontend.cluster_id.to_owned()),
+                backend_id: None,
+                address: Some(frontend.address),
+            })
+        }
+        RequestType::AddCertificate(add) => {
+            let (verb, counter) = audit_verb!("certificate_added");
+            Some(AuditEntry {
+                kind: EventKind::CertificateAdded,
+                verb,
+                counter,
+                target: format!("certificate:{}", add.address),
+                cluster_id: None,
+                backend_id: None,
+                address: Some(add.address),
+            })
+        }
+        RequestType::RemoveCertificate(remove) => {
+            let (verb, counter) = audit_verb!("certificate_removed");
+            Some(AuditEntry {
+                kind: EventKind::CertificateRemoved,
+                verb,
+                counter,
+                target: format!("certificate:{}:{}", remove.address, remove.fingerprint),
+                cluster_id: None,
+                backend_id: None,
+                address: Some(remove.address),
+            })
+        }
+        RequestType::ReplaceCertificate(replace) => {
+            let (verb, counter) = audit_verb!("certificate_replaced");
+            Some(AuditEntry {
+                kind: EventKind::CertificateReplaced,
+                verb,
+                counter,
+                target: format!(
+                    "certificate:{}:{}",
+                    replace.address, replace.old_fingerprint
+                ),
+                cluster_id: None,
+                backend_id: None,
+                address: Some(replace.address),
+            })
+        }
+        RequestType::ActivateListener(listener) => {
+            let (verb, counter) = audit_verb!("listener_activated");
+            Some(AuditEntry {
+                kind: EventKind::ListenerActivated,
+                verb,
+                counter,
+                target: format!("listener:{:?}:{}", listener.proxy(), listener.address),
+                cluster_id: None,
+                backend_id: None,
+                address: Some(listener.address),
+            })
+        }
+        RequestType::DeactivateListener(listener) => {
+            let (verb, counter) = audit_verb!("listener_deactivated");
+            Some(AuditEntry {
+                kind: EventKind::ListenerDeactivated,
+                verb,
+                counter,
+                target: format!("listener:{:?}:{}", listener.proxy(), listener.address),
+                cluster_id: None,
+                backend_id: None,
+                address: Some(listener.address),
+            })
+        }
+        // AddBackend / RemoveBackend are intentionally not audited via this
+        // taxonomy — they are already covered by the BACKEND_DOWN / BACKEND_UP
+        // events emitted by the workers when traffic reaches them.
+        _ => None,
+    }
+}
+
+/// Bump the per-verb counter, queue the [Event] for fan-out to subscribed
+/// clients, and write the structured `[AUDIT]` log line. Used by every
+/// control-plane mutation handler.
+fn audit_emit(server: &mut Server, client: &ClientSession, entry: AuditEntry, result: AuditResult) {
+    let request_id = Ulid::generate();
+    // `entry.counter` is the pre-built `config.<verb>` static-str key
+    // chosen at the construction site (paired with `verb` via
+    // `audit_verb!`), so dashboards see one counter per verb without a
+    // verb→key dispatch table.
+    count!(entry.counter, 1);
+
+    info!(
+        "[AUDIT] verb={} actor_uid={} request_id={} client_id={} target={} result={}",
+        entry.verb,
+        client.actor_uid_display(),
+        request_id,
+        client.id,
+        entry.target,
+        result.as_str(),
+    );
+
+    // Subscribers only see the proto Event; the verb / actor / request_id are
+    // captured in the audit log line above (which is already structured).
+    server.push_audit_event(Event {
+        kind: entry.kind as i32,
+        cluster_id: entry.cluster_id,
+        backend_id: entry.backend_id,
+        address: entry.address,
+    });
+}
+
+/// Same as [audit_emit] but synthesises the [AuditEntry] inline for verbs
+/// whose request payload does not carry the relevant identifiers (e.g.
+/// `Logging`, `ConfigureMetrics`, `ReloadConfiguration`). Caller MUST pair
+/// `verb` and `counter` via `audit_verb!` so the two strings cannot drift.
+fn audit_emit_inline(
+    server: &mut Server,
+    client: &ClientSession,
+    kind: EventKind,
+    verb: &'static str,
+    counter: &'static str,
+    target: String,
+    result: AuditResult,
+) {
+    audit_emit(
+        server,
+        client,
+        AuditEntry {
+            kind,
+            verb,
+            counter,
+            target,
+            cluster_id: None,
+            backend_id: None,
+            address: None,
+        },
+        result,
+    );
+}
+
+// =========================================================
 // Worker request
 
 #[derive(Debug)]
@@ -460,14 +796,59 @@ pub fn worker_request(
     client: &mut ClientSession,
     request_content: RequestType,
 ) {
+    // Snapshot the audit entry before consuming `request_content` so we can
+    // emit even when `state.dispatch` rejects the request.
+    let audit = audit_entry_for(&request_content);
+
+    // Special-case ConfigureMetrics — the proto payload is an i32 enum (no
+    // dedicated message), so we synthesise the audit entry inline.
+    let metrics_target = if let RequestType::ConfigureMetrics(value) = &request_content {
+        Some(format!(
+            "metrics:{:?}",
+            MetricsConfiguration::try_from(*value).unwrap_or(MetricsConfiguration::Disabled)
+        ))
+    } else {
+        None
+    };
+
     let request = request_content.into();
 
     if let Err(error) = server.state.dispatch(&request) {
+        if let Some(entry) = audit {
+            audit_emit(server, client, entry, AuditResult::Err);
+        } else if let Some(target) = metrics_target {
+            let (verb, counter) = audit_verb!("metrics_configured");
+            audit_emit_inline(
+                server,
+                client,
+                EventKind::MetricsConfigured,
+                verb,
+                counter,
+                target,
+                AuditResult::Err,
+            );
+        }
         client.finish_failure(format!(
             "could not dispatch request on the main process state: {error}",
         ));
         return;
     }
+
+    if let Some(entry) = audit {
+        audit_emit(server, client, entry, AuditResult::Ok);
+    } else if let Some(target) = metrics_target {
+        let (verb, counter) = audit_verb!("metrics_configured");
+        audit_emit_inline(
+            server,
+            client,
+            EventKind::MetricsConfigured,
+            verb,
+            counter,
+            target,
+            AuditResult::Ok,
+        );
+    }
+
     client.return_processing("Processing worker request...");
 
     server.scatter(

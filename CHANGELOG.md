@@ -28,6 +28,38 @@ See milestone [`v1.1.0`](https://github.com/sozu-proxy/sozu/projects/3?card_filt
 
 - **Fuzz test harness**: `e2e/src/tests/fuzz_tests.rs` integrates `cargo-fuzz` targets (`fuzz_frame_parser`, `fuzz_hpack_decoder`) as `#[ignore]`d e2e tests. Run with `cargo test -p sozu-e2e -- --ignored fuzz` (requires nightly + cargo-fuzz).
 
+#### Telemetry & observability
+
+- **H2 flood-detector exposure** (12 metrics under `h2.flood.violation.*`): every CVE mitigation in the H2 family — Rapid Reset (CVE-2023-44487), MadeYouReset (CVE-2025-8671), CONTINUATION flood (CVE-2024-27316), the PING / SETTINGS / empty-DATA flood family (CVE-2019-9512/9515/9518), header overflow, and the generic glitch budget — now emits a per-kind counter through the `handle_flood_violation` chokepoint. SIEM dashboards can window the trip rate without parsing logs.
+
+- **H2 GOAWAY and RST_STREAM by error code** (4 counter families): `h2.goaway.{sent,received}.<code>` and `h2.rst_stream.{sent,received}.<code>` for every RFC 9113 §7 error variant, plus `h2.rst_stream.received.pre_response_start` (the canonical Rapid Reset signature, emitted alongside the per-code counter). A compile-time helper macro keeps the breakdown in lock-step with the H2Error enum.
+
+- **H2 frame-type counters**: `h2.frames.rx.<kind>` for every received frame at the `handle_frame` dispatch chokepoint (11 keys), plus `h2.frames.tx.{settings,window_update,rst_stream,goaway,ping_ack}` at the control-frame serializer sites. HEADERS / DATA tx remain a follow-up (they travel through the H2 block converter).
+
+- **HPACK header-rejection counters by reason** (17 metrics under `h2.headers.rejected.*`): every site in the H2→H1 HPACK decoder that rejects a header now emits `h2.headers.rejected.total` (aggregate) plus `h2.headers.rejected.<reason>` for one of 16 bounded reasons (CRLF/NUL/CTL injection, CL/TE conflict, duplicate or malformed pseudo-headers, RFC 9113 §8.2.2 connection-specific headers, etc.). The first externally visible signal for request-smuggling probes against the H2 stack.
+
+- **TLS handshake telemetry**: `tls.handshake.failed.<reason>` (12 RustlsError buckets, with `other` fallback for future variants), `tls.handshake_ms` (HDR histogram of handshake duration), and `tls.cert.min_expires_at_seconds` (gauge of the soonest-expiring loaded certificate, recomputed on cert add/remove only).
+
+- **`x-request-id` propagation + access-log field**: incoming `x-request-id` is preserved verbatim end-to-end (`http.x_request_id.propagated`); when absent, Sōzu generates one from the request ULID and injects it (`http.x_request_id.generated`). The header value is also surfaced as a new `x_request_id` field on `RequestRecord` and `ProtobufAccessLog` (proto tag #24, wire-compatible append) — universal correlation key across Envoy / HAProxy / Sōzu hops.
+
+- **`process.uptime_seconds` and `server.live` runtime gauges**: seconds since worker start (never reset on hot upgrade), and a `1`/`0` liveness signal that flips to `0` once a graceful shutdown begins. Standard SRE inputs for "is this worker stale?" and "drain this worker before terminating" L4 health-check decisions.
+
+- **Control-plane audit `EventKind` extension + emit sites**: 14 new `EventKind` variants (CLUSTER_*, FRONTEND_*, CERTIFICATE_*, LISTENER_*, CONFIGURATION_RELOADED, WORKER_*, LOGGING_LEVEL_CHANGED, METRICS_CONFIGURED) reachable on the existing `SubscribeEvents` bus. Each privileged mutation also emits a `config.<verb>` counter and a structured `[AUDIT] verb=… actor_uid=… request_id=… target=… result=…` log line. Actor identity is captured via `SO_PEERCRED` on the unix command socket — meeting PCI-DSS 10.2 / ISO 27001 A.8.15 / SOC 2 audit-trail requirements.
+
+- **Backend H2 mux pool + flow-control telemetry**: `backend.pool.{hit,miss,size}` for connection reuse vs new dial decisions in `Router::connect` (the H2 mux makes least-loaded selection across the per-cluster connection map, which IS the pool). `backend.flow_control.paused` from the converter stall path. Symmetry guaranteed by colocating the gauge sites with the existing `backend.connections` accounting.
+
+- **Aggregate H2 connection gauges (correctness fix)**: the three per-connection absolute gauges (`h2.active_streams`, `h2.connection_window`, `h2.pending_window_updates`) suffered from last-writer-wins semantics under multi-connection load and were misleading on dashboards. Replaced with `gauge_add!` lifecycle deltas under a clearer `h2.connection.*` namespace so values aggregate across all live H2 connections. `impl Drop for ConnectionH2` rebalances each connection's contribution to zero on teardown — symmetric independent of which close path runs (graceful_goaway, force_disconnect, panic-unwind, …), making the underflow class of bug structurally impossible.
+
+- **Per-source accept telemetry**: `listener.accepted.total`, `client.connect.per_source.<bucket>` (256 bounded buckets via `LazyLock` static-string table — fixed ~10 KB heap regardless of attacker effort, OWASP A05 / NIST SP 800-92 cardinality-safe), `accept_queue.saturated_seconds` (1 Hz tick distinguishing brief spikes from sustained wedged-at-cap), `listener.connection_capped` (refusal counter). The accept-queue tuple grows to carry the peer SocketAddr; one extra `peer_addr()` syscall per accept on a path that already costs 1–2.
+
+- **Five new TLS / forwarding fields on the access log**: `tls_version`, `tls_cipher`, `tls_sni`, `tls_alpn`, `xff_chain` plumbed across H1, H2 mux, TCP, and post-upgrade pipe sessions. Wire tags 25–29 on `ProtobufAccessLog` (wire-compatible append). Direct enabler for ECS-aligned ingestion and every modern TLS-aware SOC playbook.
+
+- **`metrics.detail` cardinality knob (foundation)**: `MetricDetail` proto enum + `MetricDetailLevel` config enum (`process | frontend | cluster | backend`, mirroring HAProxy's `extra-counters` opt-in). Operators can write `detail = "frontend"` in TOML today; the value is plumbed through `ServerMetricsConfig` with backwards-compatible default. Wiring labels into the existing `incr!`/`gauge!` call sites lands as a dedicated follow-up MR.
+
+- **Two emitted-but-undocumented metrics now in `doc/configure.md`**: `https.alpn.rejected.http11_disabled` (H2-only listener refusing http/1.1 ALPN) and `http.sni_authority_mismatch` (CWE-346 cross-tenant defence).
+
+- **OpenTelemetry doc rewrite**: the section now correctly identifies the feature as W3C `traceparent` passthrough (no SDK, no spans, no OTLP exporter). The previous `Limitations` text falsely claimed H2 requests were not propagated — verified false against the on-branch source (the H1 editor runs on H2 frames via `pkawa.rs`, then re-encoded by `H2BlockConverter`).
+
 ### ✍️ Changed
 
 - **Slab capacity multiplier doubled to 4× per connection**: The internal slab allocator now reserves 4× the per-connection slot count (previously 2×) to accommodate the higher stream concurrency introduced by HTTP/2 multiplexing.
@@ -51,6 +83,8 @@ See milestone [`v1.1.0`](https://github.com/sozu-proxy/sozu/projects/3?card_filt
 - We fixed `http.errors` over-counting on session teardown: the mux `close()` path was emitting an error metric for every open stream even when the session ended cleanly, see [`9b6f9987`](https://github.com/sozu-proxy/sozu/commit/9b6f99871f2a74f120cceb13a3c3ffeab5525515).
 
 - We fixed the `local_drain` gauge wrapping to `u64::MAX` on negative values: the gauge is now clamped to zero rather than wrapping on unsigned underflow, see [`9b6f9987`](https://github.com/sozu-proxy/sozu/commit/9b6f99871f2a74f120cceb13a3c3ffeab5525515).
+
+- We fixed the three H2 connection-level gauges (`h2.connection_window`, `h2.active_streams`, `h2.pending_window_updates`) clobbering across connections: each H2 connection emitted absolute `gauge!` snapshots, so under multi-connection load the dashboard saw the value from whichever connection wrote last instead of the aggregate. The metrics are renamed to `h2.connection.window_bytes`, `h2.connection.active_streams`, and `h2.connection.pending_window_updates`, and emitted as `gauge_add!` lifecycle deltas with a paired `Drop`-side decrement so the sum across all live H2 connections is now correct (see `doc/configure.md` migration note).
 
 - We fixed missing backend metrics (response time, request count, error rate) in the mux layer that were silently dropped compared to the legacy H1/H2 handlers, see [`5a02f634`](https://github.com/sozu-proxy/sozu/commit/5a02f634e848600651a350a60e2f1fb39d0cc4dc).
 

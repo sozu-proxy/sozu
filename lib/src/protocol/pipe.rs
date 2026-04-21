@@ -95,6 +95,16 @@ pub struct Pipe<Front: SocketHandler, L: ListenerHandler> {
     request_id: Ulid,
     session_address: Option<SocketAddr>,
     websocket_context: WebSocketContext,
+    /// Connection-scoped TLS metadata captured at handshake completion,
+    /// inherited from the upstream mux `HttpContext` when `Pipe` is created
+    /// via WSS upgrade. `None` on plaintext paths (plain TCP, plain WS,
+    /// proxy-protocol) where no TLS was terminated by Sōzu.
+    tls_version: Option<&'static str>,
+    tls_cipher: Option<&'static str>,
+    /// Negotiated SNI hostname, pre-lowercased, no port. `None` on plaintext
+    /// paths or when the client omitted the SNI extension.
+    tls_sni: Option<String>,
+    tls_alpn: Option<&'static str>,
 }
 
 impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
@@ -160,10 +170,33 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             request_id,
             session_address,
             websocket_context,
+            tls_version: None,
+            tls_cipher: None,
+            tls_sni: None,
+            tls_alpn: None,
         };
 
         trace!("created pipe");
         session
+    }
+
+    /// Stamp connection-scoped TLS metadata captured at handshake time onto
+    /// the pipe for access-log emission. Called from the HTTPS→WSS upgrade
+    /// path in `https.rs::upgrade_mux` after the `Pipe` has been built from
+    /// the prior mux `HttpContext`. Leaves plaintext paths (plain TCP, plain
+    /// WS, proxy-protocol) untouched so their access logs continue to emit
+    /// `None` for all TLS fields.
+    pub fn set_tls_metadata(
+        &mut self,
+        version: Option<&'static str>,
+        cipher: Option<&'static str>,
+        sni: Option<String>,
+        alpn: Option<&'static str>,
+    ) {
+        self.tls_version = version;
+        self.tls_cipher = cipher;
+        self.tls_sni = sni;
+        self.tls_alpn = alpn;
     }
 
     pub fn front_socket(&self) -> &TcpStream {
@@ -271,6 +304,16 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             bytes_in: metrics.bin,
             bytes_out: metrics.bout,
             user_agent: None,
+            x_request_id: None,
+            // Pipe is post-upgrade; the TLS metadata was captured once at
+            // handshake in `https.rs::upgrade_handshake` and plumbed through
+            // via `set_tls_metadata`. Plaintext paths leave these fields as
+            // `None` — matching the TCP log shape.
+            tls_version: self.tls_version,
+            tls_cipher: self.tls_cipher,
+            tls_sni: self.tls_sni.as_deref(),
+            tls_alpn: self.tls_alpn,
+            xff_chain: None,
             otel: None,
         );
     }

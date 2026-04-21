@@ -32,12 +32,13 @@ jemallocator = { workspace = true, optional = true }
 libc = { workspace = true }
 log = { workspace = true }
 mio = { workspace = true, features = ["os-poll", "net"] }
-nix = { workspace = true, features = ["signal", "fs", "process"] }
+nix = { workspace = true, features = ["signal", "fs", "process", "socket"] }
 nom = { workspace = true }
 paw = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 prost = { workspace = true }
+rusty_ulid = { workspace = true }
 tempfile = { workspace = true }
 termion = { workspace = true }
 thiserror = { workspace = true }

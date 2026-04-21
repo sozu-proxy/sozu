@@ -161,27 +161,174 @@ fn has_invalid_pseudo_value_byte(value: &[u8]) -> bool {
 /// Without this check, HPACK-decoded bytes containing `\r\n` flow verbatim through
 /// kawa's H1 serializer and reach backends as injected headers — request smuggling
 /// (CWE-93, CWE-444) on H2→H1 traffic.
+#[cfg(test)]
 fn has_invalid_value_byte(value: &[u8]) -> bool {
     value
         .iter()
         .any(|&b| matches!(b, 0x00..=0x08 | 0x0A..=0x1F | 0x7F))
 }
 
-/// Returns true if the header violates HTTP/2 field requirements (RFC 9113 §8.2):
-/// - empty name
-/// - non-token or uppercase bytes in the name (CTLs, separators, space — CWE-93)
-/// - connection-specific header fields (RFC 9113 §8.2.2)
-/// - TE header with a value other than "trailers"
-/// - field value containing NUL, CR, LF, DEL or other C0 controls (RFC 9110 §5.5)
+/// Bounded enumeration of reasons a single HPACK header may be rejected by the
+/// H2 → H1 converter. Each variant maps 1:1 to a metric label suffix exposed
+/// as `h2.headers.rejected.<reason>` so SOC dashboards can break down rejection
+/// pressure by root cause without unbounded cardinality.
+///
+/// New variants must update the corresponding row in `doc/configure.md`
+/// (HTTP/2 header validation subsection).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RejectReason {
+    /// Header name contains an invalid byte (uppercase, CTL, separator, space).
+    /// CWE-93 — turns into request smuggling once the H1 serializer emits the
+    /// raw bytes on the wire.
+    InvalidNameByte,
+    /// Connection-specific header that MUST NOT appear in HTTP/2
+    /// (RFC 9113 §8.2.2): `connection`, `proxy-connection`, `transfer-encoding`,
+    /// `upgrade`, `keep-alive`.
+    ConnectionSpecificHeader,
+    /// `te` header with any value other than `trailers` (RFC 9113 §8.2.2).
+    TeNotTrailers,
+    /// CR or LF byte in a field value — request-smuggling vector
+    /// (CWE-444). NUL is reported separately via `NulInValue`.
+    CrlfInValue,
+    /// NUL byte (0x00) in a field value. Distinct from CR/LF for triage:
+    /// many smuggling toolchains pad with NULs first.
+    NulInValue,
+    /// Pseudo-header value contains a CTL or DEL byte that would corrupt the
+    /// H1 request line (RFC 9112 §3 — pseudo values are stricter than regular
+    /// field values: HTAB is also forbidden).
+    OversizedPseudoValue,
+    /// `:method` value contains a non-token byte (RFC 9110 §9 method = token).
+    /// Distinct from name-byte rejection because the byte is in the *value*,
+    /// not the name.
+    InvalidMethod,
+    /// `:scheme` value is not exactly `http` or `https` (RFC 9113 §8.3.1).
+    InvalidScheme,
+    /// `:path` value contains a `#` (fragment identifier — RFC 9112 §3.2 forbids
+    /// fragments in request-targets).
+    InvalidPath,
+    /// `:status` value is not exactly three ASCII digits (RFC 9113 §8.3.2).
+    InvalidStatus,
+    /// Two `content-length` headers with disagreeing values, or a
+    /// `transfer-encoding`/`content-length` conflict surfaced via the same
+    /// validation hook.
+    ClTeConflict,
+    /// `content-length` value is missing, empty, or contains non-digit bytes —
+    /// already disagrees with itself before any second header arrives.
+    DuplicateCl,
+    /// A pseudo-header arrived twice (`:method` after `:method`, etc. —
+    /// RFC 9113 §8.3 requires uniqueness).
+    DuplicatePseudo,
+    /// A pseudo-header arrived AFTER a regular header (RFC 9113 §8.3 requires
+    /// pseudos to precede all regular fields).
+    PseudoAfterRegular,
+    /// A `:`-prefixed name that is not one of the known request/response
+    /// pseudo-headers (RFC 9113 §8.3 — no extension pseudos accepted here).
+    UnknownPseudo,
+    /// A pseudo-header arrived with a zero-length value (RFC 9113 §8.3.1
+    /// forbids empty `:path`/`:method`/`:authority`/`:scheme`/`:status`).
+    EmptyPseudo,
+}
+
+/// Compile-time mapping from `(prefix, RejectReason)` to a static metric key.
+///
+/// Same `concat!`-based pattern as `h2_error_metric_key!` in `mux/h2.rs`:
+/// the literal is materialised at compile time so the statsd drain can store
+/// it as `&'static str` without a per-rejection allocation. Adding a new
+/// `RejectReason` variant fails the build inside this match — the metric
+/// breakdown stays in lock-step with the bounded enum (and with
+/// `doc/configure.md`'s HTTP/2 header validation table).
+macro_rules! reject_metric_key {
+    ($prefix:literal, $reason:expr) => {
+        match $reason {
+            RejectReason::InvalidNameByte => concat!($prefix, ".invalid_name_byte"),
+            RejectReason::ConnectionSpecificHeader => {
+                concat!($prefix, ".connection_specific_header")
+            }
+            RejectReason::TeNotTrailers => concat!($prefix, ".te_not_trailers"),
+            RejectReason::CrlfInValue => concat!($prefix, ".crlf_in_value"),
+            RejectReason::NulInValue => concat!($prefix, ".nul_in_value"),
+            RejectReason::OversizedPseudoValue => concat!($prefix, ".oversized_pseudo_value"),
+            RejectReason::InvalidMethod => concat!($prefix, ".invalid_method"),
+            RejectReason::InvalidScheme => concat!($prefix, ".invalid_scheme"),
+            RejectReason::InvalidPath => concat!($prefix, ".invalid_path"),
+            RejectReason::InvalidStatus => concat!($prefix, ".invalid_status"),
+            RejectReason::ClTeConflict => concat!($prefix, ".cl_te_conflict"),
+            RejectReason::DuplicateCl => concat!($prefix, ".duplicate_cl"),
+            RejectReason::DuplicatePseudo => concat!($prefix, ".duplicate_pseudo"),
+            RejectReason::PseudoAfterRegular => concat!($prefix, ".pseudo_after_regular"),
+            RejectReason::UnknownPseudo => concat!($prefix, ".unknown_pseudo"),
+            RejectReason::EmptyPseudo => concat!($prefix, ".empty_pseudo"),
+        }
+    };
+}
+
+/// Increment the per-reason counter `h2.headers.rejected.<reason>` and the
+/// per-rejection-event counter `h2.headers.rejected.total`. The total is the
+/// coarse roll-up dashboards alert on; the per-reason counter is the breakdown
+/// SOC uses to triage. Emitting both per call (rather than total once per
+/// request) keeps the totals in lockstep with the breakdown — easier to
+/// reconcile when a single request piles up several rejections.
+fn metric_reject(reason: RejectReason) {
+    incr!("h2.headers.rejected.total");
+    incr!(reject_metric_key!("h2.headers.rejected", reason));
+}
+
+/// Classify a header rejected by `is_invalid_h2_header`. Splits the original
+/// boolean check into the bounded `RejectReason` enum so the caller can emit
+/// the exact per-reason counter. Order matches `is_invalid_h2_header` so the
+/// observable validation policy is unchanged.
+fn classify_invalid_h2_header(name: &[u8], value: &[u8]) -> Option<RejectReason> {
+    if name.is_empty() {
+        // An empty name has no further byte to point at — bucket under
+        // `invalid_name_byte`; the original check treated it as a name issue.
+        return Some(RejectReason::InvalidNameByte);
+    }
+    if name[0] != b':' && has_invalid_name_byte(name) {
+        return Some(RejectReason::InvalidNameByte);
+    }
+    if is_connection_specific_header(name) {
+        return Some(RejectReason::ConnectionSpecificHeader);
+    }
+    if compare_no_case(name, b"te") && is_invalid_te_value(value) {
+        return Some(RejectReason::TeNotTrailers);
+    }
+    if let Some(reason) = classify_invalid_value_byte(value) {
+        return Some(reason);
+    }
+    None
+}
+
+/// Sub-classify which forbidden value byte caused a rejection. Distinguishes
+/// NUL from CR/LF/other-CTL because the two have different threat profiles
+/// (NUL → C string truncation, CR/LF → smuggling).
+fn classify_invalid_value_byte(value: &[u8]) -> Option<RejectReason> {
+    let mut saw_crlf = false;
+    let mut saw_nul = false;
+    for &b in value {
+        match b {
+            0x00 => saw_nul = true,
+            0x0A | 0x0D => saw_crlf = true,
+            0x01..=0x08 | 0x0B | 0x0C | 0x0E..=0x1F | 0x7F => {
+                return Some(RejectReason::CrlfInValue);
+            }
+            _ => {}
+        }
+    }
+    if saw_crlf {
+        Some(RejectReason::CrlfInValue)
+    } else if saw_nul {
+        Some(RejectReason::NulInValue)
+    } else {
+        None
+    }
+}
+
+/// Thin wrapper kept for tests and any code path that just needs the boolean.
+/// New code should call `classify_invalid_h2_header` to surface the exact
+/// rejection reason for the per-reason counter.
+#[cfg(test)]
 fn is_invalid_h2_header(name: &[u8], value: &[u8]) -> bool {
-    name.is_empty()
-        // Pseudo-header names (`:method`, etc.) are validated by the caller
-        // against the known set; unknown pseudo-headers are rejected there.
-        // Only regular header names need lowercase-token validation.
-        || (name[0] != b':' && has_invalid_name_byte(name))
-        || is_connection_specific_header(name)
-        || (compare_no_case(name, b"te") && is_invalid_te_value(value))
-        || has_invalid_value_byte(value)
+    classify_invalid_h2_header(name, value).is_some()
 }
 
 /// Validate and set Content-Length, returning false if it conflicts with a prior value
@@ -198,33 +345,45 @@ fn set_content_length(body_size: &mut BodySize, length: usize) -> bool {
 
 /// Store a pseudo-header value into kawa storage.
 ///
-/// Returns `Some(Store::Slice)` on success, or `None` if the pseudo-header was
-/// already set (`dest` is non-empty), regular headers have already appeared,
-/// the value is empty, the value contains forbidden control bytes, or the
-/// write to storage fails. Callers should set `invalid_headers = true` on `None`.
+/// Returns `Ok(Store::Slice)` on success, or `Err(RejectReason)` describing
+/// which validity rule the pseudo violated. Callers should set
+/// `invalid_headers = true` and increment the per-reason counter on `Err`.
 ///
-/// Empty values are rejected because `Store::Slice { len: 0 }` is NOT
-/// `Store::is_empty()`, so the presence checks after the decode loop would
-/// silently accept a zero-length `:path` / `:method` / `:authority` / `:scheme`
-/// (RFC 9113 §8.3.1 — pseudo-header fields MUST NOT be empty for http/https).
+/// Reasons:
+/// - `DuplicatePseudo` — `dest` is already populated (RFC 9113 §8.3 uniqueness)
+/// - `PseudoAfterRegular` — a regular header arrived first (RFC 9113 §8.3 ordering)
+/// - `EmptyPseudo` — zero-length value (RFC 9113 §8.3.1 forbids empty pseudos)
+/// - `OversizedPseudoValue` — CTL/DEL byte that would corrupt the H1 request
+///   line. Empty values are rejected before storing because
+///   `Store::Slice { len: 0 }` is NOT `Store::is_empty()`, so the presence
+///   checks after the decode loop would silently accept a zero-length pseudo.
 fn store_pseudo_header(
     dest: &Store,
     regular_headers: bool,
     kawa: &mut GenericHttpStream,
     value: &[u8],
-) -> Option<Store> {
-    if !dest.is_empty()
-        || regular_headers
-        || value.is_empty()
-        || has_invalid_pseudo_value_byte(value)
-    {
-        return None;
+) -> Result<Store, RejectReason> {
+    if !dest.is_empty() {
+        return Err(RejectReason::DuplicatePseudo);
+    }
+    if regular_headers {
+        return Err(RejectReason::PseudoAfterRegular);
+    }
+    if value.is_empty() {
+        return Err(RejectReason::EmptyPseudo);
+    }
+    if has_invalid_pseudo_value_byte(value) {
+        return Err(RejectReason::OversizedPseudoValue);
     }
     let start = kawa.storage.end as u32;
     if kawa.storage.write_all(value).is_err() {
-        return None;
+        // Storage exhaustion: report as `oversized_pseudo_value` since a
+        // pseudo whose bytes don't fit is functionally an oversized payload
+        // for the configured buffer pool. Keeps the counter cardinality
+        // bounded without inventing a transport-failure reason.
+        return Err(RejectReason::OversizedPseudoValue);
     }
-    Some(Store::Slice(Slice {
+    Ok(Store::Slice(Slice {
         start,
         len: value.len() as u32,
     }))
@@ -234,14 +393,24 @@ fn store_pseudo_header(
 ///
 /// Also handles `content-length` validation: if the header is `content-length`, its
 /// value is parsed and checked for consistency with any previously seen value.
-/// Returns `false` if content-length parsing fails or conflicts (caller should set
-/// `invalid_headers = true`).
-fn write_regular_header(kawa: &mut GenericHttpStream, key: &[u8], value: &[u8]) -> bool {
+///
+/// Returns `Ok(())` on success, or `Err(RejectReason)` describing which validity
+/// rule failed (caller should set `invalid_headers = true` and emit the
+/// matching counter):
+///
+/// - `DuplicateCl` — `content-length` empty / non-digit / parse failure
+/// - `ClTeConflict` — second `content-length` disagrees with the first one
+/// - `OversizedPseudoValue` — kawa storage write failed (buffer exhausted)
+fn write_regular_header(
+    kawa: &mut GenericHttpStream,
+    key: &[u8],
+    value: &[u8],
+) -> Result<(), RejectReason> {
     let len_key = key.len() as u32;
     let len_val = value.len() as u32;
     let start = kawa.storage.end as u32;
     if kawa.storage.write_all(value).is_err() {
-        return false;
+        return Err(RejectReason::OversizedPseudoValue);
     }
     let val = Store::Slice(Slice {
         start,
@@ -253,25 +422,25 @@ fn write_regular_header(kawa: &mut GenericHttpStream, key: &[u8], value: &[u8]) 
         // of which create a parser-divergence vector against backends. Require
         // every byte to be an ASCII digit before parsing.
         if value.is_empty() || !value.iter().all(|b| b.is_ascii_digit()) {
-            return false;
+            return Err(RejectReason::DuplicateCl);
         }
         if let Some(length) = from_utf8(value).ok().and_then(|v| v.parse::<usize>().ok()) {
             if !set_content_length(&mut kawa.body_size, length) {
-                return false;
+                return Err(RejectReason::ClTeConflict);
             }
         } else {
-            return false;
+            return Err(RejectReason::DuplicateCl);
         }
     }
     if kawa.storage.write_all(key).is_err() {
-        return false;
+        return Err(RejectReason::OversizedPseudoValue);
     }
     let key = Store::Slice(Slice {
         start: start + len_val,
         len: len_key,
     });
     kawa.push_block(Block::Header(Pair { key, val }));
-    true
+    Ok(())
 }
 
 /// Trims leading and trailing OWS (SP / HTAB per RFC 9110 §5.6.3) from a byte slice.
@@ -352,7 +521,8 @@ where
             budget_exceeded = true;
             return;
         }
-        if is_invalid_h2_header(&k, &v) {
+        if let Some(reason) = classify_invalid_h2_header(&k, &v) {
+            metric_reject(reason);
             invalid_headers = true;
             return;
         }
@@ -419,42 +589,58 @@ where
                         // reach the H1 request line and can smuggle extra path
                         // segments or headers to backends.
                         if !v.iter().all(|&b| is_tchar(b)) {
+                            metric_reject(RejectReason::InvalidMethod);
                             *invalid_headers = true;
                             return;
                         }
                         match store_pseudo_header(&method, regular_headers, kawa, &v) {
-                            Some(s) => method = s,
-                            None => *invalid_headers = true,
+                            Ok(s) => method = s,
+                            Err(reason) => {
+                                metric_reject(reason);
+                                *invalid_headers = true;
+                            }
                         }
                     } else if compare_no_case(&k, b":scheme") {
                         // RFC 9113 §8.3.1: the HPACK lowercase rule means a
                         // valid :scheme arrives exactly as "http" or "https".
                         // Anything else is a smuggling / SSRF vector.
                         if v.as_ref() != b"http" && v.as_ref() != b"https" {
+                            metric_reject(RejectReason::InvalidScheme);
                             *invalid_headers = true;
                             return;
                         }
                         match store_pseudo_header(&scheme, regular_headers, kawa, &v) {
-                            Some(s) => scheme = s,
-                            None => *invalid_headers = true,
+                            Ok(s) => scheme = s,
+                            Err(reason) => {
+                                metric_reject(reason);
+                                *invalid_headers = true;
+                            }
                         }
                     } else if compare_no_case(&k, b":path") {
                         // RFC 9112 §3.2: fragment identifiers (`#`) are
                         // prohibited in request-targets.
                         if v.contains(&b'#') {
+                            metric_reject(RejectReason::InvalidPath);
                             *invalid_headers = true;
                             return;
                         }
                         match store_pseudo_header(&path, regular_headers, kawa, &v) {
-                            Some(s) => path = s,
-                            None => *invalid_headers = true,
+                            Ok(s) => path = s,
+                            Err(reason) => {
+                                metric_reject(reason);
+                                *invalid_headers = true;
+                            }
                         }
                     } else if compare_no_case(&k, b":authority") {
                         match store_pseudo_header(&authority, regular_headers, kawa, &v) {
-                            Some(s) => authority = s,
-                            None => *invalid_headers = true,
+                            Ok(s) => authority = s,
+                            Err(reason) => {
+                                metric_reject(reason);
+                                *invalid_headers = true;
+                            }
                         }
                     } else if k.starts_with(b":") {
+                        metric_reject(RejectReason::UnknownPseudo);
                         *invalid_headers = true;
                     } else if compare_no_case(&k, b"cookie") {
                         regular_headers = true;
@@ -480,20 +666,23 @@ where
                             // cookie-value must not contain CTLs. Without this
                             // check, a crafted cookie can smuggle headers
                             // through kawa's H1 serializer.
-                            if has_invalid_value_byte(cookie_key)
-                                || has_invalid_value_byte(cookie_val)
+                            if let Some(reason) = classify_invalid_value_byte(cookie_key)
+                                .or_else(|| classify_invalid_value_byte(cookie_val))
                             {
+                                metric_reject(reason);
                                 *invalid_headers = true;
                                 return;
                             }
                             let key_start = kawa.storage.end as u32;
                             if kawa.storage.write_all(cookie_key).is_err() {
+                                metric_reject(RejectReason::OversizedPseudoValue);
                                 *invalid_headers = true;
                                 return;
                             }
                             let key_len = cookie_key.len() as u32;
                             let val_start = kawa.storage.end as u32;
                             if kawa.storage.write_all(cookie_val).is_err() {
+                                metric_reject(RejectReason::OversizedPseudoValue);
                                 *invalid_headers = true;
                                 return;
                             }
@@ -519,7 +708,8 @@ where
                         // value here and reconcile after the decode loop — at
                         // which point authority is known regardless of order.
                         regular_headers = true;
-                        if has_invalid_value_byte(&v) {
+                        if let Some(reason) = classify_invalid_value_byte(&v) {
+                            metric_reject(reason);
                             *invalid_headers = true;
                             return;
                         }
@@ -534,7 +724,8 @@ where
                         }
                     } else {
                         regular_headers = true;
-                        if !write_regular_header(kawa, &k, &v) {
+                        if let Err(reason) = write_regular_header(kawa, &k, &v) {
+                            metric_reject(reason);
                             *invalid_headers = true;
                             return;
                         }
@@ -629,23 +820,29 @@ where
                         // `+200`, ` 200`, `00200` etc., all of which diverge
                         // from the backend's H1 parser.
                         if v.len() != 3 || !v.iter().all(|b| b.is_ascii_digit()) {
+                            metric_reject(RejectReason::InvalidStatus);
                             *invalid_headers = true;
                             return;
                         }
                         match store_pseudo_header(&status, regular_headers, kawa, &v) {
-                            Some(s) => {
+                            Ok(s) => {
                                 status = s;
                                 code = (v[0] - b'0') as u16 * 100
                                     + (v[1] - b'0') as u16 * 10
                                     + (v[2] - b'0') as u16;
                             }
-                            None => *invalid_headers = true,
+                            Err(reason) => {
+                                metric_reject(reason);
+                                *invalid_headers = true;
+                            }
                         }
                     } else if k.starts_with(b":") {
+                        metric_reject(RejectReason::UnknownPseudo);
                         *invalid_headers = true;
                     } else {
                         regular_headers = true;
-                        if !write_regular_header(kawa, &k, &v) {
+                        if let Err(reason) = write_regular_header(kawa, &k, &v) {
+                            metric_reject(reason);
                             *invalid_headers = true;
                         }
                     }
@@ -782,6 +979,7 @@ pub fn handle_trailer(
         }
         // RFC 9113 §8.1: Trailers MUST NOT contain pseudo-header fields.
         if k.starts_with(b":") {
+            metric_reject(RejectReason::UnknownPseudo);
             invalid_trailers = true;
             return;
         }
@@ -790,12 +988,14 @@ pub fn handle_trailer(
         // fields (RFC 9113 §8.2.2), invalid TE values, and forbidden value
         // bytes (RFC 9110 §5.5). Without this, crafted trailer names can
         // smuggle H1 lines through kawa's serializer.
-        if is_invalid_h2_header(&k, &v) {
+        if let Some(reason) = classify_invalid_h2_header(&k, &v) {
+            metric_reject(reason);
             invalid_trailers = true;
             return;
         }
         let start = kawa.storage.end as u32;
         if kawa.storage.write_all(&k).is_err() || kawa.storage.write_all(&v).is_err() {
+            metric_reject(RejectReason::OversizedPseudoValue);
             invalid_trailers = true;
             return;
         }
@@ -1014,12 +1214,12 @@ mod tests {
         // First store succeeds
         let dest = Store::Empty;
         let result = store_pseudo_header(&dest, false, &mut kawa, b"GET");
-        assert!(result.is_some());
+        assert!(result.is_ok());
 
         // Second store with non-empty dest fails (duplicate pseudo-header)
         let dest = result.unwrap();
         let result = store_pseudo_header(&dest, false, &mut kawa, b"POST");
-        assert!(result.is_none());
+        assert!(result.is_err());
     }
 
     #[test]
@@ -1030,7 +1230,7 @@ mod tests {
         let dest = Store::Empty;
         // regular_headers = true means regular headers have already appeared
         let result = store_pseudo_header(&dest, true, &mut kawa, b"GET");
-        assert!(result.is_none());
+        assert!(result.is_err());
     }
 
     // ── is_connection_specific_header (additional case sensitivity) ────
@@ -1328,7 +1528,7 @@ mod tests {
         let mut kawa = make_generic_kawa(&mut pool, Kind::Request);
         // RFC 9113 §8.3.1: pseudo-header values MUST NOT be empty.
         let result = store_pseudo_header(&Store::Empty, false, &mut kawa, b"");
-        assert!(result.is_none());
+        assert!(result.is_err());
     }
 
     #[test]
@@ -1336,9 +1536,9 @@ mod tests {
         let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
         let mut kawa = make_generic_kawa(&mut pool, Kind::Request);
         let result = store_pseudo_header(&Store::Empty, false, &mut kawa, b"/foo\r\n");
-        assert!(result.is_none());
+        assert!(result.is_err());
         let result = store_pseudo_header(&Store::Empty, false, &mut kawa, b"a\x00b");
-        assert!(result.is_none());
+        assert!(result.is_err());
     }
 
     // ── handle_header: request pseudo-header & CTL/smuggling rejection ────
@@ -1858,7 +2058,6 @@ mod tests {
             "H2→H1 chunked body must emit Transfer-Encoding: chunked for trailer support"
         );
     }
-
     /// H2 request declaring Content-Length keeps the Length framing: the
     /// H1 backend cannot receive trailers in this case (RFC 9110 §6.5 —
     /// trailers require chunked transfer-coding), and we document that
