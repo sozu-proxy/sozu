@@ -552,7 +552,7 @@ fn audit_entry_for(request: &RequestType) -> Option<AuditEntry> {
             target: format!("frontend:http:{}:{}", frontend.hostname, frontend.address),
             cluster_id: frontend.cluster_id.clone(),
             backend_id: None,
-            address: Some(frontend.address.clone()),
+            address: Some(frontend.address),
         }),
         RequestType::AddHttpsFrontend(frontend) => Some(AuditEntry {
             kind: EventKind::FrontendAdded,
@@ -560,7 +560,7 @@ fn audit_entry_for(request: &RequestType) -> Option<AuditEntry> {
             target: format!("frontend:https:{}:{}", frontend.hostname, frontend.address),
             cluster_id: frontend.cluster_id.clone(),
             backend_id: None,
-            address: Some(frontend.address.clone()),
+            address: Some(frontend.address),
         }),
         RequestType::AddTcpFrontend(frontend) => Some(AuditEntry {
             kind: EventKind::FrontendAdded,
@@ -568,7 +568,7 @@ fn audit_entry_for(request: &RequestType) -> Option<AuditEntry> {
             target: format!("frontend:tcp:{}:{}", frontend.cluster_id, frontend.address),
             cluster_id: Some(frontend.cluster_id.to_owned()),
             backend_id: None,
-            address: Some(frontend.address.clone()),
+            address: Some(frontend.address),
         }),
         RequestType::RemoveHttpFrontend(frontend) => Some(AuditEntry {
             kind: EventKind::FrontendRemoved,
@@ -576,7 +576,7 @@ fn audit_entry_for(request: &RequestType) -> Option<AuditEntry> {
             target: format!("frontend:http:{}:{}", frontend.hostname, frontend.address),
             cluster_id: frontend.cluster_id.clone(),
             backend_id: None,
-            address: Some(frontend.address.clone()),
+            address: Some(frontend.address),
         }),
         RequestType::RemoveHttpsFrontend(frontend) => Some(AuditEntry {
             kind: EventKind::FrontendRemoved,
@@ -584,7 +584,7 @@ fn audit_entry_for(request: &RequestType) -> Option<AuditEntry> {
             target: format!("frontend:https:{}:{}", frontend.hostname, frontend.address),
             cluster_id: frontend.cluster_id.clone(),
             backend_id: None,
-            address: Some(frontend.address.clone()),
+            address: Some(frontend.address),
         }),
         RequestType::RemoveTcpFrontend(frontend) => Some(AuditEntry {
             kind: EventKind::FrontendRemoved,
@@ -592,7 +592,7 @@ fn audit_entry_for(request: &RequestType) -> Option<AuditEntry> {
             target: format!("frontend:tcp:{}:{}", frontend.cluster_id, frontend.address),
             cluster_id: Some(frontend.cluster_id.to_owned()),
             backend_id: None,
-            address: Some(frontend.address.clone()),
+            address: Some(frontend.address),
         }),
         RequestType::AddCertificate(add) => Some(AuditEntry {
             kind: EventKind::CertificateAdded,
@@ -600,7 +600,7 @@ fn audit_entry_for(request: &RequestType) -> Option<AuditEntry> {
             target: format!("certificate:{}", add.address),
             cluster_id: None,
             backend_id: None,
-            address: Some(add.address.clone()),
+            address: Some(add.address),
         }),
         RequestType::RemoveCertificate(remove) => Some(AuditEntry {
             kind: EventKind::CertificateRemoved,
@@ -608,7 +608,7 @@ fn audit_entry_for(request: &RequestType) -> Option<AuditEntry> {
             target: format!("certificate:{}:{}", remove.address, remove.fingerprint),
             cluster_id: None,
             backend_id: None,
-            address: Some(remove.address.clone()),
+            address: Some(remove.address),
         }),
         RequestType::ReplaceCertificate(replace) => Some(AuditEntry {
             kind: EventKind::CertificateReplaced,
@@ -619,7 +619,7 @@ fn audit_entry_for(request: &RequestType) -> Option<AuditEntry> {
             ),
             cluster_id: None,
             backend_id: None,
-            address: Some(replace.address.clone()),
+            address: Some(replace.address),
         }),
         RequestType::ActivateListener(listener) => Some(AuditEntry {
             kind: EventKind::ListenerActivated,
@@ -627,7 +627,7 @@ fn audit_entry_for(request: &RequestType) -> Option<AuditEntry> {
             target: format!("listener:{:?}:{}", listener.proxy(), listener.address),
             cluster_id: None,
             backend_id: None,
-            address: Some(listener.address.clone()),
+            address: Some(listener.address),
         }),
         RequestType::DeactivateListener(listener) => Some(AuditEntry {
             kind: EventKind::ListenerDeactivated,
@@ -635,7 +635,7 @@ fn audit_entry_for(request: &RequestType) -> Option<AuditEntry> {
             target: format!("listener:{:?}:{}", listener.proxy(), listener.address),
             cluster_id: None,
             backend_id: None,
-            address: Some(listener.address.clone()),
+            address: Some(listener.address),
         }),
         // AddBackend / RemoveBackend are intentionally not audited via this
         // taxonomy — they are already covered by the BACKEND_DOWN / BACKEND_UP
@@ -741,8 +741,7 @@ pub fn worker_request(
     let metrics_target = if let RequestType::ConfigureMetrics(value) = &request_content {
         Some(format!(
             "metrics:{:?}",
-            MetricsConfiguration::try_from(*value)
-                .unwrap_or(MetricsConfiguration::Disabled)
+            MetricsConfiguration::try_from(*value).unwrap_or(MetricsConfiguration::Disabled)
         ))
     } else {
         None

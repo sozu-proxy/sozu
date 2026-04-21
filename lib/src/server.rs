@@ -65,16 +65,15 @@ pub const PER_SOURCE_BUCKETS: usize = 256;
 /// `incr!` requires `&'static str`; we leak once at first access (LazyLock)
 /// for `PER_SOURCE_BUCKETS` keys, totalling ~10 KB heap. The leak is bounded
 /// by `PER_SOURCE_BUCKETS` and never grows with traffic.
-static PER_SOURCE_BUCKET_KEYS: LazyLock<[&'static str; PER_SOURCE_BUCKETS]> =
-    LazyLock::new(|| {
-        let mut keys: [&'static str; PER_SOURCE_BUCKETS] = [""; PER_SOURCE_BUCKETS];
-        for (i, slot) in keys.iter_mut().enumerate() {
-            // e.g. "client.connect.per_source.bucket_042"
-            let owned = format!("client.connect.per_source.bucket_{i:03}");
-            *slot = Box::leak(owned.into_boxed_str());
-        }
-        keys
-    });
+static PER_SOURCE_BUCKET_KEYS: LazyLock<[&'static str; PER_SOURCE_BUCKETS]> = LazyLock::new(|| {
+    let mut keys: [&'static str; PER_SOURCE_BUCKETS] = [""; PER_SOURCE_BUCKETS];
+    for (i, slot) in keys.iter_mut().enumerate() {
+        // e.g. "client.connect.per_source.bucket_042"
+        let owned = format!("client.connect.per_source.bucket_{i:03}");
+        *slot = Box::leak(owned.into_boxed_str());
+    }
+    keys
+});
 
 /// Mask an IP address to its bounded prefix (/24 for IPv4, /48 for IPv6) and
 /// hash it into one of `PER_SOURCE_BUCKETS` slots. The hash is `DefaultHasher`,
@@ -291,7 +290,13 @@ pub struct Server {
     /// without the socket having to be alive at session-creation time. The
     /// peer is `Option` because `peer_addr()` is best-effort: a peer that
     /// races to close before we read it is rare but possible.
-    accept_queue: VecDeque<(TcpStream, ListenToken, Protocol, Instant, Option<SocketAddr>)>,
+    accept_queue: VecDeque<(
+        TcpStream,
+        ListenToken,
+        Protocol,
+        Instant,
+        Option<SocketAddr>,
+    )>,
     accept_ready: HashSet<ListenToken>,
     backends: Rc<RefCell<BackendMap>>,
     base_sessions_count: usize,
@@ -1650,7 +1655,10 @@ impl Server {
                     break;
                 }
                 Err(other) => {
-                    error!("error accepting {:?} sockets: {:?}", accepted_protocol, other);
+                    error!(
+                        "error accepting {:?} sockets: {:?}",
+                        accepted_protocol, other
+                    );
                     self.accept_ready.remove(&token);
                     break;
                 }

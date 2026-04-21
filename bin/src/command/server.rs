@@ -1048,4 +1048,3 @@ mod tests {
         assert_eq!(read_gauge("configuration.frontends"), Some(2));
     }
 }
-               
