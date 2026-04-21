@@ -126,6 +126,11 @@ pub struct HttpContext {
     pub reason: Option<String>,
     // ---------- Additional optional data
     pub user_agent: Option<String>,
+    /// Value of the `x-request-id` header observed (if propagated from the
+    /// client/upstream LB) or generated (from `self.id`). Universal correlation
+    /// header — populated unconditionally by `on_request_headers` so the access
+    /// log can record the exact value forwarded to the backend.
+    pub x_request_id: Option<String>,
 
     #[cfg(feature = "opentelemetry")]
     pub otel: Option<sozu_command::logging::OpenTelemetry>,
@@ -217,6 +222,7 @@ impl HttpContext {
             status: None,
             reason: None,
             user_agent: None,
+            x_request_id: None,
 
             #[cfg(feature = "opentelemetry")]
             otel: Default::default(),
@@ -229,7 +235,7 @@ impl HttpContext {
 
     /// Callback for request:
     ///
-    /// - edit headers (connection, forwarded, sticky cookie, sozu-id)
+    /// - edit headers (connection, forwarded, sticky cookie, sozu-id, x-request-id)
     /// - save information:
     ///   - method
     ///   - authority
@@ -237,6 +243,7 @@ impl HttpContext {
     ///   - front keep-alive
     ///   - sticky cookie
     ///   - user-agent
+    ///   - x-request-id (preserved if present, else derived from `self.id`)
     fn on_request_headers(&mut self, request: &mut GenericHttpStream) {
         let buf = request.storage.mut_buffer();
 
@@ -294,6 +301,7 @@ impl HttpContext {
         let mut forwarded = None;
         let mut has_x_port = false;
         let mut has_x_proto = false;
+        let mut has_x_request_id = false;
         let mut has_connection = false;
         #[cfg(feature = "opentelemetry")]
         let mut traceparent: Option<&mut kawa::Pair> = None;
@@ -343,6 +351,17 @@ impl HttpContext {
                         forwarded = Some(header);
                     } else if compare_no_case(key, b"User-Agent") {
                         self.user_agent = header
+                            .val
+                            .data_opt(buf)
+                            .and_then(|data| from_utf8(data).ok())
+                            .map(ToOwned::to_owned);
+                    } else if compare_no_case(key, b"X-Request-Id") {
+                        // RFC: not standardized, but the de-facto correlation
+                        // header used by Envoy/HAProxy/most LBs. Preserve the
+                        // client-supplied value verbatim — overwriting it
+                        // breaks end-to-end request tracing.
+                        has_x_request_id = true;
+                        self.x_request_id = header
                             .val
                             .data_opt(buf)
                             .and_then(|data| from_utf8(data).ok())
@@ -464,6 +483,24 @@ impl HttpContext {
                 val: kawa::Store::Static(b"close"),
             }));
         }
+        // Inject "X-Request-Id" derived from the request ULID when the client
+        // (or upstream LB) did not already supply one. When already present,
+        // the header is left untouched in the block list — preserving the
+        // client-supplied value end-to-end is the whole point of this header.
+        // Either way, `self.x_request_id` is populated so the access log
+        // records the exact value forwarded to the backend.
+        if has_x_request_id {
+            incr!("http.x_request_id.propagated");
+        } else {
+            let value = self.id.to_string();
+            request.push_block(kawa::Block::Header(kawa::Pair {
+                key: kawa::Store::Static(b"X-Request-Id"),
+                val: kawa::Store::from_string(value.clone()),
+            }));
+            self.x_request_id = Some(value);
+            incr!("http.x_request_id.generated");
+        }
+
         // Create a custom "Sozu-Id" header
         request.push_block(kawa::Block::Header(kawa::Pair {
             key: kawa::Store::Static(b"Sozu-Id"),
@@ -548,6 +585,7 @@ impl HttpContext {
         self.status = None;
         self.reason = None;
         self.user_agent = None;
+        self.x_request_id = None;
     }
 
     pub fn extract_route(&self) -> Result<(&str, &str, &Method), RetrieveClusterError> {
@@ -708,6 +746,7 @@ mod tests {
         ctx.status = Some(200);
         ctx.reason = Some("OK".to_owned());
         ctx.user_agent = Some("curl/7.81".to_owned());
+        ctx.x_request_id = Some("client-xrid-123".to_owned());
 
         ctx.reset();
 
@@ -720,6 +759,7 @@ mod tests {
         assert!(ctx.status.is_none());
         assert!(ctx.reason.is_none());
         assert!(ctx.user_agent.is_none());
+        assert!(ctx.x_request_id.is_none());
     }
 
     #[test]

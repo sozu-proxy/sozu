@@ -1010,6 +1010,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             bytes_in: metrics.bin,
             bytes_out: metrics.bout,
             user_agent: self.context.user_agent.as_deref(),
+            x_request_id: self.context.x_request_id.as_deref(),
             #[cfg(feature = "opentelemetry")]
             otel: self.context.otel.as_ref(),
             #[cfg(not(feature = "opentelemetry"))]
