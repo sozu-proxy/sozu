@@ -1487,9 +1487,28 @@ fn try_h2_rapid_reset_triggers_goaway() -> State {
     }
     let _ = tls.flush();
 
-    // Read response — expect GOAWAY with ENHANCE_YOUR_CALM
-    thread::sleep(Duration::from_millis(500));
-    let response_data = read_all_available(&mut tls, Duration::from_secs(2));
+    // Poll for GOAWAY with ENHANCE_YOUR_CALM, exiting as soon as we see it.
+    // The previous shape (fixed 500ms sleep + 2s read) tripped under CPU
+    // contention — 400 frames (200 HEADERS + 200 RST_STREAM) can take
+    // longer than 500ms to process through the kernel TLS stack + Sōzu's
+    // H2 frame parser when the host is otherwise busy. The flood detector
+    // fires well before the 200th stream, so short-circuiting on the first
+    // GOAWAY keeps the happy path fast while the 8 s ceiling absorbs
+    // extreme scheduling delays.
+    let poll_deadline = std::time::Instant::now() + Duration::from_secs(8);
+    let mut response_data: Vec<u8> = Vec::new();
+    let mut got_enhance_your_calm = false;
+    while std::time::Instant::now() < poll_deadline {
+        let chunk = read_all_available(&mut tls, Duration::from_millis(100));
+        if !chunk.is_empty() {
+            response_data.extend_from_slice(&chunk);
+            let frames = parse_h2_frames(&response_data);
+            if contains_goaway_with_error(&frames, H2_ERROR_ENHANCE_YOUR_CALM) {
+                got_enhance_your_calm = true;
+                break;
+            }
+        }
+    }
     let frames = parse_h2_frames(&response_data);
 
     println!("H2 Rapid Reset - received {} frames", frames.len());
@@ -1502,7 +1521,6 @@ fn try_h2_rapid_reset_triggers_goaway() -> State {
         }
     }
 
-    let got_enhance_your_calm = contains_goaway_with_error(&frames, H2_ERROR_ENHANCE_YOUR_CALM);
     println!("H2 Rapid Reset - got ENHANCE_YOUR_CALM: {got_enhance_your_calm}");
 
     drop(tls);
