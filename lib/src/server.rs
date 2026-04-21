@@ -234,6 +234,10 @@ pub struct Server {
     last_shutting_down_message: Option<Instant>,
     last_zombie_check: Instant,
     loop_start: Instant,
+    /// Wall-clock anchor for the `process.uptime_seconds` gauge. Captured once
+    /// in [`Server::new`]; never reset on hot upgrades (the new worker that
+    /// inherits FDs is a fresh process and starts its own counter).
+    started_at: Instant,
     max_poll_errors: i32, // TODO: make this configurable? this defaults to 10000 for now
     pub poll: Poll,
     poll_timeout: Option<Duration>, // TODO: make this configurable? this defaults to 1000 milliseconds for now
@@ -399,6 +403,7 @@ impl Server {
             last_shutting_down_message: None,
             last_zombie_check: Instant::now(), // to be reset on server run
             loop_start: Instant::now(),        // to be reset on server run
+            started_at: Instant::now(),        // captured once, never reset
             max_poll_errors: 10000,            // TODO: make it configurable?
             poll_timeout: Some(Duration::from_millis(1000)), // TODO: make it configurable?
             poll,
@@ -594,6 +599,21 @@ impl Server {
 
             gauge!("client.connections", self.sessions.borrow().nb_connections);
             gauge!("slab.entries", self.sessions.borrow().slab.len());
+            // Process / runtime gauges sampled once per loop iteration. Same
+            // batch as `client.connections` so dashboards see them update in
+            // lock-step.
+            gauge!(
+                "process.uptime_seconds",
+                self.started_at.elapsed().as_secs() as usize
+            );
+            // `server.live` flips to 0 once a graceful shutdown is requested,
+            // matching Envoy's `server.live` semantics. L4 health checks
+            // (HAProxy / cloud LBs) can poll this gauge to drain a worker
+            // before the OS-level termination signal lands.
+            gauge!(
+                "server.live",
+                if self.shutting_down.is_some() { 0 } else { 1 }
+            );
             METRICS.with(|metrics| {
                 (*metrics.borrow_mut()).send_data();
             });

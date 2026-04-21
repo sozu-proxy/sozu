@@ -533,6 +533,8 @@ from metric names below.
 | `client.connections_percentage` | gauge | proxy | Percentage of `max_connections` in use |
 | `client.max_connections` | gauge | proxy | Configured maximum connections |
 | `slab.entries` | gauge | proxy | Session slab allocator slots used |
+| `process.uptime_seconds` | gauge | proxy | Seconds since the worker started. Captured once in `Server::new`; never reset on hot upgrade (the new worker starts its own counter) |
+| `server.live` | gauge | proxy | `1` while the worker accepts traffic, `0` once a graceful shutdown is requested. Mirrors Envoy `server.live` semantics — L4 health checks (HAProxy / cloud LBs) can poll this gauge to drain a worker before the OS-level termination signal lands |
 | `buffer.number` | gauge | proxy | Buffers currently allocated from the buffer pool |
 | `zombies` | counter | proxy | Zombie sessions detected and removed |
 
