@@ -850,11 +850,31 @@ message WorkerResponse {
     optional ResponseContent content = 4;
 }
 
+// label-cardinality knob for the metrics drain.
+// Mirrors HAProxy's `process|frontend|backend|server` extra-counters opt-in:
+// a higher level enables more granular labels (and thus more keys), letting
+// operators bound the StatsD keyspace explicitly.
+//
+// Each level is a SUPERSET of the previous one.
+enum MetricDetail {
+    // proxy-only counters (legacy default before opt-in landed)
+    DETAIL_PROCESS = 0;
+    // adds per-listener (frontend) breakdown for accept/connection counters
+    DETAIL_FRONTEND = 1;
+    // adds per-cluster aggregation (current default)
+    DETAIL_CLUSTER = 2;
+    // adds per-backend aggregation (cluster + backend, highest cardinality)
+    DETAIL_BACKEND = 3;
+}
+
 // intended to workers
 message ServerMetricsConfig {
     required string address = 1;
     required bool tagged_metrics = 2;
     optional string prefix = 3;
+    // optional in proto: workers built before this field default to
+    // DETAIL_CLUSTER on the lib side to preserve historical behaviour.
+    optional MetricDetail detail = 4;
 }
 
 // Used by a worker to start its server loop.
