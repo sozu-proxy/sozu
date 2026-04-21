@@ -726,6 +726,34 @@ Negotiated cipher suite (rustls):
 |--------|------|-------|-------------|
 | `http.sni_authority_mismatch` | counter | proxy | Request rejected because its `:authority` (HTTP/2) or `Host` header (HTTP/1.1) crossed the TLS SNI boundary negotiated for the connection. Defence against cross-tenant frontend confusion (CWE-346). Increment site: `lib/src/protocol/mux/router.rs`. |
 
+#### HTTP/2 frame counters
+
+Per-frame-type counters split by direction. Receive side counts every H2
+frame the parser hands to `handle_frame` — single chokepoint, so adding a
+new H2 frame type fails the build inside the metric helper. Send side
+covers the control frames Sozu emits; HEADERS and DATA tx flow through
+the H2 block converter and are not yet broken out per type (tracked as
+follow-up — pair with `back_bytes_out` for the byte view today).
+
+| Metric | Type | Scope | Description |
+|---|---|---|---|
+| `h2.frames.rx.data` | counter | proxy | DATA frames received |
+| `h2.frames.rx.headers` | counter | proxy | HEADERS frames received |
+| `h2.frames.rx.push_promise` | counter | proxy | PUSH_PROMISE frames received (always rejected; see `h2.goaway.sent.protocol_error`) |
+| `h2.frames.rx.priority` | counter | proxy | RFC 7540 PRIORITY frames received |
+| `h2.frames.rx.rst_stream` | counter | proxy | RST_STREAM frames received (paired with `h2.rst_stream.received.<code>` for per-error breakdown) |
+| `h2.frames.rx.settings` | counter | proxy | SETTINGS frames received (both peer-settings and ACKs) |
+| `h2.frames.rx.ping` | counter | proxy | PING frames received (both probes and ACKs) |
+| `h2.frames.rx.goaway` | counter | proxy | GOAWAY frames received (paired with `h2.goaway.received.<code>`) |
+| `h2.frames.rx.window_update` | counter | proxy | WINDOW_UPDATE frames received |
+| `h2.frames.rx.continuation` | counter | proxy | Reachable only via the defensive fallback path (RFC 9113 §6.10 standalone CONTINUATION) — the inline header parser absorbs CONTINUATION during HEADERS decoding, so under normal conditions this stays at zero |
+| `h2.frames.rx.unknown` | counter | proxy | Unknown frame type ignored per RFC 9113 §5.5. A non-zero rate is the early-warning signal for a peer trying H2 extensions |
+| `h2.frames.tx.settings` | counter | proxy | SETTINGS frames emitted (initial + later updates) |
+| `h2.frames.tx.window_update` | counter | proxy | WINDOW_UPDATE frames emitted (per-frame in the queued-update flush loop) |
+| `h2.frames.tx.rst_stream` | counter | proxy | RST_STREAM frames emitted (across both the queued flush loop and the end-stream cancel path) |
+| `h2.frames.tx.goaway` | counter | proxy | GOAWAY frames emitted (one per phase of `graceful_goaway`, plus error-path `goaway`) |
+| `h2.frames.tx.ping_ack` | counter | proxy | PING ACK frames emitted in response to peer probes |
+
 #### HTTP/2 GOAWAY and RST_STREAM by error code
 
 Counters split by direction (sent vs received) and RFC 9113 §7 error code.

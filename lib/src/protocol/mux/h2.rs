@@ -1778,6 +1778,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 match serializer::gen_settings(kawa.storage.space(), &self.local_settings) {
                     Ok((_, size)) => {
                         kawa.storage.fill(size);
+                        incr!("h2.frames.tx.settings");
                         // RFC 9113 §6.5: start tracking SETTINGS ACK timeout
                         self.settings_sent_at = Some(Instant::now());
                     }
@@ -2373,6 +2374,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     Ok((_, size)) => {
                         offset += size;
                         written_ids.push(stream_id);
+                        incr!("h2.frames.tx.window_update");
                     }
                     Err(_) => {
                         // Buffer full — stop here, remaining entries stay in the map
@@ -2430,6 +2432,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     Ok((_, _)) => {
                         offset += frame_size;
                         written_count += 1;
+                        incr!("h2.frames.tx.rst_stream");
                     }
                     Err(_) => break,
                 }
@@ -2528,6 +2531,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 match serializer::gen_settings(kawa.storage.space(), &self.local_settings) {
                     Ok((_, size)) => {
                         kawa.storage.fill(size);
+                        incr!("h2.frames.tx.settings");
                         // RFC 9113 §6.5: start tracking SETTINGS ACK timeout
                         self.settings_sent_at = Some(Instant::now());
                     }
@@ -3081,6 +3085,27 @@ fn metric_for_rst_stream_received(error_code: u32) -> &'static str {
         .unwrap_or("h2.rst_stream.received.unknown_error")
 }
 
+/// Static metric key for an inbound H2 frame by RFC 9113 §6 frame type.
+/// Emitted at the `handle_frame` dispatch — single chokepoint that any
+/// new H2 frame type must traverse, so adding a `Frame::*` variant fails
+/// the build here. Counts are per-frame, not per-byte; pair with
+/// `bytes_in` for traffic-mix dashboards.
+fn h2_frame_rx_metric_key(frame: &Frame) -> &'static str {
+    match frame {
+        Frame::Data(_) => "h2.frames.rx.data",
+        Frame::Headers(_) => "h2.frames.rx.headers",
+        Frame::PushPromise(_) => "h2.frames.rx.push_promise",
+        Frame::Priority(_) => "h2.frames.rx.priority",
+        Frame::RstStream(_) => "h2.frames.rx.rst_stream",
+        Frame::Settings(_) => "h2.frames.rx.settings",
+        Frame::Ping(_) => "h2.frames.rx.ping",
+        Frame::GoAway(_) => "h2.frames.rx.goaway",
+        Frame::WindowUpdate(_) => "h2.frames.rx.window_update",
+        Frame::Continuation(_) => "h2.frames.rx.continuation",
+        Frame::Unknown(_) => "h2.frames.rx.unknown",
+    }
+}
+
 impl<Front: SocketHandler> ConnectionH2<Front> {
 
     pub fn goaway(&mut self, error: H2Error) -> MuxResult {
@@ -3107,6 +3132,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         match serializer::gen_goaway(kawa.storage.space(), self.highest_peer_stream_id, error) {
             Ok((_, size)) => {
                 kawa.storage.fill(size);
+                incr!("h2.frames.tx.goaway");
                 self.state = H2State::GoAway;
                 self.expect_write = Some(H2StreamId::Zero);
                 self.readiness.interest = Ready::WRITABLE | Ready::HUP | Ready::ERROR;
@@ -3161,6 +3187,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         match serializer::gen_goaway(kawa.storage.space(), STREAM_ID_MAX, H2Error::NoError) {
             Ok((_, size)) => {
                 kawa.storage.fill(size);
+                incr!("h2.frames.tx.goaway");
                 // Stay in the current state so the connection can continue processing
                 // existing streams. The second GOAWAY will transition to GoAway state.
                 // Keep READABLE so in-flight request bodies can still be received
@@ -3309,6 +3336,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         L: ListenerHandler + L7ListenerHandler,
     {
         trace!("{} {:#?}", log_context!(self), frame);
+        // Per-frame-type RX counter. Single chokepoint covers every H2 frame
+        // type — adding a new `Frame::*` variant fails the build inside the
+        // helper, keeping the metric breakdown in lock-step with RFC 9113 §6.
+        count!(h2_frame_rx_metric_key(&frame), 1);
         match frame {
             Frame::Data(data) => self.handle_data_frame(data, wire_payload_len, context, endpoint),
             Frame::Headers(headers) => self.handle_headers_frame(headers, context, endpoint),
@@ -4027,7 +4058,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             return self.force_disconnect();
         }
         match serializer::gen_ping_acknowledgement(kawa.storage.space(), &ping.payload) {
-            Ok((_, size)) => kawa.storage.fill(size),
+            Ok((_, size)) => {
+                kawa.storage.fill(size);
+                incr!("h2.frames.tx.ping_ack");
+            }
             Err(error) => {
                 error!(
                     "{} Could not serialize PingFrame: {:?}",
@@ -4532,6 +4566,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                             if buf.len() >= frame.len() {
                                 buf[..frame.len()].copy_from_slice(&frame);
                                 kawa.storage.fill(frame.len());
+                                incr!("h2.frames.tx.rst_stream");
+                                count!(metric_for_rst_stream_sent(H2Error::Cancel), 1);
                                 self.readiness.interest.insert(Ready::WRITABLE);
                                 self.readiness.signal_pending_write();
                                 self.rst_sent.insert(id);
@@ -5098,6 +5134,54 @@ mod tests {
     /// new H2Error variant fails the build inside the macro — but a typo in
     /// the helper prefix would silently land. Walk every (direction × kind)
     /// pair and dedupe the set.
+    /// `h2_frame_rx_metric_key` must yield a distinct `&'static str` per
+    /// `Frame::*` variant. The single dispatch site in `handle_frame` reads
+    /// from this helper, so a typo or duplicate would silently clobber the
+    /// frame-mix dashboard. Asserting the literal set lets us compare against
+    /// `doc/configure.md` and the RFC 9113 §6 frame catalogue without
+    /// reconstructing every Frame variant in the test.
+    #[test]
+    fn test_h2_frame_rx_metric_keys_are_unique_and_namespaced() {
+        // Update this list whenever a new Frame variant is added — the helper
+        // match is also exhaustive, so the build will already break there
+        // before anyone notices the test missing a key.
+        let expected: [&'static str; 11] = [
+            "h2.frames.rx.data",
+            "h2.frames.rx.headers",
+            "h2.frames.rx.push_promise",
+            "h2.frames.rx.priority",
+            "h2.frames.rx.rst_stream",
+            "h2.frames.rx.settings",
+            "h2.frames.rx.ping",
+            "h2.frames.rx.goaway",
+            "h2.frames.rx.window_update",
+            "h2.frames.rx.continuation",
+            "h2.frames.rx.unknown",
+        ];
+
+        for key in expected {
+            assert!(
+                key.starts_with("h2.frames.rx."),
+                "metric key {key} is missing the h2.frames.rx. prefix",
+            );
+        }
+        let mut deduped = expected.to_vec();
+        deduped.sort_unstable();
+        deduped.dedup();
+        assert_eq!(
+            deduped.len(),
+            expected.len(),
+            "frame-rx metric keys must be unique; collisions in: {expected:?}",
+        );
+
+        // Spot-check the helper for the one variant we can construct without
+        // borrowing into a frame body — `Frame::Unknown(u8)` is just a tag.
+        assert_eq!(
+            h2_frame_rx_metric_key(&Frame::Unknown(42)),
+            "h2.frames.rx.unknown",
+        );
+    }
+
     #[test]
     fn test_per_error_code_metric_keys_are_unique_and_namespaced() {
         const ALL_ERRORS: [H2Error; 14] = [
