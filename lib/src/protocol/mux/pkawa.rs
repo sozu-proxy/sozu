@@ -4,7 +4,7 @@ use kawa::{
     Block, BodySize, Flags, Kind, Pair, ParsingPhase, StatusLine, Store, Version,
     h1::ParserCallbacks, repr::Slice,
 };
-use sozu_command::logging::is_logger_colored;
+use sozu_command::logging::ansi_palette;
 
 use crate::{
     pool::Checkout,
@@ -24,12 +24,7 @@ use crate::{
 /// (uniform across every protocol) when the logger supports ANSI.
 macro_rules! log_module_context {
     () => {{
-        let colored = is_logger_colored();
-        let (open, reset) = if colored {
-            ("\x1b[1;97m", "\x1b[0m")
-        } else {
-            ("", "")
-        };
+        let (open, reset, _, _, _) = ansi_palette();
         format!("{open}MUX-PKAWA{reset}\t >>>", open = open, reset = reset)
     }};
 }

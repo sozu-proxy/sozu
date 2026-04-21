@@ -7,7 +7,7 @@ use mio::net::{TcpListener, TcpStream};
 use rustls::{ProtocolVersion, ServerConnection};
 use rusty_ulid::Ulid;
 use socket2::{Domain, Protocol, Socket, Type};
-use sozu_command::{config::MAX_LOOP_ITERATIONS, logging::is_logger_colored};
+use sozu_command::{config::MAX_LOOP_ITERATIONS, logging::ansi_palette};
 
 #[derive(thiserror::Error, Debug)]
 pub enum ServerBindError {
@@ -85,12 +85,7 @@ pub trait SocketHandler {
 /// the kernel rejects the call (e.g. just-reset sockets).
 macro_rules! log_socket_context {
     ($self:expr) => {{
-        let colored = is_logger_colored();
-        let (open, reset, grey, gray, white) = if colored {
-            ("\x1b[1;97m", "\x1b[0m", "\x1b[37m", "\x1b[90m", "\x1b[97m")
-        } else {
-            ("", "", "", "", "")
-        };
+        let (open, reset, grey, gray, white) = ansi_palette();
         let ulid = match $self.session_ulid() {
             Some(ulid) => ulid.to_string(),
             None => "-".to_string(),
@@ -138,12 +133,7 @@ fn log_socket_module_prefix(
     session_ulid: Option<Ulid>,
     configured_peer: Option<SocketAddr>,
 ) -> String {
-    let colored = is_logger_colored();
-    let (open, reset, grey, gray, white) = if colored {
-        ("\x1b[1;97m", "\x1b[0m", "\x1b[37m", "\x1b[90m", "\x1b[97m")
-    } else {
-        ("", "", "", "", "")
-    };
+    let (open, reset, grey, gray, white) = ansi_palette();
     let ulid = match session_ulid {
         Some(ulid) => ulid.to_string(),
         None => "-".to_string(),

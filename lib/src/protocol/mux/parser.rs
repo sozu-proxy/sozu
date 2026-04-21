@@ -10,7 +10,7 @@ use nom::{
     number::complete::{be_u8, be_u16, be_u24, be_u32},
     sequence::tuple,
 };
-use sozu_command::logging::is_logger_colored;
+use sozu_command::logging::ansi_palette;
 
 /// Module-level prefix for nom-based H2 frame parser diagnostics. The parser
 /// has no session in scope, so a single `MUX-PARSER` label is used, colored
@@ -18,12 +18,7 @@ use sozu_command::logging::is_logger_colored;
 /// ANSI.
 macro_rules! log_module_context {
     () => {{
-        let colored = is_logger_colored();
-        let (open, reset) = if colored {
-            ("\x1b[1;97m", "\x1b[0m")
-        } else {
-            ("", "")
-        };
+        let (open, reset, _, _, _) = ansi_palette();
         format!("{open}MUX-PARSER{reset}\t >>>", open = open, reset = reset)
     }};
 }
