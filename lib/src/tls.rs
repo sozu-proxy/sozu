@@ -166,6 +166,30 @@ impl CertificateResolver {
         self.certificates.get(fingerprint).map(ToOwned::to_owned)
     }
 
+    /// Recompute the aggregate `tls.cert.min_expires_at_seconds` gauge across
+    /// every certificate currently loaded. Per-SNI granularity would explode
+    /// statsd key cardinality (the resolver can easily hold tens of thousands
+    /// of names on a public endpoint) and the existing `gauge!` macro has no
+    /// label support, so we expose a single absolute unix-seconds reading of
+    /// the soonest-expiring cert. Dashboards alert on this as the "next cert
+    /// to rotate" deadline; operators query per-cert detail through the
+    /// command API. `x509` timestamps are signed but `set_gauge` takes a
+    /// `usize`, so we clamp already-expired certs to 0 (which is still a
+    /// monotonic "panic now" signal to any alerting rule).
+    ///
+    /// Called from `add_certificate` / `remove_certificate` — i.e. only when
+    /// the cert set actually changes, never on the hot TLS handshake path.
+    fn publish_min_expiration_gauge(&self) {
+        let min_expiration = self
+            .certificates
+            .values()
+            .map(|c| c.expiration)
+            .min()
+            .unwrap_or(0);
+        let clamped = min_expiration.max(0) as usize;
+        gauge!("tls.cert.min_expires_at_seconds", clamped);
+    }
+
     /// persist a certificate, after ensuring validity, and checking if it can replace another certificate.
     /// return the certificate fingerprint regardless of having inserted it or not
     pub fn add_certificate(
@@ -210,6 +234,7 @@ impl CertificateResolver {
 
         self.certificates
             .insert(cert_to_add.fingerprint.to_owned(), cert_to_add.clone());
+        self.publish_min_expiration_gauge();
 
         trace!("{:#?}", self);
 
@@ -242,6 +267,7 @@ impl CertificateResolver {
             }
 
             self.certificates.remove(fingerprint);
+            self.publish_min_expiration_gauge();
         }
         trace!("{:#?}", self);
 
