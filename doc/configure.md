@@ -708,6 +708,37 @@ Negotiated cipher suite (rustls):
 | `tls.cipher.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256` | counter | proxy |
 | `tls.cipher.Unsupported` | counter | proxy |
 
+#### TLS handshake telemetry
+
+Emitted by the rustls handshake driver at `lib/src/protocol/rustls.rs`.
+Failure counters sit next to the tiered log emission in `log_handshake_error`
+so every `warn!`/`error!`/`debug!` about a broken handshake also bumps the
+matching counter. The histogram is recorded at the moment the handshake
+transitions out of `is_handshaking()` (both through the `readable` and
+`writable` exit paths).
+
+| Metric | Type | Scope | Description |
+|--------|------|-------|-------------|
+| `tls.handshake.failed.alert_received` | counter | proxy | Remote peer sent a fatal TLS alert (`RustlsError::AlertReceived`). Typical causes: cert-pinning client, stale CA bundle, scanner. Logged at `debug!`. |
+| `tls.handshake.failed.peer_incompatible` | counter | proxy | Peer advertised a version/feature mix we cannot negotiate (`PeerIncompatible`). Logged at `warn!`. |
+| `tls.handshake.failed.peer_misbehaved` | counter | proxy | Peer deviated from the TLS state machine (`PeerMisbehaved`). Logged at `warn!`. |
+| `tls.handshake.failed.invalid_message` | counter | proxy | Wire-level record parse failure (`InvalidMessage`). Logged at `warn!`. |
+| `tls.handshake.failed.inappropriate_message` | counter | proxy | Peer sent a record type that was valid on the wire but not allowed in the current phase (`InappropriateMessage`). Logged at `warn!`. |
+| `tls.handshake.failed.inappropriate_handshake_message` | counter | proxy | Peer sent a handshake sub-type the state machine did not expect (`InappropriateHandshakeMessage`). Logged at `warn!`. |
+| `tls.handshake.failed.oversized_record` | counter | proxy | Peer sent a record larger than the RFC 8446 §5.1 cap (`PeerSentOversizedRecord`). Logged at `warn!`. |
+| `tls.handshake.failed.no_alpn` | counter | proxy | ALPN negotiation failed (`NoApplicationProtocol`) — e.g. peer offered only protocols the listener does not serve. Logged at `warn!`. |
+| `tls.handshake.failed.invalid_certificate` | counter | proxy | Peer-supplied certificate failed verification (`InvalidCertificate`). Logged at `warn!`. Only relevant when mTLS is enabled. |
+| `tls.handshake.failed.decrypt_error` | counter | proxy | Record failed to decrypt (`DecryptError`) — almost always an attack or a broken middlebox. Logged at `warn!`. |
+| `tls.handshake.failed.no_certificates_present` | counter | proxy | mTLS: peer sent an empty Certificate message (`NoCertificatesPresented`). Logged at `warn!`. |
+| `tls.handshake.failed.other` | counter | proxy | Catch-all for local/config/provider failures (`General`, `Other`, `EncryptError`, `FailedToGetRandomBytes`, CRL errors, future rustls variants). Logged at `error!` — these indicate a server-side problem, not a bad client. |
+| `tls.handshake_ms` | time | proxy | Wall-clock duration in milliseconds from the first TLS byte observed on the socket to the handshake leaving `is_handshaking()`. Histogram — not a counter — so alert rules should use quantiles. |
+
+#### TLS certificate expiration
+
+| Metric | Type | Scope | Description |
+|--------|------|-------|-------------|
+| `tls.cert.min_expires_at_seconds` | gauge | proxy | Unix-seconds timestamp of the soonest-expiring certificate currently loaded in the `CertificateResolver`. Recomputed on every add/remove/replace at `lib/src/tls.rs`. Aggregate only — per-SNI granularity is intentionally omitted because statsd has no label support and the resolver can hold tens of thousands of names; operators query per-cert detail through the command API. Already-expired certificates clamp to `0`, which dashboards should interpret as the "rotate now" alert condition. |
+
 #### HTTP/2 specific
 
 | Metric | Type | Scope | Description |
