@@ -319,7 +319,9 @@ fn classify_invalid_value_byte(value: &[u8]) -> Option<RejectReason> {
         match b {
             0x00 => saw_nul = true,
             0x0A | 0x0D => saw_crlf = true,
-            0x01..=0x08 | 0x0B | 0x0C | 0x0E..=0x1F | 0x7F => return Some(RejectReason::CrlfInValue),
+            0x01..=0x08 | 0x0B | 0x0C | 0x0E..=0x1F | 0x7F => {
+                return Some(RejectReason::CrlfInValue);
+            }
             _ => {}
         }
     }

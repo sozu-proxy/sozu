@@ -3107,7 +3107,6 @@ fn h2_frame_rx_metric_key(frame: &Frame) -> &'static str {
 }
 
 impl<Front: SocketHandler> ConnectionH2<Front> {
-
     pub fn goaway(&mut self, error: H2Error) -> MuxResult {
         self.state = H2State::Error;
         self.drain.draining = true;
