@@ -4,7 +4,7 @@ use kawa::{
     AsBuffer, Block, BlockConverter, Chunk, Flags, Kawa, Pair, ParsingErrorKind, ParsingPhase,
     StatusLine, Store,
 };
-use sozu_command::logging::is_logger_colored;
+use sozu_command::logging::ansi_palette;
 
 use crate::protocol::{
     http::parser::compare_no_case,
@@ -23,12 +23,7 @@ use crate::protocol::{
 /// across every protocol) when the logger supports ANSI.
 macro_rules! log_module_context {
     () => {{
-        let colored = is_logger_colored();
-        let (open, reset) = if colored {
-            ("\x1b[1;97m", "\x1b[0m")
-        } else {
-            ("", "")
-        };
+        let (open, reset, _, _, _) = ansi_palette();
         format!("{open}MUX-CONV{reset}\t >>>", open = open, reset = reset)
     }};
 }

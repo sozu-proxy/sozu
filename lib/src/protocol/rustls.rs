@@ -5,7 +5,7 @@ use rustls::{Error as RustlsError, ServerConnection};
 use rusty_ulid::Ulid;
 use sozu_command::{
     config::MAX_LOOP_ITERATIONS,
-    logging::{LogContext, is_logger_colored},
+    logging::{LogContext, ansi_palette},
 };
 
 use crate::{
@@ -22,18 +22,7 @@ use crate::{
 /// `MUX-*` and `SOCKET` logs.
 macro_rules! log_context {
     ($self:expr) => {{
-        let colored = is_logger_colored();
-        let (open, reset, grey, gray, white) = if colored {
-            (
-                "\x1b[1;97m",
-                "\x1b[0m",
-                "\x1b[37m",
-                "\x1b[90m",
-                "\x1b[97m",
-            )
-        } else {
-            ("", "", "", "", "")
-        };
+        let (open, reset, grey, gray, white) = ansi_palette();
         format!(
             "{gray}{ctx}{reset}\t{open}RUSTLS{reset}\t{grey}Session{reset}({gray}sni{reset}={white}{sni:?}{reset}, {gray}alpn{reset}={white}{alpn}{reset}, {gray}version{reset}={white}{version:?}{reset}, {gray}source{reset}={white}{source:?}{reset}, {gray}frontend{reset}={white}{frontend}{reset}, {gray}readiness{reset}={white}{readiness}{reset})\t >>>",
             open = open,

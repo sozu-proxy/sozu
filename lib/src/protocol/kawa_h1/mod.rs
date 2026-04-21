@@ -41,7 +41,7 @@ use crate::{
     server::{CONN_RETRIES, push_event},
     socket::{SocketHandler, SocketResult, TransportProtocol, stats::socket_rtt},
     sozu_command::{
-        logging::{LogContext, is_logger_colored},
+        logging::{LogContext, ansi_palette},
         ready::Ready,
     },
     timer::TimeoutContainer,
@@ -66,18 +66,7 @@ macro_rules! log_context {
         log_context!($self, $self.response_parsing_phase())
     };
     ($self:expr, $response_phase:expr) => {{
-        let colored = is_logger_colored();
-        let (open, reset, grey, gray, white) = if colored {
-            (
-                "\x1b[1;97m",
-                "\x1b[0m",
-                "\x1b[37m",
-                "\x1b[90m",
-                "\x1b[97m",
-            )
-        } else {
-            ("", "", "", "", "")
-        };
+        let (open, reset, grey, gray, white) = ansi_palette();
         format!(
             "{gray}{ctx}{reset}\t{open}KAWA-H1{reset}\t{grey}Session{reset}({gray}public{reset}={white}{public}{reset}, {gray}session{reset}={white}{session}{reset}, {gray}frontend{reset}={white}{frontend}{reset}, {gray}request_parsing_phase{reset}={white}{request_parsing_phase:?}{reset}, {gray}response_parsing_phase{reset}={white}{response_parsing_phase:?}{reset}, {gray}frontend_readiness{reset}={white}{frontend_readiness}{reset}, {gray}backend{reset}={white}{backend}{reset}, {gray}backend_readiness{reset}={white}{backend_readiness}{reset})\t >>>",
             open = open,

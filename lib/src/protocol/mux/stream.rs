@@ -12,7 +12,7 @@ use std::{
 };
 
 use mio::Token;
-use sozu_command::logging::is_logger_colored;
+use sozu_command::logging::ansi_palette;
 
 use super::{GenericHttpStream, Position};
 use crate::{
@@ -26,12 +26,7 @@ use crate::{
 /// logger supports ANSI.
 macro_rules! log_module_context {
     () => {{
-        let colored = is_logger_colored();
-        let (open, reset) = if colored {
-            ("\x1b[1;97m", "\x1b[0m")
-        } else {
-            ("", "")
-        };
+        let (open, reset, _, _, _) = ansi_palette();
         format!("{open}MUX-STREAM{reset}\t >>>", open = open, reset = reset)
     }};
 }

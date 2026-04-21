@@ -14,7 +14,7 @@ const _: () = assert!(
 );
 
 use rusty_ulid::Ulid;
-use sozu_command::{logging::is_logger_colored, ready::Ready};
+use sozu_command::{logging::ansi_palette, ready::Ready};
 
 use crate::{
     L7ListenerHandler, ListenerHandler, Protocol, Readiness, SessionMetrics,
@@ -33,9 +33,9 @@ use crate::{
 
 /// Protocol label + session descriptor used as a prefix on every
 /// [`ConnectionH2`] log line. Matches the RUSTLS log-context convention:
-/// `MUX-H2\tSession(...)\t >>>`. When [`is_logger_colored`] is `true` the
-/// label is wrapped in bold bright-white ANSI (uniform across every protocol)
-/// and the session detail is rendered in light grey.
+/// `MUX-H2\tSession(...)\t >>>`. When colored output is enabled (via
+/// [`ansi_palette`]) the label is wrapped in bold bright-white ANSI (uniform
+/// across every protocol) and the session detail is rendered in light grey.
 ///
 /// Fields included in the session block (chosen to surface the most common
 /// H2 troubleshooting axes — flow stall, leaked stream, draining state,
@@ -56,18 +56,7 @@ use crate::{
 /// read (the colored check) and one `format!` allocation.
 macro_rules! log_context {
     ($self:expr) => {{
-        let colored = is_logger_colored();
-        let (open, reset, grey, gray, white) = if colored {
-            (
-                "\x1b[1;97m",
-                "\x1b[0m",
-                "\x1b[37m",
-                "\x1b[90m",
-                "\x1b[97m",
-            )
-        } else {
-            ("", "", "", "", "")
-        };
+        let (open, reset, grey, gray, white) = ansi_palette();
         format!(
             "[{ulid} - - -]\t{open}MUX-H2{reset}\t{grey}Session{reset}({gray}peer{reset}={white}{peer:?}{reset}, {gray}position{reset}={white}{position:?}{reset}, {gray}state{reset}={white}{state:?}{reset}, {gray}streams{reset}={white}{streams}{reset}, {gray}last_peer_id{reset}={white}{last_peer_id}{reset}, {gray}window{reset}={white}{window}{reset}, {gray}draining{reset}={white}{draining}{reset}, {gray}total_rst_streams_emitted_lifetime{reset}={white}{total_rst_streams_emitted_lifetime}{reset}, {gray}total_rst_received_lifetime{reset}={white}{total_rst_received_lifetime}{reset}, {gray}readiness{reset}={white}{readiness}{reset})\t >>>",
             open = open,
@@ -98,18 +87,7 @@ macro_rules! log_context {
 #[allow(unused_macros)]
 macro_rules! log_context_stream {
     ($self:expr, $http_context:expr) => {{
-        let colored = is_logger_colored();
-        let (open, reset, grey, gray, white) = if colored {
-            (
-                "\x1b[1;97m",
-                "\x1b[0m",
-                "\x1b[37m",
-                "\x1b[90m",
-                "\x1b[97m",
-            )
-        } else {
-            ("", "", "", "", "")
-        };
+        let (open, reset, grey, gray, white) = ansi_palette();
         format!(
             "[{ulid} {req} {cluster} {backend}]\t{open}MUX-H2{reset}\t{grey}Session{reset}({gray}peer{reset}={white}{peer:?}{reset}, {gray}position{reset}={white}{position:?}{reset}, {gray}state{reset}={white}{state:?}{reset}, {gray}streams{reset}={white}{streams}{reset}, {gray}last_peer_id{reset}={white}{last_peer_id}{reset}, {gray}window{reset}={white}{window}{reset}, {gray}draining{reset}={white}{draining}{reset}, {gray}total_rst_streams_emitted_lifetime{reset}={white}{total_rst_streams_emitted_lifetime}{reset}, {gray}total_rst_received_lifetime{reset}={white}{total_rst_received_lifetime}{reset}, {gray}readiness{reset}={white}{readiness}{reset})\t >>>",
             open = open,
@@ -141,12 +119,7 @@ macro_rules! log_context_stream {
 /// connection logs and honours the colored flag.
 macro_rules! log_module_context {
     () => {{
-        let colored = is_logger_colored();
-        let (open, reset) = if colored {
-            ("\x1b[1;97m", "\x1b[0m")
-        } else {
-            ("", "")
-        };
+        let (open, reset, _, _, _) = ansi_palette();
         format!("{open}MUX-H2{reset}\t >>>", open = open, reset = reset)
     }};
 }

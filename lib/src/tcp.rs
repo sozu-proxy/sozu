@@ -17,7 +17,7 @@ use rusty_ulid::Ulid;
 use sozu_command::{
     ObjectKind,
     config::MAX_LOOP_ITERATIONS,
-    logging::{EndpointRecord, LogContext, is_logger_colored},
+    logging::{EndpointRecord, LogContext, ansi_palette},
     proto::command::request::RequestType,
 };
 
@@ -67,18 +67,7 @@ StateMachineBuilder! {
 /// and bright-white values.
 macro_rules! log_context {
     ($self:expr) => {{
-        let colored = is_logger_colored();
-        let (open, reset, grey, gray, white) = if colored {
-            (
-                "\x1b[1;97m",
-                "\x1b[0m",
-                "\x1b[37m",
-                "\x1b[90m",
-                "\x1b[97m",
-            )
-        } else {
-            ("", "", "", "", "")
-        };
+        let (open, reset, grey, gray, white) = ansi_palette();
         format!(
             "{gray}{ctx}{reset}\t{open}TCP{reset}\t{grey}Session{reset}({gray}frontend{reset}={white}{frontend}{reset}, {gray}backend{reset}={white}{backend}{reset})\t >>>",
             open = open,

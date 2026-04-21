@@ -28,16 +28,17 @@ use std::{
 use mio::{Token, net::TcpStream};
 use rusty_ulid::Ulid;
 use sozu_command::{
-    logging::is_logger_colored,
+    logging::ansi_palette,
     proto::command::{Event, EventKind},
     ready::Ready,
 };
 
 /// Protocol label + session descriptor used as a prefix on every [`Mux`] log
 /// line. Matches the RUSTLS log-context convention:
-/// `[<ulid> - - -]\tMUX\tSession(...)\t >>>`. When [`is_logger_colored`] is
-/// `true` the label is wrapped in bold bright-white ANSI (uniform across every
-/// protocol) and the session detail block is rendered in light grey.
+/// `[<ulid> - - -]\tMUX\tSession(...)\t >>>`. When colored output is enabled
+/// (via [`ansi_palette`]) the label is wrapped in bold bright-white ANSI
+/// (uniform across every protocol) and the session detail block is rendered
+/// in light grey.
 ///
 /// Fields included in the session block:
 /// - `frontend` — mio token of the frontend socket
@@ -48,18 +49,7 @@ use sozu_command::{
 /// - `readiness` — frontend mio readiness snapshot
 macro_rules! log_context {
     ($self:expr) => {{
-        let colored = is_logger_colored();
-        let (open, reset, grey, gray, white) = if colored {
-            (
-                "\x1b[1;97m",
-                "\x1b[0m",
-                "\x1b[37m",
-                "\x1b[90m",
-                "\x1b[97m",
-            )
-        } else {
-            ("", "", "", "", "")
-        };
+        let (open, reset, grey, gray, white) = ansi_palette();
         format!(
             "[{ulid} - - -]\t{open}MUX{reset}\t{grey}Session{reset}({gray}frontend{reset}={white}{frontend}{reset}, {gray}peer{reset}={white}{peer:?}{reset}, {gray}streams{reset}={white}{streams}{reset}, {gray}backends{reset}={white}{backends}{reset}, {gray}pending_links{reset}={white}{pending_links}{reset}, {gray}readiness{reset}={white}{readiness}{reset})\t >>>",
             open = open,
@@ -86,18 +76,7 @@ macro_rules! log_context {
 /// context to correlate the line back to the rest of the session.
 macro_rules! log_context_lite {
     ($self:expr) => {{
-        let colored = is_logger_colored();
-        let (open, reset, grey, gray, white) = if colored {
-            (
-                "\x1b[1;97m",
-                "\x1b[0m",
-                "\x1b[37m",
-                "\x1b[90m",
-                "\x1b[97m",
-            )
-        } else {
-            ("", "", "", "", "")
-        };
+        let (open, reset, grey, gray, white) = ansi_palette();
         format!(
             "[{ulid} - - -]\t{open}MUX{reset}\t{grey}Session{reset}({gray}frontend{reset}={white}{frontend}{reset}, {gray}peer{reset}={white}{peer:?}{reset}, {gray}readiness{reset}={white}{readiness}{reset})\t >>>",
             open = open,
@@ -117,12 +96,7 @@ macro_rules! log_context_lite {
 /// is in scope. Honours the colored flag.
 macro_rules! log_module_context {
     () => {{
-        let colored = is_logger_colored();
-        let (open, reset) = if colored {
-            ("\x1b[1;97m", "\x1b[0m")
-        } else {
-            ("", "")
-        };
+        let (open, reset, _, _, _) = ansi_palette();
         format!("{open}MUX{reset}\t >>>", open = open, reset = reset)
     }};
 }

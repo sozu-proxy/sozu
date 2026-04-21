@@ -8,7 +8,7 @@
 use std::{cell::RefCell, collections::HashMap, rc::Rc, time::Duration};
 
 use mio::{Interest, Token, net::TcpStream};
-use sozu_command::{logging::is_logger_colored, proto::command::ListenerType};
+use sozu_command::{logging::ansi_palette, proto::command::ListenerType};
 
 use super::{
     BackendStatus, Connection, Context, DebugEvent, GlobalStreamId, Position, StreamState,
@@ -42,27 +42,11 @@ use crate::{
 ///   `Session(...)`.
 macro_rules! log_module_context {
     () => {{
-        let colored = is_logger_colored();
-        let (open, reset) = if colored {
-            ("\x1b[1;97m", "\x1b[0m")
-        } else {
-            ("", "")
-        };
+        let (open, reset, _, _, _) = ansi_palette();
         format!("{open}MUX-ROUTER{reset}\t >>>", open = open, reset = reset)
     }};
     ($http_context:expr) => {{
-        let colored = is_logger_colored();
-        let (open, reset, grey, gray, white) = if colored {
-            (
-                "\x1b[1;97m",
-                "\x1b[0m",
-                "\x1b[37m",
-                "\x1b[90m",
-                "\x1b[97m",
-            )
-        } else {
-            ("", "", "", "", "")
-        };
+        let (open, reset, grey, gray, white) = ansi_palette();
         let http_ctx: &HttpContext = &$http_context;
         let ctx = http_ctx.log_context();
         format!(

@@ -39,6 +39,37 @@ pub fn is_logger_colored() -> bool {
     LOGGER_COLORED.with(|c| c.get())
 }
 
+/// ANSI palette used by every `log_context!` / `log_*_context!` macro in the
+/// proxy stack. Returns a 5-tuple `(open, reset, grey, gray, white)` where:
+///
+/// - `open`   = `\x1b[1;97m` (bold bright-white) — protocol label (`MUX`,
+///   `MUX-H2`, `SOCKET`, `RUSTLS`, `PIPE`, …).
+/// - `reset`  = `\x1b[0m` — ANSI reset.
+/// - `grey`   = `\x1b[37m` (light grey) — `Session` keyword.
+/// - `gray`   = `\x1b[90m` (bright black) — attribute keys (`peer=`,
+///   `local=`, `cluster=`, …).
+/// - `white`  = `\x1b[97m` (bright white) — attribute values.
+///
+/// When [`is_logger_colored`] returns `false` every slot is an empty string,
+/// so macros can unconditionally inline the tokens into `format!` without
+/// leaking escape codes into plain-text log sinks.
+///
+/// Callers that only need the label pair can destructure with wildcards:
+/// `let (open, reset, _, _, _) = ansi_palette();`.
+pub fn ansi_palette() -> (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+) {
+    if is_logger_colored() {
+        ("\x1b[1;97m", "\x1b[0m", "\x1b[37m", "\x1b[90m", "\x1b[97m")
+    } else {
+        ("", "", "", "", "")
+    }
+}
+
 // TODO: check if this error is critical:
 //     could not register compat logger: SetLoggerError(())
 // The CompatLogger may need a variable that tells wether it has been initiated already
