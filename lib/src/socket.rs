@@ -76,13 +76,13 @@ pub trait SocketHandler {
 /// context) the ULID slot is rendered as `-` so the column layout stays
 /// stable across sessionless plumbing. The `[ulid - - -]` context comes first
 /// to stay aligned with `MUX-*`, `PIPE` and `RUSTLS` log lines. Colour scheme
-/// matches the rest of the mux log-context macros: `SOCKET` bold bright-white,
-/// `Session` light grey, keys gray, values bright white.
+/// comes from [`sozu_command::logging::ansi_palette`] — single source of
+/// truth for every `log_*_context!` macro in the proxy.
 ///
-/// `local` is a live `getsockname(2)` lookup and is always populated for a
-/// bound socket. `rtt` + `state` come from a single `getsockopt(TCP_INFO)`
-/// call via [`socket_snapshot`]; both render as `None` on an FSM state where
-/// the kernel rejects the call (e.g. just-reset sockets).
+/// `peer` is a live `getpeername(2)` lookup (this macro is used by
+/// [`FrontRustls`] where the accepted-socket peer is reliable; backend-facing
+/// sockets carry a cache via [`log_socket_module_prefix`]). `local`, `rtt`,
+/// `state` render per [`log_socket_module_prefix`]'s description.
 macro_rules! log_socket_context {
     ($self:expr) => {{
         let (open, reset, grey, gray, white) = ansi_palette();
@@ -113,21 +113,23 @@ macro_rules! log_socket_context {
 /// Module-level socket log prefix used from free functions (e.g. the shared
 /// `tcp_socket_*` helpers) where `self` is not in scope but the caller can
 /// still thread a session `Ulid`, a cached peer address, and the underlying
-/// [`TcpStream`] through as parameters. Renders the same `[<ulid> - - -]\t
-/// SOCKET\tSession(peer=..., local=..., rtt=..., state=..., protocol=Tcp)
-/// \t >>>` prefix as [`log_socket_context!`] so free-function error logs
-/// align column-by-column with handler-backed ones.
+/// [`TcpStream`] through as parameters. Renders the same
+/// `[<ulid> - - -]\tSOCKET\tSession(peer=..., local=..., rtt=..., state=..., protocol=Tcp)\t >>>`
+/// prefix as [`log_socket_context!`]; colour scheme via
+/// [`sozu_command::logging::ansi_palette`].
 ///
-/// When the ULID is `None` the slot is rendered as `-`. `peer` prefers the
-/// caller-supplied `configured_peer` (stored at [`SessionTcpStream`]
-/// construction, immune to ENOTCONN on a socket that failed an asynchronous
-/// `connect()`) and falls back to a live `getpeername(2)` lookup when no
-/// cache is available. `local` is a `getsockname(2)` lookup which stays
-/// valid across failed connects (the bind is local). `rtt` and `state`
-/// come from a single `getsockopt(TCP_INFO)` call — `state="SYN_SENT"` is
-/// the clearest signal for a failed outbound `connect()`. Protocol is
-/// hardcoded to `Tcp` because the helper is only called from the raw-TCP
-/// `tcp_socket_*` free functions.
+/// Per-slot semantics:
+///
+/// - `peer` — prefers the caller-supplied `configured_peer` (cached at
+///   [`SessionTcpStream`] construction, immune to ENOTCONN on a socket that
+///   failed an asynchronous `connect()`) and falls back to a live
+///   `getpeername(2)` lookup when no cache was provided.
+/// - `local` — `getsockname(2)`, stays valid across failed connects.
+/// - `rtt` / `state` — a single `getsockopt(TCP_INFO)` call via
+///   [`stats::socket_snapshot`]; both render as `None` on an FSM state
+///   where the kernel rejects the call. `state="SYN_SENT"` is the
+///   clearest signal for a failed outbound `connect()`.
+/// - `protocol` — hardcoded to `Tcp` (raw-TCP helpers only).
 fn log_socket_module_prefix(
     stream: &TcpStream,
     session_ulid: Option<Ulid>,
@@ -377,12 +379,16 @@ impl SocketHandler for TcpStream {
 pub struct SessionTcpStream {
     pub stream: TcpStream,
     pub session_ulid: Ulid,
-    /// Peer address cached at construction. Unlike a live `getpeername(2)`
-    /// lookup, this survives a socket that failed an asynchronous `connect()`
-    /// (Linux surfaces ENOTCONN via `getpeername` in that state) and is
-    /// therefore the reliable source of truth for the `peer=` slot in
-    /// [`log_socket_module_prefix`] when ECONNREFUSED fires on the first
-    /// read/write — the case that motivated this cache.
+    /// Peer address cached at construction. For backend-facing sockets
+    /// (created from a nonblocking `connect()` in `Router::connect`) this is
+    /// the cluster-configured backend address — reliable across ENOTCONN
+    /// after a failed handshake, which is the sharp case that motivates the
+    /// cache. For frontend-facing sockets constructed from an accepted
+    /// `TcpStream`, this is the client's peer address — identical to what a
+    /// live `getpeername(2)` would return, but threaded through the same
+    /// plumbing for uniformity. Used as the preferred source of truth for
+    /// the `peer=` slot in [`log_socket_module_prefix`], falling back to a
+    /// live lookup when `None`.
     pub configured_peer: Option<SocketAddr>,
 }
 
