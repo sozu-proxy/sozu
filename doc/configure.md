@@ -766,9 +766,21 @@ transitions out of `is_handshaking()` (both through the `readable` and
 
 | Metric | Type | Scope | Description |
 |--------|------|-------|-------------|
-| `h2.active_streams` | gauge | proxy | Open HTTP/2 streams on a connection |
-| `h2.connection_window` | gauge | proxy | Connection-level flow control window size (bytes) |
-| `h2.pending_window_updates` | gauge | proxy | Pending WINDOW_UPDATE frames to send |
+| `h2.connection.active_streams` | gauge | proxy | **Aggregate** count of open HTTP/2 streams across every live H2 connection on the worker. Emitted as a [`gauge_add!`] lifecycle delta from `ConnectionH2::gauge_connection_state`; the per-connection contribution is subtracted on connection drop, so the value sums correctly under multi-connection load. |
+| `h2.connection.window_bytes` | gauge | proxy | **Aggregate** sum of available connection-level flow-control window bytes across every live H2 connection. Negative per-connection windows clamp to 0 — the aggregate measures available capacity, not deficit. Lifecycle-delta semantics as above. |
+| `h2.connection.pending_window_updates` | gauge | proxy | **Aggregate** number of queued (un-flushed) per-stream WINDOW_UPDATE entries across every live H2 connection. Lifecycle-delta semantics as above. |
+
+> **Migration note (renamed metrics).** The three keys above replace the
+> earlier `h2.connection_window`, `h2.active_streams`, and
+> `h2.pending_window_updates` gauges. The old keys had **per-connection
+> snapshot** semantics implemented via absolute `gauge!`: under concurrent
+> load every H2 connection clobbered the previous one's value, so the
+> dashboard saw the last writer rather than the aggregate. The new keys
+> emit lifecycle deltas via `gauge_add!`, so the value is the **sum across
+> all live H2 connections** on the worker. Update dashboards and alerts
+> accordingly — the new values typically rise into the hundreds or
+> thousands under load instead of cycling 0…N.
+
 | `h2.flow_control_stall` | counter | proxy | Converter stalled due to flow control |
 | `h2.close_with_active_streams` | counter | proxy | H2 connections closed while streams were still active |
 | `h2.window_update_dropped` | counter | proxy | WINDOW_UPDATE frame dropped because the per-connection pending-update queue was already at capacity |
