@@ -39,6 +39,13 @@ pub struct H2BlockConverter<'a> {
     pub lowercase_buf: Vec<u8>,
     /// Reusable buffer for assembling cookie values, avoiding per-cookie allocation.
     pub cookie_buf: Vec<u8>,
+    /// `true` when the owning [`ConnectionH2`] is a backend client
+    /// (`Position::Client`) — i.e. we are writing toward the upstream
+    /// backend. Used to scope the `backend.flow_control.paused` metric so
+    /// we only count stalls in the proxy → backend direction. Captured at
+    /// converter construction (h2.rs) to avoid passing position through
+    /// every stall site.
+    pub position_is_client: bool,
 }
 
 impl H2BlockConverter<'_> {
@@ -319,6 +326,17 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                         data.len()
                     );
                     incr!("h2.flow_control_stall");
+                    if self.position_is_client {
+                        // Direction-scoped counterpart: the proxy → backend
+                        // write was paused because the backend's HTTP/2
+                        // receive window is empty. There is no symmetric
+                        // "resumed" emission — the next writable cycle just
+                        // succeeds when the backend acknowledges window
+                        // updates, so the stall metric is the only signal
+                        // available without plumbing an explicit boundary
+                        // through `flush_stream_out`.
+                        incr!("backend.flow_control.paused");
+                    }
                     kawa.blocks.push_front(Block::Chunk(Chunk { data }));
                     return false;
                 };
@@ -482,6 +500,10 @@ mod tests {
             scheme: b"https",
             lowercase_buf: Vec::new(),
             cookie_buf: Vec::new(),
+            // Tests exercise the converter in isolation; the
+            // backend.flow_control.paused metric is direction-scoped and
+            // off by default in unit tests.
+            position_is_client: false,
         }
     }
 

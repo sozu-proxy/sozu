@@ -1548,6 +1548,16 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                     let mut backend_borrow = backend.borrow_mut();
                     backend_borrow.dec_connections();
                     gauge_add!("backend.connections", -1);
+                    // Second `-1` site for `backend.pool.size` (the first is
+                    // in `connection.rs::pre_close_client_bookkeeping`). This
+                    // path runs during session teardown when the frontend
+                    // session iterates the backends map directly without
+                    // routing through `Connection::close`. Both `-1` sites
+                    // mirror the single `+1` in router.rs::connect and the
+                    // matching `backend.connections, -1` calls already
+                    // present here, so symmetry follows from
+                    // `backend.connections` correctness.
+                    gauge_add!("backend.pool.size", -1);
                     gauge_add!(
                         "connections_per_backend",
                         -1,

@@ -337,6 +337,11 @@ impl<Front: SocketHandler> Connection<Front> {
             let mut backend_borrow = backend.borrow_mut();
             backend_borrow.dec_connections();
             gauge_add!("backend.connections", -1);
+            // Pair with the `+1` at `router.rs::connect` (new-dial path).
+            // This is the graceful-close decrement, used both by the dead
+            // backend path in `mod.rs::back_readable` (which routes through
+            // `client.close()`) and by any explicit Connection::close.
+            gauge_add!("backend.pool.size", -1);
             gauge_add!(
                 "connections_per_backend",
                 -1,
