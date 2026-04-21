@@ -959,6 +959,27 @@ message ProtobufAccessLog {
     // the request ULID when the client did not supply one. Universal
     // correlation key for end-to-end tracing across Envoy/HAProxy/Sōzu hops.
     optional string x_request_id = 24;
+    // Negotiated TLS protocol version, short-form (e.g. "TLSv1.3"). Captured
+    // once at handshake completion. `None` for plaintext listeners or when
+    // the rustls version label is unknown to Sōzu.
+    optional string tls_version = 25;
+    // Negotiated TLS cipher suite, short-form (e.g.
+    // "TLS_AES_128_GCM_SHA256"). Captured once at handshake completion.
+    // `None` for plaintext listeners or when the rustls cipher label is
+    // unknown to Sōzu.
+    optional string tls_cipher = 26;
+    // TLS Server Name Indication (SNI) sent by the client at handshake.
+    // Stored pre-lowercased without a port. `None` for plaintext listeners
+    // or when the client omitted the SNI extension.
+    optional string tls_sni = 27;
+    // Negotiated ALPN protocol, short-form (e.g. "h2", "http/1.1"). `None`
+    // for plaintext listeners or when no ALPN was negotiated.
+    optional string tls_alpn = 28;
+    // Verbatim value of the client-supplied `X-Forwarded-For` header as
+    // observed before Sōzu appended its own hop. Comma-separated chain of
+    // proxy hops (e.g. `"203.0.113.5, 198.51.100.10"`). `None` if no
+    // upstream proxy supplied the header.
+    optional string xff_chain = 29;
 }
 
 message ProtobufEndpoint {

@@ -275,6 +275,11 @@ impl Stream {
             bytes_out: self.metrics.bout,
             user_agent: context.user_agent.as_deref(),
             x_request_id: context.x_request_id.as_deref(),
+            tls_version: context.tls_version,
+            tls_cipher: context.tls_cipher,
+            tls_sni: context.tls_server_name.as_deref(),
+            tls_alpn: context.tls_alpn,
+            xff_chain: context.xff_chain.as_deref(),
             #[cfg(feature = "opentelemetry")]
             otel: context.otel.as_ref(),
             #[cfg(not(feature = "opentelemetry"))]

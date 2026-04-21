@@ -266,7 +266,11 @@ impl HttpsSession {
         // downgrade-capable peer bypass H2-specific protections advertised
         // for this listener (Pass 5 Medium #4 of the security audit).
         let disable_http11 = self.listener.borrow().is_http11_disabled();
-        let alpn = match alpn {
+        // Pair the parsed AlpnProtocol with the on-the-wire label so the
+        // access log can record it as a `&'static str` without re-stringifying
+        // the protocol enum on every request. Unknown ALPN values still bail
+        // out below — only successful negotiations propagate to the log.
+        let (alpn, alpn_label): (AlpnProtocol, Option<&'static str>) = match alpn {
             Some("http/1.1") => {
                 if disable_http11 {
                     incr!("https.alpn.rejected.http11_disabled");
@@ -275,9 +279,9 @@ impl HttpsSession {
                     );
                     return None;
                 }
-                AlpnProtocol::Http11
+                (AlpnProtocol::Http11, Some("http/1.1"))
             }
-            Some("h2") => AlpnProtocol::H2,
+            Some("h2") => (AlpnProtocol::H2, Some("h2")),
             Some(other) => {
                 error!("Unsupported ALPN protocol: {}", other);
                 return None;
@@ -293,10 +297,22 @@ impl HttpsSession {
                     );
                     return None;
                 }
-                AlpnProtocol::Http11
+                (AlpnProtocol::Http11, None)
             }
         };
 
+        // Capture the negotiated TLS metadata as `&'static str` labels for the
+        // access log alongside the existing metric counters. Both calls are
+        // single rustls accessors — duplicating them keeps the metric path
+        // unchanged and avoids mutating-after-move on `handshake.session`.
+        let tls_version_label = handshake
+            .session
+            .protocol_version()
+            .and_then(rustls_version_label);
+        let tls_cipher_label = handshake
+            .session
+            .negotiated_cipher_suite()
+            .and_then(rustls_ciphersuite_label);
         if let Some(version) = handshake.session.protocol_version() {
             incr!(rustls_version_str(version));
         };
@@ -329,6 +345,12 @@ impl HttpsSession {
         // H2 stream whose `:authority` crosses the TLS trust boundary (see
         // `route_from_request`).
         context.tls_server_name = sni_owned;
+        // Stamp the connection-scoped TLS metadata so every per-stream
+        // HttpContext created by `Context::create_stream` inherits it for
+        // the access log without re-querying rustls.
+        context.tls_version = tls_version_label;
+        context.tls_cipher = tls_cipher_label;
+        context.tls_alpn = alpn_label;
         let mut frontend = match alpn {
             AlpnProtocol::Http11 => {
                 incr!("http.alpn.http11");
@@ -464,6 +486,17 @@ impl HttpsSession {
         pipe.frontend_readiness.event = frontend_readiness.event;
         pipe.backend_readiness.event = backend_readiness.event;
         pipe.set_back_token(back_token);
+        // Carry the connection-scoped TLS metadata captured at handshake time
+        // into the post-upgrade WSS pipe so its access log records the same
+        // version/cipher/sni/alpn the H1 request log already emitted. `clone`
+        // on the SNI is the only heap touch — the other three are
+        // `&'static str` borrows into the rustls label tables.
+        pipe.set_tls_metadata(
+            stream.context.tls_version,
+            stream.context.tls_cipher,
+            stream.context.tls_server_name.clone(),
+            stream.context.tls_alpn,
+        );
 
         // http.active_requests was already decremented by generate_access_log()
         // in h1.rs when the 101 response was written (before MuxResult::Upgrade).
@@ -1617,6 +1650,27 @@ fn rustls_version_str(version: ProtocolVersion) -> &'static str {
     }
 }
 
+/// Short label suitable for access logs (e.g. `"TLSv1.3"`).
+///
+/// Distinct from [`rustls_version_str`] which prefixes with `tls.version.`
+/// for metric ingestion. Returns `None` for variants Sōzu does not know how
+/// to label, so the access log records `tls_version` as absent rather than
+/// emitting a misleading `"unimplemented"` literal.
+pub(crate) fn rustls_version_label(version: ProtocolVersion) -> Option<&'static str> {
+    match version {
+        ProtocolVersion::SSLv2 => Some("SSLv2"),
+        ProtocolVersion::SSLv3 => Some("SSLv3"),
+        ProtocolVersion::TLSv1_0 => Some("TLSv1.0"),
+        ProtocolVersion::TLSv1_1 => Some("TLSv1.1"),
+        ProtocolVersion::TLSv1_2 => Some("TLSv1.2"),
+        ProtocolVersion::TLSv1_3 => Some("TLSv1.3"),
+        ProtocolVersion::DTLSv1_0 => Some("DTLSv1.0"),
+        ProtocolVersion::DTLSv1_2 => Some("DTLSv1.2"),
+        ProtocolVersion::DTLSv1_3 => Some("DTLSv1.3"),
+        _ => None,
+    }
+}
+
 /// Used for metrics keeping
 fn rustls_ciphersuite_str(cipher: SupportedCipherSuite) -> &'static str {
     match cipher.suite() {
@@ -1642,6 +1696,39 @@ fn rustls_ciphersuite_str(cipher: SupportedCipherSuite) -> &'static str {
         CipherSuite::TLS13_AES_256_GCM_SHA384 => "tls.cipher.TLS13_AES_256_GCM_SHA384",
         CipherSuite::TLS13_AES_128_GCM_SHA256 => "tls.cipher.TLS13_AES_128_GCM_SHA256",
         _ => "tls.cipher.Unsupported",
+    }
+}
+
+/// Short label suitable for access logs (e.g. `"TLS_AES_128_GCM_SHA256"`).
+///
+/// Distinct from [`rustls_ciphersuite_str`] which prefixes with `tls.cipher.`
+/// for metric ingestion. Returns `None` for cipher suites Sōzu does not know
+/// how to label, so the access log records `tls_cipher` as absent rather
+/// than emitting a misleading `"Unsupported"` literal.
+pub(crate) fn rustls_ciphersuite_label(cipher: SupportedCipherSuite) -> Option<&'static str> {
+    match cipher.suite() {
+        CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256 => {
+            Some("TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256")
+        }
+        CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 => {
+            Some("TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256")
+        }
+        CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 => {
+            Some("TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256")
+        }
+        CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384 => {
+            Some("TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384")
+        }
+        CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 => {
+            Some("TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256")
+        }
+        CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 => {
+            Some("TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384")
+        }
+        CipherSuite::TLS13_CHACHA20_POLY1305_SHA256 => Some("TLS13_CHACHA20_POLY1305_SHA256"),
+        CipherSuite::TLS13_AES_256_GCM_SHA384 => Some("TLS13_AES_256_GCM_SHA384"),
+        CipherSuite::TLS13_AES_128_GCM_SHA256 => Some("TLS13_AES_128_GCM_SHA256"),
+        _ => None,
     }
 }
 
