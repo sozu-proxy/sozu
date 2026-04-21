@@ -117,23 +117,27 @@ macro_rules! log_socket_context {
 
 /// Module-level socket log prefix used from free functions (e.g. the shared
 /// `tcp_socket_*` helpers) where `self` is not in scope but the caller can
-/// still thread a session `Ulid` and the underlying [`TcpStream`] through as
-/// parameters. Renders the same `[<ulid> - - -]\tSOCKET\tSession(peer=...,
-/// local=..., rtt=..., state=..., protocol=Tcp)\t >>>` prefix as
-/// [`log_socket_context!`] so free-function error logs align column-by-column
-/// with handler-backed ones.
+/// still thread a session `Ulid`, a cached peer address, and the underlying
+/// [`TcpStream`] through as parameters. Renders the same `[<ulid> - - -]\t
+/// SOCKET\tSession(peer=..., local=..., rtt=..., state=..., protocol=Tcp)
+/// \t >>>` prefix as [`log_socket_context!`] so free-function error logs
+/// align column-by-column with handler-backed ones.
 ///
-/// When the ULID is `None` the slot is rendered as `-`. `peer` is a live
-/// `getpeername(2)` lookup on the supplied stream: it is best-effort and may
-/// render as `None` on a socket that failed an asynchronous `connect()`
-/// (Linux returns `ENOTCONN` in that state) — exactly the ConnectionRefused
-/// case you see in the read path. `local` is a `getsockname(2)` lookup which
-/// stays valid across failed connects (the bind is local). `rtt` and `state`
+/// When the ULID is `None` the slot is rendered as `-`. `peer` prefers the
+/// caller-supplied `configured_peer` (stored at [`SessionTcpStream`]
+/// construction, immune to ENOTCONN on a socket that failed an asynchronous
+/// `connect()`) and falls back to a live `getpeername(2)` lookup when no
+/// cache is available. `local` is a `getsockname(2)` lookup which stays
+/// valid across failed connects (the bind is local). `rtt` and `state`
 /// come from a single `getsockopt(TCP_INFO)` call — `state="SYN_SENT"` is
 /// the clearest signal for a failed outbound `connect()`. Protocol is
 /// hardcoded to `Tcp` because the helper is only called from the raw-TCP
 /// `tcp_socket_*` free functions.
-fn log_socket_module_prefix(stream: &TcpStream, session_ulid: Option<Ulid>) -> String {
+fn log_socket_module_prefix(
+    stream: &TcpStream,
+    session_ulid: Option<Ulid>,
+    configured_peer: Option<SocketAddr>,
+) -> String {
     let colored = is_logger_colored();
     let (open, reset, grey, gray, white) = if colored {
         ("\x1b[1;97m", "\x1b[0m", "\x1b[37m", "\x1b[90m", "\x1b[97m")
@@ -149,7 +153,7 @@ fn log_socket_module_prefix(stream: &TcpStream, session_ulid: Option<Ulid>) -> S
     let state = snapshot.as_ref().map(|s| s.state);
     format!(
         "[{ulid} - - -]\t{open}SOCKET{reset}\t{grey}Session{reset}({gray}peer{reset}={white}{peer:?}{reset}, {gray}local{reset}={white}{local:?}{reset}, {gray}rtt{reset}={white}{rtt:?}{reset}, {gray}state{reset}={white}{state:?}{reset}, {gray}protocol{reset}={white}Tcp{reset})\t >>>",
-        peer = stream.peer_addr().ok(),
+        peer = configured_peer.or_else(|| stream.peer_addr().ok()),
         local = stream.local_addr().ok(),
     )
 }
@@ -165,6 +169,7 @@ fn tcp_socket_read(
     stream: &mut TcpStream,
     buf: &mut [u8],
     session_ulid: Option<Ulid>,
+    configured_peer: Option<SocketAddr>,
 ) -> (usize, SocketResult) {
     let mut size = 0usize;
     let mut counter = 0;
@@ -173,7 +178,7 @@ fn tcp_socket_read(
         if counter > MAX_LOOP_ITERATIONS {
             error!(
                 "{} MAX_LOOP_ITERATION reached in TcpStream::socket_read",
-                log_socket_module_prefix(stream, session_ulid)
+                log_socket_module_prefix(stream, session_ulid, configured_peer)
             );
             incr!("socket.read.infinite_loop.error");
             return (size, SocketResult::Error);
@@ -206,7 +211,7 @@ fn tcp_socket_read(
                 | ErrorKind::NotConnected => {
                     warn!(
                         "{} socket_read error={:?}",
-                        log_socket_module_prefix(stream, session_ulid),
+                        log_socket_module_prefix(stream, session_ulid, configured_peer),
                         e
                     );
                     return (size, SocketResult::Error);
@@ -217,7 +222,7 @@ fn tcp_socket_read(
                 _ => {
                     error!(
                         "{} socket_read error={:?}",
-                        log_socket_module_prefix(stream, session_ulid),
+                        log_socket_module_prefix(stream, session_ulid, configured_peer),
                         e
                     );
                     return (size, SocketResult::Error);
@@ -231,6 +236,7 @@ fn tcp_socket_write(
     stream: &mut TcpStream,
     buf: &[u8],
     session_ulid: Option<Ulid>,
+    configured_peer: Option<SocketAddr>,
 ) -> (usize, SocketResult) {
     let mut size = 0usize;
     let mut counter = 0;
@@ -239,7 +245,7 @@ fn tcp_socket_write(
         if counter > MAX_LOOP_ITERATIONS {
             error!(
                 "{} MAX_LOOP_ITERATION reached in TcpStream::socket_write",
-                log_socket_module_prefix(stream, session_ulid)
+                log_socket_module_prefix(stream, session_ulid, configured_peer)
             );
             incr!("socket.write.infinite_loop.error");
             return (size, SocketResult::Error);
@@ -269,7 +275,7 @@ fn tcp_socket_write(
                 | ErrorKind::NotConnected => {
                     warn!(
                         "{} socket_write error={:?}",
-                        log_socket_module_prefix(stream, session_ulid),
+                        log_socket_module_prefix(stream, session_ulid, configured_peer),
                         e
                     );
                     incr!("tcp.write.error");
@@ -279,7 +285,7 @@ fn tcp_socket_write(
                     //FIXME: timeout and other common errors should be sent up
                     error!(
                         "{} socket_write error={:?}",
-                        log_socket_module_prefix(stream, session_ulid),
+                        log_socket_module_prefix(stream, session_ulid, configured_peer),
                         e
                     );
                     incr!("tcp.write.error");
@@ -294,6 +300,7 @@ fn tcp_socket_write_vectored(
     stream: &mut TcpStream,
     bufs: &[std::io::IoSlice],
     session_ulid: Option<Ulid>,
+    configured_peer: Option<SocketAddr>,
 ) -> (usize, SocketResult) {
     match stream.write_vectored(bufs) {
         Ok(sz) => (sz, SocketResult::Continue),
@@ -314,7 +321,7 @@ fn tcp_socket_write_vectored(
             | ErrorKind::NotConnected => {
                 warn!(
                     "{} socket_write error={:?}",
-                    log_socket_module_prefix(stream, session_ulid),
+                    log_socket_module_prefix(stream, session_ulid, configured_peer),
                     e
                 );
                 incr!("tcp.write.error");
@@ -324,7 +331,7 @@ fn tcp_socket_write_vectored(
                 //FIXME: timeout and other common errors should be sent up
                 error!(
                     "{} socket_write error={:?}",
-                    log_socket_module_prefix(stream, session_ulid),
+                    log_socket_module_prefix(stream, session_ulid, configured_peer),
                     e
                 );
                 incr!("tcp.write.error");
@@ -336,15 +343,15 @@ fn tcp_socket_write_vectored(
 
 impl SocketHandler for TcpStream {
     fn socket_read(&mut self, buf: &mut [u8]) -> (usize, SocketResult) {
-        tcp_socket_read(self, buf, None)
+        tcp_socket_read(self, buf, None, None)
     }
 
     fn socket_write(&mut self, buf: &[u8]) -> (usize, SocketResult) {
-        tcp_socket_write(self, buf, None)
+        tcp_socket_write(self, buf, None, None)
     }
 
     fn socket_write_vectored(&mut self, bufs: &[std::io::IoSlice]) -> (usize, SocketResult) {
-        tcp_socket_write_vectored(self, bufs, None)
+        tcp_socket_write_vectored(self, bufs, None, None)
     }
 
     fn socket_ref(&self) -> &TcpStream {
@@ -380,28 +387,51 @@ impl SocketHandler for TcpStream {
 pub struct SessionTcpStream {
     pub stream: TcpStream,
     pub session_ulid: Ulid,
+    /// Peer address cached at construction. Unlike a live `getpeername(2)`
+    /// lookup, this survives a socket that failed an asynchronous `connect()`
+    /// (Linux surfaces ENOTCONN via `getpeername` in that state) and is
+    /// therefore the reliable source of truth for the `peer=` slot in
+    /// [`log_socket_module_prefix`] when ECONNREFUSED fires on the first
+    /// read/write — the case that motivated this cache.
+    pub configured_peer: Option<SocketAddr>,
 }
 
 impl SessionTcpStream {
-    pub fn new(stream: TcpStream, session_ulid: Ulid) -> Self {
+    pub fn new(stream: TcpStream, session_ulid: Ulid, configured_peer: Option<SocketAddr>) -> Self {
         Self {
             stream,
             session_ulid,
+            configured_peer,
         }
     }
 }
 
 impl SocketHandler for SessionTcpStream {
     fn socket_read(&mut self, buf: &mut [u8]) -> (usize, SocketResult) {
-        tcp_socket_read(&mut self.stream, buf, Some(self.session_ulid))
+        tcp_socket_read(
+            &mut self.stream,
+            buf,
+            Some(self.session_ulid),
+            self.configured_peer,
+        )
     }
 
     fn socket_write(&mut self, buf: &[u8]) -> (usize, SocketResult) {
-        tcp_socket_write(&mut self.stream, buf, Some(self.session_ulid))
+        tcp_socket_write(
+            &mut self.stream,
+            buf,
+            Some(self.session_ulid),
+            self.configured_peer,
+        )
     }
 
     fn socket_write_vectored(&mut self, bufs: &[std::io::IoSlice]) -> (usize, SocketResult) {
-        tcp_socket_write_vectored(&mut self.stream, bufs, Some(self.session_ulid))
+        tcp_socket_write_vectored(
+            &mut self.stream,
+            bufs,
+            Some(self.session_ulid),
+            self.configured_peer,
+        )
     }
 
     fn socket_ref(&self) -> &TcpStream {

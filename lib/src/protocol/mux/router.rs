@@ -312,7 +312,13 @@ impl Router {
                 );
             }
 
-            let socket = SessionTcpStream::new(socket, context.session_ulid);
+            // Cache the backend's configured address so SOCKET log lines
+            // fired on ECONNREFUSED (or any failed async `connect()`) can
+            // still render `peer=<backend>` — `getpeername(2)` returns
+            // ENOTCONN in that state, so the live lookup path would show
+            // `peer=None` exactly when the operator needs the backend id.
+            let backend_peer = Some(backend.borrow().address);
+            let socket = SessionTcpStream::new(socket, context.session_ulid, backend_peer);
 
             // Build an un-armed timeout: we can't call `TimeoutContainer::new`
             // yet because that requires the slab token, and we only allocate
