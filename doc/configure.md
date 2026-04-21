@@ -726,6 +726,23 @@ Negotiated cipher suite (rustls):
 |--------|------|-------|-------------|
 | `http.sni_authority_mismatch` | counter | proxy | Request rejected because its `:authority` (HTTP/2) or `Host` header (HTTP/1.1) crossed the TLS SNI boundary negotiated for the connection. Defence against cross-tenant frontend confusion (CWE-346). Increment site: `lib/src/protocol/mux/router.rs`. |
 
+#### HTTP/2 GOAWAY and RST_STREAM by error code
+
+Counters split by direction (sent vs received) and RFC 9113 §7 error code.
+Every variant in the H2Error enum gets its own counter so SOC dashboards can
+distinguish a sustained `protocol_error` (parser issue / fuzzer) from
+`enhance_your_calm` (flood-detector trip) from `no_error` (graceful drain).
+Codes the wire delivers but RFC 9113 does not define are bucketed under
+`unknown_error` to keep cardinality bounded.
+
+| Metric pattern | Type | Scope | Description |
+|---|---|---|---|
+| `h2.goaway.sent.<code>` | counter | proxy | GOAWAY emitted by Sozu. `<code>` ∈ `no_error`, `protocol_error`, `internal_error`, `flow_control_error`, `settings_timeout`, `stream_closed`, `frame_size_error`, `refused_stream`, `cancel`, `compression_error`, `connect_error`, `enhance_your_calm`, `inadequate_security`, `http_1_1_required`. The graceful drain (`graceful_goaway`) emits two `no_error` increments per connection — one per phase. |
+| `h2.goaway.received.<code>` | counter | proxy | GOAWAY received from peer. Same code suffixes as sent, plus `unknown_error` for codes outside RFC 9113 §7. Useful on backend H2 connections to detect upstreams under pressure (`enhance_your_calm`) or with bugs (`internal_error`). |
+| `h2.rst_stream.sent.<code>` | counter | proxy | RST_STREAM emitted by Sozu. Same code suffixes. The `no_error` and `cancel` increments are graceful (stream recycle, propagated client cancel); the rest are server-side defences against attacker-crafted frames. |
+| `h2.rst_stream.received.<code>` | counter | proxy | RST_STREAM received from peer. Same code suffixes plus `unknown_error`. |
+| `h2.rst_stream.received.pre_response_start` | counter | proxy | Subset of `h2.rst_stream.received.*` where the RST arrived before the backend started answering. The canonical Rapid Reset signature (CVE-2023-44487). Emitted alongside the per-code counter, not instead of, so a Rapid Reset attack surfaces both as a `cancel` rate spike and as the pre-response signal. |
+
 #### HTTP/2 flood mitigations
 
 Incremented once per connection at the moment the H2 flood detector trips its
