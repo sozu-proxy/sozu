@@ -116,7 +116,7 @@ impl HttpSession {
             gauge_add!("protocol.http", 1);
             let session_address = sock.peer_addr().ok();
             let session_ulid = rusty_ulid::Ulid::generate();
-            let sock = crate::socket::SessionTcpStream::new(sock, session_ulid);
+            let sock = crate::socket::SessionTcpStream::new(sock, session_ulid, session_address);
 
             let frontend =
                 mux::Connection::new_h1_server(session_ulid, sock, container_frontend_timeout);
@@ -196,7 +196,11 @@ impl HttpSession {
                 let session_ulid = rusty_ulid::Ulid::generate();
                 let frontend = mux::Connection::new_h1_server(
                     session_ulid,
-                    crate::socket::SessionTcpStream::new(expect.frontend, session_ulid),
+                    crate::socket::SessionTcpStream::new(
+                        expect.frontend,
+                        session_ulid,
+                        Some(session_address),
+                    ),
                     expect.container_frontend_timeout,
                 );
                 let router = mux::Router::new(
