@@ -28,6 +28,28 @@ See milestone [`v1.1.0`](https://github.com/sozu-proxy/sozu/projects/3?card_filt
 
 - **Fuzz test harness**: `e2e/src/tests/fuzz_tests.rs` integrates `cargo-fuzz` targets (`fuzz_frame_parser`, `fuzz_hpack_decoder`) as `#[ignore]`d e2e tests. Run with `cargo test -p sozu-e2e -- --ignored fuzz` (requires nightly + cargo-fuzz).
 
+#### Telemetry & observability
+
+- **H2 flood-detector exposure** (12 metrics under `h2.flood.violation.*`): every CVE mitigation in the H2 family — Rapid Reset (CVE-2023-44487), MadeYouReset (CVE-2025-8671), CONTINUATION flood (CVE-2024-27316), the PING / SETTINGS / empty-DATA flood family (CVE-2019-9512/9515/9518), header overflow, and the generic glitch budget — now emits a per-kind counter through the `handle_flood_violation` chokepoint. SIEM dashboards can window the trip rate without parsing logs.
+
+- **H2 GOAWAY and RST_STREAM by error code** (4 counter families): `h2.goaway.{sent,received}.<code>` and `h2.rst_stream.{sent,received}.<code>` for every RFC 9113 §7 error variant, plus `h2.rst_stream.received.pre_response_start` (the canonical Rapid Reset signature, emitted alongside the per-code counter). A compile-time helper macro keeps the breakdown in lock-step with the H2Error enum.
+
+- **H2 frame-type counters**: `h2.frames.rx.<kind>` for every received frame at the `handle_frame` dispatch chokepoint (11 keys), plus `h2.frames.tx.{settings,window_update,rst_stream,goaway,ping_ack}` at the control-frame serializer sites. HEADERS / DATA tx remain a follow-up (they travel through the H2 block converter).
+
+- **HPACK header-rejection counters by reason** (17 metrics under `h2.headers.rejected.*`): every site in the H2→H1 HPACK decoder that rejects a header now emits `h2.headers.rejected.total` (aggregate) plus `h2.headers.rejected.<reason>` for one of 16 bounded reasons (CRLF/NUL/CTL injection, CL/TE conflict, duplicate or malformed pseudo-headers, RFC 9113 §8.2.2 connection-specific headers, etc.). The first externally visible signal for request-smuggling probes against the H2 stack.
+
+- **TLS handshake telemetry**: `tls.handshake.failed.<reason>` (12 RustlsError buckets, with `other` fallback for future variants), `tls.handshake_ms` (HDR histogram of handshake duration), and `tls.cert.min_expires_at_seconds` (gauge of the soonest-expiring loaded certificate, recomputed on cert add/remove only).
+
+- **`x-request-id` propagation + access-log field**: incoming `x-request-id` is preserved verbatim end-to-end (`http.x_request_id.propagated`); when absent, Sōzu generates one from the request ULID and injects it (`http.x_request_id.generated`). The header value is also surfaced as a new `x_request_id` field on `RequestRecord` and `ProtobufAccessLog` (proto tag #24, wire-compatible append) — universal correlation key across Envoy / HAProxy / Sōzu hops.
+
+- **`process.uptime_seconds` and `server.live` runtime gauges**: seconds since worker start (never reset on hot upgrade), and a `1`/`0` liveness signal that flips to `0` once a graceful shutdown begins. Standard SRE inputs for "is this worker stale?" and "drain this worker before terminating" L4 health-check decisions.
+
+- **Control-plane audit `EventKind` extension**: 14 new `EventKind` variants (CLUSTER_*, FRONTEND_*, CERTIFICATE_*, LISTENER_*, CONFIGURATION_RELOADED, WORKER_*, LOGGING_LEVEL_CHANGED, METRICS_CONFIGURED) reachable on the existing `SubscribeEvents` bus. Wire-format foundation for the audit-trail story required by PCI-DSS / ISO 27001 / SOC 2; emit-site wiring for each verb is staged for a follow-up.
+
+- **Two emitted-but-undocumented metrics now in `doc/configure.md`**: `https.alpn.rejected.http11_disabled` (H2-only listener refusing http/1.1 ALPN) and `http.sni_authority_mismatch` (CWE-346 cross-tenant defence).
+
+- **OpenTelemetry doc rewrite**: the section now correctly identifies the feature as W3C `traceparent` passthrough (no SDK, no spans, no OTLP exporter). The previous `Limitations` text falsely claimed H2 requests were not propagated — verified false against the on-branch source (the H1 editor runs on H2 frames via `pkawa.rs`, then re-encoded by `H2BlockConverter`).
+
 ### ✍️ Changed
 
 - **Slab capacity multiplier doubled to 4× per connection**: The internal slab allocator now reserves 4× the per-connection slot count (previously 2×) to accommodate the higher stream concurrency introduced by HTTP/2 multiplexing.
