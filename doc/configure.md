@@ -726,6 +726,30 @@ Negotiated cipher suite (rustls):
 |--------|------|-------|-------------|
 | `http.sni_authority_mismatch` | counter | proxy | Request rejected because its `:authority` (HTTP/2) or `Host` header (HTTP/1.1) crossed the TLS SNI boundary negotiated for the connection. Defence against cross-tenant frontend confusion (CWE-346). Increment site: `lib/src/protocol/mux/router.rs`. |
 
+#### HTTP/2 flood mitigations
+
+Incremented once per connection at the moment the H2 flood detector trips its
+threshold and the proxy escalates to `GOAWAY(ENHANCE_YOUR_CALM)`. Every CVE
+mitigation in the H2 family (Rapid Reset, MadeYouReset, the CONTINUATION /
+PING / SETTINGS / empty-DATA flood family, oversized header lists, and the
+generic `glitch` budget) routes through `ConnectionH2::handle_flood_violation`,
+which emits both the contextual log line and the per-kind counter below.
+
+| Metric | Type | Scope | Description |
+|--------|------|-------|-------------|
+| `h2.flood.violation.rst_stream_window` | counter | proxy | Per-window RST_STREAM rate ceiling exceeded. Generic stream-cancel storm signal — usually a misbehaving client, sometimes Rapid Reset. |
+| `h2.flood.violation.rst_stream_lifetime` | counter | proxy | Lifetime received-RST ceiling exceeded. Catches a patient Rapid Reset attacker that stays under the windowed cap (CVE-2023-44487). |
+| `h2.flood.violation.rst_stream_pre_response_lifetime` | counter | proxy | Lifetime received-RST ceiling exceeded for streams that the backend had not yet started answering. The canonical Rapid Reset signature (CVE-2023-44487). |
+| `h2.flood.violation.rst_stream_emitted_lifetime` | counter | proxy | Lifetime server-emitted RST ceiling exceeded. MadeYouReset mitigation (CVE-2025-8671) — peer kept feeding the server crafted frames that forced it to reset streams. |
+| `h2.flood.violation.ping_window` | counter | proxy | Per-window PING flood (CVE-2019-9512). |
+| `h2.flood.violation.ping_lifetime` | counter | proxy | Lifetime PING ceiling exceeded — catches sustained low-rate PING abuse that stays under the windowed cap. |
+| `h2.flood.violation.settings_window` | counter | proxy | Per-window SETTINGS flood (CVE-2019-9515). |
+| `h2.flood.violation.settings_lifetime` | counter | proxy | Lifetime SETTINGS ceiling exceeded. |
+| `h2.flood.violation.empty_data_window` | counter | proxy | Per-window flood of empty DATA frames (CVE-2019-9518). |
+| `h2.flood.violation.continuation_per_block` | counter | proxy | Single header block split across more CONTINUATION frames than the configured cap (CVE-2024-27316). |
+| `h2.flood.violation.header_size_per_block` | counter | proxy | Single header block accumulated more bytes than the configured cap (CVE-2024-27316 sibling — header overflow). |
+| `h2.flood.violation.glitch_window` | counter | proxy | Generic anomaly budget exceeded (unknown SETTINGS, WINDOW_UPDATE on closed stream, other low-severity protocol drift). |
+
 #### Protocol upgrade failures
 
 Incremented when a session fails to transition between protocol phases:

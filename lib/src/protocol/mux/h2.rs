@@ -511,6 +511,11 @@ pub struct H2FloodViolation {
     pub error: H2Error,
     /// Human-readable name of the counter that tripped (e.g. `"RST_STREAM"`).
     pub reason: &'static str,
+    /// Statsd metric key emitted by [`ConnectionH2::handle_flood_violation`].
+    /// Carried alongside `reason` so a single field maps to both the log line
+    /// and the dashboard counter — adding a new violation kind requires
+    /// choosing both at the construction site, preventing drift.
+    pub metric_key: &'static str,
     /// Observed counter value at the moment of detection.
     pub count: u64,
     /// Configured ceiling that was crossed.
@@ -621,6 +626,7 @@ impl H2FloodDetector {
             return Some(H2FloodViolation {
                 error: H2Error::EnhanceYourCalm,
                 reason: "Rapid Reset: lifetime RST_STREAM",
+                metric_key: "h2.flood.violation.rst_stream_lifetime",
                 count: self.total_rst_received_lifetime,
                 threshold: self.config.max_rst_stream_lifetime,
             });
@@ -629,6 +635,7 @@ impl H2FloodDetector {
             return Some(H2FloodViolation {
                 error: H2Error::EnhanceYourCalm,
                 reason: "Rapid Reset: lifetime pre-response RST_STREAM",
+                metric_key: "h2.flood.violation.rst_stream_pre_response_lifetime",
                 count: self.total_abusive_rst_received_lifetime,
                 threshold: self.config.max_rst_stream_abusive_lifetime,
             });
@@ -650,6 +657,7 @@ impl H2FloodDetector {
             return Some(H2FloodViolation {
                 error: H2Error::EnhanceYourCalm,
                 reason: "MadeYouReset: lifetime server-emitted RST_STREAM",
+                metric_key: "h2.flood.violation.rst_stream_emitted_lifetime",
                 count: self.total_rst_streams_emitted_lifetime,
                 threshold: self.config.max_rst_stream_emitted_lifetime,
             });
@@ -676,11 +684,17 @@ impl H2FloodDetector {
     pub fn check_flood(&mut self) -> Option<H2FloodViolation> {
         self.maybe_reset_window();
 
-        fn flag(reason: &'static str, count: u32, threshold: u32) -> Option<H2FloodViolation> {
+        fn flag(
+            reason: &'static str,
+            metric_key: &'static str,
+            count: u32,
+            threshold: u32,
+        ) -> Option<H2FloodViolation> {
             if count > threshold {
                 Some(H2FloodViolation {
                     error: H2Error::EnhanceYourCalm,
                     reason,
+                    metric_key,
                     count: count as u64,
                     threshold: threshold as u64,
                 })
@@ -691,13 +705,22 @@ impl H2FloodDetector {
 
         flag(
             "RST_STREAM",
+            "h2.flood.violation.rst_stream_window",
             self.rst_stream_count,
             self.config.max_rst_stream_per_window,
         )
-        .or_else(|| flag("PING", self.ping_count, self.config.max_ping_per_window))
+        .or_else(|| {
+            flag(
+                "PING",
+                "h2.flood.violation.ping_window",
+                self.ping_count,
+                self.config.max_ping_per_window,
+            )
+        })
         .or_else(|| {
             flag(
                 "PING lifetime",
+                "h2.flood.violation.ping_lifetime",
                 self.total_ping_received_lifetime,
                 DEFAULT_MAX_PING_LIFETIME,
             )
@@ -705,6 +728,7 @@ impl H2FloodDetector {
         .or_else(|| {
             flag(
                 "SETTINGS",
+                "h2.flood.violation.settings_window",
                 self.settings_count,
                 self.config.max_settings_per_window,
             )
@@ -712,6 +736,7 @@ impl H2FloodDetector {
         .or_else(|| {
             flag(
                 "SETTINGS lifetime",
+                "h2.flood.violation.settings_lifetime",
                 self.total_settings_received_lifetime,
                 DEFAULT_MAX_SETTINGS_LIFETIME,
             )
@@ -719,6 +744,7 @@ impl H2FloodDetector {
         .or_else(|| {
             flag(
                 "empty DATA",
+                "h2.flood.violation.empty_data_window",
                 self.empty_data_count,
                 self.config.max_empty_data_per_window,
             )
@@ -726,6 +752,7 @@ impl H2FloodDetector {
         .or_else(|| {
             flag(
                 "CONTINUATION",
+                "h2.flood.violation.continuation_per_block",
                 self.continuation_count,
                 self.config.max_continuation_frames,
             )
@@ -733,11 +760,19 @@ impl H2FloodDetector {
         .or_else(|| {
             flag(
                 "accumulated header size",
+                "h2.flood.violation.header_size_per_block",
                 self.accumulated_header_size,
                 self.config.max_header_list_size,
             )
         })
-        .or_else(|| flag("glitch", self.glitch_count, self.config.max_glitch_count))
+        .or_else(|| {
+            flag(
+                "glitch",
+                "h2.flood.violation.glitch_window",
+                self.glitch_count,
+                self.config.max_glitch_count,
+            )
+        })
     }
 
     /// Reset CONTINUATION-specific counters when a header block is complete.
@@ -2968,8 +3003,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     ///
     /// Centralises the "flood detected" reporting so every site that observes a
     /// [`H2FloodViolation`] gets the same session-scoped log line, matching the
-    /// RUSTLS log-context convention.
+    /// RUSTLS log-context convention. Also emits the per-kind statsd counter
+    /// (`h2.flood.violation.<kind>`) so SOC dashboards can window the trip
+    /// rate without parsing logs — every CVE-mitigation in the H2 family
+    /// (Rapid Reset, MadeYouReset, CONTINUATION/PING/SETTINGS floods, header
+    /// overflow, glitch) funnels through this site.
     pub fn handle_flood_violation(&mut self, violation: H2FloodViolation) -> MuxResult {
+        count!(violation.metric_key, 1);
         warn!(
             "{} H2 flood detected: {} count {} exceeds threshold {}",
             log_context!(self),
@@ -4892,6 +4932,76 @@ mod tests {
         // Force a window reset through check_flood.
         let _ = detector.check_flood();
         assert_eq!(detector.total_rst_streams_emitted_lifetime, 10);
+    }
+
+    /// Every violation kind must carry a metric_key under the agreed
+    /// `h2.flood.violation.*` namespace, and the keys must be unique. The
+    /// statsd counter at `handle_flood_violation` reads `violation.metric_key`
+    /// directly — drift between the construction site and the metric name
+    /// would silently lose alerting on a CVE mitigation.
+    #[test]
+    fn test_flood_violation_metric_keys_are_unique_and_namespaced() {
+        // Helper: run `record_rst_lifetime` until it trips, returning the metric_key.
+        fn key_from_rst_lifetime(response_started: bool) -> &'static str {
+            let mut detector = H2FloodDetector::default();
+            loop {
+                if let Some(v) = detector.record_rst_lifetime(response_started) {
+                    return v.metric_key;
+                }
+            }
+        }
+
+        // Helper: run `record_rst_emitted` until it trips, returning the metric_key.
+        fn key_from_rst_emitted() -> &'static str {
+            let mut detector = H2FloodDetector::default();
+            loop {
+                if let Some(v) = detector.record_rst_emitted() {
+                    return v.metric_key;
+                }
+            }
+        }
+
+        // Helper: drive a single `check_flood` counter past its threshold.
+        fn key_from_check_flood(setup: impl FnOnce(&mut H2FloodDetector)) -> &'static str {
+            let mut detector = H2FloodDetector::default();
+            setup(&mut detector);
+            detector
+                .check_flood()
+                .expect("setup should always trip a flood")
+                .metric_key
+        }
+
+        let keys: [&'static str; 12] = [
+            // Lifetime methods on the detector itself.
+            key_from_rst_lifetime(true),
+            key_from_rst_lifetime(false),
+            key_from_rst_emitted(),
+            // `check_flood` arms.
+            key_from_check_flood(|d| d.rst_stream_count = u32::MAX),
+            key_from_check_flood(|d| d.ping_count = u32::MAX),
+            key_from_check_flood(|d| d.total_ping_received_lifetime = u32::MAX),
+            key_from_check_flood(|d| d.settings_count = u32::MAX),
+            key_from_check_flood(|d| d.total_settings_received_lifetime = u32::MAX),
+            key_from_check_flood(|d| d.empty_data_count = u32::MAX),
+            key_from_check_flood(|d| d.continuation_count = u32::MAX),
+            key_from_check_flood(|d| d.accumulated_header_size = u32::MAX),
+            key_from_check_flood(|d| d.glitch_count = u32::MAX),
+        ];
+
+        for key in keys {
+            assert!(
+                key.starts_with("h2.flood.violation."),
+                "metric key {key} is missing the h2.flood.violation. prefix",
+            );
+        }
+        let mut deduped = keys.to_vec();
+        deduped.sort_unstable();
+        deduped.dedup();
+        assert_eq!(
+            deduped.len(),
+            keys.len(),
+            "metric keys must be unique across violation kinds; collisions: {keys:?}",
+        );
     }
 
     #[test]
