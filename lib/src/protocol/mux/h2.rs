@@ -3013,10 +3013,17 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         self.expect_read = None;
         let kawa = &mut self.zero;
         kawa.storage.clear();
-        if matches!(error, H2Error::NoError) {
-            debug!("{} GOAWAY: {:?}", log_context!(self), error);
-        } else {
-            error!("{} GOAWAY: {:?}", log_context!(self), error);
+        // Severity tiering: only `InternalError` implies a sozu-side bug when
+        // WE emit it. Every other non-`NoError` reason is "peer misbehaved,
+        // sozu defended correctly" — operators don't need paging on abusive
+        // or buggy peers. Caller sites already log the specific antecedent
+        // (flood detected, parser failure, SETTINGS timeout, invalid window)
+        // before reaching `goaway()`, so demoting this summary line avoids
+        // duplicate noise without hiding the root cause.
+        match error {
+            H2Error::NoError => debug!("{} GOAWAY: {:?}", log_context!(self), error),
+            H2Error::InternalError => error!("{} GOAWAY: {:?}", log_context!(self), error),
+            _ => warn!("{} GOAWAY: {:?}", log_context!(self), error),
         }
 
         // RFC 9113 §6.8: last_stream_id is the highest peer-initiated stream we processed
@@ -3963,7 +3970,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 goaway.additional_debug_data
             );
         } else {
-            error!(
+            // Peer-originated failure: no variant of H2Error from a peer
+            // implies a sozu bug. Impact handling is separate (retry above
+            // `last_stream_id`, RST_STREAM for consumed streams) and logs
+            // its own details below, so the summary drops to `warn!`.
+            warn!(
                 "{} Received GOAWAY: last_stream_id={}, error={}, debug_data={:?}",
                 log_context!(self),
                 goaway.last_stream_id,
