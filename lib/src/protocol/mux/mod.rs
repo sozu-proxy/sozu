@@ -381,6 +381,26 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
             .count()
     }
 
+    /// Shared accessor for the [`HttpContext`] owned by a stream.
+    ///
+    /// Prefer this over `&self.streams[stream_id].context` at call sites
+    /// that only need read access — it keeps the `Stream`/`HttpContext`
+    /// relationship encapsulated and reads the same regardless of whether
+    /// the caller is inside `Router::connect`, the H2 mux, or a free
+    /// helper. Panics on an out-of-bounds `stream_id`, which is the same
+    /// behaviour as the raw `streams[sid]` indexing it replaces.
+    pub fn http_context(&self, stream_id: GlobalStreamId) -> &HttpContext {
+        &self.streams[stream_id].context
+    }
+
+    /// Mutable sibling of [`Self::http_context`]. Use when routing
+    /// decisions need to stamp `cluster_id` / `backend_id` on the stream's
+    /// [`HttpContext`] (e.g. `Router::connect` at the fill-cluster /
+    /// fill-backend points).
+    pub fn http_context_mut(&mut self, stream_id: GlobalStreamId) -> &mut HttpContext {
+        &mut self.streams[stream_id].context
+    }
+
     /// Register a stream as linked to a backend token in the reverse index.
     pub fn link_stream(&mut self, stream_id: GlobalStreamId, token: Token) {
         self.streams[stream_id].state = StreamState::Linked(token);

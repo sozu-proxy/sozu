@@ -30,7 +30,7 @@ use crate::{
 /// * `log_module_context!()` — zero-arg, legacy `MUX-ROUTER\t >>>` output.
 ///   Kept for sites without an `HttpContext` in scope. No call site in this
 ///   module currently uses this arm (every one has an `HttpContext` reachable
-///   via `context.streams[stream_id].context` or a direct `&mut HttpContext`
+///   via [`Context::http_context`] or a direct `&mut HttpContext`
 ///   parameter), but the arm is retained so the macro name stays stable for
 ///   future sessionless callers.
 /// * `log_module_context!($http_context)` — rich form. `$http_context` must be
@@ -235,14 +235,14 @@ impl Router {
                 return Err(BackendConnectionError::MaxSessionsMemory);
             };
             if !backend_conn.start_stream(stream_id, context) {
-                // Re-index `context.streams[stream_id].context` instead of
-                // reusing `stream_context`: `start_stream` above takes
-                // `&mut context`, which reborrows the slab mutably and
-                // ends any outstanding `stream_context` reference. A fresh
-                // shared borrow here is borrow-check clean.
+                // Use `context.http_context(stream_id)` instead of reusing
+                // `stream_context`: `start_stream` above takes `&mut
+                // context`, which reborrows the slab mutably and ends any
+                // outstanding `stream_context` reference. A fresh shared
+                // borrow via the accessor is borrow-check clean.
                 error!(
                     "{} Backend rejected stream start (max concurrent streams reached)",
-                    log_module_context!(&context.streams[stream_id].context)
+                    log_module_context!(context.http_context(stream_id))
                 );
                 return Err(BackendConnectionError::MaxSessionsMemory);
             }
@@ -290,7 +290,7 @@ impl Router {
             if let Err(e) = socket.set_nodelay(true) {
                 error!(
                     "{} error setting nodelay on back socket({:?}): {:?}",
-                    log_module_context!(&context.streams[stream_id].context),
+                    log_module_context!(context.http_context(stream_id)),
                     socket,
                     e
                 );
@@ -347,7 +347,7 @@ impl Router {
             if !connection.start_stream(stream_id, context) {
                 error!(
                     "{} Backend rejected stream start (max concurrent streams reached)",
-                    log_module_context!(&context.streams[stream_id].context)
+                    log_module_context!(context.http_context(stream_id))
                 );
                 // `connection` (socket + timeout_container) drops here.
                 return Err(BackendConnectionError::MaxSessionsMemory);
@@ -376,7 +376,7 @@ impl Router {
                 ) {
                     error!(
                         "{} error registering back socket: {:?}",
-                        log_module_context!(&context.streams[stream_id].context),
+                        log_module_context!(context.http_context(stream_id)),
                         e
                     );
                 }
