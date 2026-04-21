@@ -74,6 +74,8 @@ See milestone [`v1.1.0`](https://github.com/sozu-proxy/sozu/projects/3?card_filt
 
 - We fixed the `local_drain` gauge wrapping to `u64::MAX` on negative values: the gauge is now clamped to zero rather than wrapping on unsigned underflow, see [`9b6f9987`](https://github.com/sozu-proxy/sozu/commit/9b6f99871f2a74f120cceb13a3c3ffeab5525515).
 
+- We fixed the three H2 connection-level gauges (`h2.connection_window`, `h2.active_streams`, `h2.pending_window_updates`) clobbering across connections: each H2 connection emitted absolute `gauge!` snapshots, so under multi-connection load the dashboard saw the value from whichever connection wrote last instead of the aggregate. The metrics are renamed to `h2.connection.window_bytes`, `h2.connection.active_streams`, and `h2.connection.pending_window_updates`, and emitted as `gauge_add!` lifecycle deltas with a paired `Drop`-side decrement so the sum across all live H2 connections is now correct (see `doc/configure.md` migration note).
+
 - We fixed missing backend metrics (response time, request count, error rate) in the mux layer that were silently dropped compared to the legacy H1/H2 handlers, see [`5a02f634`](https://github.com/sozu-proxy/sozu/commit/5a02f634e848600651a350a60e2f1fb39d0cc4dc).
 
 - We fixed frontend timeout handling in the mux layer: timeouts are now re-armed after partial reads and H2 linked-stream wakeups are handled correctly to avoid spurious session drops, see [`560fac2f`](https://github.com/sozu-proxy/sozu/commit/560fac2f2cc249a66264a9233bb908059bb01ca0).
