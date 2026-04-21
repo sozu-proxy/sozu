@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fmt::{self, Debug},
     io::Error as IoError,
     ops::{Deref, DerefMut},
@@ -20,8 +20,8 @@ use sozu_command_lib::{
     channel::Channel,
     config::Config,
     proto::command::{
-        Request, ResponseContent, ResponseStatus, RunState, Status, WorkerRequest, WorkerResponse,
-        request::RequestType, response_content::ContentType,
+        Event, Request, ResponseContent, ResponseStatus, RunState, Status, WorkerRequest,
+        WorkerResponse, request::RequestType, response_content::ContentType,
     },
     ready::Ready,
     scm_socket::{Listeners, ScmSocket, ScmSocketError},
@@ -218,12 +218,37 @@ impl CommandHub {
         if let Err(err) = self.register(token, &mut stream) {
             error!("Could not register client: {}", err);
         }
+        let actor_uid = peer_uid_from_stream(&stream);
         let channel = Channel::new(stream, 4096, u64::MAX);
         let id = self.next_client_id();
-        let session = ClientSession::new(channel, id, token);
-        info!("Register new client: {}", id);
+        let session = ClientSession::new(channel, id, token, actor_uid);
+        info!(
+            "Register new client: {} (actor_uid={})",
+            id,
+            session.actor_uid_display()
+        );
         debug!("registering client {:?}", session);
         self.clients.insert(token, session);
+    }
+
+    /// Drain audit events queued by the [Server] during a client request and
+    /// fan them out to every subscribed client (same path as worker-emitted
+    /// backend events). Called from the event loop after handling a request.
+    fn flush_pending_audit_events(&mut self) {
+        let events: Vec<Event> = self.server.pending_audit_events.drain(..).collect();
+        if events.is_empty() {
+            return;
+        }
+        for event in events {
+            for client_token in &self.server.event_subscribers {
+                if let Some(client) = self.clients.get_mut(client_token) {
+                    client.return_processing_with_content(
+                        String::from("main"),
+                        ContentType::Event(event.clone()).into(),
+                    );
+                }
+            }
+        }
     }
 
     fn get_client_mut(&mut self, token: &Token) -> Option<(&mut Server, &mut ClientSession)> {
@@ -396,6 +421,7 @@ impl CommandHub {
                                 ClientResult::NewRequest(request) => {
                                     debug!("Received new request: {:?}", request);
                                     server.handle_client_request(client, request);
+                                    self.flush_pending_audit_events();
                                 }
                                 ClientResult::CloseSession => {
                                     info!("Closing client {}", client.id);
@@ -523,6 +549,10 @@ pub struct Server {
     next_session_id: SessionId,
     next_task_id: TaskId,
     next_worker_id: WorkerId,
+    /// audit events emitted by the main process for control-plane mutations,
+    /// drained by the [CommandHub] after each request and fanned out to the
+    /// subscribed clients (same channel as worker-emitted backend events).
+    pub pending_audit_events: VecDeque<Event>,
     /// the MIO structure that registers sockets and polls them all
     poll: Poll,
     /// all tasks created in one tick, to be propagated to the Hub at each tick
@@ -563,6 +593,7 @@ impl Server {
             next_session_id: 1, // 0 is reserved for the UnixListener
             next_task_id: 0,
             next_worker_id: 0,
+            pending_audit_events: VecDeque::new(),
             poll,
             queued_tasks: HashMap::new(),
             state: ConfigState::new(),
@@ -611,6 +642,12 @@ impl Server {
         gauge!("configuration.clusters", self.state.clusters.len());
         gauge!("configuration.backends", self.state.count_backends());
         gauge!("configuration.frontends", self.state.count_frontends());
+    }
+
+    /// Queue an audit event for fan-out to subscribed clients. Drained by
+    /// [CommandHub::flush_pending_audit_events] after every request handler.
+    pub fn push_audit_event(&mut self, event: Event) {
+        self.pending_audit_events.push_back(event);
     }
 
     fn next_session_token(&mut self) -> Token {
@@ -857,6 +894,28 @@ impl Server {
     }
 }
 
+/// Read the peer UID of a connected unix-domain socket via `SO_PEERCRED`.
+///
+/// Returns `None` on platforms without `SO_PEERCRED` support, or when the
+/// `getsockopt` call fails (which would be unexpected for a freshly accepted
+/// local socket but must not panic the main process).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn peer_uid_from_stream(stream: &UnixStream) -> Option<u32> {
+    use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
+    match getsockopt(stream, PeerCredentials) {
+        Ok(creds) => Some(creds.uid()),
+        Err(err) => {
+            warn!("Could not read SO_PEERCRED on command socket: {}", err);
+            None
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn peer_uid_from_stream(_stream: &UnixStream) -> Option<u32> {
+    None
+}
+
 impl Debug for Server {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Server")
@@ -868,6 +927,7 @@ impl Debug for Server {
             .field("next_session_id", &self.next_session_id)
             .field("next_task_id", &self.next_task_id)
             .field("next_worker_id", &self.next_worker_id)
+            .field("pending_audit_events", &self.pending_audit_events.len())
             .field("poll", &self.poll)
             .field("queued_tasks", &self.queued_tasks)
             .field("run_state", &self.run_state)
@@ -988,3 +1048,4 @@ mod tests {
         assert_eq!(read_gauge("configuration.frontends"), Some(2));
     }
 }
+               

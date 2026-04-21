@@ -38,6 +38,7 @@ paw = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 prost = { workspace = true }
+rusty_ulid = { workspace = true }
 tempfile = { workspace = true }
 termion = { workspace = true }
 thiserror = { workspace = true }
