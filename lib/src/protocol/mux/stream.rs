@@ -274,6 +274,7 @@ impl Stream {
             bytes_in: self.metrics.bin,
             bytes_out: self.metrics.bout,
             user_agent: context.user_agent.as_deref(),
+            x_request_id: context.x_request_id.as_deref(),
             #[cfg(feature = "opentelemetry")]
             otel: context.otel.as_ref(),
             #[cfg(not(feature = "opentelemetry"))]
