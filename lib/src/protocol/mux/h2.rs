@@ -3019,6 +3019,69 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         );
         self.goaway(violation.error)
     }
+}
+
+/// Compile-time mapping from `(prefix, H2Error)` to a static metric key.
+///
+/// Materialises a `&'static str` literal via `concat!`, so the metric key
+/// never crosses through a heap allocation and the statsd drain can store it
+/// as `&'static str`. Adding a new `H2Error` variant fails the build here —
+/// the metric breakdown stays in lock-step with RFC 9113 §7 codes.
+///
+/// Used for the per-error-code counters emitted around GOAWAY and RST_STREAM
+/// in either direction (see `metric_for_goaway_sent` etc. below).
+macro_rules! h2_error_metric_key {
+    ($prefix:literal, $error:expr) => {
+        match $error {
+            H2Error::NoError => concat!($prefix, ".no_error"),
+            H2Error::ProtocolError => concat!($prefix, ".protocol_error"),
+            H2Error::InternalError => concat!($prefix, ".internal_error"),
+            H2Error::FlowControlError => concat!($prefix, ".flow_control_error"),
+            H2Error::SettingsTimeout => concat!($prefix, ".settings_timeout"),
+            H2Error::StreamClosed => concat!($prefix, ".stream_closed"),
+            H2Error::FrameSizeError => concat!($prefix, ".frame_size_error"),
+            H2Error::RefusedStream => concat!($prefix, ".refused_stream"),
+            H2Error::Cancel => concat!($prefix, ".cancel"),
+            H2Error::CompressionError => concat!($prefix, ".compression_error"),
+            H2Error::ConnectError => concat!($prefix, ".connect_error"),
+            H2Error::EnhanceYourCalm => concat!($prefix, ".enhance_your_calm"),
+            H2Error::InadequateSecurity => concat!($prefix, ".inadequate_security"),
+            H2Error::HTTP11Required => concat!($prefix, ".http_1_1_required"),
+        }
+    };
+}
+
+/// Static metric key for an outbound GOAWAY. Same call shape as the other three
+/// helpers below — keeps the call sites uniform.
+fn metric_for_goaway_sent(error: H2Error) -> &'static str {
+    h2_error_metric_key!("h2.goaway.sent", error)
+}
+
+/// Static metric key for an inbound GOAWAY by raw wire error code. Codes
+/// outside RFC 9113 §7 fall into the dedicated `…unknown_error` bucket so the
+/// breakdown stays bounded and operators can still spot non-standard peers.
+fn metric_for_goaway_received(error_code: u32) -> &'static str {
+    H2Error::try_from(error_code)
+        .map(|e| h2_error_metric_key!("h2.goaway.received", e))
+        .unwrap_or("h2.goaway.received.unknown_error")
+}
+
+/// Static metric key for an outbound RST_STREAM. Mirrors
+/// [`metric_for_goaway_sent`] under a separate namespace so RST and GOAWAY
+/// rates can be alerted on independently.
+fn metric_for_rst_stream_sent(error: H2Error) -> &'static str {
+    h2_error_metric_key!("h2.rst_stream.sent", error)
+}
+
+/// Static metric key for an inbound RST_STREAM by raw wire error code. Same
+/// `…unknown_error` fallback as [`metric_for_goaway_received`].
+fn metric_for_rst_stream_received(error_code: u32) -> &'static str {
+    H2Error::try_from(error_code)
+        .map(|e| h2_error_metric_key!("h2.rst_stream.received", e))
+        .unwrap_or("h2.rst_stream.received.unknown_error")
+}
+
+impl<Front: SocketHandler> ConnectionH2<Front> {
 
     pub fn goaway(&mut self, error: H2Error) -> MuxResult {
         self.state = H2State::Error;
@@ -3038,6 +3101,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             H2Error::InternalError => error!("{} GOAWAY: {:?}", log_context!(self), error),
             _ => warn!("{} GOAWAY: {:?}", log_context!(self), error),
         }
+        count!(metric_for_goaway_sent(error), 1);
 
         // RFC 9113 §6.8: last_stream_id is the highest peer-initiated stream we processed
         match serializer::gen_goaway(kawa.storage.space(), self.highest_peer_stream_id, error) {
@@ -3087,6 +3151,12 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             "{} GOAWAY (graceful, phase 1): last_stream_id=0x7FFFFFFF",
             log_context!(self)
         );
+        // Phase 1 sends a NO_ERROR GOAWAY on the wire — count it under the
+        // same per-code key as phase 2. The downstream alert that wants to
+        // distinguish drain from termination compares against the
+        // `h2.goaway.sent.no_error` rate (drain) vs the other variants
+        // (termination on error).
+        count!(metric_for_goaway_sent(H2Error::NoError), 1);
 
         match serializer::gen_goaway(kawa.storage.space(), STREAM_ID_MAX, H2Error::NoError) {
             Ok((_, size)) => {
@@ -3728,6 +3798,12 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         E: Endpoint,
         L: ListenerHandler + L7ListenerHandler,
     {
+        // Per-error-code counter for the inbound RST. Emitted before the
+        // flood-detector trip check so even a connection that gets terminated
+        // by `handle_flood_violation` shows up in the per-code breakdown
+        // (the dedicated `h2.flood.violation.rst_stream_*` series tracks the
+        // mitigation event itself).
+        count!(metric_for_rst_stream_received(rst_stream.error_code), 1);
         // CVE-2023-44487 Rapid Reset + CVE-2019-9514: track RST_STREAM rate.
         self.flood_detector.rst_stream_count += 1;
         if let Some(violation) = self.flood_detector.check_flood() {
@@ -3760,6 +3836,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         };
         if let Some(violation) = self.flood_detector.record_rst_lifetime(response_started) {
             return self.handle_flood_violation(violation);
+        }
+        // Rapid Reset signature (CVE-2023-44487): a RST that arrives before the
+        // backend has begun answering. Emitted alongside the per-code counter
+        // so the SOC can alert on the rate of pre-response RSTs without
+        // having to differentiate by error code.
+        if !response_started {
+            count!("h2.rst_stream.received.pre_response_start", 1);
         }
         debug!(
             "{} RstStream({} -> {})",
@@ -3995,6 +4078,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 goaway.additional_debug_data
             );
         }
+        count!(metric_for_goaway_received(goaway.error_code), 1);
         // RFC 9113 §6.8: begin graceful drain.
         self.drain.draining = true;
         self.drain.peer_last_stream_id = Some(goaway.last_stream_id);
@@ -4391,6 +4475,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             stream.generate_access_log(true, Some("H2::Reset"), context.listener.clone());
             stream.metrics.reset();
         }
+        // Per-error-code counter for the outbound RST. Emitted regardless of
+        // `error` (including the graceful-cancel `NoError` path) so dashboards
+        // can split benign cancels from defensive resets without consulting
+        // the flood-detector keys.
+        count!(metric_for_rst_stream_sent(error), 1);
         // CVE-2025-8671 MadeYouReset: cap the total number of RST_STREAM frames
         // we emit on this connection. Graceful `NoError` cancels (e.g. stream
         // recycle, propagated client-side cancel) are exempt; only error-path
@@ -5001,6 +5090,65 @@ mod tests {
             deduped.len(),
             keys.len(),
             "metric keys must be unique across violation kinds; collisions: {keys:?}",
+        );
+    }
+
+    /// All four `metric_for_*` helpers must yield distinct, namespaced keys for
+    /// every RFC 9113 §7 error code. The macro behind them uses `concat!`, so a
+    /// new H2Error variant fails the build inside the macro — but a typo in
+    /// the helper prefix would silently land. Walk every (direction × kind)
+    /// pair and dedupe the set.
+    #[test]
+    fn test_per_error_code_metric_keys_are_unique_and_namespaced() {
+        const ALL_ERRORS: [H2Error; 14] = [
+            H2Error::NoError,
+            H2Error::ProtocolError,
+            H2Error::InternalError,
+            H2Error::FlowControlError,
+            H2Error::SettingsTimeout,
+            H2Error::StreamClosed,
+            H2Error::FrameSizeError,
+            H2Error::RefusedStream,
+            H2Error::Cancel,
+            H2Error::CompressionError,
+            H2Error::ConnectError,
+            H2Error::EnhanceYourCalm,
+            H2Error::InadequateSecurity,
+            H2Error::HTTP11Required,
+        ];
+
+        let mut keys: Vec<&'static str> = Vec::new();
+        for error in ALL_ERRORS {
+            let code = error as u32;
+            keys.push(metric_for_goaway_sent(error));
+            keys.push(metric_for_goaway_received(code));
+            keys.push(metric_for_rst_stream_sent(error));
+            keys.push(metric_for_rst_stream_received(code));
+        }
+        // …plus the four `unknown_error` fallbacks for codes outside RFC 9113 §7.
+        let unknown_code = 0xff;
+        assert!(H2Error::try_from(unknown_code).is_err());
+        keys.push(metric_for_goaway_received(unknown_code));
+        keys.push(metric_for_rst_stream_received(unknown_code));
+        // …and the dedicated Rapid Reset signature counter.
+        keys.push("h2.rst_stream.received.pre_response_start");
+
+        for key in &keys {
+            assert!(
+                key.starts_with("h2.goaway.sent.")
+                    || key.starts_with("h2.goaway.received.")
+                    || key.starts_with("h2.rst_stream.sent.")
+                    || key.starts_with("h2.rst_stream.received."),
+                "metric key {key} does not match a known per-error-code namespace",
+            );
+        }
+        let mut deduped = keys.clone();
+        deduped.sort_unstable();
+        deduped.dedup();
+        assert_eq!(
+            deduped.len(),
+            keys.len(),
+            "per-error-code metric keys must be unique; collisions in: {keys:?}",
         );
     }
 
