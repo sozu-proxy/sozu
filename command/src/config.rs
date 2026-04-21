@@ -64,10 +64,10 @@ use crate::{
     proto::command::{
         ActivateListener, AddBackend, AddCertificate, CertificateAndKey, Cluster,
         CustomHttpAnswers, HttpListenerConfig, HttpsListenerConfig, ListenerType,
-        LoadBalancingAlgorithms, LoadBalancingParams, LoadMetric, MetricsConfiguration, PathRule,
-        ProtobufAccessLogFormat, ProxyProtocolConfig, Request, RequestHttpFrontend,
-        RequestTcpFrontend, RulePosition, ServerConfig, ServerMetricsConfig, SocketAddress,
-        TcpListenerConfig, TlsVersion, WorkerRequest, request::RequestType,
+        LoadBalancingAlgorithms, LoadBalancingParams, LoadMetric, MetricDetail,
+        MetricsConfiguration, PathRule, ProtobufAccessLogFormat, ProxyProtocolConfig, Request,
+        RequestHttpFrontend, RequestTcpFrontend, RulePosition, ServerConfig, ServerMetricsConfig,
+        SocketAddress, TcpListenerConfig, TlsVersion, WorkerRequest, request::RequestType,
     },
 };
 
@@ -780,6 +780,46 @@ fn read_http_answer_file(path: &Option<String>) -> Result<Option<String>, Config
     }
 }
 
+/// Cardinality knob for metrics labels in the StatsD network drain.
+///
+/// Mirrors HAProxy's `process|frontend|backend|server` extra-counters opt-in.
+/// Operators choose the lowest level that satisfies their dashboards so that
+/// the keyspace stays bounded. Each level is a SUPERSET of the previous one:
+///
+/// - `process` — proxy-only counters (no listener, cluster, or backend label).
+/// - `frontend` — adds per-listener (frontend) breakdown.
+/// - `cluster` — adds per-cluster aggregation. **Default** (preserves the
+///   pre-knob behaviour).
+/// - `backend` — adds per-backend aggregation (cluster + backend, highest
+///   cardinality).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MetricDetailLevel {
+    Process,
+    Frontend,
+    Cluster,
+    Backend,
+}
+
+impl Default for MetricDetailLevel {
+    fn default() -> Self {
+        // Preserve the historical (pre-knob) behaviour: cluster-scoped
+        // metrics are emitted by default.
+        Self::Cluster
+    }
+}
+
+impl From<MetricDetailLevel> for MetricDetail {
+    fn from(level: MetricDetailLevel) -> Self {
+        match level {
+            MetricDetailLevel::Process => MetricDetail::DetailProcess,
+            MetricDetailLevel::Frontend => MetricDetail::DetailFrontend,
+            MetricDetailLevel::Cluster => MetricDetail::DetailCluster,
+            MetricDetailLevel::Backend => MetricDetail::DetailBackend,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MetricsConfig {
@@ -788,6 +828,10 @@ pub struct MetricsConfig {
     pub tagged_metrics: bool,
     #[serde(default)]
     pub prefix: Option<String>,
+    /// Cardinality knob for label-aware metrics. Defaults to `cluster` to
+    /// preserve historical behaviour. See [`MetricDetailLevel`].
+    #[serde(default)]
+    pub detail: MetricDetailLevel,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -2003,6 +2047,7 @@ impl From<&Config> for ServerConfig {
             address: m.address.to_string(),
             tagged_metrics: m.tagged_metrics,
             prefix: m.prefix,
+            detail: Some(MetricDetail::from(m.detail) as i32),
         });
         Self {
             max_connections: config.max_connections as u64,
@@ -2063,6 +2108,7 @@ mod tests {
                 address: "127.0.0.1:8125".parse().unwrap(),
                 tagged_metrics: false,
                 prefix: Some(String::from("sozu-metrics")),
+                detail: MetricDetailLevel::default(),
             }),
             listeners: Some(listeners),
             ..Default::default()
