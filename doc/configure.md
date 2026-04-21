@@ -672,6 +672,7 @@ These metrics are recorded with `cluster_id` and `backend_id` labels via the
 |--------|------|-------|-------------|
 | `http.alpn.h2` | counter | proxy | TLS connections where client negotiated HTTP/2 via ALPN |
 | `http.alpn.http11` | counter | proxy | TLS connections where client negotiated HTTP/1.1 via ALPN (or no ALPN) |
+| `https.alpn.rejected.http11_disabled` | counter | proxy | TLS connection refused on an H2-only listener because the peer offered `http/1.1` or no ALPN value |
 
 #### TLS version and cipher suite
 
@@ -716,8 +717,14 @@ Negotiated cipher suite (rustls):
 | `h2.pending_window_updates` | gauge | proxy | Pending WINDOW_UPDATE frames to send |
 | `h2.flow_control_stall` | counter | proxy | Converter stalled due to flow control |
 | `h2.close_with_active_streams` | counter | proxy | H2 connections closed while streams were still active |
-| `h2.window_update_dropped` | counter | proxy | WINDOW_UPDATE frames dropped (no matching stream) |
+| `h2.window_update_dropped` | counter | proxy | WINDOW_UPDATE frame dropped because the per-connection pending-update queue was already at capacity |
 | `h2.headers_no_stream.error` | counter | proxy | HEADERS frame received with no matching stream (protocol error) |
+
+#### TLS / SNI binding
+
+| Metric | Type | Scope | Description |
+|--------|------|-------|-------------|
+| `http.sni_authority_mismatch` | counter | proxy | Request rejected because its `:authority` (HTTP/2) or `Host` header (HTTP/1.1) crossed the TLS SNI boundary negotiated for the connection. Defence against cross-tenant frontend confusion (CWE-346). Increment site: `lib/src/protocol/mux/router.rs`. |
 
 #### Protocol upgrade failures
 
@@ -772,10 +779,13 @@ Incremented when a session fails to transition between protocol phases:
 - [statsd](https://github.com/etsy/statsd)
 - [grad](https://github.com/geal/grad)
 
-## OpenTelemetry
+## OpenTelemetry (traceparent passthrough)
 
-Sōzu supports [W3C Trace Context](https://www.w3.org/TR/trace-context/) propagation
-behind the `opentelemetry` compile-time feature flag.
+The `opentelemetry` compile-time feature flag enables **W3C Trace Context passthrough**:
+Sōzu parses, generates, and forwards `traceparent` headers across the proxy hop, and
+records the trace identifiers in its access logs. The feature name is historic — the
+implementation is intentionally a propagator only. There is no OpenTelemetry SDK
+dependency, no span lifecycle, and no OTLP exporter. See "Out of scope" below.
 
 ### Enabling
 
@@ -795,7 +805,10 @@ sozu-lib = { path = "lib", features = ["opentelemetry"] }
 ### How it works
 
 When the `opentelemetry` feature is enabled, Sōzu acts as a **trace context propagator**
-for HTTP/1.1 requests:
+for both HTTP/1.1 and HTTP/2 frontends. The kawa H1 editor (`lib/src/protocol/kawa_h1/editor.rs`)
+runs on every request, including those decoded from HPACK on the H2 mux path
+(`lib/src/protocol/mux/pkawa.rs` calls back into the same editor). On the wire the H2
+backend leg re-encodes the rewritten `traceparent` via `H2BlockConverter`.
 
 1. **Incoming request with `traceparent` header**: Sōzu parses the W3C traceparent
    (format: `00-<trace_id>-<parent_id>-<flags>`), preserves the trace ID, generates
@@ -822,15 +835,22 @@ When OpenTelemetry is enabled, access logs include:
 | `span_id` | 16 hex characters | Sōzu-generated span ID for this hop |
 | `parent_span_id` | 16 hex characters or `-` | Parent span ID from incoming `traceparent`, if present |
 
-### Limitations
+### Out of scope
 
-- OpenTelemetry propagation currently works on **HTTP/1.1 requests only** (the kawa H1 editor
-  path). HTTP/2 requests have the trace context extracted from access log records but do not
-  yet rewrite `traceparent` on forwarded H2 frames.
-- Sōzu does **not** export traces via OTLP. It acts as a propagator only — trace context
-  flows through access logs and forwarded headers. Use your access log pipeline to ingest
-  traces into Jaeger, Tempo, or similar backends.
-- There is no runtime configuration for OpenTelemetry — it is a compile-time feature flag only.
+The `opentelemetry` feature is intentionally narrow. It does NOT:
+
+- Pull `opentelemetry`, `opentelemetry-sdk`, `opentelemetry-otlp`, or `tracing-opentelemetry`
+  as dependencies. The feature gate (`lib/Cargo.toml`) wires no extra crates.
+- Emit spans. There is no `Span::start`/`Span::end`, no in-process exporter, no OTLP/gRPC
+  client. Use your access log pipeline to feed Jaeger, Tempo, Honeycomb, or Datadog with
+  the per-request trace identifiers.
+- Honour the sampled-flag bit of incoming `traceparent`. Today the rewritten header is
+  always emitted with `-01` (sampled). Downstream backends that respect the sampled flag
+  will see every request as sampled.
+- Provide runtime configuration. The feature is selected at compile time only.
+
+A real span model and an OTLP exporter are tracked separately and would land as their own
+feature flag rather than expanding the scope of `opentelemetry`.
 
 ## PROXY Protocol
 
