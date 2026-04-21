@@ -271,6 +271,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             bytes_in: metrics.bin,
             bytes_out: metrics.bout,
             user_agent: None,
+            x_request_id: None,
             otel: None,
         );
     }

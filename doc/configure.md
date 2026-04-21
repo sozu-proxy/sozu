@@ -743,6 +743,22 @@ Codes the wire delivers but RFC 9113 does not define are bucketed under
 | `h2.rst_stream.received.<code>` | counter | proxy | RST_STREAM received from peer. Same code suffixes plus `unknown_error`. |
 | `h2.rst_stream.received.pre_response_start` | counter | proxy | Subset of `h2.rst_stream.received.*` where the RST arrived before the backend started answering. The canonical Rapid Reset signature (CVE-2023-44487). Emitted alongside the per-code counter, not instead of, so a Rapid Reset attack surfaces both as a `cancel` rate spike and as the pre-response signal. |
 
+#### Request-ID propagation
+
+Sōzu preserves or generates an `x-request-id` header on every H1 request
+and every H2 stream (both paths share the same H1 editor callback via
+`pkawa.rs`). The value also lands on the access log's
+`x_request_id` field — same value Sōzu forwarded to the backend, end to
+end.
+
+| Metric | Type | Scope | Description |
+|---|---|---|---|
+| `http.x_request_id.propagated` | counter | proxy | Request already carried an `x-request-id` header; Sōzu preserved it verbatim |
+| `http.x_request_id.generated` | counter | proxy | Request had no `x-request-id`; Sōzu generated one from the request ULID and injected it before forwarding |
+
+The `x_request_id` access-log field (wire tag `ProtobufAccessLog.x_request_id` #24)
+carries whichever value was sent to the backend.
+
 #### HTTP/2 flood mitigations
 
 Incremented once per connection at the moment the H2 flood detector trips its
