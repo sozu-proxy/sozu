@@ -1918,6 +1918,7 @@ dependencies = [
  "num_cpus",
  "paw",
  "prost",
+ "rusty_ulid",
  "serde",
  "serde_json",
  "sozu-command-lib",
