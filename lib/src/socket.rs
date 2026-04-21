@@ -70,25 +70,24 @@ pub trait SocketHandler {
 }
 
 /// Format the socket-layer log prefix `[<session_ulid_or_->]\tSOCKET\tSession(
-/// peer=..., protocol=...)\t >>>` for a [`SocketHandler`] impl that has `self`
-/// in scope. When `$self.session_ulid()` returns `None` (e.g. the raw
-/// [`TcpStream`] impl that carries no session context) the ULID slot is
-/// rendered as `-` so the column layout stays stable across sessionless
-/// plumbing. The `[ulid - - -]` context comes first to stay aligned with
-/// `MUX-*`, `PIPE` and `RUSTLS` log lines. Colour scheme matches the rest of
-/// the mux log-context macros: `SOCKET` bold bright-white, `Session` light
-/// grey, keys gray, values bright white.
+/// peer=..., local=..., rtt=..., state=..., protocol=...)\t >>>` for a
+/// [`SocketHandler`] impl that has `self` in scope. When `$self.session_ulid()`
+/// returns `None` (e.g. the raw [`TcpStream`] impl that carries no session
+/// context) the ULID slot is rendered as `-` so the column layout stays
+/// stable across sessionless plumbing. The `[ulid - - -]` context comes first
+/// to stay aligned with `MUX-*`, `PIPE` and `RUSTLS` log lines. Colour scheme
+/// matches the rest of the mux log-context macros: `SOCKET` bold bright-white,
+/// `Session` light grey, keys gray, values bright white.
+///
+/// `local` is a live `getsockname(2)` lookup and is always populated for a
+/// bound socket. `rtt` + `state` come from a single `getsockopt(TCP_INFO)`
+/// call via [`socket_snapshot`]; both render as `None` on an FSM state where
+/// the kernel rejects the call (e.g. just-reset sockets).
 macro_rules! log_socket_context {
     ($self:expr) => {{
         let colored = is_logger_colored();
         let (open, reset, grey, gray, white) = if colored {
-            (
-                "\x1b[1;97m",
-                "\x1b[0m",
-                "\x1b[37m",
-                "\x1b[90m",
-                "\x1b[97m",
-            )
+            ("\x1b[1;97m", "\x1b[0m", "\x1b[37m", "\x1b[90m", "\x1b[97m")
         } else {
             ("", "", "", "", "")
         };
@@ -96,8 +95,11 @@ macro_rules! log_socket_context {
             Some(ulid) => ulid.to_string(),
             None => "-".to_string(),
         };
+        let snapshot = crate::socket::stats::socket_snapshot($self.socket_ref());
+        let rtt = snapshot.as_ref().map(|s| s.rtt);
+        let state = snapshot.as_ref().map(|s| s.state);
         format!(
-            "[{ulid} - - -]\t{open}SOCKET{reset}\t{grey}Session{reset}({gray}peer{reset}={white}{peer:?}{reset}, {gray}rtt{reset}={white}{rtt:?}{reset}, {gray}protocol{reset}={white}{protocol:?}{reset})\t >>>",
+            "[{ulid} - - -]\t{open}SOCKET{reset}\t{grey}Session{reset}({gray}peer{reset}={white}{peer:?}{reset}, {gray}local{reset}={white}{local:?}{reset}, {gray}rtt{reset}={white}{rtt:?}{reset}, {gray}state{reset}={white}{state:?}{reset}, {gray}protocol{reset}={white}{protocol:?}{reset})\t >>>",
             open = open,
             reset = reset,
             grey = grey,
@@ -105,7 +107,9 @@ macro_rules! log_socket_context {
             white = white,
             ulid = ulid,
             peer = $self.socket_ref().peer_addr().ok(),
-            rtt = crate::socket::stats::socket_rtt($self.socket_ref()),
+            local = $self.socket_ref().local_addr().ok(),
+            rtt = rtt,
+            state = state,
             protocol = $self.protocol(),
         )
     }};
@@ -113,32 +117,50 @@ macro_rules! log_socket_context {
 
 /// Module-level socket log prefix used from free functions (e.g. the shared
 /// `tcp_socket_*` helpers) where `self` is not in scope but the caller can
-/// still thread a session `Ulid` through as a parameter. When the ULID is
-/// `None` the slot is rendered as `-`, matching the column layout of
-/// [`log_socket_context!`]. Colour scheme identical to [`log_socket_context!`].
+/// still thread a session `Ulid` and the underlying [`TcpStream`] through as
+/// parameters. Renders the same `[<ulid> - - -]\tSOCKET\tSession(peer=...,
+/// local=..., rtt=..., state=..., protocol=Tcp)\t >>>` prefix as
+/// [`log_socket_context!`] so free-function error logs align column-by-column
+/// with handler-backed ones.
 ///
-/// Takes an `Option<Ulid>` so raw `mio::TcpStream` callers (which have no
-/// session identity) can still funnel through the same helpers.
-fn log_socket_module_prefix(session_ulid: Option<Ulid>) -> String {
+/// When the ULID is `None` the slot is rendered as `-`. `peer` is a live
+/// `getpeername(2)` lookup on the supplied stream: it is best-effort and may
+/// render as `None` on a socket that failed an asynchronous `connect()`
+/// (Linux returns `ENOTCONN` in that state) — exactly the ConnectionRefused
+/// case you see in the read path. `local` is a `getsockname(2)` lookup which
+/// stays valid across failed connects (the bind is local). `rtt` and `state`
+/// come from a single `getsockopt(TCP_INFO)` call — `state="SYN_SENT"` is
+/// the clearest signal for a failed outbound `connect()`. Protocol is
+/// hardcoded to `Tcp` because the helper is only called from the raw-TCP
+/// `tcp_socket_*` free functions.
+fn log_socket_module_prefix(stream: &TcpStream, session_ulid: Option<Ulid>) -> String {
     let colored = is_logger_colored();
-    let (open, reset, gray) = if colored {
-        ("\x1b[1;97m", "\x1b[0m", "\x1b[90m")
+    let (open, reset, grey, gray, white) = if colored {
+        ("\x1b[1;97m", "\x1b[0m", "\x1b[37m", "\x1b[90m", "\x1b[97m")
     } else {
-        ("", "", "")
+        ("", "", "", "", "")
     };
     let ulid = match session_ulid {
         Some(ulid) => ulid.to_string(),
         None => "-".to_string(),
     };
-    format!("{gray}[{ulid} - - -]{reset}\t{open}SOCKET{reset}\t >>>")
+    let snapshot = crate::socket::stats::socket_snapshot(stream);
+    let rtt = snapshot.as_ref().map(|s| s.rtt);
+    let state = snapshot.as_ref().map(|s| s.state);
+    format!(
+        "[{ulid} - - -]\t{open}SOCKET{reset}\t{grey}Session{reset}({gray}peer{reset}={white}{peer:?}{reset}, {gray}local{reset}={white}{local:?}{reset}, {gray}rtt{reset}={white}{rtt:?}{reset}, {gray}state{reset}={white}{state:?}{reset}, {gray}protocol{reset}={white}Tcp{reset})\t >>>",
+        peer = stream.peer_addr().ok(),
+        local = stream.local_addr().ok(),
+    )
 }
 
 /// Shared read/write/vectored-write logic used by both
 /// [`impl SocketHandler for TcpStream`] and
 /// [`impl SocketHandler for SessionTcpStream`]. Free-function entry point:
-/// `self` is out of scope here, so error logs use the
-/// [`log_socket_module_context!`] no-session variant. Session context is
-/// still available in the dispatching `SocketHandler` impl logs below.
+/// `self` is out of scope here, so error logs use [`log_socket_module_prefix`]
+/// which renders the same `Session(peer, rtt, protocol)` context as
+/// [`log_socket_context!`] by reading from the `stream` + `session_ulid`
+/// parameters threaded through each helper.
 fn tcp_socket_read(
     stream: &mut TcpStream,
     buf: &mut [u8],
@@ -151,7 +173,7 @@ fn tcp_socket_read(
         if counter > MAX_LOOP_ITERATIONS {
             error!(
                 "{} MAX_LOOP_ITERATION reached in TcpStream::socket_read",
-                log_socket_module_prefix(session_ulid)
+                log_socket_module_prefix(stream, session_ulid)
             );
             incr!("socket.read.infinite_loop.error");
             return (size, SocketResult::Error);
@@ -170,7 +192,7 @@ fn tcp_socket_read(
                 _ => {
                     error!(
                         "{} socket_read error={:?}",
-                        log_socket_module_prefix(session_ulid),
+                        log_socket_module_prefix(stream, session_ulid),
                         e
                     );
                     return (size, SocketResult::Error);
@@ -192,7 +214,7 @@ fn tcp_socket_write(
         if counter > MAX_LOOP_ITERATIONS {
             error!(
                 "{} MAX_LOOP_ITERATION reached in TcpStream::socket_write",
-                log_socket_module_prefix(session_ulid)
+                log_socket_module_prefix(stream, session_ulid)
             );
             incr!("socket.write.infinite_loop.error");
             return (size, SocketResult::Error);
@@ -216,7 +238,7 @@ fn tcp_socket_write(
                     //FIXME: timeout and other common errors should be sent up
                     error!(
                         "{} socket_write error={:?}",
-                        log_socket_module_prefix(session_ulid),
+                        log_socket_module_prefix(stream, session_ulid),
                         e
                     );
                     incr!("tcp.write.error");
@@ -247,7 +269,7 @@ fn tcp_socket_write_vectored(
                 //FIXME: timeout and other common errors should be sent up
                 error!(
                     "{} socket_write error={:?}",
-                    log_socket_module_prefix(session_ulid),
+                    log_socket_module_prefix(stream, session_ulid),
                     e
                 );
                 incr!("tcp.write.error");
@@ -921,9 +943,35 @@ pub mod stats {
 
     use internal::{OPT_LEVEL, OPT_NAME, TcpInfo};
 
-    /// Round trip time for a TCP socket
+    /// Point-in-time snapshot of kernel TCP bookkeeping for a socket. Populated
+    /// from a single `getsockopt(TCP_INFO)` syscall so callers that want both
+    /// the smoothed RTT and the FSM state don't pay for two trips into the
+    /// kernel. Field set is deliberately narrow — extend with more `tcp_info`
+    /// members if the log prefix grows.
+    #[derive(Clone, Debug)]
+    pub struct TcpSnapshot {
+        pub rtt: Duration,
+        pub state: &'static str,
+    }
+
+    /// Round trip time for a TCP socket. Kept for existing metric callers;
+    /// log-prefix callers should prefer [`socket_snapshot`] which returns the
+    /// RTT **and** the TCP FSM state from a single syscall.
     pub fn socket_rtt<A: AsRawFd>(socket: &A) -> Option<Duration> {
         socket_info(socket.as_raw_fd()).map(|info| Duration::from_micros(info.rtt() as u64))
+    }
+
+    /// Smoothed RTT + human-readable TCP state (`"ESTABLISHED"`, `"SYN_SENT"`,
+    /// `"CLOSE_WAIT"`, …) pulled from a single `getsockopt(TCP_INFO)` call.
+    /// Returns `None` when the kernel refuses the call — e.g. the socket has
+    /// been closed, or the FSM is in a state where `TCP_INFO` is not usable.
+    /// Safe on dying/refused sockets: the inner syscall's `status != 0`
+    /// branch is the only failure mode and it degrades to `None`.
+    pub fn socket_snapshot<A: AsRawFd>(socket: &A) -> Option<TcpSnapshot> {
+        socket_info(socket.as_raw_fd()).map(|info| TcpSnapshot {
+            rtt: Duration::from_micros(info.rtt() as u64),
+            state: info.state(),
+        })
     }
 
     #[cfg(unix)]
@@ -1005,6 +1053,29 @@ pub mod stats {
             pub fn rtt(&self) -> u32 {
                 self.tcpi_rtt
             }
+
+            /// Human-readable Linux TCP FSM state. Values follow
+            /// `include/net/tcp_states.h` (`TCP_ESTABLISHED = 1`,
+            /// `TCP_SYN_SENT = 2`, …). Anything unexpected falls back to
+            /// `"UNKNOWN"` rather than panicking — the log prefix is a
+            /// best-effort diagnostic and must not add failure modes.
+            pub fn state(&self) -> &'static str {
+                match self.tcpi_state {
+                    1 => "ESTABLISHED",
+                    2 => "SYN_SENT",
+                    3 => "SYN_RECV",
+                    4 => "FIN_WAIT1",
+                    5 => "FIN_WAIT2",
+                    6 => "TIME_WAIT",
+                    7 => "CLOSE",
+                    8 => "CLOSE_WAIT",
+                    9 => "LAST_ACK",
+                    10 => "LISTEN",
+                    11 => "CLOSING",
+                    12 => "NEW_SYN_RECV",
+                    _ => "UNKNOWN",
+                }
+            }
         }
     }
 
@@ -1046,6 +1117,27 @@ pub mod stats {
             pub fn rtt(&self) -> u32 {
                 // tcpi_srtt is in milliseconds not microseconds
                 self.tcpi_srtt * 1000
+            }
+
+            /// Human-readable Darwin TCP FSM state. Values follow
+            /// `netinet/tcp_fsm.h` (`TCPS_CLOSED = 0`, `TCPS_LISTEN = 1`,
+            /// `TCPS_SYN_SENT = 2`, …). Differs from Linux numbering —
+            /// macOS counts from 0, Linux from 1.
+            pub fn state(&self) -> &'static str {
+                match self.tcpi_state {
+                    0 => "CLOSED",
+                    1 => "LISTEN",
+                    2 => "SYN_SENT",
+                    3 => "SYN_RECEIVED",
+                    4 => "ESTABLISHED",
+                    5 => "CLOSE_WAIT",
+                    6 => "FIN_WAIT_1",
+                    7 => "CLOSING",
+                    8 => "LAST_ACK",
+                    9 => "FIN_WAIT_2",
+                    10 => "TIME_WAIT",
+                    _ => "UNKNOWN",
+                }
             }
         }
     }
