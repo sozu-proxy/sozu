@@ -850,6 +850,28 @@ end.
 The `x_request_id` access-log field (wire tag `ProtobufAccessLog.x_request_id` #24)
 carries whichever value was sent to the backend.
 
+#### TLS handshake metadata on access logs
+
+Five additional access-log fields surface the negotiated TLS metadata and
+the upstream-attested forwarded chain. They are wire-compatible appends to
+`ProtobufAccessLog` (tags 25–29) and are populated end-to-end on H1 and H2
+mux paths, plus the WSS post-upgrade pipe. Pure plaintext paths (HTTP, WS,
+TCP) emit `None` for all five.
+
+| Field | Wire tag | Source | Notes |
+|---|---|---|---|
+| `tls_version` | `ProtobufAccessLog.tls_version` #25 | `rustls_version_label(handshake.session.protocol_version())` | Short form (e.g. `TLSv1.3`). Captured once at handshake completion in `lib/src/https.rs::upgrade_handshake`. `None` when rustls reports an unknown variant. |
+| `tls_cipher` | `ProtobufAccessLog.tls_cipher` #26 | `rustls_ciphersuite_label(handshake.session.negotiated_cipher_suite())` | Short form (e.g. `TLS_AES_128_GCM_SHA256`). `None` when rustls reports an unsupported cipher. |
+| `tls_sni` | `ProtobufAccessLog.tls_sni` #27 | `handshake.session.server_name()` | Pre-lowercased, no port. Same value the routing layer uses to enforce the SNI ↔ `:authority` binding. `None` when the client omitted SNI. |
+| `tls_alpn` | `ProtobufAccessLog.tls_alpn` #28 | ALPN negotiation in `upgrade_handshake` | `h2`, `http/1.1`, or `None` when no ALPN was negotiated. |
+| `xff_chain` | `ProtobufAccessLog.xff_chain` #29 | Verbatim `X-Forwarded-For` header value | Snapshotted in `editor.rs::on_request_headers` *before* Sōzu appends its own peer hop, so the log records the upstream-attested chain (e.g. `203.0.113.5, 198.51.100.10`). `None` when the request has no `X-Forwarded-For` header. |
+
+TLS fields are connection-scoped: they are stamped once on the mux
+`Context` at handshake time and propagated to every per-stream
+`HttpContext` via `Context::create_stream`, so an H2 connection
+multiplexing N streams pays the cost once. The labels are `&'static str`
+borrows into rustls's static label tables — no per-request allocation.
+
 #### HTTP/2 flood mitigations
 
 Incremented once per connection at the moment the H2 flood detector trips its

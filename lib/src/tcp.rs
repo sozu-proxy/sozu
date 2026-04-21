@@ -238,6 +238,14 @@ impl TcpSession {
             server_rtt: None,
             user_agent: None,
             x_request_id: None,
+            // TCP listener accepts a raw `MioTcpStream` (lib/src/tcp.rs:128)
+            // — Sōzu does not terminate TLS on the TCP path, so all five TLS
+            // fields and the parsed XFF chain are always absent here.
+            tls_version: None,
+            tls_cipher: None,
+            tls_sni: None,
+            tls_alpn: None,
+            xff_chain: None,
             service_time: self.metrics.service_time(),
             response_time: self.metrics.backend_response_time(),
             request_time: self.metrics.request_time(),
