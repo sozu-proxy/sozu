@@ -994,7 +994,8 @@ pub struct FileClusterConfig {
     pub answer_503: Option<String>,
     #[serde(default)]
     pub load_metric: Option<LoadMetric>,
-    /// Use HTTP/2 for backend connections to this cluster
+    /// Backend-capability hint: `true` when the backend speaks HTTP/2 (h2c or h2+TLS once #1218 lands).
+    /// Does NOT gate H2 at the frontend — frontend H2 is ALPN-negotiated independently (see `alpn_protocols`).
     pub http2: Option<bool>,
 }
 
