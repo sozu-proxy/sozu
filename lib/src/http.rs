@@ -19,11 +19,11 @@ use sozu_command::{
     logging::CachedTags,
     proto::command::{
         Cluster, HttpListenerConfig, ListenerType, RemoveListener, RequestHttpFrontend,
-        WorkerRequest, WorkerResponse, request::RequestType,
+        UpdateHttpListenerConfig, WorkerRequest, WorkerResponse, request::RequestType,
     },
     ready::Ready,
     response::HttpFrontend,
-    state::ClusterId,
+    state::{ClusterId, StateError, validate_h2_flood_knobs_http, validate_sozu_id_header},
 };
 
 use crate::{
@@ -791,6 +791,23 @@ impl HttpProxy {
         Ok((owned.token, taken_listener))
     }
 
+    /// Apply a partial-update patch to the identified HTTP listener.
+    pub fn update_listener(&mut self, patch: UpdateHttpListenerConfig) -> Result<(), ProxyError> {
+        let address: std::net::SocketAddr = patch.address.into();
+        let listener = self
+            .listeners
+            .values()
+            .find(|l| l.borrow().address == address)
+            .ok_or(ProxyError::NoListenerFound(address))?;
+        listener
+            .borrow_mut()
+            .update_config(&patch)
+            .map_err(|listener_error| ProxyError::ListenerActivation {
+                address,
+                listener_error,
+            })
+    }
+
     pub fn add_cluster(&mut self, mut cluster: Cluster) -> Result<(), ProxyError> {
         if let Some(answer_503) = cluster.answer_503.take() {
             for listener in self.listeners.values() {
@@ -964,6 +981,122 @@ impl HttpListener {
         self.listener = Some(listener);
         self.active = true;
         Ok(self.token)
+    }
+
+    /// Apply a partial-update patch to this listener's live configuration.
+    ///
+    /// Fields absent in the patch (i.e. `None`) are preserved unchanged.
+    /// If `http_answers` is present only the listener-default templates are
+    /// replaced; per-cluster overrides in `cluster_custom_answers` are kept.
+    pub fn update_config(&mut self, patch: &UpdateHttpListenerConfig) -> Result<(), ListenerError> {
+        // Defense-in-depth validation: main-process ConfigState::dispatch
+        // validates before scatter, but a raw protobuf client or state replay
+        // may reach the worker without that check.
+        let into_listener_err = |e: StateError| match e {
+            StateError::InvalidValue { field, reason } => {
+                ListenerError::InvalidValue { field, reason }
+            }
+            _ => ListenerError::InvalidValue {
+                field: "unknown",
+                reason: "validation failed",
+            },
+        };
+        validate_h2_flood_knobs_http(patch).map_err(into_listener_err)?;
+        if let Some(ref hdr) = patch.sozu_id_header {
+            validate_sozu_id_header(hdr).map_err(into_listener_err)?;
+        }
+
+        if let Some(v) = patch.public_address {
+            self.config.public_address = Some(v);
+        }
+        if let Some(v) = patch.expect_proxy {
+            self.config.expect_proxy = v;
+        }
+        if let Some(ref v) = patch.sticky_name {
+            self.config.sticky_name = v.to_owned();
+        }
+        if let Some(v) = patch.front_timeout {
+            self.config.front_timeout = v;
+        }
+        if let Some(v) = patch.back_timeout {
+            self.config.back_timeout = v;
+        }
+        if let Some(v) = patch.connect_timeout {
+            self.config.connect_timeout = v;
+        }
+        if let Some(v) = patch.request_timeout {
+            self.config.request_timeout = v;
+        }
+        if let Some(ref v) = patch.sozu_id_header {
+            self.config.sozu_id_header = Some(v.to_owned());
+        }
+
+        // H2 flood knobs
+        if let Some(v) = patch.h2_max_rst_stream_per_window {
+            self.config.h2_max_rst_stream_per_window = Some(v);
+        }
+        if let Some(v) = patch.h2_max_ping_per_window {
+            self.config.h2_max_ping_per_window = Some(v);
+        }
+        if let Some(v) = patch.h2_max_settings_per_window {
+            self.config.h2_max_settings_per_window = Some(v);
+        }
+        if let Some(v) = patch.h2_max_empty_data_per_window {
+            self.config.h2_max_empty_data_per_window = Some(v);
+        }
+        if let Some(v) = patch.h2_max_continuation_frames {
+            self.config.h2_max_continuation_frames = Some(v);
+        }
+        if let Some(v) = patch.h2_max_glitch_count {
+            self.config.h2_max_glitch_count = Some(v);
+        }
+        if let Some(v) = patch.h2_initial_connection_window {
+            self.config.h2_initial_connection_window = Some(v);
+        }
+        if let Some(v) = patch.h2_max_concurrent_streams {
+            self.config.h2_max_concurrent_streams = Some(v);
+        }
+        if let Some(v) = patch.h2_stream_shrink_ratio {
+            self.config.h2_stream_shrink_ratio = Some(v);
+        }
+        if let Some(v) = patch.h2_max_rst_stream_lifetime {
+            self.config.h2_max_rst_stream_lifetime = Some(v);
+        }
+        if let Some(v) = patch.h2_max_rst_stream_abusive_lifetime {
+            self.config.h2_max_rst_stream_abusive_lifetime = Some(v);
+        }
+        if let Some(v) = patch.h2_max_rst_stream_emitted_lifetime {
+            self.config.h2_max_rst_stream_emitted_lifetime = Some(v);
+        }
+        if let Some(v) = patch.h2_max_header_list_size {
+            self.config.h2_max_header_list_size = Some(v);
+        }
+        if let Some(v) = patch.h2_max_header_table_size {
+            self.config.h2_max_header_table_size = Some(v);
+        }
+        if let Some(v) = patch.h2_stream_idle_timeout_seconds {
+            self.config.h2_stream_idle_timeout_seconds = Some(v);
+        }
+        if let Some(v) = patch.h2_graceful_shutdown_deadline_seconds {
+            self.config.h2_graceful_shutdown_deadline_seconds = Some(v);
+        }
+        if let Some(v) = patch.h2_max_window_update_stream0_per_window {
+            self.config.h2_max_window_update_stream0_per_window = Some(v);
+        }
+
+        // HTTP answers: replace listener defaults per-field, preserve cluster overrides
+        if let Some(ref new_answers) = patch.http_answers {
+            crate::sozu_command::state::merge_custom_http_answers(
+                &mut self.config.http_answers,
+                new_answers,
+            );
+            self.answers
+                .borrow_mut()
+                .replace_defaults(new_answers)
+                .map_err(|(status, error)| ListenerError::TemplateParse(status, error))?;
+        }
+
+        Ok(())
     }
 
     pub fn add_http_front(&mut self, http_front: HttpFrontend) -> Result<(), ListenerError> {

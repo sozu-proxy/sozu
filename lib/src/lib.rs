@@ -705,6 +705,11 @@ pub enum ListenerError {
     AddFrontend(RouterError),
     #[error("could not remove frontend: {0}")]
     RemoveFrontend(RouterError),
+    #[error("invalid value for field '{field}': {reason}")]
+    InvalidValue {
+        field: &'static str,
+        reason: &'static str,
+    },
 }
 
 /// Returned by the HTTP, HTTPS and TCP proxies

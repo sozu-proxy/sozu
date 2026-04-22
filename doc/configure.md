@@ -510,6 +510,131 @@ Operators monitoring logs should expect the following classification:
 
 In particular, the recurring `Could not look up a certificate for server name "<name>"` line (issue #774) is emitted at `warn` when the `rustls::server::ClientHello` SNI does not match any configured frontend — the usual culprit is a generic scanner (Shodan, ssllabs, Censys) probing `default.example` or an IP-only hello. No action required unless the name matches a frontend you expect to serve.
 
+## Runtime patch — `sozu listener update`
+
+`sozu listener {http,https,tcp} update` patches a live listener **in place** without cycling the listening socket. Only the fields you pass are written; all others are preserved exactly as they are. Existing sessions continue with their configuration snapshot; only new sessions, connections, or TLS handshakes — depending on the field — pick up the new values. Use `sozu listener list` to inspect current values before patching.
+
+> **Bind-only fields are not patchable.** The address, TLS crypto parameters, and the `active` flag can only be changed by removing and re-adding the listener:
+> ```bash
+> sozu listener https remove -a 0.0.0.0:8443
+> sozu listener https add --address 0.0.0.0:8443 [...]
+> ```
+> Bind-only fields: `address`, `tls_versions`, `cipher_list`, `cipher_suites`,
+> `signature_algorithms`, `groups_list`, `certificate`, `certificate_chain`, `key`,
+> `send_tls13_tickets`, `active`.
+
+### Updatable fields
+
+Fields are grouped by the earliest point at which a patched value takes effect for connections already in progress. All fields apply to new sessions immediately after the patch is acknowledged.
+
+#### HTTP and HTTPS listeners
+
+| Field | Type | Mutability class | Default | Notes |
+|---|---|---|---|---|
+| `public_address` | `SocketAddr` | session-at-accept | — | Source address reported to backends / logs |
+| `expect_proxy` | `bool` | session-at-accept | `false` | Enable PROXY protocol v1/v2 on new sessions |
+| `sticky_name` | `string` | session-at-accept | `"SOZUBALANCEID"` | Sticky-session cookie name |
+| `front_timeout` | `u32` (seconds) | session-at-accept | `60` | Max idle time on the client socket |
+| `back_timeout` | `u32` (seconds) | session-at-accept | `30` | Max idle time on the backend socket |
+| `connect_timeout` | `u32` (seconds) | session-at-accept | `3` | Max time to establish a backend connection |
+| `request_timeout` | `u32` (seconds) | session-at-accept | `10` | Max time to send a complete request |
+| `http_answers` | file paths | session-at-accept | built-in defaults | Listener-default HTTP error bodies (301/401/404/408/413/421/502/503/504/507). Per-cluster `answer_503` overrides are preserved. |
+| `sozu_id_header` | `string` | session-at-accept | `"Sozu-Id"` | Correlation header name (RFC 9110 §5.1 token; reject empty or containing CR/LF/colon/space) |
+| `h2_max_rst_stream_per_window` | `u32` (≥ 1) | per-connection setup | `100` | RST_STREAM flood cap — CVE-2023-44487, CVE-2019-9514 |
+| `h2_max_ping_per_window` | `u32` (≥ 1) | per-connection setup | `100` | PING flood cap — CVE-2019-9512 |
+| `h2_max_settings_per_window` | `u32` (≥ 1) | per-connection setup | `50` | SETTINGS flood cap — CVE-2019-9515 |
+| `h2_max_empty_data_per_window` | `u32` (≥ 1) | per-connection setup | `100` | Empty DATA flood cap — CVE-2019-9518 |
+| `h2_max_continuation_frames` | `u32` (≥ 1) | per-connection setup | `20` | CONTINUATION flood cap — CVE-2024-27316 |
+| `h2_max_glitch_count` | `u32` (≥ 1) | per-connection setup | `100` | Cumulative protocol-anomaly budget |
+| `h2_max_window_update_stream0_per_window` | `u32` (≥ 1) | per-connection setup | `100` | Stream-0 WINDOW_UPDATE flood cap |
+| `h2_max_rst_stream_lifetime` | `u64` (≥ 1) | per-connection setup | `10000` | Lifetime RST_STREAM received cap — CVE-2023-44487 |
+| `h2_max_rst_stream_abusive_lifetime` | `u64` (≥ 1) | per-connection setup | `50` | Lifetime abusive RST_STREAM cap (Rapid Reset signature) |
+| `h2_max_rst_stream_emitted_lifetime` | `u64` (≥ 1) | per-connection setup | `500` | Lifetime server-emitted RST_STREAM cap — CVE-2025-8671 |
+| `h2_initial_connection_window` | `u32` | per-connection setup | `1048576` | Connection receive window (bytes, RFC 9113 §6.9.2) |
+| `h2_max_concurrent_streams` | `u32` (≥ 1) | per-connection setup | `100` | `SETTINGS_MAX_CONCURRENT_STREAMS` |
+| `h2_stream_shrink_ratio` | `u32` (≥ 2) | per-connection setup | `2` | Stream-slot Vec shrink threshold |
+| `h2_max_header_list_size` | `u32` | per-connection setup | `65536` | HPACK decoded header budget (`SETTINGS_MAX_HEADER_LIST_SIZE`) |
+| `h2_max_header_table_size` | `u32` | per-connection setup | `65536` | HPACK dynamic table size cap (`SETTINGS_HEADER_TABLE_SIZE`) |
+| `h2_stream_idle_timeout_seconds` | `u32` | per-connection setup | `30` | Per-stream idle timeout (slow-multiplex Slowloris defence) |
+| `h2_graceful_shutdown_deadline_seconds` | `u32` | per-connection setup | `5` | Forced-close deadline after `GOAWAY(NO_ERROR)` on soft-stop. `0` = wait forever. |
+
+#### HTTPS-only fields
+
+| Field | Type | Mutability class | Default | Notes |
+|---|---|---|---|---|
+| `alpn_protocols` | `string[]` | per-handshake | `["h2","http/1.1"]` | Rebuilds the rustls `ServerConfig`. In-flight handshakes finish on the old config. Pass `--reset-alpn` on the CLI to restore the default. |
+| `strict_sni_binding` | `bool` | per-handshake | `true` | Enforce `:authority`/`Host` == TLS SNI (CWE-346/CWE-444) |
+| `disable_http11` | `bool` | per-handshake | `false` | Drop clients that do not negotiate `h2` via ALPN |
+
+#### TCP listeners
+
+| Field | Type | Mutability class | Default | Notes |
+|---|---|---|---|---|
+| `public_address` | `SocketAddr` | session-at-accept | — | |
+| `expect_proxy` | `bool` | session-at-accept | `false` | |
+| `front_timeout` | `u32` (seconds) | session-at-accept | `60` | |
+| `back_timeout` | `u32` (seconds) | session-at-accept | `30` | |
+| `connect_timeout` | `u32` (seconds) | session-at-accept | `3` | |
+
+### Examples
+
+#### Tighten H2 flood thresholds under attack (CVE-2023-44487)
+
+```bash
+# Inspect current values first
+sozu listener list
+
+# Halve the Rapid Reset budget on the HTTPS listener
+sozu listener https update -a 0.0.0.0:8443 \
+    --h2-max-rst-stream-per-window 50 \
+    --h2-max-rst-stream-abusive-lifetime 25
+
+# Confirm the new values are live
+sozu listener list
+```
+
+Existing H2 connections continue with their original thresholds. New connections
+opened after the patch acknowledge see the tighter limits.
+
+#### Toggle `disable_http11` to enforce H2-only mode
+
+```bash
+# Require all clients to negotiate h2 via TLS ALPN
+sozu listener https update -a 0.0.0.0:8443 --disable-http11
+
+# Revert — allow HTTP/1.1 fallback again
+sozu listener https update -a 0.0.0.0:8443 --enable-http11
+```
+
+The existing HTTP/1.1 sessions in progress are not disrupted; only new TLS
+handshakes that omit `h2` from their ALPN offer are refused after the patch.
+
+#### Rebrand the correlation header
+
+```bash
+# Rename "Sozu-Id" to "X-Edge-Id" organisation-wide
+sozu listener http  update -a 0.0.0.0:80   --sozu-id-header "X-Edge-Id"
+sozu listener https update -a 0.0.0.0:8443 --sozu-id-header "X-Edge-Id"
+```
+
+The new header name takes effect for sessions accepted after the patch.
+Previously accepted sessions continue to inject the old `Sozu-Id` header until
+they close.
+
+### Observability
+
+Two worker metrics track update outcomes:
+
+| Metric | Description |
+|---|---|
+| `listener.updated` | Incremented each time a worker successfully applies a patch |
+| `listener.update_failed` | Incremented when the worker-side apply returns an error |
+
+The control-plane command server also emits a `LISTENER_UPDATED` event on the
+`SubscribeEvents` bus (carrying the listener address and type) and writes a
+structured `[AUDIT]` log line with the actor uid, request id, and the full
+field-diff.
+
 ## Metrics
 
 Sōzu reports its own state to another network component through a `UDP` socket.

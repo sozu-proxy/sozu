@@ -897,6 +897,40 @@ impl HttpAnswers {
         self.cluster_custom_answers.remove(cluster_id);
     }
 
+    /// Rewrite ONLY the listener-default template fields for which the patch
+    /// provides `Some(body)`, leaving all other templates and
+    /// `cluster_custom_answers` untouched.
+    ///
+    /// Field-mask semantic: a `None` field in `new_defaults` means "preserve
+    /// the current template"; a `Some` field means "replace with this body".
+    /// This matches the update-verb documented contract — a patch that sets
+    /// only `answer_503` must leave `answer_401`/`answer_404`/etc. alone.
+    pub fn replace_defaults(
+        &mut self,
+        new_defaults: &CustomHttpAnswers,
+    ) -> Result<(), (u16, TemplateError)> {
+        macro_rules! merge {
+            ($status:expr, $field:ident) => {
+                if let Some(body) = new_defaults.$field.clone() {
+                    self.listener_answers.$field = Self::template($status, body)?;
+                }
+            };
+        }
+
+        merge!(301, answer_301);
+        merge!(400, answer_400);
+        merge!(401, answer_401);
+        merge!(404, answer_404);
+        merge!(408, answer_408);
+        merge!(413, answer_413);
+        merge!(421, answer_421);
+        merge!(502, answer_502);
+        merge!(503, answer_503);
+        merge!(504, answer_504);
+        merge!(507, answer_507);
+        Ok(())
+    }
+
     pub fn get(
         &self,
         answer: DefaultAnswer,
@@ -1029,5 +1063,108 @@ impl HttpAnswers {
         // kawa::debug_kawa(&template.kawa);
         // println!("{template:#?}");
         template.fill(&variables, &mut variables_once)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sozu_command::proto::command::CustomHttpAnswers;
+
+    use super::HttpAnswers;
+
+    /// `replace_defaults` must rewrite listener-default templates while
+    /// preserving every per-cluster entry in `cluster_custom_answers`.
+    #[test]
+    fn replace_defaults_preserves_cluster_custom_answers() {
+        // Build a fresh HttpAnswers with the stock defaults.
+        let mut answers = HttpAnswers::new(&None).expect("default HttpAnswers must parse");
+
+        // Register a per-cluster custom 503.
+        let custom_cluster_503 = "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 5\r\n\r\noops!";
+        answers
+            .add_custom_answer("my-cluster", custom_cluster_503.to_owned())
+            .expect("custom 503 must parse");
+
+        // Now replace the listener-default 503 with a different body.
+        let new_listener_503 = "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 11\r\n\r\nnew-default";
+        let patch = CustomHttpAnswers {
+            answer_503: Some(new_listener_503.to_owned()),
+            ..Default::default()
+        };
+        answers
+            .replace_defaults(&patch)
+            .expect("replace_defaults must succeed");
+
+        // (a) Listener-default template now contains the new body text.
+        let template_buf = answers.listener_answers.answer_503.kawa.storage.buffer();
+        let contains_new_default = template_buf
+            .windows(b"new-default".len())
+            .any(|w| w == b"new-default");
+        assert!(
+            contains_new_default,
+            "listener-default 503 should have been replaced with new-default"
+        );
+
+        // (b) The registered cluster's custom 503 is still intact.
+        assert!(
+            answers.cluster_custom_answers.contains_key("my-cluster"),
+            "cluster_custom_answers must be preserved after replace_defaults"
+        );
+        let cluster_buf = answers
+            .cluster_custom_answers
+            .get("my-cluster")
+            .unwrap()
+            .answer_503
+            .kawa
+            .storage
+            .buffer();
+        let contains_oops = cluster_buf.windows(b"oops!".len()).any(|w| w == b"oops!");
+        assert!(
+            contains_oops,
+            "per-cluster 503 must still contain the original custom body"
+        );
+    }
+
+    /// Regression test for the H-1 finding: `replace_defaults` must preserve
+    /// listener-default templates for fields that the patch does NOT set.
+    /// Prior behavior treated `None` as "reset to stock default", silently
+    /// wiping out any custom body configured at AddListener time.
+    #[test]
+    fn replace_defaults_preserves_unmentioned_templates() {
+        // Build HttpAnswers with a custom 401 AND 503 at creation time.
+        let initial_401 = "HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Length: 12\r\n\r\nneed-creds!!";
+        let initial_503 = "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 11\r\n\r\ninitial-503";
+        let initial = CustomHttpAnswers {
+            answer_401: Some(initial_401.to_owned()),
+            answer_503: Some(initial_503.to_owned()),
+            ..Default::default()
+        };
+        let mut answers = HttpAnswers::new(&Some(initial)).expect("initial HttpAnswers must parse");
+
+        // Patch ONLY answer_503. answer_401 must stay as-is.
+        let new_503 = "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 7\r\n\r\npatched";
+        let patch = CustomHttpAnswers {
+            answer_503: Some(new_503.to_owned()),
+            ..Default::default()
+        };
+        answers
+            .replace_defaults(&patch)
+            .expect("replace_defaults must succeed");
+
+        // 503 got the patched body.
+        let buf_503 = answers.listener_answers.answer_503.kawa.storage.buffer();
+        assert!(
+            buf_503.windows(b"patched".len()).any(|w| w == b"patched"),
+            "answer_503 should have been replaced"
+        );
+
+        // 401 must still contain the custom body from initial AddListener.
+        let buf_401 = answers.listener_answers.answer_401.kawa.storage.buffer();
+        assert!(
+            buf_401
+                .windows(b"need-creds!!".len())
+                .any(|w| w == b"need-creds!!"),
+            "answer_401 must be preserved when the patch does not set it"
+        );
     }
 }

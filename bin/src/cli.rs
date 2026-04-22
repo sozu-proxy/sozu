@@ -1,6 +1,6 @@
-use std::{collections::BTreeMap, net::SocketAddr};
+use std::{collections::BTreeMap, net::SocketAddr, path::PathBuf};
 
-use clap::{Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand};
 use sozu_command_lib::{
     proto::command::{LoadBalancingAlgorithms, TlsVersion},
     state::ClusterId as StateClusterId,
@@ -42,6 +42,10 @@ impl paw::ParseArgs for Args {
     }
 }
 
+// The `Listener` variant balloons through its HttpListenerCmd/HttpsListenerCmd
+// `Update` subvariants. Clap-derive's top-level enum can't be Boxed without
+// breaking the derive; accept the disparity.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, PartialEq, Eq, Clone, Debug)]
 pub enum SubCmd {
     #[clap(name = "start", about = "launch the main process")]
@@ -542,6 +546,10 @@ pub enum ListenerCmd {
     List,
 }
 
+// `Update` carries ~20 Option<T> fields and is the dominant variant; accept
+// the size disparity rather than Box the variant (clap-derive doesn't help
+// when you Box a subcommand struct).
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, PartialEq, Eq, Clone, Debug)]
 pub enum HttpListenerCmd {
     #[clap(name = "add")]
@@ -618,8 +626,161 @@ pub enum HttpListenerCmd {
         )]
         address: SocketAddr,
     },
+    #[clap(name = "update", about = "Patch a running HTTP listener in place")]
+    Update {
+        #[clap(
+            short = 'a',
+            long = "address",
+            help = "listener address, format: IP:port"
+        )]
+        address: SocketAddr,
+        #[clap(
+            long = "public-address",
+            help = "a different IP than the one the socket sees, for logs and forwarded headers"
+        )]
+        public_address: Option<SocketAddr>,
+        #[clap(long = "sticky-name", help = "sticky session cookie name")]
+        sticky_name: Option<String>,
+        #[clap(
+            long = "front-timeout",
+            help = "maximum time of inactivity for a frontend socket, in seconds"
+        )]
+        front_timeout: Option<u32>,
+        #[clap(
+            long = "back-timeout",
+            help = "maximum time of inactivity for a backend socket, in seconds"
+        )]
+        back_timeout: Option<u32>,
+        #[clap(
+            long = "connect-timeout",
+            help = "maximum time to connect to a backend server, in seconds"
+        )]
+        connect_timeout: Option<u32>,
+        #[clap(
+            long = "request-timeout",
+            help = "maximum time to receive a complete request, in seconds"
+        )]
+        request_timeout: Option<u32>,
+
+        // Paired boolean flags — fold to Option<bool> in the request builder
+        #[clap(long = "expect-proxy", action = ArgAction::SetTrue, overrides_with = "no_expect_proxy",
+               help = "Enable PROXY protocol header on the client socket")]
+        expect_proxy: bool,
+        #[clap(long = "no-expect-proxy", action = ArgAction::SetTrue, overrides_with = "expect_proxy",
+               help = "Disable PROXY protocol header on the client socket")]
+        no_expect_proxy: bool,
+
+        // H2 flood knobs
+        #[clap(
+            long,
+            help = "Maximum RST_STREAM frames per second window (CVE-2023-44487, CVE-2019-9514); must be >= 1"
+        )]
+        h2_max_rst_stream_per_window: Option<u32>,
+        #[clap(
+            long,
+            help = "Maximum PING frames per second window (CVE-2019-9512); must be >= 1"
+        )]
+        h2_max_ping_per_window: Option<u32>,
+        #[clap(
+            long,
+            help = "Maximum SETTINGS frames per second window (CVE-2019-9515); must be >= 1"
+        )]
+        h2_max_settings_per_window: Option<u32>,
+        #[clap(
+            long,
+            help = "Maximum empty DATA frames per second window (CVE-2019-9518); must be >= 1"
+        )]
+        h2_max_empty_data_per_window: Option<u32>,
+        #[clap(
+            long,
+            help = "Maximum CONTINUATION frames per header block (CVE-2024-27316); must be >= 1"
+        )]
+        h2_max_continuation_frames: Option<u32>,
+        #[clap(
+            long,
+            help = "Maximum accumulated protocol anomalies before ENHANCE_YOUR_CALM; must be >= 1"
+        )]
+        h2_max_glitch_count: Option<u32>,
+        #[clap(
+            long,
+            help = "Connection-level receive window size in bytes (RFC 9113 §6.9.2)"
+        )]
+        h2_initial_connection_window: Option<u32>,
+        #[clap(
+            long,
+            help = "Maximum concurrent H2 streams (SETTINGS_MAX_CONCURRENT_STREAMS); must be >= 1"
+        )]
+        h2_max_concurrent_streams: Option<u32>,
+        #[clap(
+            long,
+            help = "Shrink threshold ratio for recycled stream slots; must be >= 1"
+        )]
+        h2_stream_shrink_ratio: Option<u32>,
+        #[clap(
+            long,
+            help = "Absolute lifetime cap on RST_STREAM frames received (CVE-2023-44487)"
+        )]
+        h2_max_rst_stream_lifetime: Option<u64>,
+        #[clap(
+            long,
+            help = "Lifetime cap on abusive RST_STREAM frames — Rapid Reset signature"
+        )]
+        h2_max_rst_stream_abusive_lifetime: Option<u64>,
+        #[clap(
+            long,
+            help = "Absolute lifetime cap on RST_STREAM frames emitted by the server (CVE-2025-8671)"
+        )]
+        h2_max_rst_stream_emitted_lifetime: Option<u64>,
+        #[clap(
+            long,
+            help = "Maximum HPACK-decoded header list size per request (RFC 9113 §6.5.2)"
+        )]
+        h2_max_header_list_size: Option<u32>,
+        #[clap(long, help = "Maximum HPACK dynamic table size accepted from the peer")]
+        h2_max_header_table_size: Option<u32>,
+        #[clap(long, help = "Per-stream idle timeout in seconds")]
+        h2_stream_idle_timeout_seconds: Option<u32>,
+        #[clap(
+            long,
+            help = "Seconds to wait after GOAWAY(NO_ERROR) before force-closing; 0 = wait forever"
+        )]
+        h2_graceful_shutdown_deadline_seconds: Option<u32>,
+        #[clap(
+            long,
+            help = "Maximum connection-level (stream 0) WINDOW_UPDATE frames per window (must be >= 1)"
+        )]
+        h2_max_window_update_stream0_per_window: Option<u32>,
+        #[clap(
+            long,
+            help = "Name of the correlation header injected per request (e.g. \"Sozu-Id\")"
+        )]
+        sozu_id_header: Option<String>,
+
+        // Listener-default HTTP answer bodies (file paths)
+        #[clap(long, help = "path to file for the 301 answer body")]
+        answer_301: Option<PathBuf>,
+        #[clap(long, help = "path to file for the 401 answer body")]
+        answer_401: Option<PathBuf>,
+        #[clap(long, help = "path to file for the 404 answer body")]
+        answer_404: Option<PathBuf>,
+        #[clap(long, help = "path to file for the 408 answer body")]
+        answer_408: Option<PathBuf>,
+        #[clap(long, help = "path to file for the 413 answer body")]
+        answer_413: Option<PathBuf>,
+        #[clap(long, help = "path to file for the 421 answer body")]
+        answer_421: Option<PathBuf>,
+        #[clap(long, help = "path to file for the 502 answer body")]
+        answer_502: Option<PathBuf>,
+        #[clap(long, help = "path to file for the 503 answer body")]
+        answer_503: Option<PathBuf>,
+        #[clap(long, help = "path to file for the 504 answer body")]
+        answer_504: Option<PathBuf>,
+        #[clap(long, help = "path to file for the 507 answer body")]
+        answer_507: Option<PathBuf>,
+    },
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, PartialEq, Eq, Clone, Debug)]
 pub enum HttpsListenerCmd {
     #[clap(name = "add")]
@@ -703,8 +864,185 @@ pub enum HttpsListenerCmd {
         )]
         address: SocketAddr,
     },
+    #[clap(name = "update", about = "Patch a running HTTPS listener in place")]
+    Update {
+        #[clap(
+            short = 'a',
+            long = "address",
+            help = "listener address, format: IP:port"
+        )]
+        address: SocketAddr,
+        #[clap(
+            long = "public-address",
+            help = "a different IP than the one the socket sees, for logs and forwarded headers"
+        )]
+        public_address: Option<SocketAddr>,
+        #[clap(long = "sticky-name", help = "sticky session cookie name")]
+        sticky_name: Option<String>,
+        #[clap(
+            long = "front-timeout",
+            help = "maximum time of inactivity for a frontend socket, in seconds"
+        )]
+        front_timeout: Option<u32>,
+        #[clap(
+            long = "back-timeout",
+            help = "maximum time of inactivity for a backend socket, in seconds"
+        )]
+        back_timeout: Option<u32>,
+        #[clap(
+            long = "connect-timeout",
+            help = "maximum time to connect to a backend server, in seconds"
+        )]
+        connect_timeout: Option<u32>,
+        #[clap(
+            long = "request-timeout",
+            help = "maximum time to receive a complete request, in seconds"
+        )]
+        request_timeout: Option<u32>,
+
+        // Paired boolean flags — fold to Option<bool> in the request builder
+        #[clap(long = "expect-proxy", action = ArgAction::SetTrue, overrides_with = "no_expect_proxy",
+               help = "Enable PROXY protocol header on the client socket")]
+        expect_proxy: bool,
+        #[clap(long = "no-expect-proxy", action = ArgAction::SetTrue, overrides_with = "expect_proxy",
+               help = "Disable PROXY protocol header on the client socket")]
+        no_expect_proxy: bool,
+        #[clap(long = "strict-sni-binding", action = ArgAction::SetTrue, overrides_with = "no_strict_sni_binding",
+               help = "Require :authority/Host to match the TLS SNI (CWE-346/CWE-444)")]
+        strict_sni_binding: bool,
+        #[clap(long = "no-strict-sni-binding", action = ArgAction::SetTrue, overrides_with = "strict_sni_binding",
+               help = "Allow :authority/Host to differ from the TLS SNI")]
+        no_strict_sni_binding: bool,
+        #[clap(long = "disable-http11", action = ArgAction::SetTrue, overrides_with = "enable_http11",
+               help = "Only accept H2 connections; HTTP/1.1 is dropped at handshake")]
+        disable_http11: bool,
+        #[clap(long = "enable-http11", action = ArgAction::SetTrue, overrides_with = "disable_http11",
+               help = "Re-enable HTTP/1.1 connections alongside H2")]
+        enable_http11: bool,
+
+        // ALPN: either --alpn-protocols h2,http/1.1 (set) or --reset-alpn (empty vec = default)
+        #[clap(
+            long,
+            value_delimiter = ',',
+            conflicts_with = "reset_alpn",
+            help = "Set ALPN protocols to advertise (comma-separated: h2,http/1.1)"
+        )]
+        alpn_protocols: Option<Vec<String>>,
+        #[clap(long = "reset-alpn", action = ArgAction::SetTrue,
+               help = "Reset ALPN to the built-in default ([\"h2\", \"http/1.1\"])")]
+        reset_alpn: bool,
+
+        // H2 flood knobs
+        #[clap(
+            long,
+            help = "Maximum RST_STREAM frames per second window (CVE-2023-44487, CVE-2019-9514); must be >= 1"
+        )]
+        h2_max_rst_stream_per_window: Option<u32>,
+        #[clap(
+            long,
+            help = "Maximum PING frames per second window (CVE-2019-9512); must be >= 1"
+        )]
+        h2_max_ping_per_window: Option<u32>,
+        #[clap(
+            long,
+            help = "Maximum SETTINGS frames per second window (CVE-2019-9515); must be >= 1"
+        )]
+        h2_max_settings_per_window: Option<u32>,
+        #[clap(
+            long,
+            help = "Maximum empty DATA frames per second window (CVE-2019-9518); must be >= 1"
+        )]
+        h2_max_empty_data_per_window: Option<u32>,
+        #[clap(
+            long,
+            help = "Maximum CONTINUATION frames per header block (CVE-2024-27316); must be >= 1"
+        )]
+        h2_max_continuation_frames: Option<u32>,
+        #[clap(
+            long,
+            help = "Maximum accumulated protocol anomalies before ENHANCE_YOUR_CALM; must be >= 1"
+        )]
+        h2_max_glitch_count: Option<u32>,
+        #[clap(
+            long,
+            help = "Connection-level receive window size in bytes (RFC 9113 §6.9.2)"
+        )]
+        h2_initial_connection_window: Option<u32>,
+        #[clap(
+            long,
+            help = "Maximum concurrent H2 streams (SETTINGS_MAX_CONCURRENT_STREAMS); must be >= 1"
+        )]
+        h2_max_concurrent_streams: Option<u32>,
+        #[clap(
+            long,
+            help = "Shrink threshold ratio for recycled stream slots; must be >= 1"
+        )]
+        h2_stream_shrink_ratio: Option<u32>,
+        #[clap(
+            long,
+            help = "Absolute lifetime cap on RST_STREAM frames received (CVE-2023-44487)"
+        )]
+        h2_max_rst_stream_lifetime: Option<u64>,
+        #[clap(
+            long,
+            help = "Lifetime cap on abusive RST_STREAM frames — Rapid Reset signature"
+        )]
+        h2_max_rst_stream_abusive_lifetime: Option<u64>,
+        #[clap(
+            long,
+            help = "Absolute lifetime cap on RST_STREAM frames emitted by the server (CVE-2025-8671)"
+        )]
+        h2_max_rst_stream_emitted_lifetime: Option<u64>,
+        #[clap(
+            long,
+            help = "Maximum HPACK-decoded header list size per request (RFC 9113 §6.5.2)"
+        )]
+        h2_max_header_list_size: Option<u32>,
+        #[clap(long, help = "Maximum HPACK dynamic table size accepted from the peer")]
+        h2_max_header_table_size: Option<u32>,
+        #[clap(long, help = "Per-stream idle timeout in seconds")]
+        h2_stream_idle_timeout_seconds: Option<u32>,
+        #[clap(
+            long,
+            help = "Seconds to wait after GOAWAY(NO_ERROR) before force-closing; 0 = wait forever"
+        )]
+        h2_graceful_shutdown_deadline_seconds: Option<u32>,
+        #[clap(
+            long,
+            help = "Maximum connection-level (stream 0) WINDOW_UPDATE frames per window (must be >= 1)"
+        )]
+        h2_max_window_update_stream0_per_window: Option<u32>,
+        #[clap(
+            long,
+            help = "Name of the correlation header injected per request (e.g. \"Sozu-Id\")"
+        )]
+        sozu_id_header: Option<String>,
+
+        // Listener-default HTTP answer bodies (file paths)
+        #[clap(long, help = "path to file for the 301 answer body")]
+        answer_301: Option<PathBuf>,
+        #[clap(long, help = "path to file for the 401 answer body")]
+        answer_401: Option<PathBuf>,
+        #[clap(long, help = "path to file for the 404 answer body")]
+        answer_404: Option<PathBuf>,
+        #[clap(long, help = "path to file for the 408 answer body")]
+        answer_408: Option<PathBuf>,
+        #[clap(long, help = "path to file for the 413 answer body")]
+        answer_413: Option<PathBuf>,
+        #[clap(long, help = "path to file for the 421 answer body")]
+        answer_421: Option<PathBuf>,
+        #[clap(long, help = "path to file for the 502 answer body")]
+        answer_502: Option<PathBuf>,
+        #[clap(long, help = "path to file for the 503 answer body")]
+        answer_503: Option<PathBuf>,
+        #[clap(long, help = "path to file for the 504 answer body")]
+        answer_504: Option<PathBuf>,
+        #[clap(long, help = "path to file for the 507 answer body")]
+        answer_507: Option<PathBuf>,
+    },
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, PartialEq, Eq, Clone, Debug)]
 pub enum TcpListenerCmd {
     #[clap(name = "add")]
@@ -752,6 +1090,43 @@ pub enum TcpListenerCmd {
             help = "listener address, format: IP:port"
         )]
         address: SocketAddr,
+    },
+    #[clap(name = "update", about = "Patch a running TCP listener in place")]
+    Update {
+        #[clap(
+            short = 'a',
+            long = "address",
+            help = "listener address, format: IP:port"
+        )]
+        address: SocketAddr,
+        #[clap(
+            long = "public-address",
+            help = "a different IP than the one the socket sees, for logs and forwarded headers"
+        )]
+        public_address: Option<SocketAddr>,
+        #[clap(
+            long = "front-timeout",
+            help = "maximum time of inactivity for a frontend socket, in seconds"
+        )]
+        front_timeout: Option<u32>,
+        #[clap(
+            long = "back-timeout",
+            help = "maximum time of inactivity for a backend socket, in seconds"
+        )]
+        back_timeout: Option<u32>,
+        #[clap(
+            long = "connect-timeout",
+            help = "maximum time to connect to a backend server, in seconds"
+        )]
+        connect_timeout: Option<u32>,
+
+        // Paired boolean flags — fold to Option<bool> in the request builder
+        #[clap(long = "expect-proxy", action = ArgAction::SetTrue, overrides_with = "no_expect_proxy",
+               help = "Enable PROXY protocol header on the client socket")]
+        expect_proxy: bool,
+        #[clap(long = "no-expect-proxy", action = ArgAction::SetTrue, overrides_with = "expect_proxy",
+               help = "Disable PROXY protocol header on the client socket")]
+        no_expect_proxy: bool,
     },
 }
 

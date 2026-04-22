@@ -18,7 +18,8 @@ use sozu_command_lib::{
         AggregatedMetrics, AvailableMetrics, CertificatesWithFingerprints, ClusterHashes,
         ClusterInformations, Event, EventKind, FrontendFilters, HardStop, MetricsConfiguration,
         QueryCertificatesFilters, QueryMetricsOptions, Request, ResponseContent, ResponseStatus,
-        RunState, SoftStop, Status, WorkerInfo, WorkerInfos, WorkerRequest, WorkerResponses,
+        RunState, SoftStop, Status, UpdateHttpListenerConfig, UpdateHttpsListenerConfig,
+        UpdateTcpListenerConfig, WorkerInfo, WorkerInfos, WorkerRequest, WorkerResponses,
         request::RequestType, response_content::ContentType,
     },
 };
@@ -87,7 +88,10 @@ impl Server {
             | RequestType::RemoveHttpsFrontend(_)
             | RequestType::RemoveListener(_)
             | RequestType::RemoveTcpFrontend(_)
-            | RequestType::ReplaceCertificate(_) => {
+            | RequestType::ReplaceCertificate(_)
+            | RequestType::UpdateHttpListener(_)
+            | RequestType::UpdateHttpsListener(_)
+            | RequestType::UpdateTcpListener(_) => {
                 worker_request(self, client, request_type);
             }
             RequestType::QueryClustersHashes(_)
@@ -715,6 +719,54 @@ fn audit_entry_for(request: &RequestType) -> Option<AuditEntry> {
                 address: Some(listener.address),
             })
         }
+        RequestType::UpdateHttpListener(patch) => {
+            let (verb, counter) = audit_verb!("http_listener_updated");
+            Some(AuditEntry {
+                kind: EventKind::ListenerUpdated,
+                verb,
+                counter,
+                target: format!(
+                    "listener:http:{}:{}",
+                    patch.address,
+                    format_patch_diff_http(patch),
+                ),
+                cluster_id: None,
+                backend_id: None,
+                address: Some(patch.address),
+            })
+        }
+        RequestType::UpdateHttpsListener(patch) => {
+            let (verb, counter) = audit_verb!("https_listener_updated");
+            Some(AuditEntry {
+                kind: EventKind::ListenerUpdated,
+                verb,
+                counter,
+                target: format!(
+                    "listener:https:{}:{}",
+                    patch.address,
+                    format_patch_diff_https(patch),
+                ),
+                cluster_id: None,
+                backend_id: None,
+                address: Some(patch.address),
+            })
+        }
+        RequestType::UpdateTcpListener(patch) => {
+            let (verb, counter) = audit_verb!("tcp_listener_updated");
+            Some(AuditEntry {
+                kind: EventKind::ListenerUpdated,
+                verb,
+                counter,
+                target: format!(
+                    "listener:tcp:{}:{}",
+                    patch.address,
+                    format_patch_diff_tcp(patch),
+                ),
+                cluster_id: None,
+                backend_id: None,
+                address: Some(patch.address),
+            })
+        }
         // AddBackend / RemoveBackend are intentionally not audited via this
         // taxonomy — they are already covered by the BACKEND_DOWN / BACKEND_UP
         // events emitted by the workers when traffic reaches them.
@@ -1266,5 +1318,167 @@ impl GatheringTask for StopTask {
             "Successfully closed {} workers, {} errors, stopping the main process...",
             self.gatherer.ok, self.gatherer.errors
         ));
+    }
+}
+
+// =========================================================
+// Patch diff formatters — for the [AUDIT] target field.
+// Walk each Option field of the patch and join the non-None ones into a
+// compact key=value string so the audit log shows exactly what changed.
+
+fn format_patch_diff_http(p: &UpdateHttpListenerConfig) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(v) = p.public_address.as_ref() {
+        parts.push(format!("public_address={v}"));
+    }
+    if let Some(v) = p.expect_proxy {
+        parts.push(format!("expect_proxy={v}"));
+    }
+    if let Some(v) = p.sticky_name.as_deref() {
+        parts.push(format!("sticky_name={v}"));
+    }
+    if let Some(v) = p.front_timeout {
+        parts.push(format!("front_timeout={v}"));
+    }
+    if let Some(v) = p.back_timeout {
+        parts.push(format!("back_timeout={v}"));
+    }
+    if let Some(v) = p.connect_timeout {
+        parts.push(format!("connect_timeout={v}"));
+    }
+    if let Some(v) = p.request_timeout {
+        parts.push(format!("request_timeout={v}"));
+    }
+    if p.http_answers.is_some() {
+        parts.push("http_answers=<patched>".to_owned());
+    }
+    macro_rules! push_opt {
+        ($field:ident) => {
+            if let Some(v) = p.$field {
+                parts.push(format!("{}={}", stringify!($field), v));
+            }
+        };
+    }
+    push_opt!(h2_max_rst_stream_per_window);
+    push_opt!(h2_max_ping_per_window);
+    push_opt!(h2_max_settings_per_window);
+    push_opt!(h2_max_empty_data_per_window);
+    push_opt!(h2_max_continuation_frames);
+    push_opt!(h2_max_glitch_count);
+    push_opt!(h2_initial_connection_window);
+    push_opt!(h2_max_concurrent_streams);
+    push_opt!(h2_stream_shrink_ratio);
+    push_opt!(h2_max_rst_stream_lifetime);
+    push_opt!(h2_max_rst_stream_abusive_lifetime);
+    push_opt!(h2_max_rst_stream_emitted_lifetime);
+    push_opt!(h2_max_header_list_size);
+    push_opt!(h2_max_header_table_size);
+    push_opt!(h2_stream_idle_timeout_seconds);
+    push_opt!(h2_graceful_shutdown_deadline_seconds);
+    push_opt!(h2_max_window_update_stream0_per_window);
+    if let Some(v) = p.sozu_id_header.as_deref() {
+        parts.push(format!("sozu_id_header={v}"));
+    }
+    if parts.is_empty() {
+        "(no-op)".to_owned()
+    } else {
+        parts.join(" ")
+    }
+}
+
+fn format_patch_diff_https(p: &UpdateHttpsListenerConfig) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(v) = p.public_address.as_ref() {
+        parts.push(format!("public_address={v}"));
+    }
+    if let Some(v) = p.expect_proxy {
+        parts.push(format!("expect_proxy={v}"));
+    }
+    if let Some(v) = p.sticky_name.as_deref() {
+        parts.push(format!("sticky_name={v}"));
+    }
+    if let Some(v) = p.front_timeout {
+        parts.push(format!("front_timeout={v}"));
+    }
+    if let Some(v) = p.back_timeout {
+        parts.push(format!("back_timeout={v}"));
+    }
+    if let Some(v) = p.connect_timeout {
+        parts.push(format!("connect_timeout={v}"));
+    }
+    if let Some(v) = p.request_timeout {
+        parts.push(format!("request_timeout={v}"));
+    }
+    if p.http_answers.is_some() {
+        parts.push("http_answers=<patched>".to_owned());
+    }
+    if let Some(ref alpn) = p.alpn_protocols {
+        if alpn.values.is_empty() {
+            parts.push("alpn_protocols=<reset>".to_owned());
+        } else {
+            parts.push(format!("alpn_protocols={}", alpn.values.join(",")));
+        }
+    }
+    if let Some(v) = p.strict_sni_binding {
+        parts.push(format!("strict_sni_binding={v}"));
+    }
+    if let Some(v) = p.disable_http11 {
+        parts.push(format!("disable_http11={v}"));
+    }
+    macro_rules! push_opt {
+        ($field:ident) => {
+            if let Some(v) = p.$field {
+                parts.push(format!("{}={}", stringify!($field), v));
+            }
+        };
+    }
+    push_opt!(h2_max_rst_stream_per_window);
+    push_opt!(h2_max_ping_per_window);
+    push_opt!(h2_max_settings_per_window);
+    push_opt!(h2_max_empty_data_per_window);
+    push_opt!(h2_max_continuation_frames);
+    push_opt!(h2_max_glitch_count);
+    push_opt!(h2_initial_connection_window);
+    push_opt!(h2_max_concurrent_streams);
+    push_opt!(h2_stream_shrink_ratio);
+    push_opt!(h2_max_rst_stream_lifetime);
+    push_opt!(h2_max_rst_stream_abusive_lifetime);
+    push_opt!(h2_max_rst_stream_emitted_lifetime);
+    push_opt!(h2_max_header_list_size);
+    push_opt!(h2_max_header_table_size);
+    push_opt!(h2_stream_idle_timeout_seconds);
+    push_opt!(h2_graceful_shutdown_deadline_seconds);
+    push_opt!(h2_max_window_update_stream0_per_window);
+    if let Some(v) = p.sozu_id_header.as_deref() {
+        parts.push(format!("sozu_id_header={v}"));
+    }
+    if parts.is_empty() {
+        "(no-op)".to_owned()
+    } else {
+        parts.join(" ")
+    }
+}
+
+fn format_patch_diff_tcp(p: &UpdateTcpListenerConfig) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(v) = p.public_address.as_ref() {
+        parts.push(format!("public_address={v}"));
+    }
+    if let Some(v) = p.expect_proxy {
+        parts.push(format!("expect_proxy={v}"));
+    }
+    if let Some(v) = p.front_timeout {
+        parts.push(format!("front_timeout={v}"));
+    }
+    if let Some(v) = p.back_timeout {
+        parts.push(format!("back_timeout={v}"));
+    }
+    if let Some(v) = p.connect_timeout {
+        parts.push(format!("connect_timeout={v}"));
+    }
+    if parts.is_empty() {
+        "(no-op)".to_owned()
+    } else {
+        parts.join(" ")
     }
 }

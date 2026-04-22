@@ -99,6 +99,12 @@ message Request {
     // query the state about how many requests of each type has been received
     // since startup
     CountRequests count_requests = 46;
+    // patch a running HTTP listener in place (no socket re-bind)
+    UpdateHttpListenerConfig update_http_listener = 47;
+    // patch a running HTTPS listener in place (no socket re-bind)
+    UpdateHttpsListenerConfig update_https_listener = 48;
+    // patch a running TCP listener in place (no socket re-bind)
+    UpdateTcpListenerConfig update_tcp_listener = 49;
   }
 }
 
@@ -112,6 +118,168 @@ message SoftStop {}
 message HardStop {}
 message ReturnListenSockets {}
 message CountRequests {}
+
+// Wrapper message to distinguish "absent" (preserve) from "present but empty"
+// (reset to default) for ALPN protocols. A bare `repeated string` cannot make
+// this distinction in proto2 since field absence is not detectable for repeated
+// scalars without a sentinel.
+message AlpnProtocols {
+    repeated string values = 1;
+}
+
+// Partial-update patch for a running HTTP listener.
+// Only fields that are `Some` in the patch will be applied;
+// absent fields preserve their current value on the listener.
+// Bind-only fields (address, active) are intentionally absent — use
+// RemoveListener + AddHttpListener to change them.
+message UpdateHttpListenerConfig {
+    // identifies the listener to patch (required — used as key)
+    required SocketAddress address = 1;
+
+    optional SocketAddress public_address = 2;
+    optional bool expect_proxy = 3;
+    optional string sticky_name = 4;
+    // client inactive time, in seconds
+    optional uint32 front_timeout = 5;
+    // backend server inactive time, in seconds
+    optional uint32 back_timeout = 6;
+    // time to connect to the backend, in seconds
+    optional uint32 connect_timeout = 7;
+    // max time to send a complete request, in seconds
+    optional uint32 request_timeout = 8;
+    optional CustomHttpAnswers http_answers = 9;
+
+    // H2 flood thresholds — see HttpListenerConfig for semantics & CVE refs.
+    // All values must be >= 1 (validated server-side before applying).
+    // Maximum RST_STREAM frames per second window (CVE-2023-44487, CVE-2019-9514)
+    optional uint32 h2_max_rst_stream_per_window     = 20;
+    // Maximum PING frames per second window (CVE-2019-9512)
+    optional uint32 h2_max_ping_per_window           = 21;
+    // Maximum SETTINGS frames per second window (CVE-2019-9515)
+    optional uint32 h2_max_settings_per_window       = 22;
+    // Maximum empty DATA frames per second window (CVE-2019-9518)
+    optional uint32 h2_max_empty_data_per_window     = 23;
+    // Maximum CONTINUATION frames per header block (CVE-2024-27316)
+    optional uint32 h2_max_continuation_frames       = 24;
+    // Maximum accumulated protocol anomalies before ENHANCE_YOUR_CALM
+    optional uint32 h2_max_glitch_count              = 25;
+    // Connection-level receive window size in bytes (RFC 9113 §6.9.2)
+    optional uint32 h2_initial_connection_window     = 26;
+    // Maximum concurrent H2 streams (SETTINGS_MAX_CONCURRENT_STREAMS); >= 1
+    optional uint32 h2_max_concurrent_streams        = 27;
+    // Shrink threshold ratio for recycled stream slots; >= 1
+    optional uint32 h2_stream_shrink_ratio           = 28;
+    // Absolute lifetime cap on RST_STREAM frames received (CVE-2023-44487)
+    optional uint64 h2_max_rst_stream_lifetime       = 29;
+    // Lifetime cap on abusive RST_STREAM frames — Rapid Reset signature
+    optional uint64 h2_max_rst_stream_abusive_lifetime   = 30;
+    // Absolute lifetime cap on RST_STREAM frames emitted by the server (CVE-2025-8671)
+    optional uint64 h2_max_rst_stream_emitted_lifetime   = 31;
+    // Maximum HPACK-decoded header list size per request (RFC 9113 §6.5.2)
+    optional uint32 h2_max_header_list_size          = 32;
+    // Maximum HPACK dynamic table size accepted from the peer
+    optional uint32 h2_max_header_table_size         = 33;
+    // Per-stream idle timeout in seconds
+    optional uint32 h2_stream_idle_timeout_seconds   = 34;
+    // Maximum wall-clock seconds to wait after GOAWAY(NO_ERROR). 0 = wait forever.
+    optional uint32 h2_graceful_shutdown_deadline_seconds = 35;
+    // Maximum connection-level (stream 0) WINDOW_UPDATE frames per window; >= 1
+    optional uint32 h2_max_window_update_stream0_per_window = 36;
+    // Name of the correlation header injected per request (e.g. "Sozu-Id")
+    optional string sozu_id_header                   = 37;
+}
+
+// Partial-update patch for a running HTTPS listener.
+// Only fields that are `Some` in the patch will be applied;
+// absent fields preserve their current value on the listener.
+// Bind-only fields (tls_versions, cipher_list, cipher_suites,
+// signature_algorithms, groups_list, certificate, certificate_chain, key,
+// send_tls13_tickets, active) are intentionally absent — use
+// RemoveListener + AddHttpsListener to change them.
+message UpdateHttpsListenerConfig {
+    // identifies the listener to patch (required — used as key)
+    required SocketAddress address = 1;
+
+    optional SocketAddress public_address = 2;
+    optional bool expect_proxy = 3;
+    optional string sticky_name = 4;
+    // client inactive time, in seconds
+    optional uint32 front_timeout = 5;
+    // backend server inactive time, in seconds
+    optional uint32 back_timeout = 6;
+    // time to connect to the backend, in seconds
+    optional uint32 connect_timeout = 7;
+    // max time to send a complete request, in seconds
+    optional uint32 request_timeout = 8;
+    optional CustomHttpAnswers http_answers = 9;
+
+    // ALPN protocols to advertise during TLS handshake.
+    // Uses a wrapper message so "absent" (preserve) and "present but empty"
+    // (reset to default ["h2","http/1.1"]) are unambiguous. Valid values per
+    // element: "h2", "http/1.1". Validated server-side.
+    optional AlpnProtocols alpn_protocols = 10;
+    // When true, :authority/Host must match the TLS SNI (CWE-346/CWE-444)
+    optional bool strict_sni_binding = 11;
+    // When true, only H2 connections are accepted; HTTP/1.1 is dropped at handshake
+    optional bool disable_http11 = 12;
+
+    // H2 flood thresholds — same numbers/semantics as UpdateHttpListenerConfig.
+    // All values must be >= 1 (validated server-side before applying).
+    // Maximum RST_STREAM frames per second window (CVE-2023-44487, CVE-2019-9514)
+    optional uint32 h2_max_rst_stream_per_window     = 20;
+    // Maximum PING frames per second window (CVE-2019-9512)
+    optional uint32 h2_max_ping_per_window           = 21;
+    // Maximum SETTINGS frames per second window (CVE-2019-9515)
+    optional uint32 h2_max_settings_per_window       = 22;
+    // Maximum empty DATA frames per second window (CVE-2019-9518)
+    optional uint32 h2_max_empty_data_per_window     = 23;
+    // Maximum CONTINUATION frames per header block (CVE-2024-27316)
+    optional uint32 h2_max_continuation_frames       = 24;
+    // Maximum accumulated protocol anomalies before ENHANCE_YOUR_CALM
+    optional uint32 h2_max_glitch_count              = 25;
+    // Connection-level receive window size in bytes (RFC 9113 §6.9.2)
+    optional uint32 h2_initial_connection_window     = 26;
+    // Maximum concurrent H2 streams (SETTINGS_MAX_CONCURRENT_STREAMS); >= 1
+    optional uint32 h2_max_concurrent_streams        = 27;
+    // Shrink threshold ratio for recycled stream slots; >= 1
+    optional uint32 h2_stream_shrink_ratio           = 28;
+    // Absolute lifetime cap on RST_STREAM frames received (CVE-2023-44487)
+    optional uint64 h2_max_rst_stream_lifetime       = 29;
+    // Lifetime cap on abusive RST_STREAM frames — Rapid Reset signature
+    optional uint64 h2_max_rst_stream_abusive_lifetime   = 30;
+    // Absolute lifetime cap on RST_STREAM frames emitted by the server (CVE-2025-8671)
+    optional uint64 h2_max_rst_stream_emitted_lifetime   = 31;
+    // Maximum HPACK-decoded header list size per request (RFC 9113 §6.5.2)
+    optional uint32 h2_max_header_list_size          = 32;
+    // Maximum HPACK dynamic table size accepted from the peer
+    optional uint32 h2_max_header_table_size         = 33;
+    // Per-stream idle timeout in seconds
+    optional uint32 h2_stream_idle_timeout_seconds   = 34;
+    // Maximum wall-clock seconds to wait after GOAWAY(NO_ERROR). 0 = wait forever.
+    optional uint32 h2_graceful_shutdown_deadline_seconds = 35;
+    // Maximum connection-level (stream 0) WINDOW_UPDATE frames per window; >= 1
+    optional uint32 h2_max_window_update_stream0_per_window = 36;
+    // Name of the correlation header injected per request (e.g. "Sozu-Id")
+    optional string sozu_id_header                   = 37;
+}
+
+// Partial-update patch for a running TCP listener.
+// Only fields that are `Some` in the patch will be applied;
+// absent fields preserve their current value on the listener.
+// Bind-only fields (address, active) are intentionally absent.
+message UpdateTcpListenerConfig {
+    // identifies the listener to patch (required — used as key)
+    required SocketAddress address = 1;
+
+    optional SocketAddress public_address = 2;
+    optional bool expect_proxy = 3;
+    // client inactive time, in seconds
+    optional uint32 front_timeout = 4;
+    // backend server inactive time, in seconds
+    optional uint32 back_timeout = 5;
+    // time to connect to the backend, in seconds
+    optional uint32 connect_timeout = 6;
+}
 
 // details of an HTTP listener
 message HttpListenerConfig {
@@ -712,6 +880,8 @@ enum EventKind {
     WORKER_RELAUNCHED = 15;
     LOGGING_LEVEL_CHANGED = 16;
     METRICS_CONFIGURED = 17;
+    // A listener's configuration was patched in place via UpdateHttp/Https/TcpListenerConfig
+    LISTENER_UPDATED = 18;
 }
 
 message ClusterHashes {

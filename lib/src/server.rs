@@ -24,7 +24,8 @@ use sozu_command::{
         ClusterInformations, DeactivateListener, Event, HttpListenerConfig, HttpsListenerConfig,
         InitialState, ListenerType, LoadBalancingAlgorithms, LoadMetric, MetricsConfiguration,
         RemoveBackend, Request, ResponseStatus, ServerConfig,
-        TcpListenerConfig as CommandTcpListener, WorkerRequest, WorkerResponse,
+        TcpListenerConfig as CommandTcpListener, UpdateHttpListenerConfig,
+        UpdateHttpsListenerConfig, UpdateTcpListenerConfig, WorkerRequest, WorkerResponse,
         request::RequestType, response_content::ContentType,
     },
     ready::Ready,
@@ -1168,6 +1169,15 @@ impl Server {
             Some(RequestType::AddTcpListener(listener)) => {
                 push_queue(self.notify_add_tcp_listener(&req_id, listener));
             }
+            Some(RequestType::UpdateHttpListener(patch)) => {
+                push_queue(self.notify_update_http_listener(&req_id, patch));
+            }
+            Some(RequestType::UpdateHttpsListener(patch)) => {
+                push_queue(self.notify_update_https_listener(&req_id, patch));
+            }
+            Some(RequestType::UpdateTcpListener(patch)) => {
+                push_queue(self.notify_update_tcp_listener(&req_id, patch));
+            }
             Some(RequestType::RemoveListener(ref remove)) => {
                 debug!("{} remove {:?} listener {:?}", req_id, remove.proxy, remove);
                 self.base_sessions_count -= 1;
@@ -1307,6 +1317,44 @@ impl Server {
                 WorkerResponse::ok(req_id)
             }
             Err(e) => worker_response_error(req_id, format!("Could not add TCP listener: {e}")),
+        }
+    }
+
+    fn notify_update_http_listener(
+        &mut self,
+        req_id: &str,
+        patch: UpdateHttpListenerConfig,
+    ) -> WorkerResponse {
+        debug!("{} update http listener {:?}", req_id, patch.address);
+        match self.http.borrow_mut().update_listener(patch) {
+            Ok(()) => WorkerResponse::ok(req_id),
+            Err(e) => worker_response_error(req_id, format!("Could not update HTTP listener: {e}")),
+        }
+    }
+
+    fn notify_update_https_listener(
+        &mut self,
+        req_id: &str,
+        patch: UpdateHttpsListenerConfig,
+    ) -> WorkerResponse {
+        debug!("{} update https listener {:?}", req_id, patch.address);
+        match self.https.borrow_mut().update_listener(patch) {
+            Ok(()) => WorkerResponse::ok(req_id),
+            Err(e) => {
+                worker_response_error(req_id, format!("Could not update HTTPS listener: {e}"))
+            }
+        }
+    }
+
+    fn notify_update_tcp_listener(
+        &mut self,
+        req_id: &str,
+        patch: UpdateTcpListenerConfig,
+    ) -> WorkerResponse {
+        debug!("{} update tcp listener {:?}", req_id, patch.address);
+        match self.tcp.borrow_mut().update_listener(patch) {
+            Ok(()) => WorkerResponse::ok(req_id),
+            Err(e) => worker_response_error(req_id, format!("Could not update TCP listener: {e}")),
         }
     }
 
