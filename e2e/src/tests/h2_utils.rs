@@ -608,6 +608,29 @@ pub(crate) fn h2_handshake(
     server_settings
 }
 
+/// Variant of [`h2_handshake`] that advertises a custom
+/// `SETTINGS_INITIAL_WINDOW_SIZE` to sozu. Useful for scheduler tests that
+/// need sozu to park DATA frames in stream kawas while HEADERS still flow
+/// to the client — the classic trick to make scheduling decisions
+/// observable on the wire. Pass `0` to suppress all DATA until the test
+/// explicitly WINDOW_UPDATEs each stream.
+pub(crate) fn h2_handshake_with_initial_window(
+    stream: &mut rustls::StreamOwned<rustls::ClientConnection, TcpStream>,
+    initial_window_size: u32,
+) {
+    // SETTINGS id 0x4 = SETTINGS_INITIAL_WINDOW_SIZE (RFC 9113 §6.5.2).
+    let settings = H2Frame::settings(&[(SETTINGS_INITIAL_WINDOW_SIZE, initial_window_size)]);
+    stream.write_all(H2_CLIENT_PREFACE).unwrap();
+    stream.write_all(&settings.encode()).unwrap();
+    stream.flush().unwrap();
+
+    thread::sleep(Duration::from_millis(200));
+    let _ = read_all_available(stream, Duration::from_millis(500));
+    stream.write_all(&H2Frame::settings_ack().encode()).unwrap();
+    stream.flush().unwrap();
+    thread::sleep(Duration::from_millis(50));
+}
+
 // ============================================================================
 // Test setup helpers (T-1)
 // ============================================================================
@@ -672,6 +695,82 @@ pub(crate) fn setup_h2_test(
             back_address,
             SimpleAggregator::default(),
             AsyncBackend::http_handler(format!("pong{i}")),
+        ));
+    }
+
+    worker.read_to_last();
+    (worker, backends, front_port)
+}
+
+/// Variant of [`setup_h2_test`] where each backend returns a custom
+/// identifiable body of `body_size` bytes. The body is filled with the
+/// backend index repeated (`'0'`, `'1'`, `'2'`, ...) so a single decoded
+/// DATA payload can be attributed back to the originating backend when
+/// debugging.
+///
+/// Used by the RFC 9218 §4 scheduling tests where we need bodies large
+/// enough to produce multiple DATA frames per stream (so the wire-order
+/// round-robin vs sequential distinction is observable).
+pub(crate) fn setup_h2_test_with_large_bodies(
+    name: &str,
+    nb_backends: usize,
+    body_size: usize,
+) -> (Worker, Vec<AsyncBackend<SimpleAggregator>>, u16) {
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker = Worker::start_new_worker_owned(name, config, listeners, state);
+
+    worker.send_proxy_request_type(RequestType::AddHttpsListener(
+        ListenerBuilder::new_https(front_address.clone())
+            .to_tls(None)
+            .unwrap(),
+    ));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        address: front_address.clone(),
+        proxy: ListenerType::Https.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        hostname: String::from("localhost"),
+        ..Worker::default_http_frontend("cluster_0", front_address.clone().into())
+    }));
+
+    let certificate_and_key = CertificateAndKey {
+        certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
+        key: String::from(include_str!("../../../lib/assets/local-key.pem")),
+        certificate_chain: vec![],
+        versions: vec![],
+        names: vec![],
+    };
+    worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+        address: front_address,
+        certificate: certificate_and_key,
+        expired_at: None,
+    }));
+
+    let mut backends = Vec::new();
+    for i in 0..nb_backends {
+        let back_address = create_local_address();
+        worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+            "cluster_0",
+            format!("cluster_0-{i}"),
+            back_address,
+            None,
+        )));
+        // Identifiable body: fill with the ASCII digit of the backend index
+        // so payload inspection can tell backends apart during debugging.
+        let marker = char::from_digit((i % 10) as u32, 10).unwrap_or('X');
+        let body: String = marker.to_string().repeat(body_size);
+        backends.push(AsyncBackend::spawn_detached_backend(
+            format!("BACKEND_{i}"),
+            back_address,
+            SimpleAggregator::default(),
+            AsyncBackend::http_handler(body),
         ));
     }
 

@@ -46,6 +46,13 @@ pub struct H2BlockConverter<'a> {
     /// converter construction (h2.rs) to avoid passing position through
     /// every stall site.
     pub position_is_client: bool,
+    /// RFC 9218 §4 round-robin: when `true`, the converter emits at most one
+    /// DATA frame per `kawa.prepare()` call for the current stream. The
+    /// scheduler in [`super::h2::ConnectionH2::write_streams`] sets this flag
+    /// before processing streams with the `incremental=true` priority hint so
+    /// that same-urgency incremental streams interleave their DATA frames
+    /// fairly rather than draining one stream before moving to the next.
+    pub incremental_mode: bool,
 }
 
 impl H2BlockConverter<'_> {
@@ -361,7 +368,11 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                 kawa.push_out(data);
                 incr!("h2.frames.tx.data");
                 // kawa.push_delimiter();
-                return can_continue;
+                // RFC 9218 §4: incremental streams yield to the scheduler
+                // after every DATA frame so same-urgency incremental peers
+                // can interleave. Non-incremental streams drain sequentially
+                // (current behaviour) by honouring `can_continue`.
+                return can_continue && !self.incremental_mode;
             }
             Block::Flags(Flags {
                 end_header,
@@ -510,6 +521,9 @@ mod tests {
             // backend.flow_control.paused metric is direction-scoped and
             // off by default in unit tests.
             position_is_client: false,
+            // RFC 9218 round-robin is scheduler-driven; unit tests that
+            // exercise single-stream conversions leave it off.
+            incremental_mode: false,
         }
     }
 

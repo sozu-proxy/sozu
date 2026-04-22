@@ -870,12 +870,27 @@ impl Default for H2Settings {
 /// flag. Used by `writable()` to sort streams: lower urgency first, then
 /// stream ID for stability among same-urgency non-incremental streams.
 ///
+/// Within a same-urgency bucket the scheduler (see
+/// [`ConnectionH2::write_streams`]) drains non-incremental streams
+/// sequentially, then applies RFC 9218 §4 round-robin to the incremental
+/// streams starting from [`Self::incremental_cursor`], so multiple concurrent
+/// downloads at the same urgency interleave their DATA frames fairly.
+///
 /// Streams without an explicit `priority` header get the RFC 9218 defaults:
 /// urgency 3, incremental false.
 #[derive(Default)]
 pub struct Prioriser {
     /// Per-stream priority: stream_id -> (urgency 0-7, incremental flag)
     priorities: HashMap<StreamId, (u8, bool)>,
+    /// RFC 9218 §4 round-robin cursor: stream ID that fired first in the
+    /// last write pass over the incremental tail of the lowest-urgency
+    /// bucket that contained at least one incremental stream. The next pass
+    /// starts from the stream immediately after this ID (wrapping around),
+    /// so a single slow-draining stream cannot hog the connection.
+    ///
+    /// `0` is the "no cursor yet" sentinel and means "start from the
+    /// smallest ID in the bucket" — H2 stream IDs are always > 0.
+    incremental_cursor: StreamId,
 }
 
 /// RFC 9218 §4 default urgency value.
@@ -993,6 +1008,69 @@ impl Prioriser {
             .get(stream_id)
             .copied()
             .unwrap_or((DEFAULT_URGENCY, false))
+    }
+
+    /// Reorder a pre-sorted slice of writable stream IDs so that inside each
+    /// urgency bucket, incremental streams appear after non-incremental ones,
+    /// and the incremental tail is rotated by [`Self::incremental_cursor`]
+    /// (RFC 9218 §4).
+    ///
+    /// The input `buf` must already be sorted by `(urgency, stream_id)`:
+    /// this routine only partitions and rotates inside same-urgency
+    /// contiguous runs, it does not re-sort.
+    ///
+    /// Returns the total number of incremental streams seen, so callers that
+    /// need to update the cursor at the end of the write pass can early-exit
+    /// when the count is zero.
+    pub fn apply_incremental_rotation(&self, buf: &mut [StreamId]) -> usize {
+        let mut total_incremental = 0usize;
+        let mut i = 0;
+        while i < buf.len() {
+            let (urgency_i, _) = self.get(&buf[i]);
+            let mut j = i + 1;
+            while j < buf.len() {
+                let (urgency_j, _) = self.get(&buf[j]);
+                if urgency_j != urgency_i {
+                    break;
+                }
+                j += 1;
+            }
+            // `buf[i..j]` is a contiguous run of same-urgency stream IDs.
+            let bucket = &mut buf[i..j];
+            if bucket.len() > 1 {
+                // Stable partition: non-incremental first, incremental last,
+                // each subrange staying in ascending stream-id order.
+                bucket.sort_by_key(|id| self.get(id).1);
+                let split = bucket.partition_point(|id| !self.get(id).1);
+                let incremental_tail = &mut bucket[split..];
+                if incremental_tail.len() > 1 {
+                    // Rotate so the pass starts right after the stream that
+                    // fired first previously. `partition_point` returns the
+                    // first index whose stream ID > cursor (so cursor itself
+                    // is still drained, but after the streams ahead of it).
+                    let start =
+                        incremental_tail.partition_point(|id| *id <= self.incremental_cursor);
+                    incremental_tail.rotate_left(start);
+                }
+                total_incremental += incremental_tail.len();
+            } else if bucket.len() == 1 && self.get(&bucket[0]).1 {
+                total_incremental += 1;
+            }
+            i = j;
+        }
+        total_incremental
+    }
+
+    /// Advance the RFC 9218 §4 round-robin cursor after a write pass.
+    ///
+    /// `first_incremental_fired` is the stream ID that headed the incremental
+    /// tail we just drained; the next pass will start at the next stream
+    /// after that ID. Callers may pass `None` when no incremental streams
+    /// were eligible, leaving the cursor where it was.
+    pub fn advance_incremental_cursor(&mut self, first_incremental_fired: Option<StreamId>) {
+        if let Some(id) = first_incremental_fired {
+            self.incremental_cursor = id;
+        }
     }
 }
 
@@ -2115,20 +2193,41 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             // addition to the existing direction-agnostic
             // `h2.flow_control_stall`).
             position_is_client: self.position.is_client(),
+            // RFC 9218 §4: toggled per-stream in the loop below, driven by
+            // `Prioriser::get(stream_id).1`. Non-incremental by default so
+            // unit tests and non-scheduled callers (e.g. the resume path
+            // above) keep the sequential semantics.
+            incremental_mode: false,
         };
         self.priorities_buf.clear();
         self.priorities_buf.extend(self.streams.keys().copied());
+        // RFC 9218 §4 primary sort: ascending urgency, then stream ID for
+        // stability. The incremental flag is handled by
+        // `apply_incremental_rotation` below so it does not perturb the
+        // non-incremental fast path.
         self.priorities_buf.sort_by_cached_key(|id| {
             let (urgency, _) = self.prioriser.get(id);
             (urgency, *id)
         });
+        // RFC 9218 §4: inside each urgency bucket, move incremental streams
+        // to the tail and rotate them by the per-connection round-robin
+        // cursor so no single slow-draining stream can starve its
+        // same-urgency incremental peers.
+        let incremental_count = self
+            .prioriser
+            .apply_incremental_rotation(&mut self.priorities_buf);
 
         trace!(
-            "{} PRIORITIES: {:?}",
+            "{} PRIORITIES: {:?} (incremental_count={})",
             log_context!(self),
-            self.priorities_buf
+            self.priorities_buf,
+            incremental_count
         );
         let mut socket_write = false;
+        // RFC 9218 §4 round-robin: remember the first incremental stream we
+        // served this pass so we can advance `Prioriser::incremental_cursor`
+        // to it, causing the next pass to start with the stream just after.
+        let mut first_incremental_fired: Option<StreamId> = None;
         'outer: for idx in 0..self.priorities_buf.len() {
             let stream_id = self.priorities_buf[idx];
             let Some(&global_stream_id) = self.streams.get(&stream_id) else {
@@ -2139,6 +2238,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 );
                 continue;
             };
+            let (_, is_incremental) = self.prioriser.get(&stream_id);
             let stream = &mut context.streams[global_stream_id];
             let stream_state = stream.state;
             let parts = stream.split(&self.position);
@@ -2150,6 +2250,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 let window = min(*parts.window, self.flow_control.window);
                 converter.window = window;
                 converter.stream_id = stream_id;
+                // RFC 9218 §4: incremental streams yield the converter after
+                // a single DATA frame so same-urgency peers interleave.
+                converter.incremental_mode = is_incremental;
                 // Track RST_STREAM dedup: if kawa is in error state, the converter
                 // will generate a RST_STREAM frame. Mark it so we don't send a
                 // duplicate on the next writable cycle.
@@ -2160,6 +2263,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 let consumed = window - converter.window;
                 *parts.window = parts.window.saturating_sub(consumed);
                 self.flow_control.window = self.flow_control.window.saturating_sub(consumed);
+                if is_incremental && consumed > 0 && first_incremental_fired.is_none() {
+                    first_incremental_fired = Some(stream_id);
+                }
             }
             context.debug.push(DebugEvent::S(
                 stream_id,
@@ -2220,6 +2326,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         self.lowercase_buf = lowercase_buf;
         self.cookie_buf = cookie_buf;
         self.shrink_converter_buffers();
+        // RFC 9218 §4: commit the round-robin cursor so the next writable
+        // cycle begins with the stream immediately after the one we fired
+        // first this pass.
+        self.prioriser
+            .advance_incremental_cursor(first_incremental_fired);
         let mut close_frontend_after_completed_stream = false;
         for (dead_id, global_stream_id, token, close_frontend) in completed_streams {
             // The main write loop borrows self.encoder, so we can't mutate the
@@ -5692,6 +5803,163 @@ mod tests {
             );
         }
         assert_eq!(p.priorities.len(), 0);
+    }
+
+    // ── RFC 9218 §4 round-robin rotation ───────────────────────────────
+
+    /// Helper: mark `stream_id` as (urgency, incremental) in the map.
+    fn set_prio(p: &mut Prioriser, stream_id: StreamId, urgency: u8, incremental: bool) {
+        p.push_priority(
+            stream_id,
+            parser::PriorityPart::Rfc9218 {
+                urgency,
+                incremental,
+            },
+        );
+    }
+
+    #[test]
+    fn test_apply_incremental_rotation_all_non_incremental_is_noop() {
+        // Non-incremental streams keep the existing (urgency, stream_id) sort.
+        let mut p = Prioriser::default();
+        set_prio(&mut p, 1, 3, false);
+        set_prio(&mut p, 3, 3, false);
+        set_prio(&mut p, 5, 3, false);
+
+        let mut buf = vec![1u32, 3, 5];
+        let count = p.apply_incremental_rotation(&mut buf);
+        assert_eq!(count, 0);
+        assert_eq!(buf, vec![1, 3, 5]);
+    }
+
+    #[test]
+    fn test_apply_incremental_rotation_moves_incremental_to_tail() {
+        // Within a same-urgency bucket non-incremental must come before
+        // incremental, each subrange staying ascending.
+        let mut p = Prioriser::default();
+        set_prio(&mut p, 1, 3, true);
+        set_prio(&mut p, 3, 3, false);
+        set_prio(&mut p, 5, 3, true);
+        set_prio(&mut p, 7, 3, false);
+
+        let mut buf = vec![1u32, 3, 5, 7];
+        let count = p.apply_incremental_rotation(&mut buf);
+        assert_eq!(count, 2);
+        // Non-incremental first (3, 7), then incremental (1, 5) — ascending
+        // within each subrange before the cursor rotation.
+        assert_eq!(buf, vec![3, 7, 1, 5]);
+    }
+
+    #[test]
+    fn test_apply_incremental_rotation_respects_urgency_buckets() {
+        // Different urgency buckets must not be mixed.
+        let mut p = Prioriser::default();
+        set_prio(&mut p, 1, 0, true); // urgent incremental
+        set_prio(&mut p, 3, 3, false); // default non-incremental
+        set_prio(&mut p, 5, 3, true); // default incremental
+        set_prio(&mut p, 7, 5, false); // low-priority non-incremental
+
+        // Input is pre-sorted by (urgency, id) as the scheduler does.
+        let mut buf = vec![1u32, 3, 5, 7];
+        let count = p.apply_incremental_rotation(&mut buf);
+        assert_eq!(count, 2);
+        // Bucket 0: [1] (alone, stays). Bucket 3: [3] non-inc, [5] inc.
+        // Bucket 5: [7] alone. Cross-bucket order is preserved.
+        assert_eq!(buf, vec![1, 3, 5, 7]);
+    }
+
+    #[test]
+    fn test_apply_incremental_rotation_rotates_by_cursor() {
+        // Three same-urgency incremental streams: cursor advancement shifts
+        // the bucket so the next pass starts after the previously fired ID.
+        let mut p = Prioriser::default();
+        set_prio(&mut p, 1, 3, true);
+        set_prio(&mut p, 3, 3, true);
+        set_prio(&mut p, 5, 3, true);
+
+        let base = vec![1u32, 3, 5];
+
+        // Pass 1: cursor is 0 (initial), so order stays 1, 3, 5.
+        let mut buf = base.clone();
+        assert_eq!(p.apply_incremental_rotation(&mut buf), 3);
+        assert_eq!(buf, vec![1, 3, 5]);
+        p.advance_incremental_cursor(Some(1));
+
+        // Pass 2: cursor is 1, rotate so 3 comes first.
+        let mut buf = base.clone();
+        assert_eq!(p.apply_incremental_rotation(&mut buf), 3);
+        assert_eq!(buf, vec![3, 5, 1]);
+        p.advance_incremental_cursor(Some(3));
+
+        // Pass 3: cursor is 3, rotate so 5 comes first.
+        let mut buf = base.clone();
+        assert_eq!(p.apply_incremental_rotation(&mut buf), 3);
+        assert_eq!(buf, vec![5, 1, 3]);
+        p.advance_incremental_cursor(Some(5));
+
+        // Pass 4: cursor is 5 (largest in bucket), wrap to 1.
+        let mut buf = base;
+        assert_eq!(p.apply_incremental_rotation(&mut buf), 3);
+        assert_eq!(buf, vec![1, 3, 5]);
+    }
+
+    #[test]
+    fn test_apply_incremental_rotation_cursor_unknown_id() {
+        // Cursor points at an ID no longer active (stream completed). Rotation
+        // should still start from the smallest ID greater than the cursor.
+        let mut p = Prioriser::default();
+        set_prio(&mut p, 3, 3, true);
+        set_prio(&mut p, 5, 3, true);
+        set_prio(&mut p, 7, 3, true);
+        p.advance_incremental_cursor(Some(4)); // 4 is not in the bucket
+
+        let mut buf = vec![3u32, 5, 7];
+        assert_eq!(p.apply_incremental_rotation(&mut buf), 3);
+        assert_eq!(buf, vec![5, 7, 3]);
+    }
+
+    #[test]
+    fn test_apply_incremental_rotation_single_stream_buckets() {
+        // Single-stream buckets are a degenerate fast path: no reordering.
+        let mut p = Prioriser::default();
+        set_prio(&mut p, 1, 1, true);
+        set_prio(&mut p, 3, 2, false);
+        set_prio(&mut p, 5, 3, true);
+
+        let mut buf = vec![1u32, 3, 5];
+        let count = p.apply_incremental_rotation(&mut buf);
+        assert_eq!(count, 2);
+        assert_eq!(buf, vec![1, 3, 5]);
+    }
+
+    #[test]
+    fn test_advance_incremental_cursor_none_is_noop() {
+        // If no incremental stream fires (only non-incremental served), the
+        // cursor must stay put so fairness is preserved for the next pass.
+        let mut p = Prioriser::default();
+        p.advance_incremental_cursor(Some(5));
+        p.advance_incremental_cursor(None);
+        assert_eq!(p.incremental_cursor, 5);
+    }
+
+    #[test]
+    fn test_apply_incremental_rotation_mixed_bucket_with_cursor() {
+        // Same-urgency bucket with a mix: non-inc served first in ascending
+        // order, then the incremental tail rotated by cursor.
+        let mut p = Prioriser::default();
+        set_prio(&mut p, 1, 3, true);
+        set_prio(&mut p, 3, 3, false);
+        set_prio(&mut p, 5, 3, true);
+        set_prio(&mut p, 7, 3, false);
+        set_prio(&mut p, 9, 3, true);
+        p.advance_incremental_cursor(Some(5));
+
+        let mut buf = vec![1u32, 3, 5, 7, 9];
+        let count = p.apply_incremental_rotation(&mut buf);
+        assert_eq!(count, 3);
+        // Non-inc (3, 7) first, then incremental rotated: cursor 5 means
+        // next-after-5 = 9, then 1, then 5 (wrap).
+        assert_eq!(buf, vec![3, 7, 9, 1, 5]);
     }
 
     // ── H2FlowControl ───────────────────────────────────────────────────
