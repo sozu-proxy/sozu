@@ -1970,6 +1970,7 @@ dependencies = [
  "rustls",
  "sozu-command-lib",
  "sozu-lib",
+ "tempfile",
  "time",
  "tokio",
 ]

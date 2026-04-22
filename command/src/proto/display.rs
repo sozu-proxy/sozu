@@ -113,6 +113,9 @@ pub fn format_request_type(request_type: &RequestType) -> &str {
         RequestType::ReturnListenSockets(_) => "ReturnListenSockets",
         RequestType::QueryCertificatesFromTheState(_) => "QueryCertificatesFromTheState",
         RequestType::QueryCertificatesFromWorkers(_) => "QueryCertificatesFromWorkers",
+        RequestType::UpdateHttpListener(_) => "UpdateHttpListener",
+        RequestType::UpdateHttpsListener(_) => "UpdateHttpsListener",
+        RequestType::UpdateTcpListener(_) => "UpdateTcpListener",
     }
 }
 
@@ -1278,6 +1281,7 @@ impl Display for Event {
             EventKind::WorkerRelaunched => "worker relaunched",
             EventKind::LoggingLevelChanged => "logging level changed",
             EventKind::MetricsConfigured => "metrics configured",
+            EventKind::ListenerUpdated => "listener updated",
         };
         let address = match &self.address {
             Some(a) => a.to_string(),

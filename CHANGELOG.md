@@ -8,6 +8,8 @@ See milestone [`v1.1.0`](https://github.com/sozu-proxy/sozu/projects/3?card_filt
 
 ### 🌟 Added
 
+- **`sozu listener {http,https,tcp} update` — in-place runtime patch verb**: Operators can now tune non-bind-only listener settings on a running proxy without cycling the listening socket. Patchable fields include H2 flood thresholds (CVE-2023-44487 / CVE-2024-27316 / CVE-2025-8671 mitigations), SNI binding enforcement (`strict_sni_binding`), protocol-downgrade protection (`disable_http11`), ALPN preference, per-stream idle timeout, graceful-shutdown deadline, stream-0 WINDOW_UPDATE cap, correlation-header name (`sozu_id_header`), custom HTTP answers, and all session timeouts. The patch is field-masked: omitted fields are preserved. Existing sessions keep their configuration snapshot; only new sessions, connections, or TLS handshakes pick up the new values. CVE mitigations can now be tightened under attack without any connection disruption.
+
 - **HTTP/2 Multiplexing (Mux layer)**: Introduced a unified `Mux` protocol handler (`lib/src/protocol/mux/`) that replaces the separate H1 and H2 session handlers. The new layer supports full HTTP/2 multiplexing over a single connection, with shared stream state, flow control, and HPACK compression via the `loona-hpack` crate, see [`f7d1b659`](https://github.com/sozu-proxy/sozu/commit/f7d1b659865e7d92e732fcf8c52783713140f6a8), [`b6bffd36`](https://github.com/sozu-proxy/sozu/commit/b6bffd364355c8001da7403066c2dbcbc04445a1).
 
 - **ALPN Protocol Negotiation**: Added per-listener ALPN configuration so Sōzu can advertise `h2` and `http/1.1` during the TLS handshake and route each connection to the correct Mux path, see [`4f67d07d`](https://github.com/sozu-proxy/sozu/commit/4f67d07d6179c2af61108a24d1e1d57eec663787).
@@ -61,6 +63,8 @@ See milestone [`v1.1.0`](https://github.com/sozu-proxy/sozu/projects/3?card_filt
 - **OpenTelemetry doc rewrite**: the section now correctly identifies the feature as W3C `traceparent` passthrough (no SDK, no spans, no OTLP exporter). The previous `Limitations` text falsely claimed H2 requests were not propagated — verified false against the on-branch source (the H1 editor runs on H2 frames via `pkawa.rs`, then re-encoded by `H2BlockConverter`).
 
 ### ✍️ Changed
+
+- **`HttpAnswers::replace_defaults` preserves runtime cluster overrides on listener update**: When `sozu listener update` patches the listener-default HTTP answer bodies, per-cluster `answer_503` templates that were registered at runtime (via `sozu cluster add`) are no longer silently discarded. The new `replace_defaults` method rewrites only the listener-default template strings in place, leaving the `cluster_custom_answers` map untouched.
 
 - **Slab capacity multiplier doubled to 4× per connection**: The internal slab allocator now reserves 4× the per-connection slot count (previously 2×) to accommodate the higher stream concurrency introduced by HTTP/2 multiplexing.
 

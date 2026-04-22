@@ -39,12 +39,16 @@ use sozu_command::{
     proto::command::{
         AddCertificate, CertificateSummary, CertificatesByAddress, Cluster, HttpsListenerConfig,
         ListOfCertificatesByAddress, ListenerType, RemoveCertificate, RemoveListener,
-        ReplaceCertificate, RequestHttpFrontend, ResponseContent, TlsVersion, WorkerRequest,
-        WorkerResponse, request::RequestType, response_content::ContentType,
+        ReplaceCertificate, RequestHttpFrontend, ResponseContent, TlsVersion,
+        UpdateHttpsListenerConfig, WorkerRequest, WorkerResponse, request::RequestType,
+        response_content::ContentType,
     },
     ready::Ready,
     response::HttpFrontend,
-    state::ClusterId,
+    state::{
+        ClusterId, StateError, validate_alpn_protocols, validate_h2_flood_knobs_https,
+        validate_sozu_id_header,
+    },
 };
 
 use crate::{
@@ -1009,6 +1013,146 @@ impl HttpsListener {
         Ok(server_config)
     }
 
+    /// Apply a partial-update patch to this listener's live configuration.
+    ///
+    /// Fields absent in the patch (i.e. `None`) are preserved unchanged.
+    /// If `alpn_protocols` is present the rustls `ServerConfig` is rebuilt —
+    /// in-flight handshakes keep the old Arc; new ones see the new one.
+    /// If `http_answers` is present only the listener-default templates are
+    /// replaced; per-cluster overrides in `cluster_custom_answers` are kept.
+    pub fn update_config(
+        &mut self,
+        patch: &UpdateHttpsListenerConfig,
+    ) -> Result<(), ListenerError> {
+        // Defense-in-depth validation: main-process ConfigState::dispatch
+        // validates before scatter, but a raw protobuf client or state replay
+        // may reach the worker without that check.
+        let into_listener_err = |e: StateError| match e {
+            StateError::InvalidValue { field, reason } => {
+                ListenerError::InvalidValue { field, reason }
+            }
+            _ => ListenerError::InvalidValue {
+                field: "unknown",
+                reason: "validation failed",
+            },
+        };
+        validate_h2_flood_knobs_https(patch).map_err(into_listener_err)?;
+        if let Some(ref alpn) = patch.alpn_protocols {
+            validate_alpn_protocols(&alpn.values).map_err(into_listener_err)?;
+        }
+        if let Some(ref hdr) = patch.sozu_id_header {
+            validate_sozu_id_header(hdr).map_err(into_listener_err)?;
+        }
+
+        // --- simple field patches ---
+        if let Some(v) = patch.public_address {
+            self.config.public_address = Some(v);
+        }
+        if let Some(v) = patch.expect_proxy {
+            self.config.expect_proxy = v;
+        }
+        if let Some(ref v) = patch.sticky_name {
+            self.config.sticky_name = v.to_owned();
+        }
+        if let Some(v) = patch.front_timeout {
+            self.config.front_timeout = v;
+        }
+        if let Some(v) = patch.back_timeout {
+            self.config.back_timeout = v;
+        }
+        if let Some(v) = patch.connect_timeout {
+            self.config.connect_timeout = v;
+        }
+        if let Some(v) = patch.request_timeout {
+            self.config.request_timeout = v;
+        }
+        if let Some(v) = patch.strict_sni_binding {
+            self.config.strict_sni_binding = Some(v);
+        }
+        if let Some(v) = patch.disable_http11 {
+            self.config.disable_http11 = Some(v);
+        }
+        if let Some(ref v) = patch.sozu_id_header {
+            self.config.sozu_id_header = Some(v.to_owned());
+        }
+
+        // --- H2 flood knobs ---
+        if let Some(v) = patch.h2_max_rst_stream_per_window {
+            self.config.h2_max_rst_stream_per_window = Some(v);
+        }
+        if let Some(v) = patch.h2_max_ping_per_window {
+            self.config.h2_max_ping_per_window = Some(v);
+        }
+        if let Some(v) = patch.h2_max_settings_per_window {
+            self.config.h2_max_settings_per_window = Some(v);
+        }
+        if let Some(v) = patch.h2_max_empty_data_per_window {
+            self.config.h2_max_empty_data_per_window = Some(v);
+        }
+        if let Some(v) = patch.h2_max_continuation_frames {
+            self.config.h2_max_continuation_frames = Some(v);
+        }
+        if let Some(v) = patch.h2_max_glitch_count {
+            self.config.h2_max_glitch_count = Some(v);
+        }
+        if let Some(v) = patch.h2_initial_connection_window {
+            self.config.h2_initial_connection_window = Some(v);
+        }
+        if let Some(v) = patch.h2_max_concurrent_streams {
+            self.config.h2_max_concurrent_streams = Some(v);
+        }
+        if let Some(v) = patch.h2_stream_shrink_ratio {
+            self.config.h2_stream_shrink_ratio = Some(v);
+        }
+        if let Some(v) = patch.h2_max_rst_stream_lifetime {
+            self.config.h2_max_rst_stream_lifetime = Some(v);
+        }
+        if let Some(v) = patch.h2_max_rst_stream_abusive_lifetime {
+            self.config.h2_max_rst_stream_abusive_lifetime = Some(v);
+        }
+        if let Some(v) = patch.h2_max_rst_stream_emitted_lifetime {
+            self.config.h2_max_rst_stream_emitted_lifetime = Some(v);
+        }
+        if let Some(v) = patch.h2_max_header_list_size {
+            self.config.h2_max_header_list_size = Some(v);
+        }
+        if let Some(v) = patch.h2_max_header_table_size {
+            self.config.h2_max_header_table_size = Some(v);
+        }
+        if let Some(v) = patch.h2_stream_idle_timeout_seconds {
+            self.config.h2_stream_idle_timeout_seconds = Some(v);
+        }
+        if let Some(v) = patch.h2_graceful_shutdown_deadline_seconds {
+            self.config.h2_graceful_shutdown_deadline_seconds = Some(v);
+        }
+        if let Some(v) = patch.h2_max_window_update_stream0_per_window {
+            self.config.h2_max_window_update_stream0_per_window = Some(v);
+        }
+
+        // --- ALPN rebuild (may force a rustls ServerConfig rebuild) ---
+        if let Some(ref alpn_wrapper) = patch.alpn_protocols {
+            self.config.alpn_protocols = alpn_wrapper.values.clone();
+            self.rustls_details = Arc::new(Self::create_rustls_context(
+                &self.config,
+                self.resolver.clone(),
+            )?);
+        }
+
+        // --- HTTP answers: replace listener defaults per-field, preserve cluster overrides ---
+        if let Some(ref new_answers) = patch.http_answers {
+            crate::sozu_command::state::merge_custom_http_answers(
+                &mut self.config.http_answers,
+                new_answers,
+            );
+            self.answers
+                .borrow_mut()
+                .replace_defaults(new_answers)
+                .map_err(|(status, error)| ListenerError::TemplateParse(status, error))?;
+        }
+
+        Ok(())
+    }
+
     pub fn add_https_front(&mut self, tls_front: HttpFrontend) -> Result<(), ListenerError> {
         self.fronts
             .add_http_front(&tls_front)
@@ -1265,6 +1409,23 @@ impl HttpsProxy {
             .ok_or(ProxyError::UnactivatedListener)?;
 
         Ok((owned.token, taken_listener))
+    }
+
+    /// Apply a partial-update patch to the identified HTTPS listener.
+    pub fn update_listener(&mut self, patch: UpdateHttpsListenerConfig) -> Result<(), ProxyError> {
+        let address: std::net::SocketAddr = patch.address.into();
+        let listener = self
+            .listeners
+            .values()
+            .find(|l| l.borrow().address == address)
+            .ok_or(ProxyError::NoListenerFound(address))?;
+        listener
+            .borrow_mut()
+            .update_config(&patch)
+            .map_err(|listener_error| ProxyError::ListenerActivation {
+                address,
+                listener_error,
+            })
     }
 
     pub fn add_cluster(
