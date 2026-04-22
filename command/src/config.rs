@@ -820,6 +820,20 @@ impl From<MetricDetailLevel> for MetricDetail {
     }
 }
 
+impl From<MetricDetail> for MetricDetailLevel {
+    /// Reverse of [`From<MetricDetailLevel> for MetricDetail`] — used by the
+    /// worker side to convert the protobuf wire enum back into the
+    /// configuration enum before passing it to `sozu_lib::metrics::setup`.
+    fn from(detail: MetricDetail) -> Self {
+        match detail {
+            MetricDetail::DetailProcess => MetricDetailLevel::Process,
+            MetricDetail::DetailFrontend => MetricDetailLevel::Frontend,
+            MetricDetail::DetailCluster => MetricDetailLevel::Cluster,
+            MetricDetail::DetailBackend => MetricDetailLevel::Backend,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MetricsConfig {
