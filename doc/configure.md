@@ -800,6 +800,9 @@ transitions out of `is_handshaking()` (both through the `readable` and
 | `h2.close_with_active_streams` | counter | proxy | H2 connections closed while streams were still active |
 | `h2.window_update_dropped` | counter | proxy | WINDOW_UPDATE frame dropped because the per-connection pending-update queue was already at capacity |
 | `h2.headers_no_stream.error` | counter | proxy | HEADERS frame received with no matching stream (protocol error) |
+| `h2.frames.tx.headers` | counter | proxy | HEADERS frames emitted by the H2 block converter (one per response, plus the first frame of any header block split into HEADERS+CONTINUATION when the encoded headers exceed the negotiated `max_frame_size`) |
+| `h2.frames.tx.continuation` | counter | proxy | CONTINUATION frames emitted by the converter when a single response's encoded headers cross `max_frame_size` (default 16 KB). Stays at zero for typical responses |
+| `h2.frames.tx.data` | counter | proxy | DATA frames emitted by the converter — both the normal data path and the empty `END_STREAM`-only marker emitted when the response has zero bytes after headers |
 
 #### TLS / SNI binding
 
