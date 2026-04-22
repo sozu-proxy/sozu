@@ -132,6 +132,7 @@ impl<Front: SocketHandler> Connection<Front> {
         flood_config: h2::H2FloodConfig,
         connection_config: h2::H2ConnectionConfig,
         stream_idle_timeout: std::time::Duration,
+        graceful_shutdown_deadline: Option<std::time::Duration>,
     ) -> Option<Connection<Front>> {
         Some(Connection::H2(ConnectionH2::new(
             session_ulid,
@@ -141,6 +142,7 @@ impl<Front: SocketHandler> Connection<Front> {
             flood_config,
             connection_config,
             stream_idle_timeout,
+            graceful_shutdown_deadline,
             timeout_container,
             Some((H2StreamId::Zero, h2::CLIENT_PREFACE_SIZE)),
             Ready::READABLE | Ready::HUP | Ready::ERROR,
@@ -158,6 +160,7 @@ impl<Front: SocketHandler> Connection<Front> {
         flood_config: h2::H2FloodConfig,
         connection_config: h2::H2ConnectionConfig,
         stream_idle_timeout: std::time::Duration,
+        graceful_shutdown_deadline: Option<std::time::Duration>,
     ) -> Option<Connection<Front>> {
         // Test-only injection point: when set via
         // [`__test_force_h2_client_failure`], pretend the pool was exhausted
@@ -182,6 +185,7 @@ impl<Front: SocketHandler> Connection<Front> {
             flood_config,
             connection_config,
             stream_idle_timeout,
+            graceful_shutdown_deadline,
             timeout_container,
             None,
             Ready::WRITABLE | Ready::HUP | Ready::ERROR,
@@ -315,6 +319,18 @@ impl<Front: SocketHandler> Connection<Front> {
         match self {
             Connection::H1(_) => false,
             Connection::H2(c) => c.drain.draining,
+        }
+    }
+
+    /// Proxy-side graceful-shutdown budget exhaustion check. Only H2
+    /// connections carry the timer — H1 has no multiplex to drain, so its
+    /// answer is always `false` and the H1 path continues to fall through
+    /// to the ordinary single-response close. See
+    /// [`h2::ConnectionH2::graceful_shutdown_deadline_elapsed`].
+    pub(super) fn graceful_shutdown_deadline_elapsed(&self) -> bool {
+        match self {
+            Connection::H1(_) => false,
+            Connection::H2(c) => c.graceful_shutdown_deadline_elapsed(),
         }
     }
 

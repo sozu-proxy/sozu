@@ -1057,6 +1057,9 @@ impl Display for HttpListenerConfig {
         if let Some(v) = &self.h2_stream_idle_timeout_seconds {
             table.add_row(row!["h2 stream idle timeout (seconds)", v]);
         }
+        if let Some(v) = &self.h2_graceful_shutdown_deadline_seconds {
+            table.add_row(row!["h2 graceful shutdown deadline (seconds)", v]);
+        }
         write!(f, "{table}")
     }
 }
@@ -1123,6 +1126,9 @@ impl Display for HttpsListenerConfig {
         }
         if let Some(v) = &self.h2_stream_idle_timeout_seconds {
             table.add_row(row!["h2 stream idle timeout (seconds)", v]);
+        }
+        if let Some(v) = &self.h2_graceful_shutdown_deadline_seconds {
+            table.add_row(row!["h2 graceful shutdown deadline (seconds)", v]);
         }
         write!(f, "{table}")
     }

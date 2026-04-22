@@ -1022,6 +1022,17 @@ pub struct H2DrainState {
     pub draining: bool,
     /// Last stream ID from peer's GOAWAY (for retry decisions).
     pub peer_last_stream_id: Option<StreamId>,
+    /// Wall-clock timestamp captured the first time this connection entered
+    /// `draining` during soft-stop. Used together with
+    /// [`Self::graceful_shutdown_deadline`] to decide when to force-close.
+    /// Remains `None` until the proxy-initiated drain begins (peer-initiated
+    /// drains via `handle_goaway_frame` don't arm the forced-close timer —
+    /// the caller in `Mux::shutting_down` is the only writer).
+    pub started_at: Option<Instant>,
+    /// Wall-clock budget granted to in-flight streams after the phase-1
+    /// `GOAWAY(NO_ERROR)`. `None` means "wait indefinitely" (knob value `0`).
+    /// Default when unset upstream: 5 s (see `L7ListenerHandler`).
+    pub graceful_shutdown_deadline: Option<std::time::Duration>,
 }
 
 pub struct ConnectionH2<Front: SocketHandler> {
@@ -1199,6 +1210,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         flood_config: H2FloodConfig,
         connection_config: H2ConnectionConfig,
         stream_idle_timeout: std::time::Duration,
+        graceful_shutdown_deadline: Option<std::time::Duration>,
         timeout_container: crate::timer::TimeoutContainer,
         expect_read: Option<(H2StreamId, usize)>,
         readiness_interest: sozu_command::ready::Ready,
@@ -1245,6 +1257,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             drain: H2DrainState {
                 draining: false,
                 peer_last_stream_id: None,
+                started_at: None,
+                graceful_shutdown_deadline,
             },
             zero: kawa::Kawa::new(kawa::Kind::Request, kawa::Buffer::new(buffer)),
             bytes: H2ByteAccounting {
@@ -3286,6 +3300,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // but does not yet know the cutoff. This gives in-flight requests a chance
         // to arrive before we commit to a final last_stream_id.
         self.drain.draining = true;
+        // Arm the forced-close timer from the moment the proxy decides to drain.
+        // `Mux::shutting_down` samples it against `graceful_shutdown_deadline`
+        // and returns `true` once the budget is exhausted so the session loop
+        // tears the connection down instead of waiting forever.
+        self.drain.started_at = Some(Instant::now());
         // Keep expect_read as-is: existing streams should continue reading
         // data during phase 1. Only phase 2 (goaway()) removes READABLE.
         let kawa = &mut self.zero;
@@ -3322,6 +3341,24 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 );
                 self.force_disconnect()
             }
+        }
+    }
+
+    /// Returns `true` when the graceful-shutdown budget armed by
+    /// [`Self::graceful_goaway`] has elapsed. A return of `true` signals
+    /// the enclosing session loop that the proxy-initiated drain must
+    /// transition to a forced close: remaining streams will not complete
+    /// in time and keeping the connection open past the deadline defeats
+    /// the soft-stop SLA.
+    ///
+    /// Returns `false` when:
+    /// - drain has not started yet (`started_at` is `None`),
+    /// - the knob is `0` / `None` (indefinite wait explicitly opted in),
+    /// - or the elapsed time is still within the configured budget.
+    pub fn graceful_shutdown_deadline_elapsed(&self) -> bool {
+        match (self.drain.started_at, self.drain.graceful_shutdown_deadline) {
+            (Some(started_at), Some(deadline)) => started_at.elapsed() >= deadline,
+            _ => false,
         }
     }
 
