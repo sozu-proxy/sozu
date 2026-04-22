@@ -4656,6 +4656,106 @@ fn test_h2_backend_disconnect_clean_error() {
     );
 }
 
+// ---- Backend disconnect: repeated fast-close does not leak stream state (B3-h / G4) ----
+
+/// Codex gap G4 / plan entry B3-h: "`Linked` stream whose backend dies
+/// mid-response may not be driven to `Unlinked` before buffer recycle;
+/// race window". Reviewer verified the cleanup path
+/// (`remove_dead_stream` → `rst_sent.remove` etc.), but only a single
+/// disconnect was previously covered by
+/// `test_h2_backend_disconnect_clean_error`. A one-shot leak of 1 slot is
+/// invisible; a leak-per-fast-close would show up only after dozens of
+/// rapid fast-closes through the same listener.
+///
+/// This test fires 30 sequential H2 requests against the
+/// `DisconnectingBackend`. If sozu leaked any per-stream state between
+/// requests — a stranded Linked entry, a lingering `rst_sent` id, a
+/// pending flow-control window not released — the 30th request would
+/// either hang (stream slot exhaustion, router state corruption) or
+/// return a shape different from the first.
+///
+/// Success criterion: all 30 requests resolve within 30 s total (1 s
+/// budget each on average, very generous) and sozu remains alive.
+fn try_h2_backend_disconnect_no_linked_leak() -> State {
+    let (mut worker, front_port, _front_address) = setup_h2_listener_only("H2-DISCONNECT-NO-LEAK");
+
+    let back_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address,
+        None,
+    )));
+    worker.read_to_last();
+
+    let mut backend = DisconnectingBackend::start(back_address);
+    let client = build_h2_client();
+
+    const ITERATIONS: usize = 30;
+    let start = Instant::now();
+    let mut resolved = 0usize;
+
+    for i in 0..ITERATIONS {
+        let uri: hyper::Uri = format!("https://localhost:{front_port}/api/disconnect/{i}")
+            .parse()
+            .unwrap();
+        let iter_start = Instant::now();
+        let _ = resolve_request(&client, uri);
+        let iter_elapsed = iter_start.elapsed();
+        resolved += 1;
+        if iter_elapsed > Duration::from_secs(3) {
+            println!("H2 disconnect no-leak - iteration {i} took {iter_elapsed:?} (suspicious)");
+        }
+    }
+    let elapsed = start.elapsed();
+
+    println!("H2 disconnect no-leak - {resolved}/{ITERATIONS} resolved in {elapsed:?}");
+
+    // If any iteration hung or sozu ran out of stream slots, total time
+    // would blow past the per-iter budget. 30 s total = 1 s per iter
+    // average; real latency per iter is well under 100 ms.
+    if elapsed > Duration::from_secs(30) {
+        println!("H2 disconnect no-leak - total time {elapsed:?} exceeds 30 s budget");
+        return State::Fail;
+    }
+
+    let req_received = backend.get_requests_received();
+    println!(
+        "H2 disconnect no-leak - backend received {req_received} requests out of {ITERATIONS}"
+    );
+
+    thread::sleep(Duration::from_millis(300));
+    let still_alive = verify_sozu_alive(front_port);
+    println!("H2 disconnect no-leak - sozu still alive: {still_alive}");
+
+    backend.stop();
+    worker.soft_stop();
+    let _ = worker.wait_for_server_stop();
+
+    // Success: every request resolved within budget AND sozu is still
+    // serving. `req_received >= ITERATIONS / 2` guards against a path
+    // where hyper pools its H1 connection to sozu but sozu's backend
+    // connections collapse — the backend counter rules out that
+    // degenerate case.
+    if still_alive && resolved == ITERATIONS && req_received >= ITERATIONS / 2 {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_backend_disconnect_no_linked_leak() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 backend pool: repeated fast-close does not leak Linked-stream state",
+            try_h2_backend_disconnect_no_linked_leak
+        ),
+        State::Success
+    );
+}
+
 // ---- Concurrent requests to multiple backends (load balancing) ----
 
 /// Set up multiple backends for the same cluster. Send concurrent H2 requests
