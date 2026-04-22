@@ -501,7 +501,9 @@ message Cluster {
     required LoadBalancingAlgorithms load_balancing = 5 [default = ROUND_ROBIN];
     optional string answer_503 = 6;
     optional LoadMetric load_metric = 7;
-    // whether to use HTTP/2 for backend connections to this cluster
+    // Backend-capability hint: set to true when THE BACKEND speaks HTTP/2 (h2c or h2+TLS).
+    // This does NOT gate H2 acceptance at the frontend — frontend H2 is negotiated via
+    // TLS ALPN independently of per-cluster configuration (see alpn_protocols on the listener).
     optional bool http2 = 8;
 }
 
