@@ -53,9 +53,59 @@ pub struct H2BlockConverter<'a> {
     /// that same-urgency incremental streams interleave their DATA frames
     /// fairly rather than draining one stream before moving to the next.
     pub incremental_mode: bool,
+    /// Pending HPACK dynamic table-size update signal (RFC 7541 §4.2, §6.3).
+    ///
+    /// `Some(new_size)` when the peer's latest SETTINGS frame adjusted
+    /// `SETTINGS_HEADER_TABLE_SIZE` and we have not yet signalled the new
+    /// capacity to the decoder via a dynamic-table-size-update HPACK field
+    /// at the start of our next header block. Set by
+    /// [`super::h2::ConnectionH2`] at converter construction.
+    ///
+    /// [`emit_pending_size_update_if_new_block`] consumes this on the first
+    /// `Block::StatusLine` / `Block::Header` of each pass; the containing
+    /// `ConnectionH2` clears its own mirror only after confirming the signal
+    /// reached the wire (see `size_update_emitted` below).
+    pub pending_table_size_update: Option<u32>,
+    /// `true` once [`emit_pending_size_update_if_new_block`] has actually
+    /// written a size-update prefix into `self.out` during this write pass.
+    /// The caller in `ConnectionH2::write_streams` reads this flag to know
+    /// whether it is safe to clear its own mirror of the pending state.
+    pub size_update_emitted: bool,
 }
 
 impl H2BlockConverter<'_> {
+    /// RFC 7541 §4.2 / §6.3: emit a dynamic-table-size-update HPACK field at
+    /// the start of the next header block whenever the peer adjusted
+    /// `SETTINGS_HEADER_TABLE_SIZE`. Called at the top of every header-
+    /// producing `Block::*` arm. Only fires once per block (guarded by
+    /// `self.out.is_empty()`) and only when [`Self::pending_table_size_update`]
+    /// is `Some(_)`.
+    ///
+    /// Encoding per RFC 7541 §5.1 + §6.3: prefix bits `001`, 5-bit prefix
+    /// integer carrying the new maximum table size.
+    fn emit_pending_size_update_if_new_block(&mut self) {
+        if !self.out.is_empty() {
+            return;
+        }
+        if let Some(new_size) = self.pending_table_size_update.take() {
+            if let Err(e) =
+                loona_hpack::encoder::encode_integer_into(new_size as usize, 5, 0x20, &mut self.out)
+            {
+                error!(
+                    "{} HPACK encoding of dynamic-table-size-update signal failed: {:?}",
+                    log_module_context!(),
+                    e
+                );
+                // Leave `size_update_emitted` false so the caller retries
+                // on the next write pass. `pending_table_size_update` has
+                // already been `.take()`n — restore it so we don't drop it.
+                self.pending_table_size_update = Some(new_size);
+                return;
+            }
+            self.size_update_emitted = true;
+        }
+    }
+
     /// Check whether the HPACK output buffer has exceeded the maximum header
     /// list size. Returns `false` (stop encoding) if the limit is reached.
     fn check_header_capacity(&self) -> bool {
@@ -111,6 +161,15 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
     }
     fn call(&mut self, block: Block, kawa: &mut Kawa<T>) -> bool {
         let buffer = kawa.storage.buffer();
+        // RFC 7541 §6.3: when the peer reduced SETTINGS_HEADER_TABLE_SIZE
+        // (or changed it in any direction), the very first header block we
+        // emit afterwards MUST begin with a dynamic-table-size-update
+        // signal. `emit_pending_size_update_if_new_block` no-ops on every
+        // block past the first of a header group (guard: `self.out.is_empty`)
+        // and on DATA / flag blocks (no header output to prepend).
+        if matches!(block, Block::StatusLine | Block::Header(_)) {
+            self.emit_pending_size_update_if_new_block();
+        }
         match block {
             Block::StatusLine => match kawa.detached.status_line.pop() {
                 StatusLine::Request {
@@ -524,6 +583,11 @@ mod tests {
             // RFC 9218 round-robin is scheduler-driven; unit tests that
             // exercise single-stream conversions leave it off.
             incremental_mode: false,
+            // RFC 7541 §6.3: no pending SETTINGS_HEADER_TABLE_SIZE change
+            // in the default test converter. Tests that exercise the
+            // dynamic-table-size-update path set this explicitly.
+            pending_table_size_update: None,
+            size_update_emitted: false,
         }
     }
 
@@ -752,6 +816,127 @@ mod tests {
         assert!(result);
         // The lowercase_buf should contain the lowercased name
         assert_eq!(&conv.lowercase_buf, b"content-type");
+    }
+
+    // ── HPACK dynamic-table-size-update (RFC 7541 §4.2 / §6.3) ────────────
+
+    #[test]
+    fn test_converter_emits_pending_size_update_on_first_header_block() {
+        let mut encoder = loona_hpack::Encoder::new();
+        let mut conv = test_converter(&mut encoder);
+        conv.pending_table_size_update = Some(256);
+
+        let mut buf = vec![0u8; 4096];
+        let mut kawa = make_kawa(&mut buf, Kind::Response);
+        kawa.detached.status_line = StatusLine::Response {
+            version: kawa::Version::V20,
+            code: 200,
+            status: Store::Static(b"200"),
+            reason: Store::Static(b"OK"),
+        };
+
+        let result = conv.call(Block::StatusLine, &mut kawa);
+        assert!(result, "StatusLine encoding must succeed");
+        assert!(
+            conv.size_update_emitted,
+            "emit flag must flip once the signal bytes are written"
+        );
+        assert!(
+            conv.pending_table_size_update.is_none(),
+            "pending value must be cleared after emission"
+        );
+        // First byte of out MUST be an HPACK dynamic-table-size-update
+        // directive: prefix bits `001` (0x20..0x3F range). 256 > 30 so the
+        // encoding uses the multi-byte form: `00111111` = 0x3F then a
+        // varint-continued encoding of (256 - 31) = 225. 225 = 0xE1 in one
+        // byte since 225 < 128 is false → 0xE1 has high bit set, encoded
+        // as 0xE1 - 128 = 0x61 continuation then 0x01 final. Rather than
+        // spell the exact bytes, assert only the prefix pattern.
+        assert!(!conv.out.is_empty(), "out must contain the prefix bytes");
+        assert_eq!(
+            conv.out[0] & 0b1110_0000,
+            0b0010_0000,
+            "first byte must have HPACK size-update prefix `001xxxxx`, got {:#010b}",
+            conv.out[0]
+        );
+    }
+
+    #[test]
+    fn test_converter_skips_size_update_when_no_pending() {
+        let mut encoder = loona_hpack::Encoder::new();
+        let mut conv = test_converter(&mut encoder);
+        // pending_table_size_update is None by default.
+
+        let mut buf = vec![0u8; 4096];
+        let mut kawa = make_kawa(&mut buf, Kind::Response);
+        kawa.detached.status_line = StatusLine::Response {
+            version: kawa::Version::V20,
+            code: 200,
+            status: Store::Static(b"200"),
+            reason: Store::Static(b"OK"),
+        };
+
+        let result = conv.call(Block::StatusLine, &mut kawa);
+        assert!(result);
+        assert!(
+            !conv.size_update_emitted,
+            "emit flag must stay false when nothing was pending"
+        );
+        // Without a size-update, the first byte should be a literal/indexed
+        // header directive (0x00..=0x1F, 0x40..=0x7F, or 0x80..=0xFF),
+        // NEVER the 0b001xxxxx size-update pattern.
+        assert!(
+            !conv.out.is_empty(),
+            "out must contain the :status encoding"
+        );
+        assert_ne!(
+            conv.out[0] & 0b1110_0000,
+            0b0010_0000,
+            "first byte MUST NOT be a size-update directive when nothing pending"
+        );
+    }
+
+    #[test]
+    fn test_converter_emits_size_update_only_once_per_block() {
+        let mut encoder = loona_hpack::Encoder::new();
+        let mut conv = test_converter(&mut encoder);
+        conv.pending_table_size_update = Some(128);
+
+        let mut buf = vec![0u8; 4096];
+        let mut kawa = make_kawa(&mut buf, Kind::Response);
+        kawa.detached.status_line = StatusLine::Response {
+            version: kawa::Version::V20,
+            code: 200,
+            status: Store::Static(b"200"),
+            reason: Store::Static(b"OK"),
+        };
+
+        // First block: StatusLine — emits the size update.
+        let r1 = conv.call(Block::StatusLine, &mut kawa);
+        assert!(r1);
+        let size_after_status_line = conv.out.len();
+        assert!(conv.size_update_emitted);
+
+        // Second block: a regular header in the SAME block — must NOT
+        // re-emit the size-update (guard: `self.out.is_empty()` is now
+        // false). The output buffer should grow by the header's encoded
+        // length, not by the size-update length.
+        let r2 = conv.call(
+            Block::Header(Pair {
+                key: Store::Static(b"content-type"),
+                val: Store::Static(b"text/plain"),
+            }),
+            &mut kawa,
+        );
+        assert!(r2);
+        assert!(
+            conv.out.len() > size_after_status_line,
+            "second header must have been appended"
+        );
+        // `size_update_emitted` stays true (we fired once); pending stays
+        // cleared.
+        assert!(conv.size_update_emitted);
+        assert!(conv.pending_table_size_update.is_none());
     }
 
     // ── Elided headers ──────────────────────────────────────────────────
