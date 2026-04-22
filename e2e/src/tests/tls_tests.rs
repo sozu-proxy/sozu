@@ -1095,3 +1095,204 @@ fn test_tls_connection_close_large_response() {
         State::Success
     );
 }
+
+// ============================================================================
+// Test 7: ALPN absent on H2-only listener — RFC 9113 §3.2 gate
+// ============================================================================
+
+/// Verify that a listener configured with `disable_http11 = true` rejects
+/// clients that complete the TLS handshake without negotiating ALPN.
+///
+/// Pass 5 Medium #4 of the security audit: without this gate, a client that
+/// omits ALPN would silently be handed to the HTTP/1.1 state machine on an
+/// H2-only listener, bypassing H2-specific protections. The server-side
+/// behaviour lives at `lib/src/https.rs` (`upgrade_handshake` None-ALPN arm):
+/// on `disable_http11 = true` it bumps `https.alpn.rejected.http11_disabled`,
+/// logs a `warn!`, and returns `None` — the session transitions to
+/// `FailedUpgrade` and is torn down without emitting an H1 response.
+fn try_h2_listener_rejects_alpn_absent() -> State {
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+    let back_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_https_config(front_address.into());
+    let mut worker =
+        Worker::start_new_worker_owned("TLS-ALPN-ABSENT-REJECT", config, listeners, state);
+
+    // Build a listener that only accepts `h2` (disable_http11 = true).
+    // `ListenerBuilder` does not yet expose a `with_disable_http11` setter,
+    // so we mutate the generated HttpsListenerConfig in place before sending.
+    let mut https_listener = ListenerBuilder::new_https(front_address.clone())
+        .to_tls(None)
+        .expect("could not build HTTPS listener config");
+    https_listener.disable_http11 = Some(true);
+    worker.send_proxy_request_type(RequestType::AddHttpsListener(https_listener));
+
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        address: front_address.clone(),
+        proxy: ListenerType::Https.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        hostname: "localhost".to_owned(),
+        ..Worker::default_http_frontend("cluster_0", front_address.clone().into())
+    }));
+
+    let certificate_and_key = CertificateAndKey {
+        certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
+        key: String::from(include_str!("../../../lib/assets/local-key.pem")),
+        certificate_chain: vec![],
+        versions: vec![],
+        names: vec![],
+    };
+    worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+        address: front_address.clone(),
+        certificate: certificate_and_key,
+        expired_at: None,
+    }));
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address,
+        None,
+    )));
+
+    let mut backend = AsyncBackend::spawn_detached_backend(
+        "BACKEND",
+        back_address,
+        SimpleAggregator::default(),
+        AsyncBackend::http_handler("pong"),
+    );
+
+    worker.read_to_last();
+
+    // Client that deliberately sends no ALPN extension. rustls happily omits
+    // ALPN when `alpn_protocols` is empty (the default). The handshake itself
+    // must complete (otherwise we cannot distinguish the reject from a raw
+    // TLS failure), so we retain the custom `Verifier`.
+    let tls_config = {
+        let mut cfg = ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(Verifier))
+            .with_no_client_auth();
+        cfg.alpn_protocols = vec![];
+        cfg
+    };
+    let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let conn = rustls::ClientConnection::new(Arc::new(tls_config), server_name.to_owned()).unwrap();
+
+    let addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let tcp = match TcpStream::connect_timeout(&addr, Duration::from_secs(5)) {
+        Ok(stream) => stream,
+        Err(e) => {
+            println!("Could not connect to sozu: {e}");
+            worker.soft_stop();
+            worker.wait_for_server_stop();
+            backend.stop_and_get_aggregator();
+            return State::Fail;
+        }
+    };
+    tcp.set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set read timeout");
+    tcp.set_write_timeout(Some(Duration::from_secs(5)))
+        .expect("set write timeout");
+
+    let mut tls_stream = rustls::StreamOwned::new(conn, tcp);
+
+    // Attempt an HTTP/1.1 request. The write may succeed (the TLS handshake
+    // completes before Sozu decides to reject the session), but the server
+    // must never produce an HTTP response: reading back must observe a clean
+    // EOF / close_notify / connection reset, not `HTTP/1.1 ...`.
+    let request = "GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    let _ = tls_stream.write_all(request.as_bytes());
+    let _ = tls_stream.flush();
+
+    let mut response_bytes = Vec::new();
+    let mut buf = [0u8; 1024];
+    let start = Instant::now();
+    let connection_closed = loop {
+        match tls_stream.read(&mut buf) {
+            Ok(0) => {
+                println!(
+                    "connection closed by sozu after {:.1}s",
+                    start.elapsed().as_secs_f64()
+                );
+                break true;
+            }
+            Ok(n) => {
+                response_bytes.extend_from_slice(&buf[..n]);
+                // Any HTTP prefix means the gate is broken — Sozu would have
+                // downgraded to H1 and let the request through.
+                if response_bytes.len() >= 4 && response_bytes.starts_with(b"HTTP") {
+                    println!(
+                        "UNEXPECTED HTTP response on H2-only listener: {:?}",
+                        String::from_utf8_lossy(&response_bytes)
+                    );
+                    break false;
+                }
+                if start.elapsed() > Duration::from_secs(10) {
+                    println!(
+                        "timed out waiting for close after {} bytes",
+                        response_bytes.len()
+                    );
+                    break false;
+                }
+            }
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                if start.elapsed() > Duration::from_secs(10) {
+                    println!("timed out waiting for sozu to close the connection");
+                    break false;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => {
+                // UnexpectedEof, connection reset, close_notify, etc. all
+                // count as a reject — the server terminated the session.
+                println!(
+                    "read error after {:.1}s (expected reject): {e}",
+                    start.elapsed().as_secs_f64()
+                );
+                break true;
+            }
+        }
+    };
+    drop(tls_stream);
+
+    // Verify the backend never received anything — the gate must fire before
+    // any H1 request reaches the cluster.
+    worker.soft_stop();
+    let success = worker.wait_for_server_stop();
+    let aggregator = backend
+        .stop_and_get_aggregator()
+        .expect("Could not get aggregator");
+    println!(
+        "BACKEND: sent={}, received={}",
+        aggregator.responses_sent, aggregator.requests_received
+    );
+
+    let backend_untouched = aggregator.requests_received == 0 && aggregator.responses_sent == 0;
+
+    if success && connection_closed && backend_untouched {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_listener_rejects_alpn_absent() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "TLS: disable_http11=true listener rejects clients that omit ALPN",
+            try_h2_listener_rejects_alpn_absent
+        ),
+        State::Success
+    );
+}
