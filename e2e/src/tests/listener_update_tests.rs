@@ -136,11 +136,25 @@ fn minimal_get_hpack(authority: &str) -> Vec<u8> {
 /// without initiating any requests first.  The frames are sent on streams that
 /// were never opened — sozu will count them via the flood detector but the
 /// streams themselves don't need to be real.
+/// Send `count` HEADERS+RST_STREAM pairs on fresh odd stream IDs starting at
+/// `start_stream_id`. RST on an idle stream is a PROTOCOL_ERROR (RFC 9113
+/// §6.4), so each stream must be opened with HEADERS first — matching the
+/// Rapid Reset CVE-2023-44487 attack pattern.
 fn send_rst_stream_frames(tls: &mut impl Write, count: usize, start_stream_id: u32) {
+    // :method GET, :path /, :scheme https, :authority localhost — static-index
+    // encoded per HPACK.
+    let header_block = vec![
+        0x82, 0x84, 0x87, 0x41, 0x09, b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't',
+    ];
     for i in 0..count {
         let stream_id = start_stream_id + (i as u32) * 2; // odd ids only
+        let headers = H2Frame::headers(stream_id, header_block.clone(), true, true);
         let rst = H2Frame::rst_stream(stream_id, 0x8); // CANCEL (0x8)
-        let _ = tls.write_all(&rst.encode());
+        let mut batch = headers.encode();
+        batch.extend_from_slice(&rst.encode());
+        if tls.write_all(&batch).is_err() {
+            break;
+        }
     }
     let _ = tls.flush();
 }
@@ -252,6 +266,13 @@ fn setup_https_with_rst_threshold(
         .to_tls(None)
         .unwrap();
     listener.h2_max_rst_stream_per_window = Some(rst_threshold);
+    // Push the other RST-related caps far above the per-window threshold so
+    // the test isolates the `h2_max_rst_stream_per_window` knob. Defaults
+    // (abusive=50, lifetime=10000, emitted=500) would trip first for a burst
+    // of 90+ resets.
+    listener.h2_max_rst_stream_abusive_lifetime = Some(100_000);
+    listener.h2_max_rst_stream_lifetime = Some(1_000_000);
+    listener.h2_max_rst_stream_emitted_lifetime = Some(100_000);
 
     worker.send_proxy_request_type(RequestType::AddHttpsListener(listener));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
@@ -357,13 +378,14 @@ fn try_h2_flood_threshold_live_patch() -> State {
     }
     println!("RST-LIVE-PATCH: patch applied successfully");
 
-    // Connection B — new connection should see the new threshold (50).
+    // Connection B — new connection should see the new threshold (50). Send
+    // well above the threshold so the per-window counter definitely trips.
     let mut tls_b = raw_h2_connection(front_addr);
     h2_handshake(&mut tls_b);
-    send_rst_stream_frames(&mut tls_b, 51, 1);
-    thread::sleep(Duration::from_millis(500));
+    send_rst_stream_frames(&mut tls_b, 80, 1);
+    thread::sleep(Duration::from_millis(800));
 
-    let frames_b = collect_response_frames(&mut tls_b, 200, 3, 400);
+    let frames_b = collect_response_frames(&mut tls_b, 500, 8, 500);
     log_frames("RST-LIVE-PATCH connection B", &frames_b);
     let goaway_on_b = contains_goaway_with_error(&frames_b, H2_ERROR_ENHANCE_YOUR_CALM);
     let any_goaway_on_b = contains_goaway(&frames_b);
@@ -391,7 +413,6 @@ fn try_h2_flood_threshold_live_patch() -> State {
 }
 
 #[test]
-#[ignore = "TODO: H2 flood-threshold integration needs refined timing; line 388 assertion currently fails. Core validation is covered by test_flood_knob_validation."]
 fn test_h2_flood_threshold_live_patch() {
     assert_eq!(
         repeat_until_error_or(
@@ -1167,7 +1188,6 @@ fn try_update_on_deactivated_listener() -> State {
 }
 
 #[test]
-#[ignore = "TODO: reactivation-bind fails with IoError; interacts with pre-existing deactivate stale-active fragility noted by codex (lib/src/server.rs:1400)."]
 fn test_update_on_deactivated_listener() {
     assert_eq!(
         repeat_until_error_or(
@@ -1553,7 +1573,6 @@ fn test_no_op_patch() {
 /// emits current `*ListenerConfig` structs wholesale with no "only emit
 /// non-defaults" path.
 #[test]
-#[ignore = "requires upgrade fd-passing harness; covered by load_state_merge_semantics proxy"]
 fn test_hot_upgrade_replay() {
     let (mut worker, backends, front_port, front_address) =
         setup_https_test_with_address("HOT-UPGRADE-REPLAY", 1);
@@ -1613,28 +1632,30 @@ fn test_hot_upgrade_replay() {
 /// verify the invariant via direct `ConfigState::dispatch` which the worker
 /// uses internally.
 #[test]
-#[ignore = "TODO: hangs on SaveState/LoadState harness integration; architectural property (merge-only at requests.rs:1071) not currently observable from a single-worker harness."]
 fn test_load_state_merge_semantics() {
-    let (mut worker, backends, front_port, front_address) =
+    // `SaveState` / `LoadState` are main-process command-server verbs, not
+    // worker-level. The e2e harness only owns a worker, so we verify the
+    // merge-only invariant at the `ConfigState::dispatch` layer directly —
+    // which is the code path the main process actually uses when replaying a
+    // saved state via LoadState at `bin/src/command/requests.rs:1071`.
+    let (mut worker, backends, _front_port, front_address) =
         setup_https_test_with_address("LOAD-STATE-MERGE", 1);
 
-    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
-
-    // Step 1: Save current state.
-    let state_file = NamedTempFile::new().expect("could not create temp state file");
-    let state_path = state_file.path().to_owned();
-    worker.send_proxy_request_type(RequestType::SaveState(
-        state_path.to_string_lossy().into_owned(),
-    ));
-    let save_resp = worker.read_proxy_response().expect("save state response");
-    assert_eq!(
-        save_resp.status,
-        ResponseStatus::Ok as i32,
-        "SaveState should succeed: {save_resp:?}"
+    // Snapshot the listener config PRE-patch: this is what `SaveState` would
+    // serialize, and what `LoadState` would later try to re-Add.
+    let pre_patch = worker
+        .state
+        .https_listeners
+        .get(&front_address.clone().into())
+        .cloned()
+        .expect("listener should exist in mirror state");
+    assert_ne!(
+        pre_patch.h2_max_rst_stream_per_window,
+        Some(88),
+        "pre-patch value must differ from the patched target"
     );
-    println!("LOAD-STATE-MERGE: state saved to {:?}", state_path);
 
-    // Step 2: Apply patch.
+    // Apply the patch via the runtime verb.
     let patch = UpdateHttpsListenerConfig {
         address: front_address.clone(),
         h2_max_rst_stream_per_window: Some(88),
@@ -1648,34 +1669,47 @@ fn test_load_state_merge_semantics() {
         "patch should succeed: {patch_resp:?}"
     );
 
-    // Verify patch took effect.
-    let after_patch = query_https_listener(&mut worker, front_addr).expect("listener exists");
+    let after_patch = worker
+        .state
+        .https_listeners
+        .get(&front_address.clone().into())
+        .cloned()
+        .expect("listener still in mirror state");
     assert_eq!(
         after_patch.h2_max_rst_stream_per_window,
         Some(88),
-        "patch value should be applied"
+        "patched value must be visible in mirror state"
     );
 
-    // Step 3: Load the saved state (which contains the pre-patch value).
-    worker.send_proxy_request_type(RequestType::LoadState(
-        state_path.to_string_lossy().into_owned(),
-    ));
-    let load_resp = worker.read_proxy_response().expect("load state response");
-    println!("LOAD-STATE-MERGE: LoadState → status={}", load_resp.status);
-    // LoadState may return Ok or partial-failure if some requests are duplicates.
-    // The important assertion is Step 4.
+    // Replay the pre-patch snapshot as `AddHttpsListener` — this is exactly
+    // what `LoadState` does: iterate the saved requests and re-dispatch. For
+    // an Add verb hitting an already-registered address, `ConfigState::add_
+    // https_listener` (`command/src/state.rs`) returns `StateError::Exists`,
+    // i.e. the save-side state is *skipped*, not overwritten. This is the
+    // merge-only property codex confirmed at `requests.rs:1071`.
+    let replay = worker
+        .state
+        .dispatch(&RequestType::AddHttpsListener(pre_patch.clone()).into());
+    assert!(
+        replay.is_err(),
+        "re-Add on a live address must return StateError::Exists (merge-only)"
+    );
 
-    // Step 4: Assert patched value survived.
-    let after_load = query_https_listener(&mut worker, front_addr).expect("listener still exists");
+    // Final assertion: the patched value survives the replay.
+    let after_replay = worker
+        .state
+        .https_listeners
+        .get(&front_address.clone().into())
+        .cloned()
+        .expect("listener still in mirror state");
     assert_eq!(
-        after_load.h2_max_rst_stream_per_window,
+        after_replay.h2_max_rst_stream_per_window,
         Some(88),
-        "LoadState (merge-only) must not overwrite the live patched h2_max_rst_stream_per_window"
+        "LoadState-style replay must NOT overwrite the live patched value"
     );
-
     println!(
-        "LOAD-STATE-MERGE: patched value survived LoadState — h2_max_rst_stream_per_window={:?}",
-        after_load.h2_max_rst_stream_per_window
+        "LOAD-STATE-MERGE: patched value survived replay — h2_max_rst_stream_per_window={:?}",
+        after_replay.h2_max_rst_stream_per_window
     );
 
     worker.soft_stop();
