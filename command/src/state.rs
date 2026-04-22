@@ -1829,6 +1829,16 @@ pub fn validate_alpn_protocols(values: &[String]) -> Result<(), StateError> {
     Ok(())
 }
 
+/// Validate a `sozu_id_header` value against the RFC 9110 §5.1 `token` grammar:
+///
+/// ```text
+/// token  = 1*tchar
+/// tchar  = "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-" / "." /
+///          "^" / "_" / "`" / "|" / "~" / DIGIT / ALPHA
+/// ```
+///
+/// Rejects empty strings, non-ASCII bytes, controls (including CR/LF/tab),
+/// separators (including colon and space), and any other non-`tchar` byte.
 pub fn validate_sozu_id_header(value: &str) -> Result<(), StateError> {
     if value.is_empty() {
         return Err(StateError::InvalidValue {
@@ -1836,14 +1846,31 @@ pub fn validate_sozu_id_header(value: &str) -> Result<(), StateError> {
             reason: "must not be empty",
         });
     }
-    if value
-        .chars()
-        .any(|c| matches!(c, '\r' | '\n' | ':' | ' ' | '\t'))
-    {
-        return Err(StateError::InvalidValue {
-            field: "sozu_id_header",
-            reason: "must not contain CR, LF, colon, space, or tab (RFC 9110 §5.1 token grammar)",
-        });
+    for b in value.bytes() {
+        let is_tchar = b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'!' | b'#'
+                    | b'$'
+                    | b'%'
+                    | b'&'
+                    | b'\''
+                    | b'*'
+                    | b'+'
+                    | b'-'
+                    | b'.'
+                    | b'^'
+                    | b'_'
+                    | b'`'
+                    | b'|'
+                    | b'~'
+            );
+        if !is_tchar {
+            return Err(StateError::InvalidValue {
+                field: "sozu_id_header",
+                reason: "must be a valid HTTP header name (RFC 9110 §5.1 token: alphanumeric or one of !#$%&'*+-.^_`|~)",
+            });
+        }
     }
     Ok(())
 }

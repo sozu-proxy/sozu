@@ -46,8 +46,7 @@ use sozu_command::{
     ready::Ready,
     response::HttpFrontend,
     state::{
-        ClusterId, StateError, validate_alpn_protocols, validate_h2_flood_knobs_https,
-        validate_sozu_id_header,
+        ClusterId, validate_alpn_protocols, validate_h2_flood_knobs_https, validate_sozu_id_header,
     },
 };
 
@@ -1026,22 +1025,14 @@ impl HttpsListener {
     ) -> Result<(), ListenerError> {
         // Defense-in-depth validation: main-process ConfigState::dispatch
         // validates before scatter, but a raw protobuf client or state replay
-        // may reach the worker without that check.
-        let into_listener_err = |e: StateError| match e {
-            StateError::InvalidValue { field, reason } => {
-                ListenerError::InvalidValue { field, reason }
-            }
-            _ => ListenerError::InvalidValue {
-                field: "unknown",
-                reason: "validation failed",
-            },
-        };
-        validate_h2_flood_knobs_https(patch).map_err(into_listener_err)?;
+        // may reach the worker without that check. `StateError` lifts into
+        // `ListenerError` via `From` so `?` suffices.
+        validate_h2_flood_knobs_https(patch)?;
         if let Some(ref alpn) = patch.alpn_protocols {
-            validate_alpn_protocols(&alpn.values).map_err(into_listener_err)?;
+            validate_alpn_protocols(&alpn.values)?;
         }
         if let Some(ref hdr) = patch.sozu_id_header {
-            validate_sozu_id_header(hdr).map_err(into_listener_err)?;
+            validate_sozu_id_header(hdr)?;
         }
 
         // --- simple field patches ---
@@ -1130,12 +1121,24 @@ impl HttpsListener {
         }
 
         // --- ALPN rebuild (may force a rustls ServerConfig rebuild) ---
+        //
+        // Transactional: build the candidate rustls context first using a
+        // **cloned** config that carries the new ALPN. Only if the build
+        // succeeds do we commit `self.config.alpn_protocols` and swap the
+        // Arc. This ensures a rustls failure (crypto provider transient,
+        // resolver error, etc.) leaves the listener observably unchanged —
+        // the master-side state would still diverge from the worker-side
+        // refusal, but the worker itself stays consistent.
         if let Some(ref alpn_wrapper) = patch.alpn_protocols {
-            self.config.alpn_protocols = alpn_wrapper.values.clone();
-            self.rustls_details = Arc::new(Self::create_rustls_context(
-                &self.config,
+            let mut candidate = self.config.clone();
+            candidate.alpn_protocols = alpn_wrapper.values.clone();
+            let new_rustls = Arc::new(Self::create_rustls_context(
+                &candidate,
                 self.resolver.clone(),
             )?);
+            // Build succeeded — commit.
+            self.config.alpn_protocols = alpn_wrapper.values.clone();
+            self.rustls_details = new_rustls;
         }
 
         // --- HTTP answers: replace listener defaults per-field, preserve cluster overrides ---
