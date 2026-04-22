@@ -359,6 +359,7 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                 }
                 kawa.push_out(Store::from_slice(&header));
                 kawa.push_out(data);
+                incr!("h2.frames.tx.data");
                 // kawa.push_delimiter();
                 return can_continue;
             }
@@ -395,6 +396,7 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                         }
                         kawa.push_out(Store::from_slice(&header));
                         kawa.push_out(Store::from_vec(payload));
+                        incr!("h2.frames.tx.headers");
                         true
                     } else {
                         let chunks = payload.chunks(self.max_frame_size);
@@ -424,6 +426,7 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                                     );
                                     return false;
                                 }
+                                incr!("h2.frames.tx.headers");
                             } else if let Err(e) = gen_frame_header(
                                 &mut header,
                                 &FrameHeader {
@@ -439,6 +442,8 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                                     e
                                 );
                                 return false;
+                            } else {
+                                incr!("h2.frames.tx.continuation");
                             }
                             kawa.push_out(Store::from_slice(&header));
                             kawa.push_out(Store::from_slice(chunk));
@@ -467,6 +472,7 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                         return false;
                     }
                     kawa.push_out(Store::from_slice(&header));
+                    incr!("h2.frames.tx.data");
                 }
             }
         }
