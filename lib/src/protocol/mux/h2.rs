@@ -150,6 +150,45 @@ const FLOW_CONTROL_MAX_WINDOW: u32 = (1 << 31) - 1;
 // RFC 9113 §5.1.1: stream identifiers are 31-bit unsigned integers (2^31 - 1).
 const STREAM_ID_MAX: u32 = 0x7FFF_FFFF;
 
+/// Allocate the next locally-initiated stream identifier given the current
+/// `last_stream_id` watermark, returning `(issued_id, next_last_stream_id)`
+/// or `None` when the 31-bit space is exhausted.
+///
+/// RFC 9113 §5.1.1 reserves odd identifiers for clients and even identifiers
+/// for servers. Sōzu never server-pushes, so in practice this helper is
+/// called on the backend (client) side via [`ConnectionH2::new_stream_id`].
+/// The server branch is kept symmetrical so the behaviour is exercised by
+/// the unit tests and remains correct if push is ever enabled.
+///
+/// `last_stream_id` tracks the even "watermark" (2, 4, 6, ...). A client call
+/// issues `watermark - 1` (odd), a server call issues `watermark - 2` (even).
+/// The helper enforces two invariants:
+/// - the issued identifier never exceeds `STREAM_ID_MAX` (2³¹ - 1); and
+/// - the returned watermark is a valid starting point for the next call.
+///
+/// Exhaustion is reported with `None` to the caller, which must emit
+/// GOAWAY(NO_ERROR) and stop issuing new streams on this connection
+/// (see `start_stream` for the client-side drain path).
+pub(super) fn next_stream_id(
+    last_stream_id: StreamId,
+    is_client: bool,
+) -> Option<(StreamId, StreamId)> {
+    let next = last_stream_id.checked_add(2)?;
+    let issued = if is_client {
+        next.checked_sub(1)?
+    } else {
+        next.checked_sub(2)?
+    };
+    // RFC 9113 §5.1.1: stream identifiers are 31-bit. Reject any allocation
+    // whose issued value would exceed `STREAM_ID_MAX`; the watermark itself
+    // is allowed to sit at `STREAM_ID_MAX + 1` (the sentinel that fails the
+    // next call).
+    if issued > STREAM_ID_MAX {
+        return None;
+    }
+    Some((issued, next))
+}
+
 /// Enlarged connection-level receive window (1 MB).
 /// The RFC 9113 default is 65 535 bytes, which is too small for high-throughput
 /// proxying and causes excessive WINDOW_UPDATE round-trips. 1 MB matches the
@@ -3380,15 +3419,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     }
 
     pub fn new_stream_id(&mut self) -> Option<StreamId> {
-        let next = self.last_stream_id.checked_add(2)?;
-        if next > STREAM_ID_MAX {
-            return None;
-        }
+        let (issued, next) = next_stream_id(self.last_stream_id, self.position.is_client())?;
         self.last_stream_id = next;
-        match self.position {
-            Position::Client(..) => Some(self.last_stream_id - 1),
-            Position::Server => Some(self.last_stream_id - 2),
-        }
+        Some(issued)
     }
 
     /// Test-only setter: jump `last_stream_id` close to [`STREAM_ID_MAX`] so
@@ -6097,5 +6130,136 @@ mod tests {
         let mut buf = Vec::with_capacity(16);
         let _ = write!(buf, "{:x}", usize::MAX);
         assert_eq!(buf, max_expected.as_bytes());
+    }
+
+    // ── Stream-ID allocation / exhaustion ──────────────────────────────────
+
+    /// A fresh client connection starts with `last_stream_id == 0`. The first
+    /// call MUST issue stream `1` (odd, RFC 9113 §5.1.1) and advance the
+    /// watermark to `2`.
+    #[test]
+    fn test_next_stream_id_client_first_allocation() {
+        let (issued, next) = next_stream_id(0, true).expect("fresh client must allocate");
+        assert_eq!(issued, 1);
+        assert_eq!(next, 2);
+    }
+
+    /// Client allocation yields strictly increasing odd identifiers
+    /// (1, 3, 5, ...) as required by RFC 9113 §5.1.1.
+    #[test]
+    fn test_next_stream_id_client_sequence_is_odd_and_monotonic() {
+        let mut last = 0u32;
+        let mut issued_ids = Vec::with_capacity(8);
+        for _ in 0..8 {
+            let (id, next) = next_stream_id(last, true).expect("unexhausted");
+            assert_eq!(id & 1, 1, "client stream ids must be odd (RFC 9113 §5.1.1)");
+            assert!(issued_ids.last().is_none_or(|prev: &u32| id > *prev));
+            issued_ids.push(id);
+            last = next;
+        }
+        assert_eq!(issued_ids, vec![1, 3, 5, 7, 9, 11, 13, 15]);
+    }
+
+    /// Server-side allocation yields even identifiers. The helper
+    /// convention is `watermark - 2` for server, `watermark - 1` for client,
+    /// so both sides share the same monotonically-increasing even watermark.
+    /// Sōzu never server-pushes, but the helper must be symmetric so push
+    /// could be enabled without a regression.
+    #[test]
+    fn test_next_stream_id_server_is_even() {
+        // `last = 2` means the most recent allocation advanced the watermark
+        // to 2; server then issues `2 - 2 = 0`. This is an artefact of the
+        // shared watermark and only matters in tests — server never uses it.
+        let (issued, next) = next_stream_id(2, false).expect("server allocation");
+        assert_eq!(issued & 1, 0, "server stream ids must be even");
+        assert_eq!(next, 4);
+        assert_eq!(issued, 2);
+
+        let (issued, next) = next_stream_id(next, false).expect("second slot");
+        assert_eq!(issued, 4);
+        assert_eq!(issued & 1, 0);
+        assert_eq!(next, 6);
+    }
+
+    /// The last client-issuable odd stream ID is `STREAM_ID_MAX = 0x7FFF_FFFF`.
+    /// To issue it the watermark must advance to `STREAM_ID_MAX + 1 = 2³¹`;
+    /// the caller therefore supplies `last = STREAM_ID_MAX - 1 = 0x7FFF_FFFE`.
+    /// That call MUST succeed and return the max ID; the post-call watermark
+    /// sits at `2³¹`, which is the sentinel that makes the next call fail.
+    #[test]
+    fn test_next_stream_id_client_final_slot_allocates() {
+        let last = STREAM_ID_MAX - 1;
+        let (issued, next) = next_stream_id(last, true).expect("final slot still allocates");
+        assert_eq!(issued, STREAM_ID_MAX);
+        assert_eq!(next, STREAM_ID_MAX + 1);
+        // And the very next call MUST refuse rather than wrap.
+        assert!(next_stream_id(next, true).is_none());
+    }
+
+    /// Exhaustion case: once the client has issued stream ID `STREAM_ID_MAX`,
+    /// the watermark sits at `STREAM_ID_MAX + 1`. The next request MUST return
+    /// `None` — without this guard the helper would issue `STREAM_ID_MAX + 2`
+    /// (wrapped down to an even id), which would (a) use the reserved
+    /// high bit and (b) violate the odd-parity invariant for client streams.
+    #[test]
+    fn test_next_stream_id_client_exhausted_returns_none() {
+        let last = STREAM_ID_MAX + 1;
+        assert!(next_stream_id(last, true).is_none());
+    }
+
+    /// Exhaustion via `checked_add` saturation: defence in depth in case a
+    /// caller jumps `last_stream_id` close to `u32::MAX`. The helper must
+    /// not panic nor overflow — it must return `None`.
+    #[test]
+    fn test_next_stream_id_saturates_near_u32_max() {
+        assert!(next_stream_id(u32::MAX, true).is_none());
+        assert!(next_stream_id(u32::MAX - 1, true).is_none());
+    }
+
+    /// Server-side exhaustion: same guard, even-parity identifier space.
+    #[test]
+    fn test_next_stream_id_server_exhausted_returns_none() {
+        let last = STREAM_ID_MAX + 1;
+        assert!(next_stream_id(last, false).is_none());
+    }
+
+    /// Regression guard: the helper must never issue a stream ID that
+    /// exceeds `STREAM_ID_MAX` for either side, no matter where the
+    /// watermark sits. This walks every value in a neighbourhood of the
+    /// boundary to rule out off-by-one errors.
+    #[test]
+    fn test_next_stream_id_never_exceeds_stream_id_max() {
+        for last in (STREAM_ID_MAX - 4)..=(STREAM_ID_MAX + 4) {
+            for is_client in [true, false] {
+                if let Some((issued, next)) = next_stream_id(last, is_client) {
+                    assert!(
+                        issued <= STREAM_ID_MAX,
+                        "issued id {issued} exceeds STREAM_ID_MAX (last={last}, is_client={is_client})"
+                    );
+                    // `next` is the post-allocation watermark and may sit at
+                    // STREAM_ID_MAX + 1 — the very next call must then return None.
+                    if next > STREAM_ID_MAX {
+                        assert!(
+                            next_stream_id(next, is_client).is_none(),
+                            "second call after final slot must report exhaustion"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The helper's `is_client` flag must cleanly split the ID space so that
+    /// a client and a server peered on the same connection cannot collide.
+    /// Given the same `last_stream_id`, the two parities must differ by 1.
+    #[test]
+    fn test_next_stream_id_client_server_parities_disjoint() {
+        for last in [0u32, 2, 4, 10, 100, 1_000_000, STREAM_ID_MAX - 3] {
+            let (client_id, _) = next_stream_id(last, true).unwrap();
+            let (server_id, _) = next_stream_id(last, false).unwrap();
+            assert_eq!(client_id & 1, 1);
+            assert_eq!(server_id & 1, 0);
+            assert_eq!(client_id.abs_diff(server_id), 1);
+        }
     }
 }
