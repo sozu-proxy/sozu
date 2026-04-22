@@ -244,6 +244,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             }
             None => return Err(AcceptError::BufferCapacityReached),
         };
+        let sozu_id_header = listener.borrow().get_sozu_id_header().to_string();
         Ok(Http {
             answers,
             backend_connection_status: BackendConnectionStatus::NotConnected,
@@ -281,6 +282,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 public_address,
                 session_address,
                 sticky_name,
+                sozu_id_header,
             ),
         })
     }
