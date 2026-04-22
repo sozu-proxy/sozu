@@ -2489,6 +2489,15 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         }
     }
 
+    /// Evict every per-stream piece of state carried by this `ConnectionH2`.
+    ///
+    /// **Invariant**: `rst_sent`, `stream_last_activity_at` and `prioriser`
+    /// MUST be emptied of `stream_id` here — they are the only three
+    /// per-stream caches that are not stored in the slab-allocated
+    /// `Context.streams[]`. Forgetting any of them causes unbounded memory
+    /// growth on long-lived connections with many cancelled streams (Codex
+    /// gap G11). The `debug_assert`s below fail loudly in test builds if
+    /// someone adds a new per-stream cache without updating this function.
     fn remove_dead_stream(&mut self, stream_id: StreamId, global_stream_id: GlobalStreamId) {
         if self.streams.remove(&stream_id).is_none() {
             error!(
@@ -2500,6 +2509,14 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         self.rst_sent.remove(&stream_id);
         self.stream_last_activity_at.remove(&stream_id);
         self.prioriser.remove(&stream_id);
+        debug_assert!(
+            !self.rst_sent.contains(&stream_id),
+            "rst_sent still contains stream_id {stream_id} after eviction"
+        );
+        debug_assert!(
+            !self.stream_last_activity_at.contains_key(&stream_id),
+            "stream_last_activity_at still contains stream_id {stream_id} after eviction"
+        );
         // Invariant: expect_write/expect_read must not reference a gid whose
         // context slot may be popped by shrink_trailing_recycle after eviction.
         if matches!(self.expect_write, Some(H2StreamId::Other { gid, .. }) if gid == global_stream_id)
