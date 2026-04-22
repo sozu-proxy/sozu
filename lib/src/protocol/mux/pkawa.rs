@@ -1777,6 +1777,36 @@ mod tests {
     }
 
     #[test]
+    fn test_handle_header_rejects_empty_status() {
+        // Codex G5 concern: response pseudo-header emptiness could slip through
+        // if the three-digit guard were removed. Locks in `v.len() != 3` as
+        // the rejection gate for an empty :status (HPACK allows zero-length
+        // field values, so this must be enforced explicitly). A server
+        // emitting :status = "" would otherwise produce a malformed H1
+        // response ("HTTP/1.1  FromH2") on the backend side.
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        let err = try_decode_response_headers(
+            &mut pool,
+            &[(b":status", b""), (b"content-type", b"text/html")],
+            true,
+        );
+        assert!(err.is_err(), "empty :status must be rejected");
+    }
+
+    #[test]
+    fn test_handle_header_rejects_missing_status() {
+        // RFC 9113 §8.3.2: response HEADERS MUST contain :status. If no
+        // :status pseudo-header is present at all, the post-loop
+        // `status.is_empty()` check (line 851 of the production path) is the
+        // backstop that converts the absence into a stream-level
+        // PROTOCOL_ERROR. Without this test, silently-downgraded-to-H1
+        // responses with no status line could slip through.
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        let err = try_decode_response_headers(&mut pool, &[(b"content-type", b"text/html")], true);
+        assert!(err.is_err(), "response without :status must be rejected");
+    }
+
+    #[test]
     fn test_handle_header_rejects_ctl_in_cookie_value() {
         let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
         let err = try_decode_request_headers(
