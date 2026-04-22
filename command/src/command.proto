@@ -188,6 +188,11 @@ message HttpListenerConfig {
     // GOAWAY(NO_ERROR) before forcibly closing the connection. Default: 5.
     // Set to 0 to require streams to finish (no forced close).
     optional uint32 h2_graceful_shutdown_deadline_seconds = 28;
+    // Maximum connection-level (stream 0) WINDOW_UPDATE frames per second
+    // window. Caps non-zero stream-0 WINDOW_UPDATE floods that would otherwise
+    // stay under the generic glitch counter (zero-increment stream-0 updates
+    // already trigger GOAWAY per RFC 9113 §6.9). Default: 100.
+    optional uint32 h2_max_window_update_stream0_per_window = 29;
 }
 
 // details of an HTTPS listener
@@ -293,6 +298,11 @@ message HttpsListenerConfig {
     // GOAWAY(NO_ERROR) before forcibly closing the connection. Default: 5.
     // Set to 0 to require streams to finish (no forced close).
     optional uint32 h2_graceful_shutdown_deadline_seconds = 40;
+    // Maximum connection-level (stream 0) WINDOW_UPDATE frames per second
+    // window. Caps non-zero stream-0 WINDOW_UPDATE floods that would otherwise
+    // stay under the generic glitch counter (zero-increment stream-0 updates
+    // already trigger GOAWAY per RFC 9113 §6.9). Default: 100.
+    optional uint32 h2_max_window_update_stream0_per_window = 41;
 }
 
 // details of an TCP listener

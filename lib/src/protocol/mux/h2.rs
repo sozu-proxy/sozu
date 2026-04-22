@@ -250,6 +250,13 @@ const DEFAULT_MAX_SETTINGS_PER_WINDOW: u32 = 50;
 const DEFAULT_MAX_SETTINGS_LIFETIME: u32 = 10_000;
 /// Default maximum empty DATA frames per window (CVE-2019-9518 Empty Frames)
 const DEFAULT_MAX_EMPTY_DATA_PER_WINDOW: u32 = 100;
+/// Default maximum connection-level (stream 0) WINDOW_UPDATE frames per
+/// sliding window. Non-zero stream-0 WINDOW_UPDATE frames are otherwise
+/// uncounted by the generic glitch detector — a peer could burn proxy CPU by
+/// sending millions of legal-looking stream-0 WINDOW_UPDATEs. Value mirrors
+/// [`DEFAULT_MAX_EMPTY_DATA_PER_WINDOW`] / [`DEFAULT_MAX_PING_PER_WINDOW`] —
+/// legitimate proxies only need a handful per second.
+const DEFAULT_MAX_WINDOW_UPDATE_STREAM0_PER_WINDOW: u32 = 100;
 /// Default maximum CONTINUATION frames per header block (CVE-2024-27316)
 const DEFAULT_MAX_CONTINUATION_FRAMES: u32 = 20;
 /// Maximum accumulated header block size across CONTINUATION frames (64KB)
@@ -286,6 +293,12 @@ pub struct H2FloodConfig {
     pub max_settings_per_window: u32,
     /// Maximum empty DATA frames per second window (CVE-2019-9518)
     pub max_empty_data_per_window: u32,
+    /// Maximum connection-level (stream 0) WINDOW_UPDATE frames per sliding
+    /// window. Caps the CPU cost of a peer sending a flood of non-zero
+    /// stream-0 WINDOW_UPDATEs — each is individually legal so the generic
+    /// glitch counter does not trip, yet millions per connection still burn
+    /// server CPU parsing and updating the flow window.
+    pub max_window_update_stream0_per_window: u32,
     /// Maximum CONTINUATION frames per header block (CVE-2024-27316)
     pub max_continuation_frames: u32,
     /// Maximum accumulated protocol anomalies before ENHANCE_YOUR_CALM
@@ -317,6 +330,7 @@ impl Default for H2FloodConfig {
             max_ping_per_window: DEFAULT_MAX_PING_PER_WINDOW,
             max_settings_per_window: DEFAULT_MAX_SETTINGS_PER_WINDOW,
             max_empty_data_per_window: DEFAULT_MAX_EMPTY_DATA_PER_WINDOW,
+            max_window_update_stream0_per_window: DEFAULT_MAX_WINDOW_UPDATE_STREAM0_PER_WINDOW,
             max_continuation_frames: DEFAULT_MAX_CONTINUATION_FRAMES,
             max_glitch_count: DEFAULT_MAX_GLITCH_COUNT,
             max_rst_stream_lifetime: DEFAULT_MAX_RST_STREAM_LIFETIME,
@@ -337,6 +351,7 @@ impl H2FloodConfig {
         max_ping_per_window: u32,
         max_settings_per_window: u32,
         max_empty_data_per_window: u32,
+        max_window_update_stream0_per_window: u32,
         max_continuation_frames: u32,
         max_glitch_count: u32,
         max_rst_stream_lifetime: u64,
@@ -350,6 +365,7 @@ impl H2FloodConfig {
             max_ping_per_window: max_ping_per_window.max(1),
             max_settings_per_window: max_settings_per_window.max(1),
             max_empty_data_per_window: max_empty_data_per_window.max(1),
+            max_window_update_stream0_per_window: max_window_update_stream0_per_window.max(1),
             max_continuation_frames: max_continuation_frames.max(1),
             max_glitch_count: max_glitch_count.max(1),
             max_rst_stream_lifetime: max_rst_stream_lifetime.max(1),
@@ -610,6 +626,12 @@ pub struct H2FloodDetector {
     pub(super) total_settings_received_lifetime: u32,
     /// Empty DATA frames received in current window (CVE-2019-9518)
     pub(super) empty_data_count: u32,
+    /// Connection-level (stream 0) WINDOW_UPDATE frames received in current
+    /// sliding window. Half-decays with [`maybe_reset_window`] like other
+    /// rate counters. Increments on non-zero stream-0 WINDOW_UPDATEs only —
+    /// zero-increment frames short-circuit into GOAWAY(PROTOCOL_ERROR) per
+    /// RFC 9113 §6.9 before reaching this counter.
+    pub(super) window_update_stream0_count: u32,
     /// CONTINUATION frames received for current header block (CVE-2024-27316)
     pub(super) continuation_count: u32,
     /// Total accumulated header block size across CONTINUATION frames
@@ -640,6 +662,7 @@ impl H2FloodDetector {
             settings_count: 0,
             total_settings_received_lifetime: 0,
             empty_data_count: 0,
+            window_update_stream0_count: 0,
             continuation_count: 0,
             accumulated_header_size: 0,
             glitch_count: 0,
@@ -712,6 +735,7 @@ impl H2FloodDetector {
             self.ping_count /= 2;
             self.settings_count /= 2;
             self.empty_data_count /= 2;
+            self.window_update_stream0_count /= 2;
             self.glitch_count /= 2;
             self.window_start = Instant::now();
         }
@@ -794,6 +818,14 @@ impl H2FloodDetector {
                 "h2.flood.violation.continuation_per_block",
                 self.continuation_count,
                 self.config.max_continuation_frames,
+            )
+        })
+        .or_else(|| {
+            flag(
+                "WINDOW_UPDATE stream 0",
+                "h2.flood.violation.window_update_stream0_window",
+                self.window_update_stream0_count,
+                self.config.max_window_update_stream0_per_window,
             )
         })
         .or_else(|| {
@@ -4493,6 +4525,17 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // guard against a future parser change that drops the mask.
         let increment = i32::try_from(increment).unwrap_or(i32::MAX);
         if stream_id == 0 {
+            // Count connection-level WINDOW_UPDATEs before touching the window
+            // so a per-window flood stops us before we pay the arithmetic cost
+            // on a million-frame burst. Zero-increment frames short-circuited
+            // above, so every increment here is a legal-looking rate consumer.
+            self.flood_detector.window_update_stream0_count = self
+                .flood_detector
+                .window_update_stream0_count
+                .saturating_add(1);
+            if let Some(violation) = self.flood_detector.check_flood() {
+                return self.handle_flood_violation(violation);
+            }
             self.attribute_bytes_to_overhead();
             if let Some(window) = self.flow_control.window.checked_add(increment) {
                 if self.flow_control.window <= 0 && window > 0 {
@@ -5174,6 +5217,7 @@ mod tests {
         detector.ping_count = 60;
         detector.settings_count = 40;
         detector.empty_data_count = 20;
+        detector.window_update_stream0_count = 90;
         detector.glitch_count = 50;
 
         // Force window expiry by setting window_start to the past
@@ -5186,7 +5230,47 @@ mod tests {
         assert_eq!(detector.ping_count, 30);
         assert_eq!(detector.settings_count, 20);
         assert_eq!(detector.empty_data_count, 10);
+        assert_eq!(detector.window_update_stream0_count, 45);
         assert_eq!(detector.glitch_count, 25);
+    }
+
+    #[test]
+    fn test_flood_detector_window_update_stream0_trips_at_threshold() {
+        let config = H2FloodConfig {
+            max_window_update_stream0_per_window: 5,
+            ..H2FloodConfig::default()
+        };
+        let mut detector = H2FloodDetector::new(config);
+
+        // At threshold — no flood yet (strict greater-than, matches existing counters).
+        detector.window_update_stream0_count = 5;
+        assert!(detector.check_flood().is_none());
+
+        // Above threshold — flood with the correct violation reason + metric key.
+        detector.window_update_stream0_count = 6;
+        let violation = detector
+            .check_flood()
+            .expect("WINDOW_UPDATE stream-0 flood must trip above threshold");
+        assert_eq!(violation.error, H2Error::EnhanceYourCalm);
+        assert_eq!(violation.reason, "WINDOW_UPDATE stream 0");
+        assert_eq!(
+            violation.metric_key,
+            "h2.flood.violation.window_update_stream0_window"
+        );
+        assert_eq!(violation.count, 6);
+        assert_eq!(violation.threshold, 5);
+    }
+
+    #[test]
+    fn test_flood_detector_window_update_stream0_honours_default() {
+        // Default threshold must match the documented constant so operators
+        // can reason about behaviour without reading code.
+        let detector = H2FloodDetector::default();
+        assert_eq!(
+            detector.config.max_window_update_stream0_per_window,
+            DEFAULT_MAX_WINDOW_UPDATE_STREAM0_PER_WINDOW
+        );
+        assert_eq!(detector.window_update_stream0_count, 0);
     }
 
     #[test]

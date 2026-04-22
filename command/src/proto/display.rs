@@ -1040,6 +1040,7 @@ impl Display for HttpListenerConfig {
             &self.h2_max_ping_per_window,
             &self.h2_max_settings_per_window,
             &self.h2_max_empty_data_per_window,
+            &self.h2_max_window_update_stream0_per_window,
             &self.h2_max_continuation_frames,
             &self.h2_max_glitch_count,
             &self.h2_max_rst_stream_lifetime,
@@ -1104,6 +1105,7 @@ impl Display for HttpsListenerConfig {
             &self.h2_max_ping_per_window,
             &self.h2_max_settings_per_window,
             &self.h2_max_empty_data_per_window,
+            &self.h2_max_window_update_stream0_per_window,
             &self.h2_max_continuation_frames,
             &self.h2_max_glitch_count,
             &self.h2_max_rst_stream_lifetime,
@@ -1144,6 +1146,7 @@ fn add_h2_flood_rows(
     max_ping: &Option<u32>,
     max_settings: &Option<u32>,
     max_empty_data: &Option<u32>,
+    max_window_update_stream0: &Option<u32>,
     max_continuation: &Option<u32>,
     max_glitch: &Option<u32>,
     max_rst_stream_lifetime: &Option<u64>,
@@ -1163,6 +1166,9 @@ fn add_h2_flood_rows(
     }
     if let Some(v) = max_empty_data {
         table.add_row(row!["h2 max empty_data/window", v]);
+    }
+    if let Some(v) = max_window_update_stream0 {
+        table.add_row(row!["h2 max window_update stream0/window", v]);
     }
     if let Some(v) = max_continuation {
         table.add_row(row!["h2 max continuation frames", v]);
