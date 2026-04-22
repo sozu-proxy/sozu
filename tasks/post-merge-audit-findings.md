@@ -202,13 +202,13 @@ These items need their own dedicated conversation; they were left out
 of the post-merge sweep because they are architectural or
 harness-heavy:
 
-| ID | Item | Reason |
+| ID | Item | Status |
 |----|------|--------|
 | B3-h · G4 | Linked-stream fast-backend-close race e2e | needs full e2e harness with backend that closes mid-response + stream-state assertion hooks |
 | B3-z | 1xx informational forwarding e2e | needs backend that emits 1xx before final response |
-| B3-j · G6 | HPACK dynamic-table-size-update emission | RFC 7541 §4.2 protocol change, non-trivial |
-| B3-p · #899 | H1 trailers in `kawa_h1` | kawa upstream architectural change |
-| B3-x · #890 + #1057 | Rate-limit design doc + implementation | L-effort, needs design doc first per user's "both vectors" answer |
+| B3-j · G6 | HPACK dynamic-table-size-update emission | **shipped** as commit `a585cea3` (2026-04-22) — converter emits the `001xxxxx` directive at the start of the next header block after a SETTINGS_HEADER_TABLE_SIZE change |
+| B3-p · #899 | H1 trailers in `kawa_h1` | out-of-scope for sozu; belongs to `CleverCloud/kawa` upstream (parser does not emit trailer blocks). Sozu already forwards them if kawa produces them. Operator should open a kawa-side issue/PR |
+| B3-x · #890 + #1057 | Rate-limit design doc + implementation | **design doc shipped** as `doc/rate-limit-design.md` (commit `0031aadb`); implementation follows the §7 rollout plan in a follow-up PR |
 | B2-a · #1218 | Backend TLS | L-effort (~2-4 k LOC), user explicitly out-of-scope pre-merge |
 
 ---
