@@ -1791,12 +1791,63 @@ mod tests {
         assert!(err.is_err(), "CR in cookie key must be rejected");
     }
 
+    // ── write_regular_header: Content-Length digit-only parse ─────────────
+
+    #[test]
+    fn test_write_regular_header_content_length_digit_only() {
+        // RFC 9113 §8.1.1: Content-Length value MUST be a non-empty sequence
+        // of ASCII digits. write_regular_header must reject every non-digit
+        // variant before calling usize::from_str so no parser-divergence path
+        // reaches the backend.
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+
+        let reject_cases: &[(&[u8], &str)] = &[
+            (b"", "empty"),
+            (b" 42", "leading whitespace"),
+            (b"42 ", "trailing whitespace"),
+            (b"+42", "unary plus"),
+            (b"-42", "negative sign"),
+            (b"4\xFF2", "non-ASCII byte"),
+            (b"0x10", "non-digit hex chars"),
+        ];
+        for (val, label) in reject_cases {
+            let mut kawa = make_generic_kawa(&mut pool, Kind::Request);
+            let result = write_regular_header(&mut kawa, b"content-length", val);
+            assert!(
+                matches!(result, Err(RejectReason::DuplicateCl)),
+                "content-length {label:?} ({val:?}) must yield DuplicateCl, got {result:?}",
+            );
+        }
+
+        // Valid: a plain digit string must be accepted and set BodySize::Length.
+        let mut kawa = make_generic_kawa(&mut pool, Kind::Request);
+        let result = write_regular_header(&mut kawa, b"content-length", b"42");
+        assert!(
+            result.is_ok(),
+            "valid content-length '42' was rejected: {result:?}"
+        );
+        assert_eq!(
+            kawa.body_size,
+            kawa::BodySize::Length(42),
+            "body_size must be Length(42) after parsing '42'",
+        );
+    }
+
     #[test]
     fn test_handle_header_rejects_bad_content_length() {
         let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
-        // RFC 9110 §8.6: Content-Length is 1*DIGIT. Whitespace, sign, and
-        // trailing garbage must be rejected to avoid backend desync.
-        for bad in [&b" 42"[..], b"+42", b"42 ", b"-1", b"", b"0x10"] {
+        // RFC 9110 §8.6 / RFC 9113 §8.1.1: Content-Length is 1*DIGIT.
+        // Whitespace, sign, trailing garbage, and non-ASCII must be rejected
+        // to avoid parser-divergence against backends.
+        for bad in [
+            &b" 42"[..], // leading whitespace
+            b"+42",      // unary plus
+            b"42 ",      // trailing whitespace
+            b"-1",       // negative sign
+            b"",         // empty
+            b"0x10",     // non-digit chars
+            b"4\xFF2",   // non-ASCII byte (RFC 9113 §8.1.1: must be digits only)
+        ] {
             let err = try_decode_request_headers(
                 &mut pool,
                 &[
