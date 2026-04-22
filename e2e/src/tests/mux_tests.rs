@@ -2101,3 +2101,115 @@ fn test_h1_rejects_ambiguous_cl_te() {
         State::Success,
     );
 }
+
+// =========================================================================
+// H1 chunked-trailer end-to-end forwarding (B3-p / #899)
+// =========================================================================
+
+/// Issue #899 asked whether sozu forwards HTTP/1.1 chunked trailers through
+/// unchanged. Audit of the stack shows the plumbing is already in place
+/// — kawa's H1 parser has `ParsingPhase::Trailers` (`kawa::protocol::h1::
+/// parser::mod.rs:343`) and kawa's H1 converter serializes `Block::Header`
+/// identically whether the block originated before the body (regular
+/// header) or after (trailer). The whole chain just needs an e2e to lock
+/// the behaviour down so a future refactor cannot silently drop trailers.
+///
+/// Test shape: a sync backend sends a chunked RESPONSE whose wire layout
+/// includes `Trailer:` in the headers, body chunks, a `0\r\n` terminator,
+/// and `X-Custom-Trailer: value\r\n\r\n` after the last chunk. The client
+/// reads sozu's forwarded response and asserts BOTH the chunked body AND
+/// the trailer line are present on the wire.
+fn try_h1_chunked_trailer_forwarded() -> State {
+    let front_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, mut backends) = setup_sync_test(
+        "H1-CHUNKED-TRAILER",
+        config,
+        listeners,
+        state,
+        front_address,
+        1,
+        false,
+    );
+    let mut backend = backends.pop().unwrap();
+
+    // Backend canned response: chunked body with a trailer. The `Trailer:`
+    // header advertises the trailer-name per RFC 9110 §6.5, body is two
+    // chunks ("hello" + "world"), then terminator + trailer + CRLF.
+    let response = concat!(
+        "HTTP/1.1 200 OK\r\n",
+        "Transfer-Encoding: chunked\r\n",
+        "Trailer: X-Custom-Trailer\r\n",
+        "Connection: close\r\n",
+        "\r\n",
+        "5\r\nhello\r\n",
+        "5\r\nworld\r\n",
+        "0\r\n",
+        "X-Custom-Trailer: tail-value\r\n",
+        "\r\n",
+    );
+    backend.set_response(response);
+    backend.connect();
+
+    let mut client = Client::new(
+        "client",
+        front_address,
+        "GET /chunked-trailer HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    client.connect();
+    client.send();
+    backend.accept(0);
+    let _request = backend.receive(0);
+    backend.send(0);
+
+    // Pull the full response; the client may receive it in multiple reads
+    // because of chunked framing, so accumulate.
+    let mut observed = String::new();
+    for _ in 0..10 {
+        match client.receive() {
+            Some(chunk) if !chunk.is_empty() => observed.push_str(&chunk),
+            _ => break,
+        }
+    }
+    println!("H1 chunked-trailer - observed response:\n{observed}");
+
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+
+    // The response the client sees MUST contain:
+    // 1. The status line — sozu forwarded the response at all.
+    // 2. The `Trailer:` header — sozu did NOT strip the trailer
+    //    announcement (H2 strips this per RFC 9113 §8.2.2 but H1 must not).
+    // 3. Both body chunks, in order — the body was not truncated.
+    // 4. The trailer line `X-Custom-Trailer: tail-value` — the trailer
+    //    payload made it all the way through.
+    let has_status = observed.starts_with("HTTP/1.1 200");
+    let has_trailer_announce = observed.contains("Trailer: X-Custom-Trailer")
+        || observed.contains("trailer: X-Custom-Trailer");
+    let has_body = observed.contains("hello") && observed.contains("world");
+    let has_trailer = observed.contains("X-Custom-Trailer: tail-value")
+        || observed.contains("x-custom-trailer: tail-value");
+
+    println!(
+        "H1 chunked-trailer - status:{has_status} announce:{has_trailer_announce} body:{has_body} trailer:{has_trailer}"
+    );
+
+    if has_status && has_trailer_announce && has_body && has_trailer {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h1_chunked_trailer_forwarded() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "H1 chunked trailers forwarded through sozu (issue #899)",
+            try_h1_chunked_trailer_forwarded,
+        ),
+        State::Success,
+    );
+}
