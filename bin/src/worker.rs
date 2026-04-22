@@ -19,9 +19,9 @@ use nix::{
 };
 use sozu_command_lib::{
     channel::{Channel, ChannelError},
-    config::Config,
+    config::{Config, MetricDetailLevel},
     logging::{AccessLogFormat, LogError, setup_logging},
-    proto::command::{ServerConfig, WorkerRequest, WorkerResponse},
+    proto::command::{MetricDetail, ServerConfig, WorkerRequest, WorkerResponse},
     ready::Ready,
     request::{RequestError, read_initial_state_from_file},
     scm_socket::{Listeners, ScmSocket, ScmSocketError},
@@ -148,11 +148,22 @@ pub fn begin_worker_process(
             .address
             .parse::<SocketAddr>()
             .expect("Could not parse metrics address");
+        // Convert the proto wire enum back into the configuration enum.
+        // Workers receive the detail level over the SCM socket as
+        // `Option<i32>`; absent / unrecognised values fall back to the
+        // historical default (Cluster) so old binaries on either side keep
+        // working.
+        let detail = metrics
+            .detail
+            .and_then(|d| MetricDetail::try_from(d).ok())
+            .map(MetricDetailLevel::from)
+            .unwrap_or_default();
         metrics::setup(
             &address,
             worker_id,
             metrics.tagged_metrics,
             metrics.prefix.clone(),
+            detail,
         )
         .map_err(WorkerError::SetupMetrics)?;
     }
