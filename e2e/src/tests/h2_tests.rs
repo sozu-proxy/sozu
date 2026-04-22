@@ -1651,13 +1651,24 @@ fn try_h2_ping_flood_triggers_goaway() -> State {
     let mut tls = raw_h2_connection(front_addr);
     h2_handshake(&mut tls);
 
-    // Send 200 PING frames rapidly
+    // Send 200 PING frames rapidly. Mirror the settings-flood diagnostic
+    // added in commit 66f15b6b so CI failures surface the exact point where
+    // the kernel-buffered write started failing — typically this means the
+    // server already detected the flood and sent GOAWAY+FIN, and the client's
+    // write race against the OS close is the signal we want to preserve.
+    let mut written = 0usize;
     for i in 0..200u32 {
         let mut payload = [0u8; 8];
         payload[0..4].copy_from_slice(&i.to_be_bytes());
         let ping = H2Frame::ping(payload);
-        if tls.write_all(&ping.encode()).is_err() {
-            break;
+        match tls.write_all(&ping.encode()) {
+            Ok(()) => written += 1,
+            Err(e) => {
+                println!(
+                    "H2 Ping flood - write_all failed after {written} successful writes: {e}"
+                );
+                break;
+            }
         }
     }
     let _ = tls.flush();
