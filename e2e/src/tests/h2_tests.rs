@@ -1664,9 +1664,7 @@ fn try_h2_ping_flood_triggers_goaway() -> State {
         match tls.write_all(&ping.encode()) {
             Ok(()) => written += 1,
             Err(e) => {
-                println!(
-                    "H2 Ping flood - write_all failed after {written} successful writes: {e}"
-                );
+                println!("H2 Ping flood - write_all failed after {written} successful writes: {e}");
                 break;
             }
         }
