@@ -489,7 +489,10 @@ protocol = "https"
 
 strict_sni_binding = true   # reject host/SNI mismatch (default)
 disable_http11 = false      # allow HTTP/1.1 fallback (default)
+sozu_id_header = "Sozu-Id"  # rename the per-request correlation header (default "Sozu-Id")
 ```
+
+The `sozu_id_header` knob renames the correlation header Sozu injects on every request AND response. Each request gets a unique ULID whose value is written to both sides — operators can grep the same identifier across client logs, proxy access logs, and backend logs. Default is `Sozu-Id`; a common rebrand is `X-Request-Trace` or `X-Edge-Id`. The value must be a valid HTTP header name (token chars per RFC 9110 §5.1). Applies to both HTTP and HTTPS listeners.
 
 #### TLS handshake log severity cheat-sheet
 

@@ -546,6 +546,13 @@ pub enum FrontendFromRequestError {
 pub trait L7ListenerHandler {
     fn get_sticky_name(&self) -> &str;
 
+    /// Name of the correlation header Sozu injects into every request and
+    /// response body. Default: `"Sozu-Id"`. Operators can rebrand via the
+    /// `sozu_id_header` listener config knob.
+    fn get_sozu_id_header(&self) -> &str {
+        "Sozu-Id"
+    }
+
     fn get_connect_timeout(&self) -> u32;
 
     /// retrieve a frontend by parsing a request's hostname, uri and method

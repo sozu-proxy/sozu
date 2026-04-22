@@ -193,6 +193,10 @@ message HttpListenerConfig {
     // stay under the generic glitch counter (zero-increment stream-0 updates
     // already trigger GOAWAY per RFC 9113 §6.9). Default: 100.
     optional uint32 h2_max_window_update_stream0_per_window = 29;
+    // Name of the correlation header Sozu injects into every request and
+    // response to carry the per-request ULID. Default: "Sozu-Id". Operators
+    // who want to rebrand can set e.g. "X-Edge-Id" or "X-Request-Trace".
+    optional string sozu_id_header = 30;
 }
 
 // details of an HTTPS listener
@@ -303,6 +307,10 @@ message HttpsListenerConfig {
     // stay under the generic glitch counter (zero-increment stream-0 updates
     // already trigger GOAWAY per RFC 9113 §6.9). Default: 100.
     optional uint32 h2_max_window_update_stream0_per_window = 41;
+    // Name of the correlation header Sozu injects into every request and
+    // response to carry the per-request ULID. Default: "Sozu-Id". Operators
+    // who want to rebrand can set e.g. "X-Edge-Id" or "X-Request-Trace".
+    optional string sozu_id_header = 42;
 }
 
 // details of an TCP listener

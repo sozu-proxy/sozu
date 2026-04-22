@@ -1061,6 +1061,9 @@ impl Display for HttpListenerConfig {
         if let Some(v) = &self.h2_graceful_shutdown_deadline_seconds {
             table.add_row(row!["h2 graceful shutdown deadline (seconds)", v]);
         }
+        if let Some(v) = &self.sozu_id_header {
+            table.add_row(row!["Sozu-Id correlation header name", v]);
+        }
         write!(f, "{table}")
     }
 }
@@ -1131,6 +1134,9 @@ impl Display for HttpsListenerConfig {
         }
         if let Some(v) = &self.h2_graceful_shutdown_deadline_seconds {
             table.add_row(row!["h2 graceful shutdown deadline (seconds)", v]);
+        }
+        if let Some(v) = &self.sozu_id_header {
+            table.add_row(row!["Sozu-Id correlation header name", v]);
         }
         write!(f, "{table}")
     }

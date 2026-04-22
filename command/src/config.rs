@@ -299,6 +299,10 @@ pub struct ListenerBuilder {
     /// frames per sliding window. Caps non-zero stream-0 WINDOW_UPDATE floods
     /// that would otherwise stay under the generic glitch counter. Default: 100.
     pub h2_max_window_update_stream0_per_window: Option<u32>,
+    /// Name of the correlation header Sozu injects into every request and
+    /// response. Default: `Sozu-Id`. Operators can rebrand (e.g. `X-Edge-Id`)
+    /// without touching code.
+    pub sozu_id_header: Option<String>,
     /// H2 flood detection: max CONTINUATION frames per header block (CVE-2024-27316)
     pub h2_max_continuation_frames: Option<u32>,
     /// H2 flood detection: max accumulated protocol anomalies before ENHANCE_YOUR_CALM
@@ -409,6 +413,7 @@ impl ListenerBuilder {
             h2_max_settings_per_window: None,
             h2_max_empty_data_per_window: None,
             h2_max_window_update_stream0_per_window: None,
+            sozu_id_header: None,
             h2_max_continuation_frames: None,
             h2_max_glitch_count: None,
             h2_initial_connection_window: None,
@@ -597,6 +602,7 @@ impl ListenerBuilder {
             h2_max_header_table_size: self.h2_max_header_table_size,
             h2_stream_idle_timeout_seconds: self.h2_stream_idle_timeout_seconds,
             h2_graceful_shutdown_deadline_seconds: self.h2_graceful_shutdown_deadline_seconds,
+            sozu_id_header: self.sozu_id_header.clone(),
             ..Default::default()
         };
 
@@ -743,6 +749,7 @@ impl ListenerBuilder {
             disable_http11: self.disable_http11,
             h2_stream_idle_timeout_seconds: self.h2_stream_idle_timeout_seconds,
             h2_graceful_shutdown_deadline_seconds: self.h2_graceful_shutdown_deadline_seconds,
+            sozu_id_header: self.sozu_id_header.clone(),
         };
 
         Ok(https_listener_config)

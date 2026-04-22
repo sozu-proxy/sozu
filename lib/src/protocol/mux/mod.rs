@@ -450,6 +450,7 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
                 self.public_address,
                 self.session_address,
                 listener.get_sticky_name().to_string(),
+                listener.get_sozu_id_header().to_string(),
             );
             // Propagate the connection-scoped TLS SNI onto every per-stream
             // HttpContext so `route_from_request` can enforce the SNI ↔

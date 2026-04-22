@@ -198,6 +198,12 @@ pub struct HttpContext {
     /// rustls at handshake completion and propagated from the mux `Context`.
     /// `None` for plaintext listeners or when no ALPN was negotiated.
     pub tls_alpn: Option<&'static str>,
+    /// Name of the correlation header Sozu injects into every request and
+    /// response. Defaults to `"Sozu-Id"` via [`L7ListenerHandler::get_sozu_id_header`].
+    /// Populated at stream creation from the listener config's `sozu_id_header`
+    /// knob. Stored as an owned `String` so it survives a listener hot-reload
+    /// that changes the value.
+    pub sozu_id_header: String,
 }
 
 impl kawa::h1::ParserCallbacks<Checkout> for HttpContext {
@@ -211,6 +217,7 @@ impl kawa::h1::ParserCallbacks<Checkout> for HttpContext {
 
 impl HttpContext {
     /// Creates a new instance
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         session_id: Ulid,
         request_id: Ulid,
@@ -218,6 +225,7 @@ impl HttpContext {
         public_address: SocketAddr,
         session_address: Option<SocketAddr>,
         sticky_name: String,
+        sozu_id_header: String,
     ) -> Self {
         Self {
             session_id,
@@ -253,6 +261,7 @@ impl HttpContext {
             tls_version: None,
             tls_cipher: None,
             tls_alpn: None,
+            sozu_id_header,
         }
     }
 
@@ -533,9 +542,10 @@ impl HttpContext {
             incr!("http.x_request_id.generated");
         }
 
-        // Create a custom "Sozu-Id" header
+        // Create a custom correlation header (defaults to "Sozu-Id", can be
+        // renamed via the `sozu_id_header` listener config knob).
         request.push_block(kawa::Block::Header(kawa::Pair {
-            key: kawa::Store::Static(b"Sozu-Id"),
+            key: kawa::Store::from_string(self.sozu_id_header.clone()),
             val: kawa::Store::from_string(self.id.to_string()),
         }));
     }
@@ -600,9 +610,10 @@ impl HttpContext {
             }
         }
 
-        // Create a custom "Sozu-Id" header
+        // Create a custom correlation header (defaults to "Sozu-Id", can be
+        // renamed via the `sozu_id_header` listener config knob).
         response.push_block(kawa::Block::Header(kawa::Pair {
-            key: kawa::Store::Static(b"Sozu-Id"),
+            key: kawa::Store::from_string(self.sozu_id_header.clone()),
             val: kawa::Store::from_string(self.id.to_string()),
         }));
     }
@@ -686,7 +697,33 @@ mod tests {
                 54321,
             )),
             "SERVERID".to_owned(),
+            "Sozu-Id".to_owned(),
         )
+    }
+
+    // ── sozu_id_header ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_sozu_id_header_default_name_stored_on_context() {
+        // The make_context helper uses the documented default "Sozu-Id" to
+        // match the trait default on `L7ListenerHandler::get_sozu_id_header`.
+        let ctx = make_context();
+        assert_eq!(ctx.sozu_id_header, "Sozu-Id");
+    }
+
+    #[test]
+    fn test_sozu_id_header_custom_name_stored_on_context() {
+        // Operator-provided rename is carried verbatim onto the HttpContext.
+        let ctx = HttpContext::new(
+            Ulid::generate(),
+            Ulid::generate(),
+            Protocol::HTTP,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
+            None,
+            "SERVERID".to_owned(),
+            "X-Edge-Id".to_owned(),
+        );
+        assert_eq!(ctx.sozu_id_header, "X-Edge-Id");
     }
 
     // ── extract_route ──────────────────────────────────────────────────
