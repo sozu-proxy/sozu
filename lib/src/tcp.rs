@@ -40,7 +40,7 @@ use crate::{
     sozu_command::{
         proto::command::{
             Event, EventKind, ProxyProtocolConfig, RequestTcpFrontend, TcpListenerConfig,
-            WorkerRequest, WorkerResponse,
+            UpdateTcpListenerConfig, WorkerRequest, WorkerResponse,
         },
         ready::Ready,
         state::ClusterId,
@@ -1185,6 +1185,28 @@ impl TcpListener {
         self.active = true;
         Ok(self.token)
     }
+
+    /// Apply a partial-update patch to this TCP listener's live configuration.
+    ///
+    /// Fields absent in the patch (i.e. `None`) are preserved unchanged.
+    pub fn update_config(&mut self, patch: &UpdateTcpListenerConfig) -> Result<(), ListenerError> {
+        if let Some(v) = patch.public_address {
+            self.config.public_address = Some(v);
+        }
+        if let Some(v) = patch.expect_proxy {
+            self.config.expect_proxy = v;
+        }
+        if let Some(v) = patch.front_timeout {
+            self.config.front_timeout = v;
+        }
+        if let Some(v) = patch.back_timeout {
+            self.config.back_timeout = v;
+        }
+        if let Some(v) = patch.connect_timeout {
+            self.config.connect_timeout = v;
+        }
+        Ok(())
+    }
 }
 
 fn handle_connection_result(
@@ -1309,6 +1331,23 @@ impl TcpProxy {
             .ok_or(ProxyError::UnactivatedListener)?;
 
         Ok((owned.token, taken_listener))
+    }
+
+    /// Apply a partial-update patch to the identified TCP listener.
+    pub fn update_listener(&mut self, patch: UpdateTcpListenerConfig) -> Result<(), ProxyError> {
+        let address: SocketAddr = patch.address.into();
+        let listener = self
+            .listeners
+            .values()
+            .find(|l| l.borrow().address == address)
+            .ok_or(ProxyError::NoListenerFound(address))?;
+        listener
+            .borrow_mut()
+            .update_config(&patch)
+            .map_err(|listener_error| ProxyError::ListenerActivation {
+                address,
+                listener_error,
+            })
     }
 
     pub fn add_tcp_front(&mut self, front: RequestTcpFrontend) -> Result<(), ProxyError> {
