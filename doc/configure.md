@@ -491,6 +491,22 @@ strict_sni_binding = true   # reject host/SNI mismatch (default)
 disable_http11 = false      # allow HTTP/1.1 fallback (default)
 ```
 
+#### TLS handshake log severity cheat-sheet
+
+Sōzu tiers the log severity of every rustls handshake error by root cause so
+scanner noise does not crowd out real configuration errors (commit `156cc217`).
+Operators monitoring logs should expect the following classification:
+
+| Error variant | Level | Typical cause |
+|---------------|-------|---------------|
+| `NoApplicationProtocol`, `NoKxGroupsInCommon`, `NoCipherSuitesInCommon`, `NoCertificatesPresented` | `warn` | Remote scanner / ssllabs probe with restricted cipher or ALPN set. **Benign** — no action required unless the client is legitimate. |
+| `InappropriateMessage`, `InappropriateHandshakeMessage`, `InvalidMessage`, `PeerMisbehaved`, `PeerIncompatible`, `PeerSentOversizedRecord` | `warn` | Peer protocol violation — typically a broken or outdated TLS client, occasionally a port-scan. Review if persistent from a known client. |
+| `InvalidCertificate`, `DecryptError` | `warn` | Client certificate rejected (e.g. expired, unknown CA) or bad shared key material. Relevant only when mTLS is configured. |
+| `AlertReceived(_)` | `debug` | Client sent a TLS alert (e.g. `user_canceled`, `close_notify_required`) — conversation-level noise. |
+| Everything else (server-side faults, unexpected internal errors) | `error` | Real bug or misconfiguration on the proxy. **Actionable** — triage immediately. |
+
+In particular, the recurring `Could not look up a certificate for server name "<name>"` line (issue #774) is emitted at `warn` when the `rustls::server::ClientHello` SNI does not match any configured frontend — the usual culprit is a generic scanner (Shodan, ssllabs, Censys) probing `default.example` or an IP-only hello. No action required unless the name matches a frontend you expect to serve.
+
 ## Metrics
 
 Sōzu reports its own state to another network component through a `UDP` socket.
