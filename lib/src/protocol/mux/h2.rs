@@ -970,6 +970,12 @@ impl Prioriser {
                 urgency,
                 incremental,
             } => {
+                // RFC 9218 §7.1: a malformed or out-of-range priority field
+                // MUST be "treated as absent", NOT as a stream error. Clamping
+                // an urgency > 7 to 7 is the policy-correct interpretation:
+                // the field is still present (so defaulting would lose
+                // information) but its value is normalised to the RFC's
+                // allowed range [0..=7]. Intentionally not PROTOCOL_ERROR.
                 self.priorities
                     .insert(stream_id, (urgency.min(7), incremental));
                 false
