@@ -712,6 +712,25 @@ pub enum ListenerError {
     },
 }
 
+/// Lift control-plane validation errors into listener-level errors so the
+/// worker can surface the same message without duplicating the match.
+/// Non-`InvalidValue` variants fall back to a generic `InvalidValue` — they
+/// are not expected on the worker's `update_config` path (state lookups
+/// happen on the master) but we avoid panicking if one slips through.
+impl From<sozu_command::state::StateError> for ListenerError {
+    fn from(err: sozu_command::state::StateError) -> Self {
+        match err {
+            sozu_command::state::StateError::InvalidValue { field, reason } => {
+                ListenerError::InvalidValue { field, reason }
+            }
+            _ => ListenerError::InvalidValue {
+                field: "state",
+                reason: "unexpected state error on worker path",
+            },
+        }
+    }
+}
+
 /// Returned by the HTTP, HTTPS and TCP proxies
 #[derive(thiserror::Error, Debug)]
 pub enum ProxyError {

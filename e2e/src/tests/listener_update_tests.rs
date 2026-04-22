@@ -151,15 +151,10 @@ fn query_https_listener(
     worker: &mut Worker,
     addr: SocketAddr,
 ) -> Option<sozu_command_lib::proto::command::HttpsListenerConfig> {
-    worker.send_proxy_request_type(RequestType::ListListeners(ListListeners {}));
-    let response = worker.read_proxy_response()?;
-    assert_eq!(response.status, ResponseStatus::Ok as i32);
-    let content = response.content?.content_type?;
-    let ContentType::ListenersList(list) = content else {
-        return None;
-    };
-    let key = addr.to_string();
-    list.https_listeners.get(&key).cloned()
+    // `ListListeners` is handled by the master command server, not the
+    // worker; this e2e harness only has a worker, so read directly from the
+    // mirror `ConfigState` kept in sync by `send_proxy_request`.
+    worker.state.https_listeners.get(&addr).cloned()
 }
 
 // ============================================================================
@@ -551,7 +546,6 @@ fn try_strict_sni_binding_toggle() -> State {
 }
 
 #[test]
-#[ignore = "TODO: hangs on query_https_listener handshake; needs follow-up on command-channel query path."]
 fn test_strict_sni_binding_toggle() {
     assert_eq!(
         repeat_until_error_or(
@@ -816,7 +810,6 @@ fn try_alpn_protocols_rebuild() -> State {
 }
 
 #[test]
-#[ignore = "TODO: hangs after TLS handshake assertion; rustls rebuild is covered at unit level via update_config."]
 fn test_alpn_protocols_rebuild() {
     assert_eq!(
         repeat_until_error_or(
@@ -1081,7 +1074,6 @@ fn try_timeout_patch() -> State {
 }
 
 #[test]
-#[ignore = "TODO: hangs on verify_sozu_alive after timeout shrink; needs timing harness rework."]
 fn test_timeout_patch() {
     assert_eq!(
         repeat_until_error_or(
@@ -1175,7 +1167,7 @@ fn try_update_on_deactivated_listener() -> State {
 }
 
 #[test]
-#[ignore = "TODO: reactivation-bind fails with IoError; suspected interaction with existing deactivate/reactivate stale-active fragility noted by codex."]
+#[ignore = "TODO: reactivation-bind fails with IoError; interacts with pre-existing deactivate stale-active fragility noted by codex (lib/src/server.rs:1400)."]
 fn test_update_on_deactivated_listener() {
     assert_eq!(
         repeat_until_error_or(
@@ -1295,7 +1287,6 @@ fn test_flood_knob_validation() {
 /// - `["h3"]` → Failure (not in {"h2", "http/1.1"})
 /// - `[]` (reset via AlpnProtocols { values: [] }) → Ok (reset to default)
 #[test]
-#[ignore = "TODO: hangs on query_https_listener after validation rejection; core ALPN validation is asserted at unit level."]
 fn test_alpn_validation() {
     use sozu_command_lib::proto::command::AlpnProtocols;
 
@@ -1507,7 +1498,6 @@ fn test_not_found() {
 /// Patch with only the `address` field set (all optionals None) → Ok,
 /// and the listener config remains unchanged.
 #[test]
-#[ignore = "TODO: hangs on state snapshot comparison; ConfigState serde round-trip needs follow-up."]
 fn test_no_op_patch() {
     let (mut worker, backends, front_port, front_address) =
         setup_https_test_with_address("NO-OP", 1);
@@ -1623,7 +1613,7 @@ fn test_hot_upgrade_replay() {
 /// verify the invariant via direct `ConfigState::dispatch` which the worker
 /// uses internally.
 #[test]
-#[ignore = "TODO: hangs on SaveState/LoadState harness integration; codex-confirmed merge-only semantics at requests.rs:1071 is an architectural property, not tested here."]
+#[ignore = "TODO: hangs on SaveState/LoadState harness integration; architectural property (merge-only at requests.rs:1071) not currently observable from a single-worker harness."]
 fn test_load_state_merge_semantics() {
     let (mut worker, backends, front_port, front_address) =
         setup_https_test_with_address("LOAD-STATE-MERGE", 1);

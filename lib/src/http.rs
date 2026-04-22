@@ -23,7 +23,7 @@ use sozu_command::{
     },
     ready::Ready,
     response::HttpFrontend,
-    state::{ClusterId, StateError, validate_h2_flood_knobs_http, validate_sozu_id_header},
+    state::{ClusterId, validate_h2_flood_knobs_http, validate_sozu_id_header},
 };
 
 use crate::{
@@ -991,19 +991,11 @@ impl HttpListener {
     pub fn update_config(&mut self, patch: &UpdateHttpListenerConfig) -> Result<(), ListenerError> {
         // Defense-in-depth validation: main-process ConfigState::dispatch
         // validates before scatter, but a raw protobuf client or state replay
-        // may reach the worker without that check.
-        let into_listener_err = |e: StateError| match e {
-            StateError::InvalidValue { field, reason } => {
-                ListenerError::InvalidValue { field, reason }
-            }
-            _ => ListenerError::InvalidValue {
-                field: "unknown",
-                reason: "validation failed",
-            },
-        };
-        validate_h2_flood_knobs_http(patch).map_err(into_listener_err)?;
+        // may reach the worker without that check. `StateError` lifts into
+        // `ListenerError` via `From` so `?` suffices.
+        validate_h2_flood_knobs_http(patch)?;
         if let Some(ref hdr) = patch.sozu_id_header {
-            validate_sozu_id_header(hdr).map_err(into_listener_err)?;
+            validate_sozu_id_header(hdr)?;
         }
 
         if let Some(v) = patch.public_address {
