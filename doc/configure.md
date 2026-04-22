@@ -376,6 +376,36 @@ h2_max_glitch_count = 100             # Cumulative protocol violations
 > The event is logged at `warn` level with the specific flood type that triggered
 > disconnection.
 
+##### Tuning `h2_max_glitch_count` in production
+
+`h2_max_glitch_count` is a catch-all counter for *low-severity* protocol drift
+that no other flood counter covers. It is incremented on stream-close races
+(`RST_STREAM` / `WINDOW_UPDATE` / `DATA` on a closed stream), `WINDOW_UPDATE`
+with zero increment on a closed stream, and unknown SETTINGS identifiers. The
+counter uses a 1-second sliding window with *half-decay* (it halves at each
+window roll rather than resetting), so a threshold of `N` tolerates a one-shot
+burst of `N` glitches or a sustained rate of roughly `N/2` glitches per second.
+
+The default of `100` is conservative and protects a lightly-loaded edge well,
+but busy proxies that terminate aggressive-cancellation traffic (mobile
+clients, gRPC with deadlines, browser prefetch, fuzz harnesses) routinely
+trip it on legitimate races. If `h2.flood.violation.glitch_window` fires on
+traffic you know is benign, raise the threshold per-listener:
+
+| Traffic profile | Suggested `h2_max_glitch_count` |
+|---|---|
+| Default / low traffic | 100 |
+| Busy public edge, mixed clients | 500 |
+| gRPC / mobile / high cancellation | 1000 – 2000 |
+| Load-test absorption only | 5000 |
+
+Before raising blindly, drop the relevant module to `debug` level and check
+which branch dominates — a single misbehaving backend or client emitting
+`WINDOW_UPDATE` on closed streams can be fixed upstream instead of hiding
+behind a larger budget. Never set the threshold to `u32::MAX`; the catch-all
+is the last line of defence against peers that stay just under every specific
+per-frame cap.
+
 #### H2 connection tuning
 
 Additional H2 parameters control connection-level behavior. All are optional
