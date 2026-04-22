@@ -4286,6 +4286,135 @@ fn test_h2_to_h1_100_continue() {
     );
 }
 
+// ---- H2-to-H1 1xx informational forwarding (raw) ----
+
+/// Variant of `try_h2_to_h1_100_continue` that uses a RAW H2 client so we can
+/// actually count the HEADERS frames sozu emits to the wire. The hyper-based
+/// counterpart only surfaces the final response, so it cannot prove that the
+/// intermediate `100 Continue` HEADERS frame made it to the client — it could
+/// just as well be swallowed. Codex B3-z / plan entry from 2026-04-21.
+///
+/// Scenario: the `ContinueBackend` (H1) replies `100 Continue` then `200 OK`.
+/// Sozu MUST translate the 1xx status into an H2 HEADERS frame without
+/// `END_STREAM`, then emit a second HEADERS frame for the final 200 with
+/// `END_STREAM`. Total HEADERS frames seen client-side: **2**.
+fn try_h2_to_h1_1xx_informational_forwarded() -> State {
+    let (mut worker, front_port, front_address) = setup_h2_listener_only("H2-1XX-FWD");
+
+    let back_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address,
+        None,
+    )));
+    worker.read_to_last();
+
+    let mut backend = ContinueBackend::start(back_address);
+
+    let mut tls = raw_h2_connection(front_address.into());
+    super::h2_utils::h2_handshake(&mut tls);
+
+    // HEADERS for POST /continue with Expect: 100-continue + Content-Length: 5.
+    // Uses the HPACK static table for :method / :scheme and literal encoding
+    // for the rest — matches the pattern in h2_security_parser.rs.
+    let mut header_block = vec![
+        0x83, // :method POST (static idx 3)
+        0x87, // :scheme https (static idx 7)
+    ];
+    // :path /continue — literal new name would be wrong; :path is static idx 4
+    // for "/" or 5 for "/index.html", and the spec says to emit a literal
+    // indexed (0x04) then the new value for idx 4's name.
+    // Literal header with incremental indexing, name indexed at 4 = 0x44.
+    header_block.push(0x44);
+    header_block.push(9); // value length
+    header_block.extend_from_slice(b"/continue");
+    // :authority localhost — idx 1 = ":authority", literal value.
+    header_block.push(0x41);
+    header_block.push(9); // value length
+    header_block.extend_from_slice(b"localhost");
+    // expect: 100-continue — idx 35 = "expect", literal value.
+    header_block.push(0x40); // literal header with incremental indexing, new name
+    header_block.push(6); // name length
+    header_block.extend_from_slice(b"expect");
+    header_block.push(12); // value length
+    header_block.extend_from_slice(b"100-continue");
+    // content-length: 5 — literal new name.
+    header_block.push(0x00);
+    header_block.push(14);
+    header_block.extend_from_slice(b"content-length");
+    header_block.push(1);
+    header_block.extend_from_slice(b"5");
+    // content-type: text/plain — literal new name.
+    header_block.push(0x00);
+    header_block.push(12);
+    header_block.extend_from_slice(b"content-type");
+    header_block.push(10);
+    header_block.extend_from_slice(b"text/plain");
+
+    let h = super::h2_utils::H2Frame::headers(1, header_block, true, false);
+    tls.write_all(&h.encode()).unwrap();
+
+    // DATA frame for the request body "hello" with END_STREAM.
+    let data = super::h2_utils::H2Frame::new(
+        super::h2_utils::H2_FRAME_DATA,
+        super::h2_utils::H2_FLAG_END_STREAM,
+        1,
+        b"hello".to_vec(),
+    );
+    tls.write_all(&data.encode()).unwrap();
+    let _ = tls.flush();
+
+    // Give sozu + backend time to round-trip the 1xx + final.
+    // collect_response_frames under-samples for <1s due to the internal 100ms
+    // delay. 2s gives breathing room for the ContinueBackend's 50ms server
+    // sleep between the 100 Continue and the 200 OK.
+    let frames = super::h2_utils::collect_response_frames(&mut tls, 500, 8, 500);
+    super::h2_utils::log_frames("H2 1xx forwarding", &frames);
+
+    // Count HEADERS frames with stream_id == 1 (our request stream).
+    let header_frames: Vec<_> = frames
+        .iter()
+        .filter(|(ft, _, sid, _)| *ft == super::h2_utils::H2_FRAME_HEADERS && *sid == 1)
+        .collect();
+    println!(
+        "H2 1xx forwarding - received {} HEADERS frames on stream 1",
+        header_frames.len()
+    );
+
+    drop(tls);
+
+    thread::sleep(Duration::from_millis(200));
+    let still_alive = verify_sozu_alive(front_port);
+    println!("H2 1xx forwarding - sozu still alive: {still_alive}");
+
+    backend.stop();
+    worker.soft_stop();
+    let _ = worker.wait_for_server_stop();
+
+    // Success criterion: TWO HEADERS frames on stream 1. One for :status 100
+    // (informational, no END_STREAM), one for :status 200 (final, with
+    // END_STREAM). Anything less means the 1xx was swallowed or the final
+    // response never arrived.
+    if still_alive && header_frames.len() >= 2 {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_to_h1_1xx_informational_forwarded() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "H2-to-H1: 1xx informational HEADERS forwarded to client",
+            try_h2_to_h1_1xx_informational_forwarded
+        ),
+        State::Success
+    );
+}
+
 // ---- H2-to-H1 large headers ----
 
 /// Send an H2 request with many large custom headers through sozu to an H1
