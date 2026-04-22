@@ -1386,6 +1386,9 @@ impl HttpsProxy {
             .filter_map(|listener| {
                 let mut owned = listener.borrow_mut();
                 if let Some(listener) = owned.listener.take() {
+                    // Reset `active` so a subsequent `activate()` re-binds
+                    // instead of short-circuiting on the stale flag.
+                    owned.active = false;
                     return Some((owned.address, listener));
                 }
 
@@ -1410,6 +1413,10 @@ impl HttpsProxy {
             .listener
             .take()
             .ok_or(ProxyError::UnactivatedListener)?;
+
+        // Reset `active` so a subsequent `activate()` re-binds instead of
+        // short-circuiting on the stale flag.
+        owned.active = false;
 
         Ok((owned.token, taken_listener))
     }
