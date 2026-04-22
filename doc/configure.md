@@ -426,6 +426,7 @@ per-listener with safe compile-time defaults:
 | `h2_max_header_list_size` | 65536 | Maximum accumulated HPACK-decoded header list size per request (`SETTINGS_MAX_HEADER_LIST_SIZE`, RFC 9113 §6.5.2). |
 | `h2_stream_idle_timeout_seconds` | 30 | Per-stream idle timeout in seconds. An open H2 stream that receives no meaningful application data (non-empty DATA or HEADERS) for this duration is cancelled (`RST_STREAM` / `CANCEL`) to defend against slow-multiplex Slowloris. Active uploads that trickle DATA frames reset the timer on each frame. |
 | `h2_max_header_table_size` | 65536 | Maximum HPACK dynamic table size (`SETTINGS_HEADER_TABLE_SIZE`) accepted from the peer. Caps the peer-advertised value to prevent unbounded HPACK encoder memory growth. |
+| `h2_graceful_shutdown_deadline_seconds` | 5 | Maximum wall-clock seconds to wait for in-flight H2 streams after `GOAWAY(NO_ERROR)` has been sent during soft-stop. Once the deadline elapses the connection is forcibly closed. Set to `0` to disable the forced close entirely — shutdown then waits for every stream to drain naturally (use with caution: a long-running request can delay the whole soft-stop indefinitely). |
 
 _Configuration example:_
 
@@ -435,12 +436,13 @@ address = "0.0.0.0:443"
 protocol = "https"
 
 # H2 connection tuning (optional, defaults shown)
-h2_initial_connection_window = 1048576  # 1MB, min 65535, max 2147483647
-h2_max_concurrent_streams = 100         # min 1
-h2_stream_shrink_ratio = 2              # min 2
-h2_max_header_list_size = 65536         # HPACK decoded header budget
-h2_stream_idle_timeout_seconds = 30     # per-stream idle timeout
-h2_max_header_table_size = 65536        # HPACK dynamic table size cap
+h2_initial_connection_window = 1048576            # 1MB, min 65535, max 2147483647
+h2_max_concurrent_streams = 100                   # min 1
+h2_stream_shrink_ratio = 2                        # min 2
+h2_max_header_list_size = 65536                   # HPACK decoded header budget
+h2_stream_idle_timeout_seconds = 30               # per-stream idle timeout
+h2_max_header_table_size = 65536                  # HPACK dynamic table size cap
+h2_graceful_shutdown_deadline_seconds = 5         # soft-stop forced-close deadline (0 = wait forever)
 ```
 
 #### H2 RST_STREAM lifetime caps

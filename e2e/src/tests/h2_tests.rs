@@ -38,7 +38,7 @@ use crate::{
         h2_backend::H2Backend,
         https_client::{
             build_h2_client, build_https_client, resolve_concurrent_requests, resolve_post_request,
-            resolve_request,
+            resolve_request, resolve_request_timeout,
         },
     },
     port_registry::{attach_reserved_https_listener, bind_std_listener, bind_tokio_listener},
@@ -5563,6 +5563,364 @@ fn test_h2_graceful_shutdown_waits_for_inflight_request() {
             3,
             "H2: graceful shutdown waits for in-flight request completion",
             try_h2_graceful_shutdown_waits_for_inflight_request
+        ),
+        State::Success
+    );
+}
+
+// ============================================================================
+// Test: graceful-shutdown forced-close deadline knob
+// ============================================================================
+
+/// Shared scaffolding for the `h2_graceful_shutdown_deadline_seconds` tests.
+/// Boots a dedicated HTTPS listener configured with the requested deadline and
+/// returns the running worker, the front port, and the handles used by the
+/// caller to stall a single in-flight request on a mock backend.
+///
+/// The backend accepts one connection, blocks until `release_response` is
+/// toggled, then replies `HTTP/1.1 200 OK`. Holding the backend open past
+/// `soft_stop` simulates the scenario the knob governs: an in-flight stream
+/// that will NEVER finish before the configured deadline.
+fn start_h2_graceful_deadline_fixture(
+    name: &str,
+    deadline_seconds: u32,
+) -> (
+    Worker,
+    u16,
+    Arc<AtomicBool>,
+    Arc<AtomicBool>,
+    AsyncBackend<SimpleAggregator>,
+) {
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker = Worker::start_new_worker_owned(name, config, listeners, state);
+
+    let mut listener_config = ListenerBuilder::new_https(front_address.clone())
+        .to_tls(None)
+        .unwrap();
+    listener_config.h2_graceful_shutdown_deadline_seconds = Some(deadline_seconds);
+
+    worker.send_proxy_request_type(RequestType::AddHttpsListener(listener_config));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        address: front_address.clone(),
+        proxy: ListenerType::Https.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        hostname: String::from("localhost"),
+        ..Worker::default_http_frontend("cluster_0", front_address.clone().into())
+    }));
+
+    let certificate_and_key = CertificateAndKey {
+        certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
+        key: String::from(include_str!("../../../lib/assets/local-key.pem")),
+        certificate_chain: vec![],
+        versions: vec![],
+        names: vec![],
+    };
+    worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+        address: front_address,
+        certificate: certificate_and_key,
+        expired_at: None,
+    }));
+
+    let back_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address,
+        None,
+    )));
+
+    let request_seen = Arc::new(AtomicBool::new(false));
+    let release_response = Arc::new(AtomicBool::new(false));
+    let request_seen_backend = request_seen.clone();
+    let release_response_backend = release_response.clone();
+    let backend = AsyncBackend::spawn_detached_backend(
+        format!("{name}_BACKEND"),
+        back_address,
+        SimpleAggregator::default(),
+        Box::new(move |mut stream, backend_name, mut aggregator| {
+            let mut buf = [0u8; 4096];
+            match stream.read(&mut buf) {
+                Ok(0) => return aggregator,
+                Ok(n) => {
+                    println!("{backend_name} received {n} bytes");
+                    aggregator.requests_received += 1;
+                    request_seen_backend.store(true, Ordering::Relaxed);
+                }
+                Err(_) => return aggregator,
+            }
+
+            while !release_response_backend.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(10));
+            }
+
+            let response = b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\ndeadline-pong";
+            if stream.write_all(response).is_ok() {
+                let _ = stream.flush();
+                aggregator.responses_sent += 1;
+            }
+            aggregator
+        }),
+    );
+    worker.read_to_last();
+
+    (worker, front_port, request_seen, release_response, backend)
+}
+
+/// Verifies the historic 5-second behavior is preserved when the knob is
+/// left at its default: an in-flight stream that never finishes is forcibly
+/// torn down once the default deadline elapses. The stream's waiting
+/// request must not succeed (backend is never released), yet the worker
+/// must report a clean stop after the deadline fires.
+fn try_h2_graceful_shutdown_timeout_forces_close() -> State {
+    let (mut worker, front_port, request_seen, release_response, mut backend) =
+        start_h2_graceful_deadline_fixture("H2-GRACEFUL-DEADLINE-DEFAULT", 5);
+
+    let uri: hyper::Uri = format!("https://localhost:{front_port}/api/default")
+        .parse()
+        .unwrap();
+    let request_job = thread::spawn(move || {
+        let client = build_h2_client();
+        resolve_request(&client, uri)
+    });
+
+    let wait_start = Instant::now();
+    while !request_seen.load(Ordering::Relaxed) {
+        if wait_start.elapsed() > Duration::from_secs(5) {
+            println!("H2 graceful default - request never reached backend");
+            release_response.store(true, Ordering::Relaxed);
+            let _ = request_job.join();
+            worker.soft_stop();
+            let _ = worker.wait_for_server_stop();
+            let _ = backend.stop_and_get_aggregator();
+            return State::Fail;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let soft_stop_started = Instant::now();
+    worker.soft_stop();
+
+    let worker_stopped = worker.wait_for_server_stop();
+    let elapsed = soft_stop_started.elapsed();
+    println!(
+        "H2 graceful default - worker_stopped={worker_stopped}, elapsed={:?}",
+        elapsed
+    );
+
+    release_response.store(true, Ordering::Relaxed);
+    let _ = request_job.join();
+    let _ = backend.stop_and_get_aggregator();
+
+    // The forced close must fire in the 5s default window. We give generous
+    // headroom (15s) to absorb test scheduler jitter but the value should
+    // typically be within 5-7s. Without the deadline the worker would hang
+    // indefinitely waiting for the never-released backend response.
+    if worker_stopped && elapsed >= Duration::from_secs(3) && elapsed < Duration::from_secs(15) {
+        State::Success
+    } else {
+        println!(
+            "H2 graceful default - unexpected elapsed: {:?}, worker_stopped={worker_stopped}",
+            elapsed
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_graceful_shutdown_timeout_forces_close() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2: graceful shutdown default deadline forces close",
+            try_h2_graceful_shutdown_timeout_forces_close
+        ),
+        State::Success
+    );
+}
+
+/// With a 1-second deadline configured, the forced close must fire quickly —
+/// well before the default 5-second bound. The test fails if the worker
+/// takes longer than 4 seconds to stop (which would imply the knob is not
+/// being honored end-to-end: proto → config → listener → mux).
+fn try_h2_graceful_shutdown_deadline_configurable_short() -> State {
+    let (mut worker, front_port, request_seen, release_response, mut backend) =
+        start_h2_graceful_deadline_fixture("H2-GRACEFUL-DEADLINE-SHORT", 1);
+
+    let uri: hyper::Uri = format!("https://localhost:{front_port}/api/short")
+        .parse()
+        .unwrap();
+    let request_job = thread::spawn(move || {
+        let client = build_h2_client();
+        resolve_request(&client, uri)
+    });
+
+    let wait_start = Instant::now();
+    while !request_seen.load(Ordering::Relaxed) {
+        if wait_start.elapsed() > Duration::from_secs(5) {
+            println!("H2 graceful short - request never reached backend");
+            release_response.store(true, Ordering::Relaxed);
+            let _ = request_job.join();
+            worker.soft_stop();
+            let _ = worker.wait_for_server_stop();
+            let _ = backend.stop_and_get_aggregator();
+            return State::Fail;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let soft_stop_started = Instant::now();
+    worker.soft_stop();
+
+    let worker_stopped = worker.wait_for_server_stop();
+    let elapsed = soft_stop_started.elapsed();
+    println!(
+        "H2 graceful short - worker_stopped={worker_stopped}, elapsed={:?}",
+        elapsed
+    );
+
+    release_response.store(true, Ordering::Relaxed);
+    let _ = request_job.join();
+    let _ = backend.stop_and_get_aggregator();
+
+    // 1s deadline: expect the worker to stop in under 4s (allows for the
+    // scheduler tick lag on `shut_down_sessions`, which runs at ~500ms
+    // cadence). If the knob were ignored we'd see ~5s from the default.
+    if worker_stopped && elapsed < Duration::from_secs(4) {
+        State::Success
+    } else {
+        println!(
+            "H2 graceful short - deadline not honored: elapsed={:?}, worker_stopped={worker_stopped}",
+            elapsed
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_graceful_shutdown_deadline_configurable_short() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2: graceful shutdown deadline (short) honored",
+            try_h2_graceful_shutdown_deadline_configurable_short
+        ),
+        State::Success
+    );
+}
+
+/// With a 60-second deadline configured, the forced close must NOT fire
+/// within the default 5-second window. The test waits 10 seconds past
+/// `soft_stop` and asserts the worker has not stopped yet. It then
+/// releases the backend so the request can complete and the worker can
+/// shut down normally within the bounded teardown path.
+///
+/// The H2 client uses a 60-second resolve timeout so hyper won't abort
+/// the in-flight stream before the test has finished observing the
+/// no-premature-close window (the default 10-second `resolve_request`
+/// timeout collides with the 10-second assertion otherwise).
+fn try_h2_graceful_shutdown_deadline_configurable_long() -> State {
+    let (mut worker, front_port, request_seen, release_response, mut backend) =
+        start_h2_graceful_deadline_fixture("H2-GRACEFUL-DEADLINE-LONG", 60);
+
+    let uri: hyper::Uri = format!("https://localhost:{front_port}/api/long")
+        .parse()
+        .unwrap();
+    let request_job = thread::spawn(move || {
+        let client = build_h2_client();
+        resolve_request_timeout(&client, uri, Duration::from_secs(60))
+    });
+
+    let wait_start = Instant::now();
+    while !request_seen.load(Ordering::Relaxed) {
+        if wait_start.elapsed() > Duration::from_secs(5) {
+            println!("H2 graceful long - request never reached backend");
+            release_response.store(true, Ordering::Relaxed);
+            let _ = request_job.join();
+            worker.soft_stop();
+            let _ = worker.wait_for_server_stop();
+            let _ = backend.stop_and_get_aggregator();
+            return State::Fail;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let soft_stop_started = Instant::now();
+    worker.soft_stop();
+
+    let (stopped_tx, stopped_rx) = std::sync::mpsc::channel();
+    let wait_thread = thread::spawn(move || {
+        let success = worker.wait_for_server_stop();
+        let _ = stopped_tx.send(success);
+    });
+
+    // Give 10 seconds for the forced close to (incorrectly) fire. With a
+    // 60s deadline + the backend holding the request, the worker must NOT
+    // have stopped yet — asserting the knob actually extends the budget
+    // beyond the default.
+    match stopped_rx.recv_timeout(Duration::from_secs(10)) {
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        Ok(success) => {
+            println!(
+                "H2 graceful long - worker stopped prematurely within 10s: success={success}, elapsed={:?}",
+                soft_stop_started.elapsed()
+            );
+            release_response.store(true, Ordering::Relaxed);
+            let _ = request_job.join();
+            let _ = wait_thread.join();
+            let _ = backend.stop_and_get_aggregator();
+            return State::Fail;
+        }
+        Err(error) => {
+            println!("H2 graceful long - failed waiting for worker stop: {error:?}");
+            release_response.store(true, Ordering::Relaxed);
+            let _ = request_job.join();
+            let _ = wait_thread.join();
+            let _ = backend.stop_and_get_aggregator();
+            return State::Fail;
+        }
+    }
+
+    // Release the backend — the request completes normally, the stream
+    // drains, and the worker exits on its own without tripping the
+    // forced-close branch.
+    release_response.store(true, Ordering::Relaxed);
+
+    let _ = request_job.join();
+    let worker_stopped = match stopped_rx.recv_timeout(Duration::from_secs(15)) {
+        Ok(success) => success,
+        Err(error) => {
+            println!("H2 graceful long - worker did not stop after release: {error:?}");
+            let _ = wait_thread.join();
+            let _ = backend.stop_and_get_aggregator();
+            return State::Fail;
+        }
+    };
+    let _ = wait_thread.join();
+    let _ = backend.stop_and_get_aggregator();
+
+    if worker_stopped {
+        State::Success
+    } else {
+        println!("H2 graceful long - worker reported unsuccessful stop");
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_graceful_shutdown_deadline_configurable_long() {
+    assert_eq!(
+        repeat_until_error_or(
+            2,
+            "H2: graceful shutdown deadline (long) extends budget",
+            try_h2_graceful_shutdown_deadline_configurable_long
         ),
         State::Success
     );

@@ -366,6 +366,8 @@ impl HttpsSession {
                 let flood_config = self.listener.borrow().get_h2_flood_config();
                 let connection_config = self.listener.borrow().get_h2_connection_config();
                 let stream_idle_timeout = self.listener.borrow().get_h2_stream_idle_timeout();
+                let graceful_shutdown_deadline =
+                    self.listener.borrow().get_h2_graceful_shutdown_deadline();
                 mux::Connection::new_h2_server(
                     session_ulid,
                     front_stream,
@@ -374,6 +376,7 @@ impl HttpsSession {
                     flood_config,
                     connection_config,
                     stream_idle_timeout,
+                    graceful_shutdown_deadline,
                 )?
             }
         };
@@ -830,6 +833,14 @@ impl L7ListenerHandler for HttpsListener {
             .h2_stream_idle_timeout_seconds
             .map(|s| std::time::Duration::from_secs(u64::from(s.max(1))))
             .unwrap_or_else(|| std::time::Duration::from_secs(30))
+    }
+
+    fn get_h2_graceful_shutdown_deadline(&self) -> Option<std::time::Duration> {
+        match self.config.h2_graceful_shutdown_deadline_seconds {
+            None => Some(std::time::Duration::from_secs(5)),
+            Some(0) => None,
+            Some(s) => Some(std::time::Duration::from_secs(u64::from(s))),
+        }
     }
 }
 
