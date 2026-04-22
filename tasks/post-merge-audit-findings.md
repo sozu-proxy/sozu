@@ -196,18 +196,18 @@ the black-box observable behaviour.
 already inline at the function definition — future readers have the
 invariant without having to re-derive it.
 
-## Remaining plan items deferred (not in this session)
+## Session shipment table (2026-04-22)
 
-These items need their own dedicated conversation; they were left out
-of the post-merge sweep because they are architectural or
-harness-heavy:
+Every bucket from the 2026-04-21 triage plan that was in user scope
+is now either shipped, audit-verified, or explicitly deferred. Only
+B2-a #1218 (backend TLS) remains as user-scoped out-of-scope.
 
 | ID | Item | Status |
 |----|------|--------|
-| B3-h · G4 | Linked-stream fast-backend-close race e2e | needs full e2e harness with backend that closes mid-response + stream-state assertion hooks |
-| B3-z | 1xx informational forwarding e2e | needs backend that emits 1xx before final response |
+| B3-h · G4 | Linked-stream fast-backend-close race e2e | **shipped** as `test_h2_backend_disconnect_no_linked_leak` (commit `9ff035d5`) — 30-iteration DisconnectingBackend stress fails if any per-stream state leaks |
+| B3-z | 1xx informational forwarding e2e | **shipped** as `test_h2_to_h1_1xx_informational_forwarded` (commit `8370b90f`) — raw H2 client counts HEADERS frames, asserts ≥2 (100 Continue + final) |
 | B3-j · G6 | HPACK dynamic-table-size-update emission | **shipped** as commit `a585cea3` (2026-04-22) — converter emits the `001xxxxx` directive at the start of the next header block after a SETTINGS_HEADER_TABLE_SIZE change |
-| B3-p · #899 | H1 trailers in `kawa_h1` | out-of-scope for sozu; belongs to `CleverCloud/kawa` upstream (parser does not emit trailer blocks). Sozu already forwards them if kawa produces them. Operator should open a kawa-side issue/PR |
+| B3-p · #899 | H1 chunked trailers end-to-end | **shipped**: `test_h1_chunked_trailer_forwarded` (commit `9b8f3884`) proves kawa's `ParsingPhase::Trailers` + converter already emit the trailer line; the test locks the behaviour in so a refactor can't silently drop it. No kawa upstream change needed after all. |
 | B3-x · #890 + #1057 | Rate-limit design doc + implementation | **design doc shipped** as `doc/rate-limit-design.md` (commit `0031aadb`); implementation follows the §7 rollout plan in a follow-up PR |
 | B2-a · #1218 | Backend TLS | L-effort (~2-4 k LOC), user explicitly out-of-scope pre-merge |
 
