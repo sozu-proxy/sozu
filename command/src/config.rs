@@ -295,6 +295,10 @@ pub struct ListenerBuilder {
     pub h2_max_settings_per_window: Option<u32>,
     /// H2 flood detection: max empty DATA frames per second window (CVE-2019-9518)
     pub h2_max_empty_data_per_window: Option<u32>,
+    /// H2 flood detection: max connection-level (stream 0) WINDOW_UPDATE
+    /// frames per sliding window. Caps non-zero stream-0 WINDOW_UPDATE floods
+    /// that would otherwise stay under the generic glitch counter. Default: 100.
+    pub h2_max_window_update_stream0_per_window: Option<u32>,
     /// H2 flood detection: max CONTINUATION frames per header block (CVE-2024-27316)
     pub h2_max_continuation_frames: Option<u32>,
     /// H2 flood detection: max accumulated protocol anomalies before ENHANCE_YOUR_CALM
@@ -404,6 +408,7 @@ impl ListenerBuilder {
             h2_max_ping_per_window: None,
             h2_max_settings_per_window: None,
             h2_max_empty_data_per_window: None,
+            h2_max_window_update_stream0_per_window: None,
             h2_max_continuation_frames: None,
             h2_max_glitch_count: None,
             h2_initial_connection_window: None,
@@ -579,6 +584,7 @@ impl ListenerBuilder {
             h2_max_ping_per_window: self.h2_max_ping_per_window,
             h2_max_settings_per_window: self.h2_max_settings_per_window,
             h2_max_empty_data_per_window: self.h2_max_empty_data_per_window,
+            h2_max_window_update_stream0_per_window: self.h2_max_window_update_stream0_per_window,
             h2_max_continuation_frames: self.h2_max_continuation_frames,
             h2_max_glitch_count: self.h2_max_glitch_count,
             h2_initial_connection_window: self.h2_initial_connection_window,
@@ -722,6 +728,7 @@ impl ListenerBuilder {
             h2_max_ping_per_window: self.h2_max_ping_per_window,
             h2_max_settings_per_window: self.h2_max_settings_per_window,
             h2_max_empty_data_per_window: self.h2_max_empty_data_per_window,
+            h2_max_window_update_stream0_per_window: self.h2_max_window_update_stream0_per_window,
             h2_max_continuation_frames: self.h2_max_continuation_frames,
             h2_max_glitch_count: self.h2_max_glitch_count,
             h2_initial_connection_window: self.h2_initial_connection_window,
