@@ -492,10 +492,34 @@ address = "127.0.0.1:8125"
 # tagged_metrics = false
 # metrics key prefix
 # prefix = "sozu"
+# cardinality knob — defaults to "cluster" (preserves historical behaviour)
+# detail = "cluster"
 ```
 
 Metrics are sent at most once per second per key (if updated). Cluster/backend metrics
 that have not been updated for 10 minutes are automatically dropped from the network drain.
+
+#### Cardinality knob (`metrics.detail`)
+
+Mirrors HAProxy's `extra-counters` opt-in: operators choose the lowest level that
+satisfies their dashboards so the StatsD keyspace stays bounded. The level filters
+the `(cluster_id, backend_id)` labels at emission time — both the local CLI drain
+and the network drain see the same filtered labels, so dashboards stay consistent.
+
+Each level is a SUPERSET of the previous one:
+
+| Level | Behaviour | Use when |
+|---|---|---|
+| `process` | Both `cluster_id` and `backend_id` are dropped — proxy-only counters. | The smallest possible keyspace; dashboards aggregate everything at the worker level. |
+| `frontend` | Same as `process` today. Reserved for the per-listener (frontend) counters that are tracked as a follow-up — operators can opt in already, the value is just stored on `ServerMetricsConfig.detail` and applied on every emission. | Forward-compatible config that picks up per-listener counters when they ship without a config-file change. |
+| `cluster` | Keeps `cluster_id`, drops `backend_id`. **Default** — preserves the historical pre-knob behaviour. | The current shape of every existing dashboard. |
+| `backend` | Keeps both labels. Highest cardinality. | Per-backend SLOs / hotspot debugging when the cluster has few backends. |
+
+Filtering happens centrally in `Aggregator::receive_metric` (`lib/src/metrics/mod.rs`)
+via the pure helper `filter_labels_for_detail`, unit-tested exhaustively across all
+four levels. Workers receive the level over the SCM socket as a proto enum
+(`MetricDetail`); old binaries on either side fall back to `cluster` so a
+mixed-version rollout keeps emitting the historical metric shape.
 
 #### StatsD wire format
 
