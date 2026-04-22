@@ -1030,6 +1030,25 @@ pub fn handle_trailer(
         return Err((H2Error::ProtocolError, false));
     }
 
+    // Codex G7 / RFC 9110 §6.5: if the request/response was framed with a
+    // fixed Content-Length (not chunked), the H1-side serializer cannot emit
+    // trailers — HTTP/1.1 only carries trailers with chunked transfer-coding.
+    // The trailer block stays in kawa but the downstream writer will never
+    // reach it. Emit a visible signal so operators chasing "vanished gRPC
+    // trailers" have something to grep, without changing the drop behaviour
+    // (changing it would retroactively need to rewrite the framing, which
+    // is not possible once headers are on the wire).
+    if matches!(kawa.body_size, BodySize::Length(_)) {
+        warn!(
+            "{} H2 trailers arrived on a Content-Length-framed stream; \
+             trailers will be silently dropped by the H1 serializer \
+             (RFC 9110 §6.5). Peer should omit Content-Length for trailer \
+             delivery to upgrade framing to chunked.",
+            log_module_context!()
+        );
+        incr!("h2.trailers_dropped_content_length");
+    }
+
     kawa.push_block(Block::Flags(Flags {
         end_body: false,
         end_chunk: false,
