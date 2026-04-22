@@ -1175,6 +1175,18 @@ pub struct ConnectionH2<Front: SocketHandler> {
     pub flow_control: H2FlowControl,
     /// Highest stream ID accepted from the peer (used for GoAway last_stream_id).
     pub highest_peer_stream_id: StreamId,
+    /// RFC 7541 §4.2 / §6.3 pending dynamic-table-size-update signal.
+    ///
+    /// `Some(new_size)` when a peer SETTINGS frame adjusted
+    /// `SETTINGS_HEADER_TABLE_SIZE` and we have not yet prepended the
+    /// matching `001xxxxx` HPACK directive to a header block. Consumed and
+    /// cleared by [`H2BlockConverter::emit_pending_size_update_if_new_block`]
+    /// on the next `Block::StatusLine` or `Block::Header` encoded for the
+    /// connection. Until then the peer's decoder still has its previous
+    /// (possibly larger) table cap, so emitting is a correctness
+    /// requirement, not a nicety — see the RFC 9113 encoder-decoder
+    /// synchronisation contract (§6.5.2).
+    pub pending_table_size_update: Option<u32>,
     /// Reusable buffer for HPACK-encoded headers in the H2 block converter.
     pub converter_buf: Vec<u8>,
     /// Reusable buffer for lowercasing header keys in the H2 block converter.
@@ -1367,6 +1379,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 pending_window_updates: HashMap::new(),
             },
             highest_peer_stream_id: 0,
+            pending_table_size_update: None,
             converter_buf: Vec::new(),
             lowercase_buf: Vec::new(),
             cookie_buf: Vec::new(),
@@ -2236,6 +2249,14 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             // unit tests and non-scheduled callers (e.g. the resume path
             // above) keep the sequential semantics.
             incremental_mode: false,
+            // RFC 7541 §6.3: move the pending size-update onto the converter
+            // so the first header block of this pass prepends the signal.
+            // We clear the connection-side mirror only AFTER the write pass
+            // confirms emission via `converter.size_update_emitted`, so a
+            // DATA-only write pass (no header block) does not drop the
+            // signal.
+            pending_table_size_update: self.pending_table_size_update,
+            size_update_emitted: false,
         };
         self.priorities_buf.clear();
         self.priorities_buf.extend(self.streams.keys().copied());
@@ -2359,7 +2380,16 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         let converter_out = std::mem::take(&mut converter.out);
         let lowercase_buf = std::mem::take(&mut converter.lowercase_buf);
         let cookie_buf = std::mem::take(&mut converter.cookie_buf);
+        // RFC 7541 §6.3: clear our mirror of the pending size-update only
+        // AFTER the converter confirmed the signal was emitted to its
+        // output buffer. A DATA-only pass leaves `size_update_emitted` as
+        // `false` so the signal stays queued for the next pass with a
+        // header block.
+        let size_update_emitted = converter.size_update_emitted;
         drop(converter);
+        if size_update_emitted {
+            self.pending_table_size_update = None;
+        }
         self.converter_buf = converter_out;
         self.lowercase_buf = lowercase_buf;
         self.cookie_buf = cookie_buf;
@@ -4285,6 +4315,12 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     let capped = v.min(cap);
                     self.peer_settings.settings_header_table_size = capped;
                     self.encoder.set_max_table_size(capped as usize);
+                    // RFC 7541 §4.2 / §6.3: queue a dynamic-table-size-update
+                    // HPACK directive for the next header block we emit.
+                    // Without it, the peer's decoder keeps its previous (possibly
+                    // larger) table cap and our encoder-side change is silent
+                    // — conformance suites (h2spec `hpack/4.2`) will flag it.
+                    self.pending_table_size_update = Some(capped);
                 },
                 parser::SETTINGS_ENABLE_PUSH       => { self.peer_settings.settings_enable_push = v == 1;             is_error |= v > 1 },
                 parser::SETTINGS_MAX_CONCURRENT_STREAMS => { self.peer_settings.settings_max_concurrent_streams = v },
