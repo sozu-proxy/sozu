@@ -241,6 +241,17 @@ pub fn preface(i: &[u8]) -> IResult<&[u8], &[u8]> {
 }
 
 // https://httpwg.org/specs/rfc7540.html#rfc.section.4.1
+//
+// Codex G12 invariant (production caller contract):
+// `max_frame_size` MUST be the *negotiated* `settings_max_frame_size` from
+// the peer's latest accepted SETTINGS frame (see `H2Settings` on
+// `ConnectionH2`). It MUST NOT be `DEFAULT_MAX_FRAME_SIZE` — that RFC
+// default (16 KiB) is only correct at connection-preface time, before the
+// peer has had a chance to raise the limit. All four production callers
+// in `lib/src/protocol/mux/h2.rs` (lines 1444, 1704, 1935, 1994) thread
+// `self.local_settings.settings_max_frame_size` correctly. Tests may use
+// `DEFAULT_MAX_FRAME_SIZE` freely because they construct isolated frame
+// buffers that never flow through a real peer handshake.
 pub fn frame_header(input: &[u8], max_frame_size: u32) -> IResult<&[u8], FrameHeader, ParserError> {
     let (i, payload_len) = be_u24(input)?;
     if payload_len > max_frame_size {
