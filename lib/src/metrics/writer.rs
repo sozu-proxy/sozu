@@ -122,9 +122,18 @@ impl MetricsWriter {
                 .iter()
                 .map(|iov| {
                     let mhdr = {
-                        // Musl's msghdr has private padding fields,
-                        // so this is the only way to initialize it.
-                        let mut mhdr: msghdr = unsafe { mem::uninitialized() };
+                        // Musl's `msghdr` has private padding fields, so we
+                        // cannot construct it with struct literal syntax.
+                        // `mem::uninitialized` has been UB since Rust 1.39
+                        // (its frozen-bits guarantee was removed in favour of
+                        // `MaybeUninit`). All non-padding fields are explicit
+                        // pointers, lengths, or flags for which zero is the
+                        // valid null / empty representation, so
+                        // `MaybeUninit::zeroed` is both safe and correct.
+                        // SAFETY: `msghdr` is a C POD — every byte pattern
+                        // is a legal representation, so zero-init satisfies
+                        // `assume_init`'s invariant.
+                        let mut mhdr: msghdr = unsafe { mem::MaybeUninit::zeroed().assume_init() };
                         mhdr.msg_name = std::ptr::null_mut();
                         mhdr.msg_namelen = 0;
                         mhdr.msg_iov = iov.as_ptr() as *mut _;
