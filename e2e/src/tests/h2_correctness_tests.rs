@@ -1036,3 +1036,244 @@ fn test_h2_stranded_expect_write_peer_rst_survives_cancellation() {
         State::Success
     );
 }
+
+// ============================================================================
+// Test: RFC 9218 §4 incremental round-robin scheduling
+// ============================================================================
+
+/// Build an HPACK-encoded header block for `GET / HTTP/2 https localhost`
+/// plus an optional literal `priority` header (`u=<urgency>, <inc_token>`).
+///
+/// `inc_token` is inserted as-is after the comma — pass `"i"` for
+/// `incremental=true` and `"i=?0"` to explicitly opt out. The priority header
+/// is encoded as a literal-without-indexing field with a new name so sozu's
+/// HPACK decoder takes the `compare_no_case(&k, b"priority")` branch in
+/// `pkawa.rs:732`.
+fn build_get_headers_with_priority(urgency: u8, inc_token: &str) -> Vec<u8> {
+    let mut block = vec![
+        0x82, // :method GET (indexed)
+        0x84, // :path / (indexed)
+        0x87, // :scheme https (indexed)
+        0x41, 0x09, // :authority, value len 9
+        b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't',
+    ];
+    // Build "u=N, <inc_token>" priority value.
+    let value = format!("u={urgency}, {inc_token}");
+    // Literal Header Field without Indexing — New Name (0x00), name length 8.
+    block.push(0x00);
+    block.push(0x08);
+    block.extend_from_slice(b"priority");
+    // Value length, value bytes.
+    assert!(
+        value.len() < 127,
+        "priority value too long for short encoding"
+    );
+    block.push(value.len() as u8);
+    block.extend_from_slice(value.as_bytes());
+    block
+}
+
+/// Extract DATA frame stream IDs in arrival order, ignoring empty DATA
+/// (END_STREAM markers sometimes emit payload-less DATA frames).
+fn data_frame_stream_order(frames: &[(u8, u8, u32, Vec<u8>)]) -> Vec<u32> {
+    frames
+        .iter()
+        .filter_map(|(ft, _fl, sid, payload)| {
+            if *ft == H2_FRAME_DATA && !payload.is_empty() {
+                Some(*sid)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// RFC 9218 §4: three same-urgency streams with `priority: u=3, i` must see
+/// their DATA frames **interleaved**, not drained sequentially. The test
+/// starves sozu of per-stream send window during setup so all three
+/// backend responses sit in sozu's kawa buffers, then releases the three
+/// stream windows back-to-back. That forces the scheduler to iterate the
+/// full `priorities_buf = [1, 3, 5]` inside a single `writable()` pass,
+/// which is exactly the regime the round-robin logic governs.
+fn try_h2_rfc9218_incremental_round_robin() -> State {
+    // Three backends so each stream is served by a fresh TCP connection to
+    // a dedicated thread — avoids head-of-line blocking on the backend side
+    // that would otherwise serialize responses.
+    let (worker, backends, front_port) = setup_h2_test_with_large_bodies(
+        "H2-COR-RFC9218-INC",
+        3,
+        // Body ≈ 2 × max_frame_size (16384) → each stream emits ≥ 2 DATA
+        // frames so interleaving is observable on the wire.
+        32 * 1024,
+    );
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    // INITIAL_WINDOW_SIZE=0 → sozu cannot send DATA on a new stream until
+    // we WINDOW_UPDATE that stream explicitly. HEADERS still flow; the
+    // responses accumulate in kawa.
+    h2_handshake_with_initial_window(&mut tls, 0);
+
+    let ids = [1u32, 3, 5];
+    for sid in ids {
+        let block = build_get_headers_with_priority(3, "i");
+        let headers = H2Frame::headers(sid, block, true, true);
+        tls.write_all(&headers.encode()).unwrap();
+    }
+    tls.flush().unwrap();
+
+    // Let the three backends reply and sozu stash responses in stream
+    // kawas. No DATA can egress yet because stream windows are 0.
+    thread::sleep(Duration::from_millis(400));
+
+    // Pack all four WINDOW_UPDATEs into a single TCP write so sozu sees
+    // every stream's window lifted in one `readable()` pass and only runs
+    // `writable()` afterwards — at which point the scheduler iterates a
+    // fully-populated priorities_buf of length 3. If we flush between
+    // frames, sozu's event loop may interleave `readable()` and
+    // `writable()` and emit DATA for stream 1 alone before the other
+    // windows are lifted, producing a non-RR wire trace for timing
+    // reasons unrelated to the scheduler.
+    let mut bulk = Vec::new();
+    for sid in ids {
+        bulk.extend_from_slice(&H2Frame::window_update(sid, 1_000_000).encode());
+    }
+    bulk.extend_from_slice(&H2Frame::window_update(0, 1_000_000).encode());
+    tls.write_all(&bulk).unwrap();
+    tls.flush().unwrap();
+
+    let frames = collect_response_frames(&mut tls, 300, 6, 400);
+    log_frames("RFC 9218 incremental RR", &frames);
+
+    let order = data_frame_stream_order(&frames);
+    println!("DATA stream-ID order: {order:?}");
+
+    // Fairness predicate: count "transitions" where adjacent DATA frames
+    // belong to different streams. Sequential drain (the non-incremental
+    // baseline) gives exactly `n_streams - 1` transitions — stream IDs
+    // like [1,1,3,3,5,5] have 2 transitions for 3 streams. Round-robin
+    // produces many more transitions because each stream fires at most
+    // once per scheduling pass before yielding.
+    //
+    // The threshold is relaxed past `n_streams - 1` rather than demanding
+    // a perfect interleave: backend response arrivals are not synchronous,
+    // so the very first few DATA frames may still come from whichever
+    // stream's kawa was populated first. The RR logic must then kick in
+    // and rotate across the remaining streams — which shows up as
+    // *additional* transitions above the sequential baseline.
+    let transitions = order.windows(2).filter(|w| w[0] != w[1]).count();
+    let streams_seen: std::collections::HashSet<u32> = order.iter().copied().collect();
+    let n_streams_seen = streams_seen
+        .intersection(&ids.iter().copied().collect())
+        .count();
+    let each_stream_fired = ids.iter().all(|sid| streams_seen.contains(sid));
+    // Need ≥ 2 transitions on top of the sequential baseline to prove RR
+    // kicked in. A 3-stream round-robin drain of ~10 DATA frames typically
+    // produces ≥ 6 transitions; we demand at least `n_streams` (= 3),
+    // giving noise budget while still excluding the sequential pattern.
+    let interleaved = transitions >= n_streams_seen;
+
+    println!(
+        "each_stream_fired={each_stream_fired} transitions={transitions} \
+         interleaved={interleaved} streams_seen={n_streams_seen} \
+         total_frames={}",
+        order.len()
+    );
+
+    let infra_ok = teardown(tls, front_port, worker, backends);
+    if infra_ok && each_stream_fired && interleaved {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_rfc9218_incremental_round_robin() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 RFC 9218 §4: incremental streams interleave DATA frames",
+            try_h2_rfc9218_incremental_round_robin
+        ),
+        State::Success
+    );
+}
+
+/// RFC 9218 §4: three same-urgency streams with `priority: u=3, i=?0` must
+/// drain **sequentially** — the pre-existing behaviour. Uses the same
+/// window-starving handshake as the round-robin test so the scheduler sees
+/// all three streams as eligible in a single `writable()` pass; the only
+/// difference from that test is the `incremental` flag in the priority
+/// header. Each stream's DATA frames must appear as a contiguous run on
+/// the wire (stream order like [1,1,1,3,3,3,5,5,5]).
+fn try_h2_rfc9218_non_incremental_sequential() -> State {
+    let (worker, backends, front_port) =
+        setup_h2_test_with_large_bodies("H2-COR-RFC9218-SEQ", 3, 32 * 1024);
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    // INITIAL_WINDOW_SIZE=0 so the three responses park in kawa before any
+    // DATA is released — keeps the test symmetric with the incremental
+    // round-robin counterpart.
+    h2_handshake_with_initial_window(&mut tls, 0);
+
+    let ids = [1u32, 3, 5];
+    for sid in ids {
+        // `i=?0` = explicit non-incremental (also the RFC 9218 default when
+        // the parameter is absent).
+        let block = build_get_headers_with_priority(3, "i=?0");
+        let headers = H2Frame::headers(sid, block, true, true);
+        tls.write_all(&headers.encode()).unwrap();
+    }
+    tls.flush().unwrap();
+
+    thread::sleep(Duration::from_millis(400));
+
+    // Bulk WINDOW_UPDATE so sozu sees all three streams eligible in one
+    // pass — see the round-robin test for the rationale.
+    let mut bulk = Vec::new();
+    for sid in ids {
+        bulk.extend_from_slice(&H2Frame::window_update(sid, 1_000_000).encode());
+    }
+    bulk.extend_from_slice(&H2Frame::window_update(0, 1_000_000).encode());
+    tls.write_all(&bulk).unwrap();
+    tls.flush().unwrap();
+
+    let frames = collect_response_frames(&mut tls, 300, 6, 400);
+    log_frames("RFC 9218 non-incremental (baseline)", &frames);
+
+    let order = data_frame_stream_order(&frames);
+    println!("DATA stream-ID order: {order:?}");
+
+    // Sequential-drain assertion: for each stream, all of its DATA frames
+    // should form a contiguous block. Equivalently, the number of
+    // "transitions" (adjacent frames with different stream IDs) equals the
+    // number of streams − 1 — i.e. stream order like [1,1,1,3,3,3,5,5,5]
+    // gives 2 transitions for 3 streams. Round-robin would yield 8.
+    let transitions = order.windows(2).filter(|w| w[0] != w[1]).count();
+    let streams_seen: std::collections::HashSet<u32> = order.iter().copied().collect();
+    let n_streams = streams_seen.len();
+    let sequential = !order.is_empty() && transitions == n_streams.saturating_sub(1);
+
+    println!("transitions={transitions} streams_seen={n_streams} sequential={sequential}");
+
+    let infra_ok = teardown(tls, front_port, worker, backends);
+    if infra_ok && sequential && ids.iter().all(|sid| streams_seen.contains(sid)) {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_rfc9218_non_incremental_sequential() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 RFC 9218 §4: non-incremental streams drain sequentially",
+            try_h2_rfc9218_non_incremental_sequential
+        ),
+        State::Success
+    );
+}
