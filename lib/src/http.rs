@@ -536,6 +536,14 @@ impl L7ListenerHandler for HttpListener {
         &self.config.sticky_name
     }
 
+    fn get_sozu_id_header(&self) -> &str {
+        self.config
+            .sozu_id_header
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("Sozu-Id")
+    }
+
     fn get_connect_timeout(&self) -> u32 {
         self.config.connect_timeout
     }
