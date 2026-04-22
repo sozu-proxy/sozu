@@ -83,6 +83,7 @@ pub fn setup_metrics(config: &Config) -> Result<(), UtilError> {
             "MAIN",
             metrics.tagged_metrics,
             metrics.prefix.clone(),
+            metrics.detail,
         )
         .map_err(UtilError::SetupMetrics);
     }
