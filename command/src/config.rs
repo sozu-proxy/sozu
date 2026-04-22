@@ -327,6 +327,11 @@ pub struct ListenerBuilder {
     /// forward progress for this duration is cancelled (RST_STREAM / CANCEL)
     /// to defend against slow-multiplex Slowloris. Default: 30.
     pub h2_stream_idle_timeout_seconds: Option<u32>,
+    /// Maximum wall-clock seconds to wait for in-flight H2 streams after
+    /// `GOAWAY(NO_ERROR)` has been sent during soft-stop. Once the deadline
+    /// elapses the connection is forcibly closed with a final GOAWAY. Set to
+    /// `0` to wait for streams to finish (no forced close). Default: 5.
+    pub h2_graceful_shutdown_deadline_seconds: Option<u32>,
     /// When true, every HTTP request served on this listener must have its
     /// `:authority` / `Host` host exact-match the TLS SNI negotiated at
     /// handshake (CWE-346 / CWE-444). Applies to HTTPS listeners only;
@@ -410,6 +415,7 @@ impl ListenerBuilder {
             h2_max_header_list_size: None,
             h2_max_header_table_size: None,
             h2_stream_idle_timeout_seconds: None,
+            h2_graceful_shutdown_deadline_seconds: None,
             strict_sni_binding: None,
             disable_http11: None,
         }
@@ -584,6 +590,7 @@ impl ListenerBuilder {
             h2_max_header_list_size: self.h2_max_header_list_size,
             h2_max_header_table_size: self.h2_max_header_table_size,
             h2_stream_idle_timeout_seconds: self.h2_stream_idle_timeout_seconds,
+            h2_graceful_shutdown_deadline_seconds: self.h2_graceful_shutdown_deadline_seconds,
             ..Default::default()
         };
 
@@ -728,6 +735,7 @@ impl ListenerBuilder {
             strict_sni_binding: self.strict_sni_binding,
             disable_http11: self.disable_http11,
             h2_stream_idle_timeout_seconds: self.h2_stream_idle_timeout_seconds,
+            h2_graceful_shutdown_deadline_seconds: self.h2_graceful_shutdown_deadline_seconds,
         };
 
         Ok(https_listener_config)

@@ -184,6 +184,10 @@ message HttpListenerConfig {
     // from the peer. Caps the peer-advertised value to prevent unbounded
     // HPACK encoder memory growth. Default: 65536.
     optional uint32 h2_max_header_table_size = 26;
+    // Maximum wall-clock seconds to wait for in-flight H2 streams after
+    // GOAWAY(NO_ERROR) before forcibly closing the connection. Default: 5.
+    // Set to 0 to require streams to finish (no forced close).
+    optional uint32 h2_graceful_shutdown_deadline_seconds = 28;
 }
 
 // details of an HTTPS listener
@@ -285,6 +289,10 @@ message HttpsListenerConfig {
     // from the peer. Caps the peer-advertised value to prevent unbounded
     // HPACK encoder memory growth. Default: 65536.
     optional uint32 h2_max_header_table_size = 38;
+    // Maximum wall-clock seconds to wait for in-flight H2 streams after
+    // GOAWAY(NO_ERROR) before forcibly closing the connection. Default: 5.
+    // Set to 0 to require streams to finish (no forced close).
+    optional uint32 h2_graceful_shutdown_deadline_seconds = 40;
 }
 
 // details of an TCP listener

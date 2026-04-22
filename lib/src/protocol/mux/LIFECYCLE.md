@@ -533,17 +533,33 @@ stream id.
 
 ### 8.3 Session drain
 
-`Mux::shutting_down` (`mod.rs:1589`) is called by the server loop during
+`Mux::shutting_down` (`mod.rs:1620`) is called by the server loop during
 process shutdown or listener reload. It:
 
-1. Initiates the double-GOAWAY (`mod.rs:1596`).
+1. Initiates the double-GOAWAY (`mod.rs:1627`).
 2. Drives frontend I/O outside the epoll loop
    (`drive_frontend_shutdown_io`, `mod.rs:562`) — H2 needs extra passes
    for the peer's END_STREAM and final TLS flush.
-3. Marks `front_received_end_of_stream` on streams whose request is
-   already complete and consumed (`mod.rs:1619-1638`).
-4. Returns `true` when no `Linked` or non-quiesced `Unlinked` streams
+3. Checks the graceful-shutdown forced-close deadline: when
+   `Connection::graceful_shutdown_deadline_elapsed` returns `true` (i.e.
+   `drain.started_at + drain.graceful_shutdown_deadline <= Instant::now`)
+   the session returns `true` immediately so the server loop can tear
+   the connection down even with Linked streams still in flight.
+4. Marks `front_received_end_of_stream` on streams whose request is
+   already complete and consumed.
+5. Returns `true` when no `Linked` or non-quiesced `Unlinked` streams
    remain.
+
+The forced-close deadline is armed the first time `graceful_goaway`
+transitions `drain.draining` to `true` (see `h2.rs`): that site sets
+`drain.started_at = Some(Instant::now())`. The budget itself comes from
+the listener knob `h2_graceful_shutdown_deadline_seconds` (proto field
+`h2_graceful_shutdown_deadline_seconds`, defaulting to 5 s). Setting
+the knob to `0` maps to `graceful_shutdown_deadline = None`, which
+disables the forced-close branch entirely — shutdown then reverts to
+"wait for every stream to drain" semantics. Peer-initiated drains
+received via `handle_goaway_frame` deliberately do **not** arm
+`started_at`: the budget only applies to the proxy's own soft-stop.
 
 ### 8.4 `Connection::end_stream` (backend-side retirement)
 

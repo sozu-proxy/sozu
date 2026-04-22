@@ -1646,6 +1646,22 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         if self.drive_frontend_shutdown_io() {
             return true;
         }
+        // Forced-close deadline: once the H2 listener's
+        // `h2_graceful_shutdown_deadline_seconds` budget has elapsed from
+        // the moment `graceful_goaway` armed `drain.started_at`, stop
+        // waiting for streams and tear the session down. `drive_frontend_
+        // shutdown_io` above already had a chance to flush any pending
+        // TLS/GOAWAY records; this branch accepts that some bytes may be
+        // lost in exchange for honoring the operator-configured SLA.
+        // Listeners that disable the knob (`= 0` → `None`) short-circuit
+        // the check inside `graceful_shutdown_deadline_elapsed`.
+        if self.frontend.graceful_shutdown_deadline_elapsed() {
+            debug!(
+                "{} Mux shutting_down: graceful-shutdown deadline elapsed, forcing close",
+                log_context!(self)
+            );
+            return true;
+        }
         if matches!(self.frontend, Connection::H2(_)) && self.frontend.is_draining() {
             for stream in &mut self.context.streams {
                 if stream.front_received_end_of_stream {

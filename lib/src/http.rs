@@ -657,6 +657,14 @@ impl L7ListenerHandler for HttpListener {
             .map(|s| std::time::Duration::from_secs(u64::from(s.max(1))))
             .unwrap_or_else(|| std::time::Duration::from_secs(30))
     }
+
+    fn get_h2_graceful_shutdown_deadline(&self) -> Option<std::time::Duration> {
+        match self.config.h2_graceful_shutdown_deadline_seconds {
+            None => Some(std::time::Duration::from_secs(5)),
+            Some(0) => None,
+            Some(s) => Some(std::time::Duration::from_secs(u64::from(s))),
+        }
+    }
 }
 
 pub struct HttpProxy {

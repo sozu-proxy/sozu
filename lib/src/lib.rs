@@ -595,6 +595,19 @@ pub trait L7ListenerHandler {
     fn get_h2_stream_idle_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_secs(30)
     }
+
+    /// Wall-clock budget granted to in-flight H2 streams after soft-stop sent
+    /// the phase-1 `GOAWAY(NO_ERROR)`. Once the deadline elapses the mux
+    /// transitions to a forced close (final GOAWAY + session teardown).
+    ///
+    /// Returning `None` disables the forced close entirely — shutdown waits
+    /// for every stream to drain naturally. Returning `Some(d)` enforces the
+    /// budget. Default: `Some(Duration::from_secs(5))` (matches the historic
+    /// hard-coded 5 s deadline). Listeners expose the
+    /// `h2_graceful_shutdown_deadline_seconds` knob; value `0` maps to `None`.
+    fn get_h2_graceful_shutdown_deadline(&self) -> Option<std::time::Duration> {
+        Some(std::time::Duration::from_secs(5))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
