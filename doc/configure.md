@@ -359,6 +359,7 @@ for connection-lifetime counters):
 | `h2_max_ping_per_window` | 100 | Ping flood: client sends PING frames faster than the server can respond | CVE-2019-9512 |
 | `h2_max_settings_per_window` | 50 | Settings flood: client sends SETTINGS frames requiring ACKs, exhausting server resources | CVE-2019-9515 |
 | `h2_max_empty_data_per_window` | 100 | Empty DATA flood: client sends zero-length DATA frames to consume processing time | CVE-2019-9518 |
+| `h2_max_window_update_stream0_per_window` | 100 | Connection-level (stream 0) WINDOW_UPDATE flood: client sends a torrent of non-zero stream-0 WINDOW_UPDATE frames to burn server CPU parsing each one (zero-increment frames short-circuit into `GOAWAY(PROTOCOL_ERROR)` per RFC 9113 §6.9). | |
 | `h2_max_continuation_frames` | 20 | CONTINUATION flood: client sends many small CONTINUATION frames to exhaust header memory | CVE-2024-27316 |
 | `h2_max_glitch_count` | 100 | Cumulative protocol violations: total number of minor protocol errors before disconnection | |
 
@@ -374,6 +375,7 @@ h2_max_rst_stream_per_window = 100    # Rapid Reset (CVE-2023-44487)
 h2_max_ping_per_window = 100          # Ping flood (CVE-2019-9512)
 h2_max_settings_per_window = 50       # Settings flood (CVE-2019-9515)
 h2_max_empty_data_per_window = 100    # Empty DATA flood (CVE-2019-9518)
+h2_max_window_update_stream0_per_window = 100  # Connection-level WINDOW_UPDATE flood (stream 0)
 h2_max_continuation_frames = 20       # CONTINUATION flood (CVE-2024-27316)
 h2_max_glitch_count = 100             # Cumulative protocol violations
 ```

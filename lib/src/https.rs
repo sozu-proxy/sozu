@@ -782,6 +782,10 @@ impl L7ListenerHandler for HttpsListener {
                 .config
                 .h2_max_empty_data_per_window
                 .unwrap_or(defaults.max_empty_data_per_window),
+            max_window_update_stream0_per_window: self
+                .config
+                .h2_max_window_update_stream0_per_window
+                .unwrap_or(defaults.max_window_update_stream0_per_window),
             max_continuation_frames: self
                 .config
                 .h2_max_continuation_frames
