@@ -14,7 +14,7 @@ use sozu_command_lib::{
     scm_socket::ScmSocket,
 };
 
-use crate::command::server::{ClientId, MessageClient, WorkerId};
+use crate::command::server::{ClientId, MessageClient, PeerCred, WorkerId};
 
 /// Track a client from start to finish
 #[derive(Debug)]
@@ -30,6 +30,18 @@ pub struct ClientSession {
     /// at accept time. `None` if the peer credentials could not be read
     /// (e.g. non-Linux build or the syscall failed).
     pub actor_uid: Option<u32>,
+    /// GID of the peer process (same `SO_PEERCRED` read). `None` on error /
+    /// unsupported platforms.
+    pub actor_gid: Option<u32>,
+    /// PID of the peer process (same `SO_PEERCRED` read). Rendered in the
+    /// audit line so operators can correlate with `journalctl _PID=<pid>`
+    /// and `/proc/<pid>`. Note PIDs can be reused — combine with the
+    /// per-session ULID for stronger correlation.
+    pub actor_pid: Option<i32>,
+    /// `/proc/<pid>/comm` at accept time (up to 15 chars per kernel spec).
+    /// Useful for distinguishing `sozuctl` from ad-hoc shells that share a
+    /// UID. Cached at accept — never re-read.
+    pub actor_comm: Option<String>,
 }
 
 /// The return type of the ready method
@@ -46,7 +58,8 @@ impl ClientSession {
         mut channel: Channel<Response, Request>,
         id: ClientId,
         token: Token,
-        actor_uid: Option<u32>,
+        peer_cred: PeerCred,
+        actor_comm: Option<String>,
     ) -> Self {
         channel.interest = Ready::READABLE | Ready::ERROR | Ready::HUP;
         Self {
@@ -54,7 +67,10 @@ impl ClientSession {
             id,
             session_ulid: Ulid::generate(),
             token,
-            actor_uid,
+            actor_uid: peer_cred.uid,
+            actor_gid: peer_cred.gid,
+            actor_pid: peer_cred.pid,
+            actor_comm,
         }
     }
 
@@ -63,6 +79,32 @@ impl ClientSession {
     pub fn actor_uid_display(&self) -> String {
         match self.actor_uid {
             Some(uid) => uid.to_string(),
+            None => String::from("unknown"),
+        }
+    }
+
+    /// Render the captured peer GID. `"unknown"` when absent.
+    pub fn actor_gid_display(&self) -> String {
+        match self.actor_gid {
+            Some(gid) => gid.to_string(),
+            None => String::from("unknown"),
+        }
+    }
+
+    /// Render the captured peer PID. `"unknown"` when absent.
+    pub fn actor_pid_display(&self) -> String {
+        match self.actor_pid {
+            Some(pid) => pid.to_string(),
+            None => String::from("unknown"),
+        }
+    }
+
+    /// Render the captured `/proc/<pid>/comm` string, sanitized for audit
+    /// output (control chars stripped — `comm` is kernel-truncated but
+    /// cannot contain any tab/newline already). `"unknown"` when absent.
+    pub fn actor_comm_display(&self) -> String {
+        match &self.actor_comm {
+            Some(comm) => sanitize_for_audit(comm),
             None => String::from("unknown"),
         }
     }
@@ -100,6 +142,29 @@ impl ClientSession {
             None => ClientResult::NothingToDo,
         }
     }
+}
+
+/// Replace ASCII control characters (`\x00..=\x1f`, `\x7f`) in `s` with `?`
+/// so they cannot forge an additional audit line via `\n` / `\t` / ANSI
+/// escape sequences. Cheap: single-pass, only allocates when a replacement
+/// is needed.
+///
+/// Load-bearing: the audit log's tab-delimited layout is forgeable if any
+/// audit field contains a literal `\t` or `\n`. Applied at render time by
+/// the `audit_log_context!` macro.
+pub fn sanitize_for_audit(s: &str) -> String {
+    if s.bytes().all(|b| b >= 0x20 && b != 0x7f) {
+        return s.to_owned();
+    }
+    s.chars()
+        .map(|c| {
+            if (c as u32) < 0x20 || c == '\x7f' {
+                '?'
+            } else {
+                c
+            }
+        })
+        .collect()
 }
 
 impl MessageClient for ClientSession {
