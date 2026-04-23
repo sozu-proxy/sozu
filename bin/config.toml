@@ -40,6 +40,19 @@ log_target = "stdout"
 # It supports the same options as log_target
 # access_logs_target = "file:///var/logs/sozu-access.log"
 
+# optional dedicated file path for the control-plane audit log (every
+# `AUDIT\tCommand(...)` line sozu emits on privileged mutations). When set,
+# the line is ALSO appended to this file opened `O_APPEND | O_CREAT` with
+# mode 0o640 (owner read+write, group read). Lets operators:
+#   - separate the audit trail from the main log stream (which may include
+#     stack traces, TLS errors, protocol chatter),
+#   - grant an `audit` group tail-only access via filesystem ACL without
+#     opening up the rest of sozu's logs,
+#   - rotate the audit file independently of the main log.
+# `None` (the default) leaves audit lines routed only through log_target.
+# Accepts a plain filesystem path (no URI scheme).
+# audit_logs_target = "/var/log/sozu/audit.log"
+
 # format of the access logs. Defaults to ascii.
 # - ascii
 # - protobuf (defined in [sozu_command_lib::proto::command::ProtobufAccessLog])

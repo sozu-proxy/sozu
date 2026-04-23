@@ -1,9 +1,15 @@
 use std::{
+    cell::RefCell,
     collections::{HashMap, HashSet, VecDeque},
     fmt::{self, Debug},
-    io::Error as IoError,
+    fs::{File, OpenOptions},
+    io::{Error as IoError, Write},
     ops::{Deref, DerefMut},
-    os::fd::{AsRawFd, FromRawFd},
+    os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::fs::OpenOptionsExt,
+    },
+    path::Path,
     time::{Duration, Instant},
 };
 
@@ -184,6 +190,10 @@ pub struct CommandHub {
     clients: HashMap<Token, ClientSession>,
     /// register tasks, for parallel execution
     tasks: HashMap<TaskId, TaskContainer>,
+    /// Path of the command socket we're accepting on, stamped into every
+    /// accepted [`ClientSession::socket_path`]. Stored as `Arc<str>` so it
+    /// clones cheaply per-session.
+    command_socket_path: std::sync::Arc<str>,
 }
 
 impl Deref for CommandHub {
@@ -205,11 +215,16 @@ impl CommandHub {
         config: Config,
         executable_path: String,
     ) -> Result<Self, HubError> {
+        let command_socket_path: std::sync::Arc<str> = config
+            .command_socket_path()
+            .unwrap_or_else(|_| "unknown".to_owned())
+            .into();
         Ok(Self {
             server: Server::new(unix_listener, config, executable_path)
                 .map_err(HubError::CreateServer)?,
             clients: HashMap::new(),
             tasks: HashMap::new(),
+            command_socket_path,
         })
     }
 
@@ -220,14 +235,24 @@ impl CommandHub {
         }
         let peer_cred = peer_cred_from_stream(&stream);
         let actor_comm = peer_cred.pid.and_then(peer_comm);
+        let actor_user = peer_cred.uid.and_then(peer_user);
         let channel = Channel::new(stream, 4096, u64::MAX);
         let id = self.next_client_id();
-        let session = ClientSession::new(channel, id, token, peer_cred, actor_comm);
+        let session = ClientSession::new(
+            channel,
+            id,
+            token,
+            peer_cred,
+            actor_comm,
+            actor_user,
+            self.command_socket_path.clone(),
+        );
         info!(
-            "Register new client: {} (actor_uid={} actor_pid={} actor_comm={})",
+            "Register new client: {} (actor_uid={} actor_pid={} actor_user={} actor_comm={})",
             id,
             session.actor_uid_display(),
             session.actor_pid_display(),
+            session.actor_user_display(),
             session.actor_comm_display()
         );
         debug!("registering client {:?}", session);
@@ -280,6 +305,10 @@ impl CommandHub {
 
         let command_buffer_size = config.command_buffer_size;
         let max_command_buffer_size = config.max_command_buffer_size;
+        let command_socket_path: std::sync::Arc<str> = config
+            .command_socket_path()
+            .unwrap_or_else(|_| "unknown".to_owned())
+            .into();
 
         let mut server =
             Server::new(unix_listener, config, executable_path).map_err(HubError::CreateServer)?;
@@ -311,6 +340,7 @@ impl CommandHub {
             server,
             clients: HashMap::new(),
             tasks: HashMap::new(),
+            command_socket_path,
         })
     }
 
@@ -556,6 +586,13 @@ pub struct Server {
     /// drained by the [CommandHub] after each request and fanned out to the
     /// subscribed clients (same channel as worker-emitted backend events).
     pub pending_audit_events: VecDeque<Event>,
+    /// Dedicated file handle for the control-plane audit log, opened once
+    /// at boot if `Config::audit_logs_target` is set. Every audit line is
+    /// appended here in addition to the standard `info!` sink. `RefCell`
+    /// because the event loop is single-threaded and `audit_emit` borrows
+    /// `&Server` only, not `&mut Server`, for the whole `Event` fan-out.
+    /// `None` when no dedicated sink is configured (fallback to `log_target`).
+    pub audit_log_writer: Option<RefCell<File>>,
     /// the MIO structure that registers sockets and polls them all
     poll: Poll,
     /// all tasks created in one tick, to be propagated to the Hub at each tick
@@ -587,6 +624,20 @@ impl Server {
             )
             .map_err(ServerError::RegisterChannel)?;
 
+        let audit_log_writer = match config.audit_logs_target.as_deref() {
+            Some(path) => match open_audit_log_file(path) {
+                Ok(file) => Some(RefCell::new(file)),
+                Err(err) => {
+                    error!(
+                        "Could not open audit log file {:?}: {}. Audit lines will be routed only through the standard logger.",
+                        path, err
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+
         Ok(Self {
             config,
             event_subscribers: HashSet::new(),
@@ -597,6 +648,7 @@ impl Server {
             next_task_id: 0,
             next_worker_id: 0,
             pending_audit_events: VecDeque::new(),
+            audit_log_writer,
             poll,
             queued_tasks: HashMap::new(),
             state: ConfigState::new(),
@@ -606,6 +658,40 @@ impl Server {
         })
     }
 
+    /// Append a fully rendered audit line to the dedicated sink if one is
+    /// configured. Best-effort: failures are logged but never propagated —
+    /// the audit trail degrades gracefully to the standard logger instead
+    /// of failing the mutation.
+    pub fn append_audit_line(&self, line: &str) {
+        let Some(writer) = self.audit_log_writer.as_ref() else {
+            return;
+        };
+        let mut writer = writer.borrow_mut();
+        if let Err(err) = writeln!(writer, "{line}") {
+            error!("Could not append to audit log file: {}", err);
+        }
+    }
+}
+
+/// Open the dedicated audit log file with `O_APPEND | O_CREAT` semantics
+/// and owner/group-only mode `0o640`. Group-readable lets an `audit` group
+/// tail the file via ACL without granting full write access. The file is
+/// never truncated on open — every sozu restart continues the same audit
+/// stream (use logrotate to manage size).
+fn open_audit_log_file(path: &str) -> Result<File, IoError> {
+    let path = Path::new(path);
+    if let Some(parent) = path.parent() {
+        // Create parent dirs best-effort; failure falls through to the open.
+        let _ = std::fs::create_dir_all(parent);
+    }
+    OpenOptions::new()
+        .append(true)
+        .create(true)
+        .mode(0o640)
+        .open(path)
+}
+
+impl Server {
     /// - fork the main process into a new worker
     /// - register the worker in mio
     /// - send a Status request to the new worker
@@ -959,6 +1045,28 @@ pub(crate) fn peer_comm(pid: i32) -> Option<String> {
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 pub(crate) fn peer_comm(_pid: i32) -> Option<String> {
+    None
+}
+
+/// Resolve a uid to a POSIX account name via `getpwuid_r` (NSS). Best-effort;
+/// returns `None` when NSS has no matching user or the lookup fails. One
+/// syscall per accepted session — the command channel is a low-rate path
+/// (one sozuctl invocation opens one session).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn peer_user(uid: u32) -> Option<String> {
+    use nix::unistd::{Uid, User};
+    match User::from_uid(Uid::from_raw(uid)) {
+        Ok(Some(user)) => Some(user.name),
+        Ok(None) => None,
+        Err(err) => {
+            warn!("Could not resolve username for uid {}: {}", uid, err);
+            None
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub(crate) fn peer_user(_uid: u32) -> Option<String> {
     None
 }
 
