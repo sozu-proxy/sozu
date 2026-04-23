@@ -500,8 +500,8 @@ fn try_h2_active_upload_survives_idle_timeout() -> State {
         let data_frame = H2Frame::data(1, chunk.clone(), end_stream);
         if tls.write_all(&data_frame.encode()).is_err() {
             println!("Write failed at chunk {i} — connection closed prematurely");
-            let infra_ok = teardown(tls, front_port, worker, vec![backend]);
-            return if infra_ok { State::Fail } else { State::Fail };
+            let _ = teardown(tls, front_port, worker, vec![backend]);
+            return State::Fail;
         }
         let _ = tls.flush();
         println!("Sent DATA chunk {i}/9 (end_stream={end_stream})");

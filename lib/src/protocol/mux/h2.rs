@@ -2249,6 +2249,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             // unit tests and non-scheduled callers (e.g. the resume path
             // above) keep the sequential semantics.
             incremental_mode: false,
+            // Populated once per write pass from `apply_incremental_rotation`
+            // below. The converter uses `incremental_peer_count <= 1` to skip
+            // the RFC 9218 yield-after-one-DATA behaviour when there is no
+            // peer to interleave with (solo-bucket fast path).
+            incremental_peer_count: 0,
             // RFC 7541 §6.3: move the pending size-update onto the converter
             // so the first header block of this pass prepends the signal.
             // We clear the connection-side mirror only AFTER the write pass
@@ -2312,6 +2317,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 // RFC 9218 §4: incremental streams yield the converter after
                 // a single DATA frame so same-urgency peers interleave.
                 converter.incremental_mode = is_incremental;
+                // Solo-bucket guard: skip the yield when there is no peer
+                // to interleave with (prevents the `finalize_write`
+                // WRITABLE-withdrawal strand — see commit message + test
+                // `test_h2_solo_incremental_drains_fully`).
+                converter.incremental_peer_count = incremental_count;
                 // Track RST_STREAM dedup: if kawa is in error state, the converter
                 // will generate a RST_STREAM frame. Mark it so we don't send a
                 // duplicate on the next writable cycle.

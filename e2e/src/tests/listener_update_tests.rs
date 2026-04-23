@@ -32,9 +32,8 @@ use sozu_command_lib::{
     config::ListenerBuilder,
     proto::command::{
         ActivateListener, AddCertificate, CertificateAndKey, Cluster, CustomHttpAnswers,
-        DeactivateListener, ListListeners, ListenerType, RequestHttpFrontend, ResponseStatus,
-        SocketAddress, UpdateHttpsListenerConfig, request::RequestType,
-        response_content::ContentType,
+        DeactivateListener, ListenerType, RequestHttpFrontend, ResponseStatus, SocketAddress,
+        UpdateHttpsListenerConfig, request::RequestType,
     },
 };
 use tempfile::NamedTempFile;

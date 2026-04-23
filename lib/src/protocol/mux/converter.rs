@@ -53,6 +53,13 @@ pub struct H2BlockConverter<'a> {
     /// that same-urgency incremental streams interleave their DATA frames
     /// fairly rather than draining one stream before moving to the next.
     pub incremental_mode: bool,
+    /// Number of incremental peers in the current same-urgency bucket
+    /// (populated by the scheduler once per write pass). When `<= 1` the
+    /// yield-after-one-DATA behaviour is a no-op anti-pattern: there is no
+    /// peer to interleave with, so `kawa.prepare` should continue draining
+    /// the stream in the same pass. `0` when the converter is used outside
+    /// the scheduler (unit tests, resume path).
+    pub incremental_peer_count: usize,
     /// Pending HPACK dynamic table-size update signal (RFC 7541 §4.2, §6.3).
     ///
     /// `Some(new_size)` when the peer's latest SETTINGS frame adjusted
@@ -431,7 +438,16 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                 // after every DATA frame so same-urgency incremental peers
                 // can interleave. Non-incremental streams drain sequentially
                 // (current behaviour) by honouring `can_continue`.
-                return can_continue && !self.incremental_mode;
+                //
+                // Solo incremental guard: the yield only matters when there
+                // is at least one other incremental peer in the same
+                // urgency bucket. With <= 1 incremental peer, yielding
+                // strands the stream because `finalize_write` then strips
+                // `Ready::WRITABLE` (no `expect_write` is set on a clean
+                // yield), and edge-triggered epoll will not re-fire. See
+                // `test_h2_solo_incremental_drains_fully` and the h2.rs
+                // scheduler wiring that populates `incremental_peer_count`.
+                return can_continue && !(self.incremental_mode && self.incremental_peer_count > 1);
             }
             Block::Flags(Flags {
                 end_header,
@@ -583,6 +599,9 @@ mod tests {
             // RFC 9218 round-robin is scheduler-driven; unit tests that
             // exercise single-stream conversions leave it off.
             incremental_mode: false,
+            // Default 0 means "no scheduler context"; unit tests that do
+            // not exercise the solo-bucket guard get the safe default.
+            incremental_peer_count: 0,
             // RFC 7541 §6.3: no pending SETTINGS_HEADER_TABLE_SIZE change
             // in the default test converter. Tests that exercise the
             // dynamic-table-size-update path set this explicitly.
@@ -1179,5 +1198,105 @@ mod tests {
         );
         assert!(result, "ChunkHeader should be a no-op and return true");
         assert!(kawa.out.is_empty());
+    }
+
+    // ── RFC 9218 incremental yield: solo-bucket guard ───────────────────
+    //
+    // The converter yields after every DATA frame when
+    // `incremental_mode == true`, so same-urgency incremental peers can
+    // interleave. But when there is <= 1 incremental peer in the bucket
+    // (`incremental_peer_count <= 1`), the yield is a no-op anti-pattern
+    // that strands the stream — `finalize_write` then strips
+    // `Ready::WRITABLE` without setting `expect_write`, and edge-triggered
+    // epoll never re-fires. These tests exercise the three boundary
+    // transitions.
+
+    #[test]
+    fn test_converter_incremental_solo_does_not_yield() {
+        // peer_count = 1 means this stream is alone in the incremental
+        // bucket. The yield MUST be skipped so the stream drains in the
+        // same pass. Returning `true` signals `kawa.prepare` to continue.
+        let mut encoder = loona_hpack::Encoder::new();
+        let mut conv = test_converter(&mut encoder);
+        conv.incremental_mode = true;
+        conv.incremental_peer_count = 1;
+        conv.window = 4096;
+        let mut buf = vec![0u8; 8192];
+        let mut kawa = make_kawa(&mut buf, Kind::Response);
+
+        let data = Store::Static(b"hello world");
+        let cont = conv.call(Block::Chunk(Chunk { data }), &mut kawa);
+        assert!(
+            cont,
+            "solo incremental stream must not yield after a DATA frame \
+             (would strand the stream under finalize_write WRITABLE withdrawal)"
+        );
+    }
+
+    #[test]
+    fn test_converter_incremental_pair_yields() {
+        // peer_count = 2 is the smallest bucket where interleaving has any
+        // effect. Must yield to allow the peer to run.
+        let mut encoder = loona_hpack::Encoder::new();
+        let mut conv = test_converter(&mut encoder);
+        conv.incremental_mode = true;
+        conv.incremental_peer_count = 2;
+        conv.window = 4096;
+        let mut buf = vec![0u8; 8192];
+        let mut kawa = make_kawa(&mut buf, Kind::Response);
+
+        let data = Store::Static(b"hello world");
+        let cont = conv.call(Block::Chunk(Chunk { data }), &mut kawa);
+        assert!(
+            !cont,
+            "incremental stream with a peer must yield after a DATA frame \
+             so the peer can interleave (RFC 9218 §4)"
+        );
+    }
+
+    #[test]
+    fn test_converter_incremental_trio_yields() {
+        // peer_count = 3 is the canonical multi-peer case. Yield is
+        // required so the scheduler's round-robin cursor advances.
+        let mut encoder = loona_hpack::Encoder::new();
+        let mut conv = test_converter(&mut encoder);
+        conv.incremental_mode = true;
+        conv.incremental_peer_count = 3;
+        conv.window = 4096;
+        let mut buf = vec![0u8; 8192];
+        let mut kawa = make_kawa(&mut buf, Kind::Response);
+
+        let data = Store::Static(b"hello world");
+        let cont = conv.call(Block::Chunk(Chunk { data }), &mut kawa);
+        assert!(
+            !cont,
+            "incremental stream with two peers must yield after a DATA frame"
+        );
+    }
+
+    #[test]
+    fn test_converter_non_incremental_never_yields_regardless_of_peer_count() {
+        // When `incremental_mode == false`, the guard is skipped entirely:
+        // draining is sequential regardless of what `incremental_peer_count`
+        // says. The scheduler is responsible for setting the pair
+        // consistently, but the converter must not misbehave if they
+        // disagree (defence-in-depth).
+        for peers in [0usize, 1, 2, 5] {
+            let mut encoder = loona_hpack::Encoder::new();
+            let mut conv = test_converter(&mut encoder);
+            conv.incremental_mode = false;
+            conv.incremental_peer_count = peers;
+            conv.window = 4096;
+            let mut buf = vec![0u8; 8192];
+            let mut kawa = make_kawa(&mut buf, Kind::Response);
+
+            let data = Store::Static(b"hello world");
+            let cont = conv.call(Block::Chunk(Chunk { data }), &mut kawa);
+            assert!(
+                cont,
+                "non-incremental stream must drain sequentially regardless \
+                 of incremental_peer_count (= {peers})"
+            );
+        }
     }
 }
