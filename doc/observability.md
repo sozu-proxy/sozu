@@ -211,12 +211,79 @@ surfaces:
    `command/src/command.proto::EventKind`.
 2. An `incr!("config.<verb>")` counter is bumped (e.g.
    `config.cluster_added`).
-3. A structured audit log line is emitted at `info!` level in the MUX
-   `Session(...)` layout. Rendered form (ANSI colours off):
+3. A structured audit log line is emitted at `info!` level in the MUX-family
+   layout (keyword `Command(...)` rather than `Session(...)`, which names a
+   data-plane session). Every free-form field (`target`, `actor_comm`,
+   `reason`) is sanitized at render time — control chars (`\x00..=\x1f`,
+   `\x7f`) are replaced with `?` so attacker-influenced input cannot forge
+   additional audit lines via embedded `\t` / `\n` / ANSI escapes. Rendered
+   form (ANSI colours off):
 
    ```
-   [01HXS4GZ9EYP3F2R7K8M6B4N2C 01HXS4H5K2QR9C7PVWXY8T6ZNA my_app -]	AUDIT	Session(verb=cluster_added, actor_uid=1000, client_id=42, target=cluster:my_app, result=ok)	 >>>
+   [01HXS4GZ9EYP3F2R7K8M6B4N2C 01HXS4H5K2QR9C7PVWXY8T6ZNA my_app -]	AUDIT	Command(verb=cluster_added, actor_uid=1000, actor_gid=1000, actor_pid=12345, actor_comm=sozuctl, client_id=42, target=cluster:my_app, result=ok, sozu_version=1.1.1)
    ```
+
+   ### Field reference
+
+   **Mandatory fields** (always present):
+
+   - `verb` — stable static identifier for the audited operation (e.g.
+     `cluster_added`, `state_loaded`, `listener_updated`). One `config.<verb>`
+     statsd counter per verb.
+   - `actor_uid` / `actor_gid` / `actor_pid` — peer credentials from
+     `SO_PEERCRED` on the unix command socket. `unknown` on read failure
+     / non-Linux builds.
+   - `actor_comm` — `/proc/<pid>/comm` at accept time (up to 15 chars), lets
+     SOC distinguish `sozuctl` from ad-hoc shells that share a UID.
+   - `client_id` — per-accept monotonic counter. Distinct from the
+     `session_ulid` bracket slot, which survives as a grep-correlation key
+     across every verb a single sozuctl invocation emits.
+   - `target` — free-form verb-specific descriptor (e.g.
+     `cluster:my-cluster`, `file:/var/lib/sozu/state.bin`, `stop:hard`,
+     `listener:http:127.0.0.1:8080`). Sanitized.
+   - `result` — `ok` or `err`.
+   - `sozu_version` — `CARGO_PKG_VERSION` at build time. Forensic pin for
+     mixed-fleet audit streams.
+
+   **Optional fields** (appear when relevant):
+
+   - `error_code` — structured failure bucket: `dispatch_error`,
+     `worker_failure`, `worker_timeout`, `peer_cred_unavailable`,
+     `invalid_input`, `io_error`, `other`. Present when `result=err`.
+   - `reason` — truncated human-readable failure detail (max 256 chars,
+     sanitized). Pairs with `error_code`.
+   - `elapsed_ms` — wall-clock time between request acceptance and audit
+     emission. Set on completion-time lines.
+   - `fanout` — worker fan-out outcome: `ok`, `partial`, `timeout`, or
+     `local_only`. Set on completion-time lines for verbs that scatter to
+     workers.
+   - `workers` — `<ok>/<err>/<expected>` per-worker counts. Pairs with
+     `fanout`.
+
+   ### Two lines per worker-fanning verb
+
+   Verbs that fan out to every worker (AddCluster, RemoveHttpFrontend,
+   UpdateHttpsListener, AddCertificate, …) emit **two** audit lines:
+
+   - **Attempt-time**: `result=ok` means "accepted by the main process
+     state". Fires immediately after `state.dispatch` succeeds. No fanout /
+     elapsed_ms.
+   - **Completion-time**: emitted when every worker has responded (or the
+     scatter deadline fires). Carries `fanout=ok|partial|timeout`,
+     `workers=<ok>/<err>/<expected>`, `elapsed_ms`, and — on `result=err`
+     — `error_code` + `reason`.
+
+   Operators correlate the two via the shared `[session_ulid request_ulid …]`
+   bracket.
+
+   ### Local-only verbs
+
+   Verbs that don't fan out — `SoftStop`/`HardStop` request,
+   `LoggingLevelChanged`, `UpgradeMain` / `UpgradeWorker` init,
+   `SubscribeEvents`, `SaveState`, and `LoadState` completion — emit a
+   single audit line carrying `result` and (when applicable)
+   `error_code` + `reason`. `LoadState` and `SaveState` embed
+   `ok:<n> errors:<n>` counts in `target=file:<path>`.
 
    Bracket slots follow the `[session_ulid request_ulid cluster_id|- backend_id|-]`
    convention shared with `MUX` / `MUX-ROUTER` / `RUSTLS` / `PIPE` / `TCP` lines.

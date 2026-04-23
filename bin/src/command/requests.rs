@@ -4,6 +4,7 @@ use std::{
     fs::File,
     io::{ErrorKind, Read},
     path::PathBuf,
+    time::Instant,
 };
 
 use mio::Token;
@@ -47,19 +48,32 @@ macro_rules! audit_verb {
     };
 }
 
-/// Render the structured audit log line in the MUX `Session(...)` layout.
+/// Render the structured audit log line in the MUX-family layout.
 ///
 /// Expands to a `format!` producing
-/// `[session_ulid request_ulid cluster_id|- backend_id|-]\tAUDIT\tSession(verb=..., actor_uid=..., client_id=..., target=..., result=...)\t >>>`
+/// `[session_ulid request_ulid cluster_id|- backend_id|-]\tAUDIT\tCommand(verb=..., actor_uid=..., actor_gid=..., actor_pid=..., actor_comm=..., client_id=..., target=..., result=..., [error_code=..., reason=..., elapsed_ms=..., fanout=..., workers=<ok>/<err>/<expected>,] sozu_version=...)`
 /// with ANSI colours when the logger is colour-enabled (empty strings
-/// otherwise — see [`sozu_command_lib::logging::ansi_palette`]).
+/// otherwise — see [`sozu_command_lib::logging::ansi_palette`]). Bracketed
+/// fields are emitted only when set on [`AuditEntry`] / the caller.
 ///
-/// Mirrors the `log_context!` macro in `lib/src/protocol/mux/mod.rs:50` and
-/// the two-arm `log_module_context!` in `lib/src/protocol/mux/router.rs:43`,
-/// so operators can grep `AUDIT` alongside `MUX` / `MUX-ROUTER` / `RUSTLS` /
-/// `PIPE` / `TCP` lines with a consistent tab layout.
+/// Bracket layout mirrors `log_context!` in `lib/src/protocol/mux/mod.rs:50`
+/// so operators can grep `AUDIT` alongside `MUX` / `RUSTLS` / `PIPE` / `TCP`.
+/// Uses the `Command(...)` keyword (vs. `Session(...)` in MUX lines) because
+/// the payload describes a control-plane command, not a proxy session. The
+/// line is self-contained — no `\t >>>` continuation marker since nothing
+/// follows the closing paren.
+///
+/// Every string field — `verb` is a `&'static str` and therefore trusted,
+/// but `target`, `cluster_id`, `backend_id`, `actor_comm`, `reason` can
+/// originate from attacker-influenced input (cluster IDs from sozuctl
+/// arguments, hostnames from frontend configs, error messages from
+/// `state.dispatch`). All of them go through
+/// [`sozu_command_lib::sessions::sanitize_for_audit`] at render time to
+/// neutralise `\n`/`\t`/`\x1b` injection that would otherwise forge a
+/// second audit line.
 macro_rules! audit_log_context {
     ($client:expr, $request_id:expr, $entry:expr, $result:expr) => {{
+        use $crate::command::sessions::sanitize_for_audit;
         let (open, reset, grey, gray, white) = ::sozu_command_lib::logging::ansi_palette();
         let log_ctx = ::sozu_command_lib::logging::LogContext {
             session_id: $client.session_ulid,
@@ -67,8 +81,55 @@ macro_rules! audit_log_context {
             cluster_id: $entry.cluster_id.as_deref(),
             backend_id: $entry.backend_id.as_deref(),
         };
+        let mut extras = String::new();
+        if let Some(code) = $entry.extras.error_code {
+            extras.push_str(&format!(
+                ", {gray}error_code{reset}={white}{code}{reset}",
+                gray = gray,
+                reset = reset,
+                white = white,
+                code = code,
+            ));
+        }
+        if let Some(reason) = $entry.extras.reason.as_deref() {
+            let sanitized = sanitize_for_audit(reason);
+            let truncated = if sanitized.chars().count() > AUDIT_REASON_MAX_CHARS {
+                let cut: String = sanitized.chars().take(AUDIT_REASON_MAX_CHARS).collect();
+                format!("{cut}…")
+            } else {
+                sanitized
+            };
+            extras.push_str(&format!(
+                ", {gray}reason{reset}={white}{reason}{reset}",
+                gray = gray,
+                reset = reset,
+                white = white,
+                reason = truncated,
+            ));
+        }
+        if let Some(elapsed) = $entry.extras.elapsed_ms {
+            extras.push_str(&format!(
+                ", {gray}elapsed_ms{reset}={white}{elapsed}{reset}",
+                gray = gray,
+                reset = reset,
+                white = white,
+                elapsed = elapsed,
+            ));
+        }
+        if let Some(fanout) = $entry.extras.fanout {
+            extras.push_str(&format!(
+                ", {gray}fanout{reset}={white}{status}{reset}, {gray}workers{reset}={white}{ok}/{err}/{expected}{reset}",
+                gray = gray,
+                reset = reset,
+                white = white,
+                status = fanout.status,
+                ok = fanout.workers_ok,
+                err = fanout.workers_err,
+                expected = fanout.workers_expected,
+            ));
+        }
         format!(
-            "{gray}{ctx}{reset}\t{open}AUDIT{reset}\t{grey}Session{reset}({gray}verb{reset}={white}{verb}{reset}, {gray}actor_uid{reset}={white}{actor_uid}{reset}, {gray}client_id{reset}={white}{client_id}{reset}, {gray}target{reset}={white}{target}{reset}, {gray}result{reset}={white}{result}{reset})\t >>>",
+            "{gray}{ctx}{reset}\t{open}AUDIT{reset}\t{grey}Command{reset}({gray}verb{reset}={white}{verb}{reset}, {gray}actor_uid{reset}={white}{actor_uid}{reset}, {gray}actor_gid{reset}={white}{actor_gid}{reset}, {gray}actor_pid{reset}={white}{actor_pid}{reset}, {gray}actor_comm{reset}={white}{actor_comm}{reset}, {gray}client_id{reset}={white}{client_id}{reset}, {gray}target{reset}={white}{target}{reset}, {gray}result{reset}={white}{result}{reset}{extras}, {gray}sozu_version{reset}={white}{sozu_version}{reset})",
             open = open,
             reset = reset,
             grey = grey,
@@ -77,9 +138,14 @@ macro_rules! audit_log_context {
             ctx = log_ctx,
             verb = $entry.verb,
             actor_uid = $client.actor_uid_display(),
+            actor_gid = $client.actor_gid_display(),
+            actor_pid = $client.actor_pid_display(),
+            actor_comm = $client.actor_comm_display(),
             client_id = $client.id,
-            target = $entry.target,
+            target = sanitize_for_audit(&$entry.target),
             result = $result,
+            extras = extras,
+            sozu_version = SOZU_VERSION,
         )
     }};
 }
@@ -258,6 +324,20 @@ fn save_state(server: &mut Server, client: &mut ClientSession, path: &str) {
         match std::env::current_dir() {
             Ok(cwd) => path = cwd.join(path),
             Err(error) => {
+                let (verb, counter) = audit_verb!("state_saved");
+                audit_emit_inline(
+                    server,
+                    client,
+                    EventKind::StateSaved,
+                    verb,
+                    counter,
+                    format!("file:{}", path.display()),
+                    AuditResult::Err,
+                    AuditExtras {
+                        error_code: Some(AuditErrorCode::IoError),
+                        ..Default::default()
+                    },
+                );
                 client.finish_failure(format!("Cannot get Sōzu working directory: {error}",));
                 return;
             }
@@ -268,6 +348,20 @@ fn save_state(server: &mut Server, client: &mut ClientSession, path: &str) {
     let mut file = match File::create(&path) {
         Ok(file) => file,
         Err(error) => {
+            let (verb, counter) = audit_verb!("state_saved");
+            audit_emit_inline(
+                server,
+                client,
+                EventKind::StateSaved,
+                verb,
+                counter,
+                format!("file:{}", path.display()),
+                AuditResult::Err,
+                AuditExtras {
+                    error_code: Some(AuditErrorCode::IoError),
+                    ..Default::default()
+                },
+            );
             client.finish_failure(format!(
                 "Cannot create file at path {}: {error}",
                 path.display()
@@ -277,13 +371,38 @@ fn save_state(server: &mut Server, client: &mut ClientSession, path: &str) {
     };
 
     match server.state.write_requests_to_file(&mut file) {
-        Ok(counter) => {
+        Ok(count) => {
+            let (verb, counter) = audit_verb!("state_saved");
+            audit_emit_inline(
+                server,
+                client,
+                EventKind::StateSaved,
+                verb,
+                counter,
+                format!("file:{} messages:{count}", path.display()),
+                AuditResult::Ok,
+                AuditExtras::default(),
+            );
             client.finish_ok(format!(
-                "Saved {counter} config messages to {}",
+                "Saved {count} config messages to {}",
                 &path.display()
             ));
         }
         Err(error) => {
+            let (verb, counter) = audit_verb!("state_saved");
+            audit_emit_inline(
+                server,
+                client,
+                EventKind::StateSaved,
+                verb,
+                counter,
+                format!("file:{}", path.display()),
+                AuditResult::Err,
+                AuditExtras {
+                    error_code: Some(AuditErrorCode::IoError),
+                    ..Default::default()
+                },
+            );
             client.finish_failure(format!("Failed writing state to file: {error}"));
         }
     }
@@ -295,6 +414,11 @@ fn set_logging_level(server: &mut Server, client: &mut ClientSession, logging_fi
     let (directives, errors) = logging::parse_logging_spec(&logging_filter);
     if !errors.is_empty() {
         let (verb, counter) = audit_verb!("logging_level_changed");
+        let reason = errors
+            .iter()
+            .map(logging::LogSpecParseError::to_string)
+            .collect::<Vec<String>>()
+            .join("; ");
         audit_emit_inline(
             server,
             client,
@@ -303,15 +427,13 @@ fn set_logging_level(server: &mut Server, client: &mut ClientSession, logging_fi
             counter,
             format!("logging:{logging_filter}"),
             AuditResult::Err,
+            AuditExtras {
+                error_code: Some(AuditErrorCode::InvalidInput),
+                reason: Some(reason.clone()),
+                ..Default::default()
+            },
         );
-        client.finish_failure(format!(
-            "Error parsing logging filter:\n- {}",
-            errors
-                .iter()
-                .map(logging::LogSpecParseError::to_string)
-                .collect::<Vec<String>>()
-                .join("\n- ")
-        ));
+        client.finish_failure(format!("Error parsing logging filter:\n- {reason}"));
         return;
     }
     logging::LOGGER.with(|logger| {
@@ -336,6 +458,7 @@ fn set_logging_level(server: &mut Server, client: &mut ClientSession, logging_fi
         counter,
         format!("logging:{logging_filter}"),
         AuditResult::Ok,
+        AuditExtras::default(),
     );
 
     worker_request(server, client, RequestType::Logging(logging_filter));
@@ -344,6 +467,17 @@ fn set_logging_level(server: &mut Server, client: &mut ClientSession, logging_fi
 fn subscribe_client_to_events(server: &mut Server, client: &mut ClientSession) {
     info!("Subscribing client {:?} to listen to events", client.token);
     server.event_subscribers.insert(client.token);
+    let (verb, counter) = audit_verb!("events_subscribed");
+    audit_emit_inline(
+        server,
+        client,
+        EventKind::EventsSubscribed,
+        verb,
+        counter,
+        format!("subscribe:client_id:{}", client.id),
+        AuditResult::Ok,
+        AuditExtras::default(),
+    );
 }
 
 //===============================================
@@ -470,6 +604,7 @@ pub fn load_static_config(server: &mut Server, mut client: OptionalClient, path:
                     counter,
                     audit_target.clone(),
                     AuditResult::Err,
+                    AuditExtras::default(),
                 );
             }
             client.finish_failure(format!("could not generate new config: {config_err}"));
@@ -503,6 +638,7 @@ pub fn load_static_config(server: &mut Server, mut client: OptionalClient, path:
             counter,
             audit_target,
             AuditResult::Ok,
+            AuditExtras::default(),
         );
     }
 }
@@ -555,9 +691,9 @@ impl GatheringTask for LoadStaticConfigTask {
 // Audit trail (control-plane mutations)
 
 /// Outcome of a control-plane mutation, formatted into the structured
-/// audit log line (MUX-style `Session(...)` layout).
+/// audit log line.
 #[derive(Clone, Copy)]
-enum AuditResult {
+pub(crate) enum AuditResult {
     Ok,
     Err,
 }
@@ -577,12 +713,117 @@ impl std::fmt::Display for AuditResult {
     }
 }
 
+/// Structured failure reason. Exists so SIEM alerts can group-by without
+/// grepping free-form error strings. Paired with `result=err` in the
+/// audit line; omitted for `result=ok`.
+///
+/// `PeerCredUnavailable` and `Other` are reserved — they fire once the
+/// callers that need them land (SO_PEERCRED failure audit, catch-all
+/// emit path). Suppressing dead-code warnings keeps the taxonomy stable
+/// as we wire them up.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum AuditErrorCode {
+    /// `state.dispatch` rejected the request on the main process.
+    DispatchError,
+    /// One or more workers returned `Failure` during fan-out.
+    WorkerFailure,
+    /// Fan-out timed out before every worker responded.
+    WorkerTimeout,
+    /// `SO_PEERCRED` returned no credentials; actor attribution missing.
+    PeerCredUnavailable,
+    /// Operator supplied invalid input (e.g. malformed logging filter).
+    InvalidInput,
+    /// I/O error on state save/load (disk full, permission denied, parse).
+    IoError,
+    /// Generic bucket for anything that doesn't fit the above. Prefer
+    /// adding a new variant over reusing this.
+    Other,
+}
+
+impl AuditErrorCode {
+    fn as_str(self) -> &'static str {
+        match self {
+            AuditErrorCode::DispatchError => "dispatch_error",
+            AuditErrorCode::WorkerFailure => "worker_failure",
+            AuditErrorCode::WorkerTimeout => "worker_timeout",
+            AuditErrorCode::PeerCredUnavailable => "peer_cred_unavailable",
+            AuditErrorCode::InvalidInput => "invalid_input",
+            AuditErrorCode::IoError => "io_error",
+            AuditErrorCode::Other => "other",
+        }
+    }
+}
+
+impl std::fmt::Display for AuditErrorCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Worker fan-out outcome, rendered in the completion audit line.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum FanoutStatus {
+    /// Every expected worker acknowledged with Ok.
+    Ok,
+    /// Some workers reported Failure; others were Ok.
+    Partial,
+    /// Fan-out didn't reach all workers within the deadline.
+    Timeout,
+    /// No workers expected (local-main-only request).
+    LocalOnly,
+}
+
+impl FanoutStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            FanoutStatus::Ok => "ok",
+            FanoutStatus::Partial => "partial",
+            FanoutStatus::Timeout => "timeout",
+            FanoutStatus::LocalOnly => "local_only",
+        }
+    }
+}
+
+impl std::fmt::Display for FanoutStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Worker fan-out summary attached to completion-time audit emissions.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FanoutSummary {
+    status: FanoutStatus,
+    workers_ok: u32,
+    workers_err: u32,
+    workers_expected: u32,
+}
+
+/// Optional audit-line fields populated at completion time or when a
+/// failure reason is known. Defaulted to all-`None` at `AuditEntry`
+/// construction so the existing build sites don't all need to set them;
+/// emitters that know these values fill them in via helper constructors
+/// before calling [`audit_emit`] / [`audit_emit_inline`].
+#[derive(Debug, Default, Clone)]
+pub(crate) struct AuditExtras {
+    /// Wall-clock milliseconds between request acceptance and audit emission.
+    pub(crate) elapsed_ms: Option<u64>,
+    /// Structured failure reason. Set only on `AuditResult::Err` paths.
+    pub(crate) error_code: Option<AuditErrorCode>,
+    /// Worker fan-out outcome. Set on completion-time emissions.
+    pub(crate) fanout: Option<FanoutSummary>,
+    /// Short truncated failure detail — mirrors `finish_failure` message.
+    pub(crate) reason: Option<String>,
+}
+
 /// A control-plane mutation, broken down into the pieces the audit trail
 /// needs (event kind, verb name for the log, the matching counter key, and
 /// the optional target identifiers populated on the emitted [Event]).
+#[derive(Debug)]
 struct AuditEntry {
     kind: EventKind,
-    /// Stable verb tag rendered inside the audit `Session(verb=...)` block.
+    /// Stable verb tag rendered inside the audit `Command(verb=...)` block.
     /// Always a static string.
     verb: &'static str,
     /// Pre-built `config.<verb>` counter key. Stored as a `&'static str` so
@@ -597,7 +838,19 @@ struct AuditEntry {
     /// or `"cluster:my-cluster"`. Captures whichever identifier is meaningful
     /// for the verb.
     target: String,
+    /// Optional timing / error_code / fanout / reason fields. Defaulted at
+    /// construction; populated via [`AuditEntry::with_extras`] on the hot
+    /// paths that care.
+    extras: AuditExtras,
 }
+
+/// Truncated SHA-256 request fingerprint for dedupe / correlation.
+/// Render-only helper; see [`audit_log_context!`] for inclusion.
+const AUDIT_REASON_MAX_CHARS: usize = 256;
+
+/// Compile-time sozu version tag — rendered in every audit line so
+/// operators correlate which binary emitted which log during upgrades.
+const SOZU_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Build the [AuditEntry] for a control-plane request, or `None` for
 /// non-mutating verbs (the caller skips them — they have no audit footprint).
@@ -613,6 +866,7 @@ fn audit_entry_for(request: &RequestType) -> Option<AuditEntry> {
                 cluster_id: Some(cluster.cluster_id.to_owned()),
                 backend_id: None,
                 address: None,
+                extras: AuditExtras::default(),
             })
         }
         RequestType::RemoveCluster(cluster_id) => {
@@ -625,6 +879,7 @@ fn audit_entry_for(request: &RequestType) -> Option<AuditEntry> {
                 cluster_id: Some(cluster_id.to_owned()),
                 backend_id: None,
                 address: None,
+                extras: AuditExtras::default(),
             })
         }
         RequestType::AddHttpFrontend(frontend) => {
@@ -637,6 +892,7 @@ fn audit_entry_for(request: &RequestType) -> Option<AuditEntry> {
                 cluster_id: frontend.cluster_id.clone(),
                 backend_id: None,
                 address: Some(frontend.address),
+                extras: AuditExtras::default(),
             })
         }
         RequestType::AddHttpsFrontend(frontend) => {
@@ -649,6 +905,7 @@ fn audit_entry_for(request: &RequestType) -> Option<AuditEntry> {
                 cluster_id: frontend.cluster_id.clone(),
                 backend_id: None,
                 address: Some(frontend.address),
+                extras: AuditExtras::default(),
             })
         }
         RequestType::AddTcpFrontend(frontend) => {
@@ -661,6 +918,7 @@ fn audit_entry_for(request: &RequestType) -> Option<AuditEntry> {
                 cluster_id: Some(frontend.cluster_id.to_owned()),
                 backend_id: None,
                 address: Some(frontend.address),
+                extras: AuditExtras::default(),
             })
         }
         RequestType::RemoveHttpFrontend(frontend) => {
@@ -673,6 +931,7 @@ fn audit_entry_for(request: &RequestType) -> Option<AuditEntry> {
                 cluster_id: frontend.cluster_id.clone(),
                 backend_id: None,
                 address: Some(frontend.address),
+                extras: AuditExtras::default(),
             })
         }
         RequestType::RemoveHttpsFrontend(frontend) => {
@@ -685,6 +944,7 @@ fn audit_entry_for(request: &RequestType) -> Option<AuditEntry> {
                 cluster_id: frontend.cluster_id.clone(),
                 backend_id: None,
                 address: Some(frontend.address),
+                extras: AuditExtras::default(),
             })
         }
         RequestType::RemoveTcpFrontend(frontend) => {
@@ -697,6 +957,7 @@ fn audit_entry_for(request: &RequestType) -> Option<AuditEntry> {
                 cluster_id: Some(frontend.cluster_id.to_owned()),
                 backend_id: None,
                 address: Some(frontend.address),
+                extras: AuditExtras::default(),
             })
         }
         RequestType::AddCertificate(add) => {
@@ -709,6 +970,7 @@ fn audit_entry_for(request: &RequestType) -> Option<AuditEntry> {
                 cluster_id: None,
                 backend_id: None,
                 address: Some(add.address),
+                extras: AuditExtras::default(),
             })
         }
         RequestType::RemoveCertificate(remove) => {
@@ -721,6 +983,7 @@ fn audit_entry_for(request: &RequestType) -> Option<AuditEntry> {
                 cluster_id: None,
                 backend_id: None,
                 address: Some(remove.address),
+                extras: AuditExtras::default(),
             })
         }
         RequestType::ReplaceCertificate(replace) => {
@@ -736,6 +999,7 @@ fn audit_entry_for(request: &RequestType) -> Option<AuditEntry> {
                 cluster_id: None,
                 backend_id: None,
                 address: Some(replace.address),
+                extras: AuditExtras::default(),
             })
         }
         RequestType::ActivateListener(listener) => {
@@ -748,6 +1012,7 @@ fn audit_entry_for(request: &RequestType) -> Option<AuditEntry> {
                 cluster_id: None,
                 backend_id: None,
                 address: Some(listener.address),
+                extras: AuditExtras::default(),
             })
         }
         RequestType::DeactivateListener(listener) => {
@@ -760,6 +1025,7 @@ fn audit_entry_for(request: &RequestType) -> Option<AuditEntry> {
                 cluster_id: None,
                 backend_id: None,
                 address: Some(listener.address),
+                extras: AuditExtras::default(),
             })
         }
         RequestType::UpdateHttpListener(patch) => {
@@ -776,6 +1042,7 @@ fn audit_entry_for(request: &RequestType) -> Option<AuditEntry> {
                 cluster_id: None,
                 backend_id: None,
                 address: Some(patch.address),
+                extras: AuditExtras::default(),
             })
         }
         RequestType::UpdateHttpsListener(patch) => {
@@ -792,6 +1059,7 @@ fn audit_entry_for(request: &RequestType) -> Option<AuditEntry> {
                 cluster_id: None,
                 backend_id: None,
                 address: Some(patch.address),
+                extras: AuditExtras::default(),
             })
         }
         RequestType::UpdateTcpListener(patch) => {
@@ -808,6 +1076,59 @@ fn audit_entry_for(request: &RequestType) -> Option<AuditEntry> {
                 cluster_id: None,
                 backend_id: None,
                 address: Some(patch.address),
+                extras: AuditExtras::default(),
+            })
+        }
+        RequestType::AddHttpListener(listener) => {
+            let (verb, counter) = audit_verb!("http_listener_added");
+            Some(AuditEntry {
+                kind: EventKind::ListenerAdded,
+                verb,
+                counter,
+                target: format!("listener:http:{}", listener.address),
+                cluster_id: None,
+                backend_id: None,
+                address: Some(listener.address),
+                extras: AuditExtras::default(),
+            })
+        }
+        RequestType::AddHttpsListener(listener) => {
+            let (verb, counter) = audit_verb!("https_listener_added");
+            Some(AuditEntry {
+                kind: EventKind::ListenerAdded,
+                verb,
+                counter,
+                target: format!("listener:https:{}", listener.address),
+                cluster_id: None,
+                backend_id: None,
+                address: Some(listener.address),
+                extras: AuditExtras::default(),
+            })
+        }
+        RequestType::AddTcpListener(listener) => {
+            let (verb, counter) = audit_verb!("tcp_listener_added");
+            Some(AuditEntry {
+                kind: EventKind::ListenerAdded,
+                verb,
+                counter,
+                target: format!("listener:tcp:{}", listener.address),
+                cluster_id: None,
+                backend_id: None,
+                address: Some(listener.address),
+                extras: AuditExtras::default(),
+            })
+        }
+        RequestType::RemoveListener(remove) => {
+            let (verb, counter) = audit_verb!("listener_removed");
+            Some(AuditEntry {
+                kind: EventKind::ListenerRemoved,
+                verb,
+                counter,
+                target: format!("listener:{:?}:{}", remove.proxy(), remove.address),
+                cluster_id: None,
+                backend_id: None,
+                address: Some(remove.address),
+                extras: AuditExtras::default(),
             })
         }
         // AddBackend / RemoveBackend are intentionally not audited via this
@@ -847,7 +1168,8 @@ fn audit_emit(server: &mut Server, client: &ClientSession, entry: AuditEntry, re
 /// whose request payload does not carry the relevant identifiers (e.g.
 /// `Logging`, `ConfigureMetrics`, `ReloadConfiguration`). Caller MUST pair
 /// `verb` and `counter` via `audit_verb!` so the two strings cannot drift.
-fn audit_emit_inline(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn audit_emit_inline(
     server: &mut Server,
     client: &ClientSession,
     kind: EventKind,
@@ -855,6 +1177,7 @@ fn audit_emit_inline(
     counter: &'static str,
     target: String,
     result: AuditResult,
+    extras: AuditExtras,
 ) {
     audit_emit(
         server,
@@ -867,6 +1190,7 @@ fn audit_emit_inline(
             cluster_id: None,
             backend_id: None,
             address: None,
+            extras,
         },
         result,
     );
@@ -879,6 +1203,15 @@ fn audit_emit_inline(
 struct WorkerTask {
     pub client_token: Token,
     pub gatherer: DefaultGatherer,
+    /// Wall-clock reference captured at `worker_request` entry. Used by
+    /// [`WorkerTask::on_finish`] to compute `elapsed_ms` for the
+    /// completion-time audit emission.
+    started_at: Instant,
+    /// Snapshot of the audit entry built from the request. Carried through
+    /// the task so the completion-time audit line can attribute the verb
+    /// and target. `None` for non-audited verbs (same filter as
+    /// `audit_entry_for`).
+    audit: Option<AuditEntry>,
 }
 
 pub fn worker_request(
@@ -887,8 +1220,10 @@ pub fn worker_request(
     request_content: RequestType,
 ) {
     // Snapshot the audit entry before consuming `request_content` so we can
-    // emit even when `state.dispatch` rejects the request.
+    // emit even when `state.dispatch` rejects the request AND so the
+    // completion handler can re-emit with fanout + elapsed_ms.
     let audit = audit_entry_for(&request_content);
+    let started_at = Instant::now();
 
     // Special-case ConfigureMetrics — the proto payload is an i32 enum (no
     // dedicated message), so we synthesise the audit entry inline.
@@ -904,7 +1239,11 @@ pub fn worker_request(
     let request = request_content.into();
 
     if let Err(error) = server.state.dispatch(&request) {
-        if let Some(entry) = audit {
+        let reason = error.to_string();
+        if let Some(mut entry) = audit {
+            entry.extras.error_code = Some(AuditErrorCode::DispatchError);
+            entry.extras.reason = Some(reason.clone());
+            entry.extras.elapsed_ms = Some(elapsed_ms(started_at));
             audit_emit(server, client, entry, AuditResult::Err);
         } else if let Some(target) = metrics_target {
             let (verb, counter) = audit_verb!("metrics_configured");
@@ -916,6 +1255,12 @@ pub fn worker_request(
                 counter,
                 target,
                 AuditResult::Err,
+                AuditExtras {
+                    elapsed_ms: Some(elapsed_ms(started_at)),
+                    error_code: Some(AuditErrorCode::DispatchError),
+                    reason: Some(reason.clone()),
+                    ..Default::default()
+                },
             );
         }
         client.finish_failure(format!(
@@ -924,6 +1269,10 @@ pub fn worker_request(
         return;
     }
 
+    // Attempt-time audit — `result=ok` here only means "accepted by the
+    // main process state". The completion-time line (emitted from
+    // `WorkerTask::on_finish`) carries the fanout outcome.
+    let audit_for_task = audit.as_ref().map(clone_entry);
     if let Some(entry) = audit {
         audit_emit(server, client, entry, AuditResult::Ok);
     } else if let Some(target) = metrics_target {
@@ -936,6 +1285,7 @@ pub fn worker_request(
             counter,
             target,
             AuditResult::Ok,
+            AuditExtras::default(),
         );
     }
 
@@ -946,6 +1296,8 @@ pub fn worker_request(
         Box::new(WorkerTask {
             client_token: client.token,
             gatherer: DefaultGatherer::default(),
+            started_at,
+            audit: audit_for_task,
         }),
         Timeout::Default,
         None,
@@ -978,13 +1330,76 @@ impl GatheringTask for WorkerTask {
             }
         }
 
-        if self.gatherer.errors > 0 || timed_out {
+        let errors = self.gatherer.errors;
+        let ok = self.gatherer.ok;
+        let expected = self.gatherer.expected_responses;
+        let result = if errors > 0 || timed_out {
+            AuditResult::Err
+        } else {
+            AuditResult::Ok
+        };
+
+        // Completion-time audit: attributes the same verb as the attempt-time
+        // line but with fanout / worker counts / elapsed_ms filled in. Skip
+        // when the client disconnected or the verb is not audited.
+        if let (Some(client_ref), Some(mut entry)) = (client.as_deref(), self.audit) {
+            let fanout_status = if timed_out {
+                FanoutStatus::Timeout
+            } else if errors > 0 {
+                FanoutStatus::Partial
+            } else if expected == 0 {
+                FanoutStatus::LocalOnly
+            } else {
+                FanoutStatus::Ok
+            };
+            entry.extras.elapsed_ms = Some(elapsed_ms(self.started_at));
+            entry.extras.fanout = Some(FanoutSummary {
+                status: fanout_status,
+                workers_ok: u32::try_from(ok).unwrap_or(u32::MAX),
+                workers_err: u32::try_from(errors).unwrap_or(u32::MAX),
+                workers_expected: u32::try_from(expected).unwrap_or(u32::MAX),
+            });
+            if matches!(result, AuditResult::Err) {
+                entry.extras.error_code = Some(if timed_out {
+                    AuditErrorCode::WorkerTimeout
+                } else {
+                    AuditErrorCode::WorkerFailure
+                });
+                entry.extras.reason = Some(messages.join(", "));
+            }
+            audit_emit(server, client_ref, entry, result);
+        }
+
+        if errors > 0 || timed_out {
             client.finish_failure(messages.join(", "));
         } else {
             client.finish_ok("Successfully applied request to all workers");
         }
 
         server.update_counts();
+    }
+}
+
+/// Elapsed milliseconds since `started_at`, saturating on overflow.
+fn elapsed_ms(started_at: Instant) -> u64 {
+    u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Shallow clone of [`AuditEntry`] so the completion handler can re-emit a
+/// second line with the same taxonomy as the attempt-time line but enriched
+/// with fanout + elapsed_ms. Manual implementation because `AuditEntry`
+/// does not derive `Clone` by default (it owns `String`s that the
+/// attempt-time line consumes by value).
+fn clone_entry(entry: &AuditEntry) -> AuditEntry {
+    AuditEntry {
+        kind: entry.kind,
+        verb: entry.verb,
+        counter: entry.counter,
+        cluster_id: entry.cluster_id.clone(),
+        backend_id: entry.backend_id.clone(),
+        address: entry.address,
+        target: entry.target.clone(),
+        extras: entry.extras.clone(),
     }
 }
 
@@ -1108,13 +1523,47 @@ struct LoadStateTask {
 pub fn load_state(server: &mut Server, mut client: OptionalClient, path: &str) {
     info!("loading state at path {}", path);
 
+    let audit_target = format!("file:{path}");
+
     let mut file = match File::open(path) {
         Ok(file) => file,
         Err(err) if matches!(err.kind(), ErrorKind::NotFound) => {
+            if let Some(client_ref) = client.as_deref() {
+                let (verb, counter) = audit_verb!("state_loaded");
+                audit_emit_inline(
+                    server,
+                    client_ref,
+                    EventKind::StateLoaded,
+                    verb,
+                    counter,
+                    audit_target.clone(),
+                    AuditResult::Err,
+                    AuditExtras {
+                        error_code: Some(AuditErrorCode::IoError),
+                        ..Default::default()
+                    },
+                );
+            }
             client.finish_failure(format!("Cannot find file at path {path}"));
             return;
         }
         Err(error) => {
+            if let Some(client_ref) = client.as_deref() {
+                let (verb, counter) = audit_verb!("state_loaded");
+                audit_emit_inline(
+                    server,
+                    client_ref,
+                    EventKind::StateLoaded,
+                    verb,
+                    counter,
+                    audit_target.clone(),
+                    AuditResult::Err,
+                    AuditExtras {
+                        error_code: Some(AuditErrorCode::IoError),
+                        ..Default::default()
+                    },
+                );
+            }
             client.finish_failure(format!("Cannot open file at path {path}: {error}"));
             return;
         }
@@ -1183,8 +1632,27 @@ pub fn load_state(server: &mut Server, mut client: OptionalClient, path: &str) {
     match status {
         Ok(()) => {
             client.return_processing("Applying state file...");
+            // Success audit is emitted from `LoadStateTask::on_finish` once
+            // every worker has acknowledged — that's where we know the final
+            // ok/err split.
         }
         Err(message) => {
+            if let Some(client_ref) = client.as_deref() {
+                let (verb, counter) = audit_verb!("state_loaded");
+                audit_emit_inline(
+                    server,
+                    client_ref,
+                    EventKind::StateLoaded,
+                    verb,
+                    counter,
+                    audit_target,
+                    AuditResult::Err,
+                    AuditExtras {
+                        error_code: Some(AuditErrorCode::IoError),
+                        ..Default::default()
+                    },
+                );
+            }
             client.finish_failure(message);
             server.cancel_task(task_id);
         }
@@ -1208,6 +1676,24 @@ impl GatheringTask for LoadStateTask {
     ) {
         let DefaultGatherer { ok, errors, .. } = self.gatherer;
         server.update_counts();
+        let result = if errors == 0 {
+            AuditResult::Ok
+        } else {
+            AuditResult::Err
+        };
+        if let Some(client_ref) = client.as_deref() {
+            let (verb, counter) = audit_verb!("state_loaded");
+            audit_emit_inline(
+                server,
+                client_ref,
+                EventKind::StateLoaded,
+                verb,
+                counter,
+                format!("file:{} ok:{ok} errors:{errors}", self.path),
+                result,
+                AuditExtras::default(),
+            );
+        }
         if errors == 0 {
             client.finish_ok(format!(
                 "Successfully loaded state from path {}, {} ok messages, {} errors",
@@ -1304,6 +1790,18 @@ struct StopTask {
 
 /// stop the main process and workers, true for hard stop
 fn stop(server: &mut Server, client: &mut ClientSession, hardness: bool) {
+    let (verb, counter) = audit_verb!("sozu_stop_requested");
+    audit_emit_inline(
+        server,
+        client,
+        EventKind::SozuStopRequested,
+        verb,
+        counter,
+        format!("stop:{}", if hardness { "hard" } else { "soft" }),
+        AuditResult::Ok,
+        AuditExtras::default(),
+    );
+
     let task = Box::new(StopTask {
         client_token: client.token,
         gatherer: DefaultGatherer::default(),
@@ -1531,26 +2029,46 @@ mod audit_format_tests {
     //! (see `command/src/logging/logs.rs:30`), so `ansi_palette()` returns
     //! empty strings and the rendered line is ANSI-free — stable to match
     //! with a plain regex.
-    use super::{AuditEntry, AuditResult};
+    use super::{
+        AUDIT_REASON_MAX_CHARS, AuditEntry, AuditErrorCode, AuditExtras, AuditResult, FanoutStatus,
+        FanoutSummary, SOZU_VERSION,
+    };
     use regex::Regex;
     use rusty_ulid::Ulid;
     use sozu_command_lib::proto::command::EventKind;
 
-    /// Minimal stand-in exposing only the `ClientSession` fields and method
+    /// Minimal stand-in exposing only the `ClientSession` fields and methods
     /// that `audit_log_context!` reads. Avoids constructing the full
     /// `Channel<Response, Request>` that `ClientSession::new` requires.
     struct TestClient {
         session_ulid: Ulid,
         id: u32,
         actor_uid: Option<u32>,
+        actor_gid: Option<u32>,
+        actor_pid: Option<i32>,
+        actor_comm: Option<String>,
     }
 
     impl TestClient {
         fn actor_uid_display(&self) -> String {
-            match self.actor_uid {
-                Some(uid) => uid.to_string(),
-                None => String::from("unknown"),
-            }
+            self.actor_uid
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "unknown".to_owned())
+        }
+        fn actor_gid_display(&self) -> String {
+            self.actor_gid
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "unknown".to_owned())
+        }
+        fn actor_pid_display(&self) -> String {
+            self.actor_pid
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "unknown".to_owned())
+        }
+        fn actor_comm_display(&self) -> String {
+            self.actor_comm
+                .clone()
+                .unwrap_or_else(|| "unknown".to_owned())
         }
     }
 
@@ -1563,29 +2081,48 @@ mod audit_format_tests {
             backend_id: None,
             address: None,
             target: "cluster:my_app".to_owned(),
+            extras: AuditExtras::default(),
+        }
+    }
+
+    fn sample_client(uid: Option<u32>) -> TestClient {
+        TestClient {
+            session_ulid: Ulid::generate(),
+            id: 42,
+            actor_uid: uid,
+            actor_gid: uid,
+            actor_pid: uid.map(|v| v as i32),
+            actor_comm: uid.map(|_| "sozuctl".to_owned()),
         }
     }
 
     fn pattern() -> Regex {
-        // Anchored: covers the 4-slot bracket, the `AUDIT\tSession(...)\t >>>`
-        // tail, and the field order. Crockford base32 ULIDs are 26 chars over
-        // [0-9A-Z]; missing bracket slots render as a dash.
+        // Anchored; covers bracket + `AUDIT\tCommand(...)` + every mandatory
+        // field in order + sozu_version. Optional fields (error_code, reason,
+        // elapsed_ms, fanout, workers) may appear between `result=...` and
+        // `sozu_version=...`. Crockford base32 ULIDs are 26 chars over [0-9A-Z].
         Regex::new(concat!(
             r"^\[[0-9A-Z]{26} [0-9A-Z]{26} (?:[A-Za-z0-9_:.-]+|-) (?:[A-Za-z0-9_:.-]+|-)\]",
-            r"\tAUDIT\tSession\(",
-            r"verb=[a-z_]+, actor_uid=(?:\d+|unknown), client_id=\d+, target=[^,]+, result=(?:ok|err)",
-            r"\)\t >>>$",
+            r"\tAUDIT\tCommand\(",
+            r"verb=[a-z_]+, ",
+            r"actor_uid=(?:\d+|unknown), ",
+            r"actor_gid=(?:\d+|unknown), ",
+            r"actor_pid=(?:\d+|unknown), ",
+            r"actor_comm=\S+, ",
+            r"client_id=\d+, ",
+            r"target=[^,]+, ",
+            r"result=(?:ok|err)",
+            // Optional extras block.
+            r"(?:, (?:error_code=\S+|reason=[^,)]+|elapsed_ms=\d+|fanout=\S+|workers=\d+/\d+/\d+))*",
+            r", sozu_version=[^)]+",
+            r"\)$",
         ))
         .expect("audit-format regex must compile")
     }
 
     #[test]
     fn layout_with_cluster_id_matches() {
-        let client = TestClient {
-            session_ulid: Ulid::generate(),
-            id: 42,
-            actor_uid: Some(1000),
-        };
+        let client = sample_client(Some(1000));
         let request_id = Ulid::generate();
         let entry = sample_entry(Some("my_app"));
         let rendered = audit_log_context!(client, &request_id, &entry, AuditResult::Ok);
@@ -1597,17 +2134,51 @@ mod audit_format_tests {
 
     #[test]
     fn layout_with_dashed_cluster_and_backend_matches() {
-        let client = TestClient {
-            session_ulid: Ulid::generate(),
-            id: 1,
-            actor_uid: None,
-        };
+        let client = sample_client(None);
         let request_id = Ulid::generate();
         let entry = sample_entry(None);
         let rendered = audit_log_context!(client, &request_id, &entry, AuditResult::Err);
         assert!(
             pattern().is_match(&rendered),
             "rendered line did not match audit-log pattern.\nrendered: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn layout_with_extras_matches() {
+        let client = sample_client(Some(42));
+        let request_id = Ulid::generate();
+        let mut entry = sample_entry(Some("my_app"));
+        entry.extras.elapsed_ms = Some(17);
+        entry.extras.error_code = Some(AuditErrorCode::WorkerFailure);
+        entry.extras.reason = Some("worker 1: failed".to_owned());
+        entry.extras.fanout = Some(FanoutSummary {
+            status: FanoutStatus::Partial,
+            workers_ok: 1,
+            workers_err: 1,
+            workers_expected: 2,
+        });
+        let rendered = audit_log_context!(client, &request_id, &entry, AuditResult::Err);
+        assert!(
+            pattern().is_match(&rendered),
+            "rendered line with extras did not match.\nrendered: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn sanitizer_strips_tab_and_escape_in_target() {
+        let client = sample_client(Some(0));
+        let request_id = Ulid::generate();
+        let mut entry = sample_entry(None);
+        entry.target = "cluster:\tforge\x1b[Kghost".to_owned();
+        let rendered = audit_log_context!(client, &request_id, &entry, AuditResult::Ok);
+        assert!(
+            !rendered.contains('\t') || rendered.matches('\t').count() == 2,
+            "target field must not introduce additional tabs (only the three structural tabs allowed): {rendered:?}"
+        );
+        assert!(
+            !rendered.contains('\x1b'),
+            "target field must not carry ANSI escape codes: {rendered:?}"
         );
     }
 }
