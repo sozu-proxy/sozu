@@ -637,6 +637,24 @@ that touches `h2.rs`, `mod.rs`, or `stream.rs`.
     `backend.active_requests` itself (e.g. `h2.rs:2886-2888`,
     `h2.rs:3755-3756`, `h2.rs:4022-4025`). Otherwise load-balancing
     counters drift monotonically.
+15. **Incremental scheduler — solo-bucket non-yield.** The converter
+    (`converter.rs` `H2BlockConverter::call` DATA arm) must only yield
+    after a DATA frame when `incremental_mode == true` *and*
+    `incremental_peer_count > 1`. A solo incremental stream with no
+    peer to interleave with must drain sequentially — otherwise
+    `finalize_write` (`h2.rs:2634-2641`) withdraws `Ready::WRITABLE`
+    on a clean pass (no `expect_write` set by the converter) and
+    edge-triggered epoll never re-fires. The scheduler populates both
+    fields once per write pass from `apply_incremental_rotation`'s
+    returned count.
+16. **Never withdraw `Ready::WRITABLE` with pending back-buffer.**
+    `finalize_write` (`h2.rs:2634-2641`) removes `Ready::WRITABLE` only
+    when the pass drained cleanly (`!socket_wants_write &&
+    expect_write.is_none()`) *and* no stream has queued response bytes
+    (`back.out`/`back.blocks`). A voluntary scheduler yield can leave
+    bytes buffered without `expect_write` being set; stripping
+    WRITABLE in that state strands the stream. Defence-in-depth for
+    invariant 15 and any future yield condition.
 
 ---
 
