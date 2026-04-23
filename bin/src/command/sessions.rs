@@ -1,4 +1,4 @@
-use std::fmt::Debug;
+use std::{fmt::Debug, sync::Arc};
 
 use libc::pid_t;
 use mio::Token;
@@ -42,6 +42,16 @@ pub struct ClientSession {
     /// Useful for distinguishing `sozuctl` from ad-hoc shells that share a
     /// UID. Cached at accept — never re-read.
     pub actor_comm: Option<String>,
+    /// `getpwuid_r(actor_uid)` at accept time. Renders as the POSIX account
+    /// name (e.g. `florentin`) in the audit line — more readable than a
+    /// bare UID for SOC review. `None` when `actor_uid` is missing or NSS
+    /// lookup fails.
+    pub actor_user: Option<String>,
+    /// Path of the command socket this client connected through, shared as
+    /// an `Arc<str>` across every session accepted on the same listener.
+    /// Lets multi-instance sozu deployments disambiguate audit lines that
+    /// share a SIEM sink.
+    pub socket_path: Arc<str>,
 }
 
 /// The return type of the ready method
@@ -60,6 +70,8 @@ impl ClientSession {
         token: Token,
         peer_cred: PeerCred,
         actor_comm: Option<String>,
+        actor_user: Option<String>,
+        socket_path: Arc<str>,
     ) -> Self {
         channel.interest = Ready::READABLE | Ready::ERROR | Ready::HUP;
         Self {
@@ -71,6 +83,8 @@ impl ClientSession {
             actor_gid: peer_cred.gid,
             actor_pid: peer_cred.pid,
             actor_comm,
+            actor_user,
+            socket_path,
         }
     }
 
@@ -105,6 +119,15 @@ impl ClientSession {
     pub fn actor_comm_display(&self) -> String {
         match &self.actor_comm {
             Some(comm) => sanitize_for_audit(comm),
+            None => String::from("unknown"),
+        }
+    }
+
+    /// Render the resolved POSIX account name (`getpwuid_r(uid)`),
+    /// sanitized for audit output. `"unknown"` when absent.
+    pub fn actor_user_display(&self) -> String {
+        match &self.actor_user {
+            Some(name) => sanitize_for_audit(name),
             None => String::from("unknown"),
         }
     }

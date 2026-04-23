@@ -1355,6 +1355,15 @@ pub struct FileConfig {
     pub log_target: Option<String>,
     #[serde(default)]
     pub log_colored: bool,
+    /// Dedicated file path for the control-plane audit log. When set, every
+    /// emitted `[AUDIT]` / `Command(...)` line is also appended to this file
+    /// opened `O_APPEND | O_CREAT` with mode `0o640` (owner read+write,
+    /// group read, world nothing) so operators can separate the audit trail
+    /// from the main log stream and protect it with group-scoped ACLs /
+    /// logrotate. Independent of the standard `log_target`. `None` keeps
+    /// audit lines routed only through the standard logger.
+    #[serde(default)]
+    pub audit_logs_target: Option<String>,
     #[serde(default)]
     pub access_logs_target: Option<String>,
     #[serde(default)]
@@ -1472,6 +1481,7 @@ impl ConfigBuilder {
             front_timeout: file_config.front_timeout.unwrap_or(DEFAULT_FRONT_TIMEOUT),
             handle_process_affinity: file_config.handle_process_affinity.unwrap_or(false),
             access_logs_target: file_config.access_logs_target.clone(),
+            audit_logs_target: file_config.audit_logs_target.clone(),
             access_logs_format: file_config.access_logs_format.clone(),
             access_logs_colored: file_config.access_logs_colored,
             log_level: file_config
@@ -1722,6 +1732,10 @@ pub struct Config {
     pub log_level: String,
     pub log_target: String,
     pub log_colored: bool,
+    /// Optional dedicated file path for the control-plane audit log. See
+    /// `FileConfig::audit_logs_target` for rationale.
+    #[serde(default)]
+    pub audit_logs_target: Option<String>,
     #[serde(default)]
     pub access_logs_target: Option<String>,
     pub access_logs_format: Option<AccessLogFormat>,
@@ -2034,6 +2048,7 @@ impl fmt::Debug for Config {
             .field("log_level", &self.log_level)
             .field("log_target", &self.log_target)
             .field("access_logs_target", &self.access_logs_target)
+            .field("audit_logs_target", &self.audit_logs_target)
             .field("access_logs_format", &self.access_logs_format)
             .field("worker_count", &self.worker_count)
             .field("worker_automatic_restart", &self.worker_automatic_restart)
@@ -2099,6 +2114,7 @@ impl From<&Config> for ServerConfig {
             log_level: config.log_level.clone(),
             log_target: config.log_target.clone(),
             access_logs_target: config.access_logs_target.clone(),
+            audit_logs_target: config.audit_logs_target.clone(),
             command_buffer_size: config.command_buffer_size,
             max_command_buffer_size: config.max_command_buffer_size,
             metrics,

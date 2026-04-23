@@ -9,7 +9,9 @@ use std::{
 
 use mio::Token;
 use nom::{HexDisplay, Offset};
+use prost::Message as _;
 use rusty_ulid::Ulid;
+use sha2::{Digest, Sha256};
 use sozu_command_lib::{
     buffer::fixed::Buffer,
     config::Config,
@@ -128,8 +130,17 @@ macro_rules! audit_log_context {
                 expected = fanout.workers_expected,
             ));
         }
+        if let Some(hash) = $entry.extras.request_sha256.as_deref() {
+            extras.push_str(&format!(
+                ", {gray}request_sha256{reset}={white}{hash}{reset}",
+                gray = gray,
+                reset = reset,
+                white = white,
+                hash = hash,
+            ));
+        }
         format!(
-            "{gray}{ctx}{reset}\t{open}AUDIT{reset}\t{grey}Command{reset}({gray}verb{reset}={white}{verb}{reset}, {gray}actor_uid{reset}={white}{actor_uid}{reset}, {gray}actor_gid{reset}={white}{actor_gid}{reset}, {gray}actor_pid{reset}={white}{actor_pid}{reset}, {gray}actor_comm{reset}={white}{actor_comm}{reset}, {gray}client_id{reset}={white}{client_id}{reset}, {gray}target{reset}={white}{target}{reset}, {gray}result{reset}={white}{result}{reset}{extras}, {gray}sozu_version{reset}={white}{sozu_version}{reset})",
+            "{gray}{ctx}{reset}\t{open}AUDIT{reset}\t{grey}Command{reset}({gray}verb{reset}={white}{verb}{reset}, {gray}actor_uid{reset}={white}{actor_uid}{reset}, {gray}actor_gid{reset}={white}{actor_gid}{reset}, {gray}actor_pid{reset}={white}{actor_pid}{reset}, {gray}actor_user{reset}={white}{actor_user}{reset}, {gray}actor_comm{reset}={white}{actor_comm}{reset}, {gray}client_id{reset}={white}{client_id}{reset}, {gray}socket{reset}={white}{socket_path}{reset}, {gray}target{reset}={white}{target}{reset}, {gray}result{reset}={white}{result}{reset}{extras}, {gray}sozu_version{reset}={white}{sozu_version}{reset})",
             open = open,
             reset = reset,
             grey = grey,
@@ -140,8 +151,10 @@ macro_rules! audit_log_context {
             actor_uid = $client.actor_uid_display(),
             actor_gid = $client.actor_gid_display(),
             actor_pid = $client.actor_pid_display(),
+            actor_user = $client.actor_user_display(),
             actor_comm = $client.actor_comm_display(),
             client_id = $client.id,
+            socket_path = sanitize_for_audit(&$client.socket_path),
             target = sanitize_for_audit(&$entry.target),
             result = $result,
             extras = extras,
@@ -815,6 +828,11 @@ pub(crate) struct AuditExtras {
     pub(crate) fanout: Option<FanoutSummary>,
     /// Short truncated failure detail — mirrors `finish_failure` message.
     pub(crate) reason: Option<String>,
+    /// Truncated hex-encoded SHA-256 fingerprint of the proto `Request`
+    /// bytes, for dedupe / replay detection. First 16 hex chars (64 bits).
+    /// Set for verbs that flow through `worker_request`; `None` for inline
+    /// verbs that don't carry a payload worth hashing.
+    pub(crate) request_sha256: Option<String>,
 }
 
 /// A control-plane mutation, broken down into the pieces the audit trail
@@ -854,7 +872,16 @@ const SOZU_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Build the [AuditEntry] for a control-plane request, or `None` for
 /// non-mutating verbs (the caller skips them — they have no audit footprint).
-fn audit_entry_for(request: &RequestType) -> Option<AuditEntry> {
+///
+/// `state` is used to snapshot the pre-change listener config for
+/// `UpdateHttp/Https/TcpListener` so the audit line can show
+/// `field=old→new` pairs. Passing the `ConfigState` by reference stays
+/// cheap because only the UpdateListener arms look anything up.
+fn audit_entry_for(
+    request: &RequestType,
+    state: &sozu_command_lib::state::ConfigState,
+) -> Option<AuditEntry> {
+    use std::net::SocketAddr;
     match request {
         RequestType::AddCluster(cluster) => {
             let (verb, counter) = audit_verb!("cluster_added");
@@ -988,13 +1015,22 @@ fn audit_entry_for(request: &RequestType) -> Option<AuditEntry> {
         }
         RequestType::ReplaceCertificate(replace) => {
             let (verb, counter) = audit_verb!("certificate_replaced");
+            // Compute the new cert's fingerprint from its PEM so the audit
+            // trail records both the cert being removed AND the cert
+            // replacing it. Forensic value: rotation pattern + detection of
+            // substituted-cert attacks. Best-effort: on parse failure the
+            // new fingerprint falls back to `"unknown"` rather than
+            // aborting the audit emission.
+            let new_fp =
+                compute_certificate_fingerprint(replace.new_certificate.certificate.as_bytes())
+                    .unwrap_or_else(|| "unknown".to_owned());
             Some(AuditEntry {
                 kind: EventKind::CertificateReplaced,
                 verb,
                 counter,
                 target: format!(
-                    "certificate:{}:{}",
-                    replace.address, replace.old_fingerprint
+                    "certificate:{}:old={}:new={}",
+                    replace.address, replace.old_fingerprint, new_fp
                 ),
                 cluster_id: None,
                 backend_id: None,
@@ -1030,6 +1066,7 @@ fn audit_entry_for(request: &RequestType) -> Option<AuditEntry> {
         }
         RequestType::UpdateHttpListener(patch) => {
             let (verb, counter) = audit_verb!("http_listener_updated");
+            let current = state.http_listeners.get(&SocketAddr::from(patch.address));
             Some(AuditEntry {
                 kind: EventKind::ListenerUpdated,
                 verb,
@@ -1037,7 +1074,7 @@ fn audit_entry_for(request: &RequestType) -> Option<AuditEntry> {
                 target: format!(
                     "listener:http:{}:{}",
                     patch.address,
-                    format_patch_diff_http(patch),
+                    format_patch_diff_http(patch, current),
                 ),
                 cluster_id: None,
                 backend_id: None,
@@ -1047,6 +1084,7 @@ fn audit_entry_for(request: &RequestType) -> Option<AuditEntry> {
         }
         RequestType::UpdateHttpsListener(patch) => {
             let (verb, counter) = audit_verb!("https_listener_updated");
+            let current = state.https_listeners.get(&SocketAddr::from(patch.address));
             Some(AuditEntry {
                 kind: EventKind::ListenerUpdated,
                 verb,
@@ -1054,7 +1092,7 @@ fn audit_entry_for(request: &RequestType) -> Option<AuditEntry> {
                 target: format!(
                     "listener:https:{}:{}",
                     patch.address,
-                    format_patch_diff_https(patch),
+                    format_patch_diff_https(patch, current),
                 ),
                 cluster_id: None,
                 backend_id: None,
@@ -1064,6 +1102,7 @@ fn audit_entry_for(request: &RequestType) -> Option<AuditEntry> {
         }
         RequestType::UpdateTcpListener(patch) => {
             let (verb, counter) = audit_verb!("tcp_listener_updated");
+            let current = state.tcp_listeners.get(&SocketAddr::from(patch.address));
             Some(AuditEntry {
                 kind: EventKind::ListenerUpdated,
                 verb,
@@ -1071,7 +1110,7 @@ fn audit_entry_for(request: &RequestType) -> Option<AuditEntry> {
                 target: format!(
                     "listener:tcp:{}:{}",
                     patch.address,
-                    format_patch_diff_tcp(patch),
+                    format_patch_diff_tcp(patch, current),
                 ),
                 cluster_id: None,
                 backend_id: None,
@@ -1149,10 +1188,14 @@ fn audit_emit(server: &mut Server, client: &ClientSession, entry: AuditEntry, re
     // verb→key dispatch table.
     count!(entry.counter, 1);
 
-    info!(
-        "{}",
-        audit_log_context!(client, &request_id, &entry, result)
-    );
+    let rendered = audit_log_context!(client, &request_id, &entry, result);
+    info!("{}", rendered);
+    // Mirror to the dedicated tamper-resistant sink when configured
+    // (`config.audit_logs_target`). Best-effort; failures fall back to the
+    // standard `info!` route above. Strip ANSI escapes before writing so
+    // the dedicated file stays ASCII and SIEM-parseable even when colour
+    // is enabled on stdout.
+    server.append_audit_line(&strip_ansi(&rendered));
 
     // Subscribers only see the proto Event; the verb / actor / request_id are
     // captured in the audit log line above (which is already structured).
@@ -1162,6 +1205,33 @@ fn audit_emit(server: &mut Server, client: &ClientSession, entry: AuditEntry, re
         backend_id: entry.backend_id,
         address: entry.address,
     });
+}
+
+/// Strip ANSI CSI escape sequences from `s`. Cheap single-pass parser —
+/// recognises `\x1b[ ... m` (colour) and any other `\x1b[ ... <final>`
+/// sequence. Returns `s.to_owned()` when no ESC byte is found so the common
+/// no-colour path doesn't reallocate.
+fn strip_ansi(s: &str) -> String {
+    if !s.contains('\x1b') {
+        return s.to_owned();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        // Swallow the `[`...final-byte CSI, or drop the lone ESC.
+        if let Some('[') = chars.next() {
+            for next in chars.by_ref() {
+                if ('@'..='~').contains(&next) {
+                    break;
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Same as [audit_emit] but synthesises the [AuditEntry] inline for verbs
@@ -1222,7 +1292,7 @@ pub fn worker_request(
     // Snapshot the audit entry before consuming `request_content` so we can
     // emit even when `state.dispatch` rejects the request AND so the
     // completion handler can re-emit with fanout + elapsed_ms.
-    let audit = audit_entry_for(&request_content);
+    let audit = audit_entry_for(&request_content, &server.state);
     let started_at = Instant::now();
 
     // Special-case ConfigureMetrics — the proto payload is an i32 enum (no
@@ -1236,7 +1306,8 @@ pub fn worker_request(
         None
     };
 
-    let request = request_content.into();
+    let request: sozu_command_lib::proto::command::Request = request_content.into();
+    let request_sha256 = compute_request_sha256(&request);
 
     if let Err(error) = server.state.dispatch(&request) {
         let reason = error.to_string();
@@ -1244,6 +1315,7 @@ pub fn worker_request(
             entry.extras.error_code = Some(AuditErrorCode::DispatchError);
             entry.extras.reason = Some(reason.clone());
             entry.extras.elapsed_ms = Some(elapsed_ms(started_at));
+            entry.extras.request_sha256 = Some(request_sha256.clone());
             audit_emit(server, client, entry, AuditResult::Err);
         } else if let Some(target) = metrics_target {
             let (verb, counter) = audit_verb!("metrics_configured");
@@ -1272,8 +1344,13 @@ pub fn worker_request(
     // Attempt-time audit — `result=ok` here only means "accepted by the
     // main process state". The completion-time line (emitted from
     // `WorkerTask::on_finish`) carries the fanout outcome.
-    let audit_for_task = audit.as_ref().map(clone_entry);
-    if let Some(entry) = audit {
+    let audit_for_task = audit.as_ref().map(|entry| {
+        let mut cloned = clone_entry(entry);
+        cloned.extras.request_sha256 = Some(request_sha256.clone());
+        cloned
+    });
+    if let Some(mut entry) = audit {
+        entry.extras.request_sha256 = Some(request_sha256);
         audit_emit(server, client, entry, AuditResult::Ok);
     } else if let Some(target) = metrics_target {
         let (verb, counter) = audit_verb!("metrics_configured");
@@ -1383,6 +1460,36 @@ impl GatheringTask for WorkerTask {
 /// Elapsed milliseconds since `started_at`, saturating on overflow.
 fn elapsed_ms(started_at: Instant) -> u64 {
     u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// SHA-256 of the proto `Request` wire-encoding, hex-truncated to 16 chars
+/// (64 bits) so the audit line stays greppable without blowing up line
+/// width. Cheap: single prost `encode_to_vec` + one `Sha256::digest` on
+/// a control-plane path (one call per worker request, not per packet).
+fn compute_request_sha256(request: &sozu_command_lib::proto::command::Request) -> String {
+    let bytes = request.encode_to_vec();
+    let digest = Sha256::digest(&bytes);
+    let mut hex = String::with_capacity(16);
+    for byte in digest.iter().take(8) {
+        use std::fmt::Write as _;
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    hex
+}
+
+/// SHA-256 fingerprint of a PEM certificate, hex-encoded and truncated to
+/// 16 hex chars (64 bits) for audit brevity. `None` when the input is not
+/// parseable as PEM. Mirrors the full fingerprint workflow in
+/// `sozu_command_lib::certificate::calculate_fingerprint` but truncates
+/// for log terseness — operators correlate via the 64-bit prefix.
+fn compute_certificate_fingerprint(certificate_pem: &[u8]) -> Option<String> {
+    let fp = sozu_command_lib::certificate::calculate_fingerprint(certificate_pem).ok()?;
+    let mut hex = String::with_capacity(16);
+    for byte in fp.iter().take(8) {
+        use std::fmt::Write as _;
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    Some(hex)
 }
 
 /// Shallow clone of [`AuditEntry`] so the completion handler can re-emit a
@@ -1859,62 +1966,99 @@ impl GatheringTask for StopTask {
 
 // =========================================================
 // Patch diff formatters — for the audit `target=` field.
-// Walk each Option field of the patch and join the non-None ones into a
-// compact key=value string so the audit log shows exactly what changed.
+// Walk each Option field of the patch and, when a pre-patch listener
+// snapshot is available, emit `field=old→new` so operators see both the
+// prior and the replacement value. Falls back to `field=new` (no arrow)
+// when no current listener is known (e.g. patch arriving before the
+// listener is registered) so the audit line never swallows a change.
+//
+// Helpers live inline as macros instead of functions so `stringify!($field)`
+// picks up each field name without runtime formatting.
 
-fn format_patch_diff_http(p: &UpdateHttpListenerConfig) -> String {
+fn format_patch_diff_http(
+    p: &UpdateHttpListenerConfig,
+    current: Option<&sozu_command_lib::proto::command::HttpListenerConfig>,
+) -> String {
     let mut parts: Vec<String> = Vec::new();
-    if let Some(v) = p.public_address.as_ref() {
-        parts.push(format!("public_address={v}"));
-    }
-    if let Some(v) = p.expect_proxy {
-        parts.push(format!("expect_proxy={v}"));
-    }
-    if let Some(v) = p.sticky_name.as_deref() {
-        parts.push(format!("sticky_name={v}"));
-    }
-    if let Some(v) = p.front_timeout {
-        parts.push(format!("front_timeout={v}"));
-    }
-    if let Some(v) = p.back_timeout {
-        parts.push(format!("back_timeout={v}"));
-    }
-    if let Some(v) = p.connect_timeout {
-        parts.push(format!("connect_timeout={v}"));
-    }
-    if let Some(v) = p.request_timeout {
-        parts.push(format!("request_timeout={v}"));
-    }
-    if p.http_answers.is_some() {
-        parts.push("http_answers=<patched>".to_owned());
-    }
-    macro_rules! push_opt {
+    // Patch field is `Option<T>`, current field is `T` (required on the
+    // stored listener): `to_string()` directly.
+    macro_rules! diff_req_copy {
         ($field:ident) => {
             if let Some(v) = p.$field {
-                parts.push(format!("{}={}", stringify!($field), v));
+                let old = current
+                    .map(|c| c.$field.to_string())
+                    .unwrap_or_else(|| "?".to_owned());
+                parts.push(format!("{}={old}→{v}", stringify!($field)));
             }
         };
     }
-    push_opt!(h2_max_rst_stream_per_window);
-    push_opt!(h2_max_ping_per_window);
-    push_opt!(h2_max_settings_per_window);
-    push_opt!(h2_max_empty_data_per_window);
-    push_opt!(h2_max_continuation_frames);
-    push_opt!(h2_max_glitch_count);
-    push_opt!(h2_initial_connection_window);
-    push_opt!(h2_max_concurrent_streams);
-    push_opt!(h2_stream_shrink_ratio);
-    push_opt!(h2_max_rst_stream_lifetime);
-    push_opt!(h2_max_rst_stream_abusive_lifetime);
-    push_opt!(h2_max_rst_stream_emitted_lifetime);
-    push_opt!(h2_max_header_list_size);
-    push_opt!(h2_max_header_table_size);
-    push_opt!(h2_stream_idle_timeout_seconds);
-    push_opt!(h2_graceful_shutdown_deadline_seconds);
-    push_opt!(h2_max_window_update_stream0_per_window);
-    if let Some(v) = p.sozu_id_header.as_deref() {
-        parts.push(format!("sozu_id_header={v}"));
+    macro_rules! diff_req_str {
+        ($field:ident) => {
+            if let Some(v) = p.$field.as_deref() {
+                let old = current
+                    .map(|c| c.$field.clone())
+                    .unwrap_or_else(|| "?".to_owned());
+                parts.push(format!("{}={old}→{v}", stringify!($field)));
+            }
+        };
     }
+    // Patch field is `Option<T>`, current field is `Option<T>` (optional on
+    // the stored listener): flatten current via `and_then`.
+    macro_rules! diff_opt_copy {
+        ($field:ident) => {
+            if let Some(v) = p.$field {
+                let old = current
+                    .and_then(|c| c.$field)
+                    .map(|o| o.to_string())
+                    .unwrap_or_else(|| "?".to_owned());
+                parts.push(format!("{}={old}→{v}", stringify!($field)));
+            }
+        };
+    }
+    macro_rules! diff_opt_str {
+        ($field:ident) => {
+            if let Some(v) = p.$field.as_deref() {
+                let old = current
+                    .and_then(|c| c.$field.clone())
+                    .unwrap_or_else(|| "?".to_owned());
+                parts.push(format!("{}={old}→{v}", stringify!($field)));
+            }
+        };
+    }
+    if let Some(v) = p.public_address.as_ref() {
+        let old = current
+            .and_then(|c| c.public_address)
+            .map(|o| o.to_string())
+            .unwrap_or_else(|| "?".to_owned());
+        parts.push(format!("public_address={old}→{v}"));
+    }
+    diff_req_copy!(expect_proxy);
+    diff_req_str!(sticky_name);
+    diff_req_copy!(front_timeout);
+    diff_req_copy!(back_timeout);
+    diff_req_copy!(connect_timeout);
+    diff_req_copy!(request_timeout);
+    if p.http_answers.is_some() {
+        parts.push("http_answers=<patched>".to_owned());
+    }
+    diff_opt_copy!(h2_max_rst_stream_per_window);
+    diff_opt_copy!(h2_max_ping_per_window);
+    diff_opt_copy!(h2_max_settings_per_window);
+    diff_opt_copy!(h2_max_empty_data_per_window);
+    diff_opt_copy!(h2_max_continuation_frames);
+    diff_opt_copy!(h2_max_glitch_count);
+    diff_opt_copy!(h2_initial_connection_window);
+    diff_opt_copy!(h2_max_concurrent_streams);
+    diff_opt_copy!(h2_stream_shrink_ratio);
+    diff_opt_copy!(h2_max_rst_stream_lifetime);
+    diff_opt_copy!(h2_max_rst_stream_abusive_lifetime);
+    diff_opt_copy!(h2_max_rst_stream_emitted_lifetime);
+    diff_opt_copy!(h2_max_header_list_size);
+    diff_opt_copy!(h2_max_header_table_size);
+    diff_opt_copy!(h2_stream_idle_timeout_seconds);
+    diff_opt_copy!(h2_graceful_shutdown_deadline_seconds);
+    diff_opt_copy!(h2_max_window_update_stream0_per_window);
+    diff_opt_str!(sozu_id_header);
     if parts.is_empty() {
         "(no-op)".to_owned()
     } else {
@@ -1922,72 +2066,99 @@ fn format_patch_diff_http(p: &UpdateHttpListenerConfig) -> String {
     }
 }
 
-fn format_patch_diff_https(p: &UpdateHttpsListenerConfig) -> String {
+fn format_patch_diff_https(
+    p: &UpdateHttpsListenerConfig,
+    current: Option<&sozu_command_lib::proto::command::HttpsListenerConfig>,
+) -> String {
     let mut parts: Vec<String> = Vec::new();
+    macro_rules! diff_req_copy {
+        ($field:ident) => {
+            if let Some(v) = p.$field {
+                let old = current
+                    .map(|c| c.$field.to_string())
+                    .unwrap_or_else(|| "?".to_owned());
+                parts.push(format!("{}={old}→{v}", stringify!($field)));
+            }
+        };
+    }
+    macro_rules! diff_req_str {
+        ($field:ident) => {
+            if let Some(v) = p.$field.as_deref() {
+                let old = current
+                    .map(|c| c.$field.clone())
+                    .unwrap_or_else(|| "?".to_owned());
+                parts.push(format!("{}={old}→{v}", stringify!($field)));
+            }
+        };
+    }
+    macro_rules! diff_opt_copy {
+        ($field:ident) => {
+            if let Some(v) = p.$field {
+                let old = current
+                    .and_then(|c| c.$field)
+                    .map(|o| o.to_string())
+                    .unwrap_or_else(|| "?".to_owned());
+                parts.push(format!("{}={old}→{v}", stringify!($field)));
+            }
+        };
+    }
+    macro_rules! diff_opt_str {
+        ($field:ident) => {
+            if let Some(v) = p.$field.as_deref() {
+                let old = current
+                    .and_then(|c| c.$field.clone())
+                    .unwrap_or_else(|| "?".to_owned());
+                parts.push(format!("{}={old}→{v}", stringify!($field)));
+            }
+        };
+    }
     if let Some(v) = p.public_address.as_ref() {
-        parts.push(format!("public_address={v}"));
+        let old = current
+            .and_then(|c| c.public_address)
+            .map(|o| o.to_string())
+            .unwrap_or_else(|| "?".to_owned());
+        parts.push(format!("public_address={old}→{v}"));
     }
-    if let Some(v) = p.expect_proxy {
-        parts.push(format!("expect_proxy={v}"));
-    }
-    if let Some(v) = p.sticky_name.as_deref() {
-        parts.push(format!("sticky_name={v}"));
-    }
-    if let Some(v) = p.front_timeout {
-        parts.push(format!("front_timeout={v}"));
-    }
-    if let Some(v) = p.back_timeout {
-        parts.push(format!("back_timeout={v}"));
-    }
-    if let Some(v) = p.connect_timeout {
-        parts.push(format!("connect_timeout={v}"));
-    }
-    if let Some(v) = p.request_timeout {
-        parts.push(format!("request_timeout={v}"));
-    }
+    diff_req_copy!(expect_proxy);
+    diff_req_str!(sticky_name);
+    diff_req_copy!(front_timeout);
+    diff_req_copy!(back_timeout);
+    diff_req_copy!(connect_timeout);
+    diff_req_copy!(request_timeout);
     if p.http_answers.is_some() {
         parts.push("http_answers=<patched>".to_owned());
     }
     if let Some(ref alpn) = p.alpn_protocols {
-        if alpn.values.is_empty() {
-            parts.push("alpn_protocols=<reset>".to_owned());
+        let old = current
+            .map(|c| c.alpn_protocols.join(","))
+            .unwrap_or_else(|| "?".to_owned());
+        let new = if alpn.values.is_empty() {
+            "<reset>".to_owned()
         } else {
-            parts.push(format!("alpn_protocols={}", alpn.values.join(",")));
-        }
-    }
-    if let Some(v) = p.strict_sni_binding {
-        parts.push(format!("strict_sni_binding={v}"));
-    }
-    if let Some(v) = p.disable_http11 {
-        parts.push(format!("disable_http11={v}"));
-    }
-    macro_rules! push_opt {
-        ($field:ident) => {
-            if let Some(v) = p.$field {
-                parts.push(format!("{}={}", stringify!($field), v));
-            }
+            alpn.values.join(",")
         };
+        parts.push(format!("alpn_protocols={old}→{new}"));
     }
-    push_opt!(h2_max_rst_stream_per_window);
-    push_opt!(h2_max_ping_per_window);
-    push_opt!(h2_max_settings_per_window);
-    push_opt!(h2_max_empty_data_per_window);
-    push_opt!(h2_max_continuation_frames);
-    push_opt!(h2_max_glitch_count);
-    push_opt!(h2_initial_connection_window);
-    push_opt!(h2_max_concurrent_streams);
-    push_opt!(h2_stream_shrink_ratio);
-    push_opt!(h2_max_rst_stream_lifetime);
-    push_opt!(h2_max_rst_stream_abusive_lifetime);
-    push_opt!(h2_max_rst_stream_emitted_lifetime);
-    push_opt!(h2_max_header_list_size);
-    push_opt!(h2_max_header_table_size);
-    push_opt!(h2_stream_idle_timeout_seconds);
-    push_opt!(h2_graceful_shutdown_deadline_seconds);
-    push_opt!(h2_max_window_update_stream0_per_window);
-    if let Some(v) = p.sozu_id_header.as_deref() {
-        parts.push(format!("sozu_id_header={v}"));
-    }
+    diff_opt_copy!(strict_sni_binding);
+    diff_opt_copy!(disable_http11);
+    diff_opt_copy!(h2_max_rst_stream_per_window);
+    diff_opt_copy!(h2_max_ping_per_window);
+    diff_opt_copy!(h2_max_settings_per_window);
+    diff_opt_copy!(h2_max_empty_data_per_window);
+    diff_opt_copy!(h2_max_continuation_frames);
+    diff_opt_copy!(h2_max_glitch_count);
+    diff_opt_copy!(h2_initial_connection_window);
+    diff_opt_copy!(h2_max_concurrent_streams);
+    diff_opt_copy!(h2_stream_shrink_ratio);
+    diff_opt_copy!(h2_max_rst_stream_lifetime);
+    diff_opt_copy!(h2_max_rst_stream_abusive_lifetime);
+    diff_opt_copy!(h2_max_rst_stream_emitted_lifetime);
+    diff_opt_copy!(h2_max_header_list_size);
+    diff_opt_copy!(h2_max_header_table_size);
+    diff_opt_copy!(h2_stream_idle_timeout_seconds);
+    diff_opt_copy!(h2_graceful_shutdown_deadline_seconds);
+    diff_opt_copy!(h2_max_window_update_stream0_per_window);
+    diff_opt_str!(sozu_id_header);
     if parts.is_empty() {
         "(no-op)".to_owned()
     } else {
@@ -1995,23 +2166,32 @@ fn format_patch_diff_https(p: &UpdateHttpsListenerConfig) -> String {
     }
 }
 
-fn format_patch_diff_tcp(p: &UpdateTcpListenerConfig) -> String {
+fn format_patch_diff_tcp(
+    p: &UpdateTcpListenerConfig,
+    current: Option<&sozu_command_lib::proto::command::TcpListenerConfig>,
+) -> String {
     let mut parts: Vec<String> = Vec::new();
+    macro_rules! diff_req_copy {
+        ($field:ident) => {
+            if let Some(v) = p.$field {
+                let old = current
+                    .map(|c| c.$field.to_string())
+                    .unwrap_or_else(|| "?".to_owned());
+                parts.push(format!("{}={old}→{v}", stringify!($field)));
+            }
+        };
+    }
     if let Some(v) = p.public_address.as_ref() {
-        parts.push(format!("public_address={v}"));
+        let old = current
+            .and_then(|c| c.public_address)
+            .map(|o| o.to_string())
+            .unwrap_or_else(|| "?".to_owned());
+        parts.push(format!("public_address={old}→{v}"));
     }
-    if let Some(v) = p.expect_proxy {
-        parts.push(format!("expect_proxy={v}"));
-    }
-    if let Some(v) = p.front_timeout {
-        parts.push(format!("front_timeout={v}"));
-    }
-    if let Some(v) = p.back_timeout {
-        parts.push(format!("back_timeout={v}"));
-    }
-    if let Some(v) = p.connect_timeout {
-        parts.push(format!("connect_timeout={v}"));
-    }
+    diff_req_copy!(expect_proxy);
+    diff_req_copy!(front_timeout);
+    diff_req_copy!(back_timeout);
+    diff_req_copy!(connect_timeout);
     if parts.is_empty() {
         "(no-op)".to_owned()
     } else {
@@ -2047,6 +2227,8 @@ mod audit_format_tests {
         actor_gid: Option<u32>,
         actor_pid: Option<i32>,
         actor_comm: Option<String>,
+        actor_user: Option<String>,
+        socket_path: std::sync::Arc<str>,
     }
 
     impl TestClient {
@@ -2067,6 +2249,11 @@ mod audit_format_tests {
         }
         fn actor_comm_display(&self) -> String {
             self.actor_comm
+                .clone()
+                .unwrap_or_else(|| "unknown".to_owned())
+        }
+        fn actor_user_display(&self) -> String {
+            self.actor_user
                 .clone()
                 .unwrap_or_else(|| "unknown".to_owned())
         }
@@ -2093,6 +2280,8 @@ mod audit_format_tests {
             actor_gid: uid,
             actor_pid: uid.map(|v| v as i32),
             actor_comm: uid.map(|_| "sozuctl".to_owned()),
+            actor_user: uid.map(|_| "florentin".to_owned()),
+            socket_path: std::sync::Arc::from("/run/sozu/sock"),
         }
     }
 
@@ -2108,12 +2297,14 @@ mod audit_format_tests {
             r"actor_uid=(?:\d+|unknown), ",
             r"actor_gid=(?:\d+|unknown), ",
             r"actor_pid=(?:\d+|unknown), ",
+            r"actor_user=\S+, ",
             r"actor_comm=\S+, ",
             r"client_id=\d+, ",
+            r"socket=\S+, ",
             r"target=[^,]+, ",
             r"result=(?:ok|err)",
             // Optional extras block.
-            r"(?:, (?:error_code=\S+|reason=[^,)]+|elapsed_ms=\d+|fanout=\S+|workers=\d+/\d+/\d+))*",
+            r"(?:, (?:error_code=\S+|reason=[^,)]+|elapsed_ms=\d+|fanout=\S+|workers=\d+/\d+/\d+|request_sha256=[0-9a-f]+))*",
             r", sozu_version=[^)]+",
             r"\)$",
         ))
