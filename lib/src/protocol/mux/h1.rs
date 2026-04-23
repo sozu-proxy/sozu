@@ -152,7 +152,25 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
     /// Terminate a close-delimited kawa body by pushing END_STREAM flags.
     /// Called when the backend closes the connection to signal end-of-body
     /// (no Content-Length, no chunked encoding).
+    ///
+    /// Chunked responses that TCP-close before the terminating `0\r\n\r\n`
+    /// are demoted to `ParsingPhase::Error` so the H2 converter emits
+    /// RST_STREAM(InternalError) rather than a silent END_STREAM with a
+    /// truncated body — RFC 9112 §7.1 requires the zero-chunk terminator.
     fn terminate_close_delimited(kawa: &mut super::GenericHttpStream, stream_id: GlobalStreamId) {
+        if kawa.body_size == kawa::BodySize::Chunked {
+            warn!(
+                "{} H1 backend EOF mid-chunked response on stream {}: emitting RST_STREAM",
+                log_module_context!(),
+                stream_id
+            );
+            incr!("h1.backend_eof_before_message_complete");
+            kawa.parsing_phase
+                .error(kawa::ParsingErrorKind::Processing {
+                    message: "INTERNAL_ERROR",
+                });
+            return;
+        }
         debug!(
             "{} H1 close-delimited EOF on stream {}: terminating body",
             log_module_context!(),
@@ -229,10 +247,12 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                 self.timeout_container.cancel();
                 self.readiness.interest.remove(Ready::READABLE);
                 if let StreamState::Linked(token) = stream.state {
-                    endpoint
-                        .readiness_mut(token)
-                        .interest
-                        .insert(Ready::WRITABLE);
+                    // Signal pending write alongside the WRITABLE interest flip:
+                    // edge-triggered epoll won't re-fire for bytes we just queued
+                    // onto the peer — the synthetic event is the only wake path.
+                    let peer = endpoint.readiness_mut(token);
+                    peer.interest.insert(Ready::WRITABLE);
+                    peer.signal_pending_write();
                 }
             }
             return MuxResult::Continue;
@@ -339,10 +359,12 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                 context.pending_links.push_back(stream_id);
             }
             if let StreamState::Linked(token) = stream.state {
-                endpoint
-                    .readiness_mut(token)
-                    .interest
-                    .insert(Ready::WRITABLE)
+                // Signal pending write alongside the WRITABLE interest flip: the
+                // bytes we just parsed live in sozu's buffers, not the kernel,
+                // so edge-triggered epoll won't re-fire on its own.
+                let peer = endpoint.readiness_mut(token);
+                peer.interest.insert(Ready::WRITABLE);
+                peer.signal_pending_write();
             }
         };
         // 1xx informational: the 100 response skips main_phase (goes straight to
@@ -350,10 +372,9 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         // Trigger the frontend to write the 1xx response after all borrows end.
         if is_1xx_backend {
             if let StreamState::Linked(token) = stream.state {
-                endpoint
-                    .readiness_mut(token)
-                    .interest
-                    .insert(Ready::WRITABLE);
+                let peer = endpoint.readiness_mut(token);
+                peer.interest.insert(Ready::WRITABLE);
+                peer.signal_pending_write();
             }
         }
 
@@ -739,11 +760,15 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                     debug!("{} CLOSING H1 TERMINATED STREAM", log_context!(self));
                     stream.state = StreamState::Unlinked;
                     self.readiness.interest.insert(Ready::WRITABLE);
+                    // End-of-stream was already queued into kawa by the parser;
+                    // no fresh WRITABLE event will arrive from the kernel.
+                    self.readiness.signal_pending_write();
                 }
                 EndStreamAction::CloseDelimited => {
                     debug!("{} CLOSE DELIMITED", log_context!(self));
                     stream.state = StreamState::Unlinked;
                     self.readiness.interest.insert(Ready::WRITABLE);
+                    self.readiness.signal_pending_write();
                 }
                 EndStreamAction::ForwardUnterminated => {
                     debug!("{} CLOSING H1 UNTERMINATED STREAM", log_context!(self));
