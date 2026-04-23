@@ -27,10 +27,10 @@
 //!   `expect_write`/`expect_read` referencing the evicted gid.
 
 use std::{
-    io::Write,
+    io::{Read, Write},
     net::{Shutdown, SocketAddr},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use sozu_command_lib::{
@@ -1273,6 +1273,151 @@ fn test_h2_rfc9218_non_incremental_sequential() {
             3,
             "H2 RFC 9218 §4: non-incremental streams drain sequentially",
             try_h2_rfc9218_non_incremental_sequential
+        ),
+        State::Success
+    );
+}
+
+/// RFC 9218 §4 + sozu incremental-scheduling regression (PR #1209 follow-up):
+/// a SOLO stream whose client sent `priority: u=0, i` (Chrome's navigation
+/// default since Chrome 107) must drain its full response body promptly.
+///
+/// With only one stream in the urgency-0 incremental bucket, the round-robin
+/// yield at `converter.rs:434` has no peer to rotate to; yielding strands the
+/// stream because `finalize_write:2634-2641` removes `Ready::WRITABLE` on a
+/// clean drain when `expect_write.is_none()`. Edge-triggered epoll never
+/// re-fires (kernel TCP buffer barely touched) and no new peer frame is
+/// coming (Chrome's 6 MiB per-stream window is not yet exhausted), so the
+/// stream parks silently. `front_timeout` (60 s default per
+/// `command/src/config.rs:118 DEFAULT_FRONT_TIMEOUT`) eventually tears the
+/// TCP connection down and Chrome reports `ERR_CONNECTION_CLOSED`.
+///
+/// Test shape:
+/// - One backend serving an 80 KB body (= 5 full 16 384-byte DATA frames).
+/// - Single client, single stream id=1 with `priority: u=0, i`.
+/// - Generous initial per-stream + connection windows so flow control is
+///   never the stall reason.
+/// - Assert: full 80 KB body received within 2 s, END_STREAM flag on the
+///   last DATA frame.
+///
+/// MUST FAIL on `feat/h2-mux` HEAD (commit `fe528e75` landed the RFC 9218
+/// scheduling that introduced the strand); MUST PASS after Fix A (skip
+/// incremental yield when `incremental_peer_count <= 1`).
+fn try_h2_solo_incremental_drains_fully() -> State {
+    const BODY_SIZE: usize = 80 * 1024;
+
+    let (worker, backends, front_port) =
+        setup_h2_test_with_large_bodies("H2-COR-SOLO-INCREMENTAL", 1, BODY_SIZE);
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    // Generous initial per-stream window. Chrome advertises 6 MiB; we use
+    // 1 MiB for the test so flow control is demonstrably not the stall.
+    h2_handshake_with_initial_window(&mut tls, 1_000_000);
+
+    let sid: u32 = 1;
+    // Chrome's navigation priority: u=0 highest urgency, i (incremental).
+    let block = build_get_headers_with_priority(0, "i");
+    let headers = H2Frame::headers(sid, block, true, true);
+    tls.write_all(&headers.encode()).unwrap();
+    tls.flush().unwrap();
+
+    // Lift the connection-level window so the 80 KB body isn't capped by
+    // the default 65535 conn window — per-stream flow control alone is not
+    // enough when the connection pool needs bandwidth.
+    tls.write_all(&H2Frame::window_update(0, 1_000_000).encode())
+        .unwrap();
+    tls.flush().unwrap();
+
+    // Deadline: 2 seconds. A healthy scheduler delivers 80 KB in a few
+    // milliseconds; the bugged scheduler stalls after the first pass and
+    // never emits the final DATA + END_STREAM on this stream.
+    //
+    // We set a 250 ms socket read timeout and stop reading as soon as
+    // END_STREAM is seen on our stream id (or we time out on the 3 s wall
+    // clock). Using a pure `collect_response_frames` call would conflate
+    // "body delivered" with "connection still open and idle" — H2 keeps
+    // the TCP connection around after END_STREAM so the collect loop
+    // would spin on empty reads until its own budget expires, making the
+    // measurement useless for a body-delivery deadline.
+    tls.sock
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .ok();
+    let start = Instant::now();
+    let mut raw = Vec::new();
+    let mut rbuf = vec![0u8; 65536];
+    let mut done = false;
+    while !done && start.elapsed() < Duration::from_secs(3) {
+        match tls.read(&mut rbuf) {
+            Ok(0) => break,
+            Ok(n) => {
+                raw.extend_from_slice(&rbuf[..n]);
+                let frames = parse_h2_frames(&raw);
+                for (ft, fl, s, _) in &frames {
+                    if *ft == H2_FRAME_DATA
+                        && *s == sid
+                        && (*fl & H2_FLAG_END_STREAM) != 0
+                    {
+                        done = true;
+                        break;
+                    }
+                }
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(_) => break,
+        }
+    }
+    let elapsed = start.elapsed();
+    let frames = parse_h2_frames(&raw);
+
+    log_frames("solo incremental 80 KB", &frames);
+
+    // Count body bytes on our stream; track END_STREAM on any DATA frame.
+    let mut body_bytes: usize = 0;
+    let mut end_stream_seen = false;
+    for (ft, fl, s, payload) in &frames {
+        if *ft == H2_FRAME_DATA && *s == sid {
+            body_bytes += payload.len();
+            if (*fl & H2_FLAG_END_STREAM) != 0 {
+                end_stream_seen = true;
+            }
+        }
+    }
+
+    println!(
+        "solo-incremental: body_bytes={body_bytes}/{BODY_SIZE} \
+         end_stream={end_stream_seen} elapsed={elapsed:?}"
+    );
+
+    let infra_ok = teardown(tls, front_port, worker, backends);
+
+    let full_body = body_bytes == BODY_SIZE;
+    let in_deadline = elapsed < Duration::from_secs(2);
+
+    if infra_ok && full_body && end_stream_seen && in_deadline {
+        State::Success
+    } else {
+        println!(
+            "FAIL: body_bytes={body_bytes} (want {BODY_SIZE}), \
+             end_stream={end_stream_seen}, elapsed={elapsed:?} (want <2s), \
+             infra_ok={infra_ok}"
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_solo_incremental_drains_fully() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 solo `priority: u=0, i` stream must drain full body within 2 s",
+            try_h2_solo_incremental_drains_fully
         ),
         State::Success
     );
