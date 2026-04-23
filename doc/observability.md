@@ -31,7 +31,7 @@ observability surfaces:
                             │   (RequestRecord)               (ASCII or protobuf)
                             │
                             │   SubscribeEvents bus ───────► control-plane events
-                            │   (EventKind)                    (incl. AUDIT log line)
+                            │   (EventKind)                    (incl. audit log line — MUX-style, at debug level)
                             └──────────────────────────────┘
 ```
 
@@ -211,11 +211,20 @@ surfaces:
    `command/src/command.proto::EventKind`.
 2. An `incr!("config.<verb>")` counter is bumped (e.g.
    `config.cluster_added`).
-3. A structured `[AUDIT]` log line is emitted at `info!`:
+3. A structured audit log line is emitted at `debug!` level in the MUX
+   `Session(...)` layout. Release builds compile the macro in via the
+   `logs-debug` feature (shipped in `sozu`'s default feature set), and the
+   sample configs route it past the runtime filter via the per-module
+   directive `sozu::command::requests=debug`. Rendered form (ANSI colours
+   off, leading `sozu::command::requests\t` is the `module_path!()` prefix
+   that `debug!` prepends):
 
    ```
-   [AUDIT] verb=cluster_added actor_uid=1000 request_id=01HX… target=cluster:my_app result=ok
+   sozu::command::requests	[01HXS4GZ9EYP3F2R7K8M6B4N2C 01HXS4H5K2QR9C7PVWXY8T6ZNA my_app -]	AUDIT	Session(verb=cluster_added, actor_uid=1000, client_id=42, target=cluster:my_app, result=ok)	 >>>
    ```
+
+   Bracket slots follow the `[session_ulid request_ulid cluster_id|- backend_id|-]`
+   convention shared with `MUX` / `MUX-ROUTER` / `RUSTLS` / `PIPE` / `TCP` lines.
 
 The `actor_uid` is captured at unix-socket accept time via `SO_PEERCRED`
 (`bin/src/command/server.rs`, stored on `ClientSession.actor_uid`). Failed
@@ -231,7 +240,10 @@ To add a new audited verb:
    - Push the `Event` to the bus (find an existing `EventKind::CLUSTER_ADDED`
      emit site to copy from).
    - Emit `incr!("config.<verb>")`.
-   - Log `[AUDIT] verb=<verb> actor_uid={} request_id={} target={} result=<ok|err>`.
+   - Emit the audit line via the `audit_log_context!` macro in
+     `bin/src/command/requests.rs` — it renders the verb into the MUX
+     `Session(verb=..., actor_uid=..., client_id=..., target=..., result=...)`
+     block automatically.
 
 ## Extension checklist
 
@@ -251,7 +263,8 @@ Before merging an instrumentation change:
   (new tag), all four emit sites, and `RequestRecord::duplicate()`.
 - [ ] [`configure.md`](configure.md) is updated in the same changeset.
 - [ ] Privileged control-plane verbs land an `EventKind` + `config.<verb>`
-  counter + `[AUDIT]` log line.
+  counter + audit log line (MUX `Session(...)` layout, `debug!` level,
+  routed via the `audit_log_context!` macro).
 
 ## See also
 

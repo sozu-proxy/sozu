@@ -3,6 +3,7 @@ use std::fmt::Debug;
 use libc::pid_t;
 use mio::Token;
 use prost::Message;
+use rusty_ulid::Ulid;
 use sozu_command_lib::{
     channel::Channel,
     proto::command::{
@@ -20,6 +21,10 @@ use crate::command::server::{ClientId, MessageClient, WorkerId};
 pub struct ClientSession {
     pub channel: Channel<Response, Request>,
     pub id: ClientId,
+    /// Per-connection ULID generated at accept time. Unlike `id` (a monotonic
+    /// accept counter), this survives as a grep-correlation key across every
+    /// audit log line a sozuctl invocation produces.
+    pub session_ulid: Ulid,
     pub token: Token,
     /// UID of the peer process on the unix socket, captured via `SO_PEERCRED`
     /// at accept time. `None` if the peer credentials could not be read
@@ -47,6 +52,7 @@ impl ClientSession {
         Self {
             channel,
             id,
+            session_ulid: Ulid::generate(),
             token,
             actor_uid,
         }
