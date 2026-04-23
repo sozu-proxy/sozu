@@ -80,6 +80,12 @@ See milestone [`v1.1.0`](https://github.com/sozu-proxy/sozu/projects/3?card_filt
 
 ### ⛑️ Fixed
 
+- We fixed HTTP/2 frontend stalling after an H1 backend response arrives on slow or per-chunk-flushed streams. The H1 read path was flipping the frontend `Ready::WRITABLE` interest bit at five sites in `lib/src/protocol/mux/h1.rs` without pairing it with `signal_pending_write()`; edge-triggered epoll then never re-fired and the queued body sat in sozu's buffers. Firefox and Chrome both reproduced on large PHP/Apache assets (~300 KiB chunked).
+
+- We fixed the per-stream H2 idle timer firing mid-response on slow outbound deliveries. `stream_last_activity_at` refreshed only on inbound DATA / HEADERS, so a long-running response trickled at low bandwidth without inbound frames could be cancelled by `cancel_timed_out_streams` before completion. Outbound writes now refresh the timer alongside the existing inbound refresh sites in `lib/src/protocol/mux/h2.rs`.
+
+- We fixed chunked-transfer backend EOF being silently reported as a clean `END_STREAM` with a truncated body. `terminate_close_delimited` in `lib/src/protocol/mux/h1.rs` now demotes mid-chunked EOF to `ParsingPhase::Error`, which the H2 converter surfaces as `RST_STREAM(InternalError)` to the client per RFC 9112 §7.1 — replacing silent truncation with a loud stream error.
+
 - We fixed HTTP cleartext frontend socket shutdown using `Shutdown::Both` instead of `Shutdown::Write`. On Linux, `Shutdown::Both` discards unread receive-buffer data and can convert an otherwise clean close into a TCP RST. The HTTPS path already used `Shutdown::Write`.
 
 - We fixed an `http.active_requests` gauge underflow where idle-timeout teardown and malformed-request rejection paths decremented the counter without a prior increment, causing the gauge to wrap to `u64::MAX`, see [`9b6f9987`](https://github.com/sozu-proxy/sozu/commit/9b6f99871f2a74f120cceb13a3c3ffeab5525515).
