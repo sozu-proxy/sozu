@@ -1918,6 +1918,7 @@ dependencies = [
  "num_cpus",
  "paw",
  "prost",
+ "regex",
  "rusty_ulid",
  "serde",
  "serde_json",

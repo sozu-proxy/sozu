@@ -47,6 +47,43 @@ macro_rules! audit_verb {
     };
 }
 
+/// Render the structured audit log line in the MUX `Session(...)` layout.
+///
+/// Expands to a `format!` producing
+/// `[session_ulid request_ulid cluster_id|- backend_id|-]\tAUDIT\tSession(verb=..., actor_uid=..., client_id=..., target=..., result=...)\t >>>`
+/// with ANSI colours when the logger is colour-enabled (empty strings
+/// otherwise — see [`sozu_command_lib::logging::ansi_palette`]).
+///
+/// Mirrors the `log_context!` macro in `lib/src/protocol/mux/mod.rs:50` and
+/// the two-arm `log_module_context!` in `lib/src/protocol/mux/router.rs:43`,
+/// so operators can grep `AUDIT` alongside `MUX` / `MUX-ROUTER` / `RUSTLS` /
+/// `PIPE` / `TCP` lines with a consistent tab layout.
+macro_rules! audit_log_context {
+    ($client:expr, $request_id:expr, $entry:expr, $result:expr) => {{
+        let (open, reset, grey, gray, white) = ::sozu_command_lib::logging::ansi_palette();
+        let log_ctx = ::sozu_command_lib::logging::LogContext {
+            session_id: $client.session_ulid,
+            request_id: Some(*$request_id),
+            cluster_id: $entry.cluster_id.as_deref(),
+            backend_id: $entry.backend_id.as_deref(),
+        };
+        format!(
+            "{gray}{ctx}{reset}\t{open}AUDIT{reset}\t{grey}Session{reset}({gray}verb{reset}={white}{verb}{reset}, {gray}actor_uid{reset}={white}{actor_uid}{reset}, {gray}client_id{reset}={white}{client_id}{reset}, {gray}target{reset}={white}{target}{reset}, {gray}result{reset}={white}{result}{reset})\t >>>",
+            open = open,
+            reset = reset,
+            grey = grey,
+            gray = gray,
+            white = white,
+            ctx = log_ctx,
+            verb = $entry.verb,
+            actor_uid = $client.actor_uid_display(),
+            client_id = $client.id,
+            target = $entry.target,
+            result = $result,
+        )
+    }};
+}
+
 impl Server {
     pub fn handle_client_request(&mut self, client: &mut ClientSession, request: Request) {
         let request_type = match request.request_type {
@@ -518,7 +555,7 @@ impl GatheringTask for LoadStaticConfigTask {
 // Audit trail (control-plane mutations)
 
 /// Outcome of a control-plane mutation, formatted into the structured
-/// `[AUDIT]` log line.
+/// audit log line (MUX-style `Session(...)` layout).
 #[derive(Clone, Copy)]
 enum AuditResult {
     Ok,
@@ -534,13 +571,19 @@ impl AuditResult {
     }
 }
 
+impl std::fmt::Display for AuditResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// A control-plane mutation, broken down into the pieces the audit trail
 /// needs (event kind, verb name for the log, the matching counter key, and
 /// the optional target identifiers populated on the emitted [Event]).
 struct AuditEntry {
     kind: EventKind,
-    /// Stable verb tag rendered into the `[AUDIT]` log line. Always a static
-    /// string.
+    /// Stable verb tag rendered inside the audit `Session(verb=...)` block.
+    /// Always a static string.
     verb: &'static str,
     /// Pre-built `config.<verb>` counter key. Stored as a `&'static str` so
     /// `count!` can route it through statsd without a verb→key dispatch
@@ -775,8 +818,11 @@ fn audit_entry_for(request: &RequestType) -> Option<AuditEntry> {
 }
 
 /// Bump the per-verb counter, queue the [Event] for fan-out to subscribed
-/// clients, and write the structured `[AUDIT]` log line. Used by every
-/// control-plane mutation handler.
+/// clients, and write the structured audit log line at `debug!` level
+/// (visible in release builds via the `logs-debug` default feature; the
+/// sample configs route `sozu::command::requests=debug` through the runtime
+/// log filter so the line reaches stdout without an operator override).
+/// Used by every control-plane mutation handler.
 fn audit_emit(server: &mut Server, client: &ClientSession, entry: AuditEntry, result: AuditResult) {
     let request_id = Ulid::generate();
     // `entry.counter` is the pre-built `config.<verb>` static-str key
@@ -785,14 +831,9 @@ fn audit_emit(server: &mut Server, client: &ClientSession, entry: AuditEntry, re
     // verb→key dispatch table.
     count!(entry.counter, 1);
 
-    info!(
-        "[AUDIT] verb={} actor_uid={} request_id={} client_id={} target={} result={}",
-        entry.verb,
-        client.actor_uid_display(),
-        request_id,
-        client.id,
-        entry.target,
-        result.as_str(),
+    debug!(
+        "{}",
+        audit_log_context!(client, &request_id, &entry, result)
     );
 
     // Subscribers only see the proto Event; the verb / actor / request_id are
@@ -1322,7 +1363,7 @@ impl GatheringTask for StopTask {
 }
 
 // =========================================================
-// Patch diff formatters — for the [AUDIT] target field.
+// Patch diff formatters — for the audit `target=` field.
 // Walk each Option field of the patch and join the non-None ones into a
 // compact key=value string so the audit log shows exactly what changed.
 
@@ -1480,5 +1521,96 @@ fn format_patch_diff_tcp(p: &UpdateTcpListenerConfig) -> String {
         "(no-op)".to_owned()
     } else {
         parts.join(" ")
+    }
+}
+
+#[cfg(test)]
+mod audit_format_tests {
+    //! Drift-guard for the audit log line. Rejects any accidental change to
+    //! the MUX `Session(...)` layout that would break downstream grep-based
+    //! consumers (SIEM pipelines, operator shell recipes).
+    //!
+    //! The default thread-local logger reports `is_logger_colored() == false`
+    //! (see `command/src/logging/logs.rs:30`), so `ansi_palette()` returns
+    //! empty strings and the rendered line is ANSI-free — stable to match
+    //! with a plain regex.
+    use super::{AuditEntry, AuditResult};
+    use regex::Regex;
+    use rusty_ulid::Ulid;
+    use sozu_command_lib::proto::command::EventKind;
+
+    /// Minimal stand-in exposing only the `ClientSession` fields and method
+    /// that `audit_log_context!` reads. Avoids constructing the full
+    /// `Channel<Response, Request>` that `ClientSession::new` requires.
+    struct TestClient {
+        session_ulid: Ulid,
+        id: u32,
+        actor_uid: Option<u32>,
+    }
+
+    impl TestClient {
+        fn actor_uid_display(&self) -> String {
+            match self.actor_uid {
+                Some(uid) => uid.to_string(),
+                None => String::from("unknown"),
+            }
+        }
+    }
+
+    fn sample_entry(cluster_id: Option<&str>) -> AuditEntry {
+        AuditEntry {
+            kind: EventKind::ClusterAdded,
+            verb: "cluster_added",
+            counter: "config.cluster_added",
+            cluster_id: cluster_id.map(str::to_owned),
+            backend_id: None,
+            address: None,
+            target: "cluster:my_app".to_owned(),
+        }
+    }
+
+    fn pattern() -> Regex {
+        // Anchored: covers the 4-slot bracket, the `AUDIT\tSession(...)\t >>>`
+        // tail, and the field order. Crockford base32 ULIDs are 26 chars over
+        // [0-9A-Z]; missing bracket slots render as a dash.
+        Regex::new(concat!(
+            r"^\[[0-9A-Z]{26} [0-9A-Z]{26} (?:[A-Za-z0-9_:.-]+|-) (?:[A-Za-z0-9_:.-]+|-)\]",
+            r"\tAUDIT\tSession\(",
+            r"verb=[a-z_]+, actor_uid=(?:\d+|unknown), client_id=\d+, target=[^,]+, result=(?:ok|err)",
+            r"\)\t >>>$",
+        ))
+        .expect("audit-format regex must compile")
+    }
+
+    #[test]
+    fn layout_with_cluster_id_matches() {
+        let client = TestClient {
+            session_ulid: Ulid::generate(),
+            id: 42,
+            actor_uid: Some(1000),
+        };
+        let request_id = Ulid::generate();
+        let entry = sample_entry(Some("my_app"));
+        let rendered = audit_log_context!(client, &request_id, &entry, AuditResult::Ok);
+        assert!(
+            pattern().is_match(&rendered),
+            "rendered line did not match audit-log pattern.\nrendered: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn layout_with_dashed_cluster_and_backend_matches() {
+        let client = TestClient {
+            session_ulid: Ulid::generate(),
+            id: 1,
+            actor_uid: None,
+        };
+        let request_id = Ulid::generate();
+        let entry = sample_entry(None);
+        let rendered = audit_log_context!(client, &request_id, &entry, AuditResult::Err);
+        assert!(
+            pattern().is_match(&rendered),
+            "rendered line did not match audit-log pattern.\nrendered: {rendered:?}"
+        );
     }
 }
