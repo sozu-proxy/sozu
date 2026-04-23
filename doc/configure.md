@@ -426,7 +426,7 @@ per-listener with safe compile-time defaults:
 | `h2_max_concurrent_streams` | 100 | Maximum concurrent H2 streams the proxy accepts (`SETTINGS_MAX_CONCURRENT_STREAMS`). Minimum: 1. |
 | `h2_stream_shrink_ratio` | 2 | Shrink threshold ratio for recycled stream slots. The internal stream Vec is shrunk when `total_slots > active_streams * ratio`. Minimum: 2. |
 | `h2_max_header_list_size` | 65536 | Maximum accumulated HPACK-decoded header list size per request (`SETTINGS_MAX_HEADER_LIST_SIZE`, RFC 9113 §6.5.2). |
-| `h2_stream_idle_timeout_seconds` | 30 | Per-stream idle timeout in seconds. An open H2 stream that receives no meaningful application data (non-empty DATA or HEADERS) for this duration is cancelled (`RST_STREAM` / `CANCEL`) to defend against slow-multiplex Slowloris. Active uploads that trickle DATA frames reset the timer on each frame. |
+| `h2_stream_idle_timeout_seconds` | `max(30, back_timeout)` | Per-stream idle timeout in seconds. An open H2 stream that receives no meaningful application data (non-empty DATA or HEADERS) for this duration is cancelled (`RST_STREAM` / `CANCEL`) to defend against slow-multiplex Slowloris. When unset the listener inherits `back_timeout` (floored at 30 s) so streams are not cancelled before the backend socket budget elapses; set explicitly to cap the per-stream deadline below `back_timeout` when under a slow-multiplex attack. Active uploads that trickle DATA frames reset the timer on each frame. |
 | `h2_max_header_table_size` | 65536 | Maximum HPACK dynamic table size (`SETTINGS_HEADER_TABLE_SIZE`) accepted from the peer. Caps the peer-advertised value to prevent unbounded HPACK encoder memory growth. |
 | `h2_graceful_shutdown_deadline_seconds` | 5 | Maximum wall-clock seconds to wait for in-flight H2 streams after `GOAWAY(NO_ERROR)` has been sent during soft-stop. Once the deadline elapses the connection is forcibly closed. Set to `0` to disable the forced close entirely — shutdown then waits for every stream to drain naturally (use with caution: a long-running request can delay the whole soft-stop indefinitely). |
 
@@ -442,7 +442,7 @@ h2_initial_connection_window = 1048576            # 1MB, min 65535, max 21474836
 h2_max_concurrent_streams = 100                   # min 1
 h2_stream_shrink_ratio = 2                        # min 2
 h2_max_header_list_size = 65536                   # HPACK decoded header budget
-h2_stream_idle_timeout_seconds = 30               # per-stream idle timeout
+h2_stream_idle_timeout_seconds = 30               # per-stream idle timeout (default: max(30, back_timeout))
 h2_max_header_table_size = 65536                  # HPACK dynamic table size cap
 h2_graceful_shutdown_deadline_seconds = 5         # soft-stop forced-close deadline (0 = wait forever)
 ```
@@ -555,7 +555,7 @@ Fields are grouped by the earliest point at which a patched value takes effect f
 | `h2_stream_shrink_ratio` | `u32` (≥ 2) | per-connection setup | `2` | Stream-slot Vec shrink threshold |
 | `h2_max_header_list_size` | `u32` | per-connection setup | `65536` | HPACK decoded header budget (`SETTINGS_MAX_HEADER_LIST_SIZE`) |
 | `h2_max_header_table_size` | `u32` | per-connection setup | `65536` | HPACK dynamic table size cap (`SETTINGS_HEADER_TABLE_SIZE`) |
-| `h2_stream_idle_timeout_seconds` | `u32` | per-connection setup | `30` | Per-stream idle timeout (slow-multiplex Slowloris defence) |
+| `h2_stream_idle_timeout_seconds` | `u32` | per-connection setup | `max(30, back_timeout)` | Per-stream idle timeout (slow-multiplex Slowloris defence). When unset, inherits `back_timeout` floored at 30 s; set explicitly to cap below `back_timeout`. |
 | `h2_graceful_shutdown_deadline_seconds` | `u32` | per-connection setup | `5` | Forced-close deadline after `GOAWAY(NO_ERROR)` on soft-stop. `0` = wait forever. |
 
 #### HTTPS-only fields
