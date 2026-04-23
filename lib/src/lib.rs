@@ -597,8 +597,12 @@ pub trait L7ListenerHandler {
     /// activity high (resetting the connection idle timer on every frame) while
     /// pinning streams for the full nominal connection timeout.
     ///
-    /// Defaults to 30 seconds. Listeners return their configured value when
-    /// `h2_stream_idle_timeout_seconds` is present.
+    /// Listeners inherit `max(30s, back_timeout)` when `h2_stream_idle_timeout_seconds`
+    /// is absent so operators who raised the socket-level backend budget do not
+    /// have to duplicate the value here; the 30 s floor preserves the baseline
+    /// slow-multiplex mitigation when `back_timeout` is shorter. Set the knob
+    /// explicitly to cap the per-stream deadline below `back_timeout` (useful
+    /// when under a slow-multiplex attack).
     fn get_h2_stream_idle_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_secs(30)
     }

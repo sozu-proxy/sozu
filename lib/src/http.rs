@@ -664,10 +664,18 @@ impl L7ListenerHandler for HttpListener {
     }
 
     fn get_h2_stream_idle_timeout(&self) -> std::time::Duration {
-        self.config
+        // Inherit `back_timeout` when the knob is unset so listeners tuned for
+        // long-running backends do not cancel streams at the 30 s security
+        // floor. The `max(30, …)` keeps the baseline slow-multiplex mitigation
+        // when `back_timeout` is shorter than 30 s. Explicit values (including
+        // ones below 30 s) win — operators under a slow-multiplex attack can
+        // lower the per-stream deadline to cap buffer pinning.
+        let seconds = self
+            .config
             .h2_stream_idle_timeout_seconds
-            .map(|s| std::time::Duration::from_secs(u64::from(s.max(1))))
-            .unwrap_or_else(|| std::time::Duration::from_secs(30))
+            .map(|s| u64::from(s.max(1)))
+            .unwrap_or_else(|| u64::from(self.config.back_timeout).max(30));
+        std::time::Duration::from_secs(seconds)
     }
 
     fn get_h2_graceful_shutdown_deadline(&self) -> Option<std::time::Duration> {
@@ -1809,5 +1817,48 @@ mod tests {
             Route::ClusterId("cluster_3".to_string())
         );
         assert!(frontend5.is_err());
+    }
+
+    #[test]
+    fn h2_stream_idle_timeout_inherits_back_timeout() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 1040);
+        let build = |back_timeout: u32, explicit: Option<u32>| -> HttpListener {
+            let mut cfg = ListenerBuilder::new_http(address)
+                .to_http(None)
+                .expect("default HTTP listener config");
+            cfg.back_timeout = back_timeout;
+            cfg.h2_stream_idle_timeout_seconds = explicit;
+            HttpListener::new(cfg, Token(0)).expect("build listener")
+        };
+
+        // Knob unset: inherit back_timeout when it exceeds the 30s floor.
+        assert_eq!(
+            build(180, None).get_h2_stream_idle_timeout(),
+            Duration::from_secs(180)
+        );
+
+        // Knob unset, back_timeout below floor: stay at 30s to preserve the
+        // slow-multiplex Slowloris mitigation.
+        assert_eq!(
+            build(5, None).get_h2_stream_idle_timeout(),
+            Duration::from_secs(30)
+        );
+
+        // Explicit values win in both directions — including below the floor,
+        // so operators under attack can tighten the deadline.
+        assert_eq!(
+            build(180, Some(10)).get_h2_stream_idle_timeout(),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            build(5, Some(600)).get_h2_stream_idle_timeout(),
+            Duration::from_secs(600)
+        );
+
+        // `Some(0)` is clamped to 1s to keep the deadline non-degenerate.
+        assert_eq!(
+            build(180, Some(0)).get_h2_stream_idle_timeout(),
+            Duration::from_secs(1)
+        );
     }
 }
