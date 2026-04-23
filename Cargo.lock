@@ -1922,6 +1922,7 @@ dependencies = [
  "rusty_ulid",
  "serde",
  "serde_json",
+ "sha2",
  "sozu-command-lib",
  "sozu-lib",
  "tempfile",

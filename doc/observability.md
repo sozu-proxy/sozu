@@ -214,13 +214,13 @@ surfaces:
 3. A structured audit log line is emitted at `info!` level in the MUX-family
    layout (keyword `Command(...)` rather than `Session(...)`, which names a
    data-plane session). Every free-form field (`target`, `actor_comm`,
-   `reason`) is sanitized at render time — control chars (`\x00..=\x1f`,
-   `\x7f`) are replaced with `?` so attacker-influenced input cannot forge
-   additional audit lines via embedded `\t` / `\n` / ANSI escapes. Rendered
-   form (ANSI colours off):
+   `actor_user`, `socket`, `reason`) is sanitized at render time — control
+   chars (`\x00..=\x1f`, `\x7f`) are replaced with `?` so attacker-influenced
+   input cannot forge additional audit lines via embedded `\t` / `\n` /
+   ANSI escapes. Rendered form (ANSI colours off):
 
    ```
-   [01HXS4GZ9EYP3F2R7K8M6B4N2C 01HXS4H5K2QR9C7PVWXY8T6ZNA my_app -]	AUDIT	Command(verb=cluster_added, actor_uid=1000, actor_gid=1000, actor_pid=12345, actor_comm=sozuctl, client_id=42, target=cluster:my_app, result=ok, sozu_version=1.1.1)
+   [01HXS4GZ9EYP3F2R7K8M6B4N2C 01HXS4H5K2QR9C7PVWXY8T6ZNA my_app -]	AUDIT	Command(verb=cluster_added, actor_uid=1000, actor_gid=1000, actor_pid=12345, actor_user=florentin, actor_comm=sozuctl, client_id=42, socket=/run/sozu/sozu.sock, target=cluster:my_app, result=ok, sozu_version=1.1.1)
    ```
 
    ### Field reference
@@ -233,14 +233,22 @@ surfaces:
    - `actor_uid` / `actor_gid` / `actor_pid` — peer credentials from
      `SO_PEERCRED` on the unix command socket. `unknown` on read failure
      / non-Linux builds.
+   - `actor_user` — resolved POSIX account name (`getpwuid_r(uid)` at
+     accept time). `unknown` when NSS has no match for the UID.
    - `actor_comm` — `/proc/<pid>/comm` at accept time (up to 15 chars), lets
      SOC distinguish `sozuctl` from ad-hoc shells that share a UID.
    - `client_id` — per-accept monotonic counter. Distinct from the
      `session_ulid` bracket slot, which survives as a grep-correlation key
      across every verb a single sozuctl invocation emits.
+   - `socket` — path of the command socket the client connected through.
+     Lets multi-instance sozu deployments that share a SIEM sink pick
+     which instance emitted each line.
    - `target` — free-form verb-specific descriptor (e.g.
      `cluster:my-cluster`, `file:/var/lib/sozu/state.bin`, `stop:hard`,
-     `listener:http:127.0.0.1:8080`). Sanitized.
+     `listener:http:127.0.0.1:8080`). For `UpdateHttp/Https/TcpListener`,
+     each patched field is rendered as `field=old→new`. For
+     `ReplaceCertificate`, both old and new cert fingerprints are included
+     (`certificate:<addr>:old=<fp>:new=<fp>`). Sanitized.
    - `result` — `ok` or `err`.
    - `sozu_version` — `CARGO_PKG_VERSION` at build time. Forensic pin for
      mixed-fleet audit streams.
@@ -259,6 +267,22 @@ surfaces:
      workers.
    - `workers` — `<ok>/<err>/<expected>` per-worker counts. Pairs with
      `fanout`.
+   - `request_sha256` — truncated (64-bit, 16 hex chars) SHA-256 of the
+     proto `Request` wire-encoding. Set for verbs that flow through
+     `worker_request`. Useful for dedupe / replay detection.
+
+   ### Dedicated sink: `audit_logs_target`
+
+   Operators can route audit lines to a dedicated file (distinct from
+   `log_target`) via the `audit_logs_target` config option. Set to a plain
+   filesystem path (e.g. `/var/log/sozu/audit.log`) to have every audit line
+   also appended there. The file opens `O_APPEND | O_CREAT` with mode
+   `0o640` (owner read+write, group read), so granting an `audit` group
+   tail-only access is one filesystem ACL away. ANSI escape sequences are
+   stripped before writing to the dedicated sink so the file stays
+   SIEM-parseable even when `log_colored = true`. Write failures log a
+   warning but never block the mutation. `None` (default) keeps audit
+   lines routed only through `log_target`.
 
    ### Two lines per worker-fanning verb
 

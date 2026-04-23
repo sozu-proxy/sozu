@@ -1120,6 +1120,12 @@ message ServerConfig {
     optional ServerMetricsConfig metrics = 15;
     required ProtobufAccessLogFormat access_log_format = 16;
     required bool log_colored = 17;
+    // Dedicated file path for the control-plane audit trail. When set on the
+    // main process, every audit line is also appended to this file opened
+    // `O_APPEND | O_CREAT` with mode `0o640`. Workers currently ignore this
+    // field (audit only lives on the main), but the field is propagated on
+    // the proto wire so a future worker-side audit path can pick it up.
+    optional string audit_logs_target = 18;
 }
 
 enum ProtobufAccessLogFormat {
