@@ -2169,6 +2169,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 Some((read_stream, amount)) if write_stream == read_stream => Some(amount),
                 _ => None,
             };
+            let mut resume_bytes: usize = 0;
             let outcome = Self::flush_stream_out(
                 &mut self.socket,
                 kawa,
@@ -2181,7 +2182,16 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 None,
                 cross_read_amount,
                 &mut io_slices,
+                Some(&mut resume_bytes),
             );
+            // Refresh the per-stream idle timer when outbound bytes move: a
+            // large response delivered at low bandwidth is "active", not idle,
+            // even when the peer sends no inbound frames.
+            if resume_bytes > 0 {
+                if let Some(t) = self.stream_last_activity_at.get_mut(&stream_id) {
+                    *t = Instant::now();
+                }
+            }
             if outcome == FlushOutcome::Stalled {
                 return MuxResult::Continue;
             }
@@ -2343,6 +2353,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 kawa.blocks.len(),
                 kawa.out.len(),
             ));
+            let mut stream_bytes: usize = 0;
             let outcome = Self::flush_stream_out(
                 &mut self.socket,
                 kawa,
@@ -2355,7 +2366,18 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 Some(&mut socket_write),
                 None,
                 &mut io_slices,
+                Some(&mut stream_bytes),
             );
+            // Refresh the per-stream idle timer on outbound bytes. Without
+            // this, a long-running response trickled at low bandwidth would
+            // be killed by `cancel_timed_out_streams` mid-delivery — the
+            // inbound-only refresh at h2.rs:3887-3895 / 4026-4031 never
+            // fires while the peer is idle.
+            if stream_bytes > 0 {
+                if let Some(t) = self.stream_last_activity_at.get_mut(&stream_id) {
+                    *t = Instant::now();
+                }
+            }
             if outcome == FlushOutcome::Stalled {
                 self.expect_write = Some(H2StreamId::Other {
                     id: stream_id,
@@ -2449,6 +2471,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         mut wrote: Option<&mut bool>,
         cross_read_amount: Option<usize>,
         io_slices: &mut Vec<IoSlice<'static>>,
+        mut bytes_written: Option<&mut usize>,
     ) -> FlushOutcome {
         while !kawa.out.is_empty() {
             if let Some(flag) = wrote.as_deref_mut() {
@@ -2483,6 +2506,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             kawa.consume(size);
             position.count_bytes_out_counter(size);
             position.count_bytes_out(metrics, size);
+            if let Some(counter) = bytes_written.as_deref_mut() {
+                *counter = counter.saturating_add(size);
+            }
             if let Some(amount) = cross_read_amount {
                 // Resume path: same stream is parked waiting for buffer space.
                 // Re-enable READABLE once the write freed enough room.
