@@ -1832,8 +1832,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // RFC 9113 §6.5: check if peer has timed out on SETTINGS ACK
         if let Some(sent_at) = self.settings_sent_at {
             if sent_at.elapsed() >= SETTINGS_ACK_TIMEOUT {
-                error!(
-                    "{} SETTINGS ACK timeout: peer did not acknowledge within {:?}",
+                warn!(
+                    "{} SETTINGS ACK timeout: no SETTINGS ACK observed within {:?}",
                     log_context!(self),
                     SETTINGS_ACK_TIMEOUT
                 );
@@ -2659,8 +2659,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // RFC 9113 §6.5: check if peer has timed out on SETTINGS ACK
         if let Some(sent_at) = self.settings_sent_at {
             if sent_at.elapsed() >= SETTINGS_ACK_TIMEOUT {
-                error!(
-                    "{} SETTINGS ACK timeout: peer did not acknowledge within {:?}",
+                warn!(
+                    "{} SETTINGS ACK timeout: no SETTINGS ACK observed within {:?}",
                     log_context!(self),
                     SETTINGS_ACK_TIMEOUT
                 );
@@ -3439,6 +3439,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         self.state = H2State::Error;
         self.drain.draining = true;
         self.expect_read = None;
+        // Disarm the SETTINGS ACK timer: once we've committed to GOAWAY, the
+        // timeout check at `readable()` / `flush_pending_control_frames()` must
+        // not re-fire. Without this, `signal_pending_write()` below re-enters
+        // `writable()` → `flush_pending_control_frames()` on the next tick,
+        // the elapsed check is still true, and we emit another
+        // `warn!` + `goaway()` pair, each bumping `h2.goaway.sent.*`.
+        self.settings_sent_at = None;
         let kawa = &mut self.zero;
         kawa.storage.clear();
         // Severity tiering: only `InternalError` implies a sozu-side bug when
