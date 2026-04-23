@@ -1248,7 +1248,12 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
     /// Check the number of connection attempts against authorized connection retries
     fn check_circuit_breaker(&mut self) -> Result<(), BackendConnectionError> {
         if self.connection_attempts >= CONN_RETRIES {
-            error!(
+            incr!(
+                "backend.connect.retries_exhausted",
+                self.context.cluster_id.as_deref(),
+                self.context.backend_id.as_deref()
+            );
+            warn!(
                 "{} Max connection attempt reached ({})",
                 log_context!(self),
                 self.connection_attempts,
@@ -1750,7 +1755,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         {
             if self.backend_readiness.event.is_hup() && !self.test_backend_socket() {
                 //retry connecting the backend
-                error!(
+                warn!(
                     "{} Error connecting to backend, trying again, attempt {}",
                     log_context!(self),
                     self.connection_attempts
@@ -1768,11 +1773,20 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 let connection_result =
                     self.connect_to_backend(session.clone(), proxy.clone(), metrics);
                 if let Err(err) = &connection_result {
-                    error!(
-                        "{} Error connecting to backend: {}",
-                        log_context!(self),
-                        err
-                    );
+                    match err {
+                        // Already logged at warn! + metered at check_circuit_breaker;
+                        // avoid double-emission.
+                        BackendConnectionError::MaxConnectionRetries(_) => trace!(
+                            "{} Error connecting to backend: {}",
+                            log_context!(self),
+                            err
+                        ),
+                        _ => warn!(
+                            "{} Error connecting to backend: {}",
+                            log_context!(self),
+                            err
+                        ),
+                    }
                 }
 
                 if let Some(session_result) = handle_connection_result(connection_result) {
@@ -1831,11 +1845,20 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                         let connection_result =
                             self.connect_to_backend(session.clone(), proxy.clone(), metrics);
                         if let Err(err) = &connection_result {
-                            error!(
-                                "{} Error connecting to backend: {}",
-                                log_context!(self),
-                                err
-                            );
+                            match err {
+                                // Already logged at warn! + metered at check_circuit_breaker;
+                                // avoid double-emission.
+                                BackendConnectionError::MaxConnectionRetries(_) => trace!(
+                                    "{} Error connecting to backend: {}",
+                                    log_context!(self),
+                                    err
+                                ),
+                                _ => warn!(
+                                    "{} Error connecting to backend: {}",
+                                    log_context!(self),
+                                    err
+                                ),
+                            }
                         }
 
                         if let Some(session_result) = handle_connection_result(connection_result) {

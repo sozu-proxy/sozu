@@ -638,11 +638,20 @@ impl TcpSession {
                 self.close_backend();
                 let connection_result = self.connect_to_backend(session.clone());
                 if let Err(err) = &connection_result {
-                    error!(
-                        "{} Error connecting to backend: {}",
-                        log_context!(self),
-                        err
-                    );
+                    match err {
+                        // Already logged at warn! + metered at the retry-budget
+                        // gate in connect_to_backend; avoid double-emission.
+                        BackendConnectionError::MaxConnectionRetries(_) => trace!(
+                            "{} Error connecting to backend: {}",
+                            log_context!(self),
+                            err
+                        ),
+                        _ => warn!(
+                            "{} Error connecting to backend: {}",
+                            log_context!(self),
+                            err
+                        ),
+                    }
                 }
 
                 if let Some(state_result) = handle_connection_result(connection_result) {
@@ -655,11 +664,18 @@ impl TcpSession {
         } else if back_connected == BackendConnectionStatus::NotConnected {
             let connection_result = self.connect_to_backend(session.clone());
             if let Err(err) = &connection_result {
-                error!(
-                    "{} Error connecting to backend: {}",
-                    log_context!(self),
-                    err
-                );
+                match err {
+                    BackendConnectionError::MaxConnectionRetries(_) => trace!(
+                        "{} Error connecting to backend: {}",
+                        log_context!(self),
+                        err
+                    ),
+                    _ => warn!(
+                        "{} Error connecting to backend: {}",
+                        log_context!(self),
+                        err
+                    ),
+                }
             }
 
             if let Some(state_result) = handle_connection_result(connection_result) {
@@ -864,7 +880,12 @@ impl TcpSession {
         self.cluster_id = Some(cluster_id.clone());
 
         if self.connection_attempt >= CONN_RETRIES {
-            error!(
+            incr!(
+                "backend.connect.retries_exhausted",
+                self.cluster_id.as_deref(),
+                self.metrics.backend_id.as_deref()
+            );
+            warn!(
                 "{} Max connection attempt reached ({})",
                 log_context!(self),
                 self.connection_attempt

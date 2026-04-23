@@ -66,6 +66,8 @@ See milestone [`v1.1.0`](https://github.com/sozu-proxy/sozu/projects/3?card_filt
 
 ### ✍️ Changed
 
+- **Backend retry-budget exhaustion no longer emits `ERROR`**: TCP / HTTP/1 / HTTP/2 paths all demote the per-session retry-budget exhaustion (`CONN_RETRIES = 3` consecutive backend-connect failures) from `error!` to `warn!`, aligning the three protocols with the branch severity taxonomy (peer-driven transport conditions stay below `ERROR`). A new `backend.connect.retries_exhausted{cluster_id, backend_id}` counter is emitted at all three gates — operators alerting on this class should rate the counter instead of grepping logs. The TCP caller-echo line (`Error connecting to backend: …`) is deduplicated to `trace!` when caused by `MaxConnectionRetries` (already logged + metered at the gate). Retry budget, session-close, and 503-answer behaviour are unchanged.
+
 - **`HttpAnswers::replace_defaults` preserves runtime cluster overrides on listener update**: When `sozu listener update` patches the listener-default HTTP answer bodies, per-cluster `answer_503` templates that were registered at runtime (via `sozu cluster add`) are no longer silently discarded. The new `replace_defaults` method rewrites only the listener-default template strings in place, leaving the `cluster_custom_answers` map untouched.
 
 - **Slab capacity multiplier doubled to 4× per connection**: The internal slab allocator now reserves 4× the per-connection slot count (previously 2×) to accommodate the higher stream concurrency introduced by HTTP/2 multiplexing.

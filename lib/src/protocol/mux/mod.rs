@@ -92,12 +92,40 @@ macro_rules! log_context_lite {
     }};
 }
 
-/// Module-level prefix for logs emitted from free functions where no [`Mux`]
-/// is in scope. Honours the colored flag.
+/// Module-level prefix for logs emitted from free functions or routing
+/// blocks where no [`Mux`] is in scope. Honours the colored flag.
+///
+/// Two arms:
+/// * `log_module_context!()` — zero-arg, legacy `MUX\t >>>` output. Kept
+///   for sites without an `HttpContext` in scope (e.g. the generic
+///   `trace!` that fires before the variant-specific match).
+/// * `log_module_context!($http_context)` — rich form. `$http_context`
+///   must be `&HttpContext`. Produces the same
+///   `[session req cluster backend]` bracket as RUSTLS/PIPE/TCP followed
+///   by a `Session(...)` block, so MUX lines emitted from variant match
+///   arms stay filterable by session ULID or request ULID. Mirrors
+///   `router.rs:log_module_context!($http_context)` (see there).
 macro_rules! log_module_context {
     () => {{
         let (open, reset, _, _, _) = ansi_palette();
         format!("{open}MUX{reset}\t >>>", open = open, reset = reset)
+    }};
+    ($http_context:expr) => {{
+        let (open, reset, grey, gray, white) = ansi_palette();
+        let http_ctx: &HttpContext = &$http_context;
+        let ctx = http_ctx.log_context();
+        format!(
+            "{gray}{ctx}{reset}\t{open}MUX{reset}\t{grey}Session{reset}({gray}frontend{reset}={white}{frontend:?}{reset}, {gray}method{reset}={white}{method:?}{reset}, {gray}authority{reset}={white}{authority:?}{reset})\t >>>",
+            open = open,
+            reset = reset,
+            grey = grey,
+            gray = gray,
+            white = white,
+            ctx = ctx,
+            frontend = http_ctx.session_address,
+            method = http_ctx.method,
+            authority = http_ctx.authority,
+        )
     }};
 }
 
@@ -1080,10 +1108,17 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                         let answers = answers_rc.borrow();
                         use BackendConnectionError as BE;
                         match error {
-                            BE::Backend(BackendError::NoBackendForCluster(_))
-                            | BE::MaxConnectionRetries(_)
+                            BE::MaxConnectionRetries(_)
                             | BE::MaxSessionsMemory
                             | BE::MaxBuffers => {
+                                warn!(
+                                    "{} backend retry budget exhausted: {}",
+                                    log_module_context!(stream.context),
+                                    error
+                                );
+                                set_default_answer(stream, front_readiness, 503, &answers);
+                            }
+                            BE::Backend(BackendError::NoBackendForCluster(_)) => {
                                 set_default_answer(stream, front_readiness, 503, &answers);
                             }
                             BE::RetrieveClusterError(RetrieveClusterError::RetrieveFrontend(_)) => {

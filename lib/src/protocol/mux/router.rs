@@ -108,6 +108,11 @@ impl Router {
             .debug
             .push(DebugEvent::Str(stream.context.get_route()));
         if stream.attempts >= CONN_RETRIES {
+            incr!(
+                "backend.connect.retries_exhausted",
+                stream.context.cluster_id.as_deref(),
+                stream.context.backend_id.as_deref()
+            );
             return Err(BackendConnectionError::MaxConnectionRetries(
                 stream.context.cluster_id.clone(),
             ));

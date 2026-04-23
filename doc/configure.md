@@ -879,6 +879,7 @@ Incremented when Sōzu generates a default error response instead of proxying:
 | `backend.up` | counter | proxy | Backend marked as healthy (after successful connection) |
 | `backend.down` | counter | proxy | Backend marked as unhealthy (retry policy triggered) |
 | `backend.connections.error` | counter | proxy | Backend connection failures |
+| `backend.connect.retries_exhausted` | counter | cluster, backend | Per-session backend-connect retry budget (`CONN_RETRIES = 3`) was exhausted. Emitted once per event at the TCP, HTTP/1, and HTTP/2-mux gates. Alert on this counter's rate instead of grepping `WARN` / `ERROR` logs — the underlying log line is `warn!` since the condition is peer-driven backpressure, not a Sōzu invariant break. |
 
 #### Backend pool
 
