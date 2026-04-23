@@ -1354,10 +1354,7 @@ fn try_h2_solo_incremental_drains_fully() -> State {
                 raw.extend_from_slice(&rbuf[..n]);
                 let frames = parse_h2_frames(&raw);
                 for (ft, fl, s, _) in &frames {
-                    if *ft == H2_FRAME_DATA
-                        && *s == sid
-                        && (*fl & H2_FLAG_END_STREAM) != 0
-                    {
+                    if *ft == H2_FRAME_DATA && *s == sid && (*fl & H2_FLAG_END_STREAM) != 0 {
                         done = true;
                         break;
                     }
@@ -1418,6 +1415,656 @@ fn test_h2_solo_incremental_drains_fully() {
             3,
             "H2 solo `priority: u=0, i` stream must drain full body within 2 s",
             try_h2_solo_incremental_drains_fully
+        ),
+        State::Success
+    );
+}
+
+// ============================================================================
+// H2 large-asset repro suite (Sébastien Brunat 2026-04-23 PHP/Apache report)
+// ============================================================================
+
+/// Firefox-shape header block: same pseudo-headers as
+/// [`build_get_headers_with_priority`] but WITHOUT the `priority` literal.
+/// Firefox does not emit `priority: u=0, i` by default, so any truncation
+/// observable on this shape lives outside the RFC 9218 solo-bucket fix
+/// at `converter.rs:437-450`.
+fn build_get_headers_no_priority() -> Vec<u8> {
+    vec![
+        0x82, // :method GET (indexed)
+        0x84, // :path / (indexed)
+        0x87, // :scheme https (indexed)
+        0x41, 0x09, // :authority, value len 9
+        b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't',
+    ]
+}
+
+/// Drain one stream until END_STREAM on the given `sid` or the `deadline`
+/// expires. Returns `(body_bytes, end_stream_seen, got_rst_stream_on_sid,
+/// elapsed)`.
+///
+/// Uses the END_STREAM-aware early-exit pattern documented in memory
+/// `feedback_collect_response_frames_quiet_time.md`: a `collect_response_frames`
+/// elapsed budget measures quiet time, not body delivery. The caller's
+/// deadline wall-clock is the source of truth.
+fn drain_h2_stream_until_end_stream(
+    tls: &mut rustls::StreamOwned<rustls::ClientConnection, std::net::TcpStream>,
+    sid: u32,
+    deadline: Duration,
+) -> (usize, bool, bool, Duration) {
+    tls.sock
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .ok();
+    let start = Instant::now();
+    let mut raw = Vec::new();
+    let mut rbuf = vec![0u8; 65536];
+    let mut done = false;
+    let mut got_rst = false;
+    while !done && start.elapsed() < deadline {
+        match tls.read(&mut rbuf) {
+            Ok(0) => break,
+            Ok(n) => {
+                raw.extend_from_slice(&rbuf[..n]);
+                let frames = parse_h2_frames(&raw);
+                for (ft, fl, s, _) in &frames {
+                    if *ft == H2_FRAME_DATA && *s == sid && (*fl & H2_FLAG_END_STREAM) != 0 {
+                        done = true;
+                        break;
+                    }
+                    if *ft == H2_FRAME_HEADERS && *s == sid && (*fl & H2_FLAG_END_STREAM) != 0 {
+                        done = true;
+                        break;
+                    }
+                    if *ft == H2_FRAME_RST_STREAM && *s == sid {
+                        got_rst = true;
+                        done = true;
+                        break;
+                    }
+                }
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(_) => break,
+        }
+    }
+    let elapsed = start.elapsed();
+    let frames = parse_h2_frames(&raw);
+    let mut body_bytes = 0usize;
+    let mut end_stream_seen = false;
+    for (ft, fl, s, payload) in &frames {
+        if *ft == H2_FRAME_DATA && *s == sid {
+            body_bytes += payload.len();
+            if (*fl & H2_FLAG_END_STREAM) != 0 {
+                end_stream_seen = true;
+            }
+        }
+    }
+    (body_bytes, end_stream_seen, got_rst, elapsed)
+}
+
+/// Build a full HTTPS listener + cluster + cert + backend stack with a
+/// single configurable backend thread. Returns (worker, front_port,
+/// back_address). The caller spawns the mock backend against `back_address`.
+fn setup_single_h1_backend_listener(
+    name: &str,
+    h2_stream_idle_timeout_seconds: Option<u32>,
+) -> (Worker, u16, SocketAddr) {
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker = Worker::start_new_worker_owned(name, config, listeners, state);
+
+    let mut listener_config = ListenerBuilder::new_https(front_address.clone())
+        .to_tls(None)
+        .unwrap();
+    if let Some(secs) = h2_stream_idle_timeout_seconds {
+        listener_config.h2_stream_idle_timeout_seconds = Some(secs);
+    }
+
+    worker.send_proxy_request_type(RequestType::AddHttpsListener(listener_config));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        address: front_address.clone(),
+        proxy: ListenerType::Https.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        hostname: String::from("localhost"),
+        ..Worker::default_http_frontend("cluster_0", front_address.clone().into())
+    }));
+
+    let certificate_and_key = CertificateAndKey {
+        certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
+        key: String::from(include_str!("../../../lib/assets/local-key.pem")),
+        certificate_chain: vec![],
+        versions: vec![],
+        names: vec![],
+    };
+    worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+        address: front_address,
+        certificate: certificate_and_key,
+        expired_at: None,
+    }));
+
+    let back_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0".to_owned(),
+        back_address,
+        None,
+    )));
+    worker.read_to_last();
+    (worker, front_port, back_address)
+}
+
+// ----------------------------------------------------------------------------
+// (a) test_h2_firefox_shape_h1_cl_drains_fully — Firefox shape + H1 CL
+// ----------------------------------------------------------------------------
+
+/// Firefox shape: no `priority` header, H1 backend with Content-Length,
+/// 80 892 bytes (HAR-exact value from Sébastien Brunat's 2026-04-23 AM
+/// report). Exercises `mux/h1.rs:241-347` on the write path — the site
+/// where C1 (`signal_pending_write` missing on `Ready::WRITABLE` insert)
+/// historically parked large asset deliveries.
+///
+/// Expected on HEAD (post-C1 fix): PASS within 3 s. Before the fix: would
+/// stall — the test is a lock-in anti-regression for C1 on the Firefox
+/// code path.
+fn try_h2_firefox_shape_h1_cl_drains_fully() -> State {
+    const BODY_SIZE: usize = 80_892;
+
+    let (worker, backends, front_port) =
+        setup_h2_test_with_large_bodies("H2-LA-FF-CL", 1, BODY_SIZE);
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake_with_initial_window(&mut tls, 1_000_000);
+
+    let sid: u32 = 1;
+    let block = build_get_headers_no_priority();
+    let headers = H2Frame::headers(sid, block, true, true);
+    tls.write_all(&headers.encode()).unwrap();
+    tls.flush().unwrap();
+    tls.write_all(&H2Frame::window_update(0, 1_000_000).encode())
+        .unwrap();
+    tls.flush().unwrap();
+
+    let (body_bytes, end_stream_seen, got_rst, elapsed) =
+        drain_h2_stream_until_end_stream(&mut tls, sid, Duration::from_secs(3));
+
+    println!(
+        "firefox-shape CL: body_bytes={body_bytes}/{BODY_SIZE} \
+         end_stream={end_stream_seen} rst={got_rst} elapsed={elapsed:?}"
+    );
+
+    let infra_ok = teardown(tls, front_port, worker, backends);
+
+    if infra_ok && body_bytes == BODY_SIZE && end_stream_seen && !got_rst {
+        State::Success
+    } else {
+        println!(
+            "FAIL: body_bytes={body_bytes} (want {BODY_SIZE}), \
+             end_stream={end_stream_seen}, rst={got_rst}, \
+             elapsed={elapsed:?}, infra_ok={infra_ok}"
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_firefox_shape_h1_cl_drains_fully() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 Firefox shape (no priority) + H1 CL backend must drain 80892 B within 3 s",
+            try_h2_firefox_shape_h1_cl_drains_fully
+        ),
+        State::Success
+    );
+}
+
+// ----------------------------------------------------------------------------
+// (b) test_h2_chrome_shape_h1_cl_drains_fully — Chrome shape + H1 CL
+// ----------------------------------------------------------------------------
+
+/// Chrome shape: `priority: u=0, i`, H1 backend with Content-Length,
+/// 100 KiB. Locks in the RFC 9218 solo-bucket fix (`converter.rs:437-450`,
+/// commit `f6c02912`) on the H1-backend code path — the existing
+/// `test_h2_solo_incremental_drains_fully` uses an H2 backend via
+/// `setup_h2_test_with_large_bodies`, which internally spawns
+/// `AsyncBackend::http_handler` — so this test adds coverage for the
+/// `mux/h1.rs` → `mux/h2.rs` write-path interaction under the solo
+/// incremental shape.
+fn try_h2_chrome_shape_h1_cl_drains_fully() -> State {
+    const BODY_SIZE: usize = 100 * 1024;
+
+    let (worker, backends, front_port) =
+        setup_h2_test_with_large_bodies("H2-LA-CH-CL", 1, BODY_SIZE);
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake_with_initial_window(&mut tls, 1_000_000);
+
+    let sid: u32 = 1;
+    let block = build_get_headers_with_priority(0, "i");
+    let headers = H2Frame::headers(sid, block, true, true);
+    tls.write_all(&headers.encode()).unwrap();
+    tls.flush().unwrap();
+    tls.write_all(&H2Frame::window_update(0, 1_000_000).encode())
+        .unwrap();
+    tls.flush().unwrap();
+
+    let (body_bytes, end_stream_seen, got_rst, elapsed) =
+        drain_h2_stream_until_end_stream(&mut tls, sid, Duration::from_secs(3));
+
+    println!(
+        "chrome-shape H1 CL: body_bytes={body_bytes}/{BODY_SIZE} \
+         end_stream={end_stream_seen} rst={got_rst} elapsed={elapsed:?}"
+    );
+
+    let infra_ok = teardown(tls, front_port, worker, backends);
+
+    if infra_ok && body_bytes == BODY_SIZE && end_stream_seen && !got_rst {
+        State::Success
+    } else {
+        println!(
+            "FAIL: body_bytes={body_bytes} (want {BODY_SIZE}), \
+             end_stream={end_stream_seen}, rst={got_rst}, \
+             elapsed={elapsed:?}, infra_ok={infra_ok}"
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_chrome_shape_h1_cl_drains_fully() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 Chrome shape (u=0, i) + H1 CL backend must drain 100 KiB within 3 s",
+            try_h2_chrome_shape_h1_cl_drains_fully
+        ),
+        State::Success
+    );
+}
+
+// ----------------------------------------------------------------------------
+// (c) test_h2_php_apache_chunked_flush_drains_fully — chunked + per-chunk
+// ----------------------------------------------------------------------------
+
+/// PHP/Apache shape: chunked + per-chunk `flush()` cadence from
+/// [`ChunkedFlushH1Backend`], 312 215 bytes (HAR-exact `big.svg`). Pre-C1
+/// fix this would park because `mux/h1.rs:341-346, 351-357` flipped
+/// `Ready::WRITABLE` on the peer without `signal_pending_write()` and
+/// edge-triggered epoll never re-fired for the queued bytes. Post-fix the
+/// stream drains within 5 s.
+fn try_h2_php_apache_chunked_flush_drains_fully() -> State {
+    use crate::mock::chunked_flush_h1_backend::{
+        ChunkedFlushConfig, ChunkedFlushH1Backend, TransferEncoding,
+    };
+    const BODY_SIZE: usize = 312_215;
+
+    let (worker, front_port, back_address) =
+        setup_single_h1_backend_listener("H2-LA-PHP-CHUNKED", None);
+
+    let backend = ChunkedFlushH1Backend::start(
+        back_address,
+        ChunkedFlushConfig {
+            body_size: BODY_SIZE,
+            chunk_size: 8 * 1024,
+            inter_chunk_delay: Duration::from_micros(500),
+            transfer_encoding: TransferEncoding::Chunked,
+            tcp_nodelay: true,
+            truncate_at_byte: None,
+        },
+    );
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake_with_initial_window(&mut tls, 1_000_000);
+
+    let sid: u32 = 1;
+    let block = build_get_headers_no_priority();
+    let headers = H2Frame::headers(sid, block, true, true);
+    tls.write_all(&headers.encode()).unwrap();
+    tls.flush().unwrap();
+    tls.write_all(&H2Frame::window_update(0, 1_000_000).encode())
+        .unwrap();
+    tls.flush().unwrap();
+
+    let (body_bytes, end_stream_seen, got_rst, elapsed) =
+        drain_h2_stream_until_end_stream(&mut tls, sid, Duration::from_secs(5));
+
+    println!(
+        "php-apache-chunked: body_bytes={body_bytes}/{BODY_SIZE} \
+         end_stream={end_stream_seen} rst={got_rst} elapsed={elapsed:?} \
+         backend_responses={}",
+        backend.responses_sent()
+    );
+
+    let infra_ok = teardown(
+        tls,
+        front_port,
+        worker,
+        Vec::<AsyncBackend<SimpleAggregator>>::new(),
+    );
+    drop(backend);
+
+    if infra_ok && body_bytes == BODY_SIZE && end_stream_seen && !got_rst {
+        State::Success
+    } else {
+        println!(
+            "FAIL: body_bytes={body_bytes} (want {BODY_SIZE}), \
+             end_stream={end_stream_seen}, rst={got_rst}, \
+             elapsed={elapsed:?}, infra_ok={infra_ok}"
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_php_apache_chunked_flush_drains_fully() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 PHP/Apache chunked-flush backend must drain 312 KiB within 5 s",
+            try_h2_php_apache_chunked_flush_drains_fully
+        ),
+        State::Success
+    );
+}
+
+// ----------------------------------------------------------------------------
+// (d) test_h2_slow_backend_idle_timeout_cancels — C2 RED/GREEN
+// ----------------------------------------------------------------------------
+
+/// Slow backend shape: chunked body streamed at ~16 KiB per 1-second tick,
+/// across 4 ticks (~64 KiB total, 4-second wall clock). Listener config
+/// sets `h2_stream_idle_timeout_seconds = 2` (well below the total
+/// delivery time). Pre-C2 fix the per-stream idle timer refreshed only on
+/// inbound DATA/HEADERS (`h2.rs:3887-3895, 4026-4031`) — a long-running
+/// response without any inbound client frames would be cancelled mid-
+/// delivery. Post-fix the outbound write path refreshes the timer and
+/// the response drains to completion.
+fn try_h2_slow_backend_idle_timeout_cancels() -> State {
+    use crate::mock::chunked_flush_h1_backend::{
+        ChunkedFlushConfig, ChunkedFlushH1Backend, TransferEncoding,
+    };
+    const BODY_SIZE: usize = 64 * 1024;
+
+    let (worker, front_port, back_address) =
+        setup_single_h1_backend_listener("H2-LA-SLOW-IDLE", Some(2));
+
+    let backend = ChunkedFlushH1Backend::start(
+        back_address,
+        ChunkedFlushConfig {
+            body_size: BODY_SIZE,
+            chunk_size: 16 * 1024,
+            inter_chunk_delay: Duration::from_secs(1),
+            transfer_encoding: TransferEncoding::Chunked,
+            tcp_nodelay: true,
+            truncate_at_byte: None,
+        },
+    );
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake_with_initial_window(&mut tls, 1_000_000);
+
+    let sid: u32 = 1;
+    let block = build_get_headers_no_priority();
+    let headers = H2Frame::headers(sid, block, true, true);
+    tls.write_all(&headers.encode()).unwrap();
+    tls.flush().unwrap();
+    tls.write_all(&H2Frame::window_update(0, 1_000_000).encode())
+        .unwrap();
+    tls.flush().unwrap();
+
+    let (body_bytes, end_stream_seen, got_rst, elapsed) =
+        drain_h2_stream_until_end_stream(&mut tls, sid, Duration::from_secs(10));
+
+    println!(
+        "slow-backend idle: body_bytes={body_bytes}/{BODY_SIZE} \
+         end_stream={end_stream_seen} rst={got_rst} elapsed={elapsed:?} \
+         backend_responses={}",
+        backend.responses_sent()
+    );
+
+    let infra_ok = teardown(
+        tls,
+        front_port,
+        worker,
+        Vec::<AsyncBackend<SimpleAggregator>>::new(),
+    );
+    drop(backend);
+
+    if infra_ok && body_bytes == BODY_SIZE && end_stream_seen && !got_rst {
+        State::Success
+    } else {
+        println!(
+            "FAIL: body_bytes={body_bytes} (want {BODY_SIZE}), \
+             end_stream={end_stream_seen}, rst={got_rst}, \
+             elapsed={elapsed:?}, infra_ok={infra_ok}"
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_slow_backend_idle_timeout_cancels() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 slow chunked backend must not be cancelled by per-stream idle timer",
+            try_h2_slow_backend_idle_timeout_cancels
+        ),
+        State::Success
+    );
+}
+
+// ----------------------------------------------------------------------------
+// (e) test_h2_chunked_backend_crash_mid_stream_rsts — C3 RED/GREEN
+// ----------------------------------------------------------------------------
+
+/// Chunked backend crashes mid-body: writes ~50 KiB of a 100 KiB body then
+/// drops the TCP connection WITHOUT the terminating `0\r\n\r\n`. Pre-C3
+/// fix the H1 reader path (`mux/h1.rs:terminate_close_delimited`) would
+/// silently mark the stream END_STREAM, so the H2 converter emitted a
+/// truncated DATA frame with END_STREAM — silent corruption. Post-fix the
+/// chunked EOF is demoted to `ParsingPhase::Error` and the H2 converter
+/// emits RST_STREAM(InternalError) per RFC 9112 §7.1.
+fn try_h2_chunked_backend_crash_mid_stream_rsts() -> State {
+    use crate::mock::chunked_flush_h1_backend::{
+        ChunkedFlushConfig, ChunkedFlushH1Backend, TransferEncoding,
+    };
+    const BODY_SIZE: usize = 100 * 1024;
+    const TRUNCATE_AT: usize = 50 * 1024;
+
+    let (worker, front_port, back_address) = setup_single_h1_backend_listener("H2-LA-CRASH", None);
+
+    let backend = ChunkedFlushH1Backend::start(
+        back_address,
+        ChunkedFlushConfig {
+            body_size: BODY_SIZE,
+            chunk_size: 8 * 1024,
+            inter_chunk_delay: Duration::from_micros(500),
+            transfer_encoding: TransferEncoding::Chunked,
+            tcp_nodelay: true,
+            truncate_at_byte: Some(TRUNCATE_AT),
+        },
+    );
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake_with_initial_window(&mut tls, 1_000_000);
+
+    let sid: u32 = 1;
+    let block = build_get_headers_no_priority();
+    let headers = H2Frame::headers(sid, block, true, true);
+    tls.write_all(&headers.encode()).unwrap();
+    tls.flush().unwrap();
+    tls.write_all(&H2Frame::window_update(0, 1_000_000).encode())
+        .unwrap();
+    tls.flush().unwrap();
+
+    let (body_bytes, end_stream_seen, got_rst, elapsed) =
+        drain_h2_stream_until_end_stream(&mut tls, sid, Duration::from_secs(5));
+
+    println!(
+        "chunked-crash: body_bytes={body_bytes}/{BODY_SIZE} \
+         end_stream={end_stream_seen} rst={got_rst} elapsed={elapsed:?}"
+    );
+
+    let infra_ok = teardown(
+        tls,
+        front_port,
+        worker,
+        Vec::<AsyncBackend<SimpleAggregator>>::new(),
+    );
+    drop(backend);
+
+    // Success condition: the client must see either RST_STREAM (preferred)
+    // or no END_STREAM (partial delivery without completion). Silent
+    // END_STREAM with body_bytes == BODY_SIZE would be the C3 bug.
+    let c3_guard = got_rst || !end_stream_seen;
+    if infra_ok && c3_guard {
+        State::Success
+    } else {
+        println!(
+            "FAIL (C3 silent truncation): body_bytes={body_bytes}, \
+             end_stream={end_stream_seen}, rst={got_rst}, elapsed={elapsed:?}, \
+             infra_ok={infra_ok}"
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_chunked_backend_crash_mid_stream_rsts() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 chunked backend crash mid-body must emit RST_STREAM, not silent END_STREAM",
+            try_h2_chunked_backend_crash_mid_stream_rsts
+        ),
+        State::Success
+    );
+}
+
+// ----------------------------------------------------------------------------
+// (f) test_h2_coalesced_chrome_firefox_streams_drain — coalescing lock-in
+// ----------------------------------------------------------------------------
+
+/// Two concurrent streams on the same TLS connection: sid=1 is Chrome shape
+/// (`priority: u=0, i`), sid=3 is Firefox shape (no priority). Both served
+/// by H1 backends at 100 KiB each. Asserts both drain within 5 s. Locks in
+/// the absence of cross-stream interaction that a connection-coalescing
+/// regression (H7) could introduce.
+fn try_h2_coalesced_chrome_firefox_streams_drain() -> State {
+    const BODY_SIZE: usize = 100 * 1024;
+
+    let (worker, backends, front_port) =
+        setup_h2_test_with_large_bodies("H2-LA-COALESCED", 2, BODY_SIZE);
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake_with_initial_window(&mut tls, 1_000_000);
+
+    // sid=1 Chrome shape
+    let block1 = build_get_headers_with_priority(0, "i");
+    let h1 = H2Frame::headers(1, block1, true, true);
+    tls.write_all(&h1.encode()).unwrap();
+    // sid=3 Firefox shape
+    let block3 = build_get_headers_no_priority();
+    let h3 = H2Frame::headers(3, block3, true, true);
+    tls.write_all(&h3.encode()).unwrap();
+    tls.flush().unwrap();
+    tls.write_all(&H2Frame::window_update(0, 1_000_000).encode())
+        .unwrap();
+    tls.flush().unwrap();
+
+    // Custom drain: wait until END_STREAM on both sid=1 AND sid=3.
+    tls.sock
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .ok();
+    let start = Instant::now();
+    let deadline = Duration::from_secs(5);
+    let mut raw = Vec::new();
+    let mut rbuf = vec![0u8; 65536];
+    let mut end1 = false;
+    let mut end3 = false;
+    while (!end1 || !end3) && start.elapsed() < deadline {
+        match tls.read(&mut rbuf) {
+            Ok(0) => break,
+            Ok(n) => {
+                raw.extend_from_slice(&rbuf[..n]);
+                let frames = parse_h2_frames(&raw);
+                for (ft, fl, s, _) in &frames {
+                    if *ft == H2_FRAME_DATA && (*fl & H2_FLAG_END_STREAM) != 0 {
+                        if *s == 1 {
+                            end1 = true;
+                        }
+                        if *s == 3 {
+                            end3 = true;
+                        }
+                    }
+                }
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(_) => break,
+        }
+    }
+    let elapsed = start.elapsed();
+    let frames = parse_h2_frames(&raw);
+    let mut body1 = 0usize;
+    let mut body3 = 0usize;
+    for (ft, _fl, s, payload) in &frames {
+        if *ft == H2_FRAME_DATA {
+            if *s == 1 {
+                body1 += payload.len();
+            } else if *s == 3 {
+                body3 += payload.len();
+            }
+        }
+    }
+    println!(
+        "coalesced: sid1 body={body1}/{BODY_SIZE} end={end1}, \
+         sid3 body={body3}/{BODY_SIZE} end={end3}, elapsed={elapsed:?}"
+    );
+
+    let infra_ok = teardown(tls, front_port, worker, backends);
+
+    if infra_ok && body1 == BODY_SIZE && end1 && body3 == BODY_SIZE && end3 {
+        State::Success
+    } else {
+        println!(
+            "FAIL: sid1={body1}/{BODY_SIZE} end={end1}, \
+             sid3={body3}/{BODY_SIZE} end={end3}, elapsed={elapsed:?}, \
+             infra_ok={infra_ok}"
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_coalesced_chrome_firefox_streams_drain() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 two streams (Chrome+Firefox shape) must both drain within 5 s",
+            try_h2_coalesced_chrome_firefox_streams_drain
         ),
         State::Success
     );
