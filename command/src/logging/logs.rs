@@ -1003,7 +1003,13 @@ macro_rules! debug {
     ($format:expr $(, $args:expr)* $(,)?) => {{
         #[cfg(any(debug_assertions, feature = "logs-debug", feature = "logs-trace"))]
         $crate::_log!($crate::logging::LogLevel::Debug, concat!("{}\t", $format), module_path!() $(, $args)*);
-        #[cfg(not(any(debug_assertions, feature = "logs-trace")))]
+        // Dead-code arm silences `unused_variables` warnings on
+        // `--no-default-features` builds where the emit arm is stripped.
+        // Must gate on the SAME set of features as the emit arm above, or
+        // else both arms compile in and double-move the caller's arguments
+        // (observed on `release + logs-debug` builds where the emit arm
+        // fires and the no-op arm also fires, each consuming `$args` once).
+        #[cfg(not(any(debug_assertions, feature = "logs-debug", feature = "logs-trace")))]
         if false {$( let _ = $args; )*}
     }};
 }
