@@ -32,8 +32,9 @@ There are three configuration options related to logging:
 `log_level` follows [env_logger's level directives](https://docs.rs/env_logger/0.5.13/env_logger/).
 Moreover, the `RUST_LOG` environment variable can be used to override the log level.
 
-If sozu is built in release mode, the `DEBUG` and `TRACE` log levels are not compiled in,
-unless you set the compilation features `logs-debug` and `logs-trace`.
+Stock `sozu` builds (default features) now compile `DEBUG` in — the
+`logs-debug` flag is only load-bearing for `--no-default-features` builds.
+`TRACE` still requires the separate `logs-trace` feature at build time.
 
 ### Metrics
 

@@ -46,11 +46,14 @@ thiserror = { workspace = true }
 sozu-command-lib = { workspace = true }
 sozu-lib = { workspace = true }
 
+[dev-dependencies]
+regex = { workspace = true }
+
 [target.'cfg(target_os="linux")'.dependencies]
 num_cpus = { workspace = true }
 
 [features]
-default = ["jemallocator"]
+default = ["jemallocator", "logs-debug"]
 unstable = []
 logs-debug = ["sozu-lib/logs-debug", "sozu-command-lib/logs-debug"]
 logs-trace = ["sozu-lib/logs-trace", "sozu-command-lib/logs-trace"]
