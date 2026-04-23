@@ -818,11 +818,8 @@ fn audit_entry_for(request: &RequestType) -> Option<AuditEntry> {
 }
 
 /// Bump the per-verb counter, queue the [Event] for fan-out to subscribed
-/// clients, and write the structured audit log line at `debug!` level
-/// (visible in release builds via the `logs-debug` default feature; the
-/// sample configs route `sozu::command::requests=debug` through the runtime
-/// log filter so the line reaches stdout without an operator override).
-/// Used by every control-plane mutation handler.
+/// clients, and write the structured audit log line at `info!` level. Used
+/// by every control-plane mutation handler.
 fn audit_emit(server: &mut Server, client: &ClientSession, entry: AuditEntry, result: AuditResult) {
     let request_id = Ulid::generate();
     // `entry.counter` is the pre-built `config.<verb>` static-str key
@@ -831,7 +828,7 @@ fn audit_emit(server: &mut Server, client: &ClientSession, entry: AuditEntry, re
     // verb→key dispatch table.
     count!(entry.counter, 1);
 
-    debug!(
+    info!(
         "{}",
         audit_log_context!(client, &request_id, &entry, result)
     );

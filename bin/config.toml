@@ -14,13 +14,10 @@
 # automatic_state_save = false
 
 # logging verbosity. Possible values are "error", "warn", "info", "debug" and
-# "trace". Stock `sozu` builds enable the `logs-debug` feature by default, so
-# `debug!` callsites are compiled in. `logs-trace` still needs to be opted in
-# at build time for `trace!` output. Per-module overrides follow env_logger
-# syntax — the default below keeps the global level at "info" and routes the
-# control-plane audit module at "debug" so the audit trail reaches stdout
-# without flooding it with unrelated module chatter.
-log_level = "info,sozu::command::requests=debug"
+# "trace". For performance reasons, the logs at "debug" or "trace" level are
+# not compiled by default. To activate them, pass the "logs-debug" and
+# "logs-trace" compilation options to cargo
+log_level = "info"
 
 # where the logs will be sent. It defaults to sending the logs on standard output,
 # but they could be written to a UDP address:

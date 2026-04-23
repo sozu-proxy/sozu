@@ -632,12 +632,9 @@ Two worker metrics track update outcomes:
 
 The control-plane command server also emits a `LISTENER_UPDATED` event on the
 `SubscribeEvents` bus (carrying the listener address and type) and writes a
-structured audit log line at `debug!` level in the MUX `Session(...)` layout
-— visible in release builds via the `logs-debug` feature that ships enabled
-by default in `sozu`, and routed through the per-module directive
-`sozu::command::requests=debug` in the sample configs so it reaches stdout
-without flooding it. See [`observability.md`](observability.md#control-plane-audit-trail)
-for the full format.
+structured audit log line at `info!` level in the MUX `Session(...)` layout.
+See [`observability.md`](observability.md#control-plane-audit-trail) for the
+full format.
 
 ## Metrics
 

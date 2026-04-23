@@ -31,7 +31,7 @@ observability surfaces:
                             │   (RequestRecord)               (ASCII or protobuf)
                             │
                             │   SubscribeEvents bus ───────► control-plane events
-                            │   (EventKind)                    (incl. audit log line — MUX-style, at debug level)
+                            │   (EventKind)                    (incl. audit log line — MUX-style, at info level)
                             └──────────────────────────────┘
 ```
 
@@ -211,16 +211,11 @@ surfaces:
    `command/src/command.proto::EventKind`.
 2. An `incr!("config.<verb>")` counter is bumped (e.g.
    `config.cluster_added`).
-3. A structured audit log line is emitted at `debug!` level in the MUX
-   `Session(...)` layout. Release builds compile the macro in via the
-   `logs-debug` feature (shipped in `sozu`'s default feature set), and the
-   sample configs route it past the runtime filter via the per-module
-   directive `sozu::command::requests=debug`. Rendered form (ANSI colours
-   off, leading `sozu::command::requests\t` is the `module_path!()` prefix
-   that `debug!` prepends):
+3. A structured audit log line is emitted at `info!` level in the MUX
+   `Session(...)` layout. Rendered form (ANSI colours off):
 
    ```
-   sozu::command::requests	[01HXS4GZ9EYP3F2R7K8M6B4N2C 01HXS4H5K2QR9C7PVWXY8T6ZNA my_app -]	AUDIT	Session(verb=cluster_added, actor_uid=1000, client_id=42, target=cluster:my_app, result=ok)	 >>>
+   [01HXS4GZ9EYP3F2R7K8M6B4N2C 01HXS4H5K2QR9C7PVWXY8T6ZNA my_app -]	AUDIT	Session(verb=cluster_added, actor_uid=1000, client_id=42, target=cluster:my_app, result=ok)	 >>>
    ```
 
    Bracket slots follow the `[session_ulid request_ulid cluster_id|- backend_id|-]`
@@ -263,7 +258,7 @@ Before merging an instrumentation change:
   (new tag), all four emit sites, and `RequestRecord::duplicate()`.
 - [ ] [`configure.md`](configure.md) is updated in the same changeset.
 - [ ] Privileged control-plane verbs land an `EventKind` + `config.<verb>`
-  counter + audit log line (MUX `Session(...)` layout, `debug!` level,
+  counter + audit log line (MUX `Session(...)` layout, `info!` level,
   routed via the `audit_log_context!` macro).
 
 ## See also
