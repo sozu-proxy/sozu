@@ -882,6 +882,31 @@ enum EventKind {
     METRICS_CONFIGURED = 17;
     // A listener's configuration was patched in place via UpdateHttp/Https/TcpListenerConfig
     LISTENER_UPDATED = 18;
+    // A saved state file was loaded (batch state replay via LoadState request).
+    // Emitted once at task completion; `target=file:<path>` and `result=ok|err`
+    // with the ok/err request counts encoded in `target`.
+    STATE_LOADED = 19;
+    // A snapshot of the current state was written to disk via SaveState.
+    STATE_SAVED = 20;
+    // A new listener was added to the config (AddHttp/Https/TcpListener).
+    // Distinct from LISTENER_ACTIVATED (binds the socket) — ADDED just
+    // creates the listener's in-memory definition.
+    LISTENER_ADDED = 21;
+    // A listener's in-memory definition was removed (RemoveListener).
+    // Distinct from LISTENER_DEACTIVATED (unbinds the socket) — REMOVED
+    // drops the whole listener from the state.
+    LISTENER_REMOVED = 22;
+    // A stop request was accepted (SoftStop / HardStop).
+    // `target=stop:soft` or `stop:hard` — distinguishes drain-then-stop from
+    // immediate-abort on the audit trail.
+    SOZU_STOP_REQUESTED = 23;
+    // The main process started a re-exec upgrade (UpgradeMain).
+    MAIN_UPGRADED = 24;
+    // A worker was re-launched (UpgradeWorker).
+    WORKER_UPGRADED = 25;
+    // A client subscribed to the SubscribeEvents bus — privileged because
+    // subscribers observe every control-plane mutation.
+    EVENTS_SUBSCRIBED = 26;
 }
 
 message ClusterHashes {

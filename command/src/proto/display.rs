@@ -1282,6 +1282,14 @@ impl Display for Event {
             EventKind::LoggingLevelChanged => "logging level changed",
             EventKind::MetricsConfigured => "metrics configured",
             EventKind::ListenerUpdated => "listener updated",
+            EventKind::StateLoaded => "state loaded",
+            EventKind::StateSaved => "state saved",
+            EventKind::ListenerAdded => "listener added",
+            EventKind::ListenerRemoved => "listener removed",
+            EventKind::SozuStopRequested => "stop requested",
+            EventKind::MainUpgraded => "main upgraded",
+            EventKind::WorkerUpgraded => "worker upgraded",
+            EventKind::EventsSubscribed => "events subscribed",
         };
         let address = match &self.address {
             Some(a) => a.to_string(),

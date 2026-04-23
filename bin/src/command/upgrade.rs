@@ -15,6 +15,7 @@ use sozu_command_lib::{
 use super::sessions::WorkerSession;
 use crate::{
     command::{
+        requests::{AuditExtras, AuditResult, audit_emit_inline},
         server::{
             ClientId, Gatherer, GatheringTask, MessageClient, Server, ServerState, SessionId,
             TaskId, Timeout, WorkerId,
@@ -24,6 +25,7 @@ use crate::{
     upgrade::{UpgradeError, fork_main_into_new_main},
     util::disable_close_on_exec,
 };
+use sozu_command_lib::proto::command::EventKind;
 
 #[derive(Debug)]
 enum UpgradeWorkerProgress {
@@ -56,6 +58,17 @@ pub fn upgrade_worker(server: &mut Server, client: &mut ClientSession, old_worke
     info!(
         "client[{:?}] msg wants to upgrade worker {}",
         client.token, old_worker_id
+    );
+
+    audit_emit_inline(
+        server,
+        client,
+        EventKind::WorkerUpgraded,
+        "worker_upgraded",
+        "config.worker_upgraded",
+        format!("worker:{old_worker_id}"),
+        AuditResult::Ok,
+        AuditExtras::default(),
     );
 
     let old_worker_token = match server.get_active_worker_by_id(old_worker_id) {
@@ -308,6 +321,17 @@ pub struct UpgradeData {
 }
 
 pub fn upgrade_main(server: &mut Server, client: &mut ClientSession) {
+    audit_emit_inline(
+        server,
+        client,
+        EventKind::MainUpgraded,
+        "main_upgraded",
+        "config.main_upgraded",
+        format!("executable:{}", server.executable_path.as_str()),
+        AuditResult::Ok,
+        AuditExtras::default(),
+    );
+
     if let Err(err) = server.disable_cloexec_before_upgrade() {
         client.finish_failure(err.to_string());
     }

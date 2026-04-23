@@ -218,14 +218,17 @@ impl CommandHub {
         if let Err(err) = self.register(token, &mut stream) {
             error!("Could not register client: {}", err);
         }
-        let actor_uid = peer_uid_from_stream(&stream);
+        let peer_cred = peer_cred_from_stream(&stream);
+        let actor_comm = peer_cred.pid.and_then(peer_comm);
         let channel = Channel::new(stream, 4096, u64::MAX);
         let id = self.next_client_id();
-        let session = ClientSession::new(channel, id, token, actor_uid);
+        let session = ClientSession::new(channel, id, token, peer_cred, actor_comm);
         info!(
-            "Register new client: {} (actor_uid={})",
+            "Register new client: {} (actor_uid={} actor_pid={} actor_comm={})",
             id,
-            session.actor_uid_display()
+            session.actor_uid_display(),
+            session.actor_pid_display(),
+            session.actor_comm_display()
         );
         debug!("registering client {:?}", session);
         self.clients.insert(token, session);
@@ -894,25 +897,68 @@ impl Server {
     }
 }
 
-/// Read the peer UID of a connected unix-domain socket via `SO_PEERCRED`.
+/// Peer credentials for the unix-socket client, used for audit attribution.
 ///
-/// Returns `None` on platforms without `SO_PEERCRED` support, or when the
-/// `getsockopt` call fails (which would be unexpected for a freshly accepted
-/// local socket but must not panic the main process).
+/// `pid` is needed to correlate with `journalctl _PID=<pid>` and `/proc/<pid>`.
+/// `gid` widens the actor identity beyond uid alone. `uid` stays the primary
+/// attribution field. All three come from the same `SO_PEERCRED` `getsockopt`
+/// and are captured once at accept time (immutable for the session lifetime).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PeerCred {
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    pub pid: Option<i32>,
+}
+
+/// Read full peer credentials from a connected unix-domain socket via
+/// `SO_PEERCRED`.
+///
+/// Returns a `PeerCred` with `None` fields on platforms without `SO_PEERCRED`
+/// support, or when the `getsockopt` call fails (which would be unexpected
+/// for a freshly accepted local socket but must not panic the main process).
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn peer_uid_from_stream(stream: &UnixStream) -> Option<u32> {
+pub(crate) fn peer_cred_from_stream(stream: &UnixStream) -> PeerCred {
     use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
     match getsockopt(stream, PeerCredentials) {
-        Ok(creds) => Some(creds.uid()),
+        Ok(creds) => PeerCred {
+            uid: Some(creds.uid()),
+            gid: Some(creds.gid()),
+            pid: Some(creds.pid()),
+        },
         Err(err) => {
             warn!("Could not read SO_PEERCRED on command socket: {}", err);
-            None
+            PeerCred::default()
         }
     }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn peer_uid_from_stream(_stream: &UnixStream) -> Option<u32> {
+pub(crate) fn peer_cred_from_stream(_stream: &UnixStream) -> PeerCred {
+    PeerCred::default()
+}
+
+/// Read `/proc/<pid>/comm` to get the peer process's command name (up to
+/// 15 chars per kernel spec). Best-effort; returns `None` on any error.
+/// Cheap (one file read per accept, which happens once per sozuctl invocation).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn peer_comm(pid: i32) -> Option<String> {
+    use std::io::Read;
+    let mut buf = String::new();
+    let path = format!("/proc/{pid}/comm");
+    std::fs::File::open(&path)
+        .ok()?
+        .read_to_string(&mut buf)
+        .ok()?;
+    let trimmed = buf.trim_end_matches(['\n', '\r']);
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_owned())
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub(crate) fn peer_comm(_pid: i32) -> Option<String> {
     None
 }
 
