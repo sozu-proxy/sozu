@@ -2342,3 +2342,391 @@ fn test_h2_coalesced_chrome_firefox_streams_drain() {
         State::Success
     );
 }
+
+// ============================================================================
+// Customer HAR repro (2026-04-24 selfiexxl): H2 response body never delivered
+// ============================================================================
+//
+// The customer's Axios XHR observed `_transferSize=134`, `receive≈49.6s`,
+// `_error=net::ERR_ABORTED` on a `GET` that returned `200 OK` with
+// `Content-Length: 3752` (see `tasks/wwwselfiexxlfr-debug_7zbkq2.har`).
+// Response headers reached Chrome; the single 3752-byte DATA frame never
+// did. The request carried `priority: u=1, i` on a multiplexed connection.
+//
+// Two independent wake-gap bugs can each produce this shape on
+// `feat/h2-mux`:
+//
+// * **Bug 2 (H2 scheduler)**: `apply_incremental_rotation` in
+//   `mux/h2.rs:1063-1100` returns the TOTAL incremental-stream count across
+//   all urgency buckets. `h2.rs:2334` forwards this global count to the
+//   converter as `incremental_peer_count`, but `converter.rs:56-62`
+//   documents it as per-bucket. A stream that is SOLO in its urgency
+//   bucket but has incremental peers in OTHER urgency buckets still
+//   triggers the yield-after-one-DATA branch at `converter.rs:450`,
+//   stranding the rest of its body because `finalize_write:2670-2677`
+//   removes `Ready::WRITABLE` on a voluntary yield with no `expect_write`.
+// * **Bug 1 (H1→H2 wake-gap)**: `mux/h1.rs:324` wraps the Linked-peer
+//   `signal_pending_write()` call inside `if kawa.is_main_phase()`. When
+//   a small `Content-Length` body completes in a single `socket_read`
+//   cycle, kawa transitions straight from `Headers` to `Terminated`
+//   within one `kawa::h1::parse()` call — `is_main_phase()` is FALSE at
+//   line 324 and the signal is never emitted. A keep-alive backend makes
+//   the close-delimited fallback at lines 385-395 unreachable
+//   (`!is_keep_alive_backend` gate).
+//
+// The three tests below exercise each bug in isolation, then together.
+
+// ----------------------------------------------------------------------------
+// (g) test_h2_mixed_urgency_incremental_solo_drains — Bug 2 RED
+// ----------------------------------------------------------------------------
+
+/// Two concurrent H2 streams on the same connection, BOTH incremental, in
+/// DIFFERENT urgency buckets:
+/// * sid=1 — `priority: u=0, i` (Chrome navigation shape, solo in bucket 0)
+/// * sid=3 — `priority: u=3, i` (Chrome image/XHR shape, solo in bucket 3)
+///
+/// `apply_incremental_rotation` returns `2` (one incremental per bucket × 2
+/// buckets). On HEAD this value is fed to both streams' converter as
+/// `incremental_peer_count=2`, tripping the yield-after-one-DATA guard even
+/// though each stream is solo in its bucket. Both streams emit one DATA
+/// frame per scheduling pass, `finalize_write` strips `Ready::WRITABLE`,
+/// edge-triggered epoll never re-fires, and the remaining body bytes strand
+/// in `kawa.out` until `front_timeout` (60 s default).
+///
+/// MUST FAIL on HEAD (Bug 2). MUST PASS after the per-bucket-count fix.
+fn try_h2_mixed_urgency_incremental_solo_drains() -> State {
+    const BODY_SIZE: usize = 64 * 1024;
+
+    let (worker, backends, front_port) =
+        setup_h2_test_with_large_bodies("H2-COR-MIXURG-INC", 2, BODY_SIZE);
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake_with_initial_window(&mut tls, 1_000_000);
+
+    // sid=1, u=0, i — solo incremental in urgency-0 bucket
+    let block1 = build_get_headers_with_priority(0, "i");
+    let h1 = H2Frame::headers(1, block1, true, true);
+    tls.write_all(&h1.encode()).unwrap();
+    // sid=3, u=3, i — solo incremental in urgency-3 bucket
+    let block3 = build_get_headers_with_priority(3, "i");
+    let h3 = H2Frame::headers(3, block3, true, true);
+    tls.write_all(&h3.encode()).unwrap();
+    tls.flush().unwrap();
+
+    tls.write_all(&H2Frame::window_update(0, 1_000_000).encode())
+        .unwrap();
+    tls.flush().unwrap();
+
+    tls.sock
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .ok();
+    let start = Instant::now();
+    let deadline = Duration::from_secs(5);
+    let mut raw = Vec::new();
+    let mut rbuf = vec![0u8; 65536];
+    let mut end1 = false;
+    let mut end3 = false;
+    while (!end1 || !end3) && start.elapsed() < deadline {
+        match tls.read(&mut rbuf) {
+            Ok(0) => break,
+            Ok(n) => {
+                raw.extend_from_slice(&rbuf[..n]);
+                let frames = parse_h2_frames(&raw);
+                for (ft, fl, s, _) in &frames {
+                    if *ft == H2_FRAME_DATA && (*fl & H2_FLAG_END_STREAM) != 0 {
+                        if *s == 1 {
+                            end1 = true;
+                        }
+                        if *s == 3 {
+                            end3 = true;
+                        }
+                    }
+                }
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(_) => break,
+        }
+    }
+    let elapsed = start.elapsed();
+    let frames = parse_h2_frames(&raw);
+    let mut body1 = 0usize;
+    let mut body3 = 0usize;
+    for (ft, _fl, s, payload) in &frames {
+        if *ft == H2_FRAME_DATA {
+            if *s == 1 {
+                body1 += payload.len();
+            } else if *s == 3 {
+                body3 += payload.len();
+            }
+        }
+    }
+    println!(
+        "mixed-urgency incremental: sid1 body={body1}/{BODY_SIZE} end={end1}, \
+         sid3 body={body3}/{BODY_SIZE} end={end3}, elapsed={elapsed:?}"
+    );
+
+    let infra_ok = teardown(tls, front_port, worker, backends);
+
+    if infra_ok
+        && body1 == BODY_SIZE
+        && end1
+        && body3 == BODY_SIZE
+        && end3
+        && elapsed < Duration::from_secs(3)
+    {
+        State::Success
+    } else {
+        println!(
+            "FAIL: sid1={body1}/{BODY_SIZE} end={end1}, \
+             sid3={body3}/{BODY_SIZE} end={end3}, elapsed={elapsed:?}, \
+             infra_ok={infra_ok}"
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_mixed_urgency_incremental_solo_drains() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 two solo-in-bucket incremental streams (u=0,i + u=3,i) must drain within 3 s",
+            try_h2_mixed_urgency_incremental_solo_drains
+        ),
+        State::Success
+    );
+}
+
+// ----------------------------------------------------------------------------
+// (h) test_h2_h1_keepalive_single_read_cl_drains — Bug 1 RED
+// ----------------------------------------------------------------------------
+
+/// Single H2 stream → keep-alive H1 backend that writes the entire
+/// response (headers + 3752-byte `Content-Length` body) in ONE `write_all`
+/// syscall and then waits for the next request. Reproduces the customer
+/// HAR body size exactly.
+///
+/// sōzu's H1 reader at `mux/h1.rs` receives headers+body in a single
+/// `socket_read` cycle. `kawa::h1::parse` transitions kawa from
+/// `Headers` → `Body` → `Terminated` within one call. At `h1.rs:324`,
+/// `kawa.is_main_phase() == false` after the transition, so the
+/// `signal_pending_write()` call at line 367 is skipped. The close-
+/// delimited fallback at lines 385-395 requires `status == Closed`, which
+/// does not fire for keep-alive backends. The frontend has DATA+END_STREAM
+/// queued in `kawa.out` but never receives the wake-up; edge-triggered
+/// epoll never re-fires; the body strands until `front_timeout`.
+///
+/// MUST FAIL on HEAD (Bug 1). MUST PASS after the signal-gap fix.
+fn try_h2_h1_keepalive_single_read_cl_drains() -> State {
+    use crate::mock::single_read_h1_backend::{SingleReadConfig, SingleReadH1Backend};
+    const BODY_SIZE: usize = 3752;
+
+    let (worker, front_port, back_address) =
+        setup_single_h1_backend_listener("H2-COR-SINGLEREAD-CL", None);
+
+    let backend = SingleReadH1Backend::start(
+        back_address,
+        SingleReadConfig {
+            body_size: BODY_SIZE,
+            content_type: Some("application/json"),
+        },
+    );
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake_with_initial_window(&mut tls, 1_000_000);
+
+    let sid: u32 = 1;
+    let block = build_get_headers_no_priority();
+    let headers = H2Frame::headers(sid, block, true, true);
+    tls.write_all(&headers.encode()).unwrap();
+    tls.flush().unwrap();
+    tls.write_all(&H2Frame::window_update(0, 1_000_000).encode())
+        .unwrap();
+    tls.flush().unwrap();
+
+    let (body_bytes, end_stream_seen, got_rst, elapsed) =
+        drain_h2_stream_until_end_stream(&mut tls, sid, Duration::from_secs(3));
+
+    println!(
+        "h1-keepalive-single-read: body_bytes={body_bytes}/{BODY_SIZE} \
+         end_stream={end_stream_seen} rst={got_rst} elapsed={elapsed:?} \
+         backend_responses={}",
+        backend.responses_sent()
+    );
+
+    let infra_ok = teardown(
+        tls,
+        front_port,
+        worker,
+        Vec::<AsyncBackend<SimpleAggregator>>::new(),
+    );
+    drop(backend);
+
+    if infra_ok && body_bytes == BODY_SIZE && end_stream_seen && !got_rst {
+        State::Success
+    } else {
+        println!(
+            "FAIL: body_bytes={body_bytes} (want {BODY_SIZE}), \
+             end_stream={end_stream_seen}, rst={got_rst}, \
+             elapsed={elapsed:?}, infra_ok={infra_ok}"
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_h1_keepalive_single_read_cl_drains() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 stream → keep-alive H1 backend (CL 3752, single write) must drain within 3 s",
+            try_h2_h1_keepalive_single_read_cl_drains
+        ),
+        State::Success
+    );
+}
+
+// ----------------------------------------------------------------------------
+// (i) test_h2_customer_har_shape_drains — combined HAR repro
+// ----------------------------------------------------------------------------
+
+/// Full customer HAR reproduction: multiplexed H2 connection with two
+/// streams, both incremental, in different urgency buckets, each served by
+/// a keep-alive H1 backend that writes its response in a single syscall.
+/// sid=1 is the customer's stalling XHR (`priority: u=1, i`, 3752-byte
+/// JSON). sid=3 is a concurrent incremental request in urgency bucket 3
+/// (e.g. an image prefetch, RFC 9218 §8 default urgency).
+///
+/// On HEAD this test can fail on either Bug 1 or Bug 2 — both contribute.
+/// After both fixes land, both streams drain within the 3 s deadline.
+fn try_h2_customer_har_shape_drains() -> State {
+    use crate::mock::single_read_h1_backend::{SingleReadConfig, SingleReadH1Backend};
+    const BODY_SIZE: usize = 3752;
+
+    let (worker, front_port, back_address) =
+        setup_single_h1_backend_listener("H2-COR-HAR-SHAPE", None);
+
+    let backend = SingleReadH1Backend::start(
+        back_address,
+        SingleReadConfig {
+            body_size: BODY_SIZE,
+            content_type: Some("application/json"),
+        },
+    );
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake_with_initial_window(&mut tls, 1_000_000);
+
+    // sid=1 — customer's XHR priority: u=1, i
+    let block1 = build_get_headers_with_priority(1, "i");
+    let h1 = H2Frame::headers(1, block1, true, true);
+    tls.write_all(&h1.encode()).unwrap();
+    // sid=3 — incremental peer in a different urgency bucket
+    let block3 = build_get_headers_with_priority(3, "i");
+    let h3 = H2Frame::headers(3, block3, true, true);
+    tls.write_all(&h3.encode()).unwrap();
+    tls.flush().unwrap();
+    tls.write_all(&H2Frame::window_update(0, 1_000_000).encode())
+        .unwrap();
+    tls.flush().unwrap();
+
+    tls.sock
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .ok();
+    let start = Instant::now();
+    let deadline = Duration::from_secs(5);
+    let mut raw = Vec::new();
+    let mut rbuf = vec![0u8; 65536];
+    let mut end1 = false;
+    let mut end3 = false;
+    while (!end1 || !end3) && start.elapsed() < deadline {
+        match tls.read(&mut rbuf) {
+            Ok(0) => break,
+            Ok(n) => {
+                raw.extend_from_slice(&rbuf[..n]);
+                let frames = parse_h2_frames(&raw);
+                for (ft, fl, s, _) in &frames {
+                    if *ft == H2_FRAME_DATA && (*fl & H2_FLAG_END_STREAM) != 0 {
+                        if *s == 1 {
+                            end1 = true;
+                        }
+                        if *s == 3 {
+                            end3 = true;
+                        }
+                    }
+                }
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(_) => break,
+        }
+    }
+    let elapsed = start.elapsed();
+    let frames = parse_h2_frames(&raw);
+    let mut body1 = 0usize;
+    let mut body3 = 0usize;
+    for (ft, _fl, s, payload) in &frames {
+        if *ft == H2_FRAME_DATA {
+            if *s == 1 {
+                body1 += payload.len();
+            } else if *s == 3 {
+                body3 += payload.len();
+            }
+        }
+    }
+    println!(
+        "customer HAR shape: sid1 body={body1}/{BODY_SIZE} end={end1}, \
+         sid3 body={body3}/{BODY_SIZE} end={end3}, elapsed={elapsed:?}, \
+         backend_responses={}",
+        backend.responses_sent()
+    );
+
+    let infra_ok = teardown(
+        tls,
+        front_port,
+        worker,
+        Vec::<AsyncBackend<SimpleAggregator>>::new(),
+    );
+    drop(backend);
+
+    if infra_ok
+        && body1 == BODY_SIZE
+        && end1
+        && body3 == BODY_SIZE
+        && end3
+        && elapsed < Duration::from_secs(3)
+    {
+        State::Success
+    } else {
+        println!(
+            "FAIL: sid1={body1}/{BODY_SIZE} end={end1}, \
+             sid3={body3}/{BODY_SIZE} end={end3}, elapsed={elapsed:?}, \
+             infra_ok={infra_ok}"
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_customer_har_shape_drains() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 customer HAR shape (mixed-urgency incremental + single-read CL) must drain within 3 s",
+            try_h2_customer_har_shape_drains
+        ),
+        State::Success
+    );
+}
