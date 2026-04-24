@@ -207,7 +207,8 @@ pub(crate) fn set_default_answer(
 
     context.status = Some(code);
     stream.state = StreamState::Unlinked;
-    readiness.interest.insert(Ready::WRITABLE);
+    readiness.arm_writable();
+    incr!("h2.signal.writable.rearmed.default_answer");
 }
 
 /// Forcefully terminates a kawa message by setting the "end_stream" flag and setting the parsing_phase to Error.
@@ -223,4 +224,80 @@ pub(crate) fn forcefully_terminate_answer(
     kawa.parsing_phase.error(error.as_str().into());
     stream.state = StreamState::Unlinked;
     readiness.interest.insert(Ready::WRITABLE);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{cell::RefCell, rc::Rc};
+
+    use rusty_ulid::Ulid;
+    use sozu_command::proto::command::SocketAddress;
+
+    use super::*;
+    use crate::{Protocol, pool::Pool, protocol::kawa_h1::editor::HttpContext};
+
+    fn make_stream() -> (Rc<RefCell<Pool>>, Stream) {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 20, 16_384)));
+        let session_id = Ulid::generate();
+        let http_ctx = HttpContext {
+            keep_alive_backend: true,
+            keep_alive_frontend: true,
+            sticky_session_found: None,
+            method: None,
+            authority: None,
+            path: None,
+            status: None,
+            reason: None,
+            user_agent: None,
+            x_request_id: None,
+            xff_chain: None,
+            #[cfg(feature = "opentelemetry")]
+            otel: None,
+            closing: false,
+            session_id,
+            id: Ulid::generate(),
+            backend_id: None,
+            cluster_id: None,
+            protocol: Protocol::HTTPS,
+            public_address: SocketAddress::new_v4(127, 0, 0, 1, 0).into(),
+            session_address: None,
+            sticky_name: String::new(),
+            sticky_session: None,
+            backend_address: None,
+            tls_server_name: None,
+            strict_sni_binding: false,
+            tls_version: None,
+            tls_cipher: None,
+            tls_alpn: None,
+            sozu_id_header: String::from("Sozu-Id"),
+        };
+        let stream =
+            Stream::new(Rc::downgrade(&pool), http_ctx, 65_535).expect("pool checkout failed");
+        (pool, stream)
+    }
+
+    /// `set_default_answer` must leave the frontend readiness with both
+    /// `interest` AND `event` carrying `Ready::WRITABLE`. The `event` bit
+    /// is the `signal_pending_write` side of the invariant-15 pair — under
+    /// edge-triggered epoll, this is what causes the scheduler's next
+    /// tick to re-enter `writable()` and flush the default answer without
+    /// waiting for an external epoll event. This is the RED for Fix A.
+    #[test]
+    fn set_default_answer_arms_writable_and_signals() {
+        let (_pool, mut stream) = make_stream();
+        let mut readiness = Readiness::new();
+        let answers = HttpAnswers::new(&None).expect("HttpAnswers::new(&None) must succeed");
+
+        set_default_answer(&mut stream, &mut readiness, 504, &answers);
+
+        assert!(
+            readiness.interest.is_writable(),
+            "set_default_answer must leave Ready::WRITABLE in interest: {readiness:?}"
+        );
+        assert!(
+            readiness.event.is_writable(),
+            "set_default_answer must pair the insert with signal_pending_write so \
+             ET epoll sees WRITABLE on the event side: {readiness:?}"
+        );
+    }
 }
