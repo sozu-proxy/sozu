@@ -679,6 +679,23 @@ that touches `h2.rs`, `mod.rs`, or `stream.rs`.
     sits in a different urgency bucket — regressing the invariant-15
     solo-bucket fast path. Guarded by e2e test
     `test_h2_rfc9218_incremental_multi_bucket_drains_sequentially`.
+18. **RFC 9218 §7.1 PRIORITY_UPDATE is parsed and honoured.**
+    Frame type `0x10` is recognised at the parser (`parser.rs`
+    `FrameType::PriorityUpdate` + `priority_update_frame`) rather
+    than swallowed as `FrameType::Unknown`. `frame_header` enforces
+    `stream_id == 0` at receipt (RFC 9218 §7.1), and the handler
+    (`h2.rs` `handle_priority_update_frame`) rejects a
+    prioritized-stream-id of `0` with
+    GOAWAY(PROTOCOL_ERROR). Valid frames are decoded via
+    `pkawa::parse_rfc9218_priority` and pushed through the same
+    memory-guarded path as standalone PRIORITY frames
+    (`Prioriser::push_priority_guarded`), so a flood of
+    PRIORITY_UPDATEs for far-future stream IDs cannot pin more than
+    `MAX_PRIORITIES` entries. Updates for streams that are no longer
+    open and outside the idle look-ahead are silently dropped.
+    Guarded by e2e tests
+    `test_h2_priority_update_on_open_stream_is_accepted` and
+    `test_h2_priority_update_on_stream_zero_is_protocol_error`.
 
 ---
 

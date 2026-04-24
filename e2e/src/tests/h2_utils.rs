@@ -177,6 +177,19 @@ impl H2Frame {
         Self::new(H2_FRAME_WINDOW_UPDATE, 0, stream_id, payload)
     }
 
+    /// Build a PRIORITY_UPDATE frame (RFC 9218 §7.1, type `0x10`).
+    ///
+    /// Always sent on stream 0 (connection control stream). Payload:
+    /// 4-byte prioritized stream ID (31-bit, reserved MSB = 0) followed
+    /// by the verbatim priority field value (structured-field token, e.g.
+    /// `"u=0, i"`).
+    pub(crate) fn priority_update(prioritized_stream_id: u32, priority_field: &str) -> Self {
+        let mut payload = Vec::with_capacity(4 + priority_field.len());
+        payload.extend_from_slice(&(prioritized_stream_id & 0x7FFF_FFFF).to_be_bytes());
+        payload.extend_from_slice(priority_field.as_bytes());
+        Self::new(0x10, 0, 0, payload)
+    }
+
     /// Build a DATA frame on stream 0 (invalid per spec).
     pub(crate) fn data_on_stream_zero(payload: Vec<u8>) -> Self {
         Self::new(H2_FRAME_DATA, 0, 0, payload)

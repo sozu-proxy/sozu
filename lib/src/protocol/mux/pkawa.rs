@@ -464,7 +464,11 @@ fn trim_ows(input: &[u8]) -> &[u8] {
 ///
 /// Values outside the valid range are clamped (urgency to 0-7).
 /// Malformed tokens are silently ignored, falling back to defaults.
-fn parse_rfc9218_priority(value: &[u8]) -> (u8, bool) {
+///
+/// Re-used by the RFC 9218 §7.1 PRIORITY_UPDATE frame handler
+/// (`h2::ConnectionH2::handle_priority_update_frame`) to decode the
+/// priority field value payload — same wire format as the request header.
+pub(super) fn parse_rfc9218_priority(value: &[u8]) -> (u8, bool) {
     let mut urgency: u8 = 3; // RFC 9218 §4: default urgency
     let mut incremental = false;
 

@@ -85,10 +85,14 @@ pub enum FrameType {
     GoAway,
     WindowUpdate,
     Continuation,
+    /// RFC 9218 §7.1 — PRIORITY_UPDATE frame (type 0x10). Carries a new
+    /// priority signal for a prioritized stream, replacing the deprecated
+    /// `Priority` frame at the connection level.
+    PriorityUpdate,
     /// Frame of unknown type per RFC 9113 §5.5. Implementations MUST ignore
-    /// and discard these frames so H2 extensions (e.g. RFC 9218
-    /// PRIORITY_UPDATE, frame type 0x10) do not break interoperability.
-    /// The associated `u8` is the raw type byte for diagnostics only.
+    /// and discard these frames so future H2 extensions do not break
+    /// interoperability. The associated `u8` is the raw type byte for
+    /// diagnostics only.
     Unknown(u8),
 }
 
@@ -278,7 +282,11 @@ pub fn frame_header(input: &[u8], max_frame_size: u32) -> IResult<&[u8], FrameHe
         | FrameType::RstStream
         | FrameType::PushPromise
         | FrameType::Continuation => stream_id != 0,
-        FrameType::Settings | FrameType::Ping | FrameType::GoAway => stream_id == 0,
+        // RFC 9218 §7.1: PRIORITY_UPDATE is a connection-scoped signal
+        // (the *prioritized* stream ID lives in the payload).
+        FrameType::Settings | FrameType::Ping | FrameType::GoAway | FrameType::PriorityUpdate => {
+            stream_id == 0
+        }
         FrameType::WindowUpdate | FrameType::Unknown(_) => true,
     };
     if !valid_stream_id {
@@ -315,6 +323,8 @@ fn convert_frame_type(t: u8) -> FrameType {
         7 => FrameType::GoAway,
         8 => FrameType::WindowUpdate,
         9 => FrameType::Continuation,
+        // RFC 9218 §7.1 PRIORITY_UPDATE
+        0x10 => FrameType::PriorityUpdate,
         other => FrameType::Unknown(other),
     }
 }
@@ -331,9 +341,26 @@ pub enum Frame {
     GoAway(GoAway),
     WindowUpdate(WindowUpdate),
     Continuation(Continuation),
+    /// RFC 9218 §7.1 PRIORITY_UPDATE — connection-scoped signal that
+    /// re-prioritizes a specific stream. Payload carries the prioritized
+    /// stream ID and the verbatim priority field value (structured field).
+    PriorityUpdate(PriorityUpdate),
     /// Unknown frame type (RFC 9113 §5.5) — payload already consumed, the
     /// state machine MUST ignore it.
     Unknown(u8),
+}
+
+/// RFC 9218 §7.1 PRIORITY_UPDATE frame payload.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PriorityUpdate {
+    /// Identifier of the stream being re-prioritized (31-bit, reserved high
+    /// bit masked off). `0` MUST be treated as a connection error
+    /// (`PROTOCOL_ERROR`) by the handler.
+    pub prioritized_stream_id: u32,
+    /// Verbatim priority field value (SF-Item / ASCII). The handler passes
+    /// this through the same `parse_rfc9218_priority` helper used for the
+    /// `priority` request header.
+    pub priority_field_value: Vec<u8>,
 }
 
 pub fn frame_body<'a>(
@@ -408,6 +435,8 @@ pub fn frame_body<'a>(
             }
             window_update_frame(i, header)?
         }
+        // RFC 9218 §7.1: PRIORITY_UPDATE payload must be ≥ 4 bytes.
+        FrameType::PriorityUpdate => priority_update_frame(i, header)?,
         // RFC 9113 §5.5: silently consume unknown frame payloads.
         FrameType::Unknown(_) => unknown_frame(i, header)?,
     };
@@ -800,8 +829,8 @@ pub fn continuation_frame<'a>(
 
 /// Silently consume the payload of a frame whose type byte is not recognised,
 /// per RFC 9113 §5.5 ("Implementations MUST ignore and discard frames of
-/// unknown type"). This is how H2 extensions (e.g. RFC 9218 PRIORITY_UPDATE,
-/// type 0x10) remain interoperable with sozu.
+/// unknown type"). Previously covered RFC 9218 PRIORITY_UPDATE (type 0x10);
+/// PRIORITY_UPDATE is now parsed through [`priority_update_frame`].
 pub fn unknown_frame<'a>(
     input: &'a [u8],
     header: &FrameHeader,
@@ -813,6 +842,54 @@ pub fn unknown_frame<'a>(
     };
     Ok((remaining, Frame::Unknown(raw)))
 }
+
+/// RFC 9218 §7.1 PRIORITY_UPDATE frame parser. Payload layout:
+///
+/// ```text
+/// +-+-------------------------------------------------------------+
+/// |R|              Prioritized Stream ID (31)                     |
+/// +-+-------------------------------------------------------------+
+/// |                    Priority Field Value (*)                 ...
+/// +---------------------------------------------------------------+
+/// ```
+///
+/// - 4-byte prioritized stream ID (reserved high bit masked off).
+/// - Remainder: verbatim priority field value (ASCII / SF-Item).
+///
+/// A payload shorter than 4 bytes is `FRAME_SIZE_ERROR` per §7.1. Stream
+/// ID value `0` is rejected by the handler (connection-level
+/// `PROTOCOL_ERROR`), not here — keep the parser purely structural.
+pub fn priority_update_frame<'a>(
+    input: &'a [u8],
+    header: &FrameHeader,
+) -> IResult<&'a [u8], Frame, ParserError<'a>> {
+    if header.payload_len < PRIORITY_UPDATE_MIN_PAYLOAD {
+        return Err(Err::Failure(ParserError::new_h2(
+            input,
+            H2Error::FrameSizeError,
+        )));
+    }
+    let (remaining, payload) = take(header.payload_len)(input)?;
+    let (raw_id_bytes, value_bytes) = payload.split_at(PRIORITY_UPDATE_MIN_PAYLOAD as usize);
+    let prioritized_stream_id = u32::from_be_bytes([
+        raw_id_bytes[0],
+        raw_id_bytes[1],
+        raw_id_bytes[2],
+        raw_id_bytes[3],
+    ]) & STREAM_ID_MASK;
+    Ok((
+        remaining,
+        Frame::PriorityUpdate(PriorityUpdate {
+            prioritized_stream_id,
+            priority_field_value: value_bytes.to_vec(),
+        }),
+    ))
+}
+
+/// Minimum payload size for a PRIORITY_UPDATE frame (RFC 9218 §7.1):
+/// the 4-byte prioritized stream ID. The priority field value is allowed
+/// to be empty (defaults to the RFC 9218 §4 defaults).
+pub const PRIORITY_UPDATE_MIN_PAYLOAD: u32 = 4;
 
 #[cfg(test)]
 mod tests {
@@ -1000,23 +1077,114 @@ mod tests {
         }
     }
 
-    /// RFC 9218 PRIORITY_UPDATE (frame type 0x10) is the canonical example of
-    /// an H2 extension we must accept-and-ignore rather than kill the
-    /// connection over.
+    /// RFC 9218 §7.1: PRIORITY_UPDATE with an empty priority field value +
+    /// prioritized stream ID = 1 is a well-formed frame. The parser yields
+    /// `Frame::PriorityUpdate` with an empty `priority_field_value` — the
+    /// handler supplies the RFC 9218 §4 defaults.
     #[test]
-    fn test_priority_update_is_ignored() {
+    fn test_priority_update_empty_field_parses() {
         let input = [
-            0x00, 0x00, 0x00, // payload_len = 0
+            0x00, 0x00, 0x04, // payload_len = 4
             0x10, // type = PRIORITY_UPDATE (0x10)
             0x00, // flags = 0
-            0x00, 0x00, 0x00, 0x00, // stream_id = 0
+            0x00, 0x00, 0x00, 0x00, // stream_id = 0 (connection-scoped)
+            // prioritized stream ID (big-endian, 31-bit with reserved MSB)
+            0x00, 0x00, 0x00, 0x01,
         ];
 
         let (remaining, header) = frame_header(&input, DEFAULT_MAX_FRAME_SIZE)
             .expect("PRIORITY_UPDATE header must parse");
-        assert!(matches!(header.frame_type, FrameType::Unknown(0x10)));
+        assert!(matches!(header.frame_type, FrameType::PriorityUpdate));
         let (_, frame) = frame_body(remaining, &header).expect("body must be consumed");
-        assert!(matches!(frame, Frame::Unknown(0x10)));
+        match frame {
+            Frame::PriorityUpdate(PriorityUpdate {
+                prioritized_stream_id,
+                ref priority_field_value,
+            }) => {
+                assert_eq!(prioritized_stream_id, 1);
+                assert!(priority_field_value.is_empty());
+            }
+            other => panic!("expected Frame::PriorityUpdate, got {other:?}"),
+        }
+    }
+
+    /// RFC 9218 §7.1: PRIORITY_UPDATE with a non-empty SF-Item priority
+    /// field value. The parser preserves the raw bytes verbatim; the
+    /// handler re-uses `parse_rfc9218_priority` to extract `(urgency, i)`.
+    #[test]
+    fn test_priority_update_with_priority_field_parses() {
+        let value = b"u=0, i";
+        let mut input = vec![
+            0x00,
+            0x00,
+            0x04 + value.len() as u8, // payload_len = 4 + value
+            0x10,                     // type = PRIORITY_UPDATE
+            0x00,                     // flags = 0
+            0x00,
+            0x00,
+            0x00,
+            0x00, // connection stream
+            0x00,
+            0x00,
+            0x00,
+            0x05, // prioritized stream 5
+        ];
+        input.extend_from_slice(value);
+
+        let (remaining, header) =
+            frame_header(&input, DEFAULT_MAX_FRAME_SIZE).expect("header parses");
+        assert!(matches!(header.frame_type, FrameType::PriorityUpdate));
+        let (_, frame) = frame_body(remaining, &header).expect("body parses");
+        match frame {
+            Frame::PriorityUpdate(PriorityUpdate {
+                prioritized_stream_id,
+                ref priority_field_value,
+            }) => {
+                assert_eq!(prioritized_stream_id, 5);
+                assert_eq!(priority_field_value.as_slice(), value);
+            }
+            other => panic!("expected Frame::PriorityUpdate, got {other:?}"),
+        }
+    }
+
+    /// RFC 9218 §7.1: PRIORITY_UPDATE MUST carry at least the 4-byte
+    /// prioritized stream ID. Shorter payloads are `FRAME_SIZE_ERROR`.
+    #[test]
+    fn test_priority_update_payload_below_min_is_frame_size_error() {
+        let input = [
+            0x00, 0x00, 0x03, // payload_len = 3 (one byte short)
+            0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let (remaining, header) =
+            frame_header(&input, DEFAULT_MAX_FRAME_SIZE).expect("header parses");
+        let result = frame_body(remaining, &header);
+        match result {
+            Err(Err::Failure(e)) => {
+                assert_eq!(e.kind, ParserErrorKind::H2(H2Error::FrameSizeError));
+            }
+            other => panic!("expected FRAME_SIZE_ERROR, got {other:?}"),
+        }
+    }
+
+    /// RFC 9218 §7.1: PRIORITY_UPDATE MUST be sent on stream 0 (the
+    /// connection control stream). Any other stream ID is a connection
+    /// `PROTOCOL_ERROR`, rejected at `frame_header` time via the
+    /// frame_type ↔ stream_id cross-check.
+    #[test]
+    fn test_priority_update_on_non_zero_stream_is_protocol_error() {
+        let input = [
+            0x00, 0x00, 0x04, // payload_len = 4
+            0x10, // type = PRIORITY_UPDATE
+            0x00, // flags
+            0x00, 0x00, 0x00, 0x07, // stream_id = 7 (invalid for PRIORITY_UPDATE)
+            0x00, 0x00, 0x00, 0x01, // prioritized_stream_id
+        ];
+        match frame_header(&input, DEFAULT_MAX_FRAME_SIZE) {
+            Err(Err::Failure(e)) => {
+                assert_eq!(e.kind, ParserErrorKind::H2(H2Error::ProtocolError));
+            }
+            other => panic!("expected PROTOCOL_ERROR, got {other:?}"),
+        }
     }
 
     // ---- SETTINGS with odd payload size (not a multiple of 6) ----
