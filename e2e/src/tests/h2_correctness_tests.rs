@@ -1368,6 +1368,115 @@ fn test_h2_rfc9218_incremental_multi_bucket_drains_sequentially() {
     );
 }
 
+/// Tier 3b — RFC 9218 §7.1: a PRIORITY_UPDATE frame for an open stream
+/// with a well-formed priority field value is accepted and does not
+/// terminate the connection. The response must still drain fully with
+/// END_STREAM.
+fn try_h2_priority_update_on_open_stream_is_accepted() -> State {
+    let (worker, backends, front_port) =
+        setup_h2_test_with_large_bodies("H2-COR-PU-ACCEPT", 1, 1024);
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake_with_initial_window(&mut tls, 65_535);
+
+    // Open stream 1 with a default priority header.
+    let block = build_get_headers_with_priority(3, "i=?0");
+    let headers = H2Frame::headers(1, block, true, true);
+    tls.write_all(&headers.encode()).unwrap();
+    // Re-prioritize stream 1 mid-flight with `u=0, i`.
+    let pu = H2Frame::priority_update(1, "u=0, i");
+    tls.write_all(&pu.encode()).unwrap();
+    tls.flush().unwrap();
+
+    let frames = collect_response_frames(&mut tls, 200, 5, 400);
+    log_frames("PRIORITY_UPDATE accept", &frames);
+
+    // No GOAWAY — the response must deliver normally.
+    let has_goaway = frames.iter().any(|(ft, _, _, _)| *ft == H2_FRAME_GOAWAY);
+    let has_end_stream_on_1 = frames.iter().any(|(ft, fl, sid, _)| {
+        (*ft == H2_FRAME_DATA || *ft == H2_FRAME_HEADERS)
+            && *sid == 1
+            && (fl & H2_FLAG_END_STREAM) != 0
+    });
+
+    println!(
+        "has_goaway={has_goaway} has_end_stream_on_1={has_end_stream_on_1} frames={}",
+        frames.len()
+    );
+
+    let infra_ok = teardown(tls, front_port, worker, backends);
+    if infra_ok && !has_goaway && has_end_stream_on_1 {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_priority_update_on_open_stream_is_accepted() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 RFC 9218 §7.1: PRIORITY_UPDATE accepted + response drains",
+            try_h2_priority_update_on_open_stream_is_accepted
+        ),
+        State::Success
+    );
+}
+
+/// Tier 3b — RFC 9218 §7.1: a PRIORITY_UPDATE frame with
+/// `prioritized_stream_id == 0` is a connection-level PROTOCOL_ERROR.
+/// Sozu must emit GOAWAY(PROTOCOL_ERROR) and close the session rather
+/// than silently ignoring the frame.
+fn try_h2_priority_update_on_stream_zero_is_protocol_error() -> State {
+    let (worker, backends, front_port) =
+        setup_h2_test_with_large_bodies("H2-COR-PU-STREAM0", 1, 1024);
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake_with_initial_window(&mut tls, 65_535);
+
+    // Send a PRIORITY_UPDATE targeting stream 0 (the connection itself).
+    let pu = H2Frame::priority_update(0, "u=0, i");
+    tls.write_all(&pu.encode()).unwrap();
+    tls.flush().unwrap();
+
+    let frames = collect_response_frames(&mut tls, 200, 4, 300);
+    log_frames("PRIORITY_UPDATE stream0", &frames);
+
+    let has_protocol_error_goaway = frames.iter().any(|(ft, _, _, payload)| {
+        *ft == H2_FRAME_GOAWAY
+            && payload.len() >= 8
+            // bytes 4..8 carry the error code (RFC 9113 §6.8)
+            && u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]) == 0x1
+    });
+
+    println!(
+        "has_protocol_error_goaway={has_protocol_error_goaway} frames={}",
+        frames.len()
+    );
+
+    let infra_ok = teardown(tls, front_port, worker, backends);
+    if infra_ok && has_protocol_error_goaway {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_priority_update_on_stream_zero_is_protocol_error() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 RFC 9218 §7.1: PRIORITY_UPDATE on stream 0 → GOAWAY(PROTOCOL_ERROR)",
+            try_h2_priority_update_on_stream_zero_is_protocol_error
+        ),
+        State::Success
+    );
+}
+
 /// RFC 9218 §4 + sozu incremental-scheduling regression (PR #1209 follow-up):
 /// a SOLO stream whose client sent `priority: u=0, i` (Chrome's navigation
 /// default since Chrome 107) must drain its full response body promptly.

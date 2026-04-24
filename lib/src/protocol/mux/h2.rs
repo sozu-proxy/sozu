@@ -3577,6 +3577,7 @@ fn h2_frame_rx_metric_key(frame: &Frame) -> &'static str {
         Frame::GoAway(_) => "h2.frames.rx.goaway",
         Frame::WindowUpdate(_) => "h2.frames.rx.window_update",
         Frame::Continuation(_) => "h2.frames.rx.continuation",
+        Frame::PriorityUpdate(_) => "h2.frames.rx.priority_update",
         Frame::Unknown(_) => "h2.frames.rx.unknown",
     }
 }
@@ -3866,6 +3867,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             Frame::Ping(ping) => self.handle_ping_frame(ping),
             Frame::GoAway(goaway) => self.handle_goaway_frame(goaway, context, endpoint),
             Frame::WindowUpdate(wu) => self.handle_window_update_frame(wu, context, endpoint),
+            Frame::PriorityUpdate(pu) => self.handle_priority_update_frame(pu),
             Frame::Continuation(_) => {
                 // Unreachable: standalone CONTINUATION is rejected in
                 // `handle_header_state` (RFC 9113 §6.10) and in-block
@@ -4330,6 +4332,46 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 return self.goaway(H2Error::ProtocolError);
             }
         }
+        MuxResult::Continue
+    }
+
+    /// RFC 9218 §7.1: PRIORITY_UPDATE reprioritizes an open or idle-soon
+    /// stream at the connection level. Decodes the priority field value
+    /// (same grammar as the `priority` request header, `parse_rfc9218_priority`)
+    /// and pushes it into the `Prioriser` through the same guarded path used
+    /// for standalone PRIORITY frames — the guard bounds memory against a
+    /// client spamming PRIORITY_UPDATE for far-future stream IDs.
+    ///
+    /// Prioritized stream ID `0` is a connection-level `PROTOCOL_ERROR`
+    /// (RFC 9218 §7.1). For any other ID that is not currently open or
+    /// within the idle look-ahead budget, the update is silently dropped
+    /// (matches the PRIORITY-frame guard semantics — no state change).
+    fn handle_priority_update_frame(&mut self, pu: parser::PriorityUpdate) -> MuxResult {
+        self.attribute_bytes_to_overhead();
+        if pu.prioritized_stream_id == 0 {
+            error!(
+                "{} PRIORITY_UPDATE with prioritized_stream_id=0 (RFC 9218 §7.1)",
+                log_context!(self)
+            );
+            return self.goaway(H2Error::ProtocolError);
+        }
+        let (urgency, incremental) = pkawa::parse_rfc9218_priority(&pu.priority_field_value);
+        trace!(
+            "{} PRIORITY_UPDATE stream={} urgency={} incremental={}",
+            log_context!(self),
+            pu.prioritized_stream_id,
+            urgency,
+            incremental
+        );
+        let _ = self.prioriser.push_priority_guarded(
+            pu.prioritized_stream_id,
+            parser::PriorityPart::Rfc9218 {
+                urgency,
+                incremental,
+            },
+            self.last_stream_id,
+            &self.streams,
+        );
         MuxResult::Continue
     }
 
