@@ -1002,6 +1002,37 @@ impl Readiness {
     pub fn signal_pending_read(&mut self) {
         self.event.insert(Ready::READABLE);
     }
+
+    /// Pair `Ready::WRITABLE` insert with `signal_pending_write` — the canonical
+    /// invariant-15 form for any path that writes bytes to sozu-owned buffers
+    /// under edge-triggered epoll. See `lib/src/protocol/mux/LIFECYCLE.md`.
+    #[inline]
+    pub fn arm_writable(&mut self) {
+        self.interest.insert(Ready::WRITABLE);
+        self.signal_pending_write();
+    }
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::{Readiness, Ready};
+
+    #[test]
+    fn arm_writable_sets_interest_and_event() {
+        let mut r = Readiness::new();
+        r.arm_writable();
+        assert!(r.interest.is_writable());
+        assert!(r.event.is_writable());
+    }
+
+    #[test]
+    fn arm_writable_is_idempotent() {
+        let mut r = Readiness::new();
+        r.arm_writable();
+        r.arm_writable();
+        assert_eq!(r.interest, Ready::WRITABLE);
+        assert_eq!(r.event, Ready::WRITABLE);
+    }
 }
 
 pub fn display_ready(s: &mut [u8], readiness: Ready) {
