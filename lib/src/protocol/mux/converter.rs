@@ -439,15 +439,35 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                 // can interleave. Non-incremental streams drain sequentially
                 // (current behaviour) by honouring `can_continue`.
                 //
-                // Solo incremental guard: the yield only matters when there
-                // is at least one other incremental peer in the same
-                // urgency bucket. With <= 1 incremental peer, yielding
-                // strands the stream because `finalize_write` then strips
+                // Solo-bucket guard: the yield only matters when there is
+                // at least one other incremental peer in the same urgency
+                // bucket. With <= 1 incremental peer, yielding strands the
+                // stream because `finalize_write` then strips
                 // `Ready::WRITABLE` (no `expect_write` is set on a clean
                 // yield), and edge-triggered epoll will not re-fire. See
                 // `test_h2_solo_incremental_drains_fully` and the h2.rs
                 // scheduler wiring that populates `incremental_peer_count`.
-                return can_continue && !(self.incremental_mode && self.incremental_peer_count > 1);
+                //
+                // Tier 3c close-race guard (LIFECYCLE §9 invariant 19): if
+                // the next block is the closing `Block::Flags` with
+                // `end_stream=true`, suppress the yield unconditionally.
+                // Yielding between the last DATA and the closing Flags
+                // strands the END_STREAM marker in `kawa.blocks` — the
+                // invariant-16 finalize_write guard catches the wake-up
+                // loss, but yielding one frame later is still cheaper than
+                // paying the round-trip through the event loop for a
+                // single END_STREAM frame (often an empty DATA frame with
+                // the END_STREAM flag set, 9 bytes of overhead).
+                let next_closes_stream = matches!(
+                    kawa.blocks.front(),
+                    Some(Block::Flags(Flags {
+                        end_stream: true,
+                        ..
+                    }))
+                );
+                let yield_after_data =
+                    self.incremental_mode && self.incremental_peer_count > 1 && !next_closes_stream;
+                return can_continue && !yield_after_data;
             }
             Block::Flags(Flags {
                 end_header,
@@ -1298,5 +1318,93 @@ mod tests {
                  of incremental_peer_count (= {peers})"
             );
         }
+    }
+
+    // ── LIFECYCLE §9 invariant 19: DATA/trailer close-race suppression ────
+
+    #[test]
+    fn test_converter_suppresses_yield_before_closing_end_stream_flags() {
+        // Two incremental peers normally trigger a yield after DATA. But
+        // if the next queued block is a closing `Block::Flags` (end_stream
+        // = true), yielding would strand END_STREAM. Tier 3c:
+        // converter must drain the closing Flags in the same pass.
+        let mut encoder = loona_hpack::Encoder::new();
+        let mut conv = test_converter(&mut encoder);
+        conv.incremental_mode = true;
+        conv.incremental_peer_count = 3;
+        conv.window = 4096;
+        let mut buf = vec![0u8; 8192];
+        let mut kawa = make_kawa(&mut buf, Kind::Response);
+
+        // Pre-queue the closing Flags so the converter sees it when
+        // peeking `kawa.blocks.front()` inside the DATA arm.
+        kawa.blocks.push_back(Block::Flags(Flags {
+            end_body: true,
+            end_chunk: false,
+            end_header: false,
+            end_stream: true,
+        }));
+
+        let data = Store::Static(b"hello world");
+        let cont = conv.call(Block::Chunk(Chunk { data }), &mut kawa);
+        assert!(
+            cont,
+            "yield must be suppressed when the next block is a closing Flags \
+             (end_stream = true) — otherwise END_STREAM strands in kawa.blocks"
+        );
+    }
+
+    #[test]
+    fn test_converter_yields_before_trailing_flags_without_end_stream() {
+        // Flags blocks without `end_stream=true` (e.g. inter-chunk
+        // `end_chunk` markers the H1 parser emits mid-body) must NOT
+        // suppress the yield — they do not terminate the stream.
+        let mut encoder = loona_hpack::Encoder::new();
+        let mut conv = test_converter(&mut encoder);
+        conv.incremental_mode = true;
+        conv.incremental_peer_count = 3;
+        conv.window = 4096;
+        let mut buf = vec![0u8; 8192];
+        let mut kawa = make_kawa(&mut buf, Kind::Response);
+
+        kawa.blocks.push_back(Block::Flags(Flags {
+            end_body: false,
+            end_chunk: true,
+            end_header: false,
+            end_stream: false,
+        }));
+
+        let data = Store::Static(b"chunked body");
+        let cont = conv.call(Block::Chunk(Chunk { data }), &mut kawa);
+        assert!(
+            !cont,
+            "yield still applies when next Flags is a non-terminal marker \
+             (end_chunk without end_stream)"
+        );
+    }
+
+    #[test]
+    fn test_converter_yields_before_chunk_block() {
+        // Sanity: the close-race guard only triggers on Block::Flags —
+        // a trailing Block::Chunk does NOT suppress the yield.
+        let mut encoder = loona_hpack::Encoder::new();
+        let mut conv = test_converter(&mut encoder);
+        conv.incremental_mode = true;
+        conv.incremental_peer_count = 3;
+        conv.window = 4096;
+        let mut buf = vec![0u8; 8192];
+        let mut kawa = make_kawa(&mut buf, Kind::Response);
+
+        kawa.blocks.push_back(Block::Chunk(Chunk {
+            data: Store::Static(b"next chunk"),
+        }));
+
+        let data = Store::Static(b"hello world");
+        let cont = conv.call(Block::Chunk(Chunk { data }), &mut kawa);
+        assert!(
+            !cont,
+            "back-to-back DATA must still yield — incremental rotation depends \
+             on the converter deferring the next DATA"
+        );
     }
 }

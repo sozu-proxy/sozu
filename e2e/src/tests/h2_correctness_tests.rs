@@ -1477,6 +1477,80 @@ fn test_h2_priority_update_on_stream_zero_is_protocol_error() {
     );
 }
 
+/// Tier 3c — LIFECYCLE §9 invariant 19: the converter must NOT yield
+/// between the last DATA frame and the closing `Block::Flags`
+/// (end_stream = true). Three same-urgency incremental streams drive
+/// the round-robin yield; each response body is small enough that the
+/// scheduler reaches the closing Flags right after its first DATA frame.
+/// With Tier 3c's close-race guard, END_STREAM lands in the same pass
+/// rather than waiting for another writable tick (or — pre-invariant-16
+/// — stranding permanently).
+fn try_h2_incremental_round_robin_closes_every_stream() -> State {
+    let (worker, backends, front_port) =
+        setup_h2_test_with_large_bodies("H2-COR-RR-CLOSE", 3, 4 * 1024);
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake_with_initial_window(&mut tls, 0);
+
+    let ids = [1u32, 3, 5];
+    for sid in ids {
+        let block = build_get_headers_with_priority(3, "i");
+        let headers = H2Frame::headers(sid, block, true, true);
+        tls.write_all(&headers.encode()).unwrap();
+    }
+    tls.flush().unwrap();
+
+    thread::sleep(Duration::from_millis(400));
+
+    let mut bulk = Vec::new();
+    for sid in ids {
+        bulk.extend_from_slice(&H2Frame::window_update(sid, 1_000_000).encode());
+    }
+    bulk.extend_from_slice(&H2Frame::window_update(0, 1_000_000).encode());
+    tls.write_all(&bulk).unwrap();
+    tls.flush().unwrap();
+
+    let frames = collect_response_frames(&mut tls, 300, 6, 400);
+    log_frames("RR close-race", &frames);
+
+    // Every stream must observe at least one frame with END_STREAM set
+    // (either the terminal DATA or an empty DATA marker produced by the
+    // converter's close path).
+    let closed: std::collections::HashSet<u32> = frames
+        .iter()
+        .filter_map(|(ft, fl, sid, _)| {
+            if (*ft == H2_FRAME_DATA || *ft == H2_FRAME_HEADERS) && (fl & H2_FLAG_END_STREAM) != 0 {
+                Some(*sid)
+            } else {
+                None
+            }
+        })
+        .collect();
+    let all_closed = ids.iter().all(|sid| closed.contains(sid));
+
+    println!("closed_streams={closed:?} all_closed={all_closed}");
+
+    let infra_ok = teardown(tls, front_port, worker, backends);
+    if infra_ok && all_closed {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_incremental_round_robin_closes_every_stream() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 RFC 9218 §4 Tier 3c: round-robin drain emits END_STREAM per stream",
+            try_h2_incremental_round_robin_closes_every_stream
+        ),
+        State::Success
+    );
+}
+
 /// RFC 9218 §4 + sozu incremental-scheduling regression (PR #1209 follow-up):
 /// a SOLO stream whose client sent `priority: u=0, i` (Chrome's navigation
 /// default since Chrome 107) must drain its full response body promptly.
