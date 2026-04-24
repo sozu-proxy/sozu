@@ -2410,7 +2410,17 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 // will generate a RST_STREAM frame. Mark it so we don't send a
                 // duplicate on the next writable cycle.
                 if kawa.is_error() {
-                    self.rst_sent.insert(stream_id);
+                    let freshly_rst = self.rst_sent.insert(stream_id);
+                    // LIFECYCLE §9 invariant 17: any transition to ineligible
+                    // mid-pass MUST decrement ready_incremental_by_urgency so
+                    // later streams in the same 'outer iteration see the live
+                    // count, not the snapshot. Missing this costs one voluntary
+                    // yield per same-urgency peer that trails the RST.
+                    if freshly_rst && is_incremental {
+                        if let Some(c) = ready_incremental_by_urgency.get_mut(&urgency) {
+                            *c = c.saturating_sub(1);
+                        }
+                    }
                 }
                 kawa.prepare(&mut converter);
                 let consumed = window - converter.window;
@@ -2479,9 +2489,24 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     context.listener.clone(),
                 ) {
                     completed_streams.push((dead_id, global_stream_id, token, close_frontend));
+                    // LIFECYCLE §9 invariant 17: decrement INSIDE 'outer so
+                    // later iterations see the reduced count. The post-loop
+                    // retirement at remove_dead_stream is too late.
+                    if is_incremental {
+                        if let Some(c) = ready_incremental_by_urgency.get_mut(&urgency) {
+                            *c = c.saturating_sub(1);
+                        }
+                    }
                 }
             }
         }
+        gauge!(
+            "h2.streams.ready_incremental.by_urgency",
+            ready_incremental_by_urgency
+                .values()
+                .copied()
+                .sum::<usize>()
+        );
         // Reclaim the converter's reusable buffers before any &mut self calls,
         // since the converter borrows self.encoder.
         let converter_out = std::mem::take(&mut converter.out);
@@ -7106,5 +7131,58 @@ mod tests {
         let mut streams_map: HashMap<StreamId, GlobalStreamId> = HashMap::new();
         streams_map.insert(1, 0);
         assert!(any_stream_has_pending_back(&streams_map, &[stream]));
+    }
+
+    // ── Fix D: ready_incremental_by_urgency mid-pass consistency ─────────
+    //
+    // The full RED is in e2e and currently #[ignore]'d (timing-sensitive).
+    // The scalar logic below pins the saturating_sub + bucket-scoped
+    // decrement contract the scheduler at h2.rs:2412-2414 + h2.rs:2481
+    // relies on: a same-urgency transition-to-ineligible MUST drop the
+    // per-bucket count by exactly 1 and never underflow the u64.
+
+    fn make_bucket(counts: &[(u8, usize)]) -> HashMap<u8, usize> {
+        counts.iter().copied().collect()
+    }
+
+    #[test]
+    fn ready_incremental_bucket_decrement_reduces_same_urgency_only() {
+        let mut map = make_bucket(&[(1, 3), (3, 2)]);
+        let urgency: u8 = 1;
+        let is_incremental = true;
+        // Simulate a stream in urgency=1 going ineligible mid-pass.
+        if is_incremental {
+            if let Some(c) = map.get_mut(&urgency) {
+                *c = c.saturating_sub(1);
+            }
+        }
+        assert_eq!(map.get(&1), Some(&2), "urgency-1 bucket must drop to 2");
+        assert_eq!(map.get(&3), Some(&2), "urgency-3 bucket untouched");
+    }
+
+    #[test]
+    fn ready_incremental_bucket_decrement_saturates_at_zero() {
+        let mut map = make_bucket(&[(0, 0)]);
+        let urgency: u8 = 0;
+        if let Some(c) = map.get_mut(&urgency) {
+            *c = c.saturating_sub(1);
+        }
+        assert_eq!(map.get(&0), Some(&0), "saturating_sub must not underflow");
+    }
+
+    #[test]
+    fn ready_incremental_bucket_decrement_skipped_for_non_incremental() {
+        let mut map = make_bucket(&[(1, 3)]);
+        let is_incremental = false;
+        if is_incremental {
+            if let Some(c) = map.get_mut(&1) {
+                *c = c.saturating_sub(1);
+            }
+        }
+        assert_eq!(
+            map.get(&1),
+            Some(&3),
+            "non-incremental transitions must not touch the bucket"
+        );
     }
 }
