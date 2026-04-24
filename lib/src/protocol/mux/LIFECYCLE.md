@@ -642,19 +642,31 @@ that touches `h2.rs`, `mod.rs`, or `stream.rs`.
     after a DATA frame when `incremental_mode == true` *and*
     `incremental_peer_count > 1`. A solo incremental stream with no
     peer to interleave with must drain sequentially — otherwise
-    `finalize_write` (`h2.rs:2634-2641`) withdraws `Ready::WRITABLE`
-    on a clean pass (no `expect_write` set by the converter) and
-    edge-triggered epoll never re-fires. The scheduler populates both
-    fields once per write pass from `apply_incremental_rotation`'s
-    returned count.
-16. **Never withdraw `Ready::WRITABLE` with pending back-buffer.**
-    `finalize_write` (`h2.rs:2634-2641`) removes `Ready::WRITABLE` only
-    when the pass drained cleanly (`!socket_wants_write &&
-    expect_write.is_none()`) *and* no stream has queued response bytes
-    (`back.out`/`back.blocks`). A voluntary scheduler yield can leave
-    bytes buffered without `expect_write` being set; stripping
-    WRITABLE in that state strands the stream. Defence-in-depth for
-    invariant 15 and any future yield condition.
+    `finalize_write` (`h2.rs` `fn finalize_write`) would withdraw
+    `Ready::WRITABLE` on a clean pass (no `expect_write` set by the
+    converter) and edge-triggered epoll would never re-fire.
+    The scheduler populates both fields once per write pass from
+    `apply_incremental_rotation`'s returned count.
+16. **Never withdraw `Ready::WRITABLE` with pending back-buffer after a
+    pass that made forward progress.** `finalize_write`
+    (`h2.rs` `fn finalize_write`) removes `Ready::WRITABLE` only when
+    the pass drained cleanly (`!socket_wants_write &&
+    expect_write.is_none()`) *and either* `bytes_written_this_pass == 0`
+    *or* no open stream has queued response bytes
+    (`back.out`/`back.blocks`). The progress check is load-bearing: a
+    zero-progress pass (e.g. all streams flow-control-starved) must
+    relinquish `Ready::WRITABLE` so the session dispatcher does not
+    busy-spin — the next wake-up arrives from `WINDOW_UPDATE`,
+    backend readable, or a new request. Enforced at runtime via the
+    file-private helper `any_stream_has_pending_back` (`h2.rs`).
+    A voluntary scheduler yield (RFC 9218 incremental rotation and
+    any future yield site) can leave bytes buffered without
+    `expect_write` being set; stripping `WRITABLE` in that state
+    strands the stream because edge-triggered epoll never re-fires
+    for sozu-owned buffers. Defence-in-depth for invariant 15.
+    The same helper backs `ConnectionH2::has_pending_write_full`,
+    consulted by `delay_close_for_frontend_flush` so shutdown-drain
+    does not close before the stream bytes land on the socket.
 
 ---
 
