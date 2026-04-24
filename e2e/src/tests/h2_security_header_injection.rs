@@ -528,9 +528,8 @@ fn try_h2_path_syntax_enforced() -> State {
         // after the eager-RST fix. `!wrote` still accepted: the HPACK decoder
         // can reject a control-char `:path` early and collapse the TLS write
         // before the stream layer sees it.
-        let rejected = !wrote
-            || rejected_with_goaway_or_rst(&frames)
-            || contains_400_response(&frames);
+        let rejected =
+            !wrote || rejected_with_goaway_or_rst(&frames) || contains_400_response(&frames);
 
         if *should_reject && !rejected {
             println!("case '{label}' — expected rejection, got acceptance");

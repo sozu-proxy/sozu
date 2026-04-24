@@ -67,9 +67,9 @@ use super::h2_utils::{
     H2_ERROR_REFUSED_STREAM, H2_FRAME_DATA, H2_FRAME_HEADERS, H2_FRAME_SETTINGS, H2Frame,
     collect_response_frames, contains_goaway, contains_goaway_with_error,
     contains_headers_response, contains_rst_stream, h2_handshake, h2_handshake_with_initial_window,
-    log_frames, parse_h2_frames,
-    raw_h2_connection, read_all_available, rejected_with_goaway_or_rst, setup_h2_listener_only,
-    setup_h2_test, teardown, verify_sozu_alive,
+    log_frames, parse_h2_frames, raw_h2_connection, read_all_available,
+    rejected_with_goaway_or_rst, setup_h2_listener_only, setup_h2_test, teardown,
+    verify_sozu_alive,
 };
 use crate::{
     mock::{
