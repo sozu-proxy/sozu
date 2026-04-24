@@ -2323,11 +2323,41 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             .prioriser
             .apply_incremental_rotation(&mut self.priorities_buf);
 
+        // RFC 9218 §4 refinement (Tier 3a): the connection-global
+        // `incremental_count` is too coarse for `converter.incremental_peer_count`.
+        // A solo `u=0, i` stream with an unrelated `u=7, i` peer in a
+        // different urgency bucket would still see `incremental_peer_count > 1`
+        // and voluntarily yield — stranding bytes the invariant-15/16 guards
+        // were meant to prevent. Scope the count to same-urgency streams that
+        // are actually ready to emit this pass (eligibility mirrors the check
+        // in the write loop below).
+        let mut ready_incremental_by_urgency: HashMap<u8, usize> = HashMap::new();
+        for &sid in self.priorities_buf.iter() {
+            let (urgency, is_incremental) = self.prioriser.get(&sid);
+            if !is_incremental {
+                continue;
+            }
+            let Some(&gid) = self.streams.get(&sid) else {
+                continue;
+            };
+            let wbuffer = match self.position {
+                Position::Server => &context.streams[gid].back,
+                Position::Client(..) => &context.streams[gid].front,
+            };
+            if wbuffer.is_main_phase()
+                || (wbuffer.is_terminated() && !wbuffer.is_completed())
+                || (wbuffer.is_error() && !self.rst_sent.contains(&sid))
+            {
+                *ready_incremental_by_urgency.entry(urgency).or_insert(0) += 1;
+            }
+        }
+
         trace!(
-            "{} PRIORITIES: {:?} (incremental_count={})",
+            "{} PRIORITIES: {:?} (incremental_count={}, per_bucket={:?})",
             log_context!(self),
             self.priorities_buf,
-            incremental_count
+            incremental_count,
+            ready_incremental_by_urgency
         );
         let mut socket_write = false;
         // RFC 9218 §4 round-robin: remember the first incremental stream we
@@ -2349,7 +2379,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 );
                 continue;
             };
-            let (_, is_incremental) = self.prioriser.get(&stream_id);
+            let (urgency, is_incremental) = self.prioriser.get(&stream_id);
             let stream = &mut context.streams[global_stream_id];
             let stream_state = stream.state;
             let parts = stream.split(&self.position);
@@ -2364,11 +2394,18 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 // RFC 9218 §4: incremental streams yield the converter after
                 // a single DATA frame so same-urgency peers interleave.
                 converter.incremental_mode = is_incremental;
-                // Solo-bucket guard: skip the yield when there is no peer
-                // to interleave with (prevents the `finalize_write`
-                // WRITABLE-withdrawal strand — see commit message + test
-                // `test_h2_solo_incremental_drains_fully`).
-                converter.incremental_peer_count = incremental_count;
+                // Same-urgency-bucket ready-peer count (Tier 3a, LIFECYCLE §9
+                // invariant 17). The converter skips the yield when there is
+                // no peer in the same bucket to interleave with — prevents
+                // the `finalize_write` WRITABLE-withdrawal strand (see
+                // `test_h2_solo_incremental_drains_fully`). A connection-wide
+                // count would wrongly yield for a solo incremental stream
+                // when another urgency bucket happens to contain an
+                // incremental peer.
+                converter.incremental_peer_count = ready_incremental_by_urgency
+                    .get(&urgency)
+                    .copied()
+                    .unwrap_or(0);
                 // Track RST_STREAM dedup: if kawa is in error state, the converter
                 // will generate a RST_STREAM frame. Mark it so we don't send a
                 // duplicate on the next writable cycle.
