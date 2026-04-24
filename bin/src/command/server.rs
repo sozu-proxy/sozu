@@ -296,6 +296,7 @@ impl CommandHub {
             next_session_id,
             next_task_id,
             next_worker_id,
+            boot_generation,
         } = upgrade_data;
 
         let executable_path =
@@ -319,6 +320,9 @@ impl CommandHub {
         server.next_session_id = next_session_id;
         server.next_task_id = next_task_id;
         server.next_worker_id = next_worker_id;
+        // Carry the boot generation forward; it will be bumped one more time
+        // by `upgrade_main` before the next re-exec.
+        server.boot_generation = boot_generation;
 
         for worker in workers
             .iter()
@@ -593,6 +597,18 @@ pub struct Server {
     /// `&Server` only, not `&mut Server`, for the whole `Event` fan-out.
     /// `None` when no dedicated sink is configured (fallback to `log_target`).
     pub audit_log_writer: Option<RefCell<File>>,
+    /// Dedicated JSON-structured audit sink. Same lifecycle as
+    /// `audit_log_writer`, but writes one JSON object per line so SIEM
+    /// pipelines (Wazuh, Elastic, Loki) can ingest without bespoke parser
+    /// code. `None` when `Config::audit_logs_json_target` is unset.
+    pub audit_log_json_writer: Option<RefCell<File>>,
+    /// Boot-generation counter, incremented each time the main process
+    /// re-execs via `MAIN_UPGRADED`. Stamped into every audit line so
+    /// SOC tooling can disambiguate post-upgrade sessions from pre-upgrade
+    /// ones — `(boot_generation, session_ulid)` is the durable correlation
+    /// pair across PID reuse. Persisted across upgrades via [`UpgradeData`];
+    /// resets only on full process restart (not re-exec).
+    pub boot_generation: u32,
     /// the MIO structure that registers sockets and polls them all
     poll: Poll,
     /// all tasks created in one tick, to be propagated to the Hub at each tick
@@ -637,6 +653,19 @@ impl Server {
             },
             None => None,
         };
+        let audit_log_json_writer = match config.audit_logs_json_target.as_deref() {
+            Some(path) => match open_audit_log_file(path) {
+                Ok(file) => Some(RefCell::new(file)),
+                Err(err) => {
+                    error!(
+                        "Could not open audit JSON log file {:?}: {}. JSON audit sink disabled.",
+                        path, err
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
 
         Ok(Self {
             config,
@@ -649,6 +678,8 @@ impl Server {
             next_worker_id: 0,
             pending_audit_events: VecDeque::new(),
             audit_log_writer,
+            audit_log_json_writer,
+            boot_generation: 0,
             poll,
             queued_tasks: HashMap::new(),
             state: ConfigState::new(),
@@ -669,6 +700,19 @@ impl Server {
         let mut writer = writer.borrow_mut();
         if let Err(err) = writeln!(writer, "{line}") {
             error!("Could not append to audit log file: {}", err);
+        }
+    }
+
+    /// Append a JSON-encoded audit record to the dedicated JSON sink, if
+    /// one is configured. One line per record so SIEM parsers can stream
+    /// `tail -F`. Same best-effort behaviour as [`append_audit_line`].
+    pub fn append_audit_json(&self, json: &str) {
+        let Some(writer) = self.audit_log_json_writer.as_ref() else {
+            return;
+        };
+        let mut writer = writer.borrow_mut();
+        if let Err(err) = writeln!(writer, "{json}") {
+            error!("Could not append to audit JSON file: {}", err);
         }
     }
 }
@@ -979,6 +1023,7 @@ impl Server {
             next_session_id: self.next_session_id,
             next_task_id: self.next_task_id,
             next_worker_id: self.next_worker_id,
+            boot_generation: self.boot_generation,
         }
     }
 }

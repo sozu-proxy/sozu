@@ -318,16 +318,32 @@ pub struct UpgradeData {
     /// JSON serialized workers
     pub workers: Vec<SerializedWorkerSession>,
     pub state: ConfigState,
+    /// Boot-generation counter, bumped each time a `MAIN_UPGRADED` re-exec
+    /// happens. Stamps every audit line so SOC tooling can disambiguate
+    /// post-upgrade sessions from pre-upgrade ones (PIDs reset, but the
+    /// audit log keeps generation+session_ulid as the durable correlation
+    /// pair). `0` on first boot.
+    #[serde(default)]
+    pub boot_generation: u32,
 }
 
 pub fn upgrade_main(server: &mut Server, client: &mut ClientSession) {
+    // Bump the boot generation BEFORE serialising upgrade_data so the
+    // re-execed main starts at the new value. The audit line below
+    // already reflects the bumped value.
+    server.boot_generation = server.boot_generation.saturating_add(1);
+
     audit_emit_inline(
         server,
         client,
         EventKind::MainUpgraded,
         "main_upgraded",
         "config.main_upgraded",
-        format!("executable:{}", server.executable_path.as_str()),
+        format!(
+            "executable:{} boot_generation:{}",
+            server.executable_path.as_str(),
+            server.boot_generation
+        ),
         AuditResult::Ok,
         AuditExtras::default(),
     );
