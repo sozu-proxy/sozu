@@ -26,6 +26,10 @@ jobs:
           toolchain: ${{ matrix.rust }}
           profile: minimal
           override: true
+      - name: Install nightly toolchain (for fuzz targets)
+        run: rustup toolchain install nightly --profile minimal
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
       - name: Build
         uses: actions-rs/cargo@v1
         with:
