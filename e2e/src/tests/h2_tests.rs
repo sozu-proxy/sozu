@@ -9025,7 +9025,6 @@ fn try_h2_large_response_1gb_stress() -> State {
 }
 
 #[test]
-#[ignore] // Run manually: cargo test -p sozu-e2e -- test_h2_large_response_1gb_stress --ignored --nocapture
 fn test_h2_large_response_1gb_stress() {
     assert_eq!(
         repeat_until_error_or(

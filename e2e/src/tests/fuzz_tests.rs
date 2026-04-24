@@ -1,9 +1,12 @@
 //! Integration test that runs fuzz targets for a bounded time.
 //! Requires: cargo-fuzz installed, nightly Rust toolchain.
-//! Run manually: cargo test -p sozu-e2e -- --ignored fuzz
+//!
+//! Both targets run 10 s of fuzzing each and are part of the default
+//! `cargo test` run. Developers without nightly + cargo-fuzz will see
+//! them fail — install with `rustup toolchain install nightly` and
+//! `cargo install cargo-fuzz`.
 
 #[test]
-#[ignore] // requires nightly + cargo-fuzz
 fn fuzz_frame_parser() {
     let status = std::process::Command::new("cargo")
         .args([
@@ -21,7 +24,6 @@ fn fuzz_frame_parser() {
 }
 
 #[test]
-#[ignore] // requires nightly + cargo-fuzz
 fn fuzz_hpack_decoder() {
     let status = std::process::Command::new("cargo")
         .args([
