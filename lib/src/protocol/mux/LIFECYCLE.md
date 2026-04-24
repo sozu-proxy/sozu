@@ -515,21 +515,69 @@ a peer-side HUP after the final GOAWAY.
 Three directions:
 
 - **Peer-initiated** — `handle_rst_stream_frame` (`h2.rs` — reaches
-  `self.streams.remove(&rst_stream.stream_id)` at `h2.rs:3739`). Also
-  runs flood counters (CVE-2023-44487 Rapid Reset).
-- **Proxy-initiated, error response** — `reset_stream` (`h2.rs:4331`).
-  Transitions to `Unlinked`, may set a default answer, counts against
+  `self.streams.remove(&rst_stream.stream_id)`). Also runs flood
+  counters (CVE-2023-44487 Rapid Reset).
+- **Proxy-initiated, error response** — `reset_stream`
+  (`h2.rs:5180`). Transitions to `Unlinked`, calls
+  `forcefully_terminate_answer` for kawa cleanup, queues the outgoing
+  RST via [`enqueue_rst`](#proxy-rst-emission-path), and counts against
   `record_rst_emitted` (CVE-2025-8671 MadeYouReset) unless `NoError`.
 - **Proxy-initiated, idle cancel** — `cancel_timed_out_streams`
-  (§7.2).
+  (§7.2); the per-stream `forcefully_terminate_answer` call in the
+  `mod.rs:1299` timeout path now arms `Ready::WRITABLE` via
+  `arm_writable()` so the pair with `event::WRITABLE` actually
+  schedules the next `writable()` tick under edge-triggered epoll.
 
-All three paths eventually purge the wire-id from `self.streams`; only
-`reset_stream` still routes through stream-level state rather than
-`remove_dead_stream`, and each path must honor the invariant from §5.4.
+All three paths eventually purge the wire-id from `self.streams`.
 
-Flood-mitigation dedup: `self.rst_sent: HashSet<StreamId>`
-(`h2.rs:1028`) prevents duplicate RST_STREAM on the wire for the same
-stream id.
+#### Proxy-RST emission path
+
+`ConnectionH2::enqueue_rst(wire_stream_id, error)` (`h2.rs:3494`) is
+the canonical entry point for every proxy-emitted stream reset. It
+delegates to the free-function primitive
+`enqueue_rst_into` (`h2.rs:604`) and the free function is unit-tested
+without a full `ConnectionH2` fixture (see the four
+`test_enqueue_rst_into_*` tests). Three invariants are kept in lock-step:
+
+- **Dedupe** via `self.rst_sent: HashSet<StreamId>`: at most one RST
+  per wire stream id. `HashSet::insert` returns `false` when the id
+  is already present; the helper short-circuits on that branch so
+  `pending_rst_streams` and `total_rst_streams_queued` stay
+  consistent even when a cascading error path re-enters the reset
+  flow for the same stream.
+- **MadeYouReset queued cap** via `self.total_rst_streams_queued`
+  (capped at `MAX_PENDING_RST_STREAMS = 200`). Each freshly queued
+  RST bumps the counter; `flush_pending_control_frames` escalates to
+  `GOAWAY(ENHANCE_YOUR_CALM)` when the cap is exceeded. Orthogonal
+  to `record_rst_emitted` (the 500-emitted MadeYouReset lifetime
+  cap) — a RST can be queued-but-not-yet-emitted.
+- **Invariant 15** via `Readiness::arm_writable()` (`lib/src/lib.rs:1010`):
+  pairs `Ready::WRITABLE` interest with the matching event bit so
+  `writable()` is scheduled on the next epoll tick.
+
+The three RST push sites retrofit to `enqueue_rst`:
+- DATA-on-closed-stream (`h2.rs:1689` — `H2Error::StreamClosed`).
+- `refuse_stream_and_discard` (`h2.rs:3488` — MCS / pool exhaustion).
+- `reset_stream` (`h2.rs:5180` — per-stream error paths: malformed
+  HEADERS, content-length mismatch, WINDOW_UPDATE zero-increment or
+  overflow, unauthorised priority updates, self-dependent HEADERS).
+
+Serialisation happens in `flush_pending_control_frames`
+(`h2.rs:2867` → Phase 3 at the pending-RST-streams check, which drains
+`self.pending_rst_streams` into `self.zero` via
+`serializer::gen_rst_stream`). This path is independent of the owning
+`Stream` still being present in `self.streams`, so it survives the
+immediate `remove_dead_stream` call that every `reset_stream` caller
+performs synchronously after return.
+
+`finalize_write` (`h2.rs:2795`) retains `Ready::WRITABLE` when the
+pass completes but `pending_rst_streams` or
+`flow_control.pending_window_updates` are still non-empty — otherwise
+a partial write that deferred the Phase-3 flush (gated on
+`expect_write.is_none()`) would strand a queued RST until an
+unrelated event re-raised the writable bit. This guard, together
+with the invariant-15 arm inside `enqueue_rst`, closes the 18-check
+h2spec 2.0 gap previously reported in RFC 9113 §§5.3, 6.9, 8.1.2.
 
 ### 8.3 Session drain
 
