@@ -2356,23 +2356,25 @@ fn test_h2_coalesced_chrome_firefox_streams_drain() {
 // Two independent wake-gap bugs can each produce this shape on
 // `feat/h2-mux`:
 //
-// * **Bug 2 (H2 scheduler)**: `apply_incremental_rotation` in
-//   `mux/h2.rs:1063-1100` returns the TOTAL incremental-stream count across
-//   all urgency buckets. `h2.rs:2334` forwards this global count to the
-//   converter as `incremental_peer_count`, but `converter.rs:56-62`
-//   documents it as per-bucket. A stream that is SOLO in its urgency
-//   bucket but has incremental peers in OTHER urgency buckets still
-//   triggers the yield-after-one-DATA branch at `converter.rs:450`,
-//   stranding the rest of its body because `finalize_write:2670-2677`
-//   removes `Ready::WRITABLE` on a voluntary yield with no `expect_write`.
+// * **Bug 2 (H2 scheduler)**: the connection-global incremental count
+//   was fed to the converter as `incremental_peer_count` even when a
+//   stream was solo in its own urgency bucket — tripping the
+//   yield-after-one-DATA branch and stranding the rest of the body
+//   because `finalize_write` strips `Ready::WRITABLE` on a voluntary
+//   yield with no `expect_write`. Fixed by `3f9f5e38`, which scopes the
+//   count via the per-bucket `ready_incremental_by_urgency` HashMap in
+//   `h2.rs::write_streams` and looks it up per-stream by urgency.
 // * **Bug 1 (H1→H2 wake-gap)**: `mux/h1.rs:324` wraps the Linked-peer
-//   `signal_pending_write()` call inside `if kawa.is_main_phase()`. When
-//   a small `Content-Length` body completes in a single `socket_read`
-//   cycle, kawa transitions straight from `Headers` to `Terminated`
-//   within one `kawa::h1::parse()` call — `is_main_phase()` is FALSE at
-//   line 324 and the signal is never emitted. A keep-alive backend makes
-//   the close-delimited fallback at lines 385-395 unreachable
-//   (`!is_keep_alive_backend` gate).
+//   `signal_pending_write()` call inside `if kawa.is_main_phase()`.
+//   kawa 0.6.8 `storage/repr.rs` declares `Terminated` as a main-phase
+//   state (see the `is_main_phase` match arms), so a keep-alive H1
+//   backend that emits headers + small Content-Length body in a single
+//   parse round trip still signals correctly *today*. The historical
+//   regression covered by this test set lives in the `Headers → Body →
+//   Terminated` boundary where an older kawa returned false at line 324
+//   and skipped the peer wake. The close-delimited fallback at lines
+//   385-395 is gated on `!is_keep_alive_backend`, so it only papers
+//   over the gap on non-keep-alive backends.
 //
 // The three tests below exercise each bug in isolation, then together.
 
@@ -2385,15 +2387,20 @@ fn test_h2_coalesced_chrome_firefox_streams_drain() {
 /// * sid=1 — `priority: u=0, i` (Chrome navigation shape, solo in bucket 0)
 /// * sid=3 — `priority: u=3, i` (Chrome image/XHR shape, solo in bucket 3)
 ///
-/// `apply_incremental_rotation` returns `2` (one incremental per bucket × 2
-/// buckets). On HEAD this value is fed to both streams' converter as
-/// `incremental_peer_count=2`, tripping the yield-after-one-DATA guard even
-/// though each stream is solo in its bucket. Both streams emit one DATA
-/// frame per scheduling pass, `finalize_write` strips `Ready::WRITABLE`,
-/// edge-triggered epoll never re-fires, and the remaining body bytes strand
-/// in `kawa.out` until `front_timeout` (60 s default).
+/// Pre-`3f9f5e38`, the converter's `incremental_peer_count` read the
+/// connection-global total (2 = one incremental per urgency bucket × 2
+/// buckets), so each stream still tripped the yield-after-one-DATA guard
+/// even though it was solo in its bucket. `finalize_write` stripped
+/// `Ready::WRITABLE` on the voluntary yield, edge-triggered epoll did
+/// not re-fire, and the remaining body bytes stranded in `kawa.out`
+/// until `front_timeout` (60 s default). `3f9f5e38` replaced the global
+/// read with `ready_incremental_by_urgency`, so a solo-in-bucket
+/// incremental stream now sees `incremental_peer_count = 1` (itself)
+/// and does not yield.
 ///
-/// MUST FAIL on HEAD (Bug 2). MUST PASS after the per-bucket-count fix.
+/// Lock-in regression guard: MUST PASS on HEAD post-`3f9f5e38`. A
+/// regression that reintroduces the global-count path would fail this
+/// test within the 3 s deadline.
 fn try_h2_mixed_urgency_incremental_solo_drains() -> State {
     const BODY_SIZE: usize = 64 * 1024;
 
