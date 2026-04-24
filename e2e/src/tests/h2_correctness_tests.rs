@@ -1278,6 +1278,96 @@ fn test_h2_rfc9218_non_incremental_sequential() {
     );
 }
 
+/// Tier 3a — LIFECYCLE §9 invariant 17: RFC 9218 incremental peer count
+/// must be scoped to the same urgency bucket, not the whole connection.
+/// Two incremental streams in DIFFERENT urgency buckets (`u=0, i` and
+/// `u=7, i`) are each solo in their own bucket. With the baseline
+/// connection-global count, both streams would see
+/// `incremental_peer_count >= 2` and yield after every DATA frame,
+/// spuriously triggering the same strand the `finalize_write`
+/// WRITABLE-withdrawal guard was added for. With bucket scoping each
+/// stream sees peer count == 1 and drains sequentially — DATA frames
+/// for stream 1 form a contiguous run, stream 3 likewise.
+fn try_h2_rfc9218_incremental_multi_bucket_drains_sequentially() -> State {
+    let (worker, backends, front_port) =
+        setup_h2_test_with_large_bodies("H2-COR-RFC9218-MB", 2, 32 * 1024);
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    // INITIAL_WINDOW_SIZE=0 so both responses park in kawa before any DATA
+    // is released — ensures the scheduler sees both streams as eligible in
+    // a single `writable()` pass.
+    h2_handshake_with_initial_window(&mut tls, 0);
+
+    // Stream 1: highest urgency incremental. Stream 3: lowest urgency
+    // incremental. Different urgency buckets on purpose.
+    let request_ids: [(u32, u8); 2] = [(1, 0), (3, 7)];
+    for (sid, urgency) in request_ids {
+        let block = build_get_headers_with_priority(urgency, "i");
+        let headers = H2Frame::headers(sid, block, true, true);
+        tls.write_all(&headers.encode()).unwrap();
+    }
+    tls.flush().unwrap();
+
+    thread::sleep(Duration::from_millis(400));
+
+    // Bulk WINDOW_UPDATE — see round-robin test for rationale.
+    let mut bulk = Vec::new();
+    for (sid, _) in request_ids {
+        bulk.extend_from_slice(&H2Frame::window_update(sid, 1_000_000).encode());
+    }
+    bulk.extend_from_slice(&H2Frame::window_update(0, 1_000_000).encode());
+    tls.write_all(&bulk).unwrap();
+    tls.flush().unwrap();
+
+    let frames = collect_response_frames(&mut tls, 300, 6, 400);
+    log_frames("RFC 9218 multi-bucket incremental", &frames);
+
+    let order = data_frame_stream_order(&frames);
+    println!("DATA stream-ID order: {order:?}");
+
+    // Each stream is solo in its urgency bucket. `incremental_peer_count`
+    // is 1 per bucket → converter drains sequentially inside each bucket.
+    // Priority sort picks the lower urgency first, so stream 1 drains
+    // before stream 3. Total transitions = 1 (stream 1 block → stream 3
+    // block); baseline (without bucket scoping) would interleave and
+    // produce many more transitions.
+    let transitions = order.windows(2).filter(|w| w[0] != w[1]).count();
+    let streams_seen: std::collections::HashSet<u32> = order.iter().copied().collect();
+    let both_fired = request_ids
+        .iter()
+        .all(|(sid, _)| streams_seen.contains(sid));
+    let sequential_per_bucket =
+        !order.is_empty() && transitions == streams_seen.len().saturating_sub(1);
+
+    println!(
+        "both_fired={both_fired} transitions={transitions} \
+         sequential_per_bucket={sequential_per_bucket} \
+         streams_seen={} total_frames={}",
+        streams_seen.len(),
+        order.len()
+    );
+
+    let infra_ok = teardown(tls, front_port, worker, backends);
+    if infra_ok && both_fired && sequential_per_bucket {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_rfc9218_incremental_multi_bucket_drains_sequentially() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 RFC 9218 §4 Tier 3a: incremental_peer_count is bucket-scoped",
+            try_h2_rfc9218_incremental_multi_bucket_drains_sequentially
+        ),
+        State::Success
+    );
+}
+
 /// RFC 9218 §4 + sozu incremental-scheduling regression (PR #1209 follow-up):
 /// a SOLO stream whose client sent `priority: u=0, i` (Chrome's navigation
 /// default since Chrome 107) must drain its full response body promptly.

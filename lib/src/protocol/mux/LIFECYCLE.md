@@ -667,6 +667,18 @@ that touches `h2.rs`, `mod.rs`, or `stream.rs`.
     The same helper backs `ConnectionH2::has_pending_write_full`,
     consulted by `delay_close_for_frontend_flush` so shutdown-drain
     does not close before the stream bytes land on the socket.
+17. **RFC 9218 incremental peer count is bucket-scoped, ready-only.**
+    `converter.incremental_peer_count` (consumed by the converter's
+    DATA-arm yield decision) counts incremental streams in the
+    *same urgency bucket* that are *also ready to emit this pass*
+    (`is_main_phase()` / terminated-but-not-completed / error-but-RST-
+    not-yet-sent). Computed in `write_streams` as
+    `ready_incremental_by_urgency` and looked up per-stream by its
+    own urgency. A connection-global count would wrongly yield a
+    solo incremental stream when an unrelated incremental stream
+    sits in a different urgency bucket — regressing the invariant-15
+    solo-bucket fast path. Guarded by e2e test
+    `test_h2_rfc9218_incremental_multi_bucket_drains_sequentially`.
 
 ---
 
