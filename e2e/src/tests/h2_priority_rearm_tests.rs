@@ -325,7 +325,6 @@ fn try_h2_priority_update_rearms_writable() -> State {
     tls.sock
         .set_read_timeout(Some(Duration::from_millis(100)))
         .ok();
-    let pu_sent_at;
     let mut raw = Vec::new();
     let mut rbuf = vec![0u8; 65536];
     // Read until we've seen HEADERS for both streams, or 500 ms elapsed.
@@ -361,7 +360,7 @@ fn try_h2_priority_update_rearms_writable() -> State {
     tls.write_all(&H2Frame::priority_update(sid_b, "u=0, i").encode())
         .unwrap();
     tls.flush().unwrap();
-    pu_sent_at = Instant::now();
+    let pu_sent_at = Instant::now();
 
     // Read until END_STREAM on both streams or deadline.
     let deadline = Duration::from_secs(5);
