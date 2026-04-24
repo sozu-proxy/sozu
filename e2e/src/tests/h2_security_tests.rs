@@ -583,7 +583,10 @@ fn try_h2_missing_pseudo_headers() -> State {
         "Missing pseudo-headers - RST_STREAM: {got_rst}, GOAWAY: {got_goaway}, 400 response: {got_400}"
     );
 
-    let rejected = got_rst || got_goaway || got_400 || frames.is_empty();
+    // Stream-scope violation: sozu must emit RST_STREAM or GOAWAY. A silent
+    // connection close (empty frames) is no longer accepted since the
+    // eager-RST emission path closed the 18-check h2spec gap.
+    let rejected = got_rst || got_goaway || got_400;
     let infra_ok = teardown(tls, front_port, worker, backends);
     if infra_ok && rejected {
         State::Success
@@ -661,7 +664,9 @@ fn try_h2_uppercase_header_name() -> State {
         "Uppercase header name - RST_STREAM: {got_rst}, GOAWAY: {got_goaway}, 400 response: {got_400}"
     );
 
-    let rejected = got_rst || got_goaway || got_400 || frames.is_empty();
+    // Stream-scope violation: sozu must emit RST_STREAM or GOAWAY after the
+    // eager-RST fix. Silent close no longer accepted.
+    let rejected = got_rst || got_goaway || got_400;
     let infra_ok = teardown(tls, front_port, worker, backends);
     if infra_ok && rejected {
         State::Success
@@ -811,7 +816,8 @@ fn try_h2_desync_path_no_leading_slash() -> State {
 
     println!("Desync path no leading slash - rejected: {rejected}, 400: {got_400}");
 
-    let ok = rejected || got_400 || frames.is_empty();
+    // Stream-scope violation (malformed :path): sozu must emit RST/GOAWAY or 400.
+    let ok = rejected || got_400;
     let infra_ok = teardown(tls, front_port, worker, backends);
     if infra_ok && ok {
         State::Success
@@ -878,9 +884,9 @@ fn try_h2_desync_path_with_fragment() -> State {
 
     println!("Desync path with fragment - rejected: {rejected}, 400: {got_400}");
 
-    // H2-11: `:path` containing `#` is now rejected (RFC 9113 §8.3.1).
-    // Accept explicit rejection, 400, or silent connection close (0 frames).
-    let ok = rejected || got_400 || frames.is_empty();
+    // H2-11: `:path` containing `#` is rejected per RFC 9113 §8.3.1.
+    // Stream-scope violation: sozu must emit RST/GOAWAY or 400.
+    let ok = rejected || got_400;
     let infra_ok = teardown(tls, front_port, worker, backends);
     if infra_ok && ok {
         State::Success
@@ -938,7 +944,8 @@ fn try_h2_duplicate_pseudo_headers() -> State {
 
     println!("Duplicate pseudo-headers - rejected: {rejected}, 400: {got_400}");
 
-    let ok = rejected || got_400 || frames.is_empty();
+    // Stream-scope violation (RFC 9113 §8.1.2.1): sozu must emit RST/GOAWAY or 400.
+    let ok = rejected || got_400;
     let infra_ok = teardown(tls, front_port, worker, backends);
     if infra_ok && ok {
         State::Success
@@ -1012,7 +1019,8 @@ fn try_h2_connection_specific_headers() -> State {
             *ft == H2_FRAME_HEADERS && *sid == 1 && payload.contains(&0x8D)
         });
 
-        let this_rejected = rejected || got_400 || frames.is_empty();
+        // Stream-scope violation (RFC 9113 §8.1.2.2): sozu must emit RST/GOAWAY or 400.
+        let this_rejected = rejected || got_400;
         println!("Connection-specific header '{name}: {value}' - rejected: {this_rejected}");
 
         if !this_rejected {
@@ -1095,7 +1103,8 @@ fn try_h2_pseudo_headers_after_regular() -> State {
 
     println!("Pseudo-header after regular - rejected: {rejected}, 400: {got_400}");
 
-    let ok = rejected || got_400 || frames.is_empty();
+    // Stream-scope violation (RFC 9113 §8.1.2.1): sozu must emit RST/GOAWAY or 400.
+    let ok = rejected || got_400;
     let infra_ok = teardown(tls, front_port, worker, backends);
     if infra_ok && ok {
         State::Success
@@ -1378,10 +1387,13 @@ fn try_h2_content_length_format_fuzzing() -> State {
             *ft == H2_FRAME_HEADERS && *sid == 1 && payload.contains(&0x8D)
         });
 
-        // Silent connection close (0 frames) is a valid rejection under
-        // stricter validation — the proxy drops the connection before emitting
-        // any H2 error frame.
-        let handled = rejected || got_400 || frames.is_empty();
+        // Partial tighten post eager-RST: the three clearly dangerous
+        // values (comma-separated CL, negative CL) are stream-scope
+        // violations that must emit RST/GOAWAY or 400. Silent close is
+        // accepted only for the remaining whitespace/locale-style variants
+        // where rejection policy is still evolving.
+        let is_dangerous = *cl_value == "0," || *cl_value == "0,0" || *cl_value == "-1";
+        let handled = rejected || got_400 || (!is_dangerous && frames.is_empty());
         println!(
             "CL format fuzz '{cl_value}' - rejected: {rejected}, 400: {got_400}, silent_close: {}",
             frames.is_empty()
@@ -1391,8 +1403,7 @@ fn try_h2_content_length_format_fuzzing() -> State {
             // Not being rejected is not necessarily a failure if the value
             // is treated as-is and doesn't cause desync, but log it.
             println!("  WARNING: malformed CL '{cl_value}' not explicitly rejected");
-            // Only fail on clearly dangerous values
-            if *cl_value == "0," || *cl_value == "0,0" || *cl_value == "-1" {
+            if is_dangerous {
                 all_handled = false;
             }
         }
@@ -2884,7 +2895,8 @@ fn try_h2_multiple_content_length_values() -> State {
 
     println!("Multiple CL values - rejected: {rejected}, 400: {got_400}");
 
-    let ok = rejected || got_400 || frames.is_empty();
+    // Stream-scope violation (RFC 9113 §8.1.2.6): sozu must emit RST/GOAWAY or 400.
+    let ok = rejected || got_400;
     let infra_ok = teardown(tls, front_port, worker, backends);
     if infra_ok && ok {
         State::Success
@@ -2954,7 +2966,10 @@ fn try_h2_authority_injection_crlf() -> State {
 
     println!("Authority CRLF injection - rejected: {rejected}, 400: {got_400}");
 
-    let ok = rejected || got_400 || !write_ok || frames.is_empty();
+    // Stream-scope violation (header injection): sozu must emit RST/GOAWAY or 400.
+    // `!write_ok` still accepted: CRLF can trip HPACK decode before any frame
+    // reaches the stream layer, collapsing the TLS write.
+    let ok = rejected || got_400 || !write_ok;
     let infra_ok = teardown(tls, front_port, worker, backends);
     if infra_ok && ok {
         State::Success
@@ -3022,7 +3037,10 @@ fn try_h2_zero_length_header_name() -> State {
 
     println!("Zero-length header name - rejected: {rejected}, 400: {got_400}");
 
-    let ok = rejected || got_400 || !write_ok || frames.is_empty();
+    // Stream-scope violation (RFC 7540 §8.1.2): sozu must emit RST/GOAWAY or 400.
+    // `!write_ok` still accepted: a zero-length name is caught by the HPACK
+    // decoder and can collapse the TLS write before the stream layer sees it.
+    let ok = rejected || got_400 || !write_ok;
     let infra_ok = teardown(tls, front_port, worker, backends);
     if infra_ok && ok {
         State::Success

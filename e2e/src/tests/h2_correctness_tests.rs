@@ -85,15 +85,15 @@ fn try_h2_end_stream_nonzero_content_length() -> State {
     let frames = collect_response_frames(&mut tls, 500, 3, 500);
     log_frames("END_STREAM + CL:42", &frames);
 
-    // Expect RST_STREAM(PROTOCOL_ERROR) on stream 1, GOAWAY(PROTOCOL_ERROR),
-    // or silent connection close (0 frames — stricter CL validation rejects
-    // before emitting any H2 error frame).
+    // Stream-scope violation (RFC 9113 §8.1.2.6): END_STREAM with non-zero
+    // Content-Length must emit RST_STREAM(PROTOCOL_ERROR) or GOAWAY(PROTOCOL_ERROR)
+    // after the eager-RST fix. Silent close is no longer accepted.
     let rst_streams = extract_rst_streams(&frames);
     let has_protocol_error_rst = rst_streams
         .iter()
         .any(|(sid, ec)| *sid == 1 && *ec == H2_ERROR_PROTOCOL_ERROR);
     let has_protocol_error_goaway = contains_goaway_with_error(&frames, H2_ERROR_PROTOCOL_ERROR);
-    let rejected = has_protocol_error_rst || has_protocol_error_goaway || frames.is_empty();
+    let rejected = has_protocol_error_rst || has_protocol_error_goaway;
 
     println!("END_STREAM + CL:42 - rejected with PROTOCOL_ERROR: {rejected}");
 
