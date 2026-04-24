@@ -62,6 +62,10 @@ pub(crate) const H2_FLAG_ACK: u8 = 0x1;
 pub(crate) const H2_FLAG_END_STREAM: u8 = 0x1;
 /// END_HEADERS flag (0x4) -- used for HEADERS and CONTINUATION
 pub(crate) const H2_FLAG_END_HEADERS: u8 = 0x4;
+/// PADDED flag (0x8) -- used for DATA and HEADERS; per RFC 9113 §6.1 the
+/// first payload byte carries the pad-length and that many trailing
+/// bytes are padding. App-visible bytes exclude both.
+pub(crate) const H2_FLAG_PADDED: u8 = 0x8;
 
 // ============================================================================
 // H2 error codes (RFC 9113 Section 7)
@@ -88,10 +92,16 @@ pub(crate) const H2_CLIENT_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 // ============================================================================
 
 const SETTINGS_HEADER_TABLE_SIZE: u16 = 0x1;
+const SETTINGS_ENABLE_PUSH: u16 = 0x2;
 const SETTINGS_MAX_CONCURRENT_STREAMS: u16 = 0x3;
 const SETTINGS_INITIAL_WINDOW_SIZE: u16 = 0x4;
 const SETTINGS_MAX_FRAME_SIZE: u16 = 0x5;
 const SETTINGS_MAX_HEADER_LIST_SIZE: u16 = 0x6;
+/// SETTINGS_NO_RFC7540_PRIORITIES (RFC 9218 §2). Chromium sets this to 1 to
+/// opt out of the deprecated RFC 7540 stream-dependency priority scheme in
+/// favour of the RFC 9218 urgency/incremental model carried in the
+/// `priority` header.
+const SETTINGS_NO_RFC7540_PRIORITIES: u16 = 0x9;
 
 // ============================================================================
 // Raw H2 frame builder
@@ -642,6 +652,356 @@ pub(crate) fn h2_handshake_with_initial_window(
     stream.write_all(&H2Frame::settings_ack().encode()).unwrap();
     stream.flush().unwrap();
     thread::sleep(Duration::from_millis(50));
+}
+
+// ============================================================================
+// Chromium-146 HAR-shaped client profile (customer H2 truncation repro)
+// ============================================================================
+
+/// Chromium-146 default `SETTINGS_INITIAL_WINDOW_SIZE`: 6 MiB per stream
+/// (`kSpdyInitialWindowSize = 6 MB` in `net/spdy/spdy_session.cc`,
+/// unchanged since 2021).
+pub(crate) const CHROME146_INITIAL_WINDOW_SIZE: u32 = 6 * 1024 * 1024;
+/// Chromium-146 default `SETTINGS_HEADER_TABLE_SIZE`.
+pub(crate) const CHROME146_HEADER_TABLE_SIZE: u32 = 65_536;
+/// Chromium-146 default `SETTINGS_MAX_HEADER_LIST_SIZE`.
+pub(crate) const CHROME146_MAX_HEADER_LIST_SIZE: u32 = 262_144;
+/// Chromium-146 default `SETTINGS_MAX_CONCURRENT_STREAMS` advertised to
+/// the server (Chromium sends this value — see `spdy_session.cc`).
+pub(crate) const CHROME146_MAX_CONCURRENT_STREAMS: u32 = 1_000;
+/// H2 default `SETTINGS_MAX_FRAME_SIZE` per RFC 9113 §6.5.2 — Chromium
+/// does not raise this above the 16 KiB default in the default config.
+pub(crate) const CHROME146_MAX_FRAME_SIZE: u32 = 16_384;
+/// Chromium's target connection-level receive window: 15 MiB.
+pub(crate) const CHROME146_SESSION_RECEIVE_WINDOW: u32 = 15 * 1024 * 1024;
+/// Initial connection-level `WINDOW_UPDATE` increment Chromium emits after
+/// sending SETTINGS. RFC 9113 §6.9.2 fixes the initial connection window at
+/// 65 535; Chromium targets a 15 MiB window, so the delta is
+/// `15 * 1024 * 1024 − 65 535 = 15_663_105`.
+pub(crate) const CHROME146_CONN_WINDOW_UPDATE_DELTA: u32 =
+    CHROME146_SESSION_RECEIVE_WINDOW - 65_535;
+
+/// Chromium-146-shaped H2 handshake.
+///
+/// Sends the H2 client preface, a SETTINGS frame carrying Chromium-146
+/// defaults (HEADER_TABLE_SIZE, INITIAL_WINDOW_SIZE, MAX_CONCURRENT_STREAMS,
+/// MAX_FRAME_SIZE, MAX_HEADER_LIST_SIZE, ENABLE_PUSH=0,
+/// NO_RFC7540_PRIORITIES=1), reads and parses the server's SETTINGS, ACKs,
+/// then emits the one-shot connection-level
+/// `WINDOW_UPDATE(0, CHROME146_CONN_WINDOW_UPDATE_DELTA)` that Chromium
+/// sends to bring the connection window to 15 MiB.
+///
+/// The per-stream initial window comes from `INITIAL_WINDOW_SIZE` above
+/// (6 MiB), so streams can drain up to 6 MiB before the client must emit
+/// per-stream `WINDOW_UPDATE`s. The streaming drain helper
+/// [`drain_h2_stream_streaming`] is responsible for refilling the
+/// per-stream window for responses larger than 6 MiB.
+///
+/// Returns the parsed server `H2ServerSettings` so tests can verify Sōzu's
+/// advertised limits when relevant.
+pub(crate) fn h2_handshake_chromium_146(
+    stream: &mut rustls::StreamOwned<rustls::ClientConnection, TcpStream>,
+) -> H2ServerSettings {
+    let settings = H2Frame::settings(&[
+        (SETTINGS_HEADER_TABLE_SIZE, CHROME146_HEADER_TABLE_SIZE),
+        (SETTINGS_ENABLE_PUSH, 0),
+        (
+            SETTINGS_MAX_CONCURRENT_STREAMS,
+            CHROME146_MAX_CONCURRENT_STREAMS,
+        ),
+        (SETTINGS_INITIAL_WINDOW_SIZE, CHROME146_INITIAL_WINDOW_SIZE),
+        (SETTINGS_MAX_FRAME_SIZE, CHROME146_MAX_FRAME_SIZE),
+        (
+            SETTINGS_MAX_HEADER_LIST_SIZE,
+            CHROME146_MAX_HEADER_LIST_SIZE,
+        ),
+        (SETTINGS_NO_RFC7540_PRIORITIES, 1),
+    ]);
+    stream.write_all(H2_CLIENT_PREFACE).unwrap();
+    stream.write_all(&settings.encode()).unwrap();
+    stream.flush().unwrap();
+
+    thread::sleep(Duration::from_millis(200));
+    let data = read_all_available(stream, Duration::from_millis(500));
+
+    let frames = parse_h2_frames(&data);
+    let mut server_settings = H2ServerSettings::default();
+    for (ft, fl, _sid, payload) in &frames {
+        if *ft == H2_FRAME_SETTINGS && (*fl & H2_FLAG_ACK) == 0 {
+            server_settings = parse_settings_payload(payload);
+            break;
+        }
+    }
+
+    stream.write_all(&H2Frame::settings_ack().encode()).unwrap();
+    // One-shot conn-level WINDOW_UPDATE, mirroring Chromium's
+    // post-SETTINGS behaviour. No further stream-0 WINDOW_UPDATE is
+    // emitted during drain — `H2FloodDetector` caps stream-0 WUs at
+    // DEFAULT_MAX_WINDOW_UPDATE_STREAM0_PER_WINDOW (100) per sliding
+    // window; a per-stream refresh cadence on stream 0 would trip the
+    // detector and GOAWAY the connection.
+    stream
+        .write_all(&H2Frame::window_update(0, CHROME146_CONN_WINDOW_UPDATE_DELTA).encode())
+        .unwrap();
+    stream.flush().unwrap();
+    thread::sleep(Duration::from_millis(50));
+
+    server_settings
+}
+
+/// Build a Chromium-146-shaped HPACK header block for a GET request.
+///
+/// Encodes the four required pseudo-headers (`:method GET`, `:scheme https`,
+/// `:path <path>`, `:authority <authority>`), followed by `accept: */*`,
+/// `accept-encoding: gzip, deflate, br, zstd`, and — when `priority` is
+/// `Some(_)` — an RFC 9218 `priority` header (e.g. `"u=3, i"` for XHR/fetch).
+///
+/// All non-pseudo headers use HPACK literal-without-indexing with new
+/// name (0x00 prefix) and literal name+value bytes. This avoids depending
+/// on the HPACK dynamic table mirror between the test and Sōzu.
+///
+/// Chromium-146 default builds do NOT emit the RFC 9218 PRIORITY_UPDATE
+/// frame (type 0x10); `ShouldSendPriorityUpdate()` returns false when
+/// `enable_priority_update=false`, which is the default. Priority is
+/// conveyed header-only for XHR/fetch.
+pub(crate) fn build_chrome146_get_headers(
+    authority: &str,
+    path: &str,
+    priority: Option<&str>,
+) -> Vec<u8> {
+    let mut block = Vec::new();
+
+    // :method GET (static-table entry 2 — indexed, 0x82).
+    block.push(0x82);
+    // :scheme https (static-table entry 7 — indexed, 0x87).
+    block.push(0x87);
+    // :path <path> — literal with incremental indexing for :path (static
+    // entry 4 = ":path /"); we override the value. Use literal-without-
+    // indexing on a new name to keep encoding predictable when `path` is
+    // not `/`. Encoding: 0x00 prefix, name-length + ":path" bytes,
+    // value-length + value bytes.
+    push_literal_new_name(&mut block, b":path", path.as_bytes());
+    // :authority <authority> — literal-without-indexing new name.
+    push_literal_new_name(&mut block, b":authority", authority.as_bytes());
+    // accept: */*
+    push_literal_new_name(&mut block, b"accept", b"*/*");
+    // accept-encoding: gzip, deflate, br, zstd (Chromium 146 default).
+    push_literal_new_name(&mut block, b"accept-encoding", b"gzip, deflate, br, zstd");
+    if let Some(prio) = priority {
+        // priority: u=<urgency>, i (optional incremental), per RFC 9218 §8.
+        push_literal_new_name(&mut block, b"priority", prio.as_bytes());
+    }
+
+    block
+}
+
+/// Encode an HPACK integer with `prefix_bits` reserved for the preceding
+/// representation byte. The caller is responsible for setting the
+/// high-order prefix bits; this helper only writes the integer suffix.
+///
+/// Chrome-146 GET header blocks stay well under the 7-bit prefix ceiling
+/// (127) for both name- and value-lengths, so this helper does not
+/// exercise the multi-byte varint path — but implement it correctly so a
+/// future path (e.g. a very long cookie) does not silently corrupt the
+/// block.
+fn push_hpack_int(buf: &mut Vec<u8>, value: u32, prefix_bits: u8) {
+    let max_prefix: u32 = (1u32 << prefix_bits) - 1;
+    if value < max_prefix {
+        let last = buf.last_mut().expect("prefix byte must be pushed first");
+        *last |= value as u8;
+        return;
+    }
+    let last = buf.last_mut().expect("prefix byte must be pushed first");
+    *last |= max_prefix as u8;
+    let mut remainder = value - max_prefix;
+    while remainder >= 128 {
+        buf.push(((remainder % 128) as u8) | 0x80);
+        remainder /= 128;
+    }
+    buf.push(remainder as u8);
+}
+
+/// Push one HPACK literal header with a new (non-indexed) name. RFC 7541
+/// §6.2.2: representation byte `0000 0000`, followed by name-length +
+/// name bytes, then value-length + value bytes. Neither name nor value is
+/// Huffman-coded (high bit 0 on both lengths).
+fn push_literal_new_name(buf: &mut Vec<u8>, name: &[u8], value: &[u8]) {
+    buf.push(0x00);
+    // Name length (7-bit prefix, high bit = 0 → not Huffman-coded).
+    buf.push(0x00);
+    push_hpack_int(buf, name.len() as u32, 7);
+    buf.extend_from_slice(name);
+    // Value length (7-bit prefix, high bit = 0 → not Huffman-coded).
+    buf.push(0x00);
+    push_hpack_int(buf, value.len() as u32, 7);
+    buf.extend_from_slice(value);
+}
+
+/// Pop one complete H2 frame from the head of `carry` if present.
+/// Returns `Some((frame_type, flags, stream_id, payload))` on success,
+/// draining the frame bytes from `carry`; returns `None` when the header
+/// or payload is still partial, leaving `carry` untouched so the caller
+/// can append more bytes and retry.
+pub(crate) fn advance_one_frame(carry: &mut Vec<u8>) -> Option<(u8, u8, u32, Vec<u8>)> {
+    if carry.len() < 9 {
+        return None;
+    }
+    let length = ((carry[0] as u32) << 16) | ((carry[1] as u32) << 8) | (carry[2] as u32);
+    let frame_type = carry[3];
+    let flags = carry[4];
+    let stream_id = u32::from_be_bytes([carry[5] & 0x7F, carry[6], carry[7], carry[8]]);
+    let total = 9 + length as usize;
+    if carry.len() < total {
+        return None;
+    }
+    let payload: Vec<u8> = carry[9..total].to_vec();
+    carry.drain(..total);
+    Some((frame_type, flags, stream_id, payload))
+}
+
+/// Outcome of [`drain_h2_stream_streaming`].
+#[derive(Debug)]
+pub(crate) struct StreamingDrainOutcome {
+    /// App-visible body bytes (DATA payloads, with any PADDED bytes
+    /// stripped per RFC 9113 §6.1).
+    pub body_bytes: usize,
+    /// Whether an `END_STREAM` flag was seen on `sid` (either on a DATA
+    /// frame or on a trailer HEADERS frame).
+    pub end_stream_seen: bool,
+    /// Whether a `RST_STREAM` was received on `sid`.
+    pub got_rst: bool,
+    /// Wall-clock elapsed between entry and exit.
+    pub elapsed: Duration,
+    /// Lowercase hex sha256 of the app-visible body bytes (length 64).
+    pub sha256_hex: String,
+}
+
+/// Read and drain a single H2 stream with linear memory, emitting
+/// per-stream `WINDOW_UPDATE`s as bytes are consumed.
+///
+/// Frame advancement is inline via [`advance_one_frame`] — the full raw
+/// wire is NOT accumulated, only a `carry: Vec<u8>` of at-most-one
+/// incomplete frame's worth of bytes. DATA payloads are hashed then
+/// dropped, so memory stays O(chunk + frame) regardless of stream size.
+///
+/// Flow-control credit is refreshed only on the **prioritised stream**
+/// `sid`; the one-shot connection-level WINDOW_UPDATE emitted by
+/// [`h2_handshake_chromium_146`] covers the whole session. This
+/// intentionally mirrors Sōzu's `H2FloodDetector` constraint that caps
+/// stream-0 WUs at 100 per sliding window — refreshing the conn window
+/// frame-by-frame would GOAWAY the connection.
+///
+/// For PADDED DATA (RFC 9113 §6.1): the first payload byte is pad-length,
+/// and the trailing pad-length bytes are padding. App-visible bytes
+/// exclude both; WINDOW_UPDATE credit uses the full frame payload length
+/// (the flow window is consumed by the entire frame). Sōzu does not emit
+/// padded DATA today, but keep the helper correct for future use.
+pub(crate) fn drain_h2_stream_streaming(
+    stream: &mut rustls::StreamOwned<rustls::ClientConnection, TcpStream>,
+    sid: u32,
+    deadline: Duration,
+    window_refresh_bytes: u32,
+) -> StreamingDrainOutcome {
+    use sha2::{Digest, Sha256};
+
+    stream
+        .sock
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .ok();
+
+    let start = std::time::Instant::now();
+    let mut carry: Vec<u8> = Vec::with_capacity(64 * 1024);
+    let mut rbuf = vec![0u8; 64 * 1024];
+    let mut hasher = Sha256::new();
+    let mut body_bytes: usize = 0;
+    let mut stream_credit_since_refresh: u32 = 0;
+    let mut end_stream_seen = false;
+    let mut got_rst = false;
+    let mut done = false;
+
+    while !done && start.elapsed() < deadline {
+        match stream.read(&mut rbuf) {
+            Ok(0) => break,
+            Ok(n) => carry.extend_from_slice(&rbuf[..n]),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(_) => break,
+        }
+
+        while let Some((frame_type, flags, frame_sid, payload)) = advance_one_frame(&mut carry) {
+            if frame_type == H2_FRAME_DATA && frame_sid == sid {
+                // PADDED handling: strip the pad-length byte and the
+                // trailing padding from the app-visible bytes.
+                let app_slice: &[u8] = if (flags & H2_FLAG_PADDED) != 0 && !payload.is_empty() {
+                    let pad_len = payload[0] as usize;
+                    let end = payload.len().saturating_sub(pad_len);
+                    if 1 > end { &[] } else { &payload[1..end] }
+                } else {
+                    &payload[..]
+                };
+                hasher.update(app_slice);
+                body_bytes += app_slice.len();
+
+                // Flow-control credit: the window is consumed by the
+                // ENTIRE frame payload (including pad-length byte and
+                // padding), per RFC 9113 §6.9.1.
+                let consumed = payload.len() as u32;
+                stream_credit_since_refresh = stream_credit_since_refresh.saturating_add(consumed);
+                if stream_credit_since_refresh >= window_refresh_bytes {
+                    debug_assert!(
+                        stream_credit_since_refresh <= 0x7FFF_FFFF,
+                        "WINDOW_UPDATE increment must fit in 31 bits (RFC 9113 §6.9)"
+                    );
+                    debug_assert!(
+                        stream_credit_since_refresh >= 1,
+                        "WINDOW_UPDATE increment must be strictly positive"
+                    );
+                    stream
+                        .write_all(
+                            &H2Frame::window_update(sid, stream_credit_since_refresh).encode(),
+                        )
+                        .unwrap();
+                    stream.flush().unwrap();
+                    stream_credit_since_refresh = 0;
+                }
+
+                if (flags & H2_FLAG_END_STREAM) != 0 {
+                    end_stream_seen = true;
+                    done = true;
+                    break;
+                }
+            } else if frame_type == H2_FRAME_HEADERS && frame_sid == sid {
+                // Trailer HEADERS with END_STREAM is a valid close path.
+                if (flags & H2_FLAG_END_STREAM) != 0 {
+                    end_stream_seen = true;
+                    done = true;
+                    break;
+                }
+            } else if frame_type == H2_FRAME_RST_STREAM && frame_sid == sid {
+                got_rst = true;
+                done = true;
+                break;
+            }
+            // All other frames (server SETTINGS, PING, GOAWAY, WINDOW_UPDATE,
+            // other streams) are ignored — we only care about `sid`.
+        }
+    }
+
+    let elapsed = start.elapsed();
+    let digest = hasher.finalize();
+    let sha256_hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+
+    StreamingDrainOutcome {
+        body_bytes,
+        end_stream_seen,
+        got_rst,
+        elapsed,
+        sha256_hex,
+    }
 }
 
 // ============================================================================

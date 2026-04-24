@@ -1996,6 +1996,9 @@ fn try_h2_php_apache_chunked_flush_drains_fully() -> State {
             transfer_encoding: TransferEncoding::Chunked,
             tcp_nodelay: true,
             truncate_at_byte: None,
+            body: None,
+            extra_response_headers: vec![],
+            content_type: None,
         },
     );
 
@@ -2084,6 +2087,9 @@ fn try_h2_slow_backend_idle_timeout_cancels() -> State {
             transfer_encoding: TransferEncoding::Chunked,
             tcp_nodelay: true,
             truncate_at_byte: None,
+            body: None,
+            extra_response_headers: vec![],
+            content_type: None,
         },
     );
 
@@ -2171,6 +2177,9 @@ fn try_h2_chunked_backend_crash_mid_stream_rsts() -> State {
             transfer_encoding: TransferEncoding::Chunked,
             tcp_nodelay: true,
             truncate_at_byte: Some(TRUNCATE_AT),
+            body: None,
+            extra_response_headers: vec![],
+            content_type: None,
         },
     );
 
@@ -2733,6 +2742,290 @@ fn test_h2_customer_har_shape_drains() {
             3,
             "H2 customer HAR shape (mixed-urgency incremental + single-read CL) must drain within 3 s",
             try_h2_customer_har_shape_drains
+        ),
+        State::Success
+    );
+}
+
+// ============================================================================
+// Customer H2 truncation regression guard (cleverapps.io, 2026-04)
+//
+// A customer reported a ~7.4 MB gzipped chunked JSON response being truncated
+// at ~3 MB through Sōzu's H2 frontend. The stall reproduced only when two
+// cleverapps.io apps communicated (both had H2 enabled via ALPN) and the
+// response travelled over the H1-backend → H2-frontend path with
+// `Content-Encoding: gzip` + `Transfer-Encoding: chunked`. Moving the API to
+// a non-cleverapps.io domain (which disables H2) cleared the symptom.
+//
+// The two tests below lock in the 9-fix chain that closed the report:
+// `040e305f` (H1→H2 wake-gap + outbound idle refresh + chunked-EOF
+// classification), `164ba27a` (`finalize_write` invariant 16), `3f9f5e38`
+// (per-bucket incremental peer count), `8d226b88` (suppress incremental
+// yield before closing flags), `41bc51f2` (`set_default_answer`
+// `signal_pending_write` pairing), `3269dd06` (PRIORITY_UPDATE rearm),
+// `fead8eb0` (DATA/HEADERS handler `signal_pending_write` pairing),
+// `7ddf1f30` (RFC 9218 §7.1 PRIORITY_UPDATE parsing), `1de3faad` (per-bucket
+// incremental count consistency mid-pass).
+//
+// Test A serves a deterministic XorShift-seeded 7.76 MB synthetic payload
+// (high-entropy so gzip cannot collapse it to a trivially tiny wire), gzipped
+// with fast compression, over a TLS H2 front end with a Chromium-146 request
+// shape. It asserts sha256 byte-identity of the gzipped wire bytes within
+// 8 s. Test B is the scale-only smoke: same 7.76 MB total, synthetic 'Z'
+// fill, no gzip. Together they distinguish a "gzip-related regression" from
+// a "scale regression" if one but not the other fails.
+// ============================================================================
+
+/// Deterministic 32-byte seed for the XorShift PRNG driving the synthetic
+/// payload. Keeping it private ensures no test accidentally couples its
+/// sha256 expectation to a shared seed outside this test's scope.
+const CUSTOMER_REPRO_PAYLOAD_SEED: [u8; 32] = [
+    0x53, 0x4f, 0x5a, 0x55, 0x2d, 0x48, 0x32, 0x2d, 0x43, 0x55, 0x53, 0x54, 0x4f, 0x4d, 0x45, 0x52,
+    0x2d, 0x52, 0x45, 0x50, 0x52, 0x4f, 0x2d, 0x50, 0x52, 0x4e, 0x47, 0x2d, 0x32, 0x30, 0x32, 0x36,
+];
+
+/// Customer payload length: 7_763_292 bytes (from
+/// `tasks/outputfuzzed_16zjmiy.json`, the fuzzed sample the customer shared).
+/// Reproduces the "7 MB response" magnitude from the ticket.
+const CUSTOMER_REPRO_PAYLOAD_LEN: usize = 7_763_292;
+
+/// Fill `buf` with a deterministic XorShift-128 stream seeded from `seed`.
+/// High-entropy output — gzip on this stream yields roughly 1:1 size and
+/// therefore a gzipped wire body in the same order of magnitude as the
+/// customer's real (poorly compressible) JSON.
+///
+/// Not cryptographically random — this is a test fixture generator, not a
+/// security primitive. The determinism guarantee (same seed → same bytes)
+/// is what gives the test a stable sha256 expectation.
+fn fill_deterministic_prng(buf: &mut [u8], seed: [u8; 32]) {
+    let mut s0 = u64::from_le_bytes(seed[0..8].try_into().unwrap());
+    let mut s1 = u64::from_le_bytes(seed[8..16].try_into().unwrap());
+    let mut s2 = u64::from_le_bytes(seed[16..24].try_into().unwrap());
+    let mut s3 = u64::from_le_bytes(seed[24..32].try_into().unwrap());
+    let mut i = 0;
+    while i < buf.len() {
+        // xoshiro256++ step — good entropy, small state.
+        let result = s0.wrapping_add(s3).rotate_left(23).wrapping_add(s0);
+        let t = s1 << 17;
+        s2 ^= s0;
+        s3 ^= s1;
+        s1 ^= s2;
+        s0 ^= s3;
+        s2 ^= t;
+        s3 = s3.rotate_left(45);
+        let bytes = result.to_le_bytes();
+        let take = (buf.len() - i).min(8);
+        buf[i..i + take].copy_from_slice(&bytes[..take]);
+        i += take;
+    }
+}
+
+/// Test A — customer-shape gzipped 7.7 MB over TLS H2 with a Chromium-146
+/// request profile. Serves the synthetic payload gzipped + chunked from an
+/// H1 backend and asserts sha256 byte-identity of the gzipped wire body.
+fn try_h2_large_gzipped_chunked_drains_fully() -> State {
+    use std::io::Write as _;
+
+    use flate2::{Compression, write::GzEncoder};
+    use sha2::{Digest, Sha256};
+
+    use crate::mock::chunked_flush_h1_backend::{
+        ChunkedFlushConfig, ChunkedFlushH1Backend, TransferEncoding,
+    };
+
+    // 1. Build the deterministic plaintext payload (uncompressible by design
+    //    — gzip will not collapse high-entropy bytes).
+    let mut plaintext = vec![0u8; CUSTOMER_REPRO_PAYLOAD_LEN];
+    fill_deterministic_prng(&mut plaintext, CUSTOMER_REPRO_PAYLOAD_SEED);
+
+    // 2. Gzip with fast compression (level 1) — keeps test setup under
+    //    ~100 ms without materially changing the output size on a
+    //    high-entropy stream.
+    let mut encoder = GzEncoder::new(Vec::with_capacity(plaintext.len()), Compression::fast());
+    encoder.write_all(&plaintext).unwrap();
+    let gzipped: Vec<u8> = encoder.finish().unwrap();
+    let gzipped_len = gzipped.len();
+
+    // 3. Expected sha256 over the gzipped wire bytes. Drains produce the
+    //    same bytes verbatim (Sōzu does not re-encode or strip gzip on the
+    //    mux path), so byte-identity is the correctness predicate.
+    let mut hasher = Sha256::new();
+    hasher.update(&gzipped);
+    let expected_digest = hasher.finalize();
+    let expected_hex: String = expected_digest.iter().map(|b| format!("{b:02x}")).collect();
+
+    let gzipped_arc = std::sync::Arc::new(gzipped);
+
+    let (worker, front_port, back_address) =
+        setup_single_h1_backend_listener("H2-LA-GZIP-CUSTOMER", None);
+
+    let backend = ChunkedFlushH1Backend::start(
+        back_address,
+        ChunkedFlushConfig {
+            body_size: 0, // ignored when `body` is Some
+            chunk_size: 16 * 1024,
+            inter_chunk_delay: Duration::from_micros(500),
+            transfer_encoding: TransferEncoding::Chunked,
+            tcp_nodelay: true,
+            truncate_at_byte: None,
+            body: Some(gzipped_arc),
+            extra_response_headers: vec!["Content-Encoding: gzip".to_owned()],
+            content_type: Some("application/json".to_owned()),
+        },
+    );
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    let _server_settings = h2_handshake_chromium_146(&mut tls);
+
+    let sid: u32 = 1;
+    let block =
+        build_chrome146_get_headers("localhost", "/agents?organizationId=1", Some("u=3, i"));
+    let headers = H2Frame::headers(sid, block, true, true);
+    tls.write_all(&headers.encode()).unwrap();
+    tls.flush().unwrap();
+
+    let outcome = drain_h2_stream_streaming(&mut tls, sid, Duration::from_secs(8), 32 * 1024);
+
+    println!(
+        "h2 customer gzipped chunked: body_bytes={}/{gzipped_len} \
+         end_stream={} rst={} elapsed={:?} \
+         sha256={} expected={expected_hex} \
+         backend_responses={}",
+        outcome.body_bytes,
+        outcome.end_stream_seen,
+        outcome.got_rst,
+        outcome.elapsed,
+        outcome.sha256_hex,
+        backend.responses_sent()
+    );
+
+    let infra_ok = teardown(
+        tls,
+        front_port,
+        worker,
+        Vec::<AsyncBackend<SimpleAggregator>>::new(),
+    );
+    drop(backend);
+
+    if infra_ok
+        && !outcome.got_rst
+        && outcome.end_stream_seen
+        && outcome.body_bytes == gzipped_len
+        && outcome.sha256_hex == expected_hex
+        && outcome.elapsed < Duration::from_secs(8)
+    {
+        State::Success
+    } else {
+        println!(
+            "FAIL: body_bytes={} (want {gzipped_len}), end_stream={}, rst={}, \
+             sha256={} (want {expected_hex}), elapsed={:?}, infra_ok={infra_ok}",
+            outcome.body_bytes,
+            outcome.end_stream_seen,
+            outcome.got_rst,
+            outcome.sha256_hex,
+            outcome.elapsed,
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_large_gzipped_chunked_drains_fully() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 customer-shape 7.7 MB gzipped chunked drain (sha256 byte-identity) within 8 s",
+            try_h2_large_gzipped_chunked_drains_fully
+        ),
+        State::Success
+    );
+}
+
+/// Test B — scale-only smoke. 7.76 MB of `b'Z'` fill, chunked, no gzip.
+/// Isolates "large multi-MB drain + Chromium-146 request shape + per-stream
+/// WINDOW_UPDATE at 32 KiB cadence" from "gzip content-encoding". Length
+/// assertion only — synthetic `b'Z'` is trivially reconstructible.
+fn try_h2_large_chunked_7mb_drains_fully() -> State {
+    use crate::mock::chunked_flush_h1_backend::{
+        ChunkedFlushConfig, ChunkedFlushH1Backend, TransferEncoding,
+    };
+
+    const BODY_SIZE: usize = CUSTOMER_REPRO_PAYLOAD_LEN;
+
+    let (worker, front_port, back_address) =
+        setup_single_h1_backend_listener("H2-LA-7MB-SMOKE", None);
+
+    let backend = ChunkedFlushH1Backend::start(
+        back_address,
+        ChunkedFlushConfig {
+            body_size: BODY_SIZE,
+            chunk_size: 16 * 1024,
+            inter_chunk_delay: Duration::from_micros(500),
+            transfer_encoding: TransferEncoding::Chunked,
+            tcp_nodelay: true,
+            truncate_at_byte: None,
+            body: None,
+            extra_response_headers: vec![],
+            content_type: None,
+        },
+    );
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    let _server_settings = h2_handshake_chromium_146(&mut tls);
+
+    let sid: u32 = 1;
+    let block = build_chrome146_get_headers("localhost", "/", Some("u=3, i"));
+    let headers = H2Frame::headers(sid, block, true, true);
+    tls.write_all(&headers.encode()).unwrap();
+    tls.flush().unwrap();
+
+    let outcome = drain_h2_stream_streaming(&mut tls, sid, Duration::from_secs(8), 32 * 1024);
+
+    println!(
+        "h2 7MB smoke: body_bytes={}/{BODY_SIZE} \
+         end_stream={} rst={} elapsed={:?} \
+         backend_responses={}",
+        outcome.body_bytes,
+        outcome.end_stream_seen,
+        outcome.got_rst,
+        outcome.elapsed,
+        backend.responses_sent()
+    );
+
+    let infra_ok = teardown(
+        tls,
+        front_port,
+        worker,
+        Vec::<AsyncBackend<SimpleAggregator>>::new(),
+    );
+    drop(backend);
+
+    if infra_ok
+        && !outcome.got_rst
+        && outcome.end_stream_seen
+        && outcome.body_bytes == BODY_SIZE
+        && outcome.elapsed < Duration::from_secs(8)
+    {
+        State::Success
+    } else {
+        println!(
+            "FAIL: body_bytes={} (want {BODY_SIZE}), end_stream={}, rst={}, \
+             elapsed={:?}, infra_ok={infra_ok}",
+            outcome.body_bytes, outcome.end_stream_seen, outcome.got_rst, outcome.elapsed,
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_large_chunked_7mb_drains_fully() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 7.76 MB chunked-flush drain smoke (scale-only, no gzip) within 8 s",
+            try_h2_large_chunked_7mb_drains_fully
         ),
         State::Success
     );

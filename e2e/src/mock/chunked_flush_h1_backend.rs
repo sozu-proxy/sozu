@@ -24,6 +24,23 @@
 //! partway through the body (before the `0\r\n\r\n` terminator on chunked
 //! responses) so the H2 side must emit RST_STREAM rather than a silent
 //! END_STREAM.
+//!
+//! The response body and headers can be overridden for customer-shape
+//! reproductions:
+//!
+//! * [`ChunkedFlushConfig::body`] — `Some(Arc<Vec<u8>>)` switches the chunk
+//!   source from `b'Z'` fill to a caller-supplied buffer served verbatim
+//!   (cursor advanced by [`ChunkedFlushConfig::chunk_size`] per iteration).
+//!   The buffer length wins over [`ChunkedFlushConfig::body_size`] when set.
+//! * [`ChunkedFlushConfig::extra_response_headers`] — additional response
+//!   header lines appended after `Content-Type` / framing header (e.g.
+//!   `"Content-Encoding: gzip"`).
+//! * [`ChunkedFlushConfig::content_type`] — overrides the default
+//!   `application/octet-stream`.
+//!
+//! The customer-shape repro suite (`test_h2_large_gzipped_chunked_drains_fully`
+//! in `e2e/src/tests/h2_correctness_tests.rs`) uses all three together to
+//! serve a gzipped deterministic payload whose sha256 the test asserts.
 
 use std::{
     io::{Read, Write},
@@ -53,7 +70,9 @@ pub enum TransferEncoding {
 /// Configuration for [`ChunkedFlushH1Backend::start`].
 pub struct ChunkedFlushConfig {
     /// Total body size in bytes (payload only; chunk framing overhead is
-    /// added on top for [`TransferEncoding::Chunked`]).
+    /// added on top for [`TransferEncoding::Chunked`]). Ignored when
+    /// [`ChunkedFlushConfig::body`] is `Some(_)` — the buffer's length is
+    /// authoritative in that case.
     pub body_size: usize,
     /// Per-chunk payload size; the last chunk may be smaller.
     pub chunk_size: usize,
@@ -70,6 +89,22 @@ pub struct ChunkedFlushConfig {
     /// writing the terminating `0\r\n\r\n`. Used to reproduce C3
     /// (chunked-EOF misclassification).
     pub truncate_at_byte: Option<usize>,
+    /// When `Some(buf)`, serve those exact bytes verbatim (the backend
+    /// walks a cursor through `buf` slice-by-slice using `chunk_size`);
+    /// `body_size` is overridden to `buf.len()`. When `None`, fall back to
+    /// the default `b'Z'` fill driven by `body_size`.
+    pub body: Option<Arc<Vec<u8>>>,
+    /// Extra response header lines appended after `Content-Type` and the
+    /// framing header (`Transfer-Encoding` / `Content-Length`). Each entry
+    /// is one header, given WITHOUT the trailing `\r\n`; e.g.
+    /// `"Content-Encoding: gzip"`. Callers must not include the blank-line
+    /// terminator — the backend emits it exactly once at the end of the
+    /// header block.
+    pub extra_response_headers: Vec<String>,
+    /// Overrides the default `Content-Type: application/octet-stream`. For
+    /// `None`, the legacy default is preserved; for `Some("application/json")`
+    /// the backend sends that instead.
+    pub content_type: Option<String>,
 }
 
 /// Keep-alive HTTP/1.1 backend that serves a configurable body in small,
@@ -113,21 +148,39 @@ impl ChunkedFlushH1Backend {
                         let mut bytes_written: usize = 0;
                         let mut truncated = false;
 
-                        let headers = match config.transfer_encoding {
-                            TransferEncoding::ContentLength => format!(
-                                "HTTP/1.1 200 OK\r\n\
-                                 Content-Type: application/octet-stream\r\n\
-                                 Content-Length: {}\r\n\
-                                 \r\n",
-                                config.body_size
-                            ),
-                            TransferEncoding::Chunked => String::from(
-                                "HTTP/1.1 200 OK\r\n\
-                                 Content-Type: application/octet-stream\r\n\
-                                 Transfer-Encoding: chunked\r\n\
-                                 \r\n",
-                            ),
+                        // Effective body length: when a caller-supplied
+                        // buffer is present, its length wins over
+                        // `body_size` — we serve the buffer verbatim.
+                        let effective_body_size = match &config.body {
+                            Some(buf) => buf.len(),
+                            None => config.body_size,
                         };
+
+                        // Build the response header block as a list of
+                        // lines and join with `\r\n`, then append the
+                        // single blank-line terminator. Keeps the framing
+                        // clean when `extra_response_headers` is populated.
+                        let content_type = config
+                            .content_type
+                            .as_deref()
+                            .unwrap_or("application/octet-stream");
+                        let mut header_lines: Vec<String> = vec![
+                            String::from("HTTP/1.1 200 OK"),
+                            format!("Content-Type: {content_type}"),
+                        ];
+                        match config.transfer_encoding {
+                            TransferEncoding::ContentLength => {
+                                header_lines.push(format!("Content-Length: {effective_body_size}"))
+                            }
+                            TransferEncoding::Chunked => {
+                                header_lines.push(String::from("Transfer-Encoding: chunked"))
+                            }
+                        }
+                        for extra in &config.extra_response_headers {
+                            header_lines.push(extra.clone());
+                        }
+                        let mut headers = header_lines.join("\r\n");
+                        headers.push_str("\r\n\r\n");
                         if stream.write_all(headers.as_bytes()).is_err() {
                             continue;
                         }
@@ -139,14 +192,27 @@ impl ChunkedFlushH1Backend {
                             continue;
                         }
 
-                        // Body phase. Chunk payload is `Z` bytes so the
-                        // result is human-inspectable in logs.
-                        let chunk = vec![b'Z'; config.chunk_size.max(1)];
-                        let mut remaining = config.body_size;
+                        // Body phase. When `config.body` is `Some`, walk a
+                        // cursor through the caller-supplied buffer so the
+                        // wire content is deterministic (e.g. a gzipped
+                        // customer payload whose sha256 the test asserts
+                        // against). Otherwise emit `b'Z'` fill so the wire
+                        // stays human-inspectable in logs.
+                        let fill = if config.body.is_none() {
+                            vec![b'Z'; config.chunk_size.max(1)]
+                        } else {
+                            Vec::new()
+                        };
+                        let chunk_size = config.chunk_size.max(1);
+                        let mut pos: usize = 0;
+                        let mut remaining = effective_body_size;
                         let mut write_failed = false;
                         while remaining > 0 {
-                            let to_write = remaining.min(chunk.len());
-                            let piece = &chunk[..to_write];
+                            let to_write = remaining.min(chunk_size);
+                            let piece: &[u8] = match &config.body {
+                                Some(buf) => &buf[pos..pos + to_write],
+                                None => &fill[..to_write],
+                            };
                             match config.transfer_encoding {
                                 TransferEncoding::ContentLength => {
                                     if stream.write_all(piece).is_err() {
@@ -187,6 +253,7 @@ impl ChunkedFlushH1Backend {
                                 break;
                             }
 
+                            pos += to_write;
                             remaining -= to_write;
                             if remaining > 0 && !config.inter_chunk_delay.is_zero() {
                                 thread::sleep(config.inter_chunk_delay);

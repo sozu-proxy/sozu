@@ -633,6 +633,42 @@ Together they exercise the double-GOAWAY sequence, completion of in-flight
 large responses during worker drain, and the requirement that soft-stop waits
 for active requests instead of tearing sessions down early.
 
+### Large-asset H1→H2 regression coverage
+
+Multi-MB chunked responses flowing from an H1 backend into an H2 frontend were
+historically the hottest source of wake-gap / edge-triggered-readiness bugs on
+this branch. The large-asset suite in `e2e/src/tests/h2_correctness_tests.rs`
+locks those fixes in:
+
+- `test_h2_php_apache_chunked_flush_drains_fully` — 312 KiB chunked body with
+  per-chunk flush cadence exercising `mux/h1.rs:341-346, 351-357` (C1).
+- `test_h2_slow_backend_idle_timeout_cancels` — 64 KiB chunked body streamed
+  over 4 s, exercising the outbound refresh of `stream_last_activity_at` (C2).
+- `test_h2_chunked_backend_crash_mid_stream_rsts` — verifies the chunked-EOF
+  demotion to `ParsingPhase::Error` + `RST_STREAM(InternalError)` (C3).
+- `test_h2_large_gzipped_chunked_drains_fully` — customer-shape regression
+  guard from the cleverapps.io 2026-04 ticket: 7.76 MB deterministic payload,
+  gzipped and chunked, served through the extended `ChunkedFlushH1Backend`
+  with `Content-Encoding: gzip`. Client follows a Chromium-146 profile
+  (SETTINGS with `INITIAL_WINDOW_SIZE=6_291_456`, one-shot
+  `WINDOW_UPDATE(0, 15_663_105)`, per-stream `WINDOW_UPDATE(sid, 32 KiB)`
+  cadence, `priority: u=3, i`). Asserts sha256 byte-identity of the gzipped
+  wire body within 8 s. The streaming drain helper
+  `drain_h2_stream_streaming` keeps memory linear in one frame (not one
+  stream) by hashing DATA payloads as they arrive and only retaining an
+  at-most-one-frame `carry` tail between reads.
+- `test_h2_large_chunked_7mb_drains_fully` — scale-only companion. Same
+  7.76 MB total, `b'Z'` fill, no gzip — isolates multi-MB drain + Chromium
+  request shape + per-stream `WINDOW_UPDATE` cadence from content-encoding
+  interactions.
+
+`H2FloodDetector` caps stream-0 `WINDOW_UPDATE` frames at
+`DEFAULT_MAX_WINDOW_UPDATE_STREAM0_PER_WINDOW = 100` per sliding window
+(`lib/src/protocol/mux/h2.rs:259`, enforcement at `:856`). The drain helper
+refreshes per-stream windows only; the one-shot conn-level bump during
+`h2_handshake_chromium_146` is the single stream-0 `WINDOW_UPDATE` emitted
+during the test.
+
 ### Safety properties
 
 The implementation maintains a zero-panic-path policy for the H2 read/write
