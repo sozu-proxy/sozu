@@ -4356,10 +4356,12 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             return self.goaway(H2Error::ProtocolError);
         }
         let (urgency, incremental) = pkawa::parse_rfc9218_priority(&pu.priority_field_value);
+        let (prev_urgency, _) = self.prioriser.get(&pu.prioritized_stream_id);
         trace!(
-            "{} PRIORITY_UPDATE stream={} urgency={} incremental={}",
+            "{} PRIORITY_UPDATE stream={} urgency={}->{} incremental={} rearmed_writable=true",
             log_context!(self),
             pu.prioritized_stream_id,
+            prev_urgency,
             urgency,
             incremental
         );
@@ -4372,6 +4374,12 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             self.last_stream_id,
             &self.streams,
         );
+        // LIFECYCLE invariant 15: reprioritisation only changes ordering for
+        // the NEXT write pass. Under ET epoll, if finalize_write already
+        // stripped WRITABLE, the scheduler won't re-run without a synthetic
+        // wake — pair the interest insert with signal_pending_write.
+        self.readiness.arm_writable();
+        incr!("h2.signal.writable.rearmed.priority_update");
         MuxResult::Continue
     }
 
