@@ -13,23 +13,24 @@
 //!   lock-in regression guard rather than a RED-to-green flip. The actual
 //!   RED for Fix A is the unit test shipped alongside the patch in
 //!   `mux/answers.rs::tests`.
-//! * [`test_h2_priority_update_rearms_writable`]: Fix B — marked
-//!   `#[ignore]` because reliably forcing sozu into the WRITABLE-stripped
-//!   yielded state requires precise flow-control starvation that is
-//!   prone to CI timing noise; on a healthy event loop, most other
-//!   triggers (stream window update, PING, tick) wake the scheduler
-//!   before the rearm gap becomes observable on the wire. The RED that
-//!   drives Fix B lives in the unit test shipped alongside the patch in
-//!   `mux/h2.rs::tests`, which exercises `handle_priority_update_frame`
-//!   directly and asserts `readiness.event.is_writable()`.
-//! * [`test_h2_backend_silent_headers_data_peer_signal`]: Fix C — marked
-//!   `#[ignore]` until `e2e/src/mock/raw_h2_response_backend.rs` gains a
-//!   HEADERS-then-delay-then-DATA mode (~40 LOC extension). Deferred to a
-//!   follow-up to keep PR #1209 scope contained.
-//! * [`test_h2_mid_pass_rst_does_not_force_yield`]: Fix D — marked
-//!   `#[ignore]` because the scheduler-race observation is inherently
-//!   flaky under CI timing noise. Re-enable after confirmation across 10
-//!   consecutive CI runs. See memory `project_sozu_h2_flood_family_flakes`.
+//! * [`test_h2_priority_update_rearms_writable`]: Fix B — two streams,
+//!   a mid-flight PRIORITY_UPDATE bumps the second to `u=0, i`. Asserts
+//!   both streams drain full bodies + END_STREAM within the 5-second
+//!   post-PU budget. On HEAD the observed post-PU drain is O(100 µs),
+//!   well under the budget; on a regressed scheduler the rearm gap
+//!   strands the reprioritised stream past the deadline.
+//! * [`test_h2_backend_silent_headers_data_peer_signal`]: Fix C — exercises
+//!   the H2-backend → H2-frontend peer-rearm path using the
+//!   [`RawH2ResponseBackend::set_body_with_delay`] mode that emits
+//!   HEADERS, sleeps 50 ms, then streams DATA frames. Passes post-fix
+//!   (`fead8eb0`); a regression that drops the peer signal stalls the
+//!   client past the 1-second budget.
+//! * [`test_h2_mid_pass_rst_does_not_force_yield`]: Fix D — structural
+//!   regression guard. Asserts that RST_STREAM'ing a middle peer
+//!   mid-flight does not corrupt the surviving `u=1, i` streams'
+//!   body delivery. The one-yield-saved delta from `1de3faad`'s
+//!   mid-pass bucket decrement is below CI timing noise and is not
+//!   asserted directly (see memory `project_sozu_h2_flood_family_flakes`).
 
 use std::{
     io::{Read, Write},
@@ -47,6 +48,7 @@ use sozu_command_lib::{
 };
 
 use crate::{
+    mock::raw_h2_response_backend::RawH2ResponseBackend,
     sozu::worker::Worker,
     tests::{State, h2_utils::*, provide_port, provide_unbound_port, repeat_until_error_or},
 };
@@ -429,7 +431,6 @@ fn try_h2_priority_update_rearms_writable() -> State {
 }
 
 #[test]
-#[ignore = "fix-b RED is covered by the unit test in mux/h2.rs::tests; e2e reliability requires an e2e-hooks readiness probe (tracked as #1209-followup-fix-b-probe)"]
 fn test_h2_priority_update_rearms_writable() {
     assert_eq!(
         repeat_until_error_or(
@@ -446,28 +447,135 @@ fn test_h2_priority_update_rearms_writable() {
 // ============================================================================
 
 /// An H2 backend that emits HEADERS → 50 ms pause → DATA (END_STREAM)
-/// with a ≥ 32 KiB body (two DATA frames). The frontend must forward
-/// the full body within 500 ms post-HEADERS. Before Fix C the peer
-/// readiness is inserted but `signal_pending_write` is never called,
-/// so the frontend never wakes to forward the body bytes.
+/// with a ≥ 32 KiB body (two DATA frames — memory
+/// `feedback_h2_repro_multi_data_frames` notes that single-DATA
+/// responses pass by coincidence of the natural writable window).
 ///
-/// DEFERRED: `e2e/src/mock/raw_h2_response_backend.rs` does not yet
-/// support HEADERS-then-delay-then-DATA. Extending the mock is ~40 LOC
-/// and would grow this PR beyond the targeted invariant-15 scope.
-/// Track under `#1209-followup-fix-c-mock` — enable once the mock
-/// lands.
-#[allow(dead_code)]
+/// Before Fix C, `handle_data_frame` / `handle_headers_frame` insert
+/// `Ready::WRITABLE` on the peer readiness without pairing it with
+/// `signal_pending_write`. Under edge-triggered epoll the frontend
+/// never wakes to forward the bytes sozu just received from the H2
+/// backend — they sit in `stream.back` until an unrelated event
+/// arrives.
+///
+/// Post-fix (`fead8eb0`), the peer uses `Readiness::arm_writable`
+/// which pairs insert + signal. The client sees the full body
+/// within the 1-second budget below. Budget is intentionally wide
+/// (≥ 20× the backend delay) so CI jitter does not flip this test.
 fn try_h2_backend_silent_headers_data_peer_signal() -> State {
-    State::Success // placeholder — body follows the Fix C mock extension
+    // Body must produce ≥ 2 DATA frames on the backend → sozu hop and
+    // enough data that the frontend cannot flush everything from the
+    // single initial natural-writable window.
+    const BODY_SIZE: usize = 48 * 1024;
+
+    let (mut worker, front_port, _) = setup_h2_listener_only("H2-PRIO-REARM-FIXC");
+    // Overwrite the default cluster with one declaring `http2 = true`
+    // so sozu actually speaks H2 to RawH2ResponseBackend. Without this
+    // hint sozu sends H1 upstream, the mock cannot reply, and sozu
+    // emits a 5xx default answer in under 2 ms.
+    let mut h2_cluster = Worker::default_cluster("cluster_0");
+    h2_cluster.http2 = Some(true);
+    worker.send_proxy_request_type(
+        sozu_command_lib::proto::command::request::RequestType::AddCluster(h2_cluster),
+    );
+    let back_port = provide_unbound_port();
+    let back_address: SocketAddr = format!("127.0.0.1:{back_port}").parse().unwrap();
+    worker.send_proxy_request_type(
+        sozu_command_lib::proto::command::request::RequestType::AddBackend(
+            Worker::default_backend("cluster_0", "cluster_0-0", back_address, None),
+        ),
+    );
+    worker.read_to_last();
+
+    let backend = RawH2ResponseBackend::new(back_address);
+    let body = vec![b'X'; BODY_SIZE];
+    backend.set_body_with_delay(body.clone(), Duration::from_millis(50));
+    // Give the backend thread a moment to bind before the client
+    // connects — otherwise sozu may hit a connect error on first try.
+    thread::sleep(Duration::from_millis(100));
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake_with_initial_window(&mut tls, 1_000_000);
+
+    let sid: u32 = 1;
+    let block = build_get_with_priority(3, "i");
+    tls.write_all(&H2Frame::headers(sid, block, true, true).encode())
+        .unwrap();
+    tls.flush().unwrap();
+    // Enlarge the connection window to avoid flow-control stalling
+    // before the body lands on the wire.
+    tls.write_all(&H2Frame::window_update(0, 1_000_000).encode())
+        .unwrap();
+    tls.flush().unwrap();
+
+    let deadline = Duration::from_secs(1);
+    let start = Instant::now();
+    let mut raw = Vec::new();
+    let mut rbuf = vec![0u8; 65536];
+    let mut body_received = 0usize;
+    let mut saw_end_stream = false;
+    tls.sock
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .ok();
+    while !saw_end_stream && start.elapsed() < deadline {
+        match tls.read(&mut rbuf) {
+            Ok(0) => break,
+            Ok(n) => {
+                raw.extend_from_slice(&rbuf[..n]);
+                // Recount body + END_STREAM from scratch each pass —
+                // parse_h2_frames is pure over the accumulated buffer.
+                body_received = 0;
+                saw_end_stream = false;
+                for (ft, fl, s, payload) in parse_h2_frames(&raw) {
+                    if ft == H2_FRAME_DATA && s == sid {
+                        body_received += payload.len();
+                        if (fl & H2_FLAG_END_STREAM) != 0 {
+                            saw_end_stream = true;
+                        }
+                    }
+                }
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(_) => break,
+        }
+    }
+    let elapsed = start.elapsed();
+    println!(
+        "h2-backend-delayed-data: body={body_received}/{BODY_SIZE} \
+         end_stream={saw_end_stream} elapsed={elapsed:?}"
+    );
+
+    drop(tls);
+    drop(backend);
+    thread::sleep(Duration::from_millis(100));
+    let still_alive = verify_sozu_alive(front_port);
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+
+    if still_alive && stopped && body_received == BODY_SIZE && saw_end_stream && elapsed < deadline
+    {
+        State::Success
+    } else {
+        println!(
+            "FAIL: body_received={body_received} end_stream={saw_end_stream} \
+             elapsed={elapsed:?} alive={still_alive} stopped={stopped}"
+        );
+        State::Fail
+    }
 }
 
 #[test]
-#[ignore = "fix-c requires raw-H2 mock with HEADERS-then-delay-then-DATA support; tracked as #1209-followup-fix-c-mock"]
 fn test_h2_backend_silent_headers_data_peer_signal() {
     assert_eq!(
         repeat_until_error_or(
-            1,
-            "H2 backend HEADERS-then-delay-then-DATA must forward body under 500 ms",
+            2,
+            "H2 backend HEADERS-then-delay-then-DATA must forward body under 1 s",
             try_h2_backend_silent_headers_data_peer_signal
         ),
         State::Success
@@ -475,33 +583,174 @@ fn test_h2_backend_silent_headers_data_peer_signal() {
 }
 
 // ============================================================================
-// Test 4 — Fix D: mid-pass RST_STREAM does not force incremental yield
+// Test 4 — Fix D: mid-pass RST_STREAM does not corrupt surviving streams
 // ============================================================================
 
-/// Three streams all `u=1, i` on the same connection. The middle
-/// stream is RST_STREAM'd mid-pass. Without Fix D the surviving
-/// streams still see `incremental_peer_count = 3` for the remainder
-/// of the pass and fire one unnecessary voluntary yield each.
+/// Three concurrent `u=1, i` streams share a connection. Mid-flight —
+/// after each stream has emitted at least its HEADERS response — the
+/// client RST_STREAMs the middle one (stream B). The surviving
+/// streams (A, C) MUST complete their full bodies cleanly.
 ///
-/// DEFERRED: timing-sensitive — the scheduler races between the
-/// client RST_STREAM frame and the in-progress write pass. Even with
-/// the fix, the observable delta is one DATA frame boundary — well
-/// below CI timing noise. Re-enable after confirmation across 10
-/// consecutive CI runs, or after extending the test with an
-/// `e2e-hooks` probe that reads `incremental_peer_count` directly.
-/// See memory `project_sozu_h2_flood_family_flakes`.
-#[allow(dead_code)]
+/// This is a **structural** regression guard for Fix D (`1de3faad`)
+/// and its mid-pass mutation of `ready_incremental_by_urgency`. We do
+/// not attempt to observe the one-yield-saved delta directly — that
+/// would require an `e2e-hooks` probe on `incremental_peer_count`,
+/// and the wire delta (≤ 1 DATA frame) sits below CI timing noise.
+/// Instead, we verify that Fix D's `saturating_sub` on the bucket
+/// counter under RST / retirement paths does not break the surviving
+/// streams' body delivery.
+///
+/// A regression here (e.g. bucket underflow, stale read, borrow-check
+/// typo) would manifest as A or C stalling indefinitely, which the
+/// 5-second budget would catch.
 fn try_h2_mid_pass_rst_does_not_force_yield() -> State {
-    State::Success // placeholder — body follows a non-flaky observation probe
+    // Large body ensures the write loop still has pending bytes when
+    // the RST arrives (≥ 2 DATA frames after the RST, so a latent
+    // bucket-count bug has a chance to surface).
+    const BODY_SIZE: usize = 64 * 1024;
+
+    let (worker, backends, front_port) =
+        setup_h2_test_with_large_bodies("H2-PRIO-REARM-FIXD", 3, BODY_SIZE);
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake_with_initial_window(&mut tls, 1_000_000);
+
+    // Three streams, all urgency 1 + incremental.
+    let sid_a: u32 = 1;
+    let sid_b: u32 = 3;
+    let sid_c: u32 = 5;
+    for sid in [sid_a, sid_b, sid_c] {
+        let block = build_get_with_priority(1, "i");
+        tls.write_all(&H2Frame::headers(sid, block, true, true).encode())
+            .unwrap();
+    }
+    tls.flush().unwrap();
+    tls.write_all(&H2Frame::window_update(0, 1_000_000).encode())
+        .unwrap();
+    tls.flush().unwrap();
+
+    tls.sock
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .ok();
+    let mut raw = Vec::new();
+    let mut rbuf = vec![0u8; 65536];
+
+    // Phase 1: wait until every stream has emitted HEADERS and at
+    // least one DATA frame — confirms the scheduler is actively
+    // interleaving. Cap at 1 s so a wedged scheduler cannot hide here.
+    let phase1 = Instant::now();
+    let mut got_data = [false, false, false];
+    while !got_data.iter().all(|b| *b) && phase1.elapsed() < Duration::from_secs(1) {
+        match tls.read(&mut rbuf) {
+            Ok(0) => break,
+            Ok(n) => {
+                raw.extend_from_slice(&rbuf[..n]);
+                for (ft, _fl, s, _) in parse_h2_frames(&raw) {
+                    if ft == H2_FRAME_DATA {
+                        if s == sid_a {
+                            got_data[0] = true;
+                        } else if s == sid_b {
+                            got_data[1] = true;
+                        } else if s == sid_c {
+                            got_data[2] = true;
+                        }
+                    }
+                }
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(_) => break,
+        }
+    }
+
+    // Phase 2: RST stream B. Fix D must decrement the bucket count
+    // on the `rst_sent` mid-pass path AND on the completion path
+    // without perturbing A or C.
+    tls.write_all(&H2Frame::rst_stream(sid_b, H2_ERROR_NO_ERROR).encode())
+        .unwrap();
+    tls.flush().unwrap();
+
+    // Phase 3: wait for END_STREAM on BOTH A and C. 5 s budget well
+    // above the single-stream 64 KiB delivery baseline observed on
+    // the h2_correctness large-body tests.
+    let deadline = Duration::from_secs(5);
+    let phase3 = Instant::now();
+    let mut end_a = false;
+    let mut end_c = false;
+    let mut body_a = 0usize;
+    let mut body_c = 0usize;
+    while (!end_a || !end_c) && phase3.elapsed() < deadline {
+        match tls.read(&mut rbuf) {
+            Ok(0) => break,
+            Ok(n) => {
+                raw.extend_from_slice(&rbuf[..n]);
+                body_a = 0;
+                body_c = 0;
+                end_a = false;
+                end_c = false;
+                for (ft, fl, s, payload) in parse_h2_frames(&raw) {
+                    if ft != H2_FRAME_DATA {
+                        continue;
+                    }
+                    if s == sid_a {
+                        body_a += payload.len();
+                        if (fl & H2_FLAG_END_STREAM) != 0 {
+                            end_a = true;
+                        }
+                    } else if s == sid_c {
+                        body_c += payload.len();
+                        if (fl & H2_FLAG_END_STREAM) != 0 {
+                            end_c = true;
+                        }
+                    }
+                }
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(_) => break,
+        }
+    }
+    let phase3_elapsed = phase3.elapsed();
+    println!(
+        "mid-pass-rst: body_a={body_a}/{BODY_SIZE} end_a={end_a}, \
+         body_c={body_c}/{BODY_SIZE} end_c={end_c}, \
+         phase3_elapsed={phase3_elapsed:?}"
+    );
+
+    let infra_ok = teardown(tls, front_port, worker, backends);
+
+    if infra_ok
+        && end_a
+        && end_c
+        && body_a == BODY_SIZE
+        && body_c == BODY_SIZE
+        && phase3_elapsed < deadline
+    {
+        State::Success
+    } else {
+        println!(
+            "FAIL: end_a={end_a} end_c={end_c} body_a={body_a} body_c={body_c} \
+             phase3_elapsed={phase3_elapsed:?} infra_ok={infra_ok}"
+        );
+        State::Fail
+    }
 }
 
 #[test]
-#[ignore = "fix-d test is timing-sensitive; re-enable after 10 stable CI runs (#1209-followup-flaky)"]
 fn test_h2_mid_pass_rst_does_not_force_yield() {
     assert_eq!(
         repeat_until_error_or(
-            1,
-            "H2 mid-pass RST must not force a voluntary yield on same-urgency peers",
+            2,
+            "H2 mid-pass RST must not corrupt surviving same-urgency streams",
             try_h2_mid_pass_rst_does_not_force_yield
         ),
         State::Success
