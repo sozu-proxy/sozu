@@ -284,6 +284,72 @@ surfaces:
    warning but never block the mutation. `None` (default) keeps audit
    lines routed only through `log_target`.
 
+   ### JSON sink: `audit_logs_json_target`
+
+   For SIEM pipelines that prefer not to parse the human-readable line,
+   `audit_logs_json_target` writes a structured JSON object per line to a
+   dedicated file. Same `O_APPEND | O_CREAT | 0o640` semantics. Schema is
+   stable; every key is always present, missing values are JSON `null`:
+
+   ```json
+   {
+     "ts": "2026-04-23T13:14:15.123456Z",
+     "boot_generation": 0,
+     "session_ulid": "01HXS4GZ9EYP3F2R7K8M6B4N2C",
+     "request_ulid": "01HXS4H5K2QR9C7PVWXY8T6ZNA",
+     "actor": {
+       "uid": 1000, "gid": 1000, "pid": 12345,
+       "user": "florentin", "comm": "sozuctl", "role": "user"
+     },
+     "client_id": 42,
+     "connect_ts": "2026-04-23T13:14:14.500000Z",
+     "socket": "/run/sozu/sozu.sock",
+     "verb": "cluster_added",
+     "target": "cluster:my_app",
+     "result": "ok",
+     "cluster_id": "my_app",
+     "backend_id": null,
+     "sozu_version": "1.1.1",
+     "build_git_sha": "9a1b2c3d4e5f",
+     "extras": {
+       "elapsed_ms": 17,
+       "fanout": {"status": "ok", "workers_ok": 2, "workers_err": 0, "workers_expected": 2},
+       "request_sha256": "0123456789abcdef"
+     }
+   }
+   ```
+
+   Both sinks are independent — set both for an operator-friendly tail
+   stream + a machine-parseable archive.
+
+   ### Retention policy
+
+   PCI-DSS 10.7 requires audit trails to be **retained ≥ 1 year**, with
+   the most recent **3 months immediately available** for analysis. ISO
+   27001 A.8.15 recommends similar but defers to organisational policy.
+
+   `audit_logs_target` and `audit_logs_json_target` are append-only files
+   under your operator's logrotate / archival pipeline — the recommended
+   shape on Clever Cloud Linux deployments is:
+
+   - `/etc/logrotate.d/sozu` rotates `/var/log/sozu/audit*.{log,jsonl}`
+     **daily**, compresses with `xz` after 1 day, archives off-host
+     after 90 days.
+   - Off-host archive bucket retains for **400 days** to clear the
+     PCI-DSS 1-year window with cushion.
+   - Restrict on-host read access via `setfacl -m g:audit:r-x
+     /var/log/sozu/`; only the `audit` group should be able to tail the
+     live file.
+   - The `Server.boot_generation` field stamped on every line lets log
+     analysers stitch sessions across hot-upgrade re-execs without
+     trusting PIDs.
+
+   Sōzu does **not** rotate or compress audit files itself — that is
+   delegated to the OS-level rotator. Operators who want native rotation
+   should use `logrotate` with the `copytruncate` directive (since sōzu
+   keeps the file handle open) or send `SIGHUP` after rename to trigger
+   a re-open (not yet implemented — TODO).
+
    ### Two lines per worker-fanning verb
 
    Verbs that fan out to every worker (AddCluster, RemoveHttpFrontend,

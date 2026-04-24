@@ -1126,6 +1126,9 @@ message ServerConfig {
     // field (audit only lives on the main), but the field is propagated on
     // the proto wire so a future worker-side audit path can pick it up.
     optional string audit_logs_target = 18;
+    // Dedicated JSON mirror of the audit log. One JSON object per line for
+    // SIEM ingest. Same lifecycle as `audit_logs_target`.
+    optional string audit_logs_json_target = 19;
 }
 
 enum ProtobufAccessLogFormat {

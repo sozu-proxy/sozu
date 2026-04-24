@@ -53,6 +53,14 @@ log_target = "stdout"
 # Accepts a plain filesystem path (no URI scheme).
 # audit_logs_target = "/var/log/sozu/audit.log"
 
+# optional JSON mirror of the audit log — one JSON object per line so SIEM
+# pipelines (Wazuh, Elastic, Loki, Splunk HEC) ingest without bespoke parser
+# code. Same `O_APPEND | O_CREAT | 0o640` semantics as audit_logs_target.
+# Schema is stable: every key always present, missing values rendered as
+# JSON `null`. Independent of the human-readable sink — set both for
+# operator-friendly tail + machine-parseable archive.
+# audit_logs_json_target = "/var/log/sozu/audit.jsonl"
+
 # format of the access logs. Defaults to ascii.
 # - ascii
 # - protobuf (defined in [sozu_command_lib::proto::command::ProtobufAccessLog])

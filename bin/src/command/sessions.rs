@@ -1,4 +1,4 @@
-use std::{fmt::Debug, sync::Arc};
+use std::{fmt::Debug, sync::Arc, time::SystemTime};
 
 use libc::pid_t;
 use mio::Token;
@@ -52,6 +52,12 @@ pub struct ClientSession {
     /// Lets multi-instance sozu deployments disambiguate audit lines that
     /// share a SIEM sink.
     pub socket_path: Arc<str>,
+    /// Wall-clock time of `accept(2)` for this client connection. Rendered
+    /// as RFC 3339 UTC in the audit line so SOC tooling can window
+    /// per-session activity (e.g. "all verbs from connections that opened
+    /// in the 30s before the incident"). Stored as `SystemTime` so it
+    /// survives across the formatting boundary.
+    pub connect_ts: SystemTime,
 }
 
 /// The return type of the ready method
@@ -85,6 +91,7 @@ impl ClientSession {
             actor_comm,
             actor_user,
             socket_path,
+            connect_ts: SystemTime::now(),
         }
     }
 
@@ -111,6 +118,13 @@ impl ClientSession {
             Some(pid) => pid.to_string(),
             None => String::from("unknown"),
         }
+    }
+
+    /// Render the connection-accept timestamp as an RFC 3339 UTC string,
+    /// computed via the std-only [`crate::command::requests::rfc3339_utc`]
+    /// helper. Caller is `audit_log_context!`.
+    pub fn connect_ts_display(&self) -> String {
+        crate::command::requests::rfc3339_utc(self.connect_ts)
     }
 
     /// Render the captured `/proc/<pid>/comm` string, sanitized for audit
