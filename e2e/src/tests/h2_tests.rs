@@ -1453,8 +1453,18 @@ fn test_h2_te_header_filtering() {
 
 // ---- CVE-2023-44487: Rapid Reset triggers GOAWAY(ENHANCE_YOUR_CALM) ----
 
-/// Open an H2 connection and send 200 HEADERS+RST_STREAM pairs rapidly.
-/// Sozu must detect the flood and respond with GOAWAY(ENHANCE_YOUR_CALM).
+/// Open an H2 connection and send just over the RST_STREAM threshold of
+/// HEADERS+RST_STREAM pairs in a single batched write. Sozu must detect the
+/// flood and respond with GOAWAY(ENHANCE_YOUR_CALM).
+///
+/// Batched-write pattern (2026-04-25): RST_STREAM threshold
+/// (`H2FloodConfig::max_rst_stream_per_window`) defaults to 100. Previously
+/// this test wrote 200 pairs one-by-one with a 500 ms blanket sleep before
+/// reading — a classic race where the server could send GOAWAY+FIN mid-loop
+/// and the client's next write hit `Broken pipe`. The batched variant
+/// writes exactly threshold + 5 = 105 pairs in one TLS record and then
+/// reads deterministically; the detector has the full evidence by the time
+/// we switch modes.
 fn try_h2_rapid_reset_triggers_goaway() -> State {
     let (mut worker, mut backends, front_port) = setup_h2_test("H2-RAPID-RESET", 1);
 
@@ -1463,11 +1473,13 @@ fn try_h2_rapid_reset_triggers_goaway() -> State {
     let mut tls = raw_h2_connection(front_addr);
     h2_handshake(&mut tls);
 
-    // Send 200 HEADERS + RST_STREAM pairs rapidly on odd stream IDs.
-    // Must include all 4 pseudo-headers (RFC 9113 §8.3.1) so sozu parses
-    // them as valid requests — otherwise they're rejected as INVALID HEADERS
-    // and never counted by the flood detector.
-    for i in 0..200u32 {
+    // Send threshold + 5 pairs (HEADERS + RST_STREAM(CANCEL)) on odd stream
+    // IDs. Each HEADERS must include all 4 pseudo-headers (RFC 9113 §8.3.1)
+    // so sozu parses them as valid requests — otherwise they would be
+    // rejected as INVALID HEADERS and never reach the flood detector.
+    const PAIRS_TO_SEND: u32 = 105;
+    let mut batch = Vec::with_capacity((PAIRS_TO_SEND as usize) * 45);
+    for i in 0..PAIRS_TO_SEND {
         let stream_id = 1 + i * 2; // 1, 3, 5, 7, ...
         let header_block = vec![
             0x82, // :method GET (index 2)
@@ -1476,16 +1488,13 @@ fn try_h2_rapid_reset_triggers_goaway() -> State {
             0x41, 0x09, // :authority (literal, name index 1, value length 9)
             b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't', // "localhost"
         ];
-        let headers = H2Frame::headers(stream_id, header_block, true, true);
-        if tls.write_all(&headers.encode()).is_err() {
-            break;
-        }
-        let rst = H2Frame::rst_stream(stream_id, 0x8); // CANCEL
-        if tls.write_all(&rst.encode()).is_err() {
-            break;
-        }
+        batch.extend_from_slice(&H2Frame::headers(stream_id, header_block, true, true).encode());
+        batch.extend_from_slice(&H2Frame::rst_stream(stream_id, 0x8).encode()); // CANCEL
     }
-    let _ = tls.flush();
+    let write_ok = tls.write_all(&batch).and_then(|_| tls.flush()).is_ok();
+    if !write_ok {
+        println!("H2 Rapid Reset - batched write failed (peer closed mid-write — valid)");
+    }
 
     // Read response — expect GOAWAY with ENHANCE_YOUR_CALM
     thread::sleep(Duration::from_millis(500));
@@ -1641,8 +1650,16 @@ fn test_h2_continuation_flood_triggers_goaway() {
 
 // ---- CVE-2019-9512: Ping flood triggers GOAWAY(ENHANCE_YOUR_CALM) ----
 
-/// Open an H2 connection and send 200 PING frames rapidly.
-/// Sozu must detect the flood and respond with GOAWAY(ENHANCE_YOUR_CALM).
+/// Open an H2 connection and send just over the detector threshold of PING
+/// frames in a single batched write, then read the GOAWAY. Sozu must detect
+/// the flood and respond with GOAWAY(ENHANCE_YOUR_CALM).
+///
+/// Batched-write pattern (2026-04-25): previously this test wrote 200 frames
+/// one-by-one and then tried to read. The per-frame write loop raced sozu's
+/// detector, which fires at frame 101 and sends GOAWAY+FIN — the client then
+/// saw `Broken pipe` on frame ~180 and silently swallowed the signal.
+/// Batching into a single `write_all` + `flush` removes the race: by the
+/// time we switch to the read path, sozu has already seen the flood.
 fn try_h2_ping_flood_triggers_goaway() -> State {
     let (mut worker, mut backends, front_port) = setup_h2_test("H2-PING-FLOOD", 1);
 
@@ -1651,25 +1668,24 @@ fn try_h2_ping_flood_triggers_goaway() -> State {
     let mut tls = raw_h2_connection(front_addr);
     h2_handshake(&mut tls);
 
-    // Send 200 PING frames rapidly. Mirror the settings-flood diagnostic
-    // added in commit 66f15b6b so CI failures surface the exact point where
-    // the kernel-buffered write started failing — typically this means the
-    // server already detected the flood and sent GOAWAY+FIN, and the client's
-    // write race against the OS close is the signal we want to preserve.
-    let mut written = 0usize;
-    for i in 0..200u32 {
+    // PING threshold (`H2FloodConfig::max_ping_per_window`) defaults to 100.
+    // We send threshold + 5 = 105 frames so the 101st trips the counter
+    // while the batch stays small enough to fit comfortably in one TLS
+    // write.
+    const PINGS_TO_SEND: u32 = 105;
+    let mut batch = Vec::with_capacity((PINGS_TO_SEND as usize) * 17); // 9-byte header + 8-byte payload
+    for i in 0..PINGS_TO_SEND {
         let mut payload = [0u8; 8];
         payload[0..4].copy_from_slice(&i.to_be_bytes());
-        let ping = H2Frame::ping(payload);
-        match tls.write_all(&ping.encode()) {
-            Ok(()) => written += 1,
-            Err(e) => {
-                println!("H2 Ping flood - write_all failed after {written} successful writes: {e}");
-                break;
-            }
-        }
+        batch.extend_from_slice(&H2Frame::ping(payload).encode());
     }
-    let _ = tls.flush();
+    let write_ok = tls.write_all(&batch).and_then(|_| tls.flush()).is_ok();
+    if !write_ok {
+        // Sozu may close during the single write if the runner is slow
+        // enough that the detector fires before the last byte lands.
+        // That is still a valid outcome — sozu did enforce the cap.
+        println!("H2 Ping flood - batched write failed (peer closed mid-write — valid);");
+    }
 
     // Read response — expect GOAWAY with ENHANCE_YOUR_CALM.
     // Use collect_response_frames with multiple attempts for CI resilience:
@@ -1717,8 +1733,16 @@ fn test_h2_ping_flood_triggers_goaway() {
 
 // ---- CVE-2019-9515: Settings flood triggers GOAWAY(ENHANCE_YOUR_CALM) ----
 
-/// Open an H2 connection and send 100 SETTINGS frames rapidly.
-/// Sozu must detect the flood and respond with GOAWAY(ENHANCE_YOUR_CALM).
+/// Open an H2 connection and send just over the SETTINGS threshold in a
+/// single batched write. Sozu must detect the flood and respond with
+/// GOAWAY(ENHANCE_YOUR_CALM).
+///
+/// Batched-write pattern (2026-04-25): SETTINGS threshold
+/// (`H2FloodConfig::max_settings_per_window`) defaults to 50. Previously
+/// this test wrote 100 SETTINGS frames one-by-one and then tried to read;
+/// the per-frame loop raced sozu's detector and the silent `break` after
+/// `Broken pipe` swallowed the real signal on slow runners. Batching the
+/// writes removes the race.
 fn try_h2_settings_flood_triggers_goaway() -> State {
     let (mut worker, mut backends, front_port) = setup_h2_test("H2-SETTINGS-FLOOD", 1);
 
@@ -1727,24 +1751,20 @@ fn try_h2_settings_flood_triggers_goaway() -> State {
     let mut tls = raw_h2_connection(front_addr);
     h2_handshake(&mut tls);
 
-    // Send 100 SETTINGS frames rapidly (each with a valid setting), tracking
-    // how many writes actually succeeded. Under a known CI flake class the
-    // first post-handshake write errors and the silent `break` below used
-    // to swallow the signal entirely — `writes_ok` now surfaces the split
-    // so a future flake is diagnosable at a glance.
-    let mut writes_ok: usize = 0;
-    for _i in 0..100u32 {
-        // SETTINGS_MAX_CONCURRENT_STREAMS = 100 (a valid, harmless setting)
-        let settings = H2Frame::settings(&[(0x3, 100)]);
-        if let Err(e) = tls.write_all(&settings.encode()) {
-            println!(
-                "H2 Settings flood - write_all failed after {writes_ok} successful writes: {e}",
-            );
-            break;
-        }
-        writes_ok += 1;
+    // threshold + 5 = 55 SETTINGS frames, each with a valid setting
+    // (SETTINGS_MAX_CONCURRENT_STREAMS = 100). The batch is ~825 bytes of
+    // plaintext — well below any TLS record boundary.
+    const SETTINGS_TO_SEND: usize = 55;
+    let settings_frame = H2Frame::settings(&[(0x3, 100)]).encode();
+    let mut batch = Vec::with_capacity(SETTINGS_TO_SEND * settings_frame.len());
+    for _ in 0..SETTINGS_TO_SEND {
+        batch.extend_from_slice(&settings_frame);
     }
-    let _ = tls.flush();
+    let write_ok = tls.write_all(&batch).and_then(|_| tls.flush()).is_ok();
+    if !write_ok {
+        println!("H2 Settings flood - batched write failed (peer closed mid-write — valid)");
+    }
+    let writes_ok = if write_ok { SETTINGS_TO_SEND } else { 0 };
 
     // Read response — expect GOAWAY with ENHANCE_YOUR_CALM.
     // Use collect_response_frames with multiple attempts for CI resilience:
