@@ -918,6 +918,14 @@ pub(crate) fn drain_h2_stream_streaming(
     let mut end_stream_seen = false;
     let mut got_rst = false;
     let mut done = false;
+    // Once the write side races a peer-close (BrokenPipe / ConnectionReset
+    // on a WU flush), `can_write` flips to false. The read loop keeps
+    // running so any DATA that is already queued in the kernel receive
+    // buffer — including a trailing END_STREAM — still lands in
+    // `body_bytes`/`hasher`. The drain exits naturally via `Ok(0)` (FIN)
+    // or `Err(_)` on the read side. This preserves the "body integrity
+    // assertions at the call site are the source of truth" contract.
+    let mut can_write = true;
 
     while !done && start.elapsed() < deadline {
         match stream.read(&mut rbuf) {
@@ -967,7 +975,7 @@ pub(crate) fn drain_h2_stream_streaming(
                     break;
                 }
 
-                if stream_credit_since_refresh >= window_refresh_bytes {
+                if can_write && stream_credit_since_refresh >= window_refresh_bytes {
                     debug_assert!(
                         stream_credit_since_refresh <= 0x7FFF_FFFF,
                         "WINDOW_UPDATE increment must fit in 31 bits (RFC 9113 §6.9)"
@@ -977,15 +985,17 @@ pub(crate) fn drain_h2_stream_streaming(
                         "WINDOW_UPDATE increment must be strictly positive"
                     );
                     let frame = H2Frame::window_update(sid, stream_credit_since_refresh).encode();
-                    // Tolerate peer-close races: if the remote side has
-                    // already finished serving the stream between when
-                    // our last DATA read landed and when we try to emit
-                    // a flow-control refresh, the kernel raises EPIPE /
-                    // ECONNRESET. That is *not* a test failure — the
-                    // response-integrity assertions at the call site
-                    // (body_bytes, sha256) are the source of truth. We
-                    // stop the drain loop gracefully and let those
-                    // assertions adjudicate whether the body was complete.
+                    // Tolerate peer-close races. If the remote side has
+                    // already begun closing the stream between our last
+                    // DATA read and the next flow-control refresh, the
+                    // kernel raises EPIPE / ECONNRESET. We demote the
+                    // write side to disabled (`can_write = false`) and
+                    // keep READING: DATA that was already queued in the
+                    // kernel receive buffer — including any trailing
+                    // frame that carries END_STREAM — still lands in
+                    // `body_bytes` / `hasher`. The caller's sha256 and
+                    // `body_bytes` assertions remain the source of truth
+                    // for response integrity.
                     match stream.write_all(&frame).and_then(|_| stream.flush()) {
                         Ok(()) => stream_credit_since_refresh = 0,
                         Err(e)
@@ -998,14 +1008,11 @@ pub(crate) fn drain_h2_stream_streaming(
                                     | std::io::ErrorKind::UnexpectedEof
                             ) =>
                         {
-                            // Peer closed cleanly while we were about to
-                            // refresh. Break out of the read loop — the
-                            // next call to `stream.read()` would fail the
-                            // same way. Leave `end_stream_seen = false`
-                            // so the caller can still detect an early
-                            // close via the `body_bytes` mismatch.
-                            done = true;
-                            break;
+                            eprintln!(
+                                "drain_h2_stream_streaming: WU flush {} on stream {sid} at {body_bytes} bytes — switching to read-only drain",
+                                e.kind()
+                            );
+                            can_write = false;
                         }
                         Err(e) => {
                             panic!("unexpected WINDOW_UPDATE refresh error on stream {sid}: {e}");
