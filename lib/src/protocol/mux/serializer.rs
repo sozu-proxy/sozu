@@ -47,6 +47,11 @@ pub fn serialize_frame_type(f: &FrameType) -> u8 {
         FrameType::GoAway => 7,
         FrameType::WindowUpdate => 8,
         FrameType::Continuation => 9,
+        // RFC 9218 §7.1 PRIORITY_UPDATE. Sozu only ingests this frame
+        // (see `h2::ConnectionH2::handle_priority_update_frame`) and never
+        // emits one toward the peer, but the arm keeps the type-byte map
+        // round-trippable for tests / future use.
+        FrameType::PriorityUpdate => 0x10,
         // FrameType::Unknown is a parser-only variant used to ignore
         // extension frames per RFC 9113 §5.5; sozu never emits them.
         FrameType::Unknown(t) => t,
