@@ -587,7 +587,14 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Mux<Front, L>
 impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHandler> Mux<Front, L> {
     fn delay_close_for_frontend_flush(&mut self, reason: &'static str) -> bool {
         let _ = self.frontend.initiate_close_notify();
-        if self.frontend.has_pending_write() {
+        // LIFECYCLE §9 invariant 16: consult per-stream back-buffers in
+        // addition to the connection-level pending-write predicate so
+        // shutdown does not close while any open H2 stream still has
+        // kawa bytes queued after a voluntary scheduler yield.
+        if self
+            .frontend
+            .has_pending_write_including_streams(&self.context)
+        {
             let readiness = self.frontend.readiness_mut();
             readiness.interest = Ready::WRITABLE | Ready::HUP | Ready::ERROR;
             readiness.signal_pending_write();

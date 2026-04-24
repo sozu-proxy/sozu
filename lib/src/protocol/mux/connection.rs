@@ -338,6 +338,20 @@ impl<Front: SocketHandler> Connection<Front> {
         forward!(self, has_pending_write())
     }
 
+    /// Connection-level [`Self::has_pending_write`] extended with a per-stream
+    /// back-buffer probe (LIFECYCLE §9 invariant 16). Only H2 multiplexes
+    /// multiple streams — H1 falls back to [`Self::has_pending_write`] since
+    /// its single-response pipeline already accounts for pending bytes.
+    pub(super) fn has_pending_write_including_streams<L>(&self, context: &super::Context<L>) -> bool
+    where
+        L: ListenerHandler + L7ListenerHandler,
+    {
+        match self {
+            Connection::H1(c) => c.has_pending_write(),
+            Connection::H2(c) => c.has_pending_write_full(context),
+        }
+    }
+
     pub(super) fn initiate_close_notify(&mut self) -> bool {
         forward!(self, initiate_close_notify())
     }

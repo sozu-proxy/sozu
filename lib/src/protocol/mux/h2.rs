@@ -20,7 +20,7 @@ use crate::{
     L7ListenerHandler, ListenerHandler, Protocol, Readiness, SessionMetrics,
     protocol::mux::{
         BackendStatus, Context, DebugEvent, DebugHistory, Endpoint, GenericHttpStream,
-        GlobalStreamId, MuxResult, Position, StreamId, StreamState, converter,
+        GlobalStreamId, MuxResult, Position, Stream, StreamId, StreamState, converter,
         forcefully_terminate_answer,
         parser::{self, Frame, FrameHeader, FrameType, H2Error, Headers, WindowUpdate},
         pkawa, remove_backend_stream, serializer, set_default_answer,
@@ -552,6 +552,38 @@ fn distribute_overhead(
     metrics.bout += share_out;
     *overhead_bin -= share_in;
     *overhead_bout -= share_out;
+}
+
+/// LIFECYCLE §9 invariant 16 probe: returns `true` if any open stream still
+/// has outbound kawa bytes queued (`back.out` non-empty or `back.blocks`
+/// non-drained).
+///
+/// Used by `finalize_write` to preserve `Ready::WRITABLE` across a voluntary
+/// scheduler yield, and by `has_pending_write_full` to block shutdown-drain
+/// while bytes are still owed to the frontend.
+///
+/// `.get()` rather than direct indexing: an unknown `GlobalStreamId` is
+/// treated as "no pending bytes" rather than panicking — defence-in-depth
+/// against a stream-removal race during shutdown.
+fn any_stream_has_pending_back(
+    streams: &HashMap<StreamId, GlobalStreamId>,
+    context_streams: &[Stream],
+) -> bool {
+    any_stream_id_matches(streams, |gid| {
+        context_streams
+            .get(gid)
+            .is_some_and(|s| !s.back.out.is_empty() || !s.back.blocks.is_empty())
+    })
+}
+
+/// Iteration core of [`any_stream_has_pending_back`], split out so the
+/// invariant-16 dispatch is unit-testable without a full [`Stream`] fixture
+/// (the existing test module only covers `H2FloodDetector`).
+fn any_stream_id_matches<F>(streams: &HashMap<StreamId, GlobalStreamId>, mut probe: F) -> bool
+where
+    F: FnMut(GlobalStreamId) -> bool,
+{
+    streams.values().any(|gid| probe(*gid))
 }
 
 /// Detail of a flood-threshold violation returned by
@@ -2302,6 +2334,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // served this pass so we can advance `Prioriser::incremental_cursor`
         // to it, causing the next pass to start with the stream just after.
         let mut first_incremental_fired: Option<StreamId> = None;
+        // Total outbound bytes emitted across all stream flushes this pass —
+        // `finalize_write` uses this to distinguish a voluntary scheduler
+        // yield (progress + pending back-buffer, LIFECYCLE §9 invariant 16)
+        // from a no-progress wait state (e.g. flow-control starvation).
+        let mut total_bytes_written: usize = 0;
         'outer: for idx in 0..self.priorities_buf.len() {
             let stream_id = self.priorities_buf[idx];
             let Some(&global_stream_id) = self.streams.get(&stream_id) else {
@@ -2378,6 +2415,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     *t = Instant::now();
                 }
             }
+            total_bytes_written = total_bytes_written.saturating_add(stream_bytes);
             if outcome == FlushOutcome::Stalled {
                 self.expect_write = Some(H2StreamId::Other {
                     id: stream_id,
@@ -2451,7 +2489,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 self.graceful_goaway()
             };
         }
-        self.finalize_write(socket_write, context)
+        self.finalize_write(socket_write, total_bytes_written, context)
     }
 
     /// Remove streams that completed their lifecycle from all tracking maps.
@@ -2648,9 +2686,29 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
 
     /// Post-write phase: check drain completion, flush TLS, and update readiness.
     ///
+    /// `bytes_written_this_pass` reports the total outbound bytes `write_streams`
+    /// pushed to the socket (across every stream), and is used to distinguish
+    /// two very different "no `expect_write`" states:
+    ///
+    /// - **Voluntary yield with progress**: at least one DATA/HEADERS frame
+    ///   emitted, but a stream left non-empty `back.out`/`back.blocks` because
+    ///   the converter yielded (e.g. RFC 9218 incremental rotation). LIFECYCLE
+    ///   §9 invariant 16: keep `Ready::WRITABLE` armed so the session loop can
+    ///   resume flushing on the next tick without waiting for an external
+    ///   wake-up that edge-triggered epoll will not deliver.
+    /// - **No progress at all**: converter pushed every block back (e.g. flow
+    ///   window exhausted, no HEADERS ready yet). Strip `Ready::WRITABLE` —
+    ///   forward progress must come from an external trigger
+    ///   (`WINDOW_UPDATE`, new request), not from looping writable().
+    ///
     /// Returns `MuxResult::Continue` in the normal case, or triggers a graceful
     /// GOAWAY when draining and all streams have completed.
-    fn finalize_write<L>(&mut self, socket_write: bool, context: &mut Context<L>) -> MuxResult
+    fn finalize_write<L>(
+        &mut self,
+        socket_write: bool,
+        bytes_written_this_pass: usize,
+        context: &mut Context<L>,
+    ) -> MuxResult
     where
         L: ListenerHandler + L7ListenerHandler,
     {
@@ -2668,13 +2726,29 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             // pending encrypted data (first check triggers flush, second re-checks).
             self.ensure_tls_flushed();
         } else if self.expect_write.is_none() {
-            // We wrote everything
-            #[cfg(debug_assertions)]
-            context.debug.push(DebugEvent::Str(format!(
-                "Wrote everything: {:?}",
-                self.streams
-            )));
-            self.readiness.interest.remove(Ready::WRITABLE);
+            // LIFECYCLE §9 invariant 16: retain `Ready::WRITABLE` when a
+            // voluntary scheduler yield leaves stranded bytes in a stream's
+            // `back.out`/`back.blocks` *after* the pass made forward
+            // progress. Requiring progress avoids the degenerate no-progress
+            // loop (e.g. flow-control-starved streams) that would otherwise
+            // busy-spin against the session dispatcher.
+            if bytes_written_this_pass > 0
+                && any_stream_has_pending_back(&self.streams, &context.streams)
+            {
+                #[cfg(debug_assertions)]
+                context.debug.push(DebugEvent::Str(
+                    "finalize_write: invariant 16 retained WRITABLE (pending back-buffer)"
+                        .to_owned(),
+                ));
+            } else {
+                // We wrote everything
+                #[cfg(debug_assertions)]
+                context.debug.push(DebugEvent::Str(format!(
+                    "Wrote everything: {:?}",
+                    self.streams
+                )));
+                self.readiness.interest.remove(Ready::WRITABLE);
+            }
         }
         MuxResult::Continue
     }
@@ -3609,6 +3683,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// The TLS check is critical: `shutting_down()` uses this to prevent
     /// premature session close while response DATA is still in rustls's
     /// buffer (accepted by `socket_write_vectored` but not yet on the wire).
+    ///
+    /// Does NOT check per-stream `back.out`/`back.blocks`; use
+    /// [`Self::has_pending_write_full`] on paths that must honour
+    /// LIFECYCLE invariant 16 (e.g. shutdown-drain).
     pub fn has_pending_write(&self) -> bool {
         if self.peer_gone_after_final_goaway() {
             return false;
@@ -3616,6 +3694,18 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         self.expect_write.is_some()
             || !self.zero.storage.is_empty()
             || self.socket.socket_wants_write()
+    }
+
+    /// Connection-level [`Self::has_pending_write`] extended with a per-stream
+    /// back-buffer probe (LIFECYCLE §9 invariant 16). Used by shutdown-drain
+    /// paths that must not close while any open stream still has outbound
+    /// kawa bytes queued — a voluntary scheduler yield can leave `back.out`
+    /// or `back.blocks` non-empty without `expect_write` being set.
+    pub fn has_pending_write_full<L>(&self, context: &Context<L>) -> bool
+    where
+        L: ListenerHandler + L7ListenerHandler,
+    {
+        self.has_pending_write() || any_stream_has_pending_back(&self.streams, &context.streams)
     }
 
     /// Flush the zero buffer to the socket, counting bytes as connection overhead.
@@ -5140,7 +5230,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
 
 #[cfg(test)]
 mod tests {
+    use std::{cell::RefCell, rc::Rc};
+
     use super::*;
+    use crate::{pool::Pool, protocol::kawa_h1::editor::HttpContext};
 
     // ── H2FloodDetector ──────────────────────────────────────────────────
 
@@ -6752,5 +6845,178 @@ mod tests {
             assert_eq!(server_id & 1, 0);
             assert_eq!(client_id.abs_diff(server_id), 1);
         }
+    }
+
+    // ── LIFECYCLE §9 invariant 16: any_stream_id_matches ─────────────────
+    //
+    // Covers the iteration dispatch used by `any_stream_has_pending_back`.
+    // Testing the probe directly against a synthetic closure keeps the
+    // tests independent of the full `Stream` fixture (which requires a
+    // `Pool` and a fully-built `HttpContext`).
+
+    #[test]
+    fn test_any_stream_id_matches_empty_map_is_false() {
+        let streams: HashMap<StreamId, GlobalStreamId> = HashMap::new();
+        assert!(!any_stream_id_matches(&streams, |_| true));
+    }
+
+    #[test]
+    fn test_any_stream_id_matches_all_probe_false_is_false() {
+        let mut streams: HashMap<StreamId, GlobalStreamId> = HashMap::new();
+        streams.insert(1, 0);
+        streams.insert(3, 1);
+        streams.insert(5, 2);
+        assert!(!any_stream_id_matches(&streams, |_| false));
+    }
+
+    #[test]
+    fn test_any_stream_id_matches_any_probe_true_is_true() {
+        let mut streams: HashMap<StreamId, GlobalStreamId> = HashMap::new();
+        streams.insert(1, 0);
+        streams.insert(3, 1);
+        streams.insert(5, 2);
+        // Probe is true only for GlobalStreamId == 1 (i.e. StreamId 3).
+        assert!(any_stream_id_matches(&streams, |gid| gid == 1));
+    }
+
+    #[test]
+    fn test_any_stream_id_matches_single_entry() {
+        let mut streams: HashMap<StreamId, GlobalStreamId> = HashMap::new();
+        streams.insert(42, 7);
+        assert!(any_stream_id_matches(&streams, |gid| gid == 7));
+        assert!(!any_stream_id_matches(&streams, |gid| gid == 8));
+    }
+
+    #[test]
+    fn test_any_stream_id_matches_short_circuits() {
+        let mut streams: HashMap<StreamId, GlobalStreamId> = HashMap::new();
+        streams.insert(1, 0);
+        streams.insert(3, 1);
+        streams.insert(5, 2);
+        streams.insert(7, 3);
+        let mut calls = 0usize;
+        let result = any_stream_id_matches(&streams, |_| {
+            calls += 1;
+            true
+        });
+        assert!(result);
+        // `Iterator::any` short-circuits on the first `true` — so the probe
+        // must fire at most once in this construction.
+        assert_eq!(calls, 1);
+    }
+
+    // ── LIFECYCLE §9 invariant 16: any_stream_has_pending_back ───────────
+
+    /// Build a minimal `Stream` for invariant-16 probing. Uses the pool
+    /// plumbing so `back.blocks` / `back.out` exist; every other field is
+    /// default-valued because the predicate only reads the back buffer.
+    fn make_stream_for_invariant_16(pool: &Rc<RefCell<Pool>>, session_ulid: Ulid) -> Stream {
+        let http_ctx = HttpContext {
+            keep_alive_backend: true,
+            keep_alive_frontend: true,
+            sticky_session_found: None,
+            method: None,
+            authority: None,
+            path: None,
+            status: None,
+            reason: None,
+            user_agent: None,
+            x_request_id: None,
+            xff_chain: None,
+            #[cfg(feature = "opentelemetry")]
+            otel: None,
+            closing: false,
+            session_id: session_ulid,
+            id: Ulid::generate(),
+            backend_id: None,
+            cluster_id: None,
+            protocol: Protocol::HTTPS,
+            public_address: "127.0.0.1:0".parse().unwrap(),
+            session_address: None,
+            sticky_name: String::new(),
+            sticky_session: None,
+            backend_address: None,
+            tls_server_name: None,
+            strict_sni_binding: false,
+            tls_version: None,
+            tls_cipher: None,
+            tls_alpn: None,
+            sozu_id_header: String::from("Sozu-Id"),
+        };
+        Stream::new(Rc::downgrade(pool), http_ctx, 65_535)
+            .expect("pool should have capacity for two buffers")
+    }
+
+    fn make_pool_for_invariant_16() -> Rc<RefCell<Pool>> {
+        // Two buffer slots per stream (front + back), ten stream slots is
+        // plenty for the tests below.
+        Rc::new(RefCell::new(Pool::with_capacity(4, 20, 16_384)))
+    }
+
+    #[test]
+    fn test_any_stream_has_pending_back_empty_map_is_false() {
+        let pool = make_pool_for_invariant_16();
+        let ulid = Ulid::generate();
+        let streams_map: HashMap<StreamId, GlobalStreamId> = HashMap::new();
+        let context_streams = vec![make_stream_for_invariant_16(&pool, ulid)];
+        assert!(!any_stream_has_pending_back(&streams_map, &context_streams));
+    }
+
+    #[test]
+    fn test_any_stream_has_pending_back_all_drained_is_false() {
+        let pool = make_pool_for_invariant_16();
+        let ulid = Ulid::generate();
+        let context_streams = vec![
+            make_stream_for_invariant_16(&pool, ulid),
+            make_stream_for_invariant_16(&pool, ulid),
+        ];
+        let mut streams_map: HashMap<StreamId, GlobalStreamId> = HashMap::new();
+        streams_map.insert(1, 0);
+        streams_map.insert(3, 1);
+        // Both freshly-built streams have empty back.out and back.blocks
+        // (Kawa::new starts with empty deques).
+        assert!(!any_stream_has_pending_back(&streams_map, &context_streams));
+    }
+
+    #[test]
+    fn test_any_stream_has_pending_back_unknown_gid_is_false() {
+        // LIFECYCLE invariant 16 defence-in-depth: an unknown
+        // `GlobalStreamId` during a stream-removal race must not panic;
+        // `.get()` must short-circuit to `false`.
+        let pool = make_pool_for_invariant_16();
+        let ulid = Ulid::generate();
+        let context_streams = vec![make_stream_for_invariant_16(&pool, ulid)];
+        let mut streams_map: HashMap<StreamId, GlobalStreamId> = HashMap::new();
+        // GlobalStreamId 42 is out of range for the 1-element slice above.
+        streams_map.insert(7, 42);
+        assert!(!any_stream_has_pending_back(&streams_map, &context_streams));
+    }
+
+    #[test]
+    fn test_any_stream_has_pending_back_with_pending_blocks_is_true() {
+        let pool = make_pool_for_invariant_16();
+        let ulid = Ulid::generate();
+        let mut stream = make_stream_for_invariant_16(&pool, ulid);
+        // Push one dummy block — any Block variant is fine; the predicate
+        // only checks `blocks.is_empty()`.
+        stream.back.blocks.push_back(kawa::Block::StatusLine);
+        let mut streams_map: HashMap<StreamId, GlobalStreamId> = HashMap::new();
+        streams_map.insert(1, 0);
+        assert!(any_stream_has_pending_back(&streams_map, &[stream]));
+    }
+
+    #[test]
+    fn test_any_stream_has_pending_back_with_pending_out_is_true() {
+        let pool = make_pool_for_invariant_16();
+        let ulid = Ulid::generate();
+        let mut stream = make_stream_for_invariant_16(&pool, ulid);
+        // Non-empty out buffer with no blocks.
+        stream
+            .back
+            .out
+            .push_back(kawa::OutBlock::Store(kawa::Store::Static(b"partial frame")));
+        let mut streams_map: HashMap<StreamId, GlobalStreamId> = HashMap::new();
+        streams_map.insert(1, 0);
+        assert!(any_stream_has_pending_back(&streams_map, &[stream]));
     }
 }
