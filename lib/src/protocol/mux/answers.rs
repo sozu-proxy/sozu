@@ -4,8 +4,6 @@
 //! per-stream kawa buffers, then flip the appropriate readiness bits so the
 //! response is flushed on the next writable pass.
 
-use sozu_command::ready::Ready;
-
 use super::{GenericHttpStream, H2Error, Readiness, Stream, StreamState};
 use crate::protocol::http::{DefaultAnswer, answers::HttpAnswers};
 
@@ -223,7 +221,8 @@ pub(crate) fn forcefully_terminate_answer(
     kawa.blocks.clear();
     kawa.parsing_phase.error(error.as_str().into());
     stream.state = StreamState::Unlinked;
-    readiness.interest.insert(Ready::WRITABLE);
+    readiness.arm_writable();
+    incr!("h2.signal.writable.rearmed.forcefully_terminate_answer");
 }
 
 #[cfg(test)]

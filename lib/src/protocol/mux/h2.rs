@@ -586,6 +586,37 @@ where
     streams.values().any(|gid| probe(*gid))
 }
 
+/// Core of [`ConnectionH2::enqueue_rst`], extracted so the RST-queueing
+/// semantics (dedupe, queued-cap counter bump, invariant-15 readiness rearm)
+/// can be unit-tested without building a full `ConnectionH2<Front>` fixture.
+///
+/// Invariants enforced:
+/// - **Dedupe** via `rst_sent`: at most one queued RST per wire stream id.
+///   `HashSet::insert` returns `false` when the id is already present; we
+///   short-circuit on that branch to keep `pending_rst_streams`,
+///   `total_rst_streams_queued` and the wire counts consistent.
+/// - **MadeYouReset queued cap** (`MAX_PENDING_RST_STREAMS`): each freshly
+///   queued RST bumps `total_rst_streams_queued`, which
+///   `flush_pending_control_frames` polices to escalate to
+///   `GOAWAY(ENHANCE_YOUR_CALM)` when exceeded.
+/// - **Invariant 15** (edge-triggered epoll): pair `Ready::WRITABLE` interest
+///   with the event bit so `writable()` is scheduled on the next tick.
+fn enqueue_rst_into(
+    pending: &mut Vec<(StreamId, H2Error)>,
+    total: &mut usize,
+    rst_sent: &mut HashSet<StreamId>,
+    readiness: &mut Readiness,
+    wire_stream_id: StreamId,
+    error: H2Error,
+) {
+    if !rst_sent.insert(wire_stream_id) {
+        return;
+    }
+    pending.push((wire_stream_id, error));
+    *total += 1;
+    readiness.arm_writable();
+}
+
 /// Detail of a flood-threshold violation returned by
 /// [`H2FloodDetector::check_flood`] and [`H2FloodDetector::record_rst_lifetime`].
 ///
@@ -1687,11 +1718,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                                     if let Some(violation) = self.flood_detector.check_flood() {
                                         return self.handle_flood_violation(violation);
                                     }
-                                    self.pending_rst_streams
-                                        .push((header.stream_id, H2Error::StreamClosed));
-                                    self.total_rst_streams_queued += 1;
-                                    self.readiness.interest.insert(Ready::WRITABLE);
-                                    self.readiness.signal_pending_write();
+                                    self.enqueue_rst(header.stream_id, H2Error::StreamClosed);
                                 }
                                 _ => {
                                     // RFC 9113 §5.1: HEADERS or other frames on a
@@ -2802,6 +2829,23 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     "finalize_write: invariant 16 retained WRITABLE (pending back-buffer)"
                         .to_owned(),
                 ));
+            } else if !self.pending_rst_streams.is_empty()
+                || !self.flow_control.pending_window_updates.is_empty()
+            {
+                // Control-frame liveness: `flush_pending_control_frames` is
+                // gated on `expect_write.is_none()`, so when a prior partial
+                // write deferred the flush the RST / WINDOW_UPDATE queues
+                // stay non-empty after `expect_write` finally drains. Without
+                // this rearm the next tick would drop `Ready::WRITABLE` and
+                // the queued RST would stall until an unrelated event
+                // re-triggered writable — which is exactly the scenario
+                // h2spec trips by sending back-to-back malformed streams.
+                #[cfg(debug_assertions)]
+                context.debug.push(DebugEvent::Str(
+                    "finalize_write: retained WRITABLE (control queue non-empty)".to_owned(),
+                ));
+                self.readiness.arm_writable();
+                incr!("h2.signal.writable.rearmed.control_queue");
             } else {
                 // We wrote everything
                 #[cfg(debug_assertions)]
@@ -3431,6 +3475,33 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         self.readiness.signal_pending_write();
     }
 
+    /// Queue a `RST_STREAM` frame for serialisation by
+    /// [`Self::flush_pending_control_frames`] on the next writable tick.
+    ///
+    /// This is the canonical entry point for proxy-emitted stream resets:
+    /// `DATA` on a closed stream, `MAX_CONCURRENT_STREAMS` refusal, and the
+    /// per-stream error paths in [`Self::reset_stream`] all funnel through
+    /// here. Serialisation is independent of the owning `Stream` still
+    /// existing in `self.streams`, which is what lets us emit even after a
+    /// caller has already called [`Self::remove_dead_stream`].
+    ///
+    /// Delegates the primitive work to [`enqueue_rst_into`] so the invariants
+    /// are covered by unit tests that don't need a full `ConnectionH2`
+    /// fixture. See that function's doc-comment for the three invariants
+    /// (dedupe via `rst_sent`, MadeYouReset queued cap via
+    /// `total_rst_streams_queued`, edge-triggered-epoll arm via
+    /// [`Readiness::arm_writable`]).
+    fn enqueue_rst(&mut self, wire_stream_id: StreamId, error: H2Error) {
+        enqueue_rst_into(
+            &mut self.pending_rst_streams,
+            &mut self.total_rst_streams_queued,
+            &mut self.rst_sent,
+            &mut self.readiness,
+            wire_stream_id,
+            error,
+        );
+    }
+
     /// Refuse a newly-opened stream with RST_STREAM and discard its HEADERS payload.
     ///
     /// Used when MAX_CONCURRENT_STREAMS is exceeded or buffer pool is exhausted.
@@ -3448,10 +3519,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         error: H2Error,
         payload_len: u32,
     ) -> MuxResult {
-        self.pending_rst_streams.push((stream_id, error));
-        self.total_rst_streams_queued += 1;
-        self.readiness.interest.insert(Ready::WRITABLE);
-        self.readiness.signal_pending_write();
+        self.enqueue_rst(stream_id, error);
         self.state = H2State::Discard;
         self.expect_read = Some((H2StreamId::Zero, payload_len as usize));
         self.record_refusal_for_backpressure();
@@ -4017,6 +4085,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         expected
                     );
                     let result = self.reset_stream(
+                        data.stream_id,
                         global_stream_id,
                         context,
                         endpoint,
@@ -4128,6 +4197,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                                 expected
                             );
                             let result = self.reset_stream(
+                                data.stream_id,
                                 global_stream_id,
                                 context,
                                 endpoint,
@@ -4214,7 +4284,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
 
         if let Some(priority) = &headers.priority {
             if self.prioriser.push_priority(stream_id, priority.clone()) {
-                self.reset_stream(global_stream_id, context, endpoint, H2Error::ProtocolError);
+                self.reset_stream(
+                    stream_id,
+                    global_stream_id,
+                    context,
+                    endpoint,
+                    H2Error::ProtocolError,
+                );
                 self.remove_dead_stream(stream_id, global_stream_id);
                 return MuxResult::Continue;
             }
@@ -4250,7 +4326,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 );
                 return self.goaway(error);
             } else {
-                let result = self.reset_stream(global_stream_id, context, endpoint, error);
+                let result =
+                    self.reset_stream(stream_id, global_stream_id, context, endpoint, error);
                 self.remove_dead_stream(stream_id, global_stream_id);
                 return result;
             }
@@ -4270,6 +4347,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                             expected
                         );
                         let result = self.reset_stream(
+                            stream_id,
                             global_stream_id,
                             context,
                             endpoint,
@@ -4346,8 +4424,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             &self.streams,
         ) {
             if let Some(global_stream_id) = self.streams.get(&priority.stream_id).copied() {
-                let result =
-                    self.reset_stream(global_stream_id, context, endpoint, H2Error::ProtocolError);
+                let result = self.reset_stream(
+                    priority.stream_id,
+                    global_stream_id,
+                    context,
+                    endpoint,
+                    H2Error::ProtocolError,
+                );
                 self.remove_dead_stream(priority.stream_id, global_stream_id);
                 return result;
             } else {
@@ -4807,6 +4890,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 );
                 if let Some(global_stream_id) = self.streams.get(&stream_id).copied() {
                     let result = self.reset_stream(
+                        stream_id,
                         global_stream_id,
                         context,
                         endpoint,
@@ -4876,6 +4960,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 );
             } else {
                 let result = self.reset_stream(
+                    stream_id,
                     global_stream_id,
                     context,
                     endpoint,
@@ -5080,8 +5165,21 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         }
     }
 
+    /// Reset a stream: tear down kawa state, emit `RST_STREAM` on the wire,
+    /// and record MadeYouReset accounting.
+    ///
+    /// `wire_stream_id` is the on-wire `StreamId`; `stream_id` is the internal
+    /// `GlobalStreamId` slot. Callers already carry both so we pass them
+    /// explicitly rather than scanning `self.streams`. The wire id is threaded
+    /// into [`Self::enqueue_rst`] which queues the frame for serialisation in
+    /// [`Self::flush_pending_control_frames`] on the next writable tick —
+    /// independent of whether the caller immediately evicts the slot via
+    /// `remove_dead_stream` (which they usually do). This is what guarantees
+    /// the RST reaches the peer for malformed HEADERS / flow-control /
+    /// content-length violations flagged by h2spec 2.0.
     pub fn reset_stream<E, L>(
         &mut self,
+        wire_stream_id: StreamId,
         stream_id: GlobalStreamId,
         context: &mut Context<L>,
         mut endpoint: E,
@@ -5116,6 +5214,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             stream.generate_access_log(true, Some("H2::Reset"), context.listener.clone());
             stream.metrics.reset();
         }
+        // Queue the RST for wire emission. Independent of the owning stream
+        // remaining in `self.streams` — callers typically follow this with
+        // `remove_dead_stream`, which would otherwise evict the slot before
+        // `write_streams` could run `kawa.prepare` against the converter.
+        self.enqueue_rst(wire_stream_id, error);
         // Per-error-code counter for the outbound RST. Emitted regardless of
         // `error` (including the graceful-cancel `NoError` path) so dashboards
         // can split benign cancels from defensive resets without consulting
@@ -7183,6 +7286,164 @@ mod tests {
             map.get(&1),
             Some(&3),
             "non-incremental transitions must not touch the bucket"
+        );
+    }
+
+    // ── enqueue_rst: queue / dedupe / counter / arm invariants ───────────
+    //
+    // `enqueue_rst_into` is the free-function primitive shared by all three
+    // RST push sites (DATA-on-closed, refuse_stream_and_discard,
+    // reset_stream). The method delegates; the invariants live here.
+
+    #[test]
+    fn test_enqueue_rst_into_populates_queue_and_dedupe() {
+        let mut pending: Vec<(StreamId, H2Error)> = Vec::new();
+        let mut total: usize = 0;
+        let mut sent: HashSet<StreamId> = HashSet::new();
+        let mut readiness = Readiness::new();
+
+        enqueue_rst_into(
+            &mut pending,
+            &mut total,
+            &mut sent,
+            &mut readiness,
+            5,
+            H2Error::ProtocolError,
+        );
+        // Second call for the same stream must be a no-op.
+        enqueue_rst_into(
+            &mut pending,
+            &mut total,
+            &mut sent,
+            &mut readiness,
+            5,
+            H2Error::InternalError,
+        );
+
+        assert_eq!(pending.len(), 1, "dedupe must collapse to a single entry");
+        assert_eq!(
+            pending[0],
+            (5, H2Error::ProtocolError),
+            "the first error wins — second push is ignored"
+        );
+        assert_eq!(total, 1, "queued-cap counter must bump exactly once");
+        assert!(sent.contains(&5), "rst_sent must record the id");
+    }
+
+    #[test]
+    fn test_enqueue_rst_into_bumps_total_for_distinct_ids() {
+        let mut pending: Vec<(StreamId, H2Error)> = Vec::new();
+        let mut total: usize = 0;
+        let mut sent: HashSet<StreamId> = HashSet::new();
+        let mut readiness = Readiness::new();
+
+        for sid in [1u32, 3, 5, 7] {
+            enqueue_rst_into(
+                &mut pending,
+                &mut total,
+                &mut sent,
+                &mut readiness,
+                sid,
+                H2Error::ProtocolError,
+            );
+        }
+
+        assert_eq!(pending.len(), 4);
+        assert_eq!(total, 4);
+        assert_eq!(sent.len(), 4);
+    }
+
+    #[test]
+    fn test_enqueue_rst_into_arms_writable_in_invariant_15_form() {
+        let mut pending: Vec<(StreamId, H2Error)> = Vec::new();
+        let mut total: usize = 0;
+        let mut sent: HashSet<StreamId> = HashSet::new();
+        let mut readiness = Readiness::new();
+
+        // Precondition: no WRITABLE bits set.
+        assert!(!readiness.interest.is_writable());
+        assert!(!readiness.event.is_writable());
+
+        enqueue_rst_into(
+            &mut pending,
+            &mut total,
+            &mut sent,
+            &mut readiness,
+            9,
+            H2Error::FlowControlError,
+        );
+
+        // Postcondition: invariant-15 — both `interest` and `event` WRITABLE
+        // are raised so the next tick runs `writable()` under edge-triggered
+        // epoll.
+        assert!(
+            readiness.interest.is_writable(),
+            "arm_writable must raise the interest bit"
+        );
+        assert!(
+            readiness.event.is_writable(),
+            "arm_writable must raise the event bit (edge-triggered epoll)"
+        );
+    }
+
+    #[test]
+    fn test_enqueue_rst_into_dedupe_does_not_rearm_writable() {
+        // Dedupe is a pure short-circuit: if the stream id is already in
+        // `rst_sent`, we do not touch the readiness. This matters because
+        // a re-entrant reset_stream call during a cascading error path
+        // would otherwise re-raise WRITABLE unnecessarily — harmless but
+        // noisy in metrics.
+        let mut pending: Vec<(StreamId, H2Error)> = Vec::new();
+        let mut total: usize = 0;
+        let mut sent: HashSet<StreamId> = HashSet::new();
+        sent.insert(11);
+        let mut readiness = Readiness::new();
+
+        enqueue_rst_into(
+            &mut pending,
+            &mut total,
+            &mut sent,
+            &mut readiness,
+            11,
+            H2Error::ProtocolError,
+        );
+
+        assert!(
+            pending.is_empty(),
+            "already-sent ids must not queue a second frame"
+        );
+        assert_eq!(total, 0);
+        assert!(!readiness.interest.is_writable());
+        assert!(!readiness.event.is_writable());
+    }
+
+    // ── forcefully_terminate_answer arms WRITABLE for ET epoll ───────────
+    //
+    // Gap A in the h2spec diagnosis: the pre-fix code set `interest` but
+    // never raised `event`, so `filter_interest() = event & interest` was
+    // zero and `writable()` was never scheduled. This test pins the fix.
+
+    #[test]
+    fn test_forcefully_terminate_answer_arms_event_and_interest() {
+        let pool = make_pool_for_invariant_16();
+        let ulid = Ulid::generate();
+        let mut stream = make_stream_for_invariant_16(&pool, ulid);
+        let mut readiness = Readiness::new();
+
+        assert!(!readiness.interest.is_writable());
+        assert!(!readiness.event.is_writable());
+
+        forcefully_terminate_answer(&mut stream, &mut readiness, H2Error::ProtocolError);
+
+        assert!(
+            readiness.interest.is_writable(),
+            "forcefully_terminate_answer must set the WRITABLE interest bit"
+        );
+        assert!(
+            readiness.event.is_writable(),
+            "forcefully_terminate_answer must set the WRITABLE event bit — \
+             without this, filter_interest() = 0 under edge-triggered epoll \
+             and writable() is never scheduled (h2spec Gap A)"
         );
     }
 }
