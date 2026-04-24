@@ -951,6 +951,22 @@ pub(crate) fn drain_h2_stream_streaming(
                 // padding), per RFC 9113 §6.9.1.
                 let consumed = payload.len() as u32;
                 stream_credit_since_refresh = stream_credit_since_refresh.saturating_add(consumed);
+
+                // END_STREAM short-circuit: check BEFORE emitting a WU
+                // refresh. The final DATA frame that carries END_STREAM
+                // closes the stream — sending a WU for a stream that has
+                // just ended is pointless and races sozu's peer-close
+                // (sozu legitimately stops reading from the client once
+                // the response is complete, yielding `BrokenPipe` on any
+                // trailing client-side write). This ordering also lets us
+                // avoid spurious WU emission entirely when the entire
+                // response fits below `window_refresh_bytes`.
+                if (flags & H2_FLAG_END_STREAM) != 0 {
+                    end_stream_seen = true;
+                    done = true;
+                    break;
+                }
+
                 if stream_credit_since_refresh >= window_refresh_bytes {
                     debug_assert!(
                         stream_credit_since_refresh <= 0x7FFF_FFFF,
@@ -960,19 +976,41 @@ pub(crate) fn drain_h2_stream_streaming(
                         stream_credit_since_refresh >= 1,
                         "WINDOW_UPDATE increment must be strictly positive"
                     );
-                    stream
-                        .write_all(
-                            &H2Frame::window_update(sid, stream_credit_since_refresh).encode(),
-                        )
-                        .unwrap();
-                    stream.flush().unwrap();
-                    stream_credit_since_refresh = 0;
-                }
-
-                if (flags & H2_FLAG_END_STREAM) != 0 {
-                    end_stream_seen = true;
-                    done = true;
-                    break;
+                    let frame = H2Frame::window_update(sid, stream_credit_since_refresh).encode();
+                    // Tolerate peer-close races: if the remote side has
+                    // already finished serving the stream between when
+                    // our last DATA read landed and when we try to emit
+                    // a flow-control refresh, the kernel raises EPIPE /
+                    // ECONNRESET. That is *not* a test failure — the
+                    // response-integrity assertions at the call site
+                    // (body_bytes, sha256) are the source of truth. We
+                    // stop the drain loop gracefully and let those
+                    // assertions adjudicate whether the body was complete.
+                    match stream.write_all(&frame).and_then(|_| stream.flush()) {
+                        Ok(()) => stream_credit_since_refresh = 0,
+                        Err(e)
+                            if matches!(
+                                e.kind(),
+                                std::io::ErrorKind::BrokenPipe
+                                    | std::io::ErrorKind::ConnectionReset
+                                    | std::io::ErrorKind::ConnectionAborted
+                                    | std::io::ErrorKind::NotConnected
+                                    | std::io::ErrorKind::UnexpectedEof
+                            ) =>
+                        {
+                            // Peer closed cleanly while we were about to
+                            // refresh. Break out of the read loop — the
+                            // next call to `stream.read()` would fail the
+                            // same way. Leave `end_stream_seen = false`
+                            // so the caller can still detect an early
+                            // close via the `body_bytes` mismatch.
+                            done = true;
+                            break;
+                        }
+                        Err(e) => {
+                            panic!("unexpected WINDOW_UPDATE refresh error on stream {sid}: {e}");
+                        }
+                    }
                 }
             } else if frame_type == H2_FRAME_HEADERS && frame_sid == sid {
                 // Trailer HEADERS with END_STREAM is a valid close path.
