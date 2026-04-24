@@ -606,7 +606,6 @@ fn try_e2e_session_stream_id_exhaustion_graceful() -> State {
 }
 
 #[test]
-#[ignore = "FIX-22 requires reaching a live ConnectionH2 mid-flight — infeasible via the proxy command surface; full assertion deferred to a white-box unit test in `lib/src/protocol/mux/h2.rs`. The `#[ignore]`d smoke is kept for future wiring."]
 fn e2e_session_stream_id_exhaustion_graceful() {
     // NOTE: full exhaustion assertion requires a white-box unit test — see
     // module docstring. This E2E is a narrow smoke that a single H2→H2

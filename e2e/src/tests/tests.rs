@@ -3137,16 +3137,22 @@ fn test_alpn_prefer_h1_with_h2_client() {
 
 /// Run h2spec HTTP/2 conformance tests against Sozu.
 ///
-/// This test exercises 146 RFC 7540/9113 conformance scenarios using h2spec.
-/// It is ignored by default because it requires the h2spec binary in PATH.
+/// This test exercises 145 RFC 9113 conformance scenarios using h2spec 2.0.
 ///
-/// Install h2spec:
+/// Requires the `h2spec` binary in PATH. Install via:
 ///   go install github.com/summerwind/h2spec/cmd/h2spec@latest
 ///
-/// Run this test explicitly:
+/// Currently gated `#[ignore]` because sozu fails 18 of 145 h2spec checks,
+/// clustered in RFC 9113 §5.3 (self-dependent HEADERS), §6.9 (WINDOW_UPDATE
+/// boundary), §8.2.2 (uppercase/connection-specific/`TE`), §8.3 (pseudo-
+/// header uniqueness/ordering/allow-list), and §8.1.2.6 (content-length vs
+/// DATA reconciliation). Each is a small protocol-hardening delta tracked
+/// under the `#1209-h2spec-hardening` follow-up.
+///
+/// Run explicitly once h2spec is installed:
 ///   cargo test -p sozu-e2e -- --ignored test_h2spec_conformance --nocapture
 #[test]
-#[ignore]
+#[ignore = "18/145 h2spec checks fail — tracked as #1209-h2spec-hardening"]
 fn test_h2spec_conformance() {
     use std::process::Command;
 
