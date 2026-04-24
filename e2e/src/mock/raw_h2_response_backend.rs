@@ -50,6 +50,13 @@ struct RawResponse {
     /// Extra `(name, value)` header pairs appended after `:status`, in
     /// the order they were pushed.
     extra_headers: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Optional response body. When `Some`, HEADERS is sent without
+    /// END_STREAM, followed (after [`Self::body_delay`]) by one or more
+    /// DATA frames ≤ 16384 bytes each, last flagged END_STREAM.
+    body: Option<Vec<u8>>,
+    /// Delay between HEADERS and the first DATA frame. Only consulted
+    /// when [`Self::body`] is `Some`.
+    body_delay: Duration,
 }
 
 impl Default for RawResponse {
@@ -57,6 +64,8 @@ impl Default for RawResponse {
         Self {
             status: b"200".to_vec(),
             extra_headers: Vec::new(),
+            body: None,
+            body_delay: Duration::ZERO,
         }
     }
 }
@@ -116,23 +125,60 @@ impl RawH2ResponseBackend {
                     out.extend_from_slice(&[0, 0, 0, 0x04, 0x01, 0, 0, 0, 0]);
 
                     // HEADERS frame carrying the crafted :status + any
-                    // extra headers, END_HEADERS | END_STREAM on stream 1.
+                    // extra headers. END_HEADERS always; END_STREAM only
+                    // when there's no body (body = None preserves the
+                    // original single-frame behaviour).
                     let header_block = encode_header_block(&response_snapshot);
                     let len = header_block.len();
                     assert!(
                         len < (1 << 24),
                         "raw h2 response header block larger than 24-bit payload_len"
                     );
+                    let has_body = response_snapshot.body.is_some();
+                    let headers_flags: u8 = if has_body { 0x04 } else { 0x04 | 0x01 };
                     out.push((len >> 16) as u8);
                     out.push((len >> 8) as u8);
                     out.push(len as u8);
                     out.push(0x01); // HEADERS
-                    out.push(0x04 | 0x01); // END_HEADERS | END_STREAM
+                    out.push(headers_flags);
                     out.extend_from_slice(&1u32.to_be_bytes());
                     out.extend_from_slice(&header_block);
 
                     let _ = stream.write_all(&out).await;
                     let _ = stream.flush().await;
+
+                    // HEADERS-then-delay-then-DATA mode: split body into
+                    // ≤ 16384-byte DATA frames (default max_frame_size),
+                    // last carrying END_STREAM. The delay between HEADERS
+                    // and the first DATA surfaces the H2-backend →
+                    // H2-frontend peer-rearm gap (sozu's reader must be
+                    // woken by `signal_pending_write` after DATA arrives,
+                    // not by the initial HEADERS natural-writable).
+                    if let Some(body) = response_snapshot.body.as_ref() {
+                        if !response_snapshot.body_delay.is_zero() {
+                            tokio::time::sleep(response_snapshot.body_delay).await;
+                        }
+                        const MAX_FRAME: usize = 16384;
+                        let mut emitted = 0usize;
+                        while emitted < body.len() {
+                            let end = (emitted + MAX_FRAME).min(body.len());
+                            let chunk = &body[emitted..end];
+                            let is_last = end == body.len();
+                            let chunk_len = chunk.len();
+                            let mut frame = Vec::with_capacity(9 + chunk_len);
+                            frame.push((chunk_len >> 16) as u8);
+                            frame.push((chunk_len >> 8) as u8);
+                            frame.push(chunk_len as u8);
+                            frame.push(0x00); // DATA
+                            frame.push(if is_last { 0x01 } else { 0x00 });
+                            frame.extend_from_slice(&1u32.to_be_bytes());
+                            frame.extend_from_slice(chunk);
+                            let _ = stream.write_all(&frame).await;
+                            let _ = stream.flush().await;
+                            emitted = end;
+                        }
+                    }
+
                     // Give sozu time to consume the response before we FIN.
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     drop(stream);
@@ -164,6 +210,23 @@ impl RawH2ResponseBackend {
             .unwrap()
             .extra_headers
             .push((name.into(), value.into()));
+    }
+
+    /// Configure a response body with an optional delay between HEADERS
+    /// and the first DATA frame. When set, the response is emitted as
+    /// HEADERS (END_HEADERS, no END_STREAM) → sleep(`delay`) → DATA
+    /// frames ≤ 16 KiB each, the last flagged END_STREAM.
+    ///
+    /// Use this to reproduce the H2-backend → H2-frontend peer-rearm
+    /// gap: the initial HEADERS arrives within the natural writable
+    /// window, but the DATA frames after the delay only reach the
+    /// frontend if `signal_pending_write` is paired with the peer's
+    /// `Ready::WRITABLE` rearm.
+    #[allow(dead_code)]
+    pub fn set_body_with_delay(&self, body: impl Into<Vec<u8>>, delay: Duration) {
+        let mut response = self.response.lock().unwrap();
+        response.body = Some(body.into());
+        response.body_delay = delay;
     }
 
     #[allow(dead_code)]
