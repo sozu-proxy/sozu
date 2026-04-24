@@ -74,7 +74,7 @@ macro_rules! audit_verb {
 /// neutralise `\n`/`\t`/`\x1b` injection that would otherwise forge a
 /// second audit line.
 macro_rules! audit_log_context {
-    ($client:expr, $request_id:expr, $entry:expr, $result:expr) => {{
+    ($server:expr, $client:expr, $request_id:expr, $entry:expr, $result:expr) => {{
         use $crate::command::sessions::sanitize_for_audit;
         let (open, reset, grey, gray, white) = ::sozu_command_lib::logging::ansi_palette();
         let log_ctx = ::sozu_command_lib::logging::LogContext {
@@ -139,26 +139,33 @@ macro_rules! audit_log_context {
                 hash = hash,
             ));
         }
+        let now_ts = rfc3339_utc(std::time::SystemTime::now());
+        let connect_ts = $client.connect_ts_display();
         format!(
-            "{gray}{ctx}{reset}\t{open}AUDIT{reset}\t{grey}Command{reset}({gray}verb{reset}={white}{verb}{reset}, {gray}actor_uid{reset}={white}{actor_uid}{reset}, {gray}actor_gid{reset}={white}{actor_gid}{reset}, {gray}actor_pid{reset}={white}{actor_pid}{reset}, {gray}actor_user{reset}={white}{actor_user}{reset}, {gray}actor_comm{reset}={white}{actor_comm}{reset}, {gray}client_id{reset}={white}{client_id}{reset}, {gray}socket{reset}={white}{socket_path}{reset}, {gray}target{reset}={white}{target}{reset}, {gray}result{reset}={white}{result}{reset}{extras}, {gray}sozu_version{reset}={white}{sozu_version}{reset})",
+            "{gray}{ctx}{reset}\t{open}AUDIT{reset}\t{grey}Command{reset}({gray}ts{reset}={white}{ts}{reset}, {gray}verb{reset}={white}{verb}{reset}, {gray}actor_uid{reset}={white}{actor_uid}{reset}, {gray}actor_gid{reset}={white}{actor_gid}{reset}, {gray}actor_pid{reset}={white}{actor_pid}{reset}, {gray}actor_role{reset}={white}{actor_role}{reset}, {gray}actor_user{reset}={white}{actor_user}{reset}, {gray}actor_comm{reset}={white}{actor_comm}{reset}, {gray}client_id{reset}={white}{client_id}{reset}, {gray}connect_ts{reset}={white}{connect_ts}{reset}, {gray}socket{reset}={white}{socket_path}{reset}, {gray}target{reset}={white}{target}{reset}, {gray}result{reset}={white}{result}{reset}{extras}, {gray}sozu_version{reset}={white}{sozu_version}{reset}, {gray}build_git_sha{reset}={white}{build_git_sha}{reset}, {gray}boot_generation{reset}={white}{boot_generation}{reset})",
             open = open,
             reset = reset,
             grey = grey,
             gray = gray,
             white = white,
             ctx = log_ctx,
+            ts = now_ts,
             verb = $entry.verb,
             actor_uid = $client.actor_uid_display(),
             actor_gid = $client.actor_gid_display(),
             actor_pid = $client.actor_pid_display(),
+            actor_role = actor_role($client.actor_uid),
             actor_user = $client.actor_user_display(),
             actor_comm = $client.actor_comm_display(),
             client_id = $client.id,
+            connect_ts = connect_ts,
             socket_path = sanitize_for_audit(&$client.socket_path),
             target = sanitize_for_audit(&$entry.target),
             result = $result,
             extras = extras,
             sozu_version = SOZU_VERSION,
+            build_git_sha = SOZU_BUILD_GIT_SHA,
+            boot_generation = $server.boot_generation,
         )
     }};
 }
@@ -870,6 +877,64 @@ const AUDIT_REASON_MAX_CHARS: usize = 256;
 /// operators correlate which binary emitted which log during upgrades.
 const SOZU_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Build-time short git SHA, embedded by `bin/build.rs`. Falls back to
+/// `"unknown"` on builds outside a git tree (vendored tarballs, sysroots).
+/// Together with `sozu_version` it pins which exact commit emitted a
+/// given audit line — useful when a regression lands between the same
+/// semver tag.
+const SOZU_BUILD_GIT_SHA: &str = env!("SOZU_BUILD_GIT_SHA");
+
+/// Render an actor role hint for SOC scanning. Rule:
+/// - `uid == 0`         → `root`     (super-user, P1 alert)
+/// - `1 <= uid < 1000`  → `system`   (service account, expected daemons)
+/// - `uid >= 1000`      → `user`     (normal interactive operator)
+/// - missing            → `unknown`  (SO_PEERCRED unavailable)
+///
+/// `1000` is the conventional Linux NSS uid floor for human accounts.
+/// Operators on systems with a different convention (BSD, macOS) get the
+/// same buckets — the labels are advisory, the raw `actor_uid` is still
+/// authoritative.
+pub(crate) fn actor_role(uid: Option<u32>) -> &'static str {
+    match uid {
+        None => "unknown",
+        Some(0) => "root",
+        Some(u) if u < 1000 => "system",
+        Some(_) => "user",
+    }
+}
+
+/// Render a `SystemTime` as an RFC 3339 / ISO 8601 timestamp at UTC
+/// (`YYYY-MM-DDTHH:MM:SS.ffffffZ`). std-only — uses Howard Hinnant's
+/// `civil_from_days` algorithm so we don't pull in `chrono` / `time`.
+///
+/// Six-digit fractional seconds (microseconds) — matches what most SIEM
+/// stacks expect and avoids the precision overhead of nanoseconds.
+pub(crate) fn rfc3339_utc(t: std::time::SystemTime) -> String {
+    let dur = t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let secs = dur.as_secs() as i64;
+    let micros = dur.subsec_micros();
+
+    let days = secs.div_euclid(86_400);
+    let sec_of_day = secs.rem_euclid(86_400) as u32;
+    let hh = sec_of_day / 3600;
+    let mm = (sec_of_day / 60) % 60;
+    let ss = sec_of_day % 60;
+
+    // Hinnant's civil_from_days — `days` is days since 1970-01-01.
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = y + if m <= 2 { 1 } else { 0 };
+
+    format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}.{micros:06}Z")
+}
+
 /// Build the [AuditEntry] for a control-plane request, or `None` for
 /// non-mutating verbs (the caller skips them — they have no audit footprint).
 ///
@@ -1188,7 +1253,7 @@ fn audit_emit(server: &mut Server, client: &ClientSession, entry: AuditEntry, re
     // verb→key dispatch table.
     count!(entry.counter, 1);
 
-    let rendered = audit_log_context!(client, &request_id, &entry, result);
+    let rendered = audit_log_context!(server, client, &request_id, &entry, result);
     info!("{}", rendered);
     // Mirror to the dedicated tamper-resistant sink when configured
     // (`config.audit_logs_target`). Best-effort; failures fall back to the
@@ -1196,6 +1261,14 @@ fn audit_emit(server: &mut Server, client: &ClientSession, entry: AuditEntry, re
     // the dedicated file stays ASCII and SIEM-parseable even when colour
     // is enabled on stdout.
     server.append_audit_line(&strip_ansi(&rendered));
+
+    // JSON-structured sink (`config.audit_logs_json_target`) — one
+    // self-contained record per line, ready for Wazuh / Elastic / Loki
+    // ingest without bespoke parser code.
+    if server.audit_log_json_writer.is_some() {
+        let json = audit_record_to_json(server, client, &request_id, &entry, result);
+        server.append_audit_json(&json);
+    }
 
     // Subscribers only see the proto Event; the verb / actor / request_id are
     // captured in the audit log line above (which is already structured).
@@ -1205,6 +1278,92 @@ fn audit_emit(server: &mut Server, client: &ClientSession, entry: AuditEntry, re
         backend_id: entry.backend_id,
         address: entry.address,
     });
+}
+
+/// Build a single-line JSON record mirroring the audit line. Schema is
+/// stable: every key always present, missing values rendered as JSON
+/// `null`. Used by the dedicated JSON sink (`audit_logs_json_target`).
+///
+/// Schema sketch:
+/// ```json
+/// {
+///   "ts": "<RFC3339 UTC>",
+///   "boot_generation": <u32>,
+///   "session_ulid": "...",
+///   "request_ulid": "...",
+///   "actor": {"uid": ..., "gid": ..., "pid": ..., "user": "...", "comm": "...", "role": "..."},
+///   "client_id": ...,
+///   "connect_ts": "<RFC3339 UTC>",
+///   "socket": "...",
+///   "verb": "...",
+///   "target": "...",
+///   "result": "ok|err",
+///   "cluster_id": "..." or null,
+///   "backend_id": "..." or null,
+///   "extras": {...}
+/// }
+/// ```
+fn audit_record_to_json(
+    server: &Server,
+    client: &ClientSession,
+    request_id: &Ulid,
+    entry: &AuditEntry,
+    result: AuditResult,
+) -> String {
+    use serde_json::{Value, json};
+    let extras = {
+        let mut map = serde_json::Map::new();
+        if let Some(code) = entry.extras.error_code {
+            map.insert("error_code".to_owned(), Value::String(code.to_string()));
+        }
+        if let Some(reason) = entry.extras.reason.as_deref() {
+            map.insert("reason".to_owned(), Value::String(reason.to_owned()));
+        }
+        if let Some(elapsed) = entry.extras.elapsed_ms {
+            map.insert("elapsed_ms".to_owned(), json!(elapsed));
+        }
+        if let Some(fanout) = entry.extras.fanout {
+            map.insert(
+                "fanout".to_owned(),
+                json!({
+                    "status": fanout.status.to_string(),
+                    "workers_ok": fanout.workers_ok,
+                    "workers_err": fanout.workers_err,
+                    "workers_expected": fanout.workers_expected,
+                }),
+            );
+        }
+        if let Some(hash) = entry.extras.request_sha256.as_deref() {
+            map.insert("request_sha256".to_owned(), Value::String(hash.to_owned()));
+        }
+        Value::Object(map)
+    };
+    let record = json!({
+        "ts": rfc3339_utc(std::time::SystemTime::now()),
+        "boot_generation": server.boot_generation,
+        "session_ulid": client.session_ulid.to_string(),
+        "request_ulid": request_id.to_string(),
+        "actor": {
+            "uid": client.actor_uid,
+            "gid": client.actor_gid,
+            "pid": client.actor_pid,
+            "user": client.actor_user,
+            "comm": client.actor_comm,
+            "role": actor_role(client.actor_uid),
+        },
+        "client_id": client.id,
+        "connect_ts": client.connect_ts_display(),
+        "socket": client.socket_path.as_ref(),
+        "verb": entry.verb,
+        "target": entry.target,
+        "result": result.to_string(),
+        "cluster_id": entry.cluster_id,
+        "backend_id": entry.backend_id,
+        "sozu_version": SOZU_VERSION,
+        "build_git_sha": SOZU_BUILD_GIT_SHA,
+        "extras": extras,
+    });
+    record.to_string()
 }
 
 /// Strip ANSI CSI escape sequences from `s`. Cheap single-pass parser —
@@ -2211,11 +2370,12 @@ mod audit_format_tests {
     //! with a plain regex.
     use super::{
         AUDIT_REASON_MAX_CHARS, AuditEntry, AuditErrorCode, AuditExtras, AuditResult, FanoutStatus,
-        FanoutSummary, SOZU_VERSION,
+        FanoutSummary, SOZU_BUILD_GIT_SHA, SOZU_VERSION, actor_role, rfc3339_utc,
     };
     use regex::Regex;
     use rusty_ulid::Ulid;
     use sozu_command_lib::proto::command::EventKind;
+    use std::time::SystemTime;
 
     /// Minimal stand-in exposing only the `ClientSession` fields and methods
     /// that `audit_log_context!` reads. Avoids constructing the full
@@ -2229,6 +2389,14 @@ mod audit_format_tests {
         actor_comm: Option<String>,
         actor_user: Option<String>,
         socket_path: std::sync::Arc<str>,
+        connect_ts: SystemTime,
+    }
+
+    /// Minimal stand-in for `Server` exposing only `boot_generation`, the
+    /// only field the macro reads off of `$server`. Avoids the full Server
+    /// (Poll, listener, workers map, …) ceremony.
+    struct TestServer {
+        boot_generation: u32,
     }
 
     impl TestClient {
@@ -2257,6 +2425,9 @@ mod audit_format_tests {
                 .clone()
                 .unwrap_or_else(|| "unknown".to_owned())
         }
+        fn connect_ts_display(&self) -> String {
+            rfc3339_utc(self.connect_ts)
+        }
     }
 
     fn sample_entry(cluster_id: Option<&str>) -> AuditEntry {
@@ -2282,30 +2453,42 @@ mod audit_format_tests {
             actor_comm: uid.map(|_| "sozuctl".to_owned()),
             actor_user: uid.map(|_| "florentin".to_owned()),
             socket_path: std::sync::Arc::from("/run/sozu/sock"),
+            connect_ts: SystemTime::now(),
         }
+    }
+
+    fn sample_server(boot_generation: u32) -> TestServer {
+        TestServer { boot_generation }
     }
 
     fn pattern() -> Regex {
         // Anchored; covers bracket + `AUDIT\tCommand(...)` + every mandatory
-        // field in order + sozu_version. Optional fields (error_code, reason,
-        // elapsed_ms, fanout, workers) may appear between `result=...` and
-        // `sozu_version=...`. Crockford base32 ULIDs are 26 chars over [0-9A-Z].
+        // field in order. Optional fields (error_code, reason, elapsed_ms,
+        // fanout, workers, request_sha256) may appear between `result=...`
+        // and `sozu_version=...`. Crockford base32 ULIDs are 26 chars
+        // over [0-9A-Z]. Timestamps are RFC 3339 UTC with microsecond
+        // precision; build_git_sha is 12 hex chars or `unknown`.
         Regex::new(concat!(
             r"^\[[0-9A-Z]{26} [0-9A-Z]{26} (?:[A-Za-z0-9_:.-]+|-) (?:[A-Za-z0-9_:.-]+|-)\]",
             r"\tAUDIT\tCommand\(",
+            r"ts=\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z, ",
             r"verb=[a-z_]+, ",
             r"actor_uid=(?:\d+|unknown), ",
             r"actor_gid=(?:\d+|unknown), ",
             r"actor_pid=(?:\d+|unknown), ",
+            r"actor_role=(?:root|system|user|unknown), ",
             r"actor_user=\S+, ",
             r"actor_comm=\S+, ",
             r"client_id=\d+, ",
+            r"connect_ts=\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z, ",
             r"socket=\S+, ",
             r"target=[^,]+, ",
             r"result=(?:ok|err)",
             // Optional extras block.
             r"(?:, (?:error_code=\S+|reason=[^,)]+|elapsed_ms=\d+|fanout=\S+|workers=\d+/\d+/\d+|request_sha256=[0-9a-f]+))*",
-            r", sozu_version=[^)]+",
+            r", sozu_version=[^,]+",
+            r", build_git_sha=\S+",
+            r", boot_generation=\d+",
             r"\)$",
         ))
         .expect("audit-format regex must compile")
@@ -2313,10 +2496,11 @@ mod audit_format_tests {
 
     #[test]
     fn layout_with_cluster_id_matches() {
+        let server = sample_server(0);
         let client = sample_client(Some(1000));
         let request_id = Ulid::generate();
         let entry = sample_entry(Some("my_app"));
-        let rendered = audit_log_context!(client, &request_id, &entry, AuditResult::Ok);
+        let rendered = audit_log_context!(server, client, &request_id, &entry, AuditResult::Ok);
         assert!(
             pattern().is_match(&rendered),
             "rendered line did not match audit-log pattern.\nrendered: {rendered:?}"
@@ -2325,10 +2509,11 @@ mod audit_format_tests {
 
     #[test]
     fn layout_with_dashed_cluster_and_backend_matches() {
+        let server = sample_server(3);
         let client = sample_client(None);
         let request_id = Ulid::generate();
         let entry = sample_entry(None);
-        let rendered = audit_log_context!(client, &request_id, &entry, AuditResult::Err);
+        let rendered = audit_log_context!(server, client, &request_id, &entry, AuditResult::Err);
         assert!(
             pattern().is_match(&rendered),
             "rendered line did not match audit-log pattern.\nrendered: {rendered:?}"
@@ -2337,6 +2522,7 @@ mod audit_format_tests {
 
     #[test]
     fn layout_with_extras_matches() {
+        let server = sample_server(0);
         let client = sample_client(Some(42));
         let request_id = Ulid::generate();
         let mut entry = sample_entry(Some("my_app"));
@@ -2349,7 +2535,7 @@ mod audit_format_tests {
             workers_err: 1,
             workers_expected: 2,
         });
-        let rendered = audit_log_context!(client, &request_id, &entry, AuditResult::Err);
+        let rendered = audit_log_context!(server, client, &request_id, &entry, AuditResult::Err);
         assert!(
             pattern().is_match(&rendered),
             "rendered line with extras did not match.\nrendered: {rendered:?}"
@@ -2358,11 +2544,12 @@ mod audit_format_tests {
 
     #[test]
     fn sanitizer_strips_tab_and_escape_in_target() {
+        let server = sample_server(0);
         let client = sample_client(Some(0));
         let request_id = Ulid::generate();
         let mut entry = sample_entry(None);
         entry.target = "cluster:\tforge\x1b[Kghost".to_owned();
-        let rendered = audit_log_context!(client, &request_id, &entry, AuditResult::Ok);
+        let rendered = audit_log_context!(server, client, &request_id, &entry, AuditResult::Ok);
         assert!(
             !rendered.contains('\t') || rendered.matches('\t').count() == 2,
             "target field must not introduce additional tabs (only the three structural tabs allowed): {rendered:?}"
@@ -2370,6 +2557,39 @@ mod audit_format_tests {
         assert!(
             !rendered.contains('\x1b'),
             "target field must not carry ANSI escape codes: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn actor_role_buckets() {
+        assert_eq!(actor_role(None), "unknown");
+        assert_eq!(actor_role(Some(0)), "root");
+        assert_eq!(actor_role(Some(99)), "system");
+        assert_eq!(actor_role(Some(999)), "system");
+        assert_eq!(actor_role(Some(1000)), "user");
+        assert_eq!(actor_role(Some(65534)), "user");
+    }
+
+    #[test]
+    fn rfc3339_utc_round_numbers() {
+        // Unix epoch.
+        assert_eq!(
+            rfc3339_utc(SystemTime::UNIX_EPOCH),
+            "1970-01-01T00:00:00.000000Z"
+        );
+        // Y2K + 1 day, with microseconds.
+        let t = SystemTime::UNIX_EPOCH + std::time::Duration::new(946_771_200, 123_456_000);
+        assert_eq!(rfc3339_utc(t), "2000-01-02T00:00:00.123456Z");
+    }
+
+    #[test]
+    fn build_git_sha_format() {
+        // Either 12 hex chars (set by build.rs) or the literal "unknown"
+        // fallback for builds outside a git tree.
+        let s = SOZU_BUILD_GIT_SHA;
+        assert!(
+            s == "unknown" || (s.len() == 12 && s.chars().all(|c| c.is_ascii_hexdigit())),
+            "unexpected SOZU_BUILD_GIT_SHA: {s:?}"
         );
     }
 }
