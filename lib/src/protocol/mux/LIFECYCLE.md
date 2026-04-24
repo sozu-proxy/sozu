@@ -696,6 +696,23 @@ that touches `h2.rs`, `mod.rs`, or `stream.rs`.
     Guarded by e2e tests
     `test_h2_priority_update_on_open_stream_is_accepted` and
     `test_h2_priority_update_on_stream_zero_is_protocol_error`.
+19. **Converter close-race: no yield between last DATA and closing
+    Flags.** The H2 converter's DATA arm (`converter.rs`
+    `H2BlockConverter::call`) peeks `kawa.blocks.front()` and
+    suppresses the RFC 9218 incremental-mode yield when the next
+    queued block is a closing `Block::Flags` with `end_stream=true`.
+    Yielding between the last DATA and its companion END_STREAM
+    marker would strand the closing frame in `kawa.blocks` — the
+    invariant-16 guard in `finalize_write` already prevents the
+    wake-up being lost, but forcing a round-trip through the event
+    loop for the terminal 9-byte empty-DATA frame is wasted work.
+    The suppression is scoped narrowly: intermediate Flags blocks
+    (e.g. chunked `end_chunk` without `end_stream`) still yield,
+    and a trailing `Block::Chunk` also yields. Unit-tested in
+    `converter::tests::test_converter_suppresses_yield_before_closing_end_stream_flags`
+    / `test_converter_yields_before_trailing_flags_without_end_stream`
+    / `test_converter_yields_before_chunk_block`; end-to-end guard
+    `test_h2_incremental_round_robin_closes_every_stream`.
 
 ---
 
