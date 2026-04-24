@@ -76,7 +76,8 @@ impl SingleReadH1Backend {
                         let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
 
                         let body = vec![b'Z'; config.body_size];
-                        let content_type = config.content_type.unwrap_or("application/octet-stream");
+                        let content_type =
+                            config.content_type.unwrap_or("application/octet-stream");
 
                         loop {
                             if stop_clone.load(Ordering::Relaxed) {
