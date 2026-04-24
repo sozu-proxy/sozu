@@ -2885,7 +2885,14 @@ fn try_h2_large_gzipped_chunked_drains_fully() -> State {
     tls.write_all(&headers.encode()).unwrap();
     tls.flush().unwrap();
 
-    let outcome = drain_h2_stream_streaming(&mut tls, sid, Duration::from_secs(8), 32 * 1024);
+    // 1 MiB WU cadence (not 32 KiB): on slow CI runners the per-frame
+    // WINDOW_UPDATE pace can stack late writes past sozu's end-of-stream
+    // close. Each post-close WU increments `H2FloodDetector::glitch_count`
+    // (lib/src/protocol/mux/h2.rs:4985) and a cumulative 100+ trips a
+    // GOAWAY(ENHANCE_YOUR_CALM) that truncates the tail of the response.
+    // The 6 MiB initial stream window (CHROME146_INITIAL_WINDOW_SIZE) plus
+    // a single 1 MiB refresh is plenty of credit for a 7.77 MiB body.
+    let outcome = drain_h2_stream_streaming(&mut tls, sid, Duration::from_secs(8), 1024 * 1024);
 
     println!(
         "h2 customer gzipped chunked: body_bytes={}/{gzipped_len} \
@@ -2981,7 +2988,14 @@ fn try_h2_large_chunked_7mb_drains_fully() -> State {
     tls.write_all(&headers.encode()).unwrap();
     tls.flush().unwrap();
 
-    let outcome = drain_h2_stream_streaming(&mut tls, sid, Duration::from_secs(8), 32 * 1024);
+    // 1 MiB WU cadence (not 32 KiB): on slow CI runners the per-frame
+    // WINDOW_UPDATE pace can stack late writes past sozu's end-of-stream
+    // close. Each post-close WU increments `H2FloodDetector::glitch_count`
+    // (lib/src/protocol/mux/h2.rs:4985) and a cumulative 100+ trips a
+    // GOAWAY(ENHANCE_YOUR_CALM) that truncates the tail of the response.
+    // The 6 MiB initial stream window (CHROME146_INITIAL_WINDOW_SIZE) plus
+    // a single 1 MiB refresh is plenty of credit for a 7.77 MiB body.
+    let outcome = drain_h2_stream_streaming(&mut tls, sid, Duration::from_secs(8), 1024 * 1024);
 
     println!(
         "h2 7MB smoke: body_bytes={}/{BODY_SIZE} \
