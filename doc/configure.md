@@ -1049,6 +1049,27 @@ follow-up — pair with `back_bytes_out` for the byte view today).
 | `h2.frames.tx.goaway` | counter | proxy | GOAWAY frames emitted (one per phase of `graceful_goaway`, plus error-path `goaway`) |
 | `h2.frames.tx.ping_ack` | counter | proxy | PING ACK frames emitted in response to peer probes |
 
+#### HTTP/2 edge-triggered wake-up instrumentation
+
+LIFECYCLE `§9` invariant 15 compliance counters. Each firing records a
+site where sozu paired `Ready::WRITABLE` with `signal_pending_write` so
+the edge-triggered epoll scheduler re-runs `writable()` on the next
+tick — required whenever bytes land in sozu-owned buffers (the kernel
+never signals WRITABLE for buffers it does not own). Useful as a
+regression baseline: the first two correlate with 504/500/400 rate and
+RFC 9218 PRIORITY_UPDATE rate respectively, the last two correlate
+with backend-H2 traffic volume. A 10× spike on any counter without a
+matching spike on the upstream driver is the early warning for a hot
+loop regression.
+
+| Metric | Type | Scope | Description |
+|---|---|---|---|
+| `h2.signal.writable.rearmed.default_answer` | counter | proxy | Fired in `mux/answers.rs::set_default_answer` (504 backend timeout, 500/400 parse errors). Rate should track the default-answer render rate closely. |
+| `h2.signal.writable.rearmed.priority_update` | counter | proxy | Fired in `mux/h2.rs::handle_priority_update_frame` whenever a PRIORITY_UPDATE mutates `Prioriser` state. Pairs with `h2.frames.rx.priority_update`. Low-to-zero on Firefox-only fleets (Firefox does not emit 0x10). |
+| `h2.signal.writable.rearmed.peer_data` | counter | proxy | Fired in `mux/h2.rs::handle_data_frame` when an H2 DATA frame wakes the linked peer. Non-zero only on clusters that use H2 to the origin. |
+| `h2.signal.writable.rearmed.peer_headers` | counter | proxy | Fired in `mux/h2.rs::handle_headers_frame` when an H2 HEADERS frame wakes the linked peer. Non-zero only on clusters that use H2 to the origin. |
+| `h2.streams.ready_incremental.by_urgency` | gauge | proxy | Post-scheduling-pass snapshot of the sum of ready incremental streams across all urgency buckets (RFC 9218 §4). Debug hint for scheduler fairness — a consistently non-zero value under load means the round-robin is active. |
+
 #### HTTP/2 GOAWAY and RST_STREAM by error code
 
 Counters split by direction (sent vs received) and RFC 9113 §7 error code.
