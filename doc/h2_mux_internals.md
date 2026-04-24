@@ -387,7 +387,17 @@ Flushes control data before application frames, in order:
 3. **WINDOW_UPDATE frames**: Serializes queued `pending_window_updates` into
    the zero buffer, coalescing entries by stream ID, then flushes
 4. **Pending RST_STREAM frames**: Drains `pending_rst_streams` into the zero
-   buffer, with flood detection (`MAX_PENDING_RST_STREAMS` cap)
+   buffer, with flood detection (`MAX_PENDING_RST_STREAMS` cap). Proxy-
+   emitted RSTs (DATA-on-closed, `refuse_stream_and_discard`, `reset_stream`)
+   are queued via the canonical `ConnectionH2::enqueue_rst` helper, which
+   dedupes through `self.rst_sent`, bumps `total_rst_streams_queued`, and
+   arms WRITABLE. This path is independent of the owning `Stream` still
+   being present in `self.streams`, so it survives `remove_dead_stream`
+   eviction (which the per-stream error callers invoke synchronously after
+   `reset_stream` returns). `finalize_write` retains `Ready::WRITABLE`
+   whenever the queue is non-empty so a partial write that deferred the
+   flush (Phase 3 is gated on `expect_write.is_none()`) re-runs on the
+   next tick rather than stranding the queued RST.
 
 Returns `Some(MuxResult)` if the caller should return early, `None` to proceed.
 
