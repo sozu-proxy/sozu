@@ -5,6 +5,7 @@ rust-version = "1.85.0"
 edition = "2024"
 
 [dependencies]
+flate2 = { workspace = true }
 futures = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true, features = ["client", "server", "http1", "http2"] }
@@ -13,6 +14,7 @@ hyper-util = { workspace = true, features = ["client-legacy", "http1", "http2", 
 libc = { workspace = true }
 mio = { workspace = true }
 rustls = { workspace = true }
+sha2 = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "time"] }
 

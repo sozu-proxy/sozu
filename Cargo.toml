@@ -6,6 +6,7 @@ resolver = "2" # consistent with rust edition 2024, see https://doc.rust-lang.or
 anyhow = "^1.0.102"
 clap = "^4.6.1"
 cookie-factory = "^0.3.3"
+flate2 = "^1.1"
 futures = "^0.3.32"
 hdrhistogram = "^7.5.4"
 hex = "^0.4.3"

@@ -1962,6 +1962,7 @@ dependencies = [
 name = "sozu-e2e"
 version = "1.1.1"
 dependencies = [
+ "flate2",
  "futures",
  "http-body-util",
  "hyper",
@@ -1970,6 +1971,7 @@ dependencies = [
  "libc",
  "mio",
  "rustls",
+ "sha2",
  "sozu-command-lib",
  "sozu-lib",
  "tempfile",
