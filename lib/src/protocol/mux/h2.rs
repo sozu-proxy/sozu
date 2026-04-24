@@ -4124,10 +4124,12 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 self.mark_end_of_stream(stream);
             }
             if let StreamState::Linked(token) = stream_state {
-                endpoint
-                    .readiness_mut(token)
-                    .interest
-                    .insert(Ready::WRITABLE);
+                // Mirror of h1.rs:361-368 for the H2-backend → H2-frontend
+                // path: edge-triggered epoll will NOT re-fire for bytes we
+                // just pushed into stream.back; the synthetic event is the
+                // only wake path. LIFECYCLE invariant 15.
+                endpoint.readiness_mut(token).arm_writable();
+                incr!("h2.signal.writable.rearmed.peer_data");
             }
         }
         MuxResult::Continue
@@ -4256,10 +4258,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             self.mark_end_of_stream(stream);
         }
         if let StreamState::Linked(token) = stream.state {
-            endpoint
-                .readiness_mut(token)
-                .interest
-                .insert(Ready::WRITABLE)
+            // Mirror of handle_data_frame's rearm. LIFECYCLE invariant 15.
+            endpoint.readiness_mut(token).arm_writable();
+            incr!("h2.signal.writable.rearmed.peer_headers");
         }
         // was_initial prevents trailers from triggering connection
         if was_initial && self.position.is_server() {
