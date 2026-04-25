@@ -92,6 +92,40 @@ enum AlpnProtocol {
     Http11,
 }
 
+/// Module-level prefix for log lines emitted from this file when no session
+/// is in scope. Produces a bold bright-white `HTTPS` label in colored mode.
+/// Used by [`HttpsProxy`] / [`HttpsListener`] callbacks (`notify`,
+/// `add_cluster`, `add_*_frontend`, `accept`, `soft_stop`, `hard_stop`)
+/// which own a token map keyed by listener and have no `frontend_token` of
+/// their own.
+macro_rules! log_module_context {
+    () => {{
+        let (open, reset, _, _, _) = sozu_command::logging::ansi_palette();
+        format!("{open}HTTPS{reset}\t >>>", open = open, reset = reset)
+    }};
+}
+
+/// Per-session prefix for log lines emitted with an [`HttpsSession`] in
+/// scope. Renders the canonical `\tHTTPS\tSession(...)\t >>>` envelope from
+/// the session's `frontend_token` and `peer_address`. Operators can grep-
+/// correlate against the token id (and the peer address when present)
+/// across log lines for the same TLS connection.
+macro_rules! log_context {
+    ($self:expr) => {{
+        let (open, reset, grey, gray, white) = sozu_command::logging::ansi_palette();
+        format!(
+            "{open}HTTPS{reset}\t{grey}Session{reset}({gray}frontend{reset}={white}{frontend}{reset}, {gray}peer{reset}={white}{peer}{reset})\t >>>",
+            open = open,
+            reset = reset,
+            grey = grey,
+            gray = gray,
+            white = white,
+            frontend = $self.frontend_token.0,
+            peer = $self.peer_address.map(|a| a.to_string()).unwrap_or_else(|| "<none>".to_string()),
+        )
+    }};
+}
+
 pub struct HttpsSession {
     configured_backend_timeout: Duration,
     configured_connect_timeout: Duration,
@@ -136,7 +170,7 @@ impl HttpsSession {
         let container_frontend_timeout = TimeoutContainer::new(configured_request_timeout, token);
 
         let state = if expect_proxy {
-            trace!("starting in expect proxy state");
+            trace!("{} starting in expect proxy state", log_module_context!());
             gauge_add!("protocol.proxy.expect", 1);
             HttpsStateMachine::Expect(
                 ExpectProxyProtocol::new(container_frontend_timeout, sock, token, request_id),
@@ -173,7 +207,7 @@ impl HttpsSession {
     }
 
     pub fn upgrade(&mut self) -> SessionIsToBeClosed {
-        debug!("HTTP::upgrade");
+        debug!("{} upgrade", log_context!(self));
         let new_state = match self.state.take() {
             HttpsStateMachine::Expect(expect, ssl) => self.upgrade_expect(expect, ssl),
             HttpsStateMachine::Handshake(handshake) => self.upgrade_handshake(handshake),
@@ -183,7 +217,10 @@ impl HttpsSession {
                 // Reaching this arm means a prior upgrade already returned
                 // `None` and the session should have been closed. Fall back
                 // to closing cleanly instead of panicking the worker.
-                error!("HTTPS::upgrade called on FailedUpgrade state; closing session");
+                error!(
+                    "{} upgrade called on FailedUpgrade state; closing session",
+                    log_context!(self)
+                );
                 None
             }
         };
@@ -240,7 +277,8 @@ impl HttpsSession {
         // currently, only happens in expect proxy protocol with AF_UNSPEC address
         if !expect.container_frontend_timeout.cancel() {
             error!(
-                "failed to cancel request timeout on expect upgrade phase for 'expect proxy protocol with AF_UNSPEC address'"
+                "{} failed to cancel request timeout on expect upgrade phase for 'expect proxy protocol with AF_UNSPEC address'",
+                log_context!(self)
             );
         }
 
@@ -260,8 +298,10 @@ impl HttpsSession {
         let alpn = handshake.session.alpn_protocol();
         let alpn = alpn.and_then(|alpn| from_utf8(alpn).ok());
         debug!(
-            "Successful TLS Handshake with, received: {:?} {:?}",
-            sni_owned, alpn
+            "{} successful TLS handshake with, received: {:?} {:?}",
+            log_context!(self),
+            sni_owned,
+            alpn
         );
 
         // Reject clients that fail to negotiate `h2` when the listener is
@@ -278,7 +318,8 @@ impl HttpsSession {
                 if disable_http11 {
                     incr!("https.alpn.rejected.http11_disabled");
                     warn!(
-                        "rejecting TLS connection: listener is H2-only but client negotiated http/1.1"
+                        "{} rejecting TLS connection: listener is H2-only but client negotiated http/1.1",
+                        log_context!(self)
                     );
                     return None;
                 }
@@ -286,7 +327,11 @@ impl HttpsSession {
             }
             Some("h2") => (AlpnProtocol::H2, Some("h2")),
             Some(other) => {
-                error!("Unsupported ALPN protocol: {}", other);
+                error!(
+                    "{} unsupported ALPN protocol: {}",
+                    log_context!(self),
+                    other
+                );
                 return None;
             }
             // Some clients don't fill in the ALPN protocol. By default we
@@ -296,7 +341,8 @@ impl HttpsSession {
                 if disable_http11 {
                     incr!("https.alpn.rejected.http11_disabled");
                     warn!(
-                        "rejecting TLS connection: listener is H2-only but client did not negotiate ALPN"
+                        "{} rejecting TLS connection: listener is H2-only but client did not negotiate ALPN",
+                        log_context!(self)
                     );
                     return None;
                 }
@@ -408,9 +454,12 @@ impl HttpsSession {
     }
 
     fn upgrade_mux(&self, mut mux: MuxTls) -> Option<HttpsStateMachine> {
-        debug!("mux switching to wss");
+        debug!("{} mux switching to wss", log_context!(self));
         let Some(stream) = mux.context.streams.pop() else {
-            error!("upgrade_mux: no stream attached to the TLS mux session, closing");
+            error!(
+                "{} upgrade_mux: no stream attached to the TLS mux session, closing",
+                log_context!(self)
+            );
             return None;
         };
         // http.active_requests was already decremented by generate_access_log()
@@ -425,18 +474,25 @@ impl HttpsSession {
                     ..
                 }) => (readiness, socket, timeout_container),
                 mux::Connection::H2(_) => {
-                    error!("Only h1<->h1 connections can upgrade to websocket");
+                    error!(
+                        "{} only h1<->h1 connections can upgrade to websocket",
+                        log_context!(self)
+                    );
                     return None;
                 }
             };
 
         let mux::StreamState::Linked(back_token) = stream.state else {
-            error!("Upgrading stream should be linked to a backend");
+            error!(
+                "{} upgrading stream should be linked to a backend",
+                log_context!(self)
+            );
             return None;
         };
         let Some(backend) = mux.router.backends.remove(&back_token) else {
             error!(
-                "upgrade_mux: backend for token {:?} is missing (already disconnected?), closing",
+                "{} upgrade_mux: backend for token {:?} is missing (already disconnected?), closing",
+                log_context!(self),
                 back_token
             );
             return None;
@@ -452,11 +508,17 @@ impl HttpsSession {
                     ..
                 }) => (cluster_id, backend, readiness, socket, timeout_container),
                 mux::Connection::H1(_) => {
-                    error!("The backend disconnected just after upgrade, abort");
+                    error!(
+                        "{} the backend disconnected just after upgrade, abort",
+                        log_context!(self)
+                    );
                     return None;
                 }
                 mux::Connection::H2(_) => {
-                    error!("Only h1<->h1 connections can upgrade to websocket");
+                    error!(
+                        "{} only h1<->h1 connections can upgrade to websocket",
+                        log_context!(self)
+                    );
                     return None;
                 }
             };
@@ -517,7 +579,10 @@ impl HttpsSession {
         wss: Pipe<FrontRustls, HttpsListener>,
     ) -> Option<HttpsStateMachine> {
         // what do we do here?
-        error!("Upgrade called on WSS, this should not happen");
+        error!(
+            "{} upgrade called on WSS, this should not happen",
+            log_context!(self)
+        );
         Some(HttpsStateMachine::WebSocket(wss))
     }
 }
@@ -528,7 +593,7 @@ impl ProxySession for HttpsSession {
             return;
         }
 
-        trace!("Closing HTTPS session");
+        trace!("{} closing HTTPS session", log_context!(self));
         self.metrics.service_stop();
 
         // Restore gauges
@@ -574,8 +639,10 @@ impl ProxySession for HttpsSession {
             // error 107 NotConnected can happen when was never fully connected, or was already disconnected due to error
             if e.kind() != ErrorKind::NotConnected {
                 error!(
-                    "error shutting down front socket({:?}): {:?}",
-                    front_socket, e
+                    "{} error shutting down front socket({:?}): {:?}",
+                    log_context!(self),
+                    front_socket,
+                    e
                 );
             }
         }
@@ -585,8 +652,10 @@ impl ProxySession for HttpsSession {
         let fd = front_socket.as_raw_fd();
         if let Err(e) = proxy.registry.deregister(&mut SourceFd(&fd)) {
             error!(
-                "error deregistering front socket({:?}) while closing HTTPS session: {:?}",
-                fd, e
+                "{} error deregistering front socket({:?}) while closing HTTPS session: {:?}",
+                log_context!(self),
+                fd,
+                e
             );
         }
         proxy.remove_session(self.frontend_token);
@@ -598,7 +667,8 @@ impl ProxySession for HttpsSession {
         let session_result = self.state.timeout(token, &mut self.metrics);
         if session_result == StateResult::CloseSession {
             debug!(
-                "HTTPS timeout requested close: token={:?}, marker={:?}",
+                "{} HTTPS timeout requested close: token={:?}, marker={:?}",
+                log_context!(self),
                 token,
                 self.state.marker()
             );
@@ -612,7 +682,8 @@ impl ProxySession for HttpsSession {
 
     fn update_readiness(&mut self, token: Token, events: Ready) {
         trace!(
-            "token {:?} got event {}",
+            "{} token {:?} got event {}",
+            log_context!(self),
             token,
             super::ready_to_string(events)
         );
@@ -638,8 +709,8 @@ impl ProxySession for HttpsSession {
         };
         if to_be_closed {
             debug!(
-                "HTTPS ready requested close: token={:?}, marker={:?}",
-                self.frontend_token,
+                "{} HTTPS ready requested close: marker={:?}",
+                log_context!(self),
                 self.state.marker()
             );
         }
@@ -658,7 +729,7 @@ impl ProxySession for HttpsSession {
 
     fn print_session(&self) {
         self.state.print_state("HTTPS");
-        error!("Metrics: {:?}", self.metrics);
+        error!("{} Metrics: {:?}", log_context!(self), self.metrics);
     }
 
     fn frontend_token(&self) -> Token {
@@ -969,7 +1040,11 @@ impl HttpsListener {
                 "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384" => Some(TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384),
                 "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256" => Some(TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256),
                 other_cipher => {
-                    error!("unknown cipher: {:?}", other_cipher);
+                    error!(
+                        "{} unknown cipher: {:?}",
+                        log_module_context!(),
+                        other_cipher
+                    );
                     None
                 }
             })
@@ -982,11 +1057,15 @@ impl HttpsListener {
                 Ok(TlsVersion::TlsV12) => Some(&rustls::version::TLS12),
                 Ok(TlsVersion::TlsV13) => Some(&rustls::version::TLS13),
                 Ok(other_version) => {
-                    error!("unsupported TLS version {:?}", other_version);
+                    error!(
+                        "{} unsupported TLS version {:?}",
+                        log_module_context!(),
+                        other_version
+                    );
                     None
                 }
                 Err(_) => {
-                    error!("unsupported TLS version");
+                    error!("{} unsupported TLS version", log_module_context!());
                     None
                 }
             })
@@ -1171,7 +1250,11 @@ impl HttpsListener {
     }
 
     pub fn remove_https_front(&mut self, tls_front: HttpFrontend) -> Result<(), ListenerError> {
-        debug!("removing tls_front {:?}", tls_front);
+        debug!(
+            "{} removing tls_front {:?}",
+            log_module_context!(),
+            tls_front
+        );
         self.fronts
             .remove_http_front(&tls_front)
             .map_err(ListenerError::RemoveFrontend)
@@ -1183,13 +1266,16 @@ impl HttpsListener {
                 .map_err(|e| match e.kind() {
                     ErrorKind::WouldBlock => AcceptError::WouldBlock,
                     _ => {
-                        error!("accept() IO error: {:?}", e);
+                        error!("{} accept() IO error: {:?}", log_module_context!(), e);
                         AcceptError::IoError
                     }
                 })
                 .map(|(sock, _)| sock)
         } else {
-            error!("cannot accept connections, no listening socket available");
+            error!(
+                "{} cannot accept connections, no listening socket available",
+                log_module_context!()
+            );
             Err(AcceptError::IoError)
         }
     }
@@ -1248,7 +1334,11 @@ impl HttpsProxy {
             .retain(|_, listener| listener.borrow().address != remove_address);
 
         if !self.listeners.len() < len {
-            info!("no HTTPS listener to remove at address {}", remove_address)
+            info!(
+                "{} no HTTPS listener to remove at address {}",
+                log_module_context!(),
+                remove_address
+            )
         }
         Ok(None)
     }
@@ -1258,7 +1348,7 @@ impl HttpsProxy {
         let mut socket_errors = vec![];
         for (_, l) in listeners.iter() {
             if let Some(mut sock) = l.borrow_mut().listener.take() {
-                debug!("Deregistering socket {:?}", sock);
+                debug!("{} deregistering socket {:?}", log_module_context!(), sock);
                 if let Err(e) = self.registry.deregister(&mut sock) {
                     let error = format!("socket {sock:?}: {e:?}");
                     socket_errors.push(error);
@@ -1281,7 +1371,7 @@ impl HttpsProxy {
         let mut socket_errors = vec![];
         for (_, l) in listeners.drain() {
             if let Some(mut sock) = l.borrow_mut().listener.take() {
-                debug!("Deregistering socket {:?}", sock);
+                debug!("{} deregistering socket {:?}", log_module_context!(), sock);
                 if let Err(e) = self.registry.deregister(&mut sock) {
                     let error = format!("socket {sock:?}: {e:?}");
                     socket_errors.push(error);
@@ -1324,7 +1414,8 @@ impl HttpsProxy {
             .collect();
 
         info!(
-            "got Certificates::All query, answering with {:?}",
+            "{} got Certificates::All query, answering with {:?}",
+            log_module_context!(),
             certificates
         );
 
@@ -1359,8 +1450,10 @@ impl HttpsProxy {
             .collect();
 
         info!(
-            "got Certificates::Domain({}) query, answering with {:?}",
-            domain, certificates
+            "{} got Certificates::Domain({}) query, answering with {:?}",
+            log_module_context!(),
+            domain,
+            certificates
         );
 
         Ok(Some(
@@ -1644,14 +1737,20 @@ impl ProxyConfiguration for HttpsProxy {
             .ok_or(AcceptError::IoError)?;
         if let Err(e) = frontend_sock.set_nodelay(true) {
             error!(
-                "error setting nodelay on front socket({:?}): {:?}",
-                frontend_sock, e
+                "{} error setting nodelay on front socket({:?}): {:?}",
+                log_module_context!(),
+                frontend_sock,
+                e
             );
         }
 
         let owned = listener.borrow();
         let rustls_details = ServerConnection::new(owned.rustls_details.clone()).map_err(|e| {
-            error!("failed to create server session: {:?}", e);
+            error!(
+                "{} failed to create server session: {:?}",
+                log_module_context!(),
+                e
+            );
             AcceptError::IoError
         })?;
 
@@ -1667,8 +1766,10 @@ impl ProxyConfiguration for HttpsProxy {
             )
             .map_err(|register_error| {
                 error!(
-                    "error registering front socket({:?}): {:?}",
-                    frontend_sock, register_error
+                    "{} error registering front socket({:?}): {:?}",
+                    log_module_context!(),
+                    frontend_sock,
+                    register_error
                 );
                 AcceptError::RegisterError
             })?;
@@ -1708,80 +1809,140 @@ impl ProxyConfiguration for HttpsProxy {
 
         let content_result = match request_type {
             RequestType::AddCluster(cluster) => {
-                debug!("{} add cluster {:?}", request_id, cluster);
+                debug!(
+                    "{} {} add cluster {:?}",
+                    log_module_context!(),
+                    request_id,
+                    cluster
+                );
                 self.add_cluster(cluster)
             }
             RequestType::RemoveCluster(cluster_id) => {
-                debug!("{} remove cluster {:?}", request_id, cluster_id);
+                debug!(
+                    "{} {} remove cluster {:?}",
+                    log_module_context!(),
+                    request_id,
+                    cluster_id
+                );
                 self.remove_cluster(&cluster_id)
             }
             RequestType::AddHttpsFrontend(front) => {
-                debug!("{} add https front {:?}", request_id, front);
+                debug!(
+                    "{} {} add https front {:?}",
+                    log_module_context!(),
+                    request_id,
+                    front
+                );
                 self.add_https_frontend(front)
             }
             RequestType::RemoveHttpsFrontend(front) => {
-                debug!("{} remove https front {:?}", request_id, front);
+                debug!(
+                    "{} {} remove https front {:?}",
+                    log_module_context!(),
+                    request_id,
+                    front
+                );
                 self.remove_https_frontend(front)
             }
             RequestType::AddCertificate(add_certificate) => {
-                debug!("{} add certificate: {:?}", request_id, add_certificate);
+                debug!(
+                    "{} {} add certificate: {:?}",
+                    log_module_context!(),
+                    request_id,
+                    add_certificate
+                );
                 self.add_certificate(add_certificate)
             }
             RequestType::RemoveCertificate(remove_certificate) => {
                 debug!(
-                    "{} remove certificate: {:?}",
-                    request_id, remove_certificate
+                    "{} {} remove certificate: {:?}",
+                    log_module_context!(),
+                    request_id,
+                    remove_certificate
                 );
                 self.remove_certificate(remove_certificate)
             }
             RequestType::ReplaceCertificate(replace_certificate) => {
                 debug!(
-                    "{} replace certificate: {:?}",
-                    request_id, replace_certificate
+                    "{} {} replace certificate: {:?}",
+                    log_module_context!(),
+                    request_id,
+                    replace_certificate
                 );
                 self.replace_certificate(replace_certificate)
             }
             RequestType::RemoveListener(remove) => {
-                debug!("removing HTTPS listener at address {:?}", remove.address);
+                debug!(
+                    "{} removing HTTPS listener at address {:?}",
+                    log_module_context!(),
+                    remove.address
+                );
                 self.remove_listener(remove)
             }
             RequestType::SoftStop(_) => {
-                debug!("{} processing soft shutdown", request_id);
+                debug!(
+                    "{} {} processing soft shutdown",
+                    log_module_context!(),
+                    request_id
+                );
                 match self.soft_stop() {
                     Ok(_) => {
-                        info!("{} soft stop successful", request_id);
+                        info!(
+                            "{} {} soft stop successful",
+                            log_module_context!(),
+                            request_id
+                        );
                         return WorkerResponse::processing(request.id);
                     }
                     Err(e) => Err(e),
                 }
             }
             RequestType::HardStop(_) => {
-                debug!("{} processing hard shutdown", request_id);
+                debug!(
+                    "{} {} processing hard shutdown",
+                    log_module_context!(),
+                    request_id
+                );
                 match self.hard_stop() {
                     Ok(_) => {
-                        debug!("{} hard stop successful", request_id);
+                        debug!(
+                            "{} {} hard stop successful",
+                            log_module_context!(),
+                            request_id
+                        );
                         return WorkerResponse::processing(request.id);
                     }
                     Err(e) => Err(e),
                 }
             }
             RequestType::Status(_) => {
-                debug!("{} status", request_id);
+                debug!("{} {} status", log_module_context!(), request_id);
                 Ok(None)
             }
             RequestType::QueryCertificatesFromWorkers(filters) => {
                 if let Some(domain) = filters.domain {
-                    debug!("{} query certificate for domain {}", request_id, domain);
+                    debug!(
+                        "{} {} query certificate for domain {}",
+                        log_module_context!(),
+                        request_id,
+                        domain
+                    );
                     self.query_certificate_for_domain(domain)
                 } else {
-                    debug!("{} query all certificates", request_id);
+                    debug!(
+                        "{} {} query all certificates",
+                        log_module_context!(),
+                        request_id
+                    );
                     self.query_all_certificates()
                 }
             }
             other_request => {
                 debug!(
-                    "{} unsupported message for HTTPS proxy, ignoring {:?}",
-                    request.id, other_request
+                    "{} {} unsupported message for HTTPS proxy, ignoring {:?}",
+                    log_module_context!(),
+                    request.id,
+                    other_request
                 );
                 Err(ProxyError::UnsupportedMessage)
             }
@@ -1789,14 +1950,19 @@ impl ProxyConfiguration for HttpsProxy {
 
         match content_result {
             Ok(content) => {
-                debug!("{} successful", request_id);
+                debug!("{} {} successful", log_module_context!(), request_id);
                 match content {
                     Some(content) => WorkerResponse::ok_with_content(request_id, content),
                     None => WorkerResponse::ok(request_id),
                 }
             }
             Err(proxy_error) => {
-                debug!("{} unsuccessful: {}", request_id, proxy_error);
+                debug!(
+                    "{} {} unsuccessful: {}",
+                    log_module_context!(),
+                    request_id,
+                    proxy_error
+                );
                 WorkerResponse::error(request_id, proxy_error)
             }
         }
@@ -2001,9 +2167,9 @@ pub mod testing {
         )
         .with_context(|| "Failed at creating server")?;
 
-        debug!("starting event loop");
+        debug!("{} starting event loop", log_module_context!());
         server.run();
-        debug!("ending event loop");
+        debug!("{} ending event loop", log_module_context!());
         Ok(())
     }
 }
