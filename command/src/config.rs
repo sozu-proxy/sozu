@@ -1416,6 +1416,14 @@ pub struct FileConfig {
     /// that exceed 4 backends per session — clamped to [2, 32] at load.
     #[serde(default)]
     pub slab_entries_per_connection: Option<u64>,
+    /// Optional UID allowlist for command-socket requests. `None` (default)
+    /// preserves historical behaviour: any same-UID local process can
+    /// invoke any verb. When set, requests whose `SO_PEERCRED` UID is not
+    /// in the list are rejected. Use to restrict mutating verbs to a
+    /// specific operator UID even when other same-UID daemons coexist
+    /// (CI runners, monitoring). Lisa LISA-007 hardening.
+    #[serde(default)]
+    pub command_allowed_uids: Option<Vec<u32>>,
     pub saved_state: Option<String>,
     #[serde(default)]
     pub automatic_state_save: Option<bool>,
@@ -1602,6 +1610,7 @@ impl ConfigBuilder {
                     ServerConfig::MAX_SLAB_ENTRIES_PER_CONNECTION,
                 )
             }),
+            command_allowed_uids: file_config.command_allowed_uids.clone(),
             ..Default::default()
         };
 
@@ -1881,6 +1890,12 @@ pub struct Config {
     /// capacity is `10 + slab_entries_per_connection * max_connections`.
     #[serde(default)]
     pub slab_entries_per_connection: Option<u64>,
+    /// Optional allowlist of UIDs permitted to invoke command-socket
+    /// requests. `None` keeps the historical "any same-UID local process"
+    /// behaviour. When `Some`, every request whose `SO_PEERCRED` UID is
+    /// not in the list is rejected before reaching dispatch.
+    #[serde(default)]
+    pub command_allowed_uids: Option<Vec<u32>>,
 }
 
 fn default_front_timeout() -> u32 {

@@ -179,6 +179,32 @@ impl Server {
                 return;
             }
         };
+        // Lisa LISA-007: optional UID allowlist. `None` preserves the
+        // historical behaviour (same-UID local process can do anything).
+        // When set, requests from UIDs outside the list are rejected
+        // before dispatch — both read and write — and the rejection
+        // appears in the audit trail via `client.finish_failure`.
+        if let Some(allowed) = self.config.command_allowed_uids.as_ref() {
+            let actor_uid = client.actor_uid;
+            let permitted = actor_uid.is_some_and(|u| allowed.contains(&u));
+            if !permitted {
+                warn!(
+                    "rejecting command-socket request from non-allowlisted UID: actor_uid={} allowed={:?} verb={:?}",
+                    actor_uid
+                        .map(|u| u.to_string())
+                        .unwrap_or_else(|| "unknown".to_owned()),
+                    allowed,
+                    std::mem::discriminant(&request_type)
+                );
+                client.finish_failure(format!(
+                    "unauthorized: actor UID {} not in command_allowed_uids",
+                    actor_uid
+                        .map(|u| u.to_string())
+                        .unwrap_or_else(|| "unknown".to_owned())
+                ));
+                return;
+            }
+        }
         match request_type {
             RequestType::SaveState(path) => save_state(self, client, &path),
             RequestType::LoadState(path) => load_state(self, Some(client), &path),
