@@ -236,7 +236,17 @@ impl CommandHub {
         let peer_cred = peer_cred_from_stream(&stream);
         let actor_comm = peer_cred.pid.and_then(peer_comm);
         let actor_user = peer_cred.uid.and_then(peer_user);
-        let channel = Channel::new(stream, 4096, u64::MAX);
+        // SECURITY (CWE-770 / Lisa LISA-006): the client channel must NOT
+        // grow without bound. The previous `u64::MAX` ceiling combined with
+        // the doubling growth in `Channel::readable()` and the absence of
+        // `Vec::try_reserve` in `Buffer::grow` meant any same-UID local
+        // process could send a single oversized length-prefixed message and
+        // OOM the main process. Bind to `max_command_buffer_size` (default
+        // 2 MB, configurable) — same ceiling worker channels at the
+        // fork_main_into_worker site already use. Operators who legitimately
+        // need a larger ceiling can raise `max_command_buffer_size` in the
+        // global config.
+        let channel = Channel::new(stream, 4096, self.config.max_command_buffer_size);
         let id = self.next_client_id();
         let session = ClientSession::new(
             channel,
