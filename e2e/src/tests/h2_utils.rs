@@ -278,6 +278,21 @@ impl H2Frame {
         payload.extend_from_slice(&error_code.to_be_bytes());
         Self::new(H2_FRAME_GOAWAY, 0, 0, payload)
     }
+
+    /// Build a GOAWAY frame with `Additional Debug Data` per RFC 9113 §6.8.
+    ///
+    /// Used by the peer-initiated abort tests to mirror real-world frontends
+    /// (HAProxy chains) that attach a short `debug_data` payload describing
+    /// the abort reason. The 8-byte header (`last_stream_id` + `error_code`)
+    /// is followed by `debug` bytes verbatim.
+    #[allow(dead_code)]
+    pub(crate) fn goaway_with_debug(last_stream_id: u32, error_code: u32, debug: &[u8]) -> Self {
+        let mut payload = Vec::with_capacity(8 + debug.len());
+        payload.extend_from_slice(&(last_stream_id & 0x7FFFFFFF).to_be_bytes());
+        payload.extend_from_slice(&error_code.to_be_bytes());
+        payload.extend_from_slice(debug);
+        Self::new(H2_FRAME_GOAWAY, 0, 0, payload)
+    }
 }
 
 // ============================================================================

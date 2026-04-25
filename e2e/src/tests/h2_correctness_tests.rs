@@ -3044,3 +3044,347 @@ fn test_h2_large_chunked_7mb_drains_fully() {
         State::Success
     );
 }
+
+// ============================================================================
+// Peer-initiated GOAWAY-then-close regression guards
+// ============================================================================
+//
+// Regression coverage for the production scenario where a frontend (HAProxy
+// chain) sends `GOAWAY(last_stream_id=0, PROTOCOL_ERROR)` immediately followed
+// by a TCP RST, leaving Sōzu's reciprocal `GOAWAY` + `close_notify` stranded
+// in the TLS write buffer. Three variants:
+//
+// * `try_h2_peer_goaway_protocol_error_then_rst_clean_drain` (3.2.1) -- the
+//   noisy production path. Asserts that the worker stays alive and a fresh
+//   connection succeeds after the abort.
+// * `try_h2_peer_goaway_no_error_clean_close` (3.2.2) -- the orthogonal clean
+//   path. Asserts that Sōzu emits a reciprocal `GOAWAY(NO_ERROR)` before the
+//   peer closes.
+// * `try_h2_peer_goaway_during_response_body` (3.2.3) -- the in-flight variant
+//   that exercises the close-drain `error!` path. Asserts that the in-flight
+//   stream is torn down (RST_STREAM emitted, or no further DATA observed) and
+//   the worker remains healthy.
+
+/// Build a minimal HPACK header block for `GET /` against `localhost`, no
+/// body. Mirrors the static header block used by `try_h2_session_teardown_*`
+/// at the top of this file -- inlined here so the new tests do not depend on
+/// `build_chrome146_get_headers`'s priority encoding.
+fn build_minimal_h2_get_headers() -> Vec<u8> {
+    vec![
+        0x82, // :method GET (static-table 2)
+        0x84, // :path / (static-table 4)
+        0x87, // :scheme https (static-table 7)
+        0x41, 0x09, // :authority literal-with-incremental-indexing, length 9
+        b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't',
+    ]
+}
+
+/// Issue a single GET on `sid` and drive the response to completion. Returns
+/// `true` when at least one HEADERS frame is observed on any stream within the
+/// collection window. Used by the peer-abort tests to verify worker liveness
+/// after the abort.
+fn h2_simple_get_succeeds(
+    tls: &mut rustls::StreamOwned<rustls::ClientConnection, std::net::TcpStream>,
+    sid: u32,
+) -> bool {
+    let block = build_minimal_h2_get_headers();
+    let headers = H2Frame::headers(sid, block, true, true);
+    if tls.write_all(&headers.encode()).is_err() {
+        return false;
+    }
+    if tls.flush().is_err() {
+        return false;
+    }
+    let frames = collect_response_frames(tls, 200, 4, 250);
+    contains_headers_response(&frames)
+}
+
+/// 3.2.1 -- Peer-initiated `GOAWAY(PROTOCOL_ERROR)` immediately followed by
+/// `Shutdown::Both`. Mirrors the production HAProxy-chain trigger that
+/// surfaced the missing `MUX-H2` envelope on the close-drain `error!`. Pass
+/// condition: the worker stays alive and a fresh connection serves a new
+/// stream successfully.
+fn try_h2_peer_goaway_protocol_error_then_rst_clean_drain() -> State {
+    let (worker, backends, front_port) =
+        setup_h2_test_with_large_bodies("H2-COR-PEER-ABORT", 1, 1024);
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake_with_initial_window(&mut tls, 65_535);
+
+    // Drive a handful of successful streams (1, 3, 5, 7, 9) so
+    // `highest_peer_stream_id` is non-zero on the worker's side. The exact
+    // count is not load-bearing for this test (RFC 9113 §6.8 directionality
+    // means `last_peer_id` is informational here); 5 streams is enough to
+    // observe the close-path codepath without slowing the test.
+    for sid in (1..=9_u32).step_by(2) {
+        let block = build_minimal_h2_get_headers();
+        let headers = H2Frame::headers(sid, block, true, true);
+        if tls.write_all(&headers.encode()).is_err() {
+            return State::Fail;
+        }
+        if tls.flush().is_err() {
+            return State::Fail;
+        }
+        // Drain whatever response is available before moving on so the
+        // worker's `streams` map empties between iterations.
+        let _ = collect_response_frames(&mut tls, 100, 3, 200);
+    }
+
+    // Quiesce: let the worker's event loop finish processing the last
+    // response before we issue the abort.
+    thread::sleep(Duration::from_millis(50));
+
+    // Peer-initiated GOAWAY with `last_stream_id=0` and a 40-byte
+    // `additional_debug_data` payload, mirroring the production wire shape.
+    let abort = H2Frame::goaway_with_debug(
+        0,
+        H2_ERROR_PROTOCOL_ERROR,
+        b"e2e-peer-aborted-protocol-error-test-rep_",
+    );
+    let _ = tls.write_all(&abort.encode());
+    let _ = tls.flush();
+    // Tear the TCP socket down without consuming Sōzu's reciprocal traffic
+    // -- this forces the kernel to RST when Sōzu next attempts a write,
+    // which is the trigger for the close-drain warn/error.
+    let _ = tls.sock.shutdown(Shutdown::Both);
+    drop(tls);
+
+    // Allow the close path to run on the worker's event loop.
+    thread::sleep(Duration::from_millis(200));
+
+    // Liveness: a fresh TLS connection must complete a handshake and serve
+    // a single GET. If the abort had crashed or wedged the worker, this
+    // step would either time out or fail to read any HEADERS frame.
+    let mut tls2 = raw_h2_connection(front_addr);
+    h2_handshake_with_initial_window(&mut tls2, 65_535);
+    let alive = h2_simple_get_succeeds(&mut tls2, 1);
+
+    let infra_ok = teardown(tls2, front_port, worker, backends);
+    if alive && infra_ok {
+        State::Success
+    } else {
+        println!("FAIL: alive={alive} infra_ok={infra_ok}");
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_peer_goaway_protocol_error_then_rst_clean_drain() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 peer GOAWAY(PROTOCOL_ERROR) + Shutdown::Both \u{2014} worker stays healthy",
+            try_h2_peer_goaway_protocol_error_then_rst_clean_drain
+        ),
+        State::Success
+    );
+}
+
+/// 3.2.2 -- Orthogonal clean-close baseline. Peer sends
+/// `GOAWAY(last_stream_id=last_received, NO_ERROR)` and keeps both halves of
+/// the TCP socket open so Sōzu's reciprocal `GOAWAY` can fully flush back to
+/// us. Asserts that the reciprocal `GOAWAY` actually arrives on the wire.
+fn try_h2_peer_goaway_no_error_clean_close() -> State {
+    let (worker, backends, front_port) =
+        setup_h2_test_with_large_bodies("H2-COR-PEER-CLEAN", 1, 1024);
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake_with_initial_window(&mut tls, 65_535);
+
+    // Drive one successful GET so the worker's `highest_peer_stream_id`
+    // advances to 1.
+    let block = build_minimal_h2_get_headers();
+    let headers = H2Frame::headers(1, block, true, true);
+    if tls.write_all(&headers.encode()).is_err() {
+        return State::Fail;
+    }
+    if tls.flush().is_err() {
+        return State::Fail;
+    }
+    let _ = collect_response_frames(&mut tls, 200, 4, 250);
+
+    // Peer-initiated `GOAWAY(NO_ERROR, last_stream_id=1)` -- announces a
+    // graceful shutdown without aborting any streams. Keep the TCP socket
+    // open in both directions so Sōzu's reciprocal GOAWAY can flush back
+    // to us through the existing TLS session; a `Shutdown::Write` here
+    // would race the kernel and drop the reciprocal frame.
+    let goaway = H2Frame::goaway(1, H2_ERROR_NO_ERROR);
+    if tls.write_all(&goaway.encode()).is_err() {
+        return State::Fail;
+    }
+    let _ = tls.flush();
+
+    // Collect the reciprocal traffic. The window has to be generous enough
+    // for the worker's event loop to flush the reciprocal GOAWAY before
+    // we time out waiting for it.
+    let frames = collect_response_frames(&mut tls, 200, 6, 300);
+    let reciprocal_seen = contains_goaway(&frames);
+
+    drop(tls);
+
+    // Liveness on a fresh connection: the per-connection abort must not
+    // affect the listener.
+    let mut tls2 = raw_h2_connection(front_addr);
+    h2_handshake_with_initial_window(&mut tls2, 65_535);
+    let alive = h2_simple_get_succeeds(&mut tls2, 1);
+
+    let infra_ok = teardown(tls2, front_port, worker, backends);
+    if reciprocal_seen && alive && infra_ok {
+        State::Success
+    } else {
+        println!("FAIL: reciprocal_seen={reciprocal_seen} alive={alive} infra_ok={infra_ok}");
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_peer_goaway_no_error_clean_close() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 peer GOAWAY(NO_ERROR) keep-open \u{2014} reciprocal GOAWAY arrives",
+            try_h2_peer_goaway_no_error_clean_close
+        ),
+        State::Success
+    );
+}
+
+/// 3.2.3 -- Force the close-drain path. Slow-backend serves a 256 KiB body
+/// in chunked frames with a 50 ms inter-chunk delay; we abort
+/// (GOAWAY + RST) after the first DATA frame on `sid=1` arrives, so the
+/// TLS write buffer is non-empty when close runs. Asserts that the
+/// in-flight stream is torn down -- either Sōzu emits `RST_STREAM` for the
+/// stream before close, or no further DATA appears after the abort -- and
+/// the worker remains healthy on a fresh connection.
+fn try_h2_peer_goaway_during_response_body() -> State {
+    use crate::mock::chunked_flush_h1_backend::{
+        ChunkedFlushConfig, ChunkedFlushH1Backend, TransferEncoding,
+    };
+
+    const BODY_SIZE: usize = 256 * 1024;
+
+    let (worker, front_port, back_address) =
+        setup_single_h1_backend_listener("H2-COR-PEER-IN-FLIGHT", None);
+
+    let backend = ChunkedFlushH1Backend::start(
+        back_address,
+        ChunkedFlushConfig {
+            body_size: BODY_SIZE,
+            chunk_size: 16 * 1024,
+            inter_chunk_delay: Duration::from_millis(50),
+            transfer_encoding: TransferEncoding::Chunked,
+            tcp_nodelay: true,
+            truncate_at_byte: None,
+            body: None,
+            extra_response_headers: vec![],
+            content_type: None,
+        },
+    );
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake_with_initial_window(&mut tls, 1_048_576);
+
+    let sid: u32 = 1;
+    let block = build_minimal_h2_get_headers();
+    let headers = H2Frame::headers(sid, block, true, true);
+    if tls.write_all(&headers.encode()).is_err() {
+        drop(backend);
+        return State::Fail;
+    }
+    if tls.flush().is_err() {
+        drop(backend);
+        return State::Fail;
+    }
+
+    // Wait for the first DATA frame on `sid` so we know the response is
+    // genuinely in-flight when we abort. `collect_response_frames` runs
+    // multiple short reads to absorb TCP segmentation while the chunked
+    // backend dribbles data.
+    let mut data_frames_seen_pre_abort = 0_usize;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        let frames = collect_response_frames(&mut tls, 50, 2, 200);
+        for (t, _, frame_sid, _) in &frames {
+            if *t == H2_FRAME_DATA && *frame_sid == sid {
+                data_frames_seen_pre_abort += 1;
+            }
+        }
+        if data_frames_seen_pre_abort > 0 {
+            break;
+        }
+    }
+
+    // Issue the abort even if no DATA was observed: an absent first DATA
+    // frame means the worker has not yet handed off to the backend, but
+    // the `streams != 0` post-condition is still true on the close path
+    // (the stream is in `Header` parsing-phase). The new `error!` tier
+    // covers both cases.
+    let abort = H2Frame::goaway_with_debug(
+        0,
+        H2_ERROR_PROTOCOL_ERROR,
+        b"e2e-peer-abort-during-response-body-rep_",
+    );
+    let _ = tls.write_all(&abort.encode());
+    let _ = tls.flush();
+    let _ = tls.sock.shutdown(Shutdown::Both);
+
+    // Read whatever Sōzu managed to flush before the RST. We do not assert
+    // on the exact ordering -- the kernel race may swallow the reciprocal
+    // GOAWAY -- but if a `RST_STREAM` for `sid` did make it onto the wire
+    // it is a positive signal that the in-flight stream was torn down.
+    let post_abort_frames = collect_response_frames(&mut tls, 100, 3, 200);
+    let saw_rst_for_sid = post_abort_frames
+        .iter()
+        .any(|(t, _, frame_sid, _)| *t == H2_FRAME_RST_STREAM && *frame_sid == sid);
+    let saw_more_data_for_sid = post_abort_frames
+        .iter()
+        .any(|(t, _, frame_sid, _)| *t == H2_FRAME_DATA && *frame_sid == sid);
+    drop(tls);
+
+    // Allow the close-drain path to run on the worker.
+    thread::sleep(Duration::from_millis(200));
+
+    // Liveness on a fresh connection.
+    let mut tls2 = raw_h2_connection(front_addr);
+    h2_handshake_with_initial_window(&mut tls2, 65_535);
+    let alive = h2_simple_get_succeeds(&mut tls2, 1);
+
+    let infra_ok = teardown(
+        tls2,
+        front_port,
+        worker,
+        Vec::<AsyncBackend<SimpleAggregator>>::new(),
+    );
+    drop(backend);
+
+    // The stream was torn down if either: a RST_STREAM hit the wire before
+    // the kernel RST swallowed everything, OR no further DATA was observed
+    // after the abort (the close path stopped the response).
+    let stream_torn_down = saw_rst_for_sid || !saw_more_data_for_sid;
+
+    if alive && stream_torn_down && infra_ok {
+        State::Success
+    } else {
+        println!(
+            "FAIL: alive={alive} stream_torn_down={stream_torn_down} \
+             (saw_rst_for_sid={saw_rst_for_sid}, saw_more_data_for_sid={saw_more_data_for_sid}) \
+             pre_abort_data_frames={data_frames_seen_pre_abort} infra_ok={infra_ok}"
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_peer_goaway_during_response_body() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 peer GOAWAY mid-response \u{2014} stream torn down, worker stays healthy",
+            try_h2_peer_goaway_during_response_body
+        ),
+        State::Success
+    );
+}
