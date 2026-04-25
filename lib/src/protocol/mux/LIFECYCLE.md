@@ -4,10 +4,12 @@ Reference document for maintainers of the HTTP/1.1 + HTTP/2 multiplexing layer
 under `lib/src/protocol/mux/`.
 
 Every claim below is anchored to a concrete `file.rs:LINE` so you can jump
-straight to the code. Line numbers reflect the `feat/h2-mux` branch at the time
-this file was written; if you land a refactor that moves any of them, please
-update the citations in the same changeset — stale pointers here are treated
-as broken documentation.
+straight to the code. **Line numbers were last refreshed against HEAD
+`bcd977f1` on the `feat/h2-mux` branch.** If you land a refactor that
+moves any of them, please update the citations in the same changeset —
+stale pointers here are treated as broken documentation. When the file
+moves out from under prose pointers, fall back to the symbol name
+(`grep -n` / `rg --type rust`) and prefer that anchor in the next sweep.
 
 Scope: the server-side frontend path is the primary subject, because that is
 where the dangerous invariants live. The client-side (backend) path is covered
@@ -38,11 +40,11 @@ implementation depending on what the frontend negotiated.
 
 Two orthogonal structs hold H2 session state:
 
-- [`ConnectionH2<Front>`] — `lib/src/protocol/mux/h2.rs:980` — **per-connection**
+- [`ConnectionH2<Front>`] — `lib/src/protocol/mux/h2.rs:1217` — **per-connection**
   wire-level state: HPACK coders, frame-parser state (`H2State`), flow control
   window, flood counters, priority map, `self.streams: HashMap<StreamId,
   GlobalStreamId>`.
-- [`Context<L>`] — `lib/src/protocol/mux/mod.rs:337` — **per-session** stream
+- [`Context<L>`] — `lib/src/protocol/mux/mod.rs:339` — **per-session** stream
   buffers and routing data: `context.streams: Vec<Stream>`, `pending_links`,
   `backend_streams`, pool handle, listener, debug history.
 
@@ -67,22 +69,22 @@ index.
 
 | Type | Declaration | Purpose |
 |---|---|---|
-| `Mux<Front, L>` | `mod.rs:518` | Top-level session state |
-| `Context<L>` | `mod.rs:337` | Per-session context |
-| `Connection<Front>` | `connection.rs:54` | `H1 | H2` dispatch |
-| `ConnectionH2<Front>` | `h2.rs:980` | H2 connection state |
+| `Mux<Front, L>` | `mod.rs:568` | Top-level session state |
+| `Context<L>` | `mod.rs:339` | Per-session context |
+| `Connection<Front>` | `connection.rs:49` | `H1 | H2` dispatch |
+| `ConnectionH2<Front>` | `h2.rs:1217` | H2 connection state |
 | `ConnectionH1<Front>` | `h1.rs` (struct `ConnectionH1`) | H1 connection state |
-| `Stream` | `stream.rs:59` | Per-request buffers + HTTP context |
-| `StreamState` | `stream.rs:40` | `Idle`/`Link`/`Linked`/`Unlinked`/`Recycle` |
-| `H2State` | `h2.rs:778` | H2 connection-level state machine |
-| `H2StreamId` | `h2.rs:1095` | `Zero` or `Other { id, gid }` — used by `expect_read`/`expect_write` |
+| `Stream` | `stream.rs:54` | Per-request buffers + HTTP context |
+| `StreamState` | `stream.rs:35` | `Idle`/`Link`/`Linked`/`Unlinked`/`Recycle` |
+| `H2State` | `h2.rs:920` | H2 connection-level state machine |
+| `H2StreamId` | `h2.rs:1367` | `Zero` or `Other { id, gid }` — used by `expect_read`/`expect_write` |
 | `StreamId` (alias for `u32`) | `mod.rs:183` | On-the-wire H2 stream identifier |
 | `GlobalStreamId` (alias for `usize`) | `mod.rs:184` | Index into `context.streams` |
-| `H2FlowControl` | `h2.rs:953` | Connection-level send/recv window |
-| `H2DrainState` | `h2.rs:973` | Graceful-shutdown bookkeeping |
-| `H2ByteAccounting` | `h2.rs:963` | Overhead byte attribution |
-| `H2ConnectionConfig` | `h2.rs:360` | Per-listener tuning |
-| `H2FloodConfig` | `h2.rs:268` | CVE-mitigation thresholds |
+| `H2FlowControl` | `h2.rs:1179` | Connection-level send/recv window |
+| `H2DrainState` | `h2.rs:1199` | Graceful-shutdown bookkeeping |
+| `H2ByteAccounting` | `h2.rs:1189` | Overhead byte attribution |
+| `H2ConnectionConfig` | `h2.rs:388` | Per-listener tuning |
+| `H2FloodConfig` | `h2.rs:287` | CVE-mitigation thresholds |
 
 ---
 
@@ -92,18 +94,18 @@ index.
 
 1. The server-level session (HttpsSession / HttpSession) accepts a TCP
    connection, performs the TLS handshake, and upgrades to the mux protocol.
-2. `Connection::new_h2_server` (`connection.rs:132`) constructs a
+2. `Connection::new_h2_server` (`connection.rs:127`) constructs a
    `ConnectionH2` pre-seeded with:
    - `expect_read = Some((H2StreamId::Zero, CLIENT_PREFACE_SIZE))` —
-     24-byte preface + 9-byte SETTINGS header (`connection.rs:150`,
-     `h2.rs:187`).
+     24-byte preface + 9-byte SETTINGS header (see `h2.rs::CLIENT_PREFACE_SIZE`).
    - `readiness.interest = READABLE | HUP | ERROR`.
-3. The event loop fires `ready()` in `mod.rs:627` which dispatches to
-   `Connection::readable` → `ConnectionH2::readable` (`h2.rs:1607`).
+3. The event loop fires `ready()` which dispatches to
+   `Connection::readable` (`connection.rs:231`) → `ConnectionH2::readable`
+   (`h2.rs:1880`).
 
 ### 2.2 Connection state machine (`H2State`)
 
-Declared at `h2.rs:778` (`pub enum H2State`):
+Declared at `h2.rs:920` (`pub enum H2State`):
 
 ```
                  ClientPreface                 ← server read: 24B magic + 9B SETTINGS header
@@ -141,11 +143,11 @@ Declared at `h2.rs:778` (`pub enum H2State`):
 
 | Method | Definition | Called from |
 |---|---|---|
-| `ConnectionH2::readable` | `h2.rs:1607` | `Mux::ready` when `READABLE` asserted (`mod.rs:667`) |
-| `ConnectionH2::writable` | `h2.rs:2445` | `Mux::ready` when `WRITABLE` asserted (`mod.rs:969`) |
-| `ConnectionH2::close` | `h2.rs:4256` | `Mux::close` (`mod.rs:1519`) and dead-backend cleanup |
-| `ConnectionH2::graceful_goaway` | `h2.rs:3051` | `Mux::shutting_down` (`mod.rs:1596`) |
-| `ConnectionH2::cancel_timed_out_streams` | `h2.rs:2823` | top of every `readable()` call (`h2.rs:1616`) |
+| `ConnectionH2::readable` | `h2.rs:1880` | `Mux::ready` when `READABLE` asserted |
+| `ConnectionH2::writable` | `h2.rs:3001` | `Mux::ready` when `WRITABLE` asserted |
+| `ConnectionH2::close` | `h2.rs:5117` | `Mux::close` and dead-backend cleanup |
+| `ConnectionH2::graceful_goaway` | `h2.rs:3751` | `Mux::shutting_down` (`mod.rs:1669`) |
+| `ConnectionH2::cancel_timed_out_streams` | `h2.rs:3392` | top of every `readable()` call |
 
 ### 2.4 Termination triggers
 
@@ -253,8 +255,8 @@ runs — see §6.
 - Index: `GlobalStreamId = usize` (`mod.rs:184`).
 - Mutated by:
   - push — `create_stream` when no `Recycle` slot is available
-    (`mod.rs:482-484`).
-  - pop — `shrink_trailing_recycle` (`mod.rs:491-499`).
+    (`mod.rs:471`).
+  - pop — `shrink_trailing_recycle` (`mod.rs:541-549`).
   - in-place state edits — everywhere.
 
 ### 4.3 Invariants
@@ -278,14 +280,14 @@ request pipelining with at most one live stream at a time.
 
 ### 5.1 The fields
 
-Both declared on `ConnectionH2` (`h2.rs:988-989`):
+Both declared on `ConnectionH2` (`h2.rs:1225-1226`):
 
 ```rust
 pub expect_read:  Option<(H2StreamId, usize)>,  // (id, remaining bytes)
 pub expect_write: Option<H2StreamId>,
 ```
 
-`H2StreamId` (`h2.rs:1095`):
+`H2StreamId` (`h2.rs:1367`):
 
 ```rust
 pub enum H2StreamId {
@@ -333,14 +335,14 @@ can therefore become out-of-bounds later on if:
 Step 1 happens in every `remove_dead_stream` caller and in every reset /
 cancel path (see §8). Step 2 happens on every `create_stream` call that
 finds a recycled slot to reuse and then crosses the shrink ratio
-(`mod.rs:473-479`). Step 3 follows automatically.
+(`mod.rs:527-528`). Step 3 follows automatically.
 
 ### 5.4 Who invalidates these fields
 
 **Every site that removes a stream from `self.streams` is responsible for
 invalidating both `expect_write` and `expect_read` when they reference
 that stream's `gid`.** The canonical invalidation helper is
-`ConnectionH2::remove_dead_stream` (`h2.rs:2201`), which:
+`ConnectionH2::remove_dead_stream` (`h2.rs:2694`), which:
 
 ```rust
 if matches!(self.expect_write, Some(H2StreamId::Other { gid, .. }) if gid == global_stream_id) {
