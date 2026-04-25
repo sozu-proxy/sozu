@@ -3,6 +3,7 @@ use std::{cell::RefCell, io::Write, rc::Rc};
 use mio::{Token, net::TcpStream};
 use nom::{Err, Offset};
 use rusty_ulid::Ulid;
+use sozu_command::logging::ansi_palette;
 
 use crate::{
     Protocol, Readiness, SessionMetrics, SessionResult,
@@ -15,6 +16,41 @@ use crate::{
     sozu_command::ready::Ready,
     tcp::TcpListener,
 };
+
+/// Module-level prefix used on every log line emitted from this module when
+/// no per-session state is in scope. Produces a bold bright-white
+/// `PROXY-RELAY` label (uniform across every protocol) when the logger is in
+/// colored mode.
+#[allow(unused_macros)]
+macro_rules! log_module_context {
+    () => {{
+        let (open, reset, _, _, _) = ansi_palette();
+        format!("{open}PROXY-RELAY{reset}\t >>>", open = open, reset = reset)
+    }};
+}
+
+/// Per-session prefix for log lines emitted with a [`RelayProxyProtocol`] in
+/// scope. Renders the canonical
+/// `\tPROXY-RELAY\tSession(...)\t >>>` envelope. The relay state has no
+/// `request_id`-keyed [`LogContext`] (the caller-side ulid is not yet bound
+/// to a request); the bracket carries the front/back tokens instead.
+macro_rules! log_context {
+    ($self:expr) => {{
+        let (open, reset, grey, gray, white) = ansi_palette();
+        format!(
+            "{open}PROXY-RELAY{reset}\t{grey}Session{reset}({gray}frontend{reset}={white}{frontend}{reset}, {gray}backend{reset}={white}{backend}{reset}, {gray}front_readiness{reset}={white}{front_readiness}{reset}, {gray}back_readiness{reset}={white}{back_readiness}{reset})\t >>>",
+            open = open,
+            reset = reset,
+            grey = grey,
+            gray = gray,
+            white = white,
+            frontend = $self.frontend_token.0,
+            backend = $self.backend_token.map(|t| t.0.to_string()).unwrap_or_else(|| "<none>".to_string()),
+            front_readiness = $self.frontend_readiness,
+            back_readiness = $self.backend_readiness,
+        )
+    }};
+}
 
 pub struct RelayProxyProtocol<Front: SocketHandler> {
     cursor_header: usize,
@@ -62,10 +98,7 @@ impl<Front: SocketHandler> RelayProxyProtocol<Front> {
 
     pub fn readable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
         let (sz, res) = self.frontend.socket_read(self.frontend_buffer.space());
-        debug!(
-            "FRONT proxy protocol [{:?}]: read {} bytes and res={:?}",
-            self.frontend_token, sz, res
-        );
+        debug!("{} read {} bytes and res={:?}", log_context!(self), sz, res);
 
         if sz > 0 {
             self.frontend_buffer.fill(sz);
@@ -75,8 +108,8 @@ impl<Front: SocketHandler> RelayProxyProtocol<Front> {
 
             if res == SocketResult::Error {
                 error!(
-                    "[{:?}] front socket error, closing the connection",
-                    self.frontend_token
+                    "{} front socket error, closing the connection",
+                    log_context!(self)
                 );
                 incr!("proxy_protocol.errors");
                 self.frontend_readiness.reset();
@@ -97,8 +130,9 @@ impl<Front: SocketHandler> RelayProxyProtocol<Front> {
                 Err(Err::Incomplete(_)) => return SessionResult::Continue,
                 Err(e) => {
                     error!(
-                        "[{:?}] error parsing the proxy protocol header(error={:?}), closing the connection",
-                        self.frontend_token, e
+                        "{} error parsing the proxy protocol header (error={:?}), closing the connection",
+                        log_context!(self),
+                        e
                     );
                     return SessionResult::Close;
                 }
@@ -115,7 +149,7 @@ impl<Front: SocketHandler> RelayProxyProtocol<Front> {
     // The header is send immediately at once upon the connection is establish
     // and prepended before any data.
     pub fn back_writable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
-        debug!("Writing proxy protocol header");
+        debug!("{} writing proxy protocol header", log_context!(self));
 
         if let Some(ref mut socket) = self.backend {
             if let Some(ref header_size) = self.header_size {
@@ -129,7 +163,7 @@ impl<Front: SocketHandler> RelayProxyProtocol<Front> {
                             self.frontend_buffer.consume(sz);
 
                             if self.cursor_header >= *header_size {
-                                info!("Proxy protocol sent, upgrading");
+                                info!("{} proxy protocol sent, upgrading", log_context!(self));
                                 return SessionResult::Upgrade;
                             }
                         }
@@ -137,7 +171,7 @@ impl<Front: SocketHandler> RelayProxyProtocol<Front> {
                             incr!("proxy_protocol.errors");
                             self.frontend_readiness.reset();
                             self.backend_readiness.reset();
-                            debug!("PROXY PROTOCOL {}", e);
+                            debug!("{} write error: {}", log_context!(self), e);
                             break;
                         }
                     }
