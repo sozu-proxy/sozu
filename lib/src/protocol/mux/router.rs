@@ -408,11 +408,37 @@ impl Router {
                     token,
                     Interest::READABLE | Interest::WRITABLE,
                 ) {
+                    // SECURITY (CWE-400): treat mio registration failure as a
+                    // hard connect failure. Without this rollback the gauges
+                    // (`backend.connections`, `backend.pool.size`,
+                    // `connections_per_backend`), the slab session, and the
+                    // already-incremented `Backend.active_requests` counter
+                    // (bumped in `Connection::start_stream` ->
+                    // `pre_start_stream_client_bookkeeping`) all leak until
+                    // the connect timeout fires. Under fd pressure
+                    // (EMFILE/ENFILE) this can occur in tight bursts and
+                    // poison capacity dashboards.
                     error!(
-                        "{} error registering back socket: {:?}",
+                        "{} error registering back socket: {:?} — rolling back",
                         log_module_context!(context.http_context(stream_id)),
                         e
                     );
+                    // Undo the gauge increments committed above.
+                    gauge_add!("backend.connections", -1);
+                    gauge_add!("backend.pool.size", -1);
+                    gauge_add!(
+                        "connections_per_backend",
+                        -1,
+                        Some(&cluster_id),
+                        Some(&backend_id_for_gauge)
+                    );
+                    // Drop the slab session and the connection. The connection
+                    // is local to this scope; dropping it here also closes the
+                    // underlying TcpStream and releases the
+                    // `Backend.active_requests` increment via the regular
+                    // session drop path (`pre_close_client_bookkeeping`).
+                    proxy.borrow().remove_session(token);
+                    return Err(BackendConnectionError::MaxSessionsMemory);
                 }
             }
 
