@@ -176,7 +176,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             tls_alpn: None,
         };
 
-        trace!("created pipe");
+        trace!("{} created pipe", log_context!(session));
         session
     }
 
@@ -423,7 +423,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
     pub fn readable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
         self.reset_timeouts();
 
-        trace!("pipe readable");
+        trace!("{} pipe readable", log_context!(self));
         if self.frontend_buffer.available_space() == 0 {
             self.frontend_readiness.interest.remove(Ready::READABLE);
             self.backend_readiness.interest.insert(Ready::WRITABLE);
@@ -566,7 +566,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
 
     // Forward content to cluster
     pub fn backend_writable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
-        trace!("pipe back_writable");
+        trace!("{} pipe back_writable", log_context!(self));
 
         if self.frontend_buffer.available_data() == 0 {
             self.frontend_readiness.interest.insert(Ready::READABLE);
