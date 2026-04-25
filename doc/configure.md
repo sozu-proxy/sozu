@@ -38,6 +38,7 @@ Parameters in the global section allow you to define the global settings shared 
 | `max_buffers`              | maximum number of buffers use to proxying                                           |                                          |
 | `min_buffers`              | minimum number of buffers preallocated for proxying                                 |                                          |
 | `buffer_size`              | size, in bytes, of requests buffer used by the workers. Must be at least 16393 for HTTP/2 (16384 max frame size + 9 byte frame header) |                                          |
+| `slab_entries_per_connection` | how many slab entries each `max_connections` reserves. Defaults to 4 (1 frontend + up to 3 backend H2 connections). Raise for fan-out topologies that exceed 4 backends per session; clamped to [2, 32]. Slab capacity is `10 + slab_entries_per_connection * max_connections`. | integer 2-32 |
 | `ctl_command_timeout`      | maximum time the command line will wait for a command to complete                            |                                          |
 | `pid_file_path`            | stores the pid in a specific file location                                          |                                          |
 | `front_timeout`            | maximum time of inactivity for a front socket                                       |                                          |
