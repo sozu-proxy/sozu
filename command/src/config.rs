@@ -250,6 +250,18 @@ pub enum ConfigError {
     },
     #[error("Invalid ALPN protocol '{0}'. Valid values: \"h2\", \"http/1.1\"")]
     InvalidAlpnProtocol(String),
+    /// `disable_http11 = true` and `alpn_protocols` containing `"http/1.1"`
+    /// are mutually exclusive (Lisa LISA-TLS-004): the proxy advertises
+    /// `http/1.1` to peers, then refuses every connection that negotiates
+    /// it. The combination is a self-DoS at handshake time. Either drop
+    /// `http/1.1` from `alpn_protocols` or unset `disable_http11`.
+    #[error(
+        "disable_http11 = true is incompatible with alpn_protocols containing \"http/1.1\" \
+         on listener {address}. The proxy would advertise http/1.1 then refuse every \
+         connection that negotiates it. Drop \"http/1.1\" from alpn_protocols or unset \
+         disable_http11."
+    )]
+    DisableHttp11WithHttp11Alpn { address: String },
     /// `buffer_size` is below the H2 minimum (16 393 bytes) but at least one
     /// HTTPS listener advertises `h2` in its ALPN list. The H2 mux requires
     /// 16 384-byte frame payload + 9-byte header to fit in a single kawa
@@ -675,6 +687,17 @@ impl ListenerBuilder {
                         other => return Err(ConfigError::InvalidAlpnProtocol(other.to_owned())),
                     }
                 }
+                // Lisa LISA-TLS-004: disable_http11 + http/1.1 ALPN is a
+                // self-DoS — every connection negotiates http/1.1 then is
+                // immediately refused at `https.rs::upgrade_handshake`.
+                // Reject the combination at config load.
+                if self.disable_http11.unwrap_or(false)
+                    && protos.iter().any(|p| p == "http/1.1")
+                {
+                    return Err(ConfigError::DisableHttp11WithHttp11Alpn {
+                        address: self.address.to_string(),
+                    });
+                }
                 if !protos.iter().any(|p| p == "http/1.1") {
                     warn!(
                         "ALPN protocols do not include 'http/1.1'. Clients without H2 support will fail TLS negotiation."
@@ -688,10 +711,22 @@ impl ListenerBuilder {
                     .cloned()
                     .collect()
             }
-            _ => DEFAULT_ALPN_PROTOCOLS
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
+            _ => {
+                // Same self-DoS check on the default ALPN list (which
+                // contains "http/1.1") — `disable_http11 = true` with the
+                // implicit default ALPN must also be rejected.
+                if self.disable_http11.unwrap_or(false)
+                    && DEFAULT_ALPN_PROTOCOLS.iter().any(|p| *p == "http/1.1")
+                {
+                    return Err(ConfigError::DisableHttp11WithHttp11Alpn {
+                        address: self.address.to_string(),
+                    });
+                }
+                DEFAULT_ALPN_PROTOCOLS
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect()
+            }
         };
 
         let versions = match self.tls_versions {
