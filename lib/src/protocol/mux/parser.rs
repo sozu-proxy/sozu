@@ -244,6 +244,24 @@ pub fn preface(i: &[u8]) -> IResult<&[u8], &[u8]> {
     tag(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")(i)
 }
 
+/// `if !$cond { return FrameSizeError; }` wrapping macro for the seven
+/// fixed-size H2 frame validators in `frame_body`. Pure dispatch — the
+/// nom Err / ParserError construction stays here so callers read like
+/// the spec citation instead of a four-line ceremony.
+///
+/// `$cond` is the **passes** predicate (e.g. `header.payload_len ==
+/// PING_PAYLOAD_SIZE`); the macro converts the negation into the bail.
+macro_rules! ensure_frame_size {
+    ($input:expr, $cond:expr) => {
+        if !($cond) {
+            return Err(Err::Failure(ParserError::new_h2(
+                $input,
+                H2Error::FrameSizeError,
+            )));
+        }
+    };
+}
+
 // https://httpwg.org/specs/rfc7540.html#rfc.section.4.1
 //
 // Codex G12 invariant (production caller contract):
@@ -371,68 +389,33 @@ pub fn frame_body<'a>(
         FrameType::Data => data_frame(i, header)?,
         FrameType::Headers => headers_frame(i, header)?,
         FrameType::Priority => {
-            if header.payload_len != PRIORITY_PAYLOAD_SIZE {
-                return Err(Err::Failure(ParserError::new_h2(
-                    i,
-                    H2Error::FrameSizeError,
-                )));
-            }
+            ensure_frame_size!(i, header.payload_len == PRIORITY_PAYLOAD_SIZE);
             priority_frame(i, header)?
         }
         FrameType::RstStream => {
-            if header.payload_len != RST_STREAM_PAYLOAD_SIZE {
-                return Err(Err::Failure(ParserError::new_h2(
-                    i,
-                    H2Error::FrameSizeError,
-                )));
-            }
+            ensure_frame_size!(i, header.payload_len == RST_STREAM_PAYLOAD_SIZE);
             rst_stream_frame(i, header)?
         }
         FrameType::PushPromise => push_promise_frame(i, header)?,
         FrameType::Continuation => continuation_frame(i, header)?,
         FrameType::Settings => {
             // RFC 9113 §6.5: SETTINGS ACK with non-zero payload is FRAME_SIZE_ERROR
-            if header.flags & FLAG_ACK != 0 && header.payload_len != 0 {
-                return Err(Err::Failure(ParserError::new_h2(
-                    i,
-                    H2Error::FrameSizeError,
-                )));
-            }
-            if header.payload_len % SETTINGS_ENTRY_SIZE != 0 {
-                return Err(Err::Failure(ParserError::new_h2(
-                    i,
-                    H2Error::FrameSizeError,
-                )));
-            }
+            ensure_frame_size!(i, !(header.flags & FLAG_ACK != 0 && header.payload_len != 0));
+            ensure_frame_size!(i, header.payload_len % SETTINGS_ENTRY_SIZE == 0);
             settings_frame(i, header)?
         }
         FrameType::Ping => {
-            if header.payload_len != PING_PAYLOAD_SIZE {
-                return Err(Err::Failure(ParserError::new_h2(
-                    i,
-                    H2Error::FrameSizeError,
-                )));
-            }
+            ensure_frame_size!(i, header.payload_len == PING_PAYLOAD_SIZE);
             ping_frame(i, header)?
         }
         FrameType::GoAway => {
             // RFC 9113 §6.8: GOAWAY payload is at least 8 bytes
             // (last-stream-id + error-code). Additional debug data may follow.
-            if header.payload_len < GOAWAY_PAYLOAD_SIZE {
-                return Err(Err::Failure(ParserError::new_h2(
-                    i,
-                    H2Error::FrameSizeError,
-                )));
-            }
+            ensure_frame_size!(i, header.payload_len >= GOAWAY_PAYLOAD_SIZE);
             goaway_frame(i, header)?
         }
         FrameType::WindowUpdate => {
-            if header.payload_len != WINDOW_UPDATE_PAYLOAD_SIZE {
-                return Err(Err::Failure(ParserError::new_h2(
-                    i,
-                    H2Error::FrameSizeError,
-                )));
-            }
+            ensure_frame_size!(i, header.payload_len == WINDOW_UPDATE_PAYLOAD_SIZE);
             window_update_frame(i, header)?
         }
         // RFC 9218 §7.1: PRIORITY_UPDATE payload must be ≥ 4 bytes.
