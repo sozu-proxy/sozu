@@ -29,6 +29,18 @@ macro_rules! log_module_context {
     }};
 }
 
+/// Per-trailer-block byte cap (Lisa LISA-101 trailer carve-out). HEADERS
+/// and trailers run independent budget counters against
+/// `SETTINGS_MAX_HEADER_LIST_SIZE`, so without a tighter trailer-only
+/// ceiling the effective per-stream cap doubles. Real-world gRPC trailer
+/// blocks observed in production are 1–4 KB; 8 KiB leaves comfortable
+/// headroom while denying a peer the chance to spend a second
+/// `MAX_HEADER_LIST_SIZE` worth of bytes after the request HEADERS were
+/// already accepted. True cumulative-per-stream tracking is a follow-up
+/// (it requires adding a `Stream::cumulative_header_bytes` field plumbed
+/// through every HEADERS / CONTINUATION / trailer entry point).
+pub const MAX_TRAILER_BYTES: usize = 8 * 1024;
+
 /// Returns true if the header name contains any uppercase ASCII letter (A-Z).
 /// RFC 9113 section 8.2 requires all header field names to be lowercase in HTTP/2.
 #[cfg(test)]
@@ -719,11 +731,29 @@ where
                         }
                         match host_value {
                             Some(ref existing) if existing.as_slice() != v.as_ref() => {
-                                // Multiple disagreeing ``host`` headers are
+                                // Multiple disagreeing `host` headers are
                                 // malformed (RFC 9110 §7.2 / §5.3.1) — reject.
                                 host_conflict = true;
                             }
-                            Some(_) => {}
+                            Some(_) => {
+                                // Lisa LISA-103: duplicate identical `host:`
+                                // headers are also malformed per RFC 9110
+                                // §7.2 ("a server MUST respond with a 400
+                                // (Bad Request) status code to any HTTP/1.1
+                                // request message that lacks a Host header
+                                // field and to any request message that
+                                // contains more than one Host header field
+                                // value or has any Host header field value
+                                // that is not a valid URI authority"). The
+                                // identical-value short-circuit was lenient
+                                // because two equal `host` values produce
+                                // the same wire shape after normalisation,
+                                // but the spec is strict on COUNT not on
+                                // VALUE. Reject so request smuggling that
+                                // relies on duplicate headers cannot hide
+                                // behind value equality.
+                                host_conflict = true;
+                            }
                             None => host_value = Some(v.to_vec()),
                         }
                     } else {
@@ -971,7 +1001,16 @@ pub fn handle_trailer(
     let mut invalid_trailers = false;
     let mut budget_exceeded = false;
     let mut decoded_bytes: usize = 0;
-    let max_decoded = max_header_list_size as usize;
+    // Lisa LISA-101: HEADERS and trailers each tracked an independent
+    // `decoded_bytes` counter against `max_header_list_size`, so the
+    // effective per-stream budget was `2 × MAX_HEADER_LIST_SIZE`
+    // (~128 KiB at the default). True per-stream cumulative tracking
+    // would require plumbing a shared counter through the `Stream`
+    // struct; in the interim, cap trailer-only budget at `MAX_TRAILER_BYTES`
+    // — well above legitimate gRPC trailer sizes (1-4 KB observed in the
+    // wild, RFC 9110 §6.5 imposes no minimum) and an order of magnitude
+    // tighter than the HEADERS cap.
+    let max_decoded = (max_header_list_size as usize).min(MAX_TRAILER_BYTES);
     let decode_status = decoder.decode_with_cb(input, |k, v| {
         if invalid_trailers || budget_exceeded {
             return;
