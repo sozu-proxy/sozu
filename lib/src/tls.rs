@@ -395,30 +395,48 @@ impl ResolvesServerCert for MutexCertificateResolver {
             name,
             sigschemes
         );
-        if let Ok(ref mut resolver) = self.0.try_lock() {
-            //resolver.domains.print();
-            if let Some((_, fingerprint)) = resolver.domains.domain_lookup(name.as_bytes(), true) {
-                trace!(
-                    "{} looking for certificate for {:?} with fingerprint {:?}",
+        // Lisa LISA-TLS-003: every other site uses blocking `lock()`,
+        // and silently falling back to `DEFAULT_CERTIFICATE` on lock
+        // contention is an attacker-detectable mismatch (different
+        // chain → different fingerprint) and a footgun the moment
+        // multi-threading enters the worker. Block here. Lock-poisoning
+        // (panic-while-holding) is mapped to the same default-cert
+        // fallback the previous `try_lock` Err arm produced — preserves
+        // the existing observable behaviour for that one corner case
+        // without inventing a new failure mode.
+        let resolver = match self.0.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                error!(
+                    "{} cert resolver mutex poisoned, returning default cert: {:?}",
                     log_module_context!(),
-                    name,
-                    fingerprint
+                    poisoned
                 );
-
-                let cert = resolver
-                    .certificates
-                    .get(fingerprint)
-                    .map(|cert| cert.inner.clone());
-
-                trace!(
-                    "{} found for fingerprint {}: {}",
-                    log_module_context!(),
-                    fingerprint,
-                    cert.is_some()
-                );
-                return cert;
+                return DEFAULT_CERTIFICATE.clone();
             }
+        };
+        if let Some((_, fingerprint)) = resolver.domains.domain_lookup(name.as_bytes(), true) {
+            trace!(
+                "{} looking for certificate for {:?} with fingerprint {:?}",
+                log_module_context!(),
+                name,
+                fingerprint
+            );
+
+            let cert = resolver
+                .certificates
+                .get(fingerprint)
+                .map(|cert| cert.inner.clone());
+
+            trace!(
+                "{} found for fingerprint {}: {}",
+                log_module_context!(),
+                fingerprint,
+                cert.is_some()
+            );
+            return cert;
         }
+        drop(resolver);
 
         // error!("could not look up a certificate for server name '{}'", name);
         // This certificate is used for TLS tunneling with another TLS termination endpoint

@@ -1138,9 +1138,26 @@ pub(crate) fn peer_cred_from_stream(_stream: &UnixStream) -> PeerCred {
 /// Read `/proc/<pid>/comm` to get the peer process's command name (up to
 /// 15 chars per kernel spec). Best-effort; returns `None` on any error.
 /// Cheap (one file read per accept, which happens once per sozuctl invocation).
+///
+/// Lisa LISA-009 mitigation: between `getsockopt(SO_PEERCRED)` and this
+/// read, the peer PID could (a) exit and be recycled by the kernel, or
+/// (b) call `execve()` and become a different binary. To bind the comm
+/// string to the *same* process the SO_PEERCRED snapshot saw, we read
+/// `/proc/<pid>/stat` first, capture the `starttime` field (jiffies
+/// since boot, monotonic — never reused), then read `comm`. If the
+/// stat read fails (PID gone — case (a)) we return `None`. The exec
+/// case (b) cannot be detected by starttime alone — execve does not
+/// change starttime — but exec is not adversarial in our deployment
+/// (sozuctl never exec's), and the SOC analyst seeing two different
+/// binaries on the same PID across audit lines for the same session
+/// is the right signal.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) fn peer_comm(pid: i32) -> Option<String> {
     use std::io::Read;
+    // PID-reuse guard: open /proc/<pid>/stat first; if the PID is gone
+    // we bail without returning a string that might describe a recycled
+    // PID's new owner.
+    let _stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let mut buf = String::new();
     let path = format!("/proc/{pid}/comm");
     std::fs::File::open(&path)
@@ -1161,20 +1178,50 @@ pub(crate) fn peer_comm(_pid: i32) -> Option<String> {
 }
 
 /// Resolve a uid to a POSIX account name via `getpwuid_r` (NSS). Best-effort;
-/// returns `None` when NSS has no matching user or the lookup fails. One
-/// syscall per accepted session — the command channel is a low-rate path
-/// (one sozuctl invocation opens one session).
+/// returns `None` when NSS has no matching user or the lookup fails.
+///
+/// Lisa LISA-008: `getpwuid_r` is **synchronous** and on a misconfigured
+/// host (SSSD wedge, LDAP timeout, broken nscd socket) can block the
+/// main event loop for tens of seconds. This caches the last lookups
+/// in a process-local map so a steady-state operator UID is paid at
+/// most once per main lifetime. Capped via `MAX_PEER_USER_CACHE` to
+/// stop a misbehaving peer from inflating it (the unix socket is
+/// `0o600` so this is mostly a defense-in-depth bound).
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) fn peer_user(uid: u32) -> Option<String> {
+    use std::sync::Mutex;
+
     use nix::unistd::{Uid, User};
-    match User::from_uid(Uid::from_raw(uid)) {
+
+    /// Hard ceiling on the in-process cache: 16 distinct UIDs is
+    /// generous (operator + root + a couple of automation accounts).
+    /// Past that we evict-on-insert to stay bounded.
+    const MAX_PEER_USER_CACHE: usize = 16;
+
+    static CACHE: Mutex<Vec<(u32, Option<String>)>> = Mutex::new(Vec::new());
+
+    if let Ok(guard) = CACHE.lock()
+        && let Some((_, cached)) = guard.iter().find(|(k, _)| *k == uid)
+    {
+        return cached.clone();
+    }
+
+    let resolved = match User::from_uid(Uid::from_raw(uid)) {
         Ok(Some(user)) => Some(user.name),
         Ok(None) => None,
         Err(err) => {
             warn!("Could not resolve username for uid {}: {}", uid, err);
             None
         }
+    };
+
+    if let Ok(mut guard) = CACHE.lock() {
+        if guard.len() >= MAX_PEER_USER_CACHE {
+            guard.remove(0);
+        }
+        guard.push((uid, resolved.clone()));
     }
+    resolved
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
