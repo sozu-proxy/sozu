@@ -691,9 +691,7 @@ impl ListenerBuilder {
                 // self-DoS — every connection negotiates http/1.1 then is
                 // immediately refused at `https.rs::upgrade_handshake`.
                 // Reject the combination at config load.
-                if self.disable_http11.unwrap_or(false)
-                    && protos.iter().any(|p| p == "http/1.1")
-                {
+                if self.disable_http11.unwrap_or(false) && protos.iter().any(|p| p == "http/1.1") {
                     return Err(ConfigError::DisableHttp11WithHttp11Alpn {
                         address: self.address.to_string(),
                     });
@@ -716,7 +714,7 @@ impl ListenerBuilder {
                 // contains "http/1.1") — `disable_http11 = true` with the
                 // implicit default ALPN must also be rejected.
                 if self.disable_http11.unwrap_or(false)
-                    && DEFAULT_ALPN_PROTOCOLS.iter().any(|p| *p == "http/1.1")
+                    && DEFAULT_ALPN_PROTOCOLS.contains(&"http/1.1")
                 {
                     return Err(ConfigError::DisableHttp11WithHttp11Alpn {
                         address: self.address.to_string(),
