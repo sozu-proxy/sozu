@@ -400,7 +400,10 @@ pub fn frame_body<'a>(
         FrameType::Continuation => continuation_frame(i, header)?,
         FrameType::Settings => {
             // RFC 9113 §6.5: SETTINGS ACK with non-zero payload is FRAME_SIZE_ERROR
-            ensure_frame_size!(i, !(header.flags & FLAG_ACK != 0 && header.payload_len != 0));
+            ensure_frame_size!(
+                i,
+                !(header.flags & FLAG_ACK != 0 && header.payload_len != 0)
+            );
             ensure_frame_size!(i, header.payload_len % SETTINGS_ENTRY_SIZE == 0);
             settings_frame(i, header)?
         }
