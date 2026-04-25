@@ -33,7 +33,7 @@ use crate::command::{
         DefaultGatherer, Gatherer, GatheringTask, MessageClient, Server, ServerState, Timeout,
         WorkerId,
     },
-    sessions::{ClientSession, OptionalClient},
+    sessions::{ClientSession, OptionalClient, sanitize_for_audit},
     upgrade::{upgrade_main, upgrade_worker},
 };
 
@@ -1343,7 +1343,16 @@ fn audit_record_to_json(
             map.insert("error_code".to_owned(), Value::String(code.to_string()));
         }
         if let Some(reason) = entry.extras.reason.as_deref() {
-            map.insert("reason".to_owned(), Value::String(reason.to_owned()));
+            // INFO-1: every untrusted free-form field that ships to the
+            // JSON sink runs through `sanitize_for_audit` to match the
+            // text-sink contract. `serde_json` would JSON-escape control
+            // bytes correctly, but a SIEM that re-emits JSON to TSV/CSV
+            // can resurrect literal `\t` / `\n` and a SOC analyst
+            // grepping the flat egress would see forged columns.
+            map.insert(
+                "reason".to_owned(),
+                Value::String(sanitize_for_audit(reason)),
+            );
         }
         if let Some(elapsed) = entry.extras.elapsed_ms {
             map.insert("elapsed_ms".to_owned(), json!(elapsed));
@@ -1364,6 +1373,17 @@ fn audit_record_to_json(
         }
         Value::Object(map)
     };
+    // INFO-1: free-form attacker-influenced fields go through
+    // `sanitize_for_audit` here even though `serde_json` would already
+    // escape control bytes — defense in depth against SIEM pipelines
+    // that decode JSON and re-emit flat (TSV/CSV/syslog), which
+    // resurrects the literal control byte and re-opens the column-
+    // smuggling primitive the text sink already defends against.
+    let actor_user_sanitized = client.actor_user.as_deref().map(sanitize_for_audit);
+    let actor_comm_sanitized = client.actor_comm.as_deref().map(sanitize_for_audit);
+    let socket_sanitized = sanitize_for_audit(client.socket_path.as_ref());
+    let target_sanitized = sanitize_for_audit(&entry.target);
+    let verb_sanitized = sanitize_for_audit(entry.verb);
     let record = json!({
         "ts": rfc3339_utc(std::time::SystemTime::now()),
         "boot_generation": server.boot_generation,
@@ -1373,15 +1393,15 @@ fn audit_record_to_json(
             "uid": client.actor_uid,
             "gid": client.actor_gid,
             "pid": client.actor_pid,
-            "user": client.actor_user,
-            "comm": client.actor_comm,
+            "user": actor_user_sanitized,
+            "comm": actor_comm_sanitized,
             "role": actor_role(client.actor_uid),
         },
         "client_id": client.id,
         "connect_ts": client.connect_ts_display(),
-        "socket": client.socket_path.as_ref(),
-        "verb": entry.verb,
-        "target": entry.target,
+        "socket": socket_sanitized,
+        "verb": verb_sanitized,
+        "target": target_sanitized,
         "result": result.to_string(),
         "cluster_id": entry.cluster_id,
         "backend_id": entry.backend_id,
