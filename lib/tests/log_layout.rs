@@ -3,10 +3,14 @@
 //! Walks `lib/src/**/*.rs` and asserts that every `error!`/`warn!`/`info!`/
 //! `debug!`/`trace!` call site either:
 //!
-//! 1. begins its first format-string argument with `"{}"` AND has a
-//!    subsequent `log_context`/`log_context_lite`/`log_context_stream`/
+//! 1. has a `log_context`/`log_context_lite`/`log_context_stream`/
 //!    `log_module_context`/`log_socket_context`/`log_socket_module_prefix`
-//!    invocation within a 12-line lookahead window, OR
+//!    invocation within a bidirectional window — 24 lines back to catch the
+//!    hoisted-local shape (`let context = log_context!(self);` before a
+//!    mutably-borrowed `match &mut self.position { ... }`) and 12 lines
+//!    forward for the inline / single-arg shape. The format string is also
+//!    expected to begin with `"{}"` so the macro output flows in as the
+//!    first interpolation, OR
 //! 2. lives under a `#[cfg(test)] mod ...` block (test-only callers can
 //!    use bare `log::*`-style macros), OR
 //! 3. lives in a file on the explicit allowlist (pre-fork / control-plane
@@ -50,10 +54,6 @@ const OUT_OF_SCOPE_FILES: &[&str] = &[
 /// every `cargo build`, keeping the queue visible without breaking builds.
 const KNOWN_PREEXISTING_VIOLATIONS: &[&str] = &[
     "src/protocol/rustls.rs:430",
-    "src/protocol/mux/h2.rs:3562",
-    "src/protocol/mux/h2.rs:5473",
-    "src/protocol/mux/h2.rs:5480",
-    "src/protocol/mux/mod.rs:1484",
     "src/protocol/kawa_h1/editor.rs:361",
     "src/protocol/kawa_h1/editor.rs:375",
     "src/protocol/kawa_h1/mod.rs:1050",
@@ -79,7 +79,7 @@ const KNOWN_PREEXISTING_VIOLATIONS: &[&str] = &[
 ];
 
 /// Macro names that count as a "tag-bearing" prefix. Any of these inside the
-/// 12-line lookahead window after a raw log call satisfies the rule.
+/// bidirectional scan window around a raw log call satisfies the rule.
 const CONTEXT_MACROS: &[&str] = &[
     "log_context!",
     "log_context_lite!",
@@ -90,7 +90,16 @@ const CONTEXT_MACROS: &[&str] = &[
 ];
 
 /// Lines after a `error!(`/`warn!(`/etc. opening to scan for a context macro.
+/// Catches the inline / single-line `error!("{} ...", log_context!(self), ...)`
+/// shape and short multi-line forms.
 const LOOKAHEAD_LINES: usize = 12;
+
+/// Lines before a log call to scan for a context macro. Real code sometimes
+/// hoists `let context = log_context!(self);` to a local *before* a
+/// mutably-borrowed block (e.g. `match &mut self.position { ... }`) because
+/// the macro reads fields of `self` that the match arm holds mutably. The
+/// forward-only window misses that shape; this lookbehind catches it.
+const LOOKBEHIND_LINES: usize = 24;
 
 #[test]
 fn lib_src_log_calls_use_canonical_envelope() {
@@ -153,12 +162,15 @@ fn lib_src_log_calls_use_canonical_envelope() {
                 continue;
             }
 
-            // Look ahead up to LOOKAHEAD_LINES for a context macro. If the
-            // single-line form `error!("{} ...", log_context!(self), ...)`
-            // is already on the same line, that counts as line 0 of the
-            // lookahead.
+            // Bidirectional scan: forward LOOKAHEAD_LINES for the inline /
+            // single-line `error!("{} ...", log_context!(self), ...)` shape
+            // (line 0 of the forward window covers same-line invocations);
+            // backward LOOKBEHIND_LINES for the hoisted-local shape
+            // (`let context = log_context!(self);` before a mutably-borrowed
+            // match arm). Both are idiomatic Rust used in this codebase.
+            let start = idx.saturating_sub(LOOKBEHIND_LINES);
             let end = (idx + 1 + LOOKAHEAD_LINES).min(lines.len());
-            let window = &lines[idx..end];
+            let window = &lines[start..end];
             let has_context_macro = window
                 .iter()
                 .any(|l| CONTEXT_MACROS.iter().any(|m| l.contains(m)));
@@ -168,8 +180,9 @@ fn lib_src_log_calls_use_canonical_envelope() {
                     continue;
                 }
                 violations.push(format!(
-                    "{key}: raw log call without log_context!/log_module_context! in next {LOOKAHEAD_LINES} lines: {snippet}",
+                    "{key}: raw log call without log_context!/log_module_context! in {LOOKBEHIND_LINES} lines back / {LOOKAHEAD_LINES} forward: {snippet}",
                     key = key,
+                    LOOKBEHIND_LINES = LOOKBEHIND_LINES,
                     LOOKAHEAD_LINES = LOOKAHEAD_LINES,
                     snippet = trimmed.chars().take(80).collect::<String>(),
                 ));

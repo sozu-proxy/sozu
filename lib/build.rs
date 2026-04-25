@@ -34,7 +34,15 @@ const CONTEXT_MACROS: &[&str] = &[
     "log_socket_module_prefix",
 ];
 
+/// Lines after a `error!(`/`warn!(`/etc. opening to scan for a context macro.
 const LOOKAHEAD_LINES: usize = 12;
+
+/// Lines before a log call to scan for a context macro. Real code sometimes
+/// hoists `let context = log_context!(self);` to a local *before* a
+/// mutably-borrowed block (e.g. `match &mut self.position { ... }`) because
+/// the macro reads fields of `self` that the match arm holds mutably. The
+/// forward-only window misses that shape; this lookbehind window catches it.
+const LOOKBEHIND_LINES: usize = 24;
 
 fn main() {
     // Only re-run when source files change. Keeps incremental rebuilds fast.
@@ -90,16 +98,22 @@ fn main() {
             if !is_log_call_open(trimmed) {
                 continue;
             }
+            // Bidirectional scan: forward `LOOKAHEAD_LINES` for the
+            // single-line / single-arg form, backward `LOOKBEHIND_LINES`
+            // for the hoisted-local form (`let context = log_context!(self);`
+            // before a mutably-borrowed match).
+            let start = idx.saturating_sub(LOOKBEHIND_LINES);
             let end = (idx + 1 + LOOKAHEAD_LINES).min(lines.len());
-            let window = &lines[idx..end];
+            let window = &lines[start..end];
             let has_context_macro = window
                 .iter()
                 .any(|l| CONTEXT_MACROS.iter().any(|m| l.contains(m)));
             if !has_context_macro {
                 println!(
-                    "cargo:warning={rel}:{lineno}: raw log call missing log_context!/log_module_context! envelope (lookahead {LOOKAHEAD_LINES} lines)",
+                    "cargo:warning={rel}:{lineno}: raw log call missing log_context!/log_module_context! envelope (lookbehind {LOOKBEHIND_LINES} / lookahead {LOOKAHEAD_LINES} lines)",
                     rel = rel,
                     lineno = idx + 1,
+                    LOOKBEHIND_LINES = LOOKBEHIND_LINES,
                     LOOKAHEAD_LINES = LOOKAHEAD_LINES,
                 );
             }
