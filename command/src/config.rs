@@ -156,6 +156,17 @@ pub const DEFAULT_MAX_BUFFERS: u64 = 1_000;
 /// size of the buffers, in bytes (16 KB)
 pub const DEFAULT_BUFFER_SIZE: u64 = 16_393;
 
+/// minimum buffer size required when any HTTPS listener advertises H2 ALPN.
+///
+/// RFC 9113 §6.5.2 caps `SETTINGS_MAX_FRAME_SIZE` at 16 384 bytes by default;
+/// the on-wire H2 frame header is a fixed 9 bytes (§4.1), so the kawa storage
+/// must be able to hold 16 384 + 9 = 16 393 bytes before forwarding. A smaller
+/// `buffer_size` causes the H2 mux to deadlock on full-size frames (no panic,
+/// no obvious log) until the session timeout fires. Validated at config-load
+/// time in `ConfigBuilder::into_config` so a typo in TOML is rejected at boot,
+/// not discovered under traffic.
+pub const H2_MIN_BUFFER_SIZE: u64 = 16_393;
+
 /// maximum number of simultaneous connections (10 000)
 pub const DEFAULT_MAX_CONNECTIONS: usize = 10_000;
 
@@ -239,6 +250,23 @@ pub enum ConfigError {
     },
     #[error("Invalid ALPN protocol '{0}'. Valid values: \"h2\", \"http/1.1\"")]
     InvalidAlpnProtocol(String),
+    /// `buffer_size` is below the H2 minimum (16 393 bytes) but at least one
+    /// HTTPS listener advertises `h2` in its ALPN list. The H2 mux requires
+    /// 16 384-byte frame payload + 9-byte header to fit in a single kawa
+    /// buffer; smaller values deadlock streams that carry full-size frames.
+    /// Either raise `buffer_size` to ≥ 16 393 or remove `h2` from the
+    /// affected listeners' `alpn_protocols`.
+    #[error(
+        "buffer_size = {buffer_size} is below the H2 minimum of {minimum} but \
+         {listeners} HTTPS listener(s) advertise H2 ALPN. The H2 mux deadlocks \
+         on full-size frames with smaller buffers. Raise buffer_size to >= {minimum} \
+         or remove \"h2\" from those listeners' alpn_protocols."
+    )]
+    BufferSizeTooSmallForH2 {
+        buffer_size: u64,
+        minimum: u64,
+        listeners: usize,
+    },
 }
 
 /// An HTTP, HTTPS or TCP listener as parsed from the `Listeners` section in the toml
@@ -1700,6 +1728,27 @@ impl ConfigBuilder {
             self.populate_clusters(file_cluster_configs.clone())?;
         }
 
+        // RFC 9113 §6.5.2 + §4.1: the H2 mux must accept up to
+        // SETTINGS_MAX_FRAME_SIZE (16 384) + 9-byte frame header in a single
+        // kawa buffer. If any HTTPS listener advertises "h2" in its ALPN list
+        // and the global buffer_size is below H2_MIN_BUFFER_SIZE, the mux
+        // deadlocks on full-size DATA / HEADERS / CONTINUATION frames until
+        // the session timeout fires. Reject at config load so the failure
+        // mode surfaces at boot, not under traffic.
+        let h2_listeners = self
+            .built
+            .https_listeners
+            .iter()
+            .filter(|l| l.alpn_protocols.iter().any(|p| p == "h2"))
+            .count();
+        if h2_listeners > 0 && self.built.buffer_size < H2_MIN_BUFFER_SIZE {
+            return Err(ConfigError::BufferSizeTooSmallForH2 {
+                buffer_size: self.built.buffer_size,
+                minimum: H2_MIN_BUFFER_SIZE,
+                listeners: h2_listeners,
+            });
+        }
+
         let command_socket_path = self.file.command_socket.clone().unwrap_or({
             let mut path = env::current_dir().map_err(|e| ConfigError::Env(e.to_string()))?;
             path.push("sozu.sock");
@@ -2345,6 +2394,73 @@ mod tests {
         assert!(
             result.is_err(),
             "Should reject duplicate listener addresses"
+        );
+    }
+
+    #[test]
+    fn buffer_size_below_h2_minimum_rejected() {
+        // Default ALPN ["h2", "http/1.1"] + buffer_size = 8192 must error.
+        let toml_content = r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+            buffer_size = 8192
+
+            [[listeners]]
+            protocol = "https"
+            address = "127.0.0.1:8443"
+        "#;
+        let file_config: FileConfig =
+            toml::from_str(toml_content).expect("Could not parse TOML config");
+        let result = ConfigBuilder::new(file_config, "/tmp/test_config.toml").into_config();
+        match result {
+            Err(ConfigError::BufferSizeTooSmallForH2 {
+                buffer_size: 8192,
+                minimum: 16_393,
+                listeners: 1,
+            }) => {}
+            other => panic!("expected BufferSizeTooSmallForH2, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn buffer_size_below_h2_minimum_accepted_when_no_h2_listener() {
+        // Drop "h2" from ALPN — buffer_size = 8192 is now valid.
+        let toml_content = r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+            buffer_size = 8192
+
+            [[listeners]]
+            protocol = "https"
+            address = "127.0.0.1:8443"
+            alpn_protocols = ["http/1.1"]
+        "#;
+        let file_config: FileConfig =
+            toml::from_str(toml_content).expect("Could not parse TOML config");
+        let result = ConfigBuilder::new(file_config, "/tmp/test_config.toml").into_config();
+        assert!(
+            result.is_ok(),
+            "non-H2 HTTPS listener with sub-16393 buffer should be accepted: {result:?}"
+        );
+    }
+
+    #[test]
+    fn buffer_size_at_h2_minimum_accepted() {
+        let toml_content = r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+            buffer_size = 16393
+
+            [[listeners]]
+            protocol = "https"
+            address = "127.0.0.1:8443"
+        "#;
+        let file_config: FileConfig =
+            toml::from_str(toml_content).expect("Could not parse TOML config");
+        let result = ConfigBuilder::new(file_config, "/tmp/test_config.toml").into_config();
+        assert!(
+            result.is_ok(),
+            "buffer_size at the H2 minimum should be accepted: {result:?}"
         );
     }
 
