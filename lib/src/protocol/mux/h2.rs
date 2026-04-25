@@ -3401,6 +3401,31 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         E: Endpoint,
         L: ListenerHandler + L7ListenerHandler,
     {
+        // Lisa LISA-102: per-connection scratch Vecs (`converter_buf`,
+        // `lowercase_buf`, `cookie_buf`, `priorities_buf`) grow to a
+        // high-water mark and never shrink. On a long-lived idle H2
+        // connection that briefly carried a flurry of large headers, the
+        // backing memory stays pinned indefinitely. Reclaim past
+        // `SCRATCH_BUF_RETAIN` when the connection has live streams but
+        // each scratch buffer holds 4× the cap. Quiet-time only — runs
+        // at the top of every `cancel_timed_out_streams` invocation
+        // (which is itself called from the readable hot loop, but only
+        // on a session that has been idle long enough to risk timing
+        // out a stream).
+        const SCRATCH_BUF_RETAIN: usize = 16 * 1024;
+        if self.converter_buf.capacity() > SCRATCH_BUF_RETAIN * 4 {
+            self.converter_buf.shrink_to(SCRATCH_BUF_RETAIN);
+        }
+        if self.lowercase_buf.capacity() > SCRATCH_BUF_RETAIN * 4 {
+            self.lowercase_buf.shrink_to(SCRATCH_BUF_RETAIN);
+        }
+        if self.cookie_buf.capacity() > SCRATCH_BUF_RETAIN * 4 {
+            self.cookie_buf.shrink_to(SCRATCH_BUF_RETAIN);
+        }
+        if self.priorities_buf.capacity() > SCRATCH_BUF_RETAIN * 4 {
+            self.priorities_buf.shrink_to(SCRATCH_BUF_RETAIN);
+        }
+
         if self.streams.is_empty() || self.stream_last_activity_at.is_empty() {
             return;
         }
