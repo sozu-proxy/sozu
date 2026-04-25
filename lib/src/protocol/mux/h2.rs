@@ -5138,20 +5138,71 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 let (tls_pending_after, drain_rounds) =
                     drain_tls_close_notify(&mut self.socket, &mut self.close_notify_sent);
                 if tls_pending_after {
-                    error!(
-                        "TLS buffer NOT fully drained on close: \
-                         pending_before={}, pending_after={}, drain_rounds={}, \
-                         state={:?}, streams={}, expect_write={:?}, \
-                         close_notify_sent={}, readiness={:?}",
-                        tls_pending_before,
-                        tls_pending_after,
-                        drain_rounds,
-                        self.state,
-                        self.streams.len(),
-                        self.expect_write,
-                        self.close_notify_sent,
-                        self.readiness
-                    );
+                    // Severity tiering: key on stream-count + close-state, not
+                    // peer-vs-operator. Composes with the send-side `H2Error`
+                    // variant tier in `goaway()` — both rules demote benign
+                    // paths and keep loss-bearing paths loud.
+                    //
+                    // - `streams != 0`           -> `error!`: live streams at
+                    //   close time, response-byte loss is possible.
+                    // - `streams == 0` AND state in {GoAway, Error}
+                    //                             -> `warn!`: idle close after
+                    //   a GOAWAY exchange (peer-initiated abort or our own
+                    //   graceful drain). What's stranded is best-effort
+                    //   GOAWAY/close_notify; no application data was queued.
+                    // - `streams == 0` from any other state
+                    //                             -> `error!`: unexpected
+                    //   teardown path (no GOAWAY exchange) — keep loud so
+                    //   unknown failure modes surface.
+                    if !self.streams.is_empty() {
+                        error!(
+                            "{} TLS buffer NOT fully drained on close: \
+                             pending_before={}, pending_after={}, drain_rounds={}, \
+                             state={:?}, streams={}, expect_write={:?}, \
+                             close_notify_sent={}, readiness={:?}",
+                            log_context!(self),
+                            tls_pending_before,
+                            tls_pending_after,
+                            drain_rounds,
+                            self.state,
+                            self.streams.len(),
+                            self.expect_write,
+                            self.close_notify_sent,
+                            self.readiness
+                        );
+                    } else if matches!(self.state, H2State::GoAway | H2State::Error) {
+                        warn!(
+                            "{} TLS buffer NOT fully drained on close: \
+                             pending_before={}, pending_after={}, drain_rounds={}, \
+                             state={:?}, streams={}, expect_write={:?}, \
+                             close_notify_sent={}, readiness={:?}",
+                            log_context!(self),
+                            tls_pending_before,
+                            tls_pending_after,
+                            drain_rounds,
+                            self.state,
+                            self.streams.len(),
+                            self.expect_write,
+                            self.close_notify_sent,
+                            self.readiness
+                        );
+                    } else {
+                        error!(
+                            "{} TLS buffer NOT fully drained on close: \
+                             pending_before={}, pending_after={}, drain_rounds={}, \
+                             state={:?}, streams={}, expect_write={:?}, \
+                             close_notify_sent={}, readiness={:?}",
+                            log_context!(self),
+                            tls_pending_before,
+                            tls_pending_after,
+                            drain_rounds,
+                            self.state,
+                            self.streams.len(),
+                            self.expect_write,
+                            self.close_notify_sent,
+                            self.readiness
+                        );
+                    }
                 }
                 return;
             }
