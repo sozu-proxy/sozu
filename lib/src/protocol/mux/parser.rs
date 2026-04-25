@@ -869,6 +869,21 @@ pub fn priority_update_frame<'a>(
             H2Error::FrameSizeError,
         )));
     }
+    // RFC 9218 §7.1 priority field is an SF-Item (RFC 8941): ASCII-only,
+    // small. Real-world emissions (`u=N, i, foo=...`) are < 30 bytes.
+    // Cap at PRIORITY_UPDATE_MAX_VALUE (1024) — the same cap nghttp2 and
+    // the `h2` Rust crate apply — so an attacker cannot drive
+    // `value_bytes.to_vec()` to allocate ~16 KiB per frame
+    // (SETTINGS_MAX_FRAME_SIZE default), turning a structurally-legitimate
+    // PRIORITY_UPDATE stream into allocator pressure that the
+    // H2FloodDetector glitch budget may not catch quickly.
+    let value_len = (header.payload_len - PRIORITY_UPDATE_MIN_PAYLOAD) as usize;
+    if value_len > PRIORITY_UPDATE_MAX_VALUE {
+        return Err(Err::Failure(ParserError::new_h2(
+            input,
+            H2Error::ProtocolError,
+        )));
+    }
     let (remaining, payload) = take(header.payload_len)(input)?;
     let (raw_id_bytes, value_bytes) = payload.split_at(PRIORITY_UPDATE_MIN_PAYLOAD as usize);
     let prioritized_stream_id = u32::from_be_bytes([
@@ -890,6 +905,15 @@ pub fn priority_update_frame<'a>(
 /// the 4-byte prioritized stream ID. The priority field value is allowed
 /// to be empty (defaults to the RFC 9218 §4 defaults).
 pub const PRIORITY_UPDATE_MIN_PAYLOAD: u32 = 4;
+
+/// Maximum length of the `priority_field_value` portion of a PRIORITY_UPDATE
+/// frame (RFC 9218 §7.1). The field is a Structured Field Item (RFC 8941):
+/// ASCII-only, intended for compact dictionary payloads such as `u=3, i`.
+/// 1024 bytes mirrors nghttp2's `NGHTTP2_MAX_PRIORITY_VALUE_LEN` and the
+/// upper-bound the `h2` Rust crate enforces, an order of magnitude tighter
+/// than `SETTINGS_MAX_FRAME_SIZE` — the attacker is denied a per-frame
+/// 16 KiB allocation primitive sized in single TCP segments.
+pub const PRIORITY_UPDATE_MAX_VALUE: usize = 1024;
 
 #[cfg(test)]
 mod tests {
@@ -1163,6 +1187,59 @@ mod tests {
                 assert_eq!(e.kind, ParserErrorKind::H2(H2Error::FrameSizeError));
             }
             other => panic!("expected FRAME_SIZE_ERROR, got {other:?}"),
+        }
+    }
+
+    /// RFC 9218 §7.1 + nghttp2/h2-Rust convention: cap the
+    /// `priority_field_value` at PRIORITY_UPDATE_MAX_VALUE (1024) so a
+    /// peer cannot drive per-frame `Vec<u8>` allocations toward
+    /// SETTINGS_MAX_FRAME_SIZE (16 KiB) under cover of a structurally-
+    /// legitimate frame type.
+    #[test]
+    fn test_priority_update_oversized_value_is_protocol_error() {
+        // payload_len = 4 (sid) + 1025 (value) = 1029 → just over the cap.
+        let payload_len = (PRIORITY_UPDATE_MIN_PAYLOAD as usize) + PRIORITY_UPDATE_MAX_VALUE + 1;
+        let mut input = Vec::with_capacity(9 + payload_len);
+        // 24-bit length, big-endian.
+        input.push(((payload_len >> 16) & 0xff) as u8);
+        input.push(((payload_len >> 8) & 0xff) as u8);
+        input.push((payload_len & 0xff) as u8);
+        input.push(0x10); // type = PRIORITY_UPDATE
+        input.push(0x00); // flags
+        input.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // stream_id = 0
+        input.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]); // prioritized_stream_id = 1
+        input.extend(std::iter::repeat_n(b'a', PRIORITY_UPDATE_MAX_VALUE + 1));
+        // Use the larger frame size for the header parse so payload_len passes;
+        // the value-length cap is enforced by `priority_update_frame` itself.
+        let (remaining, header) = frame_header(&input, payload_len as u32 + 1).expect("header parses");
+        match frame_body(remaining, &header) {
+            Err(Err::Failure(e)) => {
+                assert_eq!(e.kind, ParserErrorKind::H2(H2Error::ProtocolError));
+            }
+            other => panic!("expected PROTOCOL_ERROR for oversized PRIORITY_UPDATE value, got {other:?}"),
+        }
+    }
+
+    /// Boundary case: priority value at exactly PRIORITY_UPDATE_MAX_VALUE
+    /// MUST be accepted (off-by-one regression guard).
+    #[test]
+    fn test_priority_update_at_max_value_accepted() {
+        let payload_len = (PRIORITY_UPDATE_MIN_PAYLOAD as usize) + PRIORITY_UPDATE_MAX_VALUE;
+        let mut input = Vec::with_capacity(9 + payload_len);
+        input.push(((payload_len >> 16) & 0xff) as u8);
+        input.push(((payload_len >> 8) & 0xff) as u8);
+        input.push((payload_len & 0xff) as u8);
+        input.push(0x10);
+        input.push(0x00);
+        input.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+        input.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+        input.extend(std::iter::repeat_n(b'a', PRIORITY_UPDATE_MAX_VALUE));
+        let (remaining, header) = frame_header(&input, payload_len as u32 + 1).expect("header parses");
+        match frame_body(remaining, &header) {
+            Ok((_, Frame::PriorityUpdate(pu))) => {
+                assert_eq!(pu.priority_field_value.len(), PRIORITY_UPDATE_MAX_VALUE);
+            }
+            other => panic!("expected Frame::PriorityUpdate at the cap boundary, got {other:?}"),
         }
     }
 
