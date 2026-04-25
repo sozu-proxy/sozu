@@ -1376,6 +1376,11 @@ pub struct FileConfig {
     pub min_buffers: Option<u64>,
     pub max_buffers: Option<u64>,
     pub buffer_size: Option<u64>,
+    /// Slab-entries-per-connection multiplier. `None` keeps the compile-time
+    /// default of 4. Operator-visible escape hatch for fan-out topologies
+    /// that exceed 4 backends per session — clamped to [2, 32] at load.
+    #[serde(default)]
+    pub slab_entries_per_connection: Option<u64>,
     pub saved_state: Option<String>,
     #[serde(default)]
     pub automatic_state_save: Option<bool>,
@@ -1556,6 +1561,12 @@ impl ConfigBuilder {
                 .zombie_check_interval
                 .unwrap_or(DEFAULT_ZOMBIE_CHECK_INTERVAL),
             worker_timeout: file_config.worker_timeout.unwrap_or(DEFAULT_WORKER_TIMEOUT),
+            slab_entries_per_connection: file_config.slab_entries_per_connection.map(|n| {
+                n.clamp(
+                    ServerConfig::MIN_SLAB_ENTRIES_PER_CONNECTION,
+                    ServerConfig::MAX_SLAB_ENTRIES_PER_CONNECTION,
+                )
+            }),
             ..Default::default()
         };
 
@@ -1827,6 +1838,14 @@ pub struct Config {
     pub request_timeout: u32,
     #[serde(default = "default_worker_timeout")]
     pub worker_timeout: u32,
+    /// Slab-entries-per-connection multiplier exposed for operators with
+    /// fan-out topologies that exceed the default 4 backends per session.
+    /// `None` means the default (4) applies; set values are clamped to
+    /// [`ServerConfig::MIN_SLAB_ENTRIES_PER_CONNECTION`,
+    /// `ServerConfig::MAX_SLAB_ENTRIES_PER_CONNECTION`] = [2, 32]. Slab
+    /// capacity is `10 + slab_entries_per_connection * max_connections`.
+    #[serde(default)]
+    pub slab_entries_per_connection: Option<u64>,
 }
 
 fn default_front_timeout() -> u32 {
@@ -2138,18 +2157,40 @@ fn display_toml_error(file: &str, error: &toml::de::Error) {
 }
 
 impl ServerConfig {
-    /// Number of slab entries per connection. Set to 4 to accommodate H2 multiplexing
-    /// (1 frontend + up to 3 backend connections per frontend with stream multiplexing).
-    /// Previous value was 2 for H1-only operation.
-    const SLAB_ENTRIES_PER_CONNECTION: u64 = 4;
+    /// Default number of slab entries per connection. Set to 4 to accommodate
+    /// H2 multiplexing (1 frontend + up to 3 backend connections per
+    /// frontend with stream multiplexing). Previous value was 2 for H1-only
+    /// operation. Operators with topologies that fan out across more
+    /// clusters per session can override via `slab_entries_per_connection`
+    /// in the config (clamped to [2, 32]).
+    pub const DEFAULT_SLAB_ENTRIES_PER_CONNECTION: u64 = 4;
+    /// Lower bound for the runtime knob. Below 2 the slab cannot hold one
+    /// frontend + one backend per session.
+    pub const MIN_SLAB_ENTRIES_PER_CONNECTION: u64 = 2;
+    /// Upper bound for the runtime knob. 32 caps memory blow-up from a
+    /// runaway config; 32 backends per frontend covers any sane topology.
+    pub const MAX_SLAB_ENTRIES_PER_CONNECTION: u64 = 32;
+
+    /// Effective slab-entries-per-connection. Applies the [MIN, MAX] clamp
+    /// and falls back to the default when the proto field is absent or 0.
+    pub fn effective_slab_entries_per_connection(&self) -> u64 {
+        match self.slab_entries_per_connection {
+            Some(0) | None => Self::DEFAULT_SLAB_ENTRIES_PER_CONNECTION,
+            Some(n) => n.clamp(
+                Self::MIN_SLAB_ENTRIES_PER_CONNECTION,
+                Self::MAX_SLAB_ENTRIES_PER_CONNECTION,
+            ),
+        }
+    }
 
     /// Size of the slab for the Session manager.
     ///
     /// With HTTP/2 multiplexing, each frontend session can have multiple backend
-    /// connections (one per cluster), so we allocate `SLAB_ENTRIES_PER_CONNECTION` (4)
-    /// entries per connection instead of the old H1-only multiplier of 2.
+    /// connections (one per cluster), so we allocate
+    /// [`Self::effective_slab_entries_per_connection`] entries per connection
+    /// instead of the old H1-only multiplier of 2.
     pub fn slab_capacity(&self) -> u64 {
-        10 + Self::SLAB_ENTRIES_PER_CONNECTION * self.max_connections
+        10 + self.effective_slab_entries_per_connection() * self.max_connections
     }
 }
 
@@ -2182,6 +2223,7 @@ impl From<&Config> for ServerConfig {
             metrics,
             access_log_format: ProtobufAccessLogFormat::from(&config.access_logs_format) as i32,
             log_colored: config.log_colored,
+            slab_entries_per_connection: config.slab_entries_per_connection,
         }
     }
 }
