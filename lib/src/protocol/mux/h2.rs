@@ -4073,6 +4073,21 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             (total, declared)
         };
 
+        // RFC 9113 §6.9 + §5.2: credit connection-level flow control BEFORE any
+        // early-return path. Malformed DATA still consumed the peer's send
+        // window; without crediting it back, repeated bad streams permanently
+        // shrink the connection window and stall unrelated streams that share
+        // the same H2 connection. Stream-level credit can stay below — once we
+        // RST the violating stream, its per-stream window is moot per
+        // RFC 9113 §6.9 (the receiver discards further frames for the stream).
+        let conn_threshold = self.connection_config.initial_connection_window / 2;
+        self.flow_control.received_bytes_since_update += wire_payload_len;
+        if self.flow_control.received_bytes_since_update >= conn_threshold {
+            let increment = self.flow_control.received_bytes_since_update;
+            self.queue_window_update(0, increment);
+            self.flow_control.received_bytes_since_update = 0;
+        }
+
         // RFC 9113 §8.1.1: if Content-Length is present, total DATA payload
         // must not exceed the declared length (check on every frame).
         // RFC 9110 §8.6: skip for HEAD/1xx/204/304 responses (body absent by definition).
@@ -4085,6 +4100,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         data_received,
                         expected
                     );
+                    // Pair WRITABLE arming with the queued connection-level
+                    // WINDOW_UPDATE before returning; otherwise the credit sits
+                    // until the next inbound frame on this connection.
+                    if !self.flow_control.pending_window_updates.is_empty() {
+                        self.readiness.interest.insert(Ready::WRITABLE);
+                        self.readiness.signal_pending_write();
+                    }
                     let result = self.reset_stream(
                         data.stream_id,
                         global_stream_id,
@@ -4106,20 +4128,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         let kawa = parts.rbuffer;
         self.position.count_bytes_in(parts.metrics, content_len);
 
-        // RFC 9113 §6.9 + §5.2: flow control is credited against the full wire
-        // payload length (including pad-length byte and padding), not just the
-        // application content. Otherwise the window shrinks permanently.
-
-        // Connection-level flow control (use configured window threshold)
-        let conn_threshold = self.connection_config.initial_connection_window / 2;
-        self.flow_control.received_bytes_since_update += wire_payload_len;
-        if self.flow_control.received_bytes_since_update >= conn_threshold {
-            let increment = self.flow_control.received_bytes_since_update;
-            self.queue_window_update(0, increment);
-            self.flow_control.received_bytes_since_update = 0;
-        }
-
-        // Stream-level flow control (only if stream is still open)
+        // Stream-level flow control (only if stream is still open).
+        // Connection-level credit was already applied above the CL check so
+        // malformed DATA cannot starve the connection window for other streams.
         if !data.end_stream {
             self.queue_window_update(data.stream_id, wire_payload_len);
         }
