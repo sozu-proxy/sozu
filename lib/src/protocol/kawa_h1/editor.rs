@@ -359,8 +359,11 @@ impl HttpContext {
                         if !compare_no_case(val, proto.as_bytes()) {
                             incr!("http.trusting.x_proto.diff");
                             debug!(
-                                "Trusting X-Forwarded-Proto for {:?} even though {:?} != {}",
-                                self.authority, val, proto
+                                "{} Trusting X-Forwarded-Proto for {:?} even though {:?} != {}",
+                                self.log_context(),
+                                self.authority,
+                                val,
+                                proto
                             );
                         }
                     } else if compare_no_case(key, b"X-Forwarded-Port") {
@@ -373,8 +376,11 @@ impl HttpContext {
                         if !compare_no_case(val, expected.as_bytes()) {
                             incr!("http.trusting.x_port.diff");
                             debug!(
-                                "Trusting X-Forwarded-Port for {:?} even though {:?} != {}",
-                                self.authority, val, expected
+                                "{} Trusting X-Forwarded-Port for {:?} even though {:?} != {}",
+                                self.log_context(),
+                                self.authority,
+                                val,
+                                expected
                             );
                         }
                     } else if compare_no_case(key, b"X-Forwarded-For") {

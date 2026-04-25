@@ -1604,8 +1604,10 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                     );
 
                     info!(
-                        "backend server {} at {} is up",
-                        backend.backend_id, backend.address
+                        "{} backend server {} at {} is up",
+                        log_context!(self),
+                        backend.backend_id,
+                        backend.address
                     );
 
                     push_event(Event {
@@ -2053,7 +2055,8 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> SessionState 
             return match self.timeout_status() {
                 TimeoutStatus::Request => {
                     error!(
-                        "got backend timeout while waiting for a request, this should not happen"
+                        "{} got backend timeout while waiting for a request, this should not happen",
+                        log_context!(self)
                     );
                     self.set_answer(DefaultAnswer::Answer504 {
                         duration: self.container_backend_timeout.to_string(),
