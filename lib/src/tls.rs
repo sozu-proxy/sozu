@@ -200,12 +200,7 @@ impl CertificateResolver {
     /// Called from `add_certificate` / `remove_certificate` — i.e. only when
     /// the cert set actually changes, never on the hot TLS handshake path.
     fn publish_min_expiration_gauge(&self) {
-        let Some(min_expiration) = self
-            .certificates
-            .values()
-            .map(|c| c.expiration)
-            .min()
-        else {
+        let Some(min_expiration) = self.certificates.values().map(|c| c.expiration).min() else {
             // SECURITY (Lisa LISA-TLS-001 false-positive): an empty
             // resolver is not "every cert just expired"; it is "no cert
             // has been loaded yet" — typical at process boot before the

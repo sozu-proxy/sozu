@@ -756,7 +756,9 @@ fn open_audit_log_file(path: &str) -> Result<File, IoError> {
     }
     let pre_existing = path.exists();
     let pre_existing_mode = if pre_existing {
-        std::fs::metadata(path).ok().map(|m| m.permissions().mode() & 0o777)
+        std::fs::metadata(path)
+            .ok()
+            .map(|m| m.permissions().mode() & 0o777)
     } else {
         None
     };
