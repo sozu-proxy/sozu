@@ -1211,12 +1211,15 @@ mod tests {
         input.extend(std::iter::repeat_n(b'a', PRIORITY_UPDATE_MAX_VALUE + 1));
         // Use the larger frame size for the header parse so payload_len passes;
         // the value-length cap is enforced by `priority_update_frame` itself.
-        let (remaining, header) = frame_header(&input, payload_len as u32 + 1).expect("header parses");
+        let (remaining, header) =
+            frame_header(&input, payload_len as u32 + 1).expect("header parses");
         match frame_body(remaining, &header) {
             Err(Err::Failure(e)) => {
                 assert_eq!(e.kind, ParserErrorKind::H2(H2Error::ProtocolError));
             }
-            other => panic!("expected PROTOCOL_ERROR for oversized PRIORITY_UPDATE value, got {other:?}"),
+            other => {
+                panic!("expected PROTOCOL_ERROR for oversized PRIORITY_UPDATE value, got {other:?}")
+            }
         }
     }
 
@@ -1234,7 +1237,8 @@ mod tests {
         input.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
         input.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
         input.extend(std::iter::repeat_n(b'a', PRIORITY_UPDATE_MAX_VALUE));
-        let (remaining, header) = frame_header(&input, payload_len as u32 + 1).expect("header parses");
+        let (remaining, header) =
+            frame_header(&input, payload_len as u32 + 1).expect("header parses");
         match frame_body(remaining, &header) {
             Ok((_, Frame::PriorityUpdate(pu))) => {
                 assert_eq!(pu.priority_field_value.len(), PRIORITY_UPDATE_MAX_VALUE);
