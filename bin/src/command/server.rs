@@ -2,12 +2,12 @@ use std::{
     cell::RefCell,
     collections::{HashMap, HashSet, VecDeque},
     fmt::{self, Debug},
-    fs::{File, OpenOptions},
+    fs::{DirBuilder, File, OpenOptions, Permissions},
     io::{Error as IoError, Write},
     ops::{Deref, DerefMut},
     os::{
         fd::{AsRawFd, FromRawFd},
-        unix::fs::OpenOptionsExt,
+        unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     },
     path::Path,
     time::{Duration, Instant},
@@ -722,17 +722,62 @@ impl Server {
 /// tail the file via ACL without granting full write access. The file is
 /// never truncated on open — every sozu restart continues the same audit
 /// stream (use logrotate to manage size).
+///
+/// PCI-DSS 10.5 hardening notes:
+/// 1. `OpenOptions::mode(0o640)` is honoured by Linux only when the file is
+///    *created* by this open. Pre-existing files keep their previous mode.
+///    We therefore call `set_permissions(0o640)` after open so an existing
+///    `chmod 0644` from a sloppy install or a non-mode-preserving logrotate
+///    is corrected at boot.
+/// 2. `create_dir_all` runs under the inherited worker umask (default
+///    `0o022` → directory `0o755`), which leaves the audit directory
+///    world-traversable. `DirBuilderExt::mode(0o750)` is applied so newly
+///    created parents are owner+group only. Pre-existing parents are not
+///    re-permissioned (operators may have a deliberate ACL).
+/// 3. When the existing file's mode is wider than `0o640`, a `warn!` is
+///    emitted alongside the corrective `chmod` so SOC tooling sees the
+///    transition rather than discovering it via a file-system audit.
 fn open_audit_log_file(path: &str) -> Result<File, IoError> {
     let path = Path::new(path);
     if let Some(parent) = path.parent() {
         // Create parent dirs best-effort; failure falls through to the open.
-        let _ = std::fs::create_dir_all(parent);
+        // Only newly created parents get 0o750; existing dirs are untouched.
+        let _ = DirBuilder::new().recursive(true).mode(0o750).create(parent);
     }
-    OpenOptions::new()
+    let pre_existing = path.exists();
+    let pre_existing_mode = if pre_existing {
+        std::fs::metadata(path).ok().map(|m| m.permissions().mode() & 0o777)
+    } else {
+        None
+    };
+    let file = OpenOptions::new()
         .append(true)
         .create(true)
         .mode(0o640)
-        .open(path)
+        .open(path)?;
+    // Force-narrow the mode on pre-existing files. `mode(0o640)` above is a
+    // no-op when the file already exists, so without this `set_permissions`
+    // a pre-created `audit.log` with `0o644` (or wider) would silently
+    // bypass the PCI-DSS 10.5 control.
+    if let Some(prev) = pre_existing_mode
+        && prev != 0o640
+    {
+        if prev & !0o640 != 0 {
+            warn!(
+                "audit log file {} pre-existed with mode 0o{:o} — narrowing to 0o640",
+                path.display(),
+                prev
+            );
+        }
+        if let Err(e) = file.set_permissions(Permissions::from_mode(0o640)) {
+            warn!(
+                "could not narrow audit log file {} permissions to 0o640: {:?}",
+                path.display(),
+                e
+            );
+        }
+    }
+    Ok(file)
 }
 
 impl Server {
