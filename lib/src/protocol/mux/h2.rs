@@ -1642,6 +1642,26 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         && stream_id & 1 == 1
                         && stream_id > self.last_stream_id
                     {
+                        // Lisa LISA-107: RFC 9113 §6.8 — after sending a
+                        // GOAWAY, the proxy MUST NOT accept new streams.
+                        // `graceful_goaway` sets `drain.draining = true`
+                        // and sends a phase-1 GOAWAY with last_stream_id =
+                        // STREAM_ID_MAX (so in-flight requests are still
+                        // accepted), but the contract for *new* peer-
+                        // initiated streams is that they must be refused.
+                        // Without this check, a peer racing the drain
+                        // window could open arbitrary new streams between
+                        // phase-1 and phase-2 GOAWAY emission.
+                        if self.drain.draining {
+                            if stream_id > self.highest_peer_stream_id {
+                                self.highest_peer_stream_id = stream_id;
+                            }
+                            return self.refuse_stream_and_discard(
+                                stream_id,
+                                H2Error::RefusedStream,
+                                header.payload_len,
+                            );
+                        }
                         if self.streams.len()
                             >= self.local_settings.settings_max_concurrent_streams as usize
                         {
