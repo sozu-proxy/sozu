@@ -5,11 +5,13 @@
 //!
 //! 1. has a `log_context`/`log_context_lite`/`log_context_stream`/
 //!    `log_module_context`/`log_socket_context`/`log_socket_module_prefix`
-//!    invocation within a bidirectional window — 24 lines back to catch the
-//!    hoisted-local shape (`let context = log_context!(self);` before a
-//!    mutably-borrowed `match &mut self.position { ... }`) and 12 lines
-//!    forward for the inline / single-arg shape. The format string is also
-//!    expected to begin with `"{}"` so the macro output flows in as the
+//!    invocation, OR a `.log_context(` method-call (the canonical form used
+//!    inside `kawa_h1/HttpContext` and other protocol structs that own a
+//!    `LogContext` builder), within a bidirectional window — 24 lines back
+//!    to catch the hoisted-local shape (`let context = log_context!(self);`
+//!    before a mutably-borrowed `match &mut self.position { ... }`) and 12
+//!    lines forward for the inline / single-arg shape. The format string is
+//!    also expected to begin with `"{}"` so the macro output flows in as the
 //!    first interpolation, OR
 //! 2. lives under a `#[cfg(test)] mod ...` block (test-only callers can
 //!    use bare `log::*`-style macros), OR
@@ -42,24 +44,24 @@ const OUT_OF_SCOPE_FILES: &[&str] = &[
 ];
 
 /// Pre-existing untagged log sites in protocol/runtime files that this
-/// regression guard surfaced but that this changeset deliberately did NOT
-/// rewrite. Documented at the precision `file.rs:line` so future drift in
-/// either the line numbers OR the rule can be detected: when a wrap is
+/// regression guard surfaced but that the codebase deliberately has NOT
+/// rewritten. Documented at the precision `file.rs:line` so future drift
+/// in either the line numbers OR the rule can be detected: when a wrap is
 /// added (or a violation appears in a file/line not in this list), the
 /// test fires.
 ///
-/// To extend coverage: pick a sub-list (e.g. all `tcp.rs` entries), wrap
-/// the call sites with the appropriate macro, drop the entries here, and
-/// commit. The build.rs cargo:warning emitter surfaces every entry on
-/// every `cargo build`, keeping the queue visible without breaking builds.
-const KNOWN_PREEXISTING_VIOLATIONS: &[&str] = &[
-    "src/protocol/rustls.rs:430",
-    "src/protocol/kawa_h1/editor.rs:361",
-    "src/protocol/kawa_h1/editor.rs:375",
-    "src/protocol/kawa_h1/mod.rs:1050",
-    "src/protocol/kawa_h1/mod.rs:1606",
-    "src/protocol/kawa_h1/mod.rs:2055",
-];
+/// To extend coverage: wrap the call sites with the appropriate macro
+/// (`log_context!(self)`, `log_module_context!()`, etc.) or the
+/// `self.log_context()` method-call form recognised by the walker, drop
+/// the corresponding entries here, and commit. The build.rs cargo:warning
+/// emitter surfaces every entry on every `cargo build`, keeping the queue
+/// visible without breaking builds.
+///
+/// Currently empty: every previously-tracked pre-existing violation has
+/// been either wrapped at source or auto-cleared by the bidirectional
+/// walker (which also recognises the canonical `.log_context()`
+/// method-call form, see `CONTEXT_METHOD_NEEDLE`).
+const KNOWN_PREEXISTING_VIOLATIONS: &[&str] = &[];
 
 /// Macro names that count as a "tag-bearing" prefix. Any of these inside the
 /// bidirectional scan window around a raw log call satisfies the rule.
@@ -71,6 +73,14 @@ const CONTEXT_MACROS: &[&str] = &[
     "log_socket_context!",
     "log_socket_module_prefix",
 ];
+
+/// `HttpContext::log_context(&self) -> LogContext<'_>` (and the equivalent
+/// helpers on other protocol structs) is the canonical method-call form used
+/// inside `kawa_h1/editor.rs`, `tcp.rs`, `protocol/pipe.rs`, etc. Matching
+/// `.log_context(` keeps the walker aware of method-call usage without
+/// confusing it with the macro definitions above (those start with `pub fn `
+/// or `macro_rules!`, never with `.`).
+const CONTEXT_METHOD_NEEDLE: &str = ".log_context(";
 
 /// Lines after a `error!(`/`warn!(`/etc. opening to scan for a context macro.
 /// Catches the inline / single-line `error!("{} ...", log_context!(self), ...)`
@@ -154,9 +164,9 @@ fn lib_src_log_calls_use_canonical_envelope() {
             let start = idx.saturating_sub(LOOKBEHIND_LINES);
             let end = (idx + 1 + LOOKAHEAD_LINES).min(lines.len());
             let window = &lines[start..end];
-            let has_context_macro = window
-                .iter()
-                .any(|l| CONTEXT_MACROS.iter().any(|m| l.contains(m)));
+            let has_context_macro = window.iter().any(|l| {
+                CONTEXT_MACROS.iter().any(|m| l.contains(m)) || l.contains(CONTEXT_METHOD_NEEDLE)
+            });
             if !has_context_macro {
                 let key = format!("{rel}:{lineno}", rel = rel, lineno = idx + 1);
                 if known.contains(key.as_str()) {

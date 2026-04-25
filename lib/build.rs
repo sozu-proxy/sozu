@@ -34,6 +34,13 @@ const CONTEXT_MACROS: &[&str] = &[
     "log_socket_module_prefix",
 ];
 
+/// `HttpContext::log_context(&self) -> LogContext<'_>` is the canonical
+/// method-call form used inside `kawa_h1/editor.rs` (and elsewhere when an
+/// `HttpContext` is in scope). The match is `.log_context(` so the walker
+/// only recognises method-call usage and never confuses it with the
+/// macro-arity definitions in the macro index above.
+const CONTEXT_METHOD_NEEDLE: &str = ".log_context(";
+
 /// Lines after a `error!(`/`warn!(`/etc. opening to scan for a context macro.
 const LOOKAHEAD_LINES: usize = 12;
 
@@ -105,9 +112,9 @@ fn main() {
             let start = idx.saturating_sub(LOOKBEHIND_LINES);
             let end = (idx + 1 + LOOKAHEAD_LINES).min(lines.len());
             let window = &lines[start..end];
-            let has_context_macro = window
-                .iter()
-                .any(|l| CONTEXT_MACROS.iter().any(|m| l.contains(m)));
+            let has_context_macro = window.iter().any(|l| {
+                CONTEXT_MACROS.iter().any(|m| l.contains(m)) || l.contains(CONTEXT_METHOD_NEEDLE)
+            });
             if !has_context_macro {
                 println!(
                     "cargo:warning={rel}:{lineno}: raw log call missing log_context!/log_module_context! envelope (lookbehind {LOOKBEHIND_LINES} / lookahead {LOOKAHEAD_LINES} lines)",
