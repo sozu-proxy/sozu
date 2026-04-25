@@ -395,8 +395,12 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
     ) -> Result<Rx, ChannelError> {
         let now = std::time::Instant::now();
 
-        // set a very small timeout, to repeat the loop often
-        self.set_timeout(Some(Duration::from_millis(10)))?;
+        // Lisa LISA-010: 10 ms = 100 syscalls/sec on idle WouldBlock,
+        // pinning a CPU on long blocking waits with no payload. 100 ms is
+        // a usability-acceptable resolution for the outer `timeout`
+        // deadline check (the wait is bounded by `timeout`, not by this
+        // value) and drops the steady-state read syscall rate to 10/sec.
+        self.set_timeout(Some(Duration::from_millis(100)))?;
 
         let status = loop {
             if let Some(timeout) = timeout {
@@ -433,6 +437,22 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
                 .try_into()
                 .map_err(|_| ChannelError::MismatchBufferSize)?;
             let message_len = usize::from_le_bytes(delimiter);
+
+            // Lisa LISA-011 (defense in depth): bound the parser-side
+            // length up-front. Without this an attacker who controls the
+            // first 8 bytes of a frame can declare an arbitrarily large
+            // message and drive `Buffer::grow` toward the
+            // `max_buffer_size` ceiling before any byte of payload has
+            // been read. Reject as `MessageTooLarge` so the read loop
+            // disconnects cleanly instead of running the doubling growth
+            // strategy on attacker-supplied numbers.
+            if message_len > self.max_buffer_size {
+                return Err(ChannelError::MessageTooLarge {
+                    message_len,
+                    capacity: self.front_buf.capacity(),
+                    max: self.max_buffer_size,
+                });
+            }
 
             if buffer.len() >= message_len {
                 let message = Rx::decode(&buffer[delimiter_size()..message_len])
