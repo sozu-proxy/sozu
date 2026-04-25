@@ -3419,11 +3419,23 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 sid,
                 deadline
             );
-            self.pending_rst_streams.push((sid, H2Error::Cancel));
-            // Do NOT increment total_rst_streams_queued here: proxy-initiated
-            // timeout cancellations are not peer-triggered and must not count
-            // against the lifetime RST budget (CVE-2023-44487 Rapid Reset).
-            self.rst_sent.insert(sid);
+            // Route through the canonical chokepoint so dedupe (rst_sent),
+            // queued-cap accounting (MAX_PENDING_RST_STREAMS via
+            // total_rst_streams_queued), and edge-triggered-epoll arming
+            // (Readiness::arm_writable) all stay consistent — see LIFECYCLE
+            // §8.2. The previous direct push bypassed all three: a peer
+            // that opens 200 streams and lets them all idle past
+            // stream_idle_timeout could push past the queued cap silently
+            // (no GOAWAY(ENHANCE_YOUR_CALM) escalation), a double-cancel
+            // pass would grow pending_rst_streams instead of short-
+            // circuiting on the existing rst_sent membership, and the
+            // hand-rolled `interest.insert(WRITABLE) + signal_pending_write`
+            // pair below skipped invariant 15. Counting these RSTs against
+            // the cap is a deliberate behaviour change: 200 cumulative idle
+            // cancellations from one peer IS abusive (pinning
+            // MAX_CONCURRENT_STREAMS slots), and the GOAWAY(ENHANCE_YOUR_CALM)
+            // escalation tells the peer to reconnect with a clean state.
+            self.enqueue_rst(sid, H2Error::Cancel);
 
             // Remove from streams map and recycle the context stream so the slot
             // no longer counts against MAX_CONCURRENT_STREAMS.
@@ -3471,8 +3483,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 self.remove_dead_stream(sid, global_stream_id);
             }
         }
-        self.readiness.interest.insert(Ready::WRITABLE);
-        self.readiness.signal_pending_write();
+        // Writable arming is already done by enqueue_rst -> arm_writable in
+        // the loop above; the trailing pair was redundant after the chokepoint
+        // routing landed.
     }
 
     /// Queue a `RST_STREAM` frame for serialisation by
