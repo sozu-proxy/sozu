@@ -29,6 +29,25 @@ macro_rules! log_module_context {
     }};
 }
 
+/// QW7 helper: dispatch a request pseudo-header (`:method`, `:scheme`,
+/// `:path`, `:authority`) through `store_pseudo_header`, recording the
+/// per-reason rejection metric and flipping `invalid_headers` on
+/// failure. The four call sites in `handle_header` differ only by the
+/// destination identifier; the macro keeps the dispatch shape uniform
+/// so a future fifth pseudo-header inherits both the reject metric and
+/// the invalid-flag plumbing automatically.
+macro_rules! store_or_reject {
+    ($field:expr, $regular:expr, $kawa:expr, $value:expr, $invalid:expr) => {
+        match store_pseudo_header(&$field, $regular, $kawa, &$value) {
+            Ok(s) => $field = s,
+            Err(reason) => {
+                metric_reject(reason);
+                *$invalid = true;
+            }
+        }
+    };
+}
+
 /// Per-trailer-block byte cap (Lisa LISA-101 trailer carve-out). HEADERS
 /// and trailers run independent budget counters against
 /// `SETTINGS_MAX_HEADER_LIST_SIZE`, so without a tighter trailer-only
@@ -609,13 +628,7 @@ where
                             *invalid_headers = true;
                             return;
                         }
-                        match store_pseudo_header(&method, regular_headers, kawa, &v) {
-                            Ok(s) => method = s,
-                            Err(reason) => {
-                                metric_reject(reason);
-                                *invalid_headers = true;
-                            }
-                        }
+                        store_or_reject!(method, regular_headers, kawa, v, invalid_headers);
                     } else if compare_no_case(&k, b":scheme") {
                         // RFC 9113 §8.3.1: the HPACK lowercase rule means a
                         // valid :scheme arrives exactly as "http" or "https".
@@ -625,13 +638,7 @@ where
                             *invalid_headers = true;
                             return;
                         }
-                        match store_pseudo_header(&scheme, regular_headers, kawa, &v) {
-                            Ok(s) => scheme = s,
-                            Err(reason) => {
-                                metric_reject(reason);
-                                *invalid_headers = true;
-                            }
-                        }
+                        store_or_reject!(scheme, regular_headers, kawa, v, invalid_headers);
                     } else if compare_no_case(&k, b":path") {
                         // RFC 9112 §3.2: fragment identifiers (`#`) are
                         // prohibited in request-targets.
@@ -640,21 +647,9 @@ where
                             *invalid_headers = true;
                             return;
                         }
-                        match store_pseudo_header(&path, regular_headers, kawa, &v) {
-                            Ok(s) => path = s,
-                            Err(reason) => {
-                                metric_reject(reason);
-                                *invalid_headers = true;
-                            }
-                        }
+                        store_or_reject!(path, regular_headers, kawa, v, invalid_headers);
                     } else if compare_no_case(&k, b":authority") {
-                        match store_pseudo_header(&authority, regular_headers, kawa, &v) {
-                            Ok(s) => authority = s,
-                            Err(reason) => {
-                                metric_reject(reason);
-                                *invalid_headers = true;
-                            }
-                        }
+                        store_or_reject!(authority, regular_headers, kawa, v, invalid_headers);
                     } else if k.starts_with(b":") {
                         metric_reject(RejectReason::UnknownPseudo);
                         *invalid_headers = true;

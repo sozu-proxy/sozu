@@ -98,26 +98,17 @@ impl ClientSession {
     /// Render the captured peer UID for audit logs. Returns the literal
     /// `"unknown"` when the value is missing so log lines stay structured.
     pub fn actor_uid_display(&self) -> String {
-        match self.actor_uid {
-            Some(uid) => uid.to_string(),
-            None => String::from("unknown"),
-        }
+        display_or_unknown(self.actor_uid)
     }
 
     /// Render the captured peer GID. `"unknown"` when absent.
     pub fn actor_gid_display(&self) -> String {
-        match self.actor_gid {
-            Some(gid) => gid.to_string(),
-            None => String::from("unknown"),
-        }
+        display_or_unknown(self.actor_gid)
     }
 
     /// Render the captured peer PID. `"unknown"` when absent.
     pub fn actor_pid_display(&self) -> String {
-        match self.actor_pid {
-            Some(pid) => pid.to_string(),
-            None => String::from("unknown"),
-        }
+        display_or_unknown(self.actor_pid)
     }
 
     /// Render the connection-accept timestamp as an RFC 3339 UTC string,
@@ -131,19 +122,13 @@ impl ClientSession {
     /// output (control chars stripped — `comm` is kernel-truncated but
     /// cannot contain any tab/newline already). `"unknown"` when absent.
     pub fn actor_comm_display(&self) -> String {
-        match &self.actor_comm {
-            Some(comm) => sanitize_for_audit(comm),
-            None => String::from("unknown"),
-        }
+        display_sanitized_or_unknown(self.actor_comm.as_deref())
     }
 
     /// Render the resolved POSIX account name (`getpwuid_r(uid)`),
     /// sanitized for audit output. `"unknown"` when absent.
     pub fn actor_user_display(&self) -> String {
-        match &self.actor_user {
-            Some(name) => sanitize_for_audit(name),
-            None => String::from("unknown"),
-        }
+        display_sanitized_or_unknown(self.actor_user.as_deref())
     }
 
     /// queue a response for the client (the event loop does the send)
@@ -202,6 +187,28 @@ pub fn sanitize_for_audit(s: &str) -> String {
             }
         })
         .collect()
+}
+
+/// QW8 helper: render `Option<T>` for audit output. `Some(v)` becomes
+/// `v.to_string()`, `None` becomes the literal `"unknown"`. Used by the
+/// `actor_*_display` accessors on `ClientSession` so the five near-
+/// identical 4-line methods collapse to one-line wrappers around a
+/// single rendering policy.
+pub fn display_or_unknown<T: ToString>(value: Option<T>) -> String {
+    match value {
+        Some(v) => v.to_string(),
+        None => String::from("unknown"),
+    }
+}
+
+/// QW8 companion: render `Option<&str>` through `sanitize_for_audit` so
+/// `actor_user_display` / `actor_comm_display` cannot regress against
+/// the audit-line forgery defence. `None` → `"unknown"`.
+pub fn display_sanitized_or_unknown(value: Option<&str>) -> String {
+    match value {
+        Some(s) => sanitize_for_audit(s),
+        None => String::from("unknown"),
+    }
 }
 
 impl MessageClient for ClientSession {
