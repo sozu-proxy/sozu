@@ -1129,6 +1129,14 @@ message ServerConfig {
     // Dedicated JSON mirror of the audit log. One JSON object per line for
     // SIEM ingest. Same lifecycle as `audit_logs_target`.
     optional string audit_logs_json_target = 19;
+    // Slab capacity multiplier per connection. Defaults to 4 to accommodate
+    // H2 multiplexing (1 frontend + up to 3 backend connections per
+    // frontend). Operators with topologies that fan out across more clusters
+    // per session can raise this; the slab capacity is computed as
+    // `10 + slab_entries_per_connection * max_connections`. Clamped to
+    // [2, 32] at config-load time. The previous compile-time constant was
+    // 4 and remains the default.
+    optional uint64 slab_entries_per_connection = 20;
 }
 
 enum ProtobufAccessLogFormat {
