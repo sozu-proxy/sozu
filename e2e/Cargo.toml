@@ -21,3 +21,13 @@ tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "tim
 sozu-command-lib = { workspace = true }
 sozu-lib = { workspace = true, features = ["e2e-hooks"] }
 tempfile = { workspace = true }
+
+[dev-dependencies]
+# Serialise tests that share global state (e.g. the e2e-hooks
+# `FORCE_NEW_H2_CLIENT_FAILURE` `AtomicBool` consumed by both
+# `e2e_session_router_connect_failure_no_leak` and
+# `e2e_session_stream_id_exhaustion_graceful`). Without this, the
+# default `cargo test` parallel scheduler can let the FIX-22 smoke
+# request consume the failure injection that FIX-18 just armed,
+# producing the wrong response code for both tests on CI.
+serial_test = { workspace = true }

@@ -230,7 +230,13 @@ fn try_e2e_session_router_connect_failure_no_leak() -> State {
     }
 }
 
+// Serialised against `e2e_session_stream_id_exhaustion_graceful` (FIX-22)
+// — both touch the global `FORCE_NEW_H2_CLIENT_FAILURE` injection in
+// `lib::protocol::mux::connection::test_hooks` and would otherwise race
+// each other under `cargo test`'s default parallel scheduler. Other
+// tests run in parallel as usual.
 #[test]
+#[serial_test::serial(force_h2_client_failure)]
 fn e2e_session_router_connect_failure_no_leak() {
     assert_eq!(
         repeat_until_error_or(
@@ -605,7 +611,15 @@ fn try_e2e_session_stream_id_exhaustion_graceful() -> State {
     }
 }
 
+// Serialised against `e2e_session_router_connect_failure_no_leak` (FIX-18)
+// — see that test's `#[serial]` rationale. Even though FIX-22 itself does
+// NOT arm `FORCE_NEW_H2_CLIENT_FAILURE`, it can race the FIX-18 inject:
+// FIX-22's `new_h2_client` call consumes the flag FIX-18 set on a
+// neighbouring iteration, leaving FIX-22 with a 503 and FIX-18 with a
+// 200. Sharing the same `serial(force_h2_client_failure)` group avoids
+// the cross-test interference.
 #[test]
+#[serial_test::serial(force_h2_client_failure)]
 fn e2e_session_stream_id_exhaustion_graceful() {
     // NOTE: full exhaustion assertion requires a white-box unit test — see
     // module docstring. This E2E is a narrow smoke that a single H2→H2

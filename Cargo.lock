@@ -1971,6 +1971,7 @@ dependencies = [
  "libc",
  "mio",
  "rustls",
+ "serial_test",
  "sha2",
  "sozu-command-lib",
  "sozu-lib",
