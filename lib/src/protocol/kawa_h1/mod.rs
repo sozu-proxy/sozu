@@ -1208,6 +1208,13 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                     e
                 );
             }
+            // SAFETY (TLS-truncation invariant): `Shutdown::Both` is permitted
+            // here because this is the *backend* socket of an H1 session — Sōzu
+            // currently speaks plaintext H1 to backends, so there is no
+            // outbound TLS write buffer that the kernel could discard with a
+            // RST. If backend-TLS lands later (#1218), this MUST move to
+            // `Shutdown::Write` (or `socket.send_close_notify()`) to avoid the
+            // canonical truncation anti-pattern documented in CLAUDE.md.
             if let Err(e) = socket.shutdown(Shutdown::Both) {
                 if e.kind() != ErrorKind::NotConnected {
                     error!(

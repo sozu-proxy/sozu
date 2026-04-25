@@ -863,6 +863,10 @@ impl TcpSession {
 
             let log_context = log_context!(self);
             if let Some(sock) = self.back_socket_mut() {
+                // TCP-only backend in the pure-TCP proxy: no outbound TLS
+                // buffer to truncate, so `Shutdown::Both` is the right call.
+                // If the TCP listener ever gains an inline TLS upgrade,
+                // switch to `Shutdown::Write` here.
                 if let Err(e) = sock.shutdown(Shutdown::Both) {
                     if e.kind() != ErrorKind::NotConnected {
                         error!(
@@ -1004,6 +1008,11 @@ impl ProxySession for TcpSession {
         self.cancel_timeouts();
 
         let front_socket = self.state.front_socket();
+        // TCP listener is plaintext at this layer — `Shutdown::Both` does not
+        // truncate any TLS write buffer, so the canonical anti-pattern
+        // (forces a TCP RST on the read direction, dropping in-flight bytes)
+        // does not apply. Move to `Shutdown::Write` if a TLS upgrade ever
+        // wraps this listener.
         if let Err(e) = front_socket.shutdown(Shutdown::Both) {
             // error 107 NotConnected can happen when was never fully connected, or was already disconnected due to error
             if e.kind() != ErrorKind::NotConnected {
