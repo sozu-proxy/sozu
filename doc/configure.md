@@ -331,16 +331,29 @@ The frontend and backend protocols are independent. All four combinations work:
 
 #### Buffer size for HTTP/2
 
-HTTP/2 uses a default maximum frame size of 16384 bytes (16 KiB). Sōzu needs at least
-9 additional bytes for the frame header. Set `buffer_size` in the global section to at
-least **16393**:
+HTTP/2 uses a default maximum frame size of 16384 bytes (16 KiB) per RFC 9113 §6.5.2.
+Sōzu needs at least 9 additional bytes for the frame header (§4.1). Set `buffer_size`
+in the global section to at least **16393**:
 
 ```toml
 buffer_size = 16393
 ```
 
-A smaller buffer size will cause HTTP/2 frames to be rejected by peers that expect the
-default maximum frame size.
+This is also the default — no action is needed unless an operator explicitly lowers
+`buffer_size`. **As of [PR #1209](https://github.com/sozu-proxy/sozu/pull/1209) Sōzu
+rejects start-up if `buffer_size < 16393` and any HTTPS listener advertises `h2` in
+its ALPN list**, with a `BufferSizeTooSmallForH2` error pointing at the conflicting
+listeners. The previous behaviour (silently accept the typo, then deadlock H2 mux on
+full-size frames) is gone.
+
+To run with a smaller buffer, remove `h2` from the listeners' `alpn_protocols`:
+
+```toml
+[[listeners]]
+address = "0.0.0.0:443"
+protocol = "https"
+alpn_protocols = ["http/1.1"]   # h2 removed; buffer_size < 16393 is now valid
+```
 
 #### H2 flood detection thresholds
 
@@ -1065,10 +1078,14 @@ loop regression.
 | Metric | Type | Scope | Description |
 |---|---|---|---|
 | `h2.signal.writable.rearmed.default_answer` | counter | proxy | Fired in `mux/answers.rs::set_default_answer` (504 backend timeout, 500/400 parse errors). Rate should track the default-answer render rate closely. |
+| `h2.signal.writable.rearmed.forcefully_terminate_answer` | counter | proxy | Fired in `mux/answers.rs::forcefully_terminate_answer` when the proxy injects a default answer mid-response (e.g. backend disconnects after partial body). Companion to `default_answer`; the forcefully-terminate path is exercised on backend hard-failure and proxy-initiated stream resets. |
 | `h2.signal.writable.rearmed.priority_update` | counter | proxy | Fired in `mux/h2.rs::handle_priority_update_frame` whenever a PRIORITY_UPDATE mutates `Prioriser` state. Pairs with `h2.frames.rx.priority_update`. Low-to-zero on Firefox-only fleets (Firefox does not emit 0x10). |
 | `h2.signal.writable.rearmed.peer_data` | counter | proxy | Fired in `mux/h2.rs::handle_data_frame` when an H2 DATA frame wakes the linked peer. Non-zero only on clusters that use H2 to the origin. |
 | `h2.signal.writable.rearmed.peer_headers` | counter | proxy | Fired in `mux/h2.rs::handle_headers_frame` when an H2 HEADERS frame wakes the linked peer. Non-zero only on clusters that use H2 to the origin. |
+| `h2.signal.writable.rearmed.control_queue` | counter | proxy | Fired in `mux/h2.rs::flush_pending_control_frames` when a queued WINDOW_UPDATE or RST_STREAM forces an extra writable pass. Pairs with `h2.frames.tx.window_update` / `h2.frames.tx.rst_stream`. Persistent non-zero rate without matching tx growth points to a control-frame queue that fills faster than it drains. |
 | `h2.streams.ready_incremental.by_urgency` | gauge | proxy | Post-scheduling-pass snapshot of the sum of ready incremental streams across all urgency buckets (RFC 9218 §4). Debug hint for scheduler fairness — a consistently non-zero value under load means the round-robin is active. |
+| `h2.trailers_dropped_content_length` | counter | proxy | Fired in `mux/pkawa.rs::handle_trailer` when an H2 trailer block is rejected for carrying a `Content-Length` header (RFC 9113 §8.1 disallows pseudo-headers and Content-Length in trailers). Spikes correlate with malformed gRPC clients or smuggling attempts; aggregate cardinality is bounded. |
+| `h1.backend_eof_before_message_complete` | counter | proxy | Fired in `mux/h1.rs::back_readable` when the H1 backend closes the socket before the response body is fully delivered (chunked-EOF or Content-Length-EOF mid-stream). The H2 converter surfaces this as `RST_STREAM(InternalError)` to the H2 client; non-zero rate maps to backend application crashes or proxy-side reads. |
 
 #### HTTP/2 GOAWAY and RST_STREAM by error code
 
