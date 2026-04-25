@@ -797,3 +797,40 @@ If you are fixing a bug in this module:
 Last revision date of the `feat/h2-mux` line numbers: keep this line
 *actually* current when you touch the file — greppable as
 "Last revision date".
+
+---
+
+## 11. Close-path log severity tiers
+
+The TLS-drain warning at `ConnectionH2::close` (`h2.rs:5141`,
+`Position::Server` arm) fires when `socket_wants_write()` is still true
+after `MAX_DRAIN_ROUNDS` empty `socket_write_vectored(&[])` calls. The
+severity is tiered along **stream-count + close-state**, not
+peer-vs-operator. The tier is intentionally orthogonal to — and
+composes with — the send-side `H2Error`-variant tier in `goaway()`
+(`h2.rs:3699-3703`); both rules demote benign paths and keep
+loss-bearing paths loud.
+
+| Stream count | `H2State` | Severity | Rationale |
+|---|---|---|---|
+| `streams != 0` | any | `error!` | Live streams at close time. Response bytes may have been queued in the TLS write buffer and stranded by the kernel RST. Real data loss is possible. |
+| `streams == 0` | `GoAway` or `Error` | `warn!` | Idle close after a GOAWAY exchange (peer-initiated abort or our own graceful drain). What is stranded is best-effort GOAWAY/close_notify; no application data was queued. Covers both the production HAProxy-chain RST race and operator soft-stop on an already-idle connection. |
+| `streams == 0` | any other state | `error!` | Idle close from an unexpected state (no GOAWAY exchange, e.g. `Header` or `Settings`). Worth keeping loud so unknown teardown paths surface. |
+
+The format string is prefixed with `"{}"` and `log_context!(self)` so
+the line carries the canonical `MUX-H2 Session(...)` envelope. This
+matches every other log site on `ConnectionH2`, which is required for
+operators to grep-correlate against the preceding `WARN MUX-H2`
+GOAWAY-receipt line for the same session.
+
+Regression coverage:
+
+- `e2e/src/tests/h2_correctness_tests.rs::test_h2_peer_goaway_protocol_error_then_rst_clean_drain`
+  — peer abort with stream count zero (the production scenario; new
+  `warn!` path).
+- `test_h2_peer_goaway_no_error_clean_close` — happy-abort baseline.
+- `test_h2_peer_goaway_during_response_body` — in-flight stream at
+  close time (`error!` path; asserts the stream is torn down).
+- `lib/tests/log_layout.rs` — static check that this site uses
+  `log_context!(self)` and that no protocol/runtime log call drifts
+  away from the canonical envelope.
