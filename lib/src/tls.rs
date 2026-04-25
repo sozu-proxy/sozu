@@ -200,12 +200,21 @@ impl CertificateResolver {
     /// Called from `add_certificate` / `remove_certificate` — i.e. only when
     /// the cert set actually changes, never on the hot TLS handshake path.
     fn publish_min_expiration_gauge(&self) {
-        let min_expiration = self
+        let Some(min_expiration) = self
             .certificates
             .values()
             .map(|c| c.expiration)
             .min()
-            .unwrap_or(0);
+        else {
+            // SECURITY (Lisa LISA-TLS-001 false-positive): an empty
+            // resolver is not "every cert just expired"; it is "no cert
+            // has been loaded yet" — typical at process boot before the
+            // first AddCertificate request lands. Writing 0 here pages
+            // SOC tooling on every restart with the same alert as a real
+            // expired-cert event. Skip the emit so the gauge reflects the
+            // last known good state instead of being clobbered to 0.
+            return;
+        };
         let clamped = min_expiration.max(0) as usize;
         gauge!("tls.cert.min_expires_at_seconds", clamped);
     }
