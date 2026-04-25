@@ -6,6 +6,7 @@ use std::{
 
 use mio::{Token, net::TcpStream};
 use rusty_ulid::Ulid;
+use sozu_command::logging::ansi_palette;
 
 use crate::{
     BackendConnectionStatus, Protocol, Readiness, SessionMetrics, SessionResult,
@@ -18,6 +19,40 @@ use crate::{
     sozu_command::ready::Ready,
     tcp::TcpListener,
 };
+
+/// Module-level prefix used on every log line emitted from this module when
+/// no per-session state is in scope. Produces a bold bright-white
+/// `PROXY-SEND` label (uniform across every protocol) when the logger is in
+/// colored mode.
+#[allow(unused_macros)]
+macro_rules! log_module_context {
+    () => {{
+        let (open, reset, _, _, _) = ansi_palette();
+        format!("{open}PROXY-SEND{reset}\t >>>", open = open, reset = reset)
+    }};
+}
+
+/// Per-session prefix for log lines emitted with a [`SendProxyProtocol`] in
+/// scope. Renders the canonical `\tPROXY-SEND\tSession(...)\t >>>` envelope.
+/// The send-side state has no `request_id`-keyed [`LogContext`] yet; the
+/// bracket carries the front/back tokens instead.
+macro_rules! log_context {
+    ($self:expr) => {{
+        let (open, reset, grey, gray, white) = ansi_palette();
+        format!(
+            "{open}PROXY-SEND{reset}\t{grey}Session{reset}({gray}frontend{reset}={white}{frontend}{reset}, {gray}backend{reset}={white}{backend}{reset}, {gray}front_readiness{reset}={white}{front_readiness}{reset}, {gray}back_readiness{reset}={white}{back_readiness}{reset})\t >>>",
+            open = open,
+            reset = reset,
+            grey = grey,
+            gray = gray,
+            white = white,
+            frontend = $self.frontend_token.0,
+            backend = $self.backend_token.map(|t| t.0.to_string()).unwrap_or_else(|| "<none>".to_string()),
+            front_readiness = $self.frontend_readiness,
+            back_readiness = $self.backend_readiness,
+        )
+    }};
+}
 
 pub struct SendProxyProtocol<Front: SocketHandler> {
     cursor_header: usize,
@@ -65,7 +100,10 @@ impl<Front: SocketHandler> SendProxyProtocol<Front> {
     // The header is send immediately at once upon the connection is establish
     // and prepended before any data.
     pub fn back_writable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
-        debug!("Trying to write proxy protocol header");
+        debug!(
+            "{} trying to write proxy protocol header",
+            log_context!(self)
+        );
 
         // Generate the proxy protocol header if not already exist.
         if self.header.is_none() {
@@ -95,7 +133,7 @@ impl<Front: SocketHandler> SendProxyProtocol<Front> {
                             metrics.backend_bout += sz;
 
                             if self.cursor_header == header.len() {
-                                debug!("Proxy protocol sent, upgrading");
+                                debug!("{} proxy protocol sent, upgrading", log_context!(self));
                                 return SessionResult::Upgrade;
                             }
                         }
@@ -106,7 +144,7 @@ impl<Front: SocketHandler> SendProxyProtocol<Front> {
                             }
                             e => {
                                 incr!("proxy_protocol.errors");
-                                debug!("send proxy protocol write error {:?}", e);
+                                debug!("{} write error: {:?}", log_context!(self), e);
                                 return SessionResult::Close;
                             }
                         },
@@ -115,7 +153,10 @@ impl<Front: SocketHandler> SendProxyProtocol<Front> {
             }
         }
 
-        error!("started Send proxy protocol with no header or backend socket");
+        error!(
+            "{} started send proxy protocol with no header or backend socket",
+            log_context!(self)
+        );
         SessionResult::Close
     }
 
