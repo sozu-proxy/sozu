@@ -3,6 +3,7 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc,
     },
     thread,
 };
@@ -43,10 +44,26 @@ impl H2Backend {
         let resp_count = responses_sent.clone();
         let thread_name = name.clone();
 
+        // Synchronous readiness handshake: the spawned tokio thread must
+        // signal it has bound the listener AND entered the accept loop
+        // before `H2Backend::start` returns. Without this, the test
+        // request can race the accept-loop spin-up on slow CI runners
+        // (observed on `Test (false, beta)` of run 24916520793 where
+        // FIX-18 / FIX-22 sessions saw a 503 from sozu because the
+        // backend wasn't yet draining its accept queue when sozu opened
+        // the outbound TCP connection — sozu's H2 handshake then timed
+        // out, the cluster marked the backend down for a window, and
+        // the test returned the wrong status code).
+        let (ready_tx, ready_rx) = mpsc::channel::<()>();
+
         let thread = thread::spawn(move || {
             let rt = Runtime::new().expect("could not create tokio runtime");
             rt.block_on(async move {
                 let listener = bind_tokio_listener(address, "h2 backend");
+                // Notify the caller now that we are about to enter the
+                // accept loop. After this point a TCP SYN to `address`
+                // will be drained by `listener.accept()` within ≤50 ms.
+                let _ = ready_tx.send(());
 
                 loop {
                     if stop_clone.load(Ordering::Relaxed) {
@@ -107,6 +124,14 @@ impl H2Backend {
                 }
             });
         });
+
+        // Block until the spawned thread has bound the listener and is
+        // about to call accept(). Cap at 5 s so a misconfigured runtime
+        // does not hang the test forever — that would manifest as a
+        // panic instead of the silent 503 race we are trying to close.
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("H2Backend: accept loop did not signal readiness within 5 s");
 
         Self {
             name,
