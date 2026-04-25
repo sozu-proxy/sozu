@@ -24,10 +24,30 @@ use sozu_command::{
     certificate::{
         CertificateError, Fingerprint, get_cn_and_san_attributes, parse_pem, parse_x509,
     },
+    logging::ansi_palette,
     proto::command::{AddCertificate, CertificateAndKey, ReplaceCertificate, SocketAddress},
 };
 
 use crate::router::pattern_trie::{Key, KeyValue, TrieNode};
+
+/// Module-level prefix used on every log line emitted from this module.
+/// Produces a bold bright-white `TLS-RESOLVER` label (uniform across every
+/// protocol) when the logger is in colored mode. The certificate resolver
+/// runs at listener scope -- it has no per-session state -- so this is the
+/// only macro the module needs. `RUSTLS` covers the protocol-side logs in
+/// `lib/src/protocol/rustls.rs`; `TLS-RESOLVER` is intentionally distinct so
+/// operators can tell handshake failures (RUSTLS) apart from cert-store
+/// management noise (TLS-RESOLVER).
+macro_rules! log_module_context {
+    () => {{
+        let (open, reset, _, _, _) = ansi_palette();
+        format!(
+            "{open}TLS-RESOLVER{reset}\t >>>",
+            open = open,
+            reset = reset
+        )
+    }};
+}
 
 // -----------------------------------------------------------------------------
 // Default ParsedCertificateAndKey
@@ -198,7 +218,11 @@ impl CertificateResolver {
     ) -> Result<Fingerprint, CertificateResolverError> {
         let cert_to_add = CertifiedKeyWrapper::try_from(add)?;
 
-        trace!("Certificate Resolver: adding certificate {:?}", cert_to_add);
+        trace!(
+            "{} adding certificate {:?}",
+            log_module_context!(),
+            cert_to_add
+        );
 
         if self.certificates.contains_key(&cert_to_add.fingerprint) {
             return Ok(cert_to_add.fingerprint);
@@ -219,7 +243,10 @@ impl CertificateResolver {
             let longest_lived_cert = match fingerprints_for_this_name.last() {
                 Some(cert) => cert,
                 None => {
-                    error!("no fingerprint for this name, this should not happen");
+                    error!(
+                        "{} no fingerprint for this name, this should not happen",
+                        log_module_context!()
+                    );
                     continue;
                 }
             };
@@ -236,7 +263,7 @@ impl CertificateResolver {
             .insert(cert_to_add.fingerprint.to_owned(), cert_to_add.clone());
         self.publish_min_expiration_gauge();
 
-        trace!("{:#?}", self);
+        trace!("{} {:#?}", log_module_context!(), self);
 
         Ok(cert_to_add.fingerprint)
     }
@@ -269,7 +296,7 @@ impl CertificateResolver {
             self.certificates.remove(fingerprint);
             self.publish_min_expiration_gauge();
         }
-        trace!("{:#?}", self);
+        trace!("{} {:#?}", log_module_context!(), self);
 
         Ok(())
     }
@@ -284,7 +311,11 @@ impl CertificateResolver {
         match Fingerprint::from_str(&replace.old_fingerprint) {
             Ok(old_fingerprint) => self.remove_certificate(&old_fingerprint)?,
             Err(err) => {
-                error!("failed to parse fingerprint, {}", err);
+                error!(
+                    "{} failed to parse fingerprint, {}",
+                    log_module_context!(),
+                    err
+                );
             }
         }
 
@@ -348,19 +379,26 @@ impl ResolvesServerCert for MutexCertificateResolver {
         let sigschemes = client_hello.signature_schemes();
 
         let Some(name) = server_name else {
-            error!("cannot look up certificate: no SNI from session");
+            error!(
+                "{} cannot look up certificate: no SNI from session",
+                log_module_context!()
+            );
             return None;
         };
         trace!(
-            "trying to resolve name: {:?} for signature scheme: {:?}",
-            name, sigschemes
+            "{} trying to resolve name: {:?} for signature scheme: {:?}",
+            log_module_context!(),
+            name,
+            sigschemes
         );
         if let Ok(ref mut resolver) = self.0.try_lock() {
             //resolver.domains.print();
             if let Some((_, fingerprint)) = resolver.domains.domain_lookup(name.as_bytes(), true) {
                 trace!(
-                    "looking for certificate for {:?} with fingerprint {:?}",
-                    name, fingerprint
+                    "{} looking for certificate for {:?} with fingerprint {:?}",
+                    log_module_context!(),
+                    name,
+                    fingerprint
                 );
 
                 let cert = resolver
@@ -368,7 +406,12 @@ impl ResolvesServerCert for MutexCertificateResolver {
                     .get(fingerprint)
                     .map(|cert| cert.inner.clone());
 
-                trace!("Found for fingerprint {}: {}", fingerprint, cert.is_some());
+                trace!(
+                    "{} found for fingerprint {}: {}",
+                    log_module_context!(),
+                    fingerprint,
+                    cert.is_some()
+                );
                 return cert;
             }
         }
@@ -376,7 +419,11 @@ impl ResolvesServerCert for MutexCertificateResolver {
         // error!("could not look up a certificate for server name '{}'", name);
         // This certificate is used for TLS tunneling with another TLS termination endpoint
         // Note that this is unsafe and you should provide a valid certificate
-        debug!("Default certificate is used for {}", name);
+        debug!(
+            "{} default certificate is used for {}",
+            log_module_context!(),
+            name
+        );
         incr!("tls.default_cert_used");
         DEFAULT_CERTIFICATE.clone()
     }
