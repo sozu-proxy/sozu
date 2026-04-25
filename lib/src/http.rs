@@ -66,6 +66,38 @@ StateMachineBuilder! {
     }
 }
 
+/// Module-level prefix for log lines emitted from this file when no session
+/// is in scope. Produces a bold bright-white `HTTP` label in colored mode.
+/// Used by [`HttpProxy`] / [`HttpListener`] callbacks (notify, add_cluster,
+/// add_*_frontend, accept, soft_stop, hard_stop, etc.) which own a token map
+/// keyed by listener and have no `frontend_token` of their own.
+macro_rules! log_module_context {
+    () => {{
+        let (open, reset, _, _, _) = sozu_command::logging::ansi_palette();
+        format!("{open}HTTP{reset}\t >>>", open = open, reset = reset)
+    }};
+}
+
+/// Per-session prefix for log lines emitted with an [`HttpSession`] in
+/// scope. Renders the canonical `\tHTTP\tSession(...)\t >>>` envelope from
+/// the session's `frontend_token` (mirrors the bracket convention used by
+/// `MUX-*`, `RUSTLS`, `PIPE`). Operators can grep-correlate against the
+/// token id across log lines for the same H1 connection.
+macro_rules! log_context {
+    ($self:expr) => {{
+        let (open, reset, grey, gray, white) = sozu_command::logging::ansi_palette();
+        format!(
+            "{open}HTTP{reset}\t{grey}Session{reset}({gray}frontend{reset}={white}{frontend}{reset})\t >>>",
+            open = open,
+            reset = reset,
+            grey = grey,
+            gray = gray,
+            white = white,
+            frontend = $self.frontend_token.0,
+        )
+    }};
+}
+
 /// HTTP Session to insert in the SessionManager
 ///
 /// 1 session <=> 1 HTTP connection (client to sozu)
@@ -103,7 +135,7 @@ impl HttpSession {
         let container_frontend_timeout = TimeoutContainer::new(configured_request_timeout, token);
 
         let state = if expect_proxy {
-            trace!("starting in expect proxy state");
+            trace!("{} starting in expect proxy state", log_module_context!());
             gauge_add!("protocol.proxy.expect", 1);
 
             HttpStateMachine::Expect(ExpectProxyProtocol::new(
@@ -158,7 +190,7 @@ impl HttpSession {
     }
 
     pub fn upgrade(&mut self) -> SessionIsToBeClosed {
-        debug!("HTTP::upgrade");
+        debug!("{} upgrade", log_context!(self));
         let new_state = match self.state.take() {
             HttpStateMachine::Mux(mux) => self.upgrade_mux(mux),
             HttpStateMachine::Expect(expect) => self.upgrade_expect(expect),
@@ -167,7 +199,10 @@ impl HttpSession {
                 // Reaching this arm means a prior upgrade already returned
                 // `None` and the session should have been closed. Fall back
                 // to closing cleanly instead of panicking the worker.
-                error!("HTTP::upgrade called on FailedUpgrade state; closing session");
+                error!(
+                    "{} upgrade called on FailedUpgrade state; closing session",
+                    log_context!(self)
+                );
                 None
             }
         };
@@ -186,7 +221,7 @@ impl HttpSession {
         &mut self,
         expect: ExpectProxyProtocol<TcpStream>,
     ) -> Option<HttpStateMachine> {
-        debug!("switching to HTTP");
+        debug!("{} switching to HTTP", log_context!(self));
         match expect
             .addresses
             .as_ref()
@@ -215,7 +250,10 @@ impl HttpSession {
                     public_address,
                 );
                 if context.create_stream(expect.request_id, 1 << 16).is_none() {
-                    error!("HTTP expect upgrade failed: could not create stream");
+                    error!(
+                        "{} expect upgrade failed: could not create stream",
+                        log_context!(self)
+                    );
                     return None;
                 }
                 let mut mux = Mux {
@@ -234,7 +272,8 @@ impl HttpSession {
             }
             _ => {
                 debug!(
-                    "HTTP expect upgrade failed: bad header {:?}",
+                    "{} expect upgrade failed: bad header {:?}",
+                    log_context!(self),
                     expect.addresses
                 );
                 None
@@ -243,9 +282,12 @@ impl HttpSession {
     }
 
     fn upgrade_mux(&mut self, mut mux: MuxClear) -> Option<HttpStateMachine> {
-        debug!("mux switching to ws");
+        debug!("{} mux switching to ws", log_context!(self));
         let Some(stream) = mux.context.streams.pop() else {
-            error!("upgrade_mux: no stream attached to the mux session, closing");
+            error!(
+                "{} upgrade_mux: no stream attached to the mux session, closing",
+                log_context!(self)
+            );
             return None;
         };
         // http.active_requests was already decremented by generate_access_log()
@@ -260,18 +302,25 @@ impl HttpSession {
                     ..
                 }) => (readiness, socket, timeout_container),
                 mux::Connection::H2(_) => {
-                    error!("Only h1<->h1 connections can upgrade to websocket");
+                    error!(
+                        "{} only h1<->h1 connections can upgrade to websocket",
+                        log_context!(self)
+                    );
                     return None;
                 }
             };
 
         let mux::StreamState::Linked(back_token) = stream.state else {
-            error!("Upgrading stream should be linked to a backend");
+            error!(
+                "{} upgrading stream should be linked to a backend",
+                log_context!(self)
+            );
             return None;
         };
         let Some(backend) = mux.router.backends.remove(&back_token) else {
             error!(
-                "upgrade_mux: backend for token {:?} is missing (already disconnected?), closing",
+                "{} upgrade_mux: backend for token {:?} is missing (already disconnected?), closing",
+                log_context!(self),
                 back_token
             );
             return None;
@@ -287,11 +336,17 @@ impl HttpSession {
                     ..
                 }) => (cluster_id, backend, readiness, socket, timeout_container),
                 mux::Connection::H1(_) => {
-                    error!("The backend disconnected just after upgrade, abort");
+                    error!(
+                        "{} the backend disconnected just after upgrade, abort",
+                        log_context!(self)
+                    );
                     return None;
                 }
                 mux::Connection::H2(_) => {
-                    error!("Only h1<->h1 connections can upgrade to websocket");
+                    error!(
+                        "{} only h1<->h1 connections can upgrade to websocket",
+                        log_context!(self)
+                    );
                     return None;
                 }
             };
@@ -343,7 +398,10 @@ impl HttpSession {
         ws: Pipe<crate::socket::SessionTcpStream, HttpListener>,
     ) -> Option<HttpStateMachine> {
         // what do we do here?
-        error!("Upgrade called on WS, this should not happen");
+        error!(
+            "{} upgrade called on WS, this should not happen",
+            log_context!(self)
+        );
         Some(HttpStateMachine::WebSocket(ws))
     }
 }
@@ -354,7 +412,7 @@ impl ProxySession for HttpSession {
             return;
         }
 
-        trace!("Closing HTTP session");
+        trace!("{} closing HTTP session", log_context!(self));
         self.metrics.service_stop();
 
         // Restore gauges
@@ -391,8 +449,10 @@ impl ProxySession for HttpSession {
             // error 107 NotConnected can happen when was never fully connected, or was already disconnected due to error
             if e.kind() != ErrorKind::NotConnected {
                 error!(
-                    "error shutting down front socket({:?}): {:?}",
-                    front_socket, e
+                    "{} error shutting down front socket({:?}): {:?}",
+                    log_context!(self),
+                    front_socket,
+                    e
                 )
             }
         }
@@ -402,8 +462,10 @@ impl ProxySession for HttpSession {
         let fd = front_socket.as_raw_fd();
         if let Err(e) = proxy.registry.deregister(&mut SourceFd(&fd)) {
             error!(
-                "error deregistering front socket({:?}) while closing HTTP session: {:?}",
-                fd, e
+                "{} error deregistering front socket({:?}) while closing HTTP session: {:?}",
+                log_context!(self),
+                fd,
+                e
             );
         }
         proxy.remove_session(self.frontend_token);
@@ -422,7 +484,8 @@ impl ProxySession for HttpSession {
 
     fn update_readiness(&mut self, token: Token, events: Ready) {
         trace!(
-            "token {:?} got event {}",
+            "{} token {:?} got event {}",
+            log_context!(self),
             token,
             super::ready_to_string(events)
         );
@@ -461,7 +524,7 @@ impl ProxySession for HttpSession {
 
     fn print_session(&self) {
         self.state.print_state("HTTP");
-        error!("Metrics: {:?}", self.metrics);
+        error!("{} Metrics: {:?}", log_context!(self), self.metrics);
     }
 
     fn frontend_token(&self) -> Token {
@@ -740,7 +803,11 @@ impl HttpProxy {
             .retain(|_, l| l.borrow().address != remove_address);
 
         if !self.listeners.len() < len {
-            info!("no HTTP listener to remove at address {:?}", remove_address);
+            info!(
+                "{} no HTTP listener to remove at address {:?}",
+                log_module_context!(),
+                remove_address
+            );
         }
         Ok(())
     }
@@ -910,7 +977,7 @@ impl HttpProxy {
         let mut socket_errors = vec![];
         for (_, l) in listeners.iter() {
             if let Some(mut sock) = l.borrow_mut().listener.take() {
-                debug!("Deregistering socket {:?}", sock);
+                debug!("{} deregistering socket {:?}", log_module_context!(), sock);
                 if let Err(e) = self.registry.deregister(&mut sock) {
                     let error = format!("socket {sock:?}: {e:?}");
                     socket_errors.push(error);
@@ -933,7 +1000,7 @@ impl HttpProxy {
         let mut socket_errors = vec![];
         for (_, l) in listeners.drain() {
             if let Some(mut sock) = l.borrow_mut().listener.take() {
-                debug!("Deregistering socket {:?}", sock);
+                debug!("{} deregistering socket {:?}", log_module_context!(), sock);
                 if let Err(e) = self.registry.deregister(&mut sock) {
                     let error = format!("socket {sock:?}: {e:?}");
                     socket_errors.push(error);
@@ -1113,7 +1180,11 @@ impl HttpListener {
     }
 
     pub fn remove_http_front(&mut self, http_front: HttpFrontend) -> Result<(), ListenerError> {
-        debug!("removing http_front {:?}", http_front);
+        debug!(
+            "{} removing http_front {:?}",
+            log_module_context!(),
+            http_front
+        );
         self.fronts
             .remove_http_front(&http_front)
             .map_err(ListenerError::RemoveFrontend)
@@ -1125,13 +1196,16 @@ impl HttpListener {
                 .map_err(|e| match e.kind() {
                     ErrorKind::WouldBlock => AcceptError::WouldBlock,
                     _ => {
-                        error!("accept() IO error: {:?}", e);
+                        error!("{} accept() IO error: {:?}", log_module_context!(), e);
                         AcceptError::IoError
                     }
                 })
                 .map(|(sock, _)| sock)
         } else {
-            error!("cannot accept connections, no listening socket available");
+            error!(
+                "{} cannot accept connections, no listening socket available",
+                log_module_context!()
+            );
             Err(AcceptError::IoError)
         }
     }
@@ -1143,53 +1217,95 @@ impl ProxyConfiguration for HttpProxy {
 
         let result = match request.content.request_type {
             Some(RequestType::AddCluster(cluster)) => {
-                debug!("{} add cluster {:?}", request.id, cluster);
+                debug!(
+                    "{} {} add cluster {:?}",
+                    log_module_context!(),
+                    request.id,
+                    cluster
+                );
                 self.add_cluster(cluster)
             }
             Some(RequestType::RemoveCluster(cluster_id)) => {
-                debug!("{} remove cluster {:?}", request_id, cluster_id);
+                debug!(
+                    "{} {} remove cluster {:?}",
+                    log_module_context!(),
+                    request_id,
+                    cluster_id
+                );
                 self.remove_cluster(&cluster_id)
             }
             Some(RequestType::AddHttpFrontend(front)) => {
-                debug!("{} add front {:?}", request_id, front);
+                debug!(
+                    "{} {} add front {:?}",
+                    log_module_context!(),
+                    request_id,
+                    front
+                );
                 self.add_http_frontend(front)
             }
             Some(RequestType::RemoveHttpFrontend(front)) => {
-                debug!("{} remove front {:?}", request_id, front);
+                debug!(
+                    "{} {} remove front {:?}",
+                    log_module_context!(),
+                    request_id,
+                    front
+                );
                 self.remove_http_frontend(front)
             }
             Some(RequestType::RemoveListener(remove)) => {
-                debug!("removing HTTP listener at address {:?}", remove.address);
+                debug!(
+                    "{} removing HTTP listener at address {:?}",
+                    log_module_context!(),
+                    remove.address
+                );
                 self.remove_listener(remove)
             }
             Some(RequestType::SoftStop(_)) => {
-                debug!("{} processing soft shutdown", request_id);
+                debug!(
+                    "{} {} processing soft shutdown",
+                    log_module_context!(),
+                    request_id
+                );
                 match self.soft_stop() {
                     Ok(()) => {
-                        info!("{} soft stop successful", request_id);
+                        info!(
+                            "{} {} soft stop successful",
+                            log_module_context!(),
+                            request_id
+                        );
                         return WorkerResponse::processing(request.id);
                     }
                     Err(e) => Err(e),
                 }
             }
             Some(RequestType::HardStop(_)) => {
-                debug!("{} processing hard shutdown", request_id);
+                debug!(
+                    "{} {} processing hard shutdown",
+                    log_module_context!(),
+                    request_id
+                );
                 match self.hard_stop() {
                     Ok(()) => {
-                        info!("{} hard stop successful", request_id);
+                        info!(
+                            "{} {} hard stop successful",
+                            log_module_context!(),
+                            request_id
+                        );
                         return WorkerResponse::processing(request.id);
                     }
                     Err(e) => Err(e),
                 }
             }
             Some(RequestType::Status(_)) => {
-                debug!("{} status", request_id);
+                debug!("{} {} status", log_module_context!(), request_id);
                 Ok(())
             }
             other_command => {
                 debug!(
-                    "{} unsupported message for HTTP proxy, ignoring: {:?}",
-                    request.id, other_command
+                    "{} {} unsupported message for HTTP proxy, ignoring: {:?}",
+                    log_module_context!(),
+                    request.id,
+                    other_command
                 );
                 Err(ProxyError::UnsupportedMessage)
             }
@@ -1197,11 +1313,16 @@ impl ProxyConfiguration for HttpProxy {
 
         match result {
             Ok(()) => {
-                debug!("{} successful", request_id);
+                debug!("{} {} successful", log_module_context!(), request_id);
                 WorkerResponse::ok(request_id)
             }
             Err(proxy_error) => {
-                debug!("{} unsuccessful: {}", request_id, proxy_error);
+                debug!(
+                    "{} {} unsuccessful: {}",
+                    log_module_context!(),
+                    request_id,
+                    proxy_error
+                );
                 WorkerResponse::error(request_id, proxy_error)
             }
         }
@@ -1230,8 +1351,10 @@ impl ProxyConfiguration for HttpProxy {
 
         if let Err(e) = frontend_sock.set_nodelay(true) {
             error!(
-                "error setting nodelay on front socket({:?}): {:?}",
-                frontend_sock, e
+                "{} error setting nodelay on front socket({:?}): {:?}",
+                log_module_context!(),
+                frontend_sock,
+                e
             );
         }
         let mut session_manager = self.sessions.borrow_mut();
@@ -1245,8 +1368,10 @@ impl ProxyConfiguration for HttpProxy {
             Interest::READABLE | Interest::WRITABLE,
         ) {
             error!(
-                "error registering listen socket({:?}): {:?}",
-                frontend_sock, register_error
+                "{} error registering listen socket({:?}): {:?}",
+                log_module_context!(),
+                frontend_sock,
+                register_error
             );
             return Err(AcceptError::RegisterError);
         }
@@ -1378,9 +1503,9 @@ pub mod testing {
         )
         .with_context(|| "Failed at creating server")?;
 
-        debug!("starting event loop");
+        debug!("{} starting event loop", log_module_context!());
         server.run();
-        debug!("ending event loop");
+        debug!("{} ending event loop", log_module_context!());
         Ok(())
     }
 }
