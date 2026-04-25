@@ -251,8 +251,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                     // edge-triggered epoll won't re-fire for bytes we just queued
                     // onto the peer — the synthetic event is the only wake path.
                     let peer = endpoint.readiness_mut(token);
-                    peer.interest.insert(Ready::WRITABLE);
-                    peer.signal_pending_write();
+                    peer.arm_writable();
                 }
             }
             return MuxResult::Continue;
@@ -363,8 +362,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                 // bytes we just parsed live in sozu's buffers, not the kernel,
                 // so edge-triggered epoll won't re-fire on its own.
                 let peer = endpoint.readiness_mut(token);
-                peer.interest.insert(Ready::WRITABLE);
-                peer.signal_pending_write();
+                peer.arm_writable();
             }
         };
         // 1xx informational: the 100 response skips main_phase (goes straight to
@@ -373,8 +371,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         if is_1xx_backend {
             if let StreamState::Linked(token) = stream.state {
                 let peer = endpoint.readiness_mut(token);
-                peer.interest.insert(Ready::WRITABLE);
-                peer.signal_pending_write();
+                peer.arm_writable();
             }
         }
 
@@ -633,8 +630,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             self.close_notify_sent = true;
         }
         if self.socket.socket_wants_write() {
-            self.readiness.interest.insert(Ready::WRITABLE);
-            self.readiness.signal_pending_write();
+            self.readiness.arm_writable();
             true
         } else {
             false
@@ -767,8 +763,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                 EndStreamAction::CloseDelimited => {
                     debug!("{} CLOSE DELIMITED", log_context!(self));
                     stream.state = StreamState::Unlinked;
-                    self.readiness.interest.insert(Ready::WRITABLE);
-                    self.readiness.signal_pending_write();
+                    self.readiness.arm_writable();
                 }
                 EndStreamAction::ForwardUnterminated => {
                     debug!("{} CLOSING H1 UNTERMINATED STREAM", log_context!(self));

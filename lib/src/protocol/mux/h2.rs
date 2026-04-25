@@ -124,6 +124,20 @@ macro_rules! log_module_context {
     }};
 }
 
+/// `if let Some(violation) = self.flood_detector.check_flood() { return self.handle_flood_violation(violation); }`
+/// pattern wrapped as a single statement. Pure dispatch — the actual flood
+/// thresholds and counters live inside `H2FloodDetector::check_flood` and
+/// `ConnectionH2::handle_flood_violation`, which the macro does not touch.
+/// Use this at every per-frame counter bump site so the wrapper stays
+/// uniform and a future grep for "flood-check forgot to return" finds zero.
+macro_rules! check_flood_or_return {
+    ($self:expr) => {
+        if let Some(violation) = $self.flood_detector.check_flood() {
+            return $self.handle_flood_violation(violation);
+        }
+    };
+}
+
 /// Outcome of a single-stream write flush in write_streams.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FlushOutcome {
@@ -1698,9 +1712,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                                         header.stream_id
                                     );
                                     self.flood_detector.glitch_count += 1;
-                                    if let Some(violation) = self.flood_detector.check_flood() {
-                                        return self.handle_flood_violation(violation);
-                                    }
+                                    check_flood_or_return!(self);
                                 }
                                 FrameType::Data => {
                                     // RFC 9113 §5.1: DATA on a closed stream is a
@@ -1715,9 +1727,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                                         header.stream_id
                                     );
                                     self.flood_detector.glitch_count += 1;
-                                    if let Some(violation) = self.flood_detector.check_flood() {
-                                        return self.handle_flood_violation(violation);
-                                    }
+                                    check_flood_or_return!(self);
                                     self.enqueue_rst(header.stream_id, H2Error::StreamClosed);
                                 }
                                 _ => {
@@ -1807,9 +1817,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     .flood_detector
                     .accumulated_header_size
                     .saturating_add(payload_len);
-                if let Some(violation) = self.flood_detector.check_flood() {
-                    return self.handle_flood_violation(violation);
-                }
+                check_flood_or_return!(self);
                 // RFC 9113 §10.5.1: reject header blocks that cannot be
                 // buffered. Previously we silently removed READABLE interest
                 // when amount > available_space, stalling the connection.
@@ -3323,8 +3331,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             );
             incr!("h2.window_update_dropped");
         }
-        self.readiness.interest.insert(Ready::WRITABLE);
-        self.readiness.signal_pending_write();
+        self.readiness.arm_writable();
     }
 
     /// Re-enable READABLE if this connection is parked waiting for buffer space
@@ -3787,8 +3794,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 // Keep READABLE so in-flight request bodies can still be received
                 // during phase 1. Only remove READABLE in the second GOAWAY (goaway()).
                 self.expect_write = Some(H2StreamId::Zero);
-                self.readiness.interest.insert(Ready::WRITABLE);
-                self.readiness.signal_pending_write();
+                self.readiness.arm_writable();
                 MuxResult::Continue
             }
             Err(error) => {
@@ -4041,9 +4047,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // CVE-2019-9518: track empty DATA frames (no payload, no END_STREAM)
         if data.payload.is_empty() && !data.end_stream {
             self.flood_detector.empty_data_count += 1;
-            if let Some(violation) = self.flood_detector.check_flood() {
-                return self.handle_flood_violation(violation);
-            }
+            check_flood_or_return!(self);
         }
         let Some(global_stream_id) = self.streams.get(&data.stream_id).copied() else {
             // The stream was terminated while data was expected,
@@ -4058,8 +4062,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 let increment = self.flow_control.received_bytes_since_update;
                 self.queue_window_update(0, increment);
                 self.flow_control.received_bytes_since_update = 0;
-                self.readiness.interest.insert(Ready::WRITABLE);
-                self.readiness.signal_pending_write();
+                self.readiness.arm_writable();
             }
             self.attribute_bytes_to_overhead();
             return MuxResult::Continue;
@@ -4117,8 +4120,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     // WINDOW_UPDATE before returning; otherwise the credit sits
                     // until the next inbound frame on this connection.
                     if !self.flow_control.pending_window_updates.is_empty() {
-                        self.readiness.interest.insert(Ready::WRITABLE);
-                        self.readiness.signal_pending_write();
+                        self.readiness.arm_writable();
                     }
                     let result = self.reset_stream(
                         data.stream_id,
@@ -4154,8 +4156,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // by a previous write cycle. Without the event bit set, filter_interest()
         // returns 0 and the WINDOW_UPDATEs never get flushed, stalling the client.
         if !self.flow_control.pending_window_updates.is_empty() {
-            self.readiness.interest.insert(Ready::WRITABLE);
-            self.readiness.signal_pending_write();
+            self.readiness.arm_writable();
         }
 
         // Refresh per-stream idle timer on non-empty DATA.
@@ -4535,9 +4536,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         count!(metric_for_rst_stream_received(rst_stream.error_code), 1);
         // CVE-2023-44487 Rapid Reset + CVE-2019-9514: track RST_STREAM rate.
         self.flood_detector.rst_stream_count += 1;
-        if let Some(violation) = self.flood_detector.check_flood() {
-            return self.handle_flood_violation(violation);
-        }
+        check_flood_or_return!(self);
         // Additional CVE-2023-44487 mitigation: lifetime cap on RST_STREAM
         // frames received. The per-window counter above half-decays, so a
         // patient client can keep ~50 RST/s forever; a never-decaying
@@ -4654,9 +4653,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             .flood_detector
             .total_settings_received_lifetime
             .saturating_add(1);
-        if let Some(violation) = self.flood_detector.check_flood() {
-            return self.handle_flood_violation(violation);
-        }
+        check_flood_or_return!(self);
         for setting in settings.settings {
             let v = setting.value;
             let mut is_error = false;
@@ -4746,9 +4743,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             .flood_detector
             .total_ping_received_lifetime
             .saturating_add(1);
-        if let Some(violation) = self.flood_detector.check_flood() {
-            return self.handle_flood_violation(violation);
-        }
+        check_flood_or_return!(self);
         self.attribute_bytes_to_overhead();
         let kawa = &mut self.zero;
         let ping_response_size = serializer::PING_ACKNOWLEDGEMENT_HEADER.len() + 8;
@@ -4926,9 +4921,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 }
                 // Stream not in map (already closed) — treat as glitch
                 self.flood_detector.glitch_count += 1;
-                if let Some(violation) = self.flood_detector.check_flood() {
-                    return self.handle_flood_violation(violation);
-                }
+                check_flood_or_return!(self);
                 self.attribute_bytes_to_overhead();
                 return MuxResult::Continue;
             }
@@ -4947,14 +4940,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 .flood_detector
                 .window_update_stream0_count
                 .saturating_add(1);
-            if let Some(violation) = self.flood_detector.check_flood() {
-                return self.handle_flood_violation(violation);
-            }
+            check_flood_or_return!(self);
             self.attribute_bytes_to_overhead();
             if let Some(window) = self.flow_control.window.checked_add(increment) {
                 if self.flow_control.window <= 0 && window > 0 {
-                    self.readiness.interest.insert(Ready::WRITABLE);
-                    self.readiness.signal_pending_write();
+                    self.readiness.arm_writable();
                 }
                 self.flow_control.window = window;
                 debug!(
@@ -4972,8 +4962,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             self.attribute_bytes_to_stream(&mut stream.metrics);
             if let Some(window) = stream.window.checked_add(increment) {
                 if stream.window <= 0 && window > 0 {
-                    self.readiness.interest.insert(Ready::WRITABLE);
-                    self.readiness.signal_pending_write();
+                    self.readiness.arm_writable();
                 }
                 stream.window = window;
                 debug!(
@@ -5008,9 +4997,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             // glitch so a flood contributes to `check_flood()` and can
             // eventually trigger ENHANCE_YOUR_CALM.
             self.flood_detector.glitch_count += 1;
-            if let Some(violation) = self.flood_detector.check_flood() {
-                return self.handle_flood_violation(violation);
-            }
+            check_flood_or_return!(self);
         }
         MuxResult::Continue
     }
@@ -5053,8 +5040,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             self.readiness
         );
         if open_window {
-            self.readiness.interest.insert(Ready::WRITABLE);
-            self.readiness.signal_pending_write();
+            self.readiness.arm_writable();
         }
         self.peer_settings.settings_initial_window_size = value;
         false
@@ -5354,8 +5340,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                                 kawa.storage.fill(frame.len());
                                 incr!("h2.frames.tx.rst_stream");
                                 count!(metric_for_rst_stream_sent(H2Error::Cancel), 1);
-                                self.readiness.interest.insert(Ready::WRITABLE);
-                                self.readiness.signal_pending_write();
+                                self.readiness.arm_writable();
                                 self.rst_sent.insert(id);
                             }
                         }
@@ -5391,8 +5376,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                             stream
                         );
                         stream.state = StreamState::Unlinked;
-                        self.readiness.interest.insert(Ready::WRITABLE);
-                        self.readiness.signal_pending_write();
+                        self.readiness.arm_writable();
                         context.debug.set_interesting(true);
                     }
                     EndStreamAction::CloseDelimited => {
@@ -5410,8 +5394,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         }));
                         stream.back.parsing_phase = kawa::ParsingPhase::Terminated;
                         stream.state = StreamState::Unlinked;
-                        self.readiness.interest.insert(Ready::WRITABLE);
-                        self.readiness.signal_pending_write();
+                        self.readiness.arm_writable();
                         context.debug.set_interesting(true);
                     }
                     EndStreamAction::ForwardUnterminated => {
@@ -5524,8 +5507,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         self.streams.insert(stream_id, stream);
         self.stream_last_activity_at
             .insert(stream_id, Instant::now());
-        self.readiness.interest.insert(Ready::WRITABLE);
-        self.readiness.signal_pending_write();
+        self.readiness.arm_writable();
         true
     }
 }
