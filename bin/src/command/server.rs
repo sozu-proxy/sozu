@@ -230,8 +230,18 @@ impl CommandHub {
 
     fn register_client(&mut self, mut stream: UnixStream) {
         let token = self.next_session_token();
+        // Lisa LISA-012: previously the registration error was logged and
+        // we continued anyway, inserting a session whose underlying stream
+        // had no mio readiness wired up. The session sat in
+        // `self.clients` until manual cleanup. Treat registration failure
+        // as terminal — drop the stream and return. The OS sends RST/EOF
+        // to the peer when `stream` is dropped at the end of this scope.
         if let Err(err) = self.register(token, &mut stream) {
-            error!("Could not register client: {}", err);
+            error!(
+                "Could not register client (token={:?}): {} — dropping connection",
+                token, err
+            );
+            return;
         }
         let peer_cred = peer_cred_from_stream(&stream);
         let actor_comm = peer_cred.pid.and_then(peer_comm);
