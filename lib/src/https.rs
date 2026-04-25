@@ -291,10 +291,22 @@ impl HttpsSession {
         // doing it on every route decision (RFC 9110 §4.2.3 says hostnames are
         // case-insensitive); no port is ever part of an SNI value (RFC 6066
         // §3 — `HostName` is a dns_name, no port).
+        // RFC 1034 §3.1 absolute-form: `example.com.` and `example.com`
+        // are the same host. rustls hands us the wire-form SNI verbatim;
+        // strip a single trailing dot (Lisa LISA-TLS-002) so a legitimate
+        // client emitting absolute-form SNI does not get its
+        // `host` / `:authority` rejected by `authority_matches_sni` for a
+        // length mismatch. Empty / no-SNI is unaffected.
         let sni_owned: Option<String> = handshake
             .session
             .server_name()
-            .map(|s| s.to_ascii_lowercase());
+            .map(|s| s.to_ascii_lowercase())
+            .map(|mut s| {
+                if s.ends_with('.') {
+                    s.pop();
+                }
+                s
+            });
         let alpn = handshake.session.alpn_protocol();
         let alpn = alpn.and_then(|alpn| from_utf8(alpn).ok());
         debug!(
@@ -327,6 +339,13 @@ impl HttpsSession {
             }
             Some("h2") => (AlpnProtocol::H2, Some("h2")),
             Some(other) => {
+                // Lisa LISA-TLS-005: this branch was not metered, so any
+                // operator dashboard graphing `https.alpn.rejected.*`
+                // missed unknown-protocol refusals (e.g. an `h3` mistake
+                // bleeding through some misconfiguration). Add a dedicated
+                // counter so the SOC's "ALPN refusal" ratebar matches the
+                // sum of the labelled buckets.
+                incr!("https.alpn.rejected.unsupported");
                 error!(
                     "{} unsupported ALPN protocol: {}",
                     log_context!(self),
