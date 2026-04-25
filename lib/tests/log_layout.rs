@@ -59,23 +59,6 @@ const KNOWN_PREEXISTING_VIOLATIONS: &[&str] = &[
     "src/protocol/kawa_h1/mod.rs:1050",
     "src/protocol/kawa_h1/mod.rs:1606",
     "src/protocol/kawa_h1/mod.rs:2055",
-    "src/tcp.rs:540",
-    "src/tcp.rs:584",
-    "src/tcp.rs:633",
-    "src/tcp.rs:847",
-    "src/tcp.rs:1125",
-    "src/tcp.rs:1440",
-    "src/tcp.rs:1451",
-    "src/tcp.rs:1462",
-    "src/tcp.rs:1490",
-    "src/tcp.rs:1509",
-    "src/tcp.rs:1541",
-    "src/tcp.rs:1542",
-    "src/tcp.rs:1553",
-    "src/tcp.rs:1566",
-    "src/tcp.rs:1581",
-    "src/tcp.rs:1669",
-    "src/tcp.rs:1671",
 ];
 
 /// Macro names that count as a "tag-bearing" prefix. Any of these inside the

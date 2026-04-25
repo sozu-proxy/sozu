@@ -85,6 +85,20 @@ macro_rules! log_context {
     }};
 }
 
+/// Module-level prefix for log lines emitted from this file when no
+/// [`TcpSession`] is in scope. Produces a bold bright-white `TCP` label
+/// (uniform with the per-session `log_context!`) when the logger is in
+/// colored mode. Used by [`TcpProxy`] callbacks (notify, accept,
+/// create_session, soft_stop, hard_stop, status) and the `testing`
+/// helper module which own a listener/token map but have no
+/// `frontend_token` of their own.
+macro_rules! log_module_context {
+    () => {{
+        let (open, reset, _, _, _) = sozu_command::logging::ansi_palette();
+        format!("{open}TCP{reset}\t >>>", open = open, reset = reset)
+    }};
+}
+
 pub struct TcpSession {
     backend_buffer: Option<Checkout>,
     backend_connected: BackendConnectionStatus,
@@ -538,8 +552,10 @@ impl TcpSession {
                         self.metrics.backend_id.as_deref()
                     );
                     info!(
-                        "backend server {} at {} is up",
-                        backend.backend_id, backend.address
+                        "{} backend server {} at {} is up",
+                        log_context!(self),
+                        backend.backend_id,
+                        backend.address
                     );
                     push_event(Event {
                         kind: EventKind::BackendUp as i32,
@@ -582,8 +598,10 @@ impl TcpSession {
             );
             if !already_unavailable && backend.retry_policy.is_down() {
                 error!(
-                    "backend server {} at {} is down",
-                    backend.backend_id, backend.address
+                    "{} backend server {} at {} is down",
+                    log_context!(self),
+                    backend.backend_id,
+                    backend.address
                 );
                 incr!(
                     "backend.down",
@@ -630,7 +648,10 @@ impl TcpSession {
         if back_connected.is_connecting() {
             if self.back_readiness().unwrap().event.is_hup() && !self.test_back_socket() {
                 //retry connecting the backend
-                debug!("error connecting to backend, trying again");
+                debug!(
+                    "{} error connecting to backend, trying again",
+                    log_context!(self)
+                );
                 self.connection_attempt += 1;
                 self.fail_backend_connection();
 
@@ -1437,7 +1458,11 @@ impl ProxyConfiguration for TcpProxy {
                 WorkerResponse::ok(message.id)
             }
             RequestType::SoftStop(_) => {
-                info!("{} processing soft shutdown", message.id);
+                info!(
+                    "{} {} processing soft shutdown",
+                    log_module_context!(),
+                    message.id
+                );
                 let listeners: HashMap<_, _> = self.listeners.drain().collect();
                 for (_, l) in listeners.iter() {
                     l.borrow_mut()
@@ -1448,7 +1473,7 @@ impl ProxyConfiguration for TcpProxy {
                 WorkerResponse::processing(message.id)
             }
             RequestType::HardStop(_) => {
-                info!("{} hard shutdown", message.id);
+                info!("{} {} hard shutdown", log_module_context!(), message.id);
                 let mut listeners: HashMap<_, _> = self.listeners.drain().collect();
                 for (_, l) in listeners.drain() {
                     l.borrow_mut()
@@ -1459,7 +1484,7 @@ impl ProxyConfiguration for TcpProxy {
                 WorkerResponse::ok(message.id)
             }
             RequestType::Status(_) => {
-                info!("{} status", message.id);
+                info!("{} {} status", log_module_context!(), message.id);
                 WorkerResponse::ok(message.id)
             }
             RequestType::AddCluster(cluster) => {
@@ -1488,8 +1513,10 @@ impl ProxyConfiguration for TcpProxy {
             }
             command => {
                 debug!(
-                    "{} unsupported message for TCP proxy, ignoring {:?}",
-                    message.id, command
+                    "{} {} unsupported message for TCP proxy, ignoring {:?}",
+                    log_module_context!(),
+                    message.id,
+                    command
                 );
                 WorkerResponse::error(message.id, "unsupported message")
             }
@@ -1506,7 +1533,7 @@ impl ProxyConfiguration for TcpProxy {
                     .map_err(|e| match e.kind() {
                         ErrorKind::WouldBlock => AcceptError::WouldBlock,
                         _ => {
-                            error!("accept() IO error: {:?}", e);
+                            error!("{} accept() IO error: {:?}", log_module_context!(), e);
                             AcceptError::IoError
                         }
                     })
@@ -1538,9 +1565,10 @@ impl ProxyConfiguration for TcpProxy {
         let (front_buffer, back_buffer) = match (pool.checkout(), pool.checkout()) {
             (Some(fb), Some(bb)) => (fb, bb),
             _ => {
-                error!("could not get buffers from pool");
+                error!("{} could not get buffers from pool", log_module_context!());
                 error!(
-                    "Buffer capacity has been reached, stopping to accept new connections for now"
+                    "{} Buffer capacity has been reached, stopping to accept new connections for now",
+                    log_module_context!()
                 );
                 gauge!("accept_queue.backpressure", 1);
                 self.sessions.borrow_mut().can_accept = false;
@@ -1551,7 +1579,8 @@ impl ProxyConfiguration for TcpProxy {
 
         if owned.cluster_id.is_none() {
             error!(
-                "listener at address {:?} has no linked cluster",
+                "{} listener at address {:?} has no linked cluster",
+                log_module_context!(),
                 owned.address
             );
             return Err(AcceptError::IoError);
@@ -1564,8 +1593,10 @@ impl ProxyConfiguration for TcpProxy {
 
         if let Err(e) = frontend_sock.set_nodelay(true) {
             error!(
-                "error setting nodelay on front socket({:?}): {:?}",
-                frontend_sock, e
+                "{} error setting nodelay on front socket({:?}): {:?}",
+                log_module_context!(),
+                frontend_sock,
+                e
             );
         }
 
@@ -1579,8 +1610,10 @@ impl ProxyConfiguration for TcpProxy {
             Interest::READABLE | Interest::WRITABLE,
         ) {
             error!(
-                "error registering front socket({:?}): {:?}",
-                frontend_sock, register_error
+                "{} error registering front socket({:?}): {:?}",
+                log_module_context!(),
+                frontend_sock,
+                register_error
             );
             return Err(AcceptError::RegisterError);
         }
@@ -1666,9 +1699,9 @@ pub mod testing {
         )
         .with_context(|| "Failed at creating server")?;
 
-        debug!("starting event loop");
+        debug!("{} starting event loop", log_module_context!());
         server.run();
-        debug!("ending event loop");
+        debug!("{} ending event loop", log_module_context!());
         Ok(())
     }
 }
