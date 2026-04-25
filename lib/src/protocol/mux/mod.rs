@@ -1480,14 +1480,20 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         }
     }
 
-    fn print_state(&self, context: &str) {
+    fn print_state(&self, _context: &str) {
+        // The trait-required `context: &str` parameter (protocol tag like
+        // "HTTPS"/"HTTP" passed by callers) predates the unified
+        // `log_context!(self)` envelope. The canonical `MUX` tag lives
+        // inside `log_context!`, so we ignore the parameter here and emit
+        // the bracketed Session(...) block instead, mirroring the second
+        // `error!` in this function.
         error!(
             "\
 {} Session(Mux)
 \tFrontend:
 \t\ttoken: {:?}\treadiness: {:?}
 \tBackend(s):",
-            context,
+            log_context!(self),
             self.frontend_token,
             self.frontend.readiness()
         );

@@ -3560,8 +3560,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         let previous = self.local_settings.settings_max_concurrent_streams;
         let reduced = (previous / 2).max(1);
         warn!(
-            "H2 SETTINGS back-pressure: refusals={} in {}s — halving \
+            "{} H2 SETTINGS back-pressure: refusals={} in {}s — halving \
              SETTINGS_MAX_CONCURRENT_STREAMS {} -> {}",
+            log_context!(self),
             self.refuse_count_window,
             BACKPRESSURE_WINDOW_DURATION.as_secs(),
             previous,
@@ -5465,6 +5466,16 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             // transition, the Connection lingers in `Connected` state and
             // every subsequent request returns 503 because `start_stream`
             // keeps returning false.
+            //
+            // The session envelope is hoisted to a local because the
+            // `match &mut self.position` below holds a mutable borrow on
+            // `self.position`, and `log_context!(self)` reads that field
+            // for its `position={...}` slot — calling the macro inside the
+            // match arms would conflict with the active borrow. The
+            // bidirectional regression guard in `lib/tests/log_layout.rs`
+            // (and the matching scanner in `lib/build.rs`) recognises this
+            // shape by scanning backward as well as forward from each log
+            // call.
             let context = log_context!(self);
             match &mut self.position {
                 Position::Client(cluster_id, backend, status) => {
