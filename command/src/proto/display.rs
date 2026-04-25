@@ -58,7 +58,7 @@ impl Display for QueryCertificatesFilters {
         if let Some(d) = self.domain.clone() {
             write!(f, "domain:{d}")
         } else if let Some(fp) = self.fingerprint.clone() {
-            write!(f, "domain:{fp}")
+            write!(f, "fingerprint:{fp}")
         } else {
             write!(f, "all certificates")
         }
@@ -1147,7 +1147,6 @@ impl Display for HttpsListenerConfig {
 
 /// Add H2 flood detection threshold rows to a display table.
 /// Only shows rows for values that have been explicitly configured.
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn add_h2_flood_rows(
     table: &mut Table,

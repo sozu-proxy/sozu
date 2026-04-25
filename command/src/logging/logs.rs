@@ -32,9 +32,13 @@ thread_local! {
 
 /// Returns `true` when the thread-local [`Logger`] is configured to emit colored
 /// output. Safe to call from inside an `error!`/`info!`/… argument list — the
-/// flag is mirrored into a dedicated [`Cell`] at [`Logger::init`] time so we
-/// never re-borrow the main logger cell (which is already held mutably while
-/// the outer log macro is formatting its arguments).
+/// flag mirrors [`Logger::is_colored`] (i.e. [`InnerLogger::colored`]) into a
+/// dedicated [`Cell`] at [`Logger::init`] time so we never re-borrow the main
+/// logger cell (which is already held mutably while the outer log macro is
+/// formatting its arguments). The mirror is the single source of truth for
+/// hot-path callers; `Logger::is_colored` is the single source of truth for
+/// the rest of the API. They go through the same `InnerLogger::colored`
+/// field, so they cannot diverge by construction.
 pub fn is_logger_colored() -> bool {
     LOGGER_COLORED.with(|c| c.get())
 }
@@ -190,11 +194,15 @@ impl Logger {
                     LoggerBackend::Stdout(_) => colored,
                     _ => false,
                 };
-                // Mirror into the side-channel cell so `is_logger_colored()`
-                // can be called from inside log-macro argument formatters
-                // without re-borrowing the main `LOGGER` cell (it is held
-                // mutably here and by every subsequent `error!`/`info!`/...).
-                LOGGER_COLORED.with(|c| c.set(logger.colored));
+                // Mirror into the side-channel cell via the canonical
+                // accessor so `is_logger_colored()` can be called from
+                // inside log-macro argument formatters without re-borrowing
+                // the main `LOGGER` cell (it is held mutably here and by
+                // every subsequent `error!`/`info!`/...). Going through
+                // `Logger::is_colored` (instead of the `Deref`'d
+                // `logger.colored`) makes the single source of truth
+                // explicit at the call site.
+                LOGGER_COLORED.with(|c| c.set(logger.is_colored()));
                 logger.access_colored = match (&access_backend, &backend) {
                     (Some(LoggerBackend::Stdout(_)), _) | (None, LoggerBackend::Stdout(_)) => {
                         access_colored.unwrap_or(colored)

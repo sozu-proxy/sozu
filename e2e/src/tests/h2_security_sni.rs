@@ -56,9 +56,14 @@ fn build_request_headers(authority: &[u8]) -> Vec<u8> {
         0x84, // :path / (static index 4)
         0x87, // :scheme https (static index 7)
     ];
-    // :authority — static table index 1. Literal with incremental indexing (0x41)
-    // lets us encode any value; the 6-bit length prefix fits up to 127 bytes.
-    block.push(0x41);
+    // :authority — literal-without-indexing on top of static table index 1
+    // (RFC 7541 §6.2.2: pattern `0000` in the high nibble + 4-bit name
+    // index, so `0x01` for index 1 = `:authority`). Encoding stays
+    // side-effect-free: the value never enters the HPACK dynamic table,
+    // so cross-test interference via shared coder state is impossible.
+    // The value-length byte that follows uses a 7-bit prefix (no Huffman
+    // bit set), good for any value up to 127 bytes.
+    block.push(0x01);
     block.push(authority.len() as u8);
     block.extend_from_slice(authority);
     block
@@ -532,15 +537,13 @@ fn try_h2_sni_authority_mismatch_allowed_when_strict_binding_disabled() -> State
     let after = read_counter(&mut worker, "http.sni_authority_mismatch");
     let metric_stable = after == before;
 
-    let infra_ok = teardown(
-        tls,
-        front_port,
-        worker,
-        vec![
-            // Move the backends into teardown so it stops them in the same
-            // order as every other test in this module.
-        ],
-    );
+    // `teardown(...)` takes the empty backend vec deliberately: this test
+    // needs the per-backend `requests_received` aggregators below for its
+    // strict-off acceptance check, and `stop_and_get_aggregator` consumes
+    // the handle. We stop the backends manually after the worker
+    // soft-stops so each aggregator's counter is final by the time we
+    // read it.
+    let infra_ok = teardown(tls, front_port, worker, vec![]);
     let foo_agg = foo.stop_and_get_aggregator().unwrap_or_default();
     let bar_agg = bar.stop_and_get_aggregator().unwrap_or_default();
 

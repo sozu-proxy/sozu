@@ -237,8 +237,16 @@ impl RawH2ResponseBackend {
     fn stop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(t) = self.thread.take() {
-            thread::sleep(Duration::from_millis(100));
-            drop(t);
+            // Join, do not detach: dropping the JoinHandle would leak
+            // the thread (along with its listening socket) past the
+            // test's teardown and reintroduce the port-binding flake
+            // class that motivated `port_registry` in the first place.
+            // The thread polls `stop` every ≤500 ms inside its accept
+            // loop; we cap the wait conservatively in case it races
+            // a long blocking syscall, and surface a panic payload.
+            if let Err(err) = t.join() {
+                eprintln!("raw h2 response backend thread panicked during shutdown: {err:?}");
+            }
         }
     }
 }
