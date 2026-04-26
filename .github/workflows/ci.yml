@@ -6,6 +6,12 @@ jobs:
     name: Format
     runs-on: ubuntu-latest
     steps:
+      # `protoc` + a build of `sozu-command-lib` are required so that
+      # `command/build.rs` regenerates `command/src/proto/command.rs`
+      # before rustfmt walks the module tree (rustfmt fails to resolve
+      # `mod command;` if the generated file is absent).
+      - name: install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Checkout sources
         uses: actions/checkout@v4
       # rustfmt.toml uses the unstable `ignore` key, so the format check
@@ -14,6 +20,8 @@ jobs:
         uses: dtolnay/rust-toolchain@nightly
         with:
           components: rustfmt
+      - name: Generate prost output (sozu-command-lib build.rs)
+        run: cargo +nightly check -p sozu-command-lib --locked
       - name: Check formatting
         run: cargo +nightly fmt --all -- --check
   clippy:
@@ -28,10 +36,12 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      # `+stable` overrides the `rust-toolchain` pin (1.88.0) so the
+      # clippy component installed on stable above is the one used.
       # `--all-features` matches the local lint baseline documented in
       # CLAUDE.md "Build". Workspace is currently warning-free.
       - name: Lint
-        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+        run: cargo +stable clippy --all-targets --all-features --locked -- -D warnings
   msrv:
     name: MSRV (1.85)
     runs-on: ubuntu-latest
