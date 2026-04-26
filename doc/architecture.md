@@ -30,7 +30,7 @@ Mio provides a cross platform abstraction allowing callers to receive events, li
 
 Sōzu asks mio to send all the events of a socket in [edge triggered mode](http://man7.org/linux/man-pages/man7/epoll.7.html).
 That way, it only receives an event once, and stores it in a
-[`Readiness` struct](https://github.com/sozu-proxy/sozu/blob/01a78be7d95ac295d30b342d3ec0be403c98e776/lib/src/lib.rs#L527).
+[`Readiness` struct](https://github.com/sozu-proxy/sozu/blob/main/lib/src/lib.rs).
 It will then use that information and the "interest" (indicating if the current protocol state machine wants to read or write on the socket).
 
 Each socket event is returned with a `Token` indicating its index in a `Slab` data structure. A client session can have multiple sockets (typically, a front socket and a back socket).
@@ -292,20 +292,31 @@ inline at the start of `writable()`, avoiding extra event loop iterations.
 
 ```
 lib/src/protocol/mux/
-├── mod.rs          Mux session, Stream, Router, ready() loop, stream lifecycle (2605 lines)
-├── h1.rs           HTTP/1.1 connection (ConnectionH1) (675 lines)
+├── mod.rs          Mux session, Stream, Router, ready() loop, stream lifecycle (1818 lines)
+├── h1.rs           HTTP/1.1 connection (ConnectionH1) (823 lines)
 ├── h2.rs           HTTP/2 connection (ConnectionH2), state machine, flow control,
-│                   flood detection, RFC 9218 priorities, shutdown handling (3994 lines)
-├── parser.rs       H2 binary frame parser (nom), wire format constants (1598 lines)
-├── serializer.rs   H2 frame serializer (cookie-factory), SETTINGS/GOAWAY/RST_STREAM (493 lines)
-├── converter.rs    Kawa → H2 frame converter (H2BlockConverter), HPACK encoding (823 lines)
-└── pkawa.rs        H2 → Kawa converter, HPACK decoding, pseudo-header validation,
-                    RFC 9218 priority header parsing (990 lines)
+│                   flood detection, RFC 9218 priorities, shutdown handling (7562 lines)
+├── parser.rs       H2 binary frame parser (nom), wire format constants (2246 lines)
+├── serializer.rs   H2 frame serializer (cookie-factory), SETTINGS/GOAWAY/RST_STREAM (557 lines)
+├── converter.rs    Kawa → H2 frame converter (H2BlockConverter), HPACK encoding (1410 lines)
+├── pkawa.rs        H2 → Kawa converter, HPACK decoding, pseudo-header validation,
+│                   RFC 9218 priority header parsing (2229 lines)
+├── connection.rs   Shared frontend/backend connection types and bookkeeping (578 lines)
+├── router.rs       Backend dial / pool / Router::connect orchestration (678 lines)
+├── stream.rs       Per-stream state, ownership, and bidirectional EOS tracking (290 lines)
+├── answers.rs      Mux-side default HTTP answers (302 lines)
+├── shared.rs       Cross-connection shared state (93 lines)
+└── debug.rs        Diagnostic helpers (80 lines)
 ```
 
-Total: 11178 lines of Rust across 7 modules.
+Total: 18 666 lines of Rust across 13 modules. Run
+`wc -l lib/src/protocol/mux/*.rs` to re-derive at any HEAD.
 
 #### Key design decisions
+
+The actively maintained on-branch reference for the mux is
+`lib/src/protocol/mux/LIFECYCLE.md`, which walks every state transition
+with `file.rs:LINE` citations against current HEAD.
 
 - **Bidirectional end-of-stream tracking**: Separate `front_received_end_of_stream` and
   `back_received_end_of_stream` fields on each `Stream` prevent the frontend and backend
@@ -324,9 +335,13 @@ Total: 11178 lines of Rust across 7 modules.
   H2 readable and writable passes outside the normal epoll loop so it can observe
   final peer EOF / END_STREAM events, flush GOAWAY and TLS records, and prune
   stale stream mappings created by incomplete HEADERS blocks.
-- **H2 backend (h2c)**: Controlled by `cluster.http2` in protobuf config. Sōzu speaks
-  cleartext H2 to backends. The `:scheme` pseudo-header is derived from the frontend
-  listener protocol (HTTP or HTTPS), not the backend connection.
+- **H2 backend (h2c)**: Controlled by `cluster.http2` in `command/src/command.proto`.
+  Sōzu speaks cleartext H2 to backends. The `:scheme` pseudo-header is derived from
+  the frontend listener protocol (HTTP or HTTPS), not the backend connection.
+  `cluster.http2` is a backend-capability hint only — it does NOT gate frontend H2.
+  Frontend H2 is driven by TLS ALPN negotiation on the listener (`alpn_protocols`
+  containing `"h2"`); a cluster with `http2 = false` can still serve H2 clients on
+  the frontend, with H2 → H1 conversion at the backend boundary.
 - **RFC 9218 priorities**: The `Prioriser` struct tracks urgency (0-7) and incremental
   flags per stream from the `priority` header. Stream scheduling in `write_streams()`
   sorts by urgency first (lower = higher priority), then by stream ID. Default urgency
@@ -343,13 +358,13 @@ Total: 11178 lines of Rust across 7 modules.
 
 ## Logging
 
-The [logger](https://github.com/sozu-proxy/sozu/blob/3111e2db420d2773b1f0404d6556f40b2f2ea85b/lib/src/logging.rs) is designed to reduce allocations and string interpolations, using Rust's formatting system. It can send logs on various backends: stdout, file, TCP, UDP, Unix sockets.
+The [logger](https://github.com/sozu-proxy/sozu/tree/main/command/src/logging) is designed to reduce allocations and string interpolations, using Rust's formatting system. It can send logs on various backends: stdout, file, TCP, UDP, Unix sockets.
 
 The logger can be invoked through a thread local storage variable accessible from anywhere with logging macros.
 
 ## Metrics
 
-[Metrics](https://github.com/sozu-proxy/sozu/tree/3111e2db420d2773b1f0404d6556f40b2f2ea85b/lib/src/network/metrics) work like the logger, accessible from anywhere with macros and TLS. We support two "drains": one that sends the metrics on the networks with a statsd compatible protocol, and one aggregating metrics locally, to be queried through the configuration socket.
+[Metrics](https://github.com/sozu-proxy/sozu/tree/main/lib/src/metrics) work like the logger, accessible from anywhere with macros and TLS. We support two "drains": one that sends the metrics on the networks with a statsd compatible protocol, and one aggregating metrics locally, to be queried through the configuration socket.
 
 ## Load balancing
 
