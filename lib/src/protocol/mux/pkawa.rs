@@ -1,3 +1,11 @@
+//! HPACK decode + pseudo-header validation + RFC 9218 priority parsing.
+//!
+//! Lifts decoded HPACK blocks into the Kawa request/response shape used by
+//! the rest of the stack, enforces pseudo-header ordering, the per-stream
+//! trailer budget, and emits the rejection metrics surfaced in
+//! `doc/configure.md`. Owns the priority extraction path consumed by the H2
+//! `Prioriser`.
+
 use std::{borrow::Cow, io::Write, str::from_utf8};
 
 use kawa::{

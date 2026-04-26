@@ -1,10 +1,12 @@
 #![no_main]
-//! Fuzz target for the HPACK decoder (RFC 7541).
+//! Fuzz target for the HPACK decoder (RFC 7541, `loona-hpack`).
 //!
-//! Exercises `loona_hpack::Decoder::decode` with arbitrary header block
-//! fragments. The decoder must handle any byte sequence without panicking.
-//!
-//! Run: cargo +nightly fuzz run fuzz_hpack_decoder
+//! Drives `decode_with_cb` against arbitrary header block fragments under
+//! three dynamic-table profiles (default, 256 bytes, zero) so the
+//! resize/eviction paths are exercised. The decoder must never panic and
+//! must reject malformed input cleanly. Defends against header-block
+//! oversize and incomplete-update flaws. Corpus + run instructions live
+//! in `fuzz/README.md`.
 
 use libfuzzer_sys::fuzz_target;
 

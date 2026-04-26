@@ -1,3 +1,11 @@
+//! Growable ring buffer (`Buffer`).
+//!
+//! Same `position` / `end` / `capacity` discipline as `fixed.rs` but
+//! grows the backing `Vec<u8>` on demand up to a configured cap. Shift /
+//! insert / replace operations use overlapping-safe `std::ptr::copy`
+//! (NOT `copy_nonoverlapping`) with bounds checked against
+//! `self.capacity()`.
+
 use std::{
     cmp,
     io::{self, Read, Write},

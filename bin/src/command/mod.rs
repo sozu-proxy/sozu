@@ -1,3 +1,12 @@
+//! Master command-socket subsystem.
+//!
+//! Owns the unix command socket (`UnixListener`), the supervisor-side
+//! state machine that forks workers and dispatches verbs to them, and the
+//! audit-log envelope guarding control-plane mutations. Submodules:
+//! `server` (event loop + worker bookkeeping), `sessions` (per-client
+//! request state), `requests` (verb dispatch + audit), `upgrade` (binary
+//! reload). Long-form lifecycle: `bin/src/command/LIFECYCLE.md`.
+
 mod requests;
 pub mod server;
 pub mod sessions;

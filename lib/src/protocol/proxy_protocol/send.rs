@@ -1,3 +1,10 @@
+//! PROXY-v2 send state.
+//!
+//! Synthesises a PROXY-v2 header (`HeaderV2`) describing the original
+//! client and emits it on a freshly opened backend `TcpStream` before the
+//! TCP/TLS payload begins. Used when the front-end accepted a non-PROXY
+//! connection but the configured backend expects PROXY-v2 metadata.
+
 use std::{
     cell::RefCell,
     io::{ErrorKind, Write},

@@ -1,3 +1,11 @@
+//! Master/worker hot-upgrade orchestration.
+//!
+//! Forks a child master, transfers listener and command-channel FDs over
+//! the SCM_RIGHTS unix socket (`command/src/scm_socket.rs`), re-exec's the
+//! `sozu` binary with the recovered state, and tears down the previous
+//! master once the new one acks. Keeps the data plane uninterrupted by
+//! handing off accepted listeners and existing worker FDs.
+
 use std::{
     fs::File,
     io::{Error as IoError, Read, Seek, Write},

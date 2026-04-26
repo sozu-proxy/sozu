@@ -1,3 +1,11 @@
+//! Bidirectional length-delimited unix-socket channel.
+//!
+//! Implements the master ↔ worker / master ↔ CLI message channel: each
+//! payload is preceded by a native `usize` length prefix (NOT a NUL
+//! separator — that scheme belongs to the state-file save format in
+//! `command/src/state.rs:1613`-`1630`). Bounded by the per-channel
+//! `max_buffer_size` (`channel.rs:71`) checked before payload allocation.
+
 use std::{
     cmp::min,
     fmt::Debug,

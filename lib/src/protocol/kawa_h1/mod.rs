@@ -1,3 +1,11 @@
+//! HTTP/1.1 session state on top of Kawa.
+//!
+//! Owns the H1 session state machine: Kawa-driven request/response parsing,
+//! header rewriting via `editor.rs`, default-answer rendering via
+//! `answers.rs`, and route lookup via the listener
+//! (`cluster_id_from_request`). Long-form lifecycle:
+//! `lib/src/protocol/kawa_h1/LIFECYCLE.md` (created in this changeset).
+
 pub mod answers;
 pub mod diagnostics;
 pub mod editor;

@@ -981,6 +981,10 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                     e
                                 );
                             }
+                            // invariant: write-only shutdown — Shutdown::Both on a TLS frontend
+                            // discards the receive buffer and elicits TCP RST, truncating the
+                            // already-queued response. Canonical write-up: `lib/src/https.rs:650-655`.
+                            // Backend sockets follow the same discipline for symmetry.
                             if let Err(e) = socket.shutdown(Shutdown::Write) {
                                 if e.kind() != ErrorKind::NotConnected {
                                     error!(
@@ -1405,6 +1409,12 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             // the TLS buffer may need multiple flushes. Without this loop,
             // the session is killed with unflushed TLS data, causing the
             // client to receive a truncated TLS record ("decode error").
+            //
+            // The constant 16 is empirical: it papers over a missing
+            // invariant-15 hop in the H2 mux state machine where the
+            // writable readiness signal is not always re-armed after a
+            // partial flush. Long-term plan: reach invariant-15 closure
+            // and remove this loop. See `lib/src/protocol/mux/LIFECYCLE.md`.
             let mut result = StateResult::Continue;
             for _ in 0..16 {
                 result = match self
@@ -1601,6 +1611,10 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                     e
                 );
             }
+            // invariant: write-only shutdown — Shutdown::Both on a TLS frontend
+            // discards the receive buffer and elicits TCP RST, truncating the
+            // already-queued response. Canonical write-up: `lib/src/https.rs:650-655`.
+            // Backend sockets follow the same discipline for symmetry.
             if let Err(e) = socket.shutdown(Shutdown::Write) {
                 if e.kind() != ErrorKind::NotConnected {
                     error!(

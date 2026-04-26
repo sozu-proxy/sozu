@@ -1,3 +1,11 @@
+//! Master command-verb dispatcher and audit envelope.
+//!
+//! Receives decoded `Request` protos from connected CLI clients, applies
+//! `command_allowed_uids` admission, validates and fans out cluster /
+//! listener / certificate / runtime mutations to workers, and emits the
+//! audit-log envelope (`sanitize_for_audit`-protected JSON sink) for every
+//! mutating verb. Long-form lifecycle: `bin/src/command/LIFECYCLE.md`.
+
 use std::{
     collections::{BTreeMap, HashMap},
     env,

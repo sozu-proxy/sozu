@@ -1,3 +1,11 @@
+//! Master command-server event loop.
+//!
+//! Drives the mio loop on the unix command socket: accepts CLI clients,
+//! forwards verbs to workers via per-worker `Channel`s, replays the
+//! configuration state on (re)connection, and consumes worker responses.
+//! Holds the worker registry, accepts hot-upgrade FDs, and surfaces
+//! supervisor metrics. Long-form lifecycle: `bin/src/command/LIFECYCLE.md`.
+
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet, VecDeque},

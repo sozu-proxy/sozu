@@ -1,3 +1,14 @@
+//! HTTPS proxy entry point.
+//!
+//! Owns the TLS listener config (rustls), the ALPN-driven post-handshake
+//! mux dispatch (`h2` → `ConnectionH2`, `http/1.1` → `ConnectionH1`,
+//! neither → reject + `https.alpn.rejected.{unsupported,http11_disabled}`
+//! metrics), the SNI binding policy (`strict_sni_binding`), and the
+//! listener-update surface called from the command socket. Front-end H2
+//! is gated by ALPN here; `cluster.http2` is a backend-capability hint.
+//! Frontend rustls handshake I/O lives in `lib/src/protocol/rustls.rs`;
+//! certificate resolution lives in `lib/src/tls.rs`.
+
 use std::{
     cell::RefCell,
     collections::{BTreeMap, HashMap, hash_map::Entry},

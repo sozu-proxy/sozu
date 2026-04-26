@@ -9,6 +9,11 @@
 //! also defined here: they let a connection call back into either the
 //! frontend connection or the backend [`Router`] map without knowing which
 //! direction it faces.
+//!
+//! Edge-trigger discipline lives in `mux/h2.rs` (`writable`) — the canonical
+//! home for the `signal_pending_write` / `arm_writable` invariant. This
+//! module's abstractions delegate to that discipline through the
+//! protocol-specific writers.
 
 use std::{
     cell::RefCell,

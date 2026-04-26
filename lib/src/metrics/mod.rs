@@ -1,3 +1,11 @@
+//! Metrics façade.
+//!
+//! Defines the per-thread `Aggregator`, the `incr!`/`count!`/`gauge!`/
+//! `gauge_add!`/`time!` macros consumed across the lib + bin crates, the
+//! local-vs-network drain dispatch, and the label allow/deny filtering
+//! used to keep cardinality bounded. Gauge underflow is treated as a
+//! correctness bug (saturating clamp + warn log), not a rounding artefact.
+
 mod local_drain;
 mod network_drain;
 mod writer;

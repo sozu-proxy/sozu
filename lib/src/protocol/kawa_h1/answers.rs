@@ -1,3 +1,11 @@
+//! Default HTTP answer templating.
+//!
+//! Owns the per-cluster default-answer table (`HttpAnswers`) used when Sōzu
+//! synthesises a response (parse error, route miss, backend unreachable, …).
+//! Templates are pre-rendered into `Kawa<SharedBuffer>` instances at
+//! configuration time so the hot path only needs a clone of the shared
+//! buffer.
+
 use std::{
     collections::{HashMap, VecDeque},
     fmt,

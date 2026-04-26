@@ -1,3 +1,10 @@
+//! Fixed-capacity ring buffer (`Buffer`).
+//!
+//! Tracks `position` (read cursor), `end` (write cursor), and `capacity`
+//! over a `Vec<u8>` allocated once at construction. Shift/insert/replace
+//! operations use overlapping-safe `std::ptr::copy` with all destinations
+//! bounds-checked against `self.capacity()`.
+
 use std::{
     cmp,
     io::{self, Read, Write},
