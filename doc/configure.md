@@ -62,7 +62,7 @@ worker_count = 2
 handle_process_affinity = false
 max_connections = 500
 max_buffers = 500
-buffer_size = 16384
+buffer_size = 16393
 activate_listeners = true
 ```
 
@@ -937,6 +937,7 @@ These metrics are recorded with `cluster_id` and `backend_id` labels via the
 | `http.alpn.h2` | counter | proxy | TLS connections where client negotiated HTTP/2 via ALPN |
 | `http.alpn.http11` | counter | proxy | TLS connections where client negotiated HTTP/1.1 via ALPN (or no ALPN) |
 | `https.alpn.rejected.http11_disabled` | counter | proxy | TLS connection refused on an H2-only listener because the peer offered `http/1.1` or no ALPN value |
+| `https.alpn.rejected.unsupported` | counter | proxy | TLS connection refused because the peer negotiated an ALPN protocol Sōzu does not recognise (anything other than `h2`, `http/1.1`, or absent ALPN). Add to the same SOC bucket as `https.alpn.rejected.http11_disabled`. |
 
 #### TLS version and cipher suite
 
