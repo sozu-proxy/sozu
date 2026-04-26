@@ -93,6 +93,8 @@ pub fn fork_main_into_new_main(
     executable_path: String,
     upgrade_data: UpgradeData,
 ) -> Result<(pid_t, Channel<(), bool>), UpgradeError> {
+    // SAFETY: `libc::getpid` takes no input pointers, never fails, and
+    // returns a value type. No invariant beyond "FFI signature matches libc".
     trace!("parent({})", unsafe { libc::getpid() });
 
     let mut upgrade_file = tempfile().map_err(UpgradeError::CreateUpgradeFile)?;
@@ -132,6 +134,11 @@ pub fn fork_main_into_new_main(
         .map_err(UpgradeError::BlockChannel)?;
 
     info!("launching new main");
+    // SAFETY: `fork` is unsafe because the child must avoid touching
+    // shared mutable state inherited from the parent. The child branch
+    // below restricts itself to `exec` (via `Command::exec`), which
+    // replaces the process image entirely — no inherited state matters
+    // after that point.
     match unsafe { fork().map_err(UpgradeError::Fork)? } {
         ForkResult::Parent { child } => {
             info!("new main launched, with pid {}", child);
@@ -139,6 +146,9 @@ pub fn fork_main_into_new_main(
             Ok((child.into(), fork_confirmation_channel))
         }
         ForkResult::Child => {
+            // SAFETY: `libc::getpid` takes no input pointers, never fails,
+            // and returns a value type. No invariant beyond "FFI signature
+            // matches libc".
             trace!("child({}):\twill spawn a child", unsafe { libc::getpid() });
             let res = Command::new(executable_path)
                 .arg("main")
@@ -168,6 +178,11 @@ pub fn begin_new_main_process(
     max_command_buffer_size: u64,
 ) -> Result<(), UpgradeError> {
     let mut fork_confirmation_channel: Channel<bool, ()> = Channel::new(
+        // SAFETY: `new_to_old_channel_fd` was just inherited from the
+        // pre-exec parent process via the `--fd` CLI argument. It is a valid
+        // open descriptor with no other owner inside this freshly-execed
+        // process. Ownership transfers to the `UnixStream`, whose `Drop`
+        // closes the descriptor.
         unsafe { UnixStream::from_raw_fd(new_to_old_channel_fd) },
         command_buffer_size,
         max_command_buffer_size,
@@ -180,6 +195,10 @@ pub fn begin_new_main_process(
 
     println!("reading upgrade data from file");
 
+    // SAFETY: `upgrade_file_fd` was just inherited from the pre-exec parent
+    // process via the `--upgrade-fd` CLI argument. It is a valid open
+    // descriptor with no other owner inside this freshly-execed process.
+    // Ownership transfers to the `File`, whose `Drop` closes the descriptor.
     let mut upgrade_file = unsafe { File::from_raw_fd(upgrade_file_fd) };
     let mut content = String::new();
     let _ = upgrade_file

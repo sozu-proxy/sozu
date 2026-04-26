@@ -215,6 +215,9 @@ impl Logger {
                 logger.access_logs_target = access_logs_target.map(ToOwned::to_owned);
                 logger.access_format = access_format.unwrap_or(AccessLogFormat::Ascii);
                 logger.tag = tag;
+                // SAFETY: `libc::getpid` takes no input pointers, never
+                // fails, and returns a value type. No invariant beyond
+                // "FFI signature matches libc".
                 logger.pid = unsafe { libc::getpid() };
                 logger.initialized = true;
 

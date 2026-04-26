@@ -1376,6 +1376,10 @@ impl Server {
                     .scm_listeners
                     .as_mut()
                     .and_then(|s| s.get_http(&address))
+                    // SAFETY: `fd` was just received from the supervisor via SCM_RIGHTS
+                    // (see `command/src/scm_socket.rs`) and is not owned elsewhere — the
+                    // `ScmListeners` map removes it on `get_http`. Ownership transfers to
+                    // the mio wrapper, whose `Drop` closes the descriptor.
                     .map(|fd| unsafe { MioTcpListener::from_raw_fd(fd) });
 
                 let activated_token = self.http.borrow_mut().activate_listener(&address, listener);
@@ -1395,6 +1399,10 @@ impl Server {
                     .scm_listeners
                     .as_mut()
                     .and_then(|s| s.get_https(&address))
+                    // SAFETY: `fd` was just received from the supervisor via SCM_RIGHTS
+                    // (see `command/src/scm_socket.rs`) and is not owned elsewhere — the
+                    // `ScmListeners` map removes it on `get_https`. Ownership transfers to
+                    // the mio wrapper, whose `Drop` closes the descriptor.
                     .map(|fd| unsafe { MioTcpListener::from_raw_fd(fd) });
 
                 let activated_token = self
@@ -1417,6 +1425,10 @@ impl Server {
                     .scm_listeners
                     .as_mut()
                     .and_then(|s| s.get_tcp(&address))
+                    // SAFETY: `fd` was just received from the supervisor via SCM_RIGHTS
+                    // (see `command/src/scm_socket.rs`) and is not owned elsewhere — the
+                    // `ScmListeners` map removes it on `get_tcp`. Ownership transfers to
+                    // the mio wrapper, whose `Drop` closes the descriptor.
                     .map(|fd| unsafe { MioTcpListener::from_raw_fd(fd) });
 
                 let listener_token = self.tcp.borrow_mut().activate_listener(&address, listener);

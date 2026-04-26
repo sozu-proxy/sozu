@@ -648,6 +648,11 @@ impl L7ListenerHandler for HttpListener {
           host
         }
         */
+        // SAFETY: `hostname` was just produced by `hostname_and_port` (see
+        // `lib/src/protocol/kawa_h1/parser.rs:133`), which only accepts
+        // bytes matching `is_hostname_char` (alphanumeric, `-`, `.`, plus
+        // `_` under the tolerant-http1-parser feature). All accepted
+        // bytes are ASCII (≤ 0x7F), so the slice is valid single-byte UTF-8.
         let host = unsafe { from_utf8_unchecked(hostname) };
 
         let route = self.fronts.lookup(host, uri, method).map_err(|e| {

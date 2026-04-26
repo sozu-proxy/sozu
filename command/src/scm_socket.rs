@@ -59,6 +59,10 @@ pub struct ScmSocket {
 impl ScmSocket {
     /// Create a blocking SCM socket from a raw file descriptor (unsafe)
     pub fn new(fd: RawFd) -> Result<Self, ScmSocketError> {
+        // SAFETY: `fd` is borrowed for the duration of this block. We wrap it
+        // in a `StdUnixStream` to call `set_nonblocking`, then immediately
+        // release ownership again with `into_raw_fd` so the descriptor is
+        // not closed by `Drop`. The caller retains ownership of `fd`.
         unsafe {
             let stream = StdUnixStream::from_raw_fd(fd);
             stream
@@ -83,6 +87,10 @@ impl ScmSocket {
         if self.blocking == blocking {
             return Ok(());
         }
+        // SAFETY: `self.fd` is borrowed for the duration of this block. We wrap
+        // it in a `StdUnixStream` to call `set_nonblocking`, then immediately
+        // release ownership with `into_raw_fd` so the descriptor is not closed
+        // by `Drop`. `ScmSocket` retains the original ownership.
         unsafe {
             let stream = StdUnixStream::from_raw_fd(self.fd);
             stream
@@ -255,18 +263,27 @@ impl Listeners {
     /// Deactivate all listeners by closing their file descriptors
     pub fn close(&self) {
         for (_, fd) in &self.http {
+            // SAFETY: `*fd` is owned by this `ScmListeners` table and is
+            // about to be closed by the binding's `Drop` (intentional
+            // close-by-drop). No other reference to the descriptor survives.
             unsafe {
                 let _ = TcpListener::from_raw_fd(*fd);
             }
         }
 
         for (_, fd) in &self.tls {
+            // SAFETY: `*fd` is owned by this `ScmListeners` table and is
+            // about to be closed by the binding's `Drop` (intentional
+            // close-by-drop). No other reference to the descriptor survives.
             unsafe {
                 let _ = TcpListener::from_raw_fd(*fd);
             }
         }
 
         for (_, fd) in &self.tcp {
+            // SAFETY: `*fd` is owned by this `ScmListeners` table and is
+            // about to be closed by the binding's `Drop` (intentional
+            // close-by-drop). No other reference to the descriptor survives.
             unsafe {
                 let _ = TcpListener::from_raw_fd(*fd);
             }

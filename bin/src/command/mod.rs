@@ -75,6 +75,12 @@ pub fn begin_main_process(args: &Args) -> Result<(), StartError> {
 
     update_process_limits(&config)?;
 
+    // SAFETY: `get_executable_path` is marked unsafe to keep its FFI
+    // signature consistent across platforms (see `bin/src/util.rs`).
+    // On Linux it just reads `/proc/self/exe`; on FreeBSD it issues a
+    // `sysctl` call with stack-allocated MIB. We are still in the
+    // supervisor's single-threaded startup phase before workers are
+    // forked, so no concurrent-access invariant applies.
     let executable_path = unsafe { get_executable_path().map_err(StartError::GetExecutablePath)? };
 
     let command_socket_path = config
@@ -144,6 +150,10 @@ fn update_process_limits(config: &Config) -> Result<(), StartError> {
         rlim_cur: 0,
         rlim_max: 0,
     };
+    // SAFETY: `limits` is fully initialised above; `getrlimit` writes its
+    // result through the pointer and returns an error code on failure
+    // (we do not check it — the worst case is reading the zero-initialised
+    // limits below, which fails the `rlim_max` check explicitly).
     unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) };
 
     // Ensure we don't exceed the hard limit
@@ -161,6 +171,10 @@ fn update_process_limits(config: &Config) -> Result<(), StartError> {
     if limits.rlim_cur < wanted_opened_files && limits.rlim_cur != limits.rlim_max {
         // Try to get twice what we need to be safe, or rlim_max if we exceed that
         limits.rlim_cur = limits.rlim_max.min(wanted_opened_files * 2);
+        // SAFETY: `limits` is fully initialised above; both libc calls read
+        // exactly the declared `rlimit` layout and return an error code on
+        // validation failure. We do not surface those errors here — the
+        // process continues with its current rlimit if the syscall fails.
         unsafe {
             libc::setrlimit(libc::RLIMIT_NOFILE, &limits);
 

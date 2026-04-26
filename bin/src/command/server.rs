@@ -327,9 +327,18 @@ impl CommandHub {
             boot_generation,
         } = upgrade_data;
 
+        // SAFETY: `get_executable_path` is marked unsafe to keep its FFI
+        // signature consistent across platforms (see `bin/src/util.rs`).
+        // On Linux it just reads `/proc/self/exe`; on FreeBSD it issues a
+        // `sysctl` call with stack-allocated MIB. This runs only inside
+        // the supervisor's single-threaded reload path.
         let executable_path =
             unsafe { get_executable_path().map_err(HubError::GetExecutablePath)? };
 
+        // SAFETY: `command_socket_fd` was inherited via the upgrade hand-off
+        // (see `UpgradeData`) and is not owned elsewhere in this freshly
+        // re-execed supervisor. Ownership transfers to the `UnixListener`,
+        // whose `Drop` closes the descriptor.
         let unix_listener = unsafe { UnixListener::from_raw_fd(command_socket_fd) };
 
         let command_buffer_size = config.command_buffer_size;
@@ -356,6 +365,11 @@ impl CommandHub {
             .iter()
             .filter(|w| w.run_state != RunState::Stopped && w.run_state != RunState::Stopping)
         {
+            // SAFETY: `worker.channel_fd` was inherited via the upgrade
+            // hand-off (see `UpgradeData::workers`) and is not owned
+            // elsewhere in this freshly re-execed supervisor. Ownership
+            // transfers to the `UnixStream`, whose `Drop` closes the
+            // descriptor.
             let worker_stream = unsafe { UnixStream::from_raw_fd(worker.channel_fd) };
             let channel: Channel<WorkerRequest, WorkerResponse> =
                 Channel::new(worker_stream, command_buffer_size, max_command_buffer_size);

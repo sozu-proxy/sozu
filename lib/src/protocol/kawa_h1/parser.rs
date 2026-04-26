@@ -67,6 +67,11 @@ impl Method {
         } else if compare_no_case(s, b"CONNECT") {
             Method::Connect
         } else {
+            // SAFETY: every call site of `Method::new` (see
+            // `lib/src/router/mod.rs:607` and the in-file tests) passes
+            // either `String::as_bytes()` — guaranteed valid UTF-8 by the
+            // `String` invariant — or a static ASCII byte literal. The
+            // bytes are therefore well-formed UTF-8.
             Method::Custom(String::from(unsafe { from_utf8_unchecked(s) }))
         }
     }

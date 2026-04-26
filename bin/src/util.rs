@@ -50,6 +50,10 @@ pub enum UtilError {
 /// so we need to remove the flag on the client, otherwise
 /// it won't be accessible
 pub fn enable_close_on_exec(raw_fd: RawFd) -> Result<i32, UtilError> {
+    // SAFETY: `BorrowedFd::borrow_raw` requires `raw_fd` to remain open and
+    // not be closed by anyone else for the borrow's lifetime. The caller
+    // owns `raw_fd` (typically a freshly-created tempfile or unix socket
+    // pair end), and we only use `fd` for `fcntl` calls before returning.
     let fd = unsafe { BorrowedFd::borrow_raw(raw_fd) };
     let old_flags =
         fcntl(fd, FcntlArg::F_GETFD).map_err(|err_no| UtilError::GetFlags(raw_fd, err_no))?;
@@ -65,6 +69,10 @@ pub fn enable_close_on_exec(raw_fd: RawFd) -> Result<i32, UtilError> {
 /// so we need to remove the flag on the client, otherwise
 /// it won't be accessible
 pub fn disable_close_on_exec(raw_fd: RawFd) -> Result<i32, UtilError> {
+    // SAFETY: `BorrowedFd::borrow_raw` requires `raw_fd` to remain open and
+    // not be closed by anyone else for the borrow's lifetime. The caller
+    // owns `raw_fd` (typically a freshly-created tempfile or unix socket
+    // pair end), and we only use `fd` for `fcntl` calls before returning.
     let fd = unsafe { BorrowedFd::borrow_raw(raw_fd) };
     let old_flags =
         fcntl(fd, FcntlArg::F_GETFD).map_err(|err_no| UtilError::GetFlags(raw_fd, err_no))?;
@@ -100,6 +108,8 @@ pub fn write_pid_file(config: &Config) -> Result<(), UtilError> {
         let mut file = File::create(path)
             .map_err(|io_err| UtilError::CreatePidFile(path.to_owned(), io_err))?;
 
+        // SAFETY: `libc::getpid` takes no input pointers, never fails, and
+        // returns a value type. No invariant beyond "FFI signature matches libc".
         let pid = unsafe { libc::getpid() };
 
         file.write_all(format!("{pid}").as_bytes())
@@ -207,6 +217,8 @@ pub fn set_workers_affinity(workers: &Vec<command::sessions::WorkerSession>) {
         );
     }
 
+    // SAFETY: `libc::getpid` takes no input pointers, never fails, and
+    // returns a value type. No invariant beyond "FFI signature matches libc".
     let main_pid = unsafe { libc::getpid() };
     set_process_affinity(main_pid, cpu_count);
     cpu_count += 1;
@@ -234,6 +246,11 @@ pub fn set_workers_affinity(_: &Vec<command::sessions::WorkerSession>) {}
 use std::mem;
 #[cfg(target_os = "linux")]
 pub fn set_process_affinity(pid: pid_t, cpu: usize) {
+    // SAFETY: `cpu_set_t` is a C POD; zero-init is a valid bit pattern that
+    // produces an empty CPU mask. `CPU_SET` mutates `cpu_set` in place with
+    // a valid (compile-time-checked) layout. `sched_setaffinity` reads only
+    // the declared `size_cpu_set` bytes; the kernel returns an error code
+    // on validation failure (we ignore it here — affinity is best-effort).
     unsafe {
         let mut cpu_set: cpu_set_t = mem::zeroed();
         let size_cpu_set = mem::size_of::<cpu_set_t>();
