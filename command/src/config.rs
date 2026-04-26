@@ -1788,6 +1788,7 @@ impl ConfigBuilder {
         // deadlocks on full-size DATA / HEADERS / CONTINUATION frames until
         // the session timeout fires. Reject at config load so the failure
         // mode surfaces at boot, not under traffic.
+        // Long-form rationale: `lib/src/protocol/mux/LIFECYCLE.md`.
         let h2_listeners = self
             .built
             .https_listeners

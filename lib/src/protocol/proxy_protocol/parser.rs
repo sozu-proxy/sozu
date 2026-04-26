@@ -1,3 +1,10 @@
+//! PROXY-v2 wire parser.
+//!
+//! Decodes the 12-byte PROXY-v2 signature plus the variable address block
+//! defined by the HAProxy PROXY protocol specification. Returns a
+//! `HeaderV2` to the caller (`expect.rs` / `relay.rs`); rejects malformed
+//! framing through `nom::Err` so the session can close cleanly. No I/O.
+
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 
 use nom::{

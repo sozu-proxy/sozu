@@ -1,3 +1,12 @@
+//! SCM_RIGHTS socket for FD passing between master and workers.
+//!
+//! Wraps a `SeqPacket` unix socket and uses the `nix` SCM_RIGHTS helpers
+//! to ship listener/accept FDs across the master ↔ worker boundary at
+//! startup and across hot upgrades. The borrowed-FD wrappers
+//! (`set_blocking`) hold an FD without taking ownership; the listener
+//! teardown paths intentionally take ownership through
+//! `TcpListener::from_raw_fd` so the FD is closed by drop.
+
 use std::{
     io::{IoSlice, IoSliceMut},
     net::{AddrParseError, SocketAddr},

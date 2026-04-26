@@ -1,3 +1,11 @@
+//! Per-client command-socket session state.
+//!
+//! Tracks every connected CLI/`sozu` command-socket client (pid, comm,
+//! authenticated peer credentials) and the in-flight requests waiting on
+//! worker responses. Owns the PID-reuse-guarded `peer_comm` snapshot used
+//! by the audit envelope so reused PIDs cannot impersonate another
+//! command source. Long-form lifecycle: `bin/src/command/LIFECYCLE.md`.
+
 use std::{fmt::Debug, sync::Arc, time::SystemTime};
 
 use libc::pid_t;

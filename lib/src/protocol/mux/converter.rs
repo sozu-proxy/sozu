@@ -1,3 +1,11 @@
+//! H2 kawa-to-wire converter.
+//!
+//! Owns the per-connection [`loona_hpack::Encoder`] and emits HEADERS / DATA
+//! frames on top of `Stream`-owned Kawa buffers (zero-copy slices into stream
+//! storage). HEADERS payloads exceeding `max_frame_size` are split into a
+//! HEADERS prefix plus CONTINUATION frames per RFC 9113 §6.10. Final frame
+//! serialization is delegated to `serializer.rs`.
+
 use std::cmp::min;
 
 use kawa::{

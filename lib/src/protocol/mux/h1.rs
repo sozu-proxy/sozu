@@ -1,3 +1,10 @@
+//! H1 mux connection wrapper.
+//!
+//! Hosts the single active H1 stream (`stream: GlobalStreamId`) and wires
+//! Kawa-owned H1 parsing + serialization into the shared mux `Context` so the
+//! same routing / shutdown / readiness machinery applies across H1 and H2
+//! connections. Long-form lifecycle: `lib/src/protocol/mux/LIFECYCLE.md`.
+
 use std::{io::IoSlice, time::Instant};
 
 use rusty_ulid::Ulid;

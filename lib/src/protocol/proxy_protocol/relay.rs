@@ -1,3 +1,10 @@
+//! PROXY-v2 relay state.
+//!
+//! Reads an inbound PROXY-v2 header (`parse_v2_header`) and forwards the
+//! captured bytes verbatim onto a freshly opened backend `TcpStream` before
+//! the rest of the byte stream begins. Used when Sōzu sits between two
+//! PROXY-aware peers and must preserve the original client identity.
+
 use std::{cell::RefCell, io::Write, rc::Rc};
 
 use mio::{Token, net::TcpStream};

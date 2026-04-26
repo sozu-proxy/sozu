@@ -1,3 +1,11 @@
+//! End-to-end test surface.
+//!
+//! Tests that toggle the process-wide `e2e-hooks` AtomicBools (e.g.
+//! `force_h2_client_failure`) MUST carry
+//! `#[serial_test::serial(force_h2_client_failure)]` to avoid cross-test
+//! interference. Canonical group:
+//! `e2e/src/tests/h2_security_session.rs:239, 622`.
+
 #![allow(clippy::clone_on_copy)]
 #![allow(clippy::explicit_counter_loop)]
 #![allow(clippy::field_reassign_with_default)]

@@ -1,3 +1,11 @@
+//! H2 frame-header and control-frame serializer.
+//!
+//! Cookie-factory based encoders for the wire format defined in RFC 9113 §4
+//! and §6 (frame header, SETTINGS, PING, GOAWAY, RST_STREAM, WINDOW_UPDATE).
+//! HEADERS / DATA bodies are assembled in `converter.rs`; this module owns
+//! only the structural framing and the reserved-bit masking guard against
+//! malformed `StreamId` inputs.
+
 use cookie_factory::{
     GenError,
     bytes::{be_u8, be_u16, be_u24, be_u32},

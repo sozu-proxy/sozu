@@ -1,3 +1,11 @@
+//! H1 request/response header editor.
+//!
+//! Captures method/authority/path on parse, rewrites hop-by-hop and
+//! forwarding headers (`X-Forwarded-*`, `Forwarded`, `Connection`,
+//! WebSocket-upgrade signalling, optional `traceparent`), and surfaces the
+//! canonical `LogContext` used by the access-log envelope. Acts as the
+//! Kawa `ParserCallbacks` implementation for the H1 mux path.
+
 use std::{
     io::Write as _,
     net::{IpAddr, SocketAddr},

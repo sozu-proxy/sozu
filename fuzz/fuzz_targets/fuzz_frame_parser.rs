@@ -1,10 +1,11 @@
 #![no_main]
-//! Fuzz target for the H2 frame parser.
+//! Fuzz target for the H2 frame parser (RFC 9113 §6).
 //!
-//! Exercises `frame_header`, `frame_body`, and `preface` with arbitrary input.
-//! The parser must handle any byte sequence without panicking.
-//!
-//! Run: cargo +nightly fuzz run fuzz_frame_parser
+//! Exercises `preface`, `frame_header`, and `frame_body` against arbitrary
+//! input; the parser must reject malformed framing through `H2Error` /
+//! `nom::Err` and never panic. Defends against the length-confusion family
+//! of CVEs that motivated `ensure_frame_size!`. Corpus + run instructions
+//! live in `fuzz/README.md`.
 
 use libfuzzer_sys::fuzz_target;
 use sozu_lib::protocol::mux::parser;

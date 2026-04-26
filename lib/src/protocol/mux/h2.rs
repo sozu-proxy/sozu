@@ -1,3 +1,14 @@
+//! H2 mux connection wrapper (RFC 9113).
+//!
+//! Owns wire-side connection state: HPACK encoder/decoder, peer settings,
+//! flow window, GOAWAY/RST attribution, and the [`H2FloodDetector`] backing
+//! the CVE-2023-44487 / CVE-2024-27316 / CVE-2025-8671 mitigations. Stream
+//! storage lives in the sibling `Context<L>` (`mux/mod.rs`); this module is
+//! the canonical home for the edge-trigger discipline — paths that queue
+//! bytes for a later event-loop pass must arm writable / signal pending
+//! write (cf. `arm_writable()` at the deferred-control-frame sites and
+//! `lib/src/lib.rs:1006`-`1010`).
+
 use std::{
     cmp::min,
     collections::{HashMap, HashSet},

@@ -1,3 +1,11 @@
+//! Rustls handshake driver.
+//!
+//! Owns the per-session `rustls::ServerConnection` during the TLS
+//! handshake: pumps `read_tls`/`write_tls`, surfaces handshake completion
+//! to the parent state, and emits handshake-completion metrics. Cipher /
+//! ALPN / SNI binding decisions live in `lib/src/https.rs`; certificate
+//! resolution and dynamic cert reload live in `lib/src/tls.rs`.
+
 use std::{cell::RefCell, io::ErrorKind, net::SocketAddr, rc::Rc, time::Instant};
 
 use mio::{Token, net::TcpStream};

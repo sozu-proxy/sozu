@@ -1,3 +1,13 @@
+//! H2 frame parser (nom-based).
+//!
+//! Decodes every RFC 9113 §6 frame type plus RFC 9218 `PRIORITY_UPDATE` and
+//! unknown extension frames; rejects malformed framing with the matching
+//! `H2Error` so the connection can react with GOAWAY / RST_STREAM. Mostly
+//! zero-allocation, with bounded `Vec<u8>` allocations on `priority_update`
+//! and a SETTINGS-list cap (cf. `priority_update_frame` and the SETTINGS
+//! allocation cap test). Frame-size invariants are enforced via
+//! `ensure_frame_size!`.
+
 use std::convert::From;
 
 use kawa::repr::Slice;

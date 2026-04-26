@@ -1,3 +1,11 @@
+//! Inbound PROXY-v2 expectation state.
+//!
+//! Reads bytes from the freshly accepted front-end socket until a complete
+//! PROXY v2 header has been parsed (`parse_v2_header`), captures the peer
+//! address pair, and transitions the session to the configured downstream
+//! protocol (typically `Pipe` for TCP listeners). Bounded by
+//! `MAX_LOOP_ITERATIONS` to defend against malformed/empty headers.
+
 use std::{cell::RefCell, rc::Rc};
 
 use mio::{net::TcpStream, *};

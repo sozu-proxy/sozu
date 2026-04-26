@@ -1,3 +1,12 @@
+//! Socket I/O wrappers and TCP option helpers.
+//!
+//! Hosts the `SocketHandler` trait, the `FrontRustls` wrapper that drives
+//! a rustls `ServerConnection` over a `TcpStream`, plus the ancillary
+//! `getsockopt(TCP_INFO)` / TCP-keepalive helpers. The
+//! `FrontRustls::socket_write` / `socket_write_vectored` pair is a known
+//! truncation hot spot — keep the two paths structurally symmetric (see
+//! the per-method `///` invariants).
+
 use std::{
     io::{ErrorKind, Read, Write},
     net::SocketAddr,
@@ -606,6 +615,10 @@ impl SocketHandler for FrontRustls {
         }
     }
 
+    /// Keep these two functions structurally symmetric — a divergence
+    /// caused the 4.5 MB H2 truncation bug. Tests
+    /// `e2e::tests::h2_correctness_tests::*` and
+    /// `e2e::tests::h2_tests::test_h2_large_*` are the regression guard.
     fn socket_write(&mut self, buf: &[u8]) -> (usize, SocketResult) {
         // Abort only on a true RST — a FIN on the read side still permits
         // flushing rustls's plaintext buffer (TLS half-close).
@@ -765,6 +778,11 @@ impl SocketHandler for FrontRustls {
     /// [`Self::socket_write`]: both entry points must stay structurally
     /// symmetric so that a zero-byte flush never early-returns without giving
     /// rustls a chance to emit bytes.
+    ///
+    /// Keep these two functions structurally symmetric — a divergence
+    /// caused the 4.5 MB H2 truncation bug. Tests
+    /// `e2e::tests::h2_correctness_tests::*` and
+    /// `e2e::tests::h2_tests::test_h2_large_*` are the regression guard.
     fn socket_write_vectored(&mut self, bufs: &[std::io::IoSlice]) -> (usize, SocketResult) {
         if self.peer_reset {
             return (0, SocketResult::Closed);

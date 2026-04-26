@@ -445,6 +445,10 @@ impl ProxySession for HttpSession {
         self.state.close(self.proxy.clone(), &mut self.metrics);
 
         let front_socket = self.state.front_socket();
+        // invariant: write-only shutdown — Shutdown::Both on a TLS frontend
+        // discards the receive buffer and elicits TCP RST, truncating the
+        // already-queued response. Canonical write-up: `lib/src/https.rs:650-655`.
+        // Backend sockets follow the same discipline for symmetry.
         if let Err(e) = front_socket.shutdown(Shutdown::Write) {
             // error 107 NotConnected can happen when was never fully connected, or was already disconnected due to error
             if e.kind() != ErrorKind::NotConnected {

@@ -1,3 +1,10 @@
+//! Kawa-adjacent H1 parsing helpers.
+//!
+//! Hosts the byte-comparison primitives, the `Method` enum, and the small
+//! nom helpers Kawa relies on when its tolerant/strict mode boundaries do
+//! not cover Sōzu-specific cases (custom methods, ASCII-fast-path
+//! comparisons). Pure-function module; no session state.
+
 use std::{
     cmp::min,
     fmt::{self, Write},

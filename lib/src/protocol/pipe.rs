@@ -1,3 +1,11 @@
+//! Transparent byte-stream forwarder (TCP + WebSocket post-upgrade).
+//!
+//! Forwards bytes between front and back through fixed-size buffers without
+//! payload inspection. Readiness is managed via direct mio interest toggles
+//! (no `signal_pending_write` / `arm_writable` here — those belong to the
+//! mux H2 path). Used as the post-handshake state for raw TCP listeners and
+//! after a successful WebSocket upgrade on the H1 path.
+
 use std::{cell::RefCell, net::SocketAddr, rc::Rc};
 
 use mio::{Token, net::TcpStream};
