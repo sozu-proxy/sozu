@@ -16,9 +16,23 @@ file.
 The proxy receives orders through a unix socket. The path to this unix socket can
 be defined by the `command_socket` option in the TOML configuration file.
 
-The messages are sent as binary, using protobuf,
-separated by the 0 byte.
+Messages on the live command channel are length-delimited binary protobuf: each
+frame is preceded by a native-`usize` length prefix that the parser reads via
+`Channel::read_message_*` (`command/src/channel.rs:611`). This is **not** a
+0-byte separator — the only place the legacy `\n\0` separator is still in use is
+the on-disk state-file format produced by `save_state` and consumed by
+`load_state`, which writes one JSON record per line followed by a NUL byte
+(`command/src/state.rs:1613, 1630`). Treat the two delimiters as distinct
+schemes; the live channel is binary-only.
 
-Their format is defined in `../command/command.proto`. Additionally, the
-provides the necessary channels to communicate with
-the command socket.
+Message types are defined in `../command/src/command.proto`. The
+`sozu-command-lib` crate (the `command/` workspace member) provides the
+`Channel` and `Request`/`Response` Rust bindings used to talk to the socket from
+Sōzu and from external tools such as the `sozu` CLI subcommands under
+`bin/src/ctl/`.
+
+A dedicated supervisor-lifecycle write-up — accept loop, audit log, hot
+reconfig fan-out, FD-passing for hot upgrades — is planned alongside the
+in-tree code in `bin/src/command/`. Until that lands the canonical sources are
+the module-level comments in `bin/src/command/{mod,server,sessions}.rs` and the
+control-plane audit-log section of `doc/observability.md`.
