@@ -161,6 +161,11 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
     // We get the file descriptor of the MioUnixStream socket, create a standard library UnixStream,
     // set it to nonblocking, let go of the file descriptor
     fn set_nonblocking(&mut self, nonblocking: bool) -> Result<(), ChannelError> {
+        // SAFETY: `fd` is borrowed from `self.sock` for the duration of this
+        // block. We wrap it in a `StdUnixStream` to call `set_nonblocking`,
+        // then immediately release ownership again with `into_raw_fd` so the
+        // descriptor is not closed by `Drop`. `self.sock` retains the
+        // original ownership.
         unsafe {
             let fd = self.sock.as_raw_fd();
             let stream = StdUnixStream::from_raw_fd(fd);
@@ -178,6 +183,11 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
 
     /// set the read_timeout of the unix stream. This works only temporary, be sure to set the timeout to None afterwards.
     fn set_timeout(&mut self, timeout: Option<Duration>) -> Result<(), ChannelError> {
+        // SAFETY: `fd` is borrowed from `self.sock` for the duration of this
+        // block. We wrap it in a `StdUnixStream` to call `set_read_timeout`,
+        // then immediately release ownership again with `into_raw_fd` so the
+        // descriptor is not closed by `Drop`. `self.sock` retains the
+        // original ownership.
         unsafe {
             let fd = self.sock.as_raw_fd();
             let stream = StdUnixStream::from_raw_fd(fd);

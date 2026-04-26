@@ -497,6 +497,11 @@ fn set_logging_level(server: &mut Server, client: &mut ClientSession, logging_fi
     // also change / set the content of RUST_LOG so future workers / main thread
     // will have the new logging filter value
     // TODO: Audit that the environment access only happens in single-threaded code.
+    // SAFETY: `env::set_var` in Rust 2024 is unsafe because it is not
+    // thread-safe. The supervisor that handles `LoggingFilter` requests is
+    // single-threaded (mio event loop on the command socket), and workers
+    // are separate processes that re-read RUST_LOG after fork-and-exec —
+    // so the racy read it would otherwise fight with does not exist here.
     unsafe { env::set_var("RUST_LOG", &logging_filter) };
     debug!(
         "Logging level now: {}",

@@ -30,6 +30,11 @@ trait DuplicateOwnership {
 impl<T> DuplicateOwnership for &T {
     type Target = T;
     unsafe fn duplicate(self) -> T {
+        // SAFETY: `std::ptr::read` duplicates the bit-pattern of the
+        // pointee without copying. The result aliases the original value's
+        // ownership view, so the caller MUST ensure exactly one of the two
+        // owners is wrapped in `ManuallyDrop` or `mem::forget`'d before
+        // either is dropped (cf. the type-level guidance at line 26).
         unsafe { std::ptr::read(self as *const T) }
     }
 }
@@ -40,18 +45,32 @@ where
 {
     type Target = Option<<&'a T as DuplicateOwnership>::Target>;
     unsafe fn duplicate(self) -> Self::Target {
+        // SAFETY: delegates to the inner `&T::duplicate` impl above. The
+        // same double-free obligation propagates to the caller (cf. the
+        // type-level guidance at line 26).
         unsafe { self.map(|t| t.duplicate()) }
     }
 }
 impl DuplicateOwnership for &str {
     type Target = String;
     unsafe fn duplicate(self) -> Self::Target {
+        // SAFETY: `String::from_raw_parts` reuses the underlying allocation
+        // owned by `self` without copying, so the result aliases that
+        // ownership view. Caller MUST ensure exactly one owner is wrapped
+        // in `ManuallyDrop` or `mem::forget`'d to avoid double-free
+        // (cf. the type-level guidance at line 26). The bytes are valid
+        // UTF-8 because they came from a `&str`.
         unsafe { String::from_raw_parts(self.as_ptr() as *mut _, self.len(), self.len()) }
     }
 }
 impl<T> DuplicateOwnership for &[T] {
     type Target = Vec<T>;
     unsafe fn duplicate(self) -> Self::Target {
+        // SAFETY: `Vec::from_raw_parts` reuses the underlying allocation
+        // owned by `self` without copying, so the result aliases that
+        // ownership view. Caller MUST ensure exactly one owner is wrapped
+        // in `ManuallyDrop` or `mem::forget`'d to avoid double-free
+        // (cf. the type-level guidance at line 26).
         unsafe { Vec::from_raw_parts(self.as_ptr() as *mut _, self.len(), self.len()) }
     }
 }
@@ -120,11 +139,19 @@ pub struct OpenTelemetry {
 
 impl fmt::Debug for OpenTelemetry {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        // SAFETY: `trace_id` is populated either by `parse_hex` (which
+        // verifies every byte is `is_ascii_hexdigit`) or by `random_id`
+        // (which fills from `b"0123456789abcdef"`). Both produce ASCII
+        // bytes, which are by construction valid single-byte UTF-8.
         let trace_id = unsafe { std::str::from_utf8_unchecked(&self.trace_id) };
+        // SAFETY: same provenance as `trace_id` above — `parse_hex` or
+        // `random_id` from a hex charset, ASCII guaranteed.
         let span_id = unsafe { std::str::from_utf8_unchecked(&self.span_id) };
         let parent_span_id = self
             .parent_span_id
             .as_ref()
+            // SAFETY: same provenance as `trace_id` above — `parse_hex`
+            // from a hex charset, ASCII guaranteed.
             .map(|id| unsafe { std::str::from_utf8_unchecked(id) })
             .unwrap_or("-");
         write!(f, "{trace_id} {span_id} {parent_span_id}")
@@ -198,6 +225,12 @@ impl RequestRecord<'_> {
     /// Prost needs ownership over all the fields but we don't want to take it from the user
     /// or clone them, so we use the unsafe DuplicateOwnership.
     pub fn into_binary_access_log(self) -> ManuallyDrop<ProtobufAccessLog> {
+        // SAFETY: Each `.duplicate()` call below borrows ownership without
+        // copying. The whole protobuf is wrapped in `ManuallyDrop` so its
+        // destructor never runs — the original `RequestRecord` references
+        // remain the sole owners. `std::str::from_utf8_unchecked` on `otel`
+        // fields is sound because `trace_id` / `span_id` are ASCII hex
+        // (see the `OpenTelemetry` Debug impl above for the same proof).
         unsafe {
             let endpoint = match self.endpoint {
                 EndpointRecord::Http {

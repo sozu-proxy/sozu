@@ -156,6 +156,13 @@ impl MetricsWriter {
                 break;
             }
 
+            // SAFETY: `messages` is a non-empty owned `Vec` (the
+            // `is_empty` check above ensures `messages[0]` is valid). Each
+            // `mmsghdr` contains an `msg_hdr` whose `msg_iov` points into
+            // the surrounding `iov` array, kept alive for the duration of
+            // the call. `messages.len()` matches the pointer's allocation
+            // length. libc writes per-message `msg_len` results in place
+            // and returns the number sent (or -1 on error, which we check).
             unsafe {
                 let r = libc::sendmmsg(
                     self.inner.as_ref().unwrap().socket.as_raw_fd(),

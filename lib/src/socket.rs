@@ -1075,8 +1075,15 @@ pub mod stats {
 
     #[cfg(unix)]
     pub fn socket_info(fd: libc::c_int) -> Option<TcpInfo> {
+        // SAFETY: `TcpInfo` is a C POD whose every byte pattern is a legal
+        // representation; zero-init satisfies `assume_init`'s invariant
+        // (and `std::mem::zeroed` is the canonical idiom for that).
         let mut tcp_info: TcpInfo = unsafe { std::mem::zeroed() };
         let mut len = std::mem::size_of::<TcpInfo>() as libc::socklen_t;
+        // SAFETY: `tcp_info` and `len` are fully initialised above; libc
+        // reads only `len` bytes through the pointer and writes back the
+        // resulting length. We check the return value (`status != 0`) to
+        // distinguish success from validation failure.
         let status = unsafe {
             libc::getsockopt(
                 fd,

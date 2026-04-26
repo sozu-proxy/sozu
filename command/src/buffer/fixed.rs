@@ -110,6 +110,11 @@ impl Buffer {
 
     pub fn shift(&mut self) {
         if self.inner.position > 0 {
+            // SAFETY: src and dst point into the same buffer
+            // (`self.inner.bytes`); the slice indexing above bounds-checks
+            // both ranges (`position..end` and `..length`) against the live
+            // buffer length, so they are fully inside the allocation.
+            // `ptr::copy` is overlap-safe.
             unsafe {
                 let length = self.inner.end - self.inner.position;
                 ptr::copy(
@@ -128,6 +133,11 @@ impl Buffer {
             return None;
         }
 
+        // SAFETY: src and dst point into the same buffer
+        // (`self.inner.bytes`). The early-return above guarantees
+        // `start + length < available_data`, and slice indexing
+        // bounds-checks both `begin+length..end` and `begin..next_end`
+        // against the live buffer length. `ptr::copy` is overlap-safe.
         unsafe {
             let begin = self.inner.position + start;
             let next_end = self.inner.end - length;
@@ -149,6 +159,12 @@ impl Buffer {
             return None;
         }
 
+        // SAFETY: every `ptr::copy` below moves bytes inside the same
+        // buffer (`self.inner.bytes`) or copies from the caller's `data`
+        // slice into it. The two early-return checks above bound the
+        // affected ranges against `available_data()` and `capacity()`,
+        // and each slice indexing site is bounds-checked. `ptr::copy` is
+        // overlap-safe.
         unsafe {
             let begin = self.inner.position + start;
             let slice_end = begin + data_len;
@@ -193,6 +209,11 @@ impl Buffer {
             return None;
         }
 
+        // SAFETY: both `ptr::copy` calls touch `self.inner.bytes` (same
+        // allocation) or copy from `data` into it. The early-return checks
+        // bound `start <= available_data` and the resulting tail
+        // `position + end + data_len <= capacity`, and each slice indexing
+        // site is bounds-checked. `ptr::copy` is overlap-safe.
         unsafe {
             let begin = self.inner.position + start;
             let slice_end = begin + data_len;
@@ -231,6 +252,11 @@ impl Write for Buffer {
 impl Read for Buffer {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let len = cmp::min(self.available_data(), buf.len());
+        // SAFETY: `len = min(available_data, buf.len())`, so the source
+        // range `position..position+len` lies inside `self.inner.bytes` and
+        // the destination `buf[..len]` fits the caller's `&mut [u8]`. The
+        // two slices are in different allocations; `ptr::copy` is
+        // overlap-safe regardless.
         unsafe {
             ptr::copy(
                 self.inner.bytes()[self.inner.position..self.inner.position + len].as_ptr(),

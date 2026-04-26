@@ -297,6 +297,9 @@ mod send_test {
         let backend_stream =
             StdTcpStream::connect(addr_backend).expect("could not connect to the backend");
         let fd = backend_stream.into_raw_fd();
+        // SAFETY: `fd` was just released by `into_raw_fd` from the blocking
+        // `StdTcpStream` so it is a valid open descriptor with no other owner.
+        // Ownership transfers to the mio `TcpStream`, whose `Drop` closes it.
         let backend_stream = unsafe { TcpStream::from_raw_fd(fd) };
 
         let mut send_pp = SendProxyProtocol::new(
