@@ -164,37 +164,74 @@ See milestone [`v1.1.0`](https://github.com/sozu-proxy/sozu/projects/3?card_filt
 
 ### Changelog
 
+The categorised list below covers every commit in the `1.1.1..HEAD` range as of this revision (50 entries on 2026-04-26). Bullets in the narrative sections above curate the user-visible behaviour; the bullets below give a one-line per-commit index for code review and bisection.
+
 #### 🌟 Added
 
-- [ [`f7d1b659`](https://github.com/sozu-proxy/sozu/commit/f7d1b659865e7d92e732fcf8c52783713140f6a8) ] Add HTTP/2 configuration guide to getting_started and configure [`FlorentinDUBOIS`] (`2026-03-12`)
-- [ [`b6bffd36`](https://github.com/sozu-proxy/sozu/commit/b6bffd364355c8001da7403066c2dbcbc04445a1) ] Add missing metrics to mux H1/H2 paths and document all mux metrics [`FlorentinDUBOIS`] (`2026-03-12`)
-- [ [`4f67d07d`](https://github.com/sozu-proxy/sozu/commit/4f67d07d6179c2af61108a24d1e1d57eec663787) ] Add per-listener ALPN protocol configuration [`FlorentinDUBOIS`] (`2026-03-12`)
-- [ [`2a65aa78`](https://github.com/sozu-proxy/sozu/commit/2a65aa78313f359d22d38c1c828c1960bb411bd8) ] Add cluster H2 enable/disable commands and --http2 flag [`FlorentinDUBOIS`] (`2026-03-12`)
-- [ [`7da4f580`](https://github.com/sozu-proxy/sozu/commit/7da4f580) ] OTel trace propagation [`FlorentinDUBOIS`] (`2026-03-14`)
-- [ [`4c02e918`](https://github.com/sozu-proxy/sozu/commit/4c02e918) ] RFC 9218 priorities + proportional overhead [`FlorentinDUBOIS`] (`2026-03-14`)
-- [ [`03942c11`](https://github.com/sozu-proxy/sozu/commit/03942c11) ] Configurable flood thresholds [`FlorentinDUBOIS`] (`2026-03-14`)
-
-#### ⛑️ Fixed
-
-- **Solo RFC 9218 incremental stream stall**: A single HTTP/2 stream marked `priority: u=0, i` (Chrome's navigation default) would park silently after the first DATA frame and never drain its full body — the per-stream idle timeout eventually tore the connection down as `ERR_CONNECTION_CLOSED`. Root cause: the RFC 9218 §4 scheduler yielded after every DATA frame whenever the stream was incremental, even when it was the only peer in its urgency bucket; `finalize_write` then withdrew `Ready::WRITABLE` on a clean pass (no `expect_write`) and edge-triggered epoll never re-fired. Fix: the converter now skips the yield when `incremental_peer_count <= 1` (scheduler solo-bucket fast path), and `finalize_write` refuses to withdraw `Ready::WRITABLE` while any stream still has queued response bytes in its back buffer (defence-in-depth invariant against future voluntary-yield conditions). See `lib/src/protocol/mux/LIFECYCLE.md` §9 invariants 15-16.
-- [ [`9b6f9987`](https://github.com/sozu-proxy/sozu/commit/9b6f99871f2a74f120cceb13a3c3ffeab5525515) ] Fix service_time inflation, gauge leak, and WebSocket upgrade accounting [`FlorentinDUBOIS`] (`2026-03-12`)
-- [ [`560fac2f`](https://github.com/sozu-proxy/sozu/commit/560fac2f2cc249a66264a9233bb908059bb01ca0) ] Re-arm timeouts and handle H2 Linked streams on frontend timeout [`FlorentinDUBOIS`] (`2026-03-12`)
-- [ [`5a02f634`](https://github.com/sozu-proxy/sozu/commit/5a02f634e848600651a350a60e2f1fb39d0cc4dc) ] Restore missing backend metrics in mux layer [`FlorentinDUBOIS`] (`2026-03-12`)
-- [ [`479a0bfe`](https://github.com/sozu-proxy/sozu/commit/479a0bfeba7fd9c4418b6e8652d66ec03ad58fe3) ] Downgrade noisy mux/H1/H2 logs from warn/error to debug [`FlorentinDUBOIS`] (`2026-03-12`)
-- [ [`21e7514d`](https://github.com/sozu-proxy/sozu/commit/21e7514d) ] HPACK sync + stream recycling dedup [`FlorentinDUBOIS`] (`2026-03-13`)
-- [ [`664bb659`](https://github.com/sozu-proxy/sozu/commit/664bb659) ] Round 2 review fixes [`FlorentinDUBOIS`] (`2026-03-13`)
-- [ [`025822cf`](https://github.com/sozu-proxy/sozu/commit/025822cf) ] Round 1 review findings [`FlorentinDUBOIS`] (`2026-03-13`)
-- [ [`9f414492`](https://github.com/sozu-proxy/sozu/commit/9f414492) ] Fix 1xx informational handling, proxy protocol v2 E2E, pipelining validation [`FlorentinDUBOIS`] (`2026-03-16`)
+- [ [`f6c1bc81`](https://github.com/sozu-proxy/sozu/commit/f6c1bc81eff15b5553c220738087b8077c1a836f) ] Optional `command_allowed_uids` allowlist enforced on every command-socket verb (Lisa LISA-007 follow-up).
+- [ [`e8fc5d41`](https://github.com/sozu-proxy/sozu/commit/e8fc5d4190f079350fc781777cbbeec0d457761f) ] Reject `disable_http11=true` combined with `http/1.1` in `alpn_protocols` at config load (Lisa LISA-TLS-004).
+- [ [`5f85051a`](https://github.com/sozu-proxy/sozu/commit/5f85051a7c73f3a774608c358ba13f4312fb4b66) ] Expose the `slab_entries_per_connection` knob (default 4, range 2..=64) so operators can tune slab capacity for high H2 concurrency.
+- [ [`53e84a62`](https://github.com/sozu-proxy/sozu/commit/53e84a62a51aedc07cf01f4937a843c881511a83) ] Reject sub-`H2_MIN_BUFFER_SIZE` (16 393) `buffer_size` at config load when any HTTPS listener advertises `h2` ALPN.
 
 #### ✍️ Changed
 
-- [ [`303675e9`](https://github.com/sozu-proxy/sozu/commit/303675e9707fd64055a93f0ee27bb58b72faa344) ] Apply cargo fmt to CLI, config, and HTTPS modules [`FlorentinDUBOIS`] (`2026-03-12`)
-- [ [`7917feeb`](https://github.com/sozu-proxy/sozu/commit/7917feeb) ] Struct decomposition + DefaultAnswer [`FlorentinDUBOIS`] (`2026-03-14`)
-- [ [`fc606d23`](https://github.com/sozu-proxy/sozu/commit/fc606d23) ] readable/writable split [`FlorentinDUBOIS`] (`2026-03-14`)
+- [ [`154ca855`](https://github.com/sozu-proxy/sozu/commit/154ca8555a992b0348e8baa58ad2d54240f342e3) ] Collapse actor display + pseudo-header dispatch boilerplate.
+- [ [`2b2cf5cd`](https://github.com/sozu-proxy/sozu/commit/2b2cf5cdf5c9bab3e6ad19425904dfbeecc7b4de) ] Extract `ensure_frame_size!` macro for fixed-size H2 frames in the parser.
+- [ [`37c49852`](https://github.com/sozu-proxy/sozu/commit/37c49852afcb6b4fb943e6e54b1499f501a25b6b) ] Collapse the repeated `Readiness::arm_writable` + flood-check pattern into a shared mux helper.
+- [ [`bcd977f1`](https://github.com/sozu-proxy/sozu/commit/bcd977f14b80212577327c0c527bc34cbd8f4cd3) ] Extract the log-layout scanner shared between `lib/build.rs` and the integration test guard.
+- [ [`93376b76`](https://github.com/sozu-proxy/sozu/commit/93376b7610fe947186b4d950850d4ad1a9bcaaf0) ] `cargo +nightly fmt --all` on consolidated review changes.
+- [ [`ff659ab6`](https://github.com/sozu-proxy/sozu/commit/ff659ab66c539266449a04674d43a3b0493f38df) ] Wrap the remaining 4 `kawa_h1` log sites in the `KAWA-H1` envelope and recognise `.log_context()` in the layout scanner.
+- [ [`55609f37`](https://github.com/sozu-proxy/sozu/commit/55609f37a33173e7618422b5c0986ee56aa86f7d) ] Wrap the remaining 17 `lib/src/tcp.rs` log sites in the `TCP` `log_context!` envelope.
+- [ [`361e7473`](https://github.com/sozu-proxy/sozu/commit/361e7473d5ce6e6375712dc141cd47d53b528b58) ] Wrap 4 remaining mux log sites in the `MUX`/`MUX-H2` envelope and mark them in the layout scanner.
+- [ [`fe84345e`](https://github.com/sozu-proxy/sozu/commit/fe84345ec6304a497f9d83c2ae0130cc54d75c66) ] Introduce `HTTPS` module + session log macros and wrap callers.
+- [ [`881e9316`](https://github.com/sozu-proxy/sozu/commit/881e93166239175db1e901d77e058fc32301c3f7) ] Introduce `HTTP` module + session log macros and wrap callers.
+- [ [`a7c382c4`](https://github.com/sozu-proxy/sozu/commit/a7c382c418aec46145073f2768e4c83909b84629) ] Introduce the `TLS-RESOLVER` tag and wrap callers.
+- [ [`7632768c`](https://github.com/sozu-proxy/sozu/commit/7632768cfd47178cf1ea987fb56d7c266e76ff33) ] Introduce `PROXY-EXPECT` / `PROXY-RELAY` / `PROXY-SEND` tags for the proxy-protocol surface.
+- [ [`760089ca`](https://github.com/sozu-proxy/sozu/commit/760089ca22a1c68fad9008b96bbfc68b696e7b33) ] Prefix three `pipe.rs` `trace!` sites with the `PIPE` `log_context!` envelope.
+- [ [`2d10350c`](https://github.com/sozu-proxy/sozu/commit/2d10350c6a1ce349e8153d297a4b662aea3f87fe) ] Address Copilot PR #1209 review comments.
+
+#### ⛑️ Fixed
+
+- [ [`d544657e`](https://github.com/sozu-proxy/sozu/commit/d544657e1773cdc447a020c1a09f14c8269e8f10) ] Refuse new peer-initiated streams while in graceful drain (RFC 9113 §6.8 / Lisa LISA-107).
+- [ [`e478cf8b`](https://github.com/sozu-proxy/sozu/commit/e478cf8bb4d954d1c25aa485371a6f716fca5e61) ] Shrink per-connection scratch `Vec`s at quiet-time intervals so long-lived H2 connections release headroom (Lisa LISA-102).
+- [ [`75d55a57`](https://github.com/sozu-proxy/sozu/commit/75d55a5737e875bffccc7157c9d21bc0ccae6122) ] Tighter trailer budget (`MAX_TRAILER_BYTES = 8 KiB`) and strict reject on duplicate `host:` (Lisa LISA-101 partial / LISA-103).
+- [ [`18c251f1`](https://github.com/sozu-proxy/sozu/commit/18c251f1794e4c41f15044c9170fdd9b5f9e5d99) ] Bound `message_len` at the channel parser and drop the blocking-poll cadence (Lisa LISA-010 / LISA-011).
+- [ [`b8c8fc61`](https://github.com/sozu-proxy/sozu/commit/b8c8fc610d418684dde72f1fd18150f9d96eb42b) ] Drop a unix-socket client when mio `register()` fails (Lisa LISA-012).
+- [ [`c5fe3655`](https://github.com/sozu-proxy/sozu/commit/c5fe3655c4bf8da500a89628a721577602999d15) ] Normalise the SNI trailing dot and meter unsupported-ALPN refusals (Lisa LISA-TLS-002 / LISA-TLS-005).
+- [ [`5b560197`](https://github.com/sozu-proxy/sozu/commit/5b5601978a55f1475e3df92f7cafe4471d495956) ] Skip the `tls.cert.min_expires_at_seconds` emit on an empty resolver to avoid false-positive expiry alerts at boot.
+- [ [`ee289513`](https://github.com/sozu-proxy/sozu/commit/ee289513d6d6554db8921d773eac2823656e7bb0) ] Bound the client channel `max_buffer_size` to `max_command_buffer_size` (CWE-770 hardening on the unix command socket).
+- [ [`94739e22`](https://github.com/sozu-proxy/sozu/commit/94739e22a79c927899fccd8143bd1025b4e529d4) ] Cap `PRIORITY_UPDATE` `priority_field_value` at 1024 bytes (`PRIORITY_UPDATE_MAX_VALUE`).
+- [ [`4a5c17ad`](https://github.com/sozu-proxy/sozu/commit/4a5c17ad53fe0c7e24cfbf5316ebc22d2e63b75b) ] Route `cancel_timed_out_streams` through the `enqueue_rst` chokepoint so MadeYouReset queued-cap and `Readiness::arm_writable` stay in sync.
+- [ [`cb8de0f7`](https://github.com/sozu-proxy/sozu/commit/cb8de0f791876483166f71c9ab1fbb808b8b8e51) ] Roll back gauge / slab / `active_requests` state in `Router::connect` if mio `register_socket` fails (CWE-400 hardening).
+- [ [`b3cc2a74`](https://github.com/sozu-proxy/sozu/commit/b3cc2a7435a58e5af17d76f2f8d0774d02d9f705) ] Credit connection-level flow control before the `Content-Length` early-return so RFC 9113 §5.2/§6.9 accounting cannot starve unrelated streams.
+- [ [`e346d656`](https://github.com/sozu-proxy/sozu/commit/e346d65648d9550de96da6651b3a1ac8af626f64) ] Wrap the H2 close-drain log in the `MUX-H2` envelope and tier severity by stream count + close state.
+
+#### 🛡️ Security
+
+- [ [`ad487958`](https://github.com/sozu-proxy/sozu/commit/ad4879580402305765c221a034006fbed14b4a6f) ] Apply `sanitize_for_audit` to JSON sink free-form fields (closes the SIEM-to-TSV column-smuggling primitive that JSON escaping alone does not catch).
+- [ [`a5a41b1d`](https://github.com/sozu-proxy/sozu/commit/a5a41b1db6f5ca3eb7eaea96840b659dc0353435) ] PID-reuse guard on `peer_comm` + LRU cache for `peer_user` lookups (Lisa LISA-008 / LISA-009).
+- [ [`90f25529`](https://github.com/sozu-proxy/sozu/commit/90f255299fc0acfd6f4fcd3e7bb3dfefb9f2e335) ] Force-narrow the audit-log file mode to `0o640` and create new parent directories with `0o750` (PCI-DSS 10.5).
 
 #### 📚 Documentation
 
-- [ [`6d100d1c`](https://github.com/sozu-proxy/sozu/commit/6d100d1c5bfa46889a14b5ab7b2cd6b938c0950e) ] Document ALPN behavior and add ALPN metrics to metrics reference [`FlorentinDUBOIS`] (`2026-03-12`)
+- [ [`19828c2f`](https://github.com/sozu-proxy/sozu/commit/19828c2f1b586aa4847dab0fa644a8ff947cd28e) ] Drop dead Travis/Gitter badges and refresh the workspace source map in `README.md`.
+- [ [`338c7d68`](https://github.com/sozu-proxy/sozu/commit/338c7d688a1a948438565530f00280e4814854f8) ] Retire `sozuctl`, `master/`, and Travis references in `RELEASE.md` and `CONTRIBUTING.md`.
+- [ [`7a8a331b`](https://github.com/sozu-proxy/sozu/commit/7a8a331b5e4c07b715b56a025097a75fc20181d9) ] Document the deferred-batch fixes in `CHANGELOG.md` and the `clippy` nit in `doc/configure.md`.
+- [ [`ec1b6f60`](https://github.com/sozu-proxy/sozu/commit/ec1b6f6051ad19269fcc29a55194303f9a6f5fd6) ] Add P2/P3 fix entries from the consolidated review pass to `CHANGELOG.md`.
+- [ [`4dd43bc1`](https://github.com/sozu-proxy/sozu/commit/4dd43bc19962e2a50cc0608ab7650be480285c1e) ] Refresh the `mux/LIFECYCLE.md` line citations against `bcd977f1` HEAD.
+- [ [`1128f32c`](https://github.com/sozu-proxy/sozu/commit/1128f32cf0a3c7e1033abde44e3e177d1e5c192a) ] Add a `slab_entries_per_connection` entry to `doc/configure.md`.
+- [ [`b050a2f4`](https://github.com/sozu-proxy/sozu/commit/b050a2f41d674d9fb46f3dcd9211ab64bd91b6ac) ] Document `Shutdown::Both` safety on three TCP-only sites.
+- [ [`84447456`](https://github.com/sozu-proxy/sozu/commit/84447456b7a06b3b26cf7363945b362604e19ba8) ] Document four emitted-but-undocumented metrics and clean up the changelog narrative.
+- [ [`7a40d83c`](https://github.com/sozu-proxy/sozu/commit/7a40d83cafc08d4ec6b126864ce272cd313abb2c) ] Add the close-path log-severity tiers section and refresh the `CLAUDE.md` tag inventory.
+- [ [`91dc8f06`](https://github.com/sozu-proxy/sozu/commit/91dc8f06a69d8fc7fc1eecce3d5e7473d5a71121) ] e2e GOAWAY-then-close regression guards (peer-aborted, clean, mid-response variants).
+- [ [`10bf811b`](https://github.com/sozu-proxy/sozu/commit/10bf811bcac1af00028606bab03a3c13ebf48291) ] Static log-layout integration test for `sozu-lib` covering the canonical `[session req cluster backend]` envelope.
+- [ [`06b7a555`](https://github.com/sozu-proxy/sozu/commit/06b7a555c3c9d02b2bf5fcf2ae2d8f6b383c6193) ] Serialise `FIX-18` and `FIX-22` e2e tests against the shared injection `AtomicBool`.
+- [ [`5c037551`](https://github.com/sozu-proxy/sozu/commit/5c0375518d6a2d5672526b69b1a436479c0f7c55) ] Make `H2Backend::start` synchronous on accept-loop readiness so e2e tests no longer race the runtime.
+- [ [`f5fe4b6b`](https://github.com/sozu-proxy/sozu/commit/f5fe4b6b684edd7e115c0e5add5acefa5b43c7d8) ] Raise the large-body `WINDOW_UPDATE` cadence to 1 MiB to stay below the glitch budget in soak tests.
+- [ [`01b3b9ec`](https://github.com/sozu-proxy/sozu/commit/01b3b9ecd29011f83945e79b3e04062476700046) ] Keep draining after a `WINDOW_UPDATE` write races a peer close in the H2 e2e harness.
+- [ [`1f928981`](https://github.com/sozu-proxy/sozu/commit/1f92898182f36346506e322a7308ea18e53ea664) ] Stabilise the drain helper and flood tests against peer-close races.
+
+**Full Changelog**: https://github.com/sozu-proxy/sozu/compare/1.1.1...HEAD
 
 ## 1.1.1 - 2025-11-03
 
@@ -2313,7 +2350,7 @@ Started implementation:
 - control with command line app sozuctl
 - command library
 
-[Unreleased]: https://github.com/sozu-proxy/sozu/compare/0.10.0...HEAD
+[Unreleased]: https://github.com/sozu-proxy/sozu/compare/1.1.1...HEAD
 [0.10.0]: https://github.com/sozu-proxy/sozu/compare/0.9.0...0.10.0
 [0.9.0]: https://github.com/sozu-proxy/sozu/compare/0.8.0...0.9.0
 [0.8.0]: https://github.com/sozu-proxy/sozu/compare/0.7.0...0.8.0
