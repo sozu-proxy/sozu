@@ -61,6 +61,3 @@ logs-trace = ["sozu-lib/logs-trace", "sozu-command-lib/logs-trace"]
 opentelemetry = ["sozu-lib/opentelemetry"]
 tolerant-http1-parser = ["sozu-lib/tolerant-http1-parser"]
 simd = ["sozu-lib/simd"]
-
-[badges]
-travis-ci = { repository = "sozu-proxy/sozu" }

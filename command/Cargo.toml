@@ -54,8 +54,5 @@ unstable = []
 logs-debug = []
 logs-trace = []
 
-[badges]
-travis-ci = { repository = "sozu-proxy/sozu" }
-
 [build-dependencies]
 prost-build = { workspace = true }
