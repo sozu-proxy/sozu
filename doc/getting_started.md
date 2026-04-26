@@ -29,23 +29,26 @@ Build the sozu executable and command line:
 > The `--locked` flag tells cargo to stick to dependency versions as specified in `Cargo.lock`
 > and thus prevent dependency breaks.
 
-### Crypto providers
+### Cargo features
 
-Sōzu supports multiple TLS crypto providers. Exactly one must be enabled at compile time:
+`rustls` is wired to the `ring` crypto provider via the workspace `Cargo.toml`,
+and there is no provider-pluggable surface today — the build links exactly one
+backend. The Cargo features published by the workspace tune behaviour, not
+crypto:
 
-| Feature | Provider | Notes |
-|---------|----------|-------|
-| `crypto-ring` | ring | Default, pure Rust |
-| `crypto-aws-lc-rs` | aws-lc-rs | Faster bulk transfers, post-quantum key exchange |
-| `crypto-openssl` | rustls-openssl | Uses system OpenSSL |
+| Feature | Crate(s) | Effect |
+|---------|----------|--------|
+| `tolerant-http1-parser` | `lib`, `bin` | Relaxes H1 parsing via `kawa/tolerant-parsing`. |
+| `simd` | `lib`, `bin` | Enables `kawa/simd` SIMD acceleration. |
+| `splice` | `lib` | Enables the Linux `splice(2)` fast path. |
+| `opentelemetry` | `lib`, `bin` | Compiles in OpenTelemetry export. |
+| `logs-debug` | all | Compiles in `DEBUG` logs (release strips them otherwise). |
+| `logs-trace` | all | Compiles in `TRACE` logs (release strips them otherwise). |
+| `e2e-hooks` | `lib` | Test-injection APIs — never enable in production builds. |
 
-To build with an alternative provider:
-
-```bash
-cd bin && cargo build --release --locked --no-default-features --features crypto-aws-lc-rs
-```
-
-> **Important:** `--all-features` does not work. Crypto providers are mutually exclusive.
+The authoritative list per crate lives in the per-crate `Cargo.toml`
+(`lib/Cargo.toml`, `bin/Cargo.toml`, `command/Cargo.toml`); `cargo build
+--all-features --locked` succeeds across the workspace today.
 
 ## HTTP/2 support
 
