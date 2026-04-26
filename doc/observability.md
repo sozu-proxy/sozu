@@ -220,7 +220,7 @@ surfaces:
    ANSI escapes. Rendered form (ANSI colours off):
 
    ```
-   [01HXS4GZ9EYP3F2R7K8M6B4N2C 01HXS4H5K2QR9C7PVWXY8T6ZNA my_app -]	AUDIT	Command(verb=cluster_added, actor_uid=1000, actor_gid=1000, actor_pid=12345, actor_user=florentin, actor_comm=sozuctl, client_id=42, socket=/run/sozu/sozu.sock, target=cluster:my_app, result=ok, sozu_version=1.1.1)
+   [01HXS4GZ9EYP3F2R7K8M6B4N2C 01HXS4H5K2QR9C7PVWXY8T6ZNA my_app -]	AUDIT	Command(verb=cluster_added, actor_uid=1000, actor_gid=1000, actor_pid=12345, actor_user=florentin, actor_comm=sozu, client_id=42, socket=/run/sozu/sozu.sock, target=cluster:my_app, result=ok, sozu_version=1.1.1)
    ```
 
    ### Field reference
@@ -236,10 +236,11 @@ surfaces:
    - `actor_user` — resolved POSIX account name (`getpwuid_r(uid)` at
      accept time). `unknown` when NSS has no match for the UID.
    - `actor_comm` — `/proc/<pid>/comm` at accept time (up to 15 chars), lets
-     SOC distinguish `sozuctl` from ad-hoc shells that share a UID.
+     SOC distinguish the `sozu` binary running with the `command` sub-command
+     from ad-hoc shells that share a UID.
    - `client_id` — per-accept monotonic counter. Distinct from the
      `session_ulid` bracket slot, which survives as a grep-correlation key
-     across every verb a single sozuctl invocation emits.
+     across every verb a single sozu CLI invocation emits.
    - `socket` — path of the command socket the client connected through.
      Lets multi-instance sozu deployments that share a SIEM sink pick
      which instance emitted each line.
@@ -299,7 +300,7 @@ surfaces:
      "request_ulid": "01HXS4H5K2QR9C7PVWXY8T6ZNA",
      "actor": {
        "uid": 1000, "gid": 1000, "pid": 12345,
-       "user": "florentin", "comm": "sozuctl", "role": "user"
+       "user": "florentin", "comm": "sozu", "role": "user"
      },
      "client_id": 42,
      "connect_ts": "2026-04-23T13:14:14.500000Z",
