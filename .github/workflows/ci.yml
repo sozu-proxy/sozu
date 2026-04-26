@@ -32,16 +32,19 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Checkout sources
         uses: actions/checkout@v4
-      - name: Install rust stable (clippy)
-        uses: dtolnay/rust-toolchain@stable
+      # Match the project's pinned toolchain (`rust-toolchain` = 1.88.0)
+      # so the lint baseline matches what CLAUDE.md "Build" documents.
+      # Stable 1.95 fires `mismatched_lifetime_syntaxes` and a few other
+      # newer lints that have not yet been triaged across the workspace;
+      # tracking those is its own follow-up rather than a CI gate today.
+      - name: Install rust 1.88.0 (clippy)
+        uses: dtolnay/rust-toolchain@1.88.0
         with:
           components: clippy
-      # `+stable` overrides the `rust-toolchain` pin (1.88.0) so the
-      # clippy component installed on stable above is the one used.
       # `--all-features` matches the local lint baseline documented in
-      # CLAUDE.md "Build". Workspace is currently warning-free.
+      # CLAUDE.md "Build". Workspace is currently warning-free on 1.88.0.
       - name: Lint
-        run: cargo +stable clippy --all-targets --all-features --locked -- -D warnings
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
   msrv:
     name: MSRV (1.85)
     runs-on: ubuntu-latest
