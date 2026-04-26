@@ -1,4 +1,4 @@
-# [Sōzu](https://www.sozu.io/) &middot; [![Join the chat at https://gitter.im/sozu-proxy/sozu](https://badges.gitter.im/sozu-proxy/sozu.svg)](https://gitter.im/sozu-proxy/sozu?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge) [![Build Status](https://travis-ci.org/sozu-proxy/sozu.svg?branch=master)](https://travis-ci.org/sozu-proxy/sozu)
+# [Sōzu](https://www.sozu.io/)
 
 **Sōzu** is a lightweight, fast, always-up reverse proxy server.
 
@@ -17,9 +17,16 @@ To get started check out our [documentation](./doc/README.md) !
 
 ## Exploring the source
 
-- `lib/`: the `sozu-lib` reverse proxy library contains the event loop management, the parsers and protocols
-- `bin/`: the `sozu` executable wraps the library in worker processes, and handle dynamic configuration
-- `command`: the `sozu-command-lib` contains all structures to interact with Sōzu
+The Cargo workspace ships four crates (Rust 2024 edition, MSRV 1.85):
+
+- `lib/`: the `sozu-lib` reverse proxy library hosts the single-threaded mio event loop, the HTTP/1.1, HTTP/2 multiplexer, TCP and TLS protocols, routing, sockets, metrics, and the buffer pool.
+- `bin/`: the `sozu` binary wraps the library in a master/worker supervisor, exposes the unix command socket, and orchestrates hot reconfiguration and zero-downtime upgrades.
+- `command/`: the `sozu-command-lib` ships the protobuf IPC schema, configuration parser, replicated state, channels, and FD-passing helpers used by both `lib` and `bin`.
+- `e2e/`: the `sozu-e2e` integration harness spawns real workers plus mock clients and backends to exercise the H1, H2, TLS, and PROXY-protocol paths.
+
+The `fuzz/` crate (`fuzz_frame_parser`, `fuzz_hpack_decoder`) lives outside the Cargo workspace and is built with `cargo +nightly fuzz` from inside `fuzz/`.
+
+HTTP/2 support (frontend and backend) is driven through the multiplexer in `lib/src/protocol/mux/` and TLS ALPN negotiation in `lib/src/protocol/rustls.rs`.
 
 ## License
 
@@ -41,4 +48,4 @@ sozu-command-lib is released under LGPL version 3
 
 
 
-Copyright (C) 2015-2023 Clever Cloud
+Copyright (C) 2015-2026 Clever Cloud

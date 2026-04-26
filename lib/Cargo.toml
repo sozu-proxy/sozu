@@ -84,6 +84,3 @@ opentelemetry = []
 simd = ["kawa/simd"]
 splice = []
 tolerant-http1-parser = ["kawa/tolerant-parsing"]
-
-[badges]
-travis-ci = { repository = "sozu-proxy/sozu" }
