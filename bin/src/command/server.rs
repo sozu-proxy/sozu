@@ -1159,7 +1159,7 @@ pub(crate) fn peer_cred_from_stream(_stream: &UnixStream) -> PeerCred {
 
 /// Read `/proc/<pid>/comm` to get the peer process's command name (up to
 /// 15 chars per kernel spec). Best-effort; returns `None` on any error.
-/// Cheap (one file read per accept, which happens once per sozuctl invocation).
+/// Cheap (one file read per accept, which happens once per sozu CLI invocation).
 ///
 /// Lisa LISA-009 mitigation: between `getsockopt(SO_PEERCRED)` and this
 /// read, the peer PID could (a) exit and be recycled by the kernel, or
@@ -1170,7 +1170,7 @@ pub(crate) fn peer_cred_from_stream(_stream: &UnixStream) -> PeerCred {
 /// stat read fails (PID gone — case (a)) we return `None`. The exec
 /// case (b) cannot be detected by starttime alone — execve does not
 /// change starttime — but exec is not adversarial in our deployment
-/// (sozuctl never exec's), and the SOC analyst seeing two different
+/// (the sozu CLI never exec's), and the SOC analyst seeing two different
 /// binaries on the same PID across audit lines for the same session
 /// is the right signal.
 #[cfg(any(target_os = "linux", target_os = "android"))]

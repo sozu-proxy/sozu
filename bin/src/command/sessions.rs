@@ -31,7 +31,7 @@ pub struct ClientSession {
     pub id: ClientId,
     /// Per-connection ULID generated at accept time. Unlike `id` (a monotonic
     /// accept counter), this survives as a grep-correlation key across every
-    /// audit log line a sozuctl invocation produces.
+    /// audit log line a sozu CLI invocation produces.
     pub session_ulid: Ulid,
     pub token: Token,
     /// UID of the peer process on the unix socket, captured via `SO_PEERCRED`
@@ -47,7 +47,7 @@ pub struct ClientSession {
     /// per-session ULID for stronger correlation.
     pub actor_pid: Option<i32>,
     /// `/proc/<pid>/comm` at accept time (up to 15 chars per kernel spec).
-    /// Useful for distinguishing `sozuctl` from ad-hoc shells that share a
+    /// Useful for distinguishing the `sozu` command-socket client from ad-hoc shells that share a
     /// UID. Cached at accept — never re-read.
     pub actor_comm: Option<String>,
     /// `getpwuid_r(actor_uid)` at accept time. Renders as the POSIX account
