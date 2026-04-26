@@ -75,7 +75,7 @@ macro_rules! audit_verb {
 ///
 /// Every string field — `verb` is a `&'static str` and therefore trusted,
 /// but `target`, `cluster_id`, `backend_id`, `actor_comm`, `reason` can
-/// originate from attacker-influenced input (cluster IDs from sozuctl
+/// originate from attacker-influenced input (cluster IDs from sozu CLI
 /// arguments, hostnames from frontend configs, error messages from
 /// `state.dispatch`). All of them go through
 /// [`sozu_command_lib::sessions::sanitize_for_audit`] at render time to
@@ -2509,7 +2509,7 @@ mod audit_format_tests {
             actor_uid: uid,
             actor_gid: uid,
             actor_pid: uid.map(|v| v as i32),
-            actor_comm: uid.map(|_| "sozuctl".to_owned()),
+            actor_comm: uid.map(|_| "sozu".to_owned()),
             actor_user: uid.map(|_| "florentin".to_owned()),
             socket_path: std::sync::Arc::from("/run/sozu/sock"),
             connect_ts: SystemTime::now(),
