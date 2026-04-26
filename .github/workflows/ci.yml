@@ -2,6 +2,50 @@
 name: CI
 on: [ push, pull_request ]
 jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+      # rustfmt.toml uses the unstable `ignore` key, so the format check
+      # must run on nightly. See CLAUDE.md "Build" section.
+      - name: Install rust nightly (rustfmt)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+      - name: Check formatting
+        run: cargo +nightly fmt --all -- --check
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - name: install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Checkout sources
+        uses: actions/checkout@v4
+      - name: Install rust stable (clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      # `--all-features` matches the local lint baseline documented in
+      # CLAUDE.md "Build". Workspace is currently warning-free.
+      - name: Lint
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+  msrv:
+    name: MSRV (1.85)
+    runs-on: ubuntu-latest
+    steps:
+      - name: install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Checkout sources
+        uses: actions/checkout@v4
+      # `rust-toolchain` pins 1.88.0 for everyday dev; this job verifies
+      # the advertised MSRV per Cargo.toml `rust-version = "1.85.0"`.
+      - name: Install rust 1.85.0 (advertised MSRV)
+        uses: dtolnay/rust-toolchain@1.85.0
+      - name: Build with MSRV
+        run: cargo build --all-features --locked
   test:
     name: Test
     runs-on: ubuntu-latest
@@ -21,11 +65,9 @@ jobs:
       - name: Checkout sources
         uses: actions/checkout@v4
       - name: Install rust (${{ matrix.rust }})
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.rust }}
-          profile: minimal
-          override: true
       - name: Install nightly toolchain (for fuzz targets)
         run: rustup toolchain install nightly --profile minimal
       - name: Install cargo-fuzz
@@ -37,15 +79,9 @@ jobs:
             | sudo tar -xz -C /usr/local/bin h2spec
           h2spec --version
       - name: Build
-        uses: actions-rs/cargo@v1
-        with:
-          command: build
-          args: ${{ matrix.features }}
+        run: cargo build --locked --all-features
       - name: Test
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --verbose ${{ matrix.features }}
+        run: cargo test --locked --all-features --verbose
   doc:
     name: Build documentation
     runs-on: ubuntu-latest
@@ -55,19 +91,14 @@ jobs:
       - name: Checkout sources
         uses: actions/checkout@v4
       - name: Install rust
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          profile: minimal
-          override: true
-      - name: Build
-        uses: actions-rs/cargo@v1
-        with:
-          command: doc
-          args: --verbose
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build docs
+        run: cargo doc --verbose
   dockerhub:
     name: Docker build and push to Docker Hub
     runs-on: ubuntu-latest
+    # SHA-only tagging on every push; release tagging is handled
+    # separately, see RELEASE.md.
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-qemu-action@v3
