@@ -307,6 +307,26 @@ pub enum ClusterCmd {
             help = "Use HTTP/2 for backend connections to this cluster"
         )]
         http2: bool,
+        #[clap(
+            long = "https-redirect-port",
+            help = "Port to use when building the Location header for an https_redirect (defaults to the listener's effective HTTPS port)"
+        )]
+        https_redirect_port: Option<u32>,
+        #[clap(
+            long = "www-authenticate",
+            help = "Realm string emitted in the WWW-Authenticate header on a 401 response (e.g. 'Basic realm=\"sozu\"')"
+        )]
+        www_authenticate: Option<String>,
+        #[clap(
+            long = "authorized-hash",
+            help = "Authorized credential, formatted as 'username:hex(sha256(password))'. Repeatable. Generate with: printf 'user:pass' | sed -n 's/^[^:]*://p' | { read p; printf 'user:%s' \"$(printf %s \"$p\" | sha256sum | cut -d' ' -f1)\"; }"
+        )]
+        authorized_hash: Vec<String>,
+        #[clap(
+            long = "answer",
+            help = "Per-status HTTP answer template for this cluster, formatted as <code>=<path-to-template>. Repeatable (e.g. --answer 503=/etc/sozu/503.http)."
+        )]
+        answer: Vec<String>,
     },
     #[clap(
         name = "h2",

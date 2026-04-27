@@ -153,6 +153,10 @@ impl CommandManager {
                 expect_proxy,
                 load_balancing_policy,
                 http2,
+                https_redirect_port,
+                www_authenticate,
+                authorized_hash,
+                answer,
             } => {
                 let proxy_protocol = match (send_proxy, expect_proxy) {
                     (true, true) => Some(ProxyProtocolConfig::RelayHeader),
@@ -160,6 +164,62 @@ impl CommandManager {
                     (false, true) => Some(ProxyProtocolConfig::ExpectHeader),
                     _ => None,
                 };
+
+                // Validate every authorized hash matches `<user>:<hex64>`
+                // before sending so a typo (missing colon, lowercase off,
+                // non-hex chars) surfaces here with a friendly message
+                // rather than silently rejecting traffic on the worker.
+                // Inline check: split on first `:`, then assert the right
+                // half is exactly 64 lowercase hex digits.
+                fn looks_like_authorized_hash(s: &str) -> bool {
+                    let Some((user, hex)) = s.split_once(':') else {
+                        return false;
+                    };
+                    !user.is_empty()
+                        && user
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+                        && hex.len() == 64
+                        && hex
+                            .bytes()
+                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                }
+                for hash in &authorized_hash {
+                    if !looks_like_authorized_hash(hash) {
+                        return Err(CtlError::ArgsNeeded(
+                            "valid `username:hex(sha256(password))`".to_string(),
+                            format!(
+                                "got {hash:?}; produce one with: \
+                                 printf '<password>' | sha256sum"
+                            ),
+                        ));
+                    }
+                }
+
+                // Read each `--answer code=path` template body off disk and
+                // collect into the cluster's `answers` map. The right-hand
+                // side is a path, mirroring the legacy `--answer-503`
+                // flow (see `read_http_answer_file` callers above).
+                let mut answers_map = std::collections::BTreeMap::new();
+                for entry in &answer {
+                    let (code, path) = match entry.split_once('=') {
+                        Some((c, p)) if !p.is_empty() => (c, p),
+                        _ => {
+                            return Err(CtlError::ArgsNeeded(
+                                "<code>=<path>".to_string(),
+                                format!("got {entry:?}"),
+                            ));
+                        }
+                    };
+                    let body = std::fs::read_to_string(path).map_err(|e| {
+                        CtlError::ArgsNeeded(
+                            "readable template path".to_string(),
+                            format!("{path:?}: {e}"),
+                        )
+                    })?;
+                    answers_map.insert(code.to_owned(), body);
+                }
+
                 self.send_request(
                     RequestType::AddCluster(Cluster {
                         cluster_id: id,
@@ -168,6 +228,10 @@ impl CommandManager {
                         proxy_protocol: proxy_protocol.map(|pp| pp as i32),
                         load_balancing: load_balancing_policy as i32,
                         http2: if http2 { Some(true) } else { None },
+                        answers: answers_map,
+                        https_redirect_port,
+                        authorized_hashes: authorized_hash,
+                        www_authenticate,
                         ..Default::default()
                     })
                     .into(),
