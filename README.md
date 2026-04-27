@@ -17,7 +17,7 @@ To get started check out our [documentation](./doc/README.md) !
 
 ## Exploring the source
 
-The Cargo workspace ships four crates (Rust 2024 edition, MSRV 1.85):
+The Cargo workspace ships four crates (Rust 2024 edition, MSRV 1.88):
 
 - `lib/`: the `sozu-lib` reverse proxy library hosts the single-threaded mio event loop, the HTTP/1.1, HTTP/2 multiplexer, TCP and TLS protocols, routing, sockets, metrics, and the buffer pool.
 - `bin/`: the `sozu` binary wraps the library in a master/worker supervisor, exposes the unix command socket, and orchestrates hot reconfiguration and zero-downtime upgrades.
