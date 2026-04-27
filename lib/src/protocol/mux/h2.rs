@@ -2508,6 +2508,18 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     );
                 }
                 kawa.prepare(&mut converter);
+                // The pre-prepare gate at line 2483 only inserts into
+                // `rst_sent` when `kawa.is_error()` is already true on
+                // entry. The HPACK over-budget abort path
+                // (`H2BlockConverter::check_header_capacity` →
+                // `finalize`) flips `parsing_phase` to Error AND pushes
+                // its own RST_STREAM frame inside this same prepare
+                // pass; without a post-prepare insert here the next
+                // writable cycle would gate-pass and double-emit a
+                // RST_STREAM via the existing `initialize` chokepoint.
+                if kawa.is_error() {
+                    self.rst_sent.insert(stream_id);
+                }
                 let consumed = window - converter.window;
                 *parts.window = parts.window.saturating_sub(consumed);
                 self.flow_control.window = self.flow_control.window.saturating_sub(consumed);

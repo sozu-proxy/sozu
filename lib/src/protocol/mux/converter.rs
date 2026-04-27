@@ -632,6 +632,30 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
     fn finalize(&mut self, kawa: &mut Kawa<T>) {
         if self.pending_oversized_abort {
             self.pending_oversized_abort = false;
+            // Push the RST_STREAM frame to `kawa.out` IN THIS PASS so the
+            // very next `flush_stream_out` call drains it onto the wire.
+            //
+            // Why we cannot rely on the next prepare cycle's `initialize`:
+            // `write_streams` retires a stream the moment
+            // `kawa.is_error() && kawa.is_completed()`. By clearing
+            // `kawa.blocks` (required to suppress post-RST HEADERS/DATA
+            // frames) we trip `is_completed()` immediately, which would
+            // otherwise allow the stream to be recycled with no RST on
+            // the wire — a spec violation and a hung peer (see Codex P1
+            // on commit 358e6e20). Emitting the frame here keeps the
+            // single-pass invariant: prepare → out has RST_STREAM →
+            // flush ships it → retirement check.
+            let mut frame =
+                [0u8; parser::FRAME_HEADER_SIZE + parser::RST_STREAM_PAYLOAD_SIZE as usize];
+            if let Err(e) = gen_rst_stream(&mut frame, self.stream_id, H2Error::InternalError) {
+                error!(
+                    "{} failed to serialize over-budget RST_STREAM frame: {:?}",
+                    log_module_context!(),
+                    e
+                );
+            } else {
+                kawa.push_out(Store::from_slice(&frame));
+            }
             // Preserve the original parsing_phase marker so logs and the
             // ParsingPhaseMarker telemetry stay coherent (e.g. Headers vs
             // Body) instead of getting clobbered to a synthetic value.
@@ -643,8 +667,8 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                 },
             };
             // Drop any remaining blocks — the stream is dead. Without this
-            // the next prepare cycle's pop loop would still try to encode
-            // headers/data after the synthesised RST_STREAM.
+            // a follow-on prepare pass (e.g. on the back-pressure return
+            // path) would still try to encode headers/data after our RST.
             kawa.blocks.clear();
             self.out.clear();
             incr!("h2.headers.rejected.budget_overrun");
@@ -1532,14 +1556,18 @@ mod tests {
         );
     }
 
-    /// `finalize` commits the abort: `kawa.parsing_phase` becomes
-    /// `Error{Processing(InternalError)}`, `kawa.blocks` is cleared so
-    /// no follow-on HEADERS/DATA leak after the synthesised RST_STREAM,
-    /// and the abort flag is reset so the converter is reusable.
+    /// `finalize` commits the abort in the SAME prepare pass:
+    /// - `kawa.out` carries one RST_STREAM(InternalError) frame so the
+    ///   following `flush_stream_out` ships it before the retirement
+    ///   gate retires the stream;
+    /// - `kawa.parsing_phase` becomes `Error{Processing(InternalError)}`;
+    /// - `kawa.blocks` is cleared so no follow-on HEADERS/DATA leak;
+    /// - the abort flag is reset so the converter is reusable.
     #[test]
     fn test_converter_finalize_commits_oversized_abort() {
         let mut encoder = loona_hpack::Encoder::new();
         let mut conv = test_converter(&mut encoder);
+        conv.stream_id = 7;
         let mut buf = vec![0u8; 4096];
         let mut kawa = make_kawa(&mut buf, Kind::Response);
 
@@ -1552,6 +1580,29 @@ mod tests {
 
         BlockConverter::finalize(&mut conv, &mut kawa);
 
+        // RST_STREAM frame shape: 9-byte header + 4-byte payload = 13 bytes.
+        let mut bytes = Vec::new();
+        for store in &kawa.out {
+            if let kawa::OutBlock::Store(s) = store {
+                bytes.extend_from_slice(s.data(kawa.storage.buffer()));
+            }
+        }
+        assert_eq!(
+            bytes.len(),
+            parser::FRAME_HEADER_SIZE + parser::RST_STREAM_PAYLOAD_SIZE as usize,
+            "finalize must push the RST_STREAM frame to kawa.out in the same pass"
+        );
+        assert_eq!(bytes[3], 0x03, "frame type byte must be RST_STREAM");
+        assert_eq!(
+            u32::from_be_bytes([bytes[5], bytes[6], bytes[7], bytes[8]]) & 0x7fff_ffff,
+            7,
+            "stream_id must match converter.stream_id"
+        );
+        assert_eq!(
+            u32::from_be_bytes([bytes[9], bytes[10], bytes[11], bytes[12]]),
+            H2Error::InternalError as u32,
+            "error code must be InternalError"
+        );
         match kawa.parsing_phase {
             ParsingPhase::Error {
                 marker,
