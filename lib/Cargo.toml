@@ -29,6 +29,7 @@ include = [
 
 [dependencies]
 anyhow = { workspace = true }
+base64 = { workspace = true }
 cookie-factory = { workspace = true }
 hdrhistogram = { workspace = true }
 hex = { workspace = true }
@@ -49,6 +50,7 @@ rusty_ulid = { workspace = true }
 sha2 = { workspace = true }
 slab = { workspace = true }
 socket2 = { workspace = true, features = ["all"] }
+subtle = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
 

@@ -130,6 +130,7 @@ macro_rules! log_module_context {
 }
 
 pub mod answers;
+pub mod auth;
 pub mod connection;
 mod converter;
 pub mod debug;
