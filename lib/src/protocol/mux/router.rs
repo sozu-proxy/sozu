@@ -758,9 +758,19 @@ fn apply_request_rewrites_and_headers(
     };
 
     // ── status-line authority / path rewrites ─────────────────────────
+    // The kawa request status line carries both `path` and `uri` —
+    // `path` is the abstract path (consumed by the H2 converter to
+    // emit `:path`) while `uri` is the request-line URI (consumed by
+    // the H1 converter at `kawa::protocol::h1::converter`). Both must
+    // be mutated so an H1 frontend forwarding to an H1 backend AND an
+    // H2 frontend forwarding to an H1 backend (or vice versa) see the
+    // rewritten target on the wire.
     if rewritten_host.is_some() || rewritten_path.is_some() {
         if let kawa::StatusLine::Request {
-            authority, path, ..
+            authority,
+            path,
+            uri,
+            ..
         } = &mut kawa.detached.status_line
         {
             if let Some(new_host) = rewritten_host {
@@ -768,6 +778,7 @@ fn apply_request_rewrites_and_headers(
             }
             if let Some(new_path) = rewritten_path {
                 *path = Store::from_string(new_path.to_owned());
+                *uri = Store::from_string(new_path.to_owned());
             }
         }
     }
@@ -790,12 +801,14 @@ fn apply_request_rewrites_and_headers(
         keys_to_drop.push(xfh_lower.to_vec());
     }
     if !keys_to_drop.is_empty() {
-        // SAFETY: we only read `key.data(buf_ptr)` while `kawa.blocks`
-        // is borrowed immutably during retain — buf_ptr is the same
-        // backing buffer.
+        // Read `key.data(buf_ptr)` only on non-elided headers — kawa
+        // panics on `Store::Empty.data()` (storage/repr.rs:515).
         let buf = buf_ptr;
         kawa.blocks.retain(|block| {
             if let Block::Header(Pair { key, val: _ }) = block {
+                if matches!(key, Store::Empty) {
+                    return true;
+                }
                 let key_bytes = key.data(buf);
                 let key_lower: Vec<u8> = key_bytes.iter().map(u8::to_ascii_lowercase).collect();
                 !keys_to_drop.iter().any(|k| compare_no_case(&key_lower, k))
