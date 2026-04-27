@@ -42,7 +42,6 @@ rusty_ulid = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
-trailer = { workspace = true }
 prettytable-rs = { workspace = true }
 pool = { workspace = true }
 poule = { workspace = true }

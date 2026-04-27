@@ -1954,7 +1954,6 @@ dependencies = [
  "thiserror 2.0.18",
  "time",
  "toml",
- "trailer",
  "x509-parser",
 ]
 
@@ -2326,12 +2325,6 @@ checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 dependencies = [
  "once_cell",
 ]
-
-[[package]]
-name = "trailer"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d61d37bd87407272521be2c632f558c183f6d02847e5845f663d01e310f2ce97"
 
 [[package]]
 name = "try-lock"
