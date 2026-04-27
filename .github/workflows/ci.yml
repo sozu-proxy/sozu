@@ -46,7 +46,7 @@ jobs:
       - name: Lint
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
   msrv:
-    name: MSRV (1.85)
+    name: MSRV (1.88)
     runs-on: ubuntu-latest
     steps:
       - name: install protoc
@@ -54,9 +54,9 @@ jobs:
       - name: Checkout sources
         uses: actions/checkout@v4
       # `rust-toolchain` pins 1.88.0 for everyday dev; this job verifies
-      # the advertised MSRV per Cargo.toml `rust-version = "1.85.0"`.
-      - name: Install rust 1.85.0 (advertised MSRV)
-        uses: dtolnay/rust-toolchain@1.85.0
+      # the advertised MSRV per Cargo.toml `rust-version = "1.88.0"`.
+      - name: Install rust 1.88.0 (advertised MSRV)
+        uses: dtolnay/rust-toolchain@1.88.0
       - name: Build with MSRV
         run: cargo build --all-features --locked
   test:

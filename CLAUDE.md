@@ -1,4 +1,4 @@
-Sōzu — a hot-reconfigurable HTTP/1.x + HTTP/2 reverse proxy (AGPL-3.0). Rust 2024 (MSRV 1.85.0, toolchain pinned to `1.88.0` via `rust-toolchain`). Upstream: `github.com/sozu-proxy/sozu`. The `feat/h2-mux` branch carries the H2 multiplexer rewrite; PR #1209 is open against `main`.
+Sōzu — a hot-reconfigurable HTTP/1.x + HTTP/2 reverse proxy (AGPL-3.0). Rust 2024 (MSRV 1.88.0, matching the `1.88.0` toolchain pinned in `rust-toolchain`). Upstream: `github.com/sozu-proxy/sozu`. The `feat/h2-mux` branch carries the H2 multiplexer rewrite; PR #1209 is open against `main`.
 
 This file is the primary agent instruction for the repo. It is symlinked to `AGENTS.md` so OpenAI Codex picks up the same content. Anthropic's global `~/.claude/CLAUDE.md` conventions (worktree-first, GPG sign-off, commitizen style) still apply and are not duplicated here.
 
@@ -48,7 +48,7 @@ No CI clippy/fmt job runs automatically — run both locally before pushing. CI 
 
 # Code style
 
-- **Edition 2024**, MSRV 1.85. Use 2024-only idioms freely.
+- **Edition 2024**, MSRV 1.88. Use 2024-only idioms freely.
 - **Errors**: `thiserror` for library error enums, `anyhow` at binary boundaries. Follow the nearest existing `thiserror::Error` enum; don't introduce new error crates.
 - **No panic on network-facing input.** In parser, socket, mux, TLS, command-channel, and config paths, convert invalid traffic into `SessionResult` / H2 `GOAWAY` / `RST_STREAM` / default HTTP answer + metric + contextual log. `unwrap`/`expect`/`panic!`/`unreachable!` are acceptable in tests and in hard internal invariants with useful messages.
 - **Ownership**: prefer `ToOwned::to_owned()` over `Clone::clone()` when going `&str → String` or `&[u8] → Vec<u8>` (clearer intent). Stick with `.clone()` when the type is already `Clone + !ToOwned`.
