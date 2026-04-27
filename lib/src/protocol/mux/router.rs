@@ -10,9 +10,9 @@ use std::{cell::RefCell, collections::HashMap, rc::Rc, time::Duration};
 use mio::{Interest, Token, net::TcpStream};
 use sozu_command::{logging::ansi_palette, proto::command::ListenerType};
 
-use super::{
-    BackendStatus, Connection, Context, DebugEvent, GlobalStreamId, Position, StreamState,
-};
+#[cfg(debug_assertions)]
+use super::DebugEvent;
+use super::{BackendStatus, Connection, Context, GlobalStreamId, Position, StreamState};
 use crate::{
     BackendConnectionError, L7ListenerHandler, L7Proxy, ListenerHandler, ProxySession, Readiness,
     RetrieveClusterError,
