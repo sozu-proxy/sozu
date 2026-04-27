@@ -119,7 +119,12 @@ pub enum DefaultAnswer {
         partially_parsed: String,
         invalid: String,
     },
-    Answer401 {},
+    Answer401 {
+        /// Optional `WWW-Authenticate` value (e.g. `Basic realm="…"`).
+        /// When `None` or empty the realm header line is elided by the
+        /// template engine so the response stays a bare 401.
+        www_authenticate: Option<String>,
+    },
     Answer404 {},
     Answer408 {
         duration: String,
@@ -1111,7 +1116,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             };
         }
 
-        let mut kawa = self.answers.borrow().get(
+        let (resolved_status, keep_alive, mut kawa) = self.answers.borrow().get(
             answer,
             self.context.id.to_string(),
             self.context.cluster_id.as_deref(),
@@ -1119,9 +1124,17 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             self.get_route(),
         );
         kawa.prepare(&mut kawa::h1::BlockConverter);
+        // The template's resolved status may differ from the requested
+        // code when a fallback template is selected (e.g. unknown status).
+        let status = resolved_status;
         self.context.status = Some(status);
         self.context.reason = None;
-        self.context.keep_alive_frontend = false;
+        // Honour the rendered template's `Connection` header. Built-in
+        // error templates carry `Connection: close`, but operators can
+        // ship a custom template that keeps the frontend connection alive.
+        if !keep_alive {
+            self.context.keep_alive_frontend = false;
+        }
         self.response_stream = ResponseStream::DefaultAnswer(status, kawa);
         self.frontend_readiness.interest = Ready::WRITABLE | Ready::HUP | Ready::ERROR;
         self.backend_readiness.interest = Ready::HUP | Ready::ERROR;
@@ -1371,7 +1384,9 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         let cluster_id = match route {
             Route::ClusterId(cluster_id) => cluster_id,
             Route::Deny => {
-                self.set_answer(DefaultAnswer::Answer401 {});
+                self.set_answer(DefaultAnswer::Answer401 {
+                    www_authenticate: None,
+                });
                 return Err(RetrieveClusterError::UnauthorizedRoute);
             }
         };
