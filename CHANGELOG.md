@@ -16,12 +16,19 @@ session path the upstream PRs targeted, so every running session benefits.
 
 - **Flexible HTTP answer templates per listener and per cluster**: the proto
   schema for `HttpListenerConfig`, `HttpsListenerConfig`, and `Cluster` gains
-  a `map<string, string> answers` field keyed by HTTP status code. The legacy
-  `optional CustomHttpAnswers http_answers` field is preserved on the wire so
-  existing state files round-trip (the runtime merges both for one minor).
-  The new template engine (`lib/src/protocol/kawa_h1/answers.rs`) supports
-  variable substitution via `%ROUTE`, `%REQUEST_ID`, `%CLUSTER_ID`,
-  `%BACKEND_ID`, `%DURATION`, `%CAPACITY`, `%PHASE`, `%SUCCESSFULLY_PARSED`,
+  a `map<string, string> answers` field keyed by HTTP status code. The
+  listener-level map is the global default; the cluster-level map overrides
+  it for the matching status code on requests routed to that cluster. The
+  deprecated `optional CustomHttpAnswers http_answers` field is preserved on
+  the wire so existing state files round-trip (the runtime merges both for
+  one minor). Each map value is **either a filesystem path or an
+  `inline:<body>` literal** — the inline form skips disk I/O entirely,
+  useful for short canned responses, secrets-free containers, and test
+  rigs (`sozu cluster add --answer 503='inline:HTTP/1.1 503 ...'`,
+  `[listeners.https.answers] "503" = "inline:..."`). The new template
+  engine (`lib/src/protocol/kawa_h1/answers.rs`) supports variable
+  substitution via `%ROUTE`, `%REQUEST_ID`, `%CLUSTER_ID`, `%BACKEND_ID`,
+  `%DURATION`, `%CAPACITY`, `%PHASE`, `%SUCCESSFULLY_PARSED`,
   `%PARTIALLY_PARSED`, `%INVALID` (repeatable), `%REDIRECT_LOCATION`,
   `%MESSAGE`, `%TEMPLATE_NAME` (single-use), `%WWW_AUTHENTICATE`
   (header-only, elides the line when the realm is empty), and an

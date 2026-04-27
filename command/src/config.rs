@@ -424,14 +424,20 @@ pub struct ListenerBuilder {
     /// that omit ALPN entirely) are dropped at handshake instead of
     /// silently downgrading to HTTP/1.1. Default: false.
     pub disable_http11: Option<bool>,
-    /// Per-status HTTP answer template files at listener scope. Map key is
-    /// the HTTP status code (e.g. `"503"`); map value is a filesystem path
-    /// to the template body that will be loaded into
+    /// Per-status HTTP answer templates at listener scope — the **global
+    /// default** that fires whenever no cluster-level override matches.
+    /// Map key is the HTTP status code (e.g. `"503"`); map value is
+    /// either a filesystem path or an `inline:<body>` literal, see
+    /// [`resolve_answer_source`]. Loaded into
     /// [`HttpListenerConfig::answers`] / [`HttpsListenerConfig::answers`]
-    /// at build time via [`load_answers`]. The legacy per-status
-    /// `answer_NNN` fields are still honoured for backwards compatibility
-    /// but are equivalent to a one-line entry in this map; new code
-    /// should prefer `[listeners.answers]`.
+    /// at build time via [`load_answers`].
+    ///
+    /// Cluster-level [`FileClusterConfig::answers`] entries override the
+    /// matching status here for requests routed to that cluster.
+    ///
+    /// The deprecated per-status `answer_NNN` fields are still honoured
+    /// for backwards compatibility but are equivalent to a one-line entry
+    /// in this map; new configs should prefer `[listeners.answers]`.
     pub answers: Option<BTreeMap<String, String>>,
 }
 
@@ -971,38 +977,71 @@ fn read_http_answer_file(path: &Option<String>) -> Result<Option<String>, Config
     }
 }
 
-/// Load every per-status template referenced by `answers` from disk.
+/// Resolve a single `answers` map entry into the literal template body
+/// the proto layer expects.
 ///
-/// `answers` maps an HTTP status code (e.g. `"503"`) to a filesystem path.
-/// Each path is read into a body string and inserted into the returned
-/// map under the same key, ready to be assigned to the proto-level
+/// The same resolution rule applies to entries at every layer:
+/// * **Listener-level** `[listeners.<id>.answers]` — the global default
+///   that fires whenever no more specific override matches.
+/// * **Cluster-level** `[clusters.<id>.answers]` — overrides the
+///   listener-level default for the matching status code on requests
+///   routed to that cluster.
+///
+/// Two source forms are accepted:
+/// * **Inline literal** — the value starts with the `inline:` prefix.
+///   The remainder of the value (everything after the colon) is taken
+///   as the template body verbatim. Useful for short canned responses,
+///   secrets-free containers where mounting a file is awkward, and
+///   automated test rigs that want to avoid disk I/O entirely.
+/// * **Filesystem path** — anything else. The path is opened and read
+///   into a string. Mirrors the on-disk loading the per-status
+///   [`read_http_answer_file`] helper performs for the deprecated
+///   `answer_301`..`answer_507` fields.
+///
+/// An empty inline body (`"inline:"`) is a legitimate template (a 0-byte
+/// response payload — typical with `Connection: close` and no headers).
+pub fn resolve_answer_source(value: &str) -> Result<String, ConfigError> {
+    if let Some(body) = value.strip_prefix("inline:") {
+        return Ok(body.to_owned());
+    }
+    let mut content = String::new();
+    let mut file = File::open(value).map_err(|io_error| ConfigError::FileOpen {
+        path_to_open: value.to_owned(),
+        io_error,
+    })?;
+    file.read_to_string(&mut content)
+        .map_err(|io_error| ConfigError::FileRead {
+            path_to_read: value.to_owned(),
+            io_error,
+        })?;
+    Ok(content)
+}
+
+/// Load every per-status template referenced by `answers`.
+///
+/// `answers` maps an HTTP status code (e.g. `"503"`) to either a
+/// filesystem path or an `inline:<body>` literal — see
+/// [`resolve_answer_source`] for the resolution rules. Each entry is
+/// resolved into a body string and inserted into the returned map
+/// under the same key, ready to be assigned to the proto-level
 /// `answers` field on a [`HttpListenerConfig`] / [`HttpsListenerConfig`]
-/// / [`Cluster`]. Empty path values are skipped (treated as
-/// "preserve current") so the caller can use them as a no-op stub in
-/// example configs.
+/// / [`Cluster`]. Empty values are skipped (treated as "preserve
+/// current") so the caller can use them as a no-op stub in example
+/// configs.
 ///
-/// Errors map to the existing `ConfigError::FileOpen` / `ConfigError::FileRead`
-/// variants so the operator gets the same diagnostics as the legacy
-/// `read_http_answer_file` flow.
+/// Errors map to the existing `ConfigError::FileOpen` /
+/// `ConfigError::FileRead` variants so the operator gets the same
+/// diagnostics whether the path comes from this map or from the
+/// deprecated per-status `answer_301`..`answer_507` fields.
 pub fn load_answers(
     answers: &BTreeMap<String, String>,
 ) -> Result<BTreeMap<String, String>, ConfigError> {
     let mut out = BTreeMap::new();
-    for (code, path) in answers {
-        if path.is_empty() {
+    for (code, value) in answers {
+        if value.is_empty() {
             continue;
         }
-        let mut content = String::new();
-        let mut file = File::open(path).map_err(|io_error| ConfigError::FileOpen {
-            path_to_open: path.to_owned(),
-            io_error,
-        })?;
-        file.read_to_string(&mut content)
-            .map_err(|io_error| ConfigError::FileRead {
-                path_to_read: path.to_owned(),
-                io_error,
-            })?;
-        out.insert(code.to_owned(), content);
+        out.insert(code.to_owned(), resolve_answer_source(value)?);
     }
     Ok(out)
 }
@@ -1405,10 +1444,15 @@ pub struct FileClusterConfig {
     /// Does NOT gate H2 at the frontend — frontend H2 is ALPN-negotiated independently (see `alpn_protocols`).
     pub http2: Option<bool>,
     /// Per-cluster HTTP answer template overrides keyed by HTTP status
-    /// code (e.g. `"503"`). Map values are filesystem paths to the template
-    /// body, loaded into [`Cluster::answers`] at build time via
-    /// [`load_answers`]. An entry on a cluster overrides the same status
-    /// code on the listener.
+    /// code (e.g. `"503"`). Each value is either a filesystem path or an
+    /// `inline:<body>` literal — see [`resolve_answer_source`]. Loaded
+    /// into [`Cluster::answers`] at build time via [`load_answers`].
+    ///
+    /// Layering: an entry here overrides the listener-level
+    /// `[listeners.<id>.answers]` default for the matching status on
+    /// requests routed to this cluster. The listener-level map is the
+    /// global default; the cluster-level map is the per-cluster
+    /// override.
     pub answers: Option<BTreeMap<String, String>>,
     /// Optional explicit port to use when building the `Location` header
     /// for an `https_redirect`. When unset, the listener's effective HTTPS
@@ -3161,5 +3205,32 @@ mod tests {
         let header = parse_header_edit(0, &entry).expect("clean value must be accepted");
         assert_eq!(header.key, "X-Tenant");
         assert_eq!(header.val, "alpha");
+    }
+
+    /// `inline:` strips the prefix and treats the rest as the literal
+    /// template body — useful for short canned responses, secrets-free
+    /// containers, and test rigs that want zero disk I/O.
+    #[test]
+    fn resolve_answer_source_inline_returns_literal_body() {
+        let body = resolve_answer_source("inline:HTTP/1.1 503 Service Unavailable\r\n\r\nbusy")
+            .expect("inline source must resolve");
+        assert_eq!(body, "HTTP/1.1 503 Service Unavailable\r\n\r\nbusy");
+    }
+
+    #[test]
+    fn resolve_answer_source_inline_empty_is_legitimate() {
+        let body = resolve_answer_source("inline:").expect("empty inline source must resolve");
+        assert_eq!(body, "");
+    }
+
+    /// Anything without the `inline:` prefix is read as a filesystem
+    /// path. A non-existent path bubbles up as `ConfigError::FileOpen`
+    /// so the operator gets the same diagnostics as the existing
+    /// per-status `answer_NNN` flow.
+    #[test]
+    fn resolve_answer_source_path_missing_file_errors() {
+        let err = resolve_answer_source("/nonexistent/sozu-test/never.http")
+            .expect_err("missing path must error");
+        assert!(matches!(err, ConfigError::FileOpen { .. }));
     }
 }

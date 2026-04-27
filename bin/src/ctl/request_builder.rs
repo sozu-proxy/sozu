@@ -195,27 +195,34 @@ impl CommandManager {
                     }
                 }
 
-                // Read each `--answer code=path` template body off disk and
-                // collect into the cluster's `answers` map. The right-hand
-                // side is a path, mirroring the legacy `--answer-503`
-                // flow (see `read_http_answer_file` callers above).
+                // Resolve each `--answer code=value` entry. The right-hand
+                // side is either a filesystem path or the literal
+                // template body when prefixed with `inline:`. Funnels
+                // through the canonical `resolve_answer_source` helper so
+                // the CLI and TOML loader stay in sync.
+                //
+                // Cluster-level entries override the listener-level
+                // `answers` map (which itself is the global default for
+                // every status code on that listener). Both layers
+                // accept the same `path | inline:<body>` value form.
                 let mut answers_map = std::collections::BTreeMap::new();
                 for entry in &answer {
-                    let (code, path) = match entry.split_once('=') {
-                        Some((c, p)) if !p.is_empty() => (c, p),
+                    let (code, value) = match entry.split_once('=') {
+                        Some((c, v)) if !v.is_empty() => (c, v),
                         _ => {
                             return Err(CtlError::ArgsNeeded(
-                                "<code>=<path>".to_string(),
+                                "<code>=<path|inline:body>".to_string(),
                                 format!("got {entry:?}"),
                             ));
                         }
                     };
-                    let body = std::fs::read_to_string(path).map_err(|e| {
-                        CtlError::ArgsNeeded(
-                            "readable template path".to_string(),
-                            format!("{path:?}: {e}"),
-                        )
-                    })?;
+                    let body =
+                        sozu_command_lib::config::resolve_answer_source(value).map_err(|e| {
+                            CtlError::ArgsNeeded(
+                                "readable template path or inline:<body>".to_string(),
+                                format!("{value:?}: {e}"),
+                            )
+                        })?;
                     answers_map.insert(code.to_owned(), body);
                 }
 
