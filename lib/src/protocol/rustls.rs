@@ -1,9 +1,20 @@
-use std::{cell::RefCell, io::ErrorKind, net::SocketAddr, rc::Rc};
+//! Rustls handshake driver.
+//!
+//! Owns the per-session `rustls::ServerConnection` during the TLS
+//! handshake: pumps `read_tls`/`write_tls`, surfaces handshake completion
+//! to the parent state, and emits handshake-completion metrics. Cipher /
+//! ALPN / SNI binding decisions live in `lib/src/https.rs`; certificate
+//! resolution and dynamic cert reload live in `lib/src/tls.rs`.
+
+use std::{cell::RefCell, io::ErrorKind, net::SocketAddr, rc::Rc, time::Instant};
 
 use mio::{Token, net::TcpStream};
-use rustls::ServerConnection;
+use rustls::{Error as RustlsError, ServerConnection};
 use rusty_ulid::Ulid;
-use sozu_command::{config::MAX_LOOP_ITERATIONS, logging::LogContext};
+use sozu_command::{
+    config::MAX_LOOP_ITERATIONS,
+    logging::{LogContext, ansi_palette},
+};
 
 use crate::{
     Readiness, Ready, SessionMetrics, SessionResult, StateResult, protocol::SessionState,
@@ -11,25 +22,42 @@ use crate::{
 };
 
 /// This macro is defined uniquely in this module to help the tracking of tls
-/// issues inside Sōzu
+/// issues inside Sōzu. When the logger emits to a TTY the protocol label is
+/// bold bright-white (uniform across every protocol), the `Session` keyword is
+/// light grey, attribute keys are gray and values are bright white. ANSI codes
+/// are skipped when output goes to a file or otherwise non-colored sink. The
+/// `[ulid - - -]` context prefix comes first to keep column alignment with
+/// `MUX-*` and `SOCKET` logs.
 macro_rules! log_context {
-    ($self:expr) => {
+    ($self:expr) => {{
+        let (open, reset, grey, gray, white) = ansi_palette();
         format!(
-            "RUSTLS\t{}\tSession(sni={:?}, source={:?}, frontend={}, readiness={})\t >>>",
-            $self.log_context(),
-            $self
+            "{gray}{ctx}{reset}\t{open}RUSTLS{reset}\t{grey}Session{reset}({gray}sni{reset}={white}{sni:?}{reset}, {gray}alpn{reset}={white}{alpn}{reset}, {gray}version{reset}={white}{version:?}{reset}, {gray}source{reset}={white}{source:?}{reset}, {gray}frontend{reset}={white}{frontend}{reset}, {gray}readiness{reset}={white}{readiness}{reset})\t >>>",
+            open = open,
+            reset = reset,
+            grey = grey,
+            gray = gray,
+            white = white,
+            ctx = $self.log_context(),
+            sni = $self
                 .session
                 .server_name()
                 .map(|addr| addr.to_string())
                 .unwrap_or_else(|| "<none>".to_string()),
-            $self
+            alpn = $self
+                .session
+                .alpn_protocol()
+                .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+                .unwrap_or_else(|| "<none>".to_string()),
+            version = $self.session.protocol_version(),
+            source = $self
                 .peer_address
                 .map(|addr| addr.to_string())
                 .unwrap_or_else(|| "<none>".to_string()),
-            $self.frontend_token.0,
-            $self.frontend_readiness
+            frontend = $self.frontend_token.0,
+            readiness = $self.frontend_readiness,
         )
-    };
+    }};
 }
 
 pub enum TlsState {
@@ -47,6 +75,11 @@ pub struct TlsHandshake {
     pub request_id: Ulid,
     pub session: ServerConnection,
     pub stream: TcpStream,
+    /// Wall-clock anchor for the `tls.handshake_ms` histogram. Captured the
+    /// first time the handshake state actually does I/O (not at construction,
+    /// because the session may sit in the accept queue or in expect-proxy for
+    /// an unbounded amount of time before the TLS bytes start flowing).
+    handshake_started_at: Option<Instant>,
 }
 
 impl TlsHandshake {
@@ -75,10 +108,28 @@ impl TlsHandshake {
             request_id,
             session,
             stream,
+            handshake_started_at: None,
         }
     }
 
+    /// Returns the elapsed handshake duration in milliseconds and clears the
+    /// captured start instant so the histogram is only recorded once. Returns
+    /// `None` when no I/O happened (e.g. the connection closed mid-handshake
+    /// before any bytes were exchanged); callers should not emit
+    /// `tls.handshake_ms` in that case.
+    fn record_handshake_duration_ms(&mut self) -> Option<u128> {
+        self.handshake_started_at
+            .take()
+            .map(|t| t.elapsed().as_millis())
+    }
+
     pub fn readable(&mut self) -> SessionResult {
+        // Anchor the handshake duration the first time we observe TLS bytes
+        // moving in either direction. Using `get_or_insert_with` keeps the
+        // anchor sticky across `WouldBlock` retries and across the
+        // readable/writable boundary.
+        self.handshake_started_at.get_or_insert_with(Instant::now);
+
         let mut can_read = true;
 
         loop {
@@ -110,11 +161,7 @@ impl TlsHandshake {
                 }
 
                 if let Err(e) = self.session.process_new_packets() {
-                    error!(
-                        "{} Could not perform handshake: {:?}",
-                        log_context!(self),
-                        e
-                    );
+                    self.log_handshake_error(&e);
                     return SessionResult::Close;
                 }
             }
@@ -142,12 +189,18 @@ impl TlsHandshake {
                 self.frontend_readiness.interest.insert(Ready::READABLE);
                 self.frontend_readiness.event.insert(Ready::READABLE);
                 self.frontend_readiness.interest.insert(Ready::WRITABLE);
+                if let Some(elapsed_ms) = self.record_handshake_duration_ms() {
+                    time!("tls.handshake_ms", elapsed_ms);
+                }
                 SessionResult::Upgrade
             }
         }
     }
 
     pub fn writable(&mut self) -> SessionResult {
+        // Same anchor logic as `readable()` — see the comment there.
+        self.handshake_started_at.get_or_insert_with(Instant::now);
+
         let mut can_write = true;
 
         loop {
@@ -175,11 +228,7 @@ impl TlsHandshake {
                 }
 
                 if let Err(e) = self.session.process_new_packets() {
-                    error!(
-                        "{} Could not perform handshake: {:?}",
-                        log_context!(self),
-                        e
-                    );
+                    self.log_handshake_error(&e);
                     return SessionResult::Close;
                 }
             }
@@ -201,17 +250,24 @@ impl TlsHandshake {
             SessionResult::Continue
         } else if self.session.wants_read() {
             self.frontend_readiness.interest.insert(Ready::READABLE);
+            if let Some(elapsed_ms) = self.record_handshake_duration_ms() {
+                time!("tls.handshake_ms", elapsed_ms);
+            }
             SessionResult::Upgrade
         } else {
             self.frontend_readiness.interest.insert(Ready::WRITABLE);
             self.frontend_readiness.interest.insert(Ready::READABLE);
+            if let Some(elapsed_ms) = self.record_handshake_duration_ms() {
+                time!("tls.handshake_ms", elapsed_ms);
+            }
             SessionResult::Upgrade
         }
     }
 
     pub fn log_context(&self) -> LogContext<'_> {
         LogContext {
-            request_id: self.request_id,
+            session_id: self.request_id,
+            request_id: None,
             cluster_id: None,
             backend_id: None,
         }
@@ -219,6 +275,77 @@ impl TlsHandshake {
 
     pub fn front_socket(&self) -> &TcpStream {
         &self.stream
+    }
+
+    /// Tiered logging for TLS handshake errors surfaced by `process_new_packets`.
+    ///
+    /// - `AlertReceived(_)`: remote peer rejected our cert/config (e.g. old
+    ///   CA bundle, scanner, cert-pinning client). Not actionable per-connection
+    ///   on a public endpoint, so log at `debug!`.
+    /// - Peer protocol violations (`PeerIncompatible`, `PeerMisbehaved`,
+    ///   `InvalidMessage`, inappropriate message / handshake message,
+    ///   oversized record, ALPN mismatch, bad client cert, `DecryptError`,
+    ///   `NoCertificatesPresented`): occasionally useful to spot buggy
+    ///   clients or stale roots, so log at `warn!`.
+    /// - Everything else (local/config/provider failures like `EncryptError`,
+    ///   `General`, `Other`, CRL issues, missing entropy): genuine server-side
+    ///   problems, stay at `error!`.
+    ///
+    /// Each tier additionally bumps `tls.handshake.failed.<reason>` so dashboards
+    /// can split spikes by category without having to grep logs.
+    fn log_handshake_error(&self, err: &RustlsError) {
+        let reason = handshake_failure_reason(err);
+        match err {
+            RustlsError::AlertReceived(_) => debug!(
+                "{} Could not perform handshake: {:?}",
+                log_context!(self),
+                err
+            ),
+            RustlsError::PeerIncompatible(_)
+            | RustlsError::PeerMisbehaved(_)
+            | RustlsError::InvalidMessage(_)
+            | RustlsError::InappropriateMessage { .. }
+            | RustlsError::InappropriateHandshakeMessage { .. }
+            | RustlsError::PeerSentOversizedRecord
+            | RustlsError::NoApplicationProtocol
+            | RustlsError::InvalidCertificate(_)
+            | RustlsError::DecryptError
+            | RustlsError::NoCertificatesPresented => warn!(
+                "{} Could not perform handshake: {:?}",
+                log_context!(self),
+                err
+            ),
+            _ => error!(
+                "{} Could not perform handshake: {:?}",
+                log_context!(self),
+                err
+            ),
+        }
+        count!(reason, 1);
+    }
+}
+
+/// Compile-time literal `tls.handshake.failed.<reason>` keys for every variant
+/// the proxy can observe. Free function (rather than a method) so unit tests
+/// can drive it without constructing a real `ServerConnection`. The set of
+/// suffixes is bounded — anything outside the explicit `match` arms collapses
+/// to `tls.handshake.failed.other` so statsd cardinality stays predictable.
+fn handshake_failure_reason(err: &RustlsError) -> &'static str {
+    match err {
+        RustlsError::AlertReceived(_) => "tls.handshake.failed.alert_received",
+        RustlsError::PeerIncompatible(_) => "tls.handshake.failed.peer_incompatible",
+        RustlsError::PeerMisbehaved(_) => "tls.handshake.failed.peer_misbehaved",
+        RustlsError::InvalidMessage(_) => "tls.handshake.failed.invalid_message",
+        RustlsError::InappropriateMessage { .. } => "tls.handshake.failed.inappropriate_message",
+        RustlsError::InappropriateHandshakeMessage { .. } => {
+            "tls.handshake.failed.inappropriate_handshake_message"
+        }
+        RustlsError::PeerSentOversizedRecord => "tls.handshake.failed.oversized_record",
+        RustlsError::NoApplicationProtocol => "tls.handshake.failed.no_alpn",
+        RustlsError::InvalidCertificate(_) => "tls.handshake.failed.invalid_certificate",
+        RustlsError::DecryptError => "tls.handshake.failed.decrypt_error",
+        RustlsError::NoCertificatesPresented => "tls.handshake.failed.no_certificates_present",
+        _ => "tls.handshake.failed.other",
     }
 }
 
@@ -312,5 +439,109 @@ impl SessionState for TlsHandshake {
             "{} Session(Handshake)\n\tFrontend:\n\t\ttoken: {:?}\treadiness: {:?}",
             context, self.frontend_token, self.frontend_readiness
         );
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Unit tests
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use rustls::{
+        AlertDescription, CertificateError, ContentType, Error as RustlsError, HandshakeType,
+        InvalidMessage, PeerIncompatible, PeerMisbehaved,
+    };
+
+    use super::handshake_failure_reason;
+
+    /// Every rustls error variant the proxy can observe must map to a distinct,
+    /// compile-time literal `tls.handshake.failed.<reason>` key. Unknown
+    /// variants (future rustls additions, `General`, `Other`, CRL errors, etc.)
+    /// collapse to `tls.handshake.failed.other` so statsd cardinality stays
+    /// bounded. This test also guards against accidental duplicate keys.
+    #[test]
+    fn handshake_failure_reason_maps_every_variant_to_unique_namespaced_key() {
+        let cases: &[(RustlsError, &str)] = &[
+            (
+                RustlsError::AlertReceived(AlertDescription::HandshakeFailure),
+                "tls.handshake.failed.alert_received",
+            ),
+            (
+                RustlsError::PeerIncompatible(PeerIncompatible::NoCipherSuitesInCommon),
+                "tls.handshake.failed.peer_incompatible",
+            ),
+            (
+                RustlsError::PeerMisbehaved(PeerMisbehaved::IllegalMiddleboxChangeCipherSpec),
+                "tls.handshake.failed.peer_misbehaved",
+            ),
+            (
+                RustlsError::InvalidMessage(InvalidMessage::InvalidContentType),
+                "tls.handshake.failed.invalid_message",
+            ),
+            (
+                RustlsError::InappropriateMessage {
+                    expect_types: vec![ContentType::Handshake],
+                    got_type: ContentType::ApplicationData,
+                },
+                "tls.handshake.failed.inappropriate_message",
+            ),
+            (
+                RustlsError::InappropriateHandshakeMessage {
+                    expect_types: vec![HandshakeType::ClientHello],
+                    got_type: HandshakeType::Finished,
+                },
+                "tls.handshake.failed.inappropriate_handshake_message",
+            ),
+            (
+                RustlsError::PeerSentOversizedRecord,
+                "tls.handshake.failed.oversized_record",
+            ),
+            (
+                RustlsError::NoApplicationProtocol,
+                "tls.handshake.failed.no_alpn",
+            ),
+            (
+                RustlsError::InvalidCertificate(CertificateError::Expired),
+                "tls.handshake.failed.invalid_certificate",
+            ),
+            (
+                RustlsError::DecryptError,
+                "tls.handshake.failed.decrypt_error",
+            ),
+            (
+                RustlsError::NoCertificatesPresented,
+                "tls.handshake.failed.no_certificates_present",
+            ),
+            // `Other` bucket — any variant not in the explicit list collapses here.
+            (
+                RustlsError::General("test".to_owned()),
+                "tls.handshake.failed.other",
+            ),
+            (RustlsError::EncryptError, "tls.handshake.failed.other"),
+            (
+                RustlsError::FailedToGetCurrentTime,
+                "tls.handshake.failed.other",
+            ),
+            (
+                RustlsError::HandshakeNotComplete,
+                "tls.handshake.failed.other",
+            ),
+        ];
+
+        let mut seen = HashSet::new();
+        for (err, expected) in cases {
+            let got = handshake_failure_reason(err);
+            assert_eq!(got, *expected, "variant {err:?} → {got}, want {expected}");
+            assert!(
+                got.starts_with("tls.handshake.failed."),
+                "reason {got} missing tls.handshake.failed. namespace"
+            );
+            seen.insert(got);
+        }
+
+        // 11 explicit buckets + 1 shared `other` bucket = 12 distinct keys.
+        assert_eq!(seen.len(), 12, "unexpected key set: {seen:?}");
     }
 }

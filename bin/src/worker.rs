@@ -19,9 +19,9 @@ use nix::{
 };
 use sozu_command_lib::{
     channel::{Channel, ChannelError},
-    config::Config,
+    config::{Config, MetricDetailLevel},
     logging::{AccessLogFormat, LogError, setup_logging},
-    proto::command::{ServerConfig, WorkerRequest, WorkerResponse},
+    proto::command::{MetricDetail, ServerConfig, WorkerRequest, WorkerResponse},
     ready::Ready,
     request::{RequestError, read_initial_state_from_file},
     scm_socket::{Listeners, ScmSocket, ScmSocketError},
@@ -79,6 +79,7 @@ pub enum WorkerError {
 }
 
 /// called within a worker process, this starts the actual proxy
+#[allow(dead_code)]
 pub fn begin_worker_process(
     worker_to_main_channel_fd: i32,
     worker_to_main_scm_fd: i32,
@@ -88,6 +89,11 @@ pub fn begin_worker_process(
     max_command_buffer_size: u64,
 ) -> Result<(), WorkerError> {
     let mut worker_to_main_channel: Channel<WorkerResponse, ServerConfig> = Channel::new(
+        // SAFETY: `worker_to_main_channel_fd` was just inherited from the
+        // pre-exec parent process via the `--fd` CLI argument. It is a valid
+        // open descriptor with no other owner inside this freshly-execed
+        // worker process. Ownership transfers to the `UnixStream`, whose
+        // `Drop` closes the descriptor.
         unsafe { UnixStream::from_raw_fd(worker_to_main_channel_fd) },
         command_buffer_size,
         max_command_buffer_size,
@@ -100,6 +106,11 @@ pub fn begin_worker_process(
             channel_err,
         })?;
 
+    // SAFETY: `configuration_state_fd` was just inherited from the
+    // pre-exec parent process via the `--configuration-state-fd` CLI
+    // argument. It is a valid open descriptor with no other owner inside
+    // this freshly-execed worker process. Ownership transfers to the
+    // `File`, whose `Drop` closes the descriptor.
     let mut configuration_state_file = unsafe { File::from_raw_fd(configuration_state_fd) };
 
     let worker_config = worker_to_main_channel
@@ -147,11 +158,22 @@ pub fn begin_worker_process(
             .address
             .parse::<SocketAddr>()
             .expect("Could not parse metrics address");
+        // Convert the proto wire enum back into the configuration enum.
+        // Workers receive the detail level over the SCM socket as
+        // `Option<i32>`; absent / unrecognised values fall back to the
+        // historical default (Cluster) so old binaries on either side keep
+        // working.
+        let detail = metrics
+            .detail
+            .and_then(|d| MetricDetail::try_from(d).ok())
+            .map(MetricDetailLevel::from)
+            .unwrap_or_default();
         metrics::setup(
             &address,
             worker_id,
             metrics.tagged_metrics,
             metrics.prefix.clone(),
+            detail,
         )
         .map_err(WorkerError::SetupMetrics)?;
     }
@@ -190,6 +212,8 @@ pub fn fork_main_into_worker(
     state: &ConfigState,
     listeners: Option<Listeners>,
 ) -> Result<(pid_t, Channel<WorkerRequest, WorkerResponse>, ScmSocket), WorkerError> {
+    // SAFETY: `libc::getpid` takes no input pointers, never fails, and
+    // returns a value type. No invariant beyond "FFI signature matches libc".
     trace!("parent({})", unsafe { libc::getpid() });
 
     let mut state_file = tempfile().map_err(WorkerError::CreateStateFile)?;
@@ -248,6 +272,10 @@ pub fn fork_main_into_worker(
     info!("launching worker {}", worker_id);
     debug!("executable path is {}", executable_path);
 
+    // SAFETY: `fork` is unsafe because the child must avoid touching
+    // shared mutable state inherited from the parent. The child branch
+    // below restricts itself to `Command::exec`, which replaces the process
+    // image entirely — no inherited state matters after that point.
     match unsafe { fork().map_err(WorkerError::Fork)? } {
         ForkResult::Parent { child: worker_pid } => {
             info!("launching worker {} with pid {}", worker_id, worker_pid);
@@ -283,6 +311,9 @@ pub fn fork_main_into_worker(
             ))
         }
         ForkResult::Child => {
+            // SAFETY: `libc::getpid` takes no input pointers, never fails,
+            // and returns a value type. No invariant beyond "FFI signature
+            // matches libc".
             trace!("child({}):\twill spawn a child", unsafe { libc::getpid() });
             let err = Command::new(executable_path)
                 .arg("worker")

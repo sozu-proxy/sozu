@@ -2,6 +2,63 @@
 name: CI
 on: [ push, pull_request ]
 jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      # `protoc` + a build of `sozu-command-lib` are required so that
+      # `command/build.rs` regenerates `command/src/proto/command.rs`
+      # before rustfmt walks the module tree (rustfmt fails to resolve
+      # `mod command;` if the generated file is absent).
+      - name: install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Checkout sources
+        uses: actions/checkout@v4
+      # rustfmt.toml uses the unstable `ignore` key, so the format check
+      # must run on nightly. See CLAUDE.md "Build" section.
+      - name: Install rust nightly (rustfmt)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+      - name: Generate prost output (sozu-command-lib build.rs)
+        run: cargo +nightly check -p sozu-command-lib --locked
+      - name: Check formatting
+        run: cargo +nightly fmt --all -- --check
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - name: install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Checkout sources
+        uses: actions/checkout@v4
+      # Match the project's pinned toolchain (`rust-toolchain` = 1.88.0)
+      # so the lint baseline matches what CLAUDE.md "Build" documents.
+      # Stable 1.95 fires `mismatched_lifetime_syntaxes` and a few other
+      # newer lints that have not yet been triaged across the workspace;
+      # tracking those is its own follow-up rather than a CI gate today.
+      - name: Install rust 1.88.0 (clippy)
+        uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          components: clippy
+      # `--all-features` matches the local lint baseline documented in
+      # CLAUDE.md "Build". Workspace is currently warning-free on 1.88.0.
+      - name: Lint
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+  msrv:
+    name: MSRV (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - name: install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Checkout sources
+        uses: actions/checkout@v4
+      # `rust-toolchain` pins 1.88.0 for everyday dev; this job verifies
+      # the advertised MSRV per Cargo.toml `rust-version = "1.88.0"`.
+      - name: Install rust 1.88.0 (advertised MSRV)
+        uses: dtolnay/rust-toolchain@1.88.0
+      - name: Build with MSRV
+        run: cargo build --all-features --locked
   test:
     name: Test
     runs-on: ubuntu-latest
@@ -21,21 +78,23 @@ jobs:
       - name: Checkout sources
         uses: actions/checkout@v4
       - name: Install rust (${{ matrix.rust }})
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.rust }}
-          profile: minimal
-          override: true
+      - name: Install nightly toolchain (for fuzz targets)
+        run: rustup toolchain install nightly --profile minimal
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Install h2spec (for test_h2spec_conformance)
+        run: |
+          H2SPEC_VERSION=2.6.0
+          curl -fsSL "https://github.com/summerwind/h2spec/releases/download/v${H2SPEC_VERSION}/h2spec_linux_amd64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin h2spec
+          h2spec --version
       - name: Build
-        uses: actions-rs/cargo@v1
-        with:
-          command: build
-          args: ${{ matrix.features }}
+        run: cargo build --locked --all-features
       - name: Test
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --verbose ${{ matrix.features }}
+        run: cargo test --locked --all-features --verbose
   doc:
     name: Build documentation
     runs-on: ubuntu-latest
@@ -45,19 +104,14 @@ jobs:
       - name: Checkout sources
         uses: actions/checkout@v4
       - name: Install rust
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          profile: minimal
-          override: true
-      - name: Build
-        uses: actions-rs/cargo@v1
-        with:
-          command: doc
-          args: --verbose
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build docs
+        run: cargo doc --verbose
   dockerhub:
     name: Docker build and push to Docker Hub
     runs-on: ubuntu-latest
+    # SHA-only tagging on every push; release tagging is handled
+    # separately, see RELEASE.md.
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-qemu-action@v3

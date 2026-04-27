@@ -4,31 +4,19 @@ use std::{
     ptr,
 };
 
-use libc::{c_int, c_uint, off_t, size_t, ssize_t};
-
-const SPLICE_F_NONBLOCK: c_uint = 2;
-unsafe extern "C" {
-    //ssize_t splice(int fd_in, loff_t *off_in, int fd_out,
-    //                      loff_t *off_out, size_t len, unsigned int flags);
-    pub fn splice(
-        fd_in: c_int,
-        off_in: *const off_t,
-        fd_out: c_int,
-        off_out: *const off_t,
-        len: size_t,
-        flags: c_uint,
-    ) -> ssize_t;
-
-    //int pipe2(int pipefd[2], int flags);
-    pub fn pipe2(pipefd: *mut c_int, flags: c_int) -> c_int;
-}
+use libc::c_int;
 
 pub type Pipe = [c_int; 2];
 
+#[allow(dead_code)]
 pub fn create_pipe() -> Option<Pipe> {
     let mut p: Pipe = [0; 2];
+    // SAFETY: `p` is a stack-allocated `[c_int; 2]`, so `p.as_mut_ptr()` is a
+    // valid, correctly-aligned, writable pointer to two contiguous `c_int`s,
+    // which matches pipe2's `int pipefd[2]` parameter. `pipe2` writes into the
+    // array and returns; it does not retain the pointer after return.
     unsafe {
-        if pipe2(p.as_mut_ptr(), 0) == 0 {
+        if libc::pipe2(p.as_mut_ptr(), 0) == 0 {
             Some(p)
         } else {
             None
@@ -36,15 +24,23 @@ pub fn create_pipe() -> Option<Pipe> {
     }
 }
 
+#[allow(dead_code)]
 pub fn splice_in(stream: &dyn AsRawFd, pipe: Pipe) -> Option<usize> {
+    // SAFETY: `stream.as_raw_fd()` yields a descriptor borrowed for the
+    // duration of this call — the `&dyn AsRawFd` borrow keeps its owner alive
+    // across the syscall. `pipe[1]` is the write end of a pipe created via
+    // `create_pipe`; the caller is responsible for keeping it open. Both
+    // offset pointers are null (sequential read/write). `splice` only reads
+    // the fds during the syscall and does not retain any pointer after
+    // returning.
     unsafe {
-        let res = splice(
+        let res = libc::splice(
             stream.as_raw_fd(),
-            ptr::null(),
+            ptr::null_mut(),
             pipe[1],
-            ptr::null(),
+            ptr::null_mut(),
             2048,
-            SPLICE_F_NONBLOCK,
+            libc::SPLICE_F_NONBLOCK,
         );
         if res == -1 {
             let err = Error::last_os_error().kind();
@@ -64,15 +60,23 @@ pub fn splice_in(stream: &dyn AsRawFd, pipe: Pipe) -> Option<usize> {
     }
 }
 
+#[allow(dead_code)]
 pub fn splice_out(pipe: Pipe, stream: &dyn AsRawFd) -> Option<usize> {
+    // SAFETY: `pipe[0]` is the read end of a pipe created via `create_pipe`;
+    // the caller is responsible for keeping it open. `stream.as_raw_fd()`
+    // yields a descriptor borrowed for the duration of this call — the
+    // `&dyn AsRawFd` borrow keeps its owner alive across the syscall. Both
+    // offset pointers are null (sequential read/write). `splice` only reads
+    // the fds during the syscall and does not retain any pointer after
+    // returning.
     unsafe {
-        let res = splice(
+        let res = libc::splice(
             pipe[0],
-            ptr::null(),
+            ptr::null_mut(),
             stream.as_raw_fd(),
-            ptr::null(),
+            ptr::null_mut(),
             2048,
-            SPLICE_F_NONBLOCK,
+            libc::SPLICE_F_NONBLOCK,
         );
         if res == -1 {
             let err = Error::last_os_error().kind();
@@ -97,108 +101,131 @@ mod tests {
     use std::{
         io::{Read, Write},
         net::{SocketAddr, TcpListener, TcpStream},
+        os::unix::io::AsRawFd,
         str,
-        str::FromStr,
         sync::{Arc, Barrier},
         thread,
+        time::Duration,
     };
 
     use super::*;
 
+    /// Retry a splice_in + splice_out transfer with exponential backoff.
+    /// Returns the number of bytes transferred, or panics on timeout.
+    fn splice_with_retry(from: &dyn AsRawFd, pipe: Pipe, to: &dyn AsRawFd) -> usize {
+        let mut delay = Duration::from_millis(1);
+        let max_delay = Duration::from_millis(100);
+        let mut elapsed = Duration::ZERO;
+        let timeout = Duration::from_secs(5);
+
+        let bytes_in = loop {
+            if let Some(n) = splice_in(from, pipe) {
+                break n;
+            }
+            assert!(elapsed < timeout, "splice_in timed out after {elapsed:?}");
+            thread::sleep(delay);
+            elapsed += delay;
+            delay = (delay * 2).min(max_delay);
+        };
+
+        delay = Duration::from_millis(1);
+        let mut out_elapsed = Duration::ZERO;
+
+        let bytes_out = loop {
+            if let Some(n) = splice_out(pipe, to) {
+                break n;
+            }
+            assert!(
+                out_elapsed < timeout,
+                "splice_out timed out after {out_elapsed:?}"
+            );
+            thread::sleep(delay);
+            out_elapsed += delay;
+            delay = (delay * 2).min(max_delay);
+        };
+
+        println!("splice transfer: {bytes_in} bytes in, {bytes_out} bytes out");
+        bytes_out
+    }
+
     #[test]
     fn zerocopy() {
-        let barrier = Arc::new(Barrier::new(2));
-        start_server();
-        start_server2(barrier.clone());
+        thread::scope(|s| {
+            let backend_addr = start_server(s);
+            let (proxy_addr, barrier) = start_server2(s, backend_addr);
 
-        let mut stream =
-            TcpStream::connect("127.0.0.1:2121").expect("could not connect tcp socket");
-        stream.write(&b"hello world"[..]);
-        barrier.wait();
-
-        let mut res = [0; 128];
-        let sz = stream
-            .read(&mut res[..])
-            .expect("could not read from stream");
-        println!("stream received {:?}", str::from_utf8(&res[..sz]));
-        assert_eq!(&res[..sz], &b"hello world"[..]);
-        //assert!(false);
-    }
-
-    fn start_server() {
-        let listener = TcpListener::bind("127.0.0.1:4242").expect("could not bind socket");
-        fn handle_client(stream: &mut TcpStream, id: u8) {
-            let mut buf = [0; 128];
-            let response = b" END";
-            while let Ok(sz) = stream.read(&mut buf[..]) {
-                if sz > 0 {
-                    println!("[{}] {:?}", id, str::from_utf8(&buf[..sz]));
-                    stream.write(&buf[..sz]);
-                }
-            }
-        }
-
-        let mut count = 0;
-        thread::spawn(move || {
-            for conn in listener.incoming() {
-                match conn {
-                    Ok(mut stream) => {
-                        thread::spawn(move || {
-                            println!("got a new client: {}", count);
-                            handle_client(&mut stream, count)
-                        });
-                    }
-                    Err(e) => {
-                        println!("connection failed");
-                    }
-                }
-                count += 1;
-            }
-        });
-    }
-
-    fn start_server2(barrier: Arc<Barrier>) {
-        let listener = TcpListener::bind("127.0.0.1:2121").expect("could not bind socket");
-
-        fn handle_client(
-            stream: &mut TcpStream,
-            backend: &mut TcpStream,
-            id: u8,
-            barrier: &Arc<Barrier>,
-        ) {
-            let buf = [0; 128];
-            let response = b" END";
-            unsafe {
-                if let (Some(pipe_in), Some(pipe_out)) = (create_pipe(), create_pipe()) {
-                    barrier.wait();
-                    println!("{:?}", splice_in(stream, pipe_in));
-                    println!("{:?}", splice_out(pipe_in, backend));
-                    println!("{:?}", splice_in(backend, pipe_out));
-                    println!("{:?}", splice_out(pipe_out, stream));
-                }
-            }
-        }
-
-        let mut count = 0;
-        thread::spawn(move || {
+            let mut stream = TcpStream::connect(proxy_addr).expect("could not connect to proxy");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("could not set read timeout");
+            stream
+                .write_all(b"hello world")
+                .expect("could not write to proxy");
             barrier.wait();
 
-            for conn in listener.incoming() {
-                match conn {
-                    Ok(mut stream) => {
-                        let addr: SocketAddr =
-                            FromStr::from_str("127.0.0.1:4242").expect("could not parse address");
-                        let mut backend =
-                            TcpStream::connect(addr).expect("could not create tcp stream");
-                        println!("got a new client: {}", count);
-                        handle_client(&mut stream, &mut backend, count, &barrier)
+            let mut res = [0; 128];
+            let sz = stream
+                .read(&mut res[..])
+                .expect("could not read from stream");
+            println!("stream received {:?}", str::from_utf8(&res[..sz]));
+            assert_eq!(&res[..sz], &b"hello world"[..]);
+        });
+    }
+
+    fn start_server<'scope>(scope: &'scope thread::Scope<'scope, '_>) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("could not bind echo server socket");
+        let addr = listener
+            .local_addr()
+            .expect("could not get echo server address");
+
+        scope.spawn(move || {
+            // Accept a single connection — this test only needs one round-trip
+            let mut stream = listener.accept().expect("echo server: accept failed").0;
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("could not set echo read timeout");
+            let mut buf = [0; 128];
+            loop {
+                match stream.read(&mut buf[..]) {
+                    Ok(0) => break, // EOF — peer closed connection
+                    Ok(sz) => {
+                        println!("echo: {:?}", str::from_utf8(&buf[..sz]));
+                        stream.write_all(&buf[..sz]).expect("echo write failed");
                     }
-                    Err(e) => {
-                        println!("connection failed");
-                    }
+                    Err(_) => break, // timeout or error — exit
                 }
-                count += 1;
             }
         });
+
+        addr
+    }
+
+    fn start_server2<'scope>(
+        scope: &'scope thread::Scope<'scope, '_>,
+        backend_addr: SocketAddr,
+    ) -> (SocketAddr, Arc<Barrier>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("could not bind proxy socket");
+        let proxy_addr = listener.local_addr().expect("could not get proxy address");
+        let barrier = Arc::new(Barrier::new(2));
+        let barrier_clone = barrier.to_owned();
+
+        scope.spawn(move || {
+            barrier_clone.wait();
+
+            // Accept a single connection — this test only needs one round-trip
+            let stream = listener.accept().expect("proxy: accept failed").0;
+            let backend =
+                TcpStream::connect(backend_addr).expect("could not connect to echo backend");
+            println!("proxy: got a new client");
+
+            if let (Some(pipe_in), Some(pipe_out)) = (create_pipe(), create_pipe()) {
+                // client → backend
+                splice_with_retry(&stream, pipe_in, &backend);
+                // backend → client
+                splice_with_retry(&backend, pipe_out, &stream);
+            }
+        });
+
+        (proxy_addr, barrier)
     }
 }

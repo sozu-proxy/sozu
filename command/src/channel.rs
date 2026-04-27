@@ -1,3 +1,11 @@
+//! Bidirectional length-delimited unix-socket channel.
+//!
+//! Implements the master ↔ worker / master ↔ CLI message channel: each
+//! payload is preceded by a native `usize` length prefix (NOT a NUL
+//! separator — that scheme belongs to the state-file save format in
+//! `command/src/state.rs:1613`-`1630`). Bounded by the per-channel
+//! `max_buffer_size` (`channel.rs:71`) checked before payload allocation.
+
 use std::{
     cmp::min,
     fmt::Debug,
@@ -153,6 +161,11 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
     // We get the file descriptor of the MioUnixStream socket, create a standard library UnixStream,
     // set it to nonblocking, let go of the file descriptor
     fn set_nonblocking(&mut self, nonblocking: bool) -> Result<(), ChannelError> {
+        // SAFETY: `fd` is borrowed from `self.sock` for the duration of this
+        // block. We wrap it in a `StdUnixStream` to call `set_nonblocking`,
+        // then immediately release ownership again with `into_raw_fd` so the
+        // descriptor is not closed by `Drop`. `self.sock` retains the
+        // original ownership.
         unsafe {
             let fd = self.sock.as_raw_fd();
             let stream = StdUnixStream::from_raw_fd(fd);
@@ -170,6 +183,11 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
 
     /// set the read_timeout of the unix stream. This works only temporary, be sure to set the timeout to None afterwards.
     fn set_timeout(&mut self, timeout: Option<Duration>) -> Result<(), ChannelError> {
+        // SAFETY: `fd` is borrowed from `self.sock` for the duration of this
+        // block. We wrap it in a `StdUnixStream` to call `set_read_timeout`,
+        // then immediately release ownership again with `into_raw_fd` so the
+        // descriptor is not closed by `Drop`. `self.sock` retains the
+        // original ownership.
         unsafe {
             let fd = self.sock.as_raw_fd();
             let stream = StdUnixStream::from_raw_fd(fd);
@@ -395,8 +413,12 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
     ) -> Result<Rx, ChannelError> {
         let now = std::time::Instant::now();
 
-        // set a very small timeout, to repeat the loop often
-        self.set_timeout(Some(Duration::from_millis(10)))?;
+        // 10 ms = 100 syscalls/sec on idle WouldBlock, pinning a CPU on
+        // long blocking waits with no payload. 100 ms is
+        // a usability-acceptable resolution for the outer `timeout`
+        // deadline check (the wait is bounded by `timeout`, not by this
+        // value) and drops the steady-state read syscall rate to 10/sec.
+        self.set_timeout(Some(Duration::from_millis(100)))?;
 
         let status = loop {
             if let Some(timeout) = timeout {
@@ -433,6 +455,22 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
                 .try_into()
                 .map_err(|_| ChannelError::MismatchBufferSize)?;
             let message_len = usize::from_le_bytes(delimiter);
+
+            // Defense in depth: bound the parser-side length up-front.
+            // Without this an attacker who controls the
+            // first 8 bytes of a frame can declare an arbitrarily large
+            // message and drive `Buffer::grow` toward the
+            // `max_buffer_size` ceiling before any byte of payload has
+            // been read. Reject as `MessageTooLarge` so the read loop
+            // disconnects cleanly instead of running the doubling growth
+            // strategy on attacker-supplied numbers.
+            if message_len > self.max_buffer_size {
+                return Err(ChannelError::MessageTooLarge {
+                    message_len,
+                    capacity: self.front_buf.capacity(),
+                    max: self.max_buffer_size,
+                });
+            }
 
             if buffer.len() >= message_len {
                 let message = Rx::decode(&buffer[delimiter_size()..message_len])
@@ -857,11 +895,10 @@ mod tests {
 
         assert!(result.is_err());
         let err = result.unwrap_err();
-        let err_msg = format!("{}", err);
+        let err_msg = format!("{err}");
         assert!(
             err_msg.contains("too large") || err_msg.contains("cannot grow"),
-            "unexpected error: {}",
-            err_msg
+            "unexpected error: {err_msg}"
         );
     }
 
@@ -883,8 +920,7 @@ mod tests {
         let grown_capacity = channel.back_buf.capacity();
         assert!(
             grown_capacity > 100,
-            "expected buffer growth, got capacity {}",
-            grown_capacity
+            "expected buffer growth, got capacity {grown_capacity}"
         );
 
         // Simulate full drain by consuming all data
@@ -918,17 +954,12 @@ mod tests {
         }
 
         let grown = channel.back_buf.capacity();
-        assert!(
-            grown > 32,
-            "expected buffer growth beyond 32, got {}",
-            grown
-        );
+        assert!(grown > 32, "expected buffer growth beyond 32, got {grown}");
         // doubling from 32 should yield a power-of-two-like size (64, 128, 256, ...)
         // rather than the exact needed amount
         assert!(
             grown.is_power_of_two() || grown == 10000,
-            "expected doubling growth pattern, got {}",
-            grown
+            "expected doubling growth pattern, got {grown}"
         );
     }
 }

@@ -17,7 +17,7 @@ use rusty_ulid::Ulid;
 use sozu_command::{
     ObjectKind,
     config::MAX_LOOP_ITERATIONS,
-    logging::{EndpointRecord, LogContext},
+    logging::{EndpointRecord, LogContext, ansi_palette},
     proto::command::request::RequestType,
 };
 
@@ -40,7 +40,7 @@ use crate::{
     sozu_command::{
         proto::command::{
             Event, EventKind, ProxyProtocolConfig, RequestTcpFrontend, TcpListenerConfig,
-            WorkerRequest, WorkerResponse,
+            UpdateTcpListenerConfig, WorkerRequest, WorkerResponse,
         },
         ready::Ready,
         state::ClusterId,
@@ -62,19 +62,41 @@ StateMachineBuilder! {
 }
 
 /// This macro is defined uniquely in this module to help the tracking of kawa h1
-/// issues inside Sōzu
+/// issues inside Sōzu. Colored output uses the unified log-context scheme:
+/// bold bright-white protocol label, light-grey `Session` keyword, gray keys
+/// and bright-white values.
 macro_rules! log_context {
-    ($self:expr) => {
+    ($self:expr) => {{
+        let (open, reset, grey, gray, white) = ansi_palette();
         format!(
-            "TCP\t{}\tSession(frontend={}, backend={})\t >>>",
-            $self.log_context(),
-            $self.frontend_token.0,
-            $self
+            "{gray}{ctx}{reset}\t{open}TCP{reset}\t{grey}Session{reset}({gray}frontend{reset}={white}{frontend}{reset}, {gray}backend{reset}={white}{backend}{reset})\t >>>",
+            open = open,
+            reset = reset,
+            grey = grey,
+            gray = gray,
+            white = white,
+            ctx = $self.log_context(),
+            frontend = $self.frontend_token.0,
+            backend = $self
                 .backend_token
                 .map(|token| token.0.to_string())
                 .unwrap_or_else(|| "<none>".to_string()),
         )
-    };
+    }};
+}
+
+/// Module-level prefix for log lines emitted from this file when no
+/// [`TcpSession`] is in scope. Produces a bold bright-white `TCP` label
+/// (uniform with the per-session `log_context!`) when the logger is in
+/// colored mode. Used by [`TcpProxy`] callbacks (notify, accept,
+/// create_session, soft_stop, hard_stop, status) and the `testing`
+/// helper module which own a listener/token map but have no
+/// `frontend_token` of their own.
+macro_rules! log_module_context {
+    () => {{
+        let (open, reset, _, _, _) = sozu_command::logging::ansi_palette();
+        format!("{open}TCP{reset}\t >>>", open = open, reset = reset)
+    }};
 }
 
 pub struct TcpSession {
@@ -177,6 +199,7 @@ impl TcpSession {
                     listener.clone(),
                     Protocol::TCP,
                     request_id,
+                    request_id,
                     frontend_address,
                     WebSocketContext::Tcp,
                 );
@@ -228,6 +251,15 @@ impl TcpSession {
             client_rtt: socket_rtt(self.state.front_socket()),
             server_rtt: None,
             user_agent: None,
+            x_request_id: None,
+            // TCP listener accepts a raw `MioTcpStream` (lib/src/tcp.rs:128)
+            // — Sōzu does not terminate TLS on the TCP path, so all five TLS
+            // fields and the parsed XFF chain are always absent here.
+            tls_version: None,
+            tls_cipher: None,
+            tls_sni: None,
+            tls_alpn: None,
+            xff_chain: None,
             service_time: self.metrics.service_time(),
             response_time: self.metrics.backend_response_time(),
             request_time: self.metrics.request_time(),
@@ -259,7 +291,8 @@ impl TcpSession {
 
     fn log_context(&self) -> LogContext<'_> {
         LogContext {
-            request_id: self.request_id,
+            session_id: self.request_id,
+            request_id: Some(self.request_id),
             cluster_id: self.cluster_id.as_deref(),
             backend_id: self.backend_id.as_deref(),
         }
@@ -519,8 +552,10 @@ impl TcpSession {
                         self.metrics.backend_id.as_deref()
                     );
                     info!(
-                        "backend server {} at {} is up",
-                        backend.backend_id, backend.address
+                        "{} backend server {} at {} is up",
+                        log_context!(self),
+                        backend.backend_id,
+                        backend.address
                     );
                     push_event(Event {
                         kind: EventKind::BackendUp as i32,
@@ -563,8 +598,10 @@ impl TcpSession {
             );
             if !already_unavailable && backend.retry_policy.is_down() {
                 error!(
-                    "backend server {} at {} is down",
-                    backend.backend_id, backend.address
+                    "{} backend server {} at {} is down",
+                    log_context!(self),
+                    backend.backend_id,
+                    backend.address
                 );
                 incr!(
                     "backend.down",
@@ -611,7 +648,10 @@ impl TcpSession {
         if back_connected.is_connecting() {
             if self.back_readiness().unwrap().event.is_hup() && !self.test_back_socket() {
                 //retry connecting the backend
-                debug!("error connecting to backend, trying again");
+                debug!(
+                    "{} error connecting to backend, trying again",
+                    log_context!(self)
+                );
                 self.connection_attempt += 1;
                 self.fail_backend_connection();
 
@@ -619,11 +659,20 @@ impl TcpSession {
                 self.close_backend();
                 let connection_result = self.connect_to_backend(session.clone());
                 if let Err(err) = &connection_result {
-                    error!(
-                        "{} Error connecting to backend: {}",
-                        log_context!(self),
-                        err
-                    );
+                    match err {
+                        // Already logged at warn! + metered at the retry-budget
+                        // gate in connect_to_backend; avoid double-emission.
+                        BackendConnectionError::MaxConnectionRetries(_) => trace!(
+                            "{} Error connecting to backend: {}",
+                            log_context!(self),
+                            err
+                        ),
+                        _ => warn!(
+                            "{} Error connecting to backend: {}",
+                            log_context!(self),
+                            err
+                        ),
+                    }
                 }
 
                 if let Some(state_result) = handle_connection_result(connection_result) {
@@ -636,11 +685,18 @@ impl TcpSession {
         } else if back_connected == BackendConnectionStatus::NotConnected {
             let connection_result = self.connect_to_backend(session.clone());
             if let Err(err) = &connection_result {
-                error!(
-                    "{} Error connecting to backend: {}",
-                    log_context!(self),
-                    err
-                );
+                match err {
+                    BackendConnectionError::MaxConnectionRetries(_) => trace!(
+                        "{} Error connecting to backend: {}",
+                        log_context!(self),
+                        err
+                    ),
+                    _ => warn!(
+                        "{} Error connecting to backend: {}",
+                        log_context!(self),
+                        err
+                    ),
+                }
             }
 
             if let Some(state_result) = handle_connection_result(connection_result) {
@@ -807,6 +863,10 @@ impl TcpSession {
 
             let log_context = log_context!(self);
             if let Some(sock) = self.back_socket_mut() {
+                // TCP-only backend in the pure-TCP proxy: no outbound TLS
+                // buffer to truncate, so `Shutdown::Both` is the right call.
+                // If the TCP listener ever gains an inline TLS upgrade,
+                // switch to `Shutdown::Write` here.
                 if let Err(e) = sock.shutdown(Shutdown::Both) {
                     if e.kind() != ErrorKind::NotConnected {
                         error!(
@@ -845,7 +905,12 @@ impl TcpSession {
         self.cluster_id = Some(cluster_id.clone());
 
         if self.connection_attempt >= CONN_RETRIES {
-            error!(
+            incr!(
+                "backend.connect.retries_exhausted",
+                self.cluster_id.as_deref(),
+                self.metrics.backend_id.as_deref()
+            );
+            warn!(
                 "{} Max connection attempt reached ({})",
                 log_context!(self),
                 self.connection_attempt
@@ -943,6 +1008,11 @@ impl ProxySession for TcpSession {
         self.cancel_timeouts();
 
         let front_socket = self.state.front_socket();
+        // TCP listener is plaintext at this layer — `Shutdown::Both` does not
+        // truncate any TLS write buffer, so the canonical anti-pattern
+        // (forces a TCP RST on the read direction, dropping in-flight bytes)
+        // does not apply. Move to `Shutdown::Write` if a TLS upgrade ever
+        // wraps this listener.
         if let Err(e) = front_socket.shutdown(Shutdown::Both) {
             // error 107 NotConnected can happen when was never fully connected, or was already disconnected due to error
             if e.kind() != ErrorKind::NotConnected {
@@ -1115,6 +1185,17 @@ impl ListenerHandler for TcpListener {
             None => self.tags.remove(&key),
         };
     }
+
+    fn protocol(&self) -> Protocol {
+        Protocol::TCP
+    }
+
+    fn public_address(&self) -> SocketAddr {
+        self.config
+            .public_address
+            .map(|addr| addr.into())
+            .unwrap_or(self.address)
+    }
 }
 
 impl TcpListener {
@@ -1154,6 +1235,28 @@ impl TcpListener {
         self.listener = Some(listener);
         self.active = true;
         Ok(self.token)
+    }
+
+    /// Apply a partial-update patch to this TCP listener's live configuration.
+    ///
+    /// Fields absent in the patch (i.e. `None`) are preserved unchanged.
+    pub fn update_config(&mut self, patch: &UpdateTcpListenerConfig) -> Result<(), ListenerError> {
+        if let Some(v) = patch.public_address {
+            self.config.public_address = Some(v);
+        }
+        if let Some(v) = patch.expect_proxy {
+            self.config.expect_proxy = v;
+        }
+        if let Some(v) = patch.front_timeout {
+            self.config.front_timeout = v;
+        }
+        if let Some(v) = patch.back_timeout {
+            self.config.back_timeout = v;
+        }
+        if let Some(v) = patch.connect_timeout {
+            self.config.connect_timeout = v;
+        }
+        Ok(())
     }
 }
 
@@ -1253,6 +1356,9 @@ impl TcpProxy {
             .filter_map(|listener| {
                 let mut owned = listener.borrow_mut();
                 if let Some(listener) = owned.listener.take() {
+                    // Reset `active` so a subsequent `activate()` re-binds
+                    // instead of short-circuiting on the stale flag.
+                    owned.active = false;
                     return Some((owned.address, listener));
                 }
 
@@ -1278,7 +1384,28 @@ impl TcpProxy {
             .take()
             .ok_or(ProxyError::UnactivatedListener)?;
 
+        // Reset `active` so a subsequent `activate()` re-binds instead of
+        // short-circuiting on the stale flag.
+        owned.active = false;
+
         Ok((owned.token, taken_listener))
+    }
+
+    /// Apply a partial-update patch to the identified TCP listener.
+    pub fn update_listener(&mut self, patch: UpdateTcpListenerConfig) -> Result<(), ProxyError> {
+        let address: SocketAddr = patch.address.into();
+        let listener = self
+            .listeners
+            .values()
+            .find(|l| l.borrow().address == address)
+            .ok_or(ProxyError::NoListenerFound(address))?;
+        listener
+            .borrow_mut()
+            .update_config(&patch)
+            .map_err(|listener_error| ProxyError::ListenerActivation {
+                address,
+                listener_error,
+            })
     }
 
     pub fn add_tcp_front(&mut self, front: RequestTcpFrontend) -> Result<(), ProxyError> {
@@ -1340,7 +1467,11 @@ impl ProxyConfiguration for TcpProxy {
                 WorkerResponse::ok(message.id)
             }
             RequestType::SoftStop(_) => {
-                info!("{} processing soft shutdown", message.id);
+                info!(
+                    "{} {} processing soft shutdown",
+                    log_module_context!(),
+                    message.id
+                );
                 let listeners: HashMap<_, _> = self.listeners.drain().collect();
                 for (_, l) in listeners.iter() {
                     l.borrow_mut()
@@ -1351,7 +1482,7 @@ impl ProxyConfiguration for TcpProxy {
                 WorkerResponse::processing(message.id)
             }
             RequestType::HardStop(_) => {
-                info!("{} hard shutdown", message.id);
+                info!("{} {} hard shutdown", log_module_context!(), message.id);
                 let mut listeners: HashMap<_, _> = self.listeners.drain().collect();
                 for (_, l) in listeners.drain() {
                     l.borrow_mut()
@@ -1362,7 +1493,7 @@ impl ProxyConfiguration for TcpProxy {
                 WorkerResponse::ok(message.id)
             }
             RequestType::Status(_) => {
-                info!("{} status", message.id);
+                info!("{} {} status", log_module_context!(), message.id);
                 WorkerResponse::ok(message.id)
             }
             RequestType::AddCluster(cluster) => {
@@ -1391,8 +1522,10 @@ impl ProxyConfiguration for TcpProxy {
             }
             command => {
                 debug!(
-                    "{} unsupported message for TCP proxy, ignoring {:?}",
-                    message.id, command
+                    "{} {} unsupported message for TCP proxy, ignoring {:?}",
+                    log_module_context!(),
+                    message.id,
+                    command
                 );
                 WorkerResponse::error(message.id, "unsupported message")
             }
@@ -1409,7 +1542,7 @@ impl ProxyConfiguration for TcpProxy {
                     .map_err(|e| match e.kind() {
                         ErrorKind::WouldBlock => AcceptError::WouldBlock,
                         _ => {
-                            error!("accept() IO error: {:?}", e);
+                            error!("{} accept() IO error: {:?}", log_module_context!(), e);
                             AcceptError::IoError
                         }
                     })
@@ -1441,9 +1574,10 @@ impl ProxyConfiguration for TcpProxy {
         let (front_buffer, back_buffer) = match (pool.checkout(), pool.checkout()) {
             (Some(fb), Some(bb)) => (fb, bb),
             _ => {
-                error!("could not get buffers from pool");
+                error!("{} could not get buffers from pool", log_module_context!());
                 error!(
-                    "Buffer capacity has been reached, stopping to accept new connections for now"
+                    "{} Buffer capacity has been reached, stopping to accept new connections for now",
+                    log_module_context!()
                 );
                 gauge!("accept_queue.backpressure", 1);
                 self.sessions.borrow_mut().can_accept = false;
@@ -1454,7 +1588,8 @@ impl ProxyConfiguration for TcpProxy {
 
         if owned.cluster_id.is_none() {
             error!(
-                "listener at address {:?} has no linked cluster",
+                "{} listener at address {:?} has no linked cluster",
+                log_module_context!(),
                 owned.address
             );
             return Err(AcceptError::IoError);
@@ -1467,8 +1602,10 @@ impl ProxyConfiguration for TcpProxy {
 
         if let Err(e) = frontend_sock.set_nodelay(true) {
             error!(
-                "error setting nodelay on front socket({:?}): {:?}",
-                frontend_sock, e
+                "{} error setting nodelay on front socket({:?}): {:?}",
+                log_module_context!(),
+                frontend_sock,
+                e
             );
         }
 
@@ -1482,8 +1619,10 @@ impl ProxyConfiguration for TcpProxy {
             Interest::READABLE | Interest::WRITABLE,
         ) {
             error!(
-                "error registering front socket({:?}): {:?}",
-                frontend_sock, register_error
+                "{} error registering front socket({:?}): {:?}",
+                log_module_context!(),
+                frontend_sock,
+                register_error
             );
             return Err(AcceptError::RegisterError);
         }
@@ -1569,9 +1708,9 @@ pub mod testing {
         )
         .with_context(|| "Failed at creating server")?;
 
-        debug!("starting event loop");
+        debug!("{} starting event loop", log_module_context!());
         server.run();
-        debug!("ending event loop");
+        debug!("{} ending event loop", log_module_context!());
         Ok(())
     }
 }
@@ -1587,20 +1726,20 @@ mod tests {
             atomic::{AtomicBool, Ordering},
         },
         thread,
+        time::Duration,
     };
 
     use sozu_command::{
         channel::Channel,
         config::ListenerBuilder,
         proto::command::{
-            LoadBalancingParams, RequestTcpFrontend, SocketAddress, WorkerRequest, WorkerResponse,
-            request::RequestType,
+            LoadBalancingParams, RequestTcpFrontend, SocketAddress, SoftStop, WorkerRequest,
+            WorkerResponse, request::RequestType,
         },
     };
 
     use super::testing::start_tcp_worker;
     use crate::testing::*;
-    static TEST_FINISHED: AtomicBool = AtomicBool::new(false);
 
     /*
     #[test]
@@ -1619,106 +1758,147 @@ mod tests {
     fn round_trip() {
         setup_test_logger!();
         let barrier = Arc::new(Barrier::new(2));
-        start_server(barrier.clone());
-        let _tx = start_proxy().expect("Could not start proxy");
+        let test_finished = Arc::new(AtomicBool::new(false));
+
+        let front_port1 = provide_port();
+        let front_port2 = provide_port();
+
+        let backend_port = start_server(barrier.clone(), test_finished.clone());
+        let mut command =
+            start_proxy(backend_port, front_port1, front_port2).expect("Could not start proxy");
         barrier.wait();
 
-        let mut s1 = TcpStream::connect("127.0.0.1:1234").expect("could not connect");
-        let s3 = TcpStream::connect("127.0.0.1:1234").expect("could not connect");
-        let mut s2 = TcpStream::connect("127.0.0.1:1234").expect("could not connect");
+        thread::scope(|_s| {
+            let front_addr = format!("127.0.0.1:{front_port1}");
 
-        s1.write(&b"hello "[..])
-            .map_err(|e| {
-                TEST_FINISHED.store(true, Ordering::Relaxed);
-                e
-            })
-            .unwrap();
-        println!("s1 sent");
+            let mut s1 = TcpStream::connect(&front_addr).expect("could not connect");
+            s1.set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("could not set read timeout on s1");
 
-        s2.write(&b"pouet pouet"[..])
-            .map_err(|e| {
-                TEST_FINISHED.store(true, Ordering::Relaxed);
-                e
-            })
-            .unwrap();
+            let s3 = TcpStream::connect(&front_addr).expect("could not connect");
 
-        println!("s2 sent");
+            let mut s2 = TcpStream::connect(&front_addr).expect("could not connect");
+            s2.set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("could not set read timeout on s2");
 
-        let mut res = [0; 128];
-        s1.write(&b"coucou"[..])
-            .map_err(|e| {
-                TEST_FINISHED.store(true, Ordering::Relaxed);
-                e
-            })
-            .unwrap();
+            s1.write_all(b"hello ").expect("could not write to s1");
+            println!("s1 sent");
 
-        s3.shutdown(Shutdown::Both).unwrap();
-        let sz2 = s2
-            .read(&mut res[..])
-            .map_err(|e| {
-                TEST_FINISHED.store(true, Ordering::Relaxed);
-                e
-            })
-            .expect("could not read from socket");
-        println!("s2 received {:?}", str::from_utf8(&res[..sz2]));
-        assert_eq!(&res[..sz2], &b"pouet pouet"[..]);
+            s2.write_all(b"pouet pouet").expect("could not write to s2");
+            println!("s2 sent");
 
-        let sz1 = s1
-            .read(&mut res[..])
-            .map_err(|e| {
-                TEST_FINISHED.store(true, Ordering::Relaxed);
-                e
-            })
-            .expect("could not read from socket");
-        println!(
-            "s1 received again({}): {:?}",
-            sz1,
-            str::from_utf8(&res[..sz1])
-        );
-        assert_eq!(&res[..sz1], &b"hello coucou"[..]);
-        TEST_FINISHED.store(true, Ordering::Relaxed);
+            let mut res = [0; 128];
+            s1.write_all(b"coucou").expect("could not write to s1");
+
+            s3.shutdown(Shutdown::Both).expect("could not shutdown s3");
+
+            let sz2 = s2
+                .read(&mut res[..])
+                .expect("could not read from socket s2");
+            println!("s2 received {:?}", str::from_utf8(&res[..sz2]));
+            assert_eq!(&res[..sz2], &b"pouet pouet"[..]);
+
+            let sz1 = s1
+                .read(&mut res[..])
+                .expect("could not read from socket s1");
+            println!(
+                "s1 received again({}): {:?}",
+                sz1,
+                str::from_utf8(&res[..sz1])
+            );
+            assert_eq!(&res[..sz1], &b"hello coucou"[..]);
+
+            // Signal the echo server to stop
+            test_finished.store(true, Ordering::Relaxed);
+
+            // Send SoftStop to the sozu worker so server.run() exits cleanly
+            command
+                .write_message(&WorkerRequest {
+                    id: "ID_SOFTSTOP".to_owned(),
+                    content: RequestType::SoftStop(SoftStop {}).into(),
+                })
+                .expect("could not send SoftStop to sozu worker");
+        });
     }
 
-    fn start_server(barrier: Arc<Barrier>) {
-        let listener = TcpListener::bind("127.0.0.1:5678").expect("could not bind");
-        fn handle_client(stream: &mut TcpStream, id: u8) {
-            let mut buf = [0; 128];
-            let _response = b" END";
-            while let Ok(sz) = stream.read(&mut buf[..]) {
-                if sz > 0 {
-                    println!("ECHO[{}] got \"{:?}\"", id, str::from_utf8(&buf[..sz]));
-                    stream.write(&buf[..sz]).unwrap();
-                }
-                if TEST_FINISHED.load(Ordering::Relaxed) {
-                    println!("backend server stopping");
-                    break;
-                }
-            }
-        }
+    /// Start an echo server on an ephemeral port.
+    /// Returns the port the server is listening on.
+    fn start_server(barrier: Arc<Barrier>, test_finished: Arc<AtomicBool>) -> u16 {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("could not bind echo server listener");
+        let port = listener
+            .local_addr()
+            .expect("could not get echo server local address")
+            .port();
 
-        let mut count = 0;
+        listener
+            .set_nonblocking(true)
+            .expect("could not set echo server listener to non-blocking");
+
         thread::spawn(move || {
             barrier.wait();
-            for conn in listener.incoming() {
-                match conn {
-                    Ok(mut stream) => {
+            let mut count: u8 = 0;
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let finished = test_finished.clone();
                         thread::spawn(move || {
                             println!("got a new client: {count}");
-                            handle_client(&mut stream, count)
+                            stream
+                                .set_read_timeout(Some(Duration::from_secs(2)))
+                                .expect("could not set read timeout on echo client");
+                            let mut buf = [0; 128];
+                            loop {
+                                match stream.read(&mut buf[..]) {
+                                    Ok(0) => break,
+                                    Ok(sz) => {
+                                        println!(
+                                            "ECHO[{count}] got \"{:?}\"",
+                                            str::from_utf8(&buf[..sz])
+                                        );
+                                        stream
+                                            .write_all(&buf[..sz])
+                                            .expect("could not echo data back");
+                                    }
+                                    Err(ref e)
+                                        if e.kind() == std::io::ErrorKind::WouldBlock
+                                            || e.kind() == std::io::ErrorKind::TimedOut =>
+                                    {
+                                        if finished.load(Ordering::Relaxed) {
+                                            println!("backend server stopping (client handler)");
+                                            break;
+                                        }
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
                         });
+                        count = count.wrapping_add(1);
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if test_finished.load(Ordering::Relaxed) {
+                            println!("backend server stopping (accept loop)");
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(50));
                     }
                     Err(e) => {
                         println!("connection failed: {e:?}");
                     }
                 }
-                count += 1;
             }
         });
+
+        port
     }
 
-    /// used in tests only
-    pub fn start_proxy() -> anyhow::Result<Channel<WorkerRequest, WorkerResponse>> {
-        let config = ListenerBuilder::new_tcp(SocketAddress::new_v4(127, 0, 0, 1, 1234))
+    /// Start a sozu TCP proxy worker with the given backend and frontend ports.
+    fn start_proxy(
+        backend_port: u16,
+        front_port1: u16,
+        front_port2: u16,
+    ) -> anyhow::Result<Channel<WorkerRequest, WorkerResponse>> {
+        let config = ListenerBuilder::new_tcp(SocketAddress::new_v4(127, 0, 0, 1, front_port1))
             .to_tcp(None)
             .expect("could not create listener config");
 
@@ -1729,17 +1909,19 @@ mod tests {
             start_tcp_worker(config, 100, 16384, channel).expect("could not start the tcp server");
         });
 
-        command.blocking().unwrap();
+        command
+            .blocking()
+            .expect("could not set command channel to blocking");
         {
             let front = RequestTcpFrontend {
-                cluster_id: String::from("yolo"),
-                address: SocketAddress::new_v4(127, 0, 0, 1, 1234),
+                cluster_id: "yolo".to_owned(),
+                address: SocketAddress::new_v4(127, 0, 0, 1, front_port1),
                 ..Default::default()
             };
             let backend = sozu_command_lib::response::Backend {
-                cluster_id: String::from("yolo"),
-                backend_id: String::from("yolo-0"),
-                address: SocketAddress::new_v4(127, 0, 0, 1, 5678).into(),
+                cluster_id: "yolo".to_owned(),
+                backend_id: "yolo-0".to_owned(),
+                address: SocketAddress::new_v4(127, 0, 0, 1, backend_port).into(),
                 load_balancing_parameters: Some(LoadBalancingParams::default()),
                 sticky_id: None,
                 backup: None,
@@ -1747,46 +1929,45 @@ mod tests {
 
             command
                 .write_message(&WorkerRequest {
-                    id: String::from("ID_YOLO1"),
+                    id: "ID_YOLO1".to_owned(),
                     content: RequestType::AddTcpFrontend(front).into(),
                 })
-                .unwrap();
+                .expect("could not send AddTcpFrontend for front1");
             command
                 .write_message(&WorkerRequest {
-                    id: String::from("ID_YOLO2"),
+                    id: "ID_YOLO2".to_owned(),
                     content: RequestType::AddBackend(backend.to_add_backend()).into(),
                 })
-                .unwrap();
+                .expect("could not send AddBackend for front1");
         }
         {
             let front = RequestTcpFrontend {
-                cluster_id: String::from("yolo"),
-                address: SocketAddress::new_v4(127, 0, 0, 1, 1235),
+                cluster_id: "yolo".to_owned(),
+                address: SocketAddress::new_v4(127, 0, 0, 1, front_port2),
                 ..Default::default()
             };
             let backend = sozu_command::response::Backend {
-                cluster_id: String::from("yolo"),
-                backend_id: String::from("yolo-0"),
-                address: SocketAddress::new_v4(127, 0, 0, 1, 5678).into(),
+                cluster_id: "yolo".to_owned(),
+                backend_id: "yolo-0".to_owned(),
+                address: SocketAddress::new_v4(127, 0, 0, 1, backend_port).into(),
                 load_balancing_parameters: Some(LoadBalancingParams::default()),
                 sticky_id: None,
                 backup: None,
             };
             command
                 .write_message(&WorkerRequest {
-                    id: String::from("ID_YOLO3"),
+                    id: "ID_YOLO3".to_owned(),
                     content: RequestType::AddTcpFrontend(front).into(),
                 })
-                .unwrap();
+                .expect("could not send AddTcpFrontend for front2");
             command
                 .write_message(&WorkerRequest {
-                    id: String::from("ID_YOLO4"),
+                    id: "ID_YOLO4".to_owned(),
                     content: RequestType::AddBackend(backend.to_add_backend()).into(),
                 })
-                .unwrap();
+                .expect("could not send AddBackend for front2");
         }
 
-        // not sure why four times
         for _ in 0..4 {
             println!(
                 "read_message: {:?}",

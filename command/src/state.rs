@@ -18,11 +18,13 @@ use crate::{
     proto::{
         command::{
             ActivateListener, AddBackend, AddCertificate, CertificateAndKey, Cluster,
-            ClusterInformation, DeactivateListener, FrontendFilters, HttpListenerConfig,
-            HttpsListenerConfig, InitialState, ListedFrontends, ListenerType, ListenersList,
-            PathRule, QueryCertificatesFilters, RemoveBackend, RemoveCertificate, RemoveListener,
-            ReplaceCertificate, Request, RequestCounts, RequestHttpFrontend, RequestTcpFrontend,
-            SocketAddress, TcpListenerConfig, WorkerRequest, request::RequestType,
+            ClusterInformation, CustomHttpAnswers, DeactivateListener, FrontendFilters,
+            HttpListenerConfig, HttpsListenerConfig, InitialState, ListedFrontends, ListenerType,
+            ListenersList, PathRule, QueryCertificatesFilters, RemoveBackend, RemoveCertificate,
+            RemoveListener, ReplaceCertificate, Request, RequestCounts, RequestHttpFrontend,
+            RequestTcpFrontend, SocketAddress, TcpListenerConfig, UpdateHttpListenerConfig,
+            UpdateHttpsListenerConfig, UpdateTcpListenerConfig, WorkerRequest,
+            request::RequestType,
         },
         display::format_request_type,
     },
@@ -58,6 +60,11 @@ pub enum StateError {
     FrontendConversion { frontend: String, error: String },
     #[error("Could not write state to file: {0}")]
     FileError(std::io::Error),
+    #[error("Invalid value for field '{field}': {reason}")]
+    InvalidValue {
+        field: &'static str,
+        reason: &'static str,
+    },
 }
 
 /// The `ConfigState` represents the state of Sōzu's business, which is to forward traffic
@@ -122,6 +129,9 @@ impl ConfigState {
             RequestType::RemoveTcpFrontend(front) => self.remove_tcp_frontend(front),
             RequestType::AddBackend(add_backend) => self.add_backend(add_backend),
             RequestType::RemoveBackend(backend) => self.remove_backend(backend),
+            RequestType::UpdateHttpListener(patch) => self.update_http_listener(patch),
+            RequestType::UpdateHttpsListener(patch) => self.update_https_listener(patch),
+            RequestType::UpdateTcpListener(patch) => self.update_tcp_listener(patch),
 
             // This is to avoid the error message
             RequestType::Logging(_)
@@ -241,6 +251,259 @@ impl ConfigState {
     fn remove_tcp_listener(&mut self, address: &SocketAddr) -> Result<(), StateError> {
         if self.tcp_listeners.remove(address).is_none() {
             return Err(StateError::NoChange);
+        }
+        Ok(())
+    }
+
+    /// Validate and apply a partial patch to an existing HTTP listener.
+    ///
+    /// Only `Some` fields in the patch are written; `None` fields preserve the
+    /// current value. Returns `StateError::NotFound` if the address is unknown,
+    /// `StateError::InvalidValue` if a flood-knob value is below the required
+    /// minimum.
+    fn update_http_listener(&mut self, patch: &UpdateHttpListenerConfig) -> Result<(), StateError> {
+        validate_h2_flood_knobs_http(patch)?;
+
+        let address: SocketAddr = patch.address.into();
+        let listener =
+            self.http_listeners
+                .get_mut(&address)
+                .ok_or_else(|| StateError::NotFound {
+                    kind: ObjectKind::HttpListener,
+                    id: address.to_string(),
+                })?;
+
+        // Shared session-at-accept / per-connection knobs
+        if let Some(v) = patch.public_address {
+            listener.public_address = Some(v);
+        }
+        if let Some(v) = patch.expect_proxy {
+            listener.expect_proxy = v;
+        }
+        if let Some(ref v) = patch.sticky_name {
+            listener.sticky_name = v.to_owned();
+        }
+        if let Some(v) = patch.front_timeout {
+            listener.front_timeout = v;
+        }
+        if let Some(v) = patch.back_timeout {
+            listener.back_timeout = v;
+        }
+        if let Some(v) = patch.connect_timeout {
+            listener.connect_timeout = v;
+        }
+        if let Some(v) = patch.request_timeout {
+            listener.request_timeout = v;
+        }
+        if let Some(patch_answers) = patch.http_answers.as_ref() {
+            merge_custom_http_answers(&mut listener.http_answers, patch_answers);
+        }
+        // H2 flood knobs
+        if let Some(v) = patch.h2_max_rst_stream_per_window {
+            listener.h2_max_rst_stream_per_window = Some(v);
+        }
+        if let Some(v) = patch.h2_max_ping_per_window {
+            listener.h2_max_ping_per_window = Some(v);
+        }
+        if let Some(v) = patch.h2_max_settings_per_window {
+            listener.h2_max_settings_per_window = Some(v);
+        }
+        if let Some(v) = patch.h2_max_empty_data_per_window {
+            listener.h2_max_empty_data_per_window = Some(v);
+        }
+        if let Some(v) = patch.h2_max_continuation_frames {
+            listener.h2_max_continuation_frames = Some(v);
+        }
+        if let Some(v) = patch.h2_max_glitch_count {
+            listener.h2_max_glitch_count = Some(v);
+        }
+        if let Some(v) = patch.h2_initial_connection_window {
+            listener.h2_initial_connection_window = Some(v);
+        }
+        if let Some(v) = patch.h2_max_concurrent_streams {
+            listener.h2_max_concurrent_streams = Some(v);
+        }
+        if let Some(v) = patch.h2_stream_shrink_ratio {
+            listener.h2_stream_shrink_ratio = Some(v);
+        }
+        if let Some(v) = patch.h2_max_rst_stream_lifetime {
+            listener.h2_max_rst_stream_lifetime = Some(v);
+        }
+        if let Some(v) = patch.h2_max_rst_stream_abusive_lifetime {
+            listener.h2_max_rst_stream_abusive_lifetime = Some(v);
+        }
+        if let Some(v) = patch.h2_max_rst_stream_emitted_lifetime {
+            listener.h2_max_rst_stream_emitted_lifetime = Some(v);
+        }
+        if let Some(v) = patch.h2_max_header_list_size {
+            listener.h2_max_header_list_size = Some(v);
+        }
+        if let Some(v) = patch.h2_max_header_table_size {
+            listener.h2_max_header_table_size = Some(v);
+        }
+        if let Some(v) = patch.h2_stream_idle_timeout_seconds {
+            listener.h2_stream_idle_timeout_seconds = Some(v);
+        }
+        // 0 is valid for graceful_shutdown_deadline (means "wait forever")
+        if let Some(v) = patch.h2_graceful_shutdown_deadline_seconds {
+            listener.h2_graceful_shutdown_deadline_seconds = Some(v);
+        }
+        if let Some(v) = patch.h2_max_window_update_stream0_per_window {
+            listener.h2_max_window_update_stream0_per_window = Some(v);
+        }
+        if let Some(ref v) = patch.sozu_id_header {
+            validate_sozu_id_header(v)?;
+            listener.sozu_id_header = Some(v.to_owned());
+        }
+        Ok(())
+    }
+
+    /// Validate and apply a partial patch to an existing HTTPS listener.
+    ///
+    /// Only `Some` fields in the patch are written; `None` fields preserve the
+    /// current value. Returns `StateError::NotFound` if the address is unknown,
+    /// `StateError::InvalidValue` if a flood-knob value is below the required
+    /// minimum or an ALPN value is unknown.
+    fn update_https_listener(
+        &mut self,
+        patch: &UpdateHttpsListenerConfig,
+    ) -> Result<(), StateError> {
+        validate_h2_flood_knobs_https(patch)?;
+
+        let address: SocketAddr = patch.address.into();
+        let listener =
+            self.https_listeners
+                .get_mut(&address)
+                .ok_or_else(|| StateError::NotFound {
+                    kind: ObjectKind::HttpsListener,
+                    id: address.to_string(),
+                })?;
+
+        // Shared session-at-accept / per-connection knobs
+        if let Some(v) = patch.public_address {
+            listener.public_address = Some(v);
+        }
+        if let Some(v) = patch.expect_proxy {
+            listener.expect_proxy = v;
+        }
+        if let Some(ref v) = patch.sticky_name {
+            listener.sticky_name = v.to_owned();
+        }
+        if let Some(v) = patch.front_timeout {
+            listener.front_timeout = v;
+        }
+        if let Some(v) = patch.back_timeout {
+            listener.back_timeout = v;
+        }
+        if let Some(v) = patch.connect_timeout {
+            listener.connect_timeout = v;
+        }
+        if let Some(v) = patch.request_timeout {
+            listener.request_timeout = v;
+        }
+        if let Some(patch_answers) = patch.http_answers.as_ref() {
+            merge_custom_http_answers(&mut listener.http_answers, patch_answers);
+        }
+        // HTTPS-only knobs
+        if let Some(ref alpn_wrapper) = patch.alpn_protocols {
+            validate_alpn_protocols(&alpn_wrapper.values)?;
+            // Empty values vec = reset to default (runtime treats empty as default)
+            listener.alpn_protocols = alpn_wrapper.values.clone();
+        }
+        if let Some(v) = patch.strict_sni_binding {
+            listener.strict_sni_binding = Some(v);
+        }
+        if let Some(v) = patch.disable_http11 {
+            listener.disable_http11 = Some(v);
+        }
+        // H2 flood knobs
+        if let Some(v) = patch.h2_max_rst_stream_per_window {
+            listener.h2_max_rst_stream_per_window = Some(v);
+        }
+        if let Some(v) = patch.h2_max_ping_per_window {
+            listener.h2_max_ping_per_window = Some(v);
+        }
+        if let Some(v) = patch.h2_max_settings_per_window {
+            listener.h2_max_settings_per_window = Some(v);
+        }
+        if let Some(v) = patch.h2_max_empty_data_per_window {
+            listener.h2_max_empty_data_per_window = Some(v);
+        }
+        if let Some(v) = patch.h2_max_continuation_frames {
+            listener.h2_max_continuation_frames = Some(v);
+        }
+        if let Some(v) = patch.h2_max_glitch_count {
+            listener.h2_max_glitch_count = Some(v);
+        }
+        if let Some(v) = patch.h2_initial_connection_window {
+            listener.h2_initial_connection_window = Some(v);
+        }
+        if let Some(v) = patch.h2_max_concurrent_streams {
+            listener.h2_max_concurrent_streams = Some(v);
+        }
+        if let Some(v) = patch.h2_stream_shrink_ratio {
+            listener.h2_stream_shrink_ratio = Some(v);
+        }
+        if let Some(v) = patch.h2_max_rst_stream_lifetime {
+            listener.h2_max_rst_stream_lifetime = Some(v);
+        }
+        if let Some(v) = patch.h2_max_rst_stream_abusive_lifetime {
+            listener.h2_max_rst_stream_abusive_lifetime = Some(v);
+        }
+        if let Some(v) = patch.h2_max_rst_stream_emitted_lifetime {
+            listener.h2_max_rst_stream_emitted_lifetime = Some(v);
+        }
+        if let Some(v) = patch.h2_max_header_list_size {
+            listener.h2_max_header_list_size = Some(v);
+        }
+        if let Some(v) = patch.h2_max_header_table_size {
+            listener.h2_max_header_table_size = Some(v);
+        }
+        if let Some(v) = patch.h2_stream_idle_timeout_seconds {
+            listener.h2_stream_idle_timeout_seconds = Some(v);
+        }
+        // 0 is valid for graceful_shutdown_deadline (means "wait forever")
+        if let Some(v) = patch.h2_graceful_shutdown_deadline_seconds {
+            listener.h2_graceful_shutdown_deadline_seconds = Some(v);
+        }
+        if let Some(v) = patch.h2_max_window_update_stream0_per_window {
+            listener.h2_max_window_update_stream0_per_window = Some(v);
+        }
+        if let Some(ref v) = patch.sozu_id_header {
+            validate_sozu_id_header(v)?;
+            listener.sozu_id_header = Some(v.to_owned());
+        }
+        Ok(())
+    }
+
+    /// Validate and apply a partial patch to an existing TCP listener.
+    ///
+    /// Only `Some` fields in the patch are written; `None` fields preserve the
+    /// current value. Returns `StateError::NotFound` if the address is unknown.
+    fn update_tcp_listener(&mut self, patch: &UpdateTcpListenerConfig) -> Result<(), StateError> {
+        let address: SocketAddr = patch.address.into();
+        let listener =
+            self.tcp_listeners
+                .get_mut(&address)
+                .ok_or_else(|| StateError::NotFound {
+                    kind: ObjectKind::TcpListener,
+                    id: address.to_string(),
+                })?;
+
+        if let Some(v) = patch.public_address {
+            listener.public_address = Some(v);
+        }
+        if let Some(v) = patch.expect_proxy {
+            listener.expect_proxy = v;
+        }
+        if let Some(v) = patch.front_timeout {
+            listener.front_timeout = v;
+        }
+        if let Some(v) = patch.back_timeout {
+            listener.back_timeout = v;
+        }
+        if let Some(v) = patch.connect_timeout {
+            listener.connect_timeout = v;
         }
         Ok(())
     }
@@ -464,7 +727,7 @@ impl ConfigState {
         if tcp_frontends.contains(&tcp_frontend) {
             return Err(StateError::Exists {
                 kind: ObjectKind::TcpFrontend,
-                id: format!("{:?}", tcp_frontend),
+                id: format!("{tcp_frontend:?}"),
             });
         }
 
@@ -481,7 +744,7 @@ impl ConfigState {
                 .get_mut(&front_to_remove.cluster_id)
                 .ok_or(StateError::NotFound {
                     kind: ObjectKind::TcpFrontend,
-                    id: format!("{:?}", front_to_remove),
+                    id: format!("{front_to_remove:?}"),
                 })?;
 
         let len = tcp_frontends.len();
@@ -1379,6 +1642,239 @@ impl ConfigState {
     }
 }
 
+/// Validate all H2 flood knobs in an HTTP listener patch.
+///
+/// Every flood-detector knob (including stream-0 WINDOW_UPDATE) requires a
+/// value `>= 1`. Passing `0` would disable the detector entirely and leave the
+/// proxy open to CVE-2023-44487 and related attacks. The runtime constructor
+/// `H2FloodConfig::new()` applies the same `.max(1)` clamping, but a raw
+/// protobuf client can bypass the CLI layer, so we enforce the bound here too.
+///
+/// `h2_max_concurrent_streams` and `h2_stream_shrink_ratio` are connection-
+/// config knobs that also require `>= 1`.
+///
+/// `h2_graceful_shutdown_deadline_seconds = 0` is intentionally **allowed** —
+/// it means "wait forever (no forced close after GOAWAY)".
+pub fn validate_h2_flood_knobs_http(patch: &UpdateHttpListenerConfig) -> Result<(), StateError> {
+    macro_rules! require_ge1 {
+        ($field:expr, $name:literal) => {
+            if let Some(0) = $field {
+                return Err(StateError::InvalidValue {
+                    field: $name,
+                    reason: "must be >= 1",
+                });
+            }
+        };
+    }
+    require_ge1!(
+        patch.h2_max_rst_stream_per_window,
+        "h2_max_rst_stream_per_window"
+    );
+    require_ge1!(patch.h2_max_ping_per_window, "h2_max_ping_per_window");
+    require_ge1!(
+        patch.h2_max_settings_per_window,
+        "h2_max_settings_per_window"
+    );
+    require_ge1!(
+        patch.h2_max_empty_data_per_window,
+        "h2_max_empty_data_per_window"
+    );
+    require_ge1!(
+        patch.h2_max_continuation_frames,
+        "h2_max_continuation_frames"
+    );
+    require_ge1!(patch.h2_max_glitch_count, "h2_max_glitch_count");
+    require_ge1!(
+        patch.h2_max_window_update_stream0_per_window,
+        "h2_max_window_update_stream0_per_window"
+    );
+    require_ge1!(patch.h2_max_concurrent_streams, "h2_max_concurrent_streams");
+    // Shrink ratio runtime floor is 2 (lib/src/protocol/mux/h2.rs ~448 .max(2));
+    // anything lower is silently promoted so reject at control plane.
+    if let Some(v) = patch.h2_stream_shrink_ratio {
+        if v < 2 {
+            return Err(StateError::InvalidValue {
+                field: "h2_stream_shrink_ratio",
+                reason: "must be >= 2",
+            });
+        }
+    }
+    // Lifetime caps and HPACK limits — must be >= 1 or the runtime trips on the
+    // first qualifying frame. doc/configure.md advertises "u64 (>= 1)" etc.
+    require_ge1!(
+        patch.h2_max_rst_stream_lifetime,
+        "h2_max_rst_stream_lifetime"
+    );
+    require_ge1!(
+        patch.h2_max_rst_stream_abusive_lifetime,
+        "h2_max_rst_stream_abusive_lifetime"
+    );
+    require_ge1!(
+        patch.h2_max_rst_stream_emitted_lifetime,
+        "h2_max_rst_stream_emitted_lifetime"
+    );
+    require_ge1!(patch.h2_max_header_list_size, "h2_max_header_list_size");
+    require_ge1!(patch.h2_max_header_table_size, "h2_max_header_table_size");
+    Ok(())
+}
+
+/// Validate all H2 flood knobs in an HTTPS listener patch (same rules as HTTP).
+pub fn validate_h2_flood_knobs_https(patch: &UpdateHttpsListenerConfig) -> Result<(), StateError> {
+    macro_rules! require_ge1 {
+        ($field:expr, $name:literal) => {
+            if let Some(0) = $field {
+                return Err(StateError::InvalidValue {
+                    field: $name,
+                    reason: "must be >= 1",
+                });
+            }
+        };
+    }
+    require_ge1!(
+        patch.h2_max_rst_stream_per_window,
+        "h2_max_rst_stream_per_window"
+    );
+    require_ge1!(patch.h2_max_ping_per_window, "h2_max_ping_per_window");
+    require_ge1!(
+        patch.h2_max_settings_per_window,
+        "h2_max_settings_per_window"
+    );
+    require_ge1!(
+        patch.h2_max_empty_data_per_window,
+        "h2_max_empty_data_per_window"
+    );
+    require_ge1!(
+        patch.h2_max_continuation_frames,
+        "h2_max_continuation_frames"
+    );
+    require_ge1!(patch.h2_max_glitch_count, "h2_max_glitch_count");
+    require_ge1!(
+        patch.h2_max_window_update_stream0_per_window,
+        "h2_max_window_update_stream0_per_window"
+    );
+    require_ge1!(patch.h2_max_concurrent_streams, "h2_max_concurrent_streams");
+    if let Some(v) = patch.h2_stream_shrink_ratio {
+        if v < 2 {
+            return Err(StateError::InvalidValue {
+                field: "h2_stream_shrink_ratio",
+                reason: "must be >= 2",
+            });
+        }
+    }
+    require_ge1!(
+        patch.h2_max_rst_stream_lifetime,
+        "h2_max_rst_stream_lifetime"
+    );
+    require_ge1!(
+        patch.h2_max_rst_stream_abusive_lifetime,
+        "h2_max_rst_stream_abusive_lifetime"
+    );
+    require_ge1!(
+        patch.h2_max_rst_stream_emitted_lifetime,
+        "h2_max_rst_stream_emitted_lifetime"
+    );
+    require_ge1!(patch.h2_max_header_list_size, "h2_max_header_list_size");
+    require_ge1!(patch.h2_max_header_table_size, "h2_max_header_table_size");
+    Ok(())
+}
+
+/// Validate a `sozu_id_header` value against RFC 9110 §5.1 header-name grammar.
+///
+/// Rejects empty strings and strings containing CR, LF, colon, space, or tab —
+/// a conservative approximation of the token grammar that covers all practical
+/// injection vectors without a full RFC 9110 tokenizer.
+/// Merge a `CustomHttpAnswers` patch into the listener's stored answers,
+/// preserving any field not present in the patch.
+///
+/// Field-mask semantic: `None` in `patch` means "preserve", `Some` means
+/// "replace". A no-op patch (all-None) leaves `target` untouched. If `target`
+/// is currently `None`, initialize it from the patch (any `None` field stays
+/// `None` so hot-upgrade replay sees the same partial state).
+pub fn merge_custom_http_answers(
+    target: &mut Option<CustomHttpAnswers>,
+    patch: &CustomHttpAnswers,
+) {
+    let current = target.get_or_insert_with(CustomHttpAnswers::default);
+    macro_rules! merge_field {
+        ($field:ident) => {
+            if let Some(ref v) = patch.$field {
+                current.$field = Some(v.clone());
+            }
+        };
+    }
+    merge_field!(answer_301);
+    merge_field!(answer_400);
+    merge_field!(answer_401);
+    merge_field!(answer_404);
+    merge_field!(answer_408);
+    merge_field!(answer_413);
+    merge_field!(answer_421);
+    merge_field!(answer_502);
+    merge_field!(answer_503);
+    merge_field!(answer_504);
+    merge_field!(answer_507);
+}
+
+/// Validate an `AlpnProtocols` patch: each value must be "h2" or "http/1.1".
+/// Empty values vec is allowed (reset-to-default).
+pub fn validate_alpn_protocols(values: &[String]) -> Result<(), StateError> {
+    for value in values {
+        if value != "h2" && value != "http/1.1" {
+            return Err(StateError::InvalidValue {
+                field: "alpn_protocols",
+                reason: "each value must be \"h2\" or \"http/1.1\"",
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Validate a `sozu_id_header` value against the RFC 9110 §5.1 `token` grammar:
+///
+/// ```text
+/// token  = 1*tchar
+/// tchar  = "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-" / "." /
+///          "^" / "_" / "`" / "|" / "~" / DIGIT / ALPHA
+/// ```
+///
+/// Rejects empty strings, non-ASCII bytes, controls (including CR/LF/tab),
+/// separators (including colon and space), and any other non-`tchar` byte.
+pub fn validate_sozu_id_header(value: &str) -> Result<(), StateError> {
+    if value.is_empty() {
+        return Err(StateError::InvalidValue {
+            field: "sozu_id_header",
+            reason: "must not be empty",
+        });
+    }
+    for b in value.bytes() {
+        let is_tchar = b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'!' | b'#'
+                    | b'$'
+                    | b'%'
+                    | b'&'
+                    | b'\''
+                    | b'*'
+                    | b'+'
+                    | b'-'
+                    | b'.'
+                    | b'^'
+                    | b'_'
+                    | b'`'
+                    | b'|'
+                    | b'~'
+            );
+        if !is_tchar {
+            return Err(StateError::InvalidValue {
+                field: "sozu_id_header",
+                reason: "must be a valid HTTP header name (RFC 9110 §5.1 token: alphanumeric or one of !#$%&'*+-.^_`|~)",
+            });
+        }
+    }
+    Ok(())
+}
+
 fn domain_check(
     front_hostname: &str,
     front_path_rule: &PathRule,
@@ -1479,7 +1975,8 @@ mod tests {
 
     use super::*;
     use crate::proto::command::{
-        CustomHttpAnswers, LoadBalancingParams, RequestHttpFrontend, RulePosition,
+        CustomHttpAnswers, LoadBalancingParams, RequestHttpFrontend, RequestTcpFrontend,
+        RulePosition,
     };
 
     #[test]
@@ -2164,7 +2661,7 @@ mod tests {
             .dispatch(&RequestType::AddCertificate(add_certificate).into())
             .expect("Could not add certificate");
 
-        println!("state: {:#?}", state);
+        println!("state: {state:#?}");
 
         // let fingerprint: Fingerprint = serde_json::from_str(
         //     "\"ab2618b674e15243fd02a5618c66509e4840ba60e7d64cebec84cdbfeceee0c5\"",
@@ -2178,10 +2675,7 @@ mod tests {
             ),
         });
 
-        println!(
-            "found certificate: {:#?}",
-            certificates_found_by_fingerprint
-        );
+        println!("found certificate: {certificates_found_by_fingerprint:#?}");
 
         assert!(!certificates_found_by_fingerprint.is_empty());
 
@@ -2191,5 +2685,622 @@ mod tests {
         });
 
         assert!(!certificate_found_by_domain_name.is_empty());
+    }
+
+    #[test]
+    fn count_backends_across_clusters() {
+        let mut state: ConfigState = Default::default();
+
+        assert_eq!(state.count_backends(), 0);
+
+        state
+            .dispatch(
+                &RequestType::AddBackend(AddBackend {
+                    cluster_id: String::from("cluster_1"),
+                    backend_id: String::from("cluster_1-0"),
+                    address: SocketAddress::new_v4(127, 0, 0, 1, 1026),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        assert_eq!(state.count_backends(), 1);
+
+        state
+            .dispatch(
+                &RequestType::AddBackend(AddBackend {
+                    cluster_id: String::from("cluster_1"),
+                    backend_id: String::from("cluster_1-1"),
+                    address: SocketAddress::new_v4(127, 0, 0, 1, 1027),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        assert_eq!(state.count_backends(), 2);
+
+        // add backend to a second cluster
+        state
+            .dispatch(
+                &RequestType::AddBackend(AddBackend {
+                    cluster_id: String::from("cluster_2"),
+                    backend_id: String::from("cluster_2-0"),
+                    address: SocketAddress::new_v4(192, 168, 1, 1, 8080),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        assert_eq!(state.count_backends(), 3);
+
+        // remove a backend and verify count decreases
+        state
+            .dispatch(
+                &RequestType::RemoveBackend(RemoveBackend {
+                    cluster_id: String::from("cluster_1"),
+                    backend_id: String::from("cluster_1-0"),
+                    address: SocketAddress::new_v4(127, 0, 0, 1, 1026),
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        assert_eq!(state.count_backends(), 2);
+    }
+
+    #[test]
+    fn count_frontends_across_types() {
+        let mut state: ConfigState = Default::default();
+
+        assert_eq!(state.count_frontends(), 0);
+
+        // add an HTTP frontend
+        state
+            .dispatch(
+                &RequestType::AddHttpFrontend(RequestHttpFrontend {
+                    cluster_id: Some(String::from("cluster_1")),
+                    hostname: String::from("example.com"),
+                    path: PathRule::prefix(String::from("/")),
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
+                    position: RulePosition::Tree.into(),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        assert_eq!(state.count_frontends(), 1);
+
+        // add an HTTPS frontend
+        state
+            .dispatch(
+                &RequestType::AddHttpsFrontend(RequestHttpFrontend {
+                    cluster_id: Some(String::from("cluster_1")),
+                    hostname: String::from("secure.example.com"),
+                    path: PathRule::prefix(String::from("/")),
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 8443),
+                    position: RulePosition::Tree.into(),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        assert_eq!(state.count_frontends(), 2);
+
+        // add a TCP frontend
+        state
+            .dispatch(
+                &RequestType::AddTcpFrontend(RequestTcpFrontend {
+                    cluster_id: String::from("cluster_2"),
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 5432),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        assert_eq!(state.count_frontends(), 3);
+
+        // add a second TCP frontend on the same cluster
+        state
+            .dispatch(
+                &RequestType::AddTcpFrontend(RequestTcpFrontend {
+                    cluster_id: String::from("cluster_2"),
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 5433),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        assert_eq!(state.count_frontends(), 4);
+
+        // remove the HTTP frontend
+        state
+            .dispatch(
+                &RequestType::RemoveHttpFrontend(RequestHttpFrontend {
+                    cluster_id: Some(String::from("cluster_1")),
+                    hostname: String::from("example.com"),
+                    path: PathRule::prefix(String::from("/")),
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
+                    position: RulePosition::Tree.into(),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        assert_eq!(state.count_frontends(), 3);
+    }
+
+    // ── helpers ────────────────────────────────────────────────────────────────
+
+    fn make_https_listener(address: SocketAddress) -> HttpsListenerConfig {
+        HttpsListenerConfig {
+            address,
+            sticky_name: "SOZUBALANCEID".to_owned(),
+            front_timeout: 60,
+            back_timeout: 30,
+            connect_timeout: 3,
+            request_timeout: 10,
+            ..Default::default()
+        }
+    }
+
+    fn make_http_listener(address: SocketAddress) -> HttpListenerConfig {
+        HttpListenerConfig {
+            address,
+            sticky_name: "SOZUBALANCEID".to_owned(),
+            front_timeout: 60,
+            back_timeout: 30,
+            connect_timeout: 3,
+            request_timeout: 10,
+            ..Default::default()
+        }
+    }
+
+    fn make_tcp_listener(address: SocketAddress) -> TcpListenerConfig {
+        TcpListenerConfig {
+            address,
+            front_timeout: 60,
+            back_timeout: 30,
+            connect_timeout: 3,
+            ..Default::default()
+        }
+    }
+
+    // ── update_https_listener ──────────────────────────────────────────────────
+
+    /// Happy path: patching two H2 flood knobs updates the map entry; all other
+    /// fields are left untouched.
+    #[test]
+    fn update_https_listener_happy_path_h2_knobs() {
+        let addr = SocketAddress::new_v4(0, 0, 0, 0, 8443);
+        let mut state = ConfigState::new();
+        state
+            .dispatch(&RequestType::AddHttpsListener(make_https_listener(addr)).into())
+            .unwrap();
+
+        let patch = UpdateHttpsListenerConfig {
+            address: addr,
+            h2_max_rst_stream_per_window: Some(50),
+            h2_max_ping_per_window: Some(20),
+            ..Default::default()
+        };
+        state
+            .dispatch(&RequestType::UpdateHttpsListener(patch).into())
+            .expect("update must succeed");
+
+        let listener = state
+            .https_listeners
+            .get(&SocketAddr::from(addr))
+            .expect("listener must be present");
+        assert_eq!(listener.h2_max_rst_stream_per_window, Some(50));
+        assert_eq!(listener.h2_max_ping_per_window, Some(20));
+        // Untouched fields must be unchanged
+        assert_eq!(listener.front_timeout, 60);
+        assert_eq!(listener.h2_max_settings_per_window, None);
+    }
+
+    /// NotFound: patching a listener address that was never registered returns
+    /// `StateError::NotFound`.
+    #[test]
+    fn update_https_listener_not_found() {
+        let mut state = ConfigState::new();
+        let patch = UpdateHttpsListenerConfig {
+            address: SocketAddress::new_v4(1, 2, 3, 4, 9999),
+            h2_max_rst_stream_per_window: Some(50),
+            ..Default::default()
+        };
+        let err = state
+            .dispatch(&RequestType::UpdateHttpsListener(patch).into())
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StateError::NotFound {
+                    kind: ObjectKind::HttpsListener,
+                    ..
+                }
+            ),
+            "expected NotFound, got: {err}"
+        );
+    }
+
+    /// No-op: a patch with only `address` set (all options None) is Ok and does
+    /// not change any field.
+    #[test]
+    fn update_https_listener_noop_patch() {
+        let addr = SocketAddress::new_v4(0, 0, 0, 0, 8443);
+        let mut state = ConfigState::new();
+        let original = make_https_listener(addr);
+        state
+            .dispatch(&RequestType::AddHttpsListener(original.clone()).into())
+            .unwrap();
+
+        let patch = UpdateHttpsListenerConfig {
+            address: addr,
+            ..Default::default()
+        };
+        state
+            .dispatch(&RequestType::UpdateHttpsListener(patch).into())
+            .expect("no-op patch must succeed");
+
+        let listener = state.https_listeners.get(&SocketAddr::from(addr)).unwrap();
+        assert_eq!(listener.front_timeout, original.front_timeout);
+        assert_eq!(
+            listener.h2_max_rst_stream_per_window,
+            original.h2_max_rst_stream_per_window
+        );
+    }
+
+    /// InvalidValue: setting a flood knob to 0 must be rejected.
+    #[test]
+    fn update_https_listener_invalid_value_flood_knob_zero() {
+        let addr = SocketAddress::new_v4(0, 0, 0, 0, 8443);
+        let mut state = ConfigState::new();
+        state
+            .dispatch(&RequestType::AddHttpsListener(make_https_listener(addr)).into())
+            .unwrap();
+
+        let patch = UpdateHttpsListenerConfig {
+            address: addr,
+            h2_max_rst_stream_per_window: Some(0),
+            ..Default::default()
+        };
+        let err = state
+            .dispatch(&RequestType::UpdateHttpsListener(patch).into())
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StateError::InvalidValue {
+                    field: "h2_max_rst_stream_per_window",
+                    ..
+                }
+            ),
+            "expected InvalidValue for flood knob 0, got: {err}"
+        );
+    }
+
+    /// ALPN validation: reject unknown ALPN values.
+    #[test]
+    fn update_https_listener_alpn_unknown_value_rejected() {
+        use crate::proto::command::AlpnProtocols;
+
+        let addr = SocketAddress::new_v4(0, 0, 0, 0, 8443);
+        let mut state = ConfigState::new();
+        state
+            .dispatch(&RequestType::AddHttpsListener(make_https_listener(addr)).into())
+            .unwrap();
+
+        let patch = UpdateHttpsListenerConfig {
+            address: addr,
+            alpn_protocols: Some(AlpnProtocols {
+                values: vec!["h3".to_owned()],
+            }),
+            ..Default::default()
+        };
+        let err = state
+            .dispatch(&RequestType::UpdateHttpsListener(patch).into())
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StateError::InvalidValue {
+                    field: "alpn_protocols",
+                    ..
+                }
+            ),
+            "expected InvalidValue for unknown ALPN, got: {err}"
+        );
+    }
+
+    /// ALPN validation: empty values vec = reset to default, must be accepted.
+    #[test]
+    fn update_https_listener_alpn_empty_reset_accepted() {
+        use crate::proto::command::AlpnProtocols;
+
+        let addr = SocketAddress::new_v4(0, 0, 0, 0, 8443);
+        let mut state = ConfigState::new();
+        let mut listener = make_https_listener(addr);
+        listener.alpn_protocols = vec!["h2".to_owned()];
+        state
+            .dispatch(&RequestType::AddHttpsListener(listener).into())
+            .unwrap();
+
+        let patch = UpdateHttpsListenerConfig {
+            address: addr,
+            alpn_protocols: Some(AlpnProtocols { values: vec![] }),
+            ..Default::default()
+        };
+        state
+            .dispatch(&RequestType::UpdateHttpsListener(patch).into())
+            .expect("empty ALPN reset must succeed");
+
+        let listener = state.https_listeners.get(&SocketAddr::from(addr)).unwrap();
+        assert!(
+            listener.alpn_protocols.is_empty(),
+            "ALPN must have been reset to empty"
+        );
+    }
+
+    /// ALPN validation: valid values ["h2", "http/1.1"] must be accepted.
+    #[test]
+    fn update_https_listener_alpn_valid_values_accepted() {
+        use crate::proto::command::AlpnProtocols;
+
+        let addr = SocketAddress::new_v4(0, 0, 0, 0, 8443);
+        let mut state = ConfigState::new();
+        state
+            .dispatch(&RequestType::AddHttpsListener(make_https_listener(addr)).into())
+            .unwrap();
+
+        let patch = UpdateHttpsListenerConfig {
+            address: addr,
+            alpn_protocols: Some(AlpnProtocols {
+                values: vec!["h2".to_owned(), "http/1.1".to_owned()],
+            }),
+            ..Default::default()
+        };
+        state
+            .dispatch(&RequestType::UpdateHttpsListener(patch).into())
+            .expect("valid ALPN must be accepted");
+
+        let listener = state.https_listeners.get(&SocketAddr::from(addr)).unwrap();
+        assert_eq!(listener.alpn_protocols, vec!["h2", "http/1.1"]);
+    }
+
+    /// ALPN absent wrapper: when `alpn_protocols` is None in the patch, the
+    /// listener's ALPN field must not be touched.
+    #[test]
+    fn update_https_listener_alpn_absent_preserves_existing() {
+        let addr = SocketAddress::new_v4(0, 0, 0, 0, 8443);
+        let mut state = ConfigState::new();
+        let mut listener = make_https_listener(addr);
+        listener.alpn_protocols = vec!["h2".to_owned()];
+        state
+            .dispatch(&RequestType::AddHttpsListener(listener).into())
+            .unwrap();
+
+        // patch with no alpn_protocols field
+        let patch = UpdateHttpsListenerConfig {
+            address: addr,
+            front_timeout: Some(10),
+            ..Default::default()
+        };
+        state
+            .dispatch(&RequestType::UpdateHttpsListener(patch).into())
+            .unwrap();
+
+        let listener = state.https_listeners.get(&SocketAddr::from(addr)).unwrap();
+        assert_eq!(
+            listener.alpn_protocols,
+            vec!["h2"],
+            "ALPN must be preserved when not patched"
+        );
+    }
+
+    /// sozu_id_header validation: empty string must be rejected.
+    #[test]
+    fn update_https_listener_sozu_id_header_empty_rejected() {
+        let addr = SocketAddress::new_v4(0, 0, 0, 0, 8443);
+        let mut state = ConfigState::new();
+        state
+            .dispatch(&RequestType::AddHttpsListener(make_https_listener(addr)).into())
+            .unwrap();
+
+        let patch = UpdateHttpsListenerConfig {
+            address: addr,
+            sozu_id_header: Some(String::new()),
+            ..Default::default()
+        };
+        let err = state
+            .dispatch(&RequestType::UpdateHttpsListener(patch).into())
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StateError::InvalidValue {
+                    field: "sozu_id_header",
+                    ..
+                }
+            ),
+            "expected InvalidValue for empty header name, got: {err}"
+        );
+    }
+
+    /// sozu_id_header validation: value containing colon must be rejected.
+    #[test]
+    fn update_https_listener_sozu_id_header_colon_rejected() {
+        let addr = SocketAddress::new_v4(0, 0, 0, 0, 8443);
+        let mut state = ConfigState::new();
+        state
+            .dispatch(&RequestType::AddHttpsListener(make_https_listener(addr)).into())
+            .unwrap();
+
+        let patch = UpdateHttpsListenerConfig {
+            address: addr,
+            sozu_id_header: Some("bad: value".to_owned()),
+            ..Default::default()
+        };
+        let err = state
+            .dispatch(&RequestType::UpdateHttpsListener(patch).into())
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StateError::InvalidValue {
+                    field: "sozu_id_header",
+                    ..
+                }
+            ),
+            "expected InvalidValue for header name with colon, got: {err}"
+        );
+    }
+
+    /// sozu_id_header validation: well-formed token must be accepted.
+    #[test]
+    fn update_https_listener_sozu_id_header_valid_accepted() {
+        let addr = SocketAddress::new_v4(0, 0, 0, 0, 8443);
+        let mut state = ConfigState::new();
+        state
+            .dispatch(&RequestType::AddHttpsListener(make_https_listener(addr)).into())
+            .unwrap();
+
+        let patch = UpdateHttpsListenerConfig {
+            address: addr,
+            sozu_id_header: Some("X-Edge-Id".to_owned()),
+            ..Default::default()
+        };
+        state
+            .dispatch(&RequestType::UpdateHttpsListener(patch).into())
+            .expect("valid header name must be accepted");
+
+        let listener = state.https_listeners.get(&SocketAddr::from(addr)).unwrap();
+        assert_eq!(listener.sozu_id_header.as_deref(), Some("X-Edge-Id"));
+    }
+
+    /// h2_graceful_shutdown_deadline_seconds = 0 must be allowed (means "wait forever").
+    #[test]
+    fn update_https_listener_graceful_shutdown_zero_allowed() {
+        let addr = SocketAddress::new_v4(0, 0, 0, 0, 8443);
+        let mut state = ConfigState::new();
+        state
+            .dispatch(&RequestType::AddHttpsListener(make_https_listener(addr)).into())
+            .unwrap();
+
+        let patch = UpdateHttpsListenerConfig {
+            address: addr,
+            h2_graceful_shutdown_deadline_seconds: Some(0),
+            ..Default::default()
+        };
+        state
+            .dispatch(&RequestType::UpdateHttpsListener(patch).into())
+            .expect("graceful_shutdown_deadline=0 must be allowed");
+
+        let listener = state.https_listeners.get(&SocketAddr::from(addr)).unwrap();
+        assert_eq!(listener.h2_graceful_shutdown_deadline_seconds, Some(0));
+    }
+
+    // ── update_http_listener ───────────────────────────────────────────────────
+
+    /// Happy path for HTTP listener patch.
+    #[test]
+    fn update_http_listener_happy_path() {
+        let addr = SocketAddress::new_v4(0, 0, 0, 0, 8080);
+        let mut state = ConfigState::new();
+        state
+            .dispatch(&RequestType::AddHttpListener(make_http_listener(addr)).into())
+            .unwrap();
+
+        let patch = UpdateHttpListenerConfig {
+            address: addr,
+            front_timeout: Some(15),
+            h2_max_rst_stream_per_window: Some(25),
+            ..Default::default()
+        };
+        state
+            .dispatch(&RequestType::UpdateHttpListener(patch).into())
+            .expect("HTTP update must succeed");
+
+        let listener = state.http_listeners.get(&SocketAddr::from(addr)).unwrap();
+        assert_eq!(listener.front_timeout, 15);
+        assert_eq!(listener.h2_max_rst_stream_per_window, Some(25));
+        // untouched
+        assert_eq!(listener.back_timeout, 30);
+    }
+
+    /// HTTP listener: flood knob 0 is rejected.
+    #[test]
+    fn update_http_listener_flood_knob_zero_rejected() {
+        let addr = SocketAddress::new_v4(0, 0, 0, 0, 8080);
+        let mut state = ConfigState::new();
+        state
+            .dispatch(&RequestType::AddHttpListener(make_http_listener(addr)).into())
+            .unwrap();
+
+        let patch = UpdateHttpListenerConfig {
+            address: addr,
+            h2_max_window_update_stream0_per_window: Some(0),
+            ..Default::default()
+        };
+        let err = state
+            .dispatch(&RequestType::UpdateHttpListener(patch).into())
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StateError::InvalidValue {
+                    field: "h2_max_window_update_stream0_per_window",
+                    ..
+                }
+            ),
+            "expected InvalidValue, got: {err}"
+        );
+    }
+
+    // ── update_tcp_listener ────────────────────────────────────────────────────
+
+    /// Happy path for TCP listener patch.
+    #[test]
+    fn update_tcp_listener_happy_path() {
+        let addr = SocketAddress::new_v4(0, 0, 0, 0, 9000);
+        let mut state = ConfigState::new();
+        state
+            .dispatch(&RequestType::AddTcpListener(make_tcp_listener(addr)).into())
+            .unwrap();
+
+        let patch = UpdateTcpListenerConfig {
+            address: addr,
+            front_timeout: Some(5),
+            ..Default::default()
+        };
+        state
+            .dispatch(&RequestType::UpdateTcpListener(patch).into())
+            .expect("TCP update must succeed");
+
+        let listener = state.tcp_listeners.get(&SocketAddr::from(addr)).unwrap();
+        assert_eq!(listener.front_timeout, 5);
+        assert_eq!(listener.back_timeout, 30); // untouched
+    }
+
+    /// TCP listener: NotFound when address is unknown.
+    #[test]
+    fn update_tcp_listener_not_found() {
+        let mut state = ConfigState::new();
+        let patch = UpdateTcpListenerConfig {
+            address: SocketAddress::new_v4(9, 9, 9, 9, 9999),
+            front_timeout: Some(5),
+            ..Default::default()
+        };
+        let err = state
+            .dispatch(&RequestType::UpdateTcpListener(patch).into())
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StateError::NotFound {
+                    kind: ObjectKind::TcpListener,
+                    ..
+                }
+            ),
+            "expected NotFound, got: {err}"
+        );
     }
 }

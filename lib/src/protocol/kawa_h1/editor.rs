@@ -1,3 +1,11 @@
+//! H1 request/response header editor.
+//!
+//! Captures method/authority/path on parse, rewrites hop-by-hop and
+//! forwarding headers (`X-Forwarded-*`, `Forwarded`, `Connection`,
+//! WebSocket-upgrade signalling, optional `traceparent`), and surfaces the
+//! canonical `LogContext` used by the access-log envelope. Acts as the
+//! Kawa `ParserCallbacks` implementation for the H1 mux path.
+
 use std::{
     io::Write as _,
     net::{IpAddr, SocketAddr},
@@ -8,9 +16,12 @@ use rusty_ulid::Ulid;
 use sozu_command_lib::logging::LogContext;
 
 use crate::{
-    Protocol,
+    Protocol, RetrieveClusterError,
     pool::Checkout,
-    protocol::http::{GenericHttpStream, Method, parser::compare_no_case},
+    protocol::{
+        http::{GenericHttpStream, Method, parser::compare_no_case},
+        pipe::WebSocketContext,
+    },
 };
 
 #[cfg(feature = "opentelemetry")]
@@ -123,6 +134,17 @@ pub struct HttpContext {
     pub reason: Option<String>,
     // ---------- Additional optional data
     pub user_agent: Option<String>,
+    /// Value of the `x-request-id` header observed (if propagated from the
+    /// client/upstream LB) or generated (from `self.id`). Universal correlation
+    /// header — populated unconditionally by `on_request_headers` so the access
+    /// log can record the exact value forwarded to the backend.
+    pub x_request_id: Option<String>,
+    /// Verbatim value of the client-supplied `X-Forwarded-For` header as
+    /// observed before Sōzu appended its own hop. Captured here, not at
+    /// request edit time, so the access log records the upstream-attested
+    /// chain even when Sōzu also appends its own peer to the forwarded
+    /// header. `None` if the request had no `X-Forwarded-For` header.
+    pub xff_chain: Option<String>,
 
     #[cfg(feature = "opentelemetry")]
     pub otel: Option<sozu_command::logging::OpenTelemetry>,
@@ -130,6 +152,11 @@ pub struct HttpContext {
     // ========== Read only
     /// signals wether Kawa should write a "Connection" header with a "close" value (request and response)
     pub closing: bool,
+    /// Connection/session ULID — stable across all requests multiplexed on this
+    /// TCP or TLS connection. Used as the first slot in the legacy log-context
+    /// bracket `[session req cluster backend]` and emitted into
+    /// `ProtobufAccessLog.session_id`.
+    pub session_id: Ulid,
     /// the value of the custom header, named "Sozu-Id", that Kawa should write (request and response)
     pub id: Ulid,
     pub backend_id: Option<String>,
@@ -145,6 +172,46 @@ pub struct HttpContext {
     /// the sticky session that should be used
     /// used to create a "Set-Cookie" header in the response in case it differs from sticky_session_found
     pub sticky_session: Option<String>,
+    /// the address of the backend server
+    pub backend_address: Option<SocketAddr>,
+    /// The TLS Server Name Indication (SNI) hostname negotiated at handshake.
+    ///
+    /// Populated for HTTPS listeners when the client sent an SNI extension (see
+    /// `https.rs::upgrade_handshake`). Used by the routing layer to enforce the
+    /// TLS trust boundary against the HTTP `:authority` / `Host` header — without
+    /// this check, an attacker holding a valid certificate for tenant A could
+    /// open TLS with SNI=A then send requests with `:authority=tenantB` and
+    /// reach tenant B's backend (CWE-346 / CWE-444).
+    ///
+    /// `None` when the listener is plaintext HTTP or the client omitted SNI.
+    /// Stored pre-lowercased and without a port for direct exact-match comparison.
+    pub tls_server_name: Option<String>,
+    /// Whether the router must reject this request when `tls_server_name`
+    /// does not exact-match its authority (CWE-346 / CWE-444). Mirrors
+    /// `HttpsListenerConfig::strict_sni_binding`. Set from the mux
+    /// `Context` at stream creation time (see `Context::create_stream`).
+    /// Plaintext listeners still never hit the check because
+    /// `tls_server_name` is `None`.
+    pub strict_sni_binding: bool,
+    /// Negotiated TLS protocol version as a short label (e.g. `"TLSv1.3"`).
+    /// Captured from `rustls_version_label` at handshake completion and
+    /// propagated from the mux `Context`. `None` for plaintext listeners.
+    pub tls_version: Option<&'static str>,
+    /// Negotiated TLS cipher suite as a short label (e.g.
+    /// `"TLS_AES_128_GCM_SHA256"`). Captured from `rustls_ciphersuite_label`
+    /// at handshake completion and propagated from the mux `Context`. `None`
+    /// for plaintext listeners.
+    pub tls_cipher: Option<&'static str>,
+    /// Negotiated ALPN protocol (e.g. `"h2"`, `"http/1.1"`). Captured from
+    /// rustls at handshake completion and propagated from the mux `Context`.
+    /// `None` for plaintext listeners or when no ALPN was negotiated.
+    pub tls_alpn: Option<&'static str>,
+    /// Name of the correlation header Sozu injects into every request and
+    /// response. Defaults to `"Sozu-Id"` via [`L7ListenerHandler::get_sozu_id_header`].
+    /// Populated at stream creation from the listener config's `sozu_id_header`
+    /// knob. Stored as an owned `String` so it survives a listener hot-reload
+    /// that changes the value.
+    pub sozu_id_header: String,
 }
 
 impl kawa::h1::ParserCallbacks<Checkout> for HttpContext {
@@ -158,14 +225,18 @@ impl kawa::h1::ParserCallbacks<Checkout> for HttpContext {
 
 impl HttpContext {
     /// Creates a new instance
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
+        session_id: Ulid,
         request_id: Ulid,
         protocol: Protocol,
         public_address: SocketAddr,
         session_address: Option<SocketAddr>,
         sticky_name: String,
+        sozu_id_header: String,
     ) -> Self {
         Self {
+            session_id,
             id: request_id,
             backend_id: None,
             cluster_id: None,
@@ -186,15 +257,25 @@ impl HttpContext {
             status: None,
             reason: None,
             user_agent: None,
+            x_request_id: None,
+            xff_chain: None,
 
             #[cfg(feature = "opentelemetry")]
             otel: Default::default(),
+
+            backend_address: None,
+            tls_server_name: None,
+            strict_sni_binding: true,
+            tls_version: None,
+            tls_cipher: None,
+            tls_alpn: None,
+            sozu_id_header,
         }
     }
 
     /// Callback for request:
     ///
-    /// - edit headers (connection, forwarded, sticky cookie, sozu-id)
+    /// - edit headers (connection, forwarded, sticky cookie, sozu-id, x-request-id)
     /// - save information:
     ///   - method
     ///   - authority
@@ -202,6 +283,7 @@ impl HttpContext {
     ///   - front keep-alive
     ///   - sticky cookie
     ///   - user-agent
+    ///   - x-request-id (preserved if present, else derived from `self.id`)
     fn on_request_headers(&mut self, request: &mut GenericHttpStream) {
         let buf = request.storage.mut_buffer();
 
@@ -259,6 +341,7 @@ impl HttpContext {
         let mut forwarded = None;
         let mut has_x_port = false;
         let mut has_x_proto = false;
+        let mut has_x_request_id = false;
         let mut has_connection = false;
         #[cfg(feature = "opentelemetry")]
         let mut traceparent: Option<&mut kawa::Pair> = None;
@@ -284,8 +367,11 @@ impl HttpContext {
                         if !compare_no_case(val, proto.as_bytes()) {
                             incr!("http.trusting.x_proto.diff");
                             debug!(
-                                "Trusting X-Forwarded-Proto for {:?} even though {:?} != {}",
-                                self.authority, val, proto
+                                "{} Trusting X-Forwarded-Proto for {:?} even though {:?} != {}",
+                                self.log_context(),
+                                self.authority,
+                                val,
+                                proto
                             );
                         }
                     } else if compare_no_case(key, b"X-Forwarded-Port") {
@@ -298,16 +384,39 @@ impl HttpContext {
                         if !compare_no_case(val, expected.as_bytes()) {
                             incr!("http.trusting.x_port.diff");
                             debug!(
-                                "Trusting X-Forwarded-Port for {:?} even though {:?} != {}",
-                                self.authority, val, expected
+                                "{} Trusting X-Forwarded-Port for {:?} even though {:?} != {}",
+                                self.log_context(),
+                                self.authority,
+                                val,
+                                expected
                             );
                         }
                     } else if compare_no_case(key, b"X-Forwarded-For") {
+                        // Snapshot the upstream-attested chain before we
+                        // potentially append our own peer below — the access
+                        // log records the value the client/upstream LB
+                        // forwarded, not the rewritten value Sōzu emits.
+                        self.xff_chain = header
+                            .val
+                            .data_opt(buf)
+                            .and_then(|data| from_utf8(data).ok())
+                            .map(ToOwned::to_owned);
                         x_for = Some(header);
                     } else if compare_no_case(key, b"Forwarded") {
                         forwarded = Some(header);
                     } else if compare_no_case(key, b"User-Agent") {
                         self.user_agent = header
+                            .val
+                            .data_opt(buf)
+                            .and_then(|data| from_utf8(data).ok())
+                            .map(ToOwned::to_owned);
+                    } else if compare_no_case(key, b"X-Request-Id") {
+                        // RFC: not standardized, but the de-facto correlation
+                        // header used by Envoy/HAProxy/most LBs. Preserve the
+                        // client-supplied value verbatim — overwriting it
+                        // breaks end-to-end request tracing.
+                        has_x_request_id = true;
+                        self.x_request_id = header
                             .val
                             .data_opt(buf)
                             .and_then(|data| from_utf8(data).ok())
@@ -429,9 +538,28 @@ impl HttpContext {
                 val: kawa::Store::Static(b"close"),
             }));
         }
-        // Create a custom "Sozu-Id" header
+        // Inject "X-Request-Id" derived from the request ULID when the client
+        // (or upstream LB) did not already supply one. When already present,
+        // the header is left untouched in the block list — preserving the
+        // client-supplied value end-to-end is the whole point of this header.
+        // Either way, `self.x_request_id` is populated so the access log
+        // records the exact value forwarded to the backend.
+        if has_x_request_id {
+            incr!("http.x_request_id.propagated");
+        } else {
+            let value = self.id.to_string();
+            request.push_block(kawa::Block::Header(kawa::Pair {
+                key: kawa::Store::Static(b"X-Request-Id"),
+                val: kawa::Store::from_string(value.clone()),
+            }));
+            self.x_request_id = Some(value);
+            incr!("http.x_request_id.generated");
+        }
+
+        // Create a custom correlation header (defaults to "Sozu-Id", can be
+        // renamed via the `sozu_id_header` listener config knob).
         request.push_block(kawa::Block::Header(kawa::Pair {
-            key: kawa::Store::Static(b"Sozu-Id"),
+            key: kawa::Store::from_string(self.sozu_id_header.clone()),
             val: kawa::Store::from_string(self.id.to_string()),
         }));
     }
@@ -496,9 +624,10 @@ impl HttpContext {
             }
         }
 
-        // Create a custom "Sozu-Id" header
+        // Create a custom correlation header (defaults to "Sozu-Id", can be
+        // renamed via the `sozu_id_header` listener config knob).
         response.push_block(kawa::Block::Header(kawa::Pair {
-            key: kawa::Store::Static(b"Sozu-Id"),
+            key: kawa::Store::from_string(self.sozu_id_header.clone()),
             val: kawa::Store::from_string(self.id.to_string()),
         }));
     }
@@ -513,13 +642,399 @@ impl HttpContext {
         self.status = None;
         self.reason = None;
         self.user_agent = None;
+        self.x_request_id = None;
+        self.xff_chain = None;
+        // Note: tls_server_name, tls_version, tls_cipher, tls_alpn,
+        // strict_sni_binding are connection-scoped — set once at handshake
+        // completion and reused across every keep-alive request, so reset()
+        // intentionally leaves them in place.
+    }
+
+    pub fn extract_route(&self) -> Result<(&str, &str, &Method), RetrieveClusterError> {
+        let given_method = self.method.as_ref().ok_or(RetrieveClusterError::NoMethod)?;
+        let given_authority = self
+            .authority
+            .as_deref()
+            .ok_or(RetrieveClusterError::NoHost)?;
+        let given_path = self.path.as_deref().ok_or(RetrieveClusterError::NoPath)?;
+
+        Ok((given_authority, given_path, given_method))
+    }
+
+    pub fn get_route(&self) -> String {
+        if let Some(method) = &self.method {
+            if let Some(authority) = &self.authority {
+                if let Some(path) = &self.path {
+                    return format!("{method} {authority}{path}");
+                }
+                return format!("{method} {authority}");
+            }
+            return format!("{method}");
+        }
+        String::new()
+    }
+
+    pub fn websocket_context(&self) -> WebSocketContext {
+        WebSocketContext::Http {
+            method: self.method.clone(),
+            authority: self.authority.clone(),
+            path: self.path.clone(),
+            reason: self.reason.clone(),
+            status: self.status,
+        }
     }
 
     pub fn log_context(&self) -> LogContext<'_> {
         LogContext {
-            request_id: self.id,
+            session_id: self.session_id,
+            request_id: Some(self.id),
             cluster_id: self.cluster_id.as_deref(),
             backend_id: self.backend_id.as_deref(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    /// Helper to create a minimal HttpContext for testing.
+    fn make_context() -> HttpContext {
+        HttpContext::new(
+            Ulid::generate(),
+            Ulid::generate(),
+            Protocol::HTTP,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
+            Some(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+                54321,
+            )),
+            "SERVERID".to_owned(),
+            "Sozu-Id".to_owned(),
+        )
+    }
+
+    // ── sozu_id_header ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_sozu_id_header_default_name_stored_on_context() {
+        // The make_context helper uses the documented default "Sozu-Id" to
+        // match the trait default on `L7ListenerHandler::get_sozu_id_header`.
+        let ctx = make_context();
+        assert_eq!(ctx.sozu_id_header, "Sozu-Id");
+    }
+
+    #[test]
+    fn test_sozu_id_header_custom_name_stored_on_context() {
+        // Operator-provided rename is carried verbatim onto the HttpContext.
+        let ctx = HttpContext::new(
+            Ulid::generate(),
+            Ulid::generate(),
+            Protocol::HTTP,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
+            None,
+            "SERVERID".to_owned(),
+            "X-Edge-Id".to_owned(),
+        );
+        assert_eq!(ctx.sozu_id_header, "X-Edge-Id");
+    }
+
+    // ── extract_route ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_extract_route_all_present() {
+        let mut ctx = make_context();
+        ctx.method = Some(Method::Get);
+        ctx.authority = Some("example.com".to_owned());
+        ctx.path = Some("/index.html".to_owned());
+
+        let (authority, path, method) = ctx.extract_route().unwrap();
+        assert_eq!(authority, "example.com");
+        assert_eq!(path, "/index.html");
+        assert_eq!(method, &Method::Get);
+    }
+
+    #[test]
+    fn test_extract_route_no_method() {
+        let mut ctx = make_context();
+        ctx.authority = Some("example.com".to_owned());
+        ctx.path = Some("/".to_owned());
+
+        let err = ctx.extract_route().unwrap_err();
+        assert!(matches!(err, RetrieveClusterError::NoMethod));
+    }
+
+    #[test]
+    fn test_extract_route_no_host() {
+        let mut ctx = make_context();
+        ctx.method = Some(Method::Get);
+        ctx.path = Some("/".to_owned());
+
+        let err = ctx.extract_route().unwrap_err();
+        assert!(matches!(err, RetrieveClusterError::NoHost));
+    }
+
+    #[test]
+    fn test_extract_route_no_path() {
+        let mut ctx = make_context();
+        ctx.method = Some(Method::Get);
+        ctx.authority = Some("example.com".to_owned());
+
+        let err = ctx.extract_route().unwrap_err();
+        assert!(matches!(err, RetrieveClusterError::NoPath));
+    }
+
+    // ── get_route ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_get_route_all_present() {
+        let mut ctx = make_context();
+        ctx.method = Some(Method::Get);
+        ctx.authority = Some("example.com".to_owned());
+        ctx.path = Some("/api/v1".to_owned());
+
+        assert_eq!(ctx.get_route(), "GET example.com/api/v1");
+    }
+
+    #[test]
+    fn test_get_route_method_and_authority_only() {
+        let mut ctx = make_context();
+        ctx.method = Some(Method::Post);
+        ctx.authority = Some("example.com".to_owned());
+
+        assert_eq!(ctx.get_route(), "POST example.com");
+    }
+
+    #[test]
+    fn test_get_route_method_only() {
+        let mut ctx = make_context();
+        ctx.method = Some(Method::Delete);
+
+        assert_eq!(ctx.get_route(), "DELETE");
+    }
+
+    #[test]
+    fn test_get_route_empty() {
+        let ctx = make_context();
+        assert_eq!(ctx.get_route(), "");
+    }
+
+    // ── reset ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_reset_clears_request_response_state() {
+        let mut ctx = make_context();
+        ctx.keep_alive_backend = false;
+        ctx.keep_alive_frontend = false;
+        ctx.sticky_session_found = Some("abc123".to_owned());
+        ctx.method = Some(Method::Post);
+        ctx.authority = Some("example.com".to_owned());
+        ctx.path = Some("/upload".to_owned());
+        ctx.status = Some(200);
+        ctx.reason = Some("OK".to_owned());
+        ctx.user_agent = Some("curl/7.81".to_owned());
+        ctx.x_request_id = Some("client-xrid-123".to_owned());
+        ctx.xff_chain = Some("203.0.113.5, 198.51.100.10".to_owned());
+
+        ctx.reset();
+
+        assert!(ctx.keep_alive_backend);
+        assert!(ctx.keep_alive_frontend);
+        assert!(ctx.sticky_session_found.is_none());
+        assert!(ctx.method.is_none());
+        assert!(ctx.authority.is_none());
+        assert!(ctx.path.is_none());
+        assert!(ctx.status.is_none());
+        assert!(ctx.reason.is_none());
+        assert!(ctx.user_agent.is_none());
+        assert!(ctx.x_request_id.is_none());
+        assert!(ctx.xff_chain.is_none());
+    }
+
+    #[test]
+    fn test_reset_preserves_tls_metadata() {
+        // TLS metadata is connection-scoped (set once at handshake, reused
+        // across every keep-alive request) — reset() must leave it intact
+        // so the access log of the second request still carries it.
+        let mut ctx = make_context();
+        ctx.tls_server_name = Some("example.com".to_owned());
+        ctx.tls_version = Some("TLSv1.3");
+        ctx.tls_cipher = Some("TLS_AES_128_GCM_SHA256");
+        ctx.tls_alpn = Some("h2");
+        ctx.strict_sni_binding = false;
+
+        ctx.reset();
+
+        assert_eq!(ctx.tls_server_name.as_deref(), Some("example.com"));
+        assert_eq!(ctx.tls_version, Some("TLSv1.3"));
+        assert_eq!(ctx.tls_cipher, Some("TLS_AES_128_GCM_SHA256"));
+        assert_eq!(ctx.tls_alpn, Some("h2"));
+        assert!(!ctx.strict_sni_binding);
+    }
+
+    #[test]
+    fn test_reset_preserves_connection_state() {
+        let mut ctx = make_context();
+        ctx.closing = true;
+        ctx.cluster_id = Some("cluster-1".to_owned());
+        ctx.backend_id = Some("backend-1".to_owned());
+        ctx.sticky_session = Some("session-abc".to_owned());
+
+        let original_id = ctx.id;
+        let original_protocol = ctx.protocol;
+        let original_public_address = ctx.public_address;
+
+        ctx.reset();
+
+        // Connection-level state is preserved
+        assert!(ctx.closing);
+        assert_eq!(ctx.cluster_id.as_deref(), Some("cluster-1"));
+        assert_eq!(ctx.backend_id.as_deref(), Some("backend-1"));
+        assert_eq!(ctx.sticky_session.as_deref(), Some("session-abc"));
+        assert_eq!(ctx.id, original_id);
+        assert_eq!(ctx.protocol, original_protocol);
+        assert_eq!(ctx.public_address, original_public_address);
+    }
+
+    // ── traceparent / opentelemetry helpers ─────────────────────────────
+
+    #[cfg(feature = "opentelemetry")]
+    mod otel {
+        use super::super::*;
+
+        #[test]
+        fn test_parse_hex_valid() {
+            let (val, rest) = parse_hex::<4>(b"abcd1234").unwrap();
+            assert_eq!(&val, b"abcd");
+            assert_eq!(rest, b"1234");
+        }
+
+        #[test]
+        fn test_parse_hex_exact_length() {
+            let (val, rest) = parse_hex::<8>(b"01234567").unwrap();
+            assert_eq!(&val, b"01234567");
+            assert!(rest.is_empty());
+        }
+
+        #[test]
+        fn test_parse_hex_too_short() {
+            assert!(parse_hex::<4>(b"ab").is_none());
+        }
+
+        #[test]
+        fn test_parse_hex_rejects_non_hex() {
+            assert!(parse_hex::<4>(b"ghij").is_none());
+        }
+
+        #[test]
+        fn test_parse_hex_rejects_uppercase_is_ok() {
+            // Uppercase hex digits are valid
+            let (val, _) = parse_hex::<4>(b"ABCD").unwrap();
+            assert_eq!(&val, b"ABCD");
+        }
+
+        #[test]
+        fn test_skip_separator_valid() {
+            let rest = skip_separator(b"-hello").unwrap();
+            assert_eq!(rest, b"hello");
+        }
+
+        #[test]
+        fn test_skip_separator_wrong_char() {
+            assert!(skip_separator(b"+hello").is_none());
+        }
+
+        #[test]
+        fn test_skip_separator_empty() {
+            assert!(skip_separator(b"").is_none());
+        }
+
+        #[test]
+        fn test_build_traceparent_format() {
+            let trace_id: [u8; 32] = *b"4bf92f3577b34da6a3ce929d0e0e4736";
+            let parent_id: [u8; 16] = *b"00f067aa0ba902b7";
+
+            let result = build_traceparent(&trace_id, &parent_id);
+            assert_eq!(
+                &result,
+                b"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+            );
+        }
+
+        #[test]
+        fn test_build_traceparent_length() {
+            let trace_id = [b'a'; 32];
+            let parent_id = [b'b'; 16];
+            let result = build_traceparent(&trace_id, &parent_id);
+            // Format: "00-" (3) + trace_id (32) + "-" (1) + parent_id (16) + "-01" (3) = 55
+            assert_eq!(result.len(), 55);
+        }
+
+        #[test]
+        fn test_parse_traceparent_valid() {
+            let input = b"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+            let store = kawa::Store::Static(input);
+            let (trace_id, parent_id) = parse_traceparent(&store, input).unwrap();
+            assert_eq!(&trace_id, b"4bf92f3577b34da6a3ce929d0e0e4736");
+            assert_eq!(&parent_id, b"00f067aa0ba902b7");
+        }
+
+        #[test]
+        fn test_parse_traceparent_sampled_flag_zero() {
+            let input = b"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00";
+            let store = kawa::Store::Static(input);
+            let result = parse_traceparent(&store, input);
+            assert!(result.is_some());
+        }
+
+        #[test]
+        fn test_parse_traceparent_wrong_version() {
+            let input = b"01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+            let store = kawa::Store::Static(input);
+            assert!(parse_traceparent(&store, input).is_none());
+        }
+
+        #[test]
+        fn test_parse_traceparent_too_short() {
+            let input = b"00-4bf9";
+            let store = kawa::Store::Static(input);
+            assert!(parse_traceparent(&store, input).is_none());
+        }
+
+        #[test]
+        fn test_parse_traceparent_trailing_data() {
+            // Extra characters after the trace-flags should cause rejection
+            let input = b"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-extra";
+            let store = kawa::Store::Static(input);
+            assert!(parse_traceparent(&store, input).is_none());
+        }
+
+        #[test]
+        fn test_parse_traceparent_missing_separator() {
+            let input = b"004bf92f3577b34da6a3ce929d0e0e473600f067aa0ba902b701";
+            let store = kawa::Store::Static(input);
+            assert!(parse_traceparent(&store, input).is_none());
+        }
+
+        #[test]
+        fn test_parse_build_roundtrip() {
+            let trace_id: [u8; 32] = *b"4bf92f3577b34da6a3ce929d0e0e4736";
+            let parent_id: [u8; 16] = *b"00f067aa0ba902b7";
+
+            // Build a traceparent from known IDs
+            let built = build_traceparent(&trace_id, &parent_id);
+
+            // Verify that the built value matches the expected static string,
+            // then parse that static string back to confirm roundtrip.
+            let expected: &[u8] = b"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+            assert_eq!(&built[..], expected);
+
+            let store = kawa::Store::Static(expected);
+            let (parsed_trace_id, parsed_parent_id) = parse_traceparent(&store, expected).unwrap();
+
+            assert_eq!(parsed_trace_id, trace_id);
+            assert_eq!(parsed_parent_id, parent_id);
         }
     }
 }

@@ -306,10 +306,6 @@
 
 #[macro_use]
 extern crate sozu_command_lib as sozu_command;
-#[cfg(test)]
-#[macro_use]
-extern crate quickcheck;
-
 #[macro_use]
 pub mod util;
 #[macro_use]
@@ -349,7 +345,7 @@ use std::{
 use backends::BackendError;
 use hex::FromHexError;
 use mio::{Interest, Token, net::TcpStream};
-use protocol::http::{answers::TemplateError, parser::Method};
+use protocol::http::{answers::HttpAnswers, answers::TemplateError, parser::Method};
 use router::RouterError;
 use socket::ServerBindError;
 use sozu_command::{
@@ -455,6 +451,7 @@ macro_rules! StateMachineBuilder {
         }
 
         $(#[$($state_macros)*])*
+        #[allow(clippy::large_enum_variant)]
         pub enum $state_name {
             $(
                 $(#[$($variant_macros)*])*
@@ -530,6 +527,10 @@ pub trait ListenerHandler {
     }
 
     fn set_tags(&mut self, key: String, tags: Option<BTreeMap<String, String>>);
+
+    fn protocol(&self) -> Protocol;
+
+    fn public_address(&self) -> SocketAddr;
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -545,6 +546,13 @@ pub enum FrontendFromRequestError {
 pub trait L7ListenerHandler {
     fn get_sticky_name(&self) -> &str;
 
+    /// Name of the correlation header Sozu injects into every request and
+    /// response body. Default: `"Sozu-Id"`. Operators can rebrand via the
+    /// `sozu_id_header` listener config knob.
+    fn get_sozu_id_header(&self) -> &str {
+        "Sozu-Id"
+    }
+
     fn get_connect_timeout(&self) -> u32;
 
     /// retrieve a frontend by parsing a request's hostname, uri and method
@@ -554,6 +562,63 @@ pub trait L7ListenerHandler {
         uri: &str,
         method: &Method,
     ) -> Result<Route, FrontendFromRequestError>;
+
+    /// retrieve the listener's configured HTTP answers (templates)
+    fn get_answers(&self) -> &Rc<RefCell<HttpAnswers>>;
+
+    /// H2 flood detection thresholds from the listener config.
+    /// Returns the default config when the listener does not provide custom values.
+    fn get_h2_flood_config(&self) -> protocol::mux::H2FloodConfig {
+        protocol::mux::H2FloodConfig::default()
+    }
+
+    /// H2 connection tuning from the listener config.
+    /// Returns the default config when the listener does not provide custom values.
+    fn get_h2_connection_config(&self) -> protocol::mux::H2ConnectionConfig {
+        protocol::mux::H2ConnectionConfig::default()
+    }
+
+    /// Whether requests must have their `:authority` / `Host` exact-match
+    /// the TLS SNI negotiated at handshake (CWE-346 / CWE-444).
+    ///
+    /// Defaults to `true` — the safe setting enforced by Phase 1D of the
+    /// security audit. Operators can opt out per-listener via
+    /// `HttpsListenerConfig::strict_sni_binding = false` when cross-SNI
+    /// routing is explicitly required. Plaintext HTTP listeners return the
+    /// default value; they never have an SNI to compare against, so the
+    /// routing-layer check short-circuits on `tls_server_name: None`.
+    fn get_strict_sni_binding(&self) -> bool {
+        true
+    }
+
+    /// Per-stream idle timeout for H2 connections. An open stream that makes
+    /// no forward progress for this duration is cancelled (RST_STREAM / CANCEL).
+    /// Mitigates slow-multiplex Slowloris where a client keeps connection-level
+    /// activity high (resetting the connection idle timer on every frame) while
+    /// pinning streams for the full nominal connection timeout.
+    ///
+    /// Listeners inherit `max(30s, back_timeout)` when `h2_stream_idle_timeout_seconds`
+    /// is absent so operators who raised the socket-level backend budget do not
+    /// have to duplicate the value here; the 30 s floor preserves the baseline
+    /// slow-multiplex mitigation when `back_timeout` is shorter. Set the knob
+    /// explicitly to cap the per-stream deadline below `back_timeout` (useful
+    /// when under a slow-multiplex attack).
+    fn get_h2_stream_idle_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(30)
+    }
+
+    /// Wall-clock budget granted to in-flight H2 streams after soft-stop sent
+    /// the phase-1 `GOAWAY(NO_ERROR)`. Once the deadline elapses the mux
+    /// transitions to a forced close (final GOAWAY + session teardown).
+    ///
+    /// Returning `None` disables the forced close entirely — shutdown waits
+    /// for every stream to drain naturally. Returning `Some(d)` enforces the
+    /// budget. Default: `Some(Duration::from_secs(5))` (matches the historic
+    /// hard-coded 5 s deadline). Listeners expose the
+    /// `h2_graceful_shutdown_deadline_seconds` knob; value `0` maps to `None`.
+    fn get_h2_graceful_shutdown_deadline(&self) -> Option<std::time::Duration> {
+        Some(std::time::Duration::from_secs(5))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -588,6 +653,8 @@ pub enum BackendConnectionError {
     Backend(BackendError),
     #[error("failed to retrieve the cluster: {0}")]
     RetrieveClusterError(RetrieveClusterError),
+    #[error("maximum number of buffers reached")]
+    MaxBuffers,
 }
 
 /// used in kawa_h1 module for the Http session state
@@ -603,6 +670,13 @@ pub enum RetrieveClusterError {
     UnauthorizedRoute,
     #[error("{0}")]
     RetrieveFrontend(FrontendFromRequestError),
+    #[error("HTTPS redirect required")]
+    HttpsRedirect,
+    /// The HTTP `:authority` / `Host` host does not match the TLS SNI that was
+    /// negotiated for this connection, which would cross the TLS trust boundary.
+    /// Maps to HTTP 421 Misdirected Request (RFC 9110 §15.5.20).
+    #[error("TLS SNI {sni:?} does not match HTTP authority {authority:?}")]
+    SniAuthorityMismatch { sni: String, authority: String },
 }
 
 /// Used in sessions
@@ -635,6 +709,30 @@ pub enum ListenerError {
     AddFrontend(RouterError),
     #[error("could not remove frontend: {0}")]
     RemoveFrontend(RouterError),
+    #[error("invalid value for field '{field}': {reason}")]
+    InvalidValue {
+        field: &'static str,
+        reason: &'static str,
+    },
+}
+
+/// Lift control-plane validation errors into listener-level errors so the
+/// worker can surface the same message without duplicating the match.
+/// Non-`InvalidValue` variants fall back to a generic `InvalidValue` — they
+/// are not expected on the worker's `update_config` path (state lookups
+/// happen on the master) but we avoid panicking if one slips through.
+impl From<sozu_command::state::StateError> for ListenerError {
+    fn from(err: sozu_command::state::StateError) -> Self {
+        match err {
+            sozu_command::state::StateError::InvalidValue { field, reason } => {
+                ListenerError::InvalidValue { field, reason }
+            }
+            _ => ListenerError::InvalidValue {
+                field: "state",
+                reason: "unexpected state error on worker path",
+            },
+        }
+    }
 }
 
 /// Returned by the HTTP, HTTPS and TCP proxies
@@ -665,7 +763,7 @@ pub enum ProxyError {
     },
     #[error("can not add frontend {front:?}: {error}")]
     WrongInputFrontend {
-        front: RequestHttpFrontend,
+        front: Box<RequestHttpFrontend>,
         error: String,
     },
     #[error("could not add frontend: {0}")]
@@ -891,6 +989,49 @@ impl Readiness {
     /// filters the readiness we actually want
     pub fn filter_interest(&self) -> Ready {
         self.event & self.interest
+    }
+
+    /// Signal that the socket has buffered data to write (e.g., TLS internal
+    /// buffers) that won't generate a new epoll WRITABLE event.
+    pub fn signal_pending_write(&mut self) {
+        self.event.insert(Ready::WRITABLE);
+    }
+
+    /// Signal that the socket has buffered data to read (e.g., TLS plaintext
+    /// buffer after a 1xx clear) that won't generate a new epoll READABLE event.
+    pub fn signal_pending_read(&mut self) {
+        self.event.insert(Ready::READABLE);
+    }
+
+    /// Pair `Ready::WRITABLE` insert with `signal_pending_write` — the canonical
+    /// invariant-15 form for any path that writes bytes to sozu-owned buffers
+    /// under edge-triggered epoll. See `lib/src/protocol/mux/LIFECYCLE.md`.
+    #[inline]
+    pub fn arm_writable(&mut self) {
+        self.interest.insert(Ready::WRITABLE);
+        self.signal_pending_write();
+    }
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::{Readiness, Ready};
+
+    #[test]
+    fn arm_writable_sets_interest_and_event() {
+        let mut r = Readiness::new();
+        r.arm_writable();
+        assert!(r.interest.is_writable());
+        assert!(r.event.is_writable());
+    }
+
+    #[test]
+    fn arm_writable_is_idempotent() {
+        let mut r = Readiness::new();
+        r.arm_writable();
+        r.arm_writable();
+        assert_eq!(r.interest, Ready::WRITABLE);
+        assert_eq!(r.event, Ready::WRITABLE);
     }
 }
 
@@ -1133,7 +1274,7 @@ impl PeakEWMA {
             self.rtt = rtt;
         } else {
             // new_rtt = old_rtt * e^(-elapsed/decay) + observed_rtt * (1 - e^(-elapsed/decay))
-            let weight = (-1.0 * dur.as_nanos() as f64 / self.decay).exp();
+            let weight = (-(dur.as_nanos() as f64) / self.decay).exp();
             self.rtt = self.rtt * weight + rtt * (1.0 - weight);
         }
 
@@ -1171,6 +1312,21 @@ pub mod testing {
         server::{ListenSession, ProxyChannel, Server, SessionManager},
         tcp::TcpProxy,
     };
+
+    use std::sync::atomic::{AtomicU16, Ordering};
+
+    /// Port counter for sozu listener addresses in lib tests.
+    /// Starts at 10000 to avoid collision with:
+    /// - Privileged ports (<1024)
+    /// - e2e suite (starts at 2000)
+    /// - Ephemeral port range (typically 32768+)
+    static PORT_PROVIDER: AtomicU16 = AtomicU16::new(10000);
+
+    /// Get a unique port for a sozu listener address.
+    /// Each call returns a different port, safe for parallel test execution.
+    pub fn provide_port() -> u16 {
+        PORT_PROVIDER.fetch_add(1, Ordering::SeqCst)
+    }
 
     /// Everything needed to create a Server
     pub struct ServerParts {

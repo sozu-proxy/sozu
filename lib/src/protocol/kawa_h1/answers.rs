@@ -1,3 +1,11 @@
+//! Default HTTP answer templating.
+//!
+//! Owns the per-cluster default-answer table (`HttpAnswers`) used when Sōzu
+//! synthesises a response (parse error, route miss, backend unreachable, …).
+//! Templates are pre-rendered into `Kawa<SharedBuffer>` instances at
+//! configuration time so the hot path only needs a clone of the shared
+//! buffer.
+
 use std::{
     collections::{HashMap, VecDeque},
     fmt,
@@ -309,6 +317,8 @@ pub struct ListenerAnswers {
     pub answer_408: Template,
     /// PayloadTooLarge
     pub answer_413: Template,
+    /// MisdirectedRequest (RFC 9110 §15.5.20)
+    pub answer_421: Template,
     /// BadGateway
     pub answer_502: Template,
     /// ServiceUnavailable
@@ -492,6 +502,29 @@ Sozu-Id: %REQUEST_ID\r
 }
 </pre>
 <p>Request needed more than %CAPACITY bytes to fit. Parser stopped at phase: %PHASE. %MESSAGE</p>
+<footer>This is an automatic answer by Sōzu.</footer></body></html>",
+    )
+}
+
+fn default_421() -> String {
+    String::from(
+        "\
+HTTP/1.1 421 Misdirected Request\r
+Cache-Control: no-cache\r
+Connection: close\r
+Sozu-Id: %REQUEST_ID\r
+\r
+<html><head><meta charset='utf-8'><head><body>
+<style>pre{background:#EEE;padding:10px;border:1px solid #AAA;border-radius: 5px;}</style>
+<h1>421 Misdirected Request</h1>
+<pre>
+{
+    \"status_code\": 421,
+    \"route\": \"%ROUTE\",
+    \"request_id\": \"%REQUEST_ID\"
+}
+</pre>
+<p>The request's authority does not match the TLS SNI negotiated for this connection. Retry on a fresh TLS connection that matches the target authority.</p>
 <footer>This is an automatic answer by Sōzu.</footer></body></html>",
     )
 }
@@ -753,6 +786,11 @@ impl HttpAnswers {
                 answer,
                 &[length, route, request_id, capacity, message, phase],
             ),
+            421 => Template::new(
+                421,
+                answer,
+                &[length, route, request_id]
+            ),
             502 => Template::new(
                 502,
                 answer,
@@ -817,6 +855,12 @@ impl HttpAnswers {
                         .and_then(|c| c.answer_413.clone())
                         .unwrap_or(default_413()),
                 )?,
+                answer_421: Self::template(
+                    421,
+                    conf.as_ref()
+                        .and_then(|c| c.answer_421.clone())
+                        .unwrap_or(default_421()),
+                )?,
                 answer_502: Self::template(
                     502,
                     conf.as_ref()
@@ -859,6 +903,40 @@ impl HttpAnswers {
 
     pub fn remove_custom_answer(&mut self, cluster_id: &str) {
         self.cluster_custom_answers.remove(cluster_id);
+    }
+
+    /// Rewrite ONLY the listener-default template fields for which the patch
+    /// provides `Some(body)`, leaving all other templates and
+    /// `cluster_custom_answers` untouched.
+    ///
+    /// Field-mask semantic: a `None` field in `new_defaults` means "preserve
+    /// the current template"; a `Some` field means "replace with this body".
+    /// This matches the update-verb documented contract — a patch that sets
+    /// only `answer_503` must leave `answer_401`/`answer_404`/etc. alone.
+    pub fn replace_defaults(
+        &mut self,
+        new_defaults: &CustomHttpAnswers,
+    ) -> Result<(), (u16, TemplateError)> {
+        macro_rules! merge {
+            ($status:expr, $field:ident) => {
+                if let Some(body) = new_defaults.$field.clone() {
+                    self.listener_answers.$field = Self::template($status, body)?;
+                }
+            };
+        }
+
+        merge!(301, answer_301);
+        merge!(400, answer_400);
+        merge!(401, answer_401);
+        merge!(404, answer_404);
+        merge!(408, answer_408);
+        merge!(413, answer_413);
+        merge!(421, answer_421);
+        merge!(502, answer_502);
+        merge!(503, answer_503);
+        merge!(504, answer_504);
+        merge!(507, answer_507);
+        Ok(())
     }
 
     pub fn get(
@@ -924,6 +1002,11 @@ impl HttpAnswers {
                 variables_once = vec![message.into()];
                 &self.listener_answers.answer_413
             }
+            DefaultAnswer::Answer421 {} => {
+                variables = vec![route.into(), request_id.into()];
+                variables_once = vec![];
+                &self.listener_answers.answer_421
+            }
             DefaultAnswer::Answer502 {
                 message,
                 phase,
@@ -988,5 +1071,108 @@ impl HttpAnswers {
         // kawa::debug_kawa(&template.kawa);
         // println!("{template:#?}");
         template.fill(&variables, &mut variables_once)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sozu_command::proto::command::CustomHttpAnswers;
+
+    use super::HttpAnswers;
+
+    /// `replace_defaults` must rewrite listener-default templates while
+    /// preserving every per-cluster entry in `cluster_custom_answers`.
+    #[test]
+    fn replace_defaults_preserves_cluster_custom_answers() {
+        // Build a fresh HttpAnswers with the stock defaults.
+        let mut answers = HttpAnswers::new(&None).expect("default HttpAnswers must parse");
+
+        // Register a per-cluster custom 503.
+        let custom_cluster_503 = "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 5\r\n\r\noops!";
+        answers
+            .add_custom_answer("my-cluster", custom_cluster_503.to_owned())
+            .expect("custom 503 must parse");
+
+        // Now replace the listener-default 503 with a different body.
+        let new_listener_503 = "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 11\r\n\r\nnew-default";
+        let patch = CustomHttpAnswers {
+            answer_503: Some(new_listener_503.to_owned()),
+            ..Default::default()
+        };
+        answers
+            .replace_defaults(&patch)
+            .expect("replace_defaults must succeed");
+
+        // (a) Listener-default template now contains the new body text.
+        let template_buf = answers.listener_answers.answer_503.kawa.storage.buffer();
+        let contains_new_default = template_buf
+            .windows(b"new-default".len())
+            .any(|w| w == b"new-default");
+        assert!(
+            contains_new_default,
+            "listener-default 503 should have been replaced with new-default"
+        );
+
+        // (b) The registered cluster's custom 503 is still intact.
+        assert!(
+            answers.cluster_custom_answers.contains_key("my-cluster"),
+            "cluster_custom_answers must be preserved after replace_defaults"
+        );
+        let cluster_buf = answers
+            .cluster_custom_answers
+            .get("my-cluster")
+            .unwrap()
+            .answer_503
+            .kawa
+            .storage
+            .buffer();
+        let contains_oops = cluster_buf.windows(b"oops!".len()).any(|w| w == b"oops!");
+        assert!(
+            contains_oops,
+            "per-cluster 503 must still contain the original custom body"
+        );
+    }
+
+    /// Regression test for the H-1 finding: `replace_defaults` must preserve
+    /// listener-default templates for fields that the patch does NOT set.
+    /// Prior behavior treated `None` as "reset to stock default", silently
+    /// wiping out any custom body configured at AddListener time.
+    #[test]
+    fn replace_defaults_preserves_unmentioned_templates() {
+        // Build HttpAnswers with a custom 401 AND 503 at creation time.
+        let initial_401 = "HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Length: 12\r\n\r\nneed-creds!!";
+        let initial_503 = "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 11\r\n\r\ninitial-503";
+        let initial = CustomHttpAnswers {
+            answer_401: Some(initial_401.to_owned()),
+            answer_503: Some(initial_503.to_owned()),
+            ..Default::default()
+        };
+        let mut answers = HttpAnswers::new(&Some(initial)).expect("initial HttpAnswers must parse");
+
+        // Patch ONLY answer_503. answer_401 must stay as-is.
+        let new_503 = "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 7\r\n\r\npatched";
+        let patch = CustomHttpAnswers {
+            answer_503: Some(new_503.to_owned()),
+            ..Default::default()
+        };
+        answers
+            .replace_defaults(&patch)
+            .expect("replace_defaults must succeed");
+
+        // 503 got the patched body.
+        let buf_503 = answers.listener_answers.answer_503.kawa.storage.buffer();
+        assert!(
+            buf_503.windows(b"patched".len()).any(|w| w == b"patched"),
+            "answer_503 should have been replaced"
+        );
+
+        // 401 must still contain the custom body from initial AddListener.
+        let buf_401 = answers.listener_answers.answer_401.kawa.storage.buffer();
+        assert!(
+            buf_401
+                .windows(b"need-creds!!".len())
+                .any(|w| w == b"need-creds!!"),
+            "answer_401 must be preserved when the patch does not set it"
+        );
     }
 }

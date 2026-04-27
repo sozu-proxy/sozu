@@ -23,7 +23,7 @@ impl CommandManager {
             .map_err(CtlError::ReadBlocking)
     }
 
-    fn send_request_get_response(
+    pub(super) fn send_request_get_response(
         &mut self,
         request: Request,
         timeout: bool,

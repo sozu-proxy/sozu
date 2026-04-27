@@ -81,11 +81,15 @@ impl Request {
             | RequestType::QueryClusterById(_)
             | RequestType::QueryClustersByDomain(_) => {}
 
-            // the Add***Listener and other Listener orders will be handled separately
-            // by the notify_proxys function, so we don't give them destinations
+            // the Add***Listener / Update***Listener and other Listener orders will be
+            // handled separately by the notify_proxys function, so we don't give them
+            // destinations here
             RequestType::AddHttpsListener(_)
             | RequestType::AddHttpListener(_)
             | RequestType::AddTcpListener(_)
+            | RequestType::UpdateHttpListener(_)
+            | RequestType::UpdateHttpsListener(_)
+            | RequestType::UpdateTcpListener(_)
             | RequestType::RemoveListener(_)
             | RequestType::ActivateListener(_)
             | RequestType::DeactivateListener(_)

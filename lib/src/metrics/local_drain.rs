@@ -49,7 +49,17 @@ impl AggregatedMetric {
     fn new(metric: MetricValue) -> Result<AggregatedMetric, MetricError> {
         match metric {
             MetricValue::Gauge(value) => Ok(AggregatedMetric::Gauge(value)),
-            MetricValue::GaugeAdd(value) => Ok(AggregatedMetric::Gauge(value as usize)),
+            MetricValue::GaugeAdd(value) => {
+                if value >= 0 {
+                    Ok(AggregatedMetric::Gauge(value as usize))
+                } else {
+                    error!(
+                        "local drain metric created with negative GaugeAdd({}), clamping to 0",
+                        value
+                    );
+                    Ok(AggregatedMetric::Gauge(0))
+                }
+            }
             MetricValue::Count(value) => Ok(AggregatedMetric::Count(value)),
             MetricValue::Time(value) => {
                 let mut histogram = ::hdrhistogram::Histogram::new(3).map_err(|error| {
@@ -77,7 +87,16 @@ impl AggregatedMetric {
                 *v1 = v2;
             }
             (&mut AggregatedMetric::Gauge(ref mut v1), MetricValue::GaugeAdd(v2)) => {
-                *v1 = (*v1 as i64 + v2) as usize;
+                let res = *v1 as i64 + v2;
+                *v1 = if res >= 0 {
+                    res as usize
+                } else {
+                    error!(
+                        "local drain metric {} underflow: previous value: {}, adding: {}",
+                        key, *v1, v2
+                    );
+                    0
+                };
             }
             (&mut AggregatedMetric::Count(ref mut v1), MetricValue::Count(v2)) => {
                 *v1 += v2;
@@ -87,9 +106,12 @@ impl AggregatedMetric {
                     error!("could not record time metric: {:?}", e.to_string());
                 }
             }
-            (s, m) => panic!(
-                "tried to update metric {key} of value {s:?} with an incompatible metric: {m:?}"
-            ),
+            (s, m) => {
+                error!(
+                    "tried to update metric {} of value {:?} with an incompatible metric: {:?}",
+                    key, s, m
+                );
+            }
         }
     }
 
@@ -183,7 +205,7 @@ impl MetricsMap {
 
                 // convert time metrics to a histogram format, on top of percentiles
                 if let AggregatedMetric::Time(hist) = metric {
-                    filtered.push((format!("{}_histogram", name), filter_histogram(hist)));
+                    filtered.push((format!("{name}_histogram"), filter_histogram(hist)));
                 }
                 filtered.into_iter()
             })
@@ -208,6 +230,14 @@ impl MetricsMap {
 
     fn metric_names(&self) -> impl Iterator<Item = &str> {
         self.map.keys().map(|name| name.as_str())
+    }
+
+    /// Remove all Count and Time entries, keeping Gauge entries intact.
+    /// Gauges track live resource state and must survive the hourly clear;
+    /// counters and histograms are cumulative and can be safely reset.
+    fn retain_gauges(&mut self) {
+        self.map
+            .retain(|_, v| matches!(v, AggregatedMetric::Gauge(_)));
     }
 }
 
@@ -283,6 +313,17 @@ impl LocalClusterMetrics {
         }
         false
     }
+
+    /// Clear cumulative metrics (Count, Time) while preserving Gauge entries
+    /// that track live resource state (e.g. connections_per_backend).
+    fn clear_non_gauges(&mut self) {
+        self.cluster.retain_gauges();
+        for backend in &mut self.backends {
+            backend.metrics.retain_gauges();
+        }
+        // Drop backends that have no remaining metrics after the purge
+        self.backends.retain(|b| !b.metrics.map.is_empty());
+    }
 }
 
 /// local equivalent to proto::command::BackendMetrics
@@ -344,7 +385,17 @@ impl LocalDrain {
     }
 
     pub fn clear(&mut self) {
-        self.cluster_metrics.clear();
+        // Preserve Gauge entries that track live resource state (e.g.
+        // connections_per_backend, backend.connections). Only clear
+        // cumulative metrics (Count, Time) which can safely reset.
+        // Wiping gauges causes underflows when long-lived connections
+        // (especially H2) close after the hourly clear.
+        for cluster in self.cluster_metrics.values_mut() {
+            cluster.clear_non_gauges();
+        }
+        // Drop clusters that have no remaining metrics after the purge
+        self.cluster_metrics
+            .retain(|_, c| !c.cluster.map.is_empty() || !c.backends.is_empty());
     }
 
     pub fn query(&mut self, options: &QueryMetricsOptions) -> Result<ResponseContent, MetricError> {
@@ -473,8 +524,7 @@ impl LocalDrain {
         }
 
         Err(MetricError::NoMetrics(format!(
-            "No metric for backend {}",
-            backend_id
+            "No metric for backend {backend_id}"
         )))
     }
 
@@ -701,5 +751,188 @@ mod tests {
             .expect("could not query metrics for this cluster");
 
         assert_eq!(expected_cluster_metrics, returned_cluster_metrics);
+    }
+
+    #[test]
+    fn gauge_add_negative_constructor_clamps_to_zero() {
+        // GaugeAdd(-1) as the first metric for a backend should clamp to 0,
+        // not silently wrap to usize::MAX via `value as usize`.
+        let mut local_drain = LocalDrain::new("prefix".to_string());
+
+        local_drain.receive_metric(
+            "connections_per_backend",
+            Some("test-cluster"),
+            Some("test-backend-1"),
+            MetricValue::GaugeAdd(-1),
+        );
+
+        let result = local_drain
+            .metrics_of_one_backend(
+                "test-backend-1",
+                ["connections_per_backend".to_string()].as_ref(),
+            )
+            .expect("could not query metrics for this backend");
+
+        let gauge_value = match result
+            .metrics
+            .get("connections_per_backend")
+            .and_then(|m| m.inner.as_ref())
+        {
+            Some(Inner::Gauge(v)) => *v,
+            other => panic!("expected Gauge, got {other:?}"),
+        };
+
+        assert_eq!(
+            gauge_value, 0,
+            "negative GaugeAdd as first metric must clamp to 0, not wrap"
+        );
+    }
+
+    #[test]
+    fn gauge_add_negative_on_existing_zero_clamps() {
+        // GaugeAdd(-1) on an existing Gauge(0) should clamp to 0.
+        let mut local_drain = LocalDrain::new("prefix".to_string());
+
+        // First, create the gauge with a positive value then bring it to 0.
+        local_drain.receive_metric(
+            "connections_per_backend",
+            Some("test-cluster"),
+            Some("test-backend-1"),
+            MetricValue::GaugeAdd(1),
+        );
+        local_drain.receive_metric(
+            "connections_per_backend",
+            Some("test-cluster"),
+            Some("test-backend-1"),
+            MetricValue::GaugeAdd(-1),
+        );
+
+        // Now apply a second -1, which should clamp to 0 (the underflow case).
+        local_drain.receive_metric(
+            "connections_per_backend",
+            Some("test-cluster"),
+            Some("test-backend-1"),
+            MetricValue::GaugeAdd(-1),
+        );
+
+        let result = local_drain
+            .metrics_of_one_backend(
+                "test-backend-1",
+                ["connections_per_backend".to_string()].as_ref(),
+            )
+            .expect("could not query metrics for this backend");
+
+        let gauge_value = match result
+            .metrics
+            .get("connections_per_backend")
+            .and_then(|m| m.inner.as_ref())
+        {
+            Some(Inner::Gauge(v)) => *v,
+            other => panic!("expected Gauge, got {other:?}"),
+        };
+
+        assert_eq!(gauge_value, 0, "double-decrement on gauge must clamp to 0");
+    }
+
+    #[test]
+    fn clear_preserves_gauges_and_removes_counters() {
+        // The hourly clear should preserve Gauge entries (live resource state)
+        // while removing Count and Time entries (cumulative data).
+        let mut local_drain = LocalDrain::new("prefix".to_string());
+
+        // Add a gauge (connections_per_backend) for a backend.
+        local_drain.receive_metric(
+            "connections_per_backend",
+            Some("test-cluster"),
+            Some("test-backend-1"),
+            MetricValue::GaugeAdd(3),
+        );
+
+        // Add a counter (backend.connections.error) for the same backend.
+        local_drain.receive_metric(
+            "backend.connections.error",
+            Some("test-cluster"),
+            Some("test-backend-1"),
+            MetricValue::Count(5),
+        );
+
+        // Clear — should preserve the gauge, remove the counter.
+        local_drain.clear();
+
+        let result = local_drain
+            .metrics_of_one_backend(
+                "test-backend-1",
+                [
+                    "connections_per_backend".to_string(),
+                    "backend.connections.error".to_string(),
+                ]
+                .as_ref(),
+            )
+            .expect("could not query metrics for this backend");
+
+        // Gauge should still be 3.
+        let gauge_value = match result
+            .metrics
+            .get("connections_per_backend")
+            .and_then(|m| m.inner.as_ref())
+        {
+            Some(Inner::Gauge(v)) => *v,
+            other => panic!("expected Gauge, got {other:?}"),
+        };
+        assert_eq!(gauge_value, 3, "gauge must survive clear()");
+
+        // Counter should be gone (not present in the filtered output).
+        assert!(
+            !result.metrics.contains_key("backend.connections.error"),
+            "counter must be removed by clear()"
+        );
+    }
+
+    #[test]
+    fn clear_then_gauge_decrement_works() {
+        // Simulate the hourly-clear scenario: H2 connection opened before
+        // the clear, closed after. The gauge should survive the clear and
+        // then decrement correctly to 0.
+        let mut local_drain = LocalDrain::new("prefix".to_string());
+
+        // Connection opens: gauge goes to 1.
+        local_drain.receive_metric(
+            "connections_per_backend",
+            Some("test-cluster"),
+            Some("test-backend-1"),
+            MetricValue::GaugeAdd(1),
+        );
+
+        // Hourly clear fires.
+        local_drain.clear();
+
+        // Connection closes: gauge goes from 1 to 0 (not 0 to -1).
+        local_drain.receive_metric(
+            "connections_per_backend",
+            Some("test-cluster"),
+            Some("test-backend-1"),
+            MetricValue::GaugeAdd(-1),
+        );
+
+        let result = local_drain
+            .metrics_of_one_backend(
+                "test-backend-1",
+                ["connections_per_backend".to_string()].as_ref(),
+            )
+            .expect("could not query metrics for this backend");
+
+        let gauge_value = match result
+            .metrics
+            .get("connections_per_backend")
+            .and_then(|m| m.inner.as_ref())
+        {
+            Some(Inner::Gauge(v)) => *v,
+            other => panic!("expected Gauge, got {other:?}"),
+        };
+
+        assert_eq!(
+            gauge_value, 0,
+            "gauge should be 0 after surviving clear + decrement"
+        );
     }
 }

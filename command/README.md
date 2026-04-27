@@ -29,7 +29,7 @@ message Request {
     // load a state file, given its path
     string load_state = 2;
     /*
-    40 more requests
+    many more — see command/src/command.proto
     */
   }
 }
@@ -61,4 +61,30 @@ with the `Processing` status: in a soft shutdown, a worker stops accepting
 new connections but keeps the active ones and exits when they are no longer
 active. Once all connections are done, a worker will send an answer
 with the same id and the `Ok` status.
+
+## Control-plane audit log
+
+Every privileged mutation accepted by the unix command socket is mirrored to a
+dedicated audit envelope rendered in the canonical `[session req cluster
+backend]\tAUDIT\tCommand(...)` layout. Two optional sinks ship today:
+`audit_logs_target` (text, ANSI-stripped, mirrors the `info!` line) and
+`audit_logs_json_target` (one stable-schema JSON object per line, ready for SIEM
+ingest). Both sinks open `O_APPEND | O_CREAT | chmod 0640` and create new parent
+directories with mode `0o750` so PCI-DSS 10.5 remains enforceable across
+restarts. Free-form fields (`target`, `actor.user`, `actor.comm`, `socket`,
+`extras.reason`) are sanitised before render so attacker-influenced input cannot
+forge additional audit lines via embedded `\t` / `\n` / ANSI escapes.
+
+The optional `command_allowed_uids: Vec<u32>` config field rejects any
+`SO_PEERCRED` UID outside the list at the top of `Server::handle_client_request`
+(defence in depth on top of the `0o600` socket mode). Actor identity is
+captured via `SO_PEERCRED` and enriched on accept with `/proc/<pid>/comm` and
+NSS `getpwuid_r(uid)`; `peer_comm` opens `/proc/<pid>/stat` first so a recycled
+PID returns `None` rather than the new owner's `comm`, and `peer_user` caches
+results in a 16-entry process-local LRU so an SSSD/LDAP wedge cannot stall the
+main event loop.
+
+The full schema, retention policy, and supervisor-side lifecycle (accept loop,
+fan-out across workers, FD-passing for hot upgrades) live in
+`doc/observability.md` and the module-level comments in `bin/src/command/`.
 

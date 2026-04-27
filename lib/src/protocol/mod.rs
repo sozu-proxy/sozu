@@ -1,5 +1,13 @@
-pub mod h2;
+//! Protocol-state surface area.
+//!
+//! Defines the [`SessionState`] trait that every front-end protocol
+//! implementation (`kawa_h1`, `mux`, `pipe`, `proxy_protocol`, `rustls`)
+//! plugs into the mio worker loop. State implementations decide how to
+//! react to readiness events, manage timeouts, render their internal state
+//! for debugging, and signal whether the session can be torn down.
+
 pub mod kawa_h1;
+pub mod mux;
 pub mod pipe;
 pub mod proxy_protocol;
 pub mod rustls;

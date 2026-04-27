@@ -56,9 +56,9 @@ impl Display for CertificateSummary {
 impl Display for QueryCertificatesFilters {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         if let Some(d) = self.domain.clone() {
-            write!(f, "domain:{}", d)
+            write!(f, "domain:{d}")
         } else if let Some(fp) = self.fingerprint.clone() {
-            write!(f, "domain:{}", fp)
+            write!(f, "fingerprint:{fp}")
         } else {
             write!(f, "all certificates")
         }
@@ -113,6 +113,9 @@ pub fn format_request_type(request_type: &RequestType) -> &str {
         RequestType::ReturnListenSockets(_) => "ReturnListenSockets",
         RequestType::QueryCertificatesFromTheState(_) => "QueryCertificatesFromTheState",
         RequestType::QueryCertificatesFromWorkers(_) => "QueryCertificatesFromWorkers",
+        RequestType::UpdateHttpListener(_) => "UpdateHttpListener",
+        RequestType::UpdateHttpsListener(_) => "UpdateHttpsListener",
+        RequestType::UpdateTcpListener(_) => "UpdateTcpListener",
     }
 }
 
@@ -582,13 +585,13 @@ pub fn print_listeners(listeners_list: &ListenersList) -> Result<(), DisplayErro
     println!("\nHTTP LISTENERS\n================");
 
     for (_, http_listener) in listeners_list.http_listeners.iter() {
-        println!("{}", http_listener);
+        println!("{http_listener}");
     }
 
     println!("\nHTTPS LISTENERS\n================");
 
     for (_, https_listener) in listeners_list.https_listeners.iter() {
-        println!("{}", https_listener);
+        println!("{https_listener}");
     }
 
     println!("\nTCP LISTENERS\n================");
@@ -868,7 +871,7 @@ fn print_responses_by_worker(
     json: bool,
 ) -> Result<(), DisplayError> {
     for (worker_id, content) in worker_responses.map.iter() {
-        println!("Worker {}", worker_id);
+        println!("Worker {worker_id}");
         content.display(json)?;
     }
 
@@ -920,7 +923,7 @@ fn print_certificates_by_address(list: &ListOfCertificatesByAddress) -> Result<(
         println!("\t{}:", certs.address);
 
         for summary in certs.certificate_summaries.iter() {
-            println!("\t\t{}", summary);
+            println!("\t\t{summary}");
         }
     }
     Ok(())
@@ -1034,7 +1037,37 @@ impl Display for HttpListenerConfig {
         table.add_row(row!["connect timeout", self.connect_timeout]);
         table.add_row(row!["request timeout", self.request_timeout]);
         table.add_row(row!["activated", self.active]);
-        write!(f, "{}", table)
+        add_h2_flood_rows(
+            &mut table,
+            &self.h2_max_rst_stream_per_window,
+            &self.h2_max_ping_per_window,
+            &self.h2_max_settings_per_window,
+            &self.h2_max_empty_data_per_window,
+            &self.h2_max_window_update_stream0_per_window,
+            &self.h2_max_continuation_frames,
+            &self.h2_max_glitch_count,
+            &self.h2_max_rst_stream_lifetime,
+            &self.h2_max_rst_stream_abusive_lifetime,
+            &self.h2_max_rst_stream_emitted_lifetime,
+            &self.h2_max_header_list_size,
+            &self.h2_max_header_table_size,
+        );
+        add_h2_connection_rows(
+            &mut table,
+            &self.h2_initial_connection_window,
+            &self.h2_max_concurrent_streams,
+            &self.h2_stream_shrink_ratio,
+        );
+        if let Some(v) = &self.h2_stream_idle_timeout_seconds {
+            table.add_row(row!["h2 stream idle timeout (seconds)", v]);
+        }
+        if let Some(v) = &self.h2_graceful_shutdown_deadline_seconds {
+            table.add_row(row!["h2 graceful shutdown deadline (seconds)", v]);
+        }
+        if let Some(v) = &self.sozu_id_header {
+            table.add_row(row!["Sozu-Id correlation header name", v]);
+        }
+        write!(f, "{table}")
     }
 }
 
@@ -1060,6 +1093,10 @@ impl Display for HttpsListenerConfig {
             list_string_vec(&self.signature_algorithms),
         ]);
         table.add_row(row!["groups list", list_string_vec(&self.groups_list),]);
+        table.add_row(row![
+            "alpn protocols",
+            list_string_vec(&self.alpn_protocols),
+        ]);
         table.add_row(row!["key", format!("{:?}", self.key),]);
         table.add_row(row!["expect proxy", self.expect_proxy]);
         table.add_row(row!["sticky name", self.sticky_name]);
@@ -1068,7 +1105,118 @@ impl Display for HttpsListenerConfig {
         table.add_row(row!["connect timeout", self.connect_timeout]);
         table.add_row(row!["request timeout", self.request_timeout]);
         table.add_row(row!["activated", self.active]);
-        write!(f, "{}", table)
+        add_h2_flood_rows(
+            &mut table,
+            &self.h2_max_rst_stream_per_window,
+            &self.h2_max_ping_per_window,
+            &self.h2_max_settings_per_window,
+            &self.h2_max_empty_data_per_window,
+            &self.h2_max_window_update_stream0_per_window,
+            &self.h2_max_continuation_frames,
+            &self.h2_max_glitch_count,
+            &self.h2_max_rst_stream_lifetime,
+            &self.h2_max_rst_stream_abusive_lifetime,
+            &self.h2_max_rst_stream_emitted_lifetime,
+            &self.h2_max_header_list_size,
+            &self.h2_max_header_table_size,
+        );
+        add_h2_connection_rows(
+            &mut table,
+            &self.h2_initial_connection_window,
+            &self.h2_max_concurrent_streams,
+            &self.h2_stream_shrink_ratio,
+        );
+        if let Some(v) = self.strict_sni_binding {
+            table.add_row(row!["strict sni binding", v]);
+        }
+        if let Some(v) = self.disable_http11 {
+            table.add_row(row!["disable http/1.1", v]);
+        }
+        if let Some(v) = &self.h2_stream_idle_timeout_seconds {
+            table.add_row(row!["h2 stream idle timeout (seconds)", v]);
+        }
+        if let Some(v) = &self.h2_graceful_shutdown_deadline_seconds {
+            table.add_row(row!["h2 graceful shutdown deadline (seconds)", v]);
+        }
+        if let Some(v) = &self.sozu_id_header {
+            table.add_row(row!["Sozu-Id correlation header name", v]);
+        }
+        write!(f, "{table}")
+    }
+}
+
+/// Add H2 flood detection threshold rows to a display table.
+/// Only shows rows for values that have been explicitly configured.
+#[allow(clippy::too_many_arguments)]
+fn add_h2_flood_rows(
+    table: &mut Table,
+    max_rst_stream: &Option<u32>,
+    max_ping: &Option<u32>,
+    max_settings: &Option<u32>,
+    max_empty_data: &Option<u32>,
+    max_window_update_stream0: &Option<u32>,
+    max_continuation: &Option<u32>,
+    max_glitch: &Option<u32>,
+    max_rst_stream_lifetime: &Option<u64>,
+    max_rst_stream_abusive_lifetime: &Option<u64>,
+    max_rst_stream_emitted_lifetime: &Option<u64>,
+    max_header_list_size: &Option<u32>,
+    max_header_table_size: &Option<u32>,
+) {
+    if let Some(v) = max_rst_stream {
+        table.add_row(row!["h2 max rst_stream/window", v]);
+    }
+    if let Some(v) = max_ping {
+        table.add_row(row!["h2 max ping/window", v]);
+    }
+    if let Some(v) = max_settings {
+        table.add_row(row!["h2 max settings/window", v]);
+    }
+    if let Some(v) = max_empty_data {
+        table.add_row(row!["h2 max empty_data/window", v]);
+    }
+    if let Some(v) = max_window_update_stream0 {
+        table.add_row(row!["h2 max window_update stream0/window", v]);
+    }
+    if let Some(v) = max_continuation {
+        table.add_row(row!["h2 max continuation frames", v]);
+    }
+    if let Some(v) = max_glitch {
+        table.add_row(row!["h2 max glitch count", v]);
+    }
+    if let Some(v) = max_rst_stream_lifetime {
+        table.add_row(row!["h2 max rst_stream lifetime", v]);
+    }
+    if let Some(v) = max_rst_stream_abusive_lifetime {
+        table.add_row(row!["h2 max rst_stream abusive lifetime", v]);
+    }
+    if let Some(v) = max_rst_stream_emitted_lifetime {
+        table.add_row(row!["h2 max rst_stream emitted lifetime", v]);
+    }
+    if let Some(v) = max_header_list_size {
+        table.add_row(row!["h2 max header list size", v]);
+    }
+    if let Some(v) = max_header_table_size {
+        table.add_row(row!["h2 max header table size", v]);
+    }
+}
+
+/// Add H2 connection tuning rows to a display table.
+/// Only shows rows for values that have been explicitly configured.
+fn add_h2_connection_rows(
+    table: &mut Table,
+    window: &Option<u32>,
+    max_streams: &Option<u32>,
+    shrink_ratio: &Option<u32>,
+) {
+    if let Some(v) = window {
+        table.add_row(row!["h2 initial connection window", v]);
+    }
+    if let Some(v) = max_streams {
+        table.add_row(row!["h2 max concurrent streams", v]);
+    }
+    if let Some(v) = shrink_ratio {
+        table.add_row(row!["h2 stream shrink ratio", v]);
     }
 }
 
@@ -1090,6 +1238,9 @@ impl CustomHttpAnswers {
             }
             if let Some(a) = &answers.answer_413 {
                 rows.push(row!("413", a));
+            }
+            if let Some(a) = &answers.answer_421 {
+                rows.push(row!("421", a));
             }
             if let Some(a) = &answers.answer_502 {
                 rows.push(row!("502", a));
@@ -1115,6 +1266,29 @@ impl Display for Event {
             EventKind::BackendUp => "backend up",
             EventKind::NoAvailableBackends => "no available backends",
             EventKind::RemovedBackendHasNoConnections => "removed backend has no connections",
+            EventKind::ClusterAdded => "cluster added",
+            EventKind::ClusterRemoved => "cluster removed",
+            EventKind::FrontendAdded => "frontend added",
+            EventKind::FrontendRemoved => "frontend removed",
+            EventKind::CertificateAdded => "certificate added",
+            EventKind::CertificateRemoved => "certificate removed",
+            EventKind::CertificateReplaced => "certificate replaced",
+            EventKind::ListenerActivated => "listener activated",
+            EventKind::ListenerDeactivated => "listener deactivated",
+            EventKind::ConfigurationReloaded => "configuration reloaded",
+            EventKind::WorkerKilled => "worker killed",
+            EventKind::WorkerRelaunched => "worker relaunched",
+            EventKind::LoggingLevelChanged => "logging level changed",
+            EventKind::MetricsConfigured => "metrics configured",
+            EventKind::ListenerUpdated => "listener updated",
+            EventKind::StateLoaded => "state loaded",
+            EventKind::StateSaved => "state saved",
+            EventKind::ListenerAdded => "listener added",
+            EventKind::ListenerRemoved => "listener removed",
+            EventKind::SozuStopRequested => "stop requested",
+            EventKind::MainUpgraded => "main upgraded",
+            EventKind::WorkerUpgraded => "worker upgraded",
+            EventKind::EventsSubscribed => "events subscribed",
         };
         let address = match &self.address {
             Some(a) => a.to_string(),

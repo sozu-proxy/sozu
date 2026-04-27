@@ -1,3 +1,11 @@
+//! HTTP/1.1 session state on top of Kawa.
+//!
+//! Owns the H1 session state machine: Kawa-driven request/response parsing,
+//! header rewriting via `editor.rs`, default-answer rendering via
+//! `answers.rs`, and route lookup via the listener
+//! (`cluster_id_from_request`). Long-form lifecycle:
+//! `lib/src/protocol/kawa_h1/LIFECYCLE.md` (created in this changeset).
+
 pub mod answers;
 pub mod diagnostics;
 pub mod editor;
@@ -40,25 +48,51 @@ use crate::{
     router::Route,
     server::{CONN_RETRIES, push_event},
     socket::{SocketHandler, SocketResult, TransportProtocol, stats::socket_rtt},
-    sozu_command::{logging::LogContext, ready::Ready},
+    sozu_command::{
+        logging::{LogContext, ansi_palette},
+        ready::Ready,
+    },
     timer::TimeoutContainer,
 };
 
-/// This macro is defined uniquely in this module to help the tracking of kawa h1
-/// issues inside Sōzu
+/// This macro is defined uniquely in this module to help the tracking of
+/// kawa h1 issues inside Sōzu. Colored output: bold bright-white protocol
+/// label (uniform across every protocol), light grey `Session` keyword, gray
+/// keys, bright white values. The `[ulid - - -]` context comes first to stay
+/// aligned with `MUX-*` and `SOCKET` log lines.
+///
+/// Two invocation forms:
+/// - `log_context!(self)` — reads the response parsing phase via
+///   [`Http::response_parsing_phase`]. Use when no `&mut self.response_stream`
+///   borrow is currently live.
+/// - `log_context!(self, response_phase)` — caller supplies an already-resolved
+///   `Option<kawa::ParsingPhase>`. Use when a mutable borrow of
+///   `self.response_stream` (or its `BackendAnswer` inner) is live — pass
+///   `Some(inner.parsing_phase)` through the existing mutable reference.
 macro_rules! log_context {
     ($self:expr) => {
-        format!(
-            "KAWA-H1\t{}\tSession(public={}, session={}, frontend={}, readiness={}, backend={}, readiness={})\t >>>",
-            $self.context.log_context(),
-            $self.context.public_address.to_string(),
-            $self.context.session_address.map(|addr| addr.to_string()).unwrap_or_else(|| "<none>".to_string()),
-            $self.frontend_token.0,
-            $self.frontend_readiness,
-            $self.backend_token.map(|token| token.0.to_string()).unwrap_or_else(|| "<none>".to_string()),
-            $self.backend_readiness,
-        )
+        log_context!($self, $self.response_parsing_phase())
     };
+    ($self:expr, $response_phase:expr) => {{
+        let (open, reset, grey, gray, white) = ansi_palette();
+        format!(
+            "{gray}{ctx}{reset}\t{open}KAWA-H1{reset}\t{grey}Session{reset}({gray}public{reset}={white}{public}{reset}, {gray}session{reset}={white}{session}{reset}, {gray}frontend{reset}={white}{frontend}{reset}, {gray}request_parsing_phase{reset}={white}{request_parsing_phase:?}{reset}, {gray}response_parsing_phase{reset}={white}{response_parsing_phase:?}{reset}, {gray}frontend_readiness{reset}={white}{frontend_readiness}{reset}, {gray}backend{reset}={white}{backend}{reset}, {gray}backend_readiness{reset}={white}{backend_readiness}{reset})\t >>>",
+            open = open,
+            reset = reset,
+            grey = grey,
+            gray = gray,
+            white = white,
+            ctx = $self.context.log_context(),
+            public = $self.context.public_address.to_string(),
+            session = $self.context.session_address.map(|addr| addr.to_string()).unwrap_or_else(|| "<none>".to_string()),
+            frontend = $self.frontend_token.0,
+            request_parsing_phase = $self.request_stream.parsing_phase,
+            response_parsing_phase = $response_phase,
+            frontend_readiness = $self.frontend_readiness,
+            backend = $self.backend_token.map(|token| token.0.to_string()).unwrap_or_else(|| "<none>".to_string()),
+            backend_readiness = $self.backend_readiness,
+        )
+    }};
 }
 
 /// Generic Http representation using the Kawa crate using the Checkout of Sozu as buffer
@@ -95,6 +129,11 @@ pub enum DefaultAnswer {
         phase: kawa::ParsingPhaseMarker,
         capacity: usize,
     },
+    /// RFC 9110 §15.5.20 — returned when the request's `:authority` / `Host`
+    /// host does not match the TLS SNI negotiated for this connection.
+    /// The peer may retry on a fresh TLS connection that negotiates an SNI
+    /// matching the authority.
+    Answer421 {},
     Answer502 {
         message: String,
         phase: kawa::ParsingPhaseMarker,
@@ -124,6 +163,7 @@ impl From<&DefaultAnswer> for u16 {
             DefaultAnswer::Answer404 { .. } => 404,
             DefaultAnswer::Answer408 { .. } => 408,
             DefaultAnswer::Answer413 { .. } => 413,
+            DefaultAnswer::Answer421 { .. } => 421,
             DefaultAnswer::Answer502 { .. } => 502,
             DefaultAnswer::Answer503 { .. } => 503,
             DefaultAnswer::Answer504 { .. } => 504,
@@ -197,6 +237,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         pool: Weak<RefCell<Pool>>,
         protocol: Protocol,
         public_address: SocketAddr,
+        session_id: Ulid,
         request_id: Ulid,
         session_address: Option<SocketAddr>,
         sticky_name: String,
@@ -211,6 +252,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             }
             None => return Err(AcceptError::BufferCapacityReached),
         };
+        let sozu_id_header = listener.borrow().get_sozu_id_header().to_string();
         Ok(Http {
             answers,
             backend_connection_status: BackendConnectionStatus::NotConnected,
@@ -242,11 +284,13 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 kawa::Buffer::new(back_buffer),
             )),
             context: HttpContext::new(
+                session_id,
                 request_id,
                 protocol,
                 public_address,
                 session_address,
                 sticky_name,
+                sozu_id_header,
             ),
         })
     }
@@ -286,11 +330,12 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
         // Print the left-over response buffer output to track in which case it
         // may happens
+        let response_phase = response_stream.parsing_phase;
         let response_storage = &mut response_stream.storage;
         if !response_storage.is_empty() {
             warn!(
                 "{} Leftover fragment from response: {}",
-                log_context!(self),
+                log_context!(self, Some(response_phase)),
                 parser::view(
                     response_storage.used(),
                     16,
@@ -350,7 +395,11 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             .frontend_socket
             .socket_read(self.request_stream.storage.space());
 
-        debug!("{} Read {} bytes", log_context!(self), size);
+        debug!(
+            "{} Read {} bytes",
+            log_context!(self, Some(response_stream.parsing_phase)),
+            size
+        );
 
         if size > 0 {
             self.request_stream.storage.fill(size);
@@ -392,7 +441,10 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             SocketResult::Continue => {}
         };
 
-        trace!("{} ============== readable_parse", log_context!(self));
+        trace!(
+            "{} ============== readable_parse",
+            log_context!(self, Some(response_stream.parsing_phase))
+        );
         let was_initial = self.request_stream.is_initial();
         let was_not_proxying = !self.request_stream.is_main_phase();
 
@@ -413,7 +465,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             incr!("http.frontend_parse_errors");
             warn!(
                 "{} Parsing request error in {:?}: {}",
-                log_context!(self),
+                log_context!(self, Some(response_stream.parsing_phase)),
                 marker,
                 match kind {
                     kawa::ParsingErrorKind::Consuming { index } => {
@@ -482,7 +534,11 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
         let (size, socket_state) = self.frontend_socket.socket_write_vectored(&bufs);
 
-        debug!("{} Wrote {} bytes", log_context!(self), size);
+        debug!(
+            "{} Wrote {} bytes",
+            log_context!(self, Some(response_stream.parsing_phase)),
+            size
+        );
 
         if size > 0 {
             response_stream.consume(size);
@@ -528,14 +584,20 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                     return StateResult::Upgrade;
                 }
                 kawa::StatusLine::Response { code: 100, .. } => {
-                    trace!("{} ============== HANDLE CONTINUE!", log_context!(self));
+                    trace!(
+                        "{} ============== HANDLE CONTINUE!",
+                        log_context!(self, Some(response_stream.parsing_phase))
+                    );
                     response_stream.clear();
                     self.log_request_success(metrics);
                     return StateResult::Continue;
                 }
                 kawa::StatusLine::Response { code: 103, .. } => {
                     self.backend_readiness.event.insert(Ready::READABLE);
-                    trace!("{} ============== HANDLE EARLY HINT!", log_context!(self));
+                    trace!(
+                        "{} ============== HANDLE EARLY HINT!",
+                        log_context!(self, Some(response_stream.parsing_phase))
+                    );
                     response_stream.clear();
                     self.log_request_success(metrics);
                     return StateResult::Continue;
@@ -759,7 +821,11 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         }
 
         let (size, socket_state) = backend_socket.socket_read(response_stream.storage.space());
-        debug!("{} Read {} bytes", log_context!(self), size);
+        debug!(
+            "{} Read {} bytes",
+            log_context!(self, Some(response_stream.parsing_phase)),
+            size
+        );
 
         if size > 0 {
             response_stream.storage.fill(size);
@@ -802,7 +868,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
         trace!(
             "{} ============== backend_readable_parse",
-            log_context!(self)
+            log_context!(self, Some(response_stream.parsing_phase))
         );
         kawa::h1::parse(response_stream, &mut self.context);
         // kawa::debug_kawa(&self.response_stream);
@@ -811,7 +877,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             incr!("http.backend_parse_errors");
             warn!(
                 "{} Parsing response error in {:?}: {}",
-                log_context!(self),
+                log_context!(self, Some(response_stream.parsing_phase)),
                 marker,
                 match kind {
                     kawa::ParsingErrorKind::Consuming { index } => {
@@ -865,6 +931,16 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             path: self.context.path.as_deref(),
             reason: self.context.reason.as_deref(),
             status: self.context.status,
+        }
+    }
+
+    /// Returns the kawa `ParsingPhase` of the response side, if a backend answer
+    /// has been accepted. Used by `log_context!` to surface H1 wedged-response
+    /// states without poking inside the `ResponseStream` enum at every log site.
+    fn response_parsing_phase(&self) -> Option<kawa::ParsingPhase> {
+        match &self.response_stream {
+            ResponseStream::BackendAnswer(inner) => Some(inner.parsing_phase),
+            _ => None,
         }
     }
 
@@ -944,6 +1020,12 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             bytes_in: metrics.bin,
             bytes_out: metrics.bout,
             user_agent: self.context.user_agent.as_deref(),
+            x_request_id: self.context.x_request_id.as_deref(),
+            tls_version: self.context.tls_version,
+            tls_cipher: self.context.tls_cipher,
+            tls_sni: self.context.tls_server_name.as_deref(),
+            tls_alpn: self.context.tls_alpn,
+            xff_chain: self.context.xff_chain.as_deref(),
             #[cfg(feature = "opentelemetry")]
             otel: self.context.otel.as_ref(),
             #[cfg(not(feature = "opentelemetry"))]
@@ -998,6 +1080,11 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 ),
                 DefaultAnswer::Answer413 { .. } => incr!(
                     "http.413.errors",
+                    self.context.cluster_id.as_deref(),
+                    self.context.backend_id.as_deref()
+                ),
+                DefaultAnswer::Answer421 { .. } => incr!(
+                    "http.421.errors",
                     self.context.cluster_id.as_deref(),
                     self.context.backend_id.as_deref()
                 ),
@@ -1129,6 +1216,13 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                     e
                 );
             }
+            // SAFETY (TLS-truncation invariant): `Shutdown::Both` is permitted
+            // here because this is the *backend* socket of an H1 session — Sōzu
+            // currently speaks plaintext H1 to backends, so there is no
+            // outbound TLS write buffer that the kernel could discard with a
+            // RST. If backend-TLS lands later (#1218), this MUST move to
+            // `Shutdown::Write` (or `socket.send_close_notify()`) to avoid the
+            // canonical truncation anti-pattern documented in CLAUDE.md.
             if let Err(e) = socket.shutdown(Shutdown::Both) {
                 if e.kind() != ErrorKind::NotConnected {
                     error!(
@@ -1169,7 +1263,12 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
     /// Check the number of connection attempts against authorized connection retries
     fn check_circuit_breaker(&mut self) -> Result<(), BackendConnectionError> {
         if self.connection_attempts >= CONN_RETRIES {
-            error!(
+            incr!(
+                "backend.connect.retries_exhausted",
+                self.context.cluster_id.as_deref(),
+                self.context.backend_id.as_deref()
+            );
+            warn!(
                 "{} Max connection attempt reached ({})",
                 log_context!(self),
                 self.connection_attempts,
@@ -1520,8 +1619,10 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                     );
 
                     info!(
-                        "backend server {} at {} is up",
-                        backend.backend_id, backend.address
+                        "{} backend server {} at {} is up",
+                        log_context!(self),
+                        backend.backend_id,
+                        backend.address
                     );
 
                     push_event(Event {
@@ -1607,12 +1708,12 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             (_, false) => {
                 error!(
                     "{} Backend closed before session is over",
-                    log_context!(self),
+                    log_context!(self, Some(response_stream.parsing_phase)),
                 );
 
                 trace!(
                     "{} Backend hang-up, setting the parsing phase of the response stream to terminated, this also takes care of responses that lack length information.",
-                    log_context!(self)
+                    log_context!(self, Some(response_stream.parsing_phase))
                 );
 
                 response_stream.parsing_phase = kawa::ParsingPhase::Terminated;
@@ -1671,7 +1772,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         {
             if self.backend_readiness.event.is_hup() && !self.test_backend_socket() {
                 //retry connecting the backend
-                error!(
+                warn!(
                     "{} Error connecting to backend, trying again, attempt {}",
                     log_context!(self),
                     self.connection_attempts
@@ -1689,11 +1790,20 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 let connection_result =
                     self.connect_to_backend(session.clone(), proxy.clone(), metrics);
                 if let Err(err) = &connection_result {
-                    error!(
-                        "{} Error connecting to backend: {}",
-                        log_context!(self),
-                        err
-                    );
+                    match err {
+                        // Already logged at warn! + metered at check_circuit_breaker;
+                        // avoid double-emission.
+                        BackendConnectionError::MaxConnectionRetries(_) => trace!(
+                            "{} Error connecting to backend: {}",
+                            log_context!(self),
+                            err
+                        ),
+                        _ => warn!(
+                            "{} Error connecting to backend: {}",
+                            log_context!(self),
+                            err
+                        ),
+                    }
                 }
 
                 if let Some(session_result) = handle_connection_result(connection_result) {
@@ -1752,11 +1862,20 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                         let connection_result =
                             self.connect_to_backend(session.clone(), proxy.clone(), metrics);
                         if let Err(err) = &connection_result {
-                            error!(
-                                "{} Error connecting to backend: {}",
-                                log_context!(self),
-                                err
-                            );
+                            match err {
+                                // Already logged at warn! + metered at check_circuit_breaker;
+                                // avoid double-emission.
+                                BackendConnectionError::MaxConnectionRetries(_) => trace!(
+                                    "{} Error connecting to backend: {}",
+                                    log_context!(self),
+                                    err
+                                ),
+                                _ => warn!(
+                                    "{} Error connecting to backend: {}",
+                                    log_context!(self),
+                                    err
+                                ),
+                            }
                         }
 
                         if let Some(session_result) = handle_connection_result(connection_result) {
@@ -1951,7 +2070,8 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> SessionState 
             return match self.timeout_status() {
                 TimeoutStatus::Request => {
                     error!(
-                        "got backend timeout while waiting for a request, this should not happen"
+                        "{} got backend timeout while waiting for a request, this should not happen",
+                        log_context!(self)
                     );
                     self.set_answer(DefaultAnswer::Answer504 {
                         duration: self.container_backend_timeout.to_string(),

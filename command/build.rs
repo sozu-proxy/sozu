@@ -43,8 +43,13 @@ pub fn main() {
         .enum_attribute("ProtobufEndpoint.inner", "#[derive(Ord, PartialOrd)]")
         .enum_attribute(
             "Request.request_type",
+            "#[allow(clippy::large_enum_variant)]",
+        )
+        .enum_attribute(
+            "Request.request_type",
             "#[derive(Hash, Eq, Ord, PartialOrd)]",
         )
+        .format(true)
         .out_dir("src/proto")
         .compile_protos(&["command.proto"], &["src"])
         .expect("Could not compile protobuf types in command.proto");

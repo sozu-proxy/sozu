@@ -1,10 +1,18 @@
+//! Transparent byte-stream forwarder (TCP + WebSocket post-upgrade).
+//!
+//! Forwards bytes between front and back through fixed-size buffers without
+//! payload inspection. Readiness is managed via direct mio interest toggles
+//! (no `signal_pending_write` / `arm_writable` here — those belong to the
+//! mux H2 path). Used as the post-handshake state for raw TCP listeners and
+//! after a successful WebSocket upgrade on the H1 path.
+
 use std::{cell::RefCell, net::SocketAddr, rc::Rc};
 
 use mio::{Token, net::TcpStream};
 use rusty_ulid::Ulid;
 use sozu_command::{
     config::MAX_LOOP_ITERATIONS,
-    logging::{EndpointRecord, LogContext},
+    logging::{EndpointRecord, LogContext, ansi_palette},
 };
 
 use crate::{
@@ -17,20 +25,32 @@ use crate::{
     timer::TimeoutContainer,
 };
 
-/// This macro is defined uniquely in this module to help the tracking of pipelining
-/// issues inside Sōzu
+/// This macro is defined uniquely in this module to help the tracking of
+/// pipelining issues inside Sōzu. Colored output uses bold bright-white
+/// (uniform across every protocol) for the protocol label, light grey for the
+/// `Session` keyword, gray for keys and bright white for values. The
+/// `[ulid - - -]` context comes first to stay aligned with `MUX-*` and
+/// `SOCKET` log lines.
 macro_rules! log_context {
-    ($self:expr) => {
+    ($self:expr) => {{
+        let (open, reset, grey, gray, white) = ansi_palette();
         format!(
-            "PIPE\t{}\tSession(address={}, frontend={}, readiness={}, backend={}, readiness={})\t >>>",
-            $self.log_context(),
-            $self.session_address.map(|addr| addr.to_string()).unwrap_or_else(|| "<none>".to_string()),
-            $self.frontend_token.0,
-            $self.frontend_readiness,
-            $self.backend_token.map(|token| token.0.to_string()).unwrap_or_else(|| "<none>".to_string()),
-            $self.backend_readiness,
+            "{gray}{ctx}{reset}\t{open}PIPE{reset}\t{grey}Session{reset}({gray}address{reset}={white}{address}{reset}, {gray}frontend{reset}={white}{frontend}{reset}, {gray}frontend_readiness{reset}={white}{frontend_readiness}{reset}, {gray}frontend_status{reset}={white}{frontend_status:?}{reset}, {gray}backend{reset}={white}{backend}{reset}, {gray}backend_status{reset}={white}{backend_status:?}{reset}, {gray}backend_readiness{reset}={white}{backend_readiness}{reset})\t >>>",
+            open = open,
+            reset = reset,
+            grey = grey,
+            gray = gray,
+            white = white,
+            ctx = $self.log_context(),
+            address = $self.session_address.map(|addr| addr.to_string()).unwrap_or_else(|| "<none>".to_string()),
+            frontend = $self.frontend_token.0,
+            frontend_readiness = $self.frontend_readiness,
+            frontend_status = $self.frontend_status,
+            backend = $self.backend_token.map(|token| token.0.to_string()).unwrap_or_else(|| "<none>".to_string()),
+            backend_status = $self.backend_status,
+            backend_readiness = $self.backend_readiness,
         )
-    };
+    }};
 }
 
 #[derive(PartialEq, Eq)]
@@ -77,9 +97,22 @@ pub struct Pipe<Front: SocketHandler, L: ListenerHandler> {
     frontend: Front,
     listener: Rc<RefCell<L>>,
     protocol: Protocol,
+    /// Connection/session ULID inherited from the parent mux or handshake.
+    /// Emitted in the first slot of the legacy log-context bracket.
+    session_id: Ulid,
     request_id: Ulid,
     session_address: Option<SocketAddr>,
     websocket_context: WebSocketContext,
+    /// Connection-scoped TLS metadata captured at handshake completion,
+    /// inherited from the upstream mux `HttpContext` when `Pipe` is created
+    /// via WSS upgrade. `None` on plaintext paths (plain TCP, plain WS,
+    /// proxy-protocol) where no TLS was terminated by Sōzu.
+    tls_version: Option<&'static str>,
+    tls_cipher: Option<&'static str>,
+    /// Negotiated SNI hostname, pre-lowercased, no port. `None` on plaintext
+    /// paths or when the client omitted the SNI extension.
+    tls_sni: Option<String>,
+    tls_alpn: Option<&'static str>,
 }
 
 impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
@@ -105,6 +138,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         frontend: Front,
         listener: Rc<RefCell<L>>,
         protocol: Protocol,
+        session_id: Ulid,
         request_id: Ulid,
         session_address: Option<SocketAddr>,
         websocket_context: WebSocketContext,
@@ -140,13 +174,37 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             frontend,
             listener,
             protocol,
+            session_id,
             request_id,
             session_address,
             websocket_context,
+            tls_version: None,
+            tls_cipher: None,
+            tls_sni: None,
+            tls_alpn: None,
         };
 
-        trace!("created pipe");
+        trace!("{} created pipe", log_context!(session));
         session
+    }
+
+    /// Stamp connection-scoped TLS metadata captured at handshake time onto
+    /// the pipe for access-log emission. Called from the HTTPS→WSS upgrade
+    /// path in `https.rs::upgrade_mux` after the `Pipe` has been built from
+    /// the prior mux `HttpContext`. Leaves plaintext paths (plain TCP, plain
+    /// WS, proxy-protocol) untouched so their access logs continue to emit
+    /// `None` for all TLS fields.
+    pub fn set_tls_metadata(
+        &mut self,
+        version: Option<&'static str>,
+        cipher: Option<&'static str>,
+        sni: Option<String>,
+        alpn: Option<&'static str>,
+    ) {
+        self.tls_version = version;
+        self.tls_cipher = cipher;
+        self.tls_sni = sni;
+        self.tls_alpn = alpn;
     }
 
     pub fn front_socket(&self) -> &TcpStream {
@@ -254,6 +312,16 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             bytes_in: metrics.bin,
             bytes_out: metrics.bout,
             user_agent: None,
+            x_request_id: None,
+            // Pipe is post-upgrade; the TLS metadata was captured once at
+            // handshake in `https.rs::upgrade_handshake` and plumbed through
+            // via `set_tls_metadata`. Plaintext paths leave these fields as
+            // `None` — matching the TCP log shape.
+            tls_version: self.tls_version,
+            tls_cipher: self.tls_cipher,
+            tls_sni: self.tls_sni.as_deref(),
+            tls_alpn: self.tls_alpn,
+            xff_chain: None,
             otel: None,
         );
     }
@@ -270,6 +338,17 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             message
         );
         self.print_state(self.protocol_string());
+        self.log_request(metrics, true, Some(message));
+    }
+
+    /// Access-log wrapper for benign idle-timeout tear-downs.
+    ///
+    /// Unlike `log_request_error`, this path logs at `debug!` and skips the
+    /// state dump — an idle pipe hitting its front/back_timeout is expected
+    /// behaviour (e.g. a WebSocket with no keepalive) and should not pollute
+    /// the error stream.
+    pub fn log_request_timeout(&self, metrics: &SessionMetrics, message: &str) {
+        debug!("{} pipe timeout: {}", log_context!(self), message);
         self.log_request(metrics, true, Some(message));
     }
 
@@ -352,7 +431,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
     pub fn readable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
         self.reset_timeouts();
 
-        trace!("pipe readable");
+        trace!("{} pipe readable", log_context!(self));
         if self.frontend_buffer.available_space() == 0 {
             self.frontend_readiness.interest.remove(Ready::READABLE);
             self.backend_readiness.interest.insert(Ready::WRITABLE);
@@ -495,7 +574,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
 
     // Forward content to cluster
     pub fn backend_writable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
-        trace!("pipe back_writable");
+        trace!("{} pipe back_writable", log_context!(self));
 
         if self.frontend_buffer.available_data() == 0 {
             self.frontend_readiness.interest.insert(Ready::READABLE);
@@ -593,6 +672,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             }
             if size > 0 {
                 self.frontend_readiness.interest.insert(Ready::WRITABLE);
+                count!("back_bytes_in", size as i64);
                 metrics.backend_bin += size;
             }
 
@@ -638,7 +718,8 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
 
     pub fn log_context(&self) -> LogContext<'_> {
         LogContext {
-            request_id: self.request_id,
+            session_id: self.session_id,
+            request_id: Some(self.request_id),
             cluster_id: self.cluster_id.as_deref(),
             backend_id: self.backend_id.as_deref(),
         }
@@ -772,7 +853,7 @@ impl<Front: SocketHandler, L: ListenerHandler> SessionState for Pipe<Front, L> {
     fn timeout(&mut self, token: Token, metrics: &mut SessionMetrics) -> StateResult {
         //info!("got timeout for token: {:?}", token);
         if self.frontend_token == token {
-            self.log_request_error(metrics, "frontend socket timeout");
+            self.log_request_timeout(metrics, "frontend socket timeout");
             if let Some(timeout) = self.container_frontend_timeout.as_mut() {
                 timeout.triggered()
             }
@@ -785,7 +866,7 @@ impl<Front: SocketHandler, L: ListenerHandler> SessionState for Pipe<Front, L> {
                 timeout.triggered()
             }
 
-            self.log_request_error(metrics, "backend socket timeout");
+            self.log_request_timeout(metrics, "backend socket timeout");
             return StateResult::CloseSession;
         }
 

@@ -15,7 +15,7 @@ authors = [
 ]
 categories = ["network-programming"]
 edition = "2024"
-rust-version = "1.85.0"
+rust-version = "1.88.0"
 include = [
   "./README.md",
   "Cargo.toml",
@@ -53,9 +53,6 @@ x509-parser = { workspace = true }
 unstable = []
 logs-debug = []
 logs-trace = []
-
-[badges]
-travis-ci = { repository = "sozu-proxy/sozu" }
 
 [build-dependencies]
 prost-build = { workspace = true }

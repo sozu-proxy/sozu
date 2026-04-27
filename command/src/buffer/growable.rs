@@ -1,3 +1,11 @@
+//! Growable ring buffer (`Buffer`).
+//!
+//! Same `position` / `end` / `capacity` discipline as `fixed.rs` but
+//! grows the backing `Vec<u8>` on demand up to a configured cap. Shift /
+//! insert / replace operations use overlapping-safe `std::ptr::copy`
+//! (NOT `copy_nonoverlapping`) with bounds checked against
+//! `self.capacity()`.
+
 use std::{
     cmp,
     io::{self, Read, Write},
@@ -112,6 +120,10 @@ impl Buffer {
 
     pub fn shift(&mut self) {
         if self.position > 0 {
+            // SAFETY: src and dst point into `self.memory` (same
+            // allocation); the slice indexing above bounds-checks both
+            // ranges (`position..end` and `..length`) against the live
+            // buffer length. `ptr::copy` is overlap-safe.
             unsafe {
                 let length = self.end - self.position;
                 ptr::copy(
@@ -130,6 +142,11 @@ impl Buffer {
             return None;
         }
 
+        // SAFETY: src and dst point into `self.memory` (same allocation).
+        // The early-return above guarantees `start + length < available_data`,
+        // and slice indexing bounds-checks both `begin+length..end` and
+        // `begin..next_end` against the live buffer length. `ptr::copy` is
+        // overlap-safe.
         unsafe {
             let begin = self.position + start;
             let next_end = self.end - length;
@@ -151,6 +168,11 @@ impl Buffer {
             return None;
         }
 
+        // SAFETY: every `ptr::copy` below moves bytes inside `self.memory`
+        // (same allocation) or copies from the caller's `data` slice into
+        // it. The two early-return checks above bound the affected ranges
+        // against `available_data()` and `self.capacity`, and each slice
+        // indexing site is bounds-checked. `ptr::copy` is overlap-safe.
         unsafe {
             let begin = self.position + start;
             let slice_end = begin + data_len;
@@ -193,6 +215,11 @@ impl Buffer {
             return None;
         }
 
+        // SAFETY: both `ptr::copy` calls touch `self.memory` (same
+        // allocation) or copy from `data` into it. The early-return checks
+        // bound `start <= available_data` and the resulting tail
+        // `position + end + data_len <= capacity`, and each slice indexing
+        // site is bounds-checked. `ptr::copy` is overlap-safe.
         unsafe {
             let begin = self.position + start;
             let slice_end = begin + data_len;
@@ -231,6 +258,11 @@ impl Write for Buffer {
 impl Read for Buffer {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let len = cmp::min(self.available_data(), buf.len());
+        // SAFETY: `len = min(available_data, buf.len())`, so the source
+        // range `position..position+len` lies inside `self.memory` and the
+        // destination `buf[..len]` fits the caller's `&mut [u8]`. The two
+        // slices are in different allocations; `ptr::copy` is overlap-safe
+        // regardless.
         unsafe {
             ptr::copy(
                 self.memory[self.position..self.position + len].as_ptr(),

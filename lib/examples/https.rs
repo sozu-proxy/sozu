@@ -27,6 +27,7 @@ fn main() -> anyhow::Result<()> {
         "main",
         false,
         None,
+        sozu_command_lib::config::MetricDetailLevel::default(),
     );
     gauge!("sozu.TEST", 42);
 

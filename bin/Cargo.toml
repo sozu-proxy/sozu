@@ -15,7 +15,7 @@ authors = [
 ]
 categories = ["network-programming"]
 edition = "2024"
-rust-version = "1.85.0"
+rust-version = "1.88.0"
 include = ["README.md", "Cargo.toml", "src/**/*"]
 
 [lib]
@@ -32,18 +32,23 @@ jemallocator = { workspace = true, optional = true }
 libc = { workspace = true }
 log = { workspace = true }
 mio = { workspace = true, features = ["os-poll", "net"] }
-nix = { workspace = true, features = ["signal", "fs", "process"] }
+nix = { workspace = true, features = ["signal", "fs", "process", "socket", "user"] }
 nom = { workspace = true }
 paw = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 prost = { workspace = true }
+rusty_ulid = { workspace = true }
+sha2 = { workspace = true }
 tempfile = { workspace = true }
 termion = { workspace = true }
 thiserror = { workspace = true }
 
 sozu-command-lib = { workspace = true }
 sozu-lib = { workspace = true }
+
+[dev-dependencies]
+regex = { workspace = true }
 
 [target.'cfg(target_os="linux")'.dependencies]
 num_cpus = { workspace = true }
@@ -55,6 +60,4 @@ logs-debug = ["sozu-lib/logs-debug", "sozu-command-lib/logs-debug"]
 logs-trace = ["sozu-lib/logs-trace", "sozu-command-lib/logs-trace"]
 opentelemetry = ["sozu-lib/opentelemetry"]
 tolerant-http1-parser = ["sozu-lib/tolerant-http1-parser"]
-
-[badges]
-travis-ci = { repository = "sozu-proxy/sozu" }
+simd = ["sozu-lib/simd"]

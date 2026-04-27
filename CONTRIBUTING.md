@@ -10,27 +10,30 @@ for first contributors, please check them out!
 ## Communication
 
 Most of the discussion around the project happens in the [issues](https://github.com/sozu-proxy/sozu/issues),
-so please check the list there. You can also reach out on [Gitter](https://gitter.im/sozu-proxy/sozu).
+so please check the list there.
 
 ## Navigating the source
 
 The proxy is designed to have a minimal core that you drive through external tooling.
-There are 4 Rust crates in the repository:
+The Cargo workspace ships four crates:
 
-- `lib` is the event loop handling network communication and parsing. Workers are small wrappers around this
-- `bin` is the main executable, providing a master/workers multiprocess architecture and exposing a unix socket to receive configuration changes. It also contains the command line.
-- `command` is a library wrapping the communication protocol of the unix socket. You'd typically use it to make tools to drive the proxy
+- `lib` is the event loop handling network communication and parsing. Workers are small wrappers around this.
+- `bin` is the main executable, providing a master/workers multiprocess architecture and exposing a unix socket to receive configuration changes. It also contains the command-line interface.
+- `command` is a library wrapping the communication protocol of the unix socket. You'd typically use it to make tools to drive the proxy.
+- `e2e` is the integration test harness that spawns real workers plus mock clients and backends.
 
-The easiest way to contribute would be to work on the command line (`cli.rs`) or on external tools
+The `fuzz/` crate (cargo-fuzz targets `fuzz_frame_parser`, `fuzz_hpack_decoder`) lives outside the Cargo workspace and is built with `cargo +nightly fuzz` from inside `fuzz/`.
+
+The easiest way to contribute would be to work on the command-line interface (`bin/src/ctl/`) or on external tools
 using the `command` library. `lib` can be complex since you need familiarity with
-the event loop handling, but the parsers and protocol are well separated. `bin` is
-mostly plumbing to handle command line options, handle workers and dispatching
+the event loop handling, but the parsers and protocols are well separated. `bin` is
+mostly plumbing to handle command-line options, supervise workers, and dispatch
 orders from the socket.
 
 ## Debugging
 
 If the bug or feature you are exploring is linked to the HTTP or TLS implementation,
-you can reuse directly the code of one of the [examples](https://github.com/sozu-proxy/sozu/tree/master/lib/examples),
+you can reuse directly the code of one of the [examples](https://github.com/sozu-proxy/sozu/tree/main/lib/examples),
 they allow you to use the proxy without the overhead of the worker system.
 
 Otherwise, the proxy uses the `log` crate and follows the `RUST_LOG` environment
@@ -42,7 +45,7 @@ We ([Clever Cloud](https://www.clever-cloud.com)) will ask you to sign a
 [copyright assignment agreement](https://gist.github.com/Geal/c61fc84f0a32a9b76ff606274848370d)
 before accepting your code into the project. In short, the agreement allows us
 to change the license of the project (currently in
-[AGPL 3](https://github.com/sozu-proxy/sozu/blob/master/LICENSE)) if needed.
+[AGPL 3](https://github.com/sozu-proxy/sozu/blob/main/LICENSE)) if needed.
 You can of course keep using the published version of sōzu with your contribution
 as AGPL 3.
 

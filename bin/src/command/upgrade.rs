@@ -15,6 +15,7 @@ use sozu_command_lib::{
 use super::sessions::WorkerSession;
 use crate::{
     command::{
+        requests::{AuditExtras, AuditResult, audit_emit_inline},
         server::{
             ClientId, Gatherer, GatheringTask, MessageClient, Server, ServerState, SessionId,
             TaskId, Timeout, WorkerId,
@@ -24,6 +25,7 @@ use crate::{
     upgrade::{UpgradeError, fork_main_into_new_main},
     util::disable_close_on_exec,
 };
+use sozu_command_lib::proto::command::EventKind;
 
 #[derive(Debug)]
 enum UpgradeWorkerProgress {
@@ -58,12 +60,22 @@ pub fn upgrade_worker(server: &mut Server, client: &mut ClientSession, old_worke
         client.token, old_worker_id
     );
 
+    audit_emit_inline(
+        server,
+        client,
+        EventKind::WorkerUpgraded,
+        "worker_upgraded",
+        "config.worker_upgraded",
+        format!("worker:{old_worker_id}"),
+        AuditResult::Ok,
+        AuditExtras::default(),
+    );
+
     let old_worker_token = match server.get_active_worker_by_id(old_worker_id) {
         Some(session) => session.token,
         None => {
             client.finish_failure(format!(
-                "Worker {} does not exist, or is stopping / stopped",
-                old_worker_id
+                "Worker {old_worker_id} does not exist, or is stopping / stopped"
             ));
             return;
         }
@@ -154,7 +166,7 @@ impl UpgradeWorkerTask {
         );
 
         // Stop the old worker
-        client.return_processing(format!("Soft stopping worker with id {}", old_worker_id));
+        client.return_processing(format!("Soft stopping worker with id {old_worker_id}"));
         server.scatter_on(
             RequestType::SoftStop(SoftStop {}).into(),
             finish_task,
@@ -209,8 +221,7 @@ impl GatheringTask for UpgradeWorkerTask {
             } => {
                 client.finish_ok(
                     format!(
-                        "Upgrade successful:\n- finished soft stop of worker {:?}\n- finished activation of new worker {:?}",
-                        old_worker_id, new_worker_id
+                        "Upgrade successful:\n- finished soft stop of worker {old_worker_id:?}\n- finished activation of new worker {new_worker_id:?}"
                     )
                 );
             }
@@ -241,16 +252,16 @@ impl Gatherer for UpgradeWorkerTask {
                     UpgradeWorkerProgress::RequestingListenSockets { .. } => {}
                     UpgradeWorkerProgress::StopOldActivateNew { .. } => {
                         client.return_processing(format!(
-                            "Worker {} answered OK to {}. {}",
-                            worker_id, message.id, message.message
+                            "Worker {worker_id} answered OK to {}. {}",
+                            message.id, message.message
                         ))
                     }
                 }
             }
             Ok(ResponseStatus::Failure) => self.errors += 1,
             Ok(ResponseStatus::Processing) => client.return_processing(format!(
-                "Worker {} is processing {}. {}",
-                worker_id, message.id, message.message
+                "Worker {worker_id} is processing {}. {}",
+                message.id, message.message
             )),
             Err(e) => warn!("error decoding response status: {}", e),
         }
@@ -307,9 +318,36 @@ pub struct UpgradeData {
     /// JSON serialized workers
     pub workers: Vec<SerializedWorkerSession>,
     pub state: ConfigState,
+    /// Boot-generation counter, bumped each time a `MAIN_UPGRADED` re-exec
+    /// happens. Stamps every audit line so SOC tooling can disambiguate
+    /// post-upgrade sessions from pre-upgrade ones (PIDs reset, but the
+    /// audit log keeps generation+session_ulid as the durable correlation
+    /// pair). `0` on first boot.
+    #[serde(default)]
+    pub boot_generation: u32,
 }
 
 pub fn upgrade_main(server: &mut Server, client: &mut ClientSession) {
+    // Bump the boot generation BEFORE serialising upgrade_data so the
+    // re-execed main starts at the new value. The audit line below
+    // already reflects the bumped value.
+    server.boot_generation = server.boot_generation.saturating_add(1);
+
+    audit_emit_inline(
+        server,
+        client,
+        EventKind::MainUpgraded,
+        "main_upgraded",
+        "config.main_upgraded",
+        format!(
+            "executable:{} boot_generation:{}",
+            server.executable_path.as_str(),
+            server.boot_generation
+        ),
+        AuditResult::Ok,
+        AuditExtras::default(),
+    );
+
     if let Err(err) = server.disable_cloexec_before_upgrade() {
         client.finish_failure(err.to_string());
     }
@@ -323,8 +361,7 @@ pub fn upgrade_main(server: &mut Server, client: &mut ClientSession) {
             Ok(tuple) => tuple,
             Err(fork_error) => {
                 client.finish_failure(format!(
-                    "Could not start a new main process by forking: {}",
-                    fork_error
+                    "Could not start a new main process by forking: {fork_error}"
                 ));
                 return;
             }
@@ -341,8 +378,7 @@ pub fn upgrade_main(server: &mut Server, client: &mut ClientSession) {
         client.finish_failure("Upgrade of main process failed: no feedback from the new main");
     } else {
         client.finish_ok(format!(
-            "Upgrade successful, closing main process. New main process has pid {}",
-            new_main_pid
+            "Upgrade successful, closing main process. New main process has pid {new_main_pid}"
         ));
         server.run_state = ServerState::Stopping;
     }
