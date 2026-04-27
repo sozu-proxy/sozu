@@ -180,24 +180,34 @@ impl Template {
         let mut body_size = 0;
         let mut keep_alive = true;
         let mut used_once = Vec::new();
+        // Track whether the operator-supplied template carried its own
+        // `Content-Length` header. If yes we wire that block up to the
+        // `ContentLength` placeholder (so the value is auto-resolved at
+        // `fill` time) instead of splicing in a second synthetic header
+        // — RFC 9110 §8.6 / RFC 7230 §3.3.2 forbid duplicate
+        // `Content-Length` and downstream agents reject those messages
+        // hard as a request-smuggling vector.
+        let mut content_length_seen = false;
         for mut block in kawa.blocks.into_iter() {
             match &mut block {
                 Block::ChunkHeader(_) => return Err(TemplateError::UnsupportedStreaming),
                 Block::Flags(Flags {
                     end_header: true, ..
                 }) => {
-                    // Right before the end-of-headers marker, splice in a
-                    // synthetic `Content-Length: PLACEHOLDER` header. `fill`
-                    // resolves the placeholder once the body length is known.
-                    header_replacements.push(Replacement {
-                        block_index: blocks.len(),
-                        or_elide_header: false,
-                        typ: ReplacementType::ContentLength,
-                    });
-                    blocks.push_back(Block::Header(Pair {
-                        key: Store::Static(b"Content-Length"),
-                        val: Store::Static(b"PLACEHOLDER"),
-                    }));
+                    if !content_length_seen {
+                        // Right before the end-of-headers marker, splice in a
+                        // synthetic `Content-Length: PLACEHOLDER` header. `fill`
+                        // resolves the placeholder once the body length is known.
+                        header_replacements.push(Replacement {
+                            block_index: blocks.len(),
+                            or_elide_header: false,
+                            typ: ReplacementType::ContentLength,
+                        });
+                        blocks.push_back(Block::Header(Pair {
+                            key: Store::Static(b"Content-Length"),
+                            val: Store::Static(b"PLACEHOLDER"),
+                        }));
+                    }
                     blocks.push_back(block);
                 }
                 Block::StatusLine | Block::Cookies | Block::Flags(_) => {
@@ -210,6 +220,24 @@ impl Template {
                         && compare_no_case(val_data, b"close")
                     {
                         keep_alive = false;
+                    }
+                    if compare_no_case(key_data, b"content-length") {
+                        // Hand the operator's literal Content-Length over
+                        // to the same `ContentLength` placeholder machinery
+                        // so the rendered response carries exactly one
+                        // header with the auto-computed body size.
+                        if content_length_seen {
+                            return Err(TemplateError::AlreadyConsumed("Content-Length"));
+                        }
+                        content_length_seen = true;
+                        *val = Store::Static(b"PLACEHOLDER");
+                        header_replacements.push(Replacement {
+                            block_index: blocks.len(),
+                            or_elide_header: false,
+                            typ: ReplacementType::ContentLength,
+                        });
+                        blocks.push_back(block);
+                        continue;
                     }
                     if let Some(b'%') = val_data.first() {
                         for variable in &variables {
@@ -961,14 +989,18 @@ impl HttpAnswers {
         ];
         for (name, default) in expected_defaults {
             if !listener_answers.contains_key(*name) {
-                listener_answers.insert(
-                    name.to_string(),
-                    Self::template(name, &default()).expect("built-in default templates parse"),
-                );
+                // The built-in templates are static strings shipped with
+                // the crate. A parse failure here means a regression in
+                // the bundled defaults — propagate the typed error so the
+                // worker surfaces a `ListenerError::TemplateParse(name,
+                // …)` at boot rather than panicking. Pinned by the
+                // `default_templates_all_parse` regression test below.
+                let template = Self::template(name, &default())?;
+                listener_answers.insert(name.to_string(), template);
             }
         }
         Ok(HttpAnswers {
-            fallback: Self::template("", &fallback()).expect("built-in fallback template parses"),
+            fallback: Self::template("", &fallback())?,
             listener_answers,
             cluster_answers: HashMap::new(),
         })
@@ -1155,6 +1187,17 @@ mod tests {
         merge_legacy_into_map,
     };
     use crate::protocol::http::DefaultAnswer;
+
+    /// Every bundled default template (and the fallback) must parse
+    /// cleanly so `HttpAnswers::new(&BTreeMap::new())` never returns an
+    /// error. This guards the previously-`expect`'d invariant in
+    /// `HttpAnswers::new` and turns any future regression in a default
+    /// body into a unit-test failure rather than a worker-boot panic.
+    #[test]
+    fn default_templates_all_parse() {
+        HttpAnswers::new(&BTreeMap::new())
+            .expect("every bundled default template + fallback must parse");
+    }
 
     fn body_route() -> TemplateVariable {
         TemplateVariable {

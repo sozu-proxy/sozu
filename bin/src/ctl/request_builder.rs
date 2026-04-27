@@ -169,21 +169,6 @@ impl CommandManager {
                 // before sending so a typo (missing colon, lowercase off,
                 // non-hex chars) surfaces here with a friendly message
                 // rather than silently rejecting traffic on the worker.
-                // Inline check: split on first `:`, then assert the right
-                // half is exactly 64 lowercase hex digits.
-                fn looks_like_authorized_hash(s: &str) -> bool {
-                    let Some((user, hex)) = s.split_once(':') else {
-                        return false;
-                    };
-                    !user.is_empty()
-                        && user
-                            .bytes()
-                            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-                        && hex.len() == 64
-                        && hex
-                            .bytes()
-                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-                }
                 for hash in &authorized_hash {
                     if !looks_like_authorized_hash(hash) {
                         return Err(CtlError::ArgsNeeded(
@@ -192,6 +177,20 @@ impl CommandManager {
                                 "got {hash:?}; produce one with: \
                                  printf '<password>' | sha256sum"
                             ),
+                        ));
+                    }
+                }
+
+                // The proto carries `https_redirect_port` as `u32` (matches
+                // the rewrite_port shape on the frontend) but real TCP
+                // ports are 16-bit. Reject out-of-range values up front so
+                // a typo doesn't render `Location: https://host:70000/...`
+                // on the wire.
+                if let Some(port) = https_redirect_port {
+                    if port == 0 || port > u16::MAX as u32 {
+                        return Err(CtlError::ArgsNeeded(
+                            "TCP port in 1..=65535".to_string(),
+                            format!("got https_redirect_port={port}"),
                         ));
                     }
                 }
@@ -1163,6 +1162,24 @@ fn find_cluster_configuration(content_type: ContentType, cluster_id: &str) -> Op
     }
 }
 
+/// Validate that `s` matches the canonical `<user>:<hex(sha256)>` form
+/// the worker stores in `Cluster.authorized_hashes`. Equivalent to the
+/// regex `^[A-Za-z0-9_\-]+:[0-9a-f]{64}$`; inlined as bytes so we don't
+/// pull `regex` in here for a one-line validator.
+pub(crate) fn looks_like_authorized_hash(s: &str) -> bool {
+    let Some((user, hex)) = s.split_once(':') else {
+        return false;
+    };
+    !user.is_empty()
+        && user
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        && hex.len() == 64
+        && hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 /// Load the content of an HTTP-answer file path. Returns `None` if the path is
 /// `None`. Mirrors the logic in `command/src/config.rs::read_http_answer_file`.
 fn read_answer_path(path: &Option<PathBuf>) -> Result<Option<String>, CtlError> {
@@ -1330,5 +1347,43 @@ mod tests {
             find_cluster_configuration(clusters_response(vec![cluster("other", false)]), "target");
 
         assert!(found.is_none());
+    }
+
+    #[test]
+    fn accepts_canonical_user_hex64() {
+        assert!(looks_like_authorized_hash(
+            "admin:2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b"
+        ));
+    }
+
+    #[test]
+    fn rejects_missing_colon() {
+        assert!(!looks_like_authorized_hash("admin"));
+    }
+
+    #[test]
+    fn rejects_short_hex_tail() {
+        assert!(!looks_like_authorized_hash("admin:deadbeef"));
+    }
+
+    #[test]
+    fn rejects_uppercase_hex() {
+        assert!(!looks_like_authorized_hash(
+            "admin:2BB80D537B1DA3E38BD30361AA855686BDE0EACD7162FEF6A25FE97BF527A25B"
+        ));
+    }
+
+    #[test]
+    fn rejects_empty_username() {
+        assert!(!looks_like_authorized_hash(
+            ":2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b"
+        ));
+    }
+
+    #[test]
+    fn rejects_non_alnum_username() {
+        assert!(!looks_like_authorized_hash(
+            "admin user:2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b"
+        ));
     }
 }

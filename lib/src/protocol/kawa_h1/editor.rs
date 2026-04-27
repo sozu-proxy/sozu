@@ -661,6 +661,8 @@ impl HttpContext {
         self.user_agent = None;
         self.x_request_id = None;
         self.xff_chain = None;
+        self.redirect_location = None;
+        self.www_authenticate = None;
         // Note: tls_server_name, tls_version, tls_cipher, tls_alpn,
         // strict_sni_binding are connection-scoped — set once at handshake
         // completion and reused across every keep-alive request, so reset()
@@ -853,6 +855,8 @@ mod tests {
         ctx.user_agent = Some("curl/7.81".to_owned());
         ctx.x_request_id = Some("client-xrid-123".to_owned());
         ctx.xff_chain = Some("203.0.113.5, 198.51.100.10".to_owned());
+        ctx.redirect_location = Some("https://example.com/".to_owned());
+        ctx.www_authenticate = Some("Basic realm=\"sozu\"".to_owned());
 
         ctx.reset();
 
@@ -867,6 +871,12 @@ mod tests {
         assert!(ctx.user_agent.is_none());
         assert!(ctx.x_request_id.is_none());
         assert!(ctx.xff_chain.is_none());
+        // The two stash slots written by the routing layer must clear
+        // between pipelined H1 requests; otherwise a future code path that
+        // emits a 301 / 401 default-answer without re-routing would
+        // inherit a stale Location / WWW-Authenticate from a prior request.
+        assert!(ctx.redirect_location.is_none());
+        assert!(ctx.www_authenticate.is_none());
     }
 
     #[test]
