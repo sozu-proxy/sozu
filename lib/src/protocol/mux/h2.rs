@@ -1653,8 +1653,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         && stream_id & 1 == 1
                         && stream_id > self.last_stream_id
                     {
-                        // Lisa LISA-107: RFC 9113 §6.8 — after sending a
-                        // GOAWAY, the proxy MUST NOT accept new streams.
+                        // RFC 9113 §6.8: after sending a GOAWAY, the proxy
+                        // MUST NOT accept new streams.
                         // `graceful_goaway` sets `drain.draining = true`
                         // and sends a phase-1 GOAWAY with last_stream_id =
                         // STREAM_ID_MAX (so in-flight requests are still
@@ -3432,8 +3432,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         E: Endpoint,
         L: ListenerHandler + L7ListenerHandler,
     {
-        // Lisa LISA-102: per-connection scratch Vecs (`converter_buf`,
-        // `lowercase_buf`, `cookie_buf`, `priorities_buf`) grow to a
+        // Per-connection scratch Vecs (`converter_buf`, `lowercase_buf`,
+        // `cookie_buf`, `priorities_buf`) grow to a
         // high-water mark and never shrink. On a long-lived idle H2
         // connection that briefly carried a flurry of large headers, the
         // backing memory stays pinned indefinitely. Reclaim past

@@ -94,7 +94,7 @@ accept time. The relevant fields:
 | `socket_path`   | `Arc<str>` of the listener path (`sessions.rs:58-62`)  | Disambiguate audit lines from a multi-instance deployment         |
 | `connect_ts`    | `SystemTime::now()` at accept (`sessions.rs:63-68`)    | Wall-clock anchor for SOC windowing                                |
 
-### 2.3 PID-reuse-guarded `peer_comm` — Lisa LISA-009
+### 2.3 PID-reuse-guarded `peer_comm`
 
 `peer_comm` (`bin/src/command/server.rs:1177` on Linux / `:1198` elsewhere)
 reads `/proc/<pid>/comm` to capture the command-line basename used by the
@@ -109,7 +109,7 @@ but `exec` is not adversarial in our deployment (the `sozu` CLI never
 exec's), and the SOC analyst seeing two different binaries on the same
 PID across audit lines for the same session is itself a useful signal.
 
-### 2.4 Cached `peer_user` — Lisa LISA-008
+### 2.4 Cached `peer_user`
 
 `peer_user` (`bin/src/command/server.rs:1213` on Linux / `:1250` elsewhere)
 resolves `uid → POSIX account name` via `getpwuid_r` / NSS. NSS lookups
@@ -120,7 +120,7 @@ seconds. The function caches up to `MAX_PEER_USER_CACHE = 16`
 (`server.rs:1223`) so a steady-state operator UID is paid at most once
 per main lifetime. The cache evicts on insert when the cap is reached.
 
-### 2.5 Drop-on-register-fail — Lisa LISA-012
+### 2.5 Drop-on-register-fail
 
 When `mio::Registry::register` fails for a freshly accepted client (e.g.
 the slab is exhausted or the FD is invalid), the supervisor previously
@@ -141,9 +141,9 @@ dropped at scope end, which sends RST/EOF to the peer.
 a client sends a complete `Request` over the channel. Steps:
 
 1. Reject empty `request_type` with an `error!` log (`requests.rs:185-188`).
-2. Apply `command_allowed_uids` admission (`requests.rs:195-215`,
-   Lisa LISA-007). When `Config::command_allowed_uids` is `None` (the
-   default), every same-UID local process is permitted; when set,
+2. Apply `command_allowed_uids` admission (`requests.rs:195-215`).
+   When `Config::command_allowed_uids` is `None` (the default), every
+   same-UID local process is permitted; when set,
    `actor_uid` must be in the allowlist or the request is rejected with
    `client.finish_failure("unauthorized: ...")` and recorded in the audit
    trail. The historical "any same-UID" behaviour is preserved for sites

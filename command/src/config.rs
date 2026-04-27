@@ -251,8 +251,8 @@ pub enum ConfigError {
     #[error("Invalid ALPN protocol '{0}'. Valid values: \"h2\", \"http/1.1\"")]
     InvalidAlpnProtocol(String),
     /// `disable_http11 = true` and `alpn_protocols` containing `"http/1.1"`
-    /// are mutually exclusive (Lisa LISA-TLS-004): the proxy advertises
-    /// `http/1.1` to peers, then refuses every connection that negotiates
+    /// are mutually exclusive: the proxy advertises `http/1.1` to peers,
+    /// then refuses every connection that negotiates
     /// it. The combination is a self-DoS at handshake time. Either drop
     /// `http/1.1` from `alpn_protocols` or unset `disable_http11`.
     #[error(
@@ -687,8 +687,8 @@ impl ListenerBuilder {
                         other => return Err(ConfigError::InvalidAlpnProtocol(other.to_owned())),
                     }
                 }
-                // Lisa LISA-TLS-004: disable_http11 + http/1.1 ALPN is a
-                // self-DoS — every connection negotiates http/1.1 then is
+                // disable_http11 + http/1.1 ALPN is a self-DoS — every
+                // connection negotiates http/1.1 then is
                 // immediately refused at `https.rs::upgrade_handshake`.
                 // Reject the combination at config load.
                 if self.disable_http11.unwrap_or(false) && protos.iter().any(|p| p == "http/1.1") {
@@ -1419,7 +1419,7 @@ pub struct FileConfig {
     /// invoke any verb. When set, requests whose `SO_PEERCRED` UID is not
     /// in the list are rejected. Use to restrict mutating verbs to a
     /// specific operator UID even when other same-UID daemons coexist
-    /// (CI runners, monitoring). Lisa LISA-007 hardening.
+    /// (CI runners, monitoring).
     #[serde(default)]
     pub command_allowed_uids: Option<Vec<u32>>,
     pub saved_state: Option<String>,

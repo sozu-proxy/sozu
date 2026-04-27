@@ -201,8 +201,8 @@ impl CertificateResolver {
     /// the cert set actually changes, never on the hot TLS handshake path.
     fn publish_min_expiration_gauge(&self) {
         let Some(min_expiration) = self.certificates.values().map(|c| c.expiration).min() else {
-            // SECURITY (Lisa LISA-TLS-001 false-positive): an empty
-            // resolver is not "every cert just expired"; it is "no cert
+            // SECURITY: an empty resolver is not "every cert just
+            // expired"; it is "no cert
             // has been loaded yet" — typical at process boot before the
             // first AddCertificate request lands. Writing 0 here pages
             // SOC tooling on every restart with the same alert as a real
@@ -395,8 +395,8 @@ impl ResolvesServerCert for MutexCertificateResolver {
             name,
             sigschemes
         );
-        // Lisa LISA-TLS-003: every other site uses blocking `lock()`,
-        // and silently falling back to `DEFAULT_CERTIFICATE` on lock
+        // Every other site uses blocking `lock()`, and silently falling
+        // back to `DEFAULT_CERTIFICATE` on lock
         // contention is an attacker-detectable mismatch (different
         // chain → different fingerprint) and a footgun the moment
         // multi-threading enters the worker. Block here. Lock-poisoning
