@@ -1907,6 +1907,14 @@ mod tests {
                 position: RulePosition::Tree,
                 cluster_id: Some(cluster_id1),
                 tags: None,
+                redirect: None,
+                redirect_scheme: None,
+                redirect_template: None,
+                rewrite_host: None,
+                rewrite_path: None,
+                rewrite_port: None,
+                required_auth: None,
+                headers: Vec::new(),
             })
             .expect("Could not add http frontend");
         fronts
@@ -1918,6 +1926,14 @@ mod tests {
                 position: RulePosition::Tree,
                 cluster_id: Some(cluster_id2),
                 tags: None,
+                redirect: None,
+                redirect_scheme: None,
+                redirect_template: None,
+                rewrite_host: None,
+                rewrite_path: None,
+                rewrite_port: None,
+                required_auth: None,
+                headers: Vec::new(),
             })
             .expect("Could not add http frontend");
         fronts
@@ -1929,6 +1945,14 @@ mod tests {
                 position: RulePosition::Tree,
                 cluster_id: Some(cluster_id3),
                 tags: None,
+                redirect: None,
+                redirect_scheme: None,
+                redirect_template: None,
+                rewrite_host: None,
+                rewrite_path: None,
+                rewrite_port: None,
+                required_auth: None,
+                headers: Vec::new(),
             })
             .expect("Could not add http frontend");
         fronts
@@ -1940,6 +1964,14 @@ mod tests {
                 position: RulePosition::Tree,
                 cluster_id: Some("cluster_1".to_owned()),
                 tags: None,
+                redirect: None,
+                redirect_scheme: None,
+                redirect_template: None,
+                rewrite_host: None,
+                rewrite_path: None,
+                rewrite_port: None,
+                required_auth: None,
+                headers: Vec::new(),
             })
             .expect("Could not add http frontend");
 

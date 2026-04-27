@@ -58,16 +58,15 @@ pub fn extract_authorization_header(kawa: &GenericHttpStream) -> Option<Vec<u8>>
 /// malformed input — wrong scheme, non-base64 token, missing `:`,
 /// non-UTF-8 username, or oversized payload.
 pub fn canonicalize_basic_credentials(value: &[u8]) -> Option<String> {
-    // Trim leading whitespace so e.g. `Authorization: Basic abc==` (one
-    // space, the canonical form) and `Authorization:  Basic abc==` (two
-    // spaces, still RFC-compliant) both parse.
+    // Trim leading SP only. RFC 7235 §2.1 / RFC 9110 §11.4 define the
+    // header value's grammar as `auth-scheme [ 1*SP token68 ]`, so HTAB
+    // is not permitted between the value start and the scheme. Some
+    // clients still emit a leading SP run before the scheme; that's
+    // tolerated here because the OWS preceding the field-value is
+    // already stripped by the parser.
     let mut rest = value;
-    while let Some((&first, tail)) = rest.split_first() {
-        if first == b' ' || first == b'\t' {
-            rest = tail;
-        } else {
-            break;
-        }
+    while let Some((&b' ', tail)) = rest.split_first() {
+        rest = tail;
     }
 
     // RFC 7617 § 2 mandates ASCII-case-insensitive `Basic` scheme prefix.
@@ -77,17 +76,16 @@ pub fn canonicalize_basic_credentials(value: &[u8]) -> Option<String> {
     }
     rest = &rest[scheme_len..];
 
-    // Exactly one space separates the scheme from the token in practice;
-    // trim any whitespace we encounter to be tolerant of single-tab or
-    // double-space inputs.
-    while let Some((&first, tail)) = rest.split_first() {
-        if first == b' ' || first == b'\t' {
-            rest = tail;
-        } else {
-            break;
-        }
+    // RFC 7235 §2.1: scheme and token68 are separated by `1*SP`.
+    // Reject HTAB and reject zero spaces (the scheme-token boundary must
+    // exist). Multiple leading spaces are tolerated for compatibility
+    // with clients that emit `Basic  abc==`.
+    let mut saw_space = false;
+    while let Some((&b' ', tail)) = rest.split_first() {
+        rest = tail;
+        saw_space = true;
     }
-    if rest.is_empty() {
+    if !saw_space || rest.is_empty() {
         return None;
     }
 

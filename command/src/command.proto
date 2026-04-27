@@ -674,6 +674,11 @@ message RequestHttpFrontend {
     // Header mutations applied to requests and/or responses passing through
     // this frontend. See `Header` for delete semantics.
     repeated Header headers = 15;
+
+    // Field numbers 16-19 are reserved for the next iteration so an
+    // accidental reuse during a future migration fails at proto compile
+    // time rather than silently aliasing an old field number.
+    reserved 16 to 19;
 }
 
 message RequestTcpFrontend {
@@ -826,6 +831,11 @@ message Cluster {
     // unauthenticated request is rejected. Treated as an opaque value (no
     // template substitution). Defaults to a generic realm if unset.
     optional string www_authenticate = 12;
+
+    // Field numbers 13-19 are open for the next iteration; reserve them
+    // so an accidental reuse during a future migration fails at proto
+    // compile time rather than silently aliasing an old field number.
+    reserved 13 to 19;
 }
 
 enum LoadBalancingAlgorithms {

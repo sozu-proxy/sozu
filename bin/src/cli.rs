@@ -475,6 +475,46 @@ pub enum HttpFrontendCmd {
         method: Option<String>,
         #[clap(long = "tags", help = "Specify tag (key-value pair) to apply on front-end (example: 'key=value, other-key=other-value')", value_parser = parse_tags)]
         tags: Option<BTreeMap<String, String>>,
+        #[clap(
+            long = "redirect",
+            help = "Redirect policy. Possible values: 'forward' (default), 'permanent', 'unauthorized'"
+        )]
+        redirect: Option<String>,
+        #[clap(
+            long = "redirect-scheme",
+            help = "Scheme for permanent-redirect Location URLs. Possible values: 'use-same' (default), 'use-http', 'use-https'"
+        )]
+        redirect_scheme: Option<String>,
+        #[clap(
+            long = "redirect-template",
+            help = "Optional template applied when emitting a permanent redirect. Supports %REDIRECT_LOCATION / %STATUS_CODE."
+        )]
+        redirect_template: Option<String>,
+        #[clap(
+            long = "rewrite-host",
+            help = "Rewrite request host with this template. Supports $HOST[n] / $PATH[n] capture placeholders."
+        )]
+        rewrite_host: Option<String>,
+        #[clap(
+            long = "rewrite-path",
+            help = "Rewrite request path with this template. Same grammar as --rewrite-host."
+        )]
+        rewrite_path: Option<String>,
+        #[clap(
+            long = "rewrite-port",
+            help = "Override the port in the rewritten URL (1..=65535)."
+        )]
+        rewrite_port: Option<u32>,
+        #[clap(
+            long = "required-auth",
+            help = "Require a valid Authorization: Basic header on this frontend."
+        )]
+        required_auth: bool,
+        #[clap(
+            long = "header",
+            help = "Header mutation, format: <position>=<name>=<value>. Position is 'request', 'response', or 'both'. Empty <value> deletes the header (HAProxy del-header parity). Repeatable."
+        )]
+        header: Vec<String>,
     },
     #[clap(name = "remove")]
     Remove {
