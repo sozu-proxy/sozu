@@ -1236,15 +1236,22 @@ fn build_http_frontend_add(cmd: HttpFrontendCmd) -> Result<RequestHttpFrontend, 
                 ));
             }
         };
-        // Reject CRLF / NUL / other C0 controls in either field. CRLF in
-        // the value would let an operator (or a misuse via piped CLI args)
-        // splice arbitrary header / request lines into the H1 wire on the
-        // backend side (CWE-113 / request smuggling). The H2 emission path
-        // filters at runtime; the H1 path serialises raw, so we reject at
-        // CLI parse time as a defense in depth and to give a clear error.
-        if header_value_has_control_byte(key.as_bytes()) {
+        // Reject CRLF / NUL / other C0 controls. CRLF in the value would
+        // let an operator (or a misuse via piped CLI args) splice
+        // arbitrary header / request lines into the H1 wire on the
+        // backend side (CWE-113 / request smuggling). The H2 emission
+        // path filters values at runtime; the H1 path serialises raw,
+        // so we reject at CLI parse time as a defense in depth and to
+        // give a clear error.
+        //
+        // The KEY check is stricter than the value check — RFC 9110
+        // §5.1 field names follow the `token` grammar (no HTAB, no SP,
+        // no C0 controls); reusing the value-side predicate would let
+        // `Host\t` slip through and produce an invalid header line on
+        // the wire (security review follow-up on `da845c71`).
+        if !is_valid_header_name(key.as_bytes()) {
             return Err(CtlError::ArgsNeeded(
-                "header key without control characters (NUL / CR / LF / other C0)".to_owned(),
+                "header key matching RFC 9110 token grammar (alphanumeric or one of !#$%&'*+-.^_`|~)".to_owned(),
                 format!("--header[{index}] key={key:?}"),
             ));
         }
@@ -1280,16 +1287,45 @@ fn build_http_frontend_add(cmd: HttpFrontendCmd) -> Result<RequestHttpFrontend, 
     })
 }
 
-/// Reject NUL / CR / LF / other C0 controls in a header key or value.
-/// Mirrors `command::config::header_bytes_contain_forbidden_controls`
-/// (and `lib::protocol::mux::converter::call`'s runtime filter) so the
-/// CLI rejects header injection vectors at parse time rather than
-/// letting them slip through to the H1 emission path, which serialises
-/// raw bytes onto the backend wire.
+/// Reject NUL / CR / LF / other C0 controls in a header value. HTAB
+/// (`\x09`) is permitted per RFC 9110 §5.5 and matches the runtime
+/// filter at `lib::protocol::mux::converter::call`.
 fn header_value_has_control_byte(bytes: &[u8]) -> bool {
     bytes
         .iter()
         .any(|&b| matches!(b, 0x00..=0x08 | 0x0A..=0x1F | 0x7F))
+}
+
+/// Header field names follow the RFC 9110 §5.1 `token` grammar: a
+/// non-empty sequence of `tchar` bytes (alphanumeric plus a closed
+/// punctuation list). HTAB and SP are NOT tchar — they belong to
+/// field-VALUE grammar. Reusing `header_value_has_control_byte` for
+/// keys would let `Host\t` slip through and produce an invalid header
+/// line on the H1 backend wire.
+fn is_valid_header_name(bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return false;
+    }
+    bytes.iter().all(|&b| {
+        b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'!' | b'#'
+                    | b'$'
+                    | b'%'
+                    | b'&'
+                    | b'\''
+                    | b'*'
+                    | b'+'
+                    | b'-'
+                    | b'.'
+                    | b'^'
+                    | b'_'
+                    | b'`'
+                    | b'|'
+                    | b'~'
+            )
+    })
 }
 
 /// Validate that `s` matches the canonical `<user>:<hex(sha256)>` form
