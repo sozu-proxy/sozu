@@ -525,6 +525,136 @@ Operators monitoring logs should expect the following classification:
 
 In particular, the recurring `Could not look up a certificate for server name "<name>"` line (issue #774) is emitted at `warn` when the `rustls::server::ClientHello` SNI does not match any configured frontend — the usual culprit is a generic scanner (Shodan, ssllabs, Censys) probing `default.example` or an IP-only hello. No action required unless the name matches a frontend you expect to serve.
 
+## Custom HTTP answer templates
+
+Sōzu lets operators replace any default error response with a templated body
+loaded from disk. Templates are specified as a `[listeners.answers]` map at
+listener scope or as a `[clusters.<id>.answers]` map at cluster scope; the
+key is the HTTP status code (e.g. `"503"`) and the value is the path to a
+template file. Cluster-level entries override the listener-level template
+for the same status code on requests routed through that cluster.
+
+```toml
+[listeners.https.answers]
+"401" = "/etc/sozu/templates/401.http"
+"404" = "/etc/sozu/templates/404.http"
+"503" = "/etc/sozu/templates/503.http"
+
+[clusters.MyCluster.answers]
+"503" = "/etc/sozu/templates/MyCluster.503.http"
+```
+
+Each template is a complete HTTP response (status line + headers + body) with
+optional placeholders. Sōzu substitutes the placeholders at render time:
+
+| Placeholder | Scope | Meaning |
+|-------------|-------|---------|
+| `%STATUS_CODE` | header & body | Resolved HTTP status (e.g. `503`) |
+| `%REQUEST_ID` | header & body | Per-request ULID (matches `Sozu-Id`) |
+| `%CLUSTER_ID` | header & body | Cluster the request was routed to (or empty) |
+| `%BACKEND_ID` | header & body | Backend the request was forwarded to (or empty) |
+| `%ROUTE` | header & body | Request method + authority + path |
+| `%REDIRECT_LOCATION` | header & body | Resolved `Location` URL (301 only) |
+| `%WWW_AUTHENTICATE` | header only | Realm string for 401 (header is elided when empty) |
+| `%MESSAGE`, `%PHASE`, `%SUCCESSFULLY_PARSED`, `%PARTIALLY_PARSED`, `%INVALID`, `%CAPACITY`, `%DURATION` | varies | Diagnostic detail for parse / size / timeout errors |
+
+A `Content-Length` header is auto-injected from the rendered body size when
+the template does not already carry one.
+
+When a template carries `Connection: close`, the response will close the
+frontend connection after delivery; a custom template without that header
+keeps frontend keep-alive on. The HAProxy parallel is `errorfile NNN /path`.
+
+The legacy `answer_NNN = "/path"` per-status fields under
+`[listeners.<name>]` continue to work — they are merged into the new map at
+load time so existing state files round-trip cleanly. New configs should
+prefer the `[listeners.<name>.answers]` shape.
+
+## Frontend redirect, URL rewrite, and custom headers
+
+Each frontend can carry a routing decision richer than "forward to a cluster".
+Three top-level knobs drive different policies:
+
+```toml
+[[clusters.MyCluster.frontends]]
+address  = "0.0.0.0:80"
+hostname = "old.example.com"
+# Force a permanent 301 to the canonical name on a different port.
+redirect        = "permanent"      # forward (default) | permanent | unauthorized
+redirect_scheme = "use-https"      # use-same (default) | use-http | use-https
+rewrite_host    = "new.example.com"
+rewrite_port    = 8443             # paired with `cluster.https_redirect_port`
+```
+
+`redirect = "permanent"` returns a 301 with a resolved `Location` URL built
+from `redirect_scheme`, the (optionally rewritten) host, the cluster's
+`https_redirect_port` (or the rewritten `rewrite_port`), and the original
+request path. `redirect = "unauthorized"` returns 401 unconditionally —
+useful for blanket deny-by-default frontends that still want to surface a
+login prompt with the cluster's `www_authenticate` realm.
+
+`rewrite_host` and `rewrite_path` accept a small template grammar:
+`$HOST[n]` references the n-th host capture (0 is the full hostname; 1+ are
+regex / wildcard subgroups), and `$PATH[n]` references the n-th path
+capture. When the host is rewritten, Sōzu injects the original host into
+`X-Forwarded-Host` so backends can reconstruct the request URL.
+
+Custom headers attach to the same frontend:
+
+```toml
+[[clusters.MyCluster.frontends.headers]]
+position = "request"               # request | response | both
+key      = "X-Forwarded-Proto"
+value    = "https"
+
+[[clusters.MyCluster.frontends.headers]]
+position = "response"
+key      = "X-Cache-Backend"
+value    = ""                      # empty value DELETES the header by name
+                                   # (HAProxy `del-header` parity)
+```
+
+HAProxy parallels: `http-request redirect` (permanent / scheme), `set-uri`
+and `set-path` (rewrite), `http-request set-header` and
+`http-request del-header` (custom headers).
+
+## HTTP Basic authentication on a frontend
+
+Operators can require a valid `Authorization: Basic` header on a frontend
+and validate it against a list of pre-hashed credentials on the cluster.
+The mux iterates the entire authorized list in constant time (via
+`subtle::ConstantTimeEq`), so neither the matching index nor a successful
+lookup leak through the time spent validating.
+
+```toml
+[clusters.MyCluster]
+# Realm rendered into `WWW-Authenticate: Basic realm="…"` on a 401.
+www_authenticate = 'Basic realm="MyCluster"'
+# Each entry is `username:hex(sha256(password))` — generate with
+# `printf 'admin:secret' | sha256sum` then prefix with `admin:`.
+authorized_hashes = [
+    "admin:2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b",
+]
+
+[[clusters.MyCluster.frontends]]
+address       = "0.0.0.0:80"
+hostname      = "secured.example.com"
+required_auth = true               # gate this frontend on basic-auth
+```
+
+Failure modes:
+
+- Missing `Authorization: Basic` header → 401 with the cluster's realm
+- Malformed credential (bad base64, missing `:`) → 401
+- Wrong username or password → 401
+- Empty `authorized_hashes` while the frontend has `required_auth = true`
+  → 401 (closed-by-default policy)
+
+The `WWW-Authenticate` header is rendered through the answer template's
+`%WWW_AUTHENTICATE` placeholder; when no realm is configured the entire
+header line is elided from the 401 response. HAProxy parallel:
+`http-request auth realm Foo unless { http_auth(...) }`.
+
 ## Runtime patch — `sozu listener update`
 
 `sozu listener {http,https,tcp} update` patches a live listener **in place** without cycling the listening socket. Only the fields you pass are written; all others are preserved exactly as they are. Existing sessions continue with their configuration snapshot; only new sessions, connections, or TLS handshakes — depending on the field — pick up the new values. Use `sozu listener list` to inspect current values before patching.
