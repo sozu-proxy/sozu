@@ -18,7 +18,6 @@ use crate::{
     RetrieveClusterError,
     backends::{Backend, BackendError},
     protocol::http::editor::HttpContext,
-    router::Route,
     server::CONN_RETRIES,
     socket::SessionTcpStream,
     timer::TimeoutContainer,
@@ -514,10 +513,13 @@ impl Router {
             }
         };
 
-        let cluster_id = match route {
-            Route::ClusterId(id) => id,
-            Route::Deny => {
-                trace!("{} Route::Deny", log_module_context!(context));
+        // Wave 3a will plumb every RouteResult field through `apply_route_decision`;
+        // for now collapse RouteResult to cluster_id and treat the absent
+        // cluster as the historical `Route::Deny`.
+        let cluster_id = match route.cluster_id {
+            Some(id) => id,
+            None => {
+                trace!("{} RouteResult::deny", log_module_context!(context));
                 return Err(RetrieveClusterError::UnauthorizedRoute);
             }
         };

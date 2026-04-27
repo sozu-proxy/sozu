@@ -1,15 +1,40 @@
 pub mod pattern_trie;
 
-use std::{str::from_utf8, time::Instant};
+use std::{
+    fmt::{self, Debug, Write},
+    rc::Rc,
+    str::from_utf8,
+    time::Instant,
+};
 
 use regex::bytes::Regex;
 use sozu_command::{
-    proto::command::{PathRule as CommandPathRule, PathRuleKind, RulePosition},
+    logging::CachedTags,
+    proto::command::{
+        HeaderPosition, PathRule as CommandPathRule, PathRuleKind, RedirectPolicy, RedirectScheme,
+        RulePosition,
+    },
     response::HttpFrontend,
     state::ClusterId,
 };
 
-use crate::{protocol::http::parser::Method, router::pattern_trie::TrieNode};
+use crate::{
+    protocol::http::parser::Method,
+    router::pattern_trie::{TrieMatches, TrieNode, TrieSubMatch},
+    sozu_command::logging::ansi_palette,
+};
+
+/// Module-level prefix tag for `lib/src/router/`. Honours the runtime
+/// colored-output flag via [`ansi_palette`]; consumed by every `warn!` /
+/// `error!` site below so static log-layout regression checks (see
+/// `lib/tests/log_layout.rs`) keep router log lines on the canonical
+/// `[ROUTER] >>>` envelope.
+macro_rules! log_module_context {
+    () => {{
+        let (open, reset, _, _, _) = ansi_palette();
+        format!("{open}ROUTER{reset}\t >>>", open = open, reset = reset)
+    }};
+}
 
 #[derive(thiserror::Error, Debug, PartialEq)]
 pub enum RouterError {
@@ -17,6 +42,10 @@ pub enum RouterError {
     InvalidPathRule(String),
     #[error("parsing hostname {hostname} failed")]
     InvalidDomain { hostname: String },
+    #[error("Could not parse host rewrite {0:?}")]
+    InvalidHostRewrite(String),
+    #[error("Could not parse path rewrite {0:?}")]
+    InvalidPathRewrite(String),
     #[error("Could not add route {0}")]
     AddRoute(String),
     #[error("Could not remove route {0}")]
@@ -50,35 +79,60 @@ impl Router {
         }
     }
 
+    /// Resolve a request to a [`RouteResult`].
+    ///
+    /// Looks up `(hostname, path, method)` against the pre, tree, and post
+    /// rule lists. The matched [`Route`] is converted into a [`RouteResult`]:
+    /// legacy variants ([`Route::ClusterId`], [`Route::Deny`]) synthesize a
+    /// minimal `RouteResult` so existing call sites keep working, while
+    /// [`Route::Frontend`] runs the full Frontend → RouteResult pipeline,
+    /// substituting host/path captures into [`RewriteParts`] templates.
     pub fn lookup(
         &self,
         hostname: &str,
         path: &str,
         method: &Method,
-    ) -> Result<Route, RouterError> {
+    ) -> Result<RouteResult, RouterError> {
         let hostname_b = hostname.as_bytes();
         let path_b = path.as_bytes();
-        for (domain_rule, path_rule, method_rule, cluster_id) in &self.pre {
+        for (domain_rule, path_rule, method_rule, route) in &self.pre {
             if domain_rule.matches(hostname_b)
                 && path_rule.matches(path_b) != PathRuleResult::None
                 && method_rule.matches(method) != MethodRuleResult::None
             {
-                return Ok(cluster_id.clone());
+                return Ok(RouteResult::new_no_trie(
+                    hostname_b,
+                    domain_rule,
+                    path_b,
+                    path_rule,
+                    route,
+                ));
             }
         }
 
-        if let Some((_, path_rules)) = self.tree.lookup(hostname_b, true) {
+        let trie_path: TrieMatches<'_, '_> = Vec::with_capacity(16);
+        if let Some(((_, path_rules), trie_matches)) =
+            self.tree.lookup_with_path(hostname_b, true, trie_path)
+        {
             let mut prefix_length = 0;
-            let mut route = None;
+            let mut matched: Option<(&PathRule, &Route)> = None;
 
-            for (rule, method_rule, cluster_id) in path_rules {
+            for (rule, method_rule, route) in path_rules {
                 match rule.matches(path_b) {
                     PathRuleResult::Regex | PathRuleResult::Equals => {
                         match method_rule.matches(method) {
-                            MethodRuleResult::Equals => return Ok(cluster_id.clone()),
+                            MethodRuleResult::Equals => {
+                                return Ok(RouteResult::new_with_trie(
+                                    hostname_b,
+                                    trie_matches,
+                                    path_b,
+                                    rule,
+                                    route,
+                                ));
+                            }
                             MethodRuleResult::All => {
                                 prefix_length = path_b.len();
-                                route = Some(cluster_id);
+                                matched = Some((rule, route));
                             }
                             MethodRuleResult::None => {}
                         }
@@ -89,11 +143,11 @@ impl Router {
                                 // FIXME: the rule order will be important here
                                 MethodRuleResult::Equals => {
                                     prefix_length = size;
-                                    route = Some(cluster_id);
+                                    matched = Some((rule, route));
                                 }
                                 MethodRuleResult::All => {
                                     prefix_length = size;
-                                    route = Some(cluster_id);
+                                    matched = Some((rule, route));
                                 }
                                 MethodRuleResult::None => {}
                             }
@@ -103,17 +157,29 @@ impl Router {
                 }
             }
 
-            if let Some(cluster_id) = route {
-                return Ok(cluster_id.clone());
+            if let Some((path_rule, route)) = matched {
+                return Ok(RouteResult::new_with_trie(
+                    hostname_b,
+                    trie_matches,
+                    path_b,
+                    path_rule,
+                    route,
+                ));
             }
         }
 
-        for (domain_rule, path_rule, method_rule, cluster_id) in self.post.iter() {
+        for (domain_rule, path_rule, method_rule, route) in self.post.iter() {
             if domain_rule.matches(hostname_b)
                 && path_rule.matches(path_b) != PathRuleResult::None
                 && method_rule.matches(method) != MethodRuleResult::None
             {
-                return Ok(cluster_id.clone());
+                return Ok(RouteResult::new_no_trie(
+                    hostname_b,
+                    domain_rule,
+                    path_b,
+                    path_rule,
+                    route,
+                ));
             }
         }
 
@@ -622,13 +688,679 @@ impl MethodRule {
     }
 }
 
-/// The cluster to which the traffic will be redirected
+/// What to do with a request that matches a frontend.
+///
+/// Three variants coexist during the Wave 2b → Wave 1c transition:
+///
+/// - [`Route::ClusterId`] is the legacy "forward to this cluster" variant
+///   used by call sites that build routes directly from
+///   [`HttpFrontend::cluster_id`].
+/// - [`Route::Deny`] is the legacy "send 401" variant used when a frontend
+///   has no `cluster_id`.
+/// - [`Route::Frontend`] carries a richer [`Frontend`] decision (redirect
+///   policy, rewrite templates, header edits, auth gating). Wave 1c will
+///   migrate `add_http_front` to build `Route::Frontend` once
+///   `HttpFrontend` carries the matching proto fields.
+///
+/// `Eq`/`PartialEq` compare `Frontend` variants by `Rc` pointer identity to
+/// stay consistent with `Hash`/`Ord` on [`Rc`]; this is sufficient for the
+/// router's de-duplication (`add_pre_rule`, `add_post_rule`,
+/// `add_tree_rule`) which only checks against routes created from the same
+/// configuration call.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Route {
     /// send a 401 default answer
     Deny,
     /// the cluster to which the frontend belongs
     ClusterId(ClusterId),
+    /// rich routing decision carrying redirect, rewrite, header, and auth
+    /// configuration; supersedes the legacy variants once Wave 1c migrates
+    /// the in-memory frontend wiring.
+    Frontend(Rc<Frontend>),
+}
+
+/// A single header mutation collected from a [`Frontend`] configuration.
+///
+/// `key` and `val` are owned via [`Rc`] so a `Frontend` can be held by many
+/// routing entries (pre, tree, post) without copying the underlying bytes.
+/// An empty `val` deletes the header by name (HAProxy `del-header` parity).
+#[derive(Clone, PartialEq, Eq)]
+pub struct HeaderEdit {
+    pub key: Rc<[u8]>,
+    pub val: Rc<[u8]>,
+}
+
+impl Debug for HeaderEdit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_fmt(format_args!(
+            "({:?}, {:?})",
+            String::from_utf8_lossy(&self.key),
+            String::from_utf8_lossy(&self.val)
+        ))
+    }
+}
+
+/// A parsed segment of a rewrite template.
+///
+/// `Host(i)` references the `i`-th host capture: index 0 is the full
+/// hostname; positive indices are regex or wildcard subgroups. `Path(i)`
+/// references the `i`-th path capture: index 0 is the full path; positive
+/// indices are regex groups or prefix tails. `String` holds a literal
+/// segment between captures.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RewritePart {
+    String(String),
+    Host(usize),
+    Path(usize),
+}
+
+impl RewritePart {
+    fn bytes(b: &[u8]) -> Self {
+        Self::String(from_utf8(b).unwrap_or_default().to_owned())
+    }
+}
+
+/// A pre-parsed rewrite template, decomposed into [`RewritePart`]s.
+///
+/// `RewriteParts` is built once at frontend registration time
+/// ([`Frontend::new`]) and then re-applied at lookup time via
+/// [`RewriteParts::run`] against the captures collected by the router.
+///
+/// Grammar:
+/// - `$HOST[N]` — substitute the N-th host capture
+/// - `$PATH[N]` — substitute the N-th path capture
+/// - any other byte sequence — substitute literally
+///
+/// Out-of-bounds capture indices substitute to the empty string at run
+/// time, but [`RewriteParts::parse`] rejects templates that reference
+/// capture indices the router cannot produce (the `*_cap_cap` arguments).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RewriteParts(Vec<RewritePart>);
+
+impl RewriteParts {
+    /// Parse `template` against the host/path capture caps the router can
+    /// produce for the matching domain/path rule.
+    ///
+    /// `host_cap_cap` and `path_cap_cap` are upper bounds (exclusive) on the
+    /// host and path capture indices the router can fill at lookup time.
+    /// `used_index_host` / `used_index_path` are out parameters tracking the
+    /// highest index actually referenced — callers use them to short-circuit
+    /// capture extraction when no template references captures.
+    ///
+    /// Returns `None` on syntactically malformed templates: dangling `$`,
+    /// missing closing `]`, non-digit index, or an index ≥ the cap.
+    pub fn parse(
+        template: &str,
+        host_cap_cap: usize,
+        path_cap_cap: usize,
+        used_index_host: &mut usize,
+        used_index_path: &mut usize,
+    ) -> Option<Self> {
+        let mut result = Vec::new();
+        let mut i = 0;
+        let pattern = template.as_bytes();
+        while i < pattern.len() {
+            if pattern[i] == b'$' {
+                let is_host = if pattern[i..].starts_with(b"$HOST[") {
+                    i += 6;
+                    true
+                } else if pattern[i..].starts_with(b"$PATH[") {
+                    i += 6;
+                    false
+                } else {
+                    return None;
+                };
+                let mut index = 0usize;
+                let digits_start = i;
+                while i < pattern.len() && pattern[i].is_ascii_digit() {
+                    index = index
+                        .checked_mul(10)?
+                        .checked_add((pattern[i] - b'0') as usize)?;
+                    i += 1;
+                }
+                if i == digits_start {
+                    // no digits between the `[` and the `]`
+                    return None;
+                }
+                if i >= pattern.len() || pattern[i] != b']' {
+                    return None;
+                }
+                if is_host {
+                    if index >= host_cap_cap {
+                        return None;
+                    }
+                    if index >= *used_index_host {
+                        *used_index_host = index + 1;
+                    }
+                    result.push(RewritePart::Host(index));
+                } else {
+                    if index >= path_cap_cap {
+                        return None;
+                    }
+                    if index >= *used_index_path {
+                        *used_index_path = index + 1;
+                    }
+                    result.push(RewritePart::Path(index));
+                }
+                i += 1; // consume `]`
+            } else {
+                let start = i;
+                while i < pattern.len() && pattern[i] != b'$' {
+                    i += 1;
+                }
+                result.push(RewritePart::bytes(&pattern[start..i]));
+            }
+        }
+        Some(Self(result))
+    }
+
+    /// Substitute `host_captures` and `path_captures` into the template.
+    ///
+    /// Out-of-bounds captures substitute to an empty string. The result is
+    /// allocated in one pass with the exact required capacity.
+    pub fn run(&self, host_captures: &[&str], path_captures: &[&str]) -> String {
+        let mut cap = 0usize;
+        for part in &self.0 {
+            cap += match part {
+                RewritePart::String(s) => s.len(),
+                RewritePart::Host(i) => host_captures.get(*i).map(|s| s.len()).unwrap_or(0),
+                RewritePart::Path(i) => path_captures.get(*i).map(|s| s.len()).unwrap_or(0),
+            };
+        }
+        let mut result = String::with_capacity(cap);
+        for part in &self.0 {
+            // String::write_str cannot fail — ignore the formatter result.
+            let _ = match part {
+                RewritePart::String(s) => result.write_str(s),
+                RewritePart::Host(i) => result.write_str(host_captures.get(*i).unwrap_or(&"")),
+                RewritePart::Path(i) => result.write_str(path_captures.get(*i).unwrap_or(&"")),
+            };
+        }
+        result
+    }
+}
+
+/// What to do with the traffic for a routed frontend.
+///
+/// Built once at frontend registration time. The expensive work (parsing
+/// rewrite templates, resolving headers into [`HeaderEdit`]s) happens here
+/// so [`Router::lookup`] can run cheaply on the hot path.
+///
+/// A clusterless frontend with `redirect == FORWARD` is coerced to
+/// `UNAUTHORIZED` in [`Frontend::new`] to avoid a forward loop with no
+/// backend; the explicit `UNAUTHORIZED` policy then renders a 401.
+///
+/// Tags are wrapped in [`Rc<CachedTags>`] so the same frontend can be
+/// referenced from multiple routing slots (pre/tree/post) without copying.
+#[derive(Debug, Clone)]
+pub struct Frontend {
+    pub cluster_id: Option<ClusterId>,
+    pub redirect: RedirectPolicy,
+    pub redirect_scheme: RedirectScheme,
+    pub redirect_template: Option<String>,
+    /// Number of host captures the router will collect for this frontend.
+    /// Sized from the matching [`DomainRule`]; the router skips capture
+    /// extraction entirely when this is 0 (no rewrite references `$HOST[…]`).
+    pub capture_cap_host: usize,
+    /// Number of path captures the router will collect for this frontend.
+    /// Sized from the matching [`PathRule`]; the router skips capture
+    /// extraction entirely when this is 0 (no rewrite references `$PATH[…]`).
+    pub capture_cap_path: usize,
+    pub rewrite_host: Option<RewriteParts>,
+    pub rewrite_path: Option<RewriteParts>,
+    pub rewrite_port: Option<u16>,
+    pub headers_request: Rc<[HeaderEdit]>,
+    pub headers_response: Rc<[HeaderEdit]>,
+    pub required_auth: bool,
+    pub tags: Option<Rc<CachedTags>>,
+}
+
+impl PartialEq for Frontend {
+    fn eq(&self, other: &Self) -> bool {
+        // Frontend instances share the rest of their fields with the
+        // originating HttpFrontend; equality is decided by the same fields
+        // the router uses for de-duplication.
+        self.cluster_id == other.cluster_id
+            && self.redirect == other.redirect
+            && self.redirect_scheme == other.redirect_scheme
+            && self.redirect_template == other.redirect_template
+            && self.rewrite_host == other.rewrite_host
+            && self.rewrite_path == other.rewrite_path
+            && self.rewrite_port == other.rewrite_port
+            && self.headers_request == other.headers_request
+            && self.headers_response == other.headers_response
+            && self.required_auth == other.required_auth
+    }
+}
+
+impl Eq for Frontend {}
+
+impl std::hash::Hash for Frontend {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.cluster_id.hash(state);
+        // RedirectPolicy / RedirectScheme are i32-backed proto enums; hash
+        // them as i32 to avoid requiring a Hash impl on the generated enum.
+        (self.redirect as i32).hash(state);
+        (self.redirect_scheme as i32).hash(state);
+        self.redirect_template.hash(state);
+        self.required_auth.hash(state);
+    }
+}
+
+impl PartialOrd for Frontend {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Frontend {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.cluster_id
+            .cmp(&other.cluster_id)
+            .then_with(|| (self.redirect as i32).cmp(&(other.redirect as i32)))
+            .then_with(|| (self.redirect_scheme as i32).cmp(&(other.redirect_scheme as i32)))
+            .then_with(|| self.redirect_template.cmp(&other.redirect_template))
+            .then_with(|| self.required_auth.cmp(&other.required_auth))
+    }
+}
+
+impl Frontend {
+    /// Build a [`Frontend`] from a domain/path rule pair and an
+    /// [`HttpFrontend`] configuration.
+    ///
+    /// The richer proto-level fields (`redirect`, `redirect_scheme`,
+    /// `redirect_template`, `rewrite_*`, `headers`, `required_auth`) will
+    /// arrive via Wave 1c; until they do, this constructor takes them as
+    /// explicit arguments so the data flow is testable today and the call
+    /// sites in `add_http_front` only need a one-line update once Wave 1c
+    /// plumbs the fields through `HttpFrontend`.
+    ///
+    /// Coercions:
+    /// - `redirect == UNAUTHORIZED` zeroes out rewrite/headers/auth — the
+    ///   request will be rejected with a 401 regardless.
+    /// - `redirect == FORWARD` on a clusterless frontend (`cluster_id ==
+    ///   None`) is coerced to `UNAUTHORIZED` (logged as a warning) to
+    ///   avoid a forward loop with no backend.
+    ///
+    /// Returns [`RouterError::InvalidHostRewrite`] /
+    /// [`RouterError::InvalidPathRewrite`] when a rewrite template fails to
+    /// parse against the rule's capture caps.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        domain_rule: &DomainRule,
+        path_rule: &PathRule,
+        front: &HttpFrontend,
+        redirect: RedirectPolicy,
+        redirect_scheme: RedirectScheme,
+        redirect_template: Option<String>,
+        rewrite_host: Option<String>,
+        rewrite_path: Option<String>,
+        rewrite_port: Option<u16>,
+        headers: &[sozu_command::proto::command::Header],
+        required_auth: bool,
+    ) -> Result<Self, RouterError> {
+        let cluster_id = front.cluster_id.clone();
+        let tags = front
+            .tags
+            .clone()
+            .map(|tags| Rc::new(CachedTags::new(tags)));
+
+        // Coerce clusterless FORWARD to UNAUTHORIZED before doing any
+        // expensive parsing: those routes can never proceed to a backend, so
+        // emitting a 401 is the safe default. Empty redirect_template is
+        // treated as None semantics so we never store an empty Rc<[…]>.
+        let redirect_template = redirect_template.filter(|s| !s.is_empty());
+        let rewrite_host = rewrite_host.filter(|s| !s.is_empty());
+        let rewrite_path = rewrite_path.filter(|s| !s.is_empty());
+
+        let deny = match (&cluster_id, redirect) {
+            (_, RedirectPolicy::Unauthorized) => true,
+            (None, RedirectPolicy::Forward) => {
+                warn!(
+                    "{} Frontend[domain: {:?}, path: {:?}]: forward on clusterless frontends are unauthorized",
+                    log_module_context!(),
+                    domain_rule,
+                    path_rule,
+                );
+                true
+            }
+            _ => false,
+        };
+        if deny {
+            return Ok(Self {
+                cluster_id,
+                redirect: RedirectPolicy::Unauthorized,
+                redirect_scheme,
+                redirect_template: None,
+                capture_cap_host: 0,
+                capture_cap_path: 0,
+                rewrite_host: None,
+                rewrite_path: None,
+                rewrite_port: None,
+                headers_request: Rc::new([]),
+                headers_response: Rc::new([]),
+                required_auth,
+                tags,
+            });
+        }
+
+        // Capture caps: the maximum index a `$HOST[N]` / `$PATH[N]`
+        // template can reference for this rule pair. Index 0 is always the
+        // full hostname/path; subsequent indices are wildcard tail / regex
+        // groups.
+        let mut capture_cap_host = match domain_rule {
+            DomainRule::Any => 1,
+            DomainRule::Exact(_) => 1,
+            DomainRule::Wildcard(_) => 2,
+            DomainRule::Regex(regex) => regex.captures_len(),
+        };
+        let mut capture_cap_path = match path_rule {
+            PathRule::Equals(_) => 1,
+            PathRule::Prefix(_) => 2,
+            PathRule::Regex(regex) => regex.captures_len(),
+        };
+        let mut used_capture_host = 0usize;
+        let mut used_capture_path = 0usize;
+        let rewrite_host_parts = if let Some(p) = rewrite_host {
+            Some(
+                RewriteParts::parse(
+                    &p,
+                    capture_cap_host,
+                    capture_cap_path,
+                    &mut used_capture_host,
+                    &mut used_capture_path,
+                )
+                .ok_or(RouterError::InvalidHostRewrite(p))?,
+            )
+        } else {
+            None
+        };
+        let rewrite_path_parts = if let Some(p) = rewrite_path {
+            Some(
+                RewriteParts::parse(
+                    &p,
+                    capture_cap_host,
+                    capture_cap_path,
+                    &mut used_capture_host,
+                    &mut used_capture_path,
+                )
+                .ok_or(RouterError::InvalidPathRewrite(p))?,
+            )
+        } else {
+            None
+        };
+        // Skip capture extraction at lookup time when no template references
+        // a capture for this dimension.
+        if used_capture_host == 0 {
+            capture_cap_host = 0;
+        }
+        if used_capture_path == 0 {
+            capture_cap_path = 0;
+        }
+
+        let mut headers_request = Vec::new();
+        let mut headers_response = Vec::new();
+        for header in headers {
+            let edit = HeaderEdit {
+                key: header.key.as_bytes().into(),
+                val: header.val.as_bytes().into(),
+            };
+            match header.position() {
+                HeaderPosition::Request => headers_request.push(edit),
+                HeaderPosition::Response => headers_response.push(edit),
+                HeaderPosition::Both => {
+                    headers_request.push(edit.clone());
+                    headers_response.push(edit);
+                }
+            }
+        }
+
+        Ok(Frontend {
+            cluster_id,
+            redirect,
+            redirect_scheme,
+            redirect_template,
+            capture_cap_host,
+            capture_cap_path,
+            rewrite_host: rewrite_host_parts,
+            rewrite_path: rewrite_path_parts,
+            rewrite_port,
+            headers_request: headers_request.into(),
+            headers_response: headers_response.into(),
+            required_auth,
+            tags,
+        })
+    }
+
+    /// Test-only constructor: build a Frontend that simply forwards to
+    /// `cluster_id`, with no rewrite/header/auth configuration.
+    #[cfg(test)]
+    pub fn forward(cluster_id: ClusterId) -> Self {
+        Self {
+            cluster_id: Some(cluster_id),
+            redirect: RedirectPolicy::Forward,
+            redirect_scheme: RedirectScheme::UseSame,
+            redirect_template: None,
+            capture_cap_host: 0,
+            capture_cap_path: 0,
+            rewrite_host: None,
+            rewrite_path: None,
+            rewrite_port: None,
+            headers_request: Rc::new([]),
+            headers_response: Rc::new([]),
+            required_auth: false,
+            tags: None,
+        }
+    }
+}
+
+/// Routing decision returned by [`Router::lookup`] and consumed by the
+/// session layer.
+///
+/// Computed from a matched [`Frontend`] by running [`RewriteParts::run`]
+/// against the captures collected during routing. Legacy [`Route::ClusterId`]
+/// and [`Route::Deny`] entries synthesize a minimal `RouteResult` with the
+/// proto enums set to defaults (`FORWARD` / `UNAUTHORIZED`) so existing
+/// session code keeps working until Wave 3a wires the rich fields into the
+/// mux layer.
+///
+/// Implements `PartialEq` for test parity: existing router tests compare
+/// `router.lookup(...)` against an expected route. Equality compares every
+/// public field, including the `Rc<[HeaderEdit]>` slices via pointer-or-content
+/// equality on the slice contents.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RouteResult {
+    pub cluster_id: Option<ClusterId>,
+    pub redirect: RedirectPolicy,
+    pub redirect_scheme: RedirectScheme,
+    pub redirect_template: Option<String>,
+    pub rewritten_host: Option<String>,
+    pub rewritten_path: Option<String>,
+    pub rewritten_port: Option<u16>,
+    pub headers_request: Rc<[HeaderEdit]>,
+    pub headers_response: Rc<[HeaderEdit]>,
+    pub required_auth: bool,
+    pub tags: Option<Rc<CachedTags>>,
+}
+
+impl RouteResult {
+    /// Synthesize a `RouteResult` representing a 401 (Deny) decision.
+    pub fn deny(cluster_id: Option<ClusterId>) -> Self {
+        Self {
+            cluster_id,
+            redirect: RedirectPolicy::Unauthorized,
+            redirect_scheme: RedirectScheme::UseSame,
+            redirect_template: None,
+            rewritten_host: None,
+            rewritten_path: None,
+            rewritten_port: None,
+            headers_request: Rc::new([]),
+            headers_response: Rc::new([]),
+            required_auth: false,
+            tags: None,
+        }
+    }
+
+    /// Synthesize a `RouteResult` representing a "forward to this cluster"
+    /// decision (legacy [`Route::ClusterId`] adapter).
+    pub fn forward(cluster_id: ClusterId) -> Self {
+        Self {
+            cluster_id: Some(cluster_id),
+            redirect: RedirectPolicy::Forward,
+            redirect_scheme: RedirectScheme::UseSame,
+            redirect_template: None,
+            rewritten_host: None,
+            rewritten_path: None,
+            rewritten_port: None,
+            headers_request: Rc::new([]),
+            headers_response: Rc::new([]),
+            required_auth: false,
+            tags: None,
+        }
+    }
+
+    /// Build a `RouteResult` from a [`Frontend`] and the captures collected
+    /// for this lookup.
+    fn from_frontend(
+        frontend: &Frontend,
+        captures_host: Vec<&str>,
+        path: &[u8],
+        path_rule: &PathRule,
+    ) -> Self {
+        // Unauthorized short-circuit: skip the path-capture extraction
+        // entirely — the response will not consume any rewrite output.
+        if frontend.redirect == RedirectPolicy::Unauthorized {
+            return Self {
+                cluster_id: frontend.cluster_id.clone(),
+                redirect: RedirectPolicy::Unauthorized,
+                redirect_scheme: frontend.redirect_scheme,
+                redirect_template: frontend.redirect_template.clone(),
+                rewritten_host: None,
+                rewritten_path: None,
+                rewritten_port: None,
+                headers_request: Rc::new([]),
+                headers_response: Rc::new([]),
+                required_auth: frontend.required_auth,
+                tags: frontend.tags.clone(),
+            };
+        }
+
+        let mut captures_path: Vec<&str> = Vec::with_capacity(frontend.capture_cap_path);
+        if frontend.capture_cap_path > 0 {
+            captures_path.push(from_utf8(path).unwrap_or_default());
+            match path_rule {
+                PathRule::Prefix(prefix) => {
+                    let tail_start = prefix.len().min(path.len());
+                    captures_path.push(from_utf8(&path[tail_start..]).unwrap_or_default());
+                }
+                PathRule::Regex(regex) => {
+                    if let Some(caps) = regex.captures(path) {
+                        captures_path.extend(caps.iter().skip(1).map(|c| {
+                            c.map(|m| from_utf8(m.as_bytes()).unwrap_or_default())
+                                .unwrap_or("")
+                        }));
+                    }
+                }
+                PathRule::Equals(_) => {}
+            }
+        }
+
+        Self {
+            cluster_id: frontend.cluster_id.clone(),
+            redirect: frontend.redirect,
+            redirect_scheme: frontend.redirect_scheme,
+            redirect_template: frontend.redirect_template.clone(),
+            rewritten_host: frontend
+                .rewrite_host
+                .as_ref()
+                .map(|rewrite| rewrite.run(&captures_host, &captures_path)),
+            rewritten_path: frontend
+                .rewrite_path
+                .as_ref()
+                .map(|rewrite| rewrite.run(&captures_host, &captures_path)),
+            rewritten_port: frontend.rewrite_port,
+            headers_request: frontend.headers_request.clone(),
+            headers_response: frontend.headers_response.clone(),
+            required_auth: frontend.required_auth,
+            tags: frontend.tags.clone(),
+        }
+    }
+
+    /// Build a `RouteResult` for a pre/post rule match.
+    ///
+    /// Pre/post rules carry the matched [`DomainRule`] directly so we can
+    /// extract host captures from it without going through the trie.
+    fn new_no_trie<'a>(
+        domain: &'a [u8],
+        domain_rule: &DomainRule,
+        path: &'a [u8],
+        path_rule: &PathRule,
+        route: &Route,
+    ) -> Self {
+        let frontend = match route {
+            Route::Frontend(f) => f.clone(),
+            Route::ClusterId(id) => return Self::forward(id.clone()),
+            Route::Deny => return Self::deny(None),
+        };
+        let mut captures_host: Vec<&str> = Vec::with_capacity(frontend.capture_cap_host);
+        if frontend.capture_cap_host > 0 {
+            captures_host.push(from_utf8(domain).unwrap_or_default());
+            match domain_rule {
+                DomainRule::Wildcard(suffix) => {
+                    let head_end = domain.len().saturating_sub(suffix.len().saturating_sub(1));
+                    captures_host.push(from_utf8(&domain[..head_end]).unwrap_or_default());
+                }
+                DomainRule::Regex(regex) => {
+                    if let Some(caps) = regex.captures(domain) {
+                        captures_host.extend(caps.iter().skip(1).map(|c| {
+                            c.map(|m| from_utf8(m.as_bytes()).unwrap_or_default())
+                                .unwrap_or("")
+                        }));
+                    }
+                }
+                DomainRule::Any | DomainRule::Exact(_) => {}
+            }
+        }
+        Self::from_frontend(&frontend, captures_host, path, path_rule)
+    }
+
+    /// Build a `RouteResult` for a tree-match.
+    ///
+    /// Tree matches carry the captures collected by the trie traversal
+    /// (`TrieMatches`) alongside the matched leaf path rule.
+    fn new_with_trie<'a, 'b>(
+        domain: &'a [u8],
+        domain_submatches: TrieMatches<'a, 'b>,
+        path: &'a [u8],
+        path_rule: &PathRule,
+        route: &Route,
+    ) -> Self {
+        let frontend = match route {
+            Route::Frontend(f) => f.clone(),
+            Route::ClusterId(id) => return Self::forward(id.clone()),
+            Route::Deny => return Self::deny(None),
+        };
+        let mut captures_host: Vec<&str> = Vec::with_capacity(frontend.capture_cap_host);
+        if frontend.capture_cap_host > 0 {
+            captures_host.push(from_utf8(domain).unwrap_or_default());
+            for submatch in &domain_submatches {
+                match submatch {
+                    TrieSubMatch::Wildcard(part) => {
+                        captures_host.push(from_utf8(part).unwrap_or_default());
+                    }
+                    TrieSubMatch::Regexp(part, regex) => {
+                        if let Some(caps) = regex.captures(part) {
+                            captures_host.extend(caps.iter().skip(1).map(|c| {
+                                c.map(|m| from_utf8(m.as_bytes()).unwrap_or_default())
+                                    .unwrap_or("")
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+        Self::from_frontend(&frontend, captures_host, path, path_rule)
+    }
 }
 
 #[cfg(test)]
@@ -760,7 +1492,7 @@ mod tests {
         println!("{:#?}", router.tree);
         assert_eq!(
             router.lookup("www.sozu.io", "/api", &Method::Get),
-            Ok(Route::ClusterId("base".to_string()))
+            Ok(RouteResult::forward("base".to_string()))
         );
         assert!(router.add_tree_rule(
             b"*.sozu.io",
@@ -771,11 +1503,11 @@ mod tests {
         println!("{:#?}", router.tree);
         assert_eq!(
             router.lookup("www.sozu.io", "/ap", &Method::Get),
-            Ok(Route::ClusterId("base".to_string()))
+            Ok(RouteResult::forward("base".to_string()))
         );
         assert_eq!(
             router.lookup("www.sozu.io", "/api", &Method::Get),
-            Ok(Route::ClusterId("api".to_string()))
+            Ok(RouteResult::forward("api".to_string()))
         );
     }
 
@@ -799,7 +1531,7 @@ mod tests {
         println!("{:#?}", router.tree);
         assert_eq!(
             router.lookup("www.sozu.io", "/api", &Method::Get),
-            Ok(Route::ClusterId("base".to_string()))
+            Ok(RouteResult::forward("base".to_string()))
         );
         assert!(router.add_tree_rule(
             b"api.sozu.io",
@@ -810,11 +1542,11 @@ mod tests {
         println!("{:#?}", router.tree);
         assert_eq!(
             router.lookup("www.sozu.io", "/api", &Method::Get),
-            Ok(Route::ClusterId("base".to_string()))
+            Ok(RouteResult::forward("base".to_string()))
         );
         assert_eq!(
             router.lookup("api.sozu.io", "/api", &Method::Get),
-            Ok(Route::ClusterId("api".to_string()))
+            Ok(RouteResult::forward("api".to_string()))
         );
     }
 
@@ -838,11 +1570,11 @@ mod tests {
         println!("{:#?}", router.tree);
         assert_eq!(
             router.lookup("www.sozu.io", "/", &Method::Get),
-            Ok(Route::ClusterId("base".to_string()))
+            Ok(RouteResult::forward("base".to_string()))
         );
         assert_eq!(
             router.lookup("www.doc.sozu.io", "/", &Method::Get),
-            Ok(Route::ClusterId("doc".to_string()))
+            Ok(RouteResult::forward("doc".to_string()))
         );
         assert!(router.remove_tree_rule(
             b"www./.*/.io",
@@ -853,7 +1585,7 @@ mod tests {
         assert!(router.lookup("www.sozu.io", "/", &Method::Get).is_err());
         assert_eq!(
             router.lookup("www.doc.sozu.io", "/", &Method::Get),
-            Ok(Route::ClusterId("doc".to_string()))
+            Ok(RouteResult::forward("doc".to_string()))
         );
     }
 
@@ -888,7 +1620,7 @@ mod tests {
 
         assert_eq!(
             router.lookup("www.example.com", "/helloA", &Method::new(&b"GET"[..])),
-            Ok(Route::ClusterId("example".to_string()))
+            Ok(RouteResult::forward("example".to_string()))
         );
         assert_eq!(
             router.lookup(
@@ -896,7 +1628,7 @@ mod tests {
                 "/.well-known/acme-challenge",
                 &Method::new(&b"GET"[..])
             ),
-            Ok(Route::ClusterId("acme".to_string()))
+            Ok(RouteResult::forward("acme".to_string()))
         );
         assert!(
             router
@@ -909,11 +1641,11 @@ mod tests {
                 "/helloAB/",
                 &Method::new(&b"GET"[..])
             ),
-            Ok(Route::ClusterId("examplewildcard".to_string()))
+            Ok(RouteResult::forward("examplewildcard".to_string()))
         );
         assert_eq!(
             router.lookup("test1.example.com", "/helloAB/", &Method::new(&b"GET"[..])),
-            Ok(Route::ClusterId("exampleregex".to_string()))
+            Ok(RouteResult::forward("exampleregex".to_string()))
         );
     }
 

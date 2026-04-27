@@ -357,7 +357,7 @@ use sozu_command::{
 };
 use tls::CertificateResolverError;
 
-use crate::{backends::BackendMap, router::Route};
+use crate::{backends::BackendMap, router::RouteResult};
 
 /// Anything that can be registered in mio (subscribe to kernel events)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -561,7 +561,7 @@ pub trait L7ListenerHandler {
         host: &str,
         uri: &str,
         method: &Method,
-    ) -> Result<Route, FrontendFromRequestError>;
+    ) -> Result<RouteResult, FrontendFromRequestError>;
 
     /// retrieve the listener's configured HTTP answers (templates)
     fn get_answers(&self) -> &Rc<RefCell<HttpAnswers>>;
