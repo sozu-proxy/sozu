@@ -1,36 +1,29 @@
 //! Fixed-capacity ring buffer (`Buffer`).
 //!
 //! Tracks `position` (read cursor), `end` (write cursor), and `capacity`
-//! over a `Vec<u8>` allocated once at construction. Shift/insert/replace
-//! operations use overlapping-safe `std::ptr::copy` with all destinations
-//! bounds-checked against `self.capacity()`.
+//! over a `Vec<u8>` allocated once at construction.
 
 use std::{
     cmp,
     io::{self, Read, Write},
-    ptr,
 };
 
 use poule::Reset;
 
-#[derive(Debug, PartialEq, Eq, Clone, Default)]
-pub struct BufferMetadata {
+#[derive(Debug, PartialEq, Clone)]
+pub struct Buffer {
+    memory: Vec<u8>,
     position: usize,
     end: usize,
 }
 
-#[derive(Debug, PartialEq, Clone)]
-pub struct Buffer {
-    inner: trailer::Trailer<BufferMetadata>,
-}
-
 impl Buffer {
     pub fn with_capacity(capacity: usize) -> Buffer {
-        let mut inner: trailer::Trailer<BufferMetadata> = trailer::Trailer::new(capacity);
-        inner.position = 0;
-        inner.end = 0;
-
-        Buffer { inner }
+        Buffer {
+            memory: vec![0; capacity],
+            position: 0,
+            end: 0,
+        }
     }
 
     /*pub fn from_slice(sl: &[u8]) -> Buffer {
@@ -45,7 +38,7 @@ impl Buffer {
       */
 
     pub fn grow(&mut self, new_size: usize) -> bool {
-        if self.inner.capacity() >= new_size {
+        if self.capacity() >= new_size {
             return false;
         }
 
@@ -58,25 +51,25 @@ impl Buffer {
     }
 
     pub fn available_data(&self) -> usize {
-        self.inner.end - self.inner.position
+        self.end - self.position
     }
 
     pub fn available_space(&self) -> usize {
-        self.inner.capacity() - self.inner.end
+        self.capacity() - self.end
     }
 
     pub fn capacity(&self) -> usize {
-        self.inner.capacity()
+        self.memory.len()
     }
 
     pub fn empty(&self) -> bool {
-        self.inner.position == self.inner.end
+        self.position == self.end
     }
 
     pub fn consume(&mut self, count: usize) -> usize {
         let cnt = cmp::min(count, self.available_data());
-        self.inner.position += cnt;
-        if self.inner.position > self.inner.capacity() / 2 {
+        self.position += cnt;
+        if self.position > self.capacity() / 2 {
             //trace!("consume shift: pos {}, end {}", self.position, self.end);
             self.shift();
         }
@@ -85,7 +78,7 @@ impl Buffer {
 
     pub fn fill(&mut self, count: usize) -> usize {
         let cnt = cmp::min(count, self.available_space());
-        self.inner.end += cnt;
+        self.end += cnt;
         if self.available_space() < self.available_data() + cnt {
             //trace!("fill shift: pos {}, end {}", self.position, self.end);
             self.shift();
@@ -95,141 +88,75 @@ impl Buffer {
     }
 
     pub fn reset(&mut self) {
-        self.inner.position = 0;
-        self.inner.end = 0;
+        self.position = 0;
+        self.end = 0;
     }
 
     pub fn data(&self) -> &[u8] {
-        &self.inner.bytes()[self.inner.position..self.inner.end]
+        &self.memory[self.position..self.end]
     }
 
     pub fn space(&mut self) -> &mut [u8] {
-        let range = self.inner.end..self.inner.capacity();
-        &mut self.inner.bytes_mut()[range]
+        &mut self.memory[self.end..]
     }
 
     pub fn shift(&mut self) {
-        if self.inner.position > 0 {
-            // SAFETY: src and dst point into the same buffer
-            // (`self.inner.bytes`); the slice indexing above bounds-checks
-            // both ranges (`position..end` and `..length`) against the live
-            // buffer length, so they are fully inside the allocation.
-            // `ptr::copy` is overlap-safe.
-            unsafe {
-                let length = self.inner.end - self.inner.position;
-                ptr::copy(
-                    self.inner.bytes()[self.inner.position..self.inner.end].as_ptr(),
-                    self.inner.bytes_mut()[..length].as_mut_ptr(),
-                    length,
-                );
-                self.inner.position = 0;
-                self.inner.end = length;
-            }
+        if self.position > 0 {
+            let length = self.end - self.position;
+            self.memory.copy_within(self.position..self.end, 0);
+            self.position = 0;
+            self.end = length;
         }
     }
 
     pub fn delete_slice(&mut self, start: usize, length: usize) -> Option<usize> {
-        if start + length >= self.available_data() {
+        let end = start.checked_add(length)?;
+        if end >= self.available_data() {
             return None;
         }
 
-        // SAFETY: src and dst point into the same buffer
-        // (`self.inner.bytes`). The early-return above guarantees
-        // `start + length < available_data`, and slice indexing
-        // bounds-checks both `begin+length..end` and `begin..next_end`
-        // against the live buffer length. `ptr::copy` is overlap-safe.
-        unsafe {
-            let begin = self.inner.position + start;
-            let next_end = self.inner.end - length;
-            ptr::copy(
-                self.inner.bytes()[begin + length..self.inner.end].as_ptr(),
-                self.inner.bytes_mut()[begin..next_end].as_mut_ptr(),
-                self.inner.end - (begin + length),
-            );
-            self.inner.end = next_end;
-        }
+        let begin = self.position + start;
+        let tail_start = begin + length;
+        self.memory.copy_within(tail_start..self.end, begin);
+        self.end -= length;
         Some(self.available_data())
     }
 
     pub fn replace_slice(&mut self, data: &[u8], start: usize, length: usize) -> Option<usize> {
         let data_len = data.len();
-        if start + length > self.available_data()
-            || self.inner.position + start + data_len > self.capacity()
-        {
+        let replaced_end = start.checked_add(length)?;
+        if replaced_end > self.available_data() {
             return None;
         }
 
-        // SAFETY: every `ptr::copy` below moves bytes inside the same
-        // buffer (`self.inner.bytes`) or copies from the caller's `data`
-        // slice into it. The two early-return checks above bound the
-        // affected ranges against `available_data()` and `capacity()`,
-        // and each slice indexing site is bounds-checked. `ptr::copy` is
-        // overlap-safe.
-        unsafe {
-            let begin = self.inner.position + start;
-            let slice_end = begin + data_len;
-            // we reduced the data size
-            if data_len < length {
-                ptr::copy(
-                    data.as_ptr(),
-                    self.inner.bytes_mut()[begin..slice_end].as_mut_ptr(),
-                    data_len,
-                );
+        let begin = self.position + start;
+        let tail_start = begin + length;
+        let slice_end = begin + data_len;
 
-                ptr::copy(
-                    self.inner.bytes()[start + length..self.inner.end].as_ptr(),
-                    self.inner.bytes_mut()[slice_end..].as_mut_ptr(),
-                    self.inner.end - (start + length),
-                );
-                self.inner.end -= length - data_len;
-
-            // we put more data in the buffer
-            } else {
-                ptr::copy(
-                    self.inner.bytes()[start + length..self.inner.end].as_ptr(),
-                    self.inner.bytes_mut()[start + data_len..].as_mut_ptr(),
-                    self.inner.end - (start + length),
-                );
-                ptr::copy(
-                    data.as_ptr(),
-                    self.inner.bytes_mut()[begin..slice_end].as_mut_ptr(),
-                    data_len,
-                );
-                self.inner.end += data_len - length;
+        match data_len.cmp(&length) {
+            cmp::Ordering::Less => {
+                self.memory[begin..slice_end].copy_from_slice(data);
+                self.memory.copy_within(tail_start..self.end, slice_end);
+                self.end -= length - data_len;
+            }
+            cmp::Ordering::Equal => {
+                self.memory[begin..slice_end].copy_from_slice(data);
+            }
+            cmp::Ordering::Greater => {
+                let new_end = self.end.checked_add(data_len - length)?;
+                if new_end > self.capacity() {
+                    return None;
+                }
+                self.memory.copy_within(tail_start..self.end, slice_end);
+                self.memory[begin..slice_end].copy_from_slice(data);
+                self.end = new_end;
             }
         }
         Some(self.available_data())
     }
 
     pub fn insert_slice(&mut self, data: &[u8], start: usize) -> Option<usize> {
-        let data_len = data.len();
-        if start > self.available_data()
-            || self.inner.position + self.inner.end + data_len > self.capacity()
-        {
-            return None;
-        }
-
-        // SAFETY: both `ptr::copy` calls touch `self.inner.bytes` (same
-        // allocation) or copy from `data` into it. The early-return checks
-        // bound `start <= available_data` and the resulting tail
-        // `position + end + data_len <= capacity`, and each slice indexing
-        // site is bounds-checked. `ptr::copy` is overlap-safe.
-        unsafe {
-            let begin = self.inner.position + start;
-            let slice_end = begin + data_len;
-            ptr::copy(
-                self.inner.bytes()[start..self.inner.end].as_ptr(),
-                self.inner.bytes_mut()[start + data_len..].as_mut_ptr(),
-                self.inner.end - start,
-            );
-            ptr::copy(
-                data.as_ptr(),
-                self.inner.bytes_mut()[begin..slice_end].as_mut_ptr(),
-                data_len,
-            );
-            self.inner.end += data_len;
-        }
-        Some(self.available_data())
+        self.replace_slice(data, start, 0)
     }
 }
 
@@ -252,19 +179,8 @@ impl Write for Buffer {
 impl Read for Buffer {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let len = cmp::min(self.available_data(), buf.len());
-        // SAFETY: `len = min(available_data, buf.len())`, so the source
-        // range `position..position+len` lies inside `self.inner.bytes` and
-        // the destination `buf[..len]` fits the caller's `&mut [u8]`. The
-        // two slices are in different allocations; `ptr::copy` is
-        // overlap-safe regardless.
-        unsafe {
-            ptr::copy(
-                self.inner.bytes()[self.inner.position..self.inner.position + len].as_ptr(),
-                buf.as_mut_ptr(),
-                len,
-            );
-            self.inner.position += len;
-        }
+        buf[..len].copy_from_slice(&self.memory[self.position..self.position + len]);
+        self.position += len;
         Ok(len)
     }
 }
