@@ -4,6 +4,7 @@ resolver = "2" # consistent with rust edition 2024, see https://doc.rust-lang.or
 
 [workspace.dependencies]
 anyhow = "^1.0.102"
+base64 = "^0.22.1"
 clap = "^4.6.1"
 cookie-factory = "^0.3.3"
 flate2 = "^1.1"
@@ -52,6 +53,7 @@ slab = "^0.4.12"
 socket2 = "^0.6.3"
 sozu-command-lib = { version = "^1.1.1", path = "command" }
 sozu-lib = { version = "^1.1.1", path = "lib" }
+subtle = "^2.6.1"
 tempfile = "^3.27.0"
 termion = "^4.0.6"
 thiserror = "^2.0.18"
