@@ -626,6 +626,14 @@ where
 ///   `GOAWAY(ENHANCE_YOUR_CALM)` when exceeded.
 /// - **Invariant 15** (edge-triggered epoll): pair `Ready::WRITABLE` interest
 ///   with the event bit so `writable()` is scheduled on the next tick.
+///
+/// Returns `true` when the RST was freshly queued, `false` when the
+/// stream was already in `rst_sent` (the caller asked to RST the same
+/// stream twice — a benign re-entrant idempotency, NOT a new wire
+/// emission). The boolean lets [`ConnectionH2::enqueue_rst`] account
+/// the RST only on the freshly-queued path so duplicate calls do not
+/// inflate the per-error counter or trip the MadeYouReset flood cap
+/// for frames that never reach the wire.
 fn enqueue_rst_into(
     pending: &mut Vec<(StreamId, H2Error)>,
     total: &mut usize,
@@ -633,13 +641,14 @@ fn enqueue_rst_into(
     readiness: &mut Readiness,
     wire_stream_id: StreamId,
     error: H2Error,
-) {
+) -> bool {
     if !rst_sent.insert(wire_stream_id) {
-        return;
+        return false;
     }
     pending.push((wire_stream_id, error));
     *total += 1;
     readiness.arm_writable();
+    true
 }
 
 /// Detail of a flood-threshold violation returned by
@@ -3661,7 +3670,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// `total_rst_streams_queued`, edge-triggered-epoll arm via
     /// [`Readiness::arm_writable`]).
     fn enqueue_rst(&mut self, wire_stream_id: StreamId, error: H2Error) -> Option<MuxResult> {
-        enqueue_rst_into(
+        let freshly_queued = enqueue_rst_into(
             &mut self.pending_rst_streams,
             &mut self.total_rst_streams_queued,
             &mut self.rst_sent,
@@ -3669,14 +3678,25 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             wire_stream_id,
             error,
         );
+        // Account ONLY when a new RST actually entered the queue.
+        // Calling `enqueue_rst` for a stream that already has a queued
+        // (or already-flushed) RST is the dedup short-circuit — counting
+        // those would inflate `h2.frames.tx.rst_stream` /
+        // `h2.rst_stream.sent.*` and trip the CVE-2025-8671 MadeYouReset
+        // lifetime cap on frames that never reached the wire.
+        //
         // Account at queue-time, not at drain-time. Doing it later in
         // `flush_pending_control_frames` would double-count any RST that
-        // `reset_stream` already accounted before queuing — and missing
-        // it at queue-time leaves `cancel_timed_out_streams` /
-        // `refuse_stream_and_discard` / DATA-on-closed-stream paths
-        // bypassing the MadeYouReset lifetime cap (security review
-        // LISA-001 on commit `da845c71`).
-        self.account_emitted_rst(error)
+        // a re-entrant call (DATA on a closed stream we already RSTed)
+        // tried to enqueue — and missing it at queue-time leaves
+        // `cancel_timed_out_streams` / `refuse_stream_and_discard` /
+        // DATA-on-closed-stream paths bypassing the lifetime cap
+        // (security review LISA-001 on commit `da845c71`).
+        if freshly_queued {
+            self.account_emitted_rst(error)
+        } else {
+            None
+        }
     }
 
     /// Single accounting site for proxy-emitted RST_STREAM frames.
@@ -7576,7 +7596,7 @@ mod tests {
         let mut sent: HashSet<StreamId> = HashSet::new();
         let mut readiness = Readiness::new();
 
-        enqueue_rst_into(
+        let first = enqueue_rst_into(
             &mut pending,
             &mut total,
             &mut sent,
@@ -7584,14 +7604,20 @@ mod tests {
             5,
             H2Error::ProtocolError,
         );
-        // Second call for the same stream must be a no-op.
-        enqueue_rst_into(
+        assert!(first, "first call must report freshly_queued = true");
+        // Second call for the same stream must be a no-op AND return
+        // false so accounting in `Self::enqueue_rst` skips this case.
+        let second = enqueue_rst_into(
             &mut pending,
             &mut total,
             &mut sent,
             &mut readiness,
             5,
             H2Error::InternalError,
+        );
+        assert!(
+            !second,
+            "second call for same stream must return freshly_queued = false"
         );
 
         assert_eq!(pending.len(), 1, "dedupe must collapse to a single entry");
