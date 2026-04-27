@@ -2,9 +2,12 @@
 use std::{
     cell::RefCell,
     collections::{HashSet, VecDeque},
+    hash::{DefaultHasher, Hash, Hasher},
     io::Error as IoError,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     os::unix::io::{AsRawFd, FromRawFd},
     rc::Rc,
+    sync::LazyLock,
     time::{Duration, Instant},
 };
 
@@ -21,7 +24,8 @@ use sozu_command::{
         ClusterInformations, DeactivateListener, Event, HttpListenerConfig, HttpsListenerConfig,
         InitialState, ListenerType, LoadBalancingAlgorithms, LoadMetric, MetricsConfiguration,
         RemoveBackend, Request, ResponseStatus, ServerConfig,
-        TcpListenerConfig as CommandTcpListener, WorkerRequest, WorkerResponse,
+        TcpListenerConfig as CommandTcpListener, UpdateHttpListenerConfig,
+        UpdateHttpsListenerConfig, UpdateTcpListenerConfig, WorkerRequest, WorkerResponse,
         request::RequestType, response_content::ContentType,
     },
     ready::Ready,
@@ -42,6 +46,66 @@ use crate::{
 
 // Number of retries to perform on a server after a connection failure
 pub const CONN_RETRIES: u8 = 3;
+
+/// Number of bounded buckets for the per-source connect-rate counter.
+///
+/// `incr!` requires a `&'static str`, so per-IP labelling would either need
+/// runtime `Box::leak` per unique source (unbounded under SYN flood — direct
+/// OWASP A05 / NIST SP 800-92 cardinality-blow-up risk) or a fixed bucket
+/// table. We pick the bucket table: 256 static labels precomputed at startup,
+/// each masked subnet hashes into one of them.
+///
+/// Bucket-noise vs per-IP fidelity is a deliberate trade. Operators wanting
+/// per-IP attribution should pair these counters with structured access logs
+/// or a downstream rate-limiter; the metric here is for "is some /24 spamming
+/// us right now?", not "which IP exactly". 256 buckets keep the memory + UDP
+/// statsd cost flat regardless of attacker effort.
+pub const PER_SOURCE_BUCKETS: usize = 256;
+
+/// Pre-leaked `&'static str` table for per-source bucket counters.
+/// `incr!` requires `&'static str`; we leak once at first access (LazyLock)
+/// for `PER_SOURCE_BUCKETS` keys, totalling ~10 KB heap. The leak is bounded
+/// by `PER_SOURCE_BUCKETS` and never grows with traffic.
+static PER_SOURCE_BUCKET_KEYS: LazyLock<[&'static str; PER_SOURCE_BUCKETS]> = LazyLock::new(|| {
+    let mut keys: [&'static str; PER_SOURCE_BUCKETS] = [""; PER_SOURCE_BUCKETS];
+    for (i, slot) in keys.iter_mut().enumerate() {
+        // e.g. "client.connect.per_source.bucket_042"
+        let owned = format!("client.connect.per_source.bucket_{i:03}");
+        *slot = Box::leak(owned.into_boxed_str());
+    }
+    keys
+});
+
+/// Mask an IP address to its bounded prefix (/24 for IPv4, /48 for IPv6) and
+/// hash it into one of `PER_SOURCE_BUCKETS` slots. The hash is `DefaultHasher`,
+/// which is deterministic within a process but salted across runs — fine for
+/// telemetry, not suitable for cross-host correlation.
+fn per_source_bucket(peer: &SocketAddr) -> &'static str {
+    let mut hasher = DefaultHasher::new();
+    match peer.ip() {
+        IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            // /24 mask: keep first three octets, zero the host portion.
+            let masked = Ipv4Addr::new(octets[0], octets[1], octets[2], 0);
+            masked.hash(&mut hasher);
+        }
+        IpAddr::V6(v6) => {
+            let octets = v6.octets();
+            // /48 mask: keep first 6 bytes, zero the rest.
+            let mut masked_octets = [0u8; 16];
+            masked_octets[..6].copy_from_slice(&octets[..6]);
+            Ipv6Addr::from(masked_octets).hash(&mut hasher);
+        }
+    }
+    let idx = (hasher.finish() as usize) % PER_SOURCE_BUCKETS;
+    PER_SOURCE_BUCKET_KEYS[idx]
+}
+
+/// Period between two `accept_queue.saturated_seconds` ticks. The counter is
+/// incremented once per period while [`SessionManager::can_accept`] is `false`,
+/// distinguishing "queue spent N seconds at max" from "queue briefly hit max"
+/// — the binary `accept_queue.backpressure` gauge collapses that duration.
+const ACCEPT_SATURATION_TICK: Duration = Duration::from_secs(1);
 
 pub type ProxyChannel = Channel<WorkerResponse, WorkerRequest>;
 
@@ -221,7 +285,19 @@ pub enum ServerError {
 /// by a [Token], they all have to implement the [ProxySession] trait.
 pub struct Server {
     accept_queue_timeout: Duration,
-    accept_queue: VecDeque<(TcpStream, ListenToken, Protocol, Instant)>,
+    /// Tuple layout: `(socket, listen token, protocol, accept time, peer
+    /// address)`. The peer is captured via `TcpStream::peer_addr()` at accept
+    /// time so the `client.connect.per_source.*` counter can be attributed
+    /// without the socket having to be alive at session-creation time. The
+    /// peer is `Option` because `peer_addr()` is best-effort: a peer that
+    /// races to close before we read it is rare but possible.
+    accept_queue: VecDeque<(
+        TcpStream,
+        ListenToken,
+        Protocol,
+        Instant,
+        Option<SocketAddr>,
+    )>,
     accept_ready: HashSet<ListenToken>,
     backends: Rc<RefCell<BackendMap>>,
     base_sessions_count: usize,
@@ -234,6 +310,15 @@ pub struct Server {
     last_shutting_down_message: Option<Instant>,
     last_zombie_check: Instant,
     loop_start: Instant,
+    /// Wall-clock anchor for the `process.uptime_seconds` gauge. Captured once
+    /// in [`Server::new`]; never reset on hot upgrades (the new worker that
+    /// inherits FDs is a fresh process and starts its own counter).
+    started_at: Instant,
+    /// Last time the 1Hz `accept_queue.saturated_seconds` ticker fired. The
+    /// counter is incremented once per [`ACCEPT_SATURATION_TICK`] while
+    /// `SessionManager::can_accept` is `false`, so dashboards can plot the
+    /// time spent saturated rather than just whether saturation occurred.
+    last_saturation_tick: Instant,
     max_poll_errors: i32, // TODO: make this configurable? this defaults to 10000 for now
     pub poll: Poll,
     poll_timeout: Option<Duration>, // TODO: make this configurable? this defaults to 1000 milliseconds for now
@@ -262,8 +347,8 @@ impl Server {
         )));
         let backends = Rc::new(RefCell::new(BackendMap::new()));
 
-        //FIXME: we will use a few entries for the channel, metrics socket and the listeners
-        //FIXME: for HTTP/2, we will have more than 2 entries per session
+        // Note: slab_capacity uses 4x multiplier (up from 2x) to account for H2
+        // multiplexing where each session can have multiple backend connections.
         let sessions: Rc<RefCell<SessionManager>> = SessionManager::new(
             Slab::with_capacity(config.slab_capacity() as usize),
             config.max_connections as usize,
@@ -399,6 +484,8 @@ impl Server {
             last_shutting_down_message: None,
             last_zombie_check: Instant::now(), // to be reset on server run
             loop_start: Instant::now(),        // to be reset on server run
+            started_at: Instant::now(),        // captured once, never reset
+            last_saturation_tick: Instant::now(), // 1Hz saturation ticker anchor
             max_poll_errors: 10000,            // TODO: make it configurable?
             poll_timeout: Some(Duration::from_millis(1000)), // TODO: make it configurable?
             poll,
@@ -446,8 +533,7 @@ impl Server {
                 }
             } else {
                 panic!(
-                    "plz give me a status request first when I start, you sent me this instead: {:?}",
-                    msg
+                    "plz give me a status request first when I start, you sent me this instead: {msg:?}"
                 );
             }
             server.unblock_channel();
@@ -595,6 +681,35 @@ impl Server {
 
             gauge!("client.connections", self.sessions.borrow().nb_connections);
             gauge!("slab.entries", self.sessions.borrow().slab.len());
+            // 1Hz tick for `accept_queue.saturated_seconds`. Increments once
+            // per `ACCEPT_SATURATION_TICK` while `SessionManager::can_accept`
+            // is `false`. Distinguishes "queue spent N seconds at max" from
+            // "queue briefly hit max" — the binary `accept_queue.backpressure`
+            // gauge collapses that duration. Sampled here rather than via a
+            // dedicated mio timer because the run loop ticks at least once
+            // per `poll_timeout` (1s by default), which is granular enough.
+            let now = Instant::now();
+            if now.duration_since(self.last_saturation_tick) >= ACCEPT_SATURATION_TICK {
+                if !self.sessions.borrow().can_accept {
+                    incr!("accept_queue.saturated_seconds");
+                }
+                self.last_saturation_tick = now;
+            }
+            // Process / runtime gauges sampled once per loop iteration. Same
+            // batch as `client.connections` so dashboards see them update in
+            // lock-step.
+            gauge!(
+                "process.uptime_seconds",
+                self.started_at.elapsed().as_secs() as usize
+            );
+            // `server.live` flips to 0 once a graceful shutdown is requested,
+            // matching Envoy's `server.live` semantics. L4 health checks
+            // (HAProxy / cloud LBs) can poll this gauge to drain a worker
+            // before the OS-level termination signal lands.
+            gauge!(
+                "server.live",
+                if self.shutting_down.is_some() { 0 } else { 1 }
+            );
             METRICS.with(|metrics| {
                 (*metrics.borrow_mut()).send_data();
             });
@@ -622,7 +737,7 @@ impl Server {
         let now = Instant::now();
         time!("event_loop_time", (now - self.loop_start).as_millis());
 
-        let timeout = match self.should_poll_at.as_ref() {
+        let mut timeout = match self.should_poll_at.as_ref() {
             None => self.poll_timeout,
             Some(i) => {
                 if *i <= now {
@@ -642,6 +757,14 @@ impl Server {
                 }
             }
         };
+
+        if self.shutting_down.is_some() {
+            let shutdown_tick = Duration::from_millis(100);
+            timeout = match timeout {
+                None => Some(shutdown_tick),
+                Some(current) => Some(current.min(shutdown_tick)),
+            };
+        }
 
         self.loop_start = now;
         timeout
@@ -784,8 +907,14 @@ impl Server {
         let mut sessions_to_shut_down = HashSet::new();
 
         for (_key, session) in &self.sessions.borrow().slab {
-            if session.borrow_mut().shutting_down() {
-                sessions_to_shut_down.insert(Token(session.borrow().frontend_token().0));
+            let mut session = session.borrow_mut();
+            if session.shutting_down() {
+                debug!(
+                    "Server killing session from shutting_down: token={:?}, protocol={:?}",
+                    session.frontend_token(),
+                    session.protocol()
+                );
+                sessions_to_shut_down.insert(Token(session.frontend_token().0));
             }
         }
         let _ = self.shut_down_sessions_by_frontend_tokens(sessions_to_shut_down);
@@ -870,7 +999,7 @@ impl Server {
                         break;
                     }
 
-                    if self.channel.back_buf.available_data() == 0 && queue.len() == 0 {
+                    if self.channel.back_buf.available_data() == 0 && queue.is_empty() {
                         break;
                     }
                 }
@@ -1040,6 +1169,15 @@ impl Server {
             Some(RequestType::AddTcpListener(listener)) => {
                 push_queue(self.notify_add_tcp_listener(&req_id, listener));
             }
+            Some(RequestType::UpdateHttpListener(patch)) => {
+                push_queue(self.notify_update_http_listener(&req_id, patch));
+            }
+            Some(RequestType::UpdateHttpsListener(patch)) => {
+                push_queue(self.notify_update_https_listener(&req_id, patch));
+            }
+            Some(RequestType::UpdateTcpListener(patch)) => {
+                push_queue(self.notify_update_tcp_listener(&req_id, patch));
+            }
             Some(RequestType::RemoveListener(ref remove)) => {
                 debug!("{} remove {:?} listener {:?}", req_id, remove.proxy, remove);
                 self.base_sessions_count -= 1;
@@ -1182,6 +1320,44 @@ impl Server {
         }
     }
 
+    fn notify_update_http_listener(
+        &mut self,
+        req_id: &str,
+        patch: UpdateHttpListenerConfig,
+    ) -> WorkerResponse {
+        debug!("{} update http listener {:?}", req_id, patch.address);
+        match self.http.borrow_mut().update_listener(patch) {
+            Ok(()) => WorkerResponse::ok(req_id),
+            Err(e) => worker_response_error(req_id, format!("Could not update HTTP listener: {e}")),
+        }
+    }
+
+    fn notify_update_https_listener(
+        &mut self,
+        req_id: &str,
+        patch: UpdateHttpsListenerConfig,
+    ) -> WorkerResponse {
+        debug!("{} update https listener {:?}", req_id, patch.address);
+        match self.https.borrow_mut().update_listener(patch) {
+            Ok(()) => WorkerResponse::ok(req_id),
+            Err(e) => {
+                worker_response_error(req_id, format!("Could not update HTTPS listener: {e}"))
+            }
+        }
+    }
+
+    fn notify_update_tcp_listener(
+        &mut self,
+        req_id: &str,
+        patch: UpdateTcpListenerConfig,
+    ) -> WorkerResponse {
+        debug!("{} update tcp listener {:?}", req_id, patch.address);
+        match self.tcp.borrow_mut().update_listener(patch) {
+            Ok(()) => WorkerResponse::ok(req_id),
+            Err(e) => worker_response_error(req_id, format!("Could not update TCP listener: {e}")),
+        }
+    }
+
     fn notify_activate_listener(
         &mut self,
         req_id: &str,
@@ -1200,6 +1376,10 @@ impl Server {
                     .scm_listeners
                     .as_mut()
                     .and_then(|s| s.get_http(&address))
+                    // SAFETY: `fd` was just received from the supervisor via SCM_RIGHTS
+                    // (see `command/src/scm_socket.rs`) and is not owned elsewhere — the
+                    // `ScmListeners` map removes it on `get_http`. Ownership transfers to
+                    // the mio wrapper, whose `Drop` closes the descriptor.
                     .map(|fd| unsafe { MioTcpListener::from_raw_fd(fd) });
 
                 let activated_token = self.http.borrow_mut().activate_listener(&address, listener);
@@ -1210,7 +1390,7 @@ impl Server {
                     }
                     Err(activate_error) => worker_response_error(
                         req_id,
-                        format!("Could not activate HTTP listener: {}", activate_error),
+                        format!("Could not activate HTTP listener: {activate_error}"),
                     ),
                 }
             }
@@ -1219,6 +1399,10 @@ impl Server {
                     .scm_listeners
                     .as_mut()
                     .and_then(|s| s.get_https(&address))
+                    // SAFETY: `fd` was just received from the supervisor via SCM_RIGHTS
+                    // (see `command/src/scm_socket.rs`) and is not owned elsewhere — the
+                    // `ScmListeners` map removes it on `get_https`. Ownership transfers to
+                    // the mio wrapper, whose `Drop` closes the descriptor.
                     .map(|fd| unsafe { MioTcpListener::from_raw_fd(fd) });
 
                 let activated_token = self
@@ -1232,7 +1416,7 @@ impl Server {
                     }
                     Err(activate_error) => worker_response_error(
                         req_id,
-                        format!("Could not activate HTTPS listener: {}", activate_error),
+                        format!("Could not activate HTTPS listener: {activate_error}"),
                     ),
                 }
             }
@@ -1241,6 +1425,10 @@ impl Server {
                     .scm_listeners
                     .as_mut()
                     .and_then(|s| s.get_tcp(&address))
+                    // SAFETY: `fd` was just received from the supervisor via SCM_RIGHTS
+                    // (see `command/src/scm_socket.rs`) and is not owned elsewhere — the
+                    // `ScmListeners` map removes it on `get_tcp`. Ownership transfers to
+                    // the mio wrapper, whose `Drop` closes the descriptor.
                     .map(|fd| unsafe { MioTcpListener::from_raw_fd(fd) });
 
                 let listener_token = self.tcp.borrow_mut().activate_listener(&address, listener);
@@ -1251,7 +1439,7 @@ impl Server {
                     }
                     Err(activate_error) => worker_response_error(
                         req_id,
-                        format!("Could not activate TCP listener: {}", activate_error),
+                        format!("Could not activate TCP listener: {activate_error}"),
                     ),
                 }
             }
@@ -1368,8 +1556,7 @@ impl Server {
                         return worker_response_error(
                             req_id,
                             format!(
-                                "Could not deactivate TCP listener at address {:?}: {}",
-                                address, e
+                                "Could not deactivate TCP listener at address {address:?}: {e}"
                             ),
                         );
                     }
@@ -1482,72 +1669,84 @@ impl Server {
     }
 
     pub fn accept(&mut self, token: ListenToken, protocol: Protocol) {
-        match protocol {
-            Protocol::TCPListen => loop {
-                match self.tcp.borrow_mut().accept(token) {
-                    Ok(sock) => self.accept_queue.push_back((
+        // Per-protocol counter key. Keeping the namespace static (3 keys +
+        // aggregate) is a deliberate cardinality cap: per-listener-address
+        // labelling would require runtime `Box::leak` because `incr!` takes
+        // `&'static str`, and listener addresses can be reconfigured at
+        // runtime by the control plane. Operators wanting per-listener
+        // attribution should correlate with the listener-protocol breakdown
+        // below.
+        //
+        // Non-listen protocols reach this code only on an invariant break
+        // upstream (`ready()` dispatched a non-listen `Protocol` to
+        // `accept()`). Log and return rather than panicking — defense in
+        // depth on the accept path, which is process-fatal if it aborts.
+        let (proto_key, accepted_protocol) = match protocol {
+            Protocol::TCPListen => ("listener.accepted.tcp", Protocol::TCPListen),
+            Protocol::HTTPListen => ("listener.accepted.http", Protocol::HTTPListen),
+            Protocol::HTTPSListen => ("listener.accepted.https", Protocol::HTTPSListen),
+            other => {
+                warn!(
+                    "accept() called with non-listen protocol {:?} on token {:?}; skipping",
+                    other, token
+                );
+                return;
+            }
+        };
+
+        loop {
+            let result = match accepted_protocol {
+                Protocol::TCPListen => self.tcp.borrow_mut().accept(token),
+                Protocol::HTTPListen => self.http.borrow_mut().accept(token),
+                Protocol::HTTPSListen => self.https.borrow_mut().accept(token),
+                // The outer match populates `accepted_protocol` only with the
+                // three listen variants and returns early otherwise — this
+                // arm is structurally unreachable.
+                other => unreachable!(
+                    "accept dispatch reached non-listen protocol {:?} after outer guard",
+                    other
+                ),
+            };
+            match result {
+                Ok(sock) => {
+                    // peer_addr() is one syscall (`getpeername(2)`) and runs
+                    // exactly once per accepted socket. It can fail if the
+                    // peer raced to close — recorded as `None` and silently
+                    // skipped for the per-source counter.
+                    let peer = sock.peer_addr().ok();
+                    incr!("listener.accepted.total");
+                    incr!(proto_key);
+                    if let Some(peer_addr) = peer.as_ref() {
+                        incr!(per_source_bucket(peer_addr));
+                    }
+                    self.accept_queue.push_back((
                         sock,
                         token,
-                        Protocol::TCPListen,
+                        accepted_protocol,
                         Instant::now(),
-                    )),
-                    Err(AcceptError::WouldBlock) => {
-                        self.accept_ready.remove(&token);
-                        break;
-                    }
-                    Err(other) => {
-                        error!("error accepting TCP sockets: {:?}", other);
-                        self.accept_ready.remove(&token);
-                        break;
-                    }
+                        peer,
+                    ));
                 }
-            },
-            Protocol::HTTPListen => loop {
-                match self.http.borrow_mut().accept(token) {
-                    Ok(sock) => self.accept_queue.push_back((
-                        sock,
-                        token,
-                        Protocol::HTTPListen,
-                        Instant::now(),
-                    )),
-                    Err(AcceptError::WouldBlock) => {
-                        self.accept_ready.remove(&token);
-                        break;
-                    }
-                    Err(other) => {
-                        error!("error accepting HTTP sockets: {:?}", other);
-                        self.accept_ready.remove(&token);
-                        break;
-                    }
+                Err(AcceptError::WouldBlock) => {
+                    self.accept_ready.remove(&token);
+                    break;
                 }
-            },
-            Protocol::HTTPSListen => loop {
-                match self.https.borrow_mut().accept(token) {
-                    Ok(sock) => self.accept_queue.push_back((
-                        sock,
-                        token,
-                        Protocol::HTTPSListen,
-                        Instant::now(),
-                    )),
-                    Err(AcceptError::WouldBlock) => {
-                        self.accept_ready.remove(&token);
-                        break;
-                    }
-                    Err(other) => {
-                        error!("error accepting HTTPS sockets: {:?}", other);
-                        self.accept_ready.remove(&token);
-                        break;
-                    }
+                Err(other) => {
+                    error!(
+                        "error accepting {:?} sockets: {:?}",
+                        accepted_protocol, other
+                    );
+                    self.accept_ready.remove(&token);
+                    break;
                 }
-            },
-            _ => panic!("should not call accept() on a HTTP, HTTPS or TCP session"),
+            }
         }
 
         gauge!("accept_queue.connections", self.accept_queue.len());
     }
 
     pub fn create_sessions(&mut self) {
-        while let Some((sock, token, protocol, timestamp)) = self.accept_queue.pop_back() {
+        while let Some((sock, token, protocol, timestamp, _peer)) = self.accept_queue.pop_back() {
             let wait_time = Instant::now() - timestamp;
             time!("accept_queue.wait_time", wait_time.as_millis());
             if wait_time > self.accept_queue_timeout {
@@ -1556,6 +1755,12 @@ impl Server {
             }
 
             if !self.sessions.borrow_mut().check_limits() {
+                // The socket we just popped will not be served, plus every
+                // remaining queued socket below `break` will time out.
+                // `listener.connection_capped` counts the popped socket so
+                // the counter aligns with `check_limits` invocations rather
+                // than with queue depth at the time of refusal.
+                incr!("listener.connection_capped");
                 break;
             }
 
@@ -1645,6 +1850,10 @@ impl Server {
             let session = self.sessions.borrow_mut().slab[session_token].clone();
             session.borrow_mut().update_readiness(token, events);
             if session.borrow_mut().ready(session.clone()) {
+                debug!(
+                    "Server killing session from ready: token={:?}, protocol={:?}, events={:?}",
+                    token, protocol, events
+                );
                 self.kill_session(session);
             }
         }
@@ -1657,6 +1866,11 @@ impl Server {
         if self.sessions.borrow().slab.contains(session_token) {
             let session = self.sessions.borrow_mut().slab[session_token].clone();
             if session.borrow_mut().timeout(token) {
+                debug!(
+                    "Server killing session from timeout: token={:?}, protocol={:?}",
+                    token,
+                    session.borrow().protocol()
+                );
                 self.kill_session(session);
             }
         }
@@ -1740,5 +1954,65 @@ impl ProxySession for ListenSession {
             _token, self.protocol
         );
         false
+    }
+}
+
+#[cfg(test)]
+mod accept_telemetry_tests {
+    use super::*;
+
+    /// Two IPv4 addresses sharing the same /24 must hash to the same bucket;
+    /// the masking logic guarantees this regardless of the host octet.
+    #[test]
+    fn per_source_bucket_collapses_ipv4_slash24() {
+        let a: SocketAddr = "203.0.113.5:1234".parse().unwrap();
+        let b: SocketAddr = "203.0.113.250:9999".parse().unwrap();
+        assert_eq!(
+            per_source_bucket(&a),
+            per_source_bucket(&b),
+            "addresses in the same /24 must land in the same bucket"
+        );
+    }
+
+    /// Two IPv6 addresses sharing the same /48 must hash to the same bucket.
+    #[test]
+    fn per_source_bucket_collapses_ipv6_slash48() {
+        let a: SocketAddr = "[2001:db8:1234::1]:443".parse().unwrap();
+        let b: SocketAddr = "[2001:db8:1234:abcd::ffff]:8443".parse().unwrap();
+        assert_eq!(
+            per_source_bucket(&a),
+            per_source_bucket(&b),
+            "addresses in the same /48 must land in the same bucket"
+        );
+    }
+
+    /// Every bucket label must be one of `PER_SOURCE_BUCKETS` precomputed
+    /// statics — the cardinality cap is the load-bearing property.
+    #[test]
+    fn per_source_bucket_keys_are_bounded() {
+        assert_eq!(PER_SOURCE_BUCKET_KEYS.len(), PER_SOURCE_BUCKETS);
+        for (i, key) in PER_SOURCE_BUCKET_KEYS.iter().enumerate() {
+            let expected = format!("client.connect.per_source.bucket_{i:03}");
+            assert_eq!(*key, expected.as_str());
+        }
+    }
+
+    /// A modest sample across distinct /24 prefixes should hit a healthy
+    /// number of distinct buckets — guards against the hash collapsing.
+    #[test]
+    fn per_source_bucket_distributes_distinct_subnets() {
+        let mut hits = std::collections::HashSet::new();
+        for i in 0..200u8 {
+            let addr: SocketAddr = format!("10.0.{i}.42:80").parse().unwrap();
+            hits.insert(per_source_bucket(&addr));
+        }
+        // With 200 distinct /24 prefixes hashed into 256 buckets we expect
+        // many distinct labels — assert a conservative lower bound that
+        // tolerates birthday collisions.
+        assert!(
+            hits.len() >= 100,
+            "expected at least 100 distinct buckets across 200 /24s, got {}",
+            hits.len()
+        );
     }
 }

@@ -1,3 +1,14 @@
+//! HTTPS proxy entry point.
+//!
+//! Owns the TLS listener config (rustls), the ALPN-driven post-handshake
+//! mux dispatch (`h2` → `ConnectionH2`, `http/1.1` → `ConnectionH1`,
+//! neither → reject + `https.alpn.rejected.{unsupported,http11_disabled}`
+//! metrics), the SNI binding policy (`strict_sni_binding`), and the
+//! listener-update surface called from the command socket. Front-end H2
+//! is gated by ALPN here; `cluster.http2` is a backend-capability hint.
+//! Frontend rustls handshake I/O lives in `lib/src/protocol/rustls.rs`;
+//! certificate resolution lives in `lib/src/tls.rs`.
+
 use std::{
     cell::RefCell,
     collections::{BTreeMap, HashMap, hash_map::Entry},
@@ -35,16 +46,19 @@ use rustls::{
 use rusty_ulid::Ulid;
 use sozu_command::{
     certificate::Fingerprint,
-    config::DEFAULT_CIPHER_SUITES,
+    config::{DEFAULT_ALPN_PROTOCOLS, DEFAULT_CIPHER_SUITES},
     proto::command::{
         AddCertificate, CertificateSummary, CertificatesByAddress, Cluster, HttpsListenerConfig,
         ListOfCertificatesByAddress, ListenerType, RemoveCertificate, RemoveListener,
-        ReplaceCertificate, RequestHttpFrontend, ResponseContent, TlsVersion, WorkerRequest,
-        WorkerResponse, request::RequestType, response_content::ContentType,
+        ReplaceCertificate, RequestHttpFrontend, ResponseContent, TlsVersion,
+        UpdateHttpsListenerConfig, WorkerRequest, WorkerResponse, request::RequestType,
+        response_content::ContentType,
     },
     ready::Ready,
     response::HttpFrontend,
-    state::ClusterId,
+    state::{
+        ClusterId, validate_alpn_protocols, validate_h2_flood_knobs_https, validate_sozu_id_header,
+    },
 };
 
 use crate::{
@@ -54,13 +68,10 @@ use crate::{
     backends::BackendMap,
     pool::Pool,
     protocol::{
-        Http, Pipe, SessionState,
-        h2::Http2,
-        http::{
-            ResponseStream,
-            answers::HttpAnswers,
-            parser::{Method, hostname_and_port},
-        },
+        Pipe, SessionState,
+        http::answers::HttpAnswers,
+        http::parser::{Method, hostname_and_port},
+        mux::{self, Mux, MuxTls},
         proxy_protocol::expect::ExpectProxyProtocol,
         rustls::TlsHandshake,
     },
@@ -72,32 +83,61 @@ use crate::{
     util::UnwrapLog,
 };
 
-// const SERVER_PROTOS: &[&str] = &["http/1.1", "h2"];
-const SERVER_PROTOS: &[&str] = &["http/1.1"];
-
 StateMachineBuilder! {
     /// The various Stages of an HTTPS connection:
     ///
     /// - optional (ExpectProxyProtocol)
     /// - TLS handshake
-    /// - HTTP or HTTP2
-    /// - WebSocket (passthrough), only from HTTP
+    /// - HTTP or HTTP2 (via Mux)
+    /// - WebSocket (passthrough), only from HTTP/1.1
     enum HttpsStateMachine impl SessionState {
         Expect(ExpectProxyProtocol<MioTcpStream>, ServerConnection),
         Handshake(TlsHandshake),
-        Http(Http<FrontRustls, HttpsListener>),
+        Mux(MuxTls),
         WebSocket(Pipe<FrontRustls, HttpsListener>),
-        Http2(Http2<FrontRustls>) -> todo!("H2"),
     }
 }
 
-pub enum AlpnProtocols {
+enum AlpnProtocol {
     H2,
     Http11,
 }
 
+/// Module-level prefix for log lines emitted from this file when no session
+/// is in scope. Produces a bold bright-white `HTTPS` label in colored mode.
+/// Used by [`HttpsProxy`] / [`HttpsListener`] callbacks (`notify`,
+/// `add_cluster`, `add_*_frontend`, `accept`, `soft_stop`, `hard_stop`)
+/// which own a token map keyed by listener and have no `frontend_token` of
+/// their own.
+macro_rules! log_module_context {
+    () => {{
+        let (open, reset, _, _, _) = sozu_command::logging::ansi_palette();
+        format!("{open}HTTPS{reset}\t >>>", open = open, reset = reset)
+    }};
+}
+
+/// Per-session prefix for log lines emitted with an [`HttpsSession`] in
+/// scope. Renders the canonical `\tHTTPS\tSession(...)\t >>>` envelope from
+/// the session's `frontend_token` and `peer_address`. Operators can grep-
+/// correlate against the token id (and the peer address when present)
+/// across log lines for the same TLS connection.
+macro_rules! log_context {
+    ($self:expr) => {{
+        let (open, reset, grey, gray, white) = sozu_command::logging::ansi_palette();
+        format!(
+            "{open}HTTPS{reset}\t{grey}Session{reset}({gray}frontend{reset}={white}{frontend}{reset}, {gray}peer{reset}={white}{peer}{reset})\t >>>",
+            open = open,
+            reset = reset,
+            grey = grey,
+            gray = gray,
+            white = white,
+            frontend = $self.frontend_token.0,
+            peer = $self.peer_address.map(|a| a.to_string()).unwrap_or_else(|| "<none>".to_string()),
+        )
+    }};
+}
+
 pub struct HttpsSession {
-    answers: Rc<RefCell<HttpAnswers>>,
     configured_backend_timeout: Duration,
     configured_connect_timeout: Duration,
     configured_frontend_timeout: Duration,
@@ -111,13 +151,11 @@ pub struct HttpsSession {
     proxy: Rc<RefCell<HttpsProxy>>,
     public_address: StdSocketAddr,
     state: HttpsStateMachine,
-    sticky_name: String,
 }
 
 impl HttpsSession {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        answers: Rc<RefCell<HttpAnswers>>,
         configured_backend_timeout: Duration,
         configured_connect_timeout: Duration,
         configured_frontend_timeout: Duration,
@@ -129,7 +167,6 @@ impl HttpsSession {
         public_address: StdSocketAddr,
         rustls_details: ServerConnection,
         sock: MioTcpStream,
-        sticky_name: String,
         token: Token,
         wait_time: Duration,
     ) -> HttpsSession {
@@ -144,7 +181,7 @@ impl HttpsSession {
         let container_frontend_timeout = TimeoutContainer::new(configured_request_timeout, token);
 
         let state = if expect_proxy {
-            trace!("starting in expect proxy state");
+            trace!("{} starting in expect proxy state", log_module_context!());
             gauge_add!("protocol.proxy.expect", 1);
             HttpsStateMachine::Expect(
                 ExpectProxyProtocol::new(container_frontend_timeout, sock, token, request_id),
@@ -164,7 +201,6 @@ impl HttpsSession {
 
         let metrics = SessionMetrics::new(Some(wait_time));
         HttpsSession {
-            answers,
             configured_backend_timeout,
             configured_connect_timeout,
             configured_frontend_timeout,
@@ -178,19 +214,26 @@ impl HttpsSession {
             proxy,
             public_address,
             state,
-            sticky_name,
         }
     }
 
     pub fn upgrade(&mut self) -> SessionIsToBeClosed {
-        debug!("HTTP::upgrade");
+        debug!("{} upgrade", log_context!(self));
         let new_state = match self.state.take() {
             HttpsStateMachine::Expect(expect, ssl) => self.upgrade_expect(expect, ssl),
             HttpsStateMachine::Handshake(handshake) => self.upgrade_handshake(handshake),
-            HttpsStateMachine::Http(http) => self.upgrade_http(http),
-            HttpsStateMachine::Http2(_) => self.upgrade_http2(),
+            HttpsStateMachine::Mux(mux) => self.upgrade_mux(mux),
             HttpsStateMachine::WebSocket(wss) => self.upgrade_websocket(wss),
-            HttpsStateMachine::FailedUpgrade(_) => unreachable!(),
+            HttpsStateMachine::FailedUpgrade(_) => {
+                // Reaching this arm means a prior upgrade already returned
+                // `None` and the session should have been closed. Fall back
+                // to closing cleanly instead of panicking the worker.
+                error!(
+                    "{} upgrade called on FailedUpgrade state; closing session",
+                    log_context!(self)
+                );
+                None
+            }
         };
 
         match new_state {
@@ -231,9 +274,9 @@ impl HttpsSession {
                     request_id,
                     self.peer_address,
                 );
-                handshake.frontend_readiness.event = readiness.event;
-                // Can we remove this? If not why?
-                // Add e2e test for proto-proxy upgrades
+                // Transfer both interest and event from the proxy protocol state,
+                // so the event loop properly monitors the socket after the transition.
+                handshake.frontend_readiness = readiness;
                 handshake.frontend_readiness.event.insert(Ready::READABLE);
 
                 gauge_add!("protocol.proxy.expect", -1);
@@ -245,7 +288,8 @@ impl HttpsSession {
         // currently, only happens in expect proxy protocol with AF_UNSPEC address
         if !expect.container_frontend_timeout.cancel() {
             error!(
-                "failed to cancel request timeout on expect upgrade phase for 'expect proxy protocol with AF_UNSPEC address'"
+                "{} failed to cancel request timeout on expect upgrade phase for 'expect proxy protocol with AF_UNSPEC address'",
+                log_context!(self)
             );
         }
 
@@ -253,31 +297,101 @@ impl HttpsSession {
     }
 
     fn upgrade_handshake(&mut self, handshake: TlsHandshake) -> Option<HttpsStateMachine> {
-        // Add 1st routing phase
-        // - get SNI
-        // - get ALPN
-        // - find corresponding listener
-        // - determine next protocol (tcps, https ,http2)
-
-        let sni = handshake.session.server_name();
+        // Capture the SNI as an owned, already-lowercased String so it outlives
+        // the `handshake.session` move below. Lowercasing here once avoids
+        // doing it on every route decision (RFC 9110 §4.2.3 says hostnames are
+        // case-insensitive); no port is ever part of an SNI value (RFC 6066
+        // §3 — `HostName` is a dns_name, no port).
+        // RFC 1034 §3.1 absolute-form: `example.com.` and `example.com`
+        // are the same host. rustls hands us the wire-form SNI verbatim;
+        // strip a single trailing dot so a legitimate client emitting
+        // absolute-form SNI does not get its
+        // `host` / `:authority` rejected by `authority_matches_sni` for a
+        // length mismatch. Empty / no-SNI is unaffected.
+        let sni_owned: Option<String> = handshake
+            .session
+            .server_name()
+            .map(|s| s.to_ascii_lowercase())
+            .map(|mut s| {
+                if s.ends_with('.') {
+                    s.pop();
+                }
+                s
+            });
         let alpn = handshake.session.alpn_protocol();
         let alpn = alpn.and_then(|alpn| from_utf8(alpn).ok());
         debug!(
-            "Successful TLS Handshake with, received: {:?} {:?}",
-            sni, alpn
+            "{} successful TLS handshake with, received: {:?} {:?}",
+            log_context!(self),
+            sni_owned,
+            alpn
         );
 
-        let alpn = match alpn {
-            Some("http/1.1") => AlpnProtocols::Http11,
-            Some("h2") => AlpnProtocols::H2,
+        // Reject clients that fail to negotiate `h2` when the listener is
+        // configured as H2-only: silently falling back to HTTP/1.1 would let a
+        // downgrade-capable peer bypass H2-specific protections advertised
+        // for this listener (Pass 5 Medium #4 of the security audit).
+        let disable_http11 = self.listener.borrow().is_http11_disabled();
+        // Pair the parsed AlpnProtocol with the on-the-wire label so the
+        // access log can record it as a `&'static str` without re-stringifying
+        // the protocol enum on every request. Unknown ALPN values still bail
+        // out below — only successful negotiations propagate to the log.
+        let (alpn, alpn_label): (AlpnProtocol, Option<&'static str>) = match alpn {
+            Some("http/1.1") => {
+                if disable_http11 {
+                    incr!("https.alpn.rejected.http11_disabled");
+                    warn!(
+                        "{} rejecting TLS connection: listener is H2-only but client negotiated http/1.1",
+                        log_context!(self)
+                    );
+                    return None;
+                }
+                (AlpnProtocol::Http11, Some("http/1.1"))
+            }
+            Some("h2") => (AlpnProtocol::H2, Some("h2")),
             Some(other) => {
-                error!("Unsupported ALPN protocol: {}", other);
+                // This branch was not metered, so any operator dashboard
+                // graphing `https.alpn.rejected.*`
+                // missed unknown-protocol refusals (e.g. an `h3` mistake
+                // bleeding through some misconfiguration). Add a dedicated
+                // counter so the SOC's "ALPN refusal" ratebar matches the
+                // sum of the labelled buckets.
+                incr!("https.alpn.rejected.unsupported");
+                error!(
+                    "{} unsupported ALPN protocol: {}",
+                    log_context!(self),
+                    other
+                );
                 return None;
             }
-            // Some client don't fill in the ALPN protocol, in this case we default to Http/1.1
-            None => AlpnProtocols::Http11,
+            // Some clients don't fill in the ALPN protocol. By default we
+            // downgrade to HTTP/1.1 to preserve compatibility; on an H2-only
+            // listener we instead drop the connection.
+            None => {
+                if disable_http11 {
+                    incr!("https.alpn.rejected.http11_disabled");
+                    warn!(
+                        "{} rejecting TLS connection: listener is H2-only but client did not negotiate ALPN",
+                        log_context!(self)
+                    );
+                    return None;
+                }
+                (AlpnProtocol::Http11, None)
+            }
         };
 
+        // Capture the negotiated TLS metadata as `&'static str` labels for the
+        // access log alongside the existing metric counters. Both calls are
+        // single rustls accessors — duplicating them keeps the metric path
+        // unchanged and avoids mutating-after-move on `handshake.session`.
+        let tls_version_label = handshake
+            .session
+            .protocol_version()
+            .and_then(rustls_version_label);
+        let tls_cipher_label = handshake
+            .session
+            .negotiated_cipher_suite()
+            .and_then(rustls_ciphersuite_label);
         if let Some(version) = handshake.session.protocol_version() {
             incr!(rustls_version_str(version));
         };
@@ -285,115 +399,209 @@ impl HttpsSession {
             incr!(rustls_ciphersuite_str(cipher));
         };
 
+        gauge_add!("protocol.tls.handshake", -1);
+
+        let session_ulid = rusty_ulid::Ulid::generate();
         let front_stream = FrontRustls {
             stream: handshake.stream,
             session: handshake.session,
+            peer_disconnected: false,
+            peer_reset: false,
+            session_ulid,
         };
-
-        gauge_add!("protocol.tls.handshake", -1);
-        match alpn {
-            AlpnProtocols::Http11 => {
-                let mut http = Http::new(
-                    self.answers.clone(),
-                    self.configured_backend_timeout,
-                    self.configured_connect_timeout,
-                    self.configured_frontend_timeout,
+        let router = mux::Router::new(
+            self.configured_backend_timeout,
+            self.configured_connect_timeout,
+        );
+        let mut context = mux::Context::new(
+            session_ulid,
+            self.pool.clone(),
+            self.listener.clone(),
+            self.peer_address,
+            self.public_address,
+        );
+        // Bind the TLS SNI to this session so the routing layer can reject any
+        // H2 stream whose `:authority` crosses the TLS trust boundary (see
+        // `route_from_request`).
+        context.tls_server_name = sni_owned;
+        // Stamp the connection-scoped TLS metadata so every per-stream
+        // HttpContext created by `Context::create_stream` inherits it for
+        // the access log without re-querying rustls.
+        context.tls_version = tls_version_label;
+        context.tls_cipher = tls_cipher_label;
+        context.tls_alpn = alpn_label;
+        let mut frontend = match alpn {
+            AlpnProtocol::Http11 => {
+                incr!("http.alpn.http11");
+                context.create_stream(handshake.request_id, 1 << 16)?;
+                mux::Connection::new_h1_server(
+                    session_ulid,
+                    front_stream,
                     handshake.container_frontend_timeout,
-                    front_stream,
-                    self.frontend_token,
-                    self.listener.clone(),
-                    self.pool.clone(),
-                    Protocol::HTTPS,
-                    self.public_address,
-                    handshake.request_id,
-                    self.peer_address,
-                    self.sticky_name.clone(),
                 )
-                .ok()?;
-
-                http.frontend_readiness.event = handshake.frontend_readiness.event;
-
-                gauge_add!("protocol.https", 1);
-                Some(HttpsStateMachine::Http(http))
             }
-            AlpnProtocols::H2 => {
-                let mut http = Http2::new(
+            AlpnProtocol::H2 => {
+                incr!("http.alpn.h2");
+                let flood_config = self.listener.borrow().get_h2_flood_config();
+                let connection_config = self.listener.borrow().get_h2_connection_config();
+                let stream_idle_timeout = self.listener.borrow().get_h2_stream_idle_timeout();
+                let graceful_shutdown_deadline =
+                    self.listener.borrow().get_h2_graceful_shutdown_deadline();
+                mux::Connection::new_h2_server(
+                    session_ulid,
                     front_stream,
-                    self.frontend_token,
                     self.pool.clone(),
-                    Some(self.public_address),
-                    None,
-                    self.sticky_name.clone(),
-                );
-
-                http.frontend.readiness.event = handshake.frontend_readiness.event;
-
-                gauge_add!("protocol.http2", 1);
-                Some(HttpsStateMachine::Http2(http))
+                    handshake.container_frontend_timeout,
+                    flood_config,
+                    connection_config,
+                    stream_idle_timeout,
+                    graceful_shutdown_deadline,
+                )?
             }
-        }
+        };
+        // Ensure the upgraded connection can both read and write immediately.
+        // With TLS 1.3 + NewSessionTicket, the upgrade may happen from writable()
+        // where READABLE is no longer in the event (consumed by the prior readable()
+        // call). The HTTP/2 preface may already be in rustls's plaintext buffer
+        // (not on the TCP socket), so no new READABLE event from epoll will arrive.
+        // Without WRITABLE in the event, the H2 state machine cannot transition from
+        // reading the preface to writing SETTINGS, causing a deadlock with clients
+        // (like hyper) that wait for the server's SETTINGS before proceeding.
+        frontend
+            .readiness_mut()
+            .event
+            .insert(Ready::READABLE | Ready::WRITABLE);
+
+        gauge_add!("protocol.https", 1);
+        Some(HttpsStateMachine::Mux(Mux {
+            configured_frontend_timeout: self.configured_frontend_timeout,
+            frontend_token: self.frontend_token,
+            frontend,
+            context,
+            router,
+            session_ulid,
+        }))
     }
 
-    fn upgrade_http(&self, http: Http<FrontRustls, HttpsListener>) -> Option<HttpsStateMachine> {
-        debug!("https switching to wss");
-        let front_token = self.frontend_token;
-        let back_token = match http.backend_token {
-            Some(back_token) => back_token,
-            None => {
-                warn!(
-                    "Could not upgrade https request on cluster '{:?}' ({:?}) using backend '{:?}' into secure websocket for request '{}'",
-                    http.context.cluster_id,
-                    self.frontend_token,
-                    http.context.backend_id,
-                    http.context.id
-                );
-                return None;
-            }
+    fn upgrade_mux(&self, mut mux: MuxTls) -> Option<HttpsStateMachine> {
+        debug!("{} mux switching to wss", log_context!(self));
+        let Some(stream) = mux.context.streams.pop() else {
+            error!(
+                "{} upgrade_mux: no stream attached to the TLS mux session, closing",
+                log_context!(self)
+            );
+            return None;
         };
+        // http.active_requests was already decremented by generate_access_log()
+        // in h1.rs before MuxResult::Upgrade was returned to us.
 
-        let ws_context = http.websocket_context();
-        let mut container_frontend_timeout = http.container_frontend_timeout;
-        let mut container_backend_timeout = http.container_backend_timeout;
+        let (frontend_readiness, frontend_socket, mut container_frontend_timeout) =
+            match mux.frontend {
+                mux::Connection::H1(mux::ConnectionH1 {
+                    readiness,
+                    socket,
+                    timeout_container,
+                    ..
+                }) => (readiness, socket, timeout_container),
+                mux::Connection::H2(_) => {
+                    error!(
+                        "{} only h1<->h1 connections can upgrade to websocket",
+                        log_context!(self)
+                    );
+                    return None;
+                }
+            };
+
+        let mux::StreamState::Linked(back_token) = stream.state else {
+            error!(
+                "{} upgrading stream should be linked to a backend",
+                log_context!(self)
+            );
+            return None;
+        };
+        let Some(backend) = mux.router.backends.remove(&back_token) else {
+            error!(
+                "{} upgrade_mux: backend for token {:?} is missing (already disconnected?), closing",
+                log_context!(self),
+                back_token
+            );
+            return None;
+        };
+        let (cluster_id, backend, backend_readiness, backend_socket, mut container_backend_timeout) =
+            match backend {
+                mux::Connection::H1(mux::ConnectionH1 {
+                    position:
+                        mux::Position::Client(cluster_id, backend, mux::BackendStatus::Connected),
+                    readiness,
+                    socket,
+                    timeout_container,
+                    ..
+                }) => (cluster_id, backend, readiness, socket, timeout_container),
+                mux::Connection::H1(_) => {
+                    error!(
+                        "{} the backend disconnected just after upgrade, abort",
+                        log_context!(self)
+                    );
+                    return None;
+                }
+                mux::Connection::H2(_) => {
+                    error!(
+                        "{} only h1<->h1 connections can upgrade to websocket",
+                        log_context!(self)
+                    );
+                    return None;
+                }
+            };
+
+        let ws_context = stream.context.websocket_context();
+
         container_frontend_timeout.reset();
         container_backend_timeout.reset();
 
-        let backend_buffer = if let ResponseStream::BackendAnswer(kawa) = http.response_stream {
-            kawa.storage.buffer
-        } else {
-            return None;
-        };
-
+        let backend_id = backend.borrow().backend_id.clone();
+        // Unwrap the `SessionTcpStream` that the mux put around every backend
+        // TCP socket — `Pipe::backend_socket` is typed `Option<TcpStream>`.
+        let backend_socket = backend_socket.stream;
         let mut pipe = Pipe::new(
-            backend_buffer,
-            http.context.backend_id,
-            http.backend_socket,
-            http.backend,
+            stream.back.storage.buffer,
+            Some(backend_id),
+            Some(backend_socket),
+            Some(backend),
             Some(container_backend_timeout),
             Some(container_frontend_timeout),
-            http.context.cluster_id,
-            http.request_stream.storage.buffer,
-            front_token,
-            http.frontend_socket,
+            Some(cluster_id),
+            stream.front.storage.buffer,
+            self.frontend_token,
+            frontend_socket,
             self.listener.clone(),
-            Protocol::HTTP,
-            http.context.id,
-            http.context.session_address,
+            Protocol::HTTPS,
+            stream.context.session_id,
+            stream.context.id,
+            stream.context.session_address,
             ws_context,
         );
 
-        pipe.frontend_readiness.event = http.frontend_readiness.event;
-        pipe.backend_readiness.event = http.backend_readiness.event;
+        pipe.frontend_readiness.event = frontend_readiness.event;
+        pipe.backend_readiness.event = backend_readiness.event;
         pipe.set_back_token(back_token);
+        // Carry the connection-scoped TLS metadata captured at handshake time
+        // into the post-upgrade WSS pipe so its access log records the same
+        // version/cipher/sni/alpn the H1 request log already emitted. `clone`
+        // on the SNI is the only heap touch — the other three are
+        // `&'static str` borrows into the rustls label tables.
+        pipe.set_tls_metadata(
+            stream.context.tls_version,
+            stream.context.tls_cipher,
+            stream.context.tls_server_name.clone(),
+            stream.context.tls_alpn,
+        );
 
+        // http.active_requests was already decremented by generate_access_log()
+        // in h1.rs when the 101 response was written (before MuxResult::Upgrade).
         gauge_add!("protocol.https", -1);
         gauge_add!("protocol.wss", 1);
-        gauge_add!("http.active_requests", -1);
         gauge_add!("websocket.active_requests", 1);
         Some(HttpsStateMachine::WebSocket(pipe))
-    }
-
-    fn upgrade_http2(&self) -> Option<HttpsStateMachine> {
-        todo!()
     }
 
     fn upgrade_websocket(
@@ -401,7 +609,10 @@ impl HttpsSession {
         wss: Pipe<FrontRustls, HttpsListener>,
     ) -> Option<HttpsStateMachine> {
         // what do we do here?
-        error!("Upgrade called on WSS, this should not happen");
+        error!(
+            "{} upgrade called on WSS, this should not happen",
+            log_context!(self)
+        );
         Some(HttpsStateMachine::WebSocket(wss))
     }
 }
@@ -412,29 +623,33 @@ impl ProxySession for HttpsSession {
             return;
         }
 
-        trace!("Closing HTTPS session");
+        trace!("{} closing HTTPS session", log_context!(self));
         self.metrics.service_stop();
 
         // Restore gauges
         match self.state.marker() {
             StateMarker::Expect => gauge_add!("protocol.proxy.expect", -1),
             StateMarker::Handshake => gauge_add!("protocol.tls.handshake", -1),
-            StateMarker::Http => gauge_add!("protocol.https", -1),
+            StateMarker::Mux => gauge_add!("protocol.https", -1),
             StateMarker::WebSocket => {
                 gauge_add!("protocol.wss", -1);
                 gauge_add!("websocket.active_requests", -1);
             }
-            StateMarker::Http2 => gauge_add!("protocol.http2", -1),
         }
 
         if self.state.failed() {
             match self.state.marker() {
                 StateMarker::Expect => incr!("https.upgrade.expect.failed"),
                 StateMarker::Handshake => incr!("https.upgrade.handshake.failed"),
-                StateMarker::Http => incr!("https.upgrade.http.failed"),
+                StateMarker::Mux => incr!("https.upgrade.mux.failed"),
                 StateMarker::WebSocket => incr!("https.upgrade.wss.failed"),
-                StateMarker::Http2 => incr!("https.upgrade.http2.failed"),
             }
+            // FailedUpgrade means the socket was consumed by a failed upgrade
+            // attempt, so we can only close the state (no-op) and remove the
+            // session — cancel_timeouts / front_socket are unreachable.
+            self.state.close(self.proxy.clone(), &mut self.metrics);
+            self.proxy.borrow().remove_session(self.frontend_token);
+            self.has_been_closed = true;
             return;
         }
 
@@ -443,13 +658,21 @@ impl ProxySession for HttpsSession {
         // in case of https it should also send a close notify on the client before the socket is closed below
         self.state.close(self.proxy.clone(), &mut self.metrics);
 
+        // Shut down the write side only. shutdown(Both) includes SHUT_RD which
+        // discards unread data in the receive buffer (e.g. client's GOAWAY, ACKs).
+        // On Linux, close() after SHUT_RD with discarded receive data sends TCP RST
+        // instead of FIN, destroying any data still in the send buffer — including
+        // TLS records that the drain loop just flushed. Using SHUT_WR only sends
+        // FIN after all send buffer data is delivered, preserving the response.
         let front_socket = self.state.front_socket();
-        if let Err(e) = front_socket.shutdown(Shutdown::Both) {
+        if let Err(e) = front_socket.shutdown(Shutdown::Write) {
             // error 107 NotConnected can happen when was never fully connected, or was already disconnected due to error
             if e.kind() != ErrorKind::NotConnected {
                 error!(
-                    "error shutting down front socket({:?}): {:?}",
-                    front_socket, e
+                    "{} error shutting down front socket({:?}): {:?}",
+                    log_context!(self),
+                    front_socket,
+                    e
                 );
             }
         }
@@ -459,8 +682,10 @@ impl ProxySession for HttpsSession {
         let fd = front_socket.as_raw_fd();
         if let Err(e) = proxy.registry.deregister(&mut SourceFd(&fd)) {
             error!(
-                "error deregistering front socket({:?}) while closing HTTPS session: {:?}",
-                fd, e
+                "{} error deregistering front socket({:?}) while closing HTTPS session: {:?}",
+                log_context!(self),
+                fd,
+                e
             );
         }
         proxy.remove_session(self.frontend_token);
@@ -470,6 +695,14 @@ impl ProxySession for HttpsSession {
 
     fn timeout(&mut self, token: Token) -> SessionIsToBeClosed {
         let session_result = self.state.timeout(token, &mut self.metrics);
+        if session_result == StateResult::CloseSession {
+            debug!(
+                "{} HTTPS timeout requested close: token={:?}, marker={:?}",
+                log_context!(self),
+                token,
+                self.state.marker()
+            );
+        }
         session_result == StateResult::CloseSession
     }
 
@@ -479,7 +712,8 @@ impl ProxySession for HttpsSession {
 
     fn update_readiness(&mut self, token: Token, events: Ready) {
         trace!(
-            "token {:?} got event {}",
+            "{} token {:?} got event {}",
+            log_context!(self),
             token,
             super::ready_to_string(events)
         );
@@ -503,6 +737,13 @@ impl ProxySession for HttpsSession {
                 true => true,
             },
         };
+        if to_be_closed {
+            debug!(
+                "{} HTTPS ready requested close: marker={:?}",
+                log_context!(self),
+                self.state.marker()
+            );
+        }
 
         self.metrics.service_stop();
         to_be_closed
@@ -518,7 +759,7 @@ impl ProxySession for HttpsSession {
 
     fn print_session(&self) {
         self.state.print_state("HTTPS");
-        error!("Metrics: {:?}", self.metrics);
+        error!("{} Metrics: {:?}", log_context!(self), self.metrics);
     }
 
     fn frontend_token(&self) -> Token {
@@ -557,11 +798,30 @@ impl ListenerHandler for HttpsListener {
             None => self.tags.remove(&key),
         };
     }
+
+    fn protocol(&self) -> Protocol {
+        Protocol::HTTPS
+    }
+
+    fn public_address(&self) -> StdSocketAddr {
+        self.config
+            .public_address
+            .map(|addr| addr.into())
+            .unwrap_or(self.address)
+    }
 }
 
 impl L7ListenerHandler for HttpsListener {
     fn get_sticky_name(&self) -> &str {
         &self.config.sticky_name
+    }
+
+    fn get_sozu_id_header(&self) -> &str {
+        self.config
+            .sozu_id_header
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("Sozu-Id")
     }
 
     fn get_connect_timeout(&self) -> u32 {
@@ -595,6 +855,11 @@ impl L7ListenerHandler for HttpsListener {
         // it is alright to call from_utf8_unchecked,
         // we already verified that there are only ascii
         // chars in there
+        // SAFETY: `hostname` was just produced by `hostname_and_port` (see
+        // `lib/src/protocol/kawa_h1/parser.rs:133`), which only accepts
+        // bytes matching `is_hostname_char` (alphanumeric, `-`, `.`, plus
+        // `_` under the tolerant-http1-parser feature). All accepted
+        // bytes are ASCII (≤ 0x7F), so the slice is valid single-byte UTF-8.
         let host = unsafe { from_utf8_unchecked(hostname) };
 
         let route = self.fronts.lookup(host, uri, method).map_err(|e| {
@@ -610,9 +875,124 @@ impl L7ListenerHandler for HttpsListener {
 
         Ok(route)
     }
+
+    fn get_answers(&self) -> &Rc<RefCell<HttpAnswers>> {
+        &self.answers
+    }
+
+    fn get_h2_flood_config(&self) -> crate::protocol::mux::H2FloodConfig {
+        let defaults = crate::protocol::mux::H2FloodConfig::default();
+        crate::protocol::mux::H2FloodConfig {
+            max_rst_stream_per_window: self
+                .config
+                .h2_max_rst_stream_per_window
+                .unwrap_or(defaults.max_rst_stream_per_window),
+            max_ping_per_window: self
+                .config
+                .h2_max_ping_per_window
+                .unwrap_or(defaults.max_ping_per_window),
+            max_settings_per_window: self
+                .config
+                .h2_max_settings_per_window
+                .unwrap_or(defaults.max_settings_per_window),
+            max_empty_data_per_window: self
+                .config
+                .h2_max_empty_data_per_window
+                .unwrap_or(defaults.max_empty_data_per_window),
+            max_window_update_stream0_per_window: self
+                .config
+                .h2_max_window_update_stream0_per_window
+                .unwrap_or(defaults.max_window_update_stream0_per_window),
+            max_continuation_frames: self
+                .config
+                .h2_max_continuation_frames
+                .unwrap_or(defaults.max_continuation_frames),
+            max_glitch_count: self
+                .config
+                .h2_max_glitch_count
+                .unwrap_or(defaults.max_glitch_count),
+            max_rst_stream_lifetime: self
+                .config
+                .h2_max_rst_stream_lifetime
+                .unwrap_or(defaults.max_rst_stream_lifetime),
+            max_rst_stream_abusive_lifetime: self
+                .config
+                .h2_max_rst_stream_abusive_lifetime
+                .unwrap_or(defaults.max_rst_stream_abusive_lifetime),
+            max_rst_stream_emitted_lifetime: self
+                .config
+                .h2_max_rst_stream_emitted_lifetime
+                .unwrap_or(defaults.max_rst_stream_emitted_lifetime),
+            max_header_list_size: self
+                .config
+                .h2_max_header_list_size
+                .unwrap_or(defaults.max_header_list_size),
+            max_header_table_size: self
+                .config
+                .h2_max_header_table_size
+                .unwrap_or(defaults.max_header_table_size),
+        }
+    }
+
+    fn get_h2_connection_config(&self) -> crate::protocol::mux::H2ConnectionConfig {
+        crate::protocol::mux::H2ConnectionConfig::from_optional(
+            self.config.h2_initial_connection_window,
+            self.config.h2_max_concurrent_streams,
+            self.config.h2_stream_shrink_ratio,
+        )
+    }
+
+    fn get_strict_sni_binding(&self) -> bool {
+        // Phase 1D enforced SNI↔:authority binding unconditionally; this
+        // listener knob preserves that behavior by default and lets
+        // operators opt out when cross-SNI routing is intentional.
+        //
+        // Codex G10 note: `strict_sni_binding = false` theoretically allows
+        // an attacker to present many distinct SNIs on the same TCP
+        // connection. rustls 0.23 **bans TLS renegotiation outright** (see
+        // `rustls::server::ClientHello` which is consumed during the initial
+        // handshake only), so a single TCP connection gets exactly one SNI
+        // for its lifetime — the cross-SNI-flood vector is not reachable in
+        // practice. Kept documented here so a future rustls upgrade that
+        // reintroduces renegotiation (vanishingly unlikely) surfaces the
+        // assumption during review.
+        self.config.strict_sni_binding.unwrap_or(true)
+    }
+
+    fn get_h2_stream_idle_timeout(&self) -> std::time::Duration {
+        // Inherit `back_timeout` when the knob is unset so listeners tuned for
+        // long-running backends do not cancel streams at the 30 s security
+        // floor. The `max(30, …)` keeps the baseline slow-multiplex mitigation
+        // when `back_timeout` is shorter than 30 s. Explicit values (including
+        // ones below 30 s) win — operators under a slow-multiplex attack can
+        // lower the per-stream deadline to cap buffer pinning.
+        let seconds = self
+            .config
+            .h2_stream_idle_timeout_seconds
+            .map(|s| u64::from(s.max(1)))
+            .unwrap_or_else(|| u64::from(self.config.back_timeout).max(30));
+        std::time::Duration::from_secs(seconds)
+    }
+
+    fn get_h2_graceful_shutdown_deadline(&self) -> Option<std::time::Duration> {
+        match self.config.h2_graceful_shutdown_deadline_seconds {
+            None => Some(std::time::Duration::from_secs(5)),
+            Some(0) => None,
+            Some(s) => Some(std::time::Duration::from_secs(u64::from(s))),
+        }
+    }
 }
 
 impl HttpsListener {
+    /// Whether this listener rejects clients that do not negotiate `h2`
+    /// via TLS ALPN (including those that omit ALPN). Reads the
+    /// `disable_http11` knob; defaults to `false` to preserve the
+    /// historical behavior where a missing ALPN silently downgrades
+    /// to HTTP/1.1.
+    pub fn is_http11_disabled(&self) -> bool {
+        self.config.disable_http11.unwrap_or(false)
+    }
+
     pub fn try_new(
         config: HttpsListenerConfig,
         token: Token,
@@ -695,7 +1075,11 @@ impl HttpsListener {
                 "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384" => Some(TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384),
                 "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256" => Some(TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256),
                 other_cipher => {
-                    error!("unknown cipher: {:?}", other_cipher);
+                    error!(
+                        "{} unknown cipher: {:?}",
+                        log_module_context!(),
+                        other_cipher
+                    );
                     None
                 }
             })
@@ -708,11 +1092,15 @@ impl HttpsListener {
                 Ok(TlsVersion::TlsV12) => Some(&rustls::version::TLS12),
                 Ok(TlsVersion::TlsV13) => Some(&rustls::version::TLS13),
                 Ok(other_version) => {
-                    error!("unsupported TLS version {:?}", other_version);
+                    error!(
+                        "{} unsupported TLS version {:?}",
+                        log_module_context!(),
+                        other_version
+                    );
                     None
                 }
                 Err(_) => {
-                    error!("unsupported TLS version");
+                    error!("{} unsupported TLS version", log_module_context!());
                     None
                 }
             })
@@ -730,13 +1118,164 @@ impl HttpsListener {
             .with_cert_resolver(resolver);
         server_config.send_tls13_tickets = config.send_tls13_tickets as usize;
 
-        let mut protocols = SERVER_PROTOS
-            .iter()
-            .map(|proto| proto.as_bytes().to_vec())
-            .collect::<Vec<_>>();
-        server_config.alpn_protocols.append(&mut protocols);
+        server_config.alpn_protocols = if config.alpn_protocols.is_empty() {
+            DEFAULT_ALPN_PROTOCOLS
+                .iter()
+                .map(|p| p.as_bytes().to_vec())
+                .collect()
+        } else {
+            config
+                .alpn_protocols
+                .iter()
+                .map(|p| p.as_bytes().to_vec())
+                .collect()
+        };
 
         Ok(server_config)
+    }
+
+    /// Apply a partial-update patch to this listener's live configuration.
+    ///
+    /// Fields absent in the patch (i.e. `None`) are preserved unchanged.
+    /// If `alpn_protocols` is present the rustls `ServerConfig` is rebuilt —
+    /// in-flight handshakes keep the old Arc; new ones see the new one.
+    /// If `http_answers` is present only the listener-default templates are
+    /// replaced; per-cluster overrides in `cluster_custom_answers` are kept.
+    pub fn update_config(
+        &mut self,
+        patch: &UpdateHttpsListenerConfig,
+    ) -> Result<(), ListenerError> {
+        // Defense-in-depth validation: main-process ConfigState::dispatch
+        // validates before scatter, but a raw protobuf client or state replay
+        // may reach the worker without that check. `StateError` lifts into
+        // `ListenerError` via `From` so `?` suffices.
+        validate_h2_flood_knobs_https(patch)?;
+        if let Some(ref alpn) = patch.alpn_protocols {
+            validate_alpn_protocols(&alpn.values)?;
+        }
+        if let Some(ref hdr) = patch.sozu_id_header {
+            validate_sozu_id_header(hdr)?;
+        }
+
+        // --- simple field patches ---
+        if let Some(v) = patch.public_address {
+            self.config.public_address = Some(v);
+        }
+        if let Some(v) = patch.expect_proxy {
+            self.config.expect_proxy = v;
+        }
+        if let Some(ref v) = patch.sticky_name {
+            self.config.sticky_name = v.to_owned();
+        }
+        if let Some(v) = patch.front_timeout {
+            self.config.front_timeout = v;
+        }
+        if let Some(v) = patch.back_timeout {
+            self.config.back_timeout = v;
+        }
+        if let Some(v) = patch.connect_timeout {
+            self.config.connect_timeout = v;
+        }
+        if let Some(v) = patch.request_timeout {
+            self.config.request_timeout = v;
+        }
+        if let Some(v) = patch.strict_sni_binding {
+            self.config.strict_sni_binding = Some(v);
+        }
+        if let Some(v) = patch.disable_http11 {
+            self.config.disable_http11 = Some(v);
+        }
+        if let Some(ref v) = patch.sozu_id_header {
+            self.config.sozu_id_header = Some(v.to_owned());
+        }
+
+        // --- H2 flood knobs ---
+        if let Some(v) = patch.h2_max_rst_stream_per_window {
+            self.config.h2_max_rst_stream_per_window = Some(v);
+        }
+        if let Some(v) = patch.h2_max_ping_per_window {
+            self.config.h2_max_ping_per_window = Some(v);
+        }
+        if let Some(v) = patch.h2_max_settings_per_window {
+            self.config.h2_max_settings_per_window = Some(v);
+        }
+        if let Some(v) = patch.h2_max_empty_data_per_window {
+            self.config.h2_max_empty_data_per_window = Some(v);
+        }
+        if let Some(v) = patch.h2_max_continuation_frames {
+            self.config.h2_max_continuation_frames = Some(v);
+        }
+        if let Some(v) = patch.h2_max_glitch_count {
+            self.config.h2_max_glitch_count = Some(v);
+        }
+        if let Some(v) = patch.h2_initial_connection_window {
+            self.config.h2_initial_connection_window = Some(v);
+        }
+        if let Some(v) = patch.h2_max_concurrent_streams {
+            self.config.h2_max_concurrent_streams = Some(v);
+        }
+        if let Some(v) = patch.h2_stream_shrink_ratio {
+            self.config.h2_stream_shrink_ratio = Some(v);
+        }
+        if let Some(v) = patch.h2_max_rst_stream_lifetime {
+            self.config.h2_max_rst_stream_lifetime = Some(v);
+        }
+        if let Some(v) = patch.h2_max_rst_stream_abusive_lifetime {
+            self.config.h2_max_rst_stream_abusive_lifetime = Some(v);
+        }
+        if let Some(v) = patch.h2_max_rst_stream_emitted_lifetime {
+            self.config.h2_max_rst_stream_emitted_lifetime = Some(v);
+        }
+        if let Some(v) = patch.h2_max_header_list_size {
+            self.config.h2_max_header_list_size = Some(v);
+        }
+        if let Some(v) = patch.h2_max_header_table_size {
+            self.config.h2_max_header_table_size = Some(v);
+        }
+        if let Some(v) = patch.h2_stream_idle_timeout_seconds {
+            self.config.h2_stream_idle_timeout_seconds = Some(v);
+        }
+        if let Some(v) = patch.h2_graceful_shutdown_deadline_seconds {
+            self.config.h2_graceful_shutdown_deadline_seconds = Some(v);
+        }
+        if let Some(v) = patch.h2_max_window_update_stream0_per_window {
+            self.config.h2_max_window_update_stream0_per_window = Some(v);
+        }
+
+        // --- ALPN rebuild (may force a rustls ServerConfig rebuild) ---
+        //
+        // Transactional: build the candidate rustls context first using a
+        // **cloned** config that carries the new ALPN. Only if the build
+        // succeeds do we commit `self.config.alpn_protocols` and swap the
+        // Arc. This ensures a rustls failure (crypto provider transient,
+        // resolver error, etc.) leaves the listener observably unchanged —
+        // the master-side state would still diverge from the worker-side
+        // refusal, but the worker itself stays consistent.
+        if let Some(ref alpn_wrapper) = patch.alpn_protocols {
+            let mut candidate = self.config.clone();
+            candidate.alpn_protocols = alpn_wrapper.values.clone();
+            let new_rustls = Arc::new(Self::create_rustls_context(
+                &candidate,
+                self.resolver.clone(),
+            )?);
+            // Build succeeded — commit.
+            self.config.alpn_protocols = alpn_wrapper.values.clone();
+            self.rustls_details = new_rustls;
+        }
+
+        // --- HTTP answers: replace listener defaults per-field, preserve cluster overrides ---
+        if let Some(ref new_answers) = patch.http_answers {
+            crate::sozu_command::state::merge_custom_http_answers(
+                &mut self.config.http_answers,
+                new_answers,
+            );
+            self.answers
+                .borrow_mut()
+                .replace_defaults(new_answers)
+                .map_err(|(status, error)| ListenerError::TemplateParse(status, error))?;
+        }
+
+        Ok(())
     }
 
     pub fn add_https_front(&mut self, tls_front: HttpFrontend) -> Result<(), ListenerError> {
@@ -746,7 +1285,11 @@ impl HttpsListener {
     }
 
     pub fn remove_https_front(&mut self, tls_front: HttpFrontend) -> Result<(), ListenerError> {
-        debug!("removing tls_front {:?}", tls_front);
+        debug!(
+            "{} removing tls_front {:?}",
+            log_module_context!(),
+            tls_front
+        );
         self.fronts
             .remove_http_front(&tls_front)
             .map_err(ListenerError::RemoveFrontend)
@@ -758,13 +1301,16 @@ impl HttpsListener {
                 .map_err(|e| match e.kind() {
                     ErrorKind::WouldBlock => AcceptError::WouldBlock,
                     _ => {
-                        error!("accept() IO error: {:?}", e);
+                        error!("{} accept() IO error: {:?}", log_module_context!(), e);
                         AcceptError::IoError
                     }
                 })
                 .map(|(sock, _)| sock)
         } else {
-            error!("cannot accept connections, no listening socket available");
+            error!(
+                "{} cannot accept connections, no listening socket available",
+                log_module_context!()
+            );
             Err(AcceptError::IoError)
         }
     }
@@ -823,7 +1369,11 @@ impl HttpsProxy {
             .retain(|_, listener| listener.borrow().address != remove_address);
 
         if !self.listeners.len() < len {
-            info!("no HTTPS listener to remove at address {}", remove_address)
+            info!(
+                "{} no HTTPS listener to remove at address {}",
+                log_module_context!(),
+                remove_address
+            )
         }
         Ok(None)
     }
@@ -833,7 +1383,7 @@ impl HttpsProxy {
         let mut socket_errors = vec![];
         for (_, l) in listeners.iter() {
             if let Some(mut sock) = l.borrow_mut().listener.take() {
-                debug!("Deregistering socket {:?}", sock);
+                debug!("{} deregistering socket {:?}", log_module_context!(), sock);
                 if let Err(e) = self.registry.deregister(&mut sock) {
                     let error = format!("socket {sock:?}: {e:?}");
                     socket_errors.push(error);
@@ -844,7 +1394,7 @@ impl HttpsProxy {
         if !socket_errors.is_empty() {
             return Err(ProxyError::SoftStop {
                 proxy_protocol: "HTTPS".to_string(),
-                error: format!("Error deregistering listen sockets: {:?}", socket_errors),
+                error: format!("Error deregistering listen sockets: {socket_errors:?}"),
             });
         }
 
@@ -856,7 +1406,7 @@ impl HttpsProxy {
         let mut socket_errors = vec![];
         for (_, l) in listeners.drain() {
             if let Some(mut sock) = l.borrow_mut().listener.take() {
-                debug!("Deregistering socket {:?}", sock);
+                debug!("{} deregistering socket {:?}", log_module_context!(), sock);
                 if let Err(e) = self.registry.deregister(&mut sock) {
                     let error = format!("socket {sock:?}: {e:?}");
                     socket_errors.push(error);
@@ -867,7 +1417,7 @@ impl HttpsProxy {
         if !socket_errors.is_empty() {
             return Err(ProxyError::HardStop {
                 proxy_protocol: "HTTPS".to_string(),
-                error: format!("Error deregistering listen sockets: {:?}", socket_errors),
+                error: format!("Error deregistering listen sockets: {socket_errors:?}"),
             });
         }
 
@@ -899,7 +1449,8 @@ impl HttpsProxy {
             .collect();
 
         info!(
-            "got Certificates::All query, answering with {:?}",
+            "{} got Certificates::All query, answering with {:?}",
+            log_module_context!(),
             certificates
         );
 
@@ -934,8 +1485,10 @@ impl HttpsProxy {
             .collect();
 
         info!(
-            "got Certificates::Domain({}) query, answering with {:?}",
-            domain, certificates
+            "{} got Certificates::Domain({}) query, answering with {:?}",
+            log_module_context!(),
+            domain,
+            certificates
         );
 
         Ok(Some(
@@ -969,6 +1522,9 @@ impl HttpsProxy {
             .filter_map(|listener| {
                 let mut owned = listener.borrow_mut();
                 if let Some(listener) = owned.listener.take() {
+                    // Reset `active` so a subsequent `activate()` re-binds
+                    // instead of short-circuiting on the stale flag.
+                    owned.active = false;
                     return Some((owned.address, listener));
                 }
 
@@ -994,7 +1550,28 @@ impl HttpsProxy {
             .take()
             .ok_or(ProxyError::UnactivatedListener)?;
 
+        // Reset `active` so a subsequent `activate()` re-binds instead of
+        // short-circuiting on the stale flag.
+        owned.active = false;
+
         Ok((owned.token, taken_listener))
+    }
+
+    /// Apply a partial-update patch to the identified HTTPS listener.
+    pub fn update_listener(&mut self, patch: UpdateHttpsListenerConfig) -> Result<(), ProxyError> {
+        let address: std::net::SocketAddr = patch.address.into();
+        let listener = self
+            .listeners
+            .values()
+            .find(|l| l.borrow().address == address)
+            .ok_or(ProxyError::NoListenerFound(address))?;
+        listener
+            .borrow_mut()
+            .update_config(&patch)
+            .map_err(|listener_error| ProxyError::ListenerActivation {
+                address,
+                listener_error,
+            })
     }
 
     pub fn add_cluster(
@@ -1039,7 +1616,7 @@ impl HttpsProxy {
     ) -> Result<Option<ResponseContent>, ProxyError> {
         let front = front.clone().to_frontend().map_err(|request_error| {
             ProxyError::WrongInputFrontend {
-                front,
+                front: Box::new(front),
                 error: request_error.to_string(),
             }
         })?;
@@ -1064,7 +1641,7 @@ impl HttpsProxy {
     ) -> Result<Option<ResponseContent>, ProxyError> {
         let front = front.clone().to_frontend().map_err(|request_error| {
             ProxyError::WrongInputFrontend {
-                front,
+                front: Box::new(front),
                 error: request_error.to_string(),
             }
         })?;
@@ -1195,14 +1772,20 @@ impl ProxyConfiguration for HttpsProxy {
             .ok_or(AcceptError::IoError)?;
         if let Err(e) = frontend_sock.set_nodelay(true) {
             error!(
-                "error setting nodelay on front socket({:?}): {:?}",
-                frontend_sock, e
+                "{} error setting nodelay on front socket({:?}): {:?}",
+                log_module_context!(),
+                frontend_sock,
+                e
             );
         }
 
         let owned = listener.borrow();
         let rustls_details = ServerConnection::new(owned.rustls_details.clone()).map_err(|e| {
-            error!("failed to create server session: {:?}", e);
+            error!(
+                "{} failed to create server session: {:?}",
+                log_module_context!(),
+                e
+            );
             AcceptError::IoError
         })?;
 
@@ -1218,8 +1801,10 @@ impl ProxyConfiguration for HttpsProxy {
             )
             .map_err(|register_error| {
                 error!(
-                    "error registering front socket({:?}): {:?}",
-                    frontend_sock, register_error
+                    "{} error registering front socket({:?}): {:?}",
+                    log_module_context!(),
+                    frontend_sock,
+                    register_error
                 );
                 AcceptError::RegisterError
             })?;
@@ -1230,7 +1815,6 @@ impl ProxyConfiguration for HttpsProxy {
         };
 
         let session = Rc::new(RefCell::new(HttpsSession::new(
-            owned.answers.clone(),
             Duration::from_secs(owned.config.back_timeout as u64),
             Duration::from_secs(owned.config.connect_timeout as u64),
             Duration::from_secs(owned.config.front_timeout as u64),
@@ -1242,7 +1826,6 @@ impl ProxyConfiguration for HttpsProxy {
             public_address,
             rustls_details,
             frontend_sock,
-            owned.config.sticky_name.clone(),
             session_token,
             wait_time,
         )));
@@ -1261,80 +1844,140 @@ impl ProxyConfiguration for HttpsProxy {
 
         let content_result = match request_type {
             RequestType::AddCluster(cluster) => {
-                debug!("{} add cluster {:?}", request_id, cluster);
+                debug!(
+                    "{} {} add cluster {:?}",
+                    log_module_context!(),
+                    request_id,
+                    cluster
+                );
                 self.add_cluster(cluster)
             }
             RequestType::RemoveCluster(cluster_id) => {
-                debug!("{} remove cluster {:?}", request_id, cluster_id);
+                debug!(
+                    "{} {} remove cluster {:?}",
+                    log_module_context!(),
+                    request_id,
+                    cluster_id
+                );
                 self.remove_cluster(&cluster_id)
             }
             RequestType::AddHttpsFrontend(front) => {
-                debug!("{} add https front {:?}", request_id, front);
+                debug!(
+                    "{} {} add https front {:?}",
+                    log_module_context!(),
+                    request_id,
+                    front
+                );
                 self.add_https_frontend(front)
             }
             RequestType::RemoveHttpsFrontend(front) => {
-                debug!("{} remove https front {:?}", request_id, front);
+                debug!(
+                    "{} {} remove https front {:?}",
+                    log_module_context!(),
+                    request_id,
+                    front
+                );
                 self.remove_https_frontend(front)
             }
             RequestType::AddCertificate(add_certificate) => {
-                debug!("{} add certificate: {:?}", request_id, add_certificate);
+                debug!(
+                    "{} {} add certificate: {:?}",
+                    log_module_context!(),
+                    request_id,
+                    add_certificate
+                );
                 self.add_certificate(add_certificate)
             }
             RequestType::RemoveCertificate(remove_certificate) => {
                 debug!(
-                    "{} remove certificate: {:?}",
-                    request_id, remove_certificate
+                    "{} {} remove certificate: {:?}",
+                    log_module_context!(),
+                    request_id,
+                    remove_certificate
                 );
                 self.remove_certificate(remove_certificate)
             }
             RequestType::ReplaceCertificate(replace_certificate) => {
                 debug!(
-                    "{} replace certificate: {:?}",
-                    request_id, replace_certificate
+                    "{} {} replace certificate: {:?}",
+                    log_module_context!(),
+                    request_id,
+                    replace_certificate
                 );
                 self.replace_certificate(replace_certificate)
             }
             RequestType::RemoveListener(remove) => {
-                debug!("removing HTTPS listener at address {:?}", remove.address);
+                debug!(
+                    "{} removing HTTPS listener at address {:?}",
+                    log_module_context!(),
+                    remove.address
+                );
                 self.remove_listener(remove)
             }
             RequestType::SoftStop(_) => {
-                debug!("{} processing soft shutdown", request_id);
+                debug!(
+                    "{} {} processing soft shutdown",
+                    log_module_context!(),
+                    request_id
+                );
                 match self.soft_stop() {
                     Ok(_) => {
-                        info!("{} soft stop successful", request_id);
+                        info!(
+                            "{} {} soft stop successful",
+                            log_module_context!(),
+                            request_id
+                        );
                         return WorkerResponse::processing(request.id);
                     }
                     Err(e) => Err(e),
                 }
             }
             RequestType::HardStop(_) => {
-                debug!("{} processing hard shutdown", request_id);
+                debug!(
+                    "{} {} processing hard shutdown",
+                    log_module_context!(),
+                    request_id
+                );
                 match self.hard_stop() {
                     Ok(_) => {
-                        debug!("{} hard stop successful", request_id);
+                        debug!(
+                            "{} {} hard stop successful",
+                            log_module_context!(),
+                            request_id
+                        );
                         return WorkerResponse::processing(request.id);
                     }
                     Err(e) => Err(e),
                 }
             }
             RequestType::Status(_) => {
-                debug!("{} status", request_id);
+                debug!("{} {} status", log_module_context!(), request_id);
                 Ok(None)
             }
             RequestType::QueryCertificatesFromWorkers(filters) => {
                 if let Some(domain) = filters.domain {
-                    debug!("{} query certificate for domain {}", request_id, domain);
+                    debug!(
+                        "{} {} query certificate for domain {}",
+                        log_module_context!(),
+                        request_id,
+                        domain
+                    );
                     self.query_certificate_for_domain(domain)
                 } else {
-                    debug!("{} query all certificates", request_id);
+                    debug!(
+                        "{} {} query all certificates",
+                        log_module_context!(),
+                        request_id
+                    );
                     self.query_all_certificates()
                 }
             }
             other_request => {
                 debug!(
-                    "{} unsupported message for HTTPS proxy, ignoring {:?}",
-                    request.id, other_request
+                    "{} {} unsupported message for HTTPS proxy, ignoring {:?}",
+                    log_module_context!(),
+                    request.id,
+                    other_request
                 );
                 Err(ProxyError::UnsupportedMessage)
             }
@@ -1342,14 +1985,19 @@ impl ProxyConfiguration for HttpsProxy {
 
         match content_result {
             Ok(content) => {
-                debug!("{} successful", request_id);
+                debug!("{} {} successful", log_module_context!(), request_id);
                 match content {
                     Some(content) => WorkerResponse::ok_with_content(request_id, content),
                     None => WorkerResponse::ok(request_id),
                 }
             }
             Err(proxy_error) => {
-                debug!("{} unsuccessful: {}", request_id, proxy_error);
+                debug!(
+                    "{} {} unsuccessful: {}",
+                    log_module_context!(),
+                    request_id,
+                    proxy_error
+                );
                 WorkerResponse::error(request_id, proxy_error)
             }
         }
@@ -1415,6 +2063,27 @@ fn rustls_version_str(version: ProtocolVersion) -> &'static str {
     }
 }
 
+/// Short label suitable for access logs (e.g. `"TLSv1.3"`).
+///
+/// Distinct from [`rustls_version_str`] which prefixes with `tls.version.`
+/// for metric ingestion. Returns `None` for variants Sōzu does not know how
+/// to label, so the access log records `tls_version` as absent rather than
+/// emitting a misleading `"unimplemented"` literal.
+pub(crate) fn rustls_version_label(version: ProtocolVersion) -> Option<&'static str> {
+    match version {
+        ProtocolVersion::SSLv2 => Some("SSLv2"),
+        ProtocolVersion::SSLv3 => Some("SSLv3"),
+        ProtocolVersion::TLSv1_0 => Some("TLSv1.0"),
+        ProtocolVersion::TLSv1_1 => Some("TLSv1.1"),
+        ProtocolVersion::TLSv1_2 => Some("TLSv1.2"),
+        ProtocolVersion::TLSv1_3 => Some("TLSv1.3"),
+        ProtocolVersion::DTLSv1_0 => Some("DTLSv1.0"),
+        ProtocolVersion::DTLSv1_2 => Some("DTLSv1.2"),
+        ProtocolVersion::DTLSv1_3 => Some("DTLSv1.3"),
+        _ => None,
+    }
+}
+
 /// Used for metrics keeping
 fn rustls_ciphersuite_str(cipher: SupportedCipherSuite) -> &'static str {
     match cipher.suite() {
@@ -1440,6 +2109,39 @@ fn rustls_ciphersuite_str(cipher: SupportedCipherSuite) -> &'static str {
         CipherSuite::TLS13_AES_256_GCM_SHA384 => "tls.cipher.TLS13_AES_256_GCM_SHA384",
         CipherSuite::TLS13_AES_128_GCM_SHA256 => "tls.cipher.TLS13_AES_128_GCM_SHA256",
         _ => "tls.cipher.Unsupported",
+    }
+}
+
+/// Short label suitable for access logs (e.g. `"TLS_AES_128_GCM_SHA256"`).
+///
+/// Distinct from [`rustls_ciphersuite_str`] which prefixes with `tls.cipher.`
+/// for metric ingestion. Returns `None` for cipher suites Sōzu does not know
+/// how to label, so the access log records `tls_cipher` as absent rather
+/// than emitting a misleading `"Unsupported"` literal.
+pub(crate) fn rustls_ciphersuite_label(cipher: SupportedCipherSuite) -> Option<&'static str> {
+    match cipher.suite() {
+        CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256 => {
+            Some("TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256")
+        }
+        CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 => {
+            Some("TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256")
+        }
+        CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 => {
+            Some("TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256")
+        }
+        CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384 => {
+            Some("TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384")
+        }
+        CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 => {
+            Some("TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256")
+        }
+        CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 => {
+            Some("TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384")
+        }
+        CipherSuite::TLS13_CHACHA20_POLY1305_SHA256 => Some("TLS13_CHACHA20_POLY1305_SHA256"),
+        CipherSuite::TLS13_AES_256_GCM_SHA384 => Some("TLS13_AES_256_GCM_SHA384"),
+        CipherSuite::TLS13_AES_128_GCM_SHA256 => Some("TLS13_AES_128_GCM_SHA256"),
+        _ => None,
     }
 }
 
@@ -1500,9 +2202,9 @@ pub mod testing {
         )
         .with_context(|| "Failed at creating server")?;
 
-        debug!("starting event loop");
+        debug!("{} starting event loop", log_module_context!());
         server.run();
-        debug!("ending event loop");
+        debug!("{} ending event loop", log_module_context!());
         Ok(())
     }
 }
@@ -1584,7 +2286,7 @@ mod tests {
 
         let rustls_details = Arc::new(server_config);
 
-        let default_config = ListenerBuilder::new_https(address.clone())
+        let default_config = ListenerBuilder::new_https(address)
             .to_tls(None)
             .expect("Could not create default HTTPS listener config");
 
@@ -1699,6 +2401,49 @@ mod tests {
         assert_eq!(
             trie.domain_lookup(b"hello.sub.test.example.com", true),
             Some(&("hello.sub.test.example.com".as_bytes().to_vec(), 2u8))
+        );
+    }
+
+    #[test]
+    fn h2_stream_idle_timeout_inherits_back_timeout() {
+        use std::time::Duration;
+
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 1041);
+        let build = |back_timeout: u32, explicit: Option<u32>| -> HttpsListener {
+            let mut cfg = ListenerBuilder::new_https(address)
+                .to_tls(None)
+                .expect("default HTTPS listener config");
+            cfg.back_timeout = back_timeout;
+            cfg.h2_stream_idle_timeout_seconds = explicit;
+            HttpsListener::try_new(cfg, Token(0)).expect("build listener")
+        };
+
+        // Knob unset: inherit back_timeout when it exceeds the 30s floor.
+        assert_eq!(
+            build(180, None).get_h2_stream_idle_timeout(),
+            Duration::from_secs(180)
+        );
+
+        // Knob unset, back_timeout below floor: stay at 30s.
+        assert_eq!(
+            build(5, None).get_h2_stream_idle_timeout(),
+            Duration::from_secs(30)
+        );
+
+        // Explicit values win in both directions.
+        assert_eq!(
+            build(180, Some(10)).get_h2_stream_idle_timeout(),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            build(5, Some(600)).get_h2_stream_idle_timeout(),
+            Duration::from_secs(600)
+        );
+
+        // `Some(0)` is clamped to 1s.
+        assert_eq!(
+            build(180, Some(0)).get_h2_stream_idle_timeout(),
+            Duration::from_secs(1)
         );
     }
 }

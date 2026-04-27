@@ -1,3 +1,10 @@
+//! PROXY protocol v1 / v2 header model.
+//!
+//! Owns the `ProxyProtocolHeader` enum, the `into_bytes` serializers for
+//! both wire versions, and the address helpers (`ProxyAddr`,
+//! `ProtocolSupportedV1`, `Command`, `HeaderV1`, `HeaderV2`) shared by the
+//! `expect`, `relay`, and `send` roles. No I/O here; pure data shapes.
+
 use std::{
     fmt,
     net::{SocketAddr, SocketAddrV4, SocketAddrV6},

@@ -1,0 +1,26 @@
+[package]
+name = "sozu-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+loona-hpack = "0.4"
+sozu-lib = { path = "../lib" }
+
+# Prevent this from joining the workspace
+[workspace]
+
+[[bin]]
+name = "fuzz_frame_parser"
+path = "fuzz_targets/fuzz_frame_parser.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_hpack_decoder"
+path = "fuzz_targets/fuzz_hpack_decoder.rs"
+doc = false

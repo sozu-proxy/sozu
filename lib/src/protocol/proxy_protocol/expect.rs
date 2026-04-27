@@ -1,9 +1,20 @@
+//! Inbound PROXY-v2 expectation state.
+//!
+//! Reads bytes from the freshly accepted front-end socket until a complete
+//! PROXY v2 header has been parsed (`parse_v2_header`), captures the peer
+//! address pair, and transitions the session to the configured downstream
+//! protocol (typically `Pipe` for TCP listeners). Bounded by
+//! `MAX_LOOP_ITERATIONS` to defend against malformed/empty headers.
+
 use std::{cell::RefCell, rc::Rc};
 
 use mio::{net::TcpStream, *};
 use nom::{Err, HexDisplay};
 use rusty_ulid::Ulid;
-use sozu_command::{config::MAX_LOOP_ITERATIONS, logging::LogContext};
+use sozu_command::{
+    config::MAX_LOOP_ITERATIONS,
+    logging::{LogContext, ansi_palette},
+};
 
 use super::{header::ProxyAddr, parser::parse_v2_header};
 use crate::{
@@ -18,6 +29,44 @@ use crate::{
     tcp::TcpListener,
     timer::TimeoutContainer,
 };
+
+/// Module-level prefix used on every log line emitted from this module when
+/// no per-session state is in scope. Produces a bold bright-white
+/// `PROXY-EXPECT` label (uniform across every protocol) when the logger is in
+/// colored mode.
+macro_rules! log_module_context {
+    () => {{
+        let (open, reset, _, _, _) = ansi_palette();
+        format!(
+            "{open}PROXY-EXPECT{reset}\t >>>",
+            open = open,
+            reset = reset
+        )
+    }};
+}
+
+/// Per-session prefix for log lines emitted with an
+/// [`ExpectProxyProtocol`] in scope. Renders the canonical
+/// `[ulid - - -]\tPROXY-EXPECT\tSession(...)\t >>>` envelope so operators can
+/// grep these lines alongside `MUX-*`, `RUSTLS`, and `PIPE` traffic for the
+/// same session.
+macro_rules! log_context {
+    ($self:expr) => {{
+        let (open, reset, grey, gray, white) = ansi_palette();
+        format!(
+            "{gray}{ctx}{reset}\t{open}PROXY-EXPECT{reset}\t{grey}Session{reset}({gray}frontend{reset}={white}{frontend}{reset}, {gray}index{reset}={white}{index}{reset}, {gray}readiness{reset}={white}{readiness}{reset})\t >>>",
+            open = open,
+            reset = reset,
+            grey = grey,
+            gray = gray,
+            white = white,
+            ctx = $self.log_context(),
+            frontend = $self.frontend_token.0,
+            index = $self.index,
+            readiness = $self.frontend_readiness,
+        )
+    }};
+}
 
 #[derive(Clone, Copy)]
 pub enum HeaderLen {
@@ -76,8 +125,11 @@ impl<Front: SocketHandler> ExpectProxyProtocol<Front> {
             .frontend
             .socket_read(&mut self.frontend_buffer[self.index..total_len]);
         trace!(
-            "FRONT proxy protocol [{:?}]: read {} bytes and res={:?}, index = {}, total_len = {}",
-            self.frontend_token, sz, socket_result, self.index, total_len
+            "{} read {} bytes and res={:?}, total_len = {}",
+            log_context!(self),
+            sz,
+            socket_result,
+            total_len
         );
 
         if sz > 0 {
@@ -96,8 +148,10 @@ impl<Front: SocketHandler> ExpectProxyProtocol<Front> {
         match socket_result {
             SocketResult::Error => {
                 error!(
-                    "[{:?}] (expect proxy) front socket error, closing the connection(read {}, wrote {})",
-                    self.frontend_token, metrics.bin, metrics.bout
+                    "{} front socket error, closing the connection (read {}, wrote {})",
+                    log_context!(self),
+                    metrics.bin,
+                    metrics.bout
                 );
                 incr!("proxy_protocol.errors");
                 self.frontend_readiness.reset();
@@ -106,13 +160,28 @@ impl<Front: SocketHandler> ExpectProxyProtocol<Front> {
             SocketResult::WouldBlock => {
                 self.frontend_readiness.event.remove(Ready::READABLE);
             }
-            SocketResult::Closed | SocketResult::Continue => {}
+            SocketResult::Closed => {
+                // Socket closed before any proxy-protocol bytes were received.
+                // This is the typical HAProxy bare TCP healthcheck pattern
+                // (SYN/ACK/FIN without send-proxy). Close immediately instead
+                // of waiting for request_timeout (default 10s), which would
+                // create zombie sessions consuming nb_connections quota.
+                if self.index == 0 {
+                    trace!(
+                        "{} socket closed with 0 bytes, closing session",
+                        log_context!(self)
+                    );
+                    return SessionResult::Close;
+                }
+            }
+            SocketResult::Continue => {}
         }
 
         match parse_v2_header(&self.frontend_buffer[..self.index]) {
             Ok((rest, header)) => {
                 trace!(
-                    "got expect header: {:?}, rest.len() = {}",
+                    "{} got expect header: {:?}, rest.len() = {}",
+                    log_context!(self),
                     header,
                     rest.len()
                 );
@@ -134,12 +203,12 @@ impl<Front: SocketHandler> ExpectProxyProtocol<Front> {
                     HeaderLen::Unix => {
                         if self.index == 232 {
                             error!(
-                                "[{:?}] front socket parse error, closing the connection",
-                                self.frontend_token
+                                "{} proxy protocol header exceeds maximum size (232 bytes), closing",
+                                log_context!(self)
                             );
                             incr!("proxy_protocol.errors");
                             self.frontend_readiness.reset();
-                            return SessionResult::Continue;
+                            return SessionResult::Close;
                         }
                     }
                 };
@@ -147,8 +216,8 @@ impl<Front: SocketHandler> ExpectProxyProtocol<Front> {
             }
             Err(Err::Error(e)) | Err(Err::Failure(e)) => {
                 error!(
-                    "[{:?}] expect proxy protocol front socket parse error, closing the connection:\n{}",
-                    self.frontend_token,
+                    "{} parse error, closing the connection:\n{}",
+                    log_context!(self),
                     e.input.to_hex(16)
                 );
                 incr!("proxy_protocol.errors");
@@ -186,6 +255,7 @@ impl<Front: SocketHandler> ExpectProxyProtocol<Front> {
             listener,
             Protocol::TCP,
             self.request_id,
+            self.request_id,
             addr,
             WebSocketContext::Tcp,
         );
@@ -201,7 +271,8 @@ impl<Front: SocketHandler> ExpectProxyProtocol<Front> {
 
     pub fn log_context(&self) -> LogContext<'_> {
         LogContext {
-            request_id: self.request_id,
+            session_id: self.request_id,
+            request_id: None,
             cluster_id: None,
             backend_id: None,
         }
@@ -225,9 +296,8 @@ impl<Front: SocketHandler> SessionState for ExpectProxyProtocol<Front> {
             let frontend_interest = self.frontend_readiness.filter_interest();
 
             trace!(
-                "PROXY\t{} {:?} {:?} -> None",
-                self.log_context(),
-                self.frontend_token,
+                "{} {:?} -> None",
+                log_context!(self),
                 self.frontend_readiness
             );
 
@@ -243,10 +313,7 @@ impl<Front: SocketHandler> SessionState for ExpectProxyProtocol<Front> {
             }
 
             if frontend_interest.is_error() {
-                error!(
-                    "PROXY session {:?} front error, disconnecting",
-                    self.frontend_token
-                );
+                error!("{} front error, disconnecting", log_context!(self));
                 self.frontend_readiness.interest = Ready::EMPTY;
 
                 return SessionResult::Close;
@@ -257,8 +324,9 @@ impl<Front: SocketHandler> SessionState for ExpectProxyProtocol<Front> {
 
         if counter >= MAX_LOOP_ITERATIONS {
             error!(
-                "PROXY\thandling session {:?} went through {} iterations, there's a probable infinite loop bug, closing the connection",
-                self.frontend_token, MAX_LOOP_ITERATIONS
+                "{} handling session went through {} iterations, there's a probable infinite loop bug, closing the connection",
+                log_context!(self),
+                MAX_LOOP_ITERATIONS
             );
             incr!("http.infinite_loop.error");
 
@@ -283,7 +351,8 @@ impl<Front: SocketHandler> SessionState for ExpectProxyProtocol<Front> {
         }
 
         error!(
-            "Expect state: got timeout for an invalid token: {:?}",
+            "{} got timeout for an invalid token: {:?}",
+            log_module_context!(),
             token
         );
         StateResult::CloseSession
@@ -295,8 +364,11 @@ impl<Front: SocketHandler> SessionState for ExpectProxyProtocol<Front> {
 
     fn print_state(&self, context: &str) {
         error!(
-            "{} Session(Expect)\n\tFrontend:\n\t\ttoken: {:?}\treadiness: {:?}",
-            context, self.frontend_token, self.frontend_readiness
+            "{} {} Session(Expect)\n\tFrontend:\n\t\ttoken: {:?}\treadiness: {:?}",
+            log_context!(self),
+            context,
+            self.frontend_token,
+            self.frontend_readiness
         );
     }
 }
@@ -381,7 +453,7 @@ mod expect_test {
             barrier.wait();
             match StdTcpStream::connect(next_middleware_addr) {
                 Ok(mut stream) => {
-                    stream.write(&proxy_protocol).unwrap();
+                    stream.write_all(&proxy_protocol).unwrap();
                 }
                 Err(e) => panic!("could not connect to the next middleware: {e}"),
             };

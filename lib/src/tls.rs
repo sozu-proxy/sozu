@@ -24,10 +24,30 @@ use sozu_command::{
     certificate::{
         CertificateError, Fingerprint, get_cn_and_san_attributes, parse_pem, parse_x509,
     },
+    logging::ansi_palette,
     proto::command::{AddCertificate, CertificateAndKey, ReplaceCertificate, SocketAddress},
 };
 
 use crate::router::pattern_trie::{Key, KeyValue, TrieNode};
+
+/// Module-level prefix used on every log line emitted from this module.
+/// Produces a bold bright-white `TLS-RESOLVER` label (uniform across every
+/// protocol) when the logger is in colored mode. The certificate resolver
+/// runs at listener scope -- it has no per-session state -- so this is the
+/// only macro the module needs. `RUSTLS` covers the protocol-side logs in
+/// `lib/src/protocol/rustls.rs`; `TLS-RESOLVER` is intentionally distinct so
+/// operators can tell handshake failures (RUSTLS) apart from cert-store
+/// management noise (TLS-RESOLVER).
+macro_rules! log_module_context {
+    () => {{
+        let (open, reset, _, _, _) = ansi_palette();
+        format!(
+            "{open}TLS-RESOLVER{reset}\t >>>",
+            open = open,
+            reset = reset
+        )
+    }};
+}
 
 // -----------------------------------------------------------------------------
 // Default ParsedCertificateAndKey
@@ -166,6 +186,34 @@ impl CertificateResolver {
         self.certificates.get(fingerprint).map(ToOwned::to_owned)
     }
 
+    /// Recompute the aggregate `tls.cert.min_expires_at_seconds` gauge across
+    /// every certificate currently loaded. Per-SNI granularity would explode
+    /// statsd key cardinality (the resolver can easily hold tens of thousands
+    /// of names on a public endpoint) and the existing `gauge!` macro has no
+    /// label support, so we expose a single absolute unix-seconds reading of
+    /// the soonest-expiring cert. Dashboards alert on this as the "next cert
+    /// to rotate" deadline; operators query per-cert detail through the
+    /// command API. `x509` timestamps are signed but `set_gauge` takes a
+    /// `usize`, so we clamp already-expired certs to 0 (which is still a
+    /// monotonic "panic now" signal to any alerting rule).
+    ///
+    /// Called from `add_certificate` / `remove_certificate` — i.e. only when
+    /// the cert set actually changes, never on the hot TLS handshake path.
+    fn publish_min_expiration_gauge(&self) {
+        let Some(min_expiration) = self.certificates.values().map(|c| c.expiration).min() else {
+            // SECURITY: an empty resolver is not "every cert just
+            // expired"; it is "no cert
+            // has been loaded yet" — typical at process boot before the
+            // first AddCertificate request lands. Writing 0 here pages
+            // SOC tooling on every restart with the same alert as a real
+            // expired-cert event. Skip the emit so the gauge reflects the
+            // last known good state instead of being clobbered to 0.
+            return;
+        };
+        let clamped = min_expiration.max(0) as usize;
+        gauge!("tls.cert.min_expires_at_seconds", clamped);
+    }
+
     /// persist a certificate, after ensuring validity, and checking if it can replace another certificate.
     /// return the certificate fingerprint regardless of having inserted it or not
     pub fn add_certificate(
@@ -174,7 +222,11 @@ impl CertificateResolver {
     ) -> Result<Fingerprint, CertificateResolverError> {
         let cert_to_add = CertifiedKeyWrapper::try_from(add)?;
 
-        trace!("Certificate Resolver: adding certificate {:?}", cert_to_add);
+        trace!(
+            "{} adding certificate {:?}",
+            log_module_context!(),
+            cert_to_add
+        );
 
         if self.certificates.contains_key(&cert_to_add.fingerprint) {
             return Ok(cert_to_add.fingerprint);
@@ -195,7 +247,10 @@ impl CertificateResolver {
             let longest_lived_cert = match fingerprints_for_this_name.last() {
                 Some(cert) => cert,
                 None => {
-                    error!("no fingerprint for this name, this should not happen");
+                    error!(
+                        "{} no fingerprint for this name, this should not happen",
+                        log_module_context!()
+                    );
                     continue;
                 }
             };
@@ -210,8 +265,9 @@ impl CertificateResolver {
 
         self.certificates
             .insert(cert_to_add.fingerprint.to_owned(), cert_to_add.clone());
+        self.publish_min_expiration_gauge();
 
-        trace!("{:#?}", self);
+        trace!("{} {:#?}", log_module_context!(), self);
 
         Ok(cert_to_add.fingerprint)
     }
@@ -242,8 +298,9 @@ impl CertificateResolver {
             }
 
             self.certificates.remove(fingerprint);
+            self.publish_min_expiration_gauge();
         }
-        trace!("{:#?}", self);
+        trace!("{} {:#?}", log_module_context!(), self);
 
         Ok(())
     }
@@ -258,7 +315,11 @@ impl CertificateResolver {
         match Fingerprint::from_str(&replace.old_fingerprint) {
             Ok(old_fingerprint) => self.remove_certificate(&old_fingerprint)?,
             Err(err) => {
-                error!("failed to parse fingerprint, {}", err);
+                error!(
+                    "{} failed to parse fingerprint, {}",
+                    log_module_context!(),
+                    err
+                );
             }
         }
 
@@ -321,38 +382,70 @@ impl ResolvesServerCert for MutexCertificateResolver {
         let server_name = client_hello.server_name();
         let sigschemes = client_hello.signature_schemes();
 
-        if server_name.is_none() {
-            error!("cannot look up certificate: no SNI from session");
+        let Some(name) = server_name else {
+            error!(
+                "{} cannot look up certificate: no SNI from session",
+                log_module_context!()
+            );
             return None;
-        }
-
-        let name: &str = server_name.unwrap();
+        };
         trace!(
-            "trying to resolve name: {:?} for signature scheme: {:?}",
-            name, sigschemes
+            "{} trying to resolve name: {:?} for signature scheme: {:?}",
+            log_module_context!(),
+            name,
+            sigschemes
         );
-        if let Ok(ref mut resolver) = self.0.try_lock() {
-            //resolver.domains.print();
-            if let Some((_, fingerprint)) = resolver.domains.domain_lookup(name.as_bytes(), true) {
-                trace!(
-                    "looking for certificate for {:?} with fingerprint {:?}",
-                    name, fingerprint
+        // Every other site uses blocking `lock()`, and silently falling
+        // back to `DEFAULT_CERTIFICATE` on lock
+        // contention is an attacker-detectable mismatch (different
+        // chain → different fingerprint) and a footgun the moment
+        // multi-threading enters the worker. Block here. Lock-poisoning
+        // (panic-while-holding) is mapped to the same default-cert
+        // fallback the previous `try_lock` Err arm produced — preserves
+        // the existing observable behaviour for that one corner case
+        // without inventing a new failure mode.
+        let resolver = match self.0.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                error!(
+                    "{} cert resolver mutex poisoned, returning default cert: {:?}",
+                    log_module_context!(),
+                    poisoned
                 );
-
-                let cert = resolver
-                    .certificates
-                    .get(fingerprint)
-                    .map(|cert| cert.inner.clone());
-
-                trace!("Found for fingerprint {}: {}", fingerprint, cert.is_some());
-                return cert;
+                return DEFAULT_CERTIFICATE.clone();
             }
+        };
+        if let Some((_, fingerprint)) = resolver.domains.domain_lookup(name.as_bytes(), true) {
+            trace!(
+                "{} looking for certificate for {:?} with fingerprint {:?}",
+                log_module_context!(),
+                name,
+                fingerprint
+            );
+
+            let cert = resolver
+                .certificates
+                .get(fingerprint)
+                .map(|cert| cert.inner.clone());
+
+            trace!(
+                "{} found for fingerprint {}: {}",
+                log_module_context!(),
+                fingerprint,
+                cert.is_some()
+            );
+            return cert;
         }
+        drop(resolver);
 
         // error!("could not look up a certificate for server name '{}'", name);
         // This certificate is used for TLS tunneling with another TLS termination endpoint
         // Note that this is unsafe and you should provide a valid certificate
-        debug!("Default certificate is used for {}", name);
+        debug!(
+            "{} default certificate is used for {}",
+            log_module_context!(),
+            name
+        );
         incr!("tls.default_cert_used");
         DEFAULT_CERTIFICATE.clone()
     }
@@ -479,11 +572,11 @@ mod tests {
         };
 
         let wildcard_example_org_fingerprint = resolver.add_certificate(&AddCertificate {
-            address: address.clone(),
+            address,
             certificate: wildcard_example_org,
             expired_at: Some(
                 (SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?
-                    + Duration::from_secs(1 * 365 * 24 * 3600))
+                    + Duration::from_secs(365 * 24 * 3600))
                 .as_secs() as i64,
             ),
         })?;
@@ -512,7 +605,6 @@ mod tests {
                     + Duration::from_secs(2 * 365 * 24 * 3600))
                 .as_secs() as i64,
             ),
-            ..Default::default()
         })?;
 
         let www_example_org = resolver
@@ -567,7 +659,7 @@ mod tests {
         };
 
         let fingerprint_2y = resolver.add_certificate(&AddCertificate {
-            address: address.clone(),
+            address,
             certificate: certificate_and_key_2y,
             expired_at: None,
         })?;
@@ -626,7 +718,7 @@ mod tests {
         };
 
         let fingerprint_1y_overriden = resolver.add_certificate(&AddCertificate {
-            address: address.clone(),
+            address,
             certificate: certificate_and_key_1y,
             expired_at: Some(
                 (SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?

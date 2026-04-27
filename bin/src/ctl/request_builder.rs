@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, fs::File, io::Read as IoRead, path::PathBuf};
 
 use sozu_command_lib::{
     certificate::{
@@ -6,20 +6,22 @@ use sozu_command_lib::{
     },
     config::ListenerBuilder,
     proto::command::{
-        ActivateListener, AddBackend, AddCertificate, Cluster, CountRequests, DeactivateListener,
-        FrontendFilters, HardStop, ListListeners, ListenerType, LoadBalancingParams,
-        MetricsConfiguration, PathRule, ProxyProtocolConfig, QueryCertificatesFilters,
-        QueryClusterByDomain, QueryClustersHashes, RemoveBackend, RemoveCertificate,
-        RemoveListener, ReplaceCertificate, RequestHttpFrontend, RequestTcpFrontend, RulePosition,
-        SocketAddress, SoftStop, Status, SubscribeEvents, TlsVersion, request::RequestType,
+        ActivateListener, AddBackend, AddCertificate, AlpnProtocols, Cluster, CountRequests,
+        CustomHttpAnswers, DeactivateListener, FrontendFilters, HardStop, ListListeners,
+        ListenerType, LoadBalancingParams, MetricsConfiguration, PathRule, ProxyProtocolConfig,
+        QueryCertificatesFilters, QueryClusterByDomain, QueryClustersHashes, RemoveBackend,
+        RemoveCertificate, RemoveListener, ReplaceCertificate, RequestHttpFrontend,
+        RequestTcpFrontend, RulePosition, SocketAddress, SoftStop, Status, SubscribeEvents,
+        TlsVersion, UpdateHttpListenerConfig, UpdateHttpsListenerConfig, UpdateTcpListenerConfig,
+        request::RequestType, response_content,
     },
 };
 
 use super::CtlError;
 use crate::{
     cli::{
-        BackendCmd, ClusterCmd, HttpFrontendCmd, HttpListenerCmd, HttpsListenerCmd, MetricsCmd,
-        TcpFrontendCmd, TcpListenerCmd,
+        BackendCmd, ClusterCmd, ClusterH2Cmd, HttpFrontendCmd, HttpListenerCmd, HttpsListenerCmd,
+        MetricsCmd, TcpFrontendCmd, TcpListenerCmd,
     },
     ctl::CommandManager,
 };
@@ -150,6 +152,7 @@ impl CommandManager {
                 send_proxy,
                 expect_proxy,
                 load_balancing_policy,
+                http2,
             } => {
                 let proxy_protocol = match (send_proxy, expect_proxy) {
                     (true, true) => Some(ProxyProtocolConfig::RelayHeader),
@@ -164,12 +167,14 @@ impl CommandManager {
                         https_redirect,
                         proxy_protocol: proxy_protocol.map(|pp| pp as i32),
                         load_balancing: load_balancing_policy as i32,
+                        http2: if http2 { Some(true) } else { None },
                         ..Default::default()
                     })
                     .into(),
                 )
             }
             ClusterCmd::Remove { id } => self.send_request(RequestType::RemoveCluster(id).into()),
+            ClusterCmd::H2 { cmd } => self.cluster_h2_command(cmd),
             ClusterCmd::List {
                 id: cluster_id,
                 domain,
@@ -204,6 +209,42 @@ impl CommandManager {
                 self.send_request(request)
             }
         }
+    }
+
+    pub fn cluster_h2_command(&mut self, cmd: ClusterH2Cmd) -> Result<(), CtlError> {
+        let (cluster_id, enable) = match cmd {
+            ClusterH2Cmd::Enable { id } => (id, true),
+            ClusterH2Cmd::Disable { id } => (id, false),
+        };
+
+        let request = RequestType::QueryClusterById(cluster_id.clone()).into();
+        let response = self.send_request_get_response(request, true)?;
+
+        let cluster = response
+            .content
+            .and_then(|c| c.content_type)
+            .and_then(|ct| match ct {
+                response_content::ContentType::Clusters(infos) => infos
+                    .vec
+                    .into_iter()
+                    .find(|info| {
+                        info.configuration
+                            .as_ref()
+                            .is_some_and(|c| c.cluster_id == cluster_id)
+                    })
+                    .and_then(|info| info.configuration),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                CtlError::ArgsNeeded("cluster not found".to_owned(), cluster_id.clone())
+            })?;
+
+        let updated = Cluster {
+            http2: Some(enable),
+            ..cluster
+        };
+
+        self.send_request(RequestType::AddCluster(updated).into())
     }
 
     pub fn tcp_frontend_command(&mut self, cmd: TcpFrontendCmd) -> Result<(), CtlError> {
@@ -359,6 +400,95 @@ impl CommandManager {
             HttpsListenerCmd::Deactivate { address } => {
                 self.deactivate_listener(address.into(), ListenerType::Https)
             }
+            HttpsListenerCmd::Update {
+                address,
+                public_address,
+                sticky_name,
+                front_timeout,
+                back_timeout,
+                connect_timeout,
+                request_timeout,
+                expect_proxy,
+                no_expect_proxy,
+                strict_sni_binding,
+                no_strict_sni_binding,
+                disable_http11,
+                enable_http11,
+                alpn_protocols,
+                reset_alpn,
+                h2_max_rst_stream_per_window,
+                h2_max_ping_per_window,
+                h2_max_settings_per_window,
+                h2_max_empty_data_per_window,
+                h2_max_continuation_frames,
+                h2_max_glitch_count,
+                h2_initial_connection_window,
+                h2_max_concurrent_streams,
+                h2_stream_shrink_ratio,
+                h2_max_rst_stream_lifetime,
+                h2_max_rst_stream_abusive_lifetime,
+                h2_max_rst_stream_emitted_lifetime,
+                h2_max_header_list_size,
+                h2_max_header_table_size,
+                h2_stream_idle_timeout_seconds,
+                h2_graceful_shutdown_deadline_seconds,
+                h2_max_window_update_stream0_per_window,
+                sozu_id_header,
+                answer_301,
+                answer_401,
+                answer_404,
+                answer_408,
+                answer_413,
+                answer_421,
+                answer_502,
+                answer_503,
+                answer_504,
+                answer_507,
+            } => self.update_https_listener_command(
+                address,
+                public_address,
+                sticky_name,
+                front_timeout,
+                back_timeout,
+                connect_timeout,
+                request_timeout,
+                expect_proxy,
+                no_expect_proxy,
+                strict_sni_binding,
+                no_strict_sni_binding,
+                disable_http11,
+                enable_http11,
+                alpn_protocols,
+                reset_alpn,
+                h2_max_rst_stream_per_window,
+                h2_max_ping_per_window,
+                h2_max_settings_per_window,
+                h2_max_empty_data_per_window,
+                h2_max_continuation_frames,
+                h2_max_glitch_count,
+                h2_initial_connection_window,
+                h2_max_concurrent_streams,
+                h2_stream_shrink_ratio,
+                h2_max_rst_stream_lifetime,
+                h2_max_rst_stream_abusive_lifetime,
+                h2_max_rst_stream_emitted_lifetime,
+                h2_max_header_list_size,
+                h2_max_header_table_size,
+                h2_stream_idle_timeout_seconds,
+                h2_graceful_shutdown_deadline_seconds,
+                h2_max_window_update_stream0_per_window,
+                sozu_id_header,
+                answer_301,
+                answer_401,
+                answer_404,
+                answer_408,
+                answer_413,
+                answer_421,
+                answer_502,
+                answer_503,
+                answer_504,
+                answer_507,
+            ),
         }
     }
 
@@ -400,6 +530,83 @@ impl CommandManager {
             HttpListenerCmd::Deactivate { address } => {
                 self.deactivate_listener(address.into(), ListenerType::Http)
             }
+            HttpListenerCmd::Update {
+                address,
+                public_address,
+                sticky_name,
+                front_timeout,
+                back_timeout,
+                connect_timeout,
+                request_timeout,
+                expect_proxy,
+                no_expect_proxy,
+                h2_max_rst_stream_per_window,
+                h2_max_ping_per_window,
+                h2_max_settings_per_window,
+                h2_max_empty_data_per_window,
+                h2_max_continuation_frames,
+                h2_max_glitch_count,
+                h2_initial_connection_window,
+                h2_max_concurrent_streams,
+                h2_stream_shrink_ratio,
+                h2_max_rst_stream_lifetime,
+                h2_max_rst_stream_abusive_lifetime,
+                h2_max_rst_stream_emitted_lifetime,
+                h2_max_header_list_size,
+                h2_max_header_table_size,
+                h2_stream_idle_timeout_seconds,
+                h2_graceful_shutdown_deadline_seconds,
+                h2_max_window_update_stream0_per_window,
+                sozu_id_header,
+                answer_301,
+                answer_401,
+                answer_404,
+                answer_408,
+                answer_413,
+                answer_421,
+                answer_502,
+                answer_503,
+                answer_504,
+                answer_507,
+            } => self.update_http_listener_command(
+                address,
+                public_address,
+                sticky_name,
+                front_timeout,
+                back_timeout,
+                connect_timeout,
+                request_timeout,
+                expect_proxy,
+                no_expect_proxy,
+                h2_max_rst_stream_per_window,
+                h2_max_ping_per_window,
+                h2_max_settings_per_window,
+                h2_max_empty_data_per_window,
+                h2_max_continuation_frames,
+                h2_max_glitch_count,
+                h2_initial_connection_window,
+                h2_max_concurrent_streams,
+                h2_stream_shrink_ratio,
+                h2_max_rst_stream_lifetime,
+                h2_max_rst_stream_abusive_lifetime,
+                h2_max_rst_stream_emitted_lifetime,
+                h2_max_header_list_size,
+                h2_max_header_table_size,
+                h2_stream_idle_timeout_seconds,
+                h2_graceful_shutdown_deadline_seconds,
+                h2_max_window_update_stream0_per_window,
+                sozu_id_header,
+                answer_301,
+                answer_401,
+                answer_404,
+                answer_408,
+                answer_413,
+                answer_421,
+                answer_502,
+                answer_503,
+                answer_504,
+                answer_507,
+            ),
         }
     }
 
@@ -427,11 +634,269 @@ impl CommandManager {
             TcpListenerCmd::Deactivate { address } => {
                 self.deactivate_listener(address.into(), ListenerType::Tcp)
             }
+            TcpListenerCmd::Update {
+                address,
+                public_address,
+                front_timeout,
+                back_timeout,
+                connect_timeout,
+                expect_proxy,
+                no_expect_proxy,
+            } => self.update_tcp_listener_command(
+                address,
+                public_address,
+                front_timeout,
+                back_timeout,
+                connect_timeout,
+                expect_proxy,
+                no_expect_proxy,
+            ),
         }
     }
 
     pub fn list_listeners(&mut self) -> Result<(), CtlError> {
         self.send_request(RequestType::ListListeners(ListListeners {}).into())
+    }
+
+    /// Patch a running HTTP listener in place. Only `Some` fields in the patch
+    /// are applied; `None` fields preserve the listener's current value.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_http_listener_command(
+        &mut self,
+        address: std::net::SocketAddr,
+        public_address: Option<std::net::SocketAddr>,
+        sticky_name: Option<String>,
+        front_timeout: Option<u32>,
+        back_timeout: Option<u32>,
+        connect_timeout: Option<u32>,
+        request_timeout: Option<u32>,
+        expect_proxy_flag: bool,
+        no_expect_proxy_flag: bool,
+        h2_max_rst_stream_per_window: Option<u32>,
+        h2_max_ping_per_window: Option<u32>,
+        h2_max_settings_per_window: Option<u32>,
+        h2_max_empty_data_per_window: Option<u32>,
+        h2_max_continuation_frames: Option<u32>,
+        h2_max_glitch_count: Option<u32>,
+        h2_initial_connection_window: Option<u32>,
+        h2_max_concurrent_streams: Option<u32>,
+        h2_stream_shrink_ratio: Option<u32>,
+        h2_max_rst_stream_lifetime: Option<u64>,
+        h2_max_rst_stream_abusive_lifetime: Option<u64>,
+        h2_max_rst_stream_emitted_lifetime: Option<u64>,
+        h2_max_header_list_size: Option<u32>,
+        h2_max_header_table_size: Option<u32>,
+        h2_stream_idle_timeout_seconds: Option<u32>,
+        h2_graceful_shutdown_deadline_seconds: Option<u32>,
+        h2_max_window_update_stream0_per_window: Option<u32>,
+        sozu_id_header: Option<String>,
+        answer_301: Option<PathBuf>,
+        answer_401: Option<PathBuf>,
+        answer_404: Option<PathBuf>,
+        answer_408: Option<PathBuf>,
+        answer_413: Option<PathBuf>,
+        answer_421: Option<PathBuf>,
+        answer_502: Option<PathBuf>,
+        answer_503: Option<PathBuf>,
+        answer_504: Option<PathBuf>,
+        answer_507: Option<PathBuf>,
+    ) -> Result<(), CtlError> {
+        let expect_proxy = if expect_proxy_flag {
+            Some(true)
+        } else if no_expect_proxy_flag {
+            Some(false)
+        } else {
+            None
+        };
+
+        let http_answers = build_http_answers(
+            answer_301, answer_401, answer_404, answer_408, answer_413, answer_421, answer_502,
+            answer_503, answer_504, answer_507,
+        )?;
+
+        let patch = UpdateHttpListenerConfig {
+            address: address.into(),
+            public_address: public_address.map(|a| a.into()),
+            expect_proxy,
+            sticky_name,
+            front_timeout,
+            back_timeout,
+            connect_timeout,
+            request_timeout,
+            http_answers,
+            h2_max_rst_stream_per_window,
+            h2_max_ping_per_window,
+            h2_max_settings_per_window,
+            h2_max_empty_data_per_window,
+            h2_max_continuation_frames,
+            h2_max_glitch_count,
+            h2_initial_connection_window,
+            h2_max_concurrent_streams,
+            h2_stream_shrink_ratio,
+            h2_max_rst_stream_lifetime,
+            h2_max_rst_stream_abusive_lifetime,
+            h2_max_rst_stream_emitted_lifetime,
+            h2_max_header_list_size,
+            h2_max_header_table_size,
+            h2_stream_idle_timeout_seconds,
+            h2_graceful_shutdown_deadline_seconds,
+            h2_max_window_update_stream0_per_window,
+            sozu_id_header,
+        };
+        self.send_request(RequestType::UpdateHttpListener(patch).into())
+    }
+
+    /// Patch a running HTTPS listener in place. Only `Some` fields in the patch
+    /// are applied; `None` fields preserve the listener's current value.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_https_listener_command(
+        &mut self,
+        address: std::net::SocketAddr,
+        public_address: Option<std::net::SocketAddr>,
+        sticky_name: Option<String>,
+        front_timeout: Option<u32>,
+        back_timeout: Option<u32>,
+        connect_timeout: Option<u32>,
+        request_timeout: Option<u32>,
+        expect_proxy_flag: bool,
+        no_expect_proxy_flag: bool,
+        strict_sni_binding_flag: bool,
+        no_strict_sni_binding_flag: bool,
+        disable_http11_flag: bool,
+        enable_http11_flag: bool,
+        alpn_protocols: Option<Vec<String>>,
+        reset_alpn: bool,
+        h2_max_rst_stream_per_window: Option<u32>,
+        h2_max_ping_per_window: Option<u32>,
+        h2_max_settings_per_window: Option<u32>,
+        h2_max_empty_data_per_window: Option<u32>,
+        h2_max_continuation_frames: Option<u32>,
+        h2_max_glitch_count: Option<u32>,
+        h2_initial_connection_window: Option<u32>,
+        h2_max_concurrent_streams: Option<u32>,
+        h2_stream_shrink_ratio: Option<u32>,
+        h2_max_rst_stream_lifetime: Option<u64>,
+        h2_max_rst_stream_abusive_lifetime: Option<u64>,
+        h2_max_rst_stream_emitted_lifetime: Option<u64>,
+        h2_max_header_list_size: Option<u32>,
+        h2_max_header_table_size: Option<u32>,
+        h2_stream_idle_timeout_seconds: Option<u32>,
+        h2_graceful_shutdown_deadline_seconds: Option<u32>,
+        h2_max_window_update_stream0_per_window: Option<u32>,
+        sozu_id_header: Option<String>,
+        answer_301: Option<PathBuf>,
+        answer_401: Option<PathBuf>,
+        answer_404: Option<PathBuf>,
+        answer_408: Option<PathBuf>,
+        answer_413: Option<PathBuf>,
+        answer_421: Option<PathBuf>,
+        answer_502: Option<PathBuf>,
+        answer_503: Option<PathBuf>,
+        answer_504: Option<PathBuf>,
+        answer_507: Option<PathBuf>,
+    ) -> Result<(), CtlError> {
+        let expect_proxy = if expect_proxy_flag {
+            Some(true)
+        } else if no_expect_proxy_flag {
+            Some(false)
+        } else {
+            None
+        };
+
+        let strict_sni_binding = if strict_sni_binding_flag {
+            Some(true)
+        } else if no_strict_sni_binding_flag {
+            Some(false)
+        } else {
+            None
+        };
+
+        let disable_http11 = if disable_http11_flag {
+            Some(true)
+        } else if enable_http11_flag {
+            Some(false)
+        } else {
+            None
+        };
+
+        // `--reset-alpn` ⇒ Some(AlpnProtocols { values: [] }) = "reset to default"
+        // `--alpn-protocols h2,http/1.1` ⇒ Some(AlpnProtocols { values: [...] })
+        // neither ⇒ None = "preserve current value"
+        let alpn_protocols_patch = if reset_alpn {
+            Some(AlpnProtocols { values: vec![] })
+        } else {
+            alpn_protocols.map(|values| AlpnProtocols { values })
+        };
+
+        let http_answers = build_http_answers(
+            answer_301, answer_401, answer_404, answer_408, answer_413, answer_421, answer_502,
+            answer_503, answer_504, answer_507,
+        )?;
+
+        let patch = UpdateHttpsListenerConfig {
+            address: address.into(),
+            public_address: public_address.map(|a| a.into()),
+            expect_proxy,
+            sticky_name,
+            front_timeout,
+            back_timeout,
+            connect_timeout,
+            request_timeout,
+            http_answers,
+            alpn_protocols: alpn_protocols_patch,
+            strict_sni_binding,
+            disable_http11,
+            h2_max_rst_stream_per_window,
+            h2_max_ping_per_window,
+            h2_max_settings_per_window,
+            h2_max_empty_data_per_window,
+            h2_max_continuation_frames,
+            h2_max_glitch_count,
+            h2_initial_connection_window,
+            h2_max_concurrent_streams,
+            h2_stream_shrink_ratio,
+            h2_max_rst_stream_lifetime,
+            h2_max_rst_stream_abusive_lifetime,
+            h2_max_rst_stream_emitted_lifetime,
+            h2_max_header_list_size,
+            h2_max_header_table_size,
+            h2_stream_idle_timeout_seconds,
+            h2_graceful_shutdown_deadline_seconds,
+            h2_max_window_update_stream0_per_window,
+            sozu_id_header,
+        };
+        self.send_request(RequestType::UpdateHttpsListener(patch).into())
+    }
+
+    /// Patch a running TCP listener in place. Only `Some` fields in the patch
+    /// are applied; `None` fields preserve the listener's current value.
+    pub fn update_tcp_listener_command(
+        &mut self,
+        address: std::net::SocketAddr,
+        public_address: Option<std::net::SocketAddr>,
+        front_timeout: Option<u32>,
+        back_timeout: Option<u32>,
+        connect_timeout: Option<u32>,
+        expect_proxy_flag: bool,
+        no_expect_proxy_flag: bool,
+    ) -> Result<(), CtlError> {
+        let expect_proxy = if expect_proxy_flag {
+            Some(true)
+        } else if no_expect_proxy_flag {
+            Some(false)
+        } else {
+            None
+        };
+
+        let patch = UpdateTcpListenerConfig {
+            address: address.into(),
+            public_address: public_address.map(|a| a.into()),
+            expect_proxy,
+            front_timeout,
+            back_timeout,
+            connect_timeout,
+        };
+        self.send_request(RequestType::UpdateTcpListener(patch).into())
     }
 
     pub fn remove_listener(
@@ -611,4 +1076,59 @@ impl CommandManager {
         debug!("upgrading worker {}", worker_id);
         self.send_request(RequestType::UpgradeWorker(worker_id).into())
     }
+}
+
+/// Load the content of an HTTP-answer file path. Returns `None` if the path is
+/// `None`. Mirrors the logic in `command/src/config.rs::read_http_answer_file`.
+fn read_answer_path(path: &Option<PathBuf>) -> Result<Option<String>, CtlError> {
+    let Some(path) = path else { return Ok(None) };
+    let mut content = String::new();
+    File::open(path)
+        .and_then(|mut f| f.read_to_string(&mut content))
+        .map_err(|io_error| CtlError::ResolvePath(path.display().to_string(), io_error))?;
+    Ok(Some(content))
+}
+
+/// Build a [`CustomHttpAnswers`] proto from optional file-path arguments.
+/// Returns `None` when every path argument is `None` (no-op on the listener).
+#[allow(clippy::too_many_arguments)]
+fn build_http_answers(
+    answer_301: Option<PathBuf>,
+    answer_401: Option<PathBuf>,
+    answer_404: Option<PathBuf>,
+    answer_408: Option<PathBuf>,
+    answer_413: Option<PathBuf>,
+    answer_421: Option<PathBuf>,
+    answer_502: Option<PathBuf>,
+    answer_503: Option<PathBuf>,
+    answer_504: Option<PathBuf>,
+    answer_507: Option<PathBuf>,
+) -> Result<Option<CustomHttpAnswers>, CtlError> {
+    // Only produce the sub-message when at least one path was given.
+    if answer_301.is_none()
+        && answer_401.is_none()
+        && answer_404.is_none()
+        && answer_408.is_none()
+        && answer_413.is_none()
+        && answer_421.is_none()
+        && answer_502.is_none()
+        && answer_503.is_none()
+        && answer_504.is_none()
+        && answer_507.is_none()
+    {
+        return Ok(None);
+    }
+    Ok(Some(CustomHttpAnswers {
+        answer_301: read_answer_path(&answer_301)?,
+        answer_400: None, // not exposed via the CLI update verb
+        answer_401: read_answer_path(&answer_401)?,
+        answer_404: read_answer_path(&answer_404)?,
+        answer_408: read_answer_path(&answer_408)?,
+        answer_413: read_answer_path(&answer_413)?,
+        answer_421: read_answer_path(&answer_421)?,
+        answer_502: read_answer_path(&answer_502)?,
+        answer_503: read_answer_path(&answer_503)?,
+        answer_504: read_answer_path(&answer_504)?,
+        answer_507: read_answer_path(&answer_507)?,
+    }))
 }

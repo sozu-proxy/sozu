@@ -1,3 +1,11 @@
+//! Metrics façade.
+//!
+//! Defines the per-thread `Aggregator`, the `incr!`/`count!`/`gauge!`/
+//! `gauge_add!`/`time!` macros consumed across the lib + bin crates, the
+//! local-vs-network drain dispatch, and the label allow/deny filtering
+//! used to keep cardinality bounded. Gauge underflow is treated as a
+//! correctness bug (saturating clamp + warn log), not a rounding artefact.
+
 mod local_drain;
 mod network_drain;
 mod writer;
@@ -12,11 +20,37 @@ use std::{
 };
 
 use mio::net::UdpSocket;
+use sozu_command::config::MetricDetailLevel;
 use sozu_command::proto::command::{
     FilteredMetrics, MetricsConfiguration, QueryMetricsOptions, ResponseContent,
 };
 
 use crate::metrics::{local_drain::LocalDrain, network_drain::NetworkDrain};
+
+/// Filter `(cluster_id, backend_id)` labels at emission time according to the
+/// configured [`MetricDetailLevel`]. Each level is a SUPERSET of the previous
+/// in cardinality terms:
+///
+/// - `Process`: drop both labels — proxy-only counters (smallest keyspace).
+/// - `Frontend`: same as `Process` today; reserved for the per-listener
+///   counters tracked as a follow-up. Listed in the proto + config so
+///   operators can opt in once per-listener labels land.
+/// - `Cluster`: keep `cluster_id`, drop `backend_id` — current default.
+/// - `Backend`: keep both — current historical behaviour.
+///
+/// Pure function so the filter can be unit-tested exhaustively without the
+/// drain machinery in scope.
+fn filter_labels_for_detail<'a>(
+    detail: MetricDetailLevel,
+    cluster_id: Option<&'a str>,
+    backend_id: Option<&'a str>,
+) -> (Option<&'a str>, Option<&'a str>) {
+    match detail {
+        MetricDetailLevel::Process | MetricDetailLevel::Frontend => (None, None),
+        MetricDetailLevel::Cluster => (cluster_id, None),
+        MetricDetailLevel::Backend => (cluster_id, backend_id),
+    }
+}
 
 thread_local! {
   pub static METRICS: RefCell<Aggregator> = RefCell::new(Aggregator::new(String::from("sozu")));
@@ -130,6 +164,7 @@ pub fn setup<O: Into<String>>(
     origin: O,
     use_tagged_metrics: bool,
     prefix: Option<String>,
+    detail: MetricDetailLevel,
 ) -> Result<(), MetricError> {
     let metrics_socket = udp_bind()?;
 
@@ -145,6 +180,7 @@ pub fn setup<O: Into<String>>(
         (*metrics.borrow_mut()).set_up_remote(metrics_socket, *metrics_host);
         (*metrics.borrow_mut()).set_up_origin(origin.into());
         (*metrics.borrow_mut()).set_up_tagged_metrics(use_tagged_metrics);
+        (*metrics.borrow_mut()).set_up_detail(detail);
     });
     Ok(())
 }
@@ -166,6 +202,12 @@ pub struct Aggregator {
     network: Option<NetworkDrain>,
     /// gather metrics locally, queried by the CLI
     local: LocalDrain,
+    /// Cardinality knob — filters `(cluster_id, backend_id)` labels at
+    /// emission time. Defaults to `Cluster` to preserve the historical
+    /// pre-knob behaviour (cluster-scoped metrics emitted, backend-scoped
+    /// labels dropped before this knob existed only when the macros didn't
+    /// pass them).
+    detail: MetricDetailLevel,
 }
 
 impl Aggregator {
@@ -174,6 +216,7 @@ impl Aggregator {
             prefix: prefix.clone(),
             network: None,
             local: LocalDrain::new(prefix),
+            detail: MetricDetailLevel::default(),
         }
     }
 
@@ -195,6 +238,12 @@ impl Aggregator {
         if let Some(n) = self.network.as_mut() {
             n.use_tagged_metrics = tagged;
         }
+    }
+
+    /// Cardinality knob — see [`MetricDetailLevel`] and
+    /// [`filter_labels_for_detail`] for the per-level filtering rules.
+    pub fn set_up_detail(&mut self, detail: MetricDetailLevel) {
+        self.detail = detail;
     }
 
     pub fn socket(&self) -> Option<&UdpSocket> {
@@ -256,6 +305,11 @@ impl Subscriber for Aggregator {
         backend_id: Option<&str>,
         metric: MetricValue,
     ) {
+        // Apply the cardinality knob BEFORE handing the metric to either
+        // drain. Both drains see the same filtered labels, keeping the local
+        // CLI view consistent with what statsd receives on the wire.
+        let (cluster_id, backend_id) =
+            filter_labels_for_detail(self.detail, cluster_id, backend_id);
         if let Some(ref mut net) = self.network.as_mut() {
             net.receive_metric(label, cluster_id, backend_id, metric.to_owned());
         }
@@ -400,3 +454,63 @@ macro_rules! record_backend_metrics (
     });
   }
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filter_labels_process_drops_both() {
+        assert_eq!(
+            filter_labels_for_detail(MetricDetailLevel::Process, Some("c"), Some("b")),
+            (None, None),
+        );
+    }
+
+    #[test]
+    fn filter_labels_frontend_drops_both_today() {
+        // Reserved for per-listener counters; same as Process for now.
+        assert_eq!(
+            filter_labels_for_detail(MetricDetailLevel::Frontend, Some("c"), Some("b")),
+            (None, None),
+        );
+    }
+
+    #[test]
+    fn filter_labels_cluster_keeps_cluster_drops_backend() {
+        assert_eq!(
+            filter_labels_for_detail(MetricDetailLevel::Cluster, Some("c"), Some("b")),
+            (Some("c"), None),
+        );
+    }
+
+    #[test]
+    fn filter_labels_backend_keeps_both() {
+        assert_eq!(
+            filter_labels_for_detail(MetricDetailLevel::Backend, Some("c"), Some("b")),
+            (Some("c"), Some("b")),
+        );
+    }
+
+    #[test]
+    fn filter_labels_none_in_none_out() {
+        // Absent labels stay absent regardless of detail level — the filter
+        // never invents a label, only drops.
+        for detail in [
+            MetricDetailLevel::Process,
+            MetricDetailLevel::Frontend,
+            MetricDetailLevel::Cluster,
+            MetricDetailLevel::Backend,
+        ] {
+            assert_eq!(filter_labels_for_detail(detail, None, None), (None, None));
+        }
+    }
+
+    #[test]
+    fn aggregator_default_detail_is_cluster() {
+        // Pre-knob behaviour preserved: if a worker / process never calls
+        // `set_up_detail`, cluster-scoped metrics still reach the drains.
+        let agg = Aggregator::new("sozu".to_owned());
+        assert_eq!(agg.detail, MetricDetailLevel::Cluster);
+    }
+}

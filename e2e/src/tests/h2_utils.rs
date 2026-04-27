@@ -1,0 +1,1429 @@
+//! Reusable H2 test utilities for crafting raw frames, establishing TLS
+//! connections, performing handshakes, and asserting protocol-level behavior.
+//!
+//! This module extracts shared infrastructure from `h2_tests.rs` and
+//! `h2_security_tests.rs` so that all H2 e2e tests can use a single set
+//! of well-tested helpers.
+
+use std::{
+    io::{Read, Write},
+    net::{SocketAddr, TcpStream},
+    sync::Arc,
+    thread,
+    time::Duration,
+};
+
+use rustls::ClientConfig;
+use sozu_command_lib::{
+    config::ListenerBuilder,
+    proto::command::{
+        ActivateListener, AddCertificate, CertificateAndKey, ListenerType, RequestHttpFrontend,
+        SocketAddress, request::RequestType,
+    },
+};
+
+use crate::{
+    mock::{
+        aggregator::SimpleAggregator, async_backend::BackendHandle as AsyncBackend,
+        https_client::Verifier,
+    },
+    sozu::worker::Worker,
+    tests::{provide_port, tests::create_local_address},
+};
+
+// ============================================================================
+// H2 frame type constants (RFC 9113 Section 6)
+// ============================================================================
+
+/// DATA frame type (0x0) -- RFC 9113 Section 6.1
+pub(crate) const H2_FRAME_DATA: u8 = 0x0;
+/// HEADERS frame type (0x1) -- RFC 9113 Section 6.2
+pub(crate) const H2_FRAME_HEADERS: u8 = 0x1;
+/// RST_STREAM frame type (0x3) -- RFC 9113 Section 6.4
+pub(crate) const H2_FRAME_RST_STREAM: u8 = 0x3;
+/// SETTINGS frame type (0x4) -- RFC 9113 Section 6.5
+pub(crate) const H2_FRAME_SETTINGS: u8 = 0x4;
+/// PING frame type (0x6) -- RFC 9113 Section 6.7
+pub(crate) const H2_FRAME_PING: u8 = 0x6;
+/// GOAWAY frame type (0x7) -- RFC 9113 Section 6.8
+pub(crate) const H2_FRAME_GOAWAY: u8 = 0x7;
+/// WINDOW_UPDATE frame type (0x8) -- RFC 9113 Section 6.9
+pub(crate) const H2_FRAME_WINDOW_UPDATE: u8 = 0x8;
+/// CONTINUATION frame type (0x9) -- RFC 9113 Section 6.10
+pub(crate) const H2_FRAME_CONTINUATION: u8 = 0x9;
+
+// ============================================================================
+// H2 flag constants (RFC 9113)
+// ============================================================================
+
+/// ACK flag (0x1) -- used for SETTINGS and PING
+pub(crate) const H2_FLAG_ACK: u8 = 0x1;
+/// END_STREAM flag (0x1) -- used for DATA and HEADERS
+pub(crate) const H2_FLAG_END_STREAM: u8 = 0x1;
+/// END_HEADERS flag (0x4) -- used for HEADERS and CONTINUATION
+pub(crate) const H2_FLAG_END_HEADERS: u8 = 0x4;
+/// PADDED flag (0x8) -- used for DATA and HEADERS; per RFC 9113 §6.1 the
+/// first payload byte carries the pad-length and that many trailing
+/// bytes are padding. App-visible bytes exclude both.
+pub(crate) const H2_FLAG_PADDED: u8 = 0x8;
+
+// ============================================================================
+// H2 error codes (RFC 9113 Section 7)
+// ============================================================================
+
+/// NO_ERROR (0x0)
+pub(crate) const H2_ERROR_NO_ERROR: u32 = 0x0;
+/// PROTOCOL_ERROR (0x1)
+pub(crate) const H2_ERROR_PROTOCOL_ERROR: u32 = 0x1;
+/// FLOW_CONTROL_ERROR (0x3)
+pub(crate) const H2_ERROR_FLOW_CONTROL_ERROR: u32 = 0x3;
+/// FRAME_SIZE_ERROR (0x6)
+pub(crate) const H2_ERROR_FRAME_SIZE_ERROR: u32 = 0x6;
+/// REFUSED_STREAM (0x7)
+pub(crate) const H2_ERROR_REFUSED_STREAM: u32 = 0x7;
+/// ENHANCE_YOUR_CALM (0xb)
+pub(crate) const H2_ERROR_ENHANCE_YOUR_CALM: u32 = 0xb;
+
+/// The HTTP/2 connection preface sent by the client (RFC 9113 Section 3.4).
+pub(crate) const H2_CLIENT_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+// ============================================================================
+// H2 SETTINGS identifiers (RFC 9113 Section 6.5.2)
+// ============================================================================
+
+const SETTINGS_HEADER_TABLE_SIZE: u16 = 0x1;
+const SETTINGS_ENABLE_PUSH: u16 = 0x2;
+const SETTINGS_MAX_CONCURRENT_STREAMS: u16 = 0x3;
+const SETTINGS_INITIAL_WINDOW_SIZE: u16 = 0x4;
+const SETTINGS_MAX_FRAME_SIZE: u16 = 0x5;
+const SETTINGS_MAX_HEADER_LIST_SIZE: u16 = 0x6;
+/// SETTINGS_NO_RFC7540_PRIORITIES (RFC 9218 §2). Chromium sets this to 1 to
+/// opt out of the deprecated RFC 7540 stream-dependency priority scheme in
+/// favour of the RFC 9218 urgency/incremental model carried in the
+/// `priority` header.
+const SETTINGS_NO_RFC7540_PRIORITIES: u16 = 0x9;
+
+// ============================================================================
+// Raw H2 frame builder
+// ============================================================================
+
+/// A minimal H2 frame builder for crafting raw frames in tests.
+pub(crate) struct H2Frame {
+    pub(crate) frame_type: u8,
+    pub(crate) flags: u8,
+    pub(crate) stream_id: u32,
+    pub(crate) payload: Vec<u8>,
+}
+
+impl H2Frame {
+    pub(crate) fn new(frame_type: u8, flags: u8, stream_id: u32, payload: Vec<u8>) -> Self {
+        Self {
+            frame_type,
+            flags,
+            stream_id,
+            payload,
+        }
+    }
+
+    pub(crate) fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(9 + self.payload.len());
+        let len = self.payload.len() as u32;
+        // 3 bytes length (big-endian)
+        buf.push((len >> 16) as u8);
+        buf.push((len >> 8) as u8);
+        buf.push(len as u8);
+        // 1 byte type
+        buf.push(self.frame_type);
+        // 1 byte flags
+        buf.push(self.flags);
+        // 4 bytes stream id (MSB reserved, must be 0)
+        buf.extend_from_slice(&(self.stream_id & 0x7FFFFFFF).to_be_bytes());
+        // payload
+        buf.extend_from_slice(&self.payload);
+        buf
+    }
+
+    /// Build a SETTINGS frame (stream 0, no flags = not ACK).
+    pub(crate) fn settings(settings: &[(u16, u32)]) -> Self {
+        let mut payload = Vec::new();
+        for &(id, value) in settings {
+            payload.extend_from_slice(&id.to_be_bytes());
+            payload.extend_from_slice(&value.to_be_bytes());
+        }
+        Self::new(H2_FRAME_SETTINGS, 0, 0, payload)
+    }
+
+    /// Build a SETTINGS ACK frame.
+    pub(crate) fn settings_ack() -> Self {
+        Self::new(H2_FRAME_SETTINGS, 0x1, 0, Vec::new())
+    }
+
+    /// Build a HEADERS frame. If `end_headers` is false, CONTINUATION is expected.
+    pub(crate) fn headers(
+        stream_id: u32,
+        header_block: Vec<u8>,
+        end_headers: bool,
+        end_stream: bool,
+    ) -> Self {
+        let mut flags = 0u8;
+        if end_headers {
+            flags |= H2_FLAG_END_HEADERS;
+        }
+        if end_stream {
+            flags |= H2_FLAG_END_STREAM;
+        }
+        Self::new(H2_FRAME_HEADERS, flags, stream_id, header_block)
+    }
+
+    /// Build a CONTINUATION frame.
+    pub(crate) fn continuation(stream_id: u32, header_block: Vec<u8>, end_headers: bool) -> Self {
+        let flags = if end_headers { H2_FLAG_END_HEADERS } else { 0 };
+        Self::new(H2_FRAME_CONTINUATION, flags, stream_id, header_block)
+    }
+
+    /// Build a WINDOW_UPDATE frame.
+    pub(crate) fn window_update(stream_id: u32, increment: u32) -> Self {
+        let payload = (increment & 0x7FFFFFFF).to_be_bytes().to_vec();
+        Self::new(H2_FRAME_WINDOW_UPDATE, 0, stream_id, payload)
+    }
+
+    /// Build a PRIORITY_UPDATE frame (RFC 9218 §7.1, type `0x10`).
+    ///
+    /// Always sent on stream 0 (connection control stream). Payload:
+    /// 4-byte prioritized stream ID (31-bit, reserved MSB = 0) followed
+    /// by the verbatim priority field value (structured-field token, e.g.
+    /// `"u=0, i"`).
+    pub(crate) fn priority_update(prioritized_stream_id: u32, priority_field: &str) -> Self {
+        let mut payload = Vec::with_capacity(4 + priority_field.len());
+        payload.extend_from_slice(&(prioritized_stream_id & 0x7FFF_FFFF).to_be_bytes());
+        payload.extend_from_slice(priority_field.as_bytes());
+        Self::new(0x10, 0, 0, payload)
+    }
+
+    /// Build a DATA frame on stream 0 (invalid per spec).
+    pub(crate) fn data_on_stream_zero(payload: Vec<u8>) -> Self {
+        Self::new(H2_FRAME_DATA, 0, 0, payload)
+    }
+
+    /// Build a frame with an unknown/invalid type.
+    pub(crate) fn invalid_type(stream_id: u32) -> Self {
+        // Frame type 0xFF is not defined in the spec
+        Self::new(0xFF, 0, stream_id, vec![0xDE, 0xAD])
+    }
+
+    /// Build a SETTINGS frame on a non-zero stream (invalid per spec).
+    pub(crate) fn settings_on_stream(stream_id: u32) -> Self {
+        Self::new(H2_FRAME_SETTINGS, 0, stream_id, Vec::new())
+    }
+
+    /// Build an oversized frame -- payload bigger than default max_frame_size (16384).
+    pub(crate) fn oversized(stream_id: u32) -> Self {
+        let payload = vec![0u8; 16385]; // 1 byte over default max
+        Self::new(H2_FRAME_DATA, 0, stream_id, payload)
+    }
+
+    /// Build a PRIORITY frame (RFC 9113 §6.3).
+    ///
+    /// Payload layout (5 bytes):
+    ///   * bit 0    -- `exclusive` dependency flag
+    ///   * bits 1-31 -- 31-bit `stream_dependency`
+    ///   * byte 5    -- `weight` (peer's declared value + 1 on the wire)
+    ///
+    /// Type=0x2, flags=0x0, always on a non-zero `stream_id`.
+    pub(crate) fn priority(stream_id: u32, dep: u32, weight: u8, exclusive: bool) -> Self {
+        let mut payload = Vec::with_capacity(5);
+        let mut dep_bytes = (dep & 0x7FFF_FFFF).to_be_bytes();
+        if exclusive {
+            dep_bytes[0] |= 0x80;
+        }
+        payload.extend_from_slice(&dep_bytes);
+        payload.push(weight);
+        // PRIORITY is frame type 0x2 (not one of the named constants above
+        // because the production parser accepts it but tests rarely need it
+        // otherwise).
+        Self::new(0x2, 0, stream_id, payload)
+    }
+
+    /// Build a RST_STREAM frame with the given error code.
+    pub(crate) fn rst_stream(stream_id: u32, error_code: u32) -> Self {
+        Self::new(
+            H2_FRAME_RST_STREAM,
+            0,
+            stream_id,
+            error_code.to_be_bytes().to_vec(),
+        )
+    }
+
+    /// Build a PING frame (non-ACK) with the given 8-byte payload.
+    pub(crate) fn ping(payload: [u8; 8]) -> Self {
+        Self::new(H2_FRAME_PING, 0, 0, payload.to_vec())
+    }
+
+    /// Build a SETTINGS ACK frame WITH a non-empty payload (invalid per RFC 9113 Section 6.5).
+    pub(crate) fn settings_ack_with_payload(payload: Vec<u8>) -> Self {
+        Self::new(H2_FRAME_SETTINGS, H2_FLAG_ACK, 0, payload)
+    }
+
+    /// Build a DATA frame on a given stream.
+    pub(crate) fn data(stream_id: u32, payload: Vec<u8>, end_stream: bool) -> Self {
+        let flags = if end_stream { H2_FLAG_END_STREAM } else { 0 };
+        Self::new(H2_FRAME_DATA, flags, stream_id, payload)
+    }
+
+    /// Build a GOAWAY frame.
+    #[allow(dead_code)]
+    pub(crate) fn goaway(last_stream_id: u32, error_code: u32) -> Self {
+        let mut payload = Vec::with_capacity(8);
+        payload.extend_from_slice(&(last_stream_id & 0x7FFFFFFF).to_be_bytes());
+        payload.extend_from_slice(&error_code.to_be_bytes());
+        Self::new(H2_FRAME_GOAWAY, 0, 0, payload)
+    }
+
+    /// Build a GOAWAY frame with `Additional Debug Data` per RFC 9113 §6.8.
+    ///
+    /// Used by the peer-initiated abort tests to mirror real-world frontends
+    /// (HAProxy chains) that attach a short `debug_data` payload describing
+    /// the abort reason. The 8-byte header (`last_stream_id` + `error_code`)
+    /// is followed by `debug` bytes verbatim.
+    #[allow(dead_code)]
+    pub(crate) fn goaway_with_debug(last_stream_id: u32, error_code: u32, debug: &[u8]) -> Self {
+        let mut payload = Vec::with_capacity(8 + debug.len());
+        payload.extend_from_slice(&(last_stream_id & 0x7FFFFFFF).to_be_bytes());
+        payload.extend_from_slice(&error_code.to_be_bytes());
+        payload.extend_from_slice(debug);
+        Self::new(H2_FRAME_GOAWAY, 0, 0, payload)
+    }
+}
+
+// ============================================================================
+// Frame I/O helpers
+// ============================================================================
+
+/// HTTP/1.x header-block terminator. Shared across the mock backends
+/// that loop-read until headers are complete.
+pub(crate) const HTTP_HEADER_END: &[u8] = b"\r\n\r\n";
+
+/// Upper bound on how many bytes the loop-read helpers will accumulate
+/// before bailing out. Protects mock backends against a misbehaving peer
+/// that dribbles bytes forever without ever closing or emitting
+/// `\r\n\r\n`.
+const LOOP_READ_MAX_BYTES: usize = 64 * 1024;
+
+/// Read raw bytes from a stream, tolerating timeouts.
+pub(crate) fn read_all_available(stream: &mut impl Read, timeout: Duration) -> Vec<u8> {
+    let mut buf = vec![0u8; 65536];
+    let mut result = Vec::new();
+    let start = std::time::Instant::now();
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => result.extend_from_slice(&buf[..n]),
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                if start.elapsed() >= timeout {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            Err(_) => break,
+        }
+    }
+    result
+}
+
+/// Read until `target_len` bytes have been accumulated, EOF, or the
+/// global `timeout` elapses. Used by mock backends that expect a
+/// fixed-size payload (e.g. PROXY-protocol v2 header + known-size body)
+/// and need to tolerate TCP segmentation across the sender's
+/// `write_all` boundaries.
+pub(crate) fn read_at_least(
+    stream: &mut impl Read,
+    target_len: usize,
+    timeout: Duration,
+) -> Vec<u8> {
+    let mut result = Vec::with_capacity(target_len);
+    let mut buf = [0u8; 4096];
+    let start = std::time::Instant::now();
+    while result.len() < target_len {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => result.extend_from_slice(&buf[..n]),
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                if start.elapsed() >= timeout {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            Err(_) => break,
+        }
+    }
+    result
+}
+
+/// Read until an HTTP header block terminator (`\r\n\r\n`) is
+/// observed, EOF, or the global `timeout` elapses. Capped at
+/// [`LOOP_READ_MAX_BYTES`] to guard against a peer that never emits the
+/// terminator. Used by HTTP/1 mock backends that need the full header
+/// block before branching on `Expect:`/`Transfer-Encoding:`/etc.
+pub(crate) fn read_until_header_end(stream: &mut impl Read, timeout: Duration) -> Vec<u8> {
+    let mut result = Vec::with_capacity(4096);
+    let mut buf = [0u8; 4096];
+    let start = std::time::Instant::now();
+    loop {
+        // Cheap terminator scan: only inspect the tail, not the whole
+        // accumulated buffer. `HTTP_HEADER_END` is 4 bytes so we need
+        // to look at the last `new_bytes + 3` bytes of `result` after
+        // each read to catch terminators straddling segment
+        // boundaries.
+        if result.len() > LOOP_READ_MAX_BYTES {
+            break;
+        }
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                let tail_start = result.len().saturating_sub(HTTP_HEADER_END.len() - 1);
+                result.extend_from_slice(&buf[..n]);
+                if result[tail_start..]
+                    .windows(HTTP_HEADER_END.len())
+                    .any(|w| w == HTTP_HEADER_END)
+                {
+                    break;
+                }
+            }
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                if start.elapsed() >= timeout {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            Err(_) => break,
+        }
+    }
+    result
+}
+
+/// Parse H2 frames from raw bytes. Returns (frame_type, flags, stream_id, payload) tuples.
+pub(crate) fn parse_h2_frames(data: &[u8]) -> Vec<(u8, u8, u32, Vec<u8>)> {
+    let mut frames = Vec::new();
+    let mut pos = 0;
+    while pos + 9 <= data.len() {
+        let length =
+            ((data[pos] as u32) << 16) | ((data[pos + 1] as u32) << 8) | (data[pos + 2] as u32);
+        let frame_type = data[pos + 3];
+        let flags = data[pos + 4];
+        let stream_id = u32::from_be_bytes([
+            data[pos + 5] & 0x7F,
+            data[pos + 6],
+            data[pos + 7],
+            data[pos + 8],
+        ]);
+        let payload_end = pos + 9 + length as usize;
+        if payload_end > data.len() {
+            break;
+        }
+        let payload = data[pos + 9..payload_end].to_vec();
+        frames.push((frame_type, flags, stream_id, payload));
+        pos = payload_end;
+    }
+    frames
+}
+
+// ============================================================================
+// Frame inspection helpers
+// ============================================================================
+
+/// Check if any parsed frame is a GOAWAY frame.
+pub(crate) fn contains_goaway(frames: &[(u8, u8, u32, Vec<u8>)]) -> bool {
+    frames.iter().any(|(t, _, _, _)| *t == H2_FRAME_GOAWAY)
+}
+
+/// Check if any parsed frame is a RST_STREAM (type 0x3).
+pub(crate) fn contains_rst_stream(frames: &[(u8, u8, u32, Vec<u8>)]) -> bool {
+    frames.iter().any(|(t, _, _, _)| *t == H2_FRAME_RST_STREAM)
+}
+
+/// Extract the error code from the first GOAWAY frame, if any.
+/// GOAWAY payload: 4 bytes last_stream_id + 4 bytes error_code.
+pub(crate) fn goaway_error_code(frames: &[(u8, u8, u32, Vec<u8>)]) -> Option<u32> {
+    for (t, _, _, payload) in frames {
+        if *t == H2_FRAME_GOAWAY && payload.len() >= 8 {
+            return Some(u32::from_be_bytes([
+                payload[4], payload[5], payload[6], payload[7],
+            ]));
+        }
+    }
+    None
+}
+
+/// Extract the last_stream_id from the first GOAWAY frame, if any.
+pub(crate) fn goaway_last_stream_id(frames: &[(u8, u8, u32, Vec<u8>)]) -> Option<u32> {
+    for (t, _, _, payload) in frames {
+        if *t == H2_FRAME_GOAWAY && payload.len() >= 8 {
+            return Some(u32::from_be_bytes([
+                payload[0] & 0x7F,
+                payload[1],
+                payload[2],
+                payload[3],
+            ]));
+        }
+    }
+    None
+}
+
+/// Check if frames contain a GOAWAY with a specific error code.
+pub(crate) fn contains_goaway_with_error(
+    frames: &[(u8, u8, u32, Vec<u8>)],
+    expected_error: u32,
+) -> bool {
+    goaway_error_code(frames) == Some(expected_error)
+}
+
+/// Extract RST_STREAM frames: returns (stream_id, error_code) tuples.
+/// RST_STREAM payload: 4 bytes error_code.
+pub(crate) fn extract_rst_streams(frames: &[(u8, u8, u32, Vec<u8>)]) -> Vec<(u32, u32)> {
+    frames
+        .iter()
+        .filter(|(t, _, _, payload)| *t == H2_FRAME_RST_STREAM && payload.len() >= 4)
+        .map(|(_, _, sid, payload)| {
+            let error_code = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+            (*sid, error_code)
+        })
+        .collect()
+}
+
+/// Check if any RST_STREAM frame has a given error code for a given stream.
+#[allow(dead_code)]
+pub(crate) fn contains_rst_stream_with_error(
+    frames: &[(u8, u8, u32, Vec<u8>)],
+    stream_id: u32,
+    expected_error: u32,
+) -> bool {
+    extract_rst_streams(frames)
+        .iter()
+        .any(|(sid, ec)| *sid == stream_id && *ec == expected_error)
+}
+
+// ============================================================================
+// TLS connection helper (T-4)
+// ============================================================================
+
+/// Create a raw TLS connection with H2 ALPN to the given address using
+/// `sni` as the TLS SNI server name.
+///
+/// Returns a `rustls::StreamOwned` that can be used for raw frame I/O.
+/// The connection uses a permissive certificate verifier (accepts
+/// self-signed) and sets 2-second read/write timeouts.
+///
+/// Separating the SNI from the TCP address lets SNI-focused tests
+/// (FIX-7 / FIX-8 / FIX-9 / FIX-10) exercise virtual-host routing and
+/// `strict_sni_binding` without having to rewrite `/etc/hosts` or build
+/// the rustls config by hand each time.
+pub(crate) fn raw_h2_connection_with_sni(
+    addr: SocketAddr,
+    sni: &str,
+) -> rustls::StreamOwned<rustls::ClientConnection, TcpStream> {
+    let config = ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(Verifier))
+        .with_no_client_auth();
+
+    let mut config = config;
+    config.alpn_protocols = vec![b"h2".to_vec()];
+
+    let server_name =
+        rustls::pki_types::ServerName::try_from(sni.to_owned()).expect("invalid SNI host name");
+    let conn = rustls::ClientConnection::new(Arc::new(config), server_name).unwrap();
+
+    let tcp = TcpStream::connect(addr).expect("could not connect to sozu");
+    tcp.set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set read timeout");
+    tcp.set_write_timeout(Some(Duration::from_secs(2)))
+        .expect("set write timeout");
+
+    rustls::StreamOwned::new(conn, tcp)
+}
+
+/// Create a raw TLS connection with H2 ALPN to the given address using
+/// `localhost` as SNI — the default for every existing non-SNI test.
+///
+/// Kept as a thin wrapper around [`raw_h2_connection_with_sni`] so the
+/// 40+ existing call sites do not need editing.
+pub(crate) fn raw_h2_connection(
+    addr: SocketAddr,
+) -> rustls::StreamOwned<rustls::ClientConnection, TcpStream> {
+    raw_h2_connection_with_sni(addr, "localhost")
+}
+
+// ============================================================================
+// H2 server settings (T-3)
+// ============================================================================
+
+/// Parsed SETTINGS values received from sozu during the H2 handshake.
+#[derive(Debug, Default)]
+pub(crate) struct H2ServerSettings {
+    pub max_concurrent_streams: Option<u32>,
+    pub initial_window_size: Option<u32>,
+    pub max_frame_size: Option<u32>,
+    pub header_table_size: Option<u32>,
+    pub max_header_list_size: Option<u32>,
+}
+
+/// Parse SETTINGS key-value pairs from a SETTINGS frame payload.
+fn parse_settings_payload(payload: &[u8]) -> H2ServerSettings {
+    let mut settings = H2ServerSettings::default();
+    let mut pos = 0;
+    while pos + 6 <= payload.len() {
+        let id = u16::from_be_bytes([payload[pos], payload[pos + 1]]);
+        let value = u32::from_be_bytes([
+            payload[pos + 2],
+            payload[pos + 3],
+            payload[pos + 4],
+            payload[pos + 5],
+        ]);
+        match id {
+            SETTINGS_HEADER_TABLE_SIZE => settings.header_table_size = Some(value),
+            SETTINGS_MAX_CONCURRENT_STREAMS => settings.max_concurrent_streams = Some(value),
+            SETTINGS_INITIAL_WINDOW_SIZE => settings.initial_window_size = Some(value),
+            SETTINGS_MAX_FRAME_SIZE => settings.max_frame_size = Some(value),
+            SETTINGS_MAX_HEADER_LIST_SIZE => settings.max_header_list_size = Some(value),
+            _ => {} // Unknown settings are ignored per spec
+        }
+        pos += 6;
+    }
+    settings
+}
+
+// ============================================================================
+// H2 handshake (T-3)
+// ============================================================================
+
+/// Send the H2 client preface and an initial empty SETTINGS frame, then
+/// read and parse the server's SETTINGS. Send SETTINGS ACK and return
+/// the parsed server settings.
+///
+/// Tests that do not need the settings can simply ignore the return value.
+pub(crate) fn h2_handshake(
+    stream: &mut rustls::StreamOwned<rustls::ClientConnection, TcpStream>,
+) -> H2ServerSettings {
+    // Send client preface
+    stream.write_all(H2_CLIENT_PREFACE).unwrap();
+    // Send empty SETTINGS
+    stream.write_all(&H2Frame::settings(&[]).encode()).unwrap();
+    stream.flush().unwrap();
+
+    // Read server's response (SETTINGS, possibly WINDOW_UPDATE, etc.)
+    thread::sleep(Duration::from_millis(200));
+    let data = read_all_available(stream, Duration::from_millis(500));
+
+    // Parse frames and extract the first non-ACK SETTINGS frame
+    let frames = parse_h2_frames(&data);
+    let mut server_settings = H2ServerSettings::default();
+    for (ft, fl, _sid, payload) in &frames {
+        if *ft == H2_FRAME_SETTINGS && (*fl & H2_FLAG_ACK) == 0 {
+            server_settings = parse_settings_payload(payload);
+            break;
+        }
+    }
+
+    // Send SETTINGS ACK
+    stream.write_all(&H2Frame::settings_ack().encode()).unwrap();
+    stream.flush().unwrap();
+
+    // Small delay for the ACK to be processed
+    thread::sleep(Duration::from_millis(50));
+
+    server_settings
+}
+
+/// Variant of [`h2_handshake`] that advertises a custom
+/// `SETTINGS_INITIAL_WINDOW_SIZE` to sozu. Useful for scheduler tests that
+/// need sozu to park DATA frames in stream kawas while HEADERS still flow
+/// to the client — the classic trick to make scheduling decisions
+/// observable on the wire. Pass `0` to suppress all DATA until the test
+/// explicitly WINDOW_UPDATEs each stream.
+pub(crate) fn h2_handshake_with_initial_window(
+    stream: &mut rustls::StreamOwned<rustls::ClientConnection, TcpStream>,
+    initial_window_size: u32,
+) {
+    // SETTINGS id 0x4 = SETTINGS_INITIAL_WINDOW_SIZE (RFC 9113 §6.5.2).
+    let settings = H2Frame::settings(&[(SETTINGS_INITIAL_WINDOW_SIZE, initial_window_size)]);
+    stream.write_all(H2_CLIENT_PREFACE).unwrap();
+    stream.write_all(&settings.encode()).unwrap();
+    stream.flush().unwrap();
+
+    thread::sleep(Duration::from_millis(200));
+    let _ = read_all_available(stream, Duration::from_millis(500));
+    stream.write_all(&H2Frame::settings_ack().encode()).unwrap();
+    stream.flush().unwrap();
+    thread::sleep(Duration::from_millis(50));
+}
+
+// ============================================================================
+// Chromium-146 HAR-shaped client profile (customer H2 truncation repro)
+// ============================================================================
+
+/// Chromium-146 default `SETTINGS_INITIAL_WINDOW_SIZE`: 6 MiB per stream
+/// (`kSpdyInitialWindowSize = 6 MB` in `net/spdy/spdy_session.cc`,
+/// unchanged since 2021).
+pub(crate) const CHROME146_INITIAL_WINDOW_SIZE: u32 = 6 * 1024 * 1024;
+/// Chromium-146 default `SETTINGS_HEADER_TABLE_SIZE`.
+pub(crate) const CHROME146_HEADER_TABLE_SIZE: u32 = 65_536;
+/// Chromium-146 default `SETTINGS_MAX_HEADER_LIST_SIZE`.
+pub(crate) const CHROME146_MAX_HEADER_LIST_SIZE: u32 = 262_144;
+/// Chromium-146 default `SETTINGS_MAX_CONCURRENT_STREAMS` advertised to
+/// the server (Chromium sends this value — see `spdy_session.cc`).
+pub(crate) const CHROME146_MAX_CONCURRENT_STREAMS: u32 = 1_000;
+/// H2 default `SETTINGS_MAX_FRAME_SIZE` per RFC 9113 §6.5.2 — Chromium
+/// does not raise this above the 16 KiB default in the default config.
+pub(crate) const CHROME146_MAX_FRAME_SIZE: u32 = 16_384;
+/// Chromium's target connection-level receive window: 15 MiB.
+pub(crate) const CHROME146_SESSION_RECEIVE_WINDOW: u32 = 15 * 1024 * 1024;
+/// Initial connection-level `WINDOW_UPDATE` increment Chromium emits after
+/// sending SETTINGS. RFC 9113 §6.9.2 fixes the initial connection window at
+/// 65 535; Chromium targets a 15 MiB window, so the delta is
+/// `15 * 1024 * 1024 − 65 535 = 15_663_105`.
+pub(crate) const CHROME146_CONN_WINDOW_UPDATE_DELTA: u32 =
+    CHROME146_SESSION_RECEIVE_WINDOW - 65_535;
+
+/// Chromium-146-shaped H2 handshake.
+///
+/// Sends the H2 client preface, a SETTINGS frame carrying Chromium-146
+/// defaults (HEADER_TABLE_SIZE, INITIAL_WINDOW_SIZE, MAX_CONCURRENT_STREAMS,
+/// MAX_FRAME_SIZE, MAX_HEADER_LIST_SIZE, ENABLE_PUSH=0,
+/// NO_RFC7540_PRIORITIES=1), reads and parses the server's SETTINGS, ACKs,
+/// then emits the one-shot connection-level
+/// `WINDOW_UPDATE(0, CHROME146_CONN_WINDOW_UPDATE_DELTA)` that Chromium
+/// sends to bring the connection window to 15 MiB.
+///
+/// The per-stream initial window comes from `INITIAL_WINDOW_SIZE` above
+/// (6 MiB), so streams can drain up to 6 MiB before the client must emit
+/// per-stream `WINDOW_UPDATE`s. The streaming drain helper
+/// [`drain_h2_stream_streaming`] is responsible for refilling the
+/// per-stream window for responses larger than 6 MiB.
+///
+/// Returns the parsed server `H2ServerSettings` so tests can verify Sōzu's
+/// advertised limits when relevant.
+pub(crate) fn h2_handshake_chromium_146(
+    stream: &mut rustls::StreamOwned<rustls::ClientConnection, TcpStream>,
+) -> H2ServerSettings {
+    let settings = H2Frame::settings(&[
+        (SETTINGS_HEADER_TABLE_SIZE, CHROME146_HEADER_TABLE_SIZE),
+        (SETTINGS_ENABLE_PUSH, 0),
+        (
+            SETTINGS_MAX_CONCURRENT_STREAMS,
+            CHROME146_MAX_CONCURRENT_STREAMS,
+        ),
+        (SETTINGS_INITIAL_WINDOW_SIZE, CHROME146_INITIAL_WINDOW_SIZE),
+        (SETTINGS_MAX_FRAME_SIZE, CHROME146_MAX_FRAME_SIZE),
+        (
+            SETTINGS_MAX_HEADER_LIST_SIZE,
+            CHROME146_MAX_HEADER_LIST_SIZE,
+        ),
+        (SETTINGS_NO_RFC7540_PRIORITIES, 1),
+    ]);
+    stream.write_all(H2_CLIENT_PREFACE).unwrap();
+    stream.write_all(&settings.encode()).unwrap();
+    stream.flush().unwrap();
+
+    thread::sleep(Duration::from_millis(200));
+    let data = read_all_available(stream, Duration::from_millis(500));
+
+    let frames = parse_h2_frames(&data);
+    let mut server_settings = H2ServerSettings::default();
+    for (ft, fl, _sid, payload) in &frames {
+        if *ft == H2_FRAME_SETTINGS && (*fl & H2_FLAG_ACK) == 0 {
+            server_settings = parse_settings_payload(payload);
+            break;
+        }
+    }
+
+    stream.write_all(&H2Frame::settings_ack().encode()).unwrap();
+    // One-shot conn-level WINDOW_UPDATE, mirroring Chromium's
+    // post-SETTINGS behaviour. No further stream-0 WINDOW_UPDATE is
+    // emitted during drain — `H2FloodDetector` caps stream-0 WUs at
+    // DEFAULT_MAX_WINDOW_UPDATE_STREAM0_PER_WINDOW (100) per sliding
+    // window; a per-stream refresh cadence on stream 0 would trip the
+    // detector and GOAWAY the connection.
+    stream
+        .write_all(&H2Frame::window_update(0, CHROME146_CONN_WINDOW_UPDATE_DELTA).encode())
+        .unwrap();
+    stream.flush().unwrap();
+    thread::sleep(Duration::from_millis(50));
+
+    server_settings
+}
+
+/// Build a Chromium-146-shaped HPACK header block for a GET request.
+///
+/// Encodes the four required pseudo-headers (`:method GET`, `:scheme https`,
+/// `:path <path>`, `:authority <authority>`), followed by `accept: */*`,
+/// `accept-encoding: gzip, deflate, br, zstd`, and — when `priority` is
+/// `Some(_)` — an RFC 9218 `priority` header (e.g. `"u=3, i"` for XHR/fetch).
+///
+/// All non-pseudo headers use HPACK literal-without-indexing with new
+/// name (0x00 prefix) and literal name+value bytes. This avoids depending
+/// on the HPACK dynamic table mirror between the test and Sōzu.
+///
+/// Chromium-146 default builds do NOT emit the RFC 9218 PRIORITY_UPDATE
+/// frame (type 0x10); `ShouldSendPriorityUpdate()` returns false when
+/// `enable_priority_update=false`, which is the default. Priority is
+/// conveyed header-only for XHR/fetch.
+pub(crate) fn build_chrome146_get_headers(
+    authority: &str,
+    path: &str,
+    priority: Option<&str>,
+) -> Vec<u8> {
+    let mut block = Vec::new();
+
+    // :method GET (static-table entry 2 — indexed, 0x82).
+    block.push(0x82);
+    // :scheme https (static-table entry 7 — indexed, 0x87).
+    block.push(0x87);
+    // :path <path> — literal with incremental indexing for :path (static
+    // entry 4 = ":path /"); we override the value. Use literal-without-
+    // indexing on a new name to keep encoding predictable when `path` is
+    // not `/`. Encoding: 0x00 prefix, name-length + ":path" bytes,
+    // value-length + value bytes.
+    push_literal_new_name(&mut block, b":path", path.as_bytes());
+    // :authority <authority> — literal-without-indexing new name.
+    push_literal_new_name(&mut block, b":authority", authority.as_bytes());
+    // accept: */*
+    push_literal_new_name(&mut block, b"accept", b"*/*");
+    // accept-encoding: gzip, deflate, br, zstd (Chromium 146 default).
+    push_literal_new_name(&mut block, b"accept-encoding", b"gzip, deflate, br, zstd");
+    if let Some(prio) = priority {
+        // priority: u=<urgency>, i (optional incremental), per RFC 9218 §8.
+        push_literal_new_name(&mut block, b"priority", prio.as_bytes());
+    }
+
+    block
+}
+
+/// Encode an HPACK integer with `prefix_bits` reserved for the preceding
+/// representation byte. The caller is responsible for setting the
+/// high-order prefix bits; this helper only writes the integer suffix.
+///
+/// Chrome-146 GET header blocks stay well under the 7-bit prefix ceiling
+/// (127) for both name- and value-lengths, so this helper does not
+/// exercise the multi-byte varint path — but implement it correctly so a
+/// future path (e.g. a very long cookie) does not silently corrupt the
+/// block.
+fn push_hpack_int(buf: &mut Vec<u8>, value: u32, prefix_bits: u8) {
+    let max_prefix: u32 = (1u32 << prefix_bits) - 1;
+    if value < max_prefix {
+        let last = buf.last_mut().expect("prefix byte must be pushed first");
+        *last |= value as u8;
+        return;
+    }
+    let last = buf.last_mut().expect("prefix byte must be pushed first");
+    *last |= max_prefix as u8;
+    let mut remainder = value - max_prefix;
+    while remainder >= 128 {
+        buf.push(((remainder % 128) as u8) | 0x80);
+        remainder /= 128;
+    }
+    buf.push(remainder as u8);
+}
+
+/// Push one HPACK literal header with a new (non-indexed) name. RFC 7541
+/// §6.2.2: representation byte `0000 0000`, followed by name-length +
+/// name bytes, then value-length + value bytes. Neither name nor value is
+/// Huffman-coded (high bit 0 on both lengths).
+fn push_literal_new_name(buf: &mut Vec<u8>, name: &[u8], value: &[u8]) {
+    buf.push(0x00);
+    // Name length (7-bit prefix, high bit = 0 → not Huffman-coded).
+    buf.push(0x00);
+    push_hpack_int(buf, name.len() as u32, 7);
+    buf.extend_from_slice(name);
+    // Value length (7-bit prefix, high bit = 0 → not Huffman-coded).
+    buf.push(0x00);
+    push_hpack_int(buf, value.len() as u32, 7);
+    buf.extend_from_slice(value);
+}
+
+/// Pop one complete H2 frame from the head of `carry` if present.
+/// Returns `Some((frame_type, flags, stream_id, payload))` on success,
+/// draining the frame bytes from `carry`; returns `None` when the header
+/// or payload is still partial, leaving `carry` untouched so the caller
+/// can append more bytes and retry.
+pub(crate) fn advance_one_frame(carry: &mut Vec<u8>) -> Option<(u8, u8, u32, Vec<u8>)> {
+    if carry.len() < 9 {
+        return None;
+    }
+    let length = ((carry[0] as u32) << 16) | ((carry[1] as u32) << 8) | (carry[2] as u32);
+    let frame_type = carry[3];
+    let flags = carry[4];
+    let stream_id = u32::from_be_bytes([carry[5] & 0x7F, carry[6], carry[7], carry[8]]);
+    let total = 9 + length as usize;
+    if carry.len() < total {
+        return None;
+    }
+    let payload: Vec<u8> = carry[9..total].to_vec();
+    carry.drain(..total);
+    Some((frame_type, flags, stream_id, payload))
+}
+
+/// Outcome of [`drain_h2_stream_streaming`].
+#[derive(Debug)]
+pub(crate) struct StreamingDrainOutcome {
+    /// App-visible body bytes (DATA payloads, with any PADDED bytes
+    /// stripped per RFC 9113 §6.1).
+    pub body_bytes: usize,
+    /// Whether an `END_STREAM` flag was seen on `sid` (either on a DATA
+    /// frame or on a trailer HEADERS frame).
+    pub end_stream_seen: bool,
+    /// Whether a `RST_STREAM` was received on `sid`.
+    pub got_rst: bool,
+    /// Wall-clock elapsed between entry and exit.
+    pub elapsed: Duration,
+    /// Lowercase hex sha256 of the app-visible body bytes (length 64).
+    pub sha256_hex: String,
+}
+
+/// Read and drain a single H2 stream with linear memory, emitting
+/// per-stream `WINDOW_UPDATE`s as bytes are consumed.
+///
+/// Frame advancement is inline via [`advance_one_frame`] — the full raw
+/// wire is NOT accumulated, only a `carry: Vec<u8>` of at-most-one
+/// incomplete frame's worth of bytes. DATA payloads are hashed then
+/// dropped, so memory stays O(chunk + frame) regardless of stream size.
+///
+/// Flow-control credit is refreshed only on the **prioritised stream**
+/// `sid`; the one-shot connection-level WINDOW_UPDATE emitted by
+/// [`h2_handshake_chromium_146`] covers the whole session. This
+/// intentionally mirrors Sōzu's `H2FloodDetector` constraint that caps
+/// stream-0 WUs at 100 per sliding window — refreshing the conn window
+/// frame-by-frame would GOAWAY the connection.
+///
+/// For PADDED DATA (RFC 9113 §6.1): the first payload byte is pad-length,
+/// and the trailing pad-length bytes are padding. App-visible bytes
+/// exclude both; WINDOW_UPDATE credit uses the full frame payload length
+/// (the flow window is consumed by the entire frame). Sōzu does not emit
+/// padded DATA today, but keep the helper correct for future use.
+pub(crate) fn drain_h2_stream_streaming(
+    stream: &mut rustls::StreamOwned<rustls::ClientConnection, TcpStream>,
+    sid: u32,
+    deadline: Duration,
+    window_refresh_bytes: u32,
+) -> StreamingDrainOutcome {
+    use sha2::{Digest, Sha256};
+
+    stream
+        .sock
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .ok();
+
+    let start = std::time::Instant::now();
+    let mut carry: Vec<u8> = Vec::with_capacity(64 * 1024);
+    let mut rbuf = vec![0u8; 64 * 1024];
+    let mut hasher = Sha256::new();
+    let mut body_bytes: usize = 0;
+    let mut stream_credit_since_refresh: u32 = 0;
+    let mut end_stream_seen = false;
+    let mut got_rst = false;
+    let mut done = false;
+    // Once the write side races a peer-close (BrokenPipe / ConnectionReset
+    // on a WU flush), `can_write` flips to false. The read loop keeps
+    // running so any DATA that is already queued in the kernel receive
+    // buffer — including a trailing END_STREAM — still lands in
+    // `body_bytes`/`hasher`. The drain exits naturally via `Ok(0)` (FIN)
+    // or `Err(_)` on the read side. This preserves the "body integrity
+    // assertions at the call site are the source of truth" contract.
+    let mut can_write = true;
+
+    while !done && start.elapsed() < deadline {
+        match stream.read(&mut rbuf) {
+            Ok(0) => break,
+            Ok(n) => carry.extend_from_slice(&rbuf[..n]),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(_) => break,
+        }
+
+        while let Some((frame_type, flags, frame_sid, payload)) = advance_one_frame(&mut carry) {
+            if frame_type == H2_FRAME_DATA && frame_sid == sid {
+                // PADDED handling: strip the pad-length byte and the
+                // trailing padding from the app-visible bytes.
+                let app_slice: &[u8] = if (flags & H2_FLAG_PADDED) != 0 && !payload.is_empty() {
+                    let pad_len = payload[0] as usize;
+                    let end = payload.len().saturating_sub(pad_len);
+                    if 1 > end { &[] } else { &payload[1..end] }
+                } else {
+                    &payload[..]
+                };
+                hasher.update(app_slice);
+                body_bytes += app_slice.len();
+
+                // Flow-control credit: the window is consumed by the
+                // ENTIRE frame payload (including pad-length byte and
+                // padding), per RFC 9113 §6.9.1.
+                let consumed = payload.len() as u32;
+                stream_credit_since_refresh = stream_credit_since_refresh.saturating_add(consumed);
+
+                // END_STREAM short-circuit: check BEFORE emitting a WU
+                // refresh. The final DATA frame that carries END_STREAM
+                // closes the stream — sending a WU for a stream that has
+                // just ended is pointless and races sozu's peer-close
+                // (sozu legitimately stops reading from the client once
+                // the response is complete, yielding `BrokenPipe` on any
+                // trailing client-side write). This ordering also lets us
+                // avoid spurious WU emission entirely when the entire
+                // response fits below `window_refresh_bytes`.
+                if (flags & H2_FLAG_END_STREAM) != 0 {
+                    end_stream_seen = true;
+                    done = true;
+                    break;
+                }
+
+                if can_write && stream_credit_since_refresh >= window_refresh_bytes {
+                    debug_assert!(
+                        stream_credit_since_refresh <= 0x7FFF_FFFF,
+                        "WINDOW_UPDATE increment must fit in 31 bits (RFC 9113 §6.9)"
+                    );
+                    debug_assert!(
+                        stream_credit_since_refresh >= 1,
+                        "WINDOW_UPDATE increment must be strictly positive"
+                    );
+                    let frame = H2Frame::window_update(sid, stream_credit_since_refresh).encode();
+                    // Tolerate peer-close races. If the remote side has
+                    // already begun closing the stream between our last
+                    // DATA read and the next flow-control refresh, the
+                    // kernel raises EPIPE / ECONNRESET. We demote the
+                    // write side to disabled (`can_write = false`) and
+                    // keep READING: DATA that was already queued in the
+                    // kernel receive buffer — including any trailing
+                    // frame that carries END_STREAM — still lands in
+                    // `body_bytes` / `hasher`. The caller's sha256 and
+                    // `body_bytes` assertions remain the source of truth
+                    // for response integrity.
+                    match stream.write_all(&frame).and_then(|_| stream.flush()) {
+                        Ok(()) => stream_credit_since_refresh = 0,
+                        Err(e)
+                            if matches!(
+                                e.kind(),
+                                std::io::ErrorKind::BrokenPipe
+                                    | std::io::ErrorKind::ConnectionReset
+                                    | std::io::ErrorKind::ConnectionAborted
+                                    | std::io::ErrorKind::NotConnected
+                                    | std::io::ErrorKind::UnexpectedEof
+                            ) =>
+                        {
+                            eprintln!(
+                                "drain_h2_stream_streaming: WU flush {} on stream {sid} at {body_bytes} bytes — switching to read-only drain",
+                                e.kind()
+                            );
+                            can_write = false;
+                        }
+                        Err(e) => {
+                            panic!("unexpected WINDOW_UPDATE refresh error on stream {sid}: {e}");
+                        }
+                    }
+                }
+            } else if frame_type == H2_FRAME_HEADERS && frame_sid == sid {
+                // Trailer HEADERS with END_STREAM is a valid close path.
+                if (flags & H2_FLAG_END_STREAM) != 0 {
+                    end_stream_seen = true;
+                    done = true;
+                    break;
+                }
+            } else if frame_type == H2_FRAME_RST_STREAM && frame_sid == sid {
+                got_rst = true;
+                done = true;
+                break;
+            }
+            // All other frames (server SETTINGS, PING, GOAWAY, WINDOW_UPDATE,
+            // other streams) are ignored — we only care about `sid`.
+        }
+    }
+
+    let elapsed = start.elapsed();
+    let digest = hasher.finalize();
+    let sha256_hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+
+    StreamingDrainOutcome {
+        body_bytes,
+        end_stream_seen,
+        got_rst,
+        elapsed,
+        sha256_hex,
+    }
+}
+
+// ============================================================================
+// Test setup helpers (T-1)
+// ============================================================================
+
+/// Setup an HTTPS listener with H2 support, a cluster, TLS certificate, and
+/// N async backends. Returns (worker, backends, front_port).
+///
+/// This is the standard H2 test setup that replaces 60-100 lines of
+/// boilerplate in each test function.
+pub(crate) fn setup_h2_test(
+    name: &str,
+    nb_backends: usize,
+) -> (Worker, Vec<AsyncBackend<SimpleAggregator>>, u16) {
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker = Worker::start_new_worker_owned(name, config, listeners, state);
+
+    worker.send_proxy_request_type(RequestType::AddHttpsListener(
+        ListenerBuilder::new_https(front_address.clone())
+            .to_tls(None)
+            .unwrap(),
+    ));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        address: front_address.clone(),
+        proxy: ListenerType::Https.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        hostname: String::from("localhost"),
+        ..Worker::default_http_frontend("cluster_0", front_address.clone().into())
+    }));
+
+    let certificate_and_key = CertificateAndKey {
+        certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
+        key: String::from(include_str!("../../../lib/assets/local-key.pem")),
+        certificate_chain: vec![],
+        versions: vec![],
+        names: vec![],
+    };
+    worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+        address: front_address,
+        certificate: certificate_and_key,
+        expired_at: None,
+    }));
+
+    let mut backends = Vec::new();
+    for i in 0..nb_backends {
+        let back_address = create_local_address();
+        worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+            "cluster_0",
+            format!("cluster_0-{i}"),
+            back_address,
+            None,
+        )));
+        backends.push(AsyncBackend::spawn_detached_backend(
+            format!("BACKEND_{i}"),
+            back_address,
+            SimpleAggregator::default(),
+            AsyncBackend::http_handler(format!("pong{i}")),
+        ));
+    }
+
+    worker.read_to_last();
+    (worker, backends, front_port)
+}
+
+/// Variant of [`setup_h2_test`] where each backend returns a custom
+/// identifiable body of `body_size` bytes. The body is filled with the
+/// backend index repeated (`'0'`, `'1'`, `'2'`, ...) so a single decoded
+/// DATA payload can be attributed back to the originating backend when
+/// debugging.
+///
+/// Used by the RFC 9218 §4 scheduling tests where we need bodies large
+/// enough to produce multiple DATA frames per stream (so the wire-order
+/// round-robin vs sequential distinction is observable).
+pub(crate) fn setup_h2_test_with_large_bodies(
+    name: &str,
+    nb_backends: usize,
+    body_size: usize,
+) -> (Worker, Vec<AsyncBackend<SimpleAggregator>>, u16) {
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker = Worker::start_new_worker_owned(name, config, listeners, state);
+
+    worker.send_proxy_request_type(RequestType::AddHttpsListener(
+        ListenerBuilder::new_https(front_address.clone())
+            .to_tls(None)
+            .unwrap(),
+    ));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        address: front_address.clone(),
+        proxy: ListenerType::Https.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        hostname: String::from("localhost"),
+        ..Worker::default_http_frontend("cluster_0", front_address.clone().into())
+    }));
+
+    let certificate_and_key = CertificateAndKey {
+        certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
+        key: String::from(include_str!("../../../lib/assets/local-key.pem")),
+        certificate_chain: vec![],
+        versions: vec![],
+        names: vec![],
+    };
+    worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+        address: front_address,
+        certificate: certificate_and_key,
+        expired_at: None,
+    }));
+
+    let mut backends = Vec::new();
+    for i in 0..nb_backends {
+        let back_address = create_local_address();
+        worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+            "cluster_0",
+            format!("cluster_0-{i}"),
+            back_address,
+            None,
+        )));
+        // Identifiable body: fill with the ASCII digit of the backend index
+        // so payload inspection can tell backends apart during debugging.
+        let marker = char::from_digit((i % 10) as u32, 10).unwrap_or('X');
+        let body: String = marker.to_string().repeat(body_size);
+        backends.push(AsyncBackend::spawn_detached_backend(
+            format!("BACKEND_{i}"),
+            back_address,
+            SimpleAggregator::default(),
+            AsyncBackend::http_handler(body),
+        ));
+    }
+
+    worker.read_to_last();
+    (worker, backends, front_port)
+}
+
+/// Setup HTTPS listener with TLS and a cluster, but do NOT add backends.
+/// The caller is responsible for adding backends and calling `worker.read_to_last()`.
+pub(crate) fn setup_h2_listener_only(name: &str) -> (Worker, u16, SocketAddress) {
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker = Worker::start_new_worker_owned(name, config, listeners, state);
+
+    worker.send_proxy_request_type(RequestType::AddHttpsListener(
+        ListenerBuilder::new_https(front_address.clone())
+            .to_tls(None)
+            .unwrap(),
+    ));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        address: front_address.clone(),
+        proxy: ListenerType::Https.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        hostname: String::from("localhost"),
+        ..Worker::default_http_frontend("cluster_0", front_address.clone().into())
+    }));
+
+    let certificate_and_key = CertificateAndKey {
+        certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
+        key: String::from(include_str!("../../../lib/assets/local-key.pem")),
+        certificate_chain: vec![],
+        versions: vec![],
+        names: vec![],
+    };
+    worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+        address: front_address.clone(),
+        certificate: certificate_and_key,
+        expired_at: None,
+    }));
+
+    (worker, front_port, front_address)
+}
+
+/// Check that sozu is still alive and accepts a new TCP connection.
+pub(crate) fn verify_sozu_alive(front_port: u16) -> bool {
+    match TcpStream::connect_timeout(
+        &format!("127.0.0.1:{front_port}").parse().unwrap(),
+        Duration::from_secs(2),
+    ) {
+        Ok(_) => true,
+        Err(e) => {
+            println!("verify_sozu_alive: TCP connect failed: {e}");
+            false
+        }
+    }
+}
+
+/// Collect response frames from a TLS stream with multiple read attempts.
+/// More reliable than a single read because sozu may need multiple event-loop
+/// ticks to process input and emit a response.
+pub(crate) fn collect_response_frames(
+    tls: &mut impl Read,
+    initial_delay_ms: u64,
+    attempts: usize,
+    read_timeout_ms: u64,
+) -> Vec<(u8, u8, u32, Vec<u8>)> {
+    thread::sleep(Duration::from_millis(initial_delay_ms));
+    let mut all_data = Vec::new();
+    for _ in 0..attempts {
+        let chunk = read_all_available(tls, Duration::from_millis(read_timeout_ms));
+        if !chunk.is_empty() {
+            all_data.extend_from_slice(&chunk);
+        }
+        if all_data.is_empty() {
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+    parse_h2_frames(&all_data)
+}
+
+/// Log parsed frames for debugging.
+pub(crate) fn log_frames(test_name: &str, frames: &[(u8, u8, u32, Vec<u8>)]) {
+    println!("{test_name} - received {} frames", frames.len());
+    for (i, (ft, fl, sid, payload)) in frames.iter().enumerate() {
+        if *ft == H2_FRAME_GOAWAY && payload.len() >= 8 {
+            let error_code = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
+            println!("  frame {i}: GOAWAY error_code=0x{error_code:x}");
+        } else if *ft == H2_FRAME_RST_STREAM && payload.len() >= 4 {
+            let error_code = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+            println!("  frame {i}: RST_STREAM stream={sid} error_code=0x{error_code:x}");
+        } else {
+            println!(
+                "  frame {i}: type=0x{ft:02x} flags=0x{fl:02x} stream={sid} len={}",
+                payload.len()
+            );
+        }
+    }
+}
+
+/// Standard test teardown: drop TLS, verify sozu is alive, soft-stop worker.
+/// Returns true if both sozu-alive check and worker stop succeeded.
+pub(crate) fn teardown<T>(
+    tls: T,
+    front_port: u16,
+    mut worker: Worker,
+    mut backends: Vec<AsyncBackend<SimpleAggregator>>,
+) -> bool {
+    drop(tls);
+    thread::sleep(Duration::from_millis(200));
+    let still_alive = verify_sozu_alive(front_port);
+    println!("  sozu still alive: {still_alive}");
+
+    worker.soft_stop();
+    let success = worker.wait_for_server_stop();
+    for backend in backends.iter_mut() {
+        backend.stop_and_get_aggregator();
+    }
+    success && still_alive
+}
+
+// ============================================================================
+// Assertion helpers (T-5)
+// ============================================================================
+
+/// Assert that the response frames contain a GOAWAY with the specified error code.
+///
+/// Panics with a descriptive message if no matching GOAWAY is found.
+pub(crate) fn assert_goaway_received(frames: &[(u8, u8, u32, Vec<u8>)], expected_error: u32) {
+    let actual = goaway_error_code(frames);
+    assert!(
+        actual == Some(expected_error),
+        "Expected GOAWAY with error code 0x{expected_error:x}, got {:?} (frames: {} total)",
+        actual.map(|e| format!("0x{e:x}")),
+        frames.len()
+    );
+}
+
+/// Assert that the response frames contain a GOAWAY with a specific error code
+/// and last_stream_id.
+pub(crate) fn assert_goaway_with_last_stream(
+    frames: &[(u8, u8, u32, Vec<u8>)],
+    expected_error: u32,
+    expected_last_stream: u32,
+) {
+    let actual_error = goaway_error_code(frames);
+    let actual_last_stream = goaway_last_stream_id(frames);
+    assert!(
+        actual_error == Some(expected_error) && actual_last_stream == Some(expected_last_stream),
+        "Expected GOAWAY(error=0x{expected_error:x}, last_stream={expected_last_stream}), \
+         got error={:?} last_stream={:?}",
+        actual_error.map(|e| format!("0x{e:x}")),
+        actual_last_stream
+    );
+}
+
+/// Assert that a RST_STREAM was received for a specific stream with a specific error.
+///
+/// Panics with a descriptive message if no matching RST_STREAM is found.
+pub(crate) fn assert_rst_stream_received(
+    frames: &[(u8, u8, u32, Vec<u8>)],
+    stream_id: u32,
+    expected_error: u32,
+) {
+    let rst_streams = extract_rst_streams(frames);
+    let found = rst_streams
+        .iter()
+        .any(|(sid, ec)| *sid == stream_id && *ec == expected_error);
+    assert!(
+        found,
+        "Expected RST_STREAM on stream {stream_id} with error 0x{expected_error:x}, \
+         got RST_STREAMs: {rst_streams:?}"
+    );
+}
+
+/// Assert that SETTINGS ACK was received.
+///
+/// Panics if no SETTINGS frame with the ACK flag is found.
+pub(crate) fn assert_settings_ack_received(frames: &[(u8, u8, u32, Vec<u8>)]) {
+    let found = frames
+        .iter()
+        .any(|(ft, fl, _, _)| *ft == H2_FRAME_SETTINGS && (*fl & H2_FLAG_ACK) != 0);
+    assert!(
+        found,
+        "Expected SETTINGS ACK frame, but none found among {} frames",
+        frames.len()
+    );
+}
+
+/// Check if the response contains a GOAWAY or RST_STREAM indicating a
+/// protocol-level rejection.
+pub(crate) fn rejected_with_goaway_or_rst(frames: &[(u8, u8, u32, Vec<u8>)]) -> bool {
+    contains_rst_stream(frames)
+        || frames.iter().any(|(t, _, _, payload)| {
+            if *t != H2_FRAME_GOAWAY {
+                return false;
+            }
+
+            if payload.len() < 8 {
+                return true;
+            }
+
+            u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]])
+                != H2_ERROR_NO_ERROR
+        })
+}
+
+/// Check if frames contain a HEADERS response (type 0x1) on any stream.
+pub(crate) fn contains_headers_response(frames: &[(u8, u8, u32, Vec<u8>)]) -> bool {
+    frames.iter().any(|(t, _, _, _)| *t == H2_FRAME_HEADERS)
+}
+
+/// Check if frames contain a DATA frame on any stream.
+#[allow(dead_code)]
+pub(crate) fn contains_data_frame(frames: &[(u8, u8, u32, Vec<u8>)]) -> bool {
+    frames.iter().any(|(t, _, _, _)| *t == H2_FRAME_DATA)
+}

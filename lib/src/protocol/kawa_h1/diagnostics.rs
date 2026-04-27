@@ -1,3 +1,10 @@
+//! Human-readable diagnostics for H1 parse failures.
+//!
+//! Renders Kawa `ParsingPhase` / `ParsingErrorKind` values plus a hex-dump
+//! window into the offending buffer region for the access log and
+//! debug-level traces. Intent: make tolerant-vs-strict parser rejections
+//! debuggable without a packet capture.
+
 use std::fmt::Write;
 
 use kawa::{ParsingErrorKind, ParsingPhase, ParsingPhaseMarker};

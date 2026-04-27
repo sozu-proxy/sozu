@@ -31,14 +31,44 @@ log_level = "info"
 # to_stdout
 log_target = "stdout"
 
+# enable ANSI colour codes on the main log stream. Only honoured when
+# log_target is "stdout"; TCP / UDP / file sinks ignore this flag.
+# Defaults to false.
+# log_colored = true
+
 # optional different target for access logs (IP addresses, domains, URI, HTTP status, etc)
 # It supports the same options as log_target
 # access_logs_target = "file:///var/logs/sozu-access.log"
+
+# optional dedicated file path for the control-plane audit log (every
+# `AUDIT\tCommand(...)` line sozu emits on privileged mutations). When set,
+# the line is ALSO appended to this file opened `O_APPEND | O_CREAT` with
+# mode 0o640 (owner read+write, group read). Lets operators:
+#   - separate the audit trail from the main log stream (which may include
+#     stack traces, TLS errors, protocol chatter),
+#   - grant an `audit` group tail-only access via filesystem ACL without
+#     opening up the rest of sozu's logs,
+#   - rotate the audit file independently of the main log.
+# `None` (the default) leaves audit lines routed only through log_target.
+# Accepts a plain filesystem path (no URI scheme).
+# audit_logs_target = "/var/log/sozu/audit.log"
+
+# optional JSON mirror of the audit log — one JSON object per line so SIEM
+# pipelines (Wazuh, Elastic, Loki, Splunk HEC) ingest without bespoke parser
+# code. Same `O_APPEND | O_CREAT | 0o640` semantics as audit_logs_target.
+# Schema is stable: every key always present, missing values rendered as
+# JSON `null`. Independent of the human-readable sink — set both for
+# operator-friendly tail + machine-parseable archive.
+# audit_logs_json_target = "/var/log/sozu/audit.jsonl"
 
 # format of the access logs. Defaults to ascii.
 # - ascii
 # - protobuf (defined in [sozu_command_lib::proto::command::ProtobufAccessLog])
 # access_logs_format = "ascii"
+
+# enable ANSI colour codes on access logs. Only honoured when the access-log
+# target is "stdout". If unset, inherits log_colored. Defaults to false.
+# access_logs_colored = true
 
 # path to the unix socket file used to send commands to sozu
 # default value points to "sozu.sock" file in the current directory
@@ -131,6 +161,11 @@ buffer_size = 16393
 # sozu verifies regularly if there are such zombie sessions, logs their state
 # and removes them
 # zombie_check_interval = 1800
+
+# maximum time (in seconds) a TCP connection stays in sozu's accept queue
+# before being dropped. Raising this helps absorb accept-queue bursts at the
+# cost of slower rejection of overloaded listeners. Defaults to 60.
+# accept_queue_timeout = 60
 
 # by default, all listeners start a TCP listen socket o startup
 # if set to false, this option will prevent them from listening. You can then add
@@ -275,6 +310,40 @@ cipher_list = [
 #key = "../lib/assets/key_test.pem"
 #certificate_chain = "../lib/assets/certificate_chain.pem"
 
+# ALPN (Application-Layer Protocol Negotiation) protocols to advertise
+# during the TLS handshake, in order of server preference.
+# The server selects the first protocol from this list that the client also supports.
+# Valid values: "h2" (HTTP/2), "http/1.1" (HTTP/1.1)
+# Defaults to ["h2", "http/1.1"] (prefer HTTP/2).
+#
+# alpn_protocols = ["h2", "http/1.1"]
+#
+# To disable HTTP/2 and force HTTP/1.1 only:
+# alpn_protocols = ["http/1.1"]
+#
+# To require HTTP/2 (clients without H2 support will fail TLS negotiation):
+# alpn_protocols = ["h2"]
+
+# H2 connection tuning (optional, defaults shown)
+# h2_initial_connection_window = 1048576  # 1MB, min 65535, max 2147483647
+# h2_max_concurrent_streams = 100         # min 1
+# h2_stream_shrink_ratio = 2              # min 2
+
+# H2 RST_STREAM lifetime caps. See `doc/configure.md` for the full flood-detection
+# surface; these three catch patient-attacker patterns that stay under the
+# per-window counters.
+# h2_max_rst_stream_lifetime = 10000          # received RST ceiling (CVE-2023-44487)
+# h2_max_rst_stream_abusive_lifetime = 50     # received pre-response RST (Rapid Reset)
+# h2_max_rst_stream_emitted_lifetime = 500    # server-emitted RST (CVE-2025-8671 MadeYouReset)
+
+# H2 catch-all protocol-drift budget. 1-second sliding window with half-decay,
+# default 100. Raise on busy edges that terminate high-cancellation traffic
+# (gRPC, mobile, browser prefetch) — the default trips on legitimate
+# stream-close races. See `doc/configure.md` (Tuning h2_max_glitch_count) for
+# the decision matrix; 500 is a reasonable public-edge value, 1000–2000 for
+# heavy cancellation, never raise to u32::MAX.
+# h2_max_glitch_count = 500
+
 # Number of TLS 1.3 tickets to send to a client when establishing a connection.
 # The tickets allow the client to resume a session. This protects the client
 # agains session tracking. Increases the number of getrandom syscalls,
@@ -325,6 +394,9 @@ load_balancing = "ROUND_ROBIN"
 # - sticky_session = false # activates sticky sessions for this cluster
 # - https_redirect = false #  activates automatic redirection to HTTPS for this cluster
 # - custom_tag: a tag to retrieve a frontend with the CLI or in the logs
+#
+# use HTTP/2 for backend connections (h2c). Defaults to false.
+# http2 = true
 frontends = [
     { address = "0.0.0.0:8080", hostname = "lolcatho.st", tags = { key = "value" }, path = "/api" },
     # HTTPS frontends also have an optional `tls_versions` key like the HTTPS listeners

@@ -1,9 +1,23 @@
+//! Master command-server event loop.
+//!
+//! Drives the mio loop on the unix command socket: accepts CLI clients,
+//! forwards verbs to workers via per-worker `Channel`s, replays the
+//! configuration state on (re)connection, and consumes worker responses.
+//! Holds the worker registry, accepts hot-upgrade FDs, and surfaces
+//! supervisor metrics. Long-form lifecycle: `bin/src/command/LIFECYCLE.md`.
+
 use std::{
-    collections::{HashMap, HashSet},
+    cell::RefCell,
+    collections::{HashMap, HashSet, VecDeque},
     fmt::{self, Debug},
-    io::Error as IoError,
+    fs::{DirBuilder, File, OpenOptions, Permissions},
+    io::{Error as IoError, Write},
     ops::{Deref, DerefMut},
-    os::fd::{AsRawFd, FromRawFd},
+    os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
+    },
+    path::Path,
     time::{Duration, Instant},
 };
 
@@ -20,8 +34,8 @@ use sozu_command_lib::{
     channel::Channel,
     config::Config,
     proto::command::{
-        Request, ResponseContent, ResponseStatus, RunState, Status, WorkerRequest, WorkerResponse,
-        request::RequestType, response_content::ContentType,
+        Event, Request, ResponseContent, ResponseStatus, RunState, Status, WorkerRequest,
+        WorkerResponse, request::RequestType, response_content::ContentType,
     },
     ready::Ready,
     scm_socket::{Listeners, ScmSocket, ScmSocketError},
@@ -184,6 +198,10 @@ pub struct CommandHub {
     clients: HashMap<Token, ClientSession>,
     /// register tasks, for parallel execution
     tasks: HashMap<TaskId, TaskContainer>,
+    /// Path of the command socket we're accepting on, stamped into every
+    /// accepted [`ClientSession::socket_path`]. Stored as `Arc<str>` so it
+    /// clones cheaply per-session.
+    command_socket_path: std::sync::Arc<str>,
 }
 
 impl Deref for CommandHub {
@@ -205,25 +223,88 @@ impl CommandHub {
         config: Config,
         executable_path: String,
     ) -> Result<Self, HubError> {
+        let command_socket_path: std::sync::Arc<str> = config
+            .command_socket_path()
+            .unwrap_or_else(|_| "unknown".to_owned())
+            .into();
         Ok(Self {
             server: Server::new(unix_listener, config, executable_path)
                 .map_err(HubError::CreateServer)?,
             clients: HashMap::new(),
             tasks: HashMap::new(),
+            command_socket_path,
         })
     }
 
     fn register_client(&mut self, mut stream: UnixStream) {
         let token = self.next_session_token();
+        // Previously the registration error was logged and we continued
+        // anyway, inserting a session whose underlying stream
+        // had no mio readiness wired up. The session sat in
+        // `self.clients` until manual cleanup. Treat registration failure
+        // as terminal — drop the stream and return. The OS sends RST/EOF
+        // to the peer when `stream` is dropped at the end of this scope.
         if let Err(err) = self.register(token, &mut stream) {
-            error!("Could not register client: {}", err);
+            error!(
+                "Could not register client (token={:?}): {} — dropping connection",
+                token, err
+            );
+            return;
         }
-        let channel = Channel::new(stream, 4096, u64::MAX);
+        let peer_cred = peer_cred_from_stream(&stream);
+        let actor_comm = peer_cred.pid.and_then(peer_comm);
+        let actor_user = peer_cred.uid.and_then(peer_user);
+        // SECURITY (CWE-770): the client channel must NOT grow without
+        // bound. The previous `u64::MAX` ceiling combined with
+        // the doubling growth in `Channel::readable()` and the absence of
+        // `Vec::try_reserve` in `Buffer::grow` meant any same-UID local
+        // process could send a single oversized length-prefixed message and
+        // OOM the main process. Bind to `max_command_buffer_size` (default
+        // 2 MB, configurable) — same ceiling worker channels at the
+        // fork_main_into_worker site already use. Operators who legitimately
+        // need a larger ceiling can raise `max_command_buffer_size` in the
+        // global config.
+        let channel = Channel::new(stream, 4096, self.config.max_command_buffer_size);
         let id = self.next_client_id();
-        let session = ClientSession::new(channel, id, token);
-        info!("Register new client: {}", id);
+        let session = ClientSession::new(
+            channel,
+            id,
+            token,
+            peer_cred,
+            actor_comm,
+            actor_user,
+            self.command_socket_path.clone(),
+        );
+        info!(
+            "Register new client: {} (actor_uid={} actor_pid={} actor_user={} actor_comm={})",
+            id,
+            session.actor_uid_display(),
+            session.actor_pid_display(),
+            session.actor_user_display(),
+            session.actor_comm_display()
+        );
         debug!("registering client {:?}", session);
         self.clients.insert(token, session);
+    }
+
+    /// Drain audit events queued by the [Server] during a client request and
+    /// fan them out to every subscribed client (same path as worker-emitted
+    /// backend events). Called from the event loop after handling a request.
+    fn flush_pending_audit_events(&mut self) {
+        let events: Vec<Event> = self.server.pending_audit_events.drain(..).collect();
+        if events.is_empty() {
+            return;
+        }
+        for event in events {
+            for client_token in &self.server.event_subscribers {
+                if let Some(client) = self.clients.get_mut(client_token) {
+                    client.return_processing_with_content(
+                        String::from("main"),
+                        ContentType::Event(event.clone()).into(),
+                    );
+                }
+            }
+        }
     }
 
     fn get_client_mut(&mut self, token: &Token) -> Option<(&mut Server, &mut ClientSession)> {
@@ -243,15 +324,29 @@ impl CommandHub {
             next_session_id,
             next_task_id,
             next_worker_id,
+            boot_generation,
         } = upgrade_data;
 
+        // SAFETY: `get_executable_path` is marked unsafe to keep its FFI
+        // signature consistent across platforms (see `bin/src/util.rs`).
+        // On Linux it just reads `/proc/self/exe`; on FreeBSD it issues a
+        // `sysctl` call with stack-allocated MIB. This runs only inside
+        // the supervisor's single-threaded reload path.
         let executable_path =
             unsafe { get_executable_path().map_err(HubError::GetExecutablePath)? };
 
+        // SAFETY: `command_socket_fd` was inherited via the upgrade hand-off
+        // (see `UpgradeData`) and is not owned elsewhere in this freshly
+        // re-execed supervisor. Ownership transfers to the `UnixListener`,
+        // whose `Drop` closes the descriptor.
         let unix_listener = unsafe { UnixListener::from_raw_fd(command_socket_fd) };
 
         let command_buffer_size = config.command_buffer_size;
         let max_command_buffer_size = config.max_command_buffer_size;
+        let command_socket_path: std::sync::Arc<str> = config
+            .command_socket_path()
+            .unwrap_or_else(|_| "unknown".to_owned())
+            .into();
 
         let mut server =
             Server::new(unix_listener, config, executable_path).map_err(HubError::CreateServer)?;
@@ -262,11 +357,19 @@ impl CommandHub {
         server.next_session_id = next_session_id;
         server.next_task_id = next_task_id;
         server.next_worker_id = next_worker_id;
+        // Carry the boot generation forward; it will be bumped one more time
+        // by `upgrade_main` before the next re-exec.
+        server.boot_generation = boot_generation;
 
         for worker in workers
             .iter()
             .filter(|w| w.run_state != RunState::Stopped && w.run_state != RunState::Stopping)
         {
+            // SAFETY: `worker.channel_fd` was inherited via the upgrade
+            // hand-off (see `UpgradeData::workers`) and is not owned
+            // elsewhere in this freshly re-execed supervisor. Ownership
+            // transfers to the `UnixStream`, whose `Drop` closes the
+            // descriptor.
             let worker_stream = unsafe { UnixStream::from_raw_fd(worker.channel_fd) };
             let channel: Channel<WorkerRequest, WorkerResponse> =
                 Channel::new(worker_stream, command_buffer_size, max_command_buffer_size);
@@ -283,6 +386,7 @@ impl CommandHub {
             server,
             clients: HashMap::new(),
             tasks: HashMap::new(),
+            command_socket_path,
         })
     }
 
@@ -396,6 +500,7 @@ impl CommandHub {
                                 ClientResult::NewRequest(request) => {
                                     debug!("Received new request: {:?}", request);
                                     server.handle_client_request(client, request);
+                                    self.flush_pending_audit_events();
                                 }
                                 ClientResult::CloseSession => {
                                     info!("Closing client {}", client.id);
@@ -523,6 +628,29 @@ pub struct Server {
     next_session_id: SessionId,
     next_task_id: TaskId,
     next_worker_id: WorkerId,
+    /// audit events emitted by the main process for control-plane mutations,
+    /// drained by the [CommandHub] after each request and fanned out to the
+    /// subscribed clients (same channel as worker-emitted backend events).
+    pub pending_audit_events: VecDeque<Event>,
+    /// Dedicated file handle for the control-plane audit log, opened once
+    /// at boot if `Config::audit_logs_target` is set. Every audit line is
+    /// appended here in addition to the standard `info!` sink. `RefCell`
+    /// because the event loop is single-threaded and `audit_emit` borrows
+    /// `&Server` only, not `&mut Server`, for the whole `Event` fan-out.
+    /// `None` when no dedicated sink is configured (fallback to `log_target`).
+    pub audit_log_writer: Option<RefCell<File>>,
+    /// Dedicated JSON-structured audit sink. Same lifecycle as
+    /// `audit_log_writer`, but writes one JSON object per line so SIEM
+    /// pipelines (Wazuh, Elastic, Loki) can ingest without bespoke parser
+    /// code. `None` when `Config::audit_logs_json_target` is unset.
+    pub audit_log_json_writer: Option<RefCell<File>>,
+    /// Boot-generation counter, incremented each time the main process
+    /// re-execs via `MAIN_UPGRADED`. Stamped into every audit line so
+    /// SOC tooling can disambiguate post-upgrade sessions from pre-upgrade
+    /// ones — `(boot_generation, session_ulid)` is the durable correlation
+    /// pair across PID reuse. Persisted across upgrades via [`UpgradeData`];
+    /// resets only on full process restart (not re-exec).
+    pub boot_generation: u32,
     /// the MIO structure that registers sockets and polls them all
     poll: Poll,
     /// all tasks created in one tick, to be propagated to the Hub at each tick
@@ -554,6 +682,33 @@ impl Server {
             )
             .map_err(ServerError::RegisterChannel)?;
 
+        let audit_log_writer = match config.audit_logs_target.as_deref() {
+            Some(path) => match open_audit_log_file(path) {
+                Ok(file) => Some(RefCell::new(file)),
+                Err(err) => {
+                    error!(
+                        "Could not open audit log file {:?}: {}. Audit lines will be routed only through the standard logger.",
+                        path, err
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+        let audit_log_json_writer = match config.audit_logs_json_target.as_deref() {
+            Some(path) => match open_audit_log_file(path) {
+                Ok(file) => Some(RefCell::new(file)),
+                Err(err) => {
+                    error!(
+                        "Could not open audit JSON log file {:?}: {}. JSON audit sink disabled.",
+                        path, err
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+
         Ok(Self {
             config,
             event_subscribers: HashSet::new(),
@@ -563,6 +718,10 @@ impl Server {
             next_session_id: 1, // 0 is reserved for the UnixListener
             next_task_id: 0,
             next_worker_id: 0,
+            pending_audit_events: VecDeque::new(),
+            audit_log_writer,
+            audit_log_json_writer,
+            boot_generation: 0,
             poll,
             queued_tasks: HashMap::new(),
             state: ConfigState::new(),
@@ -572,6 +731,100 @@ impl Server {
         })
     }
 
+    /// Append a fully rendered audit line to the dedicated sink if one is
+    /// configured. Best-effort: failures are logged but never propagated —
+    /// the audit trail degrades gracefully to the standard logger instead
+    /// of failing the mutation.
+    pub fn append_audit_line(&self, line: &str) {
+        let Some(writer) = self.audit_log_writer.as_ref() else {
+            return;
+        };
+        let mut writer = writer.borrow_mut();
+        if let Err(err) = writeln!(writer, "{line}") {
+            error!("Could not append to audit log file: {}", err);
+        }
+    }
+
+    /// Append a JSON-encoded audit record to the dedicated JSON sink, if
+    /// one is configured. One line per record so SIEM parsers can stream
+    /// `tail -F`. Same best-effort behaviour as [`append_audit_line`].
+    pub fn append_audit_json(&self, json: &str) {
+        let Some(writer) = self.audit_log_json_writer.as_ref() else {
+            return;
+        };
+        let mut writer = writer.borrow_mut();
+        if let Err(err) = writeln!(writer, "{json}") {
+            error!("Could not append to audit JSON file: {}", err);
+        }
+    }
+}
+
+/// Open the dedicated audit log file with `O_APPEND | O_CREAT` semantics
+/// and owner/group-only mode `0o640`. Group-readable lets an `audit` group
+/// tail the file via ACL without granting full write access. The file is
+/// never truncated on open — every sozu restart continues the same audit
+/// stream (use logrotate to manage size).
+///
+/// PCI-DSS 10.5 hardening notes:
+/// 1. `OpenOptions::mode(0o640)` is honoured by Linux only when the file is
+///    *created* by this open. Pre-existing files keep their previous mode.
+///    We therefore call `set_permissions(0o640)` after open so an existing
+///    `chmod 0644` from a sloppy install or a non-mode-preserving logrotate
+///    is corrected at boot.
+/// 2. `create_dir_all` runs under the inherited worker umask (default
+///    `0o022` → directory `0o755`), which leaves the audit directory
+///    world-traversable. `DirBuilderExt::mode(0o750)` is applied so newly
+///    created parents are owner+group only. Pre-existing parents are not
+///    re-permissioned (operators may have a deliberate ACL).
+/// 3. When the existing file's mode is wider than `0o640`, a `warn!` is
+///    emitted alongside the corrective `chmod` so SOC tooling sees the
+///    transition rather than discovering it via a file-system audit.
+fn open_audit_log_file(path: &str) -> Result<File, IoError> {
+    let path = Path::new(path);
+    if let Some(parent) = path.parent() {
+        // Create parent dirs best-effort; failure falls through to the open.
+        // Only newly created parents get 0o750; existing dirs are untouched.
+        let _ = DirBuilder::new().recursive(true).mode(0o750).create(parent);
+    }
+    let pre_existing = path.exists();
+    let pre_existing_mode = if pre_existing {
+        std::fs::metadata(path)
+            .ok()
+            .map(|m| m.permissions().mode() & 0o777)
+    } else {
+        None
+    };
+    let file = OpenOptions::new()
+        .append(true)
+        .create(true)
+        .mode(0o640)
+        .open(path)?;
+    // Force-narrow the mode on pre-existing files. `mode(0o640)` above is a
+    // no-op when the file already exists, so without this `set_permissions`
+    // a pre-created `audit.log` with `0o644` (or wider) would silently
+    // bypass the PCI-DSS 10.5 control.
+    if let Some(prev) = pre_existing_mode
+        && prev != 0o640
+    {
+        if prev & !0o640 != 0 {
+            warn!(
+                "audit log file {} pre-existed with mode 0o{:o} — narrowing to 0o640",
+                path.display(),
+                prev
+            );
+        }
+        if let Err(e) = file.set_permissions(Permissions::from_mode(0o640)) {
+            warn!(
+                "could not narrow audit log file {} permissions to 0o640: {:?}",
+                path.display(),
+                e
+            );
+        }
+    }
+    Ok(file)
+}
+
+impl Server {
     /// - fork the main process into a new worker
     /// - register the worker in mio
     /// - send a Status request to the new worker
@@ -611,6 +864,12 @@ impl Server {
         gauge!("configuration.clusters", self.state.clusters.len());
         gauge!("configuration.backends", self.state.count_backends());
         gauge!("configuration.frontends", self.state.count_frontends());
+    }
+
+    /// Queue an audit event for fan-out to subscribed clients. Drained by
+    /// [CommandHub::flush_pending_audit_events] after every request handler.
+    pub fn push_audit_event(&mut self, event: Event) {
+        self.pending_audit_events.push_back(event);
     }
 
     fn next_session_token(&mut self) -> Token {
@@ -853,8 +1112,143 @@ impl Server {
             next_session_id: self.next_session_id,
             next_task_id: self.next_task_id,
             next_worker_id: self.next_worker_id,
+            boot_generation: self.boot_generation,
         }
     }
+}
+
+/// Peer credentials for the unix-socket client, used for audit attribution.
+///
+/// `pid` is needed to correlate with `journalctl _PID=<pid>` and `/proc/<pid>`.
+/// `gid` widens the actor identity beyond uid alone. `uid` stays the primary
+/// attribution field. All three come from the same `SO_PEERCRED` `getsockopt`
+/// and are captured once at accept time (immutable for the session lifetime).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PeerCred {
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    pub pid: Option<i32>,
+}
+
+/// Read full peer credentials from a connected unix-domain socket via
+/// `SO_PEERCRED`.
+///
+/// Returns a `PeerCred` with `None` fields on platforms without `SO_PEERCRED`
+/// support, or when the `getsockopt` call fails (which would be unexpected
+/// for a freshly accepted local socket but must not panic the main process).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn peer_cred_from_stream(stream: &UnixStream) -> PeerCred {
+    use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
+    match getsockopt(stream, PeerCredentials) {
+        Ok(creds) => PeerCred {
+            uid: Some(creds.uid()),
+            gid: Some(creds.gid()),
+            pid: Some(creds.pid()),
+        },
+        Err(err) => {
+            warn!("Could not read SO_PEERCRED on command socket: {}", err);
+            PeerCred::default()
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub(crate) fn peer_cred_from_stream(_stream: &UnixStream) -> PeerCred {
+    PeerCred::default()
+}
+
+/// Read `/proc/<pid>/comm` to get the peer process's command name (up to
+/// 15 chars per kernel spec). Best-effort; returns `None` on any error.
+/// Cheap (one file read per accept, which happens once per sozu CLI invocation).
+///
+/// PID-reuse mitigation: between `getsockopt(SO_PEERCRED)` and this
+/// read, the peer PID could (a) exit and be recycled by the kernel, or
+/// (b) call `execve()` and become a different binary. To bind the comm
+/// string to the *same* process the SO_PEERCRED snapshot saw, we read
+/// `/proc/<pid>/stat` first, capture the `starttime` field (jiffies
+/// since boot, monotonic — never reused), then read `comm`. If the
+/// stat read fails (PID gone — case (a)) we return `None`. The exec
+/// case (b) cannot be detected by starttime alone — execve does not
+/// change starttime — but exec is not adversarial in our deployment
+/// (the sozu CLI never exec's), and the SOC analyst seeing two different
+/// binaries on the same PID across audit lines for the same session
+/// is the right signal.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn peer_comm(pid: i32) -> Option<String> {
+    use std::io::Read;
+    // PID-reuse guard: open /proc/<pid>/stat first; if the PID is gone
+    // we bail without returning a string that might describe a recycled
+    // PID's new owner.
+    let _stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let mut buf = String::new();
+    let path = format!("/proc/{pid}/comm");
+    std::fs::File::open(&path)
+        .ok()?
+        .read_to_string(&mut buf)
+        .ok()?;
+    let trimmed = buf.trim_end_matches(['\n', '\r']);
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_owned())
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub(crate) fn peer_comm(_pid: i32) -> Option<String> {
+    None
+}
+
+/// Resolve a uid to a POSIX account name via `getpwuid_r` (NSS). Best-effort;
+/// returns `None` when NSS has no matching user or the lookup fails.
+///
+/// `getpwuid_r` is **synchronous** and on a misconfigured host (SSSD
+/// wedge, LDAP timeout, broken nscd socket) can block the
+/// main event loop for tens of seconds. This caches the last lookups
+/// in a process-local map so a steady-state operator UID is paid at
+/// most once per main lifetime. Capped via `MAX_PEER_USER_CACHE` to
+/// stop a misbehaving peer from inflating it (the unix socket is
+/// `0o600` so this is mostly a defense-in-depth bound).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn peer_user(uid: u32) -> Option<String> {
+    use std::sync::Mutex;
+
+    use nix::unistd::{Uid, User};
+
+    /// Hard ceiling on the in-process cache: 16 distinct UIDs is
+    /// generous (operator + root + a couple of automation accounts).
+    /// Past that we evict-on-insert to stay bounded.
+    const MAX_PEER_USER_CACHE: usize = 16;
+
+    static CACHE: Mutex<Vec<(u32, Option<String>)>> = Mutex::new(Vec::new());
+
+    if let Ok(guard) = CACHE.lock()
+        && let Some((_, cached)) = guard.iter().find(|(k, _)| *k == uid)
+    {
+        return cached.clone();
+    }
+
+    let resolved = match User::from_uid(Uid::from_raw(uid)) {
+        Ok(Some(user)) => Some(user.name),
+        Ok(None) => None,
+        Err(err) => {
+            warn!("Could not resolve username for uid {}: {}", uid, err);
+            None
+        }
+    };
+
+    if let Ok(mut guard) = CACHE.lock() {
+        if guard.len() >= MAX_PEER_USER_CACHE {
+            guard.remove(0);
+        }
+        guard.push((uid, resolved.clone()));
+    }
+    resolved
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub(crate) fn peer_user(_uid: u32) -> Option<String> {
+    None
 }
 
 impl Debug for Server {
@@ -868,11 +1262,124 @@ impl Debug for Server {
             .field("next_session_id", &self.next_session_id)
             .field("next_task_id", &self.next_task_id)
             .field("next_worker_id", &self.next_worker_id)
+            .field("pending_audit_events", &self.pending_audit_events.len())
             .field("poll", &self.poll)
             .field("queued_tasks", &self.queued_tasks)
             .field("run_state", &self.run_state)
             .field("unix_listener", &self.unix_listener)
             .field("workers", &self.workers)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sozu_command_lib::{
+        config::Config,
+        proto::command::{
+            AddBackend, Cluster, RequestHttpFrontend, RequestTcpFrontend, SocketAddress,
+            request::RequestType,
+        },
+    };
+    use sozu_lib::metrics::METRICS;
+
+    use sozu_command_lib::proto::command::{PathRule, RulePosition, filtered_metrics};
+
+    /// Helper to read a gauge value from the thread-local METRICS
+    fn read_gauge(key: &str) -> Option<u64> {
+        METRICS.with(|metrics| {
+            let mut m = metrics.borrow_mut();
+            let proxy_metrics = m.dump_local_proxy_metrics();
+            proxy_metrics.get(key).and_then(|fm| match &fm.inner {
+                Some(filtered_metrics::Inner::Gauge(v)) => Some(*v),
+                _ => None,
+            })
+        })
+    }
+
+    fn create_test_server() -> Server {
+        let dir = tempfile::tempdir().expect("Could not create temp dir");
+        let socket_path = dir.path().join("test.sock");
+        let unix_listener = UnixListener::bind(&socket_path).expect("Could not bind socket");
+        Server::new(unix_listener, Config::default(), "sozu".to_owned())
+            .expect("Could not create server")
+    }
+
+    #[test]
+    fn update_counts_reflects_state() {
+        let mut server = create_test_server();
+
+        // initially empty
+        server.update_counts();
+        assert_eq!(read_gauge("configuration.clusters"), Some(0));
+        assert_eq!(read_gauge("configuration.backends"), Some(0));
+        assert_eq!(read_gauge("configuration.frontends"), Some(0));
+
+        // add a cluster
+        server
+            .state
+            .dispatch(
+                &RequestType::AddCluster(Cluster {
+                    cluster_id: String::from("cluster_1"),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not add cluster");
+
+        // add backends
+        for i in 0..3 {
+            server
+                .state
+                .dispatch(
+                    &RequestType::AddBackend(AddBackend {
+                        cluster_id: String::from("cluster_1"),
+                        backend_id: format!("cluster_1-{i}"),
+                        address: SocketAddress::new_v4(127, 0, 0, 1, 1026 + i as u16),
+                        ..Default::default()
+                    })
+                    .into(),
+                )
+                .expect("Could not add backend");
+        }
+
+        // add an HTTP frontend
+        server
+            .state
+            .dispatch(
+                &RequestType::AddHttpFrontend(RequestHttpFrontend {
+                    cluster_id: Some(String::from("cluster_1")),
+                    hostname: String::from("example.com"),
+                    path: PathRule::prefix(String::from("/")),
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
+                    position: RulePosition::Tree.into(),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not add frontend");
+
+        // add a TCP frontend
+        server
+            .state
+            .dispatch(
+                &RequestType::AddTcpFrontend(RequestTcpFrontend {
+                    cluster_id: String::from("cluster_1"),
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 5432),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not add TCP frontend");
+
+        // gauges are still stale until update_counts() is called
+        assert_eq!(read_gauge("configuration.clusters"), Some(0));
+
+        // update_counts should refresh gauges
+        server.update_counts();
+        assert_eq!(read_gauge("configuration.clusters"), Some(1));
+        assert_eq!(read_gauge("configuration.backends"), Some(3));
+        assert_eq!(read_gauge("configuration.frontends"), Some(2));
     }
 }

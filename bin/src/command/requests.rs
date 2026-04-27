@@ -1,13 +1,25 @@
+//! Master command-verb dispatcher and audit envelope.
+//!
+//! Receives decoded `Request` protos from connected CLI clients, applies
+//! `command_allowed_uids` admission, validates and fans out cluster /
+//! listener / certificate / runtime mutations to workers, and emits the
+//! audit-log envelope (`sanitize_for_audit`-protected JSON sink) for every
+//! mutating verb. Long-form lifecycle: `bin/src/command/LIFECYCLE.md`.
+
 use std::{
     collections::{BTreeMap, HashMap},
     env,
     fs::File,
     io::{ErrorKind, Read},
     path::PathBuf,
+    time::Instant,
 };
 
 use mio::Token;
 use nom::{HexDisplay, Offset};
+use prost::Message as _;
+use rusty_ulid::Ulid;
+use sha2::{Digest, Sha256};
 use sozu_command_lib::{
     buffer::fixed::Buffer,
     config::Config,
@@ -15,10 +27,11 @@ use sozu_command_lib::{
     parser::parse_several_requests,
     proto::command::{
         AggregatedMetrics, AvailableMetrics, CertificatesWithFingerprints, ClusterHashes,
-        ClusterInformations, FrontendFilters, HardStop, QueryCertificatesFilters,
-        QueryMetricsOptions, Request, ResponseContent, ResponseStatus, RunState, SoftStop, Status,
-        WorkerInfo, WorkerInfos, WorkerRequest, WorkerResponses, request::RequestType,
-        response_content::ContentType,
+        ClusterInformations, Event, EventKind, FrontendFilters, HardStop, MetricsConfiguration,
+        QueryCertificatesFilters, QueryMetricsOptions, Request, ResponseContent, ResponseStatus,
+        RunState, SoftStop, Status, UpdateHttpListenerConfig, UpdateHttpsListenerConfig,
+        UpdateTcpListenerConfig, WorkerInfo, WorkerInfos, WorkerRequest, WorkerResponses,
+        request::RequestType, response_content::ContentType,
     },
 };
 use sozu_lib::metrics::METRICS;
@@ -28,9 +41,142 @@ use crate::command::{
         DefaultGatherer, Gatherer, GatheringTask, MessageClient, Server, ServerState, Timeout,
         WorkerId,
     },
-    sessions::{ClientSession, OptionalClient},
+    sessions::{ClientSession, OptionalClient, sanitize_for_audit},
     upgrade::{upgrade_main, upgrade_worker},
 };
+
+/// Pair a verb tag with its `config.<verb>` counter key in a single place so
+/// the two strings cannot drift. Both must be string literals because the
+/// metric drain stores `&'static str` keys.
+///
+/// Defined at the top of the module so that in-file macros expand before any
+/// call site (Rust `macro_rules!` macros are textually scoped — definition
+/// must precede use within a module).
+macro_rules! audit_verb {
+    ($verb:literal) => {
+        ($verb, concat!("config.", $verb))
+    };
+}
+
+/// Render the structured audit log line in the MUX-family layout.
+///
+/// Expands to a `format!` producing
+/// `[session_ulid request_ulid cluster_id|- backend_id|-]\tAUDIT\tCommand(verb=..., actor_uid=..., actor_gid=..., actor_pid=..., actor_comm=..., client_id=..., target=..., result=..., [error_code=..., reason=..., elapsed_ms=..., fanout=..., workers=<ok>/<err>/<expected>,] sozu_version=...)`
+/// with ANSI colours when the logger is colour-enabled (empty strings
+/// otherwise — see [`sozu_command_lib::logging::ansi_palette`]). Bracketed
+/// fields are emitted only when set on [`AuditEntry`] / the caller.
+///
+/// Bracket layout mirrors `log_context!` in `lib/src/protocol/mux/mod.rs:50`
+/// so operators can grep `AUDIT` alongside `MUX` / `RUSTLS` / `PIPE` / `TCP`.
+/// Uses the `Command(...)` keyword (vs. `Session(...)` in MUX lines) because
+/// the payload describes a control-plane command, not a proxy session. The
+/// line is self-contained — no `\t >>>` continuation marker since nothing
+/// follows the closing paren.
+///
+/// Every string field — `verb` is a `&'static str` and therefore trusted,
+/// but `target`, `cluster_id`, `backend_id`, `actor_comm`, `reason` can
+/// originate from attacker-influenced input (cluster IDs from sozu CLI
+/// arguments, hostnames from frontend configs, error messages from
+/// `state.dispatch`). All of them go through
+/// [`sozu_command_lib::sessions::sanitize_for_audit`] at render time to
+/// neutralise `\n`/`\t`/`\x1b` injection that would otherwise forge a
+/// second audit line.
+macro_rules! audit_log_context {
+    ($server:expr, $client:expr, $request_id:expr, $entry:expr, $result:expr) => {{
+        use $crate::command::sessions::sanitize_for_audit;
+        let (open, reset, grey, gray, white) = ::sozu_command_lib::logging::ansi_palette();
+        let log_ctx = ::sozu_command_lib::logging::LogContext {
+            session_id: $client.session_ulid,
+            request_id: Some(*$request_id),
+            cluster_id: $entry.cluster_id.as_deref(),
+            backend_id: $entry.backend_id.as_deref(),
+        };
+        let mut extras = String::new();
+        if let Some(code) = $entry.extras.error_code {
+            extras.push_str(&format!(
+                ", {gray}error_code{reset}={white}{code}{reset}",
+                gray = gray,
+                reset = reset,
+                white = white,
+                code = code,
+            ));
+        }
+        if let Some(reason) = $entry.extras.reason.as_deref() {
+            let sanitized = sanitize_for_audit(reason);
+            let truncated = if sanitized.chars().count() > AUDIT_REASON_MAX_CHARS {
+                let cut: String = sanitized.chars().take(AUDIT_REASON_MAX_CHARS).collect();
+                format!("{cut}…")
+            } else {
+                sanitized
+            };
+            extras.push_str(&format!(
+                ", {gray}reason{reset}={white}{reason}{reset}",
+                gray = gray,
+                reset = reset,
+                white = white,
+                reason = truncated,
+            ));
+        }
+        if let Some(elapsed) = $entry.extras.elapsed_ms {
+            extras.push_str(&format!(
+                ", {gray}elapsed_ms{reset}={white}{elapsed}{reset}",
+                gray = gray,
+                reset = reset,
+                white = white,
+                elapsed = elapsed,
+            ));
+        }
+        if let Some(fanout) = $entry.extras.fanout {
+            extras.push_str(&format!(
+                ", {gray}fanout{reset}={white}{status}{reset}, {gray}workers{reset}={white}{ok}/{err}/{expected}{reset}",
+                gray = gray,
+                reset = reset,
+                white = white,
+                status = fanout.status,
+                ok = fanout.workers_ok,
+                err = fanout.workers_err,
+                expected = fanout.workers_expected,
+            ));
+        }
+        if let Some(hash) = $entry.extras.request_sha256.as_deref() {
+            extras.push_str(&format!(
+                ", {gray}request_sha256{reset}={white}{hash}{reset}",
+                gray = gray,
+                reset = reset,
+                white = white,
+                hash = hash,
+            ));
+        }
+        let now_ts = rfc3339_utc(std::time::SystemTime::now());
+        let connect_ts = $client.connect_ts_display();
+        format!(
+            "{gray}{ctx}{reset}\t{open}AUDIT{reset}\t{grey}Command{reset}({gray}ts{reset}={white}{ts}{reset}, {gray}verb{reset}={white}{verb}{reset}, {gray}actor_uid{reset}={white}{actor_uid}{reset}, {gray}actor_gid{reset}={white}{actor_gid}{reset}, {gray}actor_pid{reset}={white}{actor_pid}{reset}, {gray}actor_role{reset}={white}{actor_role}{reset}, {gray}actor_user{reset}={white}{actor_user}{reset}, {gray}actor_comm{reset}={white}{actor_comm}{reset}, {gray}client_id{reset}={white}{client_id}{reset}, {gray}connect_ts{reset}={white}{connect_ts}{reset}, {gray}socket{reset}={white}{socket_path}{reset}, {gray}target{reset}={white}{target}{reset}, {gray}result{reset}={white}{result}{reset}{extras}, {gray}sozu_version{reset}={white}{sozu_version}{reset}, {gray}build_git_sha{reset}={white}{build_git_sha}{reset}, {gray}boot_generation{reset}={white}{boot_generation}{reset})",
+            open = open,
+            reset = reset,
+            grey = grey,
+            gray = gray,
+            white = white,
+            ctx = log_ctx,
+            ts = now_ts,
+            verb = $entry.verb,
+            actor_uid = $client.actor_uid_display(),
+            actor_gid = $client.actor_gid_display(),
+            actor_pid = $client.actor_pid_display(),
+            actor_role = actor_role($client.actor_uid),
+            actor_user = $client.actor_user_display(),
+            actor_comm = $client.actor_comm_display(),
+            client_id = $client.id,
+            connect_ts = connect_ts,
+            socket_path = sanitize_for_audit(&$client.socket_path),
+            target = sanitize_for_audit(&$entry.target),
+            result = $result,
+            extras = extras,
+            sozu_version = SOZU_VERSION,
+            build_git_sha = SOZU_BUILD_GIT_SHA,
+            boot_generation = $server.boot_generation,
+        )
+    }};
+}
 
 impl Server {
     pub fn handle_client_request(&mut self, client: &mut ClientSession, request: Request) {
@@ -41,6 +187,32 @@ impl Server {
                 return;
             }
         };
+        // Optional UID allowlist. `None` preserves the historical
+        // behaviour (same-UID local process can do anything).
+        // When set, requests from UIDs outside the list are rejected
+        // before dispatch — both read and write — and the rejection
+        // appears in the audit trail via `client.finish_failure`.
+        if let Some(allowed) = self.config.command_allowed_uids.as_ref() {
+            let actor_uid = client.actor_uid;
+            let permitted = actor_uid.is_some_and(|u| allowed.contains(&u));
+            if !permitted {
+                warn!(
+                    "rejecting command-socket request from non-allowlisted UID: actor_uid={} allowed={:?} verb={:?}",
+                    actor_uid
+                        .map(|u| u.to_string())
+                        .unwrap_or_else(|| "unknown".to_owned()),
+                    allowed,
+                    std::mem::discriminant(&request_type)
+                );
+                client.finish_failure(format!(
+                    "unauthorized: actor UID {} not in command_allowed_uids",
+                    actor_uid
+                        .map(|u| u.to_string())
+                        .unwrap_or_else(|| "unknown".to_owned())
+                ));
+                return;
+            }
+        }
         match request_type {
             RequestType::SaveState(path) => save_state(self, client, &path),
             RequestType::LoadState(path) => load_state(self, Some(client), &path),
@@ -73,7 +245,10 @@ impl Server {
             | RequestType::RemoveHttpsFrontend(_)
             | RequestType::RemoveListener(_)
             | RequestType::RemoveTcpFrontend(_)
-            | RequestType::ReplaceCertificate(_) => {
+            | RequestType::ReplaceCertificate(_)
+            | RequestType::UpdateHttpListener(_)
+            | RequestType::UpdateHttpsListener(_)
+            | RequestType::UpdateTcpListener(_) => {
                 worker_request(self, client, request_type);
             }
             RequestType::QueryClustersHashes(_)
@@ -203,6 +378,20 @@ fn save_state(server: &mut Server, client: &mut ClientSession, path: &str) {
         match std::env::current_dir() {
             Ok(cwd) => path = cwd.join(path),
             Err(error) => {
+                let (verb, counter) = audit_verb!("state_saved");
+                audit_emit_inline(
+                    server,
+                    client,
+                    EventKind::StateSaved,
+                    verb,
+                    counter,
+                    format!("file:{}", path.display()),
+                    AuditResult::Err,
+                    AuditExtras {
+                        error_code: Some(AuditErrorCode::IoError),
+                        ..Default::default()
+                    },
+                );
                 client.finish_failure(format!("Cannot get Sōzu working directory: {error}",));
                 return;
             }
@@ -213,6 +402,20 @@ fn save_state(server: &mut Server, client: &mut ClientSession, path: &str) {
     let mut file = match File::create(&path) {
         Ok(file) => file,
         Err(error) => {
+            let (verb, counter) = audit_verb!("state_saved");
+            audit_emit_inline(
+                server,
+                client,
+                EventKind::StateSaved,
+                verb,
+                counter,
+                format!("file:{}", path.display()),
+                AuditResult::Err,
+                AuditExtras {
+                    error_code: Some(AuditErrorCode::IoError),
+                    ..Default::default()
+                },
+            );
             client.finish_failure(format!(
                 "Cannot create file at path {}: {error}",
                 path.display()
@@ -222,13 +425,38 @@ fn save_state(server: &mut Server, client: &mut ClientSession, path: &str) {
     };
 
     match server.state.write_requests_to_file(&mut file) {
-        Ok(counter) => {
+        Ok(count) => {
+            let (verb, counter) = audit_verb!("state_saved");
+            audit_emit_inline(
+                server,
+                client,
+                EventKind::StateSaved,
+                verb,
+                counter,
+                format!("file:{} messages:{count}", path.display()),
+                AuditResult::Ok,
+                AuditExtras::default(),
+            );
             client.finish_ok(format!(
-                "Saved {counter} config messages to {}",
+                "Saved {count} config messages to {}",
                 &path.display()
             ));
         }
         Err(error) => {
+            let (verb, counter) = audit_verb!("state_saved");
+            audit_emit_inline(
+                server,
+                client,
+                EventKind::StateSaved,
+                verb,
+                counter,
+                format!("file:{}", path.display()),
+                AuditResult::Err,
+                AuditExtras {
+                    error_code: Some(AuditErrorCode::IoError),
+                    ..Default::default()
+                },
+            );
             client.finish_failure(format!("Failed writing state to file: {error}"));
         }
     }
@@ -239,14 +467,27 @@ fn set_logging_level(server: &mut Server, client: &mut ClientSession, logging_fi
     debug!("Changing main process log level to {}", logging_filter);
     let (directives, errors) = logging::parse_logging_spec(&logging_filter);
     if !errors.is_empty() {
-        client.finish_failure(format!(
-            "Error parsing logging filter:\n- {}",
-            errors
-                .iter()
-                .map(logging::LogSpecParseError::to_string)
-                .collect::<Vec<String>>()
-                .join("\n- ")
-        ));
+        let (verb, counter) = audit_verb!("logging_level_changed");
+        let reason = errors
+            .iter()
+            .map(logging::LogSpecParseError::to_string)
+            .collect::<Vec<String>>()
+            .join("; ");
+        audit_emit_inline(
+            server,
+            client,
+            EventKind::LoggingLevelChanged,
+            verb,
+            counter,
+            format!("logging:{logging_filter}"),
+            AuditResult::Err,
+            AuditExtras {
+                error_code: Some(AuditErrorCode::InvalidInput),
+                reason: Some(reason.clone()),
+                ..Default::default()
+            },
+        );
+        client.finish_failure(format!("Error parsing logging filter:\n- {reason}"));
         return;
     }
     logging::LOGGER.with(|logger| {
@@ -256,10 +497,27 @@ fn set_logging_level(server: &mut Server, client: &mut ClientSession, logging_fi
     // also change / set the content of RUST_LOG so future workers / main thread
     // will have the new logging filter value
     // TODO: Audit that the environment access only happens in single-threaded code.
+    // SAFETY: `env::set_var` in Rust 2024 is unsafe because it is not
+    // thread-safe. The supervisor that handles `LoggingFilter` requests is
+    // single-threaded (mio event loop on the command socket), and workers
+    // are separate processes that re-read RUST_LOG after fork-and-exec —
+    // so the racy read it would otherwise fight with does not exist here.
     unsafe { env::set_var("RUST_LOG", &logging_filter) };
     debug!(
         "Logging level now: {}",
         env::var("RUST_LOG").unwrap_or("could get RUST_LOG from env".to_string())
+    );
+
+    let (verb, counter) = audit_verb!("logging_level_changed");
+    audit_emit_inline(
+        server,
+        client,
+        EventKind::LoggingLevelChanged,
+        verb,
+        counter,
+        format!("logging:{logging_filter}"),
+        AuditResult::Ok,
+        AuditExtras::default(),
     );
 
     worker_request(server, client, RequestType::Logging(logging_filter));
@@ -268,6 +526,17 @@ fn set_logging_level(server: &mut Server, client: &mut ClientSession, logging_fi
 fn subscribe_client_to_events(server: &mut Server, client: &mut ClientSession) {
     info!("Subscribing client {:?} to listen to events", client.token);
     server.event_subscribers.insert(client.token);
+    let (verb, counter) = audit_verb!("events_subscribed");
+    audit_emit_inline(
+        server,
+        client,
+        EventKind::EventsSubscribed,
+        verb,
+        counter,
+        format!("subscribe:client_id:{}", client.id),
+        AuditResult::Ok,
+        AuditExtras::default(),
+    );
 }
 
 //===============================================
@@ -377,10 +646,27 @@ pub fn load_static_config(server: &mut Server, mut client: OptionalClient, path:
         config.config_path
     ));
 
+    let audit_target = format!("config:{}", config.config_path);
+
     let config_messages = match config.generate_config_messages() {
         Ok(messages) => messages,
         Err(config_err) => {
-            client.finish_failure(format!("could not generate new config: {}", config_err));
+            // Only attribute the audit event when a client triggered the
+            // reload — at startup (`client == None`) there is no actor.
+            if let Some(client_ref) = client.as_deref() {
+                let (verb, counter) = audit_verb!("configuration_reloaded");
+                audit_emit_inline(
+                    server,
+                    client_ref,
+                    EventKind::ConfigurationReloaded,
+                    verb,
+                    counter,
+                    audit_target.clone(),
+                    AuditResult::Err,
+                    AuditExtras::default(),
+                );
+            }
+            client.finish_failure(format!("could not generate new config: {config_err}"));
             return;
         }
     };
@@ -388,7 +674,7 @@ pub fn load_static_config(server: &mut Server, mut client: OptionalClient, path:
     for (request_index, message) in config_messages.into_iter().enumerate() {
         let request = message.content;
         if let Err(error) = server.state.dispatch(&request) {
-            client.return_processing(format!("Could not execute request on state: {:#}", error));
+            client.return_processing(format!("Could not execute request on state: {error:#}"));
             continue;
         }
 
@@ -399,6 +685,20 @@ pub fn load_static_config(server: &mut Server, mut client: OptionalClient, path:
         }
 
         server.scatter_on(request, task_id, request_index, None);
+    }
+
+    if let Some(client_ref) = client.as_deref() {
+        let (verb, counter) = audit_verb!("configuration_reloaded");
+        audit_emit_inline(
+            server,
+            client_ref,
+            EventKind::ConfigurationReloaded,
+            verb,
+            counter,
+            audit_target,
+            AuditResult::Ok,
+            AuditExtras::default(),
+        );
     }
 }
 
@@ -447,12 +747,759 @@ impl GatheringTask for LoadStaticConfigTask {
 }
 
 // =========================================================
+// Audit trail (control-plane mutations)
+
+/// Outcome of a control-plane mutation, formatted into the structured
+/// audit log line.
+#[derive(Clone, Copy)]
+pub(crate) enum AuditResult {
+    Ok,
+    Err,
+}
+
+impl AuditResult {
+    fn as_str(self) -> &'static str {
+        match self {
+            AuditResult::Ok => "ok",
+            AuditResult::Err => "err",
+        }
+    }
+}
+
+impl std::fmt::Display for AuditResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Structured failure reason. Exists so SIEM alerts can group-by without
+/// grepping free-form error strings. Paired with `result=err` in the
+/// audit line; omitted for `result=ok`.
+///
+/// `PeerCredUnavailable` and `Other` are reserved — they fire once the
+/// callers that need them land (SO_PEERCRED failure audit, catch-all
+/// emit path). Suppressing dead-code warnings keeps the taxonomy stable
+/// as we wire them up.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum AuditErrorCode {
+    /// `state.dispatch` rejected the request on the main process.
+    DispatchError,
+    /// One or more workers returned `Failure` during fan-out.
+    WorkerFailure,
+    /// Fan-out timed out before every worker responded.
+    WorkerTimeout,
+    /// `SO_PEERCRED` returned no credentials; actor attribution missing.
+    PeerCredUnavailable,
+    /// Operator supplied invalid input (e.g. malformed logging filter).
+    InvalidInput,
+    /// I/O error on state save/load (disk full, permission denied, parse).
+    IoError,
+    /// Generic bucket for anything that doesn't fit the above. Prefer
+    /// adding a new variant over reusing this.
+    Other,
+}
+
+impl AuditErrorCode {
+    fn as_str(self) -> &'static str {
+        match self {
+            AuditErrorCode::DispatchError => "dispatch_error",
+            AuditErrorCode::WorkerFailure => "worker_failure",
+            AuditErrorCode::WorkerTimeout => "worker_timeout",
+            AuditErrorCode::PeerCredUnavailable => "peer_cred_unavailable",
+            AuditErrorCode::InvalidInput => "invalid_input",
+            AuditErrorCode::IoError => "io_error",
+            AuditErrorCode::Other => "other",
+        }
+    }
+}
+
+impl std::fmt::Display for AuditErrorCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Worker fan-out outcome, rendered in the completion audit line.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum FanoutStatus {
+    /// Every expected worker acknowledged with Ok.
+    Ok,
+    /// Some workers reported Failure; others were Ok.
+    Partial,
+    /// Fan-out didn't reach all workers within the deadline.
+    Timeout,
+    /// No workers expected (local-main-only request).
+    LocalOnly,
+}
+
+impl FanoutStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            FanoutStatus::Ok => "ok",
+            FanoutStatus::Partial => "partial",
+            FanoutStatus::Timeout => "timeout",
+            FanoutStatus::LocalOnly => "local_only",
+        }
+    }
+}
+
+impl std::fmt::Display for FanoutStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Worker fan-out summary attached to completion-time audit emissions.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FanoutSummary {
+    status: FanoutStatus,
+    workers_ok: u32,
+    workers_err: u32,
+    workers_expected: u32,
+}
+
+/// Optional audit-line fields populated at completion time or when a
+/// failure reason is known. Defaulted to all-`None` at `AuditEntry`
+/// construction so the existing build sites don't all need to set them;
+/// emitters that know these values fill them in via helper constructors
+/// before calling [`audit_emit`] / [`audit_emit_inline`].
+#[derive(Debug, Default, Clone)]
+pub(crate) struct AuditExtras {
+    /// Wall-clock milliseconds between request acceptance and audit emission.
+    pub(crate) elapsed_ms: Option<u64>,
+    /// Structured failure reason. Set only on `AuditResult::Err` paths.
+    pub(crate) error_code: Option<AuditErrorCode>,
+    /// Worker fan-out outcome. Set on completion-time emissions.
+    pub(crate) fanout: Option<FanoutSummary>,
+    /// Short truncated failure detail — mirrors `finish_failure` message.
+    pub(crate) reason: Option<String>,
+    /// Truncated hex-encoded SHA-256 fingerprint of the proto `Request`
+    /// bytes, for dedupe / replay detection. First 16 hex chars (64 bits).
+    /// Set for verbs that flow through `worker_request`; `None` for inline
+    /// verbs that don't carry a payload worth hashing.
+    pub(crate) request_sha256: Option<String>,
+}
+
+/// A control-plane mutation, broken down into the pieces the audit trail
+/// needs (event kind, verb name for the log, the matching counter key, and
+/// the optional target identifiers populated on the emitted [Event]).
+#[derive(Debug)]
+struct AuditEntry {
+    kind: EventKind,
+    /// Stable verb tag rendered inside the audit `Command(verb=...)` block.
+    /// Always a static string.
+    verb: &'static str,
+    /// Pre-built `config.<verb>` counter key. Stored as a `&'static str` so
+    /// `count!` can route it through statsd without a verb→key dispatch
+    /// table — the construction sites pair `verb` and `counter` at a single
+    /// site, eliminating drift.
+    counter: &'static str,
+    cluster_id: Option<String>,
+    backend_id: Option<String>,
+    address: Option<sozu_command_lib::proto::command::SocketAddress>,
+    /// Free-form target descriptor for the audit log, e.g. `"address:127.0.0.1:8080"`
+    /// or `"cluster:my-cluster"`. Captures whichever identifier is meaningful
+    /// for the verb.
+    target: String,
+    /// Optional timing / error_code / fanout / reason fields. Defaulted at
+    /// construction; populated via [`AuditEntry::with_extras`] on the hot
+    /// paths that care.
+    extras: AuditExtras,
+}
+
+/// Truncated SHA-256 request fingerprint for dedupe / correlation.
+/// Render-only helper; see [`audit_log_context!`] for inclusion.
+const AUDIT_REASON_MAX_CHARS: usize = 256;
+
+/// Compile-time sozu version tag — rendered in every audit line so
+/// operators correlate which binary emitted which log during upgrades.
+const SOZU_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Build-time short git SHA, embedded by `bin/build.rs`. Falls back to
+/// `"unknown"` on builds outside a git tree (vendored tarballs, sysroots).
+/// Together with `sozu_version` it pins which exact commit emitted a
+/// given audit line — useful when a regression lands between the same
+/// semver tag.
+const SOZU_BUILD_GIT_SHA: &str = env!("SOZU_BUILD_GIT_SHA");
+
+/// Render an actor role hint for SOC scanning. Rule:
+/// - `uid == 0`         → `root`     (super-user, P1 alert)
+/// - `1 <= uid < 1000`  → `system`   (service account, expected daemons)
+/// - `uid >= 1000`      → `user`     (normal interactive operator)
+/// - missing            → `unknown`  (SO_PEERCRED unavailable)
+///
+/// `1000` is the conventional Linux NSS uid floor for human accounts.
+/// Operators on systems with a different convention (BSD, macOS) get the
+/// same buckets — the labels are advisory, the raw `actor_uid` is still
+/// authoritative.
+pub(crate) fn actor_role(uid: Option<u32>) -> &'static str {
+    match uid {
+        None => "unknown",
+        Some(0) => "root",
+        Some(u) if u < 1000 => "system",
+        Some(_) => "user",
+    }
+}
+
+/// Render a `SystemTime` as an RFC 3339 / ISO 8601 timestamp at UTC
+/// (`YYYY-MM-DDTHH:MM:SS.ffffffZ`). std-only — uses Howard Hinnant's
+/// `civil_from_days` algorithm so we don't pull in `chrono` / `time`.
+///
+/// Six-digit fractional seconds (microseconds) — matches what most SIEM
+/// stacks expect and avoids the precision overhead of nanoseconds.
+pub(crate) fn rfc3339_utc(t: std::time::SystemTime) -> String {
+    let dur = t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let secs = dur.as_secs() as i64;
+    let micros = dur.subsec_micros();
+
+    let days = secs.div_euclid(86_400);
+    let sec_of_day = secs.rem_euclid(86_400) as u32;
+    let hh = sec_of_day / 3600;
+    let mm = (sec_of_day / 60) % 60;
+    let ss = sec_of_day % 60;
+
+    // Hinnant's civil_from_days — `days` is days since 1970-01-01.
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = y + if m <= 2 { 1 } else { 0 };
+
+    format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}.{micros:06}Z")
+}
+
+/// Build the [AuditEntry] for a control-plane request, or `None` for
+/// non-mutating verbs (the caller skips them — they have no audit footprint).
+///
+/// `state` is used to snapshot the pre-change listener config for
+/// `UpdateHttp/Https/TcpListener` so the audit line can show
+/// `field=old→new` pairs. Passing the `ConfigState` by reference stays
+/// cheap because only the UpdateListener arms look anything up.
+fn audit_entry_for(
+    request: &RequestType,
+    state: &sozu_command_lib::state::ConfigState,
+) -> Option<AuditEntry> {
+    use std::net::SocketAddr;
+    match request {
+        RequestType::AddCluster(cluster) => {
+            let (verb, counter) = audit_verb!("cluster_added");
+            Some(AuditEntry {
+                kind: EventKind::ClusterAdded,
+                verb,
+                counter,
+                target: format!("cluster:{}", cluster.cluster_id),
+                cluster_id: Some(cluster.cluster_id.to_owned()),
+                backend_id: None,
+                address: None,
+                extras: AuditExtras::default(),
+            })
+        }
+        RequestType::RemoveCluster(cluster_id) => {
+            let (verb, counter) = audit_verb!("cluster_removed");
+            Some(AuditEntry {
+                kind: EventKind::ClusterRemoved,
+                verb,
+                counter,
+                target: format!("cluster:{cluster_id}"),
+                cluster_id: Some(cluster_id.to_owned()),
+                backend_id: None,
+                address: None,
+                extras: AuditExtras::default(),
+            })
+        }
+        RequestType::AddHttpFrontend(frontend) => {
+            let (verb, counter) = audit_verb!("http_frontend_added");
+            Some(AuditEntry {
+                kind: EventKind::FrontendAdded,
+                verb,
+                counter,
+                target: format!("frontend:http:{}:{}", frontend.hostname, frontend.address),
+                cluster_id: frontend.cluster_id.clone(),
+                backend_id: None,
+                address: Some(frontend.address),
+                extras: AuditExtras::default(),
+            })
+        }
+        RequestType::AddHttpsFrontend(frontend) => {
+            let (verb, counter) = audit_verb!("https_frontend_added");
+            Some(AuditEntry {
+                kind: EventKind::FrontendAdded,
+                verb,
+                counter,
+                target: format!("frontend:https:{}:{}", frontend.hostname, frontend.address),
+                cluster_id: frontend.cluster_id.clone(),
+                backend_id: None,
+                address: Some(frontend.address),
+                extras: AuditExtras::default(),
+            })
+        }
+        RequestType::AddTcpFrontend(frontend) => {
+            let (verb, counter) = audit_verb!("tcp_frontend_added");
+            Some(AuditEntry {
+                kind: EventKind::FrontendAdded,
+                verb,
+                counter,
+                target: format!("frontend:tcp:{}:{}", frontend.cluster_id, frontend.address),
+                cluster_id: Some(frontend.cluster_id.to_owned()),
+                backend_id: None,
+                address: Some(frontend.address),
+                extras: AuditExtras::default(),
+            })
+        }
+        RequestType::RemoveHttpFrontend(frontend) => {
+            let (verb, counter) = audit_verb!("http_frontend_removed");
+            Some(AuditEntry {
+                kind: EventKind::FrontendRemoved,
+                verb,
+                counter,
+                target: format!("frontend:http:{}:{}", frontend.hostname, frontend.address),
+                cluster_id: frontend.cluster_id.clone(),
+                backend_id: None,
+                address: Some(frontend.address),
+                extras: AuditExtras::default(),
+            })
+        }
+        RequestType::RemoveHttpsFrontend(frontend) => {
+            let (verb, counter) = audit_verb!("https_frontend_removed");
+            Some(AuditEntry {
+                kind: EventKind::FrontendRemoved,
+                verb,
+                counter,
+                target: format!("frontend:https:{}:{}", frontend.hostname, frontend.address),
+                cluster_id: frontend.cluster_id.clone(),
+                backend_id: None,
+                address: Some(frontend.address),
+                extras: AuditExtras::default(),
+            })
+        }
+        RequestType::RemoveTcpFrontend(frontend) => {
+            let (verb, counter) = audit_verb!("tcp_frontend_removed");
+            Some(AuditEntry {
+                kind: EventKind::FrontendRemoved,
+                verb,
+                counter,
+                target: format!("frontend:tcp:{}:{}", frontend.cluster_id, frontend.address),
+                cluster_id: Some(frontend.cluster_id.to_owned()),
+                backend_id: None,
+                address: Some(frontend.address),
+                extras: AuditExtras::default(),
+            })
+        }
+        RequestType::AddCertificate(add) => {
+            let (verb, counter) = audit_verb!("certificate_added");
+            Some(AuditEntry {
+                kind: EventKind::CertificateAdded,
+                verb,
+                counter,
+                target: format!("certificate:{}", add.address),
+                cluster_id: None,
+                backend_id: None,
+                address: Some(add.address),
+                extras: AuditExtras::default(),
+            })
+        }
+        RequestType::RemoveCertificate(remove) => {
+            let (verb, counter) = audit_verb!("certificate_removed");
+            Some(AuditEntry {
+                kind: EventKind::CertificateRemoved,
+                verb,
+                counter,
+                target: format!("certificate:{}:{}", remove.address, remove.fingerprint),
+                cluster_id: None,
+                backend_id: None,
+                address: Some(remove.address),
+                extras: AuditExtras::default(),
+            })
+        }
+        RequestType::ReplaceCertificate(replace) => {
+            let (verb, counter) = audit_verb!("certificate_replaced");
+            // Compute the new cert's fingerprint from its PEM so the audit
+            // trail records both the cert being removed AND the cert
+            // replacing it. Forensic value: rotation pattern + detection of
+            // substituted-cert attacks. Best-effort: on parse failure the
+            // new fingerprint falls back to `"unknown"` rather than
+            // aborting the audit emission.
+            let new_fp =
+                compute_certificate_fingerprint(replace.new_certificate.certificate.as_bytes())
+                    .unwrap_or_else(|| "unknown".to_owned());
+            Some(AuditEntry {
+                kind: EventKind::CertificateReplaced,
+                verb,
+                counter,
+                target: format!(
+                    "certificate:{}:old={}:new={}",
+                    replace.address, replace.old_fingerprint, new_fp
+                ),
+                cluster_id: None,
+                backend_id: None,
+                address: Some(replace.address),
+                extras: AuditExtras::default(),
+            })
+        }
+        RequestType::ActivateListener(listener) => {
+            let (verb, counter) = audit_verb!("listener_activated");
+            Some(AuditEntry {
+                kind: EventKind::ListenerActivated,
+                verb,
+                counter,
+                target: format!("listener:{:?}:{}", listener.proxy(), listener.address),
+                cluster_id: None,
+                backend_id: None,
+                address: Some(listener.address),
+                extras: AuditExtras::default(),
+            })
+        }
+        RequestType::DeactivateListener(listener) => {
+            let (verb, counter) = audit_verb!("listener_deactivated");
+            Some(AuditEntry {
+                kind: EventKind::ListenerDeactivated,
+                verb,
+                counter,
+                target: format!("listener:{:?}:{}", listener.proxy(), listener.address),
+                cluster_id: None,
+                backend_id: None,
+                address: Some(listener.address),
+                extras: AuditExtras::default(),
+            })
+        }
+        RequestType::UpdateHttpListener(patch) => {
+            let (verb, counter) = audit_verb!("http_listener_updated");
+            let current = state.http_listeners.get(&SocketAddr::from(patch.address));
+            Some(AuditEntry {
+                kind: EventKind::ListenerUpdated,
+                verb,
+                counter,
+                target: format!(
+                    "listener:http:{}:{}",
+                    patch.address,
+                    format_patch_diff_http(patch, current),
+                ),
+                cluster_id: None,
+                backend_id: None,
+                address: Some(patch.address),
+                extras: AuditExtras::default(),
+            })
+        }
+        RequestType::UpdateHttpsListener(patch) => {
+            let (verb, counter) = audit_verb!("https_listener_updated");
+            let current = state.https_listeners.get(&SocketAddr::from(patch.address));
+            Some(AuditEntry {
+                kind: EventKind::ListenerUpdated,
+                verb,
+                counter,
+                target: format!(
+                    "listener:https:{}:{}",
+                    patch.address,
+                    format_patch_diff_https(patch, current),
+                ),
+                cluster_id: None,
+                backend_id: None,
+                address: Some(patch.address),
+                extras: AuditExtras::default(),
+            })
+        }
+        RequestType::UpdateTcpListener(patch) => {
+            let (verb, counter) = audit_verb!("tcp_listener_updated");
+            let current = state.tcp_listeners.get(&SocketAddr::from(patch.address));
+            Some(AuditEntry {
+                kind: EventKind::ListenerUpdated,
+                verb,
+                counter,
+                target: format!(
+                    "listener:tcp:{}:{}",
+                    patch.address,
+                    format_patch_diff_tcp(patch, current),
+                ),
+                cluster_id: None,
+                backend_id: None,
+                address: Some(patch.address),
+                extras: AuditExtras::default(),
+            })
+        }
+        RequestType::AddHttpListener(listener) => {
+            let (verb, counter) = audit_verb!("http_listener_added");
+            Some(AuditEntry {
+                kind: EventKind::ListenerAdded,
+                verb,
+                counter,
+                target: format!("listener:http:{}", listener.address),
+                cluster_id: None,
+                backend_id: None,
+                address: Some(listener.address),
+                extras: AuditExtras::default(),
+            })
+        }
+        RequestType::AddHttpsListener(listener) => {
+            let (verb, counter) = audit_verb!("https_listener_added");
+            Some(AuditEntry {
+                kind: EventKind::ListenerAdded,
+                verb,
+                counter,
+                target: format!("listener:https:{}", listener.address),
+                cluster_id: None,
+                backend_id: None,
+                address: Some(listener.address),
+                extras: AuditExtras::default(),
+            })
+        }
+        RequestType::AddTcpListener(listener) => {
+            let (verb, counter) = audit_verb!("tcp_listener_added");
+            Some(AuditEntry {
+                kind: EventKind::ListenerAdded,
+                verb,
+                counter,
+                target: format!("listener:tcp:{}", listener.address),
+                cluster_id: None,
+                backend_id: None,
+                address: Some(listener.address),
+                extras: AuditExtras::default(),
+            })
+        }
+        RequestType::RemoveListener(remove) => {
+            let (verb, counter) = audit_verb!("listener_removed");
+            Some(AuditEntry {
+                kind: EventKind::ListenerRemoved,
+                verb,
+                counter,
+                target: format!("listener:{:?}:{}", remove.proxy(), remove.address),
+                cluster_id: None,
+                backend_id: None,
+                address: Some(remove.address),
+                extras: AuditExtras::default(),
+            })
+        }
+        // AddBackend / RemoveBackend are intentionally not audited via this
+        // taxonomy — they are already covered by the BACKEND_DOWN / BACKEND_UP
+        // events emitted by the workers when traffic reaches them.
+        _ => None,
+    }
+}
+
+/// Bump the per-verb counter, queue the [Event] for fan-out to subscribed
+/// clients, and write the structured audit log line at `info!` level. Used
+/// by every control-plane mutation handler.
+fn audit_emit(server: &mut Server, client: &ClientSession, entry: AuditEntry, result: AuditResult) {
+    let request_id = Ulid::generate();
+    // `entry.counter` is the pre-built `config.<verb>` static-str key
+    // chosen at the construction site (paired with `verb` via
+    // `audit_verb!`), so dashboards see one counter per verb without a
+    // verb→key dispatch table.
+    count!(entry.counter, 1);
+
+    let rendered = audit_log_context!(server, client, &request_id, &entry, result);
+    info!("{}", rendered);
+    // Mirror to the dedicated tamper-resistant sink when configured
+    // (`config.audit_logs_target`). Best-effort; failures fall back to the
+    // standard `info!` route above. Strip ANSI escapes before writing so
+    // the dedicated file stays ASCII and SIEM-parseable even when colour
+    // is enabled on stdout.
+    server.append_audit_line(&strip_ansi(&rendered));
+
+    // JSON-structured sink (`config.audit_logs_json_target`) — one
+    // self-contained record per line, ready for Wazuh / Elastic / Loki
+    // ingest without bespoke parser code.
+    if server.audit_log_json_writer.is_some() {
+        let json = audit_record_to_json(server, client, &request_id, &entry, result);
+        server.append_audit_json(&json);
+    }
+
+    // Subscribers only see the proto Event; the verb / actor / request_id are
+    // captured in the audit log line above (which is already structured).
+    server.push_audit_event(Event {
+        kind: entry.kind as i32,
+        cluster_id: entry.cluster_id,
+        backend_id: entry.backend_id,
+        address: entry.address,
+    });
+}
+
+/// Build a single-line JSON record mirroring the audit line. Schema is
+/// stable: every key always present, missing values rendered as JSON
+/// `null`. Used by the dedicated JSON sink (`audit_logs_json_target`).
+///
+/// Schema sketch:
+/// ```json
+/// {
+///   "ts": "<RFC3339 UTC>",
+///   "boot_generation": <u32>,
+///   "session_ulid": "...",
+///   "request_ulid": "...",
+///   "actor": {"uid": ..., "gid": ..., "pid": ..., "user": "...", "comm": "...", "role": "..."},
+///   "client_id": ...,
+///   "connect_ts": "<RFC3339 UTC>",
+///   "socket": "...",
+///   "verb": "...",
+///   "target": "...",
+///   "result": "ok|err",
+///   "cluster_id": "..." or null,
+///   "backend_id": "..." or null,
+///   "extras": {...}
+/// }
+/// ```
+fn audit_record_to_json(
+    server: &Server,
+    client: &ClientSession,
+    request_id: &Ulid,
+    entry: &AuditEntry,
+    result: AuditResult,
+) -> String {
+    use serde_json::{Value, json};
+    let extras = {
+        let mut map = serde_json::Map::new();
+        if let Some(code) = entry.extras.error_code {
+            map.insert("error_code".to_owned(), Value::String(code.to_string()));
+        }
+        if let Some(reason) = entry.extras.reason.as_deref() {
+            // INFO-1: every untrusted free-form field that ships to the
+            // JSON sink runs through `sanitize_for_audit` to match the
+            // text-sink contract. `serde_json` would JSON-escape control
+            // bytes correctly, but a SIEM that re-emits JSON to TSV/CSV
+            // can resurrect literal `\t` / `\n` and a SOC analyst
+            // grepping the flat egress would see forged columns.
+            map.insert(
+                "reason".to_owned(),
+                Value::String(sanitize_for_audit(reason)),
+            );
+        }
+        if let Some(elapsed) = entry.extras.elapsed_ms {
+            map.insert("elapsed_ms".to_owned(), json!(elapsed));
+        }
+        if let Some(fanout) = entry.extras.fanout {
+            map.insert(
+                "fanout".to_owned(),
+                json!({
+                    "status": fanout.status.to_string(),
+                    "workers_ok": fanout.workers_ok,
+                    "workers_err": fanout.workers_err,
+                    "workers_expected": fanout.workers_expected,
+                }),
+            );
+        }
+        if let Some(hash) = entry.extras.request_sha256.as_deref() {
+            map.insert("request_sha256".to_owned(), Value::String(hash.to_owned()));
+        }
+        Value::Object(map)
+    };
+    // INFO-1: free-form attacker-influenced fields go through
+    // `sanitize_for_audit` here even though `serde_json` would already
+    // escape control bytes — defense in depth against SIEM pipelines
+    // that decode JSON and re-emit flat (TSV/CSV/syslog), which
+    // resurrects the literal control byte and re-opens the column-
+    // smuggling primitive the text sink already defends against.
+    let actor_user_sanitized = client.actor_user.as_deref().map(sanitize_for_audit);
+    let actor_comm_sanitized = client.actor_comm.as_deref().map(sanitize_for_audit);
+    let socket_sanitized = sanitize_for_audit(client.socket_path.as_ref());
+    let target_sanitized = sanitize_for_audit(&entry.target);
+    let verb_sanitized = sanitize_for_audit(entry.verb);
+    let record = json!({
+        "ts": rfc3339_utc(std::time::SystemTime::now()),
+        "boot_generation": server.boot_generation,
+        "session_ulid": client.session_ulid.to_string(),
+        "request_ulid": request_id.to_string(),
+        "actor": {
+            "uid": client.actor_uid,
+            "gid": client.actor_gid,
+            "pid": client.actor_pid,
+            "user": actor_user_sanitized,
+            "comm": actor_comm_sanitized,
+            "role": actor_role(client.actor_uid),
+        },
+        "client_id": client.id,
+        "connect_ts": client.connect_ts_display(),
+        "socket": socket_sanitized,
+        "verb": verb_sanitized,
+        "target": target_sanitized,
+        "result": result.to_string(),
+        "cluster_id": entry.cluster_id,
+        "backend_id": entry.backend_id,
+        "sozu_version": SOZU_VERSION,
+        "build_git_sha": SOZU_BUILD_GIT_SHA,
+        "extras": extras,
+    });
+    record.to_string()
+}
+
+/// Strip ANSI CSI escape sequences from `s`. Cheap single-pass parser —
+/// recognises `\x1b[ ... m` (colour) and any other `\x1b[ ... <final>`
+/// sequence. Returns `s.to_owned()` when no ESC byte is found so the common
+/// no-colour path doesn't reallocate.
+fn strip_ansi(s: &str) -> String {
+    if !s.contains('\x1b') {
+        return s.to_owned();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        // Swallow the `[`...final-byte CSI, or drop the lone ESC.
+        if let Some('[') = chars.next() {
+            for next in chars.by_ref() {
+                if ('@'..='~').contains(&next) {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Same as [audit_emit] but synthesises the [AuditEntry] inline for verbs
+/// whose request payload does not carry the relevant identifiers (e.g.
+/// `Logging`, `ConfigureMetrics`, `ReloadConfiguration`). Caller MUST pair
+/// `verb` and `counter` via `audit_verb!` so the two strings cannot drift.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn audit_emit_inline(
+    server: &mut Server,
+    client: &ClientSession,
+    kind: EventKind,
+    verb: &'static str,
+    counter: &'static str,
+    target: String,
+    result: AuditResult,
+    extras: AuditExtras,
+) {
+    audit_emit(
+        server,
+        client,
+        AuditEntry {
+            kind,
+            verb,
+            counter,
+            target,
+            cluster_id: None,
+            backend_id: None,
+            address: None,
+            extras,
+        },
+        result,
+    );
+}
+
+// =========================================================
 // Worker request
 
 #[derive(Debug)]
 struct WorkerTask {
     pub client_token: Token,
     pub gatherer: DefaultGatherer,
+    /// Wall-clock reference captured at `worker_request` entry. Used by
+    /// [`WorkerTask::on_finish`] to compute `elapsed_ms` for the
+    /// completion-time audit emission.
+    started_at: Instant,
+    /// Snapshot of the audit entry built from the request. Carried through
+    /// the task so the completion-time audit line can attribute the verb
+    /// and target. `None` for non-audited verbs (same filter as
+    /// `audit_entry_for`).
+    audit: Option<AuditEntry>,
 }
 
 pub fn worker_request(
@@ -460,14 +1507,83 @@ pub fn worker_request(
     client: &mut ClientSession,
     request_content: RequestType,
 ) {
-    let request = request_content.into();
+    // Snapshot the audit entry before consuming `request_content` so we can
+    // emit even when `state.dispatch` rejects the request AND so the
+    // completion handler can re-emit with fanout + elapsed_ms.
+    let audit = audit_entry_for(&request_content, &server.state);
+    let started_at = Instant::now();
+
+    // Special-case ConfigureMetrics — the proto payload is an i32 enum (no
+    // dedicated message), so we synthesise the audit entry inline.
+    let metrics_target = if let RequestType::ConfigureMetrics(value) = &request_content {
+        Some(format!(
+            "metrics:{:?}",
+            MetricsConfiguration::try_from(*value).unwrap_or(MetricsConfiguration::Disabled)
+        ))
+    } else {
+        None
+    };
+
+    let request: sozu_command_lib::proto::command::Request = request_content.into();
+    let request_sha256 = compute_request_sha256(&request);
 
     if let Err(error) = server.state.dispatch(&request) {
+        let reason = error.to_string();
+        if let Some(mut entry) = audit {
+            entry.extras.error_code = Some(AuditErrorCode::DispatchError);
+            entry.extras.reason = Some(reason.clone());
+            entry.extras.elapsed_ms = Some(elapsed_ms(started_at));
+            entry.extras.request_sha256 = Some(request_sha256.clone());
+            audit_emit(server, client, entry, AuditResult::Err);
+        } else if let Some(target) = metrics_target {
+            let (verb, counter) = audit_verb!("metrics_configured");
+            audit_emit_inline(
+                server,
+                client,
+                EventKind::MetricsConfigured,
+                verb,
+                counter,
+                target,
+                AuditResult::Err,
+                AuditExtras {
+                    elapsed_ms: Some(elapsed_ms(started_at)),
+                    error_code: Some(AuditErrorCode::DispatchError),
+                    reason: Some(reason.clone()),
+                    ..Default::default()
+                },
+            );
+        }
         client.finish_failure(format!(
             "could not dispatch request on the main process state: {error}",
         ));
         return;
     }
+
+    // Attempt-time audit — `result=ok` here only means "accepted by the
+    // main process state". The completion-time line (emitted from
+    // `WorkerTask::on_finish`) carries the fanout outcome.
+    let audit_for_task = audit.as_ref().map(|entry| {
+        let mut cloned = clone_entry(entry);
+        cloned.extras.request_sha256 = Some(request_sha256.clone());
+        cloned
+    });
+    if let Some(mut entry) = audit {
+        entry.extras.request_sha256 = Some(request_sha256);
+        audit_emit(server, client, entry, AuditResult::Ok);
+    } else if let Some(target) = metrics_target {
+        let (verb, counter) = audit_verb!("metrics_configured");
+        audit_emit_inline(
+            server,
+            client,
+            EventKind::MetricsConfigured,
+            verb,
+            counter,
+            target,
+            AuditResult::Ok,
+            AuditExtras::default(),
+        );
+    }
+
     client.return_processing("Processing worker request...");
 
     server.scatter(
@@ -475,6 +1591,8 @@ pub fn worker_request(
         Box::new(WorkerTask {
             client_token: client.token,
             gatherer: DefaultGatherer::default(),
+            started_at,
+            audit: audit_for_task,
         }),
         Timeout::Default,
         None,
@@ -492,7 +1610,7 @@ impl GatheringTask for WorkerTask {
 
     fn on_finish(
         self: Box<Self>,
-        _server: &mut Server,
+        server: &mut Server,
         client: &mut OptionalClient,
         timed_out: bool,
     ) {
@@ -507,11 +1625,106 @@ impl GatheringTask for WorkerTask {
             }
         }
 
-        if self.gatherer.errors > 0 || timed_out {
+        let errors = self.gatherer.errors;
+        let ok = self.gatherer.ok;
+        let expected = self.gatherer.expected_responses;
+        let result = if errors > 0 || timed_out {
+            AuditResult::Err
+        } else {
+            AuditResult::Ok
+        };
+
+        // Completion-time audit: attributes the same verb as the attempt-time
+        // line but with fanout / worker counts / elapsed_ms filled in. Skip
+        // when the client disconnected or the verb is not audited.
+        if let (Some(client_ref), Some(mut entry)) = (client.as_deref(), self.audit) {
+            let fanout_status = if timed_out {
+                FanoutStatus::Timeout
+            } else if errors > 0 {
+                FanoutStatus::Partial
+            } else if expected == 0 {
+                FanoutStatus::LocalOnly
+            } else {
+                FanoutStatus::Ok
+            };
+            entry.extras.elapsed_ms = Some(elapsed_ms(self.started_at));
+            entry.extras.fanout = Some(FanoutSummary {
+                status: fanout_status,
+                workers_ok: u32::try_from(ok).unwrap_or(u32::MAX),
+                workers_err: u32::try_from(errors).unwrap_or(u32::MAX),
+                workers_expected: u32::try_from(expected).unwrap_or(u32::MAX),
+            });
+            if matches!(result, AuditResult::Err) {
+                entry.extras.error_code = Some(if timed_out {
+                    AuditErrorCode::WorkerTimeout
+                } else {
+                    AuditErrorCode::WorkerFailure
+                });
+                entry.extras.reason = Some(messages.join(", "));
+            }
+            audit_emit(server, client_ref, entry, result);
+        }
+
+        if errors > 0 || timed_out {
             client.finish_failure(messages.join(", "));
         } else {
             client.finish_ok("Successfully applied request to all workers");
         }
+
+        server.update_counts();
+    }
+}
+
+/// Elapsed milliseconds since `started_at`, saturating on overflow.
+fn elapsed_ms(started_at: Instant) -> u64 {
+    u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// SHA-256 of the proto `Request` wire-encoding, hex-truncated to 16 chars
+/// (64 bits) so the audit line stays greppable without blowing up line
+/// width. Cheap: single prost `encode_to_vec` + one `Sha256::digest` on
+/// a control-plane path (one call per worker request, not per packet).
+fn compute_request_sha256(request: &sozu_command_lib::proto::command::Request) -> String {
+    let bytes = request.encode_to_vec();
+    let digest = Sha256::digest(&bytes);
+    let mut hex = String::with_capacity(16);
+    for byte in digest.iter().take(8) {
+        use std::fmt::Write as _;
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    hex
+}
+
+/// SHA-256 fingerprint of a PEM certificate, hex-encoded and truncated to
+/// 16 hex chars (64 bits) for audit brevity. `None` when the input is not
+/// parseable as PEM. Mirrors the full fingerprint workflow in
+/// `sozu_command_lib::certificate::calculate_fingerprint` but truncates
+/// for log terseness — operators correlate via the 64-bit prefix.
+fn compute_certificate_fingerprint(certificate_pem: &[u8]) -> Option<String> {
+    let fp = sozu_command_lib::certificate::calculate_fingerprint(certificate_pem).ok()?;
+    let mut hex = String::with_capacity(16);
+    for byte in fp.iter().take(8) {
+        use std::fmt::Write as _;
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    Some(hex)
+}
+
+/// Shallow clone of [`AuditEntry`] so the completion handler can re-emit a
+/// second line with the same taxonomy as the attempt-time line but enriched
+/// with fanout + elapsed_ms. Manual implementation because `AuditEntry`
+/// does not derive `Clone` by default (it owns `String`s that the
+/// attempt-time line consumes by value).
+fn clone_entry(entry: &AuditEntry) -> AuditEntry {
+    AuditEntry {
+        kind: entry.kind,
+        verb: entry.verb,
+        counter: entry.counter,
+        cluster_id: entry.cluster_id.clone(),
+        backend_id: entry.backend_id.clone(),
+        address: entry.address,
+        target: entry.target.clone(),
+        extras: entry.extras.clone(),
     }
 }
 
@@ -635,13 +1848,47 @@ struct LoadStateTask {
 pub fn load_state(server: &mut Server, mut client: OptionalClient, path: &str) {
     info!("loading state at path {}", path);
 
+    let audit_target = format!("file:{path}");
+
     let mut file = match File::open(path) {
         Ok(file) => file,
         Err(err) if matches!(err.kind(), ErrorKind::NotFound) => {
+            if let Some(client_ref) = client.as_deref() {
+                let (verb, counter) = audit_verb!("state_loaded");
+                audit_emit_inline(
+                    server,
+                    client_ref,
+                    EventKind::StateLoaded,
+                    verb,
+                    counter,
+                    audit_target.clone(),
+                    AuditResult::Err,
+                    AuditExtras {
+                        error_code: Some(AuditErrorCode::IoError),
+                        ..Default::default()
+                    },
+                );
+            }
             client.finish_failure(format!("Cannot find file at path {path}"));
             return;
         }
         Err(error) => {
+            if let Some(client_ref) = client.as_deref() {
+                let (verb, counter) = audit_verb!("state_loaded");
+                audit_emit_inline(
+                    server,
+                    client_ref,
+                    EventKind::StateLoaded,
+                    verb,
+                    counter,
+                    audit_target.clone(),
+                    AuditResult::Err,
+                    AuditExtras {
+                        error_code: Some(AuditErrorCode::IoError),
+                        ..Default::default()
+                    },
+                );
+            }
             client.finish_failure(format!("Cannot open file at path {path}: {error}"));
             return;
         }
@@ -701,7 +1948,7 @@ pub fn load_state(server: &mut Server, mut client: OptionalClient, path: &str) {
                 }
             }
             Err(parse_error) => {
-                break Err(format!("saved state parse error: {:?}", parse_error));
+                break Err(format!("saved state parse error: {parse_error:?}"));
             }
         }
         buffer.consume(offset);
@@ -710,8 +1957,27 @@ pub fn load_state(server: &mut Server, mut client: OptionalClient, path: &str) {
     match status {
         Ok(()) => {
             client.return_processing("Applying state file...");
+            // Success audit is emitted from `LoadStateTask::on_finish` once
+            // every worker has acknowledged — that's where we know the final
+            // ok/err split.
         }
         Err(message) => {
+            if let Some(client_ref) = client.as_deref() {
+                let (verb, counter) = audit_verb!("state_loaded");
+                audit_emit_inline(
+                    server,
+                    client_ref,
+                    EventKind::StateLoaded,
+                    verb,
+                    counter,
+                    audit_target,
+                    AuditResult::Err,
+                    AuditExtras {
+                        error_code: Some(AuditErrorCode::IoError),
+                        ..Default::default()
+                    },
+                );
+            }
             client.finish_failure(message);
             server.cancel_task(task_id);
         }
@@ -729,11 +1995,30 @@ impl GatheringTask for LoadStateTask {
 
     fn on_finish(
         self: Box<Self>,
-        _server: &mut Server,
+        server: &mut Server,
         client: &mut OptionalClient,
         _timed_out: bool,
     ) {
         let DefaultGatherer { ok, errors, .. } = self.gatherer;
+        server.update_counts();
+        let result = if errors == 0 {
+            AuditResult::Ok
+        } else {
+            AuditResult::Err
+        };
+        if let Some(client_ref) = client.as_deref() {
+            let (verb, counter) = audit_verb!("state_loaded");
+            audit_emit_inline(
+                server,
+                client_ref,
+                EventKind::StateLoaded,
+                verb,
+                counter,
+                format!("file:{} ok:{ok} errors:{errors}", self.path),
+                result,
+                AuditExtras::default(),
+            );
+        }
         if errors == 0 {
             client.finish_ok(format!(
                 "Successfully loaded state from path {}, {} ok messages, {} errors",
@@ -830,6 +2115,18 @@ struct StopTask {
 
 /// stop the main process and workers, true for hard stop
 fn stop(server: &mut Server, client: &mut ClientSession, hardness: bool) {
+    let (verb, counter) = audit_verb!("sozu_stop_requested");
+    audit_emit_inline(
+        server,
+        client,
+        EventKind::SozuStopRequested,
+        verb,
+        counter,
+        format!("stop:{}", if hardness { "hard" } else { "soft" }),
+        AuditResult::Ok,
+        AuditExtras::default(),
+    );
+
     let task = Box::new(StopTask {
         client_token: client.token,
         gatherer: DefaultGatherer::default(),
@@ -882,5 +2179,476 @@ impl GatheringTask for StopTask {
             "Successfully closed {} workers, {} errors, stopping the main process...",
             self.gatherer.ok, self.gatherer.errors
         ));
+    }
+}
+
+// =========================================================
+// Patch diff formatters — for the audit `target=` field.
+// Walk each Option field of the patch and, when a pre-patch listener
+// snapshot is available, emit `field=old→new` so operators see both the
+// prior and the replacement value. Falls back to `field=new` (no arrow)
+// when no current listener is known (e.g. patch arriving before the
+// listener is registered) so the audit line never swallows a change.
+//
+// Helpers live inline as macros instead of functions so `stringify!($field)`
+// picks up each field name without runtime formatting.
+
+fn format_patch_diff_http(
+    p: &UpdateHttpListenerConfig,
+    current: Option<&sozu_command_lib::proto::command::HttpListenerConfig>,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    // Patch field is `Option<T>`, current field is `T` (required on the
+    // stored listener): `to_string()` directly.
+    macro_rules! diff_req_copy {
+        ($field:ident) => {
+            if let Some(v) = p.$field {
+                let old = current
+                    .map(|c| c.$field.to_string())
+                    .unwrap_or_else(|| "?".to_owned());
+                parts.push(format!("{}={old}→{v}", stringify!($field)));
+            }
+        };
+    }
+    macro_rules! diff_req_str {
+        ($field:ident) => {
+            if let Some(v) = p.$field.as_deref() {
+                let old = current
+                    .map(|c| c.$field.clone())
+                    .unwrap_or_else(|| "?".to_owned());
+                parts.push(format!("{}={old}→{v}", stringify!($field)));
+            }
+        };
+    }
+    // Patch field is `Option<T>`, current field is `Option<T>` (optional on
+    // the stored listener): flatten current via `and_then`.
+    macro_rules! diff_opt_copy {
+        ($field:ident) => {
+            if let Some(v) = p.$field {
+                let old = current
+                    .and_then(|c| c.$field)
+                    .map(|o| o.to_string())
+                    .unwrap_or_else(|| "?".to_owned());
+                parts.push(format!("{}={old}→{v}", stringify!($field)));
+            }
+        };
+    }
+    macro_rules! diff_opt_str {
+        ($field:ident) => {
+            if let Some(v) = p.$field.as_deref() {
+                let old = current
+                    .and_then(|c| c.$field.clone())
+                    .unwrap_or_else(|| "?".to_owned());
+                parts.push(format!("{}={old}→{v}", stringify!($field)));
+            }
+        };
+    }
+    if let Some(v) = p.public_address.as_ref() {
+        let old = current
+            .and_then(|c| c.public_address)
+            .map(|o| o.to_string())
+            .unwrap_or_else(|| "?".to_owned());
+        parts.push(format!("public_address={old}→{v}"));
+    }
+    diff_req_copy!(expect_proxy);
+    diff_req_str!(sticky_name);
+    diff_req_copy!(front_timeout);
+    diff_req_copy!(back_timeout);
+    diff_req_copy!(connect_timeout);
+    diff_req_copy!(request_timeout);
+    if p.http_answers.is_some() {
+        parts.push("http_answers=<patched>".to_owned());
+    }
+    diff_opt_copy!(h2_max_rst_stream_per_window);
+    diff_opt_copy!(h2_max_ping_per_window);
+    diff_opt_copy!(h2_max_settings_per_window);
+    diff_opt_copy!(h2_max_empty_data_per_window);
+    diff_opt_copy!(h2_max_continuation_frames);
+    diff_opt_copy!(h2_max_glitch_count);
+    diff_opt_copy!(h2_initial_connection_window);
+    diff_opt_copy!(h2_max_concurrent_streams);
+    diff_opt_copy!(h2_stream_shrink_ratio);
+    diff_opt_copy!(h2_max_rst_stream_lifetime);
+    diff_opt_copy!(h2_max_rst_stream_abusive_lifetime);
+    diff_opt_copy!(h2_max_rst_stream_emitted_lifetime);
+    diff_opt_copy!(h2_max_header_list_size);
+    diff_opt_copy!(h2_max_header_table_size);
+    diff_opt_copy!(h2_stream_idle_timeout_seconds);
+    diff_opt_copy!(h2_graceful_shutdown_deadline_seconds);
+    diff_opt_copy!(h2_max_window_update_stream0_per_window);
+    diff_opt_str!(sozu_id_header);
+    if parts.is_empty() {
+        "(no-op)".to_owned()
+    } else {
+        parts.join(" ")
+    }
+}
+
+fn format_patch_diff_https(
+    p: &UpdateHttpsListenerConfig,
+    current: Option<&sozu_command_lib::proto::command::HttpsListenerConfig>,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    macro_rules! diff_req_copy {
+        ($field:ident) => {
+            if let Some(v) = p.$field {
+                let old = current
+                    .map(|c| c.$field.to_string())
+                    .unwrap_or_else(|| "?".to_owned());
+                parts.push(format!("{}={old}→{v}", stringify!($field)));
+            }
+        };
+    }
+    macro_rules! diff_req_str {
+        ($field:ident) => {
+            if let Some(v) = p.$field.as_deref() {
+                let old = current
+                    .map(|c| c.$field.clone())
+                    .unwrap_or_else(|| "?".to_owned());
+                parts.push(format!("{}={old}→{v}", stringify!($field)));
+            }
+        };
+    }
+    macro_rules! diff_opt_copy {
+        ($field:ident) => {
+            if let Some(v) = p.$field {
+                let old = current
+                    .and_then(|c| c.$field)
+                    .map(|o| o.to_string())
+                    .unwrap_or_else(|| "?".to_owned());
+                parts.push(format!("{}={old}→{v}", stringify!($field)));
+            }
+        };
+    }
+    macro_rules! diff_opt_str {
+        ($field:ident) => {
+            if let Some(v) = p.$field.as_deref() {
+                let old = current
+                    .and_then(|c| c.$field.clone())
+                    .unwrap_or_else(|| "?".to_owned());
+                parts.push(format!("{}={old}→{v}", stringify!($field)));
+            }
+        };
+    }
+    if let Some(v) = p.public_address.as_ref() {
+        let old = current
+            .and_then(|c| c.public_address)
+            .map(|o| o.to_string())
+            .unwrap_or_else(|| "?".to_owned());
+        parts.push(format!("public_address={old}→{v}"));
+    }
+    diff_req_copy!(expect_proxy);
+    diff_req_str!(sticky_name);
+    diff_req_copy!(front_timeout);
+    diff_req_copy!(back_timeout);
+    diff_req_copy!(connect_timeout);
+    diff_req_copy!(request_timeout);
+    if p.http_answers.is_some() {
+        parts.push("http_answers=<patched>".to_owned());
+    }
+    if let Some(ref alpn) = p.alpn_protocols {
+        let old = current
+            .map(|c| c.alpn_protocols.join(","))
+            .unwrap_or_else(|| "?".to_owned());
+        let new = if alpn.values.is_empty() {
+            "<reset>".to_owned()
+        } else {
+            alpn.values.join(",")
+        };
+        parts.push(format!("alpn_protocols={old}→{new}"));
+    }
+    diff_opt_copy!(strict_sni_binding);
+    diff_opt_copy!(disable_http11);
+    diff_opt_copy!(h2_max_rst_stream_per_window);
+    diff_opt_copy!(h2_max_ping_per_window);
+    diff_opt_copy!(h2_max_settings_per_window);
+    diff_opt_copy!(h2_max_empty_data_per_window);
+    diff_opt_copy!(h2_max_continuation_frames);
+    diff_opt_copy!(h2_max_glitch_count);
+    diff_opt_copy!(h2_initial_connection_window);
+    diff_opt_copy!(h2_max_concurrent_streams);
+    diff_opt_copy!(h2_stream_shrink_ratio);
+    diff_opt_copy!(h2_max_rst_stream_lifetime);
+    diff_opt_copy!(h2_max_rst_stream_abusive_lifetime);
+    diff_opt_copy!(h2_max_rst_stream_emitted_lifetime);
+    diff_opt_copy!(h2_max_header_list_size);
+    diff_opt_copy!(h2_max_header_table_size);
+    diff_opt_copy!(h2_stream_idle_timeout_seconds);
+    diff_opt_copy!(h2_graceful_shutdown_deadline_seconds);
+    diff_opt_copy!(h2_max_window_update_stream0_per_window);
+    diff_opt_str!(sozu_id_header);
+    if parts.is_empty() {
+        "(no-op)".to_owned()
+    } else {
+        parts.join(" ")
+    }
+}
+
+fn format_patch_diff_tcp(
+    p: &UpdateTcpListenerConfig,
+    current: Option<&sozu_command_lib::proto::command::TcpListenerConfig>,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    macro_rules! diff_req_copy {
+        ($field:ident) => {
+            if let Some(v) = p.$field {
+                let old = current
+                    .map(|c| c.$field.to_string())
+                    .unwrap_or_else(|| "?".to_owned());
+                parts.push(format!("{}={old}→{v}", stringify!($field)));
+            }
+        };
+    }
+    if let Some(v) = p.public_address.as_ref() {
+        let old = current
+            .and_then(|c| c.public_address)
+            .map(|o| o.to_string())
+            .unwrap_or_else(|| "?".to_owned());
+        parts.push(format!("public_address={old}→{v}"));
+    }
+    diff_req_copy!(expect_proxy);
+    diff_req_copy!(front_timeout);
+    diff_req_copy!(back_timeout);
+    diff_req_copy!(connect_timeout);
+    if parts.is_empty() {
+        "(no-op)".to_owned()
+    } else {
+        parts.join(" ")
+    }
+}
+
+#[cfg(test)]
+mod audit_format_tests {
+    //! Drift-guard for the audit log line. Rejects any accidental change to
+    //! the MUX `Session(...)` layout that would break downstream grep-based
+    //! consumers (SIEM pipelines, operator shell recipes).
+    //!
+    //! The default thread-local logger reports `is_logger_colored() == false`
+    //! (see `command/src/logging/logs.rs:30`), so `ansi_palette()` returns
+    //! empty strings and the rendered line is ANSI-free — stable to match
+    //! with a plain regex.
+    use super::{
+        AUDIT_REASON_MAX_CHARS, AuditEntry, AuditErrorCode, AuditExtras, AuditResult, FanoutStatus,
+        FanoutSummary, SOZU_BUILD_GIT_SHA, SOZU_VERSION, actor_role, rfc3339_utc,
+    };
+    use regex::Regex;
+    use rusty_ulid::Ulid;
+    use sozu_command_lib::proto::command::EventKind;
+    use std::time::SystemTime;
+
+    /// Minimal stand-in exposing only the `ClientSession` fields and methods
+    /// that `audit_log_context!` reads. Avoids constructing the full
+    /// `Channel<Response, Request>` that `ClientSession::new` requires.
+    struct TestClient {
+        session_ulid: Ulid,
+        id: u32,
+        actor_uid: Option<u32>,
+        actor_gid: Option<u32>,
+        actor_pid: Option<i32>,
+        actor_comm: Option<String>,
+        actor_user: Option<String>,
+        socket_path: std::sync::Arc<str>,
+        connect_ts: SystemTime,
+    }
+
+    /// Minimal stand-in for `Server` exposing only `boot_generation`, the
+    /// only field the macro reads off of `$server`. Avoids the full Server
+    /// (Poll, listener, workers map, …) ceremony.
+    struct TestServer {
+        boot_generation: u32,
+    }
+
+    impl TestClient {
+        fn actor_uid_display(&self) -> String {
+            self.actor_uid
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "unknown".to_owned())
+        }
+        fn actor_gid_display(&self) -> String {
+            self.actor_gid
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "unknown".to_owned())
+        }
+        fn actor_pid_display(&self) -> String {
+            self.actor_pid
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "unknown".to_owned())
+        }
+        fn actor_comm_display(&self) -> String {
+            self.actor_comm
+                .clone()
+                .unwrap_or_else(|| "unknown".to_owned())
+        }
+        fn actor_user_display(&self) -> String {
+            self.actor_user
+                .clone()
+                .unwrap_or_else(|| "unknown".to_owned())
+        }
+        fn connect_ts_display(&self) -> String {
+            rfc3339_utc(self.connect_ts)
+        }
+    }
+
+    fn sample_entry(cluster_id: Option<&str>) -> AuditEntry {
+        AuditEntry {
+            kind: EventKind::ClusterAdded,
+            verb: "cluster_added",
+            counter: "config.cluster_added",
+            cluster_id: cluster_id.map(str::to_owned),
+            backend_id: None,
+            address: None,
+            target: "cluster:my_app".to_owned(),
+            extras: AuditExtras::default(),
+        }
+    }
+
+    fn sample_client(uid: Option<u32>) -> TestClient {
+        TestClient {
+            session_ulid: Ulid::generate(),
+            id: 42,
+            actor_uid: uid,
+            actor_gid: uid,
+            actor_pid: uid.map(|v| v as i32),
+            actor_comm: uid.map(|_| "sozu".to_owned()),
+            actor_user: uid.map(|_| "florentin".to_owned()),
+            socket_path: std::sync::Arc::from("/run/sozu/sock"),
+            connect_ts: SystemTime::now(),
+        }
+    }
+
+    fn sample_server(boot_generation: u32) -> TestServer {
+        TestServer { boot_generation }
+    }
+
+    fn pattern() -> Regex {
+        // Anchored; covers bracket + `AUDIT\tCommand(...)` + every mandatory
+        // field in order. Optional fields (error_code, reason, elapsed_ms,
+        // fanout, workers, request_sha256) may appear between `result=...`
+        // and `sozu_version=...`. Crockford base32 ULIDs are 26 chars
+        // over [0-9A-Z]. Timestamps are RFC 3339 UTC with microsecond
+        // precision; build_git_sha is 12 hex chars or `unknown`.
+        Regex::new(concat!(
+            r"^\[[0-9A-Z]{26} [0-9A-Z]{26} (?:[A-Za-z0-9_:.-]+|-) (?:[A-Za-z0-9_:.-]+|-)\]",
+            r"\tAUDIT\tCommand\(",
+            r"ts=\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z, ",
+            r"verb=[a-z_]+, ",
+            r"actor_uid=(?:\d+|unknown), ",
+            r"actor_gid=(?:\d+|unknown), ",
+            r"actor_pid=(?:\d+|unknown), ",
+            r"actor_role=(?:root|system|user|unknown), ",
+            r"actor_user=\S+, ",
+            r"actor_comm=\S+, ",
+            r"client_id=\d+, ",
+            r"connect_ts=\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z, ",
+            r"socket=\S+, ",
+            r"target=[^,]+, ",
+            r"result=(?:ok|err)",
+            // Optional extras block.
+            r"(?:, (?:error_code=\S+|reason=[^,)]+|elapsed_ms=\d+|fanout=\S+|workers=\d+/\d+/\d+|request_sha256=[0-9a-f]+))*",
+            r", sozu_version=[^,]+",
+            r", build_git_sha=\S+",
+            r", boot_generation=\d+",
+            r"\)$",
+        ))
+        .expect("audit-format regex must compile")
+    }
+
+    #[test]
+    fn layout_with_cluster_id_matches() {
+        let server = sample_server(0);
+        let client = sample_client(Some(1000));
+        let request_id = Ulid::generate();
+        let entry = sample_entry(Some("my_app"));
+        let rendered = audit_log_context!(server, client, &request_id, &entry, AuditResult::Ok);
+        assert!(
+            pattern().is_match(&rendered),
+            "rendered line did not match audit-log pattern.\nrendered: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn layout_with_dashed_cluster_and_backend_matches() {
+        let server = sample_server(3);
+        let client = sample_client(None);
+        let request_id = Ulid::generate();
+        let entry = sample_entry(None);
+        let rendered = audit_log_context!(server, client, &request_id, &entry, AuditResult::Err);
+        assert!(
+            pattern().is_match(&rendered),
+            "rendered line did not match audit-log pattern.\nrendered: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn layout_with_extras_matches() {
+        let server = sample_server(0);
+        let client = sample_client(Some(42));
+        let request_id = Ulid::generate();
+        let mut entry = sample_entry(Some("my_app"));
+        entry.extras.elapsed_ms = Some(17);
+        entry.extras.error_code = Some(AuditErrorCode::WorkerFailure);
+        entry.extras.reason = Some("worker 1: failed".to_owned());
+        entry.extras.fanout = Some(FanoutSummary {
+            status: FanoutStatus::Partial,
+            workers_ok: 1,
+            workers_err: 1,
+            workers_expected: 2,
+        });
+        let rendered = audit_log_context!(server, client, &request_id, &entry, AuditResult::Err);
+        assert!(
+            pattern().is_match(&rendered),
+            "rendered line with extras did not match.\nrendered: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn sanitizer_strips_tab_and_escape_in_target() {
+        let server = sample_server(0);
+        let client = sample_client(Some(0));
+        let request_id = Ulid::generate();
+        let mut entry = sample_entry(None);
+        entry.target = "cluster:\tforge\x1b[Kghost".to_owned();
+        let rendered = audit_log_context!(server, client, &request_id, &entry, AuditResult::Ok);
+        assert!(
+            !rendered.contains('\t') || rendered.matches('\t').count() == 2,
+            "target field must not introduce additional tabs (only the three structural tabs allowed): {rendered:?}"
+        );
+        assert!(
+            !rendered.contains('\x1b'),
+            "target field must not carry ANSI escape codes: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn actor_role_buckets() {
+        assert_eq!(actor_role(None), "unknown");
+        assert_eq!(actor_role(Some(0)), "root");
+        assert_eq!(actor_role(Some(99)), "system");
+        assert_eq!(actor_role(Some(999)), "system");
+        assert_eq!(actor_role(Some(1000)), "user");
+        assert_eq!(actor_role(Some(65534)), "user");
+    }
+
+    #[test]
+    fn rfc3339_utc_round_numbers() {
+        // Unix epoch.
+        assert_eq!(
+            rfc3339_utc(SystemTime::UNIX_EPOCH),
+            "1970-01-01T00:00:00.000000Z"
+        );
+        // Y2K + 1 day, with microseconds.
+        let t = SystemTime::UNIX_EPOCH + std::time::Duration::new(946_771_200, 123_456_000);
+        assert_eq!(rfc3339_utc(t), "2000-01-02T00:00:00.123456Z");
+    }
+
+    #[test]
+    fn build_git_sha_format() {
+        // Either 12 hex chars (set by build.rs) or the literal "unknown"
+        // fallback for builds outside a git tree.
+        let s = SOZU_BUILD_GIT_SHA;
+        assert!(
+            s == "unknown" || (s.len() == 12 && s.chars().all(|c| c.is_ascii_hexdigit())),
+            "unexpected SOZU_BUILD_GIT_SHA: {s:?}"
+        );
     }
 }

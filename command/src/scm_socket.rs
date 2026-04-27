@@ -1,3 +1,12 @@
+//! SCM_RIGHTS socket for FD passing between master and workers.
+//!
+//! Wraps a `SeqPacket` unix socket and uses the `nix` SCM_RIGHTS helpers
+//! to ship listener/accept FDs across the master ↔ worker boundary at
+//! startup and across hot upgrades. The borrowed-FD wrappers
+//! (`set_blocking`) hold an FD without taking ownership; the listener
+//! teardown paths intentionally take ownership through
+//! `TcpListener::from_raw_fd` so the FD is closed by drop.
+
 use std::{
     io::{IoSlice, IoSliceMut},
     net::{AddrParseError, SocketAddr},
@@ -50,6 +59,10 @@ pub struct ScmSocket {
 impl ScmSocket {
     /// Create a blocking SCM socket from a raw file descriptor (unsafe)
     pub fn new(fd: RawFd) -> Result<Self, ScmSocketError> {
+        // SAFETY: `fd` is borrowed for the duration of this block. We wrap it
+        // in a `StdUnixStream` to call `set_nonblocking`, then immediately
+        // release ownership again with `into_raw_fd` so the descriptor is
+        // not closed by `Drop`. The caller retains ownership of `fd`.
         unsafe {
             let stream = StdUnixStream::from_raw_fd(fd);
             stream
@@ -74,6 +87,10 @@ impl ScmSocket {
         if self.blocking == blocking {
             return Ok(());
         }
+        // SAFETY: `self.fd` is borrowed for the duration of this block. We wrap
+        // it in a `StdUnixStream` to call `set_nonblocking`, then immediately
+        // release ownership with `into_raw_fd` so the descriptor is not closed
+        // by `Drop`. `ScmSocket` retains the original ownership.
         unsafe {
             let stream = StdUnixStream::from_raw_fd(self.fd);
             stream
@@ -246,18 +263,27 @@ impl Listeners {
     /// Deactivate all listeners by closing their file descriptors
     pub fn close(&self) {
         for (_, fd) in &self.http {
+            // SAFETY: `*fd` is owned by this `ScmListeners` table and is
+            // about to be closed by the binding's `Drop` (intentional
+            // close-by-drop). No other reference to the descriptor survives.
             unsafe {
                 let _ = TcpListener::from_raw_fd(*fd);
             }
         }
 
         for (_, fd) in &self.tls {
+            // SAFETY: `*fd` is owned by this `ScmListeners` table and is
+            // about to be closed by the binding's `Drop` (intentional
+            // close-by-drop). No other reference to the descriptor survives.
             unsafe {
                 let _ = TcpListener::from_raw_fd(*fd);
             }
         }
 
         for (_, fd) in &self.tcp {
+            // SAFETY: `*fd` is owned by this `ScmListeners` table and is
+            // about to be closed by the binding's `Drop` (intentional
+            // close-by-drop). No other reference to the descriptor survives.
             unsafe {
                 let _ = TcpListener::from_raw_fd(*fd);
             }

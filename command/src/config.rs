@@ -64,10 +64,10 @@ use crate::{
     proto::command::{
         ActivateListener, AddBackend, AddCertificate, CertificateAndKey, Cluster,
         CustomHttpAnswers, HttpListenerConfig, HttpsListenerConfig, ListenerType,
-        LoadBalancingAlgorithms, LoadBalancingParams, LoadMetric, MetricsConfiguration, PathRule,
-        ProtobufAccessLogFormat, ProxyProtocolConfig, Request, RequestHttpFrontend,
-        RequestTcpFrontend, RulePosition, ServerConfig, ServerMetricsConfig, SocketAddress,
-        TcpListenerConfig, TlsVersion, WorkerRequest, request::RequestType,
+        LoadBalancingAlgorithms, LoadBalancingParams, LoadMetric, MetricDetail,
+        MetricsConfiguration, PathRule, ProtobufAccessLogFormat, ProxyProtocolConfig, Request,
+        RequestHttpFrontend, RequestTcpFrontend, RulePosition, ServerConfig, ServerMetricsConfig,
+        SocketAddress, TcpListenerConfig, TlsVersion, WorkerRequest, request::RequestType,
     },
 };
 
@@ -110,6 +110,10 @@ pub const DEFAULT_SIGNATURE_ALGORITHMS: [&str; 9] = [
 
 pub const DEFAULT_GROUPS_LIST: [&str; 4] = ["P-521", "P-384", "P-256", "x25519"];
 
+/// Default ALPN protocols advertised by HTTPS listeners.
+/// Both HTTP/2 and HTTP/1.1 are enabled, allowing clients to negotiate either.
+pub const DEFAULT_ALPN_PROTOCOLS: [&str; 2] = ["h2", "http/1.1"];
+
 /// maximum time of inactivity for a frontend socket (60 seconds)
 pub const DEFAULT_FRONT_TIMEOUT: u32 = 60;
 
@@ -151,6 +155,17 @@ pub const DEFAULT_MAX_BUFFERS: u64 = 1_000;
 
 /// size of the buffers, in bytes (16 KB)
 pub const DEFAULT_BUFFER_SIZE: u64 = 16_393;
+
+/// minimum buffer size required when any HTTPS listener advertises H2 ALPN.
+///
+/// RFC 9113 §6.5.2 caps `SETTINGS_MAX_FRAME_SIZE` at 16 384 bytes by default;
+/// the on-wire H2 frame header is a fixed 9 bytes (§4.1), so the kawa storage
+/// must be able to hold 16 384 + 9 = 16 393 bytes before forwarding. A smaller
+/// `buffer_size` causes the H2 mux to deadlock on full-size frames (no panic,
+/// no obvious log) until the session timeout fires. Validated at config-load
+/// time in `ConfigBuilder::into_config` so a typo in TOML is rejected at boot,
+/// not discovered under traffic.
+pub const H2_MIN_BUFFER_SIZE: u64 = 16_393;
 
 /// maximum number of simultaneous connections (10 000)
 pub const DEFAULT_MAX_CONNECTIONS: usize = 10_000;
@@ -233,6 +248,37 @@ pub enum ConfigError {
         expected: ListenerProtocol,
         found: Option<ListenerProtocol>,
     },
+    #[error("Invalid ALPN protocol '{0}'. Valid values: \"h2\", \"http/1.1\"")]
+    InvalidAlpnProtocol(String),
+    /// `disable_http11 = true` and `alpn_protocols` containing `"http/1.1"`
+    /// are mutually exclusive: the proxy advertises `http/1.1` to peers,
+    /// then refuses every connection that negotiates
+    /// it. The combination is a self-DoS at handshake time. Either drop
+    /// `http/1.1` from `alpn_protocols` or unset `disable_http11`.
+    #[error(
+        "disable_http11 = true is incompatible with alpn_protocols containing \"http/1.1\" \
+         on listener {address}. The proxy would advertise http/1.1 then refuse every \
+         connection that negotiates it. Drop \"http/1.1\" from alpn_protocols or unset \
+         disable_http11."
+    )]
+    DisableHttp11WithHttp11Alpn { address: String },
+    /// `buffer_size` is below the H2 minimum (16 393 bytes) but at least one
+    /// HTTPS listener advertises `h2` in its ALPN list. The H2 mux requires
+    /// 16 384-byte frame payload + 9-byte header to fit in a single kawa
+    /// buffer; smaller values deadlock streams that carry full-size frames.
+    /// Either raise `buffer_size` to ≥ 16 393 or remove `h2` from the
+    /// affected listeners' `alpn_protocols`.
+    #[error(
+        "buffer_size = {buffer_size} is below the H2 minimum of {minimum} but \
+         {listeners} HTTPS listener(s) advertise H2 ALPN. The H2 mux deadlocks \
+         on full-size frames with smaller buffers. Raise buffer_size to >= {minimum} \
+         or remove \"h2\" from those listeners' alpn_protocols."
+    )]
+    BufferSizeTooSmallForH2 {
+        buffer_size: u64,
+        minimum: u64,
+        listeners: usize,
+    },
 }
 
 /// An HTTP, HTTPS or TCP listener as parsed from the `Listeners` section in the toml
@@ -248,6 +294,9 @@ pub struct ListenerBuilder {
     pub answer_404: Option<String>,
     pub answer_408: Option<String>,
     pub answer_413: Option<String>,
+    /// RFC 9110 §15.5.20 — returned when the request's `:authority` / `Host`
+    /// host does not match the TLS SNI negotiated for this connection.
+    pub answer_421: Option<String>,
     pub answer_502: Option<String>,
     pub answer_503: Option<String>,
     pub answer_504: Option<String>,
@@ -275,6 +324,73 @@ pub struct ListenerBuilder {
     /// The ticket allow the client to resume a session. This protects the client
     /// agains session tracking. Defaults to 4.
     pub send_tls13_tickets: Option<u64>,
+    /// ALPN protocols to advertise during TLS handshake, in order of preference.
+    /// Valid values: "h2", "http/1.1". Defaults to ["h2", "http/1.1"].
+    pub alpn_protocols: Option<Vec<String>>,
+    /// H2 flood detection: max RST_STREAM frames per second window (CVE-2023-44487, CVE-2019-9514)
+    pub h2_max_rst_stream_per_window: Option<u32>,
+    /// H2 flood detection: max PING frames per second window (CVE-2019-9512)
+    pub h2_max_ping_per_window: Option<u32>,
+    /// H2 flood detection: max SETTINGS frames per second window (CVE-2019-9515)
+    pub h2_max_settings_per_window: Option<u32>,
+    /// H2 flood detection: max empty DATA frames per second window (CVE-2019-9518)
+    pub h2_max_empty_data_per_window: Option<u32>,
+    /// H2 flood detection: max connection-level (stream 0) WINDOW_UPDATE
+    /// frames per sliding window. Caps non-zero stream-0 WINDOW_UPDATE floods
+    /// that would otherwise stay under the generic glitch counter. Default: 100.
+    pub h2_max_window_update_stream0_per_window: Option<u32>,
+    /// Name of the correlation header Sozu injects into every request and
+    /// response. Default: `Sozu-Id`. Operators can rebrand (e.g. `X-Edge-Id`)
+    /// without touching code.
+    pub sozu_id_header: Option<String>,
+    /// H2 flood detection: max CONTINUATION frames per header block (CVE-2024-27316)
+    pub h2_max_continuation_frames: Option<u32>,
+    /// H2 flood detection: max accumulated protocol anomalies before ENHANCE_YOUR_CALM
+    pub h2_max_glitch_count: Option<u32>,
+    /// H2 connection-level receive window size in bytes (RFC 9113 §6.9.2). Default: 1048576 (1MB).
+    pub h2_initial_connection_window: Option<u32>,
+    /// Maximum concurrent H2 streams (SETTINGS_MAX_CONCURRENT_STREAMS). Default: 100.
+    pub h2_max_concurrent_streams: Option<u32>,
+    /// Shrink threshold ratio for recycled stream slots. Default: 2.
+    pub h2_stream_shrink_ratio: Option<u32>,
+    /// H2 flood detection: absolute lifetime cap on RST_STREAM frames
+    /// received on a single connection (CVE-2023-44487). Default: 10000.
+    pub h2_max_rst_stream_lifetime: Option<u64>,
+    /// H2 flood detection: lifetime cap on "abusive" (pre-response-start)
+    /// RST_STREAM frames (Rapid Reset signature, CVE-2023-44487). Default: 50.
+    pub h2_max_rst_stream_abusive_lifetime: Option<u64>,
+    /// H2 flood detection: absolute lifetime cap on **server-emitted**
+    /// RST_STREAM frames (CVE-2025-8671 "MadeYouReset"). Only non-`NoError`
+    /// resets count — graceful cancels are exempt. Default: 500.
+    pub h2_max_rst_stream_emitted_lifetime: Option<u64>,
+    /// H2 flood detection: maximum accumulated HPACK-decoded header list
+    /// size per request (SETTINGS_MAX_HEADER_LIST_SIZE, RFC 9113 §6.5.2).
+    /// Default: 65536.
+    pub h2_max_header_list_size: Option<u32>,
+    /// Maximum HPACK dynamic table size (SETTINGS_HEADER_TABLE_SIZE) accepted
+    /// from the peer. Caps the value the peer advertises in SETTINGS frames to
+    /// prevent unbounded HPACK encoder memory growth. Default: 65536.
+    pub h2_max_header_table_size: Option<u32>,
+    /// Per-stream idle timeout, in seconds. An open H2 stream that makes no
+    /// forward progress for this duration is cancelled (RST_STREAM / CANCEL)
+    /// to defend against slow-multiplex Slowloris. Default: 30.
+    pub h2_stream_idle_timeout_seconds: Option<u32>,
+    /// Maximum wall-clock seconds to wait for in-flight H2 streams after
+    /// `GOAWAY(NO_ERROR)` has been sent during soft-stop. Once the deadline
+    /// elapses the connection is forcibly closed with a final GOAWAY. Set to
+    /// `0` to wait for streams to finish (no forced close). Default: 5.
+    pub h2_graceful_shutdown_deadline_seconds: Option<u32>,
+    /// When true, every HTTP request served on this listener must have its
+    /// `:authority` / `Host` host exact-match the TLS SNI negotiated at
+    /// handshake (CWE-346 / CWE-444). Applies to HTTPS listeners only;
+    /// plaintext HTTP listeners never have an SNI to compare against.
+    /// Default: true.
+    pub strict_sni_binding: Option<bool>,
+    /// When true, this HTTPS listener only accepts HTTP/2 connections;
+    /// clients that do not negotiate `h2` via TLS ALPN (including those
+    /// that omit ALPN entirely) are dropped at handshake instead of
+    /// silently downgrading to HTTP/1.1. Default: false.
+    pub disable_http11: Option<bool>,
 }
 
 pub fn default_sticky_name() -> String {
@@ -310,6 +426,7 @@ impl ListenerBuilder {
             answer_404: None,
             answer_408: None,
             answer_413: None,
+            answer_421: None,
             answer_502: None,
             answer_503: None,
             answer_504: None,
@@ -330,6 +447,27 @@ impl ListenerBuilder {
             send_tls13_tickets: None,
             sticky_name: DEFAULT_STICKY_NAME.to_string(),
             tls_versions: None,
+            alpn_protocols: None,
+            h2_max_rst_stream_per_window: None,
+            h2_max_ping_per_window: None,
+            h2_max_settings_per_window: None,
+            h2_max_empty_data_per_window: None,
+            h2_max_window_update_stream0_per_window: None,
+            sozu_id_header: None,
+            h2_max_continuation_frames: None,
+            h2_max_glitch_count: None,
+            h2_initial_connection_window: None,
+            h2_max_concurrent_streams: None,
+            h2_stream_shrink_ratio: None,
+            h2_max_rst_stream_lifetime: None,
+            h2_max_rst_stream_abusive_lifetime: None,
+            h2_max_rst_stream_emitted_lifetime: None,
+            h2_max_header_list_size: None,
+            h2_max_header_table_size: None,
+            h2_stream_idle_timeout_seconds: None,
+            h2_graceful_shutdown_deadline_seconds: None,
+            strict_sni_binding: None,
+            disable_http11: None,
         }
     }
 
@@ -372,6 +510,11 @@ impl ListenerBuilder {
 
     pub fn with_cipher_suites(&mut self, cipher_suites: Option<Vec<String>>) -> &mut Self {
         self.cipher_suites = cipher_suites;
+        self
+    }
+
+    pub fn with_alpn_protocols(&mut self, alpn_protocols: Option<Vec<String>>) -> &mut Self {
+        self.alpn_protocols = alpn_protocols;
         self
     }
 
@@ -440,6 +583,7 @@ impl ListenerBuilder {
             answer_404: read_http_answer_file(&self.answer_404)?,
             answer_408: read_http_answer_file(&self.answer_408)?,
             answer_413: read_http_answer_file(&self.answer_413)?,
+            answer_421: read_http_answer_file(&self.answer_421)?,
             answer_502: read_http_answer_file(&self.answer_502)?,
             answer_503: read_http_answer_file(&self.answer_503)?,
             answer_504: read_http_answer_file(&self.answer_504)?,
@@ -481,6 +625,24 @@ impl ListenerBuilder {
             connect_timeout: self.connect_timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT),
             request_timeout: self.request_timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT),
             http_answers,
+            h2_max_rst_stream_per_window: self.h2_max_rst_stream_per_window,
+            h2_max_ping_per_window: self.h2_max_ping_per_window,
+            h2_max_settings_per_window: self.h2_max_settings_per_window,
+            h2_max_empty_data_per_window: self.h2_max_empty_data_per_window,
+            h2_max_window_update_stream0_per_window: self.h2_max_window_update_stream0_per_window,
+            h2_max_continuation_frames: self.h2_max_continuation_frames,
+            h2_max_glitch_count: self.h2_max_glitch_count,
+            h2_initial_connection_window: self.h2_initial_connection_window,
+            h2_max_concurrent_streams: self.h2_max_concurrent_streams,
+            h2_stream_shrink_ratio: self.h2_stream_shrink_ratio,
+            h2_max_rst_stream_lifetime: self.h2_max_rst_stream_lifetime,
+            h2_max_rst_stream_abusive_lifetime: self.h2_max_rst_stream_abusive_lifetime,
+            h2_max_rst_stream_emitted_lifetime: self.h2_max_rst_stream_emitted_lifetime,
+            h2_max_header_list_size: self.h2_max_header_list_size,
+            h2_max_header_table_size: self.h2_max_header_table_size,
+            h2_stream_idle_timeout_seconds: self.h2_stream_idle_timeout_seconds,
+            h2_graceful_shutdown_deadline_seconds: self.h2_graceful_shutdown_deadline_seconds,
+            sozu_id_header: self.sozu_id_header.clone(),
             ..Default::default()
         };
 
@@ -516,6 +678,54 @@ impl ListenerBuilder {
             .collect();
 
         let groups_list: Vec<String> = DEFAULT_GROUPS_LIST.into_iter().map(String::from).collect();
+
+        let alpn_protocols: Vec<String> = match &self.alpn_protocols {
+            Some(protos) if !protos.is_empty() => {
+                for proto in protos {
+                    match proto.as_str() {
+                        "h2" | "http/1.1" => {}
+                        other => return Err(ConfigError::InvalidAlpnProtocol(other.to_owned())),
+                    }
+                }
+                // disable_http11 + http/1.1 ALPN is a self-DoS — every
+                // connection negotiates http/1.1 then is
+                // immediately refused at `https.rs::upgrade_handshake`.
+                // Reject the combination at config load.
+                if self.disable_http11.unwrap_or(false) && protos.iter().any(|p| p == "http/1.1") {
+                    return Err(ConfigError::DisableHttp11WithHttp11Alpn {
+                        address: self.address.to_string(),
+                    });
+                }
+                if !protos.iter().any(|p| p == "http/1.1") {
+                    warn!(
+                        "ALPN protocols do not include 'http/1.1'. Clients without H2 support will fail TLS negotiation."
+                    );
+                }
+                // Deduplicate while preserving order
+                let mut seen = std::collections::HashSet::new();
+                protos
+                    .iter()
+                    .filter(|p| seen.insert(p.as_str()))
+                    .cloned()
+                    .collect()
+            }
+            _ => {
+                // Same self-DoS check on the default ALPN list (which
+                // contains "http/1.1") — `disable_http11 = true` with the
+                // implicit default ALPN must also be rejected.
+                if self.disable_http11.unwrap_or(false)
+                    && DEFAULT_ALPN_PROTOCOLS.contains(&"http/1.1")
+                {
+                    return Err(ConfigError::DisableHttp11WithHttp11Alpn {
+                        address: self.address.to_string(),
+                    });
+                }
+                DEFAULT_ALPN_PROTOCOLS
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect()
+            }
+        };
 
         let versions = match self.tls_versions {
             None => vec![TlsVersion::TlsV12 as i32, TlsVersion::TlsV13 as i32],
@@ -580,6 +790,27 @@ impl ListenerBuilder {
                 .send_tls13_tickets
                 .unwrap_or(DEFAULT_SEND_TLS_13_TICKETS),
             http_answers,
+            alpn_protocols,
+            h2_max_rst_stream_per_window: self.h2_max_rst_stream_per_window,
+            h2_max_ping_per_window: self.h2_max_ping_per_window,
+            h2_max_settings_per_window: self.h2_max_settings_per_window,
+            h2_max_empty_data_per_window: self.h2_max_empty_data_per_window,
+            h2_max_window_update_stream0_per_window: self.h2_max_window_update_stream0_per_window,
+            h2_max_continuation_frames: self.h2_max_continuation_frames,
+            h2_max_glitch_count: self.h2_max_glitch_count,
+            h2_initial_connection_window: self.h2_initial_connection_window,
+            h2_max_concurrent_streams: self.h2_max_concurrent_streams,
+            h2_stream_shrink_ratio: self.h2_stream_shrink_ratio,
+            h2_max_rst_stream_lifetime: self.h2_max_rst_stream_lifetime,
+            h2_max_rst_stream_abusive_lifetime: self.h2_max_rst_stream_abusive_lifetime,
+            h2_max_rst_stream_emitted_lifetime: self.h2_max_rst_stream_emitted_lifetime,
+            h2_max_header_list_size: self.h2_max_header_list_size,
+            h2_max_header_table_size: self.h2_max_header_table_size,
+            strict_sni_binding: self.strict_sni_binding,
+            disable_http11: self.disable_http11,
+            h2_stream_idle_timeout_seconds: self.h2_stream_idle_timeout_seconds,
+            h2_graceful_shutdown_deadline_seconds: self.h2_graceful_shutdown_deadline_seconds,
+            sozu_id_header: self.sozu_id_header.clone(),
         };
 
         Ok(https_listener_config)
@@ -632,6 +863,60 @@ fn read_http_answer_file(path: &Option<String>) -> Result<Option<String>, Config
     }
 }
 
+/// Cardinality knob for metrics labels in the StatsD network drain.
+///
+/// Mirrors HAProxy's `process|frontend|backend|server` extra-counters opt-in.
+/// Operators choose the lowest level that satisfies their dashboards so that
+/// the keyspace stays bounded. Each level is a SUPERSET of the previous one:
+///
+/// - `process` — proxy-only counters (no listener, cluster, or backend label).
+/// - `frontend` — adds per-listener (frontend) breakdown.
+/// - `cluster` — adds per-cluster aggregation. **Default** (preserves the
+///   pre-knob behaviour).
+/// - `backend` — adds per-backend aggregation (cluster + backend, highest
+///   cardinality).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MetricDetailLevel {
+    Process,
+    Frontend,
+    Cluster,
+    Backend,
+}
+
+impl Default for MetricDetailLevel {
+    fn default() -> Self {
+        // Preserve the historical (pre-knob) behaviour: cluster-scoped
+        // metrics are emitted by default.
+        Self::Cluster
+    }
+}
+
+impl From<MetricDetailLevel> for MetricDetail {
+    fn from(level: MetricDetailLevel) -> Self {
+        match level {
+            MetricDetailLevel::Process => MetricDetail::DetailProcess,
+            MetricDetailLevel::Frontend => MetricDetail::DetailFrontend,
+            MetricDetailLevel::Cluster => MetricDetail::DetailCluster,
+            MetricDetailLevel::Backend => MetricDetail::DetailBackend,
+        }
+    }
+}
+
+impl From<MetricDetail> for MetricDetailLevel {
+    /// Reverse of [`From<MetricDetailLevel> for MetricDetail`] — used by the
+    /// worker side to convert the protobuf wire enum back into the
+    /// configuration enum before passing it to `sozu_lib::metrics::setup`.
+    fn from(detail: MetricDetail) -> Self {
+        match detail {
+            MetricDetail::DetailProcess => MetricDetailLevel::Process,
+            MetricDetail::DetailFrontend => MetricDetailLevel::Frontend,
+            MetricDetail::DetailCluster => MetricDetailLevel::Cluster,
+            MetricDetail::DetailBackend => MetricDetailLevel::Backend,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MetricsConfig {
@@ -640,6 +925,10 @@ pub struct MetricsConfig {
     pub tagged_metrics: bool,
     #[serde(default)]
     pub prefix: Option<String>,
+    /// Cardinality knob for label-aware metrics. Defaults to `cluster` to
+    /// preserve historical behaviour. See [`MetricDetailLevel`].
+    #[serde(default)]
+    pub detail: MetricDetailLevel,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -788,6 +1077,9 @@ pub struct FileClusterConfig {
     pub answer_503: Option<String>,
     #[serde(default)]
     pub load_metric: Option<LoadMetric>,
+    /// Backend-capability hint: `true` when the backend speaks HTTP/2 (h2c or h2+TLS once #1218 lands).
+    /// Does NOT gate H2 at the frontend — frontend H2 is ALPN-negotiated independently (see `alpn_protocols`).
+    pub http2: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -883,6 +1175,7 @@ impl FileClusterConfig {
                     load_balancing: self.load_balancing,
                     load_metric: self.load_metric,
                     answer_503,
+                    http2: self.http2,
                 }))
             }
         }
@@ -975,6 +1268,7 @@ pub struct HttpClusterConfig {
     pub load_balancing: LoadBalancingAlgorithms,
     pub load_metric: Option<LoadMetric>,
     pub answer_503: Option<String>,
+    pub http2: Option<bool>,
 }
 
 impl HttpClusterConfig {
@@ -988,6 +1282,7 @@ impl HttpClusterConfig {
                 load_balancing: self.load_balancing as i32,
                 answer_503: self.answer_503.clone(),
                 load_metric: self.load_metric.map(|s| s as i32),
+                http2: self.http2,
             })
             .into(),
         ];
@@ -1049,6 +1344,7 @@ impl TcpClusterConfig {
                 load_balancing: self.load_balancing as i32,
                 load_metric: self.load_metric.map(|s| s as i32),
                 answer_503: None,
+                http2: None,
             })
             .into(),
         ];
@@ -1113,6 +1409,19 @@ pub struct FileConfig {
     pub min_buffers: Option<u64>,
     pub max_buffers: Option<u64>,
     pub buffer_size: Option<u64>,
+    /// Slab-entries-per-connection multiplier. `None` keeps the compile-time
+    /// default of 4. Operator-visible escape hatch for fan-out topologies
+    /// that exceed 4 backends per session — clamped to [2, 32] at load.
+    #[serde(default)]
+    pub slab_entries_per_connection: Option<u64>,
+    /// Optional UID allowlist for command-socket requests. `None` (default)
+    /// preserves historical behaviour: any same-UID local process can
+    /// invoke any verb. When set, requests whose `SO_PEERCRED` UID is not
+    /// in the list are rejected. Use to restrict mutating verbs to a
+    /// specific operator UID even when other same-UID daemons coexist
+    /// (CI runners, monitoring).
+    #[serde(default)]
+    pub command_allowed_uids: Option<Vec<u32>>,
     pub saved_state: Option<String>,
     #[serde(default)]
     pub automatic_state_save: Option<bool>,
@@ -1120,6 +1429,21 @@ pub struct FileConfig {
     pub log_target: Option<String>,
     #[serde(default)]
     pub log_colored: bool,
+    /// Dedicated file path for the control-plane audit log. When set, every
+    /// emitted `[AUDIT]` / `Command(...)` line is also appended to this file
+    /// opened `O_APPEND | O_CREAT` with mode `0o640` (owner read+write,
+    /// group read, world nothing) so operators can separate the audit trail
+    /// from the main log stream and protect it with group-scoped ACLs /
+    /// logrotate. Independent of the standard `log_target`. `None` keeps
+    /// audit lines routed only through the standard logger.
+    #[serde(default)]
+    pub audit_logs_target: Option<String>,
+    /// Dedicated file path for a JSON-encoded mirror of the audit log.
+    /// One JSON object per line so SIEM pipelines (Wazuh, Elastic, Loki)
+    /// ingest without bespoke parsers. Same `O_APPEND | O_CREAT | 0o640`
+    /// as `audit_logs_target`. `None` disables the JSON mirror.
+    #[serde(default)]
+    pub audit_logs_json_target: Option<String>,
     #[serde(default)]
     pub access_logs_target: Option<String>,
     #[serde(default)]
@@ -1237,6 +1561,8 @@ impl ConfigBuilder {
             front_timeout: file_config.front_timeout.unwrap_or(DEFAULT_FRONT_TIMEOUT),
             handle_process_affinity: file_config.handle_process_affinity.unwrap_or(false),
             access_logs_target: file_config.access_logs_target.clone(),
+            audit_logs_target: file_config.audit_logs_target.clone(),
+            audit_logs_json_target: file_config.audit_logs_json_target.clone(),
             access_logs_format: file_config.access_logs_format.clone(),
             access_logs_colored: file_config.access_logs_colored,
             log_level: file_config
@@ -1276,6 +1602,13 @@ impl ConfigBuilder {
                 .zombie_check_interval
                 .unwrap_or(DEFAULT_ZOMBIE_CHECK_INTERVAL),
             worker_timeout: file_config.worker_timeout.unwrap_or(DEFAULT_WORKER_TIMEOUT),
+            slab_entries_per_connection: file_config.slab_entries_per_connection.map(|n| {
+                n.clamp(
+                    ServerConfig::MIN_SLAB_ENTRIES_PER_CONNECTION,
+                    ServerConfig::MAX_SLAB_ENTRIES_PER_CONNECTION,
+                )
+            }),
+            command_allowed_uids: file_config.command_allowed_uids.clone(),
             ..Default::default()
         };
 
@@ -1448,6 +1781,28 @@ impl ConfigBuilder {
             self.populate_clusters(file_cluster_configs.clone())?;
         }
 
+        // RFC 9113 §6.5.2 + §4.1: the H2 mux must accept up to
+        // SETTINGS_MAX_FRAME_SIZE (16 384) + 9-byte frame header in a single
+        // kawa buffer. If any HTTPS listener advertises "h2" in its ALPN list
+        // and the global buffer_size is below H2_MIN_BUFFER_SIZE, the mux
+        // deadlocks on full-size DATA / HEADERS / CONTINUATION frames until
+        // the session timeout fires. Reject at config load so the failure
+        // mode surfaces at boot, not under traffic.
+        // Long-form rationale: `lib/src/protocol/mux/LIFECYCLE.md`.
+        let h2_listeners = self
+            .built
+            .https_listeners
+            .iter()
+            .filter(|l| l.alpn_protocols.iter().any(|p| p == "h2"))
+            .count();
+        if h2_listeners > 0 && self.built.buffer_size < H2_MIN_BUFFER_SIZE {
+            return Err(ConfigError::BufferSizeTooSmallForH2 {
+                buffer_size: self.built.buffer_size,
+                minimum: H2_MIN_BUFFER_SIZE,
+                listeners: h2_listeners,
+            });
+        }
+
         let command_socket_path = self.file.command_socket.clone().unwrap_or({
             let mut path = env::current_dir().map_err(|e| ConfigError::Env(e.to_string()))?;
             path.push("sozu.sock");
@@ -1487,6 +1842,14 @@ pub struct Config {
     pub log_level: String,
     pub log_target: String,
     pub log_colored: bool,
+    /// Optional dedicated file path for the control-plane audit log. See
+    /// `FileConfig::audit_logs_target` for rationale.
+    #[serde(default)]
+    pub audit_logs_target: Option<String>,
+    /// Optional JSON mirror of the audit log; see
+    /// `FileConfig::audit_logs_json_target`.
+    #[serde(default)]
+    pub audit_logs_json_target: Option<String>,
     #[serde(default)]
     pub access_logs_target: Option<String>,
     pub access_logs_format: Option<AccessLogFormat>,
@@ -1518,6 +1881,20 @@ pub struct Config {
     pub request_timeout: u32,
     #[serde(default = "default_worker_timeout")]
     pub worker_timeout: u32,
+    /// Slab-entries-per-connection multiplier exposed for operators with
+    /// fan-out topologies that exceed the default 4 backends per session.
+    /// `None` means the default (4) applies; set values are clamped to
+    /// [`ServerConfig::MIN_SLAB_ENTRIES_PER_CONNECTION`,
+    /// `ServerConfig::MAX_SLAB_ENTRIES_PER_CONNECTION`] = [2, 32]. Slab
+    /// capacity is `10 + slab_entries_per_connection * max_connections`.
+    #[serde(default)]
+    pub slab_entries_per_connection: Option<u64>,
+    /// Optional allowlist of UIDs permitted to invoke command-socket
+    /// requests. `None` keeps the historical "any same-UID local process"
+    /// behaviour. When `Some`, every request whose `SO_PEERCRED` UID is
+    /// not in the list is rejected before reaching dispatch.
+    #[serde(default)]
+    pub command_allowed_uids: Option<Vec<u32>>,
 }
 
 fn default_front_timeout() -> u32 {
@@ -1799,6 +2176,8 @@ impl fmt::Debug for Config {
             .field("log_level", &self.log_level)
             .field("log_target", &self.log_target)
             .field("access_logs_target", &self.access_logs_target)
+            .field("audit_logs_target", &self.audit_logs_target)
+            .field("audit_logs_json_target", &self.audit_logs_json_target)
             .field("access_logs_format", &self.access_logs_format)
             .field("worker_count", &self.worker_count)
             .field("worker_automatic_restart", &self.worker_automatic_restart)
@@ -1827,9 +2206,40 @@ fn display_toml_error(file: &str, error: &toml::de::Error) {
 }
 
 impl ServerConfig {
-    /// size of the slab for the Session manager
+    /// Default number of slab entries per connection. Set to 4 to accommodate
+    /// H2 multiplexing (1 frontend + up to 3 backend connections per
+    /// frontend with stream multiplexing). Previous value was 2 for H1-only
+    /// operation. Operators with topologies that fan out across more
+    /// clusters per session can override via `slab_entries_per_connection`
+    /// in the config (clamped to [2, 32]).
+    pub const DEFAULT_SLAB_ENTRIES_PER_CONNECTION: u64 = 4;
+    /// Lower bound for the runtime knob. Below 2 the slab cannot hold one
+    /// frontend + one backend per session.
+    pub const MIN_SLAB_ENTRIES_PER_CONNECTION: u64 = 2;
+    /// Upper bound for the runtime knob. 32 caps memory blow-up from a
+    /// runaway config; 32 backends per frontend covers any sane topology.
+    pub const MAX_SLAB_ENTRIES_PER_CONNECTION: u64 = 32;
+
+    /// Effective slab-entries-per-connection. Applies the [MIN, MAX] clamp
+    /// and falls back to the default when the proto field is absent or 0.
+    pub fn effective_slab_entries_per_connection(&self) -> u64 {
+        match self.slab_entries_per_connection {
+            Some(0) | None => Self::DEFAULT_SLAB_ENTRIES_PER_CONNECTION,
+            Some(n) => n.clamp(
+                Self::MIN_SLAB_ENTRIES_PER_CONNECTION,
+                Self::MAX_SLAB_ENTRIES_PER_CONNECTION,
+            ),
+        }
+    }
+
+    /// Size of the slab for the Session manager.
+    ///
+    /// With HTTP/2 multiplexing, each frontend session can have multiple backend
+    /// connections (one per cluster), so we allocate
+    /// [`Self::effective_slab_entries_per_connection`] entries per connection
+    /// instead of the old H1-only multiplier of 2.
     pub fn slab_capacity(&self) -> u64 {
-        10 + 2 * self.max_connections
+        10 + self.effective_slab_entries_per_connection() * self.max_connections
     }
 }
 
@@ -1840,6 +2250,7 @@ impl From<&Config> for ServerConfig {
             address: m.address.to_string(),
             tagged_metrics: m.tagged_metrics,
             prefix: m.prefix,
+            detail: Some(MetricDetail::from(m.detail) as i32),
         });
         Self {
             max_connections: config.max_connections as u64,
@@ -1854,11 +2265,14 @@ impl From<&Config> for ServerConfig {
             log_level: config.log_level.clone(),
             log_target: config.log_target.clone(),
             access_logs_target: config.access_logs_target.clone(),
+            audit_logs_target: config.audit_logs_target.clone(),
+            audit_logs_json_target: config.audit_logs_json_target.clone(),
             command_buffer_size: config.command_buffer_size,
             max_command_buffer_size: config.max_command_buffer_size,
             metrics,
             access_log_format: ProtobufAccessLogFormat::from(&config.access_logs_format) as i32,
             log_colored: config.log_colored,
+            slab_entries_per_connection: config.slab_entries_per_connection,
         }
     }
 }
@@ -1900,6 +2314,7 @@ mod tests {
                 address: "127.0.0.1:8125".parse().unwrap(),
                 tagged_metrics: false,
                 prefix: Some(String::from("sozu-metrics")),
+                detail: MetricDetailLevel::default(),
             }),
             listeners: Some(listeners),
             ..Default::default()
@@ -2071,5 +2486,128 @@ mod tests {
             result.is_err(),
             "Should reject duplicate listener addresses"
         );
+    }
+
+    #[test]
+    fn buffer_size_below_h2_minimum_rejected() {
+        // Default ALPN ["h2", "http/1.1"] + buffer_size = 8192 must error.
+        let toml_content = r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+            buffer_size = 8192
+
+            [[listeners]]
+            protocol = "https"
+            address = "127.0.0.1:8443"
+        "#;
+        let file_config: FileConfig =
+            toml::from_str(toml_content).expect("Could not parse TOML config");
+        let result = ConfigBuilder::new(file_config, "/tmp/test_config.toml").into_config();
+        match result {
+            Err(ConfigError::BufferSizeTooSmallForH2 {
+                buffer_size: 8192,
+                minimum: 16_393,
+                listeners: 1,
+            }) => {}
+            other => panic!("expected BufferSizeTooSmallForH2, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn buffer_size_below_h2_minimum_accepted_when_no_h2_listener() {
+        // Drop "h2" from ALPN — buffer_size = 8192 is now valid.
+        let toml_content = r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+            buffer_size = 8192
+
+            [[listeners]]
+            protocol = "https"
+            address = "127.0.0.1:8443"
+            alpn_protocols = ["http/1.1"]
+        "#;
+        let file_config: FileConfig =
+            toml::from_str(toml_content).expect("Could not parse TOML config");
+        let result = ConfigBuilder::new(file_config, "/tmp/test_config.toml").into_config();
+        assert!(
+            result.is_ok(),
+            "non-H2 HTTPS listener with sub-16393 buffer should be accepted: {result:?}"
+        );
+    }
+
+    #[test]
+    fn buffer_size_at_h2_minimum_accepted() {
+        let toml_content = r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+            buffer_size = 16393
+
+            [[listeners]]
+            protocol = "https"
+            address = "127.0.0.1:8443"
+        "#;
+        let file_config: FileConfig =
+            toml::from_str(toml_content).expect("Could not parse TOML config");
+        let result = ConfigBuilder::new(file_config, "/tmp/test_config.toml").into_config();
+        assert!(
+            result.is_ok(),
+            "buffer_size at the H2 minimum should be accepted: {result:?}"
+        );
+    }
+
+    #[test]
+    fn alpn_protocols_default() {
+        let mut builder = ListenerBuilder::new_https(SocketAddress::new_v4(127, 0, 0, 1, 8443));
+        let config = builder.to_tls(None).expect("to_tls should succeed");
+        assert_eq!(config.alpn_protocols, vec!["h2", "http/1.1"]);
+    }
+
+    #[test]
+    fn alpn_protocols_custom() {
+        let mut builder = ListenerBuilder::new_https(SocketAddress::new_v4(127, 0, 0, 1, 8443));
+        builder.with_alpn_protocols(Some(vec!["http/1.1".to_owned()]));
+        let config = builder.to_tls(None).expect("to_tls should succeed");
+        assert_eq!(config.alpn_protocols, vec!["http/1.1"]);
+    }
+
+    #[test]
+    fn alpn_protocols_invalid_rejected() {
+        let mut builder = ListenerBuilder::new_https(SocketAddress::new_v4(127, 0, 0, 1, 8443));
+        builder.with_alpn_protocols(Some(vec!["h3".to_owned()]));
+        let result = builder.to_tls(None);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("h3"),
+            "error should mention the invalid protocol: {err}"
+        );
+    }
+
+    #[test]
+    fn alpn_protocols_empty_uses_default() {
+        let mut builder = ListenerBuilder::new_https(SocketAddress::new_v4(127, 0, 0, 1, 8443));
+        builder.with_alpn_protocols(Some(vec![]));
+        let config = builder.to_tls(None).expect("to_tls should succeed");
+        assert_eq!(config.alpn_protocols, vec!["h2", "http/1.1"]);
+    }
+
+    #[test]
+    fn alpn_protocols_deduplicated() {
+        let mut builder = ListenerBuilder::new_https(SocketAddress::new_v4(127, 0, 0, 1, 8443));
+        builder.with_alpn_protocols(Some(vec![
+            "h2".to_owned(),
+            "h2".to_owned(),
+            "http/1.1".to_owned(),
+        ]));
+        let config = builder.to_tls(None).expect("to_tls should succeed");
+        assert_eq!(config.alpn_protocols, vec!["h2", "http/1.1"]);
+    }
+
+    #[test]
+    fn alpn_protocols_order_preserved() {
+        let mut builder = ListenerBuilder::new_https(SocketAddress::new_v4(127, 0, 0, 1, 8443));
+        builder.with_alpn_protocols(Some(vec!["http/1.1".to_owned(), "h2".to_owned()]));
+        let config = builder.to_tls(None).expect("to_tls should succeed");
+        assert_eq!(config.alpn_protocols, vec!["http/1.1", "h2"]);
     }
 }

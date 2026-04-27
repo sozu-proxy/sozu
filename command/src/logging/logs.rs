@@ -1,5 +1,5 @@
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     cmp, env,
     fmt::Arguments,
     fs::{File, OpenOptions},
@@ -23,6 +23,55 @@ use crate::{
 
 thread_local! {
   pub static LOGGER: RefCell<Logger> = RefCell::new(Logger::new());
+  /// Side-channel mirror of [`InnerLogger::colored`]. Read by
+  /// [`is_logger_colored`] without borrowing the [`LOGGER`] cell, so macros
+  /// like `log_context!` can consult it while the logger is already held
+  /// mutably by the enclosing `error!`/`info!`/... emission.
+  static LOGGER_COLORED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Returns `true` when the thread-local [`Logger`] is configured to emit colored
+/// output. Safe to call from inside an `error!`/`info!`/… argument list — the
+/// flag mirrors [`Logger::is_colored`] (i.e. [`InnerLogger::colored`]) into a
+/// dedicated [`Cell`] at [`Logger::init`] time so we never re-borrow the main
+/// logger cell (which is already held mutably while the outer log macro is
+/// formatting its arguments). The mirror is the single source of truth for
+/// hot-path callers; `Logger::is_colored` is the single source of truth for
+/// the rest of the API. They go through the same `InnerLogger::colored`
+/// field, so they cannot diverge by construction.
+pub fn is_logger_colored() -> bool {
+    LOGGER_COLORED.with(|c| c.get())
+}
+
+/// ANSI palette used by every `log_context!` / `log_*_context!` macro in the
+/// proxy stack. Returns a 5-tuple `(open, reset, grey, gray, white)` where:
+///
+/// - `open`   = `\x1b[1;97m` (bold bright-white) — protocol label (`MUX`,
+///   `MUX-H2`, `SOCKET`, `RUSTLS`, `PIPE`, …).
+/// - `reset`  = `\x1b[0m` — ANSI reset.
+/// - `grey`   = `\x1b[37m` (light grey) — `Session` keyword.
+/// - `gray`   = `\x1b[90m` (bright black) — attribute keys (`peer=`,
+///   `local=`, `cluster=`, …).
+/// - `white`  = `\x1b[97m` (bright white) — attribute values.
+///
+/// When [`is_logger_colored`] returns `false` every slot is an empty string,
+/// so macros can unconditionally inline the tokens into `format!` without
+/// leaking escape codes into plain-text log sinks.
+///
+/// Callers that only need the label pair can destructure with wildcards:
+/// `let (open, reset, _, _, _) = ansi_palette();`.
+pub fn ansi_palette() -> (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+) {
+    if is_logger_colored() {
+        ("\x1b[1;97m", "\x1b[0m", "\x1b[37m", "\x1b[90m", "\x1b[97m")
+    } else {
+        ("", "", "", "", "")
+    }
 }
 
 // TODO: check if this error is critical:
@@ -145,6 +194,15 @@ impl Logger {
                     LoggerBackend::Stdout(_) => colored,
                     _ => false,
                 };
+                // Mirror into the side-channel cell via the canonical
+                // accessor so `is_logger_colored()` can be called from
+                // inside log-macro argument formatters without re-borrowing
+                // the main `LOGGER` cell (it is held mutably here and by
+                // every subsequent `error!`/`info!`/...). Going through
+                // `Logger::is_colored` (instead of the `Deref`'d
+                // `logger.colored`) makes the single source of truth
+                // explicit at the call site.
+                LOGGER_COLORED.with(|c| c.set(logger.is_colored()));
                 logger.access_colored = match (&access_backend, &backend) {
                     (Some(LoggerBackend::Stdout(_)), _) | (None, LoggerBackend::Stdout(_)) => {
                         access_colored.unwrap_or(colored)
@@ -157,6 +215,9 @@ impl Logger {
                 logger.access_logs_target = access_logs_target.map(ToOwned::to_owned);
                 logger.access_format = access_format.unwrap_or(AccessLogFormat::Ascii);
                 logger.tag = tag;
+                // SAFETY: `libc::getpid` takes no input pointers, never
+                // fails, and returns a value type. No invariant beyond
+                // "FFI signature matches libc".
                 logger.pid = unsafe { libc::getpid() };
                 logger.initialized = true;
 
@@ -175,6 +236,11 @@ impl Logger {
 
     pub fn split(&mut self) -> (i32, &str, &mut InnerLogger) {
         (self.pid, &self.tag, &mut self.inner)
+    }
+
+    /// Returns `true` when the logger emits colored output on its main backend.
+    pub fn is_colored(&self) -> bool {
+        self.inner.colored
     }
 }
 
@@ -948,7 +1014,13 @@ macro_rules! debug {
     ($format:expr $(, $args:expr)* $(,)?) => {{
         #[cfg(any(debug_assertions, feature = "logs-debug", feature = "logs-trace"))]
         $crate::_log!($crate::logging::LogLevel::Debug, concat!("{}\t", $format), module_path!() $(, $args)*);
-        #[cfg(not(any(debug_assertions, feature = "logs-trace")))]
+        // Dead-code arm silences `unused_variables` warnings on
+        // `--no-default-features` builds where the emit arm is stripped.
+        // Must gate on the SAME set of features as the emit arm above, or
+        // else both arms compile in and double-move the caller's arguments
+        // (observed on `release + logs-debug` builds where the emit arm
+        // fires and the no-op arm also fires, each consuming `$args` once).
+        #[cfg(not(any(debug_assertions, feature = "logs-debug", feature = "logs-trace")))]
         if false {$( let _ = $args; )*}
     }};
 }

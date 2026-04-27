@@ -1,3 +1,6 @@
+#![allow(clippy::result_large_err)]
+#![allow(clippy::too_many_arguments)]
+
 mod command;
 mod request_builder;
 
@@ -120,7 +123,7 @@ impl CommandManager {
                 None => self.upgrade_main(),
                 Some(worker_id) => self.upgrade_worker(worker_id),
             },
-            SubCmd::Status {} => self.status(),
+            SubCmd::Status => self.status(),
             SubCmd::Metrics { cmd } => match cmd {
                 MetricsCmd::Get {
                     list,

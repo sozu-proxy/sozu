@@ -33,6 +33,14 @@ log_target = "stdout"
 # It supports the same options as log_target
 # access_logs_target = "file:///var/log/sozu-access.log"
 
+# optional dedicated file path for the control-plane audit log. See
+# `bin/config.toml` for rationale. Accepts a plain filesystem path.
+# audit_logs_target = "/var/log/sozu/audit.log"
+
+# optional JSON mirror of the audit log — one JSON object per line. See
+# `bin/config.toml` for the full schema rationale.
+# audit_logs_json_target = "/var/log/sozu/audit.jsonl"
+
 # path to the unix socket file used to send commands to sozu
 # default value points to "sozu.sock" file in the current directory
 command_socket = "/run/sozu/sozu.sock"

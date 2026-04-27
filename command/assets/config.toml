@@ -7,7 +7,7 @@ max_command_buffer_size = 163840
 worker_count = 1
 max_connections = 20000
 max_buffers = 1000
-buffer_size = 16384
+buffer_size = 16393
 
 [[listeners]]
 address = "0.0.0.0:80"
