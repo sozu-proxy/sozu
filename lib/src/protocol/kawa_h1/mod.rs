@@ -45,7 +45,6 @@ use crate::{
         pipe::WebSocketContext,
     },
     retry::RetryPolicy,
-    router::Route,
     server::{CONN_RETRIES, push_event},
     socket::{SocketHandler, SocketResult, TransportProtocol, stats::socket_rtt},
     sozu_command::{
@@ -1381,9 +1380,13 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             }
         };
 
-        let cluster_id = match route {
-            Route::ClusterId(cluster_id) => cluster_id,
-            Route::Deny => {
+        // Wave 2b carries the new RouteResult shape; the mux integration in
+        // Wave 3a will read every field. Until then, this legacy kawa_h1
+        // path collapses RouteResult down to its `cluster_id` and treats an
+        // absent cluster as the historical `Route::Deny`.
+        let cluster_id = match route.cluster_id {
+            Some(cluster_id) => cluster_id,
+            None => {
                 self.set_answer(DefaultAnswer::Answer401 {
                     www_authenticate: None,
                 });

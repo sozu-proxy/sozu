@@ -41,7 +41,7 @@ use crate::{
         mux::{self, Mux, MuxClear},
         proxy_protocol::expect::ExpectProxyProtocol,
     },
-    router::{Route, Router},
+    router::{RouteResult, Router},
     server::{ListenToken, SessionManager},
     socket::server_bind,
     timer::TimeoutContainer,
@@ -621,7 +621,7 @@ impl L7ListenerHandler for HttpListener {
         host: &str,
         uri: &str,
         method: &Method,
-    ) -> Result<Route, FrontendFromRequestError> {
+    ) -> Result<RouteResult, FrontendFromRequestError> {
         let start = Instant::now();
         let (remaining_input, (hostname, _)) = match hostname_and_port(host.as_bytes()) {
             Ok(tuple) => tuple,
@@ -662,7 +662,7 @@ impl L7ListenerHandler for HttpListener {
 
         let now = Instant::now();
 
-        if let Route::ClusterId(cluster) = &route {
+        if let Some(cluster) = route.cluster_id.as_deref() {
             time!("frontend_matching_time", cluster, (now - start).as_millis());
         }
 
@@ -1966,20 +1966,32 @@ mod tests {
         let frontend4 = listener.frontend_from_request("lolcatho.st", "/yolo/swag", &Method::Get);
         let frontend5 = listener.frontend_from_request("domain", "/", &Method::Get);
         assert_eq!(
-            frontend1.expect("should find frontend"),
-            Route::ClusterId("cluster_1".to_string())
+            frontend1
+                .expect("should find frontend")
+                .cluster_id
+                .as_deref(),
+            Some("cluster_1")
         );
         assert_eq!(
-            frontend2.expect("should find frontend"),
-            Route::ClusterId("cluster_1".to_string())
+            frontend2
+                .expect("should find frontend")
+                .cluster_id
+                .as_deref(),
+            Some("cluster_1")
         );
         assert_eq!(
-            frontend3.expect("should find frontend"),
-            Route::ClusterId("cluster_2".to_string())
+            frontend3
+                .expect("should find frontend")
+                .cluster_id
+                .as_deref(),
+            Some("cluster_2")
         );
         assert_eq!(
-            frontend4.expect("should find frontend"),
-            Route::ClusterId("cluster_3".to_string())
+            frontend4
+                .expect("should find frontend")
+                .cluster_id
+                .as_deref(),
+            Some("cluster_3")
         );
         assert!(frontend5.is_err());
     }

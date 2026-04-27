@@ -75,7 +75,7 @@ use crate::{
         proxy_protocol::expect::ExpectProxyProtocol,
         rustls::TlsHandshake,
     },
-    router::{Route, Router},
+    router::{RouteResult, Router},
     server::{ListenToken, SessionManager},
     socket::{FrontRustls, server_bind},
     timer::TimeoutContainer,
@@ -833,7 +833,7 @@ impl L7ListenerHandler for HttpsListener {
         host: &str,
         uri: &str,
         method: &Method,
-    ) -> Result<Route, FrontendFromRequestError> {
+    ) -> Result<RouteResult, FrontendFromRequestError> {
         let start = Instant::now();
         let (remaining_input, (hostname, _)) = match hostname_and_port(host.as_bytes()) {
             Ok(tuple) => tuple,
@@ -869,7 +869,7 @@ impl L7ListenerHandler for HttpsListener {
 
         let now = Instant::now();
 
-        if let Route::ClusterId(cluster) = &route {
+        if let Some(cluster) = route.cluster_id.as_deref() {
             time!("frontend_matching_time", cluster, (now - start).as_millis());
         }
 
@@ -2340,26 +2340,38 @@ mod tests {
         println!("TEST {}", line!());
         let frontend1 = listener.frontend_from_request("lolcatho.st", "/", &Method::Get);
         assert_eq!(
-            frontend1.expect("should find a frontend"),
-            Route::ClusterId("cluster_1".to_string())
+            frontend1
+                .expect("should find a frontend")
+                .cluster_id
+                .as_deref(),
+            Some("cluster_1")
         );
         println!("TEST {}", line!());
         let frontend2 = listener.frontend_from_request("lolcatho.st", "/test", &Method::Get);
         assert_eq!(
-            frontend2.expect("should find a frontend"),
-            Route::ClusterId("cluster_1".to_string())
+            frontend2
+                .expect("should find a frontend")
+                .cluster_id
+                .as_deref(),
+            Some("cluster_1")
         );
         println!("TEST {}", line!());
         let frontend3 = listener.frontend_from_request("lolcatho.st", "/yolo/test", &Method::Get);
         assert_eq!(
-            frontend3.expect("should find a frontend"),
-            Route::ClusterId("cluster_2".to_string())
+            frontend3
+                .expect("should find a frontend")
+                .cluster_id
+                .as_deref(),
+            Some("cluster_2")
         );
         println!("TEST {}", line!());
         let frontend4 = listener.frontend_from_request("lolcatho.st", "/yolo/swag", &Method::Get);
         assert_eq!(
-            frontend4.expect("should find a frontend"),
-            Route::ClusterId("cluster_3".to_string())
+            frontend4
+                .expect("should find a frontend")
+                .cluster_id
+                .as_deref(),
+            Some("cluster_3")
         );
         println!("TEST {}", line!());
         let frontend5 = listener.frontend_from_request("domain", "/", &Method::Get);
