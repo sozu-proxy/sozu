@@ -527,19 +527,27 @@ In particular, the recurring `Could not look up a certificate for server name "<
 
 ## Custom HTTP answer templates
 
-Sōzu lets operators replace any default error response with a templated body
-loaded from disk. Templates are specified as a `[listeners.answers]` map at
-listener scope or as a `[clusters.<id>.answers]` map at cluster scope; the
-key is the HTTP status code (e.g. `"503"`) and the value is the path to a
-template file. Cluster-level entries override the listener-level template
-for the same status code on requests routed through that cluster.
+Sōzu lets operators replace any default error response with a templated body.
+Templates are specified as a `[listeners.<id>.answers]` map at listener
+scope — the **global default** that fires whenever no cluster-level
+override matches — or as a `[clusters.<id>.answers]` map at cluster
+scope, which overrides the matching listener entry on requests routed
+through that cluster. Both layers accept the same key/value shape: the
+key is the HTTP status code (e.g. `"503"`); the value is **either** a
+filesystem path **or** an `inline:<body>` literal where everything
+after the colon is taken verbatim as the template body (no file I/O).
+The inline form is convenient for short canned responses, secrets-free
+containers where mounting a template directory is awkward, and test
+rigs that want to avoid disk dependencies.
 
 ```toml
+# listener-level: global default for every status not overridden by a cluster.
 [listeners.https.answers]
-"401" = "/etc/sozu/templates/401.http"
+"401" = "/etc/sozu/templates/401.http"               # filesystem path
 "404" = "/etc/sozu/templates/404.http"
-"503" = "/etc/sozu/templates/503.http"
+"503" = """inline:HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 4\r\n\r\nbusy"""
 
+# cluster-level: overrides the listener default for THIS cluster only.
 [clusters.MyCluster.answers]
 "503" = "/etc/sozu/templates/MyCluster.503.http"
 ```
