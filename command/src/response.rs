@@ -51,6 +51,7 @@ impl From<HttpFrontend> for RequestHttpFrontend {
             method: val.method,
             position: val.position.into(),
             tags: val.tags.unwrap_or_default(),
+            ..Default::default()
         }
     }
 }

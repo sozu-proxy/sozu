@@ -277,6 +277,7 @@ impl CommandManager {
                     method,
                     position: RulePosition::Tree.into(),
                     tags: tags.unwrap_or_default(),
+                    ..Default::default()
                 })
                 .into(),
             ),
@@ -322,6 +323,7 @@ impl CommandManager {
                     method,
                     position: RulePosition::Tree.into(),
                     tags: tags.unwrap_or_default(),
+                    ..Default::default()
                 })
                 .into(),
             ),
@@ -731,6 +733,7 @@ impl CommandManager {
             h2_graceful_shutdown_deadline_seconds,
             h2_max_window_update_stream0_per_window,
             sozu_id_header,
+            ..Default::default()
         };
         self.send_request(RequestType::UpdateHttpListener(patch).into())
     }
@@ -853,6 +856,7 @@ impl CommandManager {
             h2_graceful_shutdown_deadline_seconds,
             h2_max_window_update_stream0_per_window,
             sozu_id_header,
+            ..Default::default()
         };
         self.send_request(RequestType::UpdateHttpsListener(patch).into())
     }
