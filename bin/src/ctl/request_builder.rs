@@ -13,7 +13,7 @@ use sozu_command_lib::{
         RemoveCertificate, RemoveListener, ReplaceCertificate, RequestHttpFrontend,
         RequestTcpFrontend, RulePosition, SocketAddress, SoftStop, Status, SubscribeEvents,
         TlsVersion, UpdateHttpListenerConfig, UpdateHttpsListenerConfig, UpdateTcpListenerConfig,
-        request::RequestType, response_content,
+        request::RequestType, response_content::ContentType,
     },
 };
 
@@ -222,19 +222,8 @@ impl CommandManager {
 
         let cluster = response
             .content
-            .and_then(|c| c.content_type)
-            .and_then(|ct| match ct {
-                response_content::ContentType::Clusters(infos) => infos
-                    .vec
-                    .into_iter()
-                    .find(|info| {
-                        info.configuration
-                            .as_ref()
-                            .is_some_and(|c| c.cluster_id == cluster_id)
-                    })
-                    .and_then(|info| info.configuration),
-                _ => None,
-            })
+            .and_then(|content| content.content_type)
+            .and_then(|content_type| find_cluster_configuration(content_type, &cluster_id))
             .ok_or_else(|| {
                 CtlError::ArgsNeeded("cluster not found".to_owned(), cluster_id.clone())
             })?;
@@ -1078,6 +1067,34 @@ impl CommandManager {
     }
 }
 
+fn find_cluster_configuration(content_type: ContentType, cluster_id: &str) -> Option<Cluster> {
+    match content_type {
+        ContentType::Clusters(infos) => infos
+            .vec
+            .into_iter()
+            .find(|info| {
+                info.configuration
+                    .as_ref()
+                    .is_some_and(|cluster| cluster.cluster_id == cluster_id)
+            })
+            .and_then(|info| info.configuration),
+        ContentType::WorkerResponses(mut worker_responses) => {
+            if let Some(content) = worker_responses.map.remove("main") {
+                return content
+                    .content_type
+                    .and_then(|content_type| find_cluster_configuration(content_type, cluster_id));
+            }
+
+            worker_responses.map.into_values().find_map(|content| {
+                content
+                    .content_type
+                    .and_then(|content_type| find_cluster_configuration(content_type, cluster_id))
+            })
+        }
+        _ => None,
+    }
+}
+
 /// Load the content of an HTTP-answer file path. Returns `None` if the path is
 /// `None`. Mirrors the logic in `command/src/config.rs::read_http_answer_file`.
 fn read_answer_path(path: &Option<PathBuf>) -> Result<Option<String>, CtlError> {
@@ -1131,4 +1148,119 @@ fn build_http_answers(
         answer_504: read_answer_path(&answer_504)?,
         answer_507: read_answer_path(&answer_507)?,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use sozu_command_lib::proto::command::{
+        ClusterInformation, ClusterInformations, LoadBalancingAlgorithms, ResponseContent,
+        WorkerResponses,
+    };
+
+    use super::*;
+
+    fn cluster(cluster_id: &str, sticky_session: bool) -> Cluster {
+        Cluster {
+            cluster_id: cluster_id.to_owned(),
+            sticky_session,
+            https_redirect: false,
+            load_balancing: LoadBalancingAlgorithms::RoundRobin as i32,
+            ..Default::default()
+        }
+    }
+
+    fn clusters_response(clusters: Vec<Cluster>) -> ContentType {
+        ContentType::Clusters(ClusterInformations {
+            vec: clusters
+                .into_iter()
+                .map(|cluster| ClusterInformation {
+                    configuration: Some(cluster),
+                    ..Default::default()
+                })
+                .collect(),
+        })
+    }
+
+    fn response_content(content_type: ContentType) -> ResponseContent {
+        ResponseContent {
+            content_type: Some(content_type),
+        }
+    }
+
+    #[test]
+    fn finds_cluster_configuration_from_direct_cluster_response() {
+        let found = find_cluster_configuration(
+            clusters_response(vec![cluster("other", false), cluster("target", true)]),
+            "target",
+        );
+
+        assert_eq!(found.map(|cluster| cluster.sticky_session), Some(true));
+    }
+
+    #[test]
+    fn finds_cluster_configuration_from_main_worker_response() {
+        let mut map = BTreeMap::new();
+        map.insert(
+            "0".to_owned(),
+            response_content(clusters_response(vec![cluster("target", true)])),
+        );
+        map.insert(
+            "main".to_owned(),
+            response_content(clusters_response(vec![cluster("target", false)])),
+        );
+
+        let found = find_cluster_configuration(
+            ContentType::WorkerResponses(WorkerResponses { map }),
+            "target",
+        );
+
+        assert_eq!(found.map(|cluster| cluster.sticky_session), Some(false));
+    }
+
+    #[test]
+    fn falls_back_to_worker_cluster_response_when_main_is_absent() {
+        let mut map = BTreeMap::new();
+        map.insert(
+            "0".to_owned(),
+            response_content(clusters_response(vec![cluster("target", true)])),
+        );
+
+        let found = find_cluster_configuration(
+            ContentType::WorkerResponses(WorkerResponses { map }),
+            "target",
+        );
+
+        assert_eq!(
+            found.map(|cluster| cluster.cluster_id),
+            Some("target".to_owned())
+        );
+    }
+
+    #[test]
+    fn does_not_fall_back_to_worker_when_main_is_present() {
+        let mut map = BTreeMap::new();
+        map.insert(
+            "0".to_owned(),
+            response_content(clusters_response(vec![cluster("target", true)])),
+        );
+        map.insert(
+            "main".to_owned(),
+            response_content(clusters_response(vec![cluster("other", false)])),
+        );
+
+        let found = find_cluster_configuration(
+            ContentType::WorkerResponses(WorkerResponses { map }),
+            "target",
+        );
+
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn returns_none_when_cluster_is_missing() {
+        let found =
+            find_cluster_configuration(clusters_response(vec![cluster("other", false)]), "target");
+
+        assert!(found.is_none());
+    }
 }
