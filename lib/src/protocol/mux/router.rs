@@ -20,10 +20,7 @@ use crate::{
     BackendConnectionError, L7ListenerHandler, L7Proxy, ListenerHandler, ProxySession, Readiness,
     RetrieveClusterError,
     backends::{Backend, BackendError},
-    protocol::{
-        http::editor::{HeaderEditSnapshot, HttpContext},
-        kawa_h1::parser::compare_no_case,
-    },
+    protocol::http::editor::{HeaderEditSnapshot, HttpContext},
     router::{HeaderEdit, RouteResult},
     server::CONN_RETRIES,
     socket::SessionTcpStream,
@@ -490,6 +487,11 @@ impl Router {
                 return Err(cluster_error);
             }
         };
+        // Snapshot the pre-rewrite authority into an owned string so we
+        // can later stash it on `context.original_authority` without
+        // mutably aliasing the immutable borrow that `host: &str` still
+        // holds on `context`.
+        let captured_authority = host.to_owned();
 
         // ── TLS SNI ↔ HTTP :authority binding ─────────────────────────────
         // Reject any request whose authority hostname does not exact-match the
@@ -531,6 +533,14 @@ impl Router {
                 return Err(RetrieveClusterError::RetrieveFrontend(frontend_error));
             }
         };
+
+        // Stash the pre-rewrite authority unconditionally so log lines,
+        // access logs, and audit records that fire on ANY downstream
+        // path (denial, redirect, basic-auth 401, backend-connect
+        // failure, successful forward) carry the value the client
+        // actually sent. Capturing inside the rewrite helper alone would
+        // lose it on every branch where the rewrite is not applied.
+        context.original_authority = Some(captured_authority);
 
         // ── Resolve the routing decision ──────────────────────────────────
         // Snapshot the policy fields we need before consuming `route`, then
@@ -713,12 +723,25 @@ impl Router {
 /// request kawa. Mutations land before backend connect so the backend
 /// wire carries the rewritten shape:
 ///
-/// 1. If `rewritten_host` is set, capture the original authority into
-///    `context.original_authority`, replace the request-line authority
-///    with the rewritten value, replace the `Host` request header (so
-///    H1 backends see the same value the H2 `:authority` would carry),
-///    and inject `X-Forwarded-Host` carrying the original.
-/// 2. If `rewritten_path` is set, replace the request-line path.
+/// 1. If `rewritten_host` is set, replace the request-line authority
+///    with the rewritten value, replace any existing `Host` request
+///    header (so H1 backends see the same value the H2 `:authority`
+///    would carry), and inject `X-Forwarded-Host` carrying the
+///    pre-rewrite authority. The X-Forwarded-Host injection ONLY fires
+///    when `rewritten_host` is set — without a rewrite there is no host
+///    swap to disclose, and HAProxy's `option forwardfor` style
+///    headers (`X-Forwarded-For`, `X-Forwarded-Proto`) still flow from
+///    the kawa parser. The pre-rewrite authority itself is captured by
+///    the caller (`route_from_request`) into `context.original_authority`
+///    on every routed request so it survives every downstream code path
+///    (audit, deny, redirect, basic-auth 401, backend-connect failure).
+///    Dedup rule: the synthetic Host AND any pre-existing Host header
+///    are dropped in the retain pass below before the rewritten Host is
+///    appended, so the wire never carries two `Host:` headers.
+/// 2. If `rewritten_path` is set, replace both the abstract path
+///    (consumed by H2 `:path`) and the request-line URI (consumed by
+///    the H1 converter) so cardinality H1↔H1, H1↔H2, H2↔H1, H2↔H2 all
+///    propagate the rewritten target.
 /// 3. For every `headers_request` edit:
 ///    - empty `val` → remove every existing header with the matching
 ///      name from `kawa.blocks` (HAProxy `del-header` parity);
@@ -739,20 +762,13 @@ fn apply_request_rewrites_and_headers(
         return;
     }
 
-    // Capture the pre-rewrite authority so the X-Forwarded-Host we
-    // inject below carries what the client actually sent. Read off the
-    // request-line authority Store rather than the existing `Host:`
-    // header so H2 frontends (which never carry a literal `Host:`) get
-    // the same X-Forwarded-Host shape as H1.
-    let original_authority = if rewritten_host.is_some() {
-        let buf = kawa.storage.buffer();
-        if let kawa::StatusLine::Request { authority, .. } = &kawa.detached.status_line {
-            std::str::from_utf8(authority.data(buf))
-                .ok()
-                .map(str::to_owned)
-        } else {
-            None
-        }
+    // `route_from_request` already captured the pre-rewrite authority
+    // into `context.original_authority`. Re-borrow it here for the
+    // optional X-Forwarded-Host injection rather than re-parsing the
+    // kawa Store. Cloning a short header value (typically `host:port`)
+    // is cheaper than another UTF-8 decode of the request-line slice.
+    let original_authority: Option<String> = if rewritten_host.is_some() {
+        context.original_authority.clone()
     } else {
         None
     };
@@ -783,26 +799,40 @@ fn apply_request_rewrites_and_headers(
         }
     }
 
-    // ── delete pass on existing blocks ────────────────────────────────
-    // Collect lowercase keys of every "delete this header" edit and the
-    // synthetic `Host` / `X-Forwarded-Host` keys we know we're about to
-    // overwrite. Filter `kawa.blocks` once with a single retain pass.
-    let buf_ptr = kawa.storage.buffer();
+    // ── single-pass split: deletes vs. sets ───────────────────────────
+    // Walk `headers_request` once and separate each edit into either the
+    // delete list (empty val) or the insert list (non-empty val). Two
+    // passes was wasteful when an operator stacks many `--header` flags;
+    // one pass keeps the allocation profile flat.
     let host_lower = b"host";
     let xfh_lower = b"x-forwarded-host";
     let rewriting_host = rewritten_host.is_some();
-    let mut keys_to_drop: Vec<Vec<u8>> = headers_request
-        .iter()
-        .filter(|e| e.val.is_empty())
-        .map(|e| e.key.iter().map(u8::to_ascii_lowercase).collect())
-        .collect();
+    let mut keys_to_drop: Vec<Vec<u8>> = Vec::with_capacity(headers_request.len() + 2);
+    let mut to_insert: Vec<Block> = Vec::with_capacity(headers_request.len() + 2);
+    for edit in headers_request {
+        if edit.val.is_empty() {
+            keys_to_drop.push(edit.key.iter().map(u8::to_ascii_lowercase).collect());
+        } else {
+            to_insert.push(Block::Header(Pair {
+                key: Store::from_slice(&edit.key),
+                val: Store::from_slice(&edit.val),
+            }));
+        }
+    }
     if rewriting_host {
         keys_to_drop.push(host_lower.to_vec());
         keys_to_drop.push(xfh_lower.to_vec());
     }
+
+    // ── delete pass on existing blocks ────────────────────────────────
+    let buf_ptr = kawa.storage.buffer();
     if !keys_to_drop.is_empty() {
-        // Read `key.data(buf_ptr)` only on non-elided headers — kawa
-        // panics on `Store::Empty.data()` (storage/repr.rs:515).
+        // Read `key.data(buf_ptr)` only on non-elided headers — kawa's
+        // earlier passes (HPACK decoder, H1 header parser) tag suppressed
+        // headers with `Store::Empty` rather than removing them, and
+        // calling `.data()` on `Store::Empty` panics in
+        // `kawa-0.6.8/src/storage/repr.rs`. Pinning the guard explicitly
+        // until kawa changes its policy.
         let buf = buf_ptr;
         kawa.blocks.retain(|block| {
             if let Block::Header(Pair { key, val: _ }) = block {
@@ -810,8 +840,14 @@ fn apply_request_rewrites_and_headers(
                     return true;
                 }
                 let key_bytes = key.data(buf);
+                // Both `keys_to_drop` and `key_lower` are pre-lowercased,
+                // so a byte-equality compare is sufficient — a second
+                // ASCII-fold pass via `compare_no_case` would just burn
+                // cycles re-folding bytes that are already canonical.
                 let key_lower: Vec<u8> = key_bytes.iter().map(u8::to_ascii_lowercase).collect();
-                !keys_to_drop.iter().any(|k| compare_no_case(&key_lower, k))
+                !keys_to_drop
+                    .iter()
+                    .any(|k| k.as_slice() == key_lower.as_slice())
             } else {
                 true
             }
@@ -822,48 +858,32 @@ fn apply_request_rewrites_and_headers(
     // Every header we add (rewritten Host, X-Forwarded-Host,
     // operator-supplied set/append edits) must land before
     // `Block::Flags { end_header: true }` so the converter emits them
-    // as part of the request header block.
-    let end_header_idx = kawa.blocks.iter().position(|b| {
-        matches!(
-            b,
-            Block::Flags(kawa::Flags {
-                end_header: true,
-                ..
-            })
-        )
-    });
+    // as part of the request header block. Synthetic Host/X-Forwarded-Host
+    // are prepended (they describe the rewrite, not an operator policy).
+    let end_header_idx = super::shared::end_of_headers_index(kawa);
 
-    let mut to_insert: Vec<Block> = Vec::new();
-    if let Some(new_host) = rewritten_host {
-        to_insert.push(Block::Header(Pair {
-            key: Store::Static(b"Host"),
-            val: Store::from_string(new_host.to_owned()),
-        }));
+    if rewriting_host {
+        let mut synth: Vec<Block> = Vec::with_capacity(2);
+        if let Some(new_host) = rewritten_host {
+            synth.push(Block::Header(Pair {
+                key: Store::Static(b"Host"),
+                val: Store::from_string(new_host.to_owned()),
+            }));
+        }
         if let Some(orig) = original_authority.as_deref() {
-            to_insert.push(Block::Header(Pair {
+            synth.push(Block::Header(Pair {
                 key: Store::Static(b"X-Forwarded-Host"),
                 val: Store::from_string(orig.to_owned()),
             }));
         }
-    }
-    for edit in headers_request {
-        if edit.val.is_empty() {
-            continue;
-        }
-        to_insert.push(Block::Header(Pair {
-            key: Store::from_slice(&edit.key),
-            val: Store::from_slice(&edit.val),
-        }));
+        synth.append(&mut to_insert);
+        to_insert = synth;
     }
     if !to_insert.is_empty() {
         let insert_at = end_header_idx.unwrap_or(kawa.blocks.len());
         for (offset, block) in to_insert.into_iter().enumerate() {
             kawa.blocks.insert(insert_at + offset, block);
         }
-    }
-
-    if rewriting_host {
-        context.original_authority = original_authority;
     }
 }
 

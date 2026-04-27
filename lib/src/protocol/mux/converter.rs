@@ -86,6 +86,16 @@ pub struct H2BlockConverter<'a> {
     /// The caller in `ConnectionH2::write_streams` reads this flag to know
     /// whether it is safe to clear its own mirror of the pending state.
     pub size_update_emitted: bool,
+    /// `true` when [`Self::check_header_capacity`] tripped the
+    /// `MAX_HEADER_LIST_SIZE` budget mid-encoding. Set during `call()`,
+    /// committed in [`Self::finalize`] which flips `kawa.parsing_phase`
+    /// to `Error{Processing(InternalError)}` (so the next prepare
+    /// cycle's `initialize` synthesises an RST_STREAM frame) and drains
+    /// any remaining `kawa.blocks` so we do not emit HEADERS/DATA frames
+    /// after the RST. Defer-then-commit is required: `call()` borrows
+    /// `kawa.storage.buffer()` for the whole body, which forecloses the
+    /// `&mut kawa.parsing_phase` write that the abort needs.
+    pub pending_oversized_abort: bool,
 }
 
 impl H2BlockConverter<'_> {
@@ -121,16 +131,35 @@ impl H2BlockConverter<'_> {
         }
     }
 
-    /// Check whether the HPACK output buffer has exceeded the maximum header
-    /// list size. Returns `false` (stop encoding) if the limit is reached.
-    fn check_header_capacity(&self) -> bool {
+    /// Guard the HPACK output buffer against [`MAX_HEADER_LIST_SIZE`] and
+    /// flag the converter for an over-budget abort if the limit is
+    /// reached.
+    ///
+    /// Returning `false` from a `BlockConverter::call` only breaks the
+    /// `kawa.prepare` loop — by itself it does NOT signal any error to
+    /// the peer, and a partial header block left in `self.out` would
+    /// emit as a truncated HEADERS frame on the next flush, wedging the
+    /// stream. To turn over-budget injection into a clean failure we
+    /// (1) clear the partial block and (2) raise `pending_oversized_abort`,
+    /// which [`Self::finalize`] commits by flipping `kawa.parsing_phase`
+    /// to `Error{Processing(InternalError)}` and draining any remaining
+    /// blocks. The next `prepare` cycle's `initialize` chokepoint at
+    /// lines 173-208 then synthesises a typed `RST_STREAM(InternalError)`
+    /// frame on the wire.
+    ///
+    /// Defer-then-commit is necessary because `call` already holds an
+    /// immutable borrow of `kawa.storage.buffer()` for the duration of
+    /// the body; `finalize` runs after that borrow is released.
+    fn check_header_capacity(&mut self) -> bool {
         if self.out.len() > MAX_HEADER_LIST_SIZE {
             error!(
-                "{} HPACK output buffer ({} bytes) exceeds MAX_HEADER_LIST_SIZE ({}), stopping header encoding",
+                "{} HPACK output buffer ({} bytes) exceeds MAX_HEADER_LIST_SIZE ({}), aborting header block",
                 log_module_context!(),
                 self.out.len(),
                 MAX_HEADER_LIST_SIZE
             );
+            self.out.clear();
+            self.pending_oversized_abort = true;
             return false;
         }
         true
@@ -175,6 +204,14 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
         }
     }
     fn call(&mut self, block: Block, kawa: &mut Kawa<T>) -> bool {
+        // Once `kawa.parsing_phase` is `Error`, `initialize` has already
+        // synthesised a RST_STREAM frame for this prepare cycle. Drop any
+        // remaining blocks instead of trying to encode HEADERS/DATA frames
+        // that would land on the wire after the RST and break the stream
+        // post-condition.
+        if matches!(kawa.parsing_phase, ParsingPhase::Error { .. }) {
+            return false;
+        }
         let buffer = kawa.storage.buffer();
         // RFC 7541 §6.3: when the peer reduced SETTINGS_HEADER_TABLE_SIZE
         // (or changed it in any direction), the very first header block we
@@ -592,7 +629,27 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
         }
         true
     }
-    fn finalize(&mut self, _kawa: &mut Kawa<T>) {
+    fn finalize(&mut self, kawa: &mut Kawa<T>) {
+        if self.pending_oversized_abort {
+            self.pending_oversized_abort = false;
+            // Preserve the original parsing_phase marker so logs and the
+            // ParsingPhaseMarker telemetry stay coherent (e.g. Headers vs
+            // Body) instead of getting clobbered to a synthetic value.
+            let marker = kawa.parsing_phase.marker();
+            kawa.parsing_phase = ParsingPhase::Error {
+                marker,
+                kind: ParsingErrorKind::Processing {
+                    message: H2Error::InternalError.as_str(),
+                },
+            };
+            // Drop any remaining blocks — the stream is dead. Without this
+            // the next prepare cycle's pop loop would still try to encode
+            // headers/data after the synthesised RST_STREAM.
+            kawa.blocks.clear();
+            self.out.clear();
+            incr!("h2.headers.rejected.budget_overrun");
+            return;
+        }
         if !self.out.is_empty() {
             error!(
                 "{} H2BlockConverter finalize: out buffer not empty ({} bytes remaining), clearing",
@@ -635,6 +692,7 @@ mod tests {
             // dynamic-table-size-update path set this explicitly.
             pending_table_size_update: None,
             size_update_emitted: false,
+            pending_oversized_abort: false,
         }
     }
 
@@ -1413,6 +1471,146 @@ mod tests {
             !cont,
             "back-to-back DATA must still yield — incremental rotation depends \
              on the converter deferring the next DATA"
+        );
+    }
+
+    // ── HPACK budget over-run ────────────────────────────────────────────
+
+    /// `check_header_capacity` setting `pending_oversized_abort` should
+    /// stop the encoding pass cleanly: `self.out` is dropped (no truncated
+    /// HEADERS frame escapes), the converter raises the abort flag, and
+    /// `finalize` commits by flipping `kawa.parsing_phase` to
+    /// `Error{Processing(InternalError)}` so the next prepare cycle's
+    /// `initialize` synthesises a typed RST_STREAM frame.
+    #[test]
+    fn test_converter_aborts_on_header_budget_overrun() {
+        let mut encoder = loona_hpack::Encoder::new();
+        let mut conv = test_converter(&mut encoder);
+        let mut buf = vec![0u8; 4096];
+        let mut kawa = make_kawa(&mut buf, Kind::Response);
+
+        // Pre-populate `self.out` past `MAX_HEADER_LIST_SIZE` so that the
+        // very next capacity check trips the abort. We use a Status:200
+        // pseudo-header to drive the encode path through the Response arm
+        // of `Block::StatusLine`.
+        conv.out = vec![0u8; super::MAX_HEADER_LIST_SIZE + 1];
+        kawa.detached.status_line = StatusLine::Response {
+            version: kawa::Version::V20,
+            code: 200,
+            status: Store::Static(b"200"),
+            reason: Store::Empty,
+        };
+        let cont = conv.call(Block::StatusLine, &mut kawa);
+        assert!(!cont, "overflow must break the prepare loop");
+        assert!(
+            conv.pending_oversized_abort,
+            "abort flag must be raised when MAX_HEADER_LIST_SIZE is exceeded"
+        );
+        assert!(
+            conv.out.is_empty(),
+            "the partial HPACK block must not escape as a truncated HEADERS frame"
+        );
+
+        // Subsequent calls within the SAME prepare cycle should be no-ops
+        // (the prepare loop already broke; we only assert the early-out
+        // works in case a caller ever invokes call() manually after a
+        // false return).
+        kawa.parsing_phase = ParsingPhase::Error {
+            marker: kawa::ParsingPhaseMarker::Headers,
+            kind: ParsingErrorKind::Processing { message: "test" },
+        };
+        let cont = conv.call(
+            Block::Header(Pair {
+                key: Store::Static(b"x-after-rst"),
+                val: Store::Static(b"1"),
+            }),
+            &mut kawa,
+        );
+        assert!(
+            !cont,
+            "post-error call() must short-circuit so we do not append frames after RST_STREAM"
+        );
+    }
+
+    /// `finalize` commits the abort: `kawa.parsing_phase` becomes
+    /// `Error{Processing(InternalError)}`, `kawa.blocks` is cleared so
+    /// no follow-on HEADERS/DATA leak after the synthesised RST_STREAM,
+    /// and the abort flag is reset so the converter is reusable.
+    #[test]
+    fn test_converter_finalize_commits_oversized_abort() {
+        let mut encoder = loona_hpack::Encoder::new();
+        let mut conv = test_converter(&mut encoder);
+        let mut buf = vec![0u8; 4096];
+        let mut kawa = make_kawa(&mut buf, Kind::Response);
+
+        conv.pending_oversized_abort = true;
+        kawa.blocks.push_back(Block::Header(Pair {
+            key: Store::Static(b"x-leftover"),
+            val: Store::Static(b"1"),
+        }));
+        kawa.parsing_phase = ParsingPhase::Headers;
+
+        BlockConverter::finalize(&mut conv, &mut kawa);
+
+        match kawa.parsing_phase {
+            ParsingPhase::Error {
+                marker,
+                kind: ParsingErrorKind::Processing { message },
+            } => {
+                assert_eq!(marker, kawa::ParsingPhaseMarker::Headers);
+                assert_eq!(message, H2Error::InternalError.as_str());
+            }
+            other => panic!("expected Error{{Processing(InternalError)}}, got {other:?}"),
+        }
+        assert!(
+            kawa.blocks.is_empty(),
+            "remaining blocks must be drained so they do not emit after RST_STREAM"
+        );
+        assert!(!conv.pending_oversized_abort, "abort flag must reset");
+    }
+
+    /// After `finalize` flipped `kawa.parsing_phase` to `Error{Processing}`,
+    /// the next prepare cycle's `initialize` must synthesise a single
+    /// RST_STREAM(InternalError) frame and push it onto `kawa.out`.
+    #[test]
+    fn test_converter_initialize_emits_rst_stream_on_error_phase() {
+        let mut encoder = loona_hpack::Encoder::new();
+        let mut conv = test_converter(&mut encoder);
+        conv.stream_id = 5;
+        let mut buf = vec![0u8; 4096];
+        let mut kawa = make_kawa(&mut buf, Kind::Response);
+        kawa.parsing_phase = ParsingPhase::Error {
+            marker: kawa::ParsingPhaseMarker::Headers,
+            kind: ParsingErrorKind::Processing {
+                message: H2Error::InternalError.as_str(),
+            },
+        };
+
+        BlockConverter::initialize(&mut conv, &mut kawa);
+
+        // RST_STREAM frame: 9-byte header + 4-byte payload (error code).
+        let mut bytes = Vec::new();
+        for store in &kawa.out {
+            if let kawa::OutBlock::Store(s) = store {
+                bytes.extend_from_slice(s.data(kawa.storage.buffer()));
+            }
+        }
+        assert_eq!(
+            bytes.len(),
+            parser::FRAME_HEADER_SIZE + parser::RST_STREAM_PAYLOAD_SIZE as usize,
+            "exactly one RST_STREAM frame must be emitted"
+        );
+        // Payload type = 0x03 (RST_STREAM), stream_id = 5, error code = 2 (InternalError).
+        assert_eq!(bytes[3], 0x03, "frame type must be RST_STREAM");
+        assert_eq!(
+            u32::from_be_bytes([bytes[5], bytes[6], bytes[7], bytes[8]]) & 0x7fff_ffff,
+            5,
+            "stream id must match"
+        );
+        assert_eq!(
+            u32::from_be_bytes([bytes[9], bytes[10], bytes[11], bytes[12]]),
+            H2Error::InternalError as u32,
+            "error code must be InternalError"
         );
     }
 }

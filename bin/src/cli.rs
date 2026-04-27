@@ -512,7 +512,7 @@ pub enum HttpFrontendCmd {
         required_auth: bool,
         #[clap(
             long = "header",
-            help = "Header mutation, format: <position>=<name>=<value>. Position is 'request', 'response', or 'both'. Empty <value> deletes the header (HAProxy del-header parity). Repeatable."
+            help = "Header mutation, format: <position>=<name>=<value>. Position is 'request', 'response', or 'both'. Empty <value> deletes the header (HAProxy del-header parity). Repeatable. To replace a header, pass it twice: first with an empty value (deletes the existing one), then with the new value (sets it). The runtime applies all deletes before any sets."
         )]
         header: Vec<String>,
     },
