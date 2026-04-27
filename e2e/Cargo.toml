@@ -5,6 +5,7 @@ rust-version = "1.88.0"
 edition = "2024"
 
 [dependencies]
+base64 = { workspace = true }
 flate2 = { workspace = true }
 futures = { workspace = true }
 http-body-util = { workspace = true }

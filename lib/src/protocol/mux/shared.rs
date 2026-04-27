@@ -128,6 +128,11 @@ pub(super) fn apply_response_header_edits(
         let buf = kawa.storage.buffer();
         kawa.blocks.retain(|block| {
             if let Block::Header(Pair { key, val: _ }) = block {
+                // Skip elided headers — `key.data()` would panic on
+                // `Store::Empty` (kawa storage/repr.rs:515).
+                if matches!(key, Store::Empty) {
+                    return true;
+                }
                 let key_lower: Vec<u8> = key.data(buf).iter().map(u8::to_ascii_lowercase).collect();
                 !keys_to_drop.iter().any(|k| compare_no_case(&key_lower, k))
             } else {
