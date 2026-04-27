@@ -2,7 +2,7 @@ use std::{cmp::Ordering, collections::BTreeMap, fmt, net::SocketAddr};
 
 use crate::{
     proto::command::{
-        AddBackend, FilteredTimeSerie, LoadBalancingParams, PathRule, PathRuleKind,
+        AddBackend, FilteredTimeSerie, Header, LoadBalancingParams, PathRule, PathRuleKind,
         RequestHttpFrontend, RequestTcpFrontend, Response, ResponseContent, ResponseStatus,
         RulePosition, RunState, WorkerResponse,
     },
@@ -39,6 +39,35 @@ pub struct HttpFrontend {
     #[serde(default)]
     pub position: RulePosition,
     pub tags: Option<BTreeMap<String, String>>,
+    /// Resolved frontend-level policy carried over from
+    /// [`RequestHttpFrontend`]. The router consults these to build a
+    /// [`Route::Frontend(Rc<Frontend>)`] when any are non-default,
+    /// otherwise falls back to the legacy `Route::ClusterId` /
+    /// `Route::Deny` shapes.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redirect: Option<i32>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redirect_scheme: Option<i32>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redirect_template: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rewrite_host: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rewrite_path: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rewrite_port: Option<u32>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub required_auth: Option<bool>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<Header>,
 }
 
 impl From<HttpFrontend> for RequestHttpFrontend {
@@ -51,7 +80,14 @@ impl From<HttpFrontend> for RequestHttpFrontend {
             method: val.method,
             position: val.position.into(),
             tags: val.tags.unwrap_or_default(),
-            ..Default::default()
+            redirect: val.redirect,
+            redirect_scheme: val.redirect_scheme,
+            redirect_template: val.redirect_template,
+            rewrite_host: val.rewrite_host,
+            rewrite_path: val.rewrite_path,
+            rewrite_port: val.rewrite_port,
+            required_auth: val.required_auth,
+            headers: val.headers,
         }
     }
 }

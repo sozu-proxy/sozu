@@ -1299,6 +1299,41 @@ mod tests {
         );
     }
 
+    /// Adjacent body variables (`%A%B` with no literal between them) must
+    /// keep `body_size` accounting consistent. Each variable's placeholder
+    /// is removed from the running body size before the runtime value is
+    /// added, so the post-fill total equals the substituted value bytes
+    /// even when two placeholders are back-to-back. This guards against
+    /// the `body_size -= variable.name.len() + 1` underflow class that
+    /// would otherwise be brittle on corner cases.
+    #[test]
+    fn template_fill_adjacent_body_variables() {
+        // Two placeholders, no literal between them, plus a literal head
+        // and tail so we're sure the inter-chunk arithmetic balances.
+        let body = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n[%ROUTE%ROUTE]";
+        let template = Template::new(Some(200), body, &[body_route()])
+            .expect("adjacent %VAR%VAR template compiles");
+        let mut empty_once: Vec<Vec<u8>> = Vec::new();
+        let rendered = template.fill(&[b"X".to_vec()], &mut empty_once);
+        let mut concatenated = Vec::new();
+        let buf = rendered.storage.buffer();
+        for block in &rendered.blocks {
+            if let kawa::Block::Chunk(kawa::Chunk { data }) = block {
+                concatenated.extend_from_slice(data.data(buf));
+            }
+        }
+        // Each `%ROUTE` placeholder (6 bytes + leading `%` = 7 bytes) is
+        // replaced with the 1-byte runtime value. The concatenated body
+        // bytes must read literally `[XX]` — proving both substitutions
+        // landed and the inter-chunk arithmetic kept the chunk
+        // boundaries.
+        assert!(
+            concatenated.windows(b"[XX]".len()).any(|w| w == b"[XX]"),
+            "adjacent variables must both substitute, got {:?}",
+            String::from_utf8_lossy(&concatenated),
+        );
+    }
+
     /// `or_elide_header: true` drops the surrounding header line when the
     /// substitution is empty. This is the path that makes
     /// `WWW-Authenticate: <realm>` disappear when the cluster has no realm

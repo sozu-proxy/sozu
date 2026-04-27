@@ -297,8 +297,10 @@ pub enum ConfigError {
     /// A `[[clusters.<id>.frontends.headers]]` entry carried an unknown
     /// `position` value. Accepted values are `request`, `response`, `both`
     /// (case-insensitive).
-    #[error("invalid header position '{0}'. Valid values: \"request\", \"response\", \"both\"")]
-    InvalidHeaderPosition(String),
+    #[error(
+        "invalid header position '{position}' at headers[{index}]. Valid values: \"request\", \"response\", \"both\""
+    )]
+    InvalidHeaderPosition { index: usize, position: String },
 }
 
 /// An HTTP, HTTPS or TCP listener as parsed from the `Listeners` section in the toml
@@ -1217,8 +1219,8 @@ impl FileClusterFrontendConfig {
         let headers = match self.headers.as_ref() {
             Some(entries) => {
                 let mut out = Vec::with_capacity(entries.len());
-                for entry in entries {
-                    out.push(parse_header_edit(entry)?);
+                for (index, entry) in entries.iter().enumerate() {
+                    out.push(parse_header_edit(index, entry)?);
                 }
                 out
             }
@@ -1269,14 +1271,25 @@ pub(crate) fn parse_redirect_scheme(value: &str) -> Result<RedirectScheme, Confi
 }
 
 /// Parse a `[[clusters.<id>.frontends.headers]]` entry into the proto
-/// [`Header`] message. An empty `value` is the HAProxy `del-header` parity
-/// (deletes the header by name); the proto carries the empty string verbatim.
-pub(crate) fn parse_header_edit(entry: &HeaderEditConfig) -> Result<Header, ConfigError> {
+/// [`Header`] message. `index` is the zero-based position of `entry` in
+/// the source array — surfaced into the error so a multi-entry config
+/// pinpoints the bad row instead of just naming the unknown position.
+/// An empty `value` is the HAProxy `del-header` parity (deletes the
+/// header by name); the proto carries the empty string verbatim.
+pub(crate) fn parse_header_edit(
+    index: usize,
+    entry: &HeaderEditConfig,
+) -> Result<Header, ConfigError> {
     let position = match entry.position.to_ascii_lowercase().as_str() {
         "request" => HeaderPosition::Request,
         "response" => HeaderPosition::Response,
         "both" => HeaderPosition::Both,
-        _ => return Err(ConfigError::InvalidHeaderPosition(entry.position.clone())),
+        _ => {
+            return Err(ConfigError::InvalidHeaderPosition {
+                index,
+                position: entry.position.clone(),
+            });
+        }
     };
     Ok(Header {
         position: position as i32,

@@ -197,30 +197,60 @@ impl Router {
 
         let method_rule = MethodRule::new(front.method.clone());
 
-        let route = match &front.cluster_id {
-            Some(cluster_id) => Route::ClusterId(cluster_id.clone()),
-            None => Route::Deny,
+        // Decide between the legacy `Route::ClusterId`/`Route::Deny` shape
+        // and the rich `Route::Frontend(Rc<Frontend>)` shape: any non-
+        // default policy field flips us onto the rich path so the mux
+        // can honour redirect/rewrite/headers/auth at request time.
+        let has_policy = front.redirect.is_some()
+            || front.redirect_scheme.is_some()
+            || front.redirect_template.is_some()
+            || front.rewrite_host.is_some()
+            || front.rewrite_path.is_some()
+            || front.rewrite_port.is_some()
+            || front.required_auth.unwrap_or(false)
+            || !front.headers.is_empty();
+
+        let domain =
+            front
+                .hostname
+                .parse::<DomainRule>()
+                .map_err(|_| RouterError::InvalidDomain {
+                    hostname: front.hostname.clone(),
+                })?;
+
+        let route = if has_policy {
+            let redirect = front
+                .redirect
+                .and_then(|r| RedirectPolicy::try_from(r).ok())
+                .unwrap_or(RedirectPolicy::Forward);
+            let redirect_scheme = front
+                .redirect_scheme
+                .and_then(|s| RedirectScheme::try_from(s).ok())
+                .unwrap_or(RedirectScheme::UseSame);
+            let frontend = Frontend::new(
+                &domain,
+                &path_rule,
+                front,
+                redirect,
+                redirect_scheme,
+                front.redirect_template.clone(),
+                front.rewrite_host.clone(),
+                front.rewrite_path.clone(),
+                front.rewrite_port.and_then(|p| u16::try_from(p).ok()),
+                &front.headers,
+                front.required_auth.unwrap_or(false),
+            )?;
+            Route::Frontend(Rc::new(frontend))
+        } else {
+            match &front.cluster_id {
+                Some(cluster_id) => Route::ClusterId(cluster_id.clone()),
+                None => Route::Deny,
+            }
         };
 
         let success = match front.position {
-            RulePosition::Pre => {
-                let domain = front.hostname.parse::<DomainRule>().map_err(|_| {
-                    RouterError::InvalidDomain {
-                        hostname: front.hostname.clone(),
-                    }
-                })?;
-
-                self.add_pre_rule(&domain, &path_rule, &method_rule, &route)
-            }
-            RulePosition::Post => {
-                let domain = front.hostname.parse::<DomainRule>().map_err(|_| {
-                    RouterError::InvalidDomain {
-                        hostname: front.hostname.clone(),
-                    }
-                })?;
-
-                self.add_post_rule(&domain, &path_rule, &method_rule, &route)
-            }
+            RulePosition::Pre => self.add_pre_rule(&domain, &path_rule, &method_rule, &route),
+            RulePosition::Post => self.add_post_rule(&domain, &path_rule, &method_rule, &route),
             RulePosition::Tree => {
                 self.add_tree_rule(front.hostname.as_bytes(), &path_rule, &method_rule, &route)
             }

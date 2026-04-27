@@ -177,6 +177,14 @@ impl RequestHttpFrontend {
                 }
             })?,
             tags: Some(self.tags),
+            redirect: self.redirect,
+            redirect_scheme: self.redirect_scheme,
+            redirect_template: self.redirect_template,
+            rewrite_host: self.rewrite_host,
+            rewrite_path: self.rewrite_path,
+            rewrite_port: self.rewrite_port,
+            required_auth: self.required_auth,
+            headers: self.headers,
         })
     }
 }

@@ -322,28 +322,10 @@ impl CommandManager {
 
     pub fn http_frontend_command(&mut self, cmd: HttpFrontendCmd) -> Result<(), CtlError> {
         match cmd {
-            HttpFrontendCmd::Add {
-                hostname,
-                path_prefix,
-                path_regex,
-                path_equals,
-                address,
-                method,
-                cluster_id: route,
-                tags,
-            } => self.send_request(
-                RequestType::AddHttpFrontend(RequestHttpFrontend {
-                    cluster_id: route.into(),
-                    address: address.into(),
-                    hostname,
-                    path: PathRule::from_cli_options(path_prefix, path_regex, path_equals),
-                    method,
-                    position: RulePosition::Tree.into(),
-                    tags: tags.unwrap_or_default(),
-                    ..Default::default()
-                })
-                .into(),
-            ),
+            HttpFrontendCmd::Add { .. } => {
+                let frontend = build_http_frontend_add(cmd)?;
+                self.send_request(RequestType::AddHttpFrontend(frontend).into())
+            }
             HttpFrontendCmd::Remove {
                 hostname,
                 path_prefix,
@@ -368,28 +350,10 @@ impl CommandManager {
 
     pub fn https_frontend_command(&mut self, cmd: HttpFrontendCmd) -> Result<(), CtlError> {
         match cmd {
-            HttpFrontendCmd::Add {
-                hostname,
-                path_prefix,
-                path_regex,
-                path_equals,
-                address,
-                method,
-                cluster_id: route,
-                tags,
-            } => self.send_request(
-                RequestType::AddHttpsFrontend(RequestHttpFrontend {
-                    cluster_id: route.into(),
-                    address: address.into(),
-                    hostname,
-                    path: PathRule::from_cli_options(path_prefix, path_regex, path_equals),
-                    method,
-                    position: RulePosition::Tree.into(),
-                    tags: tags.unwrap_or_default(),
-                    ..Default::default()
-                })
-                .into(),
-            ),
+            HttpFrontendCmd::Add { .. } => {
+                let frontend = build_http_frontend_add(cmd)?;
+                self.send_request(RequestType::AddHttpsFrontend(frontend).into())
+            }
             HttpFrontendCmd::Remove {
                 hostname,
                 path_prefix,
@@ -1160,6 +1124,142 @@ fn find_cluster_configuration(content_type: ContentType, cluster_id: &str) -> Op
         }
         _ => None,
     }
+}
+
+/// Build a [`RequestHttpFrontend`] from the policy fields collected by
+/// `HttpFrontendCmd::Add`. The same builder feeds both
+/// `RequestType::AddHttpFrontend` and `RequestType::AddHttpsFrontend` so
+/// the two `frontend {http,https} add` paths stay in lock-step.
+///
+/// Validates each policy field up front and returns a typed
+/// [`CtlError::ArgsNeeded`] on a malformed input rather than letting a
+/// silent default reach the worker.
+fn build_http_frontend_add(cmd: HttpFrontendCmd) -> Result<RequestHttpFrontend, CtlError> {
+    let HttpFrontendCmd::Add {
+        hostname,
+        path_prefix,
+        path_regex,
+        path_equals,
+        address,
+        method,
+        cluster_id: route,
+        tags,
+        redirect,
+        redirect_scheme,
+        redirect_template,
+        rewrite_host,
+        rewrite_path,
+        rewrite_port,
+        required_auth,
+        header,
+    } = cmd
+    else {
+        return Err(CtlError::ArgsNeeded(
+            "HttpFrontendCmd::Add".to_owned(),
+            "got non-Add variant — should be unreachable".to_owned(),
+        ));
+    };
+
+    // Map `--redirect <forward|permanent|unauthorized>` onto the proto
+    // enum. Unknown / mistyped value surfaces a typed error here.
+    let redirect_proto = match redirect.as_deref() {
+        None => None,
+        Some(s) => Some(match s.to_ascii_lowercase().as_str() {
+            "forward" => sozu_command_lib::proto::command::RedirectPolicy::Forward as i32,
+            "permanent" => sozu_command_lib::proto::command::RedirectPolicy::Permanent as i32,
+            "unauthorized" => sozu_command_lib::proto::command::RedirectPolicy::Unauthorized as i32,
+            other => {
+                return Err(CtlError::ArgsNeeded(
+                    "redirect in {forward, permanent, unauthorized}".to_owned(),
+                    format!("got --redirect={other:?}"),
+                ));
+            }
+        }),
+    };
+
+    let redirect_scheme_proto = match redirect_scheme.as_deref() {
+        None => None,
+        Some(s) => Some(match s.to_ascii_lowercase().as_str() {
+            "use-same" | "use_same" => {
+                sozu_command_lib::proto::command::RedirectScheme::UseSame as i32
+            }
+            "use-http" | "use_http" => {
+                sozu_command_lib::proto::command::RedirectScheme::UseHttp as i32
+            }
+            "use-https" | "use_https" => {
+                sozu_command_lib::proto::command::RedirectScheme::UseHttps as i32
+            }
+            other => {
+                return Err(CtlError::ArgsNeeded(
+                    "redirect-scheme in {use-same, use-http, use-https}".to_owned(),
+                    format!("got --redirect-scheme={other:?}"),
+                ));
+            }
+        }),
+    };
+
+    if let Some(port) = rewrite_port {
+        if port == 0 || port > u16::MAX as u32 {
+            return Err(CtlError::ArgsNeeded(
+                "TCP port in 1..=65535".to_owned(),
+                format!("got rewrite_port={port}"),
+            ));
+        }
+    }
+
+    // Each `--header` entry is `<position>=<key>=<value>`. Split on the
+    // first two `=` so the value may contain further `=` bytes (common
+    // in cookie / quoted strings). Empty value preserves HAProxy
+    // `del-header` parity.
+    let mut headers_proto = Vec::with_capacity(header.len());
+    for (index, raw) in header.iter().enumerate() {
+        let (position, rest) = raw.split_once('=').ok_or_else(|| {
+            CtlError::ArgsNeeded(
+                "<position>=<name>=<value>".to_owned(),
+                format!("--header[{index}] = {raw:?} (missing first `=`)"),
+            )
+        })?;
+        let (key, val) = rest.split_once('=').ok_or_else(|| {
+            CtlError::ArgsNeeded(
+                "<position>=<name>=<value>".to_owned(),
+                format!("--header[{index}] = {raw:?} (missing second `=`)"),
+            )
+        })?;
+        let position_proto = match position.to_ascii_lowercase().as_str() {
+            "request" => sozu_command_lib::proto::command::HeaderPosition::Request as i32,
+            "response" => sozu_command_lib::proto::command::HeaderPosition::Response as i32,
+            "both" => sozu_command_lib::proto::command::HeaderPosition::Both as i32,
+            other => {
+                return Err(CtlError::ArgsNeeded(
+                    "header position in {request, response, both}".to_owned(),
+                    format!("--header[{index}] position={other:?}"),
+                ));
+            }
+        };
+        headers_proto.push(sozu_command_lib::proto::command::Header {
+            position: position_proto,
+            key: key.to_owned(),
+            val: val.to_owned(),
+        });
+    }
+
+    Ok(RequestHttpFrontend {
+        cluster_id: route.into(),
+        address: address.into(),
+        hostname,
+        path: PathRule::from_cli_options(path_prefix, path_regex, path_equals),
+        method,
+        position: RulePosition::Tree.into(),
+        tags: tags.unwrap_or_default(),
+        redirect: redirect_proto,
+        redirect_scheme: redirect_scheme_proto,
+        redirect_template,
+        rewrite_host,
+        rewrite_path,
+        rewrite_port,
+        required_auth: if required_auth { Some(true) } else { None },
+        headers: headers_proto,
+    })
 }
 
 /// Validate that `s` matches the canonical `<user>:<hex(sha256)>` form
