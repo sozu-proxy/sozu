@@ -5,19 +5,27 @@
 //! Templates are pre-rendered into `Kawa<SharedBuffer>` instances at
 //! configuration time so the hot path only needs a clone of the shared
 //! buffer.
+//!
+//! Templates are keyed by HTTP status as a string (e.g. `"503"`). Bodies
+//! and selected headers may carry `%PLACEHOLDER` variables — the `Template`
+//! engine validates the variable set at parse time and substitutes the
+//! runtime values when rendering. Variables with `or_elide_header: true`
+//! cause the surrounding header line to be dropped if the substituted value
+//! is empty (`%WWW_AUTHENTICATE` being the canonical case).
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     fmt,
     rc::Rc,
 };
 
 use kawa::{
-    AsBuffer, Block, BodySize, Buffer, Chunk, Kawa, Kind, Pair, ParsingPhase, ParsingPhaseMarker,
-    StatusLine, Store, h1::NoCallbacks,
+    AsBuffer, Block, BodySize, Buffer, Chunk, Flags, Kawa, Kind, Pair, ParsingPhase,
+    ParsingPhaseMarker, StatusLine, Store, h1::NoCallbacks,
 };
 use sozu_command::proto::command::CustomHttpAnswers;
 
+use super::parser::compare_no_case;
 use crate::{protocol::http::DefaultAnswer, sozu_command::state::ClusterId};
 
 #[derive(Clone)]
@@ -43,6 +51,8 @@ pub enum TemplateError {
     InvalidTemplate(ParsingPhase),
     #[error("unexpected status code: {0}")]
     InvalidStatusCode(u16),
+    #[error("unexpected size info: {0:?}")]
+    InvalidSizeInfo(BodySize),
     #[error("streaming is not supported in templates")]
     UnsupportedStreaming,
     #[error("template variable {0} is not allowed in headers")]
@@ -58,6 +68,7 @@ pub struct TemplateVariable {
     name: &'static str,
     valid_in_body: bool,
     valid_in_header: bool,
+    or_elide_header: bool,
     typ: ReplacementType,
 }
 
@@ -71,11 +82,17 @@ pub enum ReplacementType {
 #[derive(Clone, Copy, Debug)]
 pub struct Replacement {
     block_index: usize,
+    or_elide_header: bool,
     typ: ReplacementType,
 }
 
-// TODO: rename for clarity, for instance HttpAnswerTemplate
 pub struct Template {
+    /// HTTP status code parsed from the template's status line.
+    status: u16,
+    /// `false` when the parsed template carries `Connection: close`. Used by
+    /// callers to flip `keep_alive_frontend` once the rendered answer is
+    /// queued.
+    keep_alive: bool,
     kawa: DefaultAnswerStream,
     body_replacements: Vec<Replacement>,
     header_replacements: Vec<Replacement>,
@@ -86,6 +103,8 @@ pub struct Template {
 impl fmt::Debug for Template {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Template")
+            .field("status", &self.status)
+            .field("keep_alive", &self.keep_alive)
             .field("body_replacements", &self.body_replacements)
             .field("header_replacements", &self.header_replacements)
             .field("body_size", &self.body_size)
@@ -94,12 +113,18 @@ impl fmt::Debug for Template {
 }
 
 impl Template {
-    /// sanitize the template: transform newlines \r (CR) to \r\n (CRLF)
+    /// Sanitize the template (CR → CRLF), parse it as an HTTP/1.1 response,
+    /// validate every `%VAR` against the variable set, and pre-bake the
+    /// block sequence so [`Template::fill`] only needs to swap `Store`s.
     fn new(
-        status: u16,
-        answer: String,
+        status: Option<u16>,
+        answer: &str,
         variables: &[TemplateVariable],
     ) -> Result<Self, TemplateError> {
+        // Re-index the caller-supplied variables so each `Variable` /
+        // `VariableOnce` occupies a contiguous slot. Callers describe
+        // variables declaratively (Variable(0)/VariableOnce(0)) and we
+        // rewrite the indices to match the per-template flat array.
         let mut i = 0;
         let mut j = 0;
         let variables = variables
@@ -134,28 +159,58 @@ impl Template {
         if !kawa.is_main_phase() {
             return Err(TemplateError::InvalidTemplate(kawa.parsing_phase));
         }
-        if let StatusLine::Response { code, .. } = kawa.detached.status_line {
-            if code != status {
-                return Err(TemplateError::InvalidStatusCode(code));
+        if kawa.body_size != BodySize::Empty {
+            return Err(TemplateError::InvalidSizeInfo(kawa.body_size));
+        }
+        let resolved_status = if let StatusLine::Response { code, .. } = &kawa.detached.status_line
+        {
+            if let Some(expected_code) = status {
+                if expected_code != *code {
+                    return Err(TemplateError::InvalidStatusCode(*code));
+                }
             }
+            *code
         } else {
             return Err(TemplateError::InvalidType);
-        }
+        };
         let buf = kawa.storage.buffer();
         let mut blocks = VecDeque::new();
         let mut header_replacements = Vec::new();
         let mut body_replacements = Vec::new();
         let mut body_size = 0;
+        let mut keep_alive = true;
         let mut used_once = Vec::new();
         for mut block in kawa.blocks.into_iter() {
             match &mut block {
                 Block::ChunkHeader(_) => return Err(TemplateError::UnsupportedStreaming),
+                Block::Flags(Flags {
+                    end_header: true, ..
+                }) => {
+                    // Right before the end-of-headers marker, splice in a
+                    // synthetic `Content-Length: PLACEHOLDER` header. `fill`
+                    // resolves the placeholder once the body length is known.
+                    header_replacements.push(Replacement {
+                        block_index: blocks.len(),
+                        or_elide_header: false,
+                        typ: ReplacementType::ContentLength,
+                    });
+                    blocks.push_back(Block::Header(Pair {
+                        key: Store::Static(b"Content-Length"),
+                        val: Store::Static(b"PLACEHOLDER"),
+                    }));
+                    blocks.push_back(block);
+                }
                 Block::StatusLine | Block::Cookies | Block::Flags(_) => {
                     blocks.push_back(block);
                 }
                 Block::Header(Pair { key, val }) => {
                     let val_data = val.data(buf);
                     let key_data = key.data(buf);
+                    if compare_no_case(key_data, b"connection")
+                        && compare_no_case(val_data, b"close")
+                    {
+                        keep_alive = false;
+                    }
                     if let Some(b'%') = val_data.first() {
                         for variable in &variables {
                             if &val_data[1..] == variable.name.as_bytes() {
@@ -173,14 +228,11 @@ impl Template {
                                         }
                                         used_once.push(var_index);
                                     }
-                                    ReplacementType::ContentLength => {
-                                        if let Some(b'%') = key_data.first() {
-                                            *key = Store::new_slice(buf, &key_data[1..]);
-                                        }
-                                    }
+                                    ReplacementType::ContentLength => {}
                                 }
                                 header_replacements.push(Replacement {
                                     block_index: blocks.len(),
+                                    or_elide_header: variable.or_elide_header,
                                     typ: variable.typ,
                                 });
                                 break;
@@ -223,6 +275,7 @@ impl Template {
                                     }
                                     body_replacements.push(Replacement {
                                         block_index: blocks.len(),
+                                        or_elide_header: false,
                                         typ: variable.typ,
                                     });
                                     blocks.push_back(Block::Chunk(Chunk {
@@ -244,6 +297,8 @@ impl Template {
         }
         kawa.blocks = blocks;
         Ok(Self {
+            status: resolved_status,
+            keep_alive,
             kawa,
             body_replacements,
             header_replacements,
@@ -251,6 +306,8 @@ impl Template {
         })
     }
 
+    /// Substitute runtime values into a pre-parsed template, eliding header
+    /// lines whose value substitutes to empty when `or_elide_header` is set.
     fn fill(&self, variables: &[Vec<u8>], variables_once: &mut [Vec<u8>]) -> DefaultAnswerStream {
         let mut blocks = self.kawa.blocks.clone();
         let mut body_size = self.body_size;
@@ -287,6 +344,13 @@ impl Template {
                         pair.val = Store::from_string(body_size.to_string())
                     }
                 }
+                // `Store::is_empty` reports the enum variant, not the byte
+                // length of the held data; we want elision when the
+                // substituted value contributes zero bytes, so check `len`.
+                #[allow(clippy::len_zero)]
+                if pair.val.len() == 0 && replacement.or_elide_header {
+                    pair.elide();
+                }
             }
         }
         Kawa {
@@ -303,64 +367,48 @@ impl Template {
     }
 }
 
-/// a set of templates for HTTP answers, meant for one listener to use
-pub struct ListenerAnswers {
-    /// MovedPermanently
-    pub answer_301: Template,
-    /// BadRequest
-    pub answer_400: Template,
-    /// Unauthorized
-    pub answer_401: Template,
-    /// NotFound
-    pub answer_404: Template,
-    /// RequestTimeout
-    pub answer_408: Template,
-    /// PayloadTooLarge
-    pub answer_413: Template,
-    /// MisdirectedRequest (RFC 9110 §15.5.20)
-    pub answer_421: Template,
-    /// BadGateway
-    pub answer_502: Template,
-    /// ServiceUnavailable
-    pub answer_503: Template,
-    /// GatewayTimeout
-    pub answer_504: Template,
-    /// InsufficientStorage
-    pub answer_507: Template,
-}
-
-/// templates for HTTP answers, set for one cluster
-#[allow(non_snake_case)]
-pub struct ClusterAnswers {
-    /// ServiceUnavailable
-    pub answer_503: Template,
-}
-
+/// Per-cluster + per-listener templated HTTP answer registry.
+///
+/// `cluster_answers` overrides `listener_answers` when both define the same
+/// status. `fallback` is used when neither has the requested status — useful
+/// for templates picked by name rather than by code (currently only the
+/// `Answer*` variants in [`DefaultAnswer`]).
 pub struct HttpAnswers {
-    pub listener_answers: ListenerAnswers, // configurated answers
-    pub cluster_custom_answers: HashMap<ClusterId, ClusterAnswers>,
+    pub cluster_answers: HashMap<ClusterId, BTreeMap<String, Template>>,
+    pub listener_answers: BTreeMap<String, Template>,
+    pub fallback: Template,
 }
 
-// const HEADERS: &str = "Connection: close\r
-// Content-Length: 0\r
-// Sozu-Id: %REQUEST_ID\r
-// \r";
-// const STYLE: &str = "<style>
-// pre {
-//   background: #EEE;
-//   padding: 10px;
-//   border: 1px solid #AAA;
-//   border-radius: 5px;
-// }
-// </style>";
-// const FOOTER: &str = "<footer>This is an automatic answer by Sōzu.</footer>";
+fn fallback() -> String {
+    String::from(
+        "\
+HTTP/1.1 404 Not Found\r
+Cache-Control: no-cache\r
+Connection: close\r
+Sozu-Id: %REQUEST_ID\r
+\r
+<html><head><meta charset='utf-8'><head><body>
+<style>pre{background:#EEE;padding:10px;border:1px solid #AAA;border-radius: 5px;}</style>
+<h1>404 Not Found</h1>
+<pre>
+{
+    \"status_code\": 404,
+    \"route\": \"%ROUTE\",
+    \"request_id\": \"%REQUEST_ID\",
+    \"cluster_id\": \"%CLUSTER_ID\"
+}
+</pre>
+<h1>A frontend requested template \"%TEMPLATE_NAME\" that couldn't be found</h1>
+<footer>This is an automatic answer by Sōzu.</footer></body></html>",
+    )
+}
+
 fn default_301() -> String {
     String::from(
         "\
 HTTP/1.1 301 Moved Permanently\r
 Location: %REDIRECT_LOCATION\r
 Connection: close\r
-Content-Length: 0\r
 Sozu-Id: %REQUEST_ID\r
 \r\n",
     )
@@ -372,7 +420,6 @@ fn default_400() -> String {
 HTTP/1.1 400 Bad Request\r
 Cache-Control: no-cache\r
 Connection: close\r
-%Content-Length: %CONTENT_LENGTH\r
 Sozu-Id: %REQUEST_ID\r
 \r
 <html><head><meta charset='utf-8'><head><body>
@@ -421,6 +468,7 @@ fn default_401() -> String {
 HTTP/1.1 401 Unauthorized\r
 Cache-Control: no-cache\r
 Connection: close\r
+WWW-Authenticate: %WWW_AUTHENTICATE\r
 Sozu-Id: %REQUEST_ID\r
 \r
 <html><head><meta charset='utf-8'><head><body>
@@ -488,7 +536,6 @@ fn default_413() -> String {
 HTTP/1.1 413 Payload Too Large\r
 Cache-Control: no-cache\r
 Connection: close\r
-%Content-Length: %CONTENT_LENGTH\r
 Sozu-Id: %REQUEST_ID\r
 \r
 <html><head><meta charset='utf-8'><head><body>
@@ -535,7 +582,6 @@ fn default_502() -> String {
 HTTP/1.1 502 Bad Gateway\r
 Cache-Control: no-cache\r
 Connection: close\r
-%Content-Length: %CONTENT_LENGTH\r
 Sozu-Id: %REQUEST_ID\r
 \r
 <html><head><meta charset='utf-8'><head><body>
@@ -549,9 +595,9 @@ Sozu-Id: %REQUEST_ID\r
     \"cluster_id\": \"%CLUSTER_ID\",
     \"backend_id\": \"%BACKEND_ID\",
     \"parsing_phase\": \"%PHASE\",
-    \"successfully_parsed\": \"%SUCCESSFULLY_PARSED\",
-    \"partially_parsed\": \"%PARTIALLY_PARSED\",
-    \"invalid\": \"%INVALID\"
+    \"successfully_parsed\": %SUCCESSFULLY_PARSED,
+    \"partially_parsed\": %PARTIALLY_PARSED,
+    \"invalid\": %INVALID
 }
 </pre>
 <p>Response could not be parsed. %MESSAGE</p>
@@ -586,7 +632,6 @@ fn default_503() -> String {
 HTTP/1.1 503 Service Unavailable\r
 Cache-Control: no-cache\r
 Connection: close\r
-%Content-Length: %CONTENT_LENGTH\r
 Sozu-Id: %REQUEST_ID\r
 \r
 <html><head><meta charset='utf-8'><head><body>
@@ -637,7 +682,6 @@ fn default_507() -> String {
 HTTP/1.1 507 Insufficient Storage\r
 Cache-Control: no-cache\r
 Connection: close\r
-%Content-Length: %CONTENT_LENGTH\r
 Sozu-Id: %REQUEST_ID\r
 \r
 <html><head><meta charset='utf-8'><head><body>
@@ -652,7 +696,7 @@ Sozu-Id: %REQUEST_ID\r
     \"backend_id\": \"%BACKEND_ID\"
 }
 </pre>
-<p>Response needed more than %CAPACITY bytes to fit. Parser stopped at phase: %PHASE. %MESSAGE/p>
+<p>Response needed more than %CAPACITY bytes to fit. Parser stopped at phase: %PHASE. %MESSAGE</p>
 <footer>This is an automatic answer by Sōzu.</footer></body></html>",
     )
 }
@@ -671,274 +715,296 @@ fn phase_to_vec(phase: ParsingPhaseMarker) -> Vec<u8> {
     .into()
 }
 
-impl HttpAnswers {
-    #[rustfmt::skip]
-    pub fn template(status: u16, answer: String) -> Result<Template, (u16, TemplateError)> {
-        let length = TemplateVariable {
-            name: "CONTENT_LENGTH",
-            valid_in_body: false,
-            valid_in_header: true,
-            typ: ReplacementType::ContentLength,
+/// Flatten a legacy [`CustomHttpAnswers`] (per-status `Option<String>` fields)
+/// into the new [`BTreeMap<String, String>`] shape, dropping any `None` field.
+///
+/// Used to reconcile state files produced by older managers (which still
+/// emit `http_answers`) with the new template-engine map. The new map wins
+/// on collision; this helper only fills in entries that the new map does
+/// not already define.
+pub fn legacy_to_map(legacy: &CustomHttpAnswers) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    macro_rules! insert {
+        ($code:literal, $field:ident) => {
+            if let Some(ref v) = legacy.$field {
+                out.insert($code.to_owned(), v.to_owned());
+            }
         };
+    }
+    insert!("301", answer_301);
+    insert!("400", answer_400);
+    insert!("401", answer_401);
+    insert!("404", answer_404);
+    insert!("408", answer_408);
+    insert!("413", answer_413);
+    insert!("421", answer_421);
+    insert!("502", answer_502);
+    insert!("503", answer_503);
+    insert!("504", answer_504);
+    insert!("507", answer_507);
+    out
+}
 
+/// Fold a legacy [`CustomHttpAnswers`] into the new map without overriding
+/// existing entries. Lets the worker accept managers that still populate
+/// `http_answers` while preferring the template map when both are set.
+pub fn merge_legacy_into_map(answers: &mut BTreeMap<String, String>, legacy: &CustomHttpAnswers) {
+    for (code, body) in legacy_to_map(legacy) {
+        answers.entry(code).or_insert(body);
+    }
+}
+
+impl HttpAnswers {
+    /// Parse a single template body. Use the status-string variants of the
+    /// canonical variable set when the name parses as a known HTTP status;
+    /// otherwise fall back to the broadest variable set so user-defined
+    /// templates (selected by name) still get the common variables.
+    #[rustfmt::skip]
+    pub fn template(name: &str, answer: &str) -> Result<Template, (String, TemplateError)> {
         let route = TemplateVariable {
             name: "ROUTE",
             valid_in_body: true,
             valid_in_header: true,
+            or_elide_header: false,
             typ: ReplacementType::Variable(0),
         };
         let request_id = TemplateVariable {
             name: "REQUEST_ID",
             valid_in_body: true,
             valid_in_header: true,
+            or_elide_header: false,
             typ: ReplacementType::Variable(0),
         };
         let cluster_id = TemplateVariable {
             name: "CLUSTER_ID",
             valid_in_body: true,
             valid_in_header: true,
+            or_elide_header: false,
             typ: ReplacementType::Variable(0),
         };
         let backend_id = TemplateVariable {
             name: "BACKEND_ID",
             valid_in_body: true,
             valid_in_header: true,
+            or_elide_header: false,
             typ: ReplacementType::Variable(0),
         };
         let duration = TemplateVariable {
             name: "DURATION",
             valid_in_body: true,
             valid_in_header: true,
+            or_elide_header: false,
             typ: ReplacementType::Variable(0),
         };
         let capacity = TemplateVariable {
             name: "CAPACITY",
             valid_in_body: true,
             valid_in_header: true,
+            or_elide_header: false,
             typ: ReplacementType::Variable(0),
         };
         let phase = TemplateVariable {
             name: "PHASE",
             valid_in_body: true,
             valid_in_header: true,
+            or_elide_header: false,
             typ: ReplacementType::Variable(0),
         };
 
         let location = TemplateVariable {
             name: "REDIRECT_LOCATION",
-            valid_in_body: false,
+            valid_in_body: true,
             valid_in_header: true,
+            or_elide_header: false,
             typ: ReplacementType::VariableOnce(0),
         };
         let message = TemplateVariable {
             name: "MESSAGE",
             valid_in_body: true,
             valid_in_header: false,
+            or_elide_header: false,
+            typ: ReplacementType::VariableOnce(0),
+        };
+        let template_name = TemplateVariable {
+            name: "TEMPLATE_NAME",
+            valid_in_body: true,
+            valid_in_header: true,
+            or_elide_header: false,
+            typ: ReplacementType::VariableOnce(0),
+        };
+        let www_authenticate = TemplateVariable {
+            name: "WWW_AUTHENTICATE",
+            valid_in_body: false,
+            valid_in_header: true,
+            // empty realm → drop the `WWW-Authenticate` header line entirely
+            or_elide_header: true,
             typ: ReplacementType::VariableOnce(0),
         };
         let successfully_parsed = TemplateVariable {
             name: "SUCCESSFULLY_PARSED",
             valid_in_body: true,
             valid_in_header: false,
+            or_elide_header: false,
             typ: ReplacementType::Variable(0),
         };
         let partially_parsed = TemplateVariable {
             name: "PARTIALLY_PARSED",
             valid_in_body: true,
             valid_in_header: false,
+            or_elide_header: false,
             typ: ReplacementType::Variable(0),
         };
         let invalid = TemplateVariable {
             name: "INVALID",
             valid_in_body: true,
             valid_in_header: false,
+            or_elide_header: false,
             typ: ReplacementType::Variable(0),
         };
 
-        match status {
-            301 => Template::new(
-                301,
+        match name {
+            "301" => Template::new(
+                Some(301),
                 answer,
-                &[length, route, request_id, location]
+                &[route, request_id, location]
             ),
-            400 => Template::new(
-                400,
+            "400" => Template::new(
+                Some(400),
                 answer,
-                &[length, route, request_id, message, phase, successfully_parsed, partially_parsed, invalid],
+                &[route, request_id, message, phase, successfully_parsed, partially_parsed, invalid],
             ),
-            401 => Template::new(
-                401,
+            "401" => Template::new(
+                Some(401),
                 answer,
-                &[length, route, request_id]
+                &[route, request_id, www_authenticate]
             ),
-            404 => Template::new(
-                404,
+            "404" => Template::new(
+                Some(404),
                 answer,
-                &[length, route, request_id]
+                &[route, request_id]
             ),
-            408 => Template::new(
-                408,
+            "408" => Template::new(
+                Some(408),
                 answer,
-                &[length, route, request_id, duration]
+                &[route, request_id, duration]
             ),
-            413 => Template::new(
-                413,
+            "413" => Template::new(
+                Some(413),
                 answer,
-                &[length, route, request_id, capacity, message, phase],
+                &[route, request_id, capacity, message, phase],
             ),
-            421 => Template::new(
-                421,
+            "421" => Template::new(
+                Some(421),
                 answer,
-                &[length, route, request_id]
+                &[route, request_id]
             ),
-            502 => Template::new(
-                502,
+            "502" => Template::new(
+                Some(502),
                 answer,
-                &[length, route, request_id, cluster_id, backend_id, message, phase, successfully_parsed, partially_parsed, invalid],
+                &[route, request_id, cluster_id, backend_id, message, phase, successfully_parsed, partially_parsed, invalid],
             ),
-            503 => Template::new(
-                503,
+            "503" => Template::new(
+                Some(503),
                 answer,
-                &[length, route, request_id, cluster_id, backend_id, message],
+                &[route, request_id, cluster_id, backend_id, message],
             ),
-            504 => Template::new(
-                504,
+            "504" => Template::new(
+                Some(504),
                 answer,
-                &[length, route, request_id, cluster_id, backend_id, duration],
+                &[route, request_id, cluster_id, backend_id, duration],
             ),
-            507 => Template::new(
-                507,
+            "507" => Template::new(
+                Some(507),
                 answer,
-                &[length, route, request_id, cluster_id, backend_id, capacity, message, phase],
+                &[route, request_id, cluster_id, backend_id, capacity, message, phase],
             ),
-            _ => Err(TemplateError::InvalidStatusCode(status)),
+            _ => Template::new(
+                None,
+                answer,
+                &[route, request_id, cluster_id, location, template_name],
+            ),
         }
-        .map_err(|e| (status, e))
+        .map_err(|e| (name.to_owned(), e))
     }
 
-    pub fn new(conf: &Option<CustomHttpAnswers>) -> Result<Self, (u16, TemplateError)> {
+    /// Compile every `(name → body)` pair into a templates map. Stops on the
+    /// first parse error; the returned tuple identifies which template failed.
+    pub fn templates(
+        answers: &BTreeMap<String, String>,
+    ) -> Result<BTreeMap<String, Template>, (String, TemplateError)> {
+        answers
+            .iter()
+            .map(|(name, answer)| {
+                Self::template(name, answer).map(|template| (name.clone(), template))
+            })
+            .collect::<Result<_, _>>()
+    }
+
+    /// Build the listener-level template registry. The map can be empty —
+    /// every status code referenced in [`DefaultAnswer`] gets a built-in
+    /// fallback template.
+    pub fn new(answers: &BTreeMap<String, String>) -> Result<Self, (String, TemplateError)> {
+        type DefaultBuilder = fn() -> String;
+        let mut listener_answers = Self::templates(answers)?;
+        let expected_defaults: &[(&str, DefaultBuilder)] = &[
+            ("301", default_301),
+            ("400", default_400),
+            ("401", default_401),
+            ("404", default_404),
+            ("408", default_408),
+            ("413", default_413),
+            ("421", default_421),
+            ("502", default_502),
+            ("503", default_503),
+            ("504", default_504),
+            ("507", default_507),
+        ];
+        for (name, default) in expected_defaults {
+            if !listener_answers.contains_key(*name) {
+                listener_answers.insert(
+                    name.to_string(),
+                    Self::template(name, &default()).expect("built-in default templates parse"),
+                );
+            }
+        }
         Ok(HttpAnswers {
-            listener_answers: ListenerAnswers {
-                answer_301: Self::template(
-                    301,
-                    conf.as_ref()
-                        .and_then(|c| c.answer_301.clone())
-                        .unwrap_or(default_301()),
-                )?,
-                answer_400: Self::template(
-                    400,
-                    conf.as_ref()
-                        .and_then(|c| c.answer_400.clone())
-                        .unwrap_or(default_400()),
-                )?,
-                answer_401: Self::template(
-                    401,
-                    conf.as_ref()
-                        .and_then(|c| c.answer_401.clone())
-                        .unwrap_or(default_401()),
-                )?,
-                answer_404: Self::template(
-                    404,
-                    conf.as_ref()
-                        .and_then(|c| c.answer_404.clone())
-                        .unwrap_or(default_404()),
-                )?,
-                answer_408: Self::template(
-                    408,
-                    conf.as_ref()
-                        .and_then(|c| c.answer_408.clone())
-                        .unwrap_or(default_408()),
-                )?,
-                answer_413: Self::template(
-                    413,
-                    conf.as_ref()
-                        .and_then(|c| c.answer_413.clone())
-                        .unwrap_or(default_413()),
-                )?,
-                answer_421: Self::template(
-                    421,
-                    conf.as_ref()
-                        .and_then(|c| c.answer_421.clone())
-                        .unwrap_or(default_421()),
-                )?,
-                answer_502: Self::template(
-                    502,
-                    conf.as_ref()
-                        .and_then(|c| c.answer_502.clone())
-                        .unwrap_or(default_502()),
-                )?,
-                answer_503: Self::template(
-                    503,
-                    conf.as_ref()
-                        .and_then(|c| c.answer_503.clone())
-                        .unwrap_or(default_503()),
-                )?,
-                answer_504: Self::template(
-                    504,
-                    conf.as_ref()
-                        .and_then(|c| c.answer_504.clone())
-                        .unwrap_or(default_504()),
-                )?,
-                answer_507: Self::template(
-                    507,
-                    conf.as_ref()
-                        .and_then(|c| c.answer_507.clone())
-                        .unwrap_or(default_507()),
-                )?,
-            },
-            cluster_custom_answers: HashMap::new(),
+            fallback: Self::template("", &fallback()).expect("built-in fallback template parses"),
+            listener_answers,
+            cluster_answers: HashMap::new(),
         })
     }
 
-    pub fn add_custom_answer(
+    /// Register or extend the per-cluster template overrides for `cluster_id`.
+    ///
+    /// New entries shadow the listener-level templates for the matching
+    /// status. Existing entries with the same status are replaced. Entries
+    /// already registered for the cluster but absent from `answers` are kept.
+    pub fn add_cluster_answers(
         &mut self,
         cluster_id: &str,
-        answer_503: String,
-    ) -> Result<(), (u16, TemplateError)> {
-        let answer_503 = Self::template(503, answer_503)?;
-        self.cluster_custom_answers
-            .insert(cluster_id.to_string(), ClusterAnswers { answer_503 });
-        Ok(())
-    }
-
-    pub fn remove_custom_answer(&mut self, cluster_id: &str) {
-        self.cluster_custom_answers.remove(cluster_id);
-    }
-
-    /// Rewrite ONLY the listener-default template fields for which the patch
-    /// provides `Some(body)`, leaving all other templates and
-    /// `cluster_custom_answers` untouched.
-    ///
-    /// Field-mask semantic: a `None` field in `new_defaults` means "preserve
-    /// the current template"; a `Some` field means "replace with this body".
-    /// This matches the update-verb documented contract — a patch that sets
-    /// only `answer_503` must leave `answer_401`/`answer_404`/etc. alone.
-    pub fn replace_defaults(
-        &mut self,
-        new_defaults: &CustomHttpAnswers,
-    ) -> Result<(), (u16, TemplateError)> {
-        macro_rules! merge {
-            ($status:expr, $field:ident) => {
-                if let Some(body) = new_defaults.$field.clone() {
-                    self.listener_answers.$field = Self::template($status, body)?;
-                }
-            };
+        answers: &BTreeMap<String, String>,
+    ) -> Result<(), (String, TemplateError)> {
+        if answers.is_empty() {
+            return Ok(());
         }
-
-        merge!(301, answer_301);
-        merge!(400, answer_400);
-        merge!(401, answer_401);
-        merge!(404, answer_404);
-        merge!(408, answer_408);
-        merge!(413, answer_413);
-        merge!(421, answer_421);
-        merge!(502, answer_502);
-        merge!(503, answer_503);
-        merge!(504, answer_504);
-        merge!(507, answer_507);
+        let mut compiled = Self::templates(answers)?;
+        self.cluster_answers
+            .entry(cluster_id.to_owned())
+            .or_default()
+            .append(&mut compiled);
         Ok(())
     }
 
+    /// Drop every per-cluster override for `cluster_id`. Subsequent lookups
+    /// fall through to the listener-level template.
+    pub fn remove_cluster_answers(&mut self, cluster_id: &str) {
+        self.cluster_answers.remove(cluster_id);
+    }
+
+    /// Lookup + render. Returns the resolved status, the template's
+    /// `keep_alive` flag (false when the template carries
+    /// `Connection: close`), and the rendered Kawa stream ready to be
+    /// prepared for the wire.
     pub fn get(
         &self,
         answer: DefaultAnswer,
@@ -946,14 +1012,14 @@ impl HttpAnswers {
         cluster_id: Option<&str>,
         backend_id: Option<&str>,
         route: String,
-    ) -> DefaultAnswerStream {
+    ) -> (u16, bool, DefaultAnswerStream) {
         let variables: Vec<Vec<u8>>;
         let mut variables_once: Vec<Vec<u8>>;
-        let template = match answer {
+        let name = match answer {
             DefaultAnswer::Answer301 { location } => {
                 variables = vec![route.into(), request_id.into()];
                 variables_once = vec![location.into()];
-                &self.listener_answers.answer_301
+                "301"
             }
             DefaultAnswer::Answer400 {
                 message,
@@ -971,22 +1037,22 @@ impl HttpAnswers {
                     invalid.into(),
                 ];
                 variables_once = vec![message.into()];
-                &self.listener_answers.answer_400
+                "400"
             }
-            DefaultAnswer::Answer401 {} => {
+            DefaultAnswer::Answer401 { www_authenticate } => {
                 variables = vec![route.into(), request_id.into()];
-                variables_once = vec![];
-                &self.listener_answers.answer_401
+                variables_once = vec![www_authenticate.unwrap_or_default().into()];
+                "401"
             }
             DefaultAnswer::Answer404 {} => {
                 variables = vec![route.into(), request_id.into()];
                 variables_once = vec![];
-                &self.listener_answers.answer_404
+                "404"
             }
             DefaultAnswer::Answer408 { duration } => {
                 variables = vec![route.into(), request_id.into(), duration.to_string().into()];
                 variables_once = vec![];
-                &self.listener_answers.answer_408
+                "408"
             }
             DefaultAnswer::Answer413 {
                 message,
@@ -1000,12 +1066,12 @@ impl HttpAnswers {
                     phase_to_vec(phase),
                 ];
                 variables_once = vec![message.into()];
-                &self.listener_answers.answer_413
+                "413"
             }
             DefaultAnswer::Answer421 {} => {
                 variables = vec![route.into(), request_id.into()];
                 variables_once = vec![];
-                &self.listener_answers.answer_421
+                "421"
             }
             DefaultAnswer::Answer502 {
                 message,
@@ -1025,7 +1091,7 @@ impl HttpAnswers {
                     invalid.into(),
                 ];
                 variables_once = vec![message.into()];
-                &self.listener_answers.answer_502
+                "502"
             }
             DefaultAnswer::Answer503 { message } => {
                 variables = vec![
@@ -1035,10 +1101,7 @@ impl HttpAnswers {
                     backend_id.unwrap_or_default().into(),
                 ];
                 variables_once = vec![message.into()];
-                cluster_id
-                    .and_then(|id: &str| self.cluster_custom_answers.get(id))
-                    .map(|c| &c.answer_503)
-                    .unwrap_or_else(|| &self.listener_answers.answer_503)
+                "503"
             }
             DefaultAnswer::Answer504 { duration } => {
                 variables = vec![
@@ -1049,7 +1112,7 @@ impl HttpAnswers {
                     duration.to_string().into(),
                 ];
                 variables_once = vec![];
-                &self.listener_answers.answer_504
+                "504"
             }
             DefaultAnswer::Answer507 {
                 phase,
@@ -1065,114 +1128,288 @@ impl HttpAnswers {
                     phase_to_vec(phase),
                 ];
                 variables_once = vec![message.into()];
-                &self.listener_answers.answer_507
+                "507"
             }
         };
-        // kawa::debug_kawa(&template.kawa);
-        // println!("{template:#?}");
-        template.fill(&variables, &mut variables_once)
+        let template = cluster_id
+            .and_then(|id| self.cluster_answers.get(id))
+            .and_then(|answers| answers.get(name))
+            .or_else(|| self.listener_answers.get(name))
+            .unwrap_or(&self.fallback);
+        (
+            template.status,
+            template.keep_alive,
+            template.fill(&variables, &mut variables_once),
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use sozu_command::proto::command::CustomHttpAnswers;
 
-    use super::HttpAnswers;
+    use super::{
+        HttpAnswers, ReplacementType, Template, TemplateError, TemplateVariable, legacy_to_map,
+        merge_legacy_into_map,
+    };
+    use crate::protocol::http::DefaultAnswer;
 
-    /// `replace_defaults` must rewrite listener-default templates while
-    /// preserving every per-cluster entry in `cluster_custom_answers`.
+    fn body_route() -> TemplateVariable {
+        TemplateVariable {
+            name: "ROUTE",
+            valid_in_body: true,
+            valid_in_header: true,
+            or_elide_header: false,
+            typ: ReplacementType::Variable(0),
+        }
+    }
+
+    fn header_realm() -> TemplateVariable {
+        TemplateVariable {
+            name: "WWW_AUTHENTICATE",
+            valid_in_body: false,
+            valid_in_header: true,
+            or_elide_header: true,
+            typ: ReplacementType::VariableOnce(0),
+        }
+    }
+
+    fn variable_once_message() -> TemplateVariable {
+        TemplateVariable {
+            name: "MESSAGE",
+            valid_in_body: true,
+            valid_in_header: false,
+            or_elide_header: false,
+            typ: ReplacementType::VariableOnce(0),
+        }
+    }
+
+    /// `Template::new` accepts a well-formed body that uses a declared
+    /// variable.
     #[test]
-    fn replace_defaults_preserves_cluster_custom_answers() {
-        // Build a fresh HttpAnswers with the stock defaults.
-        let mut answers = HttpAnswers::new(&None).expect("default HttpAnswers must parse");
-
-        // Register a per-cluster custom 503.
-        let custom_cluster_503 = "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 5\r\n\r\noops!";
-        answers
-            .add_custom_answer("my-cluster", custom_cluster_503.to_owned())
-            .expect("custom 503 must parse");
-
-        // Now replace the listener-default 503 with a different body.
-        let new_listener_503 = "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 11\r\n\r\nnew-default";
-        let patch = CustomHttpAnswers {
-            answer_503: Some(new_listener_503.to_owned()),
-            ..Default::default()
-        };
-        answers
-            .replace_defaults(&patch)
-            .expect("replace_defaults must succeed");
-
-        // (a) Listener-default template now contains the new body text.
-        let template_buf = answers.listener_answers.answer_503.kawa.storage.buffer();
-        let contains_new_default = template_buf
-            .windows(b"new-default".len())
-            .any(|w| w == b"new-default");
+    fn template_new_accepts_known_variable() {
+        let body = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nroute=%ROUTE";
+        let template =
+            Template::new(Some(200), body, &[body_route()]).expect("template must compile");
+        let mut empty_once: Vec<Vec<u8>> = Vec::new();
+        let rendered = template.fill(&[b"hello".to_vec()], &mut empty_once);
+        let buf = rendered.storage.buffer();
         assert!(
-            contains_new_default,
-            "listener-default 503 should have been replaced with new-default"
-        );
-
-        // (b) The registered cluster's custom 503 is still intact.
-        assert!(
-            answers.cluster_custom_answers.contains_key("my-cluster"),
-            "cluster_custom_answers must be preserved after replace_defaults"
-        );
-        let cluster_buf = answers
-            .cluster_custom_answers
-            .get("my-cluster")
-            .unwrap()
-            .answer_503
-            .kawa
-            .storage
-            .buffer();
-        let contains_oops = cluster_buf.windows(b"oops!".len()).any(|w| w == b"oops!");
-        assert!(
-            contains_oops,
-            "per-cluster 503 must still contain the original custom body"
+            rendered.blocks.iter().any(
+                |block| matches!(block, kawa::Block::Chunk(kawa::Chunk { data })
+                    if data.data(buf) == b"hello")
+            ),
+            "rendered body must contain the substituted ROUTE variable"
         );
     }
 
-    /// Regression test for the H-1 finding: `replace_defaults` must preserve
-    /// listener-default templates for fields that the patch does NOT set.
-    /// Prior behavior treated `None` as "reset to stock default", silently
-    /// wiping out any custom body configured at AddListener time.
+    /// Header-only variable referenced from the body must error at compile
+    /// time. Exercises the `valid_in_body` guard, which is the same code
+    /// path that catches an unknown `%FOOBAR` (no matching variable, but
+    /// inversely: a typed mismatch).
     #[test]
-    fn replace_defaults_preserves_unmentioned_templates() {
-        // Build HttpAnswers with a custom 401 AND 503 at creation time.
-        let initial_401 = "HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Length: 12\r\n\r\nneed-creds!!";
-        let initial_503 = "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 11\r\n\r\ninitial-503";
-        let initial = CustomHttpAnswers {
-            answer_401: Some(initial_401.to_owned()),
-            answer_503: Some(initial_503.to_owned()),
-            ..Default::default()
-        };
-        let mut answers = HttpAnswers::new(&Some(initial)).expect("initial HttpAnswers must parse");
+    fn template_new_rejects_header_only_in_body() {
+        let body = "HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\nrealm=%WWW_AUTHENTICATE";
+        let err = Template::new(Some(401), body, &[header_realm()])
+            .expect_err("variable not allowed in body must error");
+        match err {
+            TemplateError::NotAllowedInBody(name) => assert_eq!(name, "WWW_AUTHENTICATE"),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
 
-        // Patch ONLY answer_503. answer_401 must stay as-is.
-        let new_503 = "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 7\r\n\r\npatched";
-        let patch = CustomHttpAnswers {
-            answer_503: Some(new_503.to_owned()),
-            ..Default::default()
-        };
-        answers
-            .replace_defaults(&patch)
-            .expect("replace_defaults must succeed");
+    /// `Template::new` enforces `VariableOnce` semantics: a one-shot
+    /// variable referenced twice must error at compile time.
+    #[test]
+    fn template_new_rejects_variable_once_reused() {
+        let body = "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n%MESSAGE %MESSAGE";
+        let err = Template::new(Some(503), body, &[variable_once_message()])
+            .expect_err("VariableOnce reused twice must error");
+        match err {
+            TemplateError::AlreadyConsumed(name) => assert_eq!(name, "MESSAGE"),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
 
-        // 503 got the patched body.
-        let buf_503 = answers.listener_answers.answer_503.kawa.storage.buffer();
+    /// `Template::fill` substitutes the runtime value into the body chunk.
+    #[test]
+    fn template_fill_substitutes_body_variable() {
+        let body = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nroute=%ROUTE";
+        let template = Template::new(Some(200), body, &[body_route()]).expect("template compiles");
+        let mut empty_once: Vec<Vec<u8>> = Vec::new();
+        let rendered = template.fill(&[b"abc".to_vec()], &mut empty_once);
+        let mut concatenated = Vec::new();
+        let buf = rendered.storage.buffer();
+        for block in &rendered.blocks {
+            if let kawa::Block::Chunk(kawa::Chunk { data }) = block {
+                concatenated.extend_from_slice(data.data(buf));
+            }
+        }
         assert!(
-            buf_503.windows(b"patched".len()).any(|w| w == b"patched"),
-            "answer_503 should have been replaced"
+            concatenated
+                .windows(b"route=abc".len())
+                .any(|w| w == b"route=abc"),
+            "rendered body must contain the substituted variable, got {:?}",
+            String::from_utf8_lossy(&concatenated),
         );
+    }
 
-        // 401 must still contain the custom body from initial AddListener.
-        let buf_401 = answers.listener_answers.answer_401.kawa.storage.buffer();
+    /// `or_elide_header: true` drops the surrounding header line when the
+    /// substitution is empty. This is the path that makes
+    /// `WWW-Authenticate: <realm>` disappear when the cluster has no realm
+    /// configured.
+    #[test]
+    fn template_fill_elides_header_when_empty() {
+        let body = "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: %WWW_AUTHENTICATE\r\nConnection: close\r\n\r\n";
+        let template =
+            Template::new(Some(401), body, &[header_realm()]).expect("template compiles");
+        // empty realm → header is elided
+        let mut variables_once = vec![Vec::<u8>::new()];
+        let rendered = template.fill(&[], &mut variables_once);
+        let buf = rendered.storage.buffer();
+        let elided = rendered.blocks.iter().any(|block| match block {
+            kawa::Block::Header(pair) => pair.is_elided() && pair.val.data(buf).is_empty(),
+            _ => false,
+        });
         assert!(
-            buf_401
-                .windows(b"need-creds!!".len())
-                .any(|w| w == b"need-creds!!"),
-            "answer_401 must be preserved when the patch does not set it"
+            elided,
+            "WWW-Authenticate header must be elided when realm is empty"
+        );
+        // Non-empty realm → header is kept with the substituted value.
+        let mut variables_once = vec![b"Basic realm=\"test\"".to_vec()];
+        let rendered = template.fill(&[], &mut variables_once);
+        let buf = rendered.storage.buffer();
+        let kept = rendered.blocks.iter().any(|block| match block {
+            kawa::Block::Header(pair) => {
+                !pair.is_elided() && pair.key.data(buf).eq_ignore_ascii_case(b"WWW-Authenticate")
+            }
+            _ => false,
+        });
+        assert!(
+            kept,
+            "WWW-Authenticate header must be kept when realm is non-empty"
+        );
+    }
+
+    /// `add_cluster_answers` followed by `get` returns the per-cluster
+    /// override; `remove_cluster_answers` falls back to the listener-level
+    /// template.
+    #[test]
+    fn cluster_overrides_listener() {
+        let mut answers = HttpAnswers::new(&BTreeMap::new()).expect("default HttpAnswers");
+        let custom_503 =
+            "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\nfrom-cluster";
+        let mut overrides = BTreeMap::new();
+        overrides.insert("503".to_owned(), custom_503.to_owned());
+        answers
+            .add_cluster_answers("c1", &overrides)
+            .expect("override compiles");
+
+        let (status, _keep_alive, rendered) = answers.get(
+            DefaultAnswer::Answer503 {
+                message: String::new(),
+            },
+            "rid".to_owned(),
+            Some("c1"),
+            None,
+            "/".to_owned(),
+        );
+        assert_eq!(status, 503);
+        let buf = rendered.storage.buffer();
+        let body_has_override = rendered.blocks.iter().any(|block| match block {
+            kawa::Block::Chunk(kawa::Chunk { data }) => data.data(buf) == b"from-cluster",
+            _ => false,
+        });
+        assert!(body_has_override, "cluster-level body must win");
+
+        // Remove and check the listener-level body comes back.
+        answers.remove_cluster_answers("c1");
+        let (_, _, rendered) = answers.get(
+            DefaultAnswer::Answer503 {
+                message: String::new(),
+            },
+            "rid".to_owned(),
+            Some("c1"),
+            None,
+            "/".to_owned(),
+        );
+        let buf = rendered.storage.buffer();
+        let body_still_overridden = rendered.blocks.iter().any(|block| match block {
+            kawa::Block::Chunk(kawa::Chunk { data }) => data.data(buf) == b"from-cluster",
+            _ => false,
+        });
+        assert!(
+            !body_still_overridden,
+            "after remove, listener-level body must take over"
+        );
+    }
+
+    /// Round-trip a legacy `CustomHttpAnswers { answer_503: ... }` through
+    /// `legacy_to_map` + `HttpAnswers::new`, and verify the rendered 503
+    /// carries the legacy body.
+    #[test]
+    fn legacy_to_map_roundtrip() {
+        let legacy = CustomHttpAnswers {
+            answer_503: Some(
+                "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\nlegacy-503"
+                    .to_owned(),
+            ),
+            ..Default::default()
+        };
+        let map = legacy_to_map(&legacy);
+        assert!(map.contains_key("503"), "legacy_to_map must preserve 503");
+        let answers = HttpAnswers::new(&map).expect("HttpAnswers::new accepts legacy map");
+        let (status, _, rendered) = answers.get(
+            DefaultAnswer::Answer503 {
+                message: String::new(),
+            },
+            "rid".to_owned(),
+            None,
+            None,
+            "/".to_owned(),
+        );
+        assert_eq!(status, 503);
+        let buf = rendered.storage.buffer();
+        let has_legacy = rendered.blocks.iter().any(|block| match block {
+            kawa::Block::Chunk(kawa::Chunk { data }) => data.data(buf) == b"legacy-503",
+            _ => false,
+        });
+        assert!(
+            has_legacy,
+            "legacy-503 body must round-trip into the new map"
+        );
+    }
+
+    /// `merge_legacy_into_map` does not override existing entries — the new
+    /// map wins on collision (per the proto comment on field 9/12/21/38/43).
+    #[test]
+    fn merge_legacy_into_map_prefers_new() {
+        let mut new_map = BTreeMap::new();
+        new_map.insert(
+            "503".to_owned(),
+            "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\nfrom-new".to_owned(),
+        );
+        let legacy = CustomHttpAnswers {
+            answer_503: Some(
+                "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\nfrom-legacy"
+                    .to_owned(),
+            ),
+            answer_404: Some(
+                "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\nlegacy-404".to_owned(),
+            ),
+            ..Default::default()
+        };
+        merge_legacy_into_map(&mut new_map, &legacy);
+        assert_eq!(
+            new_map.get("503").map(String::as_str),
+            Some("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\nfrom-new"),
+            "new map must keep its 503 even though legacy has one"
+        );
+        assert!(
+            new_map.contains_key("404"),
+            "legacy 404 must fill in when new map does not define one"
         );
     }
 }

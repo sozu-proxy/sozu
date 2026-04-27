@@ -122,7 +122,12 @@ fn default_answer_for_code(code: u16) -> DefaultAnswer {
             partially_parsed: "null".to_owned(),
             invalid: "null".to_owned(),
         },
-        401 => DefaultAnswer::Answer401 {},
+        401 => DefaultAnswer::Answer401 {
+            // Wave 3a will populate the realm from the cluster config; for
+            // now emit a bare 401 — the template engine elides the
+            // `WWW-Authenticate` header when the value is empty.
+            www_authenticate: None,
+        },
         404 => DefaultAnswer::Answer404 {},
         408 => DefaultAnswer::Answer408 {
             duration: String::new(),
@@ -190,7 +195,6 @@ pub(crate) fn set_default_answer(
             ),
         }
     } else {
-        context.keep_alive_frontend = false;
         default_answer_for_code(code)
     };
 
@@ -199,11 +203,21 @@ pub(crate) fn set_default_answer(
     let cluster_id = context.cluster_id.as_deref();
     let backend_id = context.backend_id.as_deref();
 
-    let rendered = answers.get(answer, request_id, cluster_id, backend_id, route);
+    let (resolved_status, keep_alive, rendered) =
+        answers.get(answer, request_id, cluster_id, backend_id, route);
+    // Honour the rendered template's `Connection` header. Most error
+    // templates carry `Connection: close`, which flips the frontend
+    // keep-alive bit to false; cluster operators can opt back into
+    // keep-alive by shipping a custom template without that header.
+    if !keep_alive {
+        context.keep_alive_frontend = false;
+    }
     copy_default_answer_to_stream(rendered, kawa);
     ensure_default_answer_end_stream(kawa);
 
-    context.status = Some(code);
+    // The template's resolved status may differ from the requested code
+    // when a fallback template is selected (e.g. unknown status).
+    context.status = Some(resolved_status);
     stream.state = StreamState::Unlinked;
     readiness.arm_writable();
     incr!("h2.signal.writable.rearmed.default_answer");
@@ -285,7 +299,8 @@ mod tests {
     fn set_default_answer_arms_writable_and_signals() {
         let (_pool, mut stream) = make_stream();
         let mut readiness = Readiness::new();
-        let answers = HttpAnswers::new(&None).expect("HttpAnswers::new(&None) must succeed");
+        let answers = HttpAnswers::new(&std::collections::BTreeMap::new())
+            .expect("HttpAnswers::new with empty map must succeed");
 
         set_default_answer(&mut stream, &mut readiness, 504, &answers);
 

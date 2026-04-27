@@ -697,8 +697,8 @@ pub enum ListenerError {
     Resolver(CertificateResolverError),
     #[error("failed to parse pem, {0}")]
     PemParse(String),
-    #[error("failed to parse template {0}: {1}")]
-    TemplateParse(u16, TemplateError),
+    #[error("failed to parse template {0:?}: {1}")]
+    TemplateParse(String, TemplateError),
     #[error("failed to build rustls context, {0}")]
     BuildRustls(String),
     #[error("could not activate listener with address {address:?}: {error}")]
