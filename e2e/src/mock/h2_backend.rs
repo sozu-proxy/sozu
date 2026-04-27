@@ -23,12 +23,17 @@ use crate::port_registry::bind_tokio_listener;
 /// frontend rewrites + header edits — counters alone do not catch a
 /// rewrite bug that lands the request on the right path with the wrong
 /// authority, etc.
+///
+/// Header values are stored as `Vec<u8>` so a regression that forwards a
+/// non-UTF-8 byte (a corrupted upstream header, a smuggled control char)
+/// surfaces in the assertion diff rather than being silently lossily
+/// downgraded to an empty string by `HeaderValue::to_str`.
 #[derive(Debug, Clone)]
 pub struct RecordedH2Request {
     pub method: String,
     pub authority: String,
     pub path: String,
-    pub headers: Vec<(String, String)>,
+    pub headers: Vec<(String, Vec<u8>)>,
 }
 
 /// An HTTP/2 mock backend that accepts cleartext H2 connections (h2c).
@@ -138,10 +143,7 @@ impl H2Backend {
                                         .headers()
                                         .iter()
                                         .map(|(k, v)| {
-                                            (
-                                                k.as_str().to_owned(),
-                                                v.to_str().unwrap_or("").to_owned(),
-                                            )
+                                            (k.as_str().to_owned(), v.as_bytes().to_vec())
                                         })
                                         .collect(),
                                 };
@@ -200,9 +202,18 @@ impl H2Backend {
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(thread) = self.thread.take() {
-            // Give the thread a moment to see the stop signal
-            thread::sleep(std::time::Duration::from_millis(100));
-            drop(thread);
+            // Join the spawned thread so its tokio runtime drops in
+            // lockstep with the test exit. Detaching it (the previous
+            // `drop(thread)`) leaves the runtime — and its threadpool —
+            // alive across subsequent tests in the same process, which
+            // cumulatively starves cargo's default thread budget on
+            // contended CI and amplifies otherwise-unrelated flakes.
+            // The accept loop polls the stop flag every 50 ms (see the
+            // timeout inside `start`) so this join completes within
+            // ~100 ms of the stop signal.
+            if let Err(payload) = thread.join() {
+                eprintln!("H2Backend: spawned thread panicked: {payload:?}");
+            }
         }
     }
 
