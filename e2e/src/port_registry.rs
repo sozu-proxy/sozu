@@ -12,6 +12,15 @@ use sozu_command_lib::scm_socket::Listeners;
 const PORT_SEARCH_START: u16 = 20_000;
 const PORT_SEARCH_END: u16 = 65_000;
 
+/// Process-wide port allocator backing every e2e test.
+///
+/// Leak window: a test that panics between [`PortRegistry::reserve_listener_port`]
+/// and the matching [`PortRegistry::take_listener`] (called via
+/// [`bind_std_listener`] / [`bind_tokio_listener`]) leaves its
+/// `pending_listener` open until the process exits. The 45 000-port
+/// search range absorbs this for the typical e2e budget; converting
+/// `provide_port` into a `Drop`-guarded reservation handle is tracked
+/// for a follow-up that touches every call site at once.
 struct PortRegistry {
     next_port: u16,
     issued_ports: HashSet<u16>,

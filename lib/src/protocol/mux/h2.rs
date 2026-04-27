@@ -2370,6 +2370,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             // signal.
             pending_table_size_update: self.pending_table_size_update,
             size_update_emitted: false,
+            // Reset on every write pass; `check_header_capacity` flips it
+            // mid-call and `finalize` commits the abort by flipping
+            // `kawa.parsing_phase` to Error so the next pass emits
+            // RST_STREAM(InternalError).
+            pending_oversized_abort: false,
         };
         self.priorities_buf.clear();
         self.priorities_buf.extend(self.streams.keys().copied());

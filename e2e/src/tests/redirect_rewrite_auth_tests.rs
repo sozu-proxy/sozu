@@ -12,12 +12,12 @@
 //!     answer templates) and a sample of backend-visible mutations
 //!     (rewrite, header inject) — H1 backend still captures via
 //!     [`SyncBackend`].
-//!   * H1 ↔ H2 / H2 ↔ H2 — exercised at the routing-decision level by
-//!     setting `cluster.http2 = true`. Wire-level assertions on the H2
-//!     backend side require extending the [`H2Backend`] mock to capture
-//!     request authority/path/headers; those are covered by smoke tests
-//!     here that verify the request reaches the backend at all (via the
-//!     `requests_received` counter).
+//!   * H1 ↔ H2 / H2 ↔ H2 — backend-side assertions read from
+//!     [`H2Backend::recorded_requests`] which captures the rewritten
+//!     authority, path, method, and forwarded headers per request.
+//!     Smoke coverage plus rewrite-path / response-header tests on this
+//!     diagonal so a bug in the H2 emission path (`mux/h2.rs::write_streams`
+//!     applying response edits before `kawa.prepare`) surfaces here.
 
 use std::time::Duration;
 
@@ -91,12 +91,18 @@ fn add_backend(
 /// Retry [`SyncBackend::accept`] for up to `total_ms` (the underlying
 /// listener has a 100 ms read timeout, so a single call can return
 /// before sozu has opened its outbound connection on a slow CI runner).
+///
+/// The 100 ms internal poll is short enough that a busy spin would burn
+/// a full CPU core on every retry. Sleep 5 ms between attempts so the
+/// overall budget still expires within `total_ms` (~20 attempts on the
+/// hot path, fewer when the listener returns earlier).
 fn accept_with_retry(backend: &mut SyncBackend, client_id: usize, total_ms: u64) -> bool {
     let deadline = std::time::Instant::now() + Duration::from_millis(total_ms);
     while std::time::Instant::now() < deadline {
         if backend.accept(client_id) {
             return true;
         }
+        std::thread::sleep(Duration::from_millis(5));
     }
     false
 }
@@ -1078,13 +1084,31 @@ fn test_response_header_inject_h2_h1() {
 }
 
 // ═════════════════════════════════════════════════════════════════════
-// Cardinality matrix — H2 backend smoke (cluster.http2 = true)
+// Cardinality matrix — H2 backend coverage (cluster.http2 = true)
 // ═════════════════════════════════════════════════════════════════════
 
-/// Smoke test that a request reaches the H2 backend when the cluster
-/// is marked `http2 = true`. Asserts on `H2Backend::get_requests_received`
-/// — deeper assertions on the request authority/path/headers would
-/// require extending the mock to expose them.
+/// Snapshot the H2 backend until at least `target` requests are
+/// recorded or the deadline expires. Polls every 25 ms so a slow CI
+/// runner does not return an empty log.
+fn wait_for_h2_requests(
+    backend: &H2Backend,
+    target: usize,
+    deadline: std::time::Instant,
+) -> Vec<crate::mock::h2_backend::RecordedH2Request> {
+    while std::time::Instant::now() < deadline {
+        let snapshot = backend.recorded_requests();
+        if snapshot.len() >= target {
+            return snapshot;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    backend.recorded_requests()
+}
+
+/// H1 frontend → H2 backend smoke. Asserts on the recorded request
+/// shape (method, path, authority) so a future regression in the H2
+/// pseudo-header emission surfaces here, not just in the request
+/// counter.
 pub fn try_h1_to_h2_backend_smoke() -> State {
     let front_address = create_local_address();
     let back_address = create_local_address();
@@ -1101,7 +1125,7 @@ pub fn try_h1_to_h2_backend_smoke() -> State {
             .into(),
     );
     add_backend(&mut worker, "h1h2_cluster", "h1h2_back_0", back_address);
-    let mut backend = H2Backend::start("h1h2_back", back_address, "pong");
+    let backend = H2Backend::start("h1h2_back", back_address, "pong");
     worker.read_to_last();
 
     let mut client = Client::new(
@@ -1112,27 +1136,205 @@ pub fn try_h1_to_h2_backend_smoke() -> State {
     client.connect();
     client.send();
     let resp = client.receive();
-    // Give the H2 backend a moment to register the request.
-    std::thread::sleep(Duration::from_millis(250));
-    let count = backend.get_requests_received();
-    backend.stop();
+
+    let deadline = std::time::Instant::now() + Duration::from_millis(2500);
+    let snapshot = wait_for_h2_requests(&backend, 1, deadline);
+    drop(backend);
     worker.soft_stop();
     worker.wait_for_server_stop();
 
-    if count >= 1 && resp.is_some() {
-        State::Success
-    } else {
+    if resp.is_none() || snapshot.is_empty() {
         eprintln!(
-            "expected at least one request on the H2 backend (got {count}), client got resp={resp:?}"
+            "H1↔H2 smoke: expected ≥1 backend request and a frontend response, got resp={resp:?} backend={snapshot:?}"
         );
-        State::Fail
+        return State::Fail;
     }
+    let req = &snapshot[0];
+    if req.method != "GET" {
+        eprintln!("H1↔H2 smoke: expected method GET, got {:?}", req.method);
+        return State::Fail;
+    }
+    if req.path != "/" {
+        eprintln!("H1↔H2 smoke: expected path '/', got {:?}", req.path);
+        return State::Fail;
+    }
+    if !req.authority.starts_with("localhost") {
+        eprintln!(
+            "H1↔H2 smoke: expected :authority to start with 'localhost', got {:?}",
+            req.authority
+        );
+        return State::Fail;
+    }
+    State::Success
 }
 
 #[test]
 fn test_h1_to_h2_backend_smoke() {
     assert_eq!(
         repeat_until_error_or(1, "H1↔H2-backend smoke", try_h1_to_h2_backend_smoke),
+        State::Success
+    );
+}
+
+/// H1 frontend → H2 backend with a `--rewrite-path` policy. Asserts
+/// the H2 backend received the rewritten path AND the rewritten
+/// authority is reflected in `:authority` (mux applies both via the
+/// kawa StatusLine.path/uri rewrite then the converter emits them as
+/// pseudo-headers).
+pub fn try_rewrite_path_h1_h2() -> State {
+    let front_address = create_local_address();
+    let back_address = create_local_address();
+    let mut worker = spawn_worker_with_http_listener("REW-H1H2", front_address);
+    worker.send_proxy_request(
+        RequestType::AddCluster(Cluster {
+            http2: Some(true),
+            ..Worker::default_cluster("rewp_h1h2_cluster")
+        })
+        .into(),
+    );
+    worker.send_proxy_request(
+        RequestType::AddHttpFrontend(RequestHttpFrontend {
+            rewrite_host: Some("backend.example.com".to_owned()),
+            rewrite_path: Some("/v2/api".to_owned()),
+            ..Worker::default_http_frontend("rewp_h1h2_cluster", front_address)
+        })
+        .into(),
+    );
+    add_backend(
+        &mut worker,
+        "rewp_h1h2_cluster",
+        "rewp_h1h2_back_0",
+        back_address,
+    );
+    let backend = H2Backend::start("rewp_h1h2_back", back_address, "pong");
+    worker.read_to_last();
+
+    let mut client = Client::new(
+        "rewp_h1h2_client",
+        front_address,
+        http_request("GET", "/legacy/api", "ping", "localhost"),
+    );
+    client.connect();
+    client.send();
+    let resp = client.receive();
+
+    let deadline = std::time::Instant::now() + Duration::from_millis(2500);
+    let snapshot = wait_for_h2_requests(&backend, 1, deadline);
+    drop(backend);
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+
+    if resp.is_none() || snapshot.is_empty() {
+        eprintln!("rewrite H1↔H2: missing data, resp={resp:?} backend={snapshot:?}");
+        return State::Fail;
+    }
+    let req = &snapshot[0];
+    if req.path != "/v2/api" {
+        eprintln!(
+            "rewrite H1↔H2: expected :path '/v2/api', got {:?}",
+            req.path
+        );
+        return State::Fail;
+    }
+    if req.authority != "backend.example.com" {
+        eprintln!(
+            "rewrite H1↔H2: expected :authority 'backend.example.com', got {:?}",
+            req.authority
+        );
+        return State::Fail;
+    }
+    let xfh = req
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("x-forwarded-host"))
+        .map(|(_, v)| v.as_str());
+    if !matches!(xfh, Some(v) if v.starts_with("localhost")) {
+        eprintln!("rewrite H1↔H2: expected X-Forwarded-Host carrying 'localhost', got {xfh:?}");
+        return State::Fail;
+    }
+    State::Success
+}
+
+#[test]
+fn test_rewrite_path_h1_h2() {
+    assert_eq!(
+        repeat_until_error_or(1, "rewrite H1↔H2", try_rewrite_path_h1_h2),
+        State::Success
+    );
+}
+
+/// H2 frontend (TLS h2) → H2 backend (h2c) with a `--header
+/// request=X-Tenant=foo` injection. Asserts the H2 backend received
+/// the operator-configured request header on the wire.
+pub fn try_request_header_inject_h2_h2() -> State {
+    use crate::mock::https_client::{build_h2_client, resolve_request};
+
+    let front_address = create_local_address();
+    let back_address = create_local_address();
+    let mut worker = spawn_worker_with_https_listener("REQ-INJ-H2H2", front_address);
+    worker.send_proxy_request(
+        RequestType::AddCluster(Cluster {
+            http2: Some(true),
+            ..Worker::default_cluster("reqi_h2h2_cluster")
+        })
+        .into(),
+    );
+    worker.send_proxy_request(
+        RequestType::AddHttpsFrontend(RequestHttpFrontend {
+            headers: vec![Header {
+                position: HeaderPosition::Request as i32,
+                key: "X-Tenant".to_owned(),
+                val: "alpha".to_owned(),
+            }],
+            ..Worker::default_http_frontend("reqi_h2h2_cluster", front_address)
+        })
+        .into(),
+    );
+    add_backend(
+        &mut worker,
+        "reqi_h2h2_cluster",
+        "reqi_h2h2_back_0",
+        back_address,
+    );
+    let backend = H2Backend::start("reqi_h2h2_back", back_address, "pong");
+    worker.read_to_last();
+
+    let uri: hyper::Uri = format!("https://localhost:{}/", front_address.port())
+        .parse()
+        .expect("H2H2 inject URI must parse");
+    let client = build_h2_client();
+    let outcome = resolve_request(&client, uri);
+
+    let deadline = std::time::Instant::now() + Duration::from_millis(2500);
+    let snapshot = wait_for_h2_requests(&backend, 1, deadline);
+    drop(backend);
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+
+    if !matches!(outcome, Some((s, _)) if s.as_u16() == 200) {
+        eprintln!("inject H2↔H2: expected status 200, got {outcome:?}");
+        return State::Fail;
+    }
+    let Some(req) = snapshot.first() else {
+        eprintln!("inject H2↔H2: H2 backend recorded no request");
+        return State::Fail;
+    };
+    let injected = req
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("x-tenant"))
+        .map(|(_, v)| v.as_str());
+    if injected != Some("alpha") {
+        eprintln!("inject H2↔H2: expected X-Tenant: alpha on backend, got {injected:?}");
+        return State::Fail;
+    }
+    State::Success
+}
+
+#[test]
+fn test_request_header_inject_h2_h2() {
+    assert_eq!(
+        repeat_until_error_or(2, "request inject H2↔H2", try_request_header_inject_h2_h2),
         State::Success
     );
 }
