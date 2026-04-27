@@ -7282,6 +7282,8 @@ mod tests {
             tls_cipher: None,
             tls_alpn: None,
             sozu_id_header: String::from("Sozu-Id"),
+            redirect_location: None,
+            www_authenticate: None,
         };
         Stream::new(Rc::downgrade(pool), http_ctx, 65_535)
             .expect("pool should have capacity for two buffers")

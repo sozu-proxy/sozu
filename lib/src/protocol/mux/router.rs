@@ -8,7 +8,10 @@
 use std::{cell::RefCell, collections::HashMap, rc::Rc, time::Duration};
 
 use mio::{Interest, Token, net::TcpStream};
-use sozu_command::{logging::ansi_palette, proto::command::ListenerType};
+use sozu_command::{
+    logging::ansi_palette,
+    proto::command::{ListenerType, RedirectPolicy, RedirectScheme},
+};
 
 #[cfg(debug_assertions)]
 use super::DebugEvent;
@@ -18,6 +21,7 @@ use crate::{
     RetrieveClusterError,
     backends::{Backend, BackendError},
     protocol::http::editor::HttpContext,
+    router::RouteResult,
     server::CONN_RETRIES,
     socket::SessionTcpStream,
     timer::TimeoutContainer,
@@ -118,10 +122,18 @@ impl Router {
         }
         stream.attempts += 1;
 
-        let stream_context = &mut stream.context;
+        // Borrow the front kawa first (immutable, lives until route_from_request returns)
+        // and the context mutably so route_from_request can stash redirect_location /
+        // www_authenticate. We split the borrows manually to keep the rest of `connect`
+        // working with `stream_context` aliasing `stream.context`.
+        let (front_ref, stream_context_ref) = {
+            let stream_split = &mut *stream;
+            (&stream_split.front, &mut stream_split.context)
+        };
         let cluster_id = self
-            .route_from_request(stream_context, &context.listener)
+            .route_from_request(stream_context_ref, front_ref, &context.listener, &proxy)
             .map_err(BackendConnectionError::RetrieveClusterError)?;
+        let stream_context = &mut stream.context;
         stream_context.cluster_id = Some(cluster_id.to_owned());
 
         let (frontend_should_stick, frontend_should_redirect_https, h2) = proxy
@@ -455,7 +467,9 @@ impl Router {
     fn route_from_request<L: ListenerHandler + L7ListenerHandler>(
         &mut self,
         context: &mut HttpContext,
+        front: &super::GenericHttpStream,
         listener: &Rc<RefCell<L>>,
+        proxy: &Rc<RefCell<dyn L7Proxy>>,
     ) -> Result<String, RetrieveClusterError> {
         let (host, uri, method) = match context.extract_route() {
             Ok(tuple) => tuple,
@@ -513,16 +527,87 @@ impl Router {
             }
         };
 
-        // Wave 3a will plumb every RouteResult field through `apply_route_decision`;
-        // for now collapse RouteResult to cluster_id and treat the absent
-        // cluster as the historical `Route::Deny`.
-        let cluster_id = match route.cluster_id {
-            Some(id) => id,
-            None => {
-                trace!("{} RouteResult::deny", log_module_context!(context));
-                return Err(RetrieveClusterError::UnauthorizedRoute);
-            }
-        };
+        // ── Resolve the routing decision ──────────────────────────────────
+        // Snapshot the policy fields we need before consuming `route`, then
+        // map each policy outcome to either an early-error variant (which
+        // the caller turns into a default answer) or a cluster_id (which
+        // proceeds to backend connect).
+        let RouteResult {
+            cluster_id,
+            redirect,
+            redirect_scheme,
+            rewritten_port,
+            required_auth: frontend_required_auth,
+            ..
+        } = route;
+
+        // Look up cluster-side policy knobs once. The values we need are:
+        //  - `https_redirect` (legacy) and `https_redirect_port` for the 301 location URL
+        //  - `authorized_hashes` and `www_authenticate` for the 401 path
+        let (legacy_https_redirect, https_redirect_port, authorized_hashes, www_authenticate) =
+            match cluster_id.as_deref() {
+                Some(id) => proxy
+                    .borrow()
+                    .clusters()
+                    .get(id)
+                    .map(|c| {
+                        (
+                            c.https_redirect,
+                            c.https_redirect_port,
+                            c.authorized_hashes.clone(),
+                            c.www_authenticate.clone(),
+                        )
+                    })
+                    .unwrap_or((false, None, Vec::new(), None)),
+                None => (false, None, Vec::new(), None),
+            };
+
+        // ── 1. Explicit `RedirectPolicy::UNAUTHORIZED` or clusterless deny ─
+        if matches!(redirect, RedirectPolicy::Unauthorized) || cluster_id.is_none() {
+            context.www_authenticate = www_authenticate.clone();
+            trace!("{} RouteResult::deny", log_module_context!(context));
+            return Err(RetrieveClusterError::UnauthorizedRoute);
+        }
+
+        let cluster_id = cluster_id.expect("cluster_id is Some at this point");
+
+        // ── 2. Explicit `RedirectPolicy::PERMANENT` ─────────────────────────
+        if matches!(redirect, RedirectPolicy::Permanent) {
+            let scheme = resolve_redirect_scheme(redirect_scheme, context);
+            let port = rewritten_port.map(|p| p as u32).or(https_redirect_port);
+            context.redirect_location = Some(build_redirect_location(scheme, context, port));
+            return Err(RetrieveClusterError::HttpsRedirect);
+        }
+
+        // ── 3. Legacy `cluster.https_redirect` (HTTP-only listeners) ───────
+        // The caller (`Router::connect`) still gates on listener kind so a
+        // plaintext listener's HTTP→HTTPS redirect rolls through the same
+        // 301 default-answer path. We compute the URL here so the
+        // listener-kind branch in `connect` only needs to bubble up
+        // `RetrieveClusterError::HttpsRedirect`.
+        if legacy_https_redirect {
+            let port = https_redirect_port;
+            context.redirect_location = Some(build_redirect_location("https", context, port));
+        }
+
+        // ── 4. Basic auth check (only when `required_auth` was set) ────────
+        // The check iterates the full hash list in constant time (see
+        // `crate::protocol::mux::auth::check_basic`) so the time spent
+        // does not leak which hash matched, or whether any did at all.
+        // On failure, stash the cluster's `www_authenticate` realm so the
+        // 401 default-answer can render the matching `WWW-Authenticate`
+        // header. An empty realm causes the template engine to elide the
+        // header entirely (`or_elide_header = true`).
+        if frontend_required_auth
+            && !crate::protocol::mux::auth::check_basic(front, &authorized_hashes)
+        {
+            context.www_authenticate = www_authenticate.clone();
+            trace!(
+                "{} basic-auth check failed; emitting 401",
+                log_module_context!(context)
+            );
+            return Err(RetrieveClusterError::UnauthorizedRoute);
+        }
 
         Ok(cluster_id)
     }
@@ -586,6 +671,49 @@ impl Router {
                 .backend_from_cluster_id(cluster_id),
         }
     }
+}
+
+/// Resolve the protocol scheme to use when emitting a redirect's `Location`
+/// header. Maps the proto enum onto `"http"` / `"https"`, with `USE_SAME`
+/// preserving the request's scheme (HTTPS for TLS listeners, HTTP otherwise).
+fn resolve_redirect_scheme(scheme: RedirectScheme, context: &HttpContext) -> &'static str {
+    match scheme {
+        RedirectScheme::UseHttps => "https",
+        RedirectScheme::UseHttp => "http",
+        RedirectScheme::UseSame => {
+            if context.tls_server_name.is_some() {
+                "https"
+            } else {
+                "http"
+            }
+        }
+    }
+}
+
+/// Build the `Location` URL for a redirect response. Defaults the port
+/// suffix only when the operator provided one or when scheme defaults
+/// would mismatch (port 80 on https / 443 on http stays implicit).
+fn build_redirect_location(scheme: &str, context: &HttpContext, port: Option<u32>) -> String {
+    let authority = context.authority.as_deref().unwrap_or_default();
+    let path = context.path.as_deref().unwrap_or("/");
+    // Strip an existing `:port` from the authority — operators typically
+    // configure `https_redirect_port` precisely because the listener's
+    // port differs from the redirect target.
+    let host_only = match authority.rsplit_once(':') {
+        Some((host, port_part))
+            if !port_part.is_empty() && port_part.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            host
+        }
+        _ => authority,
+    };
+    let port_suffix = match port {
+        Some(80) if scheme == "http" => String::new(),
+        Some(443) if scheme == "https" => String::new(),
+        Some(p) => format!(":{p}"),
+        None => String::new(),
+    };
+    format!("{scheme}://{host_only}{port_suffix}{path}")
 }
 
 /// Exact-match test between an HTTP `:authority` / `Host` value and a TLS SNI.

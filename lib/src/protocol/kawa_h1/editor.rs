@@ -212,6 +212,21 @@ pub struct HttpContext {
     /// knob. Stored as an owned `String` so it survives a listener hot-reload
     /// that changes the value.
     pub sozu_id_header: String,
+    /// Resolved `Location` URL stashed by the routing layer when a frontend
+    /// triggers a permanent redirect (`RedirectPolicy::PERMANENT` or the
+    /// legacy `cluster.https_redirect`). Read by the default-answer 301
+    /// path so the response carries the correct target URL — including
+    /// optional `cluster.https_redirect_port` and rewrite-template captures.
+    /// `None` when the request is not redirecting.
+    pub redirect_location: Option<String>,
+    /// `WWW-Authenticate` realm stashed by the routing layer when a
+    /// frontend rejects an unauthenticated request (`required_auth = true`
+    /// without a valid `Authorization: Basic` header, or
+    /// `RedirectPolicy::UNAUTHORIZED`). Read by the default-answer 401
+    /// path so the response carries the cluster's configured
+    /// `www_authenticate` value. `None` falls back to template default
+    /// (header is elided when no realm is configured).
+    pub www_authenticate: Option<String>,
 }
 
 impl kawa::h1::ParserCallbacks<Checkout> for HttpContext {
@@ -270,6 +285,8 @@ impl HttpContext {
             tls_cipher: None,
             tls_alpn: None,
             sozu_id_header,
+            redirect_location: None,
+            www_authenticate: None,
         }
     }
 
