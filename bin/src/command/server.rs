@@ -238,8 +238,8 @@ impl CommandHub {
 
     fn register_client(&mut self, mut stream: UnixStream) {
         let token = self.next_session_token();
-        // Lisa LISA-012: previously the registration error was logged and
-        // we continued anyway, inserting a session whose underlying stream
+        // Previously the registration error was logged and we continued
+        // anyway, inserting a session whose underlying stream
         // had no mio readiness wired up. The session sat in
         // `self.clients` until manual cleanup. Treat registration failure
         // as terminal — drop the stream and return. The OS sends RST/EOF
@@ -254,8 +254,8 @@ impl CommandHub {
         let peer_cred = peer_cred_from_stream(&stream);
         let actor_comm = peer_cred.pid.and_then(peer_comm);
         let actor_user = peer_cred.uid.and_then(peer_user);
-        // SECURITY (CWE-770 / Lisa LISA-006): the client channel must NOT
-        // grow without bound. The previous `u64::MAX` ceiling combined with
+        // SECURITY (CWE-770): the client channel must NOT grow without
+        // bound. The previous `u64::MAX` ceiling combined with
         // the doubling growth in `Channel::readable()` and the absence of
         // `Vec::try_reserve` in `Buffer::grow` meant any same-UID local
         // process could send a single oversized length-prefixed message and
@@ -1161,7 +1161,7 @@ pub(crate) fn peer_cred_from_stream(_stream: &UnixStream) -> PeerCred {
 /// 15 chars per kernel spec). Best-effort; returns `None` on any error.
 /// Cheap (one file read per accept, which happens once per sozu CLI invocation).
 ///
-/// Lisa LISA-009 mitigation: between `getsockopt(SO_PEERCRED)` and this
+/// PID-reuse mitigation: between `getsockopt(SO_PEERCRED)` and this
 /// read, the peer PID could (a) exit and be recycled by the kernel, or
 /// (b) call `execve()` and become a different binary. To bind the comm
 /// string to the *same* process the SO_PEERCRED snapshot saw, we read
@@ -1202,8 +1202,8 @@ pub(crate) fn peer_comm(_pid: i32) -> Option<String> {
 /// Resolve a uid to a POSIX account name via `getpwuid_r` (NSS). Best-effort;
 /// returns `None` when NSS has no matching user or the lookup fails.
 ///
-/// Lisa LISA-008: `getpwuid_r` is **synchronous** and on a misconfigured
-/// host (SSSD wedge, LDAP timeout, broken nscd socket) can block the
+/// `getpwuid_r` is **synchronous** and on a misconfigured host (SSSD
+/// wedge, LDAP timeout, broken nscd socket) can block the
 /// main event loop for tens of seconds. This caches the last lookups
 /// in a process-local map so a steady-state operator UID is paid at
 /// most once per main lifetime. Capped via `MAX_PEER_USER_CACHE` to

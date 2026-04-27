@@ -187,8 +187,8 @@ impl Server {
                 return;
             }
         };
-        // Lisa LISA-007: optional UID allowlist. `None` preserves the
-        // historical behaviour (same-UID local process can do anything).
+        // Optional UID allowlist. `None` preserves the historical
+        // behaviour (same-UID local process can do anything).
         // When set, requests from UIDs outside the list are rejected
         // before dispatch — both read and write — and the rejection
         // appears in the audit trail via `client.finish_failure`.

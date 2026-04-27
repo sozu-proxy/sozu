@@ -56,8 +56,8 @@ macro_rules! store_or_reject {
     };
 }
 
-/// Per-trailer-block byte cap (Lisa LISA-101 trailer carve-out). HEADERS
-/// and trailers run independent budget counters against
+/// Per-trailer-block byte cap (trailer carve-out). HEADERS and trailers
+/// run independent budget counters against
 /// `SETTINGS_MAX_HEADER_LIST_SIZE`, so without a tighter trailer-only
 /// ceiling the effective per-stream cap doubles. Real-world gRPC trailer
 /// blocks observed in production are 1–4 KB; 8 KiB leaves comfortable
@@ -739,9 +739,9 @@ where
                                 host_conflict = true;
                             }
                             Some(_) => {
-                                // Lisa LISA-103: duplicate identical `host:`
-                                // headers are also malformed per RFC 9110
-                                // §7.2 ("a server MUST respond with a 400
+                                // Duplicate identical `host:` headers are
+                                // also malformed per RFC 9110 §7.2 ("a
+                                // server MUST respond with a 400
                                 // (Bad Request) status code to any HTTP/1.1
                                 // request message that lacks a Host header
                                 // field and to any request message that
@@ -1004,8 +1004,8 @@ pub fn handle_trailer(
     let mut invalid_trailers = false;
     let mut budget_exceeded = false;
     let mut decoded_bytes: usize = 0;
-    // Lisa LISA-101: HEADERS and trailers each tracked an independent
-    // `decoded_bytes` counter against `max_header_list_size`, so the
+    // HEADERS and trailers each tracked an independent `decoded_bytes`
+    // counter against `max_header_list_size`, so the
     // effective per-stream budget was `2 × MAX_HEADER_LIST_SIZE`
     // (~128 KiB at the default). True per-stream cumulative tracking
     // would require plumbing a shared counter through the `Stream`

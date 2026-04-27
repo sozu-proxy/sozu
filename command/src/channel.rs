@@ -413,8 +413,8 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
     ) -> Result<Rx, ChannelError> {
         let now = std::time::Instant::now();
 
-        // Lisa LISA-010: 10 ms = 100 syscalls/sec on idle WouldBlock,
-        // pinning a CPU on long blocking waits with no payload. 100 ms is
+        // 10 ms = 100 syscalls/sec on idle WouldBlock, pinning a CPU on
+        // long blocking waits with no payload. 100 ms is
         // a usability-acceptable resolution for the outer `timeout`
         // deadline check (the wait is bounded by `timeout`, not by this
         // value) and drops the steady-state read syscall rate to 10/sec.
@@ -456,8 +456,8 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
                 .map_err(|_| ChannelError::MismatchBufferSize)?;
             let message_len = usize::from_le_bytes(delimiter);
 
-            // Lisa LISA-011 (defense in depth): bound the parser-side
-            // length up-front. Without this an attacker who controls the
+            // Defense in depth: bound the parser-side length up-front.
+            // Without this an attacker who controls the
             // first 8 bytes of a frame can declare an arbitrarily large
             // message and drive `Buffer::grow` toward the
             // `max_buffer_size` ceiling before any byte of payload has

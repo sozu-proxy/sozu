@@ -304,8 +304,8 @@ impl HttpsSession {
         // §3 — `HostName` is a dns_name, no port).
         // RFC 1034 §3.1 absolute-form: `example.com.` and `example.com`
         // are the same host. rustls hands us the wire-form SNI verbatim;
-        // strip a single trailing dot (Lisa LISA-TLS-002) so a legitimate
-        // client emitting absolute-form SNI does not get its
+        // strip a single trailing dot so a legitimate client emitting
+        // absolute-form SNI does not get its
         // `host` / `:authority` rejected by `authority_matches_sni` for a
         // length mismatch. Empty / no-SNI is unaffected.
         let sni_owned: Option<String> = handshake
@@ -350,8 +350,8 @@ impl HttpsSession {
             }
             Some("h2") => (AlpnProtocol::H2, Some("h2")),
             Some(other) => {
-                // Lisa LISA-TLS-005: this branch was not metered, so any
-                // operator dashboard graphing `https.alpn.rejected.*`
+                // This branch was not metered, so any operator dashboard
+                // graphing `https.alpn.rejected.*`
                 // missed unknown-protocol refusals (e.g. an `h3` mistake
                 // bleeding through some misconfiguration). Add a dedicated
                 // counter so the SOC's "ALPN refusal" ratebar matches the
