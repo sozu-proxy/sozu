@@ -811,6 +811,7 @@ impl ListenerBuilder {
             h2_stream_idle_timeout_seconds: self.h2_stream_idle_timeout_seconds,
             h2_graceful_shutdown_deadline_seconds: self.h2_graceful_shutdown_deadline_seconds,
             sozu_id_header: self.sozu_id_header.clone(),
+            ..Default::default()
         };
 
         Ok(https_listener_config)
@@ -1234,6 +1235,7 @@ impl HttpFrontendConfig {
                     method: self.method.clone(),
                     position: self.position.into(),
                     tags,
+                    ..Default::default()
                 })
                 .into(),
             );
@@ -1248,6 +1250,7 @@ impl HttpFrontendConfig {
                     method: self.method.clone(),
                     position: self.position.into(),
                     tags,
+                    ..Default::default()
                 })
                 .into(),
             );
@@ -1283,6 +1286,7 @@ impl HttpClusterConfig {
                 answer_503: self.answer_503.clone(),
                 load_metric: self.load_metric.map(|s| s as i32),
                 http2: self.http2,
+                ..Default::default()
             })
             .into(),
         ];
@@ -1345,6 +1349,7 @@ impl TcpClusterConfig {
                 load_metric: self.load_metric.map(|s| s as i32),
                 answer_503: None,
                 http2: None,
+                ..Default::default()
             })
             .into(),
         ];

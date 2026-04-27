@@ -30,6 +30,16 @@ pub fn main() {
         .message_attribute("Response", "#[derive(Hash, Eq)]")
         .message_attribute("InitialState", "#[derive(Hash, Eq)]")
         .message_attribute("ProtobufAccessLog", "#[derive(Hash, Eq)]")
+        // The messages below carry at least one `map<string, string>` field
+        // (`tags`, `answers`) or a nested `Header` value. prost stops
+        // auto-deriving `Hash`/`Eq` once a map appears, and downstream code
+        // (state-diff hashing, IPC framing, request fan-out) needs both
+        // traits, so re-attach them explicitly here.
+        .message_attribute("Cluster", "#[derive(Hash, Eq)]")
+        .message_attribute("HttpListenerConfig", "#[derive(Hash, Eq)]")
+        .message_attribute("HttpsListenerConfig", "#[derive(Hash, Eq)]")
+        .message_attribute("UpdateHttpListenerConfig", "#[derive(Hash, Eq)]")
+        .message_attribute("UpdateHttpsListenerConfig", "#[derive(Hash, Eq)]")
         .enum_attribute(".", "#[serde(rename_all = \"SCREAMING_SNAKE_CASE\")]")
         .enum_attribute(
             "ResponseContent.content_type",
