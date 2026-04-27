@@ -1302,13 +1302,13 @@ pub(crate) fn parse_header_edit(
             });
         }
     };
-    if header_bytes_contain_forbidden_controls(entry.key.as_bytes()) {
+    if !header_name_is_valid_token(entry.key.as_bytes()) {
         return Err(ConfigError::InvalidHeaderBytes {
             index,
             field: "key",
         });
     }
-    if header_bytes_contain_forbidden_controls(entry.value.as_bytes()) {
+    if header_value_contains_forbidden_controls(entry.value.as_bytes()) {
         return Err(ConfigError::InvalidHeaderBytes {
             index,
             field: "value",
@@ -1321,14 +1321,51 @@ pub(crate) fn parse_header_edit(
     })
 }
 
-/// Reject any byte value that would let a header injection escape the
-/// header block on the wire (RFC 9110 §5.5 / RFC 9113 §8.2.1):
-/// `\0..=\x08`, `\x0A..=\x1F`, and `\x7F` (so the entire C0 control set
+/// Field names follow the RFC 9110 §5.1 `token` grammar: non-empty,
+/// composed of `tchar` bytes (alphanumeric plus a closed punctuation
+/// list). HTAB and SP are NOT tchar — they belong to field-value
+/// grammar and must be rejected in the name. Reusing the more
+/// permissive value-side filter would let `Host\t` slip through and
+/// produce an invalid header line on the H1 wire (security review
+/// LISA-002 follow-up).
+pub(crate) fn header_name_is_valid_token(bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return false;
+    }
+    bytes.iter().all(|&b| is_tchar(b))
+}
+
+/// `tchar = "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-" / "." /
+/// "^" / "_" / "`" / "|" / "~" / DIGIT / ALPHA` per RFC 9110 §5.6.2.
+fn is_tchar(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+/// Reject any byte that would let a header injection escape the value
+/// block on the wire (RFC 9110 §5.5 / RFC 9113 §8.2.1):
+/// `\0..=\x08`, `\x0A..=\x1F`, and `\x7F` — the entire C0 control set
 /// minus horizontal tab `\x09`, which RFC 9110 explicitly permits in
-/// field values). Mirrors the runtime filter at
+/// field values. Mirrors the runtime filter at
 /// `lib/src/protocol/mux/converter.rs::call` so config-load and runtime
 /// agree on which header values may travel.
-pub(crate) fn header_bytes_contain_forbidden_controls(bytes: &[u8]) -> bool {
+pub(crate) fn header_value_contains_forbidden_controls(bytes: &[u8]) -> bool {
     bytes
         .iter()
         .any(|&b| matches!(b, 0x00..=0x08 | 0x0A..=0x1F | 0x7F))
@@ -3054,9 +3091,10 @@ mod tests {
     }
 
     /// Horizontal tab `\t` (0x09) is permitted in field values per
-    /// RFC 9110 §5.5 (folded-header obs-fold parts). The validator
-    /// must NOT reject it — otherwise legitimate operator configs
-    /// (e.g. `Authorization: Basic\tCREDENTIALS`) become unusable.
+    /// RFC 9110 §5.5 (folded-header obs-fold parts). The value-side
+    /// validator must NOT reject it — otherwise legitimate operator
+    /// configs (e.g. `Authorization: Basic\tCREDENTIALS`) become
+    /// unusable. The key-side validator IS stricter (token grammar).
     #[test]
     fn parse_header_edit_accepts_tab_in_value() {
         let entry = HeaderEditConfig {
@@ -3066,6 +3104,51 @@ mod tests {
         };
         let header = parse_header_edit(0, &entry).expect("tab in value must be accepted");
         assert_eq!(header.val, "with\ttab");
+    }
+
+    /// Header NAMES follow `token` grammar per RFC 9110 §5.1. HTAB and
+    /// SP are NOT tchar; the key-side validator must reject them even
+    /// though the value-side validator permits HTAB. Without this,
+    /// an operator entry like `key = "Host\t"` would emit `Host\t: …`
+    /// on the H1 wire and produce an invalid (but parser-tolerant)
+    /// header line that some backends silently accept as `Host:`.
+    #[test]
+    fn parse_header_edit_rejects_tab_in_key() {
+        let entry = HeaderEditConfig {
+            position: "request".to_owned(),
+            key: "Host\t".to_owned(),
+            value: "ok".to_owned(),
+        };
+        let err = parse_header_edit(0, &entry).expect_err("HTAB in key must be rejected");
+        match err {
+            ConfigError::InvalidHeaderBytes { field, .. } => assert_eq!(field, "key"),
+            other => panic!("expected InvalidHeaderBytes{{field=\"key\"}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_header_edit_rejects_space_in_key() {
+        let entry = HeaderEditConfig {
+            position: "request".to_owned(),
+            key: "X Test".to_owned(),
+            value: "ok".to_owned(),
+        };
+        let err = parse_header_edit(0, &entry).expect_err("SP in key must be rejected");
+        assert!(matches!(err, ConfigError::InvalidHeaderBytes { .. }));
+    }
+
+    #[test]
+    fn parse_header_edit_rejects_empty_key() {
+        let entry = HeaderEditConfig {
+            position: "request".to_owned(),
+            key: String::new(),
+            value: "ok".to_owned(),
+        };
+        let err = parse_header_edit(0, &entry).expect_err("empty key must be rejected");
+        assert!(matches!(
+            err,
+            ConfigError::InvalidHeaderBytes { field: "key", .. }
+        ));
     }
 
     #[test]
