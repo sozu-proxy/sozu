@@ -111,10 +111,20 @@ fn ensure_default_answer_end_stream(kawa: &mut GenericHttpStream) {
 ///
 /// The mux layer does not have HTTP/1.1 parse state, so error-detail fields
 /// (`message`, `phase`, `successfully_parsed`, etc.) are filled with neutral
-/// placeholders. The 301 redirect is the only code that needs real context data
-/// and is therefore handled inline in [`set_default_answer`].
-fn default_answer_for_code(code: u16) -> DefaultAnswer {
+/// placeholders. The 301 redirect and 401 unauthorized variants take the
+/// caller-supplied context (the `Location` URL and the `WWW-Authenticate`
+/// realm respectively) so the routing layer can drive both `https_redirect`
+/// and the explicit `RedirectPolicy::PERMANENT` /
+/// `RedirectPolicy::UNAUTHORIZED` policies through the same chokepoint.
+fn default_answer_for_code(
+    code: u16,
+    redirect_location: Option<&str>,
+    www_authenticate: Option<&str>,
+) -> DefaultAnswer {
     match code {
+        301 => DefaultAnswer::Answer301 {
+            location: redirect_location.unwrap_or_default().to_owned(),
+        },
         400 => DefaultAnswer::Answer400 {
             message: String::new(),
             phase: kawa::ParsingPhaseMarker::Error,
@@ -123,10 +133,12 @@ fn default_answer_for_code(code: u16) -> DefaultAnswer {
             invalid: "null".to_owned(),
         },
         401 => DefaultAnswer::Answer401 {
-            // Wave 3a will populate the realm from the cluster config; for
-            // now emit a bare 401 — the template engine elides the
-            // `WWW-Authenticate` header when the value is empty.
-            www_authenticate: None,
+            // The realm flows in from `cluster.www_authenticate` via
+            // `HttpContext.www_authenticate`. The template engine elides
+            // the `WWW-Authenticate` header when the value is empty
+            // (`or_elide_header = true`) so a None / empty realm yields
+            // a plain 401 without a synthetic header.
+            www_authenticate: www_authenticate.map(str::to_owned),
         },
         404 => DefaultAnswer::Answer404 {},
         408 => DefaultAnswer::Answer408 {
@@ -186,17 +198,27 @@ pub(crate) fn set_default_answer(
         context.backend_id.as_deref()
     );
 
-    let answer = if code == 301 {
-        DefaultAnswer::Answer301 {
-            location: format!(
+    // Routing layer stashes both the resolved `Location` URL (for 301) and
+    // the `WWW-Authenticate` realm (for 401). Fall back to the legacy
+    // `https://<authority><path>` shape when no explicit redirect target was
+    // computed — this preserves behaviour for the historical
+    // `cluster.https_redirect = true` path that did not carry per-frontend
+    // policy.
+    let fallback_location;
+    let redirect_location = match context.redirect_location.as_deref() {
+        Some(l) => Some(l),
+        None if code == 301 => {
+            fallback_location = format!(
                 "https://{}{}",
                 context.authority.as_deref().unwrap_or_default(),
                 context.path.as_deref().unwrap_or_default()
-            ),
+            );
+            Some(fallback_location.as_str())
         }
-    } else {
-        default_answer_for_code(code)
+        None => None,
     };
+    let answer =
+        default_answer_for_code(code, redirect_location, context.www_authenticate.as_deref());
 
     let request_id = context.id.to_string();
     let route = context.get_route();
@@ -283,6 +305,8 @@ mod tests {
             tls_cipher: None,
             tls_alpn: None,
             sozu_id_header: String::from("Sozu-Id"),
+            redirect_location: None,
+            www_authenticate: None,
         };
         let stream =
             Stream::new(Rc::downgrade(&pool), http_ctx, 65_535).expect("pool checkout failed");
