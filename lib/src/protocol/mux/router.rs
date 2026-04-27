@@ -20,8 +20,11 @@ use crate::{
     BackendConnectionError, L7ListenerHandler, L7Proxy, ListenerHandler, ProxySession, Readiness,
     RetrieveClusterError,
     backends::{Backend, BackendError},
-    protocol::http::editor::HttpContext,
-    router::RouteResult,
+    protocol::{
+        http::editor::{HeaderEditSnapshot, HttpContext},
+        kawa_h1::parser::compare_no_case,
+    },
+    router::{HeaderEdit, RouteResult},
     server::CONN_RETRIES,
     socket::SessionTcpStream,
     timer::TimeoutContainer,
@@ -122,13 +125,15 @@ impl Router {
         }
         stream.attempts += 1;
 
-        // Borrow the front kawa first (immutable, lives until route_from_request returns)
-        // and the context mutably so route_from_request can stash redirect_location /
-        // www_authenticate. We split the borrows manually to keep the rest of `connect`
-        // working with `stream_context` aliasing `stream.context`.
+        // Borrow front mutably (so route_from_request can rewrite the request
+        // line authority/path and inject request-side header edits before we
+        // forward to the backend) plus context mutably (so it can stash
+        // redirect_location / www_authenticate / original_authority /
+        // headers_response). We split-borrow manually to keep the rest of
+        // `connect` working with `stream_context` aliasing `stream.context`.
         let (front_ref, stream_context_ref) = {
             let stream_split = &mut *stream;
-            (&stream_split.front, &mut stream_split.context)
+            (&mut stream_split.front, &mut stream_split.context)
         };
         let cluster_id = self
             .route_from_request(stream_context_ref, front_ref, &context.listener, &proxy)
@@ -467,7 +472,7 @@ impl Router {
     fn route_from_request<L: ListenerHandler + L7ListenerHandler>(
         &mut self,
         context: &mut HttpContext,
-        front: &super::GenericHttpStream,
+        front: &mut super::GenericHttpStream,
         listener: &Rc<RefCell<L>>,
         proxy: &Rc<RefCell<dyn L7Proxy>>,
     ) -> Result<String, RetrieveClusterError> {
@@ -536,7 +541,11 @@ impl Router {
             cluster_id,
             redirect,
             redirect_scheme,
+            rewritten_host,
+            rewritten_path,
             rewritten_port,
+            headers_request,
+            headers_response,
             required_auth: frontend_required_auth,
             ..
         } = route;
@@ -613,6 +622,29 @@ impl Router {
             return Err(RetrieveClusterError::UnauthorizedRoute);
         }
 
+        // ── 5. Request-side mutations on the front kawa ────────────────────
+        // From here on the route is a Forward — apply the frontend's
+        // rewrite + header policy to the request kawa so the backend
+        // wire carries the operator-configured shape.
+        apply_request_rewrites_and_headers(
+            front,
+            context,
+            rewritten_host.as_deref(),
+            rewritten_path.as_deref(),
+            &headers_request,
+        );
+
+        // Stash the response-side header edits for the emission path
+        // (`mux/h1.rs::writable`, `mux/h2.rs::write_streams`) to apply
+        // before `kawa.prepare(...)`.
+        context.headers_response.clear();
+        for edit in headers_response.iter() {
+            context.headers_response.push(HeaderEditSnapshot {
+                key: edit.key.to_vec(),
+                val: edit.val.to_vec(),
+            });
+        }
+
         Ok(cluster_id)
     }
 
@@ -674,6 +706,151 @@ impl Router {
                 .borrow_mut()
                 .backend_from_cluster_id(cluster_id),
         }
+    }
+}
+
+/// Apply the frontend's request-side rewrite + header policy to the
+/// request kawa. Mutations land before backend connect so the backend
+/// wire carries the rewritten shape:
+///
+/// 1. If `rewritten_host` is set, capture the original authority into
+///    `context.original_authority`, replace the request-line authority
+///    with the rewritten value, replace the `Host` request header (so
+///    H1 backends see the same value the H2 `:authority` would carry),
+///    and inject `X-Forwarded-Host` carrying the original.
+/// 2. If `rewritten_path` is set, replace the request-line path.
+/// 3. For every `headers_request` edit:
+///    - empty `val` → remove every existing header with the matching
+///      name from `kawa.blocks` (HAProxy `del-header` parity);
+///    - non-empty `val` → append the header before the `end_header`
+///      flag block. Set/replace semantics: callers that want to replace
+///      a header pass two edits (one delete with empty val, one set
+///      with the new value).
+fn apply_request_rewrites_and_headers(
+    kawa: &mut super::GenericHttpStream,
+    context: &mut HttpContext,
+    rewritten_host: Option<&str>,
+    rewritten_path: Option<&str>,
+    headers_request: &[HeaderEdit],
+) {
+    use kawa::{Block, Pair, Store};
+
+    if rewritten_host.is_none() && rewritten_path.is_none() && headers_request.is_empty() {
+        return;
+    }
+
+    // Capture the pre-rewrite authority so the X-Forwarded-Host we
+    // inject below carries what the client actually sent. Read off the
+    // request-line authority Store rather than the existing `Host:`
+    // header so H2 frontends (which never carry a literal `Host:`) get
+    // the same X-Forwarded-Host shape as H1.
+    let original_authority = if rewritten_host.is_some() {
+        let buf = kawa.storage.buffer();
+        if let kawa::StatusLine::Request { authority, .. } = &kawa.detached.status_line {
+            std::str::from_utf8(authority.data(buf))
+                .ok()
+                .map(str::to_owned)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // ── status-line authority / path rewrites ─────────────────────────
+    if rewritten_host.is_some() || rewritten_path.is_some() {
+        if let kawa::StatusLine::Request {
+            authority, path, ..
+        } = &mut kawa.detached.status_line
+        {
+            if let Some(new_host) = rewritten_host {
+                *authority = Store::from_string(new_host.to_owned());
+            }
+            if let Some(new_path) = rewritten_path {
+                *path = Store::from_string(new_path.to_owned());
+            }
+        }
+    }
+
+    // ── delete pass on existing blocks ────────────────────────────────
+    // Collect lowercase keys of every "delete this header" edit and the
+    // synthetic `Host` / `X-Forwarded-Host` keys we know we're about to
+    // overwrite. Filter `kawa.blocks` once with a single retain pass.
+    let buf_ptr = kawa.storage.buffer();
+    let host_lower = b"host";
+    let xfh_lower = b"x-forwarded-host";
+    let rewriting_host = rewritten_host.is_some();
+    let mut keys_to_drop: Vec<Vec<u8>> = headers_request
+        .iter()
+        .filter(|e| e.val.is_empty())
+        .map(|e| e.key.iter().map(u8::to_ascii_lowercase).collect())
+        .collect();
+    if rewriting_host {
+        keys_to_drop.push(host_lower.to_vec());
+        keys_to_drop.push(xfh_lower.to_vec());
+    }
+    if !keys_to_drop.is_empty() {
+        // SAFETY: we only read `key.data(buf_ptr)` while `kawa.blocks`
+        // is borrowed immutably during retain — buf_ptr is the same
+        // backing buffer.
+        let buf = buf_ptr;
+        kawa.blocks.retain(|block| {
+            if let Block::Header(Pair { key, val: _ }) = block {
+                let key_bytes = key.data(buf);
+                let key_lower: Vec<u8> = key_bytes.iter().map(u8::to_ascii_lowercase).collect();
+                !keys_to_drop.iter().any(|k| compare_no_case(&key_lower, k))
+            } else {
+                true
+            }
+        });
+    }
+
+    // ── insertion before the end-of-headers flag ──────────────────────
+    // Every header we add (rewritten Host, X-Forwarded-Host,
+    // operator-supplied set/append edits) must land before
+    // `Block::Flags { end_header: true }` so the converter emits them
+    // as part of the request header block.
+    let end_header_idx = kawa.blocks.iter().position(|b| {
+        matches!(
+            b,
+            Block::Flags(kawa::Flags {
+                end_header: true,
+                ..
+            })
+        )
+    });
+
+    let mut to_insert: Vec<Block> = Vec::new();
+    if let Some(new_host) = rewritten_host {
+        to_insert.push(Block::Header(Pair {
+            key: Store::Static(b"Host"),
+            val: Store::from_string(new_host.to_owned()),
+        }));
+        if let Some(orig) = original_authority.as_deref() {
+            to_insert.push(Block::Header(Pair {
+                key: Store::Static(b"X-Forwarded-Host"),
+                val: Store::from_string(orig.to_owned()),
+            }));
+        }
+    }
+    for edit in headers_request {
+        if edit.val.is_empty() {
+            continue;
+        }
+        to_insert.push(Block::Header(Pair {
+            key: Store::from_slice(&edit.key),
+            val: Store::from_slice(&edit.val),
+        }));
+    }
+    if !to_insert.is_empty() {
+        let insert_at = end_header_idx.unwrap_or(kawa.blocks.len());
+        for (offset, block) in to_insert.into_iter().enumerate() {
+            kawa.blocks.insert(insert_at + offset, block);
+        }
+    }
+
+    if rewriting_host {
+        context.original_authority = original_authority;
     }
 }
 

@@ -6,9 +6,12 @@
 //! load-bearing for TLS close_notify ordering (see agent memory
 //! `feedback_tls_write_symmetry`).
 
-use crate::socket::{SocketHandler, SocketResult};
+use crate::{
+    protocol::{http::editor::HeaderEditSnapshot, kawa_h1::parser::compare_no_case},
+    socket::{SocketHandler, SocketResult},
+};
 
-use super::Stream;
+use super::{GenericHttpStream, Stream};
 
 /// Decision returned by [`end_stream_decision`] for the server-side end-of-stream path.
 ///
@@ -90,4 +93,73 @@ pub(super) fn drain_tls_close_notify<S: SocketHandler>(
         }
     }
     (socket.socket_wants_write(), drain_rounds)
+}
+
+/// Apply per-frontend response-side header edits to a response kawa
+/// just before [`kawa::Kawa::prepare`] runs. Mirrors the request-side
+/// pass that `Router::route_from_request` runs against the front kawa
+/// at routing time:
+///
+/// - empty `val` → remove every existing header with the matching name
+///   from `kawa.blocks` (HAProxy `del-header` parity);
+/// - non-empty `val` → append the header before the `end_header` flag
+///   block.
+///
+/// Both H1 and H2 emission paths funnel through here so the on-wire
+/// header set stays consistent. Per-edit set/replace semantics are
+/// expressed as two entries: one with empty `val` (delete) followed by
+/// one with the new value (set).
+pub(super) fn apply_response_header_edits(
+    kawa: &mut GenericHttpStream,
+    edits: &[HeaderEditSnapshot],
+) {
+    use kawa::{Block, Pair, Store};
+
+    if edits.is_empty() {
+        return;
+    }
+
+    let keys_to_drop: Vec<Vec<u8>> = edits
+        .iter()
+        .filter(|e| e.val.is_empty())
+        .map(|e| e.key.iter().map(u8::to_ascii_lowercase).collect())
+        .collect();
+    if !keys_to_drop.is_empty() {
+        let buf = kawa.storage.buffer();
+        kawa.blocks.retain(|block| {
+            if let Block::Header(Pair { key, val: _ }) = block {
+                let key_lower: Vec<u8> = key.data(buf).iter().map(u8::to_ascii_lowercase).collect();
+                !keys_to_drop.iter().any(|k| compare_no_case(&key_lower, k))
+            } else {
+                true
+            }
+        });
+    }
+
+    let end_header_idx = kawa.blocks.iter().position(|b| {
+        matches!(
+            b,
+            Block::Flags(kawa::Flags {
+                end_header: true,
+                ..
+            })
+        )
+    });
+
+    let mut to_insert: Vec<Block> = Vec::new();
+    for edit in edits {
+        if edit.val.is_empty() {
+            continue;
+        }
+        to_insert.push(Block::Header(Pair {
+            key: Store::from_slice(&edit.key),
+            val: Store::from_slice(&edit.val),
+        }));
+    }
+    if !to_insert.is_empty() {
+        let insert_at = end_header_idx.unwrap_or(kawa.blocks.len());
+        for (offset, block) in to_insert.into_iter().enumerate() {
+            kawa.blocks.insert(insert_at + offset, block);
+        }
+    }
 }

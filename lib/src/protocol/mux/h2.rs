@@ -2488,6 +2488,20 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         }
                     }
                 }
+                // Apply per-frontend response-side header edits
+                // (set/replace/delete) stashed by the routing layer at
+                // request time. H2 frontends always run as Server
+                // position; the back-side H2 client (when sozu speaks
+                // H2 to a backend) is a request emission and was
+                // already mutated by Router::route_from_request.
+                if matches!(self.position, super::Position::Server)
+                    && !parts.context.headers_response.is_empty()
+                {
+                    super::shared::apply_response_header_edits(
+                        kawa,
+                        &parts.context.headers_response,
+                    );
+                }
                 kawa.prepare(&mut converter);
                 let consumed = window - converter.window;
                 *parts.window = parts.window.saturating_sub(consumed);
@@ -7284,6 +7298,8 @@ mod tests {
             sozu_id_header: String::from("Sozu-Id"),
             redirect_location: None,
             www_authenticate: None,
+            original_authority: None,
+            headers_response: Vec::new(),
         };
         Stream::new(Rc::downgrade(pool), http_ctx, 65_535)
             .expect("pool should have capacity for two buffers")

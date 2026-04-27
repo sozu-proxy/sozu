@@ -307,6 +307,8 @@ mod tests {
             sozu_id_header: String::from("Sozu-Id"),
             redirect_location: None,
             www_authenticate: None,
+            original_authority: None,
+            headers_response: Vec::new(),
         };
         let stream =
             Stream::new(Rc::downgrade(&pool), http_ctx, 65_535).expect("pool checkout failed");

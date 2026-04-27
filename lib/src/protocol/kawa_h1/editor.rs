@@ -227,6 +227,29 @@ pub struct HttpContext {
     /// `www_authenticate` value. `None` falls back to template default
     /// (header is elided when no realm is configured).
     pub www_authenticate: Option<String>,
+    /// Original authority captured before a rewrite-host fired; emitted
+    /// back to the backend as `X-Forwarded-Host` so the backend can
+    /// reconstruct the public URL even though `:authority` / `Host` was
+    /// rewritten on the wire. `None` when no host rewrite happened.
+    pub original_authority: Option<String>,
+    /// Per-frontend response-side header edits (set/replace/delete)
+    /// stashed by the routing layer for the emission boundary in
+    /// `mux/h1.rs::writable` and `mux/h2.rs::write_streams` to apply
+    /// before `kawa.prepare(...)`. Empty when the frontend has no
+    /// response-side header policy. An entry with an empty `val`
+    /// deletes the header by name (HAProxy `del-header` parity); a
+    /// non-empty `val` set/replaces.
+    pub headers_response: Vec<HeaderEditSnapshot>,
+}
+
+/// Owned snapshot of a per-frontend header edit, captured at routing
+/// time so the emission boundary can apply set/replace/delete without
+/// touching the routing layer's `Rc<[HeaderEdit]>` slices. Empty `val`
+/// deletes the header by name (HAProxy `del-header` parity).
+#[derive(Debug, Clone)]
+pub struct HeaderEditSnapshot {
+    pub key: Vec<u8>,
+    pub val: Vec<u8>,
 }
 
 impl kawa::h1::ParserCallbacks<Checkout> for HttpContext {
@@ -287,6 +310,8 @@ impl HttpContext {
             sozu_id_header,
             redirect_location: None,
             www_authenticate: None,
+            original_authority: None,
+            headers_response: Vec::new(),
         }
     }
 
@@ -663,6 +688,8 @@ impl HttpContext {
         self.xff_chain = None;
         self.redirect_location = None;
         self.www_authenticate = None;
+        self.original_authority = None;
+        self.headers_response.clear();
         // Note: tls_server_name, tls_version, tls_cipher, tls_alpn,
         // strict_sni_binding are connection-scoped — set once at handshake
         // completion and reused across every keep-alive request, so reset()
@@ -857,6 +884,11 @@ mod tests {
         ctx.xff_chain = Some("203.0.113.5, 198.51.100.10".to_owned());
         ctx.redirect_location = Some("https://example.com/".to_owned());
         ctx.www_authenticate = Some("Basic realm=\"sozu\"".to_owned());
+        ctx.original_authority = Some("old.example.com".to_owned());
+        ctx.headers_response.push(HeaderEditSnapshot {
+            key: b"X-Cache".to_vec(),
+            val: b"HIT".to_vec(),
+        });
 
         ctx.reset();
 
@@ -871,12 +903,16 @@ mod tests {
         assert!(ctx.user_agent.is_none());
         assert!(ctx.x_request_id.is_none());
         assert!(ctx.xff_chain.is_none());
-        // The two stash slots written by the routing layer must clear
+        // The four stash slots written by the routing layer must clear
         // between pipelined H1 requests; otherwise a future code path that
         // emits a 301 / 401 default-answer without re-routing would
-        // inherit a stale Location / WWW-Authenticate from a prior request.
+        // inherit a stale Location / WWW-Authenticate from a prior request,
+        // or the backend would receive a stale X-Forwarded-Host or a stale
+        // response-side header edit.
         assert!(ctx.redirect_location.is_none());
         assert!(ctx.www_authenticate.is_none());
+        assert!(ctx.original_authority.is_none());
+        assert!(ctx.headers_response.is_empty());
     }
 
     #[test]

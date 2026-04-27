@@ -425,6 +425,14 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         let stream = &mut context.streams[stream_id];
         let parts = stream.split(&self.position);
         let kawa = parts.wbuffer;
+        // Apply per-frontend response-side header edits stashed by the
+        // routing layer at request time. Only the Server-position pass
+        // touches the response back-kawa; the Client-position pass
+        // (writing the request to the backend) has already had its
+        // edits applied in `Router::route_from_request`.
+        if matches!(self.position, Position::Server) && !parts.context.headers_response.is_empty() {
+            super::shared::apply_response_header_edits(kawa, &parts.context.headers_response);
+        }
         kawa.prepare(&mut kawa::h1::BlockConverter);
         let mut io_slices = Vec::new();
         for block in kawa.out.iter() {
