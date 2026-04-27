@@ -569,7 +569,12 @@ impl Router {
             return Err(RetrieveClusterError::UnauthorizedRoute);
         }
 
-        let cluster_id = cluster_id.expect("cluster_id is Some at this point");
+        let Some(cluster_id) = cluster_id else {
+            // Guarded by the clusterless-deny branch immediately above;
+            // the `is_none()` arm has already returned `UnauthorizedRoute`
+            // by the time control reaches here.
+            unreachable!("cluster_id was checked Some above")
+        };
 
         // ── 2. Explicit `RedirectPolicy::PERMANENT` ─────────────────────────
         if matches!(redirect, RedirectPolicy::Permanent) {
@@ -580,12 +585,11 @@ impl Router {
         }
 
         // ── 3. Legacy `cluster.https_redirect` (HTTP-only listeners) ───────
-        // The caller (`Router::connect`) still gates on listener kind so a
-        // plaintext listener's HTTP→HTTPS redirect rolls through the same
-        // 301 default-answer path. We compute the URL here so the
-        // listener-kind branch in `connect` only needs to bubble up
-        // `RetrieveClusterError::HttpsRedirect`.
-        if legacy_https_redirect {
+        // The caller (`Router::connect`) emits the actual 301 only on
+        // `ListenerType::Http`; gate the URL stash on the same predicate
+        // so an HTTPS listener never carries a stale `redirect_location`
+        // into a downstream default-answer path.
+        if legacy_https_redirect && matches!(proxy.borrow().kind(), ListenerType::Http) {
             let port = https_redirect_port;
             context.redirect_location = Some(build_redirect_location("https", context, port));
         }

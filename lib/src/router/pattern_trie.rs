@@ -656,6 +656,50 @@ mod tests {
         );
     }
 
+    /// Segment regexes must match the entire segment, not just a prefix.
+    /// Without `\A...\z` anchoring the previous behaviour matched any
+    /// segment whose prefix satisfied the pattern, silently widening the
+    /// routing surface. This regression test exercises the exact-match
+    /// invariant that anchoring guarantees.
+    #[test]
+    fn segment_regex_rejects_partial_matches() {
+        let mut root: TrieNode<u8> = TrieNode::root();
+        // The regex segment `cdn[0-9]+` must match `cdn1`, `cdn99`, etc.
+        // exactly — never `cdn1xxx` or `xxxcdn1` as a prefix/suffix.
+        assert_eq!(
+            root.insert(Vec::from(&b"/cdn[0-9]+/.example.com"[..]), 7),
+            InsertResult::Ok
+        );
+
+        // Exact-match cases still resolve.
+        assert_eq!(
+            root.domain_lookup(b"cdn1.example.com".as_ref(), false),
+            Some(&(b"/cdn[0-9]+/.example.com".to_vec(), 7))
+        );
+        assert_eq!(
+            root.domain_lookup(b"cdn123.example.com".as_ref(), false),
+            Some(&(b"/cdn[0-9]+/.example.com".to_vec(), 7))
+        );
+
+        // Trailing characters past the digit run must fail. Pre-anchoring
+        // the trie would have matched `cdn1xxx` because `cdn[0-9]+` ate
+        // the `cdn1` prefix; with `\A...\z` the segment is rejected.
+        assert_eq!(
+            root.domain_lookup(b"cdn1xxx.example.com".as_ref(), false),
+            None
+        );
+        // Leading characters likewise must fail.
+        assert_eq!(
+            root.domain_lookup(b"xxxcdn1.example.com".as_ref(), false),
+            None
+        );
+        // Non-digit middle bytes break the digit run and the segment.
+        assert_eq!(
+            root.domain_lookup(b"cdnabc.example.com".as_ref(), false),
+            None
+        );
+    }
+
     #[test]
     fn add_child_to_leaf() {
         let mut root1: TrieNode<u8> = TrieNode::root();

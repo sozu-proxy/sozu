@@ -618,6 +618,12 @@ enum RedirectScheme {
 // preparation). Mirrors HAProxy `http-request set-header` /
 // `http-response set-header` parity.
 enum HeaderPosition {
+    // Reserve 0 for the proto-default-encoded shape so a `Header` written
+    // by `..Default::default()` (or by an older client) deserialises into
+    // an explicit "unset" rather than failing `HeaderPosition::try_from(0)`.
+    // The runtime treats this as a hard config error and rejects the
+    // header rather than guessing a position.
+    HEADER_POSITION_UNSPECIFIED = 0;
     REQUEST = 1;
     RESPONSE = 2;
     BOTH = 3;

@@ -25,9 +25,10 @@ use crate::{
 };
 
 /// Module-level prefix tag for `lib/src/router/`. Honours the runtime
-/// colored-output flag via [`ansi_palette`]; consumed by every `warn!` /
-/// `error!` site below so static log-layout regression checks (see
-/// `lib/tests/log_layout.rs`) keep router log lines on the canonical
+/// colored-output flag via [`ansi_palette`]; consumed by the single
+/// `warn!` site in `Frontend::new` (and any future emitter without an
+/// `HttpContext` in scope) so static log-layout regression checks
+/// (`lib/tests/log_layout.rs`) keep router log lines on the canonical
 /// `[ROUTER] >>>` envelope.
 macro_rules! log_module_context {
     () => {{
@@ -754,12 +755,6 @@ enum RewritePart {
     Path(usize),
 }
 
-impl RewritePart {
-    fn bytes(b: &[u8]) -> Self {
-        Self::String(from_utf8(b).unwrap_or_default().to_owned())
-    }
-}
-
 /// A pre-parsed rewrite template, decomposed into [`RewritePart`]s.
 ///
 /// `RewriteParts` is built once at frontend registration time
@@ -848,7 +843,11 @@ impl RewriteParts {
                 while i < pattern.len() && pattern[i] != b'$' {
                     i += 1;
                 }
-                result.push(RewritePart::bytes(&pattern[start..i]));
+                // `pattern` is `template.as_bytes()` and the split is on
+                // the ASCII byte `$` (0x24), which is always a single-byte
+                // UTF-8 character — so `template[start..i]` lies on char
+                // boundaries and is safe to index directly.
+                result.push(RewritePart::String(template[start..i].to_owned()));
             }
         }
         Some(Self(result))
@@ -1111,6 +1110,19 @@ impl Frontend {
                 HeaderPosition::Both => {
                     headers_request.push(edit.clone());
                     headers_response.push(edit);
+                }
+                // The proto-default-encoded shape (`position: 0`). The TOML
+                // loader rejects this case in `parse_header_edit` so the
+                // path is only reachable via a manually-constructed
+                // `Header { position: 0, … }` from a buggy or older
+                // client. Drop the edit rather than guessing a position.
+                HeaderPosition::Unspecified => {
+                    warn!(
+                        "{} dropping Header {{ key: {:?}, val: {:?} }} with HEADER_POSITION_UNSPECIFIED",
+                        log_module_context!(),
+                        header.key,
+                        header.val,
+                    );
                 }
             }
         }

@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 use super::GenericHttpStream;
-use crate::protocol::http::parser::{Method, compare_no_case};
+use crate::protocol::http::parser::compare_no_case;
 
 /// Maximum length of a base64-decoded `Authorization: Basic` payload we
 /// accept. RFC 7617 does not impose a limit, but credentials longer than
@@ -29,19 +29,6 @@ use crate::protocol::http::parser::{Method, compare_no_case};
 /// hostile peers from forcing the worker to allocate large transient
 /// buffers per failed auth attempt.
 const MAX_DECODED_CREDENTIAL_BYTES: usize = 4096;
-
-/// Lowercase hex encoding of `bytes`. Matches the format every entry in
-/// `Cluster.authorized_hashes` is expected to use, so the encoded value
-/// can be compared bit-for-bit.
-fn to_hex(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        // `{:02x}` is the canonical lowercase 2-wide hex representation.
-        out.push(char::from_digit((byte >> 4) as u32, 16).expect("hi nibble"));
-        out.push(char::from_digit((byte & 0x0f) as u32, 16).expect("lo nibble"));
-    }
-    out
-}
 
 /// Find the first `Authorization` header value in the front kawa.
 ///
@@ -117,24 +104,56 @@ pub fn canonicalize_basic_credentials(value: &[u8]) -> Option<String> {
     hasher.update(password);
     let digest = hasher.finalize();
 
-    Some(format!("{}:{}", username, to_hex(&digest)))
+    Some(format!("{}:{}", username, hex::encode(digest)))
+}
+
+/// Maximum byte length of a canonical `username:hex(sha256)` credential
+/// we are willing to compare in constant time. The realistic shape uses a
+/// short username plus a 65-byte `:hex64` tail, so 256 covers every
+/// reasonable operator config while keeping the per-compare stack buffer
+/// small.
+const AUTH_COMPARE_PAD_LEN: usize = 256;
+
+/// Pad `input` into a fixed-length envelope so [`subtle::ConstantTimeEq`]
+/// runs its full byte-loop regardless of whether the candidate and the
+/// stored hash differ in length. The trailing 8 bytes encode the input's
+/// actual length as little-endian `u64` so two inputs that share a prefix
+/// but differ in total length cannot collide post-padding.
+fn pad_for_constant_time_compare(input: &[u8]) -> [u8; AUTH_COMPARE_PAD_LEN + 8] {
+    let mut buf = [0u8; AUTH_COMPARE_PAD_LEN + 8];
+    let n = input.len().min(AUTH_COMPARE_PAD_LEN);
+    buf[..n].copy_from_slice(&input[..n]);
+    buf[AUTH_COMPARE_PAD_LEN..].copy_from_slice(&(input.len() as u64).to_le_bytes());
+    buf
 }
 
 /// Compare `candidate` against every entry in `authorized_hashes` using
 /// constant-time equality. Returns `true` if any entry matches.
 ///
-/// Iterates the entire slice on every call regardless of where (or whether)
-/// a match is found, so the time spent validating a credential does not
-/// vary with the position of the matching entry. This defeats timing
-/// side-channel attacks that would otherwise leak the size of the realm
-/// or the index of the matching credential.
+/// Both sides are padded to a fixed [`AUTH_COMPARE_PAD_LEN`] envelope plus
+/// a length suffix before [`subtle::ConstantTimeEq`] runs, so:
+///   * the per-entry compare loop iterates the full padded length even
+///     when the candidate and the stored hash differ in length (subtle's
+///     slice `ct_eq` short-circuits on length mismatch — the padding here
+///     defeats that leak);
+///   * the outer loop iterates the entire slice on every call regardless
+///     of where (or whether) a match is found, so the time spent
+///     validating a credential does not vary with the position of the
+///     matching entry.
+///
+/// This defeats timing side-channel attacks that would otherwise leak
+/// the size of the realm, the length of the matching username, or the
+/// index of the matching credential.
 pub fn check_authorized_hashes(candidate: &str, authorized_hashes: &[String]) -> bool {
-    let candidate = candidate.as_bytes();
+    let candidate_padded = pad_for_constant_time_compare(candidate.as_bytes());
     let mut matched = subtle::Choice::from(0u8);
     for hash in authorized_hashes {
-        // ConstantTimeEq returns Choice(0)/Choice(1) without short-circuit.
-        // BitOr-assign over `Choice` likewise does not branch.
-        matched |= candidate.ct_eq(hash.as_bytes());
+        let entry_padded = pad_for_constant_time_compare(hash.as_bytes());
+        // Both buffers are exactly `AUTH_COMPARE_PAD_LEN + 8` bytes, so
+        // subtle's slice `ct_eq` runs the full byte-loop instead of
+        // bailing on length. `BitOr` over `Choice` likewise does not
+        // branch.
+        matched |= candidate_padded.as_slice().ct_eq(entry_padded.as_slice());
     }
     bool::from(matched)
 }
@@ -154,12 +173,6 @@ pub fn check_basic(kawa: &GenericHttpStream, authorized_hashes: &[String]) -> bo
     check_authorized_hashes(&canonical, authorized_hashes)
 }
 
-/// Suppress the unused-import lint on `Method` when this module is built
-/// without test cfg. The type is named in doc-comment intra-doc links and
-/// pulled in here purely for that purpose.
-#[allow(dead_code)]
-const _METHOD_USED: Option<Method> = None;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,12 +182,6 @@ mod tests {
     /// re-derive it on every run.
     const SECRET_SHA256_HEX: &str =
         "2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b";
-
-    #[test]
-    fn to_hex_matches_format_macro() {
-        let bytes = [0x00, 0x10, 0xff, 0xa5];
-        assert_eq!(to_hex(&bytes), "0010ffa5");
-    }
 
     #[test]
     fn canonicalize_round_trips_admin_secret() {
