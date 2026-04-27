@@ -301,6 +301,17 @@ pub enum ConfigError {
         "invalid header position '{position}' at headers[{index}]. Valid values: \"request\", \"response\", \"both\""
     )]
     InvalidHeaderPosition { index: usize, position: String },
+    /// A `[[clusters.<id>.frontends.headers]]` entry contains a forbidden
+    /// byte (NUL, CR, LF, or another C0 control) in its key or value.
+    /// Accepting these would produce HTTP request/response splitting on
+    /// the wire (CWE-113) — the worker's H2 emission path filters them
+    /// at runtime, but the H1 path serialises raw, so we reject at
+    /// config-load time as a defense in depth.
+    #[error(
+        "invalid header bytes in {field} at headers[{index}]: control characters \
+         (NUL / CR / LF / other C0) are forbidden in header keys and values"
+    )]
+    InvalidHeaderBytes { index: usize, field: &'static str },
 }
 
 /// An HTTP, HTTPS or TCP listener as parsed from the `Listeners` section in the toml
@@ -1291,11 +1302,36 @@ pub(crate) fn parse_header_edit(
             });
         }
     };
+    if header_bytes_contain_forbidden_controls(entry.key.as_bytes()) {
+        return Err(ConfigError::InvalidHeaderBytes {
+            index,
+            field: "key",
+        });
+    }
+    if header_bytes_contain_forbidden_controls(entry.value.as_bytes()) {
+        return Err(ConfigError::InvalidHeaderBytes {
+            index,
+            field: "value",
+        });
+    }
     Ok(Header {
         position: position as i32,
         key: entry.key.clone(),
         val: entry.value.clone(),
     })
+}
+
+/// Reject any byte value that would let a header injection escape the
+/// header block on the wire (RFC 9110 §5.5 / RFC 9113 §8.2.1):
+/// `\0..=\x08`, `\x0A..=\x1F`, and `\x7F` (so the entire C0 control set
+/// minus horizontal tab `\x09`, which RFC 9110 explicitly permits in
+/// field values). Mirrors the runtime filter at
+/// `lib/src/protocol/mux/converter.rs::call` so config-load and runtime
+/// agree on which header values may travel.
+pub(crate) fn header_bytes_contain_forbidden_controls(bytes: &[u8]) -> bool {
+    bytes
+        .iter()
+        .any(|&b| matches!(b, 0x00..=0x08 | 0x0A..=0x1F | 0x7F))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -2963,5 +2999,84 @@ mod tests {
         builder.with_alpn_protocols(Some(vec!["http/1.1".to_owned(), "h2".to_owned()]));
         let config = builder.to_tls(None).expect("to_tls should succeed");
         assert_eq!(config.alpn_protocols, vec!["http/1.1", "h2"]);
+    }
+
+    /// CRLF or NUL in a `[[clusters.<id>.frontends.headers]]` value
+    /// would let an operator-supplied config splice arbitrary
+    /// header / request lines into the H1 wire on the backend side
+    /// (CWE-113). The H2 emission path filters at runtime; we reject
+    /// at config-load time as a defense in depth.
+    #[test]
+    fn parse_header_edit_rejects_crlf_in_value() {
+        let entry = HeaderEditConfig {
+            position: "request".to_owned(),
+            key: "X-Test".to_owned(),
+            value: "value\r\nEvil-Header: stolen".to_owned(),
+        };
+        let err = parse_header_edit(0, &entry).expect_err("CRLF in value must be rejected");
+        match err {
+            ConfigError::InvalidHeaderBytes { index, field } => {
+                assert_eq!(index, 0);
+                assert_eq!(field, "value");
+            }
+            other => panic!("expected InvalidHeaderBytes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_header_edit_rejects_lf_in_key() {
+        let entry = HeaderEditConfig {
+            position: "response".to_owned(),
+            key: "X-\nTest".to_owned(),
+            value: "ok".to_owned(),
+        };
+        let err = parse_header_edit(2, &entry).expect_err("LF in key must be rejected");
+        match err {
+            ConfigError::InvalidHeaderBytes { index, field } => {
+                assert_eq!(index, 2);
+                assert_eq!(field, "key");
+            }
+            other => panic!("expected InvalidHeaderBytes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_header_edit_rejects_nul() {
+        let entry = HeaderEditConfig {
+            position: "both".to_owned(),
+            key: "X-Test".to_owned(),
+            value: "with\0nul".to_owned(),
+        };
+        assert!(matches!(
+            parse_header_edit(0, &entry),
+            Err(ConfigError::InvalidHeaderBytes { .. })
+        ));
+    }
+
+    /// Horizontal tab `\t` (0x09) is permitted in field values per
+    /// RFC 9110 §5.5 (folded-header obs-fold parts). The validator
+    /// must NOT reject it — otherwise legitimate operator configs
+    /// (e.g. `Authorization: Basic\tCREDENTIALS`) become unusable.
+    #[test]
+    fn parse_header_edit_accepts_tab_in_value() {
+        let entry = HeaderEditConfig {
+            position: "request".to_owned(),
+            key: "X-Test".to_owned(),
+            value: "with\ttab".to_owned(),
+        };
+        let header = parse_header_edit(0, &entry).expect("tab in value must be accepted");
+        assert_eq!(header.val, "with\ttab");
+    }
+
+    #[test]
+    fn parse_header_edit_accepts_clean_value() {
+        let entry = HeaderEditConfig {
+            position: "request".to_owned(),
+            key: "X-Tenant".to_owned(),
+            value: "alpha".to_owned(),
+        };
+        let header = parse_header_edit(0, &entry).expect("clean value must be accepted");
+        assert_eq!(header.key, "X-Tenant");
+        assert_eq!(header.val, "alpha");
     }
 }

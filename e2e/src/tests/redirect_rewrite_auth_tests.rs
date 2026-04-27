@@ -96,15 +96,22 @@ fn add_backend(
 /// a full CPU core on every retry. Sleep 5 ms between attempts so the
 /// overall budget still expires within `total_ms` (~20 attempts on the
 /// hot path, fewer when the listener returns earlier).
+///
+/// Deadline check sits AFTER the accept attempt so we always make a
+/// final attempt right at the boundary — a `while now < deadline` check
+/// at the top would skip the last `accept()` call when the loop sleeps
+/// straight onto the deadline (security-review LISA-006).
 fn accept_with_retry(backend: &mut SyncBackend, client_id: usize, total_ms: u64) -> bool {
     let deadline = std::time::Instant::now() + Duration::from_millis(total_ms);
-    while std::time::Instant::now() < deadline {
+    loop {
         if backend.accept(client_id) {
             return true;
         }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
         std::thread::sleep(Duration::from_millis(5));
     }
-    false
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -1247,8 +1254,8 @@ pub fn try_rewrite_path_h1_h2() -> State {
         .headers
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case("x-forwarded-host"))
-        .map(|(_, v)| v.as_str());
-    if !matches!(xfh, Some(v) if v.starts_with("localhost")) {
+        .map(|(_, v)| v.as_slice());
+    if !matches!(xfh, Some(v) if v.starts_with(b"localhost")) {
         eprintln!("rewrite H1↔H2: expected X-Forwarded-Host carrying 'localhost', got {xfh:?}");
         return State::Fail;
     }
@@ -1323,8 +1330,8 @@ pub fn try_request_header_inject_h2_h2() -> State {
         .headers
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case("x-tenant"))
-        .map(|(_, v)| v.as_str());
-    if injected != Some("alpha") {
+        .map(|(_, v)| v.as_slice());
+    if injected != Some(b"alpha".as_slice()) {
         eprintln!("inject H2↔H2: expected X-Tenant: alpha on backend, got {injected:?}");
         return State::Fail;
     }

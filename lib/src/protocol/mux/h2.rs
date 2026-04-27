@@ -2440,6 +2440,12 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // yield (progress + pending back-buffer, LIFECYCLE §9 invariant 16)
         // from a no-progress wait state (e.g. flow-control starvation).
         let mut total_bytes_written: usize = 0;
+        // Collect every fresh RST_STREAM emitted via the converter
+        // (`initialize` chokepoint or the HPACK over-budget abort path)
+        // so we can run `account_emitted_rst` for each one AFTER the
+        // converter is dropped — the converter holds `&mut self.encoder`
+        // for the loop body so we cannot take `&mut self` until then.
+        let mut freshly_emitted_rsts: Vec<H2Error> = Vec::new();
         'outer: for idx in 0..self.priorities_buf.len() {
             let stream_id = self.priorities_buf[idx];
             let Some(&global_stream_id) = self.streams.get(&stream_id) else {
@@ -2478,8 +2484,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     .copied()
                     .unwrap_or(0);
                 // Track RST_STREAM dedup: if kawa is in error state, the converter
-                // will generate a RST_STREAM frame. Mark it so we don't send a
-                // duplicate on the next writable cycle.
+                // will generate a RST_STREAM frame via `initialize`. Mark it so we
+                // don't send a duplicate on the next writable cycle.
                 if kawa.is_error() {
                     let freshly_rst = self.rst_sent.insert(stream_id);
                     // LIFECYCLE §9 invariant 17: any transition to ineligible
@@ -2491,6 +2497,17 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         if let Some(c) = ready_incremental_by_urgency.get_mut(&urgency) {
                             *c = c.saturating_sub(1);
                         }
+                    }
+                    // Account for the RST that `initialize` is about to emit
+                    // for this stream. Without this the MadeYouReset lifetime
+                    // cap is evadable: any path that flips `parsing_phase` to
+                    // Error before reaching this gate (oversized inbound
+                    // trailers, malformed bodies, etc.) would land an
+                    // unaccounted RST on the wire. We defer the actual
+                    // accounting call until after `drop(converter)` — the
+                    // converter holds `&mut self.encoder` here.
+                    if freshly_rst {
+                        freshly_emitted_rsts.push(rst_error_from_kawa(kawa));
                     }
                 }
                 // Apply per-frontend response-side header edits
@@ -2517,8 +2534,30 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 // pass; without a post-prepare insert here the next
                 // writable cycle would gate-pass and double-emit a
                 // RST_STREAM via the existing `initialize` chokepoint.
-                if kawa.is_error() {
-                    self.rst_sent.insert(stream_id);
+                //
+                // Per Codex P2: the converter's direct RST emission
+                // bypasses the metric/flood accounting that
+                // `Self::reset_stream` performs. Mirror it here so a
+                // peer that drives oversized headers across many
+                // streams cannot escape the MadeYouReset emitted-RST
+                // lifetime cap and so dashboards see the per-error
+                // counter and the global tx counter.
+                //
+                // Per Codex P3: when an incremental stream flips to
+                // Error mid-prepare, the RFC 9218 §4 yield-after-one
+                // accounting must drop this stream from the
+                // same-urgency ready bucket so trailing peers see the
+                // live count.
+                let freshly_rst_post_prepare = kawa.is_error() && self.rst_sent.insert(stream_id);
+                if freshly_rst_post_prepare {
+                    // Defer accounting until after `drop(converter)`; same
+                    // reason as the pre-prepare collector above.
+                    freshly_emitted_rsts.push(rst_error_from_kawa(kawa));
+                    if is_incremental {
+                        if let Some(c) = ready_incremental_by_urgency.get_mut(&urgency) {
+                            *c = c.saturating_sub(1);
+                        }
+                    }
                 }
                 let consumed = window - converter.window;
                 *parts.window = parts.window.saturating_sub(consumed);
@@ -2618,6 +2657,16 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         drop(converter);
         if size_update_emitted {
             self.pending_table_size_update = None;
+        }
+        // Account every RST that the converter emitted during this pass
+        // (pre-prepare gate + post-prepare HPACK over-budget abort) so
+        // the global tx counter, the per-error breakdown, and the
+        // MadeYouReset emitted-RST lifetime cap stay in step. If the
+        // cap trips, propagate the GOAWAY result.
+        for error in freshly_emitted_rsts {
+            if let Some(result) = self.account_emitted_rst(error) {
+                return result;
+            }
         }
         self.converter_buf = converter_out;
         self.lowercase_buf = lowercase_buf;
@@ -3031,36 +3080,66 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
 
         // Flush pending RST_STREAM frames (queued when refusing streams).
         if !self.pending_rst_streams.is_empty() && self.expect_write.is_none() {
-            let kawa = &mut self.zero;
-            kawa.storage.clear();
-            let buf = kawa.storage.space();
-            let mut offset = 0;
-            let mut written_count = 0;
-            for &(stream_id, ref error) in &self.pending_rst_streams {
-                let frame_size =
-                    parser::FRAME_HEADER_SIZE + parser::RST_STREAM_PAYLOAD_SIZE as usize;
-                if offset + frame_size > buf.len() {
-                    break;
-                }
-                match serializer::gen_rst_stream(&mut buf[offset..], stream_id, error.to_owned()) {
-                    Ok((_, _)) => {
-                        offset += frame_size;
-                        written_count += 1;
-                        incr!("h2.frames.tx.rst_stream");
+            // Snapshot the per-frame error codes before mutating
+            // `self.zero` — we feed them into `account_emitted_rst` after
+            // the wire write so flood-protection sees every emitted frame
+            // (gap flagged in the security review on `da845c71`).
+            let drained_errors: Vec<H2Error> = {
+                let kawa = &mut self.zero;
+                kawa.storage.clear();
+                let buf = kawa.storage.space();
+                let mut offset = 0;
+                let mut written_errors: Vec<H2Error> = Vec::new();
+                for &(stream_id, ref error) in &self.pending_rst_streams {
+                    let frame_size =
+                        parser::FRAME_HEADER_SIZE + parser::RST_STREAM_PAYLOAD_SIZE as usize;
+                    if offset + frame_size > buf.len() {
+                        break;
                     }
-                    Err(_) => break,
+                    match serializer::gen_rst_stream(
+                        &mut buf[offset..],
+                        stream_id,
+                        error.to_owned(),
+                    ) {
+                        Ok((_, _)) => {
+                            offset += frame_size;
+                            written_errors.push(error.to_owned());
+                        }
+                        Err(_) => break,
+                    }
                 }
-            }
-            self.pending_rst_streams.drain(..written_count);
-            if offset > 0 {
-                kawa.storage.fill(offset);
+                self.pending_rst_streams.drain(..written_errors.len());
+                if offset > 0 {
+                    kawa.storage.fill(offset);
+                }
+                written_errors
+            };
+            if !drained_errors.is_empty() {
                 if self.flush_zero_to_socket() {
                     self.expect_write = Some(H2StreamId::Zero);
                     // Edge-triggered epoll: ensure pending TLS data gets flushed
                     if self.socket.socket_wants_write() {
                         self.readiness.event.insert(Ready::WRITABLE);
                     }
+                    // Account each drained RST through the single helper so
+                    // the global tx counter, the per-error breakdown, and
+                    // the MadeYouReset lifetime cap stay in step. If the
+                    // cap trips on this batch, propagate the GOAWAY result
+                    // instead of `Continue`.
+                    for error in drained_errors {
+                        if let Some(result) = self.account_emitted_rst(error) {
+                            return Some(result);
+                        }
+                    }
                     return Some(MuxResult::Continue);
+                }
+                // Wire write deferred (e.g. socket not writable yet) —
+                // still account: the RST is committed into `self.zero`,
+                // a subsequent writable cycle will drain it.
+                for error in drained_errors {
+                    if let Some(result) = self.account_emitted_rst(error) {
+                        return Some(result);
+                    }
                 }
             }
         }
@@ -3609,6 +3688,34 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         );
     }
 
+    /// Single accounting site for proxy-emitted RST_STREAM frames that
+    /// reach the wire outside [`Self::reset_stream`] (which already does
+    /// its own accounting).
+    ///
+    /// Three things must happen for every emitted RST so flood-protection
+    /// stays honest: the global tx counter, the per-error breakdown, and
+    /// the MadeYouReset emitted-RST lifetime cap. Callers are the
+    /// pre-prepare gate (`write_streams` line ~2483, where
+    /// `kawa.is_error()` was true on entry), the post-prepare gate (line
+    /// ~2546, where the HPACK over-budget abort flipped the phase
+    /// inside `kawa.prepare`), the converter's `initialize` chokepoint
+    /// (which we cannot instrument directly because it lives behind
+    /// `kawa.prepare` without `&mut self` access), and the
+    /// `pending_rst_streams` drain in `flush_pending_control_frames`.
+    /// Returning `Some(MuxResult)` means the caller MUST short-circuit
+    /// with that result — the flood detector tripped its lifetime cap
+    /// and converted to a connection-wide GOAWAY.
+    fn account_emitted_rst(&mut self, error: H2Error) -> Option<MuxResult> {
+        incr!("h2.frames.tx.rst_stream");
+        count!(metric_for_rst_stream_sent(error), 1);
+        if !matches!(error, H2Error::NoError) {
+            if let Some(violation) = self.flood_detector.record_rst_emitted() {
+                return Some(self.handle_flood_violation(violation));
+            }
+        }
+        None
+    }
+
     /// Refuse a newly-opened stream with RST_STREAM and discard its HEADERS payload.
     ///
     /// Used when MAX_CONCURRENT_STREAMS is exceeded or buffer pool is exhausted.
@@ -3698,6 +3805,21 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             violation.threshold,
         );
         self.goaway(violation.error)
+    }
+}
+
+/// Recover the [`H2Error`] code that the converter's `initialize`
+/// chokepoint will encode into the synthesised RST_STREAM frame for a
+/// kawa stuck in [`kawa::ParsingPhase::Error`]. Mirrors the parse +
+/// fallback at `lib/src/protocol/mux/converter.rs::initialize` so the
+/// flood-accounting helper sees the same code that lands on the wire.
+fn rst_error_from_kawa<T: kawa::AsBuffer>(kawa: &kawa::Kawa<T>) -> H2Error {
+    match kawa.parsing_phase {
+        kawa::ParsingPhase::Error {
+            kind: kawa::ParsingErrorKind::Processing { message },
+            ..
+        } => message.parse::<H2Error>().unwrap_or(H2Error::InternalError),
+        _ => H2Error::InternalError,
     }
 }
 

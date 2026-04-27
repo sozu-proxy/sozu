@@ -809,7 +809,20 @@ fn apply_request_rewrites_and_headers(
     let rewriting_host = rewritten_host.is_some();
     let mut keys_to_drop: Vec<Vec<u8>> = Vec::with_capacity(headers_request.len() + 2);
     let mut to_insert: Vec<Block> = Vec::with_capacity(headers_request.len() + 2);
+    // Track whether any operator-supplied edit names Host or
+    // X-Forwarded-Host so we always dedup the existing kawa Host header
+    // before inserting the operator's value. Without this, an operator
+    // who sets `--header request=Host=evil` on a frontend WITHOUT
+    // `--rewrite-host` lands TWO `Host:` headers on the backend wire —
+    // a request-smuggling primitive on backends that pick last-Host
+    // (CWE-444 cousin).
+    let mut operator_overrides_host = false;
+    let mut operator_overrides_xfh = false;
     for edit in headers_request {
+        let key_is_host = edit.key.eq_ignore_ascii_case(host_lower);
+        let key_is_xfh = edit.key.eq_ignore_ascii_case(xfh_lower);
+        operator_overrides_host |= key_is_host;
+        operator_overrides_xfh |= key_is_xfh;
         if edit.val.is_empty() {
             keys_to_drop.push(edit.key.iter().map(u8::to_ascii_lowercase).collect());
         } else {
@@ -819,8 +832,10 @@ fn apply_request_rewrites_and_headers(
             }));
         }
     }
-    if rewriting_host {
+    if rewriting_host || operator_overrides_host {
         keys_to_drop.push(host_lower.to_vec());
+    }
+    if rewriting_host || operator_overrides_xfh {
         keys_to_drop.push(xfh_lower.to_vec());
     }
 

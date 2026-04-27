@@ -1236,6 +1236,24 @@ fn build_http_frontend_add(cmd: HttpFrontendCmd) -> Result<RequestHttpFrontend, 
                 ));
             }
         };
+        // Reject CRLF / NUL / other C0 controls in either field. CRLF in
+        // the value would let an operator (or a misuse via piped CLI args)
+        // splice arbitrary header / request lines into the H1 wire on the
+        // backend side (CWE-113 / request smuggling). The H2 emission path
+        // filters at runtime; the H1 path serialises raw, so we reject at
+        // CLI parse time as a defense in depth and to give a clear error.
+        if header_value_has_control_byte(key.as_bytes()) {
+            return Err(CtlError::ArgsNeeded(
+                "header key without control characters (NUL / CR / LF / other C0)".to_owned(),
+                format!("--header[{index}] key={key:?}"),
+            ));
+        }
+        if header_value_has_control_byte(val.as_bytes()) {
+            return Err(CtlError::ArgsNeeded(
+                "header value without control characters (NUL / CR / LF / other C0)".to_owned(),
+                format!("--header[{index}] val={val:?}"),
+            ));
+        }
         headers_proto.push(sozu_command_lib::proto::command::Header {
             position: position_proto,
             key: key.to_owned(),
@@ -1260,6 +1278,18 @@ fn build_http_frontend_add(cmd: HttpFrontendCmd) -> Result<RequestHttpFrontend, 
         required_auth: if required_auth { Some(true) } else { None },
         headers: headers_proto,
     })
+}
+
+/// Reject NUL / CR / LF / other C0 controls in a header key or value.
+/// Mirrors `command::config::header_bytes_contain_forbidden_controls`
+/// (and `lib::protocol::mux::converter::call`'s runtime filter) so the
+/// CLI rejects header injection vectors at parse time rather than
+/// letting them slip through to the H1 emission path, which serialises
+/// raw bytes onto the backend wire.
+fn header_value_has_control_byte(bytes: &[u8]) -> bool {
+    bytes
+        .iter()
+        .any(|&b| matches!(b, 0x00..=0x08 | 0x0A..=0x1F | 0x7F))
 }
 
 /// Validate that `s` matches the canonical `<user>:<hex(sha256)>` form
