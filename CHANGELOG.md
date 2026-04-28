@@ -4,6 +4,10 @@
 
 See milestone [`v1.1.0`](https://github.com/sozu-proxy/sozu/projects/3?card_filter_query=milestone%3Av1.1.0)
 
+### Security
+
+- **Worker panic on short hostnames vs `Wildcard` rules ([#1223](https://github.com/sozu-proxy/sozu/issues/1223))**: `DomainRule::Wildcard::matches` in `lib/src/router/mod.rs` computed `hostname.len() - s.len() + 1` unconditionally, panicking with `attempt to subtract with overflow` in debug builds when the incoming hostname was shorter than the configured wildcard pattern (CWE-191 → CWE-754, remote-reachable DoS). In release builds the wrap is masked by the `&&` short-circuit on `ends_with(suffix)`, so the false-positive in §1 of the issue was rare; debug builds always panicked. The arm now uses `<[u8]>::strip_suffix` and validates the leftmost prefix on the returned slice — there is no length arithmetic to underflow, and short hostnames return `false` without panic. Boundary case `hostname == suffix` (empty leftmost label, e.g. `.foo.example.com` against `*.foo.example.com`) is now rejected as an invalid DNS label per RFC 1035 §3.1. Reachable from H1 (`HttpListener::frontend_from_request`, `lib/src/http.rs:658`), H2 (single-byte `:authority`, `lib/src/https.rs:865`), and operator-driven `Router::has_hostname` introspection. Affected versions: all releases including `sozu-lib` 1.1.1 and earlier (bug introduced in `a9dd46e9`, 2019-06-04). Regression tests `match_domain_rule_wildcard_short_hostname_does_not_panic` and `router_lookup_wildcard_pre_rule_short_hostname_does_not_panic` in `lib/src/router/mod.rs`.
+
 ## feat/answer-templates-rewrite-auth - Unreleased
 
 Brings the upstream answer-template / URL-rewrite / basic-auth feature stack
