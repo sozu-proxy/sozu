@@ -669,6 +669,34 @@ The `WWW-Authenticate` header is rendered through the answer template's
 header line is elided from the 401 response. HAProxy parallel:
 `http-request auth realm Foo unless { http_auth(...) }`.
 
+### Tuning the credential decode cap
+
+A hostile peer can send arbitrarily long `Authorization: Basic <token>`
+values. Sōzu base64-decodes the token in a transient allocation; an
+unbounded decode per failed-auth attempt is a memory pressure vector.
+The worker caps the decoded length to **4096 bytes by default** —
+well above the realistic `username:password` shape (typical credentials
+are <100 bytes). Operators running hardened tenants can lower this in
+the main TOML config:
+
+```toml
+# in the top-level config (alongside `buffer_size`, `max_connections`, etc.)
+basic_auth_max_credential_bytes = 256
+```
+
+The override is committed once on each worker at boot and applies to
+every cluster. Setting `0` is a no-op (the built-in default stays in
+force) so an explicit zero in a config file does not accidentally
+disable the cap.
+
+The config validator emits a `warn!` line at boot when the configured
+cap is **>= `buffer_size / 3`**: at that point a single failed-auth
+attempt can pin ~33% of the per-frontend buffer's worth of bytes,
+which combined with in-flight request/response framing pushes the
+buffer toward back-pressure under load. The warning is informational
+only — operators with a deliberate trade-off can keep the value, but
+the surprise stays visible in the boot log.
+
 ## Runtime patch — `sozu listener update`
 
 `sozu listener {http,https,tcp} update` patches a live listener **in place** without cycling the listening socket. Only the fields you pass are written; all others are preserved exactly as they are. Existing sessions continue with their configuration snapshot; only new sessions, connections, or TLS handshakes — depending on the field — pick up the new values. Use `sozu listener list` to inspect current values before patching.

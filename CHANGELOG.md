@@ -66,6 +66,15 @@ session path the upstream PRs targeted, so every running session benefits.
   (`171a31ce` upstream) was designed to prevent. New workspace dependencies
   `base64 = ^0.22.1` and `subtle = ^2.6.1`.
 
+  The maximum decoded credential length is operator-tunable via the new
+  main-config field `basic_auth_max_credential_bytes` (default 4096).
+  Lower values (256 / 512) bound the per-failed-auth allocation tighter
+  for hardened tenants. Setting `0` is a no-op so an explicit zero
+  cannot disable the cap by accident. The config validator emits a
+  `warn!` at boot when the configured cap is `>= buffer_size / 3` —
+  informational only, but flags the back-pressure trade-off
+  (a single failed auth pinning ~33% of the per-frontend buffer).
+
 - **Pattern-trie segment regex anchoring with capture propagation**: every
   segment-level regex inserted into the routing trie is now wrapped with
   `\A...\z` at insert time so a pattern like `cdn[0-9]+` matches `cdn1`

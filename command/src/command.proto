@@ -1264,6 +1264,16 @@ message ServerConfig {
     // [2, 32] at config-load time. The previous compile-time constant was
     // 4 and remains the default.
     optional uint64 slab_entries_per_connection = 20;
+    // Maximum length, in bytes, of a base64-decoded `Authorization: Basic`
+    // payload accepted by `mux::auth`. Caps the per-failed-auth allocation
+    // so a hostile peer cannot force the worker to decode arbitrarily
+    // large tokens. RFC 7617 imposes no upper bound; the default is 4096
+    // (well above the realistic shape `username:password`). Operators on
+    // tight memory budgets can lower this to 256-512; values that approach
+    // the per-frontend `buffer_size` raise a warning at config-load time
+    // (see config.rs validation). Set once at worker boot via
+    // `mux::auth::set_max_decoded_credential_bytes`.
+    optional uint64 basic_auth_max_credential_bytes = 21;
 }
 
 enum ProtobufAccessLogFormat {

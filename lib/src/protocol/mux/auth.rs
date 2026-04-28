@@ -23,12 +23,45 @@ use subtle::ConstantTimeEq;
 use super::GenericHttpStream;
 use crate::protocol::http::parser::compare_no_case;
 
-/// Maximum length of a base64-decoded `Authorization: Basic` payload we
-/// accept. RFC 7617 does not impose a limit, but credentials longer than
-/// 4 KiB are pathological for HTTP Basic. Capping the decode result keeps
-/// hostile peers from forcing the worker to allocate large transient
-/// buffers per failed auth attempt.
-const MAX_DECODED_CREDENTIAL_BYTES: usize = 4096;
+/// Built-in default for the maximum length, in bytes, of a base64-decoded
+/// `Authorization: Basic` payload. RFC 7617 does not impose a limit, but
+/// credentials longer than 4 KiB are pathological for HTTP Basic.
+/// Operators can override via `basic_auth_max_credential_bytes` in the
+/// main TOML config; the override is committed once at worker boot via
+/// [`set_max_decoded_credential_bytes`].
+const DEFAULT_MAX_DECODED_CREDENTIAL_BYTES: usize = 4096;
+
+/// Process-wide override for [`DEFAULT_MAX_DECODED_CREDENTIAL_BYTES`].
+/// Set once on each worker at startup from
+/// [`sozu_command::proto::command::ServerConfig::basic_auth_max_credential_bytes`]
+/// via [`set_max_decoded_credential_bytes`]. Reading uses a relaxed
+/// `OnceLock::get` so the auth fast path stays branch-and-load with no
+/// atomic hand-off. Set-once semantics are sufficient because the cap is
+/// a global hardening knob — it never changes after boot.
+static MAX_DECODED_CREDENTIAL_BYTES_OVERRIDE: std::sync::OnceLock<usize> =
+    std::sync::OnceLock::new();
+
+/// Install the operator-configured cap. Called from
+/// `lib::server::Server::try_new_from_config` exactly once per worker
+/// process. Subsequent calls are no-ops (the `OnceLock` rejects the
+/// second `set`); the first wins. A `0` value is treated as "use the
+/// built-in default" so an operator config that explicitly sets `0` does
+/// not disable Basic-auth length-bound protection by accident.
+pub fn set_max_decoded_credential_bytes(cap: usize) {
+    if cap == 0 {
+        return;
+    }
+    let _ = MAX_DECODED_CREDENTIAL_BYTES_OVERRIDE.set(cap);
+}
+
+/// Resolve the active cap: operator override when present, otherwise the
+/// built-in [`DEFAULT_MAX_DECODED_CREDENTIAL_BYTES`].
+fn max_decoded_credential_bytes() -> usize {
+    MAX_DECODED_CREDENTIAL_BYTES_OVERRIDE
+        .get()
+        .copied()
+        .unwrap_or(DEFAULT_MAX_DECODED_CREDENTIAL_BYTES)
+}
 
 /// Find the first `Authorization` header value in the front kawa.
 ///
@@ -90,7 +123,7 @@ pub fn canonicalize_basic_credentials(value: &[u8]) -> Option<String> {
     }
 
     let decoded = STANDARD.decode(rest).ok()?;
-    if decoded.len() > MAX_DECODED_CREDENTIAL_BYTES {
+    if decoded.len() > max_decoded_credential_bytes() {
         return None;
     }
 
@@ -214,11 +247,21 @@ mod tests {
 
     #[test]
     fn canonicalize_rejects_oversized_payload() {
-        // 5 KB base64 payload — well above MAX_DECODED_CREDENTIAL_BYTES.
-        let payload = "a".repeat(MAX_DECODED_CREDENTIAL_BYTES * 2);
+        // 5 KB+ base64 payload — well above the active cap.
+        let payload = "a".repeat(max_decoded_credential_bytes() * 2);
         let token = STANDARD.encode(format!("{payload}:pwd"));
         let header = format!("Basic {token}");
         assert!(canonicalize_basic_credentials(header.as_bytes()).is_none());
+    }
+
+    /// Calling `set_max_decoded_credential_bytes(0)` is a no-op so an
+    /// operator config that explicitly zeroes the field cannot disable
+    /// the hardening cap by accident — the default 4096 stays in force.
+    #[test]
+    fn set_max_decoded_credential_bytes_zero_is_noop() {
+        let before = max_decoded_credential_bytes();
+        set_max_decoded_credential_bytes(0);
+        assert_eq!(max_decoded_credential_bytes(), before);
     }
 
     #[test]
