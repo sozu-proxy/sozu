@@ -92,6 +92,11 @@ The following metrics track requests that are correctly sent to the backend serv
 * `sozu.http.status.3xx`: counts requests with 300 to 399 status
 * `sozu.http.status.4xx`: counts requests with 400 to 499 status
 * `sozu.http.status.5xx`: counts requests with 500 to 599 status
+* `sozu.http.status.<code>`: per-code counters for an eighteen-code short-list
+  (`200/201/204`, `301/302/304`, `400/401/403/404/408/413/429`,
+  `500/502/503/504/507`); see `doc/configure.md` for the full list. Codes
+  outside the list contribute only to their bucket so the metric keyspace
+  stays bounded.
 * `sozu.http.requests`: incremented at each request (sum of above counters)
 
 #### data transmitted
@@ -183,7 +188,7 @@ These metrics are closely linked to resource usage, which is tracked by the foll
 * `sozu.slab.entries`: number of slots used in the slab allocator. Typically, there's one slot per listener socket,
 one for the connection to the main process, one for the metrics socket, then one per frontend connection and
 one per backend connection. So the number of connections should always be close to (but lower than) the slab count.
-* `sozu.buffer.number`: number of buffers used in the buffer pool. Inactive sessions and requests for which we send
+* `sozu.buffer.in_use` (renamed from `sozu.buffer.number`): number of buffers used in the buffer pool. Inactive sessions and requests for which we send
 a default answer (400, 404, 413, 503 HTTP errors) do not use buffers. Active HTTP sessions use one buffer (except
 in pipelining mode), WebSocket sessions use two buffers. So the number of buffers should always be lower than the
 slab count, and lower than the number of connections.

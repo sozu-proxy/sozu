@@ -927,12 +927,17 @@ from metric names below.
 | `configuration.backends` | gauge | proxy | Number of configured backend servers |
 | `configuration.frontends` | gauge | proxy | Number of configured frontends |
 | `client.connections` | gauge | proxy | Active frontend connections |
-| `client.connections_percentage` | gauge | proxy | Percentage of `max_connections` in use |
-| `client.max_connections` | gauge | proxy | Configured maximum connections |
+| `client.connections_max` | gauge | proxy | Configured `max_connections`. Renamed from `client.max_connections` |
+| `client.connections_percent` | gauge | proxy | Percentage of `max_connections` in use. Renamed from `client.connections_percentage` |
 | `slab.entries` | gauge | proxy | Session slab allocator slots used |
+| `slab.capacity` | gauge | proxy | Configured slab capacity (`10 + slab_entries_per_connection * max_connections`) |
+| `slab.usage_percent` | gauge | proxy | `slab.entries * 100 / slab.capacity`. Pure slab-utilisation gauge |
+| `slab.accept_threshold_percent` | gauge | proxy | `slab.entries * 100 / (10 + 2 * max_connections)`. Charts proximity to the `at_capacity()` accept gate, which can flip true while `slab.usage_percent` still shows headroom (configured slab is larger when `slab_entries_per_connection > 2`) |
 | `process.uptime_seconds` | gauge | proxy | Seconds since the worker started. Captured once in `Server::new`; never reset on hot upgrade (the new worker starts its own counter) |
 | `server.live` | gauge | proxy | `1` while the worker accepts traffic, `0` once a graceful shutdown is requested. Mirrors Envoy `server.live` semantics — L4 health checks (HAProxy / cloud LBs) can poll this gauge to drain a worker before the OS-level termination signal lands |
-| `buffer.number` | gauge | proxy | Buffers currently allocated from the buffer pool |
+| `buffer.in_use` | gauge | proxy | Buffers currently checked out of the buffer pool. Renamed from `buffer.number` |
+| `buffer.capacity` | gauge | proxy | Configured buffer pool capacity |
+| `buffer.usage_percent` | gauge | proxy | `buffer.in_use * 100 / buffer.capacity` |
 | `zombies` | counter | proxy | Zombie sessions detected and removed |
 
 #### Accept queue
@@ -992,7 +997,7 @@ transitions through phases (e.g., Expect → TLS Handshake → HTTPS → WSS).
 | `http.active_requests` | gauge | proxy | Currently in-flight requests |
 | `http.e2e.http11` | counter | proxy | Completed HTTP/1.1 request/response cycles |
 | `http.e2e.h2` | counter | proxy | Completed HTTP/2 request/response cycles |
-| `http.errors` | counter | proxy | General HTTP processing errors |
+| `http.errors` | counter | proxy, cluster, backend | General HTTP processing errors. Labels are filtered centrally per `metrics.detail`: `process` / `frontend` collapse to a proxy-wide counter, `cluster` (default) attributes per cluster, `backend` keeps the per-backend split |
 | `tcp.requests` | counter | proxy | TCP proxy connection requests |
 
 #### Byte counters
@@ -1020,7 +1025,12 @@ p99.9, p99.99, p99.999, p100) and sent as `|ms` values over StatsD.
 
 #### Response status classes
 
-Incremented per backend response (scope: cluster + backend for `1xx`–`5xx`):
+Incremented per backend response (scope: cluster + backend for `1xx`–`5xx`).
+Buckets are emitted for every response with a status; per-code counters
+below are emitted in addition to the bucket for the eighteen short-listed
+codes Sōzu either generates as a default answer or that operators routinely
+chart. Status codes outside that list contribute only to their bucket so
+the metric keyspace stays bounded.
 
 | Metric | Type | Scope | Description |
 |--------|------|-------|-------------|
@@ -1031,6 +1041,10 @@ Incremented per backend response (scope: cluster + backend for `1xx`–`5xx`):
 | `http.status.5xx` | counter | cluster, backend | 5xx server error responses |
 | `http.status.other` | counter | proxy | Non-standard status codes |
 | `http.status.none` | counter | proxy | Responses without a status code |
+| `http.status.200` / `201` / `204` | counter | cluster, backend | Common 2xx success codes (in addition to `http.status.2xx`) |
+| `http.status.301` / `302` / `304` | counter | cluster, backend | Common 3xx redirect/cache codes (in addition to `http.status.3xx`) |
+| `http.status.400` / `401` / `403` / `404` / `408` / `413` / `429` | counter | cluster, backend | Common 4xx client-error codes (in addition to `http.status.4xx`) |
+| `http.status.500` / `502` / `503` / `504` / `507` | counter | cluster, backend | Common 5xx server-error codes (in addition to `http.status.5xx`) |
 
 #### Default answer / error responses
 
