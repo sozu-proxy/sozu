@@ -159,7 +159,17 @@ impl Template {
         if !kawa.is_main_phase() {
             return Err(TemplateError::InvalidTemplate(kawa.parsing_phase));
         }
-        if kawa.body_size != BodySize::Empty {
+        // Reject only `Chunked` — a streaming framing makes no sense in a
+        // static answer template. `BodySize::Length(N)` is what kawa
+        // reports for the common operator shape
+        // `…\r\nContent-Length: N\r\n\r\n<N-byte body>` (used by the
+        // legacy `answer_NNN` fields and the test fixtures that round-
+        // trip those responses), so accepting it is required for
+        // backwards compatibility. The block walk below routes the
+        // operator's `Content-Length` header through the `ContentLength`
+        // placeholder so the rendered response carries exactly one
+        // header (RFC 9110 §8.6 / RFC 7230 §3.3.2 dedup invariant).
+        if matches!(kawa.body_size, BodySize::Chunked) {
             return Err(TemplateError::InvalidSizeInfo(kawa.body_size));
         }
         let resolved_status = if let StatusLine::Response { code, .. } = &kawa.detached.status_line
@@ -183,10 +193,20 @@ impl Template {
         // Track whether the operator-supplied template carried its own
         // `Content-Length` header. If yes we wire that block up to the
         // `ContentLength` placeholder (so the value is auto-resolved at
-        // `fill` time) instead of splicing in a second synthetic header
-        // — RFC 9110 §8.6 / RFC 7230 §3.3.2 forbid duplicate
+        // `fill` time after any `%`-substitutions in the body) instead
+        // of letting the literal value drift away from the actual body
+        // length — RFC 9110 §8.6 / RFC 7230 §3.3.2 forbid duplicate
         // `Content-Length` and downstream agents reject those messages
         // hard as a request-smuggling vector.
+        //
+        // We deliberately do NOT synthesise a `Content-Length` when the
+        // operator template omits one. Inserting a synthetic
+        // `Content-Length: 0` line would shift wire bytes for every
+        // header-only template (default 301 redirects, default 404,
+        // operator-supplied templates that intentionally rely on
+        // `Connection: close` for body framing). Operators who want a
+        // specific Content-Length include it in their template; those
+        // who don't get the bytes they wrote.
         let mut content_length_seen = false;
         for mut block in kawa.blocks.into_iter() {
             match &mut block {
@@ -194,20 +214,6 @@ impl Template {
                 Block::Flags(Flags {
                     end_header: true, ..
                 }) => {
-                    if !content_length_seen {
-                        // Right before the end-of-headers marker, splice in a
-                        // synthetic `Content-Length: PLACEHOLDER` header. `fill`
-                        // resolves the placeholder once the body length is known.
-                        header_replacements.push(Replacement {
-                            block_index: blocks.len(),
-                            or_elide_header: false,
-                            typ: ReplacementType::ContentLength,
-                        });
-                        blocks.push_back(Block::Header(Pair {
-                            key: Store::Static(b"Content-Length"),
-                            val: Store::Static(b"PLACEHOLDER"),
-                        }));
-                    }
                     blocks.push_back(block);
                 }
                 Block::StatusLine | Block::Cookies | Block::Flags(_) => {
@@ -1182,6 +1188,8 @@ mod tests {
 
     use sozu_command::proto::command::CustomHttpAnswers;
 
+    use kawa::BodySize;
+
     use super::{
         HttpAnswers, ReplacementType, Template, TemplateError, TemplateVariable, legacy_to_map,
         merge_legacy_into_map,
@@ -1458,6 +1466,99 @@ mod tests {
             has_legacy,
             "legacy-503 body must round-trip into the new map"
         );
+    }
+
+    /// Operator-supplied templates that carry a literal `Content-Length`
+    /// must compile (no `InvalidSizeInfo` rejection) AND must not emit
+    /// two `Content-Length` headers on the wire — the literal value
+    /// gets routed through the [`ReplacementType::ContentLength`]
+    /// placeholder so the rendered response carries exactly one header,
+    /// auto-recomputed from the actual body size after fill-time
+    /// substitutions.
+    ///
+    /// Regression guard against the CI failure on
+    /// `test_http_answers_replace_preserves_cluster_overrides` where
+    /// the parser rejected `…\r\nContent-Length: 19\r\n\r\n<19-byte body>`
+    /// with `InvalidSizeInfo(Length(19))`.
+    #[test]
+    fn template_new_accepts_literal_content_length() {
+        let body =
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 19\r\n\r\ncluster-custom-503!";
+        let template =
+            Template::new(Some(503), body, &[]).expect("literal Content-Length compiles");
+        let mut empty_once: Vec<Vec<u8>> = Vec::new();
+        let rendered = template.fill(&[], &mut empty_once);
+        let buf = rendered.storage.buffer();
+
+        // Exactly one Content-Length header survives in the rendered
+        // response. Two would be a CWE-444 / smuggling primitive.
+        let cl_count = rendered
+            .blocks
+            .iter()
+            .filter(|block| match block {
+                kawa::Block::Header(pair) => {
+                    !pair.is_elided() && pair.key.data(buf).eq_ignore_ascii_case(b"Content-Length")
+                }
+                _ => false,
+            })
+            .count();
+        assert_eq!(
+            cl_count, 1,
+            "literal Content-Length must dedup to a single header"
+        );
+        // Body bytes survived the parse → fill round-trip.
+        let has_body = rendered.blocks.iter().any(|block| match block {
+            kawa::Block::Chunk(kawa::Chunk { data }) => data.data(buf) == b"cluster-custom-503!",
+            _ => false,
+        });
+        assert!(
+            has_body,
+            "literal body bytes must survive into the rendered response"
+        );
+    }
+
+    /// Templates that omit `Content-Length` must NOT have one
+    /// synthesised — operators rely on the byte-for-byte shape of
+    /// header-only templates (default 301 redirect, default 404, any
+    /// `Connection: close` short response). Auto-injecting
+    /// `Content-Length: 0` is the regression that broke
+    /// `test_http_behaviors` and `test_https_redirect` in CI.
+    #[test]
+    fn template_new_does_not_synthesise_content_length() {
+        let body = "HTTP/1.1 301 Moved Permanently\r\nLocation: https://example.com/\r\nConnection: close\r\n\r\n";
+        let template = Template::new(Some(301), body, &[]).expect("header-only template compiles");
+        let mut empty_once: Vec<Vec<u8>> = Vec::new();
+        let rendered = template.fill(&[], &mut empty_once);
+        let buf = rendered.storage.buffer();
+        let cl_count = rendered
+            .blocks
+            .iter()
+            .filter(|block| match block {
+                kawa::Block::Header(pair) => {
+                    !pair.is_elided() && pair.key.data(buf).eq_ignore_ascii_case(b"Content-Length")
+                }
+                _ => false,
+            })
+            .count();
+        assert_eq!(
+            cl_count, 0,
+            "templates without Content-Length must not have one synthesised"
+        );
+    }
+
+    /// `Transfer-Encoding: chunked` is the only `BodySize` shape we
+    /// reject — a streaming framing makes no sense in a static
+    /// template. `Length(_)` and `Empty` both compile.
+    #[test]
+    fn template_new_rejects_chunked_template() {
+        let body =
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n0\r\n\r\n";
+        let err =
+            Template::new(Some(200), body, &[]).expect_err("chunked template must be rejected");
+        match err {
+            TemplateError::InvalidSizeInfo(BodySize::Chunked) => {}
+            other => panic!("expected InvalidSizeInfo(Chunked), got {other:?}"),
+        }
     }
 
     /// `merge_legacy_into_map` does not override existing entries — the new

@@ -36,6 +36,37 @@ use crate::{
     },
 };
 
+/// Wallclock budget for the H1 [`SyncBackend`] to register a single
+/// connection from sozu after the test sends its request. Calibrated
+/// for the listener's 100 ms internal poll plus several retries; large
+/// enough to absorb a slow CI runner without bloating happy-path
+/// runtime (the loop exits on the first successful accept).
+const SYNC_BACKEND_ACCEPT_BUDGET_MS: u64 = 2000;
+
+/// Larger accept budget for tests that drive two sequential client
+/// connections through the same backend (e.g. basic-auth tests that
+/// retry after the 401). The backend is single-threaded — the second
+/// accept needs the budget of two cycles.
+const SYNC_BACKEND_TWO_SHOT_ACCEPT_BUDGET_MS: u64 = 4000;
+
+/// Sleep between [`SyncBackend::accept`] retries. Small enough that the
+/// 2 s budget gets ~400 attempts; large enough that a busy spin does
+/// not burn a CPU core. Does not extend the deadline (see
+/// `accept_with_retry`).
+const SYNC_BACKEND_RETRY_SLEEP_MS: u64 = 5;
+
+/// Wallclock budget for the [`H2Backend`] mock to record at least one
+/// request after the test resolves its frontend response. The hyper
+/// service runs on a dedicated tokio runtime; under contended CI we
+/// poll for up to this window before reading the recorded snapshot.
+const H2_BACKEND_RECORD_BUDGET_MS: u64 = 2500;
+
+/// Poll interval used by [`wait_for_h2_requests`] while waiting for
+/// the [`H2Backend`] to register a request. Same trade-off as the
+/// SyncBackend retry sleep — small enough to react quickly under load,
+/// large enough to avoid a busy spin.
+const H2_BACKEND_RECORD_POLL_MS: u64 = 25;
+
 /// Helper to spawn a fresh sozu worker with a single HTTP listener at
 /// `front_address` and return the worker. The cluster + frontend +
 /// backends are added by each test on top of this baseline so the
@@ -92,15 +123,11 @@ fn add_backend(
 /// listener has a 100 ms read timeout, so a single call can return
 /// before sozu has opened its outbound connection on a slow CI runner).
 ///
-/// The 100 ms internal poll is short enough that a busy spin would burn
-/// a full CPU core on every retry. Sleep 5 ms between attempts so the
-/// overall budget still expires within `total_ms` (~20 attempts on the
-/// hot path, fewer when the listener returns earlier).
-///
-/// Deadline check sits AFTER the accept attempt so we always make a
-/// final attempt right at the boundary — a `while now < deadline` check
-/// at the top would skip the last `accept()` call when the loop sleeps
-/// straight onto the deadline (security-review LISA-006).
+/// Sleeps [`SYNC_BACKEND_RETRY_SLEEP_MS`] between attempts so a busy
+/// spin doesn't burn a CPU core. Deadline check sits AFTER the accept
+/// attempt so the boundary attempt always runs — a `while now < deadline`
+/// check at the top would skip the last `accept()` call when the loop
+/// sleeps straight onto the deadline.
 fn accept_with_retry(backend: &mut SyncBackend, client_id: usize, total_ms: u64) -> bool {
     let deadline = std::time::Instant::now() + Duration::from_millis(total_ms);
     loop {
@@ -110,7 +137,7 @@ fn accept_with_retry(backend: &mut SyncBackend, client_id: usize, total_ms: u64)
         if std::time::Instant::now() >= deadline {
             return false;
         }
-        std::thread::sleep(Duration::from_millis(5));
+        std::thread::sleep(Duration::from_millis(SYNC_BACKEND_RETRY_SLEEP_MS));
     }
 }
 
@@ -331,7 +358,7 @@ pub fn try_basic_auth_h1_h1() -> State {
         let mut client = Client::new("auth_ok", front_address, req);
         client.connect();
         client.send();
-        accept_with_retry(&mut backend, 0, 2000);
+        accept_with_retry(&mut backend, 0, SYNC_BACKEND_ACCEPT_BUDGET_MS);
         let _ = backend.receive(0);
         backend.send(0);
         let resp = client.receive().expect("client must receive 200");
@@ -395,7 +422,7 @@ pub fn try_rewrite_host_h1_h1() -> State {
     );
     client.connect();
     client.send();
-    accept_with_retry(&mut backend, 0, 2000);
+    accept_with_retry(&mut backend, 0, SYNC_BACKEND_ACCEPT_BUDGET_MS);
     let received = backend.receive(0).expect("backend must receive request");
     backend.send(0);
     let _ = client.receive();
@@ -459,7 +486,7 @@ pub fn try_rewrite_path_h1_h1() -> State {
     );
     client.connect();
     client.send();
-    accept_with_retry(&mut backend, 0, 2000);
+    accept_with_retry(&mut backend, 0, SYNC_BACKEND_ACCEPT_BUDGET_MS);
     let received = backend.receive(0).expect("backend must receive request");
     backend.send(0);
     let _ = client.receive();
@@ -522,7 +549,7 @@ pub fn try_request_header_inject_h1_h1() -> State {
     );
     client.connect();
     client.send();
-    accept_with_retry(&mut backend, 0, 2000);
+    accept_with_retry(&mut backend, 0, SYNC_BACKEND_ACCEPT_BUDGET_MS);
     let received = backend.receive(0).expect("backend must receive request");
     backend.send(0);
     let _ = client.receive();
@@ -580,7 +607,7 @@ pub fn try_request_header_delete_h1_h1() -> State {
     let mut client = Client::new("rd_client", front_address, req.to_owned());
     client.connect();
     client.send();
-    accept_with_retry(&mut backend, 0, 2000);
+    accept_with_retry(&mut backend, 0, SYNC_BACKEND_ACCEPT_BUDGET_MS);
     let received = backend.receive(0).expect("backend must receive request");
     backend.send(0);
     let _ = client.receive();
@@ -644,7 +671,7 @@ pub fn try_response_header_inject_h1_h1() -> State {
     );
     client.connect();
     client.send();
-    accept_with_retry(&mut backend, 0, 2000);
+    accept_with_retry(&mut backend, 0, SYNC_BACKEND_ACCEPT_BUDGET_MS);
     let _ = backend.receive(0);
     backend.send(0);
     let resp = client.receive().expect("client must receive response");
@@ -704,7 +731,7 @@ pub fn try_response_header_delete_h1_h1() -> State {
     );
     client.connect();
     client.send();
-    accept_with_retry(&mut backend, 0, 2000);
+    accept_with_retry(&mut backend, 0, SYNC_BACKEND_ACCEPT_BUDGET_MS);
     let _ = backend.receive(0);
     backend.send(0);
     let resp = client.receive().expect("client must receive response");
@@ -790,10 +817,6 @@ fn test_per_cluster_503_template() {
         State::Success
     );
 }
-
-// ═════════════════════════════════════════════════════════════════════
-// Cardinality matrix — H2 frontend variants
-// ═════════════════════════════════════════════════════════════════════
 
 // ═════════════════════════════════════════════════════════════════════
 // Cardinality matrix — H2 frontend variants
@@ -971,7 +994,7 @@ pub fn try_basic_auth_h2_h1() -> State {
         .expect("H2 request must build");
     let rt = tokio::runtime::Runtime::new().expect("runtime");
     let backend_handle = std::thread::spawn(move || {
-        if accept_with_retry(&mut backend, 0, 4000) {
+        if accept_with_retry(&mut backend, 0, SYNC_BACKEND_TWO_SHOT_ACCEPT_BUDGET_MS) {
             let _ = backend.receive(0);
             backend.send(0);
         }
@@ -1055,7 +1078,7 @@ pub fn try_response_header_inject_h2_h1() -> State {
 
     let client = build_h2_client();
     let backend_handle = std::thread::spawn(move || {
-        if accept_with_retry(&mut backend, 0, 4000) {
+        if accept_with_retry(&mut backend, 0, SYNC_BACKEND_TWO_SHOT_ACCEPT_BUDGET_MS) {
             let _ = backend.receive(0);
             backend.send(0);
         }
@@ -1107,7 +1130,7 @@ fn wait_for_h2_requests(
         if snapshot.len() >= target {
             return snapshot;
         }
-        std::thread::sleep(Duration::from_millis(25));
+        std::thread::sleep(Duration::from_millis(H2_BACKEND_RECORD_POLL_MS));
     }
     backend.recorded_requests()
 }
@@ -1144,7 +1167,7 @@ pub fn try_h1_to_h2_backend_smoke() -> State {
     client.send();
     let resp = client.receive();
 
-    let deadline = std::time::Instant::now() + Duration::from_millis(2500);
+    let deadline = std::time::Instant::now() + Duration::from_millis(H2_BACKEND_RECORD_BUDGET_MS);
     let snapshot = wait_for_h2_requests(&backend, 1, deadline);
     drop(backend);
     worker.soft_stop();
@@ -1225,7 +1248,7 @@ pub fn try_rewrite_path_h1_h2() -> State {
     client.send();
     let resp = client.receive();
 
-    let deadline = std::time::Instant::now() + Duration::from_millis(2500);
+    let deadline = std::time::Instant::now() + Duration::from_millis(H2_BACKEND_RECORD_BUDGET_MS);
     let snapshot = wait_for_h2_requests(&backend, 1, deadline);
     drop(backend);
     worker.soft_stop();
@@ -1312,7 +1335,7 @@ pub fn try_request_header_inject_h2_h2() -> State {
     let client = build_h2_client();
     let outcome = resolve_request(&client, uri);
 
-    let deadline = std::time::Instant::now() + Duration::from_millis(2500);
+    let deadline = std::time::Instant::now() + Duration::from_millis(H2_BACKEND_RECORD_BUDGET_MS);
     let snapshot = wait_for_h2_requests(&backend, 1, deadline);
     drop(backend);
     worker.soft_stop();
