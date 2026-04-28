@@ -65,8 +65,11 @@ Every mio registration carries a `Token` (a `usize`). The
 maps each token back to the session that owns the registration. This
 slab is also the unit of bookkeeping that enforces `max_connections`
 (`lib/src/server.rs:188, 194`) and gauges
-`client.connections` / `client.connections_percentage` /
-`client.max_connections` (`lib/src/server.rs:223-228`).
+`client.connections`, `client.connections_max`,
+`client.connections_percent`, `slab.{entries,capacity,usage_percent,
+accept_threshold_percent}` and `buffer.{in_use,capacity,usage_percent}`,
+all sampled once per run-loop iteration in
+`Server::run` (`lib/src/server.rs`).
 
 A single session typically occupies *two* slab entries while it is
 forwarding traffic: one for the frontend token (registered when the
@@ -462,8 +465,11 @@ set to read a session's life from a dashboard:
   (`lib/src/protocol/rustls.rs:193, 254, 261, 328-345`).
 - `https.alpn.rejected.{unsupported,http11_disabled}` — ALPN refusal
   causes (`lib/src/https.rs:342, 359, 372`).
-- `client.connections{,_percentage}`, `client.max_connections` —
-  slab-backed lifecycle gauges (`lib/src/server.rs:223-228, 236-241`).
+- `client.connections`, `client.connections_max`,
+  `client.connections_percent` — slab-backed lifecycle gauges
+  (`client.connections` is sampled per increment/decrement in
+  `SessionManager::incr/decr`; `_max` and `_percent` are sampled in the
+  run loop alongside `slab.*` and `buffer.*`).
 - `accept_queue.backpressure`, `accept_queue.saturated_seconds` —
   binary backpressure + time-integrated saturation
   (`lib/src/server.rs:196, 207, 682-699`).
