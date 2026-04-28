@@ -1046,7 +1046,17 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         self.log_request(metrics, false, None);
     }
     pub fn log_request_error(&self, metrics: &mut SessionMetrics, message: &str) {
-        incr!("http.errors");
+        // Labelled with `(cluster_id, backend_id)` so per-cluster dashboards
+        // can attribute error rates. The labels are dropped centrally by
+        // `filter_labels_for_detail` (`metrics/mod.rs`) when
+        // `metrics.detail` is `process` / `frontend` / `cluster`, so default
+        // setups still see the same proxy-wide counter — no double-counting,
+        // no surprise cardinality.
+        incr!(
+            "http.errors",
+            self.context.cluster_id.as_deref(),
+            self.context.backend_id.as_deref()
+        );
         error!(
             "{} Could not process request properly got: {}",
             log_context!(self),

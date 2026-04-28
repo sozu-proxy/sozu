@@ -205,7 +205,14 @@ impl Stream {
             self.request_counted = false;
         }
         if error {
-            incr!("http.errors");
+            // Labelled with `(cluster_id, backend_id)`; see the matching
+            // emission in `kawa_h1::log_request_error` for the cardinality
+            // contract (`metrics::filter_labels_for_detail`).
+            incr!(
+                "http.errors",
+                context.cluster_id.as_deref(),
+                context.backend_id.as_deref()
+            );
         }
         let protocol = match context.protocol {
             Protocol::HTTP => "http",
