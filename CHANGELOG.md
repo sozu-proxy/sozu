@@ -4,6 +4,129 @@
 
 See milestone [`v1.1.0`](https://github.com/sozu-proxy/sozu/projects/3?card_filter_query=milestone%3Av1.1.0)
 
+## feat/answer-templates-rewrite-auth - Unreleased
+
+Brings the upstream answer-template / URL-rewrite / basic-auth feature stack
+(originally proposed across PRs #1206, #1207, #1208, #1210) onto current `main`
+without unwinding the `feat/h2-mux` work merged in #1209. The features are
+re-implemented at the active `mux/` layer instead of the legacy `kawa_h1/`
+session path the upstream PRs targeted, so every running session benefits.
+
+### 🌟 Added
+
+- **Flexible HTTP answer templates per listener and per cluster**: the proto
+  schema for `HttpListenerConfig`, `HttpsListenerConfig`, and `Cluster` gains
+  a `map<string, string> answers` field keyed by HTTP status code. The
+  listener-level map is the global default; the cluster-level map overrides
+  it for the matching status code on requests routed to that cluster. The
+  deprecated `optional CustomHttpAnswers http_answers` field is preserved on
+  the wire so existing state files round-trip (the runtime merges both for
+  one minor). Each map value is **either an inline literal body (the
+  default) or `file://<path>` to load off disk** — the inline form
+  skips disk I/O entirely, useful for short canned responses,
+  secrets-free containers, and test rigs
+  (`sozu cluster add --answer 503='HTTP/1.1 503 ...'` or
+  `[listeners.https.answers] "503" = "..."` for inline,
+  `--answer 503=file:///etc/sozu/503.http` for path). The new template
+  engine (`lib/src/protocol/kawa_h1/answers.rs`) supports variable
+  substitution via `%ROUTE`, `%REQUEST_ID`, `%CLUSTER_ID`, `%BACKEND_ID`,
+  `%DURATION`, `%CAPACITY`, `%PHASE`, `%SUCCESSFULLY_PARSED`,
+  `%PARTIALLY_PARSED`, `%INVALID` (repeatable), `%REDIRECT_LOCATION`,
+  `%MESSAGE`, `%TEMPLATE_NAME` (single-use), `%WWW_AUTHENTICATE`
+  (header-only, elides the line when the realm is empty). When the
+  template carries a literal `Content-Length`, the engine recomputes
+  the value from the actual rendered body size after `%`-substitutions
+  — closing the RFC 9110 §8.6 / RFC 7230 §3.3.2 anti-smuggling drift.
+  Templates that omit `Content-Length` keep their byte-for-byte shape;
+  nothing is synthesised. Per-cluster overrides hot-swap via
+  `AddCluster` / `RemoveCluster`. HAProxy parallel: `errorfile NNN /path`.
+
+- **URL rewrite, redirect, and per-frontend custom headers**: new
+  `RequestHttpFrontend` fields (`redirect`, `redirect_scheme`,
+  `redirect_template`, `rewrite_host`, `rewrite_path`, `rewrite_port`,
+  `headers`, `required_auth`) drive frontend-level routing decisions.
+  `RedirectPolicy::PERMANENT` emits a 301 with a resolved `Location` header
+  built from `redirect_scheme` (USE_SAME / USE_HTTP / USE_HTTPS) and the
+  cluster's optional `https_redirect_port`. `RedirectPolicy::UNAUTHORIZED`
+  (or a clusterless `FORWARD`) emits a 401. `Header { position, key, val }`
+  carries request- or response-side header edits; an empty `val` deletes
+  the header by name (HAProxy `del-header` parity).
+
+- **HTTP Basic authentication on a per-frontend basis**: clusters gain
+  `authorized_hashes: repeated string` (entries shaped
+  `username:hex(sha256(password))`) and `www_authenticate: optional string`
+  (realm). Frontends with `required_auth = true` invoke
+  `mux::auth::check_basic`, which extracts the `Authorization: Basic`
+  header, base64-decodes the token, hashes the password with SHA-256,
+  and compares against every entry in `authorized_hashes` using
+  `subtle::ConstantTimeEq` over the full list (no early exit). Failure
+  produces a 401 with a `WWW-Authenticate: Basic realm="<realm>"` header
+  rendered through the answer-template engine. The credential boundary
+  is hardened against the timing side-channel that PR #1210's review fix
+  (`171a31ce` upstream) was designed to prevent. New workspace dependencies
+  `base64 = ^0.22.1` and `subtle = ^2.6.1`.
+
+  The maximum decoded credential length is operator-tunable via the new
+  main-config field `basic_auth_max_credential_bytes` (default 4096).
+  Lower values (256 / 512) bound the per-failed-auth allocation tighter
+  for hardened tenants. Setting `0` is a no-op so an explicit zero
+  cannot disable the cap by accident. The config validator emits a
+  `warn!` at boot when the configured cap is `>= buffer_size / 3` —
+  informational only, but flags the back-pressure trade-off
+  (a single failed auth pinning ~33% of the per-frontend buffer).
+
+- **Pattern-trie segment regex anchoring with capture propagation**: every
+  segment-level regex inserted into the routing trie is now wrapped with
+  `\A...\z` at insert time so a pattern like `cdn[0-9]+` matches `cdn1`
+  exactly but not `cdn1xxx`. A new `lookup_with_path` helper records the
+  non-literal segments matched during traversal (`TrieSubMatch::Wildcard`
+  / `TrieSubMatch::Regexp`) so the routing layer can re-run
+  `Regex::captures` on the matched bytes and feed the captures into
+  rewrite templates (`$HOST[n]` / `$PATH[n]` placeholders).
+
+- **`Frontend` and `RouteResult` types in the routing layer**: the bare
+  `Route::ClusterId` / `Route::Deny` decision is replaced by a richer
+  `Frontend` (per-frontend policy, cached header-edit slices, capture
+  capacity counts) and `RouteResult` (resolved policy plus substituted
+  rewritten host/path). The `L7ListenerHandler::frontend_from_request`
+  trait return type changes to `Result<RouteResult, _>`. Legacy
+  `Route::ClusterId` and `Route::Deny` variants remain so existing
+  match arms still compile; a follow-up will retire them.
+
+### 🔄 Changed
+
+- `HttpAnswers::new` now takes `&BTreeMap<String, String>` instead of
+  `&Option<CustomHttpAnswers>`. `HttpAnswers::get` returns
+  `(u16, bool, DefaultAnswerStream)` so the rendered template's
+  `Connection` header can drive the frontend keep-alive bit (templates
+  that ship `Connection: close` flip the flag; operators can opt back
+  into keep-alive by shipping a custom template without that header).
+  All in-tree call sites update in lockstep; legacy state files merge
+  the populated `CustomHttpAnswers` fields into the new map at load.
+
+- `mux/answers.rs::default_answer_for_code` becomes a pure builder that
+  takes the redirect URL and `WWW-Authenticate` realm as parameters.
+  `set_default_answer` reads them from `HttpContext.redirect_location`
+  and `HttpContext.www_authenticate` (stashed by the routing layer)
+  before falling back to the legacy `https://<authority><path>` shape.
+
+- `CachedTags` derives `PartialEq + Eq + Clone` so `RouteResult` can
+  derive `PartialEq` for assertions in router unit tests.
+
+### ⚠️ Behaviour-affecting
+
+- Pattern-trie domain regexes now match the entire segment. Operators
+  who relied on partial-segment matching (e.g. a `cdn[0-9]+` rule
+  inadvertently matching `cdn123xxx`) need to widen their patterns
+  explicitly. Every pre-existing in-tree regex test passes unchanged
+  with the new anchoring.
+
+- The HAProxy-style `del-header` semantic (empty `Header.val` removes
+  the named header) is **not** a no-op. Operators who already configured
+  custom headers with the empty string as a value should set a
+  whitespace-only value instead — though that is malformed per RFC 9110
+  §5.5 and should be reviewed.
+
 ## feat/h2-mux - Unreleased
 
 ### 🌟 Added

@@ -8,7 +8,10 @@
 use std::{cell::RefCell, collections::HashMap, rc::Rc, time::Duration};
 
 use mio::{Interest, Token, net::TcpStream};
-use sozu_command::{logging::ansi_palette, proto::command::ListenerType};
+use sozu_command::{
+    logging::ansi_palette,
+    proto::command::{ListenerType, RedirectPolicy, RedirectScheme},
+};
 
 #[cfg(debug_assertions)]
 use super::DebugEvent;
@@ -17,8 +20,8 @@ use crate::{
     BackendConnectionError, L7ListenerHandler, L7Proxy, ListenerHandler, ProxySession, Readiness,
     RetrieveClusterError,
     backends::{Backend, BackendError},
-    protocol::http::editor::HttpContext,
-    router::Route,
+    protocol::http::editor::{HeaderEditSnapshot, HttpContext},
+    router::{HeaderEdit, RouteResult},
     server::CONN_RETRIES,
     socket::SessionTcpStream,
     timer::TimeoutContainer,
@@ -119,10 +122,20 @@ impl Router {
         }
         stream.attempts += 1;
 
-        let stream_context = &mut stream.context;
+        // Borrow front mutably (so route_from_request can rewrite the request
+        // line authority/path and inject request-side header edits before we
+        // forward to the backend) plus context mutably (so it can stash
+        // redirect_location / www_authenticate / original_authority /
+        // headers_response). We split-borrow manually to keep the rest of
+        // `connect` working with `stream_context` aliasing `stream.context`.
+        let (front_ref, stream_context_ref) = {
+            let stream_split = &mut *stream;
+            (&mut stream_split.front, &mut stream_split.context)
+        };
         let cluster_id = self
-            .route_from_request(stream_context, &context.listener)
+            .route_from_request(stream_context_ref, front_ref, &context.listener, &proxy)
             .map_err(BackendConnectionError::RetrieveClusterError)?;
+        let stream_context = &mut stream.context;
         stream_context.cluster_id = Some(cluster_id.to_owned());
 
         let (frontend_should_stick, frontend_should_redirect_https, h2) = proxy
@@ -456,7 +469,9 @@ impl Router {
     fn route_from_request<L: ListenerHandler + L7ListenerHandler>(
         &mut self,
         context: &mut HttpContext,
+        front: &mut super::GenericHttpStream,
         listener: &Rc<RefCell<L>>,
+        proxy: &Rc<RefCell<dyn L7Proxy>>,
     ) -> Result<String, RetrieveClusterError> {
         let (host, uri, method) = match context.extract_route() {
             Ok(tuple) => tuple,
@@ -472,6 +487,11 @@ impl Router {
                 return Err(cluster_error);
             }
         };
+        // Snapshot the pre-rewrite authority into an owned string so we
+        // can later stash it on `context.original_authority` without
+        // mutably aliasing the immutable borrow that `host: &str` still
+        // holds on `context`.
+        let captured_authority = host.to_owned();
 
         // ── TLS SNI ↔ HTTP :authority binding ─────────────────────────────
         // Reject any request whose authority hostname does not exact-match the
@@ -514,13 +534,126 @@ impl Router {
             }
         };
 
-        let cluster_id = match route {
-            Route::ClusterId(id) => id,
-            Route::Deny => {
-                trace!("{} Route::Deny", log_module_context!(context));
-                return Err(RetrieveClusterError::UnauthorizedRoute);
-            }
+        // Stash the pre-rewrite authority unconditionally so log lines,
+        // access logs, and audit records that fire on ANY downstream
+        // path (denial, redirect, basic-auth 401, backend-connect
+        // failure, successful forward) carry the value the client
+        // actually sent. Capturing inside the rewrite helper alone would
+        // lose it on every branch where the rewrite is not applied.
+        context.original_authority = Some(captured_authority);
+
+        // ── Resolve the routing decision ──────────────────────────────────
+        // Snapshot the policy fields we need before consuming `route`, then
+        // map each policy outcome to either an early-error variant (which
+        // the caller turns into a default answer) or a cluster_id (which
+        // proceeds to backend connect).
+        let RouteResult {
+            cluster_id,
+            redirect,
+            redirect_scheme,
+            rewritten_host,
+            rewritten_path,
+            rewritten_port,
+            headers_request,
+            headers_response,
+            required_auth: frontend_required_auth,
+            ..
+        } = route;
+
+        // Look up cluster-side policy knobs once. The values we need are:
+        //  - `https_redirect` (legacy) and `https_redirect_port` for the 301 location URL
+        //  - `authorized_hashes` and `www_authenticate` for the 401 path
+        let (legacy_https_redirect, https_redirect_port, authorized_hashes, www_authenticate) =
+            match cluster_id.as_deref() {
+                Some(id) => proxy
+                    .borrow()
+                    .clusters()
+                    .get(id)
+                    .map(|c| {
+                        (
+                            c.https_redirect,
+                            c.https_redirect_port,
+                            c.authorized_hashes.clone(),
+                            c.www_authenticate.clone(),
+                        )
+                    })
+                    .unwrap_or((false, None, Vec::new(), None)),
+                None => (false, None, Vec::new(), None),
+            };
+
+        // ── 1. Explicit `RedirectPolicy::UNAUTHORIZED` or clusterless deny ─
+        if matches!(redirect, RedirectPolicy::Unauthorized) || cluster_id.is_none() {
+            context.www_authenticate = www_authenticate.clone();
+            trace!("{} RouteResult::deny", log_module_context!(context));
+            return Err(RetrieveClusterError::UnauthorizedRoute);
+        }
+
+        let Some(cluster_id) = cluster_id else {
+            // Guarded by the clusterless-deny branch immediately above;
+            // the `is_none()` arm has already returned `UnauthorizedRoute`
+            // by the time control reaches here.
+            unreachable!("cluster_id was checked Some above")
         };
+
+        // ── 2. Explicit `RedirectPolicy::PERMANENT` ─────────────────────────
+        if matches!(redirect, RedirectPolicy::Permanent) {
+            let scheme = resolve_redirect_scheme(redirect_scheme, context);
+            let port = rewritten_port.map(|p| p as u32).or(https_redirect_port);
+            context.redirect_location = Some(build_redirect_location(scheme, context, port));
+            return Err(RetrieveClusterError::HttpsRedirect);
+        }
+
+        // ── 3. Legacy `cluster.https_redirect` (HTTP-only listeners) ───────
+        // The caller (`Router::connect`) emits the actual 301 only on
+        // `ListenerType::Http`; gate the URL stash on the same predicate
+        // so an HTTPS listener never carries a stale `redirect_location`
+        // into a downstream default-answer path.
+        if legacy_https_redirect && matches!(proxy.borrow().kind(), ListenerType::Http) {
+            let port = https_redirect_port;
+            context.redirect_location = Some(build_redirect_location("https", context, port));
+        }
+
+        // ── 4. Basic auth check (only when `required_auth` was set) ────────
+        // The check iterates the full hash list in constant time (see
+        // `crate::protocol::mux::auth::check_basic`) so the time spent
+        // does not leak which hash matched, or whether any did at all.
+        // On failure, stash the cluster's `www_authenticate` realm so the
+        // 401 default-answer can render the matching `WWW-Authenticate`
+        // header. An empty realm causes the template engine to elide the
+        // header entirely (`or_elide_header = true`).
+        if frontend_required_auth
+            && !crate::protocol::mux::auth::check_basic(front, &authorized_hashes)
+        {
+            context.www_authenticate = www_authenticate.clone();
+            trace!(
+                "{} basic-auth check failed; emitting 401",
+                log_module_context!(context)
+            );
+            return Err(RetrieveClusterError::UnauthorizedRoute);
+        }
+
+        // ── 5. Request-side mutations on the front kawa ────────────────────
+        // From here on the route is a Forward — apply the frontend's
+        // rewrite + header policy to the request kawa so the backend
+        // wire carries the operator-configured shape.
+        apply_request_rewrites_and_headers(
+            front,
+            context,
+            rewritten_host.as_deref(),
+            rewritten_path.as_deref(),
+            &headers_request,
+        );
+
+        // Stash the response-side header edits for the emission path
+        // (`mux/h1.rs::writable`, `mux/h2.rs::write_streams`) to apply
+        // before `kawa.prepare(...)`.
+        context.headers_response.clear();
+        for edit in headers_response.iter() {
+            context.headers_response.push(HeaderEditSnapshot {
+                key: edit.key.to_vec(),
+                val: edit.val.to_vec(),
+            });
+        }
 
         Ok(cluster_id)
     }
@@ -584,6 +717,232 @@ impl Router {
                 .backend_from_cluster_id(cluster_id),
         }
     }
+}
+
+/// Apply the frontend's request-side rewrite + header policy to the
+/// request kawa. Mutations land before backend connect so the backend
+/// wire carries the rewritten shape:
+///
+/// 1. If `rewritten_host` is set, replace the request-line authority
+///    with the rewritten value, replace any existing `Host` request
+///    header (so H1 backends see the same value the H2 `:authority`
+///    would carry), and inject `X-Forwarded-Host` carrying the
+///    pre-rewrite authority. The X-Forwarded-Host injection ONLY fires
+///    when `rewritten_host` is set — without a rewrite there is no host
+///    swap to disclose, and HAProxy's `option forwardfor` style
+///    headers (`X-Forwarded-For`, `X-Forwarded-Proto`) still flow from
+///    the kawa parser. The pre-rewrite authority itself is captured by
+///    the caller (`route_from_request`) into `context.original_authority`
+///    on every routed request so it survives every downstream code path
+///    (audit, deny, redirect, basic-auth 401, backend-connect failure).
+///    Dedup rule: the synthetic Host AND any pre-existing Host header
+///    are dropped in the retain pass below before the rewritten Host is
+///    appended, so the wire never carries two `Host:` headers.
+/// 2. If `rewritten_path` is set, replace both the abstract path
+///    (consumed by H2 `:path`) and the request-line URI (consumed by
+///    the H1 converter) so cardinality H1↔H1, H1↔H2, H2↔H1, H2↔H2 all
+///    propagate the rewritten target.
+/// 3. For every `headers_request` edit:
+///    - empty `val` → remove every existing header with the matching
+///      name from `kawa.blocks` (HAProxy `del-header` parity);
+///    - non-empty `val` → append the header before the `end_header`
+///      flag block. Set/replace semantics: callers that want to replace
+///      a header pass two edits (one delete with empty val, one set
+///      with the new value).
+fn apply_request_rewrites_and_headers(
+    kawa: &mut super::GenericHttpStream,
+    context: &mut HttpContext,
+    rewritten_host: Option<&str>,
+    rewritten_path: Option<&str>,
+    headers_request: &[HeaderEdit],
+) {
+    use kawa::{Block, Pair, Store};
+
+    if rewritten_host.is_none() && rewritten_path.is_none() && headers_request.is_empty() {
+        return;
+    }
+
+    // `route_from_request` already captured the pre-rewrite authority
+    // into `context.original_authority`. Re-borrow it here for the
+    // optional X-Forwarded-Host injection rather than re-parsing the
+    // kawa Store. Cloning a short header value (typically `host:port`)
+    // is cheaper than another UTF-8 decode of the request-line slice.
+    let original_authority: Option<String> = if rewritten_host.is_some() {
+        context.original_authority.clone()
+    } else {
+        None
+    };
+
+    // ── status-line authority / path rewrites ─────────────────────────
+    // The kawa request status line carries both `path` and `uri` —
+    // `path` is the abstract path (consumed by the H2 converter to
+    // emit `:path`) while `uri` is the request-line URI (consumed by
+    // the H1 converter at `kawa::protocol::h1::converter`). Both must
+    // be mutated so an H1 frontend forwarding to an H1 backend AND an
+    // H2 frontend forwarding to an H1 backend (or vice versa) see the
+    // rewritten target on the wire.
+    if rewritten_host.is_some() || rewritten_path.is_some() {
+        if let kawa::StatusLine::Request {
+            authority,
+            path,
+            uri,
+            ..
+        } = &mut kawa.detached.status_line
+        {
+            if let Some(new_host) = rewritten_host {
+                *authority = Store::from_string(new_host.to_owned());
+            }
+            if let Some(new_path) = rewritten_path {
+                *path = Store::from_string(new_path.to_owned());
+                *uri = Store::from_string(new_path.to_owned());
+            }
+        }
+    }
+
+    // ── single-pass split: deletes vs. sets ───────────────────────────
+    // Walk `headers_request` once and separate each edit into either the
+    // delete list (empty val) or the insert list (non-empty val). Two
+    // passes was wasteful when an operator stacks many `--header` flags;
+    // one pass keeps the allocation profile flat.
+    let host_lower = b"host";
+    let xfh_lower = b"x-forwarded-host";
+    let rewriting_host = rewritten_host.is_some();
+    let mut keys_to_drop: Vec<Vec<u8>> = Vec::with_capacity(headers_request.len() + 2);
+    let mut to_insert: Vec<Block> = Vec::with_capacity(headers_request.len() + 2);
+    // Track whether any operator-supplied edit names Host or
+    // X-Forwarded-Host so we always dedup the existing kawa Host header
+    // before inserting the operator's value. Without this, an operator
+    // who sets `--header request=Host=evil` on a frontend WITHOUT
+    // `--rewrite-host` lands TWO `Host:` headers on the backend wire —
+    // a request-smuggling primitive on backends that pick last-Host
+    // (CWE-444 cousin).
+    let mut operator_overrides_host = false;
+    let mut operator_overrides_xfh = false;
+    for edit in headers_request {
+        let key_is_host = edit.key.eq_ignore_ascii_case(host_lower);
+        let key_is_xfh = edit.key.eq_ignore_ascii_case(xfh_lower);
+        operator_overrides_host |= key_is_host;
+        operator_overrides_xfh |= key_is_xfh;
+        if edit.val.is_empty() {
+            keys_to_drop.push(edit.key.iter().map(u8::to_ascii_lowercase).collect());
+        } else {
+            to_insert.push(Block::Header(Pair {
+                key: Store::from_slice(&edit.key),
+                val: Store::from_slice(&edit.val),
+            }));
+        }
+    }
+    if rewriting_host || operator_overrides_host {
+        keys_to_drop.push(host_lower.to_vec());
+    }
+    if rewriting_host || operator_overrides_xfh {
+        keys_to_drop.push(xfh_lower.to_vec());
+    }
+
+    // ── delete pass on existing blocks ────────────────────────────────
+    let buf_ptr = kawa.storage.buffer();
+    if !keys_to_drop.is_empty() {
+        // Read `key.data(buf_ptr)` only on non-elided headers — kawa's
+        // earlier passes (HPACK decoder, H1 header parser) tag suppressed
+        // headers with `Store::Empty` rather than removing them, and
+        // calling `.data()` on `Store::Empty` panics in
+        // `kawa-0.6.8/src/storage/repr.rs`. Pinning the guard explicitly
+        // until kawa changes its policy.
+        let buf = buf_ptr;
+        kawa.blocks.retain(|block| {
+            if let Block::Header(Pair { key, val: _ }) = block {
+                if matches!(key, Store::Empty) {
+                    return true;
+                }
+                let key_bytes = key.data(buf);
+                // Both `keys_to_drop` and `key_lower` are pre-lowercased,
+                // so a byte-equality compare is sufficient — a second
+                // ASCII-fold pass via `compare_no_case` would just burn
+                // cycles re-folding bytes that are already canonical.
+                let key_lower: Vec<u8> = key_bytes.iter().map(u8::to_ascii_lowercase).collect();
+                !keys_to_drop
+                    .iter()
+                    .any(|k| k.as_slice() == key_lower.as_slice())
+            } else {
+                true
+            }
+        });
+    }
+
+    // ── insertion before the end-of-headers flag ──────────────────────
+    // Every header we add (rewritten Host, X-Forwarded-Host,
+    // operator-supplied set/append edits) must land before
+    // `Block::Flags { end_header: true }` so the converter emits them
+    // as part of the request header block. Synthetic Host/X-Forwarded-Host
+    // are prepended (they describe the rewrite, not an operator policy).
+    let end_header_idx = super::shared::end_of_headers_index(kawa);
+
+    if rewriting_host {
+        let mut synth: Vec<Block> = Vec::with_capacity(2);
+        if let Some(new_host) = rewritten_host {
+            synth.push(Block::Header(Pair {
+                key: Store::Static(b"Host"),
+                val: Store::from_string(new_host.to_owned()),
+            }));
+        }
+        if let Some(orig) = original_authority.as_deref() {
+            synth.push(Block::Header(Pair {
+                key: Store::Static(b"X-Forwarded-Host"),
+                val: Store::from_string(orig.to_owned()),
+            }));
+        }
+        synth.append(&mut to_insert);
+        to_insert = synth;
+    }
+    if !to_insert.is_empty() {
+        let insert_at = end_header_idx.unwrap_or(kawa.blocks.len());
+        for (offset, block) in to_insert.into_iter().enumerate() {
+            kawa.blocks.insert(insert_at + offset, block);
+        }
+    }
+}
+
+/// Resolve the protocol scheme to use when emitting a redirect's `Location`
+/// header. Maps the proto enum onto `"http"` / `"https"`, with `USE_SAME`
+/// preserving the request's scheme (HTTPS for TLS listeners, HTTP otherwise).
+fn resolve_redirect_scheme(scheme: RedirectScheme, context: &HttpContext) -> &'static str {
+    match scheme {
+        RedirectScheme::UseHttps => "https",
+        RedirectScheme::UseHttp => "http",
+        RedirectScheme::UseSame => {
+            if context.tls_server_name.is_some() {
+                "https"
+            } else {
+                "http"
+            }
+        }
+    }
+}
+
+/// Build the `Location` URL for a redirect response. Defaults the port
+/// suffix only when the operator provided one or when scheme defaults
+/// would mismatch (port 80 on https / 443 on http stays implicit).
+fn build_redirect_location(scheme: &str, context: &HttpContext, port: Option<u32>) -> String {
+    let authority = context.authority.as_deref().unwrap_or_default();
+    let path = context.path.as_deref().unwrap_or("/");
+    // Strip an existing `:port` from the authority — operators typically
+    // configure `https_redirect_port` precisely because the listener's
+    // port differs from the redirect target.
+    let host_only = match authority.rsplit_once(':') {
+        Some((host, port_part))
+            if !port_part.is_empty() && port_part.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            host
+        }
+        _ => authority,
+    };
+    let port_suffix = match port {
+        Some(80) if scheme == "http" => String::new(),
+        Some(443) if scheme == "https" => String::new(),
+        Some(p) => format!(":{p}"),
+        None => String::new(),
+    };
+    format!("{scheme}://{host_only}{port_suffix}{path}")
 }
 
 /// Exact-match test between an HTTP `:authority` / `Host` value and a TLS SNI.

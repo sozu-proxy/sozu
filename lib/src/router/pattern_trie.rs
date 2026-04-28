@@ -42,6 +42,24 @@ pub struct TrieNode<V> {
     regexps: Vec<(Regex, TrieNode<V>)>,
 }
 
+/// One step of a trie traversal where a non-literal segment matched.
+///
+/// `Wildcard` carries the actual segment bytes consumed by a `*` wildcard
+/// (so a router that wants to capture them can splice them into a rewrite
+/// template). `Regexp` carries both the matched bytes and the regex itself
+/// so the caller can re-run `Regex::captures` to pull explicit groups.
+#[derive(Debug)]
+pub enum TrieSubMatch<'a, 'b> {
+    Wildcard(&'a [u8]),
+    Regexp(&'a [u8], &'b Regex),
+}
+
+/// Ordered list of non-literal trie segments visited during a successful
+/// `lookup_with_path` traversal. Routers feed the entries into rewrite
+/// templates (`$HOST[n]`) so frontend rewrites can reach into the matched
+/// segments. Empty when only literal segments matched.
+pub type TrieMatches<'a, 'b> = Vec<TrieSubMatch<'a, 'b>>;
+
 impl<V: PartialEq> std::cmp::PartialEq for TrieNode<V> {
     fn eq(&self, other: &Self) -> bool {
         self.key_value == other.key_value
@@ -120,13 +138,19 @@ impl<V: Debug + Clone> TrieNode<V> {
                 }
 
                 if let Ok(s) = str::from_utf8(&partial_key[pos + 1..partial_key.len() - 1]) {
+                    let anchored_s = format!("\\A{s}\\z");
                     for t in self.regexps.iter_mut() {
-                        if t.0.as_str() == s {
+                        if t.0.as_str() == anchored_s {
                             return t.1.insert_recursive(&partial_key[..pos - 1], key, value);
                         }
                     }
 
-                    if let Ok(r) = Regex::new(s) {
+                    // Anchor segment regexes so they only match the entire
+                    // segment, not partial overlaps. Without `\A...\z`, a
+                    // pattern like `cdn[0-9]+` would match `cdn123xxx`,
+                    // which silently widens the routing surface.
+                    let anchored = format!("\\A{s}\\z");
+                    if let Ok(r) = Regex::new(&anchored) {
                         if pos > 0 {
                             let mut node = TrieNode::root();
                             let pos = pos - 1;
@@ -219,10 +243,11 @@ impl<V: Debug + Clone> TrieNode<V> {
                 }
 
                 if let Ok(s) = str::from_utf8(&partial_key[pos + 1..partial_key.len() - 1]) {
+                    let anchored_s = format!("\\A{s}\\z");
                     if pos > 0 {
                         let mut remove_result = RemoveResult::NotFound;
                         for t in self.regexps.iter_mut() {
-                            if t.0.as_str() == s
+                            if t.0.as_str() == anchored_s
                                 && t.1.remove_recursive(&partial_key[..pos - 1]) == RemoveResult::Ok
                             {
                                 remove_result = RemoveResult::Ok;
@@ -231,7 +256,7 @@ impl<V: Debug + Clone> TrieNode<V> {
                         return remove_result;
                     } else {
                         let len = self.regexps.len();
-                        self.regexps.retain(|(r, _)| r.as_str() != s);
+                        self.regexps.retain(|(r, _)| r.as_str() != anchored_s);
                         if len > self.regexps.len() {
                             return RemoveResult::Ok;
                         }
@@ -260,6 +285,60 @@ impl<V: Debug + Clone> TrieNode<V> {
                 }
             },
             None => RemoveResult::NotFound,
+        }
+    }
+
+    /// Look up `partial_key` and additionally collect the non-literal segments
+    /// that matched along the way (`TrieMatches`).
+    ///
+    /// Equivalent to `lookup` for callers that don't need the captures, but
+    /// frontends with `$HOST[n]` rewrite templates need the matched segments
+    /// to fill the placeholders. The accumulator is passed in by value so
+    /// callers can pre-size it (`Vec::with_capacity`) and we own the path
+    /// returned alongside the value.
+    pub fn lookup_with_path<'a, 'b>(
+        &'b self,
+        partial_key: &'a [u8],
+        accept_wildcard: bool,
+        mut trace: TrieMatches<'a, 'b>,
+    ) -> Option<(&'b KeyValue<Key, V>, TrieMatches<'a, 'b>)> {
+        if partial_key.is_empty() {
+            return self.key_value.as_ref().map(|kv| (kv, trace));
+        }
+
+        let pos = find_last_dot(partial_key);
+        let (prefix, suffix) = match pos {
+            None => (&b""[..], partial_key),
+            Some(pos) => (&partial_key[..pos], &partial_key[pos..]),
+        };
+
+        match self.children.get(suffix) {
+            Some(child) => child.lookup_with_path(prefix, accept_wildcard, trace),
+            None => {
+                if prefix.is_empty() && self.wildcard.is_some() && accept_wildcard {
+                    let segment = if !suffix.is_empty() && suffix[0] == b'.' {
+                        &suffix[1..]
+                    } else {
+                        suffix
+                    };
+                    trace.push(TrieSubMatch::Wildcard(segment));
+                    self.wildcard.as_ref().map(|kv| (kv, trace))
+                } else {
+                    for (regexp, child) in self.regexps.iter() {
+                        let segment = if !suffix.is_empty() && suffix[0] == b'.' {
+                            &suffix[1..]
+                        } else {
+                            suffix
+                        };
+                        if regexp.is_match(segment) {
+                            let mut next = trace;
+                            next.push(TrieSubMatch::Regexp(segment, regexp));
+                            return child.lookup_with_path(prefix, accept_wildcard, next);
+                        }
+                    }
+                    None
+                }
+            }
         }
     }
 
@@ -332,8 +411,9 @@ impl<V: Debug + Clone> TrieNode<V> {
                 }
 
                 if let Ok(s) = str::from_utf8(&partial_key[pos + 1..partial_key.len() - 1]) {
+                    let anchored_s = format!("\\A{s}\\z");
                     for t in self.regexps.iter_mut() {
-                        if t.0.as_str() == s {
+                        if t.0.as_str() == anchored_s {
                             return t.1.lookup_mut(&partial_key[..pos - 1], accept_wildcard);
                         }
                     }
@@ -573,6 +653,50 @@ mod tests {
         assert_eq!(
             root.domain_lookup(b"www.doc.sozu.com".as_ref(), false),
             Some(&(b"www.doc./.*/.com".to_vec(), 2))
+        );
+    }
+
+    /// Segment regexes must match the entire segment, not just a prefix.
+    /// Without `\A...\z` anchoring the previous behaviour matched any
+    /// segment whose prefix satisfied the pattern, silently widening the
+    /// routing surface. This regression test exercises the exact-match
+    /// invariant that anchoring guarantees.
+    #[test]
+    fn segment_regex_rejects_partial_matches() {
+        let mut root: TrieNode<u8> = TrieNode::root();
+        // The regex segment `cdn[0-9]+` must match `cdn1`, `cdn99`, etc.
+        // exactly — never `cdn1xxx` or `xxxcdn1` as a prefix/suffix.
+        assert_eq!(
+            root.insert(Vec::from(&b"/cdn[0-9]+/.example.com"[..]), 7),
+            InsertResult::Ok
+        );
+
+        // Exact-match cases still resolve.
+        assert_eq!(
+            root.domain_lookup(b"cdn1.example.com".as_ref(), false),
+            Some(&(b"/cdn[0-9]+/.example.com".to_vec(), 7))
+        );
+        assert_eq!(
+            root.domain_lookup(b"cdn123.example.com".as_ref(), false),
+            Some(&(b"/cdn[0-9]+/.example.com".to_vec(), 7))
+        );
+
+        // Trailing characters past the digit run must fail. Pre-anchoring
+        // the trie would have matched `cdn1xxx` because `cdn[0-9]+` ate
+        // the `cdn1` prefix; with `\A...\z` the segment is rejected.
+        assert_eq!(
+            root.domain_lookup(b"cdn1xxx.example.com".as_ref(), false),
+            None
+        );
+        // Leading characters likewise must fail.
+        assert_eq!(
+            root.domain_lookup(b"xxxcdn1.example.com".as_ref(), false),
+            None
+        );
+        // Non-digit middle bytes break the digit run and the segment.
+        assert_eq!(
+            root.domain_lookup(b"cdnabc.example.com".as_ref(), false),
+            None
         );
     }
 

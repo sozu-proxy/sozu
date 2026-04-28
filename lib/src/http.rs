@@ -41,7 +41,7 @@ use crate::{
         mux::{self, Mux, MuxClear},
         proxy_protocol::expect::ExpectProxyProtocol,
     },
-    router::{Route, Router},
+    router::{RouteResult, Router},
     server::{ListenToken, SessionManager},
     socket::server_bind,
     timer::TimeoutContainer,
@@ -621,7 +621,7 @@ impl L7ListenerHandler for HttpListener {
         host: &str,
         uri: &str,
         method: &Method,
-    ) -> Result<Route, FrontendFromRequestError> {
+    ) -> Result<RouteResult, FrontendFromRequestError> {
         let start = Instant::now();
         let (remaining_input, (hostname, _)) = match hostname_and_port(host.as_bytes()) {
             Ok(tuple) => tuple,
@@ -662,7 +662,7 @@ impl L7ListenerHandler for HttpListener {
 
         let now = Instant::now();
 
-        if let Route::ClusterId(cluster) = &route {
+        if let Some(cluster) = route.cluster_id.as_deref() {
             time!("frontend_matching_time", cluster, (now - start).as_millis());
         }
 
@@ -900,15 +900,21 @@ impl HttpProxy {
     }
 
     pub fn add_cluster(&mut self, mut cluster: Cluster) -> Result<(), ProxyError> {
+        // Reconcile the legacy single-status `answer_503` field with the
+        // new map. The new map wins on collision.
+        let mut overrides = cluster.answers.clone();
         if let Some(answer_503) = cluster.answer_503.take() {
+            overrides.entry("503".to_owned()).or_insert(answer_503);
+        }
+        if !overrides.is_empty() {
             for listener in self.listeners.values() {
                 listener
                     .borrow()
                     .answers
                     .borrow_mut()
-                    .add_custom_answer(&cluster.cluster_id, answer_503.clone())
-                    .map_err(|(status, error)| {
-                        ProxyError::AddCluster(ListenerError::TemplateParse(status, error))
+                    .add_cluster_answers(&cluster.cluster_id, &overrides)
+                    .map_err(|(name, error)| {
+                        ProxyError::AddCluster(ListenerError::TemplateParse(name, error))
                     })?;
             }
         }
@@ -924,7 +930,7 @@ impl HttpProxy {
                 .borrow()
                 .answers
                 .borrow_mut()
-                .remove_custom_answer(cluster_id);
+                .remove_cluster_answers(cluster_id);
         }
         Ok(())
     }
@@ -1033,10 +1039,18 @@ impl HttpListener {
         Ok(HttpListener {
             active: false,
             address: config.address.into(),
-            answers: Rc::new(RefCell::new(
-                HttpAnswers::new(&config.http_answers)
-                    .map_err(|(status, error)| ListenerError::TemplateParse(status, error))?,
-            )),
+            answers: Rc::new(RefCell::new({
+                // Reconcile the legacy `http_answers` per-status fields
+                // with the new template map: the new map wins on
+                // collision, the legacy fields fill in any status the
+                // operator hasn't yet migrated.
+                let mut answers_map = config.answers.clone();
+                if let Some(ref legacy) = config.http_answers {
+                    crate::protocol::http::answers::merge_legacy_into_map(&mut answers_map, legacy);
+                }
+                HttpAnswers::new(&answers_map)
+                    .map_err(|(name, error)| ListenerError::TemplateParse(name, error))?
+            })),
             config,
             fronts: Router::new(),
             listener: None,
@@ -1167,16 +1181,35 @@ impl HttpListener {
             self.config.h2_max_window_update_stream0_per_window = Some(v);
         }
 
-        // HTTP answers: replace listener defaults per-field, preserve cluster overrides
-        if let Some(ref new_answers) = patch.http_answers {
-            crate::sozu_command::state::merge_custom_http_answers(
-                &mut self.config.http_answers,
-                new_answers,
-            );
-            self.answers
-                .borrow_mut()
-                .replace_defaults(new_answers)
-                .map_err(|(status, error)| ListenerError::TemplateParse(status, error))?;
+        // HTTP answers: merge legacy `http_answers` and the new `answers`
+        // map on top of the existing config, then rebuild the listener-level
+        // template registry. Per-cluster overrides in
+        // `HttpAnswers::cluster_answers` are preserved across the rebuild.
+        let answers_changed = patch.http_answers.is_some() || !patch.answers.is_empty();
+        if answers_changed {
+            if let Some(ref new_answers) = patch.http_answers {
+                crate::sozu_command::state::merge_custom_http_answers(
+                    &mut self.config.http_answers,
+                    new_answers,
+                );
+            }
+            for (code, body) in &patch.answers {
+                if !body.is_empty() {
+                    self.config.answers.insert(code.clone(), body.clone());
+                }
+            }
+
+            let mut answers_map = self.config.answers.clone();
+            if let Some(ref legacy) = self.config.http_answers {
+                crate::protocol::http::answers::merge_legacy_into_map(&mut answers_map, legacy);
+            }
+            // Rebuild the listener-level templates and migrate the existing
+            // per-cluster overrides over to the new `HttpAnswers`.
+            let mut new_answers = HttpAnswers::new(&answers_map)
+                .map_err(|(name, error)| ListenerError::TemplateParse(name, error))?;
+            let preserved = std::mem::take(&mut self.answers.borrow_mut().cluster_answers);
+            new_answers.cluster_answers = preserved;
+            *self.answers.borrow_mut() = new_answers;
         }
 
         Ok(())
@@ -1532,7 +1565,7 @@ mod tests {
         time::Duration,
     };
 
-    use sozu_command::proto::command::{CustomHttpAnswers, SocketAddress};
+    use sozu_command::proto::command::SocketAddress;
 
     use super::{testing::start_http_worker, *};
     use crate::sozu_command::{
@@ -1874,6 +1907,14 @@ mod tests {
                 position: RulePosition::Tree,
                 cluster_id: Some(cluster_id1),
                 tags: None,
+                redirect: None,
+                redirect_scheme: None,
+                redirect_template: None,
+                rewrite_host: None,
+                rewrite_path: None,
+                rewrite_port: None,
+                required_auth: None,
+                headers: Vec::new(),
             })
             .expect("Could not add http frontend");
         fronts
@@ -1885,6 +1926,14 @@ mod tests {
                 position: RulePosition::Tree,
                 cluster_id: Some(cluster_id2),
                 tags: None,
+                redirect: None,
+                redirect_scheme: None,
+                redirect_template: None,
+                rewrite_host: None,
+                rewrite_path: None,
+                rewrite_port: None,
+                required_auth: None,
+                headers: Vec::new(),
             })
             .expect("Could not add http frontend");
         fronts
@@ -1896,6 +1945,14 @@ mod tests {
                 position: RulePosition::Tree,
                 cluster_id: Some(cluster_id3),
                 tags: None,
+                redirect: None,
+                redirect_scheme: None,
+                redirect_template: None,
+                rewrite_host: None,
+                rewrite_path: None,
+                rewrite_port: None,
+                required_auth: None,
+                headers: Vec::new(),
             })
             .expect("Could not add http frontend");
         fronts
@@ -1907,6 +1964,14 @@ mod tests {
                 position: RulePosition::Tree,
                 cluster_id: Some("cluster_1".to_owned()),
                 tags: None,
+                redirect: None,
+                redirect_scheme: None,
+                redirect_template: None,
+                rewrite_host: None,
+                rewrite_path: None,
+                rewrite_port: None,
+                required_auth: None,
+                headers: Vec::new(),
             })
             .expect("Could not add http frontend");
 
@@ -1920,9 +1985,7 @@ mod tests {
             listener: None,
             address: address.into(),
             fronts,
-            answers: Rc::new(RefCell::new(
-                HttpAnswers::new(&Some(CustomHttpAnswers::default())).unwrap(),
-            )),
+            answers: Rc::new(RefCell::new(HttpAnswers::new(&BTreeMap::new()).unwrap())),
             config: default_config,
             token: Token(0),
             active: true,
@@ -1935,20 +1998,32 @@ mod tests {
         let frontend4 = listener.frontend_from_request("lolcatho.st", "/yolo/swag", &Method::Get);
         let frontend5 = listener.frontend_from_request("domain", "/", &Method::Get);
         assert_eq!(
-            frontend1.expect("should find frontend"),
-            Route::ClusterId("cluster_1".to_string())
+            frontend1
+                .expect("should find frontend")
+                .cluster_id
+                .as_deref(),
+            Some("cluster_1")
         );
         assert_eq!(
-            frontend2.expect("should find frontend"),
-            Route::ClusterId("cluster_1".to_string())
+            frontend2
+                .expect("should find frontend")
+                .cluster_id
+                .as_deref(),
+            Some("cluster_1")
         );
         assert_eq!(
-            frontend3.expect("should find frontend"),
-            Route::ClusterId("cluster_2".to_string())
+            frontend3
+                .expect("should find frontend")
+                .cluster_id
+                .as_deref(),
+            Some("cluster_2")
         );
         assert_eq!(
-            frontend4.expect("should find frontend"),
-            Route::ClusterId("cluster_3".to_string())
+            frontend4
+                .expect("should find frontend")
+                .cluster_id
+                .as_deref(),
+            Some("cluster_3")
         );
         assert!(frontend5.is_err());
     }

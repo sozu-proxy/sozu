@@ -107,7 +107,7 @@ pub enum EndpointRecord<'a> {
 }
 
 /// used to aggregate tags in a session
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CachedTags {
     pub tags: BTreeMap<String, String>,
     pub concatenated: String,

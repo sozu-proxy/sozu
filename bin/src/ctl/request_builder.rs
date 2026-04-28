@@ -153,6 +153,10 @@ impl CommandManager {
                 expect_proxy,
                 load_balancing_policy,
                 http2,
+                https_redirect_port,
+                www_authenticate,
+                authorized_hash,
+                answer,
             } => {
                 let proxy_protocol = match (send_proxy, expect_proxy) {
                     (true, true) => Some(ProxyProtocolConfig::RelayHeader),
@@ -160,6 +164,69 @@ impl CommandManager {
                     (false, true) => Some(ProxyProtocolConfig::ExpectHeader),
                     _ => None,
                 };
+
+                // Validate every authorized hash matches `<user>:<hex64>`
+                // before sending so a typo (missing colon, lowercase off,
+                // non-hex chars) surfaces here with a friendly message
+                // rather than silently rejecting traffic on the worker.
+                for hash in &authorized_hash {
+                    if !looks_like_authorized_hash(hash) {
+                        return Err(CtlError::ArgsNeeded(
+                            "valid `username:hex(sha256(password))`".to_string(),
+                            format!(
+                                "got {hash:?}; produce one with: \
+                                 printf '<password>' | sha256sum"
+                            ),
+                        ));
+                    }
+                }
+
+                // The proto carries `https_redirect_port` as `u32` (matches
+                // the rewrite_port shape on the frontend) but real TCP
+                // ports are 16-bit. Reject out-of-range values up front so
+                // a typo doesn't render `Location: https://host:70000/...`
+                // on the wire.
+                if let Some(port) = https_redirect_port {
+                    if port == 0 || port > u16::MAX as u32 {
+                        return Err(CtlError::ArgsNeeded(
+                            "TCP port in 1..=65535".to_string(),
+                            format!("got https_redirect_port={port}"),
+                        ));
+                    }
+                }
+
+                // Resolve each `--answer code=value` entry. The
+                // right-hand side is the literal template body by
+                // default; `file://<path>` opts into reading the body
+                // off disk. Funnels through the canonical
+                // `resolve_answer_source` helper so the CLI and TOML
+                // loader stay in sync.
+                //
+                // Cluster-level entries override the listener-level
+                // `answers` map (which itself is the global default for
+                // every status code on that listener). Both layers
+                // accept the same `<body> | file://<path>` value form.
+                let mut answers_map = std::collections::BTreeMap::new();
+                for entry in &answer {
+                    let (code, value) = match entry.split_once('=') {
+                        Some((c, v)) if !v.is_empty() => (c, v),
+                        _ => {
+                            return Err(CtlError::ArgsNeeded(
+                                "<code>=<body>|file://<path>".to_string(),
+                                format!("got {entry:?}"),
+                            ));
+                        }
+                    };
+                    let body =
+                        sozu_command_lib::config::resolve_answer_source(value).map_err(|e| {
+                            CtlError::ArgsNeeded(
+                                "literal body or readable file://<path>".to_string(),
+                                format!("{value:?}: {e}"),
+                            )
+                        })?;
+                    answers_map.insert(code.to_owned(), body);
+                }
+
                 self.send_request(
                     RequestType::AddCluster(Cluster {
                         cluster_id: id,
@@ -168,6 +235,10 @@ impl CommandManager {
                         proxy_protocol: proxy_protocol.map(|pp| pp as i32),
                         load_balancing: load_balancing_policy as i32,
                         http2: if http2 { Some(true) } else { None },
+                        answers: answers_map,
+                        https_redirect_port,
+                        authorized_hashes: authorized_hash,
+                        www_authenticate,
                         ..Default::default()
                     })
                     .into(),
@@ -259,27 +330,10 @@ impl CommandManager {
 
     pub fn http_frontend_command(&mut self, cmd: HttpFrontendCmd) -> Result<(), CtlError> {
         match cmd {
-            HttpFrontendCmd::Add {
-                hostname,
-                path_prefix,
-                path_regex,
-                path_equals,
-                address,
-                method,
-                cluster_id: route,
-                tags,
-            } => self.send_request(
-                RequestType::AddHttpFrontend(RequestHttpFrontend {
-                    cluster_id: route.into(),
-                    address: address.into(),
-                    hostname,
-                    path: PathRule::from_cli_options(path_prefix, path_regex, path_equals),
-                    method,
-                    position: RulePosition::Tree.into(),
-                    tags: tags.unwrap_or_default(),
-                })
-                .into(),
-            ),
+            HttpFrontendCmd::Add { .. } => {
+                let frontend = build_http_frontend_add(cmd)?;
+                self.send_request(RequestType::AddHttpFrontend(frontend).into())
+            }
             HttpFrontendCmd::Remove {
                 hostname,
                 path_prefix,
@@ -304,27 +358,10 @@ impl CommandManager {
 
     pub fn https_frontend_command(&mut self, cmd: HttpFrontendCmd) -> Result<(), CtlError> {
         match cmd {
-            HttpFrontendCmd::Add {
-                hostname,
-                path_prefix,
-                path_regex,
-                path_equals,
-                address,
-                method,
-                cluster_id: route,
-                tags,
-            } => self.send_request(
-                RequestType::AddHttpsFrontend(RequestHttpFrontend {
-                    cluster_id: route.into(),
-                    address: address.into(),
-                    hostname,
-                    path: PathRule::from_cli_options(path_prefix, path_regex, path_equals),
-                    method,
-                    position: RulePosition::Tree.into(),
-                    tags: tags.unwrap_or_default(),
-                })
-                .into(),
-            ),
+            HttpFrontendCmd::Add { .. } => {
+                let frontend = build_http_frontend_add(cmd)?;
+                self.send_request(RequestType::AddHttpsFrontend(frontend).into())
+            }
             HttpFrontendCmd::Remove {
                 hostname,
                 path_prefix,
@@ -731,6 +768,7 @@ impl CommandManager {
             h2_graceful_shutdown_deadline_seconds,
             h2_max_window_update_stream0_per_window,
             sozu_id_header,
+            ..Default::default()
         };
         self.send_request(RequestType::UpdateHttpListener(patch).into())
     }
@@ -853,6 +891,7 @@ impl CommandManager {
             h2_graceful_shutdown_deadline_seconds,
             h2_max_window_update_stream0_per_window,
             sozu_id_header,
+            ..Default::default()
         };
         self.send_request(RequestType::UpdateHttpsListener(patch).into())
     }
@@ -1095,6 +1134,226 @@ fn find_cluster_configuration(content_type: ContentType, cluster_id: &str) -> Op
     }
 }
 
+/// Build a [`RequestHttpFrontend`] from the policy fields collected by
+/// `HttpFrontendCmd::Add`. The same builder feeds both
+/// `RequestType::AddHttpFrontend` and `RequestType::AddHttpsFrontend` so
+/// the two `frontend {http,https} add` paths stay in lock-step.
+///
+/// Validates each policy field up front and returns a typed
+/// [`CtlError::ArgsNeeded`] on a malformed input rather than letting a
+/// silent default reach the worker.
+fn build_http_frontend_add(cmd: HttpFrontendCmd) -> Result<RequestHttpFrontend, CtlError> {
+    let HttpFrontendCmd::Add {
+        hostname,
+        path_prefix,
+        path_regex,
+        path_equals,
+        address,
+        method,
+        cluster_id: route,
+        tags,
+        redirect,
+        redirect_scheme,
+        redirect_template,
+        rewrite_host,
+        rewrite_path,
+        rewrite_port,
+        required_auth,
+        header,
+    } = cmd
+    else {
+        return Err(CtlError::ArgsNeeded(
+            "HttpFrontendCmd::Add".to_owned(),
+            "got non-Add variant — should be unreachable".to_owned(),
+        ));
+    };
+
+    // Map `--redirect <forward|permanent|unauthorized>` onto the proto
+    // enum. Unknown / mistyped value surfaces a typed error here.
+    let redirect_proto = match redirect.as_deref() {
+        None => None,
+        Some(s) => Some(match s.to_ascii_lowercase().as_str() {
+            "forward" => sozu_command_lib::proto::command::RedirectPolicy::Forward as i32,
+            "permanent" => sozu_command_lib::proto::command::RedirectPolicy::Permanent as i32,
+            "unauthorized" => sozu_command_lib::proto::command::RedirectPolicy::Unauthorized as i32,
+            other => {
+                return Err(CtlError::ArgsNeeded(
+                    "redirect in {forward, permanent, unauthorized}".to_owned(),
+                    format!("got --redirect={other:?}"),
+                ));
+            }
+        }),
+    };
+
+    let redirect_scheme_proto = match redirect_scheme.as_deref() {
+        None => None,
+        Some(s) => Some(match s.to_ascii_lowercase().as_str() {
+            "use-same" | "use_same" => {
+                sozu_command_lib::proto::command::RedirectScheme::UseSame as i32
+            }
+            "use-http" | "use_http" => {
+                sozu_command_lib::proto::command::RedirectScheme::UseHttp as i32
+            }
+            "use-https" | "use_https" => {
+                sozu_command_lib::proto::command::RedirectScheme::UseHttps as i32
+            }
+            other => {
+                return Err(CtlError::ArgsNeeded(
+                    "redirect-scheme in {use-same, use-http, use-https}".to_owned(),
+                    format!("got --redirect-scheme={other:?}"),
+                ));
+            }
+        }),
+    };
+
+    if let Some(port) = rewrite_port {
+        if port == 0 || port > u16::MAX as u32 {
+            return Err(CtlError::ArgsNeeded(
+                "TCP port in 1..=65535".to_owned(),
+                format!("got rewrite_port={port}"),
+            ));
+        }
+    }
+
+    // Each `--header` entry is `<position>=<key>=<value>`. Split on the
+    // first two `=` so the value may contain further `=` bytes (common
+    // in cookie / quoted strings). Empty value preserves HAProxy
+    // `del-header` parity.
+    let mut headers_proto = Vec::with_capacity(header.len());
+    for (index, raw) in header.iter().enumerate() {
+        let (position, rest) = raw.split_once('=').ok_or_else(|| {
+            CtlError::ArgsNeeded(
+                "<position>=<name>=<value>".to_owned(),
+                format!("--header[{index}] = {raw:?} (missing first `=`)"),
+            )
+        })?;
+        let (key, val) = rest.split_once('=').ok_or_else(|| {
+            CtlError::ArgsNeeded(
+                "<position>=<name>=<value>".to_owned(),
+                format!("--header[{index}] = {raw:?} (missing second `=`)"),
+            )
+        })?;
+        let position_proto = match position.to_ascii_lowercase().as_str() {
+            "request" => sozu_command_lib::proto::command::HeaderPosition::Request as i32,
+            "response" => sozu_command_lib::proto::command::HeaderPosition::Response as i32,
+            "both" => sozu_command_lib::proto::command::HeaderPosition::Both as i32,
+            other => {
+                return Err(CtlError::ArgsNeeded(
+                    "header position in {request, response, both}".to_owned(),
+                    format!("--header[{index}] position={other:?}"),
+                ));
+            }
+        };
+        // Reject CRLF / NUL / other C0 controls. CRLF in the value would
+        // let an operator (or a misuse via piped CLI args) splice
+        // arbitrary header / request lines into the H1 wire on the
+        // backend side (CWE-113 / request smuggling). The H2 emission
+        // path filters values at runtime; the H1 path serialises raw,
+        // so we reject at CLI parse time as a defense in depth and to
+        // give a clear error.
+        //
+        // The KEY check is stricter than the value check — RFC 9110
+        // §5.1 field names follow the `token` grammar (no HTAB, no SP,
+        // no C0 controls); reusing the value-side predicate would let
+        // `Host\t` slip through and produce an invalid header line on
+        // the wire (security review follow-up on `da845c71`).
+        if !is_valid_header_name(key.as_bytes()) {
+            return Err(CtlError::ArgsNeeded(
+                "header key matching RFC 9110 token grammar (alphanumeric or one of !#$%&'*+-.^_`|~)".to_owned(),
+                format!("--header[{index}] key={key:?}"),
+            ));
+        }
+        if header_value_has_control_byte(val.as_bytes()) {
+            return Err(CtlError::ArgsNeeded(
+                "header value without control characters (NUL / CR / LF / other C0)".to_owned(),
+                format!("--header[{index}] val={val:?}"),
+            ));
+        }
+        headers_proto.push(sozu_command_lib::proto::command::Header {
+            position: position_proto,
+            key: key.to_owned(),
+            val: val.to_owned(),
+        });
+    }
+
+    Ok(RequestHttpFrontend {
+        cluster_id: route.into(),
+        address: address.into(),
+        hostname,
+        path: PathRule::from_cli_options(path_prefix, path_regex, path_equals),
+        method,
+        position: RulePosition::Tree.into(),
+        tags: tags.unwrap_or_default(),
+        redirect: redirect_proto,
+        redirect_scheme: redirect_scheme_proto,
+        redirect_template,
+        rewrite_host,
+        rewrite_path,
+        rewrite_port,
+        required_auth: if required_auth { Some(true) } else { None },
+        headers: headers_proto,
+    })
+}
+
+/// Reject NUL / CR / LF / other C0 controls in a header value. HTAB
+/// (`\x09`) is permitted per RFC 9110 §5.5 and matches the runtime
+/// filter at `lib::protocol::mux::converter::call`.
+fn header_value_has_control_byte(bytes: &[u8]) -> bool {
+    bytes
+        .iter()
+        .any(|&b| matches!(b, 0x00..=0x08 | 0x0A..=0x1F | 0x7F))
+}
+
+/// Header field names follow the RFC 9110 §5.1 `token` grammar: a
+/// non-empty sequence of `tchar` bytes (alphanumeric plus a closed
+/// punctuation list). HTAB and SP are NOT tchar — they belong to
+/// field-VALUE grammar. Reusing `header_value_has_control_byte` for
+/// keys would let `Host\t` slip through and produce an invalid header
+/// line on the H1 backend wire.
+fn is_valid_header_name(bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return false;
+    }
+    bytes.iter().all(|&b| {
+        b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'!' | b'#'
+                    | b'$'
+                    | b'%'
+                    | b'&'
+                    | b'\''
+                    | b'*'
+                    | b'+'
+                    | b'-'
+                    | b'.'
+                    | b'^'
+                    | b'_'
+                    | b'`'
+                    | b'|'
+                    | b'~'
+            )
+    })
+}
+
+/// Validate that `s` matches the canonical `<user>:<hex(sha256)>` form
+/// the worker stores in `Cluster.authorized_hashes`. Equivalent to the
+/// regex `^[A-Za-z0-9_\-]+:[0-9a-f]{64}$`; inlined as bytes so we don't
+/// pull `regex` in here for a one-line validator.
+pub(crate) fn looks_like_authorized_hash(s: &str) -> bool {
+    let Some((user, hex)) = s.split_once(':') else {
+        return false;
+    };
+    !user.is_empty()
+        && user
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        && hex.len() == 64
+        && hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 /// Load the content of an HTTP-answer file path. Returns `None` if the path is
 /// `None`. Mirrors the logic in `command/src/config.rs::read_http_answer_file`.
 fn read_answer_path(path: &Option<PathBuf>) -> Result<Option<String>, CtlError> {
@@ -1262,5 +1521,43 @@ mod tests {
             find_cluster_configuration(clusters_response(vec![cluster("other", false)]), "target");
 
         assert!(found.is_none());
+    }
+
+    #[test]
+    fn accepts_canonical_user_hex64() {
+        assert!(looks_like_authorized_hash(
+            "admin:2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b"
+        ));
+    }
+
+    #[test]
+    fn rejects_missing_colon() {
+        assert!(!looks_like_authorized_hash("admin"));
+    }
+
+    #[test]
+    fn rejects_short_hex_tail() {
+        assert!(!looks_like_authorized_hash("admin:deadbeef"));
+    }
+
+    #[test]
+    fn rejects_uppercase_hex() {
+        assert!(!looks_like_authorized_hash(
+            "admin:2BB80D537B1DA3E38BD30361AA855686BDE0EACD7162FEF6A25FE97BF527A25B"
+        ));
+    }
+
+    #[test]
+    fn rejects_empty_username() {
+        assert!(!looks_like_authorized_hash(
+            ":2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b"
+        ));
+    }
+
+    #[test]
+    fn rejects_non_alnum_username() {
+        assert!(!looks_like_authorized_hash(
+            "admin user:2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b"
+        ));
     }
 }

@@ -626,6 +626,14 @@ where
 ///   `GOAWAY(ENHANCE_YOUR_CALM)` when exceeded.
 /// - **Invariant 15** (edge-triggered epoll): pair `Ready::WRITABLE` interest
 ///   with the event bit so `writable()` is scheduled on the next tick.
+///
+/// Returns `true` when the RST was freshly queued, `false` when the
+/// stream was already in `rst_sent` (the caller asked to RST the same
+/// stream twice — a benign re-entrant idempotency, NOT a new wire
+/// emission). The boolean lets [`ConnectionH2::enqueue_rst`] account
+/// the RST only on the freshly-queued path so duplicate calls do not
+/// inflate the per-error counter or trip the MadeYouReset flood cap
+/// for frames that never reach the wire.
 fn enqueue_rst_into(
     pending: &mut Vec<(StreamId, H2Error)>,
     total: &mut usize,
@@ -633,13 +641,14 @@ fn enqueue_rst_into(
     readiness: &mut Readiness,
     wire_stream_id: StreamId,
     error: H2Error,
-) {
+) -> bool {
     if !rst_sent.insert(wire_stream_id) {
-        return;
+        return false;
     }
     pending.push((wire_stream_id, error));
     *total += 1;
     readiness.arm_writable();
+    true
 }
 
 /// Detail of a flood-threshold violation returned by
@@ -1759,7 +1768,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                                     );
                                     self.flood_detector.glitch_count += 1;
                                     check_flood_or_return!(self);
-                                    self.enqueue_rst(header.stream_id, H2Error::StreamClosed);
+                                    if let Some(result) =
+                                        self.enqueue_rst(header.stream_id, H2Error::StreamClosed)
+                                    {
+                                        return result;
+                                    }
                                 }
                                 _ => {
                                     // RFC 9113 §5.1: HEADERS or other frames on a
@@ -2370,6 +2383,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             // signal.
             pending_table_size_update: self.pending_table_size_update,
             size_update_emitted: false,
+            // Reset on every write pass; `check_header_capacity` flips it
+            // mid-call and `finalize` commits the abort by flipping
+            // `kawa.parsing_phase` to Error so the next pass emits
+            // RST_STREAM(InternalError).
+            pending_oversized_abort: false,
         };
         self.priorities_buf.clear();
         self.priorities_buf.extend(self.streams.keys().copied());
@@ -2435,6 +2453,12 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // yield (progress + pending back-buffer, LIFECYCLE §9 invariant 16)
         // from a no-progress wait state (e.g. flow-control starvation).
         let mut total_bytes_written: usize = 0;
+        // Collect every fresh RST_STREAM emitted via the converter
+        // (`initialize` chokepoint or the HPACK over-budget abort path)
+        // so we can run `account_emitted_rst` for each one AFTER the
+        // converter is dropped — the converter holds `&mut self.encoder`
+        // for the loop body so we cannot take `&mut self` until then.
+        let mut freshly_emitted_rsts: Vec<H2Error> = Vec::new();
         'outer: for idx in 0..self.priorities_buf.len() {
             let stream_id = self.priorities_buf[idx];
             let Some(&global_stream_id) = self.streams.get(&stream_id) else {
@@ -2473,8 +2497,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     .copied()
                     .unwrap_or(0);
                 // Track RST_STREAM dedup: if kawa is in error state, the converter
-                // will generate a RST_STREAM frame. Mark it so we don't send a
-                // duplicate on the next writable cycle.
+                // will generate a RST_STREAM frame via `initialize`. Mark it so we
+                // don't send a duplicate on the next writable cycle.
                 if kawa.is_error() {
                     let freshly_rst = self.rst_sent.insert(stream_id);
                     // LIFECYCLE §9 invariant 17: any transition to ineligible
@@ -2487,8 +2511,67 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                             *c = c.saturating_sub(1);
                         }
                     }
+                    // Account for the RST that `initialize` is about to emit
+                    // for this stream. Without this the MadeYouReset lifetime
+                    // cap is evadable: any path that flips `parsing_phase` to
+                    // Error before reaching this gate (oversized inbound
+                    // trailers, malformed bodies, etc.) would land an
+                    // unaccounted RST on the wire. We defer the actual
+                    // accounting call until after `drop(converter)` — the
+                    // converter holds `&mut self.encoder` here.
+                    if freshly_rst {
+                        freshly_emitted_rsts.push(rst_error_from_kawa(kawa));
+                    }
+                }
+                // Apply per-frontend response-side header edits
+                // (set/replace/delete) stashed by the routing layer at
+                // request time. H2 frontends always run as Server
+                // position; the back-side H2 client (when sozu speaks
+                // H2 to a backend) is a request emission and was
+                // already mutated by Router::route_from_request.
+                if matches!(self.position, super::Position::Server)
+                    && !parts.context.headers_response.is_empty()
+                {
+                    super::shared::apply_response_header_edits(
+                        kawa,
+                        &parts.context.headers_response,
+                    );
                 }
                 kawa.prepare(&mut converter);
+                // The pre-prepare gate at line 2483 only inserts into
+                // `rst_sent` when `kawa.is_error()` is already true on
+                // entry. The HPACK over-budget abort path
+                // (`H2BlockConverter::check_header_capacity` →
+                // `finalize`) flips `parsing_phase` to Error AND pushes
+                // its own RST_STREAM frame inside this same prepare
+                // pass; without a post-prepare insert here the next
+                // writable cycle would gate-pass and double-emit a
+                // RST_STREAM via the existing `initialize` chokepoint.
+                //
+                // Per Codex P2: the converter's direct RST emission
+                // bypasses the metric/flood accounting that
+                // `Self::reset_stream` performs. Mirror it here so a
+                // peer that drives oversized headers across many
+                // streams cannot escape the MadeYouReset emitted-RST
+                // lifetime cap and so dashboards see the per-error
+                // counter and the global tx counter.
+                //
+                // Per Codex P3: when an incremental stream flips to
+                // Error mid-prepare, the RFC 9218 §4 yield-after-one
+                // accounting must drop this stream from the
+                // same-urgency ready bucket so trailing peers see the
+                // live count.
+                let freshly_rst_post_prepare = kawa.is_error() && self.rst_sent.insert(stream_id);
+                if freshly_rst_post_prepare {
+                    // Defer accounting until after `drop(converter)`; same
+                    // reason as the pre-prepare collector above.
+                    freshly_emitted_rsts.push(rst_error_from_kawa(kawa));
+                    if is_incremental {
+                        if let Some(c) = ready_incremental_by_urgency.get_mut(&urgency) {
+                            *c = c.saturating_sub(1);
+                        }
+                    }
+                }
                 let consumed = window - converter.window;
                 *parts.window = parts.window.saturating_sub(consumed);
                 self.flow_control.window = self.flow_control.window.saturating_sub(consumed);
@@ -2587,6 +2670,16 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         drop(converter);
         if size_update_emitted {
             self.pending_table_size_update = None;
+        }
+        // Account every RST that the converter emitted during this pass
+        // (pre-prepare gate + post-prepare HPACK over-budget abort) so
+        // the global tx counter, the per-error breakdown, and the
+        // MadeYouReset emitted-RST lifetime cap stay in step. If the
+        // cap trips, propagate the GOAWAY result.
+        for error in freshly_emitted_rsts {
+            if let Some(result) = self.account_emitted_rst(error) {
+                return result;
+            }
         }
         self.converter_buf = converter_out;
         self.lowercase_buf = lowercase_buf;
@@ -2999,6 +3092,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         }
 
         // Flush pending RST_STREAM frames (queued when refusing streams).
+        // Accounting happens at queue-time inside `Self::enqueue_rst`, so
+        // this drain only serialises and flushes — no metric/flood calls
+        // here would double-count.
         if !self.pending_rst_streams.is_empty() && self.expect_write.is_none() {
             let kawa = &mut self.zero;
             kawa.storage.clear();
@@ -3015,7 +3111,6 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     Ok((_, _)) => {
                         offset += frame_size;
                         written_count += 1;
-                        incr!("h2.frames.tx.rst_stream");
                     }
                     Err(_) => break,
                 }
@@ -3498,7 +3593,14 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             // cancellations from one peer IS abusive (pinning
             // MAX_CONCURRENT_STREAMS slots), and the GOAWAY(ENHANCE_YOUR_CALM)
             // escalation tells the peer to reconnect with a clean state.
-            self.enqueue_rst(sid, H2Error::Cancel);
+            //
+            // We deliberately ignore the `Option<MuxResult>` flood-violation
+            // signal here — `cancel_timed_out_streams` returns `()` and is
+            // called as best-effort housekeeping during the read path. A
+            // flood violation that becomes visible mid-iteration will be
+            // re-detected on the next `record_rst_emitted` call (the
+            // counter is sticky), so dropping the early-return is safe.
+            let _ = self.enqueue_rst(sid, H2Error::Cancel);
 
             // Remove from streams map and recycle the context stream so the slot
             // no longer counts against MAX_CONCURRENT_STREAMS.
@@ -3567,8 +3669,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// (dedupe via `rst_sent`, MadeYouReset queued cap via
     /// `total_rst_streams_queued`, edge-triggered-epoll arm via
     /// [`Readiness::arm_writable`]).
-    fn enqueue_rst(&mut self, wire_stream_id: StreamId, error: H2Error) {
-        enqueue_rst_into(
+    fn enqueue_rst(&mut self, wire_stream_id: StreamId, error: H2Error) -> Option<MuxResult> {
+        let freshly_queued = enqueue_rst_into(
             &mut self.pending_rst_streams,
             &mut self.total_rst_streams_queued,
             &mut self.rst_sent,
@@ -3576,6 +3678,59 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             wire_stream_id,
             error,
         );
+        // Account ONLY when a new RST actually entered the queue.
+        // Calling `enqueue_rst` for a stream that already has a queued
+        // (or already-flushed) RST is the dedup short-circuit — counting
+        // those would inflate `h2.frames.tx.rst_stream` /
+        // `h2.rst_stream.sent.*` and trip the CVE-2025-8671 MadeYouReset
+        // lifetime cap on frames that never reached the wire.
+        //
+        // Account at queue-time, not at drain-time. Doing it later in
+        // `flush_pending_control_frames` would double-count any RST that
+        // a re-entrant call (DATA on a closed stream we already RSTed)
+        // tried to enqueue — and missing it at queue-time leaves
+        // `cancel_timed_out_streams` / `refuse_stream_and_discard` /
+        // DATA-on-closed-stream paths bypassing the lifetime cap
+        // (security review LISA-001 on commit `da845c71`).
+        if freshly_queued {
+            self.account_emitted_rst(error)
+        } else {
+            None
+        }
+    }
+
+    /// Single accounting site for proxy-emitted RST_STREAM frames.
+    /// Three things must happen for every emitted RST so flood-protection
+    /// stays honest: the global tx counter, the per-error breakdown,
+    /// and the MadeYouReset emitted-RST lifetime cap.
+    ///
+    /// Two distinct emission paths feed this helper:
+    ///   * Queued frames — [`Self::enqueue_rst`] (and therefore every
+    ///     callable that funnels through it: `reset_stream`,
+    ///     `refuse_stream_and_discard`, `cancel_timed_out_streams`,
+    ///     DATA-on-closed-stream) calls this once at queue-time. The
+    ///     drain in `flush_pending_control_frames` does NOT call it
+    ///     again — that would double-count.
+    ///   * Converter-emitted frames — the converter's `initialize`
+    ///     chokepoint (and the HPACK over-budget abort path) writes
+    ///     RST_STREAM frames straight into `kawa.out` from inside
+    ///     `kawa.prepare`. We collect those `H2Error` codes during the
+    ///     `write_streams` loop and call this helper for each one
+    ///     after `drop(converter)` (because the converter holds
+    ///     `&mut self.encoder`).
+    ///
+    /// Returning `Some(MuxResult)` means the caller MUST short-circuit
+    /// with that result — the flood detector tripped its lifetime cap
+    /// and converted to a connection-wide GOAWAY.
+    fn account_emitted_rst(&mut self, error: H2Error) -> Option<MuxResult> {
+        incr!("h2.frames.tx.rst_stream");
+        count!(metric_for_rst_stream_sent(error), 1);
+        if !matches!(error, H2Error::NoError) {
+            if let Some(violation) = self.flood_detector.record_rst_emitted() {
+                return Some(self.handle_flood_violation(violation));
+            }
+        }
+        None
     }
 
     /// Refuse a newly-opened stream with RST_STREAM and discard its HEADERS payload.
@@ -3595,7 +3750,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         error: H2Error,
         payload_len: u32,
     ) -> MuxResult {
-        self.enqueue_rst(stream_id, error);
+        if let Some(result) = self.enqueue_rst(stream_id, error) {
+            return result;
+        }
         self.state = H2State::Discard;
         self.expect_read = Some((H2StreamId::Zero, payload_len as usize));
         self.record_refusal_for_backpressure();
@@ -3667,6 +3824,21 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             violation.threshold,
         );
         self.goaway(violation.error)
+    }
+}
+
+/// Recover the [`H2Error`] code that the converter's `initialize`
+/// chokepoint will encode into the synthesised RST_STREAM frame for a
+/// kawa stuck in [`kawa::ParsingPhase::Error`]. Mirrors the parse +
+/// fallback at `lib/src/protocol/mux/converter.rs::initialize` so the
+/// flood-accounting helper sees the same code that lands on the wire.
+fn rst_error_from_kawa<T: kawa::AsBuffer>(kawa: &kawa::Kawa<T>) -> H2Error {
+    match kawa.parsing_phase {
+        kawa::ParsingPhase::Error {
+            kind: kawa::ParsingErrorKind::Processing { message },
+            ..
+        } => message.parse::<H2Error>().unwrap_or(H2Error::InternalError),
+        _ => H2Error::InternalError,
     }
 }
 
@@ -5336,20 +5508,14 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // remaining in `self.streams` — callers typically follow this with
         // `remove_dead_stream`, which would otherwise evict the slot before
         // `write_streams` could run `kawa.prepare` against the converter.
-        self.enqueue_rst(wire_stream_id, error);
-        // Per-error-code counter for the outbound RST. Emitted regardless of
-        // `error` (including the graceful-cancel `NoError` path) so dashboards
-        // can split benign cancels from defensive resets without consulting
-        // the flood-detector keys.
-        count!(metric_for_rst_stream_sent(error), 1);
-        // CVE-2025-8671 MadeYouReset: cap the total number of RST_STREAM frames
-        // we emit on this connection. Graceful `NoError` cancels (e.g. stream
-        // recycle, propagated client-side cancel) are exempt; only error-path
-        // resets — driven by attacker-crafted frames — feed the counter.
-        if !matches!(error, H2Error::NoError) {
-            if let Some(violation) = self.flood_detector.record_rst_emitted() {
-                return self.handle_flood_violation(violation);
-            }
+        //
+        // `enqueue_rst` performs every accounting side-effect at queue
+        // time (per-error counter, global tx counter, CVE-2025-8671
+        // MadeYouReset lifetime cap). Graceful `NoError` cancels —
+        // stream recycle, propagated client-side cancel — are exempt
+        // from the lifetime cap inside the accounting helper itself.
+        if let Some(result) = self.enqueue_rst(wire_stream_id, error) {
+            return result;
         }
         MuxResult::Continue
     }
@@ -7282,6 +7448,10 @@ mod tests {
             tls_cipher: None,
             tls_alpn: None,
             sozu_id_header: String::from("Sozu-Id"),
+            redirect_location: None,
+            www_authenticate: None,
+            original_authority: None,
+            headers_response: Vec::new(),
         };
         Stream::new(Rc::downgrade(pool), http_ctx, 65_535)
             .expect("pool should have capacity for two buffers")
@@ -7426,7 +7596,7 @@ mod tests {
         let mut sent: HashSet<StreamId> = HashSet::new();
         let mut readiness = Readiness::new();
 
-        enqueue_rst_into(
+        let first = enqueue_rst_into(
             &mut pending,
             &mut total,
             &mut sent,
@@ -7434,14 +7604,20 @@ mod tests {
             5,
             H2Error::ProtocolError,
         );
-        // Second call for the same stream must be a no-op.
-        enqueue_rst_into(
+        assert!(first, "first call must report freshly_queued = true");
+        // Second call for the same stream must be a no-op AND return
+        // false so accounting in `Self::enqueue_rst` skips this case.
+        let second = enqueue_rst_into(
             &mut pending,
             &mut total,
             &mut sent,
             &mut readiness,
             5,
             H2Error::InternalError,
+        );
+        assert!(
+            !second,
+            "second call for same stream must return freshly_queued = false"
         );
 
         assert_eq!(pending.len(), 1, "dedupe must collapse to a single entry");

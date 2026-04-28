@@ -357,7 +357,7 @@ use sozu_command::{
 };
 use tls::CertificateResolverError;
 
-use crate::{backends::BackendMap, router::Route};
+use crate::{backends::BackendMap, router::RouteResult};
 
 /// Anything that can be registered in mio (subscribe to kernel events)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -561,7 +561,7 @@ pub trait L7ListenerHandler {
         host: &str,
         uri: &str,
         method: &Method,
-    ) -> Result<Route, FrontendFromRequestError>;
+    ) -> Result<RouteResult, FrontendFromRequestError>;
 
     /// retrieve the listener's configured HTTP answers (templates)
     fn get_answers(&self) -> &Rc<RefCell<HttpAnswers>>;
@@ -697,8 +697,8 @@ pub enum ListenerError {
     Resolver(CertificateResolverError),
     #[error("failed to parse pem, {0}")]
     PemParse(String),
-    #[error("failed to parse template {0}: {1}")]
-    TemplateParse(u16, TemplateError),
+    #[error("failed to parse template {0:?}: {1}")]
+    TemplateParse(String, TemplateError),
     #[error("failed to build rustls context, {0}")]
     BuildRustls(String),
     #[error("could not activate listener with address {address:?}: {error}")]

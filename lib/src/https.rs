@@ -75,7 +75,7 @@ use crate::{
         proxy_protocol::expect::ExpectProxyProtocol,
         rustls::TlsHandshake,
     },
-    router::{Route, Router},
+    router::{RouteResult, Router},
     server::{ListenToken, SessionManager},
     socket::{FrontRustls, server_bind},
     timer::TimeoutContainer,
@@ -833,7 +833,7 @@ impl L7ListenerHandler for HttpsListener {
         host: &str,
         uri: &str,
         method: &Method,
-    ) -> Result<Route, FrontendFromRequestError> {
+    ) -> Result<RouteResult, FrontendFromRequestError> {
         let start = Instant::now();
         let (remaining_input, (hostname, _)) = match hostname_and_port(host.as_bytes()) {
             Ok(tuple) => tuple,
@@ -869,7 +869,7 @@ impl L7ListenerHandler for HttpsListener {
 
         let now = Instant::now();
 
-        if let Route::ClusterId(cluster) = &route {
+        if let Some(cluster) = route.cluster_id.as_deref() {
             time!("frontend_matching_time", cluster, (now - start).as_millis());
         }
 
@@ -1001,6 +1001,19 @@ impl HttpsListener {
 
         let server_config = Arc::new(Self::create_rustls_context(&config, resolver.to_owned())?);
 
+        let answers = {
+            // Reconcile the legacy `http_answers` per-status fields with
+            // the new template map: the new map wins on collision, the
+            // legacy fields fill in any status the operator hasn't yet
+            // migrated.
+            let mut answers_map = config.answers.clone();
+            if let Some(ref legacy) = config.http_answers {
+                crate::protocol::http::answers::merge_legacy_into_map(&mut answers_map, legacy);
+            }
+            HttpAnswers::new(&answers_map)
+                .map_err(|(name, error)| ListenerError::TemplateParse(name, error))?
+        };
+
         Ok(HttpsListener {
             listener: None,
             address: config.address.into(),
@@ -1008,10 +1021,7 @@ impl HttpsListener {
             rustls_details: server_config,
             active: false,
             fronts: Router::new(),
-            answers: Rc::new(RefCell::new(
-                HttpAnswers::new(&config.http_answers)
-                    .map_err(|(status, error)| ListenerError::TemplateParse(status, error))?,
-            )),
+            answers: Rc::new(RefCell::new(answers)),
             config,
             token,
             tags: BTreeMap::new(),
@@ -1263,16 +1273,33 @@ impl HttpsListener {
             self.rustls_details = new_rustls;
         }
 
-        // --- HTTP answers: replace listener defaults per-field, preserve cluster overrides ---
-        if let Some(ref new_answers) = patch.http_answers {
-            crate::sozu_command::state::merge_custom_http_answers(
-                &mut self.config.http_answers,
-                new_answers,
-            );
-            self.answers
-                .borrow_mut()
-                .replace_defaults(new_answers)
-                .map_err(|(status, error)| ListenerError::TemplateParse(status, error))?;
+        // HTTP answers: merge legacy `http_answers` and the new `answers`
+        // map on top of the existing config, then rebuild the listener-level
+        // template registry. Per-cluster overrides in
+        // `HttpAnswers::cluster_answers` are preserved across the rebuild.
+        let answers_changed = patch.http_answers.is_some() || !patch.answers.is_empty();
+        if answers_changed {
+            if let Some(ref new_answers) = patch.http_answers {
+                crate::sozu_command::state::merge_custom_http_answers(
+                    &mut self.config.http_answers,
+                    new_answers,
+                );
+            }
+            for (code, body) in &patch.answers {
+                if !body.is_empty() {
+                    self.config.answers.insert(code.clone(), body.clone());
+                }
+            }
+
+            let mut answers_map = self.config.answers.clone();
+            if let Some(ref legacy) = self.config.http_answers {
+                crate::protocol::http::answers::merge_legacy_into_map(&mut answers_map, legacy);
+            }
+            let mut rebuilt = HttpAnswers::new(&answers_map)
+                .map_err(|(name, error)| ListenerError::TemplateParse(name, error))?;
+            let preserved = std::mem::take(&mut self.answers.borrow_mut().cluster_answers);
+            rebuilt.cluster_answers = preserved;
+            *self.answers.borrow_mut() = rebuilt;
         }
 
         Ok(())
@@ -1578,13 +1605,19 @@ impl HttpsProxy {
         &mut self,
         mut cluster: Cluster,
     ) -> Result<Option<ResponseContent>, ProxyError> {
+        let mut cluster_overrides = cluster.answers.clone();
         if let Some(answer_503) = cluster.answer_503.take() {
+            cluster_overrides
+                .entry("503".to_owned())
+                .or_insert(answer_503);
+        }
+        if !cluster_overrides.is_empty() {
             for listener in self.listeners.values() {
                 listener
                     .borrow()
                     .answers
                     .borrow_mut()
-                    .add_custom_answer(&cluster.cluster_id, answer_503.clone())
+                    .add_cluster_answers(&cluster.cluster_id, &cluster_overrides)
                     .map_err(|(status, error)| {
                         ProxyError::AddCluster(ListenerError::TemplateParse(status, error))
                     })?;
@@ -1604,7 +1637,7 @@ impl HttpsProxy {
                 .borrow()
                 .answers
                 .borrow_mut()
-                .remove_custom_answer(cluster_id);
+                .remove_cluster_answers(cluster_id);
         }
 
         Ok(None)
@@ -2213,10 +2246,7 @@ pub mod testing {
 mod tests {
     use std::sync::Arc;
 
-    use sozu_command::{
-        config::ListenerBuilder,
-        proto::command::{CustomHttpAnswers, SocketAddress},
-    };
+    use sozu_command::{config::ListenerBuilder, proto::command::SocketAddress};
 
     use super::*;
     use crate::router::{MethodRule, PathRule, Route, Router, pattern_trie::TrieNode};
@@ -2299,7 +2329,7 @@ mod tests {
             rustls_details,
             resolver,
             answers: Rc::new(RefCell::new(
-                HttpAnswers::new(&Some(CustomHttpAnswers::default())).unwrap(),
+                HttpAnswers::new(&std::collections::BTreeMap::new()).unwrap(),
             )),
             config: default_config,
             token: Token(0),
@@ -2310,26 +2340,38 @@ mod tests {
         println!("TEST {}", line!());
         let frontend1 = listener.frontend_from_request("lolcatho.st", "/", &Method::Get);
         assert_eq!(
-            frontend1.expect("should find a frontend"),
-            Route::ClusterId("cluster_1".to_string())
+            frontend1
+                .expect("should find a frontend")
+                .cluster_id
+                .as_deref(),
+            Some("cluster_1")
         );
         println!("TEST {}", line!());
         let frontend2 = listener.frontend_from_request("lolcatho.st", "/test", &Method::Get);
         assert_eq!(
-            frontend2.expect("should find a frontend"),
-            Route::ClusterId("cluster_1".to_string())
+            frontend2
+                .expect("should find a frontend")
+                .cluster_id
+                .as_deref(),
+            Some("cluster_1")
         );
         println!("TEST {}", line!());
         let frontend3 = listener.frontend_from_request("lolcatho.st", "/yolo/test", &Method::Get);
         assert_eq!(
-            frontend3.expect("should find a frontend"),
-            Route::ClusterId("cluster_2".to_string())
+            frontend3
+                .expect("should find a frontend")
+                .cluster_id
+                .as_deref(),
+            Some("cluster_2")
         );
         println!("TEST {}", line!());
         let frontend4 = listener.frontend_from_request("lolcatho.st", "/yolo/swag", &Method::Get);
         assert_eq!(
-            frontend4.expect("should find a frontend"),
-            Route::ClusterId("cluster_3".to_string())
+            frontend4
+                .expect("should find a frontend")
+                .cluster_id
+                .as_deref(),
+            Some("cluster_3")
         );
         println!("TEST {}", line!());
         let frontend5 = listener.frontend_from_request("domain", "/", &Method::Get);
