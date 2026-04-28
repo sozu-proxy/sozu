@@ -497,6 +497,11 @@ impl Router {
 pub enum DomainRule {
     Any,
     Exact(String),
+    /// Matches when `hostname` ends with `s[1..]` (the wildcard pattern with
+    /// the leading `*` stripped) and the remaining leftmost prefix is
+    /// non-empty and contains no `.`. Comparison is byte-exact and
+    /// case-sensitive; no IDN/punycode normalisation is performed here.
+    /// Stored with the leading `*`.
     Wildcard(String),
     Regex(Regex),
 }
@@ -559,9 +564,10 @@ impl DomainRule {
         match self {
             DomainRule::Any => true,
             DomainRule::Wildcard(s) => {
-                let len_without_suffix = hostname.len() - s.len() + 1;
-                hostname.ends_with(&s.as_bytes()[1..])
-                    && !&hostname[..len_without_suffix].contains(&b'.')
+                let suffix = &s.as_bytes()[1..];
+                hostname
+                    .strip_suffix(suffix)
+                    .is_some_and(|prefix| !prefix.is_empty() && !prefix.contains(&b'.'))
             }
             DomainRule::Exact(s) => s.as_bytes() == hostname,
             DomainRule::Regex(r) => {
@@ -1492,6 +1498,59 @@ mod tests {
                 .parse::<DomainRule>()
                 .unwrap()
                 .matches("cdn10.exampleAcom".as_bytes())
+        );
+    }
+
+    #[test]
+    fn match_domain_rule_wildcard_short_hostname_does_not_panic() {
+        let rule = DomainRule::Wildcard("*.foo.example.com".to_string());
+
+        // Regression for issue #1223: an empty hostname must not panic and must not match.
+        assert!(!rule.matches(b""));
+
+        // Hostname strictly shorter than the suffix must not panic and must not match.
+        assert!(!rule.matches(b"a.b"));
+        assert!(!rule.matches(b"x"));
+
+        // Boundary: hostname equal to the suffix (s without the leading '*') has an empty
+        // leftmost label. RFC 1035 §3.1 forbids empty labels, so reject.
+        assert!(!rule.matches(b".foo.example.com"));
+
+        // Multi-label leftmost prefix (existing intent — single-label only).
+        assert!(!rule.matches(b"y.x.foo.example.com"));
+
+        // Single-label leftmost prefix — must still match (this is the happy case the
+        // pre-existing match_domain_rule already covers, repeated here for symmetry).
+        assert!(rule.matches(b"x.foo.example.com"));
+    }
+
+    #[test]
+    fn router_lookup_wildcard_pre_rule_short_hostname_does_not_panic() {
+        let mut router = Router::new();
+
+        // Wildcard in a pre-rule routes through DomainRule::Wildcard::matches
+        // (not the trie). This is the path that panicked on issue #1223.
+        assert!(router.add_pre_rule(
+            &"*.foo.example.com".parse::<DomainRule>().unwrap(),
+            &PathRule::Prefix("/".to_string()),
+            &MethodRule::new(Some("GET".to_string())),
+            &Route::ClusterId("wildcard".to_string()),
+        ));
+
+        let method = Method::new(&b"GET"[..]);
+
+        // Issue #1223: short hostnames must not panic Router::lookup.
+        assert!(router.lookup("", "/", &method).is_err());
+        assert!(router.lookup("x", "/", &method).is_err());
+        assert!(router.lookup("a.b", "/", &method).is_err());
+
+        // Boundary: hostname equal to the suffix has an empty leftmost label.
+        assert!(router.lookup(".foo.example.com", "/", &method).is_err());
+
+        // Happy case: single-label leftmost matches via the pre-rule path.
+        assert_eq!(
+            router.lookup("x.foo.example.com", "/", &method),
+            Ok(RouteResult::forward("wildcard".to_string()))
         );
     }
 
