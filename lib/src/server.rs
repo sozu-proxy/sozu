@@ -340,6 +340,15 @@ impl Server {
         expects_initial_status: bool,
     ) -> Result<Self, ServerError> {
         let event_loop = Poll::new().map_err(ServerError::CreatePoll)?;
+        // Commit the operator-configured Basic-auth credential cap (or
+        // keep the built-in default) once per worker process. The
+        // `OnceLock` rejects any later attempt to change the value, so
+        // calling here — before any L7 listener has accepted a request
+        // — guarantees the cap is in force the first time `mux::auth`
+        // runs.
+        if let Some(cap) = config.basic_auth_max_credential_bytes {
+            crate::protocol::mux::auth::set_max_decoded_credential_bytes(cap as usize);
+        }
         let pool = Rc::new(RefCell::new(Pool::with_capacity(
             config.min_buffers as usize,
             config.max_buffers as usize,

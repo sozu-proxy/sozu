@@ -1884,6 +1884,17 @@ pub struct FileConfig {
     /// that exceed 4 backends per session — clamped to [2, 32] at load.
     #[serde(default)]
     pub slab_entries_per_connection: Option<u64>,
+    /// Maximum length, in bytes, of a base64-decoded `Authorization: Basic`
+    /// payload accepted by the worker's `mux::auth` module. Caps the
+    /// per-failed-auth allocation so a hostile peer cannot force the worker
+    /// to decode arbitrarily large tokens. RFC 7617 imposes no upper bound
+    /// — defaults to 4096, which is well above the realistic
+    /// `username:password` shape. Operators running hardened tenants can
+    /// lower this to e.g. 256 or 512 to bound the allocation tighter.
+    /// Values >= `buffer_size / 3` emit a warning at config-load time
+    /// (the credential cap shouldn't dominate the per-frontend buffer).
+    #[serde(default)]
+    pub basic_auth_max_credential_bytes: Option<u64>,
     /// Optional UID allowlist for command-socket requests. `None` (default)
     /// preserves historical behaviour: any same-UID local process can
     /// invoke any verb. When set, requests whose `SO_PEERCRED` UID is not
@@ -2079,6 +2090,7 @@ impl ConfigBuilder {
                 )
             }),
             command_allowed_uids: file_config.command_allowed_uids.clone(),
+            basic_auth_max_credential_bytes: file_config.basic_auth_max_credential_bytes,
             ..Default::default()
         };
 
@@ -2273,6 +2285,28 @@ impl ConfigBuilder {
             });
         }
 
+        // Warn (no hard reject) when the configured Basic-auth credential
+        // cap is large enough to dominate the per-frontend buffer. The
+        // worker copies a decoded credential into a transient allocation
+        // sized by this cap; values >= 33% of `buffer_size` mean a single
+        // failed-auth attempt can hold a third of the buffer's worth of
+        // bytes, which combined with in-flight request/response framing
+        // pushes the buffer toward back-pressure under load. Log only —
+        // operators with deliberate threat models may choose this
+        // trade-off, but the surprise needs to be visible.
+        if let Some(cap) = self.built.basic_auth_max_credential_bytes {
+            let third = self.built.buffer_size / 3;
+            if cap >= third {
+                warn!(
+                    "basic_auth_max_credential_bytes = {} is >= buffer_size / 3 ({}); \
+                     a hostile peer can pin ~33% of the per-frontend buffer per failed auth \
+                     attempt. Consider lowering basic_auth_max_credential_bytes (typical \
+                     credentials are <100 bytes) or raising buffer_size.",
+                    cap, third
+                );
+            }
+        }
+
         let command_socket_path = self.file.command_socket.clone().unwrap_or({
             let mut path = env::current_dir().map_err(|e| ConfigError::Env(e.to_string()))?;
             path.push("sozu.sock");
@@ -2365,6 +2399,12 @@ pub struct Config {
     /// not in the list is rejected before reaching dispatch.
     #[serde(default)]
     pub command_allowed_uids: Option<Vec<u32>>,
+    /// Maximum length, in bytes, of a base64-decoded `Authorization: Basic`
+    /// payload accepted by `mux::auth`. `None` keeps the compile-time
+    /// default of 4096. Set once on each worker at boot via
+    /// [`ServerConfig::basic_auth_max_credential_bytes`].
+    #[serde(default)]
+    pub basic_auth_max_credential_bytes: Option<u64>,
 }
 
 fn default_front_timeout() -> u32 {
@@ -2743,6 +2783,7 @@ impl From<&Config> for ServerConfig {
             access_log_format: ProtobufAccessLogFormat::from(&config.access_logs_format) as i32,
             log_colored: config.log_colored,
             slab_entries_per_connection: config.slab_entries_per_connection,
+            basic_auth_max_credential_bytes: config.basic_auth_max_credential_bytes,
         }
     }
 }
