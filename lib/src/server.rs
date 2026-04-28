@@ -308,6 +308,10 @@ pub struct Server {
         Instant,
         Option<SocketAddr>,
     )>,
+    /// When the accept queue saturates and `check_limits` refuses, evict the
+    /// oldest non-listener sessions to make room. Default off — see
+    /// `command::config::DEFAULT_EVICT_ON_QUEUE_FULL` for the rationale.
+    evict_on_queue_full: bool,
     accept_ready: HashSet<ListenToken>,
     backends: Rc<RefCell<BackendMap>>,
     base_sessions_count: usize,
@@ -497,6 +501,7 @@ impl Server {
                 server_config.accept_queue_timeout,
             )),
             accept_queue: VecDeque::new(),
+            evict_on_queue_full: server_config.evict_on_queue_full.unwrap_or(false),
             accept_ready: HashSet::new(),
             backends,
             base_sessions_count,
@@ -1841,7 +1846,47 @@ impl Server {
                 // the counter aligns with `check_limits` invocations rather
                 // than with queue depth at the time of refusal.
                 incr!("listener.connection_capped");
-                break;
+
+                if !self.evict_on_queue_full {
+                    break;
+                }
+
+                // Skip eviction during graceful shutdown — defeats the
+                // shutting_down semantics and is wasted work since the
+                // worker is winding down anyway.
+                if self.shutting_down.is_some() {
+                    break;
+                }
+
+                // Evict 1% of `max_connections` per iteration. Conservative
+                // ratio: large enough to make meaningful progress clearing
+                // the accept queue, small enough to limit collateral damage
+                // to active sessions. The cap loop re-checks limits after
+                // each eviction round, so multiple rounds can run if the
+                // queue has many pending connections. Decoupled from
+                // `slab_entries_per_connection` (which only sizes the slab,
+                // not `max_connections`).
+                let to_evict = (self.sessions.borrow().max_connections / 100).max(1);
+                let evicted = self.evict_least_active_sessions(to_evict);
+                if evicted == 0 {
+                    // Informational, not an invariant break: the worker may
+                    // be at boot, or every active session is a system
+                    // protocol (Channel/Metrics/Timer/listeners) and is
+                    // ineligible. Stay at warn so operators see it in info-
+                    // level production logs.
+                    warn!("evict_on_queue_full enabled but no candidate sessions to evict");
+                    break;
+                }
+
+                count!("sessions.evicted", evicted as i64);
+                warn!(
+                    "evicted {} least recently active sessions to make room",
+                    evicted
+                );
+
+                if !self.sessions.borrow_mut().check_limits() {
+                    break;
+                }
             }
 
             //FIXME: check the timestamp
@@ -1984,6 +2029,64 @@ impl Server {
             error!("Could not block channel: {}", e);
         }
     }
+
+    /// Evict the `count` least-recently-active non-listener sessions and
+    /// return how many tokens were enqueued for shutdown. Used by
+    /// `create_sessions` when the accept queue is saturated and the
+    /// `evict_on_queue_full` knob is set.
+    ///
+    /// Uses `select_nth_unstable_by_key` (introselect, O(n) average) to
+    /// partition the oldest `count` sessions in-place rather than a full
+    /// O(n log n) sort. The candidate `Vec` is unavoidable because of
+    /// `RefCell` borrow rules — the immutable borrow on `self.sessions`
+    /// must drop before `shut_down_sessions_by_frontend_tokens` can take
+    /// its mutable borrow.
+    fn evict_least_active_sessions(&self, count: usize) -> usize {
+        if count == 0 {
+            return 0;
+        }
+
+        let tokens = {
+            let sessions = self.sessions.borrow();
+            let mut candidates: Vec<(Token, Instant)> = sessions
+                .slab
+                .iter()
+                .filter(|(_, session)| {
+                    !matches!(
+                        session.borrow().protocol(),
+                        Protocol::HTTPListen
+                            | Protocol::HTTPSListen
+                            | Protocol::TCPListen
+                            | Protocol::Channel
+                            | Protocol::Metrics
+                            | Protocol::Timer
+                    )
+                })
+                .map(|(_, session)| {
+                    let s = session.borrow();
+                    (s.frontend_token(), s.last_event())
+                })
+                .collect();
+
+            // Early return is load-bearing: the `pivot` computation below
+            // does `count.min(len) - 1`, which underflows on empty input.
+            if candidates.is_empty() {
+                return 0;
+            }
+
+            let pivot = count.min(candidates.len()) - 1;
+            candidates.select_nth_unstable_by_key(pivot, |&(_, last_event)| last_event);
+
+            candidates[..=pivot]
+                .iter()
+                .map(|&(token, _)| token)
+                .collect::<HashSet<Token>>()
+        };
+
+        let evicted = tokens.len();
+        self.shut_down_sessions_by_frontend_tokens(tokens);
+        evicted
+    }
 }
 
 /// log the error together with the request id
@@ -2094,5 +2197,68 @@ mod accept_telemetry_tests {
             "expected at least 100 distinct buckets across 200 /24s, got {}",
             hits.len()
         );
+    }
+}
+
+#[cfg(test)]
+mod eviction_tests {
+    use std::collections::HashSet;
+    use std::time::{Duration, Instant};
+
+    use mio::Token;
+
+    /// `select_nth_unstable_by_key` partitions in O(n) so that the first
+    /// `pivot + 1` entries are the `pivot + 1` smallest by key. This guards
+    /// against a future refactor swapping the comparator orientation.
+    #[test]
+    fn select_nth_finds_oldest_sessions() {
+        let now = Instant::now();
+        let mut candidates = [
+            (Token(1), now - Duration::from_secs(10)), // 10s old
+            (Token(2), now - Duration::from_secs(50)), // 50s old (oldest)
+            (Token(3), now - Duration::from_secs(5)),  // 5s old (newest)
+            (Token(4), now - Duration::from_secs(30)), // 30s old
+            (Token(5), now - Duration::from_secs(20)), // 20s old
+        ];
+
+        let count = 2;
+        let pivot = count.min(candidates.len()) - 1;
+        candidates.select_nth_unstable_by_key(pivot, |&(_, last_event)| last_event);
+
+        let selected: HashSet<Token> = candidates[..=pivot]
+            .iter()
+            .map(|&(token, _)| token)
+            .collect();
+
+        assert_eq!(selected.len(), 2);
+        assert!(
+            selected.contains(&Token(2)),
+            "should contain 50s-old session"
+        );
+        assert!(
+            selected.contains(&Token(4)),
+            "should contain 30s-old session"
+        );
+    }
+
+    /// When `count` exceeds available candidates, the pivot collapses to
+    /// `len - 1` so we evict everything; this test pins that behaviour
+    /// against a future refactor that might silently truncate.
+    #[test]
+    fn select_nth_with_count_exceeding_candidates() {
+        let now = Instant::now();
+        let mut candidates = [(Token(1), now - Duration::from_secs(10))];
+
+        let count = 5;
+        let pivot = count.min(candidates.len()) - 1;
+        candidates.select_nth_unstable_by_key(pivot, |&(_, last_event)| last_event);
+
+        let selected: HashSet<Token> = candidates[..=pivot]
+            .iter()
+            .map(|&(token, _)| token)
+            .collect();
+
+        assert_eq!(selected.len(), 1);
+        assert!(selected.contains(&Token(1)));
     }
 }
