@@ -54,7 +54,7 @@ Three properties shape every extension:
 | `incr!(key)` / `incr!(key, cluster_id, backend_id)` | `&'static str` | Increment by 1. The 3-arg form labels by cluster+backend. | `incr!("h2.frames.rx.data");` |
 | `count!(key, value)` | `&'static str, i64` | Increment by N (e.g. byte counts). | `count!("bytes_in", n as i64);` |
 | `decr!(key)` | `&'static str` | Decrement by 1. Pair with a prior `incr!`. | `decr!("http.active_requests");` |
-| `gauge!(key, value)` | `&'static str, usize` | **Absolute snapshot.** ⚠️ Last-writer-wins across emit sites — only safe for proxy-level state with a single emitter (e.g. `client.connections`). | `gauge!("client.max_connections", n);` |
+| `gauge!(key, value)` | `&'static str, usize` | **Absolute snapshot.** ⚠️ Last-writer-wins across emit sites — only safe for proxy-level state with a single emitter (e.g. `client.connections`). | `gauge!("client.connections_max", n);` |
 | `gauge_add!(key, delta)` / `gauge_add!(key, delta, cluster, backend)` | `&'static str, i64` | **Lifecycle delta.** Aggregates correctly across emit sites. Pair every `+1` with a `-1` on every close path. | `gauge_add!("backend.pool.size", 1);` |
 | `time!(key, ms)` / `time!(key, cluster_id, ms)` | `&'static str, usize` | Latency in ms. Stored as HDR histogram in the local drain. | `time!("backend_response_time", cluster, ms);` |
 

@@ -8,6 +8,26 @@ See milestone [`v1.1.0`](https://github.com/sozu-proxy/sozu/projects/3?card_filt
 
 - **TLS certificate hot-rotation no longer drops the working certificate on failure ([#1202](https://github.com/sozu-proxy/sozu/pull/1202))**: `CertificateResolver::replace_certificate` in `lib/src/tls.rs` now adds the new certificate before removing the old one. A parse or signing-key failure on the new certificate leaves the previous certificate in place, so the listener keeps serving traffic across rotation hiccups instead of going cert-less for the affected name. Closes [#774](https://github.com/sozu-proxy/sozu/issues/774).
 - **`name_fingerprint_idx` no longer leaks empty entries on certificate removal ([#1202](https://github.com/sozu-proxy/sozu/pull/1202))**: `CertificateResolver::remove_certificate` in `lib/src/tls.rs` now drops the index entry when its last fingerprint is removed, instead of leaving an empty `Vec` behind. Prevents a slow memory and key-cardinality leak on long-running listeners with high certificate churn. The `drain(..).filter(...).collect()` pattern is replaced with `Entry::Occupied` + `retain` + explicit empty-entry deletion.
+### Added
+
+- **Per-status-code HTTP counters across H1 and H2 ([#1196](https://github.com/sozu-proxy/sozu/pull/1196))**: in addition to the bucket counters `http.status.{1xx,…,5xx,other,none}`, Sōzu now emits `http.status.<code>` for an eighteen-code short-list — `200/201/204`, `301/302/304`, `400/401/403/404/408/413/429`, `500/502/503/504/507`. The list covers Sōzu's default-answer codes and the upstream codes operators routinely chart. Codes outside the list contribute only to their bucket so the metric keyspace stays bounded. The lookup lives in `lib/src/metrics/mod.rs::http_status_code_metric_name` and is shared by H1 (`save_http_status_metric`) and H2 (`mux::stream::generate_access_log`). Closes [#937](https://github.com/sozu-proxy/sozu/issues/937), [#1146](https://github.com/sozu-proxy/sozu/issues/1146).
+- **Buffer pool gauges ([#1196](https://github.com/sozu-proxy/sozu/pull/1196))**: the run loop now samples `buffer.in_use` (renamed from `buffer.number`), `buffer.capacity`, and `buffer.usage_percent` once per iteration alongside `process.uptime_seconds` / `server.live`. `buffer.in_use` is still emitted on checkout/drop in `lib/src/pool.rs` for high-resolution dashboards.
+- **Slab utilisation gauges ([#1196](https://github.com/sozu-proxy/sozu/pull/1196))**: `slab.capacity`, `slab.usage_percent` (against `slab.capacity()`), and `slab.accept_threshold_percent` (against the historical `at_capacity()` gate `10 + 2 * max_connections`). The two percent gauges are kept independent because `slab_entries_per_connection` can make configured slab capacity larger than the accept gate, and operators want to chart both frontiers.
+
+### Changed (potentially dashboard-breaking)
+
+- **Renamed metrics ([#1196](https://github.com/sozu-proxy/sozu/pull/1196))**:
+  - `client.connections_percentage` → `client.connections_percent`
+  - `client.max_connections` → `client.connections_max`
+  - `buffer.number` → `buffer.in_use`
+
+  The new names are emitted from the run loop alongside the rest of the
+  proxy gauges; per-event emission of `client.connections_*` from
+  `SessionManager::incr/decr` is dropped (the high-resolution
+  `client.connections` signal is preserved). Dashboards scraping the old
+  names need to be updated.
+
+- **`http.errors` is now labelled with `(cluster_id, backend_id)` ([#1196](https://github.com/sozu-proxy/sozu/pull/1196))**: emitted with labels in both `kawa_h1::log_request_error` and `mux::stream::generate_access_log`. The labels are filtered centrally by `metrics.detail` (`metrics/mod.rs::filter_labels_for_detail`): `process` / `frontend` collapse to a proxy-wide counter (no behaviour change for default deployments that already used `process`), `cluster` (the documented default) attributes errors per cluster, `backend` keeps the per-backend split. No double-counting: the prior unlabeled emission was replaced, not duplicated. Closes [#597](https://github.com/sozu-proxy/sozu/issues/597).
 
 ### Security
 
