@@ -52,6 +52,42 @@ fn filter_labels_for_detail<'a>(
     }
 }
 
+/// Map a numeric HTTP status code to its dedicated counter name, if any.
+///
+/// Returns `Some("http.status.<code>")` for the eighteen status codes Sōzu
+/// either generates as a default answer or that operators routinely chart
+/// (`200/201/204`, `301/302/304`, `400/401/403/404/408/413/429`, plus the
+/// `5xx` family Sōzu can synthesise — `500/502/503/504/507`). All other
+/// codes return `None` so the bucket counter (`http.status.{1xx,…,other}`)
+/// remains the sole emission and metric cardinality stays bounded.
+///
+/// Hoisted out of the protocol modules so H1 (`kawa_h1::save_http_status_metric`)
+/// and H2 (`mux::stream::generate_access_log`) cannot drift on which codes
+/// get a per-code counter.
+pub(crate) fn http_status_code_metric_name(status: u16) -> Option<&'static str> {
+    match status {
+        200 => Some("http.status.200"),
+        201 => Some("http.status.201"),
+        204 => Some("http.status.204"),
+        301 => Some("http.status.301"),
+        302 => Some("http.status.302"),
+        304 => Some("http.status.304"),
+        400 => Some("http.status.400"),
+        401 => Some("http.status.401"),
+        403 => Some("http.status.403"),
+        404 => Some("http.status.404"),
+        408 => Some("http.status.408"),
+        413 => Some("http.status.413"),
+        429 => Some("http.status.429"),
+        500 => Some("http.status.500"),
+        502 => Some("http.status.502"),
+        503 => Some("http.status.503"),
+        504 => Some("http.status.504"),
+        507 => Some("http.status.507"),
+        _ => None,
+    }
+}
+
 thread_local! {
   pub static METRICS: RefCell<Aggregator> = RefCell::new(Aggregator::new(String::from("sozu")));
 }
