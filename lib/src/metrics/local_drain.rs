@@ -935,4 +935,66 @@ mod tests {
             "gauge should be 0 after surviving clear + decrement"
         );
     }
+
+    #[test]
+    fn receive_and_yield_http_status_metrics() {
+        // Sanity check that per-code counters (`http.status.{200,…}`) and the
+        // bucket counter (`http.status.2xx`) are stored independently and
+        // retrievable per backend, mirroring what the H1 + H2 emission paths
+        // produce after `crate::metrics::http_status_code_metric_name` short-
+        // lists a code.
+        let mut local_drain = LocalDrain::new("prefix".to_string());
+
+        for _ in 0..2 {
+            local_drain.receive_metric(
+                "http.status.2xx",
+                Some("test-cluster"),
+                Some("test-backend"),
+                MetricValue::Count(1),
+            );
+            local_drain.receive_metric(
+                "http.status.200",
+                Some("test-cluster"),
+                Some("test-backend"),
+                MetricValue::Count(1),
+            );
+        }
+        local_drain.receive_metric(
+            "http.status.404",
+            Some("test-cluster"),
+            Some("test-backend"),
+            MetricValue::Count(1),
+        );
+
+        let backend_metrics = local_drain
+            .metrics_of_one_backend(
+                "test-backend",
+                [
+                    "http.status.2xx".to_string(),
+                    "http.status.200".to_string(),
+                    "http.status.404".to_string(),
+                ]
+                .as_ref(),
+            )
+            .expect("could not query metrics for this backend");
+
+        assert_eq!(
+            backend_metrics.metrics.get("http.status.2xx"),
+            Some(&FilteredMetrics {
+                inner: Some(Inner::Count(2)),
+            })
+        );
+        assert_eq!(
+            backend_metrics.metrics.get("http.status.200"),
+            Some(&FilteredMetrics {
+                inner: Some(Inner::Count(2)),
+            })
+        );
+        assert_eq!(
+            backend_metrics.metrics.get("http.status.404"),
+            Some(&FilteredMetrics {
+                inner: Some(Inner::Count(1)),
+            })
+        );
+    }
 }
