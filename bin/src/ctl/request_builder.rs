@@ -195,23 +195,24 @@ impl CommandManager {
                     }
                 }
 
-                // Resolve each `--answer code=value` entry. The right-hand
-                // side is either a filesystem path or the literal
-                // template body when prefixed with `inline:`. Funnels
-                // through the canonical `resolve_answer_source` helper so
-                // the CLI and TOML loader stay in sync.
+                // Resolve each `--answer code=value` entry. The
+                // right-hand side is the literal template body by
+                // default; `file://<path>` opts into reading the body
+                // off disk. Funnels through the canonical
+                // `resolve_answer_source` helper so the CLI and TOML
+                // loader stay in sync.
                 //
                 // Cluster-level entries override the listener-level
                 // `answers` map (which itself is the global default for
                 // every status code on that listener). Both layers
-                // accept the same `path | inline:<body>` value form.
+                // accept the same `<body> | file://<path>` value form.
                 let mut answers_map = std::collections::BTreeMap::new();
                 for entry in &answer {
                     let (code, value) = match entry.split_once('=') {
                         Some((c, v)) if !v.is_empty() => (c, v),
                         _ => {
                             return Err(CtlError::ArgsNeeded(
-                                "<code>=<path|inline:body>".to_string(),
+                                "<code>=<body>|file://<path>".to_string(),
                                 format!("got {entry:?}"),
                             ));
                         }
@@ -219,7 +220,7 @@ impl CommandManager {
                     let body =
                         sozu_command_lib::config::resolve_answer_source(value).map_err(|e| {
                             CtlError::ArgsNeeded(
-                                "readable template path or inline:<body>".to_string(),
+                                "literal body or readable file://<path>".to_string(),
                                 format!("{value:?}: {e}"),
                             )
                         })?;

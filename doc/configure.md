@@ -533,23 +533,23 @@ scope — the **global default** that fires whenever no cluster-level
 override matches — or as a `[clusters.<id>.answers]` map at cluster
 scope, which overrides the matching listener entry on requests routed
 through that cluster. Both layers accept the same key/value shape: the
-key is the HTTP status code (e.g. `"503"`); the value is **either** a
-filesystem path **or** an `inline:<body>` literal where everything
-after the colon is taken verbatim as the template body (no file I/O).
-The inline form is convenient for short canned responses, secrets-free
-containers where mounting a template directory is awkward, and test
-rigs that want to avoid disk dependencies.
+key is the HTTP status code (e.g. `"503"`); the value is **either** an
+inline literal body (the default — the value is taken verbatim) **or**
+`file://<path>` to load the body off disk. The inline form is
+convenient for short canned responses, secrets-free containers where
+mounting a template directory is awkward, and test rigs that want to
+avoid disk dependencies.
 
 ```toml
 # listener-level: global default for every status not overridden by a cluster.
 [listeners.https.answers]
-"401" = "/etc/sozu/templates/401.http"               # filesystem path
-"404" = "/etc/sozu/templates/404.http"
-"503" = """inline:HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 4\r\n\r\nbusy"""
+"401" = "file:///etc/sozu/templates/401.http"        # load from disk
+"404" = "file:///etc/sozu/templates/404.http"
+"503" = """HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 4\r\n\r\nbusy"""  # inline literal (no prefix)
 
 # cluster-level: overrides the listener default for THIS cluster only.
 [clusters.MyCluster.answers]
-"503" = "/etc/sozu/templates/MyCluster.503.http"
+"503" = "file:///etc/sozu/templates/MyCluster.503.http"
 ```
 
 Each template is a complete HTTP response (status line + headers + body) with
@@ -566,8 +566,14 @@ optional placeholders. Sōzu substitutes the placeholders at render time:
 | `%WWW_AUTHENTICATE` | header only | Realm string for 401 (header is elided when empty) |
 | `%MESSAGE`, `%PHASE`, `%SUCCESSFULLY_PARSED`, `%PARTIALLY_PARSED`, `%INVALID`, `%CAPACITY`, `%DURATION` | varies | Diagnostic detail for parse / size / timeout errors |
 
-A `Content-Length` header is auto-injected from the rendered body size when
-the template does not already carry one.
+When the template carries a `Content-Length: <N>` header, the engine
+recomputes the value from the actual rendered body size after
+`%`-substitutions — so a literal value that drifted from the body
+length cannot land on the wire (RFC 9110 §8.6 / RFC 7230 §3.3.2 anti-
+smuggling). Templates that omit `Content-Length` keep the byte-for-byte
+shape they were written with; nothing is synthesised. Operators who
+want a Content-Length include one; those who rely on `Connection:
+close` for body framing get a clean header-only response.
 
 When a template carries `Connection: close`, the response will close the
 frontend connection after delivery; a custom template without that header

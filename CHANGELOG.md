@@ -21,18 +21,24 @@ session path the upstream PRs targeted, so every running session benefits.
   it for the matching status code on requests routed to that cluster. The
   deprecated `optional CustomHttpAnswers http_answers` field is preserved on
   the wire so existing state files round-trip (the runtime merges both for
-  one minor). Each map value is **either a filesystem path or an
-  `inline:<body>` literal** — the inline form skips disk I/O entirely,
-  useful for short canned responses, secrets-free containers, and test
-  rigs (`sozu cluster add --answer 503='inline:HTTP/1.1 503 ...'`,
-  `[listeners.https.answers] "503" = "inline:..."`). The new template
+  one minor). Each map value is **either an inline literal body (the
+  default) or `file://<path>` to load off disk** — the inline form
+  skips disk I/O entirely, useful for short canned responses,
+  secrets-free containers, and test rigs
+  (`sozu cluster add --answer 503='HTTP/1.1 503 ...'` or
+  `[listeners.https.answers] "503" = "..."` for inline,
+  `--answer 503=file:///etc/sozu/503.http` for path). The new template
   engine (`lib/src/protocol/kawa_h1/answers.rs`) supports variable
   substitution via `%ROUTE`, `%REQUEST_ID`, `%CLUSTER_ID`, `%BACKEND_ID`,
   `%DURATION`, `%CAPACITY`, `%PHASE`, `%SUCCESSFULLY_PARSED`,
   `%PARTIALLY_PARSED`, `%INVALID` (repeatable), `%REDIRECT_LOCATION`,
   `%MESSAGE`, `%TEMPLATE_NAME` (single-use), `%WWW_AUTHENTICATE`
-  (header-only, elides the line when the realm is empty), and an
-  auto-injected `Content-Length`. Per-cluster overrides hot-swap via
+  (header-only, elides the line when the realm is empty). When the
+  template carries a literal `Content-Length`, the engine recomputes
+  the value from the actual rendered body size after `%`-substitutions
+  — closing the RFC 9110 §8.6 / RFC 7230 §3.3.2 anti-smuggling drift.
+  Templates that omit `Content-Length` keep their byte-for-byte shape;
+  nothing is synthesised. Per-cluster overrides hot-swap via
   `AddCluster` / `RemoveCluster`. HAProxy parallel: `errorfile NNN /path`.
 
 - **URL rewrite, redirect, and per-frontend custom headers**: new

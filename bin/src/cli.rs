@@ -324,7 +324,7 @@ pub enum ClusterCmd {
         authorized_hash: Vec<String>,
         #[clap(
             long = "answer",
-            help = "Per-status HTTP answer template for this cluster. Format: <code>=<path-to-template> for an on-disk template, or <code>=inline:<body> for an inline literal (the body after `inline:` is taken verbatim, no file I/O). Repeatable. Examples: --answer 503=/etc/sozu/503.http , --answer 503='inline:HTTP/1.1 503 Service Unavailable\\r\\n\\r\\nbusy'."
+            help = "Per-status HTTP answer template for this cluster. Format: <code>=<body> for an inline literal (the value is taken verbatim, no disk I/O), or <code>=file://<path> to load the body off disk. Repeatable. Examples: --answer 503='HTTP/1.1 503 Service Unavailable\\r\\n\\r\\nbusy' , --answer 503=file:///etc/sozu/503.http ."
         )]
         answer: Vec<String>,
     },

@@ -988,33 +988,32 @@ fn read_http_answer_file(path: &Option<String>) -> Result<Option<String>, Config
 ///   routed to that cluster.
 ///
 /// Two source forms are accepted:
-/// * **Inline literal** — the value starts with the `inline:` prefix.
-///   The remainder of the value (everything after the colon) is taken
-///   as the template body verbatim. Useful for short canned responses,
-///   secrets-free containers where mounting a file is awkward, and
-///   automated test rigs that want to avoid disk I/O entirely.
-/// * **Filesystem path** — anything else. The path is opened and read
-///   into a string. Mirrors the on-disk loading the per-status
-///   [`read_http_answer_file`] helper performs for the deprecated
-///   `answer_301`..`answer_507` fields.
-///
-/// An empty inline body (`"inline:"`) is a legitimate template (a 0-byte
-/// response payload — typical with `Connection: close` and no headers).
+/// * **Filesystem path** — the value starts with the `file://` URI
+///   scheme. Everything after the prefix is treated as a path; the
+///   path is opened and read into a string. Mirrors the on-disk
+///   loading the per-status [`read_http_answer_file`] helper performs
+///   for the deprecated `answer_301`..`answer_507` fields.
+/// * **Inline literal** (default) — anything else. The value is taken
+///   verbatim as the template body, including an empty string (a
+///   0-byte response payload, typical with `Connection: close` and no
+///   headers). The bare-string default keeps the common case — a
+///   short canned response — typing-light; operators who need a file
+///   say so explicitly with `file://`.
 pub fn resolve_answer_source(value: &str) -> Result<String, ConfigError> {
-    if let Some(body) = value.strip_prefix("inline:") {
-        return Ok(body.to_owned());
-    }
-    let mut content = String::new();
-    let mut file = File::open(value).map_err(|io_error| ConfigError::FileOpen {
-        path_to_open: value.to_owned(),
-        io_error,
-    })?;
-    file.read_to_string(&mut content)
-        .map_err(|io_error| ConfigError::FileRead {
-            path_to_read: value.to_owned(),
+    if let Some(path) = value.strip_prefix("file://") {
+        let mut content = String::new();
+        let mut file = File::open(path).map_err(|io_error| ConfigError::FileOpen {
+            path_to_open: path.to_owned(),
             io_error,
         })?;
-    Ok(content)
+        file.read_to_string(&mut content)
+            .map_err(|io_error| ConfigError::FileRead {
+                path_to_read: path.to_owned(),
+                io_error,
+            })?;
+        return Ok(content);
+    }
+    Ok(value.to_owned())
 }
 
 /// Load every per-status template referenced by `answers`.
@@ -3207,30 +3206,38 @@ mod tests {
         assert_eq!(header.val, "alpha");
     }
 
-    /// `inline:` strips the prefix and treats the rest as the literal
-    /// template body — useful for short canned responses, secrets-free
-    /// containers, and test rigs that want zero disk I/O.
+    /// A bare string with no scheme prefix is the inline literal body.
+    /// This is the common case — short canned responses inline in TOML
+    /// or a `--answer` flag, no disk I/O.
     #[test]
-    fn resolve_answer_source_inline_returns_literal_body() {
-        let body = resolve_answer_source("inline:HTTP/1.1 503 Service Unavailable\r\n\r\nbusy")
-            .expect("inline source must resolve");
+    fn resolve_answer_source_bare_string_is_literal() {
+        let body = resolve_answer_source("HTTP/1.1 503 Service Unavailable\r\n\r\nbusy")
+            .expect("bare-string source must resolve");
         assert_eq!(body, "HTTP/1.1 503 Service Unavailable\r\n\r\nbusy");
     }
 
     #[test]
-    fn resolve_answer_source_inline_empty_is_legitimate() {
-        let body = resolve_answer_source("inline:").expect("empty inline source must resolve");
+    fn resolve_answer_source_empty_string_is_legitimate() {
+        let body = resolve_answer_source("").expect("empty source must resolve");
         assert_eq!(body, "");
     }
 
-    /// Anything without the `inline:` prefix is read as a filesystem
-    /// path. A non-existent path bubbles up as `ConfigError::FileOpen`
-    /// so the operator gets the same diagnostics as the existing
-    /// per-status `answer_NNN` flow.
+    /// `file://` opts into reading the path off disk. A non-existent
+    /// path bubbles up as `ConfigError::FileOpen` so the operator gets
+    /// the same diagnostics as the existing per-status `answer_NNN`
+    /// flow.
     #[test]
-    fn resolve_answer_source_path_missing_file_errors() {
-        let err = resolve_answer_source("/nonexistent/sozu-test/never.http")
+    fn resolve_answer_source_file_scheme_missing_file_errors() {
+        let err = resolve_answer_source("file:///nonexistent/sozu-test/never.http")
             .expect_err("missing path must error");
+        assert!(matches!(err, ConfigError::FileOpen { .. }));
+    }
+
+    /// `file://` strips the scheme; an empty path after the scheme is
+    /// rejected (empty path on filesystem read).
+    #[test]
+    fn resolve_answer_source_file_scheme_empty_path_errors() {
+        let err = resolve_answer_source("file://").expect_err("empty path must error");
         assert!(matches!(err, ConfigError::FileOpen { .. }));
     }
 }
