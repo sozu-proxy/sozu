@@ -4,6 +4,27 @@
 
 See milestone [`v1.1.0`](https://github.com/sozu-proxy/sozu/projects/3?card_filter_query=milestone%3Av1.1.0)
 
+### Added
+
+- **Per-status-code HTTP counters across H1 and H2 ([#1196](https://github.com/sozu-proxy/sozu/pull/1196))**: in addition to the bucket counters `http.status.{1xx,…,5xx,other,none}`, Sōzu now emits `http.status.<code>` for an eighteen-code short-list — `200/201/204`, `301/302/304`, `400/401/403/404/408/413/429`, `500/502/503/504/507`. The list covers Sōzu's default-answer codes and the upstream codes operators routinely chart. Codes outside the list contribute only to their bucket so the metric keyspace stays bounded. The lookup lives in `lib/src/metrics/mod.rs::http_status_code_metric_name` and is shared by H1 (`save_http_status_metric`) and H2 (`mux::stream::generate_access_log`). Closes [#937](https://github.com/sozu-proxy/sozu/issues/937), [#1146](https://github.com/sozu-proxy/sozu/issues/1146).
+- **Buffer pool gauges ([#1196](https://github.com/sozu-proxy/sozu/pull/1196))**: the run loop now samples `buffer.in_use` (renamed from `buffer.number`), `buffer.capacity`, and `buffer.usage_percent` once per iteration alongside `process.uptime_seconds` / `server.live`. `buffer.in_use` is still emitted on checkout/drop in `lib/src/pool.rs` for high-resolution dashboards.
+- **Slab utilisation gauges ([#1196](https://github.com/sozu-proxy/sozu/pull/1196))**: `slab.capacity`, `slab.usage_percent` (against `slab.capacity()`), and `slab.accept_threshold_percent` (against the historical `at_capacity()` gate `10 + 2 * max_connections`). The two percent gauges are kept independent because `slab_entries_per_connection` can make configured slab capacity larger than the accept gate, and operators want to chart both frontiers.
+
+### Changed (potentially dashboard-breaking)
+
+- **Renamed metrics ([#1196](https://github.com/sozu-proxy/sozu/pull/1196))**:
+  - `client.connections_percentage` → `client.connections_percent`
+  - `client.max_connections` → `client.connections_max`
+  - `buffer.number` → `buffer.in_use`
+
+  The new names are emitted from the run loop alongside the rest of the
+  proxy gauges; per-event emission of `client.connections_*` from
+  `SessionManager::incr/decr` is dropped (the high-resolution
+  `client.connections` signal is preserved). Dashboards scraping the old
+  names need to be updated.
+
+- **`http.errors` is now labelled with `(cluster_id, backend_id)` ([#1196](https://github.com/sozu-proxy/sozu/pull/1196))**: emitted with labels in both `kawa_h1::log_request_error` and `mux::stream::generate_access_log`. The labels are filtered centrally by `metrics.detail` (`metrics/mod.rs::filter_labels_for_detail`): `process` / `frontend` collapse to a proxy-wide counter (no behaviour change for default deployments that already used `process`), `cluster` (the documented default) attributes errors per cluster, `backend` keeps the per-backend split. No double-counting: the prior unlabeled emission was replaced, not duplicated. Closes [#597](https://github.com/sozu-proxy/sozu/issues/597).
+
 ### Security
 
 - **Worker panic on short hostnames vs `Wildcard` rules ([#1223](https://github.com/sozu-proxy/sozu/issues/1223))**: `DomainRule::Wildcard::matches` in `lib/src/router/mod.rs` computed `hostname.len() - s.len() + 1` unconditionally, panicking with `attempt to subtract with overflow` in debug builds when the incoming hostname was shorter than the configured wildcard pattern (CWE-191 → CWE-754, remote-reachable DoS). In release builds the wrap is masked by the `&&` short-circuit on `ends_with(suffix)`, so the false-positive in §1 of the issue was rare; debug builds always panicked. The arm now uses `<[u8]>::strip_suffix` and validates the leftmost prefix on the returned slice — there is no length arithmetic to underflow, and short hostnames return `false` without panic. Boundary case `hostname == suffix` (empty leftmost label, e.g. `.foo.example.com` against `*.foo.example.com`) is now rejected as an invalid DNS label per RFC 1035 §3.1. Reachable from H1 (`HttpListener::frontend_from_request`, `lib/src/http.rs:658`), H2 (single-byte `:authority`, `lib/src/https.rs:865`), and operator-driven `Router::has_hostname` introspection. Affected versions: all releases including `sozu-lib` 1.1.1 and earlier (bug introduced in `a9dd46e9`, 2019-06-04). Regression tests `match_domain_rule_wildcard_short_hostname_does_not_panic` and `router_lookup_wildcard_pre_rule_short_hostname_does_not_panic` in `lib/src/router/mod.rs`.

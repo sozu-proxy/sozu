@@ -49,7 +49,7 @@ impl Pool {
             })
             .map(|c| {
                 let old_buffer_count = BUFFER_COUNT.fetch_add(1, Ordering::SeqCst);
-                gauge!("buffer.number", old_buffer_count + 1);
+                gauge!("buffer.in_use", old_buffer_count + 1);
                 Checkout { inner: c }
             })
     }
@@ -113,7 +113,7 @@ impl ops::DerefMut for Checkout {
 impl Drop for Checkout {
     fn drop(&mut self) {
         let old_buffer_count = BUFFER_COUNT.fetch_sub(1, Ordering::SeqCst);
-        gauge!("buffer.number", old_buffer_count - 1);
+        gauge!("buffer.in_use", old_buffer_count - 1);
     }
 }
 
