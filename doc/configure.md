@@ -48,6 +48,7 @@ Parameters in the global section allow you to define the global settings shared 
 | `accept_queue_timeout`     | maximum time (in seconds) a TCP connection stays in sozu's accept queue before being dropped. Defaults to `60`.                                         | seconds |
 | `request_timeout`          | maximum time of inactivity for a request                                            |                                          |
 | `zombie_check_interval`    | duration between checks for zombie sessions                                         |                                          |
+| `evict_on_queue_full`      | evict the least-recently-active sessions when `max_connections` is reached, making room for new accepts. Defaults to `false`: during a DDoS the existing connections are more likely to be legitimate clients than the queued ones, so refusing new accepts is the safer mitigation. Enable when overload is dominated by normal traffic spikes. Triggers a config-load `warn!` when `max_connections < 100` because the 1% eviction batch clamps to 1 (so the per-round share grows). | `true`, `false` (default: `false`) |
 | `activate_listeners`       | automatically start listeners                                                       |                                          |
 
 _Example:_
@@ -955,6 +956,7 @@ from metric names below.
 | `listener.accepted.https` | counter | proxy | Sockets accepted on HTTPS listeners |
 | `listener.connection_capped` | counter | proxy | Sockets refused by `create_sessions` because `SessionManager::check_limits` returned `false` (max connections reached or slab at capacity) |
 | `client.connect.per_source.bucket_000` … `bucket_255` | counter | proxy | Per-accept counter bucketed by masked source subnet. Source IPs are masked to /24 (IPv4) or /48 (IPv6) and hashed (`DefaultHasher`) into 256 fixed buckets. The bucket noise is intentional: `incr!` requires `&'static str` keys, and a per-IP counter would be unbounded under SYN flood (OWASP A05, NIST SP 800-92). Operators wanting per-IP attribution should pair these counters with structured access logs or a downstream rate-limiter |
+| `sessions.evicted` | counter | proxy | Sessions force-closed by `evict_on_queue_full` to make room for new accepts. Counts the number of evictions DECIDED in a cap event (one per call to `evict_least_active_sessions`); the helper may skip already-closed tokens, so a small drift versus the slab-removal count is possible. Only emitted when `evict_on_queue_full = true` |
 
 The accept-loop telemetry above does **not** label by listener address.
 `incr!` requires `&'static str` keys, and listener addresses can be added or
