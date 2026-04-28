@@ -185,7 +185,22 @@ impl SessionManager {
 
     /// The slab is considered at capacity if it contains more sessions than twice max_connections
     pub fn at_capacity(&self) -> bool {
-        self.slab.len() >= 10 + 2 * self.max_connections
+        self.slab.len() >= self.accept_slab_threshold()
+    }
+
+    /// The slab fill level at which `at_capacity` flips to true and the
+    /// accept queue is flushed. Reported as `slab.accept_threshold` so the
+    /// per-iteration `slab.accept_threshold_percent` gauge in the run loop
+    /// can chart proximity to this gate, distinct from raw slab usage.
+    ///
+    /// The constant `10 + 2 * max_connections` is the historical pre-knob
+    /// budget; configured slab capacity is
+    /// `10 + slab_entries_per_connection * max_connections` (see
+    /// `command/src/config.rs`) and can be larger, so `slab.usage_percent`
+    /// (against `slab.capacity()`) and `slab.accept_threshold_percent`
+    /// (against this gate) are emitted as independent gauges.
+    pub fn accept_slab_threshold(&self) -> usize {
+        10 + 2 * self.max_connections
     }
 
     /// Check the number of connections against max_connections, and the slab capacity.
@@ -220,12 +235,12 @@ impl SessionManager {
     pub fn incr(&mut self) {
         self.nb_connections += 1;
         assert!(self.nb_connections <= self.max_connections);
+        // `client.connections_max` and `client.connections_percent` are
+        // emitted from the run loop alongside `process.uptime_seconds` /
+        // `server.live` so all proxy gauges advance in lock-step. Keeping
+        // `client.connections` per-event preserves the high-resolution
+        // signal scrapers expect.
         gauge!("client.connections", self.nb_connections);
-        gauge!(
-            "client.connections_percentage",
-            self.nb_connections * 100 / self.max_connections
-        );
-        gauge!("client.max_connections", self.max_connections);
     }
 
     /// Decrements the number of sessions, start accepting new connections
@@ -234,11 +249,6 @@ impl SessionManager {
         assert!(self.nb_connections != 0);
         self.nb_connections -= 1;
         gauge!("client.connections", self.nb_connections);
-        gauge!(
-            "client.connections_percentage",
-            self.nb_connections * 100 / self.max_connections
-        );
-        gauge!("client.max_connections", self.max_connections);
 
         // do not be ready to accept right away, wait until we get back to 10% capacity
         if !self.can_accept && self.nb_connections < self.max_connections * 90 / 100 {
@@ -320,6 +330,12 @@ pub struct Server {
     /// time spent saturated rather than just whether saturation occurred.
     last_saturation_tick: Instant,
     max_poll_errors: i32, // TODO: make this configurable? this defaults to 10000 for now
+    /// Shared reference to the buffer pool the protocol stacks check buffers
+    /// in and out of. Held here so the run loop can sample
+    /// `buffer.in_use` / `buffer.capacity` / `buffer.usage_percent` once per
+    /// iteration without requiring each protocol module to expose its own
+    /// snapshot.
+    pool: Rc<RefCell<Pool>>,
     pub poll: Poll,
     poll_timeout: Option<Duration>, // TODO: make this configurable? this defaults to 1000 milliseconds for now
     scm_listeners: Option<Listeners>,
@@ -496,6 +512,7 @@ impl Server {
             started_at: Instant::now(),        // captured once, never reset
             last_saturation_tick: Instant::now(), // 1Hz saturation ticker anchor
             max_poll_errors: 10000,            // TODO: make it configurable?
+            pool,
             poll_timeout: Some(Duration::from_millis(1000)), // TODO: make it configurable?
             poll,
             scm_listeners: None,
@@ -688,8 +705,62 @@ impl Server {
                 });
             }
 
-            gauge!("client.connections", self.sessions.borrow().nb_connections);
-            gauge!("slab.entries", self.sessions.borrow().slab.len());
+            // Frontend session gauges. `client.connections` keeps the
+            // per-event signal from `SessionManager::incr/decr`; the rest
+            // follow the once-per-iteration batching contract this run loop
+            // uses for `process.uptime_seconds` / `server.live`.
+            //
+            // `slab.usage_percent` charts pure slab utilisation against
+            // `slab.capacity()`. `slab.accept_threshold_percent` charts how
+            // close the slab is to the `at_capacity()` accept gate
+            // (`10 + 2 * max_connections`, see
+            // `SessionManager::accept_slab_threshold`). Configured slab
+            // capacity can be larger than that gate (`slab_entries_per_connection`
+            // > 2), so the two gauges are kept independent on purpose.
+            {
+                let sessions = self.sessions.borrow();
+                let nb_connections = sessions.nb_connections;
+                let max_connections = sessions.max_connections;
+                let slab_len = sessions.slab.len();
+                let slab_capacity = sessions.slab.capacity();
+                let accept_threshold = sessions.accept_slab_threshold();
+
+                gauge!("client.connections", nb_connections);
+                gauge!("client.connections_max", max_connections);
+                if max_connections > 0 {
+                    gauge!(
+                        "client.connections_percent",
+                        nb_connections * 100 / max_connections
+                    );
+                }
+
+                gauge!("slab.entries", slab_len);
+                gauge!("slab.capacity", slab_capacity);
+                if slab_capacity > 0 {
+                    gauge!("slab.usage_percent", slab_len * 100 / slab_capacity);
+                }
+                if accept_threshold > 0 {
+                    gauge!(
+                        "slab.accept_threshold_percent",
+                        slab_len * 100 / accept_threshold
+                    );
+                }
+            }
+            // Buffer pool gauges. `buffer.in_use` replaces the older
+            // `buffer.number` (renamed in `lib/src/pool.rs` for naming
+            // consistency with the surrounding `buffer.*` keys).
+            // `buffer.usage_percent` is computed against the configured
+            // `buffer.capacity` so dashboards can chart pool pressure.
+            {
+                let pool = self.pool.borrow();
+                let used = pool.inner.used();
+                let capacity = pool.inner.capacity();
+                gauge!("buffer.in_use", used);
+                gauge!("buffer.capacity", capacity);
+                if capacity > 0 {
+                    gauge!("buffer.usage_percent", used * 100 / capacity);
+                }
+            }
             // 1Hz tick for `accept_queue.saturated_seconds`. Increments once
             // per `ACCEPT_SATURATION_TICK` while `SessionManager::can_accept`
             // is `false`. Distinguishes "queue spent N seconds at max" from

@@ -205,7 +205,14 @@ impl Stream {
             self.request_counted = false;
         }
         if error {
-            incr!("http.errors");
+            // Labelled with `(cluster_id, backend_id)`; see the matching
+            // emission in `kawa_h1::log_request_error` for the cardinality
+            // contract (`metrics::filter_labels_for_detail`).
+            incr!(
+                "http.errors",
+                context.cluster_id.as_deref(),
+                context.backend_id.as_deref()
+            );
         }
         let protocol = match context.protocol {
             Protocol::HTTP => "http",
@@ -220,8 +227,11 @@ impl Stream {
             }
         };
 
-        // Save the HTTP status code of the backend response
-        let key = if let Some(status) = context.status {
+        // Save the HTTP status code of the backend response. Emits the bucket
+        // counter unconditionally, plus the per-code counter from
+        // `crate::metrics::http_status_code_metric_name` when the status is on
+        // the short-list shared with the H1 path (`save_http_status_metric`).
+        let bucket_key = if let Some(status) = context.status {
             match status {
                 100..=199 => "http.status.1xx",
                 200..=299 => "http.status.2xx",
@@ -234,10 +244,20 @@ impl Stream {
             "http.status.none"
         };
         incr!(
-            key,
+            bucket_key,
             context.cluster_id.as_deref(),
             context.backend_id.as_deref()
         );
+
+        if let Some(status) = context.status {
+            if let Some(per_code) = crate::metrics::http_status_code_metric_name(status) {
+                incr!(
+                    per_code,
+                    context.cluster_id.as_deref(),
+                    context.backend_id.as_deref()
+                );
+            }
+        }
 
         let endpoint = sozu_command::logging::EndpointRecord::Http {
             method: context.method.as_deref(),
