@@ -2177,7 +2177,17 @@ fn handle_connection_result(
     }
 }
 
-/// Save the HTTP status code of the backend response
+/// Save the HTTP status code of the backend response.
+///
+/// Emits two counters per response with a known status:
+///
+/// 1. The bucket counter `http.status.{1xx,…,5xx,other}` (always),
+/// 2. A per-code counter `http.status.{200,301,…}` when the code is on the
+///    short-list maintained by [`crate::metrics::http_status_code_metric_name`].
+///
+/// Status-less responses still emit `http.status.none` upstream of this
+/// function (see `generate_access_log` for the H2 path); the H1 entry point
+/// only carries `Some(status)` so the `else` branch is unnecessary here.
 fn save_http_status_metric(status: Option<u16>, context: LogContext) {
     if let Some(status) = status {
         match status {
@@ -2200,6 +2210,10 @@ fn save_http_status_metric(status: Option<u16>, context: LogContext) {
                 // http responses with other codes (protocol error)
                 incr!("http.status.other");
             }
+        }
+
+        if let Some(per_code) = crate::metrics::http_status_code_metric_name(status) {
+            incr!(per_code, context.cluster_id, context.backend_id);
         }
     }
 }
