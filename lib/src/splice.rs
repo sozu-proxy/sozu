@@ -35,7 +35,6 @@ pub const SPLICE_PIPE_CAPACITY: usize = 65_536;
 /// the destination socket — this is the "in flight in kernel" signal
 /// that `Pipe::check_connections` consumes to keep half-closed sessions
 /// alive while the kernel still owns the data.
-#[allow(dead_code)] // wired through `protocol::pipe::Pipe` in a follow-up commit
 pub struct SplicePipe {
     pub in_pipe: [libc::c_int; 2],
     pub out_pipe: [libc::c_int; 2],
@@ -47,7 +46,6 @@ impl SplicePipe {
     /// Allocate two `pipe2(O_NONBLOCK | O_CLOEXEC)` pairs. Returns
     /// `None` if either allocation fails (typically RLIMIT_NOFILE
     /// pressure); the caller falls back to the buffered path.
-    #[allow(dead_code)]
     pub fn new() -> Option<Self> {
         let in_pipe = create_pipe()?;
         let out_pipe = match create_pipe() {
@@ -106,7 +104,6 @@ fn create_pipe() -> Option<[libc::c_int; 2]> {
 /// `SocketResult::WouldBlock` means the source has no more data right
 /// now; `SocketResult::Closed` means the source sent EOF. The caller
 /// is responsible for incrementing the matching `*_pipe_pending`.
-#[allow(dead_code)]
 pub fn splice_in(fd: &dyn AsRawFd, pipe_write_end: libc::c_int) -> (usize, SocketResult) {
     // SAFETY: `fd.as_raw_fd()` borrows the descriptor from its owner;
     // the `&dyn AsRawFd` keeps the owner alive for the duration of the
@@ -152,7 +149,6 @@ pub fn splice_in(fd: &dyn AsRawFd, pipe_write_end: libc::c_int) -> (usize, Socke
 /// the kernel for more bytes than the pipe contains. The caller is
 /// responsible for decrementing the matching `*_pipe_pending` by
 /// `bytes_moved`.
-#[allow(dead_code)]
 pub fn splice_out(
     pipe_read_end: libc::c_int,
     fd: &dyn AsRawFd,

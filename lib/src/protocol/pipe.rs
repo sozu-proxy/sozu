@@ -25,6 +25,9 @@ use crate::{
     timer::TimeoutContainer,
 };
 
+#[cfg(all(target_os = "linux", feature = "splice"))]
+use crate::splice::{self, SPLICE_PIPE_CAPACITY, SplicePipe};
+
 /// This macro is defined uniquely in this module to help the tracking of
 /// pipelining issues inside Sōzu. Colored output uses bold bright-white
 /// (uniform across every protocol) for the protocol label, light grey for the
@@ -113,6 +116,12 @@ pub struct Pipe<Front: SocketHandler, L: ListenerHandler> {
     /// paths or when the client omitted the SNI extension.
     tls_sni: Option<String>,
     tls_alpn: Option<&'static str>,
+    /// Kernel-pipe pair used for zero-copy `splice(2)` forwarding on
+    /// `Protocol::TCP` listeners. Allocated lazily in `new()` and
+    /// `None` for WebSocket-after-upgrade paths or when allocation
+    /// failed (caller falls back to the buffered path).
+    #[cfg(all(target_os = "linux", feature = "splice"))]
+    splice_pipe: Option<SplicePipe>,
 }
 
 impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
@@ -182,6 +191,12 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             tls_cipher: None,
             tls_sni: None,
             tls_alpn: None,
+            #[cfg(all(target_os = "linux", feature = "splice"))]
+            splice_pipe: if protocol == Protocol::TCP {
+                SplicePipe::new()
+            } else {
+                None
+            },
         };
 
         trace!("{} created pipe", log_context!(session));
@@ -352,13 +367,46 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         self.log_request(metrics, true, Some(message));
     }
 
+    /// Bytes currently sitting inside the `splice` frontend→backend
+    /// kernel pipe (`0` if splice is disabled or the pipe was not
+    /// allocated). Counted as "request in flight" by `check_connections`
+    /// so a half-closed session stays alive until the kernel drains.
+    #[cfg(all(target_os = "linux", feature = "splice"))]
+    fn splice_in_pending(&self) -> usize {
+        self.splice_pipe
+            .as_ref()
+            .map(|p| p.in_pipe_pending)
+            .unwrap_or(0)
+    }
+    #[cfg(not(all(target_os = "linux", feature = "splice")))]
+    fn splice_in_pending(&self) -> usize {
+        0
+    }
+
+    /// Bytes currently sitting inside the `splice` backend→frontend
+    /// kernel pipe. Counterpart to `splice_in_pending` for the response
+    /// direction.
+    #[cfg(all(target_os = "linux", feature = "splice"))]
+    fn splice_out_pending(&self) -> usize {
+        self.splice_pipe
+            .as_ref()
+            .map(|p| p.out_pipe_pending)
+            .unwrap_or(0)
+    }
+    #[cfg(not(all(target_os = "linux", feature = "splice")))]
+    fn splice_out_pending(&self) -> usize {
+        0
+    }
+
     /// Wether the session should be kept open, depending on endpoints status
     /// and buffer usage (both in memory and in kernel)
     pub fn check_connections(&self) -> bool {
         let request_is_inflight = self.frontend_buffer.available_data() > 0
-            || self.frontend_readiness.event.is_readable();
-        let response_is_inflight =
-            self.backend_buffer.available_data() > 0 || self.backend_readiness.event.is_readable();
+            || self.frontend_readiness.event.is_readable()
+            || self.splice_in_pending() > 0;
+        let response_is_inflight = self.backend_buffer.available_data() > 0
+            || self.backend_readiness.event.is_readable()
+            || self.splice_out_pending() > 0;
         match (self.frontend_status, self.backend_status) {
             (ConnectionStatus::Normal, ConnectionStatus::Normal) => true,
             (ConnectionStatus::Normal, ConnectionStatus::ReadOpen) => true,
@@ -402,7 +450,8 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
 
     pub fn backend_hup(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
         self.backend_status = ConnectionStatus::Closed;
-        if self.backend_buffer.available_data() == 0 {
+        let pipe_has_data = self.splice_out_pending() > 0;
+        if self.backend_buffer.available_data() == 0 && !pipe_has_data {
             if self.backend_readiness.event.is_readable() {
                 self.backend_readiness.interest.insert(Ready::READABLE);
                 debug!(
@@ -429,6 +478,11 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
 
     // Read content from the session
     pub fn readable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
+        #[cfg(all(target_os = "linux", feature = "splice"))]
+        if self.protocol == Protocol::TCP && self.splice_pipe.is_some() {
+            return self.splice_readable(metrics);
+        }
+
         self.reset_timeouts();
 
         trace!("{} pipe readable", log_context!(self));
@@ -496,6 +550,11 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
 
     // Forward content to session
     pub fn writable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
+        #[cfg(all(target_os = "linux", feature = "splice"))]
+        if self.protocol == Protocol::TCP && self.splice_pipe.is_some() {
+            return self.splice_writable(metrics);
+        }
+
         trace!("{} Pipe writable", log_context!(self));
         if self.backend_buffer.available_data() == 0 {
             self.backend_readiness.interest.insert(Ready::READABLE);
@@ -574,6 +633,11 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
 
     // Forward content to cluster
     pub fn backend_writable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
+        #[cfg(all(target_os = "linux", feature = "splice"))]
+        if self.protocol == Protocol::TCP && self.splice_pipe.is_some() {
+            return self.splice_backend_writable(metrics);
+        }
+
         trace!("{} pipe back_writable", log_context!(self));
 
         if self.frontend_buffer.available_data() == 0 {
@@ -653,6 +717,11 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
 
     // Read content from cluster
     pub fn backend_readable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
+        #[cfg(all(target_os = "linux", feature = "splice"))]
+        if self.protocol == Protocol::TCP && self.splice_pipe.is_some() {
+            return self.splice_backend_readable(metrics);
+        }
+
         self.reset_timeouts();
 
         trace!("{} Pipe backend_readable", log_context!(self));
@@ -711,6 +780,325 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
                 }
                 SocketResult::Continue => {}
             }
+        }
+
+        SessionResult::Continue
+    }
+
+    /// Zero-copy fast path of `readable`: pull bytes off the frontend
+    /// socket into the kernel `in_pipe` via `splice(2)`, then mark the
+    /// backend writable so the data drains in the next event loop tick.
+    ///
+    /// Mirrors `readable`'s `ConnectionStatus` transitions and metric
+    /// emissions exactly so observability and the `check_connections`
+    /// state machine behave the same with or without the feature flag.
+    #[cfg(all(target_os = "linux", feature = "splice"))]
+    fn splice_readable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
+        self.reset_timeouts();
+
+        trace!("{} pipe splice_readable", log_context!(self));
+        if self.splice_in_pending() >= SPLICE_PIPE_CAPACITY {
+            // Pipe is full — stop reading and let the backend drain it.
+            self.frontend_readiness.interest.remove(Ready::READABLE);
+            self.backend_readiness.interest.insert(Ready::WRITABLE);
+            return SessionResult::Continue;
+        }
+
+        let pipe_write_end = self.splice_pipe.as_ref().unwrap().in_pipe[1];
+        let (sz, res) = splice::splice_in(self.frontend.socket_ref(), pipe_write_end);
+        debug!("{} Spliced {} bytes from frontend", log_context!(self), sz);
+
+        if sz > 0 {
+            self.splice_pipe.as_mut().unwrap().in_pipe_pending += sz;
+            count!("bytes_in", sz as i64);
+            metrics.bin += sz;
+            self.backend_readiness.interest.insert(Ready::WRITABLE);
+        } else {
+            self.frontend_readiness.event.remove(Ready::READABLE);
+
+            if res == SocketResult::Continue {
+                self.frontend_status = match self.frontend_status {
+                    ConnectionStatus::Normal => ConnectionStatus::WriteOpen,
+                    ConnectionStatus::ReadOpen => ConnectionStatus::Closed,
+                    s => s,
+                };
+            }
+        }
+
+        if !self.check_connections() {
+            self.frontend_readiness.reset();
+            self.backend_readiness.reset();
+            self.log_request_success(metrics);
+            return SessionResult::Close;
+        }
+
+        match res {
+            SocketResult::Error => {
+                self.frontend_readiness.reset();
+                self.backend_readiness.reset();
+                self.log_request_error(metrics, "splice front socket read error");
+                return SessionResult::Close;
+            }
+            SocketResult::Closed => {
+                self.frontend_readiness.reset();
+                self.backend_readiness.reset();
+                self.log_request_success(metrics);
+                return SessionResult::Close;
+            }
+            SocketResult::WouldBlock => {
+                self.frontend_readiness.event.remove(Ready::READABLE);
+            }
+            SocketResult::Continue => {}
+        }
+
+        self.backend_readiness.interest.insert(Ready::WRITABLE);
+        SessionResult::Continue
+    }
+
+    /// Zero-copy fast path of `writable`: drain the backend→frontend
+    /// kernel `out_pipe` toward the frontend socket via `splice(2)`.
+    /// Mirrors `writable`'s loop, status transitions, and metric
+    /// emissions.
+    #[cfg(all(target_os = "linux", feature = "splice"))]
+    fn splice_writable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
+        trace!("{} Pipe splice_writable", log_context!(self));
+        if self.splice_out_pending() == 0 {
+            self.backend_readiness.interest.insert(Ready::READABLE);
+            self.frontend_readiness.interest.remove(Ready::WRITABLE);
+            return SessionResult::Continue;
+        }
+
+        let mut sz = 0usize;
+        let mut res = SocketResult::Continue;
+        while res == SocketResult::Continue {
+            let pending = self.splice_out_pending();
+            // no more data in pipe, stop here
+            if pending == 0 {
+                count!("bytes_out", sz as i64);
+                metrics.bout += sz;
+                self.backend_readiness.interest.insert(Ready::READABLE);
+                self.frontend_readiness.interest.remove(Ready::WRITABLE);
+                return SessionResult::Continue;
+            }
+
+            let pipe_read_end = self.splice_pipe.as_ref().unwrap().out_pipe[0];
+            let (current_sz, current_res) =
+                splice::splice_out(pipe_read_end, self.frontend.socket_ref(), pending);
+            res = current_res;
+            if current_sz > 0 {
+                self.splice_pipe.as_mut().unwrap().out_pipe_pending -= current_sz;
+            }
+            sz += current_sz;
+
+            if current_sz == 0 && res == SocketResult::Continue {
+                self.frontend_status = match self.frontend_status {
+                    ConnectionStatus::Normal => ConnectionStatus::ReadOpen,
+                    ConnectionStatus::WriteOpen => ConnectionStatus::Closed,
+                    s => s,
+                };
+            }
+
+            if !self.check_connections() {
+                metrics.bout += sz;
+                count!("bytes_out", sz as i64);
+                self.frontend_readiness.reset();
+                self.backend_readiness.reset();
+                self.log_request_success(metrics);
+                return SessionResult::Close;
+            }
+        }
+
+        if sz > 0 {
+            count!("bytes_out", sz as i64);
+            self.backend_readiness.interest.insert(Ready::READABLE);
+            metrics.bout += sz;
+        }
+
+        debug!(
+            "{} Spliced {} bytes (out_pipe_pending={})",
+            log_context!(self),
+            sz,
+            self.splice_out_pending()
+        );
+
+        match res {
+            SocketResult::Error => {
+                self.frontend_readiness.reset();
+                self.backend_readiness.reset();
+                self.log_request_error(metrics, "splice front socket write error");
+                return SessionResult::Close;
+            }
+            SocketResult::Closed => {
+                self.frontend_readiness.reset();
+                self.backend_readiness.reset();
+                self.log_request_success(metrics);
+                return SessionResult::Close;
+            }
+            SocketResult::WouldBlock => {
+                self.frontend_readiness.event.remove(Ready::WRITABLE);
+            }
+            SocketResult::Continue => {}
+        }
+
+        SessionResult::Continue
+    }
+
+    /// Zero-copy fast path of `backend_writable`: drain the
+    /// frontend→backend kernel `in_pipe` toward the backend socket via
+    /// `splice(2)`. Mirrors `backend_writable`'s loop, status
+    /// transitions, and metric emissions.
+    #[cfg(all(target_os = "linux", feature = "splice"))]
+    fn splice_backend_writable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
+        trace!("{} pipe splice_backend_writable", log_context!(self));
+
+        if self.splice_in_pending() == 0 {
+            self.frontend_readiness.interest.insert(Ready::READABLE);
+            self.backend_readiness.interest.remove(Ready::WRITABLE);
+            return SessionResult::Continue;
+        }
+
+        let output_size = self.splice_in_pending();
+        let mut sz = 0usize;
+        let mut socket_res = SocketResult::Continue;
+
+        while socket_res == SocketResult::Continue {
+            let pending = self.splice_in_pending();
+            // no more data in pipe, stop here
+            if pending == 0 {
+                self.frontend_readiness.interest.insert(Ready::READABLE);
+                self.backend_readiness.interest.remove(Ready::WRITABLE);
+                count!("back_bytes_out", sz as i64);
+                metrics.backend_bout += sz;
+                return SessionResult::Continue;
+            }
+
+            let pipe_read_end = self.splice_pipe.as_ref().unwrap().in_pipe[0];
+            let (current_sz, current_res) = match self.backend_socket.as_ref() {
+                Some(b) => splice::splice_out(pipe_read_end, b, pending),
+                None => break,
+            };
+            socket_res = current_res;
+            if current_sz > 0 {
+                self.splice_pipe.as_mut().unwrap().in_pipe_pending -= current_sz;
+            }
+            sz += current_sz;
+
+            if current_sz == 0 && current_res == SocketResult::Continue {
+                self.backend_status = match self.backend_status {
+                    ConnectionStatus::Normal => ConnectionStatus::ReadOpen,
+                    ConnectionStatus::WriteOpen => ConnectionStatus::Closed,
+                    s => s,
+                };
+            }
+        }
+
+        count!("back_bytes_out", sz as i64);
+        metrics.backend_bout += sz;
+
+        if !self.check_connections() {
+            self.frontend_readiness.reset();
+            self.backend_readiness.reset();
+            self.log_request_success(metrics);
+            return SessionResult::Close;
+        }
+
+        debug!(
+            "{} Spliced {} bytes of {}",
+            log_context!(self),
+            sz,
+            output_size
+        );
+
+        match socket_res {
+            SocketResult::Error => {
+                self.frontend_readiness.reset();
+                self.backend_readiness.reset();
+                self.log_request_error(metrics, "splice back socket write error");
+                return SessionResult::Close;
+            }
+            SocketResult::Closed => {
+                self.frontend_readiness.reset();
+                self.backend_readiness.reset();
+                self.log_request_success(metrics);
+                return SessionResult::Close;
+            }
+            SocketResult::WouldBlock => {
+                self.backend_readiness.event.remove(Ready::WRITABLE);
+            }
+            SocketResult::Continue => {}
+        }
+        SessionResult::Continue
+    }
+
+    /// Zero-copy fast path of `backend_readable`: pull bytes off the
+    /// backend socket into the kernel `out_pipe` via `splice(2)`, then
+    /// mark the frontend writable so the data drains in the next event
+    /// loop tick. Mirrors `backend_readable`'s status transitions and
+    /// metric emissions.
+    #[cfg(all(target_os = "linux", feature = "splice"))]
+    fn splice_backend_readable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
+        self.reset_timeouts();
+
+        trace!("{} Pipe splice_backend_readable", log_context!(self));
+        if self.splice_out_pending() >= SPLICE_PIPE_CAPACITY {
+            // Pipe is full — stop reading and let the frontend drain it.
+            self.backend_readiness.interest.remove(Ready::READABLE);
+            self.frontend_readiness.interest.insert(Ready::WRITABLE);
+            return SessionResult::Continue;
+        }
+
+        let pipe_write_end = self.splice_pipe.as_ref().unwrap().out_pipe[1];
+        let (size, remaining) = match self.backend_socket.as_ref() {
+            Some(b) => splice::splice_in(b, pipe_write_end),
+            None => return SessionResult::Continue,
+        };
+
+        debug!("{} Spliced {} bytes from backend", log_context!(self), size);
+
+        if remaining != SocketResult::Continue || size == 0 {
+            self.backend_readiness.event.remove(Ready::READABLE);
+        }
+        if size > 0 {
+            self.splice_pipe.as_mut().unwrap().out_pipe_pending += size;
+            self.frontend_readiness.interest.insert(Ready::WRITABLE);
+            count!("back_bytes_in", size as i64);
+            metrics.backend_bin += size;
+        }
+
+        if size == 0 && remaining == SocketResult::Closed {
+            self.backend_status = match self.backend_status {
+                ConnectionStatus::Normal => ConnectionStatus::WriteOpen,
+                ConnectionStatus::ReadOpen => ConnectionStatus::Closed,
+                s => s,
+            };
+
+            if !self.check_connections() {
+                self.frontend_readiness.reset();
+                self.backend_readiness.reset();
+                self.log_request_success(metrics);
+                return SessionResult::Close;
+            }
+        }
+
+        match remaining {
+            SocketResult::Error => {
+                self.frontend_readiness.reset();
+                self.backend_readiness.reset();
+                self.log_request_error(metrics, "splice back socket read error");
+                return SessionResult::Close;
+            }
+            SocketResult::Closed => {
+                if !self.check_connections() {
+                    self.frontend_readiness.reset();
+                    self.backend_readiness.reset();
+                    self.log_request_success(metrics);
+                    return SessionResult::Close;
+                }
+            }
+            SocketResult::WouldBlock => {
+                self.backend_readiness.event.remove(Ready::READABLE);
+            }
+            SocketResult::Continue => {}
         }
 
         SessionResult::Continue
