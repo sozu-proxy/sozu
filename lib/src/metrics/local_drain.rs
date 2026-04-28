@@ -720,23 +720,23 @@ mod tests {
 
     #[test]
     fn receive_and_yield_cluster_metrics() {
+        // Mirrors what `kawa_h1::log_request_error` and
+        // `mux::stream::generate_access_log` emit when `metrics.detail` is
+        // `cluster`: the dotted metric name `http.errors` aggregated under
+        // the cluster (with the backend label dropped centrally).
         let mut local_drain = LocalDrain::new("prefix".to_string());
-        local_drain.receive_metric(
-            "http_errors",
-            Some("test-cluster"),
-            None,
-            MetricValue::Count(1),
-        );
-        local_drain.receive_metric(
-            "http_errors",
-            Some("test-cluster"),
-            None,
-            MetricValue::Count(1),
-        );
+        for _ in 0..2 {
+            local_drain.receive_metric(
+                "http.errors",
+                Some("test-cluster"),
+                None,
+                MetricValue::Count(1),
+            );
+        }
 
         let mut map = BTreeMap::new();
         map.insert(
-            "http_errors".to_string(),
+            "http.errors".to_string(),
             FilteredMetrics {
                 inner: Some(Inner::Count(2)),
             },
@@ -747,10 +747,37 @@ mod tests {
         };
 
         let returned_cluster_metrics = local_drain
-            .metrics_of_one_cluster("test-cluster", ["http_errors".to_string()].as_ref())
+            .metrics_of_one_cluster("test-cluster", ["http.errors".to_string()].as_ref())
             .expect("could not query metrics for this cluster");
 
         assert_eq!(expected_cluster_metrics, returned_cluster_metrics);
+    }
+
+    #[test]
+    fn receive_and_yield_http_error_metrics_per_backend() {
+        // Same shape as the cluster-level test above, but with the backend
+        // label preserved (the `metrics.detail = "backend"` path).
+        let mut local_drain = LocalDrain::new("prefix".to_string());
+
+        for _ in 0..3 {
+            local_drain.receive_metric(
+                "http.errors",
+                Some("test-cluster"),
+                Some("test-backend"),
+                MetricValue::Count(1),
+            );
+        }
+
+        let backend_metrics = local_drain
+            .metrics_of_one_backend("test-backend", ["http.errors".to_string()].as_ref())
+            .expect("could not query metrics for this backend");
+
+        assert_eq!(
+            backend_metrics.metrics.get("http.errors"),
+            Some(&FilteredMetrics {
+                inner: Some(Inner::Count(3)),
+            })
+        );
     }
 
     #[test]
