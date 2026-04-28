@@ -2319,6 +2319,22 @@ impl ConfigBuilder {
             }
         }
 
+        // The eviction batch is `(max_connections / 100).max(1)` — a 1% ratio
+        // by design. Below 100 connections the floor of 1 means each cap
+        // event evicts a larger share than 1% of capacity (e.g. 4% at
+        // max_connections=25), which can surprise an operator who reads the
+        // knob as "1% per round". Warn at config load so the discrepancy is
+        // visible at boot, not under traffic.
+        if self.built.evict_on_queue_full && self.built.max_connections < 100 {
+            let pct = 100usize.div_ceil(self.built.max_connections);
+            warn!(
+                "evict_on_queue_full enabled with max_connections = {}; the eviction batch \
+                 clamps to 1, equivalent to ~{}% of capacity per cap event (the knob is \
+                 documented as 1%). Confirm this is intended.",
+                self.built.max_connections, pct
+            );
+        }
+
         let command_socket_path = self.file.command_socket.clone().unwrap_or({
             let mut path = env::current_dir().map_err(|e| ConfigError::Env(e.to_string()))?;
             path.push("sozu.sock");
