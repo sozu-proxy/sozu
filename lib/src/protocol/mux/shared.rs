@@ -6,7 +6,12 @@
 //! load-bearing for TLS close_notify ordering (see agent memory
 //! `feedback_tls_write_symmetry`).
 
-use crate::socket::{SocketHandler, SocketResult};
+use kawa::AsBuffer;
+
+use crate::{
+    protocol::http::editor::HeaderEditSnapshot,
+    socket::{SocketHandler, SocketResult},
+};
 
 use super::Stream;
 
@@ -90,4 +95,295 @@ pub(super) fn drain_tls_close_notify<S: SocketHandler>(
         }
     }
     (socket.socket_wants_write(), drain_rounds)
+}
+
+/// Apply per-frontend response-side header edits to a response kawa
+/// just before [`kawa::Kawa::prepare`] runs. Mirrors the request-side
+/// pass that `Router::route_from_request` runs against the front kawa
+/// at routing time:
+///
+/// - empty `val` → remove every existing header with the matching name
+///   from `kawa.blocks` (HAProxy `del-header` parity);
+/// - non-empty `val` → append the header before the `end_header` flag
+///   block.
+///
+/// Both H1 and H2 emission paths funnel through here so the on-wire
+/// header set stays consistent. Per-edit set/replace semantics are
+/// expressed as two entries: one with empty `val` (delete) followed by
+/// one with the new value (set).
+pub(super) fn apply_response_header_edits<T: AsBuffer>(
+    kawa: &mut kawa::Kawa<T>,
+    edits: &[HeaderEditSnapshot],
+) {
+    use kawa::{Block, Pair, Store};
+
+    if edits.is_empty() {
+        return;
+    }
+
+    let keys_to_drop: Vec<Vec<u8>> = edits
+        .iter()
+        .filter(|e| e.val.is_empty())
+        .map(|e| e.key.iter().map(u8::to_ascii_lowercase).collect())
+        .collect();
+    if !keys_to_drop.is_empty() {
+        let buf = kawa.storage.buffer();
+        kawa.blocks.retain(|block| {
+            if let Block::Header(Pair { key, val: _ }) = block {
+                // Skip elided headers — kawa's earlier passes (HPACK
+                // decoder, H1 header parser) rewrite headers they want to
+                // suppress to `Pair { key: Store::Empty, val: Store::Empty }`
+                // rather than removing them in-place. Calling `.data()` on
+                // `Store::Empty` panics in `kawa-0.6.8/src/storage/repr.rs`
+                // (the impl unwraps a `None` slice). Pinning this guard
+                // explicitly until kawa changes its policy.
+                if matches!(key, Store::Empty) {
+                    return true;
+                }
+                // Both `keys_to_drop` and `key_lower` are already
+                // ASCII-lowercased, so a byte-equality compare is enough;
+                // a second `compare_no_case` pass would just refold
+                // bytes that are already canonical.
+                let key_lower: Vec<u8> = key.data(buf).iter().map(u8::to_ascii_lowercase).collect();
+                !keys_to_drop
+                    .iter()
+                    .any(|k| k.as_slice() == key_lower.as_slice())
+            } else {
+                true
+            }
+        });
+    }
+
+    let end_header_idx = end_of_headers_index(kawa);
+
+    let mut to_insert: Vec<Block> = Vec::new();
+    for edit in edits {
+        if edit.val.is_empty() {
+            continue;
+        }
+        to_insert.push(Block::Header(Pair {
+            key: Store::from_slice(&edit.key),
+            val: Store::from_slice(&edit.val),
+        }));
+    }
+    if !to_insert.is_empty() {
+        // Insert each edit one position deeper than the previous so we
+        // preserve operator order at the wire. `insert_at` points at the
+        // existing `Block::Flags { end_header: true }` (or
+        // `kawa.blocks.len()` when absent); each successive insert pushes
+        // that anchor right by one — the `+ offset` keeps the flag block
+        // (and any post-headers blocks) trailing the new entries even
+        // when elided headers sit between them.
+        let insert_at = end_header_idx.unwrap_or(kawa.blocks.len());
+        for (offset, block) in to_insert.into_iter().enumerate() {
+            kawa.blocks.insert(insert_at + offset, block);
+        }
+    }
+}
+
+/// Locate the `Block::Flags { end_header: true }` block in `kawa.blocks`.
+///
+/// Both the request-side rewrite helper (`mux::router`) and the
+/// response-side edit helper above use this anchor as the insertion
+/// point for new header blocks: anything after the end-of-headers flag
+/// is body / chunks / trailers and must NOT receive a Header block. A
+/// shared helper keeps the predicate canonical so a future change to
+/// `kawa::Flags` (e.g. adding fields) only needs touching once.
+pub(super) fn end_of_headers_index<T: AsBuffer>(kawa: &kawa::Kawa<T>) -> Option<usize> {
+    kawa.blocks.iter().position(|b| {
+        matches!(
+            b,
+            kawa::Block::Flags(kawa::Flags {
+                end_header: true,
+                ..
+            })
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_response_header_edits;
+    use crate::protocol::http::editor::HeaderEditSnapshot;
+    use kawa::{
+        AsBuffer, Block, Buffer, Flags, Kawa, Kind, Pair, SliceBuffer, StatusLine, Store, Version,
+    };
+
+    fn make_kawa<'a>(buf: &'a mut [u8]) -> Kawa<SliceBuffer<'a>> {
+        Kawa::new(Kind::Response, Buffer::new(SliceBuffer(buf)))
+    }
+
+    fn pretty_blocks<T: AsBuffer>(kawa: &Kawa<T>) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let buf = kawa.storage.buffer();
+        kawa.blocks
+            .iter()
+            .filter_map(|b| {
+                if let Block::Header(Pair { key, val }) = b {
+                    if matches!(key, Store::Empty) {
+                        Some((b"<elided>".to_vec(), b"".to_vec()))
+                    } else {
+                        Some((key.data(buf).to_vec(), val.data(buf).to_vec()))
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Insertion offset arithmetic: when the response already carries
+    /// elided headers (kawa marks suppressed headers as `Store::Empty`
+    /// instead of removing them), inserting two new headers must keep
+    /// them contiguous AND keep the `end_header` flag block trailing.
+    #[test]
+    fn test_response_edit_offsets_with_elided_headers() {
+        let mut buf = vec![0u8; 4096];
+        let mut kawa = make_kawa(&mut buf);
+        kawa.detached.status_line = StatusLine::Response {
+            version: Version::V11,
+            code: 200,
+            status: Store::Static(b"200"),
+            reason: Store::Static(b"OK"),
+        };
+        // Pre-populate with a real header, an elided header (suppressed
+        // by an earlier kawa pass), another real header, and finally the
+        // end-of-headers flag block.
+        kawa.blocks.push_back(Block::Header(Pair {
+            key: Store::Static(b"server"),
+            val: Store::Static(b"sozu"),
+        }));
+        kawa.blocks.push_back(Block::Header(Pair {
+            key: Store::Empty,
+            val: Store::Empty,
+        }));
+        kawa.blocks.push_back(Block::Header(Pair {
+            key: Store::Static(b"content-length"),
+            val: Store::Static(b"3"),
+        }));
+        kawa.blocks.push_back(Block::Flags(Flags {
+            end_body: false,
+            end_chunk: false,
+            end_header: true,
+            end_stream: false,
+        }));
+
+        apply_response_header_edits(
+            &mut kawa,
+            &[
+                HeaderEditSnapshot {
+                    key: b"x-frame-options".to_vec(),
+                    val: b"DENY".to_vec(),
+                },
+                HeaderEditSnapshot {
+                    key: b"x-content-type-options".to_vec(),
+                    val: b"nosniff".to_vec(),
+                },
+            ],
+        );
+
+        let names: Vec<Vec<u8>> = pretty_blocks(&kawa).into_iter().map(|(k, _)| k).collect();
+        assert_eq!(
+            names,
+            vec![
+                b"server".to_vec(),
+                b"<elided>".to_vec(),
+                b"content-length".to_vec(),
+                b"x-frame-options".to_vec(),
+                b"x-content-type-options".to_vec(),
+            ],
+            "new headers must land in order, between the last real header and the end-of-headers flag"
+        );
+
+        // The end-of-headers flag must still be the final block.
+        assert!(
+            matches!(
+                kawa.blocks.back(),
+                Some(Block::Flags(Flags {
+                    end_header: true,
+                    ..
+                }))
+            ),
+            "end_header flag must remain the last block"
+        );
+    }
+
+    /// Delete-by-name with elided headers around the target: the elided
+    /// blocks must survive the retain pass (their `key.data()` would
+    /// panic) and the targeted header must be dropped.
+    #[test]
+    fn test_response_edit_delete_skips_elided_blocks() {
+        let mut buf = vec![0u8; 4096];
+        let mut kawa = make_kawa(&mut buf);
+        kawa.blocks.push_back(Block::Header(Pair {
+            key: Store::Empty,
+            val: Store::Empty,
+        }));
+        kawa.blocks.push_back(Block::Header(Pair {
+            key: Store::Static(b"x-internal"),
+            val: Store::Static(b"secret"),
+        }));
+        kawa.blocks.push_back(Block::Header(Pair {
+            key: Store::Empty,
+            val: Store::Empty,
+        }));
+        kawa.blocks.push_back(Block::Flags(Flags {
+            end_body: false,
+            end_chunk: false,
+            end_header: true,
+            end_stream: false,
+        }));
+
+        apply_response_header_edits(
+            &mut kawa,
+            &[HeaderEditSnapshot {
+                key: b"X-Internal".to_vec(),
+                val: Vec::new(),
+            }],
+        );
+
+        let names: Vec<Vec<u8>> = pretty_blocks(&kawa).into_iter().map(|(k, _)| k).collect();
+        assert_eq!(
+            names,
+            vec![b"<elided>".to_vec(), b"<elided>".to_vec()],
+            "x-internal must be dropped; elided blocks must survive the retain pass"
+        );
+    }
+
+    /// Delete-then-set: the helper applies all deletes first, then
+    /// inserts the non-empty edits. Two edits with the same key
+    /// (one delete, one set) effectively replace the value.
+    #[test]
+    fn test_response_edit_delete_then_set_replaces() {
+        let mut buf = vec![0u8; 4096];
+        let mut kawa = make_kawa(&mut buf);
+        kawa.blocks.push_back(Block::Header(Pair {
+            key: Store::Static(b"cache-control"),
+            val: Store::Static(b"public"),
+        }));
+        kawa.blocks.push_back(Block::Flags(Flags {
+            end_body: false,
+            end_chunk: false,
+            end_header: true,
+            end_stream: false,
+        }));
+
+        apply_response_header_edits(
+            &mut kawa,
+            &[
+                HeaderEditSnapshot {
+                    key: b"Cache-Control".to_vec(),
+                    val: Vec::new(),
+                },
+                HeaderEditSnapshot {
+                    key: b"Cache-Control".to_vec(),
+                    val: b"no-store".to_vec(),
+                },
+            ],
+        );
+
+        let pairs = pretty_blocks(&kawa);
+        assert_eq!(pairs.len(), 1, "only the replacement header must remain");
+        assert_eq!(pairs[0].0, b"Cache-Control");
+        assert_eq!(pairs[0].1, b"no-store");
+    }
 }

@@ -63,11 +63,12 @@ use crate::{
     logging::AccessLogFormat,
     proto::command::{
         ActivateListener, AddBackend, AddCertificate, CertificateAndKey, Cluster,
-        CustomHttpAnswers, HttpListenerConfig, HttpsListenerConfig, ListenerType,
-        LoadBalancingAlgorithms, LoadBalancingParams, LoadMetric, MetricDetail,
-        MetricsConfiguration, PathRule, ProtobufAccessLogFormat, ProxyProtocolConfig, Request,
-        RequestHttpFrontend, RequestTcpFrontend, RulePosition, ServerConfig, ServerMetricsConfig,
-        SocketAddress, TcpListenerConfig, TlsVersion, WorkerRequest, request::RequestType,
+        CustomHttpAnswers, Header, HeaderPosition, HttpListenerConfig, HttpsListenerConfig,
+        ListenerType, LoadBalancingAlgorithms, LoadBalancingParams, LoadMetric, MetricDetail,
+        MetricsConfiguration, PathRule, ProtobufAccessLogFormat, ProxyProtocolConfig,
+        RedirectPolicy, RedirectScheme, Request, RequestHttpFrontend, RequestTcpFrontend,
+        RulePosition, ServerConfig, ServerMetricsConfig, SocketAddress, TcpListenerConfig,
+        TlsVersion, WorkerRequest, request::RequestType,
     },
 };
 
@@ -279,6 +280,38 @@ pub enum ConfigError {
         minimum: u64,
         listeners: usize,
     },
+    /// `redirect = "<value>"` on a frontend used a value the parser doesn't
+    /// recognise. Accepted values are `forward`, `permanent`, `unauthorized`
+    /// (case-insensitive).
+    #[error(
+        "invalid redirect policy '{0}'. Valid values: \"forward\", \"permanent\", \"unauthorized\""
+    )]
+    InvalidRedirectPolicy(String),
+    /// `redirect_scheme = "<value>"` on a frontend used a value the parser
+    /// doesn't recognise. Accepted values are `use-same`, `use-http`,
+    /// `use-https` (case-insensitive).
+    #[error(
+        "invalid redirect scheme '{0}'. Valid values: \"use-same\", \"use-http\", \"use-https\""
+    )]
+    InvalidRedirectScheme(String),
+    /// A `[[clusters.<id>.frontends.headers]]` entry carried an unknown
+    /// `position` value. Accepted values are `request`, `response`, `both`
+    /// (case-insensitive).
+    #[error(
+        "invalid header position '{position}' at headers[{index}]. Valid values: \"request\", \"response\", \"both\""
+    )]
+    InvalidHeaderPosition { index: usize, position: String },
+    /// A `[[clusters.<id>.frontends.headers]]` entry contains a forbidden
+    /// byte (NUL, CR, LF, or another C0 control) in its key or value.
+    /// Accepting these would produce HTTP request/response splitting on
+    /// the wire (CWE-113) — the worker's H2 emission path filters them
+    /// at runtime, but the H1 path serialises raw, so we reject at
+    /// config-load time as a defense in depth.
+    #[error(
+        "invalid header bytes in {field} at headers[{index}]: control characters \
+         (NUL / CR / LF / other C0) are forbidden in header keys and values"
+    )]
+    InvalidHeaderBytes { index: usize, field: &'static str },
 }
 
 /// An HTTP, HTTPS or TCP listener as parsed from the `Listeners` section in the toml
@@ -391,6 +424,21 @@ pub struct ListenerBuilder {
     /// that omit ALPN entirely) are dropped at handshake instead of
     /// silently downgrading to HTTP/1.1. Default: false.
     pub disable_http11: Option<bool>,
+    /// Per-status HTTP answer templates at listener scope — the **global
+    /// default** that fires whenever no cluster-level override matches.
+    /// Map key is the HTTP status code (e.g. `"503"`); map value is
+    /// either a filesystem path or an `inline:<body>` literal, see
+    /// [`resolve_answer_source`]. Loaded into
+    /// [`HttpListenerConfig::answers`] / [`HttpsListenerConfig::answers`]
+    /// at build time via [`load_answers`].
+    ///
+    /// Cluster-level [`FileClusterConfig::answers`] entries override the
+    /// matching status here for requests routed to that cluster.
+    ///
+    /// The deprecated per-status `answer_NNN` fields are still honoured
+    /// for backwards compatibility but are equivalent to a one-line entry
+    /// in this map; new configs should prefer `[listeners.answers]`.
+    pub answers: Option<BTreeMap<String, String>>,
 }
 
 pub fn default_sticky_name() -> String {
@@ -468,6 +516,7 @@ impl ListenerBuilder {
             h2_graceful_shutdown_deadline_seconds: None,
             strict_sni_binding: None,
             disable_http11: None,
+            answers: None,
         }
     }
 
@@ -574,6 +623,28 @@ impl ListenerBuilder {
         self
     }
 
+    /// Register a single per-status answer template file path on this
+    /// listener. The path is read off disk into the resulting listener's
+    /// `answers` map at build time via [`load_answers`]. Repeated calls
+    /// with the same status code overwrite the prior entry.
+    pub fn with_answer<S, P>(&mut self, code: S, path: P) -> &mut Self
+    where
+        S: ToString,
+        P: ToString,
+    {
+        self.answers
+            .get_or_insert_with(BTreeMap::new)
+            .insert(code.to_string(), path.to_string());
+        self
+    }
+
+    /// Replace the listener-scope answer-template path map. See
+    /// [`Self::with_answer`].
+    pub fn with_answers(&mut self, answers: BTreeMap<String, String>) -> &mut Self {
+        self.answers = Some(answers);
+        self
+    }
+
     /// Get the custom HTTP answers from the file system using the provided paths
     fn get_http_answers(&self) -> Result<Option<CustomHttpAnswers>, ConfigError> {
         let http_answers = CustomHttpAnswers {
@@ -590,6 +661,45 @@ impl ListenerBuilder {
             answer_507: read_http_answer_file(&self.answer_507)?,
         };
         Ok(Some(http_answers))
+    }
+
+    /// Build the proto-side `answers` map for this listener.
+    ///
+    /// Merges, in order:
+    /// 1. legacy per-status `answer_NNN` fields (if set), so legacy state
+    ///    files round-trip into the new shape;
+    /// 2. the explicit `[listeners.answers]` map (loaded via [`load_answers`]),
+    ///    so new entries take precedence over legacy ones.
+    fn get_listener_answers(&self) -> Result<BTreeMap<String, String>, ConfigError> {
+        let mut out = BTreeMap::new();
+
+        // Pull bodies from the legacy per-status fields first so the new map
+        // takes precedence on collision. Empty bodies are skipped to keep the
+        // proto map minimal.
+        macro_rules! merge_legacy {
+            ($code:literal, $field:ident) => {
+                if let Some(body) = read_http_answer_file(&self.$field)? {
+                    out.insert($code.to_owned(), body);
+                }
+            };
+        }
+        merge_legacy!("301", answer_301);
+        merge_legacy!("400", answer_400);
+        merge_legacy!("401", answer_401);
+        merge_legacy!("404", answer_404);
+        merge_legacy!("408", answer_408);
+        merge_legacy!("413", answer_413);
+        merge_legacy!("421", answer_421);
+        merge_legacy!("502", answer_502);
+        merge_legacy!("503", answer_503);
+        merge_legacy!("504", answer_504);
+        merge_legacy!("507", answer_507);
+
+        if let Some(map) = &self.answers {
+            let loaded = load_answers(map)?;
+            out.extend(loaded);
+        }
+        Ok(out)
     }
 
     /// Assign the timeouts of the config to this listener, only if timeouts did not exist
@@ -614,6 +724,7 @@ impl ListenerBuilder {
         }
 
         let http_answers = self.get_http_answers()?;
+        let answers = self.get_listener_answers()?;
 
         let configuration = HttpListenerConfig {
             address: self.address.into(),
@@ -625,6 +736,7 @@ impl ListenerBuilder {
             connect_timeout: self.connect_timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT),
             request_timeout: self.request_timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT),
             http_answers,
+            answers,
             h2_max_rst_stream_per_window: self.h2_max_rst_stream_per_window,
             h2_max_ping_per_window: self.h2_max_ping_per_window,
             h2_max_settings_per_window: self.h2_max_settings_per_window,
@@ -763,6 +875,7 @@ impl ListenerBuilder {
             .unwrap_or_default();
 
         let http_answers = self.get_http_answers()?;
+        let answers = self.get_listener_answers()?;
 
         if let Some(config) = config {
             self.assign_config_timeouts(config);
@@ -790,6 +903,7 @@ impl ListenerBuilder {
                 .send_tls13_tickets
                 .unwrap_or(DEFAULT_SEND_TLS_13_TICKETS),
             http_answers,
+            answers,
             alpn_protocols,
             h2_max_rst_stream_per_window: self.h2_max_rst_stream_per_window,
             h2_max_ping_per_window: self.h2_max_ping_per_window,
@@ -861,6 +975,74 @@ fn read_http_answer_file(path: &Option<String>) -> Result<Option<String>, Config
         }
         None => Ok(None),
     }
+}
+
+/// Resolve a single `answers` map entry into the literal template body
+/// the proto layer expects.
+///
+/// The same resolution rule applies to entries at every layer:
+/// * **Listener-level** `[listeners.<id>.answers]` — the global default
+///   that fires whenever no more specific override matches.
+/// * **Cluster-level** `[clusters.<id>.answers]` — overrides the
+///   listener-level default for the matching status code on requests
+///   routed to that cluster.
+///
+/// Two source forms are accepted:
+/// * **Filesystem path** — the value starts with the `file://` URI
+///   scheme. Everything after the prefix is treated as a path; the
+///   path is opened and read into a string. Mirrors the on-disk
+///   loading the per-status [`read_http_answer_file`] helper performs
+///   for the deprecated `answer_301`..`answer_507` fields.
+/// * **Inline literal** (default) — anything else. The value is taken
+///   verbatim as the template body, including an empty string (a
+///   0-byte response payload, typical with `Connection: close` and no
+///   headers). The bare-string default keeps the common case — a
+///   short canned response — typing-light; operators who need a file
+///   say so explicitly with `file://`.
+pub fn resolve_answer_source(value: &str) -> Result<String, ConfigError> {
+    if let Some(path) = value.strip_prefix("file://") {
+        let mut content = String::new();
+        let mut file = File::open(path).map_err(|io_error| ConfigError::FileOpen {
+            path_to_open: path.to_owned(),
+            io_error,
+        })?;
+        file.read_to_string(&mut content)
+            .map_err(|io_error| ConfigError::FileRead {
+                path_to_read: path.to_owned(),
+                io_error,
+            })?;
+        return Ok(content);
+    }
+    Ok(value.to_owned())
+}
+
+/// Load every per-status template referenced by `answers`.
+///
+/// `answers` maps an HTTP status code (e.g. `"503"`) to either a
+/// filesystem path or an `inline:<body>` literal — see
+/// [`resolve_answer_source`] for the resolution rules. Each entry is
+/// resolved into a body string and inserted into the returned map
+/// under the same key, ready to be assigned to the proto-level
+/// `answers` field on a [`HttpListenerConfig`] / [`HttpsListenerConfig`]
+/// / [`Cluster`]. Empty values are skipped (treated as "preserve
+/// current") so the caller can use them as a no-op stub in example
+/// configs.
+///
+/// Errors map to the existing `ConfigError::FileOpen` /
+/// `ConfigError::FileRead` variants so the operator gets the same
+/// diagnostics whether the path comes from this map or from the
+/// deprecated per-status `answer_301`..`answer_507` fields.
+pub fn load_answers(
+    answers: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, ConfigError> {
+    let mut out = BTreeMap::new();
+    for (code, value) in answers {
+        if value.is_empty() {
+            continue;
+        }
+        out.insert(code.to_owned(), resolve_answer_source(value)?);
+    }
+    Ok(out)
 }
 
 /// Cardinality knob for metrics labels in the StatsD network drain.
@@ -958,6 +1140,48 @@ pub struct FileClusterFrontendConfig {
     #[serde(default)]
     pub position: RulePosition,
     pub tags: Option<BTreeMap<String, String>>,
+    /// Frontend-level redirect policy. Accepted values are `forward`
+    /// (default — route to the backend), `permanent` (return 301 with the
+    /// computed `Location`), or `unauthorized` (return 401 with
+    /// `WWW-Authenticate: Basic realm=…`). Case-insensitive.
+    pub redirect: Option<String>,
+    /// Scheme used when emitting a permanent redirect's `Location`. Accepted
+    /// values are `use-same` (default — preserve request scheme), `use-http`,
+    /// `use-https`. Case-insensitive.
+    pub redirect_scheme: Option<String>,
+    /// Optional template applied to the emitted permanent-redirect response
+    /// body. Supports the `%REDIRECT_LOCATION` / `%STATUS_CODE` etc.
+    /// variables documented in `doc/configure.md`.
+    pub redirect_template: Option<String>,
+    /// Rewrite host template. Supports `$HOST[n]` / `$PATH[n]` placeholders
+    /// populated from regex captures collected during routing.
+    pub rewrite_host: Option<String>,
+    /// Rewrite path template. Same grammar as `rewrite_host`.
+    pub rewrite_path: Option<String>,
+    /// Optional literal port override on the rewritten URL.
+    pub rewrite_port: Option<u32>,
+    /// When true, requests routed through this frontend must carry a valid
+    /// `Authorization: Basic <user:pass>` header whose hash matches one of
+    /// the cluster's `authorized_hashes`. Default: false.
+    pub required_auth: Option<bool>,
+    /// Header mutations applied to requests and/or responses passing through
+    /// this frontend. See [`HeaderEditConfig`] for the empty-value-deletes
+    /// semantics (HAProxy `del-header` parity).
+    pub headers: Option<Vec<HeaderEditConfig>>,
+}
+
+/// A single header mutation as serialised under
+/// `[[clusters.<id>.frontends.headers]]`. Maps to the proto [`Header`]
+/// message at request-build time.
+///
+/// `position` accepts `request`, `response`, or `both` (case-insensitive).
+/// An empty `value` deletes the header by name (HAProxy `del-header` parity).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HeaderEditConfig {
+    pub position: String,
+    pub key: String,
+    pub value: String,
 }
 
 impl FileClusterFrontendConfig {
@@ -1032,6 +1256,26 @@ impl FileClusterFrontendConfig {
             (Some(s), None) => PathRule::prefix(s.clone()),
         };
 
+        let redirect = match self.redirect.as_deref() {
+            Some(v) => Some(parse_redirect_policy(v)?),
+            None => None,
+        };
+        let redirect_scheme = match self.redirect_scheme.as_deref() {
+            Some(v) => Some(parse_redirect_scheme(v)?),
+            None => None,
+        };
+
+        let headers = match self.headers.as_ref() {
+            Some(entries) => {
+                let mut out = Vec::with_capacity(entries.len());
+                for (index, entry) in entries.iter().enumerate() {
+                    out.push(parse_header_edit(index, entry)?);
+                }
+                out
+            }
+            None => Vec::new(),
+        };
+
         Ok(HttpFrontendConfig {
             address: self.address,
             hostname,
@@ -1043,8 +1287,126 @@ impl FileClusterFrontendConfig {
             path,
             method: self.method.clone(),
             tags: self.tags.clone(),
+            redirect,
+            redirect_scheme,
+            redirect_template: self.redirect_template.clone(),
+            rewrite_host: self.rewrite_host.clone(),
+            rewrite_path: self.rewrite_path.clone(),
+            rewrite_port: self.rewrite_port,
+            required_auth: self.required_auth,
+            headers,
         })
     }
+}
+
+/// Parse a `redirect` TOML value (case-insensitive) into the proto enum.
+pub(crate) fn parse_redirect_policy(value: &str) -> Result<RedirectPolicy, ConfigError> {
+    match value.to_ascii_lowercase().as_str() {
+        "forward" => Ok(RedirectPolicy::Forward),
+        "permanent" => Ok(RedirectPolicy::Permanent),
+        "unauthorized" => Ok(RedirectPolicy::Unauthorized),
+        _ => Err(ConfigError::InvalidRedirectPolicy(value.to_owned())),
+    }
+}
+
+/// Parse a `redirect_scheme` TOML value (case-insensitive) into the proto enum.
+pub(crate) fn parse_redirect_scheme(value: &str) -> Result<RedirectScheme, ConfigError> {
+    match value.to_ascii_lowercase().as_str() {
+        "use-same" | "use_same" => Ok(RedirectScheme::UseSame),
+        "use-http" | "use_http" => Ok(RedirectScheme::UseHttp),
+        "use-https" | "use_https" => Ok(RedirectScheme::UseHttps),
+        _ => Err(ConfigError::InvalidRedirectScheme(value.to_owned())),
+    }
+}
+
+/// Parse a `[[clusters.<id>.frontends.headers]]` entry into the proto
+/// [`Header`] message. `index` is the zero-based position of `entry` in
+/// the source array — surfaced into the error so a multi-entry config
+/// pinpoints the bad row instead of just naming the unknown position.
+/// An empty `value` is the HAProxy `del-header` parity (deletes the
+/// header by name); the proto carries the empty string verbatim.
+pub(crate) fn parse_header_edit(
+    index: usize,
+    entry: &HeaderEditConfig,
+) -> Result<Header, ConfigError> {
+    let position = match entry.position.to_ascii_lowercase().as_str() {
+        "request" => HeaderPosition::Request,
+        "response" => HeaderPosition::Response,
+        "both" => HeaderPosition::Both,
+        _ => {
+            return Err(ConfigError::InvalidHeaderPosition {
+                index,
+                position: entry.position.clone(),
+            });
+        }
+    };
+    if !header_name_is_valid_token(entry.key.as_bytes()) {
+        return Err(ConfigError::InvalidHeaderBytes {
+            index,
+            field: "key",
+        });
+    }
+    if header_value_contains_forbidden_controls(entry.value.as_bytes()) {
+        return Err(ConfigError::InvalidHeaderBytes {
+            index,
+            field: "value",
+        });
+    }
+    Ok(Header {
+        position: position as i32,
+        key: entry.key.clone(),
+        val: entry.value.clone(),
+    })
+}
+
+/// Field names follow the RFC 9110 §5.1 `token` grammar: non-empty,
+/// composed of `tchar` bytes (alphanumeric plus a closed punctuation
+/// list). HTAB and SP are NOT tchar — they belong to field-value
+/// grammar and must be rejected in the name. Reusing the more
+/// permissive value-side filter would let `Host\t` slip through and
+/// produce an invalid header line on the H1 wire (security review
+/// LISA-002 follow-up).
+pub(crate) fn header_name_is_valid_token(bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return false;
+    }
+    bytes.iter().all(|&b| is_tchar(b))
+}
+
+/// `tchar = "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-" / "." /
+/// "^" / "_" / "`" / "|" / "~" / DIGIT / ALPHA` per RFC 9110 §5.6.2.
+fn is_tchar(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+/// Reject any byte that would let a header injection escape the value
+/// block on the wire (RFC 9110 §5.5 / RFC 9113 §8.2.1):
+/// `\0..=\x08`, `\x0A..=\x1F`, and `\x7F` — the entire C0 control set
+/// minus horizontal tab `\x09`, which RFC 9110 explicitly permits in
+/// field values. Mirrors the runtime filter at
+/// `lib/src/protocol/mux/converter.rs::call` so config-load and runtime
+/// agree on which header values may travel.
+pub(crate) fn header_value_contains_forbidden_controls(bytes: &[u8]) -> bool {
+    bytes
+        .iter()
+        .any(|&b| matches!(b, 0x00..=0x08 | 0x0A..=0x1F | 0x7F))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1080,6 +1442,31 @@ pub struct FileClusterConfig {
     /// Backend-capability hint: `true` when the backend speaks HTTP/2 (h2c or h2+TLS once #1218 lands).
     /// Does NOT gate H2 at the frontend — frontend H2 is ALPN-negotiated independently (see `alpn_protocols`).
     pub http2: Option<bool>,
+    /// Per-cluster HTTP answer template overrides keyed by HTTP status
+    /// code (e.g. `"503"`). Each value is either a filesystem path or an
+    /// `inline:<body>` literal — see [`resolve_answer_source`]. Loaded
+    /// into [`Cluster::answers`] at build time via [`load_answers`].
+    ///
+    /// Layering: an entry here overrides the listener-level
+    /// `[listeners.<id>.answers]` default for the matching status on
+    /// requests routed to this cluster. The listener-level map is the
+    /// global default; the cluster-level map is the per-cluster
+    /// override.
+    pub answers: Option<BTreeMap<String, String>>,
+    /// Optional explicit port to use when building the `Location` header
+    /// for an `https_redirect`. When unset, the listener's effective HTTPS
+    /// port is used. Lets operators front a non-standard HTTPS port (e.g.
+    /// 8443) on the redirect target while keeping `https_redirect = true`.
+    pub https_redirect_port: Option<u32>,
+    /// Authorized credentials for HTTP basic authentication, formatted as
+    /// `username:hex(sha256(password))` (lower-case hex). Empty list
+    /// disables auth even when a frontend sets `required_auth = true` —
+    /// such requests are rejected with 401.
+    pub authorized_hashes: Option<Vec<String>>,
+    /// Realm string emitted in `WWW-Authenticate: Basic realm="…"` when
+    /// an unauthenticated request is rejected. Treated as an opaque
+    /// value (no template substitution).
+    pub www_authenticate: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1141,6 +1528,11 @@ impl FileClusterConfig {
                     _ => None,
                 };
 
+                let answers = match self.answers.as_ref() {
+                    Some(map) => load_answers(map)?,
+                    None => BTreeMap::new(),
+                };
+
                 Ok(ClusterConfig::Tcp(TcpClusterConfig {
                     cluster_id: cluster_id.to_string(),
                     frontends,
@@ -1148,6 +1540,10 @@ impl FileClusterConfig {
                     proxy_protocol,
                     load_balancing: self.load_balancing,
                     load_metric: self.load_metric,
+                    answers,
+                    https_redirect_port: self.https_redirect_port,
+                    authorized_hashes: self.authorized_hashes.unwrap_or_default(),
+                    www_authenticate: self.www_authenticate,
                 }))
             }
             FileClusterProtocolConfig::Http => {
@@ -1166,6 +1562,11 @@ impl FileClusterConfig {
                         .ok()
                 });
 
+                let answers = match self.answers.as_ref() {
+                    Some(map) => load_answers(map)?,
+                    None => BTreeMap::new(),
+                };
+
                 Ok(ClusterConfig::Http(HttpClusterConfig {
                     cluster_id: cluster_id.to_string(),
                     frontends,
@@ -1176,6 +1577,10 @@ impl FileClusterConfig {
                     load_metric: self.load_metric,
                     answer_503,
                     http2: self.http2,
+                    answers,
+                    https_redirect_port: self.https_redirect_port,
+                    authorized_hashes: self.authorized_hashes.unwrap_or_default(),
+                    www_authenticate: self.www_authenticate,
                 }))
             }
         }
@@ -1197,6 +1602,26 @@ pub struct HttpFrontendConfig {
     #[serde(default)]
     pub position: RulePosition,
     pub tags: Option<BTreeMap<String, String>>,
+    /// Resolved redirect policy. `None` keeps the proto-default `FORWARD`.
+    #[serde(default)]
+    pub redirect: Option<RedirectPolicy>,
+    /// Resolved redirect scheme. `None` keeps the proto-default `USE_SAME`.
+    #[serde(default)]
+    pub redirect_scheme: Option<RedirectScheme>,
+    #[serde(default)]
+    pub redirect_template: Option<String>,
+    #[serde(default)]
+    pub rewrite_host: Option<String>,
+    #[serde(default)]
+    pub rewrite_path: Option<String>,
+    #[serde(default)]
+    pub rewrite_port: Option<u32>,
+    #[serde(default)]
+    pub required_auth: Option<bool>,
+    /// Header mutations applied to requests and/or responses passing through
+    /// this frontend. Empty by default.
+    #[serde(default)]
+    pub headers: Vec<Header>,
 }
 
 impl HttpFrontendConfig {
@@ -1234,6 +1659,14 @@ impl HttpFrontendConfig {
                     method: self.method.clone(),
                     position: self.position.into(),
                     tags,
+                    redirect: self.redirect.map(|r| r as i32),
+                    required_auth: self.required_auth,
+                    redirect_scheme: self.redirect_scheme.map(|s| s as i32),
+                    redirect_template: self.redirect_template.clone(),
+                    rewrite_host: self.rewrite_host.clone(),
+                    rewrite_path: self.rewrite_path.clone(),
+                    rewrite_port: self.rewrite_port,
+                    headers: self.headers.clone(),
                 })
                 .into(),
             );
@@ -1248,6 +1681,14 @@ impl HttpFrontendConfig {
                     method: self.method.clone(),
                     position: self.position.into(),
                     tags,
+                    redirect: self.redirect.map(|r| r as i32),
+                    required_auth: self.required_auth,
+                    redirect_scheme: self.redirect_scheme.map(|s| s as i32),
+                    redirect_template: self.redirect_template.clone(),
+                    rewrite_host: self.rewrite_host.clone(),
+                    rewrite_path: self.rewrite_path.clone(),
+                    rewrite_port: self.rewrite_port,
+                    headers: self.headers.clone(),
                 })
                 .into(),
             );
@@ -1269,6 +1710,16 @@ pub struct HttpClusterConfig {
     pub load_metric: Option<LoadMetric>,
     pub answer_503: Option<String>,
     pub http2: Option<bool>,
+    /// Per-status template body map (already loaded from disk). Maps to
+    /// the proto [`Cluster::answers`] field.
+    #[serde(default)]
+    pub answers: BTreeMap<String, String>,
+    #[serde(default)]
+    pub https_redirect_port: Option<u32>,
+    #[serde(default)]
+    pub authorized_hashes: Vec<String>,
+    #[serde(default)]
+    pub www_authenticate: Option<String>,
 }
 
 impl HttpClusterConfig {
@@ -1283,6 +1734,10 @@ impl HttpClusterConfig {
                 answer_503: self.answer_503.clone(),
                 load_metric: self.load_metric.map(|s| s as i32),
                 http2: self.http2,
+                answers: self.answers.clone(),
+                https_redirect_port: self.https_redirect_port,
+                authorized_hashes: self.authorized_hashes.clone(),
+                www_authenticate: self.www_authenticate.clone(),
             })
             .into(),
         ];
@@ -1331,6 +1786,17 @@ pub struct TcpClusterConfig {
     pub proxy_protocol: Option<ProxyProtocolConfig>,
     pub load_balancing: LoadBalancingAlgorithms,
     pub load_metric: Option<LoadMetric>,
+    /// Per-status template body map (already loaded from disk). Even
+    /// though TCP clusters do not emit HTTP responses, the field is
+    /// carried for shape uniformity with [`HttpClusterConfig`].
+    #[serde(default)]
+    pub answers: BTreeMap<String, String>,
+    #[serde(default)]
+    pub https_redirect_port: Option<u32>,
+    #[serde(default)]
+    pub authorized_hashes: Vec<String>,
+    #[serde(default)]
+    pub www_authenticate: Option<String>,
 }
 
 impl TcpClusterConfig {
@@ -1345,6 +1811,10 @@ impl TcpClusterConfig {
                 load_metric: self.load_metric.map(|s| s as i32),
                 answer_503: None,
                 http2: None,
+                answers: self.answers.clone(),
+                https_redirect_port: self.https_redirect_port,
+                authorized_hashes: self.authorized_hashes.clone(),
+                www_authenticate: self.www_authenticate.clone(),
             })
             .into(),
         ];
@@ -1414,6 +1884,17 @@ pub struct FileConfig {
     /// that exceed 4 backends per session — clamped to [2, 32] at load.
     #[serde(default)]
     pub slab_entries_per_connection: Option<u64>,
+    /// Maximum length, in bytes, of a base64-decoded `Authorization: Basic`
+    /// payload accepted by the worker's `mux::auth` module. Caps the
+    /// per-failed-auth allocation so a hostile peer cannot force the worker
+    /// to decode arbitrarily large tokens. RFC 7617 imposes no upper bound
+    /// — defaults to 4096, which is well above the realistic
+    /// `username:password` shape. Operators running hardened tenants can
+    /// lower this to e.g. 256 or 512 to bound the allocation tighter.
+    /// Values >= `buffer_size / 3` emit a warning at config-load time
+    /// (the credential cap shouldn't dominate the per-frontend buffer).
+    #[serde(default)]
+    pub basic_auth_max_credential_bytes: Option<u64>,
     /// Optional UID allowlist for command-socket requests. `None` (default)
     /// preserves historical behaviour: any same-UID local process can
     /// invoke any verb. When set, requests whose `SO_PEERCRED` UID is not
@@ -1609,6 +2090,7 @@ impl ConfigBuilder {
                 )
             }),
             command_allowed_uids: file_config.command_allowed_uids.clone(),
+            basic_auth_max_credential_bytes: file_config.basic_auth_max_credential_bytes,
             ..Default::default()
         };
 
@@ -1803,6 +2285,28 @@ impl ConfigBuilder {
             });
         }
 
+        // Warn (no hard reject) when the configured Basic-auth credential
+        // cap is large enough to dominate the per-frontend buffer. The
+        // worker copies a decoded credential into a transient allocation
+        // sized by this cap; values >= 33% of `buffer_size` mean a single
+        // failed-auth attempt can hold a third of the buffer's worth of
+        // bytes, which combined with in-flight request/response framing
+        // pushes the buffer toward back-pressure under load. Log only —
+        // operators with deliberate threat models may choose this
+        // trade-off, but the surprise needs to be visible.
+        if let Some(cap) = self.built.basic_auth_max_credential_bytes {
+            let third = self.built.buffer_size / 3;
+            if cap >= third {
+                warn!(
+                    "basic_auth_max_credential_bytes = {} is >= buffer_size / 3 ({}); \
+                     a hostile peer can pin ~33% of the per-frontend buffer per failed auth \
+                     attempt. Consider lowering basic_auth_max_credential_bytes (typical \
+                     credentials are <100 bytes) or raising buffer_size.",
+                    cap, third
+                );
+            }
+        }
+
         let command_socket_path = self.file.command_socket.clone().unwrap_or({
             let mut path = env::current_dir().map_err(|e| ConfigError::Env(e.to_string()))?;
             path.push("sozu.sock");
@@ -1895,6 +2399,12 @@ pub struct Config {
     /// not in the list is rejected before reaching dispatch.
     #[serde(default)]
     pub command_allowed_uids: Option<Vec<u32>>,
+    /// Maximum length, in bytes, of a base64-decoded `Authorization: Basic`
+    /// payload accepted by `mux::auth`. `None` keeps the compile-time
+    /// default of 4096. Set once on each worker at boot via
+    /// [`ServerConfig::basic_auth_max_credential_bytes`].
+    #[serde(default)]
+    pub basic_auth_max_credential_bytes: Option<u64>,
 }
 
 fn default_front_timeout() -> u32 {
@@ -2273,6 +2783,7 @@ impl From<&Config> for ServerConfig {
             access_log_format: ProtobufAccessLogFormat::from(&config.access_logs_format) as i32,
             log_colored: config.log_colored,
             slab_entries_per_connection: config.slab_entries_per_connection,
+            basic_auth_max_credential_bytes: config.basic_auth_max_credential_bytes,
         }
     }
 }
@@ -2609,5 +3120,165 @@ mod tests {
         builder.with_alpn_protocols(Some(vec!["http/1.1".to_owned(), "h2".to_owned()]));
         let config = builder.to_tls(None).expect("to_tls should succeed");
         assert_eq!(config.alpn_protocols, vec!["http/1.1", "h2"]);
+    }
+
+    /// CRLF or NUL in a `[[clusters.<id>.frontends.headers]]` value
+    /// would let an operator-supplied config splice arbitrary
+    /// header / request lines into the H1 wire on the backend side
+    /// (CWE-113). The H2 emission path filters at runtime; we reject
+    /// at config-load time as a defense in depth.
+    #[test]
+    fn parse_header_edit_rejects_crlf_in_value() {
+        let entry = HeaderEditConfig {
+            position: "request".to_owned(),
+            key: "X-Test".to_owned(),
+            value: "value\r\nEvil-Header: stolen".to_owned(),
+        };
+        let err = parse_header_edit(0, &entry).expect_err("CRLF in value must be rejected");
+        match err {
+            ConfigError::InvalidHeaderBytes { index, field } => {
+                assert_eq!(index, 0);
+                assert_eq!(field, "value");
+            }
+            other => panic!("expected InvalidHeaderBytes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_header_edit_rejects_lf_in_key() {
+        let entry = HeaderEditConfig {
+            position: "response".to_owned(),
+            key: "X-\nTest".to_owned(),
+            value: "ok".to_owned(),
+        };
+        let err = parse_header_edit(2, &entry).expect_err("LF in key must be rejected");
+        match err {
+            ConfigError::InvalidHeaderBytes { index, field } => {
+                assert_eq!(index, 2);
+                assert_eq!(field, "key");
+            }
+            other => panic!("expected InvalidHeaderBytes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_header_edit_rejects_nul() {
+        let entry = HeaderEditConfig {
+            position: "both".to_owned(),
+            key: "X-Test".to_owned(),
+            value: "with\0nul".to_owned(),
+        };
+        assert!(matches!(
+            parse_header_edit(0, &entry),
+            Err(ConfigError::InvalidHeaderBytes { .. })
+        ));
+    }
+
+    /// Horizontal tab `\t` (0x09) is permitted in field values per
+    /// RFC 9110 §5.5 (folded-header obs-fold parts). The value-side
+    /// validator must NOT reject it — otherwise legitimate operator
+    /// configs (e.g. `Authorization: Basic\tCREDENTIALS`) become
+    /// unusable. The key-side validator IS stricter (token grammar).
+    #[test]
+    fn parse_header_edit_accepts_tab_in_value() {
+        let entry = HeaderEditConfig {
+            position: "request".to_owned(),
+            key: "X-Test".to_owned(),
+            value: "with\ttab".to_owned(),
+        };
+        let header = parse_header_edit(0, &entry).expect("tab in value must be accepted");
+        assert_eq!(header.val, "with\ttab");
+    }
+
+    /// Header NAMES follow `token` grammar per RFC 9110 §5.1. HTAB and
+    /// SP are NOT tchar; the key-side validator must reject them even
+    /// though the value-side validator permits HTAB. Without this,
+    /// an operator entry like `key = "Host\t"` would emit `Host\t: …`
+    /// on the H1 wire and produce an invalid (but parser-tolerant)
+    /// header line that some backends silently accept as `Host:`.
+    #[test]
+    fn parse_header_edit_rejects_tab_in_key() {
+        let entry = HeaderEditConfig {
+            position: "request".to_owned(),
+            key: "Host\t".to_owned(),
+            value: "ok".to_owned(),
+        };
+        let err = parse_header_edit(0, &entry).expect_err("HTAB in key must be rejected");
+        match err {
+            ConfigError::InvalidHeaderBytes { field, .. } => assert_eq!(field, "key"),
+            other => panic!("expected InvalidHeaderBytes{{field=\"key\"}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_header_edit_rejects_space_in_key() {
+        let entry = HeaderEditConfig {
+            position: "request".to_owned(),
+            key: "X Test".to_owned(),
+            value: "ok".to_owned(),
+        };
+        let err = parse_header_edit(0, &entry).expect_err("SP in key must be rejected");
+        assert!(matches!(err, ConfigError::InvalidHeaderBytes { .. }));
+    }
+
+    #[test]
+    fn parse_header_edit_rejects_empty_key() {
+        let entry = HeaderEditConfig {
+            position: "request".to_owned(),
+            key: String::new(),
+            value: "ok".to_owned(),
+        };
+        let err = parse_header_edit(0, &entry).expect_err("empty key must be rejected");
+        assert!(matches!(
+            err,
+            ConfigError::InvalidHeaderBytes { field: "key", .. }
+        ));
+    }
+
+    #[test]
+    fn parse_header_edit_accepts_clean_value() {
+        let entry = HeaderEditConfig {
+            position: "request".to_owned(),
+            key: "X-Tenant".to_owned(),
+            value: "alpha".to_owned(),
+        };
+        let header = parse_header_edit(0, &entry).expect("clean value must be accepted");
+        assert_eq!(header.key, "X-Tenant");
+        assert_eq!(header.val, "alpha");
+    }
+
+    /// A bare string with no scheme prefix is the inline literal body.
+    /// This is the common case — short canned responses inline in TOML
+    /// or a `--answer` flag, no disk I/O.
+    #[test]
+    fn resolve_answer_source_bare_string_is_literal() {
+        let body = resolve_answer_source("HTTP/1.1 503 Service Unavailable\r\n\r\nbusy")
+            .expect("bare-string source must resolve");
+        assert_eq!(body, "HTTP/1.1 503 Service Unavailable\r\n\r\nbusy");
+    }
+
+    #[test]
+    fn resolve_answer_source_empty_string_is_legitimate() {
+        let body = resolve_answer_source("").expect("empty source must resolve");
+        assert_eq!(body, "");
+    }
+
+    /// `file://` opts into reading the path off disk. A non-existent
+    /// path bubbles up as `ConfigError::FileOpen` so the operator gets
+    /// the same diagnostics as the existing per-status `answer_NNN`
+    /// flow.
+    #[test]
+    fn resolve_answer_source_file_scheme_missing_file_errors() {
+        let err = resolve_answer_source("file:///nonexistent/sozu-test/never.http")
+            .expect_err("missing path must error");
+        assert!(matches!(err, ConfigError::FileOpen { .. }));
+    }
+
+    /// `file://` strips the scheme; an empty path after the scheme is
+    /// rejected (empty path on filesystem read).
+    #[test]
+    fn resolve_answer_source_file_scheme_empty_path_errors() {
+        let err = resolve_answer_source("file://").expect_err("empty path must error");
+        assert!(matches!(err, ConfigError::FileOpen { .. }));
     }
 }

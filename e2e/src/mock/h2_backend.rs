@@ -1,7 +1,7 @@
 use std::{
     net::SocketAddr,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
@@ -18,6 +18,24 @@ use tokio::runtime::Runtime;
 
 use crate::port_registry::bind_tokio_listener;
 
+/// One row of the H2 backend's request log. Cardinality tests use this
+/// to assert deep equality on what reached the wire after Sōzu applied
+/// frontend rewrites + header edits — counters alone do not catch a
+/// rewrite bug that lands the request on the right path with the wrong
+/// authority, etc.
+///
+/// Header values are stored as `Vec<u8>` so a regression that forwards a
+/// non-UTF-8 byte (a corrupted upstream header, a smuggled control char)
+/// surfaces in the assertion diff rather than being silently lossily
+/// downgraded to an empty string by `HeaderValue::to_str`.
+#[derive(Debug, Clone)]
+pub struct RecordedH2Request {
+    pub method: String,
+    pub authority: String,
+    pub path: String,
+    pub headers: Vec<(String, Vec<u8>)>,
+}
+
 /// An HTTP/2 mock backend that accepts cleartext H2 connections (h2c).
 ///
 /// Sozu connects to backends over plain TCP and speaks HTTP/2 directly
@@ -28,6 +46,7 @@ pub struct H2Backend {
     stop: Arc<AtomicBool>,
     pub requests_received: Arc<AtomicUsize>,
     pub responses_sent: Arc<AtomicUsize>,
+    requests_log: Arc<Mutex<Vec<RecordedH2Request>>>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -38,10 +57,12 @@ impl H2Backend {
         let stop = Arc::new(AtomicBool::new(false));
         let requests_received = Arc::new(AtomicUsize::new(0));
         let responses_sent = Arc::new(AtomicUsize::new(0));
+        let requests_log: Arc<Mutex<Vec<RecordedH2Request>>> = Arc::new(Mutex::new(Vec::new()));
 
         let stop_clone = stop.clone();
         let req_count = requests_received.clone();
         let resp_count = responses_sent.clone();
+        let req_log = requests_log.clone();
         let thread_name = name.clone();
 
         // Synchronous readiness handshake: the spawned tokio thread must
@@ -88,6 +109,7 @@ impl H2Backend {
                     let body = body.clone();
                     let req_count = req_count.clone();
                     let resp_count = resp_count.clone();
+                    let req_log = req_log.clone();
                     let name = thread_name.clone();
 
                     tokio::spawn(async move {
@@ -96,6 +118,7 @@ impl H2Backend {
                             let body = body.clone();
                             let req_count = req_count.clone();
                             let resp_count = resp_count.clone();
+                            let req_log = req_log.clone();
                             let name = name.clone();
                             async move {
                                 req_count.fetch_add(1, Ordering::Relaxed);
@@ -104,6 +127,29 @@ impl H2Backend {
                                     req.method(),
                                     req.uri()
                                 );
+                                // Snapshot the request shape so cardinality
+                                // tests can assert on the rewritten authority
+                                // / path / forwarded headers that reached the
+                                // backend wire.
+                                let recorded = RecordedH2Request {
+                                    method: req.method().as_str().to_owned(),
+                                    authority: req
+                                        .uri()
+                                        .authority()
+                                        .map(|a| a.as_str().to_owned())
+                                        .unwrap_or_default(),
+                                    path: req.uri().path().to_owned(),
+                                    headers: req
+                                        .headers()
+                                        .iter()
+                                        .map(|(k, v)| {
+                                            (k.as_str().to_owned(), v.as_bytes().to_vec())
+                                        })
+                                        .collect(),
+                                };
+                                if let Ok(mut log) = req_log.lock() {
+                                    log.push(recorded);
+                                }
 
                                 let response = Response::builder()
                                     .status(200)
@@ -138,16 +184,36 @@ impl H2Backend {
             stop,
             requests_received,
             responses_sent,
+            requests_log,
             thread: Some(thread),
         }
+    }
+
+    /// Snapshot of every request the backend received since [`start`].
+    /// Cardinality tests use this to assert on the authority/path/headers
+    /// the backend actually saw on the wire.
+    pub fn recorded_requests(&self) -> Vec<RecordedH2Request> {
+        self.requests_log
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
     }
 
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(thread) = self.thread.take() {
-            // Give the thread a moment to see the stop signal
-            thread::sleep(std::time::Duration::from_millis(100));
-            drop(thread);
+            // Join the spawned thread so its tokio runtime drops in
+            // lockstep with the test exit. Detaching it (the previous
+            // `drop(thread)`) leaves the runtime — and its threadpool —
+            // alive across subsequent tests in the same process, which
+            // cumulatively starves cargo's default thread budget on
+            // contended CI and amplifies otherwise-unrelated flakes.
+            // The accept loop polls the stop flag every 50 ms (see the
+            // timeout inside `start`) so this join completes within
+            // ~100 ms of the stop signal.
+            if let Err(payload) = thread.join() {
+                eprintln!("H2Backend: spawned thread panicked: {payload:?}");
+            }
         }
     }
 

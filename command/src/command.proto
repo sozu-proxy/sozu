@@ -147,6 +147,9 @@ message UpdateHttpListenerConfig {
     optional uint32 connect_timeout = 7;
     // max time to send a complete request, in seconds
     optional uint32 request_timeout = 8;
+    // DEPRECATED: per-status answer message. Prefer the `answers` map at
+    // field 38. Kept on the wire so older managers can still patch a running
+    // listener for one minor; on the worker side both fields are merged.
     optional CustomHttpAnswers http_answers = 9;
 
     // H2 flood thresholds — see HttpListenerConfig for semantics & CVE refs.
@@ -187,6 +190,12 @@ message UpdateHttpListenerConfig {
     optional uint32 h2_max_window_update_stream0_per_window = 36;
     // Name of the correlation header injected per request (e.g. "Sozu-Id")
     optional string sozu_id_header                   = 37;
+    // Per-status HTTP answer template bodies, keyed by HTTP status code
+    // (e.g. "503"). Replaces the per-field shape of `CustomHttpAnswers` (field
+    // 9). An entry with an empty value is treated as "preserve current"; an
+    // entry with a non-empty value replaces the listener's stored template
+    // for that status. To clear a status template, recreate the listener.
+    map<string, string> answers                     = 38;
 }
 
 // Partial-update patch for a running HTTPS listener.
@@ -211,6 +220,9 @@ message UpdateHttpsListenerConfig {
     optional uint32 connect_timeout = 7;
     // max time to send a complete request, in seconds
     optional uint32 request_timeout = 8;
+    // DEPRECATED: per-status answer message. Prefer the `answers` map at
+    // field 38. Kept on the wire so older managers can still patch a running
+    // listener for one minor; on the worker side both fields are merged.
     optional CustomHttpAnswers http_answers = 9;
 
     // ALPN protocols to advertise during TLS handshake.
@@ -261,6 +273,12 @@ message UpdateHttpsListenerConfig {
     optional uint32 h2_max_window_update_stream0_per_window = 36;
     // Name of the correlation header injected per request (e.g. "Sozu-Id")
     optional string sozu_id_header                   = 37;
+    // Per-status HTTP answer template bodies, keyed by HTTP status code
+    // (e.g. "503"). Replaces the per-field shape of `CustomHttpAnswers` (field
+    // 9). An entry with an empty value is treated as "preserve current"; an
+    // entry with a non-empty value replaces the listener's stored template
+    // for that status. To clear a status template, recreate the listener.
+    map<string, string> answers                     = 38;
 }
 
 // Partial-update patch for a running TCP listener.
@@ -297,6 +315,9 @@ message HttpListenerConfig {
     required uint32 request_timeout = 10 [default = 10];
     // wether the listener is actively listening on its socket
     required bool active = 11 [default = false];
+    // DEPRECATED: per-status answer message. Prefer the `answers` map at
+    // field 31. Kept on the wire so legacy state files round-trip cleanly;
+    // workers populate both fields and treat them as equivalent on read.
     optional CustomHttpAnswers http_answers = 12;
     // H2 flood detection thresholds (CVE mitigations).
     // All are optional; when absent, built-in defaults are used.
@@ -365,6 +386,11 @@ message HttpListenerConfig {
     // response to carry the per-request ULID. Default: "Sozu-Id". Operators
     // who want to rebrand can set e.g. "X-Edge-Id" or "X-Request-Trace".
     optional string sozu_id_header = 30;
+    // Per-status HTTP answer template bodies, keyed by HTTP status code
+    // (e.g. "404", "503"). Replaces the per-field shape of `CustomHttpAnswers`
+    // (field 12). The new field is populated alongside `http_answers` so
+    // legacy state files round-trip; new code should read this map.
+    map<string, string> answers = 31;
 }
 
 // details of an HTTPS listener
@@ -396,6 +422,9 @@ message HttpsListenerConfig {
     // The tickets allow the client to resume a session. This protects the client
     // agains session tracking. Defaults to 4.
     required uint64 send_tls13_tickets = 20;
+    // DEPRECATED: per-status answer message. Prefer the `answers` map at
+    // field 43. Kept on the wire so legacy state files round-trip cleanly;
+    // workers populate both fields and treat them as equivalent on read.
     optional CustomHttpAnswers http_answers = 21;
     // ALPN protocols to advertise during TLS handshake, in order of preference.
     // Valid values: "h2", "http/1.1". Defaults to ["h2", "http/1.1"].
@@ -479,6 +508,11 @@ message HttpsListenerConfig {
     // response to carry the per-request ULID. Default: "Sozu-Id". Operators
     // who want to rebrand can set e.g. "X-Edge-Id" or "X-Request-Trace".
     optional string sozu_id_header = 42;
+    // Per-status HTTP answer template bodies, keyed by HTTP status code
+    // (e.g. "404", "503"). Replaces the per-field shape of `CustomHttpAnswers`
+    // (field 21). The new field is populated alongside `http_answers` so
+    // legacy state files round-trip; new code should read this map.
+    map<string, string> answers = 43;
 }
 
 // details of an TCP listener
@@ -556,6 +590,57 @@ message ListenersList {
     map<string, TcpListenerConfig> tcp_listeners = 3;
 }
 
+// Frontend-level redirect policy. Mirrors HAProxy's
+// `http-request redirect|deny|auth` directives.
+// FORWARD routes to the backend (default).
+// PERMANENT returns 301 with a `Location` header derived from
+// `redirect_scheme`, optional `rewrite_*` fields, and `cluster.https_redirect_port`.
+// UNAUTHORIZED returns 401 with `WWW-Authenticate: Basic realm=...`
+// using `cluster.www_authenticate`; suitable for blanket deny-by-default
+// routes that still want to surface a login prompt.
+enum RedirectPolicy {
+    FORWARD = 0;
+    PERMANENT = 1;
+    UNAUTHORIZED = 2;
+}
+
+// Scheme to use when building the `Location` header for a permanent redirect.
+// USE_SAME preserves the request scheme (default), USE_HTTP forces `http://`,
+// USE_HTTPS forces `https://`.
+enum RedirectScheme {
+    USE_SAME = 0;
+    USE_HTTP = 1;
+    USE_HTTPS = 2;
+}
+
+// Where a `Header` mutation applies. `BOTH` applies the same edit on the
+// request side (before backend connect) and the response side (before kawa
+// preparation). Mirrors HAProxy `http-request set-header` /
+// `http-response set-header` parity.
+enum HeaderPosition {
+    // Reserve 0 for the proto-default-encoded shape so a `Header` written
+    // by `..Default::default()` (or by an older client) deserialises into
+    // an explicit "unset" rather than failing `HeaderPosition::try_from(0)`.
+    // The runtime treats this as a hard config error and rejects the
+    // header rather than guessing a position.
+    HEADER_POSITION_UNSPECIFIED = 0;
+    REQUEST = 1;
+    RESPONSE = 2;
+    BOTH = 3;
+}
+
+// A single header mutation applied to a request, response, or both.
+//
+// An empty `val` deletes the header by name (HAProxy `del-header` parity).
+// A non-empty `val` performs a set/replace; a header with the same name is
+// overwritten. Header names are matched case-insensitively per RFC 9110 §5.1.
+message Header {
+    required HeaderPosition position = 1;
+    required string key = 2;
+    // Empty `val` deletes the header by name (HAProxy `del-header` parity).
+    required string val = 3;
+}
+
 // An HTTP or HTTPS frontend, as order to, or received from, Sōzu
 message RequestHttpFrontend {
     optional string cluster_id = 1;
@@ -566,6 +651,29 @@ message RequestHttpFrontend {
     required RulePosition position = 6 [default = TREE];
     // custom tags to identify the frontend in the access logs
     map<string, string> tags = 7;
+    // Redirect policy for this frontend. Default `FORWARD` (no redirect).
+    optional RedirectPolicy redirect = 8 [default = FORWARD];
+    // When true, requests routed through this frontend must carry a valid
+    // `Authorization: Basic <user:pass>` header whose hash matches one of
+    // `cluster.authorized_hashes`. Default: false.
+    optional bool required_auth = 9;
+    // Scheme to use when emitting a 301 `Location` header. Default `USE_SAME`
+    // (preserve the request scheme).
+    optional RedirectScheme redirect_scheme = 10 [default = USE_SAME];
+    // Optional template applied when emitting a permanent redirect. Supports
+    // `%REDIRECT_LOCATION` / `%STATUS_CODE` etc. — see `doc/configure.md`.
+    optional string redirect_template = 11;
+    // Rewrite host template. Supports `$HOST[n]` / `$PATH[n]` placeholders
+    // populated from regex captures collected during routing. When set, both
+    // the backend authority/path and the wire request line are rewritten.
+    optional string rewrite_host = 12;
+    // Rewrite path template. Same grammar as `rewrite_host`.
+    optional string rewrite_path = 13;
+    // Optional literal port override on the rewritten URL.
+    optional uint32 rewrite_port = 14;
+    // Header mutations applied to requests and/or responses passing through
+    // this frontend. See `Header` for delete semantics.
+    repeated Header headers = 15;
 }
 
 message RequestTcpFrontend {
@@ -699,6 +807,25 @@ message Cluster {
     // This does NOT gate H2 acceptance at the frontend — frontend H2 is negotiated via
     // TLS ALPN independently of per-cluster configuration (see alpn_protocols on the listener).
     optional bool http2 = 8;
+    // Per-cluster HTTP answer template overrides keyed by HTTP status code
+    // (e.g. "503"). Override a listener-level answer for this cluster only.
+    map<string, string> answers = 9;
+    // Optional explicit port to use when building the `Location` header for
+    // an `https_redirect`. When unset, the listener's effective HTTPS port is
+    // used. Lets operators front a non-standard HTTPS port (e.g. 8443) on
+    // the redirect target while keeping `https_redirect = true`.
+    optional uint32 https_redirect_port = 10;
+    // Authorized credentials for HTTP basic authentication. Each entry is
+    // formatted as `username:hex(sha256(password))` (lower-case hex). The
+    // mux compares the supplied `Authorization: Basic` header in
+    // constant-time against the full list. Empty list disables auth even
+    // when a frontend sets `required_auth = true` — those requests are
+    // rejected with a 401.
+    repeated string authorized_hashes = 11;
+    // Realm string emitted in `WWW-Authenticate: Basic realm="…"` when an
+    // unauthenticated request is rejected. Treated as an opaque value (no
+    // template substitution). Defaults to a generic realm if unset.
+    optional string www_authenticate = 12;
 }
 
 enum LoadBalancingAlgorithms {
@@ -1137,6 +1264,16 @@ message ServerConfig {
     // [2, 32] at config-load time. The previous compile-time constant was
     // 4 and remains the default.
     optional uint64 slab_entries_per_connection = 20;
+    // Maximum length, in bytes, of a base64-decoded `Authorization: Basic`
+    // payload accepted by `mux::auth`. Caps the per-failed-auth allocation
+    // so a hostile peer cannot force the worker to decode arbitrarily
+    // large tokens. RFC 7617 imposes no upper bound; the default is 4096
+    // (well above the realistic shape `username:password`). Operators on
+    // tight memory budgets can lower this to 256-512; values that approach
+    // the per-frontend `buffer_size` raise a warning at config-load time
+    // (see config.rs validation). Set once at worker boot via
+    // `mux::auth::set_max_decoded_credential_bytes`.
+    optional uint64 basic_auth_max_credential_bytes = 21;
 }
 
 enum ProtobufAccessLogFormat {

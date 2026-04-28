@@ -36,6 +36,7 @@ mod h2_tests;
 pub(crate) mod h2_utils;
 mod listener_update_tests;
 mod mux_tests;
+mod redirect_rewrite_auth_tests;
 mod tcp_tests;
 mod tests;
 mod tls_tests;
