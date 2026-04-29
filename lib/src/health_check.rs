@@ -257,10 +257,21 @@ impl HealthChecker {
                         let request_bytes = if config.is_h2c.unwrap_or(false) {
                             build_h2c_probe_bytes(probe_uri, address)
                         } else {
+                            // RFC 9110 §7.2: `Host` MUST carry the
+                            // authority component, including the port
+                            // when it differs from the URI scheme's
+                            // default. SocketAddr's Display impl emits
+                            // `ip:port` (with brackets for IPv6), which
+                            // is unambiguous against any non-default
+                            // backend port. Backends that demand a
+                            // specific virtual-host name should expose
+                            // a non-vhost health endpoint (the same
+                            // pattern nginx/apache document) — adding
+                            // a per-cluster `host` field on
+                            // `HealthCheckConfig` is tracked as a
+                            // follow-up.
                             format!(
-                                "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-                                probe_uri,
-                                address.ip()
+                                "GET {probe_uri} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
                             )
                             .into_bytes()
                         };
