@@ -105,6 +105,13 @@ message Request {
     UpdateHttpsListenerConfig update_https_listener = 48;
     // patch a running TCP listener in place (no socket re-bind)
     UpdateTcpListenerConfig update_tcp_listener = 49;
+    // set the global per-(cluster, source-IP) connection limit at
+    // runtime. `0` is "unlimited". Per-cluster overrides set on the
+    // `Cluster` message take precedence at admit time.
+    uint64 set_max_connections_per_ip = 50;
+    // query the current global per-(cluster, source-IP) connection
+    // limit. Workers reply with `MaxConnectionsPerIpLimit`.
+    QueryMaxConnectionsPerIp query_max_connections_per_ip = 51;
   }
 }
 
@@ -118,6 +125,7 @@ message SoftStop {}
 message HardStop {}
 message ReturnListenSockets {}
 message CountRequests {}
+message QueryMaxConnectionsPerIp {}
 
 // Wrapper message to distinguish "absent" (preserve) from "present but empty"
 // (reset to default) for ALPN protocols. A bare `repeated string` cannot make
@@ -554,7 +562,8 @@ message CustomHttpAnswers {
     optional string answer_504 = 9;
     // InsufficientStorage
     optional string answer_507 = 10;
-
+    // TooManyRequests (per-(cluster, source-IP) connection limit hit)
+    optional string answer_429 = 12;
 }
 
 message ActivateListener {
@@ -826,6 +835,17 @@ message Cluster {
     // unauthenticated request is rejected. Treated as an opaque value (no
     // template substitution). Defaults to a generic realm if unset.
     optional string www_authenticate = 12;
+    // Per-cluster override for the global `max_connections_per_ip`.
+    // `None` (field absent) inherits the global default. `Some(0)` is
+    // explicit "unlimited for this cluster". `Some(n > 0)` overrides with
+    // the cluster-specific limit. Counts are kept per
+    // `(cluster_id, source_ip)` pair, so two clusters never share a
+    // counter even from the same IP.
+    optional uint64 max_connections_per_ip = 13;
+    // Per-cluster override for the global `retry_after` header value
+    // (seconds, HTTP 429 only). `None` inherits the global default.
+    // `Some(0)` omits the header.
+    optional uint32 retry_after = 14;
 }
 
 enum LoadBalancingAlgorithms {
@@ -945,6 +965,8 @@ message ResponseContent {
         CertificatesWithFingerprints certificates_with_fingerprints = 12;
         // a census of the types of requests received since startup,
         RequestCounts request_counts = 13;
+        // current global per-(cluster, source-IP) connection limit
+        MaxConnectionsPerIpLimit max_connections_per_ip_limit = 14;
     }
 }
 
@@ -1162,6 +1184,12 @@ message RequestCounts {
     map<string, int32> map = 1;
 }
 
+// `0` means unlimited (the feature is disabled). Returned by workers in
+// response to `Request.query_max_connections_per_ip`.
+message MaxConnectionsPerIpLimit {
+    required uint64 limit = 1;
+}
+
 // matches std::net::SocketAddr in the Rust library
 // beware that the ports are expressed with uint32 here,
 // but they should NOT exceed uint16 value
@@ -1278,6 +1306,21 @@ message ServerConfig {
     // least recently active sessions to make room for new connections.
     // Defaults to false: during DDoS, existing connections are likely real clients.
     optional bool evict_on_queue_full = 22 [default = false];
+    // Default per-(cluster, source-IP) connection limit. `0` means unlimited
+    // (the default). When a request resolves to a cluster whose
+    // `(cluster_id, client_ip)` already holds this many concurrent
+    // connections, the proxy answers HTTP 429 (H1 + H2) or closes the TCP
+    // socket gracefully. Each cluster may override with its own
+    // `max_connections_per_ip`. The source IP is the proxy-protocol
+    // address when present, else `peer_addr`.
+    optional uint64 max_connections_per_ip = 23 [default = 0];
+    // Default `Retry-After` header value (seconds) sent on HTTP 429
+    // responses. `0` omits the header (rendering `Retry-After: 0` invites
+    // an immediate retry that defeats the limit). Per-cluster overrides
+    // are available on the `Cluster` message. TCP rejections do not emit
+    // this value (no HTTP envelope), but it is still accepted in the
+    // proto/config shape for symmetry.
+    optional uint32 retry_after = 24 [default = 60];
 }
 
 enum ProtobufAccessLogFormat {

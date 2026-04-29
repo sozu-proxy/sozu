@@ -50,6 +50,8 @@ Parameters in the global section allow you to define the global settings shared 
 | `zombie_check_interval`    | duration between checks for zombie sessions                                         |                                          |
 | `evict_on_queue_full`      | evict the least-recently-active sessions when `max_connections` is reached, making room for new accepts. Defaults to `false`: during a DDoS the existing connections are more likely to be legitimate clients than the queued ones, so refusing new accepts is the safer mitigation. Enable when overload is dominated by normal traffic spikes. Triggers a config-load `warn!` when `max_connections < 100` because the 1% eviction batch clamps to 1 (so the per-round share grows). | `true`, `false` (default: `false`) |
 | `activate_listeners`       | automatically start listeners                                                       |                                          |
+| `max_connections_per_ip`   | global default per-(cluster, source-IP) connection limit. `0` disables the feature (default). The source IP is taken from the parsed PROXY-protocol header when present, else `peer_addr`. HTTP/HTTPS clients hitting the limit receive `429 Too Many Requests`; TCP clients see a graceful FIN. Each cluster may override via its own `max_connections_per_ip` field (`None` inherits, `Some(0)` is explicit unlimited, `Some(n > 0)` overrides). Counters are kept per `(cluster_id, source_ip)`, so two clusters never share a counter. | integer (0 = unlimited) |
+| `retry_after`              | global default `Retry-After` header value (seconds) for HTTP 429 responses. `0` omits the header — `Retry-After: 0` invites an immediate retry that defeats the limit. Each cluster may override. TCP listeners ignore this value (no HTTP envelope). | integer (0 = omit) |
 
 _Example:_
 
@@ -930,6 +932,7 @@ from metric names below.
 | `client.connections` | gauge | proxy | Active frontend connections |
 | `client.connections_max` | gauge | proxy | Configured `max_connections`. Renamed from `client.max_connections` |
 | `client.connections_percent` | gauge | proxy | Percentage of `max_connections` in use. Renamed from `client.connections_percentage` |
+| `connections.rejected_per_cluster_ip` | counter | cluster, backend | HTTP/HTTPS request answered with 429 (or TCP session closed pre-backend) because the per-(cluster, source-IP) connection limit was reached. Labels carry `cluster_id` and `backend_id` (always empty for this counter — the rejection happens before backend selection). |
 | `slab.entries` | gauge | proxy | Session slab allocator slots used |
 | `slab.capacity` | gauge | proxy | Configured slab capacity (`10 + slab_entries_per_connection * max_connections`) |
 | `slab.usage_percent` | gauge | proxy | `slab.entries * 100 / slab.capacity`. Pure slab-utilisation gauge |

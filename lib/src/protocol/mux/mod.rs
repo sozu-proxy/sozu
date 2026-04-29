@@ -156,7 +156,9 @@ use crate::{
     socket::{FrontRustls, SessionTcpStream, SocketHandler, SocketResult},
 };
 
-pub(crate) use crate::protocol::mux::answers::{forcefully_terminate_answer, set_default_answer};
+pub(crate) use crate::protocol::mux::answers::{
+    forcefully_terminate_answer, set_default_answer, set_default_answer_with_retry_after,
+};
 use crate::protocol::mux::connection::{EndpointClient, EndpointServer};
 pub use crate::protocol::mux::{
     answers::terminate_default_answer,
@@ -1106,10 +1108,13 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                     .set_duration(self.configured_frontend_timeout);
                 let front_readiness = self.frontend.readiness_mut();
                 dirty = true;
-                match self
-                    .router
-                    .connect(stream_id, context, session.clone(), proxy.clone())
-                {
+                match self.router.connect(
+                    stream_id,
+                    context,
+                    session.clone(),
+                    proxy.clone(),
+                    self.frontend_token,
+                ) {
                     Ok(_) => {
                         let state = context.streams[stream_id].state;
                         context.debug.push(DebugEvent::CC(stream_id, state));
@@ -1175,6 +1180,29 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                     msg
                                 );
                                 set_default_answer(stream, front_readiness, 503, &answers);
+                            }
+                            // Per-(cluster, source-IP) connection limit reached.
+                            // Emit HTTP 429 with the resolved `Retry-After`. The
+                            // value is computed in `Router::connect` (where the
+                            // SessionManager + cluster override are reachable)
+                            // and stashed on the stream context just before the
+                            // error is returned, so the answer engine can render
+                            // (or elide) the header without re-deriving the
+                            // resolution chain here.
+                            BE::TooManyConnectionsPerIp { ref cluster_id } => {
+                                debug!(
+                                    "{} per-(cluster, source-IP) limit hit for cluster {:?}",
+                                    log_module_context!(),
+                                    cluster_id
+                                );
+                                let retry_after = stream.context.retry_after_seconds;
+                                set_default_answer_with_retry_after(
+                                    stream,
+                                    front_readiness,
+                                    429,
+                                    &answers,
+                                    retry_after,
+                                );
                             }
                         }
                         context.debug.push(DebugEvent::CCF(stream_id, error));

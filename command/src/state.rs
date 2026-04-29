@@ -133,7 +133,12 @@ impl ConfigState {
             RequestType::UpdateHttpsListener(patch) => self.update_https_listener(patch),
             RequestType::UpdateTcpListener(patch) => self.update_tcp_listener(patch),
 
-            // This is to avoid the error message
+            // This is to avoid the error message. These request types are
+            // worker-only / runtime-only and do not affect the persisted
+            // ConfigState (e.g., a worker-side global limit set via
+            // SetMaxConnectionsPerIp does NOT survive a worker restart;
+            // operators must mirror the change in the TOML to make it
+            // sticky).
             RequestType::Logging(_)
             | RequestType::CountRequests(_)
             | RequestType::Status(_)
@@ -145,6 +150,8 @@ impl ConfigState {
             | RequestType::QueryClustersHashes(_)
             | RequestType::ConfigureMetrics(_)
             | RequestType::ReturnListenSockets(_)
+            | RequestType::SetMaxConnectionsPerIp(_)
+            | RequestType::QueryMaxConnectionsPerIp(_)
             | RequestType::HardStop(_) => Ok(()),
 
             _other_request => Err(StateError::UndispatchableRequest),
