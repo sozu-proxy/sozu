@@ -269,6 +269,18 @@ pub struct HttpContext {
     /// header entirely — `Retry-After: 0` invites an immediate retry
     /// that defeats the limit. Unused for any other status code.
     pub retry_after_seconds: Option<u32>,
+    /// Frontend-supplied template body that overrides the listener /
+    /// cluster default `http.301.redirection` for a single
+    /// `RedirectPolicy::PERMANENT` request. Stashed by the routing layer
+    /// from `RouteResult::redirect_template` and consumed by the 301
+    /// branch of `mux::answers::set_default_answer_with_retry_after`,
+    /// which compiles the body via `HttpAnswers::render_inline_301` and
+    /// renders it with the same `(REDIRECT_LOCATION, ROUTE,
+    /// REQUEST_ID)` variable schema as the persistent template chain.
+    /// `None` falls back to the cluster / listener default. Unused for
+    /// any other status code or for the legacy
+    /// `cluster.https_redirect = true` path (which never sets it).
+    pub frontend_redirect_template: Option<String>,
 }
 
 /// Owned snapshot of a per-frontend header edit, captured at routing
@@ -346,6 +358,7 @@ impl HttpContext {
             original_authority: None,
             headers_response: Vec::new(),
             retry_after_seconds: None,
+            frontend_redirect_template: None,
         }
     }
 

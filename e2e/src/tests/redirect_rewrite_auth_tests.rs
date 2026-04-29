@@ -1368,3 +1368,127 @@ fn test_request_header_inject_h2_h2() {
         State::Success
     );
 }
+
+// ═════════════════════════════════════════════════════════════════════
+// Redirect plumbing — `redirect_template` + `rewrite_host` on 301
+// ═════════════════════════════════════════════════════════════════════
+
+/// Two interlocking invariants on the `RedirectPolicy::PERMANENT` path,
+/// pinned in one fixture because they share the same call site:
+///
+/// - `redirect_template` is plumbed into the 301 default-answer. When
+///   the field was destructured out of `RouteResult` only to be dropped,
+///   the operator-supplied template had no observable effect; the
+///   response always rendered the listener / cluster default. The test
+///   ships a template carrying a load-bearing `X-Custom-Redirect`
+///   header that the listener default does NOT emit, so its presence
+///   in the response confirms the inline-render path ran.
+///
+/// - `rewrite_host` feeds the 301 `Location`. When
+///   `build_redirect_location` only read `context.authority`, a
+///   `rewrite_host = "new.example.com"` frontend redirected the client
+///   back to the original `Host:` header. The test sends a request to
+///   `old.example.com` (here: `localhost`) and asserts the resulting
+///   `Location:` carries `new.example.com`.
+pub fn try_redirect_permanent_uses_rewrite_host_and_template() -> State {
+    let front_address = create_local_address();
+    let unused_back = create_unbound_local_address();
+    let mut worker = spawn_worker_with_http_listener("REDIR-TEMPLATE-REWRITE", front_address);
+
+    worker.send_proxy_request(
+        RequestType::AddCluster(Cluster {
+            https_redirect_port: Some(8443),
+            ..Worker::default_cluster("redir_tmpl_cluster")
+        })
+        .into(),
+    );
+
+    // Custom 301 template carrying a load-bearing `X-Custom-Redirect`
+    // header. RFC 9110 §5: header-field-name is case-insensitive; the
+    // listener-default `http.301.redirection` template does NOT emit
+    // this header, so its presence in the response is a clean signal
+    // that the inline-render path ran.
+    //
+    // `%REDIRECT_LOCATION` is the canonical placeholder for the 301
+    // Location URL — the same variable schema the listener default
+    // uses, so the same `(REDIRECT_LOCATION, ROUTE, REQUEST_ID)`
+    // variable feed produced by `Router::connect` flows in cleanly.
+    let custom_template = "\
+HTTP/1.1 301 Moved Permanently\r\n\
+Location: %REDIRECT_LOCATION\r\n\
+X-Custom-Redirect: from-template\r\n\
+Content-Length: 0\r\n\r\n"
+        .to_owned();
+
+    worker.send_proxy_request(
+        RequestType::AddHttpFrontend(RequestHttpFrontend {
+            redirect: Some(RedirectPolicy::Permanent as i32),
+            redirect_scheme: Some(RedirectScheme::UseHttps as i32),
+            redirect_template: Some(custom_template),
+            // `rewrite_host` is a literal target host (the static
+            // grammar; capture-templating uses `%1` etc., not exercised
+            // here). The frontend's hostname stays `localhost` so the
+            // request still routes to this cluster; the rewrite kicks
+            // in for the post-route `Location` URL.
+            rewrite_host: Some("new.example.com".to_owned()),
+            ..Worker::default_http_frontend("redir_tmpl_cluster", front_address)
+        })
+        .into(),
+    );
+    add_backend(
+        &mut worker,
+        "redir_tmpl_cluster",
+        "redir_tmpl_back_0",
+        unused_back,
+    );
+    worker.read_to_last();
+
+    let mut client = Client::new(
+        "redir_tmpl_client",
+        front_address,
+        http_request("GET", "/path", "ping", "localhost"),
+    );
+    client.connect();
+    client.send();
+    let response = client
+        .receive()
+        .expect("frontend must emit a 301 default-answer");
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+
+    let lower = response.to_ascii_lowercase();
+
+    // Template assertion: the operator-supplied template ran. The
+    // listener default never emits `X-Custom-Redirect`, so this header
+    // proves the inline render path took over the answer.
+    if !lower.contains("x-custom-redirect: from-template") {
+        eprintln!("expected X-Custom-Redirect from operator template, got:\n{response}");
+        return State::Fail;
+    }
+
+    // Host assertion: the 301 Location uses the rewritten host, not the
+    // original `Host: localhost` from the request line.
+    if !lower.contains("location: https://new.example.com") {
+        eprintln!("expected Location to use rewritten host new.example.com, got:\n{response}");
+        return State::Fail;
+    }
+
+    if !response.contains("301") {
+        eprintln!("expected 301 status, got:\n{response}");
+        return State::Fail;
+    }
+
+    State::Success
+}
+
+#[test]
+fn test_redirect_permanent_uses_rewrite_host_and_template() {
+    assert_eq!(
+        repeat_until_error_or(
+            2,
+            "permanent redirect renders custom redirect_template and Location uses rewrite_host",
+            try_redirect_permanent_uses_rewrite_host_and_template,
+        ),
+        State::Success,
+    );
+}
