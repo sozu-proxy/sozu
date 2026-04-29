@@ -64,16 +64,20 @@ jobs:
     name: Build Sozu 🦀 (${{ matrix.provider }})
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        provider: [crypto-ring, crypto-aws-lc-rs, crypto-openssl]
+        provider: [crypto-ring, crypto-aws-lc-rs, crypto-openssl, fips]
     steps:
       - name: Install protobuf compiler and cmake
         run: sudo apt-get install -y protobuf-compiler cmake
 
-      - name: Install rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          rustflags: ""
+      # Pin to project MSRV (matches the clippy/crypto-providers jobs).
+      # `dtolnay/rust-toolchain` does not inject `-D warnings`, so the
+      # newer stable lints fired by the GitHub runner (e.g.
+      # `mismatched_lifetime_syntaxes` on rust 1.95) do not break the
+      # build artefact path.
+      - name: Install rust 1.88.0
+        uses: dtolnay/rust-toolchain@1.88.0
 
       - uses: actions/checkout@v4
 
@@ -124,8 +128,9 @@ jobs:
       runs-on: ubuntu-latest
       needs: [build-bombardier, build-lagging_server, build-sozu]
       strategy:
+        fail-fast: false
         matrix:
-          provider: [crypto-ring, crypto-aws-lc-rs, crypto-openssl]
+          provider: [crypto-ring, crypto-aws-lc-rs, crypto-openssl, fips]
       steps:
       - uses: actions/checkout@v4
 
@@ -195,6 +200,49 @@ jobs:
       - name: ⚡ Launch bench
         working-directory: .github/workflows
         run: python bench.py
+
+  criterion:
+      name: Criterion benches 🦀 (${{ matrix.provider }})
+      runs-on: ubuntu-latest
+      timeout-minutes: 30
+      strategy:
+        # Same provider matrix as the Bombardier bench so a regression
+        # in any provider's TLS handshake / cert load / KX path shows
+        # up in the Criterion artefacts. `fail-fast: false` so a
+        # single-provider failure does not cancel siblings.
+        fail-fast: false
+        matrix:
+          provider: [crypto-ring, crypto-aws-lc-rs, crypto-openssl, fips]
+      steps:
+        - name: Install system dependencies
+          run: sudo apt-get update && sudo apt-get install -y protobuf-compiler cmake
+
+        - name: Install rust 1.88.0
+          uses: dtolnay/rust-toolchain@1.88.0
+
+        - uses: actions/checkout@v4
+
+        - uses: Swatinem/rust-cache@v2
+          with:
+            cache-all-crates: true
+            prefix-key: "criterion-${{ matrix.provider }}"
+
+        # `cargo bench` walks every `[[bench]]` target in `lib/benches/`:
+        # `crypto_provider` (provider init / cert load / KX), `h2_scheduling`
+        # (RFC 9218 priority sort), and `header_formatting` (header
+        # write hot path). Each provider runs the full set so we
+        # catch handshake / pseudo-header / cert-load regressions in
+        # any direction. `--no-run` would compile only; we want real
+        # samples so dashboards and Criterion's text reports populate.
+        - name: Run Criterion benches with ${{ matrix.provider }}
+          run: cargo bench -p sozu-lib --no-default-features --features ${{ matrix.provider }}
+
+        - name: 📤 Upload Criterion report
+          if: always()
+          uses: actions/upload-artifact@v4
+          with:
+            name: criterion-${{ matrix.provider }}
+            path: target/criterion
 
   bench-logs:
       name: benchmark the logger
