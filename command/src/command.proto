@@ -204,6 +204,12 @@ message UpdateHttpListenerConfig {
     // entry with a non-empty value replaces the listener's stored template
     // for that status. To clear a status template, recreate the listener.
     map<string, string> answers                     = 38;
+    // When true, any client-supplied `X-Real-IP` header is stripped from
+    // requests before forwarding (anti-spoofing). See HttpListenerConfig.
+    optional bool elide_x_real_ip                   = 39;
+    // When true, a proxy-generated `X-Real-IP` header carrying the connection
+    // peer IP is appended to every forwarded request. See HttpListenerConfig.
+    optional bool send_x_real_ip                    = 40;
 }
 
 // Partial-update patch for a running HTTPS listener.
@@ -287,6 +293,12 @@ message UpdateHttpsListenerConfig {
     // entry with a non-empty value replaces the listener's stored template
     // for that status. To clear a status template, recreate the listener.
     map<string, string> answers                     = 38;
+    // When true, any client-supplied `X-Real-IP` header is stripped from
+    // requests before forwarding (anti-spoofing). See HttpsListenerConfig.
+    optional bool elide_x_real_ip                   = 39;
+    // When true, a proxy-generated `X-Real-IP` header carrying the connection
+    // peer IP is appended to every forwarded request. See HttpsListenerConfig.
+    optional bool send_x_real_ip                    = 40;
 }
 
 // Partial-update patch for a running TCP listener.
@@ -399,6 +411,15 @@ message HttpListenerConfig {
     // (field 12). The new field is populated alongside `http_answers` so
     // legacy state files round-trip; new code should read this map.
     map<string, string> answers = 31;
+    // When true, any client-supplied `X-Real-IP` header is stripped from
+    // requests before forwarding (anti-spoofing). Independently combinable
+    // with `send_x_real_ip`. Default: false.
+    optional bool elide_x_real_ip = 32 [default = false];
+    // When true, a proxy-generated `X-Real-IP` header carrying the connection
+    // peer IP (post-PROXY-v2 unwrap, i.e. the original client IP) is appended
+    // to every forwarded request. Independently combinable with
+    // `elide_x_real_ip`. Default: false.
+    optional bool send_x_real_ip = 33 [default = false];
 }
 
 // details of an HTTPS listener
@@ -521,6 +542,15 @@ message HttpsListenerConfig {
     // (field 21). The new field is populated alongside `http_answers` so
     // legacy state files round-trip; new code should read this map.
     map<string, string> answers = 43;
+    // When true, any client-supplied `X-Real-IP` header is stripped from
+    // requests before forwarding (anti-spoofing). Independently combinable
+    // with `send_x_real_ip`. Default: false.
+    optional bool elide_x_real_ip = 44 [default = false];
+    // When true, a proxy-generated `X-Real-IP` header carrying the connection
+    // peer IP (post-PROXY-v2 unwrap, i.e. the original client IP) is appended
+    // to every forwarded request. Independently combinable with
+    // `elide_x_real_ip`. Default: false.
+    optional bool send_x_real_ip = 45 [default = false];
 }
 
 // details of an TCP listener

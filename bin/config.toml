@@ -267,6 +267,17 @@ address = "0.0.0.0:8080"
 # this option is incompatible with public_address
 # expect_proxy = false
 
+# When true, strip any client-supplied `X-Real-IP` header from forwarded
+# requests (anti-spoofing). Independently combinable with `send_x_real_ip`.
+# Default: false.
+# elide_x_real_ip = false
+
+# When true, append a proxy-generated `X-Real-IP` header carrying the
+# connection peer IP (post-PROXY-v2 unwrap, i.e. the original client IP)
+# to every forwarded request. Independently combinable with
+# `elide_x_real_ip`. Default: false.
+# send_x_real_ip = false
+
 # Example for a HTTPS listener
 [[listeners]]
 protocol = "https"
@@ -304,6 +315,17 @@ address = "0.0.0.0:8443"
 # Configures the client socket to receive a PROXY protocol header
 # this option is incompatible with public_address
 # expect_proxy = false
+
+# When true, strip any client-supplied `X-Real-IP` header from forwarded
+# requests (anti-spoofing). Independently combinable with `send_x_real_ip`.
+# Default: false.
+# elide_x_real_ip = false
+
+# When true, append a proxy-generated `X-Real-IP` header carrying the
+# connection peer IP (post-PROXY-v2 unwrap, i.e. the original client IP)
+# to every forwarded request. Independently combinable with
+# `elide_x_real_ip`. Default: false.
+# send_x_real_ip = false
 
 # Supported TLS versions. Possible values are "SSL_V2", "SSL_V3", "TLSv1", "TLS_V11", "TLS_V12", "TLS_V13".
 # Defaults to `["TLS_V12", "TLS_V13"]`. Besides, `rustls` tls provider only support "TLS_V12" and "TLS_V13" values.

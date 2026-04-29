@@ -4557,6 +4557,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         let stream = &mut context.streams[global_stream_id];
         let parts = &mut stream.split(&self.position);
         let was_initial = parts.rbuffer.is_initial();
+        let elide_x_real_ip = parts.context.elide_x_real_ip;
         let status = pkawa::handle_header(
             &mut self.decoder,
             &mut self.prioriser,
@@ -4566,6 +4567,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             headers.end_stream,
             parts.context,
             self.flood_detector.config.max_header_list_size,
+            elide_x_real_ip,
         );
         kawa.storage.clear();
         if let Err((error, global)) = status {
@@ -7444,6 +7446,8 @@ mod tests {
             backend_address: None,
             tls_server_name: None,
             strict_sni_binding: false,
+            elide_x_real_ip: false,
+            send_x_real_ip: false,
             tls_version: None,
             tls_cipher: None,
             tls_alpn: None,

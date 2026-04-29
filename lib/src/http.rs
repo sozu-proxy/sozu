@@ -757,6 +757,14 @@ impl L7ListenerHandler for HttpListener {
             Some(s) => Some(std::time::Duration::from_secs(u64::from(s))),
         }
     }
+
+    fn get_elide_x_real_ip(&self) -> bool {
+        self.config.elide_x_real_ip.unwrap_or(false)
+    }
+
+    fn get_send_x_real_ip(&self) -> bool {
+        self.config.send_x_real_ip.unwrap_or(false)
+    }
 }
 
 pub struct HttpProxy {
@@ -1126,6 +1134,12 @@ impl HttpListener {
         }
         if let Some(ref v) = patch.sozu_id_header {
             self.config.sozu_id_header = Some(v.to_owned());
+        }
+        if let Some(v) = patch.elide_x_real_ip {
+            self.config.elide_x_real_ip = Some(v);
+        }
+        if let Some(v) = patch.send_x_real_ip {
+            self.config.send_x_real_ip = Some(v);
         }
 
         // H2 flood knobs

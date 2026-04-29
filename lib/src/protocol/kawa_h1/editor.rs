@@ -193,6 +193,27 @@ pub struct HttpContext {
     /// Plaintext listeners still never hit the check because
     /// `tls_server_name` is `None`.
     pub strict_sni_binding: bool,
+    /// When `true`, the request-side block walk in `on_request_headers`
+    /// strips any client-supplied `X-Real-IP` header before forwarding
+    /// (anti-spoofing). Mirrors `HttpListenerConfig::elide_x_real_ip` /
+    /// `HttpsListenerConfig::elide_x_real_ip`. Set from the mux `Context`
+    /// at stream creation (see `Context::create_stream`); listener-scoped
+    /// and never reset across keep-alive requests. Independent of
+    /// `send_x_real_ip`. The same flag is plumbed into
+    /// `pkawa::handle_trailer` so trailer HEADERS frames cannot bypass
+    /// the elision.
+    pub elide_x_real_ip: bool,
+    /// When `true`, `on_request_headers` injects a proxy-generated
+    /// `X-Real-IP` header carrying `session_address.ip()` (post-PROXY-v2
+    /// unwrap, i.e. the original client IP). Mirrors
+    /// `HttpListenerConfig::send_x_real_ip` /
+    /// `HttpsListenerConfig::send_x_real_ip`. Set from the mux `Context`
+    /// at stream creation (see `Context::create_stream`); listener-scoped
+    /// and never reset across keep-alive requests. Independent of
+    /// `elide_x_real_ip`. When `session_address` is `None` (raw socket
+    /// without a peer), no header is appended — identical to the
+    /// existing X-Forwarded-For / Forwarded synthesis behaviour.
+    pub send_x_real_ip: bool,
     /// Negotiated TLS protocol version as a short label (e.g. `"TLSv1.3"`).
     /// Captured from `rustls_version_label` at handshake completion and
     /// propagated from the mux `Context`. `None` for plaintext listeners.
@@ -280,6 +301,8 @@ impl HttpContext {
         session_address: Option<SocketAddr>,
         sticky_name: String,
         sozu_id_header: String,
+        elide_x_real_ip: bool,
+        send_x_real_ip: bool,
     ) -> Self {
         Self {
             session_id,
@@ -312,6 +335,8 @@ impl HttpContext {
             backend_address: None,
             tls_server_name: None,
             strict_sni_binding: true,
+            elide_x_real_ip,
+            send_x_real_ip,
             tls_version: None,
             tls_cipher: None,
             tls_alpn: None,
@@ -326,7 +351,8 @@ impl HttpContext {
 
     /// Callback for request:
     ///
-    /// - edit headers (connection, forwarded, sticky cookie, sozu-id, x-request-id)
+    /// - edit headers (connection, forwarded, sticky cookie, sozu-id,
+    ///   x-request-id, x-real-ip)
     /// - save information:
     ///   - method
     ///   - authority
@@ -453,6 +479,15 @@ impl HttpContext {
                             .and_then(|data| from_utf8(data).ok())
                             .map(ToOwned::to_owned);
                         x_for = Some(header);
+                    } else if compare_no_case(key, b"X-Real-IP") && self.elide_x_real_ip {
+                        // Anti-spoofing: a client cannot supply its own
+                        // `X-Real-IP` and have it reach the backend. The
+                        // proxy-injected value (when `send_x_real_ip` is
+                        // also set) is appended after this loop. H2 trailer
+                        // HEADERS frames bypass this callback; they are
+                        // covered by the matching elision in
+                        // `pkawa::handle_trailer`.
+                        header.elide();
                     } else if compare_no_case(key, b"Forwarded") {
                         forwarded = Some(header);
                     } else if compare_no_case(key, b"User-Agent") {
@@ -551,6 +586,24 @@ impl HttpContext {
                 write_forwarded_for_by(&mut hdr_buf, peer_ip, peer_port, public_ip);
                 request.push_block(kawa::Block::Header(kawa::Pair {
                     key: kawa::Store::Static(b"Forwarded"),
+                    val: kawa::Store::from_vec(std::mem::take(&mut hdr_buf)),
+                }));
+            }
+
+            // Inject a proxy-generated `X-Real-IP` header carrying the
+            // peer IP (post-PROXY-v2 unwrap, so the original client IP
+            // even when the upstream presented PROXY-v2). Folded into the
+            // `if let Some(peer_addr)` arm so missing peers (raw socket,
+            // no PROXY-v2) skip the injection silently — identical to the
+            // X-Forwarded-For / Forwarded synthesis behaviour above. Any
+            // client-supplied `X-Real-IP` was either elided in the block
+            // walk (if `elide_x_real_ip` is on) or passes through; this
+            // header is appended last so order in the resulting block
+            // list is deterministic for tests.
+            if self.send_x_real_ip {
+                let _ = write!(hdr_buf, "{peer_ip}");
+                request.push_block(kawa::Block::Header(kawa::Pair {
+                    key: kawa::Store::Static(b"X-Real-IP"),
                     val: kawa::Store::from_vec(std::mem::take(&mut hdr_buf)),
                 }));
             }
@@ -700,9 +753,10 @@ impl HttpContext {
         self.original_authority = None;
         self.headers_response.clear();
         // Note: tls_server_name, tls_version, tls_cipher, tls_alpn,
-        // strict_sni_binding are connection-scoped — set once at handshake
-        // completion and reused across every keep-alive request, so reset()
-        // intentionally leaves them in place.
+        // strict_sni_binding, elide_x_real_ip, send_x_real_ip are
+        // connection-scoped — set once at handshake completion and reused
+        // across every keep-alive request, so reset() intentionally leaves
+        // them in place.
     }
 
     pub fn extract_route(&self) -> Result<(&str, &str, &Method), RetrieveClusterError> {
@@ -767,6 +821,8 @@ mod tests {
             )),
             "SERVERID".to_owned(),
             "Sozu-Id".to_owned(),
+            false,
+            false,
         )
     }
 
@@ -791,6 +847,8 @@ mod tests {
             None,
             "SERVERID".to_owned(),
             "X-Edge-Id".to_owned(),
+            false,
+            false,
         );
         assert_eq!(ctx.sozu_id_header, "X-Edge-Id");
     }
