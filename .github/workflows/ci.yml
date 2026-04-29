@@ -116,10 +116,15 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler cmake
       - name: Checkout sources
         uses: actions/checkout@v4
-      - name: Install rust
-        uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          toolchain: stable
+      # Match the project's pinned toolchain (`rust-toolchain = 1.88.0`
+      # and `rust-version = "1.88.0"`). Stable 1.95 fires the new
+      # `mismatched_lifetime_syntaxes` lint that has not yet been
+      # triaged across the workspace; the clippy job pins 1.88.0 for
+      # the same reason. `dtolnay/rust-toolchain` (unlike
+      # `actions-rust-lang/setup-rust-toolchain`) does not inject
+      # `-D warnings` into RUSTFLAGS, so build steps stay portable.
+      - name: Install rust 1.88.0
+        uses: dtolnay/rust-toolchain@1.88.0
       - name: Install h2spec (for test_h2spec_conformance under e2e)
         run: |
           H2SPEC_VERSION=2.6.0
