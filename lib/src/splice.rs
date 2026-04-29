@@ -1,98 +1,290 @@
+//! Linux zero-copy data transfer between two TCP sockets via the
+//! `splice(2)` and `pipe2(2)` syscalls.
+//!
+//! [`SplicePipe`] owns a pair of kernel pipes that carry data between a
+//! frontend socket and a backend socket without round-tripping payload
+//! through user space. Its `Drop` impl closes all four pipe fds.
+//!
+//! The pipe capacity matches the default Linux pipe buffer size
+//! (64 KiB). Both ends are created with `O_NONBLOCK` so [`splice_in`] /
+//! [`splice_out`] never block the event loop, and `O_CLOEXEC` so the
+//! fds are not inherited across `exec()` boundaries (master/worker
+//! hot-upgrade safety).
+
 use std::{
     io::{Error, ErrorKind},
     os::unix::io::AsRawFd,
     ptr,
 };
 
-use libc::c_int;
+use crate::socket::SocketResult;
 
-pub type Pipe = [c_int; 2];
+/// Default kernel-pipe capacity (64 KiB), matching the Linux default
+/// for an unprivileged pipe and the historical `splice(2)` chunk size.
+/// Operators can raise it with `splice_pipe_capacity_bytes` in the main
+/// TOML config; the override is committed once per worker via
+/// [`set_pipe_capacity`].
+pub const DEFAULT_SPLICE_PIPE_CAPACITY: usize = 65_536;
 
-#[allow(dead_code)]
-pub fn create_pipe() -> Option<Pipe> {
-    let mut p: Pipe = [0; 2];
-    // SAFETY: `p` is a stack-allocated `[c_int; 2]`, so `p.as_mut_ptr()` is a
-    // valid, correctly-aligned, writable pointer to two contiguous `c_int`s,
-    // which matches pipe2's `int pipefd[2]` parameter. `pipe2` writes into the
-    // array and returns; it does not retain the pointer after return.
-    unsafe {
-        if libc::pipe2(p.as_mut_ptr(), 0) == 0 {
-            Some(p)
-        } else {
-            None
+/// Process-wide override for [`DEFAULT_SPLICE_PIPE_CAPACITY`], applied
+/// to every newly created [`SplicePipe`]. Set once on each worker at
+/// startup from
+/// [`sozu_command::proto::command::ServerConfig::splice_pipe_capacity_bytes`]
+/// via [`set_pipe_capacity`]. Set-once semantics are sufficient because
+/// the cap is a global tuning knob — it never changes after boot.
+static PIPE_CAPACITY_OVERRIDE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+/// Install the operator-configured pipe capacity. Called from
+/// `lib::server::Server::try_new_from_config` exactly once per worker
+/// process. Subsequent calls are no-ops (the `OnceLock` rejects the
+/// second `set`); the first wins. A `0` value is treated as "use the
+/// built-in default" so an operator config that explicitly sets `0`
+/// does not collapse the pipe to PAGE_SIZE by accident.
+pub fn set_pipe_capacity(bytes: usize) {
+    if bytes == 0 {
+        return;
+    }
+    let _ = PIPE_CAPACITY_OVERRIDE.set(bytes);
+}
+
+/// Resolve the active capacity request: operator override when present,
+/// otherwise the built-in [`DEFAULT_SPLICE_PIPE_CAPACITY`]. The kernel
+/// can still adjust the realised value at `fcntl(F_SETPIPE_SZ)` time;
+/// see [`SplicePipe::new`].
+fn requested_pipe_capacity() -> usize {
+    PIPE_CAPACITY_OVERRIDE
+        .get()
+        .copied()
+        .unwrap_or(DEFAULT_SPLICE_PIPE_CAPACITY)
+}
+
+/// A pair of kernel pipes used to carry zero-copy traffic between a
+/// frontend socket and a backend socket.
+///
+/// `in_pipe` carries data from the frontend toward the backend.
+/// `out_pipe` carries data from the backend toward the frontend.
+///
+/// Each pipe is `[read_end, write_end]`. `*_pipe_pending` tracks how
+/// many bytes have been spliced into the pipe but not yet drained to
+/// the destination socket — this is the "in flight in kernel" signal
+/// that `Pipe::check_connections` consumes to keep half-closed sessions
+/// alive while the kernel still owns the data.
+///
+/// `capacity` is the realised kernel-pipe size in bytes after applying
+/// the operator-requested capacity via `fcntl(F_SETPIPE_SZ)`. It may
+/// differ from the request: the kernel rounds up to a page boundary
+/// and clamps at `/proc/sys/fs/pipe-max-size` for unprivileged
+/// processes. `splice_in` uses this value as the per-call `len`, so a
+/// larger pipe means fewer syscalls under bulk-transfer load.
+pub struct SplicePipe {
+    pub in_pipe: [libc::c_int; 2],
+    pub out_pipe: [libc::c_int; 2],
+    pub in_pipe_pending: usize,
+    pub out_pipe_pending: usize,
+    pub capacity: usize,
+}
+
+impl SplicePipe {
+    /// Allocate two `pipe2(O_NONBLOCK | O_CLOEXEC)` pairs and apply the
+    /// operator-requested capacity (or the built-in 64 KiB default) to
+    /// both via `fcntl(F_SETPIPE_SZ)`. The realised size — possibly
+    /// page-rounded or kernel-clamped — is read back via
+    /// `fcntl(F_GETPIPE_SZ)` and stored in `capacity`. Returns `None`
+    /// if either pipe allocation fails (typically RLIMIT_NOFILE
+    /// pressure); the caller falls back to the buffered path.
+    pub fn new() -> Option<Self> {
+        let in_pipe = create_pipe()?;
+        let out_pipe = match create_pipe() {
+            Some(p) => p,
+            None => {
+                // SAFETY: `in_pipe` was just successfully created by
+                // `create_pipe`; both fds are owned by this stack frame
+                // and not yet handed to anyone else. Closing them here
+                // before returning `None` prevents the leak.
+                unsafe {
+                    libc::close(in_pipe[0]);
+                    libc::close(in_pipe[1]);
+                }
+                return None;
+            }
+        };
+        let requested = requested_pipe_capacity();
+        let capacity = apply_pipe_capacity(in_pipe[0], out_pipe[0], requested);
+        Some(SplicePipe {
+            in_pipe,
+            out_pipe,
+            in_pipe_pending: 0,
+            out_pipe_pending: 0,
+            capacity,
+        })
+    }
+}
+
+/// Resize both pipes via `fcntl(F_SETPIPE_SZ)` and return the realised
+/// capacity. Linux applies the resize to the whole pipe pair regardless
+/// of which end is targeted, so we operate on the read ends. Failures
+/// are non-fatal: the kernel keeps the previous capacity (typically
+/// `PAGE_SIZE * 16` = 64 KiB), and we read it back via `F_GETPIPE_SZ`.
+/// We return the smaller of the two realised sizes so `splice_in` never
+/// asks the kernel for more than the receiving pipe can accept.
+fn apply_pipe_capacity(in_read: libc::c_int, out_read: libc::c_int, requested: usize) -> usize {
+    let in_actual = set_and_query_pipe_size(in_read, requested);
+    let out_actual = set_and_query_pipe_size(out_read, requested);
+    in_actual.min(out_actual)
+}
+
+/// Apply `requested` via `F_SETPIPE_SZ` (warn on failure) and read back
+/// the realised size via `F_GETPIPE_SZ`. Falls back to
+/// `DEFAULT_SPLICE_PIPE_CAPACITY` if both syscalls fail (only when the
+/// fd is not a pipe, which would be a programming error).
+fn set_and_query_pipe_size(fd: libc::c_int, requested: usize) -> usize {
+    // SAFETY: `fd` is a pipe end fd owned by the caller (`SplicePipe`
+    // above) and is valid until that struct's `Drop` closes it. The
+    // kernel reads the integer argument and does not retain a pointer.
+    let set_ret = unsafe { libc::fcntl(fd, libc::F_SETPIPE_SZ, requested as libc::c_int) };
+    if set_ret == -1 {
+        let err = Error::last_os_error();
+        warn!(
+            "SPLICE\tF_SETPIPE_SZ({}) on pipe fd({}) failed: {:?}; keeping the kernel default. Lower the requested value or raise /proc/sys/fs/pipe-max-size.",
+            requested, fd, err
+        );
+    }
+    // SAFETY: same as above; F_GETPIPE_SZ returns the realised size.
+    let get_ret = unsafe { libc::fcntl(fd, libc::F_GETPIPE_SZ) };
+    if get_ret < 0 {
+        DEFAULT_SPLICE_PIPE_CAPACITY
+    } else {
+        get_ret as usize
+    }
+}
+
+impl Drop for SplicePipe {
+    fn drop(&mut self) {
+        // SAFETY: All four fds were created by `create_pipe` in
+        // `SplicePipe::new`, are exclusively owned by this struct, and
+        // are about to go out of scope. The worker event loop is
+        // single-threaded, so no `splice(2)` call is in flight against
+        // these fds when Drop runs.
+        unsafe {
+            libc::close(self.in_pipe[0]);
+            libc::close(self.in_pipe[1]);
+            libc::close(self.out_pipe[0]);
+            libc::close(self.out_pipe[1]);
         }
     }
 }
 
-#[allow(dead_code)]
-pub fn splice_in(stream: &dyn AsRawFd, pipe: Pipe) -> Option<usize> {
-    // SAFETY: `stream.as_raw_fd()` yields a descriptor borrowed for the
-    // duration of this call — the `&dyn AsRawFd` borrow keeps its owner alive
-    // across the syscall. `pipe[1]` is the write end of a pipe created via
-    // `create_pipe`; the caller is responsible for keeping it open. Both
-    // offset pointers are null (sequential read/write). `splice` only reads
-    // the fds during the syscall and does not retain any pointer after
-    // returning.
-    unsafe {
-        let res = libc::splice(
-            stream.as_raw_fd(),
+/// Allocate one `pipe2(O_NONBLOCK | O_CLOEXEC)` pair.
+fn create_pipe() -> Option<[libc::c_int; 2]> {
+    let mut fds: [libc::c_int; 2] = [0; 2];
+    // SAFETY: `fds.as_mut_ptr()` is a valid, correctly-aligned writable
+    // pointer to two contiguous `c_int`s, matching pipe2's
+    // `int pipefd[2]` parameter. pipe2 writes the two new fds into the
+    // array and does not retain the pointer after it returns.
+    let ret = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) };
+    if ret == 0 { Some(fds) } else { None }
+}
+
+/// Splice up to `len` bytes from `fd` into the write end of a kernel
+/// pipe. Returns `(bytes_moved, status)`.
+///
+/// Pass the receiving pipe's realised capacity (see [`SplicePipe::capacity`])
+/// so the syscall never asks the kernel for more than the pipe can
+/// accept. `SocketResult::WouldBlock` means the source has no more
+/// data right now; `SocketResult::Closed` means the source sent EOF.
+/// The caller is responsible for incrementing the matching
+/// `*_pipe_pending`.
+pub fn splice_in(
+    fd: &dyn AsRawFd,
+    pipe_write_end: libc::c_int,
+    len: usize,
+) -> (usize, SocketResult) {
+    // SAFETY: `fd.as_raw_fd()` borrows the descriptor from its owner;
+    // the `&dyn AsRawFd` keeps the owner alive for the duration of the
+    // syscall. `pipe_write_end` is the write end of a pipe owned by the
+    // caller (typically a `SplicePipe`). Both offset pointers are null
+    // (sequential, no offset). The kernel does not retain any pointer
+    // after `splice` returns.
+    let res = unsafe {
+        libc::splice(
+            fd.as_raw_fd(),
             ptr::null_mut(),
-            pipe[1],
+            pipe_write_end,
             ptr::null_mut(),
-            2048,
-            libc::SPLICE_F_NONBLOCK,
-        );
-        if res == -1 {
-            let err = Error::last_os_error().kind();
-            if err != ErrorKind::WouldBlock {
-                error!(
-                    "SPLICE\terr transferring from tcp({}) to pipe({}): {:?}",
-                    stream.as_raw_fd(),
-                    pipe[1],
-                    err
-                );
+            len,
+            libc::SPLICE_F_NONBLOCK | libc::SPLICE_F_MOVE,
+        )
+    };
+    match res {
+        -1 => {
+            let err = Error::last_os_error();
+            match err.kind() {
+                ErrorKind::WouldBlock => (0, SocketResult::WouldBlock),
+                _ => {
+                    error!(
+                        "SPLICE\terr splicing from fd({}) to pipe({}): {:?}",
+                        fd.as_raw_fd(),
+                        pipe_write_end,
+                        err
+                    );
+                    (0, SocketResult::Error)
+                }
             }
-            None
-        } else {
-            //error!("transferred {} bytes from tcp({}) to pipe({})", res, stream.as_raw_fd(), pipe[1]);
-            Some(res as usize)
         }
+        0 => (0, SocketResult::Closed),
+        n => (n as usize, SocketResult::Continue),
     }
 }
 
-#[allow(dead_code)]
-pub fn splice_out(pipe: Pipe, stream: &dyn AsRawFd) -> Option<usize> {
-    // SAFETY: `pipe[0]` is the read end of a pipe created via `create_pipe`;
-    // the caller is responsible for keeping it open. `stream.as_raw_fd()`
-    // yields a descriptor borrowed for the duration of this call — the
-    // `&dyn AsRawFd` borrow keeps its owner alive across the syscall. Both
-    // offset pointers are null (sequential read/write). `splice` only reads
-    // the fds during the syscall and does not retain any pointer after
-    // returning.
-    unsafe {
-        let res = libc::splice(
-            pipe[0],
+/// Splice up to `len` bytes from the read end of a kernel pipe into
+/// `fd`. Returns `(bytes_moved, status)`.
+///
+/// `len` should match the caller's `*_pipe_pending` so we never ask
+/// the kernel for more bytes than the pipe contains. The caller is
+/// responsible for decrementing the matching `*_pipe_pending` by
+/// `bytes_moved`.
+pub fn splice_out(
+    pipe_read_end: libc::c_int,
+    fd: &dyn AsRawFd,
+    len: usize,
+) -> (usize, SocketResult) {
+    if len == 0 {
+        return (0, SocketResult::Continue);
+    }
+    // SAFETY: `pipe_read_end` is the read end of a pipe owned by the
+    // caller. `fd.as_raw_fd()` borrows the destination descriptor from
+    // its owner; the `&dyn AsRawFd` keeps that owner alive for the
+    // duration of the syscall. Both offset pointers are null
+    // (sequential). The kernel does not retain any pointer after
+    // `splice` returns.
+    let res = unsafe {
+        libc::splice(
+            pipe_read_end,
             ptr::null_mut(),
-            stream.as_raw_fd(),
+            fd.as_raw_fd(),
             ptr::null_mut(),
-            2048,
-            libc::SPLICE_F_NONBLOCK,
-        );
-        if res == -1 {
-            let err = Error::last_os_error().kind();
-            if err != ErrorKind::WouldBlock {
-                error!(
-                    "SPLICE\terr transferring from pipe({}) to tcp({}): {:?}",
-                    pipe[0],
-                    stream.as_raw_fd(),
-                    err
-                );
+            len,
+            libc::SPLICE_F_NONBLOCK | libc::SPLICE_F_MOVE,
+        )
+    };
+    match res {
+        -1 => {
+            let err = Error::last_os_error();
+            match err.kind() {
+                ErrorKind::WouldBlock => (0, SocketResult::WouldBlock),
+                _ => {
+                    error!(
+                        "SPLICE\terr splicing from pipe({}) to fd({}): {:?}",
+                        pipe_read_end,
+                        fd.as_raw_fd(),
+                        err
+                    );
+                    (0, SocketResult::Error)
+                }
             }
-            None
-        } else {
-            //error!("transferred {} bytes from pipe({}) to tcp({})", res, pipe[0], stream.as_raw_fd());
-            Some(res as usize)
         }
+        0 => (0, SocketResult::Closed),
+        n => (n as usize, SocketResult::Continue),
     }
 }
 
@@ -100,132 +292,63 @@ pub fn splice_out(pipe: Pipe, stream: &dyn AsRawFd) -> Option<usize> {
 mod tests {
     use std::{
         io::{Read, Write},
-        net::{SocketAddr, TcpListener, TcpStream},
-        os::unix::io::AsRawFd,
-        str,
-        sync::{Arc, Barrier},
+        net::{TcpListener, TcpStream},
         thread,
         time::Duration,
     };
 
     use super::*;
 
-    /// Retry a splice_in + splice_out transfer with exponential backoff.
-    /// Returns the number of bytes transferred, or panics on timeout.
-    fn splice_with_retry(from: &dyn AsRawFd, pipe: Pipe, to: &dyn AsRawFd) -> usize {
-        let mut delay = Duration::from_millis(1);
-        let max_delay = Duration::from_millis(100);
-        let mut elapsed = Duration::ZERO;
-        let timeout = Duration::from_secs(5);
-
-        let bytes_in = loop {
-            if let Some(n) = splice_in(from, pipe) {
-                break n;
-            }
-            assert!(elapsed < timeout, "splice_in timed out after {elapsed:?}");
-            thread::sleep(delay);
-            elapsed += delay;
-            delay = (delay * 2).min(max_delay);
-        };
-
-        delay = Duration::from_millis(1);
-        let mut out_elapsed = Duration::ZERO;
-
-        let bytes_out = loop {
-            if let Some(n) = splice_out(pipe, to) {
-                break n;
-            }
-            assert!(
-                out_elapsed < timeout,
-                "splice_out timed out after {out_elapsed:?}"
-            );
-            thread::sleep(delay);
-            out_elapsed += delay;
-            delay = (delay * 2).min(max_delay);
-        };
-
-        println!("splice transfer: {bytes_in} bytes in, {bytes_out} bytes out");
-        bytes_out
-    }
-
+    /// Round-trip a payload through a kernel pipe and assert the byte
+    /// count is preserved. Exercises `create_pipe`, `splice_in`, and
+    /// `splice_out` end-to-end with two real sockets.
     #[test]
-    fn zerocopy() {
-        thread::scope(|s| {
-            let backend_addr = start_server(s);
-            let (proxy_addr, barrier) = start_server2(s, backend_addr);
+    fn splice_roundtrip() {
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").expect("bind proxy");
+        let proxy_addr = proxy_listener.local_addr().expect("local_addr");
 
-            let mut stream = TcpStream::connect(proxy_addr).expect("could not connect to proxy");
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .expect("could not set read timeout");
-            stream
-                .write_all(b"hello world")
-                .expect("could not write to proxy");
-            barrier.wait();
+        let pipe = create_pipe().expect("create_pipe");
 
-            let mut res = [0; 128];
-            let sz = stream
-                .read(&mut res[..])
-                .expect("could not read from stream");
-            println!("stream received {:?}", str::from_utf8(&res[..sz]));
-            assert_eq!(&res[..sz], &b"hello world"[..]);
-        });
-    }
+        let pipe_thread = thread::spawn(move || {
+            let (conn, _) = proxy_listener.accept().expect("accept");
+            conn.set_read_timeout(Some(Duration::from_secs(2))).ok();
 
-    fn start_server<'scope>(scope: &'scope thread::Scope<'scope, '_>) -> SocketAddr {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("could not bind echo server socket");
-        let addr = listener
-            .local_addr()
-            .expect("could not get echo server address");
-
-        scope.spawn(move || {
-            // Accept a single connection — this test only needs one round-trip
-            let mut stream = listener.accept().expect("echo server: accept failed").0;
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .expect("could not set echo read timeout");
-            let mut buf = [0; 128];
-            loop {
-                match stream.read(&mut buf[..]) {
-                    Ok(0) => break, // EOF — peer closed connection
-                    Ok(sz) => {
-                        println!("echo: {:?}", str::from_utf8(&buf[..sz]));
-                        stream.write_all(&buf[..sz]).expect("echo write failed");
-                    }
-                    Err(_) => break, // timeout or error — exit
+            // Pull bytes off the wire into the kernel pipe. The client
+            // side may not have written yet, so retry on WouldBlock
+            // with a short cap.
+            let mut moved = 0usize;
+            for _ in 0..50 {
+                let (sz, status) = splice_in(&conn, pipe[1], DEFAULT_SPLICE_PIPE_CAPACITY);
+                if sz > 0 {
+                    moved = sz;
+                    assert_eq!(status, SocketResult::Continue);
+                    break;
                 }
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert!(moved > 0, "splice_in moved 0 bytes");
+
+            // Drain the pipe back into the same socket.
+            let (sz_out, status_out) = splice_out(pipe[0], &conn, moved);
+            assert_eq!(sz_out, moved, "splice_out byte count mismatch");
+            assert_eq!(status_out, SocketResult::Continue);
+
+            // SAFETY: pipe is locally owned and going out of scope.
+            unsafe {
+                libc::close(pipe[0]);
+                libc::close(pipe[1]);
             }
         });
 
-        addr
-    }
+        let mut client = TcpStream::connect(proxy_addr).expect("connect");
+        client.set_read_timeout(Some(Duration::from_secs(2))).ok();
+        let payload = b"splice test data";
+        client.write_all(payload).expect("client write");
 
-    fn start_server2<'scope>(
-        scope: &'scope thread::Scope<'scope, '_>,
-        backend_addr: SocketAddr,
-    ) -> (SocketAddr, Arc<Barrier>) {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("could not bind proxy socket");
-        let proxy_addr = listener.local_addr().expect("could not get proxy address");
-        let barrier = Arc::new(Barrier::new(2));
-        let barrier_clone = barrier.to_owned();
+        let mut buf = [0u8; 128];
+        let n = client.read(&mut buf).expect("client read");
+        assert_eq!(&buf[..n], payload);
 
-        scope.spawn(move || {
-            barrier_clone.wait();
-
-            // Accept a single connection — this test only needs one round-trip
-            let stream = listener.accept().expect("proxy: accept failed").0;
-            let backend =
-                TcpStream::connect(backend_addr).expect("could not connect to echo backend");
-            println!("proxy: got a new client");
-
-            if let (Some(pipe_in), Some(pipe_out)) = (create_pipe(), create_pipe()) {
-                // client → backend
-                splice_with_retry(&stream, pipe_in, &backend);
-                // backend → client
-                splice_with_retry(&backend, pipe_out, &stream);
-            }
-        });
-
-        (proxy_addr, barrier)
+        pipe_thread.join().expect("pipe thread");
     }
 }

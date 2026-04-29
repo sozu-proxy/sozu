@@ -488,6 +488,16 @@ impl Server {
         if let Some(cap) = config.basic_auth_max_credential_bytes {
             crate::protocol::mux::auth::set_max_decoded_credential_bytes(cap as usize);
         }
+        // Same set-once-per-worker-boot pattern for the splice kernel-pipe
+        // capacity. The setter no-ops on `0` so an explicit zero in config
+        // does not collapse the pipe to PAGE_SIZE; the kernel still applies
+        // page-rounding and `/proc/sys/fs/pipe-max-size` clamping at
+        // SplicePipe::new time. Cfg-gated because the splice module only
+        // exists on Linux + `splice` feature.
+        #[cfg(all(target_os = "linux", feature = "splice"))]
+        if let Some(cap) = config.splice_pipe_capacity_bytes {
+            crate::splice::set_pipe_capacity(cap as usize);
+        }
         let pool = Rc::new(RefCell::new(Pool::with_capacity(
             config.min_buffers as usize,
             config.max_buffers as usize,

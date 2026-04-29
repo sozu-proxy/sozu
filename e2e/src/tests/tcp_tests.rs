@@ -688,3 +688,278 @@ fn test_tcp_proxy_protocol_v2() {
         State::Success,
     );
 }
+
+// =========================================================================
+// Test 6: Concurrent TCP sessions across multiple backends
+//
+// Exercises the splice fast path under concurrency: N clients connect to
+// the proxy at once, each backed by an independent backend. Sozu must
+// allocate one SplicePipe per session and drive them in parallel from the
+// single-threaded event loop. The buffered path passes the same test, so
+// this also serves as a feature-flag equivalence check on CI.
+// =========================================================================
+
+fn try_tcp_proxy_concurrent_async() -> State {
+    const N: usize = 4;
+    let (mut worker, backend_addrs, front_address) = setup_tcp_test("TCP-CONCURRENT", N);
+
+    // Spawn N independent backend echo servers, one per registered
+    // backend address. Each accepts a single connection, reads the
+    // request, and writes a backend-tagged response so we can match
+    // requests to responses without relying on Sozu's load-balancing
+    // policy.
+    let backend_handles: Vec<_> = backend_addrs
+        .into_iter()
+        .enumerate()
+        .map(|(i, addr)| {
+            thread::spawn(move || {
+                let listener = bind_std_listener(addr, "concurrent backend");
+                let (mut stream, _) = listener.accept().expect("backend accept");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .expect("set read timeout");
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(3)))
+                    .expect("set write timeout");
+                let mut buf = [0u8; 256];
+                let n = stream.read(&mut buf).expect("backend read");
+                let response = format!("response-from-backend-{i}");
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("backend write");
+                n
+            })
+        })
+        .collect();
+
+    // Give the backend listeners a moment to enter accept().
+    thread::sleep(Duration::from_millis(50));
+
+    // N concurrent clients. Each writes a tagged request and reads
+    // until short-read so segmented responses are handled correctly.
+    let client_handles: Vec<_> = (0..N)
+        .map(|i| {
+            thread::spawn(move || {
+                let mut stream = raw_connect(front_address);
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .expect("set read timeout");
+                let req = format!("request-from-client-{i}");
+                stream.write_all(req.as_bytes()).expect("client write");
+                raw_read_all(&mut stream)
+            })
+        })
+        .collect();
+
+    let responses: Vec<Vec<u8>> = client_handles
+        .into_iter()
+        .map(|h| h.join().expect("client thread"))
+        .collect();
+    for h in backend_handles {
+        h.join().expect("backend thread");
+    }
+
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+
+    // Every client must have received some response. We don't assert
+    // a specific client→backend mapping because the load balancer's
+    // policy is implementation-defined; the spliced byte streams just
+    // have to round-trip cleanly.
+    let all_received = responses.iter().all(|r| !r.is_empty());
+    let total_bytes: usize = responses.iter().map(|r| r.len()).sum();
+    println!(
+        "Concurrent test: {} responses, {total_bytes} total bytes",
+        responses.len()
+    );
+
+    if stopped && all_received {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_tcp_proxy_concurrent_async() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "TCP concurrent: N clients × N backends round-trip in parallel",
+            try_tcp_proxy_concurrent_async,
+        ),
+        State::Success,
+    );
+}
+
+// =========================================================================
+// Test 7: Multiple request/response cycles on a single TCP session
+//
+// Long-lived TCP connections (databases, custom protocols, websocket-like
+// streams) drive many request/response cycles over the same socket. For
+// the splice path this exercises the SplicePipe lifecycle across
+// successive `splice_in`/`splice_out` calls without recreating pipes.
+// =========================================================================
+
+fn try_tcp_proxy_multiple_requests() -> State {
+    const N_REQUESTS: usize = 5;
+    let (mut worker, backend_addrs, front_address) = setup_tcp_test("TCP-MULTIREQ", 1);
+    let back_address = backend_addrs[0];
+
+    // Backend: accept one connection, then echo N_REQUESTS messages.
+    let backend_handle = thread::spawn(move || {
+        let listener = bind_std_listener(back_address, "multireq backend");
+        let (mut stream, _) = listener.accept().expect("backend accept");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .expect("set read timeout");
+        stream
+            .set_write_timeout(Some(Duration::from_secs(3)))
+            .expect("set write timeout");
+
+        let mut total_echoed = 0usize;
+        for _ in 0..N_REQUESTS {
+            let mut buf = [0u8; 64];
+            let n = match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            stream.write_all(&buf[..n]).expect("backend write echo");
+            total_echoed += 1;
+        }
+        total_echoed
+    });
+
+    thread::sleep(Duration::from_millis(50));
+
+    let mut stream = raw_connect(front_address);
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("set read timeout");
+
+    let mut received = Vec::with_capacity(N_REQUESTS);
+    for i in 0..N_REQUESTS {
+        let req = format!("req-{i}");
+        stream.write_all(req.as_bytes()).expect("client write");
+        let mut buf = [0u8; 64];
+        let n = stream.read(&mut buf).expect("client read");
+        received.push(String::from_utf8_lossy(&buf[..n]).into_owned());
+    }
+    drop(stream);
+
+    let echoed = backend_handle.join().expect("backend thread");
+
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+
+    println!(
+        "Multi-request test: client got {} echoes, backend echoed {echoed}",
+        received.len(),
+    );
+
+    let all_match = received.len() == N_REQUESTS
+        && received
+            .iter()
+            .enumerate()
+            .all(|(i, r)| r == &format!("req-{i}"));
+
+    if stopped && all_match && echoed == N_REQUESTS {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_tcp_proxy_multiple_requests() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "TCP multiple requests: N round-trips on one persistent connection",
+            try_tcp_proxy_multiple_requests,
+        ),
+        State::Success,
+    );
+}
+
+// =========================================================================
+// Test 8: Soft-stop with an active TCP session
+//
+// Triggers `soft_stop` while a TCP session is mid-flight (data exchanged,
+// no FIN yet). The worker must drain in-flight bytes (including any
+// kernel-pipe pending data on the splice path) and exit cleanly.
+// =========================================================================
+
+fn try_tcp_soft_stop_with_active_sessions() -> State {
+    let (mut worker, backend_addrs, front_address) = setup_tcp_test("TCP-SOFTSTOP", 1);
+    let back_address = backend_addrs[0];
+
+    // Backend: accept, read the client's request, send a response,
+    // then linger briefly so the soft_stop arrives while the session
+    // is still attached.
+    let backend_handle = thread::spawn(move || {
+        let listener = bind_std_listener(back_address, "softstop backend");
+        let (mut stream, _) = listener.accept().expect("backend accept");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .expect("set read timeout");
+        stream
+            .set_write_timeout(Some(Duration::from_secs(3)))
+            .expect("set write timeout");
+        let mut buf = [0u8; 256];
+        let n = stream.read(&mut buf).unwrap_or(0);
+        if n > 0 {
+            let _ = stream.write_all(b"backend-mid-stream-response");
+        }
+        // Hold the socket open while the test triggers soft_stop.
+        thread::sleep(Duration::from_millis(300));
+        n
+    });
+
+    thread::sleep(Duration::from_millis(50));
+
+    let client_handle = thread::spawn(move || {
+        let mut stream = raw_connect(front_address);
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .expect("set read timeout");
+        stream
+            .write_all(b"client-mid-stream-request")
+            .expect("client write");
+        // Try to read; soft_stop may interleave with the response.
+        let mut buf = [0u8; 256];
+        stream.read(&mut buf).unwrap_or(0)
+    });
+
+    // Let the data start flowing through the pipe in both directions
+    // before the soft-stop hits.
+    thread::sleep(Duration::from_millis(150));
+
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+
+    let backend_read = backend_handle.join().expect("backend thread");
+    let client_read = client_handle.join().expect("client thread");
+
+    println!(
+        "Soft-stop test: backend read {backend_read} request bytes, client read {client_read} response bytes, worker stopped cleanly: {stopped}"
+    );
+
+    // The contract here is "no panic, no hang". Any bytes that flowed
+    // before soft_stop are a bonus; what matters is that the worker
+    // returned from wait_for_server_stop without timing out.
+    if stopped { State::Success } else { State::Fail }
+}
+
+#[test]
+fn test_tcp_soft_stop_with_active_sessions() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "TCP soft-stop: graceful shutdown with active TCP session",
+            try_tcp_soft_stop_with_active_sessions,
+        ),
+        State::Success,
+    );
+}

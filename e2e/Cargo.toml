@@ -32,3 +32,10 @@ tempfile = { workspace = true }
 # request consume the failure injection that FIX-18 just armed,
 # producing the wrong response code for both tests on CI.
 serial_test = { workspace = true }
+
+[features]
+# Forward sozu-lib's `splice` feature so the dependency-tree compiles
+# the splice integration in `lib/src/protocol/pipe.rs`. The TCP tests
+# in `tests/tcp_tests.rs` are protocol-level and run identically with
+# or without the feature enabled — CI exercises both configurations.
+splice = ["sozu-lib/splice"]
