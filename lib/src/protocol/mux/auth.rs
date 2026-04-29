@@ -175,10 +175,30 @@ fn pad_for_constant_time_compare(input: &[u8]) -> [u8; AUTH_COMPARE_PAD_LEN + 8]
 /// This defeats timing side-channel attacks that would otherwise leak
 /// the size of the realm, the length of the matching username, or the
 /// index of the matching credential.
+///
+/// ── Length-bound prelude ──
+///
+/// `pad_for_constant_time_compare` silently truncates inputs longer than
+/// [`AUTH_COMPARE_PAD_LEN`]. Two credentials that share their first 256
+/// bytes — for example, the same long username with different password
+/// digests — would produce identical padded buffers (and identical length
+/// suffixes if the inputs share a length), letting a bogus password
+/// authenticate as the long-username slot. The pre-loop guard below
+/// rejects any input that would be truncated before the compare runs, so
+/// the constant-time loop only ever sees values we can encode without
+/// loss. Stored entries that exceed the bound are skipped by the same
+/// rule — operator config should never produce them, but we refuse to
+/// silently truncate one if it slips through.
 pub fn check_authorized_hashes(candidate: &str, authorized_hashes: &[String]) -> bool {
+    if candidate.len() > AUTH_COMPARE_PAD_LEN {
+        return false;
+    }
     let candidate_padded = pad_for_constant_time_compare(candidate.as_bytes());
     let mut matched = subtle::Choice::from(0u8);
     for hash in authorized_hashes {
+        if hash.len() > AUTH_COMPARE_PAD_LEN {
+            continue;
+        }
         let entry_padded = pad_for_constant_time_compare(hash.as_bytes());
         // Both buffers are exactly `AUTH_COMPARE_PAD_LEN + 8` bytes, so
         // subtle's slice `ct_eq` runs the full byte-loop instead of
@@ -277,6 +297,47 @@ mod tests {
         let wrong = "admin:0000000000000000000000000000000000000000000000000000000000000000";
         let list = [format!("admin:{SECRET_SHA256_HEX}")];
         assert!(!check_authorized_hashes(wrong, &list));
+    }
+
+    /// `pad_for_constant_time_compare` truncates inputs to
+    /// `AUTH_COMPARE_PAD_LEN = 256` bytes. Two canonical credentials whose
+    /// first 256 bytes match — e.g. the same long username with different
+    /// password digests at offsets > 256 — would otherwise produce
+    /// identical padded buffers and authenticate as each other. The fix
+    /// rejects any candidate whose canonical length exceeds the envelope
+    /// before the compare loop runs.
+    #[test]
+    fn check_authorized_hashes_rejects_overlong_candidate() {
+        // Username large enough that the `:hex64` suffix sits past byte 256.
+        // 250 bytes of `a` + ":" + 64 hex = 315 bytes total.
+        let long_user = "a".repeat(250);
+        let stored = format!("{long_user}:{SECRET_SHA256_HEX}");
+        let attacker = format!(
+            "{long_user}:0000000000000000000000000000000000000000000000000000000000000000"
+        );
+        assert!(stored.len() > AUTH_COMPARE_PAD_LEN);
+        assert!(attacker.len() > AUTH_COMPARE_PAD_LEN);
+        assert_eq!(stored.len(), attacker.len()); // same length suffix
+        let list = [stored];
+        // Without the length guard the attacker credential would compare
+        // equal to `stored` because the differing digest is past byte 256
+        // and `pad_for_constant_time_compare` would truncate both inputs
+        // to the same prefix. The guard rejects both — no auth bypass.
+        assert!(!check_authorized_hashes(&attacker, &list));
+    }
+
+    /// Stored entries that are themselves overlong are skipped rather than
+    /// silently truncated. An operator config containing such an entry
+    /// would not authenticate any candidate against it; that is preferred
+    /// over admitting a collision.
+    #[test]
+    fn check_authorized_hashes_skips_overlong_stored_entry() {
+        let valid = format!("admin:{SECRET_SHA256_HEX}");
+        let overlong = format!("{}:{SECRET_SHA256_HEX}", "a".repeat(250));
+        assert!(overlong.len() > AUTH_COMPARE_PAD_LEN);
+        // The valid entry still matches; the overlong stored entry is skipped.
+        let list = [overlong, valid.clone()];
+        assert!(check_authorized_hashes(&valid, &list));
     }
 
     #[test]
