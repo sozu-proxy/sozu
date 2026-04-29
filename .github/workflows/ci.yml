@@ -98,9 +98,12 @@ jobs:
   crypto-providers:
     name: Crypto provider ${{ matrix.provider }}
     runs-on: ubuntu-latest
-    # The e2e step exercises 328 real-listener tests behind rustls; budget
-    # generously so a slow runner does not flake.
-    timeout-minutes: 30
+    # The e2e step exercises 328 real-listener tests behind rustls. On
+    # cold-cache CI runners with provider-specific cmake builds (notably
+    # `aws-lc-rs` / `fips`) the build + e2e step has been observed at
+    # ~30 min on the slowest provider; budget 60 min so a transient
+    # runner slowdown does not flake the whole matrix.
+    timeout-minutes: 60
     strategy:
       # Don't cancel sibling matrix entries on a single-provider failure —
       # the goal is to know which providers passed and which broke.
