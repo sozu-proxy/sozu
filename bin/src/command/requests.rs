@@ -268,6 +268,14 @@ impl Server {
 
             RequestType::LaunchWorker(_) => {} // not yet implemented, nor used, anywhere
             RequestType::ReturnListenSockets(_) => {} // This is only implemented by workers,
+            // Per-(cluster, source-IP) connection-limit runtime hooks. Both
+            // the setter and the query are pure worker-side operations
+            // (the live counter lives in `SessionManager`, not in the
+            // master's `ConfigState`), so we hand them off to the
+            // generic worker fan-out path.
+            RequestType::SetMaxConnectionsPerIp(_) | RequestType::QueryMaxConnectionsPerIp(_) => {
+                worker_request(self, client, request_type);
+            }
         }
     }
 

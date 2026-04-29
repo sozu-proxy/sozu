@@ -212,6 +212,7 @@ impl CommandManager {
             },
             SubCmd::Config { cmd: _ } => Ok(()), // noop, handled at the beginning of the method
             SubCmd::Events => self.events(),
+            SubCmd::ConnectionLimit { cmd } => self.connection_limit_command(cmd),
             rest => {
                 panic!("that command should have been handled earlier: {rest:x?}")
             }

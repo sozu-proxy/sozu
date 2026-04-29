@@ -240,6 +240,14 @@ pub struct HttpContext {
     /// deletes the header by name (HAProxy `del-header` parity); a
     /// non-empty `val` set/replaces.
     pub headers_response: Vec<HeaderEditSnapshot>,
+    /// Resolved `Retry-After` value (seconds) for an HTTP 429 default
+    /// answer. Computed in `Router::connect` when the per-(cluster,
+    /// source-IP) connection limit is hit, by folding the cluster's
+    /// `retry_after` override over the global default. `None` (or
+    /// `Some(0)`) tells the answer engine to omit the `Retry-After`
+    /// header entirely — `Retry-After: 0` invites an immediate retry
+    /// that defeats the limit. Unused for any other status code.
+    pub retry_after_seconds: Option<u32>,
 }
 
 /// Owned snapshot of a per-frontend header edit, captured at routing
@@ -312,6 +320,7 @@ impl HttpContext {
             www_authenticate: None,
             original_authority: None,
             headers_response: Vec::new(),
+            retry_after_seconds: None,
         }
     }
 

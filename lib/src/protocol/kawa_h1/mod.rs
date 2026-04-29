@@ -138,6 +138,14 @@ pub enum DefaultAnswer {
     /// The peer may retry on a fresh TLS connection that negotiates an SNI
     /// matching the authority.
     Answer421 {},
+    /// RFC 6585 §4 — emitted when the per-(cluster, source-IP) connection
+    /// limit is reached. `retry_after` is the suggested wait, in seconds;
+    /// `None` (or `Some(0)`) tells the template engine to omit the header
+    /// — `Retry-After: 0` invites an immediate retry that defeats the
+    /// limit.
+    Answer429 {
+        retry_after: Option<u32>,
+    },
     Answer502 {
         message: String,
         phase: kawa::ParsingPhaseMarker,
@@ -168,6 +176,7 @@ impl From<&DefaultAnswer> for u16 {
             DefaultAnswer::Answer408 { .. } => 408,
             DefaultAnswer::Answer413 { .. } => 413,
             DefaultAnswer::Answer421 { .. } => 421,
+            DefaultAnswer::Answer429 { .. } => 429,
             DefaultAnswer::Answer502 { .. } => 502,
             DefaultAnswer::Answer503 { .. } => 503,
             DefaultAnswer::Answer504 { .. } => 504,
@@ -1099,6 +1108,11 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 ),
                 DefaultAnswer::Answer421 { .. } => incr!(
                     "http.421.errors",
+                    self.context.cluster_id.as_deref(),
+                    self.context.backend_id.as_deref()
+                ),
+                DefaultAnswer::Answer429 { .. } => incr!(
+                    "connections.rejected_per_cluster_ip",
                     self.context.cluster_id.as_deref(),
                     self.context.backend_id.as_deref()
                 ),

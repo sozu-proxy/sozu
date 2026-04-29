@@ -9,19 +9,20 @@ use sozu_command_lib::{
         ActivateListener, AddBackend, AddCertificate, AlpnProtocols, Cluster, CountRequests,
         CustomHttpAnswers, DeactivateListener, FrontendFilters, HardStop, ListListeners,
         ListenerType, LoadBalancingParams, MetricsConfiguration, PathRule, ProxyProtocolConfig,
-        QueryCertificatesFilters, QueryClusterByDomain, QueryClustersHashes, RemoveBackend,
-        RemoveCertificate, RemoveListener, ReplaceCertificate, RequestHttpFrontend,
-        RequestTcpFrontend, RulePosition, SocketAddress, SoftStop, Status, SubscribeEvents,
-        TlsVersion, UpdateHttpListenerConfig, UpdateHttpsListenerConfig, UpdateTcpListenerConfig,
-        request::RequestType, response_content::ContentType,
+        QueryCertificatesFilters, QueryClusterByDomain, QueryClustersHashes,
+        QueryMaxConnectionsPerIp, RemoveBackend, RemoveCertificate, RemoveListener,
+        ReplaceCertificate, RequestHttpFrontend, RequestTcpFrontend, RulePosition, SocketAddress,
+        SoftStop, Status, SubscribeEvents, TlsVersion, UpdateHttpListenerConfig,
+        UpdateHttpsListenerConfig, UpdateTcpListenerConfig, request::RequestType,
+        response_content::ContentType,
     },
 };
 
 use super::CtlError;
 use crate::{
     cli::{
-        BackendCmd, ClusterCmd, ClusterH2Cmd, HttpFrontendCmd, HttpListenerCmd, HttpsListenerCmd,
-        MetricsCmd, TcpFrontendCmd, TcpListenerCmd,
+        BackendCmd, ClusterCmd, ClusterH2Cmd, ConnectionLimitCmd, HttpFrontendCmd, HttpListenerCmd,
+        HttpsListenerCmd, MetricsCmd, TcpFrontendCmd, TcpListenerCmd,
     },
     ctl::CommandManager,
 };
@@ -466,6 +467,7 @@ impl CommandManager {
                 answer_408,
                 answer_413,
                 answer_421,
+                answer_429,
                 answer_502,
                 answer_503,
                 answer_504,
@@ -510,6 +512,7 @@ impl CommandManager {
                 answer_408,
                 answer_413,
                 answer_421,
+                answer_429,
                 answer_502,
                 answer_503,
                 answer_504,
@@ -590,6 +593,7 @@ impl CommandManager {
                 answer_408,
                 answer_413,
                 answer_421,
+                answer_429,
                 answer_502,
                 answer_503,
                 answer_504,
@@ -628,6 +632,7 @@ impl CommandManager {
                 answer_408,
                 answer_413,
                 answer_421,
+                answer_429,
                 answer_502,
                 answer_503,
                 answer_504,
@@ -722,6 +727,7 @@ impl CommandManager {
         answer_408: Option<PathBuf>,
         answer_413: Option<PathBuf>,
         answer_421: Option<PathBuf>,
+        answer_429: Option<PathBuf>,
         answer_502: Option<PathBuf>,
         answer_503: Option<PathBuf>,
         answer_504: Option<PathBuf>,
@@ -736,8 +742,8 @@ impl CommandManager {
         };
 
         let http_answers = build_http_answers(
-            answer_301, answer_401, answer_404, answer_408, answer_413, answer_421, answer_502,
-            answer_503, answer_504, answer_507,
+            answer_301, answer_401, answer_404, answer_408, answer_413, answer_421, answer_429,
+            answer_502, answer_503, answer_504, answer_507,
         )?;
 
         let patch = UpdateHttpListenerConfig {
@@ -817,6 +823,7 @@ impl CommandManager {
         answer_408: Option<PathBuf>,
         answer_413: Option<PathBuf>,
         answer_421: Option<PathBuf>,
+        answer_429: Option<PathBuf>,
         answer_502: Option<PathBuf>,
         answer_503: Option<PathBuf>,
         answer_504: Option<PathBuf>,
@@ -856,8 +863,8 @@ impl CommandManager {
         };
 
         let http_answers = build_http_answers(
-            answer_301, answer_401, answer_404, answer_408, answer_413, answer_421, answer_502,
-            answer_503, answer_504, answer_507,
+            answer_301, answer_401, answer_404, answer_408, answer_413, answer_421, answer_429,
+            answer_502, answer_503, answer_504, answer_507,
         )?;
 
         let patch = UpdateHttpsListenerConfig {
@@ -1103,6 +1110,25 @@ impl CommandManager {
     pub fn upgrade_worker(&mut self, worker_id: u32) -> Result<(), CtlError> {
         debug!("upgrading worker {}", worker_id);
         self.send_request(RequestType::UpgradeWorker(worker_id).into())
+    }
+
+    /// Drives `sozu connection-limit {set|remove|show}` from the CLI to
+    /// the worker via the command socket. The setter is non-sticky:
+    /// workers reset to the TOML-configured value on restart, so
+    /// operators must mirror the change in the config to make it
+    /// durable. The query path returns the live in-memory value.
+    pub fn connection_limit_command(&mut self, cmd: ConnectionLimitCmd) -> Result<(), CtlError> {
+        match cmd {
+            ConnectionLimitCmd::Set { limit } => {
+                self.send_request(RequestType::SetMaxConnectionsPerIp(limit).into())
+            }
+            ConnectionLimitCmd::Remove => {
+                self.send_request(RequestType::SetMaxConnectionsPerIp(0).into())
+            }
+            ConnectionLimitCmd::Show => self.send_request(
+                RequestType::QueryMaxConnectionsPerIp(QueryMaxConnectionsPerIp {}).into(),
+            ),
+        }
     }
 }
 
@@ -1375,6 +1401,7 @@ fn build_http_answers(
     answer_408: Option<PathBuf>,
     answer_413: Option<PathBuf>,
     answer_421: Option<PathBuf>,
+    answer_429: Option<PathBuf>,
     answer_502: Option<PathBuf>,
     answer_503: Option<PathBuf>,
     answer_504: Option<PathBuf>,
@@ -1387,6 +1414,7 @@ fn build_http_answers(
         && answer_408.is_none()
         && answer_413.is_none()
         && answer_421.is_none()
+        && answer_429.is_none()
         && answer_502.is_none()
         && answer_503.is_none()
         && answer_504.is_none()
@@ -1402,6 +1430,7 @@ fn build_http_answers(
         answer_408: read_answer_path(&answer_408)?,
         answer_413: read_answer_path(&answer_413)?,
         answer_421: read_answer_path(&answer_421)?,
+        answer_429: read_answer_path(&answer_429)?,
         answer_502: read_answer_path(&answer_502)?,
         answer_503: read_answer_path(&answer_503)?,
         answer_504: read_answer_path(&answer_504)?,

@@ -198,6 +198,19 @@ pub const DEFAULT_SEND_TLS_13_TICKETS: u64 = 4;
 /// for both logs and access logs
 pub const DEFAULT_LOG_TARGET: &str = "stdout";
 
+/// Default per-(cluster, source-IP) connection limit. `0` means unlimited.
+/// Counts are kept per `(cluster_id, source_ip)` so two clusters never
+/// share a counter even from the same IP. Per-cluster overrides on the
+/// `Cluster` message take precedence.
+pub const DEFAULT_MAX_CONNECTIONS_PER_IP: u64 = 0;
+
+/// Default `Retry-After` header value (seconds) on HTTP 429 responses
+/// emitted when a per-(cluster, source-IP) connection limit is hit. `0`
+/// omits the header — `Retry-After: 0` invites an immediate retry that
+/// defeats the limit. TCP rejections do not emit this value (no HTTP
+/// envelope), but the field is accepted for symmetry.
+pub const DEFAULT_RETRY_AFTER: u32 = 60;
+
 #[derive(Debug)]
 pub enum IncompatibilityKind {
     PublicAddress,
@@ -341,6 +354,11 @@ pub struct ListenerBuilder {
     pub answer_503: Option<String>,
     pub answer_504: Option<String>,
     pub answer_507: Option<String>,
+    /// RFC 6585 §4 — emitted when a request would have reached a backend
+    /// but the per-(cluster, source-IP) connection limit is full. Honoured
+    /// like the other deprecated `answer_NNN` fields: copies into the
+    /// listener-level `answers` map at the matching status.
+    pub answer_429: Option<String>,
     pub tls_versions: Option<Vec<TlsVersion>>,
     pub cipher_list: Option<Vec<String>>,
     pub cipher_suites: Option<Vec<String>>,
@@ -486,6 +504,7 @@ impl ListenerBuilder {
             answer_503: None,
             answer_504: None,
             answer_507: None,
+            answer_429: None,
             back_timeout: None,
             certificate_chain: None,
             certificate: None,
@@ -666,6 +685,7 @@ impl ListenerBuilder {
             answer_503: read_http_answer_file(&self.answer_503)?,
             answer_504: read_http_answer_file(&self.answer_504)?,
             answer_507: read_http_answer_file(&self.answer_507)?,
+            answer_429: read_http_answer_file(&self.answer_429)?,
         };
         Ok(Some(http_answers))
     }
@@ -701,6 +721,7 @@ impl ListenerBuilder {
         merge_legacy!("503", answer_503);
         merge_legacy!("504", answer_504);
         merge_legacy!("507", answer_507);
+        merge_legacy!("429", answer_429);
 
         if let Some(map) = &self.answers {
             let loaded = load_answers(map)?;
@@ -1474,6 +1495,19 @@ pub struct FileClusterConfig {
     /// an unauthenticated request is rejected. Treated as an opaque
     /// value (no template substitution).
     pub www_authenticate: Option<String>,
+    /// Override the global per-(cluster, source-IP) connection limit for
+    /// this cluster. `None` (field absent) inherits the global default
+    /// `max_connections_per_ip`. `Some(0)` is explicit "unlimited for
+    /// this cluster". `Some(n > 0)` overrides with the cluster-specific
+    /// limit. The source IP is taken from the parsed proxy-protocol
+    /// header when present, else `peer_addr`.
+    pub max_connections_per_ip: Option<u64>,
+    /// Override the global `Retry-After` header value (seconds) emitted
+    /// on HTTP 429 responses for this cluster. `None` inherits the global
+    /// default. `Some(0)` omits the header. TCP clusters carry this
+    /// field for shape uniformity but never emit the header (no HTTP
+    /// envelope).
+    pub retry_after: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1551,6 +1585,8 @@ impl FileClusterConfig {
                     https_redirect_port: self.https_redirect_port,
                     authorized_hashes: self.authorized_hashes.unwrap_or_default(),
                     www_authenticate: self.www_authenticate,
+                    max_connections_per_ip: self.max_connections_per_ip,
+                    retry_after: self.retry_after,
                 }))
             }
             FileClusterProtocolConfig::Http => {
@@ -1588,6 +1624,8 @@ impl FileClusterConfig {
                     https_redirect_port: self.https_redirect_port,
                     authorized_hashes: self.authorized_hashes.unwrap_or_default(),
                     www_authenticate: self.www_authenticate,
+                    max_connections_per_ip: self.max_connections_per_ip,
+                    retry_after: self.retry_after,
                 }))
             }
         }
@@ -1727,6 +1765,14 @@ pub struct HttpClusterConfig {
     pub authorized_hashes: Vec<String>,
     #[serde(default)]
     pub www_authenticate: Option<String>,
+    /// Per-cluster override of the global `max_connections_per_ip`. See
+    /// [`FileClusterConfig::max_connections_per_ip`] for semantics.
+    #[serde(default)]
+    pub max_connections_per_ip: Option<u64>,
+    /// Per-cluster override of the global `retry_after` HTTP-429 header
+    /// value (seconds). See [`FileClusterConfig::retry_after`].
+    #[serde(default)]
+    pub retry_after: Option<u32>,
 }
 
 impl HttpClusterConfig {
@@ -1745,6 +1791,8 @@ impl HttpClusterConfig {
                 https_redirect_port: self.https_redirect_port,
                 authorized_hashes: self.authorized_hashes.clone(),
                 www_authenticate: self.www_authenticate.clone(),
+                max_connections_per_ip: self.max_connections_per_ip,
+                retry_after: self.retry_after,
             })
             .into(),
         ];
@@ -1804,6 +1852,15 @@ pub struct TcpClusterConfig {
     pub authorized_hashes: Vec<String>,
     #[serde(default)]
     pub www_authenticate: Option<String>,
+    /// Per-cluster override of the global `max_connections_per_ip`. See
+    /// [`FileClusterConfig::max_connections_per_ip`] for semantics.
+    #[serde(default)]
+    pub max_connections_per_ip: Option<u64>,
+    /// Per-cluster override of the global `retry_after`. TCP listeners
+    /// never emit `Retry-After`; the field is carried for shape
+    /// uniformity with [`HttpClusterConfig`].
+    #[serde(default)]
+    pub retry_after: Option<u32>,
 }
 
 impl TcpClusterConfig {
@@ -1822,6 +1879,8 @@ impl TcpClusterConfig {
                 https_redirect_port: self.https_redirect_port,
                 authorized_hashes: self.authorized_hashes.clone(),
                 www_authenticate: self.www_authenticate.clone(),
+                max_connections_per_ip: self.max_connections_per_ip,
+                retry_after: self.retry_after,
             })
             .into(),
         ];
@@ -1902,6 +1961,22 @@ pub struct FileConfig {
     /// (the credential cap shouldn't dominate the per-frontend buffer).
     #[serde(default)]
     pub basic_auth_max_credential_bytes: Option<u64>,
+    /// Default per-(cluster, source-IP) connection limit. `None` keeps
+    /// `0` (unlimited). Each cluster may override via its own
+    /// `max_connections_per_ip`. The source IP is taken from the parsed
+    /// proxy-protocol header when present, else `peer_addr`. When the
+    /// limit is reached, HTTP requests are answered with `429 Too Many
+    /// Requests` (with optional `Retry-After`) and TCP sessions are
+    /// closed gracefully without dialing the backend.
+    #[serde(default)]
+    pub max_connections_per_ip: Option<u64>,
+    /// Default `Retry-After` header value (seconds) sent on HTTP 429
+    /// responses. `Some(0)` or `None` keeping the default `0` omits the
+    /// header (rendering `Retry-After: 0` invites an immediate retry that
+    /// defeats the limit). Per-cluster overrides apply for HTTP listeners
+    /// only. TCP listeners ignore this value (no HTTP envelope).
+    #[serde(default)]
+    pub retry_after: Option<u32>,
     /// Optional UID allowlist for command-socket requests. `None` (default)
     /// preserves historical behaviour: any same-UID local process can
     /// invoke any verb. When set, requests whose `SO_PEERCRED` UID is not
@@ -2103,6 +2178,10 @@ impl ConfigBuilder {
             }),
             command_allowed_uids: file_config.command_allowed_uids.clone(),
             basic_auth_max_credential_bytes: file_config.basic_auth_max_credential_bytes,
+            max_connections_per_ip: file_config
+                .max_connections_per_ip
+                .unwrap_or(DEFAULT_MAX_CONNECTIONS_PER_IP),
+            retry_after: file_config.retry_after.unwrap_or(DEFAULT_RETRY_AFTER),
             ..Default::default()
         };
 
@@ -2435,6 +2514,16 @@ pub struct Config {
     /// [`ServerConfig::basic_auth_max_credential_bytes`].
     #[serde(default)]
     pub basic_auth_max_credential_bytes: Option<u64>,
+    /// Default per-(cluster, source-IP) connection limit. `0` means
+    /// unlimited. Each cluster may override via its own
+    /// `max_connections_per_ip`. Source IP attribution honours the
+    /// proxy-protocol header when present.
+    #[serde(default = "default_max_connections_per_ip")]
+    pub max_connections_per_ip: u64,
+    /// Default `Retry-After` header value (seconds) emitted on HTTP 429
+    /// responses. `0` omits the header.
+    #[serde(default = "default_retry_after")]
+    pub retry_after: u32,
 }
 
 fn default_front_timeout() -> u32 {
@@ -2471,6 +2560,14 @@ fn default_disable_cluster_metrics() -> bool {
 
 fn default_worker_timeout() -> u32 {
     DEFAULT_WORKER_TIMEOUT
+}
+
+fn default_max_connections_per_ip() -> u64 {
+    DEFAULT_MAX_CONNECTIONS_PER_IP
+}
+
+fn default_retry_after() -> u32 {
+    DEFAULT_RETRY_AFTER
 }
 
 impl Config {
@@ -2820,6 +2917,8 @@ impl From<&Config> for ServerConfig {
             slab_entries_per_connection: config.slab_entries_per_connection,
             basic_auth_max_credential_bytes: config.basic_auth_max_credential_bytes,
             evict_on_queue_full: Some(config.evict_on_queue_full),
+            max_connections_per_ip: Some(config.max_connections_per_ip),
+            retry_after: Some(config.retry_after),
         }
     }
 }

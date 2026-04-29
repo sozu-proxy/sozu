@@ -116,6 +116,8 @@ pub fn format_request_type(request_type: &RequestType) -> &str {
         RequestType::UpdateHttpListener(_) => "UpdateHttpListener",
         RequestType::UpdateHttpsListener(_) => "UpdateHttpsListener",
         RequestType::UpdateTcpListener(_) => "UpdateTcpListener",
+        RequestType::SetMaxConnectionsPerIp(_) => "SetMaxConnectionsPerIp",
+        RequestType::QueryMaxConnectionsPerIp(_) => "QueryMaxConnectionsPerIp",
     }
 }
 
@@ -193,6 +195,17 @@ impl ResponseContent {
             }
             ContentType::Clusters(_) | ContentType::ClusterHashes(_) => Ok(()), // not displayed directly, see print_cluster_responses
             ContentType::CertificatesByAddress(certs) => print_certificates_by_address(certs),
+            ContentType::MaxConnectionsPerIpLimit(limit_info) => {
+                if limit_info.limit == 0 {
+                    println!("Max connections per (cluster, source-IP): unlimited (0)");
+                } else {
+                    println!(
+                        "Max connections per (cluster, source-IP): {}",
+                        limit_info.limit
+                    );
+                }
+                Ok(())
+            }
             ContentType::Event(_event) => Ok(()), // not event displayed yet!
         }
     }
