@@ -4,8 +4,22 @@
 //! per-stream kawa buffers, then flip the appropriate readiness bits so the
 //! response is flushed on the next writable pass.
 
+use sozu_command::logging::ansi_palette;
+
 use super::{GenericHttpStream, H2Error, Readiness, Stream, StreamState};
 use crate::protocol::http::{DefaultAnswer, answers::HttpAnswers};
+
+/// Module-level prefix used on every log line emitted from the mux
+/// answers helpers. The standalone helpers run before any per-stream
+/// scope is in hand (or after it has been torn down), so a single
+/// `MUX-ANSWERS` label is used, coloured bold bright-white (uniform
+/// across every protocol) when the logger supports ANSI.
+macro_rules! log_module_context {
+    () => {{
+        let (open, reset, _, _, _) = ansi_palette();
+        format!("{open}MUX-ANSWERS{reset}\t >>>", open = open, reset = reset)
+    }};
+}
 
 /// Terminate a default answer with optional `Connection: close` and `Cache-Control` headers.
 ///
@@ -247,8 +261,44 @@ pub(crate) fn set_default_answer_with_retry_after(
     let cluster_id = context.cluster_id.as_deref();
     let backend_id = context.backend_id.as_deref();
 
-    let (resolved_status, keep_alive, rendered) =
-        answers.get(answer, request_id, cluster_id, backend_id, route);
+    // ── Frontend-scoped 301 template override ──
+    //
+    // A `Frontend` with `redirect = permanent` may carry its own
+    // `redirect_template` body that overrides the persistent
+    // listener / cluster `http.301.redirection` template for this one
+    // request. Compile on demand via
+    // `HttpAnswers::render_inline_301`; on any compile failure (operator
+    // config bug surfacing late) fall through to the regular
+    // `answers.get` path so the request still completes with the
+    // listener default — a rendered fallback is always preferable to a
+    // hung response or 503.
+    let inline_override = if code == 301 {
+        context
+            .frontend_redirect_template
+            .as_deref()
+            .and_then(|template_str| {
+                let result = HttpAnswers::render_inline_301(
+                    template_str,
+                    context.redirect_location.clone(),
+                    context.id.to_string(),
+                    context.get_route(),
+                );
+                if result.is_none() {
+                    error!(
+                        "{} frontend redirect_template failed to compile, falling back to default 301 template",
+                        log_module_context!()
+                    );
+                    incr!("http.301.redirect_template.compile_error");
+                }
+                result
+            })
+    } else {
+        None
+    };
+
+    let (resolved_status, keep_alive, rendered) = inline_override.unwrap_or_else(|| {
+        answers.get(answer, request_id, cluster_id, backend_id, route)
+    });
     // Honour the rendered template's `Connection` header. Most error
     // templates carry `Connection: close`, which flips the frontend
     // keep-alive bit to false; cluster operators can opt back into
@@ -334,6 +384,7 @@ mod tests {
             original_authority: None,
             headers_response: Vec::new(),
             retry_after_seconds: None,
+            frontend_redirect_template: None,
         };
         let stream =
             Stream::new(Rc::downgrade(&pool), http_ctx, 65_535).expect("pool checkout failed");

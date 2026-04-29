@@ -7457,6 +7457,7 @@ mod tests {
             original_authority: None,
             headers_response: Vec::new(),
             retry_after_seconds: None,
+            frontend_redirect_template: None,
         };
         Stream::new(Rc::downgrade(pool), http_ctx, 65_535)
             .expect("pool should have capacity for two buffers")
