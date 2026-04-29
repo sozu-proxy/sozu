@@ -112,7 +112,26 @@ message Request {
     // query the current global per-(cluster, source-IP) connection
     // limit. Workers reply with `MaxConnectionsPerIpLimit`.
     QueryMaxConnectionsPerIp query_max_connections_per_ip = 51;
+    // set or update the health check configuration for a cluster.
+    // Renumbered from PR #1191's original `47` to avoid collision with
+    // post-1209 `update_http_listener`.
+    SetHealthCheck set_health_check = 52;
+    // remove the health check configuration from a cluster.
+    // Renumbered from PR #1191's original `48`.
+    string remove_health_check = 53;
+    // list health check configurations (optional cluster id filter).
+    // Renumbered from PR #1191's original `49`.
+    QueryHealthChecks query_health_checks = 54;
   }
+}
+
+message QueryHealthChecks {
+    optional string cluster_id = 1;
+}
+
+message SetHealthCheck {
+    required string cluster_id = 1;
+    required HealthCheckConfig config = 2;
 }
 
 message ListWorkers {}
@@ -876,6 +895,19 @@ message Cluster {
     // (seconds, HTTP 429 only). `None` inherits the global default.
     // `Some(0)` omits the header.
     optional uint32 retry_after = 14;
+    // Optional HTTP health check configuration for backends in this cluster.
+    // Renumbered from PR #1191's original `8` to avoid collision with
+    // `http2` (post-1209 backend H2-capability hint).
+    optional HealthCheckConfig health_check = 15;
+}
+
+message HealthCheckConfig {
+    required string uri = 1;
+    required uint32 interval = 2 [default = 10];
+    required uint32 timeout = 3 [default = 5];
+    required uint32 healthy_threshold = 4 [default = 3];
+    required uint32 unhealthy_threshold = 5 [default = 3];
+    required uint32 expected_status = 6 [default = 0];
 }
 
 enum LoadBalancingAlgorithms {
@@ -997,7 +1029,14 @@ message ResponseContent {
         RequestCounts request_counts = 13;
         // current global per-(cluster, source-IP) connection limit
         MaxConnectionsPerIpLimit max_connections_per_ip_limit = 14;
+        // health check configurations by cluster (renumbered from PR #1191's
+        // original `14` since post-1209 occupies that tag).
+        HealthChecksList health_checks_list = 15;
     }
+}
+
+message HealthChecksList {
+    map<string, HealthCheckConfig> map = 1;
 }
 
 // a map of worker_id -> ResponseContent
@@ -1086,6 +1125,13 @@ enum EventKind {
     // A client subscribed to the SubscribeEvents bus — privileged because
     // subscribers observe every control-plane mutation.
     EVENTS_SUBSCRIBED = 26;
+    // Backend health-check transitioned to healthy after consecutive successes.
+    // Renumbered from PR #1191's original `4` to avoid collision with
+    // `CLUSTER_ADDED` from the post-1209 audit-trail enum.
+    HEALTH_CHECK_HEALTHY = 27;
+    // Backend health-check transitioned to unhealthy after consecutive failures.
+    // Renumbered from PR #1191's original `5` for the same reason as above.
+    HEALTH_CHECK_UNHEALTHY = 28;
 }
 
 message ClusterHashes {

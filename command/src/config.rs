@@ -63,12 +63,12 @@ use crate::{
     logging::AccessLogFormat,
     proto::command::{
         ActivateListener, AddBackend, AddCertificate, CertificateAndKey, Cluster,
-        CustomHttpAnswers, Header, HeaderPosition, HttpListenerConfig, HttpsListenerConfig,
-        ListenerType, LoadBalancingAlgorithms, LoadBalancingParams, LoadMetric, MetricDetail,
-        MetricsConfiguration, PathRule, ProtobufAccessLogFormat, ProxyProtocolConfig,
-        RedirectPolicy, RedirectScheme, Request, RequestHttpFrontend, RequestTcpFrontend,
-        RulePosition, ServerConfig, ServerMetricsConfig, SocketAddress, TcpListenerConfig,
-        TlsVersion, WorkerRequest, request::RequestType,
+        CustomHttpAnswers, Header, HeaderPosition, HealthCheckConfig, HttpListenerConfig,
+        HttpsListenerConfig, ListenerType, LoadBalancingAlgorithms, LoadBalancingParams,
+        LoadMetric, MetricDetail, MetricsConfiguration, PathRule, ProtobufAccessLogFormat,
+        ProxyProtocolConfig, RedirectPolicy, RedirectScheme, Request, RequestHttpFrontend,
+        RequestTcpFrontend, RulePosition, ServerConfig, ServerMetricsConfig, SocketAddress,
+        TcpListenerConfig, TlsVersion, WorkerRequest, request::RequestType,
     },
 };
 
@@ -1478,6 +1478,45 @@ pub enum FileClusterProtocolConfig {
     Tcp,
 }
 
+fn default_health_check_interval() -> u32 {
+    10
+}
+fn default_health_check_timeout() -> u32 {
+    5
+}
+fn default_health_check_threshold() -> u32 {
+    3
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileHealthCheckConfig {
+    pub uri: String,
+    #[serde(default = "default_health_check_interval")]
+    pub interval: u32,
+    #[serde(default = "default_health_check_timeout")]
+    pub timeout: u32,
+    #[serde(default = "default_health_check_threshold")]
+    pub healthy_threshold: u32,
+    #[serde(default = "default_health_check_threshold")]
+    pub unhealthy_threshold: u32,
+    #[serde(default)]
+    pub expected_status: u32,
+}
+
+impl FileHealthCheckConfig {
+    pub fn to_proto(&self) -> HealthCheckConfig {
+        HealthCheckConfig {
+            uri: self.uri.to_owned(),
+            interval: self.interval,
+            timeout: self.timeout,
+            healthy_threshold: self.healthy_threshold,
+            unhealthy_threshold: self.unhealthy_threshold,
+            expected_status: self.expected_status,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileClusterConfig {
@@ -1534,6 +1573,11 @@ pub struct FileClusterConfig {
     /// field for shape uniformity but never emit the header (no HTTP
     /// envelope).
     pub retry_after: Option<u32>,
+    /// Optional HTTP health-check configuration (see `[clusters.<id>.health_check]`).
+    /// Only HTTP/1.1 probes are sent today; backends with `http2 = true` may
+    /// fail probes — see `doc/health_checks.md`.
+    #[serde(default)]
+    pub health_check: Option<FileHealthCheckConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1613,6 +1657,7 @@ impl FileClusterConfig {
                     www_authenticate: self.www_authenticate,
                     max_connections_per_ip: self.max_connections_per_ip,
                     retry_after: self.retry_after,
+                    health_check: self.health_check.as_ref().map(|hc| hc.to_proto()),
                 }))
             }
             FileClusterProtocolConfig::Http => {
@@ -1652,6 +1697,7 @@ impl FileClusterConfig {
                     www_authenticate: self.www_authenticate,
                     max_connections_per_ip: self.max_connections_per_ip,
                     retry_after: self.retry_after,
+                    health_check: self.health_check.as_ref().map(|hc| hc.to_proto()),
                 }))
             }
         }
@@ -1799,6 +1845,9 @@ pub struct HttpClusterConfig {
     /// value (seconds). See [`FileClusterConfig::retry_after`].
     #[serde(default)]
     pub retry_after: Option<u32>,
+    /// Optional HTTP health-check configuration. HTTP/1.1 probes only.
+    #[serde(default)]
+    pub health_check: Option<HealthCheckConfig>,
 }
 
 impl HttpClusterConfig {
@@ -1819,6 +1868,7 @@ impl HttpClusterConfig {
                 www_authenticate: self.www_authenticate.clone(),
                 max_connections_per_ip: self.max_connections_per_ip,
                 retry_after: self.retry_after,
+                health_check: self.health_check.clone(),
             })
             .into(),
         ];
@@ -1887,6 +1937,11 @@ pub struct TcpClusterConfig {
     /// uniformity with [`HttpClusterConfig`].
     #[serde(default)]
     pub retry_after: Option<u32>,
+    /// Optional HTTP health-check configuration. TCP clusters carry this
+    /// field for shape uniformity with [`HttpClusterConfig`]; probes are
+    /// HTTP/1.1 only and TCP-only backends should leave this absent.
+    #[serde(default)]
+    pub health_check: Option<HealthCheckConfig>,
 }
 
 impl TcpClusterConfig {
@@ -1907,6 +1962,7 @@ impl TcpClusterConfig {
                 www_authenticate: self.www_authenticate.clone(),
                 max_connections_per_ip: self.max_connections_per_ip,
                 retry_after: self.retry_after,
+                health_check: self.health_check.clone(),
             })
             .into(),
         ];

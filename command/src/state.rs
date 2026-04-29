@@ -19,12 +19,12 @@ use crate::{
         command::{
             ActivateListener, AddBackend, AddCertificate, CertificateAndKey, Cluster,
             ClusterInformation, CustomHttpAnswers, DeactivateListener, FrontendFilters,
-            HttpListenerConfig, HttpsListenerConfig, InitialState, ListedFrontends, ListenerType,
-            ListenersList, PathRule, QueryCertificatesFilters, RemoveBackend, RemoveCertificate,
-            RemoveListener, ReplaceCertificate, Request, RequestCounts, RequestHttpFrontend,
-            RequestTcpFrontend, SocketAddress, TcpListenerConfig, UpdateHttpListenerConfig,
-            UpdateHttpsListenerConfig, UpdateTcpListenerConfig, WorkerRequest,
-            request::RequestType,
+            HealthChecksList, HttpListenerConfig, HttpsListenerConfig, InitialState,
+            ListedFrontends, ListenerType, ListenersList, PathRule, QueryCertificatesFilters,
+            RemoveBackend, RemoveCertificate, RemoveListener, ReplaceCertificate, Request,
+            RequestCounts, RequestHttpFrontend, RequestTcpFrontend, SetHealthCheck, SocketAddress,
+            TcpListenerConfig, UpdateHttpListenerConfig, UpdateHttpsListenerConfig,
+            UpdateTcpListenerConfig, WorkerRequest, request::RequestType,
         },
         display::format_request_type,
     },
@@ -132,6 +132,8 @@ impl ConfigState {
             RequestType::UpdateHttpListener(patch) => self.update_http_listener(patch),
             RequestType::UpdateHttpsListener(patch) => self.update_https_listener(patch),
             RequestType::UpdateTcpListener(patch) => self.update_tcp_listener(patch),
+            RequestType::SetHealthCheck(set) => self.set_health_check(set),
+            RequestType::RemoveHealthCheck(cluster_id) => self.remove_health_check(cluster_id),
 
             // This is to avoid the error message. These request types are
             // worker-only / runtime-only and do not affect the persisted
@@ -189,6 +191,47 @@ impl ConfigState {
                 id: cluster_id.to_owned(),
             }),
         }
+    }
+
+    fn set_health_check(&mut self, set: &SetHealthCheck) -> Result<(), StateError> {
+        match self.clusters.get_mut(&set.cluster_id) {
+            Some(cluster) => {
+                cluster.health_check = Some(set.config.to_owned());
+                Ok(())
+            }
+            None => Err(StateError::NotFound {
+                kind: ObjectKind::Cluster,
+                id: set.cluster_id.to_owned(),
+            }),
+        }
+    }
+
+    fn remove_health_check(&mut self, cluster_id: &str) -> Result<(), StateError> {
+        match self.clusters.get_mut(cluster_id) {
+            Some(cluster) => {
+                cluster.health_check = None;
+                Ok(())
+            }
+            None => Err(StateError::NotFound {
+                kind: ObjectKind::Cluster,
+                id: cluster_id.to_owned(),
+            }),
+        }
+    }
+
+    pub fn list_health_checks(&self, cluster_id: Option<&str>) -> HealthChecksList {
+        let map = self
+            .clusters
+            .iter()
+            .filter(|(id, _)| cluster_id.is_none_or(|filter| filter == id.as_str()))
+            .filter_map(|(id, cluster)| {
+                cluster
+                    .health_check
+                    .as_ref()
+                    .map(|hc| (id.to_owned(), hc.to_owned()))
+            })
+            .collect();
+        HealthChecksList { map }
     }
 
     fn add_http_listener(&mut self, listener: &HttpListenerConfig) -> Result<(), StateError> {
