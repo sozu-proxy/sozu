@@ -317,8 +317,7 @@ impl SessionManager {
             return;
         };
         for (cluster_id, ips) in by_cluster {
-            let Entry::Occupied(mut outer) =
-                self.connections_per_cluster_ip.entry(cluster_id)
+            let Entry::Occupied(mut outer) = self.connections_per_cluster_ip.entry(cluster_id)
             else {
                 continue;
             };

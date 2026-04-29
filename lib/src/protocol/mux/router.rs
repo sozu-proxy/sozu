@@ -1035,9 +1035,7 @@ fn build_redirect_location(
     let authority = host_override
         .or(context.authority.as_deref())
         .unwrap_or_default();
-    let path = path_override
-        .or(context.path.as_deref())
-        .unwrap_or("/");
+    let path = path_override.or(context.path.as_deref()).unwrap_or("/");
     // Strip an existing `:port` from the authority — operators typically
     // configure `https_redirect_port` precisely because the listener's
     // port differs from the redirect target. Bracketed IPv6 literals

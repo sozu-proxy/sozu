@@ -71,7 +71,9 @@ fn open_dangling_connection(addr: SocketAddr) -> Option<TcpStream> {
     let mut stream = TcpStream::connect(addr).ok()?;
     stream.set_nodelay(true).ok();
     // Partial request — no `\r\n\r\n` terminator, so sōzu waits.
-    stream.write_all(b"GET /idle HTTP/1.1\r\nHost: localhost\r\n").ok()?;
+    stream
+        .write_all(b"GET /idle HTTP/1.1\r\nHost: localhost\r\n")
+        .ok()?;
     Some(stream)
 }
 
@@ -91,8 +93,7 @@ fn try_evict_on_queue_full_accepts_after_eviction() -> State {
     attach_reserved_http_listener(&mut listeners, front_address);
     let state = ConfigState::new();
 
-    let mut worker =
-        Worker::start_new_worker_owned("EVICT-ACCEPTS", config, listeners, state);
+    let mut worker = Worker::start_new_worker_owned("EVICT-ACCEPTS", config, listeners, state);
 
     // Activate the listener and a single cluster + frontend + backend
     // so the worker has SOMETHING to route requests to.
@@ -222,8 +223,7 @@ fn try_evict_disabled_drops_overflow() -> State {
     attach_reserved_http_listener(&mut listeners, front_address);
     let state = ConfigState::new();
 
-    let mut worker =
-        Worker::start_new_worker_owned("EVICT-DISABLED", config, listeners, state);
+    let mut worker = Worker::start_new_worker_owned("EVICT-DISABLED", config, listeners, state);
 
     worker.send_proxy_request(Request {
         request_type: Some(RequestType::AddHttpListener(
