@@ -342,7 +342,11 @@ impl Template {
 
     /// Substitute runtime values into a pre-parsed template, eliding header
     /// lines whose value substitutes to empty when `or_elide_header` is set.
-    fn fill(&self, variables: &[Vec<u8>], variables_once: &mut [Vec<u8>]) -> DefaultAnswerStream {
+    pub(crate) fn fill(
+        &self,
+        variables: &[Vec<u8>],
+        variables_once: &mut [Vec<u8>],
+    ) -> DefaultAnswerStream {
         let mut blocks = self.kawa.blocks.clone();
         let mut body_size = self.body_size;
         for replacement in &self.body_replacements {
@@ -1085,6 +1089,46 @@ impl HttpAnswers {
     /// fall through to the listener-level template.
     pub fn remove_cluster_answers(&mut self, cluster_id: &str) {
         self.cluster_answers.remove(cluster_id);
+    }
+
+    /// Compile a frontend-supplied 301 template on the fly and render it
+    /// with the canonical `(REDIRECT_LOCATION, ROUTE, REQUEST_ID)`
+    /// variable schema, returning the same `(status, keep_alive,
+    /// rendered_stream)` triple as [`HttpAnswers::get`].
+    ///
+    /// ── Why a one-off compile path ──
+    ///
+    /// `HttpAnswers::get` resolves a template via the persistent lookup
+    /// chain (per-cluster override → listener default → fallback). A
+    /// `Frontend` may instead carry its own `redirect_template` (proto +
+    /// TOML) that should override the chain for a single
+    /// `RedirectPolicy::PERMANENT` request. Storing the compiled
+    /// template in the persistent map would require a per-frontend key
+    /// (which the map is not designed for) and would still diverge if
+    /// two frontends on the same cluster carried different templates.
+    /// Compiling on demand sidesteps both issues at the cost of one
+    /// `Template::new` per redirected request — measurable but bounded
+    /// by Frontend cardinality, since templates that compile cleanly
+    /// today will compile cleanly tomorrow.
+    ///
+    /// Returns `None` when compilation fails. Callers MUST fall back to
+    /// the regular `HttpAnswers::get` path so a late-discovered config
+    /// bug never blocks the request — the rendered listener default is
+    /// always preferable to a 503 / hung response.
+    pub fn render_inline_301(
+        answer_str: &str,
+        location: Option<String>,
+        request_id: String,
+        route: String,
+    ) -> Option<(u16, bool, DefaultAnswerStream)> {
+        let template = Self::template("301", answer_str).ok()?;
+        // Variable order must match the `DefaultAnswer::Answer301` arm of
+        // `HttpAnswers::get`: `(ROUTE, REQUEST_ID)` are persistent
+        // `Variable` slots, `REDIRECT_LOCATION` is the once slot.
+        let variables: Vec<Vec<u8>> = vec![route.into(), request_id.into()];
+        let mut variables_once: Vec<Vec<u8>> = vec![location.unwrap_or_default().into()];
+        let stream = template.fill(&variables, &mut variables_once);
+        Some((template.status, template.keep_alive, stream))
     }
 
     /// Lookup + render. Returns the resolved status, the template's
