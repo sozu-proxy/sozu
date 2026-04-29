@@ -185,13 +185,28 @@ pub struct SessionManager {
     /// `Router::connect` resolves to a fresh `(cluster, ip)` pair, and
     /// decremented when the session closes. Empty when the feature is
     /// unused.
-    connections_per_cluster_ip: HashMap<(String, IpAddr), usize>,
-    /// Reverse index: per-token set of `(cluster, ip)` pairs already
-    /// counted against `connections_per_cluster_ip`. Used to make
-    /// `track_cluster_ip` idempotent within a session (so H2 streams
-    /// to the same cluster from the same client only consume one slot
-    /// in the limit) and to drain a session's contributions on close.
-    cluster_ip_tracks: HashMap<Token, HashSet<(String, IpAddr)>>,
+    ///
+    /// ── Why nested maps instead of `HashMap<(String, IpAddr), usize>` ──
+    ///
+    /// The per-request hot path (`cluster_ip_at_limit`, called from
+    /// `mux/router::connect` for every cluster-resolving request) used
+    /// to allocate a `String` to build the compound key on every
+    /// lookup. Splitting the storage so the outer key is `String`
+    /// lets the lookup take `&str` — `HashMap::get(cluster_id)` on a
+    /// `HashMap<String, _>` accepts a borrow via the `Borrow<str>`
+    /// impl. The hot path no longer allocates; the only `String` clone
+    /// is in `track_cluster_ip`, which runs at most once per
+    /// `(cluster, ip)` pair per session. Memory footprint is unchanged
+    /// in steady state — entries are still reaped to zero on session
+    /// close.
+    connections_per_cluster_ip: HashMap<String, HashMap<IpAddr, usize>>,
+    /// Reverse index: per-token map of `cluster_id` → set of source IPs
+    /// already counted against `connections_per_cluster_ip`. Used to
+    /// make `track_cluster_ip` idempotent within a session (so H2
+    /// streams to the same cluster from the same client only consume
+    /// one slot in the limit) and to drain a session's contributions on
+    /// close. Same nesting rationale as above.
+    cluster_ip_tracks: HashMap<Token, HashMap<String, HashSet<IpAddr>>>,
 }
 
 impl SessionManager {
@@ -234,6 +249,11 @@ impl SessionManager {
     /// `(cluster, ip)` is NEVER at the limit — H2 sessions multiplex
     /// many streams to the same cluster on a single connection, and
     /// the limit governs distinct frontend connections, not streams.
+    ///
+    /// Hot-path: called for every cluster-resolving request from
+    /// `mux/router::connect`. The nested-map storage lets both lookups
+    /// borrow `cluster_id` and `ip`; no per-call allocation runs here
+    /// in steady state.
     pub fn cluster_ip_at_limit(
         &self,
         token: Token,
@@ -245,16 +265,17 @@ impl SessionManager {
         if limit == 0 {
             return false;
         }
-        let key = (cluster_id.to_owned(), *ip);
         if self
             .cluster_ip_tracks
             .get(&token)
-            .is_some_and(|s| s.contains(&key))
+            .and_then(|by_cluster| by_cluster.get(cluster_id))
+            .is_some_and(|ips| ips.contains(ip))
         {
             return false;
         }
         self.connections_per_cluster_ip
-            .get(&key)
+            .get(cluster_id)
+            .and_then(|by_ip| by_ip.get(ip))
             .is_some_and(|c| (*c as u64) >= limit)
     }
 
@@ -262,33 +283,56 @@ impl SessionManager {
     /// Idempotent within a token: a second call for the same
     /// `(cluster, ip)` is a no-op so H2 retries / multi-stream opens
     /// to the same cluster do not double-count.
+    ///
+    /// Allocates a single owned `String` per `(token, cluster)` pair on
+    /// first observation — `entry(cluster_id.clone())` materialises a
+    /// new outer-map slot. Subsequent IPs under the same `(token,
+    /// cluster)` reuse the existing slot.
     pub fn track_cluster_ip(&mut self, token: Token, cluster_id: String, ip: IpAddr) {
-        let key = (cluster_id, ip);
         let inserted = self
             .cluster_ip_tracks
             .entry(token)
             .or_default()
-            .insert(key.clone());
+            .entry(cluster_id.clone())
+            .or_default()
+            .insert(ip);
         if inserted {
-            *self.connections_per_cluster_ip.entry(key).or_insert(0) += 1;
+            *self
+                .connections_per_cluster_ip
+                .entry(cluster_id)
+                .or_default()
+                .entry(ip)
+                .or_insert(0) += 1;
         }
     }
 
     /// Drain every `(cluster, ip)` slot held by `token` and apply the
     /// matching decrements. Called on session teardown only — there is
     /// no per-stream untrack because the limit is per-connection, not
-    /// per-stream.
+    /// per-stream. Removes empty inner maps so the outer
+    /// `connections_per_cluster_ip` does not retain `(cluster_id,
+    /// empty_map)` orphans across cluster lifetimes.
     pub fn untrack_all_cluster_ip(&mut self, token: Token) {
-        let Some(entries) = self.cluster_ip_tracks.remove(&token) else {
+        let Some(by_cluster) = self.cluster_ip_tracks.remove(&token) else {
             return;
         };
-        for key in entries {
-            if let Entry::Occupied(mut entry) = self.connections_per_cluster_ip.entry(key) {
-                let count = entry.get_mut();
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    entry.remove();
+        for (cluster_id, ips) in by_cluster {
+            let Entry::Occupied(mut outer) =
+                self.connections_per_cluster_ip.entry(cluster_id)
+            else {
+                continue;
+            };
+            for ip in ips {
+                if let Entry::Occupied(mut inner) = outer.get_mut().entry(ip) {
+                    let count = inner.get_mut();
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        inner.remove();
+                    }
                 }
+            }
+            if outer.get().is_empty() {
+                outer.remove();
             }
         }
     }
