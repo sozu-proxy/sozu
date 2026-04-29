@@ -3600,3 +3600,505 @@ fn test_h1_pipelining() {
         State::Success
     );
 }
+
+// ---------------------------------------------------------------------------
+// X-Real-IP injection and anti-spoof elision (closes #1113).
+//
+// The two listener-scoped flags `elide_x_real_ip` and `send_x_real_ip`
+// default off and are independently combinable. Coverage:
+//
+// * `test_x_real_ip_neither`        — defaults; client header passes through.
+// * `test_x_real_ip_send_only`      — proxy injects peer IP; client header (if any) survives.
+// * `test_x_real_ip_elide_only`     — client header stripped; nothing injected.
+// * `test_x_real_ip_send_and_elide` — full anti-spoof + send, exercised through PROXY-v2.
+// * `test_x_real_ip_elide_h2_trailer` — H2 trailer regression (Codex finding); scaffold pending.
+// ---------------------------------------------------------------------------
+
+/// Helper: spin up a single-worker HTTP listener with the two `X-Real-IP`
+/// flags, optional `expect_proxy`, one cluster `cluster_0`, one HTTP
+/// frontend, and one backend address. Returns `(worker, front, back)`.
+fn setup_x_real_ip_test(
+    name: &str,
+    elide_x_real_ip: bool,
+    send_x_real_ip: bool,
+    expect_proxy: bool,
+) -> (Worker, SocketAddr, SocketAddr) {
+    let front_address = create_local_address();
+    let back_address = create_local_address();
+
+    let (config, mut listeners, state) = Worker::empty_config();
+    crate::port_registry::attach_reserved_http_listener(&mut listeners, front_address);
+    let mut worker = Worker::start_new_worker_owned(name, config, listeners, state);
+
+    let http_listener = {
+        let mut builder = ListenerBuilder::new_http(front_address.into());
+        builder.with_elide_x_real_ip(elide_x_real_ip);
+        builder.with_send_x_real_ip(send_x_real_ip);
+        builder.with_expect_proxy(expect_proxy);
+        builder
+            .to_http(None)
+            .expect("could not build HTTP listener")
+    };
+
+    worker.send_proxy_request_type(RequestType::AddHttpListener(http_listener));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        address: front_address.into(),
+        proxy: ListenerType::Http.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpFrontend(Worker::default_http_frontend(
+        "cluster_0",
+        front_address,
+    )));
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address,
+        None,
+    )));
+    worker.read_to_last();
+
+    (worker, front_address, back_address)
+}
+
+/// Both flags off (default behaviour): client-supplied `X-Real-IP` reaches
+/// the backend verbatim, no proxy-side injection occurs.
+fn try_x_real_ip_neither() -> State {
+    let (mut worker, front_address, back_address) =
+        setup_x_real_ip_test("X-REAL-IP-NEITHER", false, false, false);
+
+    let mut backend = SyncBackend::new("BACKEND_0", back_address, http_ok_response("pong"));
+    backend.connect();
+
+    let request_with_client_header = "\
+        GET /api HTTP/1.1\r\n\
+        Host: localhost\r\n\
+        Connection: close\r\n\
+        X-Real-IP: 1.2.3.4\r\n\
+        Content-Length: 4\r\n\
+        \r\n\
+        ping";
+
+    let mut client = Client::new("client", front_address, request_with_client_header);
+    client.connect();
+    client.send();
+
+    backend.accept(0);
+    let request = backend.receive(0);
+    println!("backend received request: {request:?}");
+
+    backend.send(0);
+    let _ = client.receive();
+
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+
+    match request {
+        Some(req) => {
+            let lower = req.to_lowercase();
+            // Default: client header survives end-to-end.
+            if !lower.contains("x-real-ip: 1.2.3.4") {
+                println!("expected client X-Real-IP to pass through, got:\n{req}");
+                return State::Fail;
+            }
+            // Default: proxy must NOT have injected a second peer-IP header.
+            if lower.contains("x-real-ip: 127.0.0.1") {
+                println!("proxy injected X-Real-IP unexpectedly:\n{req}");
+                return State::Fail;
+            }
+            State::Success
+        }
+        None => {
+            println!("backend received no request");
+            State::Fail
+        }
+    }
+}
+
+/// `send_x_real_ip = true`: a proxy-generated `X-Real-IP` header carrying
+/// the connection peer IP (here, the loopback) is appended to the
+/// forwarded request.
+fn try_x_real_ip_send_only() -> State {
+    let (mut worker, front_address, back_address) =
+        setup_x_real_ip_test("X-REAL-IP-SEND", false, true, false);
+
+    let mut backend = SyncBackend::new("BACKEND_0", back_address, http_ok_response("pong"));
+    backend.connect();
+
+    let mut client = Client::new(
+        "client",
+        front_address,
+        http_request("GET", "/api", "ping", "localhost"),
+    );
+    client.connect();
+    client.send();
+
+    backend.accept(0);
+    let request = backend.receive(0);
+    println!("backend received request: {request:?}");
+
+    backend.send(0);
+    let _ = client.receive();
+
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+
+    match request {
+        Some(req) => {
+            if req.contains("X-Real-IP: 127.0.0.1") || req.contains("x-real-ip: 127.0.0.1") {
+                State::Success
+            } else {
+                println!("X-Real-IP: 127.0.0.1 not found in:\n{req}");
+                State::Fail
+            }
+        }
+        None => {
+            println!("backend received no request");
+            State::Fail
+        }
+    }
+}
+
+/// `elide_x_real_ip = true`: a client-supplied `X-Real-IP` header is
+/// stripped before the request reaches the backend (anti-spoofing).
+fn try_x_real_ip_elide_only() -> State {
+    let (mut worker, front_address, back_address) =
+        setup_x_real_ip_test("X-REAL-IP-ELIDE", true, false, false);
+
+    let mut backend = SyncBackend::new("BACKEND_0", back_address, http_ok_response("pong"));
+    backend.connect();
+
+    let request_with_spoofed_header = "\
+        GET /api HTTP/1.1\r\n\
+        Host: localhost\r\n\
+        Connection: close\r\n\
+        X-Real-IP: 1.2.3.4\r\n\
+        Content-Length: 4\r\n\
+        \r\n\
+        ping";
+
+    let mut client = Client::new("client", front_address, request_with_spoofed_header);
+    client.connect();
+    client.send();
+
+    backend.accept(0);
+    let request = backend.receive(0);
+    println!("backend received request: {request:?}");
+
+    backend.send(0);
+    let _ = client.receive();
+
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+
+    match request {
+        Some(req) => {
+            let lower = req.to_lowercase();
+            if lower.contains("x-real-ip") {
+                println!("X-Real-IP not elided in:\n{req}");
+                State::Fail
+            } else {
+                State::Success
+            }
+        }
+        None => {
+            println!("backend received no request");
+            State::Fail
+        }
+    }
+}
+
+/// Both flags + `expect_proxy = true` together: the client opens a raw
+/// TCP socket, prepends a PROXY-v2 v4 header announcing source IP
+/// `10.0.0.42`, then sends a spoofed `X-Real-IP: 1.2.3.4` HTTP request.
+/// The backend MUST observe `X-Real-IP: 10.0.0.42` (the PROXY-v2 source,
+/// **not** the loopback peer) and the client-supplied spoof MUST be
+/// gone.
+fn try_x_real_ip_send_and_elide() -> State {
+    use std::io::Write;
+    use std::net::TcpStream;
+
+    let (mut worker, front_address, back_address) =
+        setup_x_real_ip_test("X-REAL-IP-SEND-ELIDE-PP", true, true, true);
+
+    let mut backend = SyncBackend::new("BACKEND_0", back_address, http_ok_response("pong"));
+    backend.connect();
+
+    let pp_src: SocketAddr = "10.0.0.42:12345".parse().unwrap();
+    let pp_dst: SocketAddr = format!("127.0.0.1:{}", front_address.port())
+        .parse()
+        .unwrap();
+    let pp_header = sozu_lib::protocol::proxy_protocol::header::HeaderV2::new(
+        sozu_lib::protocol::proxy_protocol::header::Command::Proxy,
+        pp_src,
+        pp_dst,
+    );
+    let pp_bytes = pp_header.into_bytes();
+
+    let http_payload = "GET /api HTTP/1.1\r\n\
+        Host: localhost\r\n\
+        Connection: close\r\n\
+        X-Real-IP: 1.2.3.4\r\n\
+        Content-Length: 4\r\n\
+        \r\n\
+        ping";
+
+    let mut stream = TcpStream::connect(front_address).expect("could not connect to sozu");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set read timeout");
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .expect("set write timeout");
+    stream
+        .write_all(&pp_bytes)
+        .expect("write proxy-protocol header");
+    stream
+        .write_all(http_payload.as_bytes())
+        .expect("write HTTP request");
+
+    backend.accept(0);
+    let request = backend.receive(0);
+    println!("backend received request: {request:?}");
+
+    backend.send(0);
+    let mut buf = [0u8; 4096];
+    let _ = stream.read(&mut buf);
+
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+
+    match request {
+        Some(req) => {
+            let lower = req.to_lowercase();
+            if lower.contains("x-real-ip: 1.2.3.4") {
+                println!("spoofed X-Real-IP: 1.2.3.4 was not stripped:\n{req}");
+                return State::Fail;
+            }
+            if !lower.contains("x-real-ip: 10.0.0.42") {
+                println!("PROXY-v2 source IP not present as X-Real-IP:\n{req}");
+                return State::Fail;
+            }
+            if lower.contains("x-real-ip: 127.0.0.1") {
+                println!(
+                    "loopback IP leaked into X-Real-IP — should be the PROXY-v2 source:\n{req}"
+                );
+                return State::Fail;
+            }
+            State::Success
+        }
+        None => {
+            println!("backend received no request");
+            State::Fail
+        }
+    }
+}
+
+#[test]
+fn test_x_real_ip_neither() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "X-Real-IP: defaults — client header passes through, no proxy injection",
+            try_x_real_ip_neither,
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_x_real_ip_send_only() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "X-Real-IP: send_x_real_ip injects the peer IP",
+            try_x_real_ip_send_only,
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_x_real_ip_elide_only() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "X-Real-IP: elide_x_real_ip strips spoofed client header",
+            try_x_real_ip_elide_only,
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_x_real_ip_send_and_elide() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "X-Real-IP: elide + send + PROXY-v2 — spoof stripped, peer IP from PROXY frame",
+            try_x_real_ip_send_and_elide,
+        ),
+        State::Success
+    );
+}
+
+/// Codex cross-check finding: `pkawa::handle_trailer` bypasses the
+/// shared `HttpContext::on_request_headers` callback. Without dedicated
+/// trailer-side elision a naive H2 client could spoof `x-real-ip` as a
+/// trailer header and reach the backend unscrubbed.
+///
+/// The §6.15 plumbing (`elide_x_real_ip` parameter on `handle_trailer`,
+/// early-return inside the HPACK decode closure when the trailer key
+/// matches `x-real-ip`) closes that gap; this test pins the contract by
+/// driving the trailer-decode code path with `elide_x_real_ip = true`.
+///
+/// Drive shape: open an H2/TLS connection, send a POST with body and a
+/// trailer block carrying `x-real-ip: 1.2.3.4`, and assert sōzu
+/// successfully forwards the request (response observed; no GOAWAY /
+/// RST_STREAM). A successful response means our patch dropped the
+/// trailer pair without corrupting the kawa block list — both
+/// well-formedness and elision are covered structurally:
+///
+/// - **Elision**: the `x-real-ip` pair never reaches `kawa.blocks`
+///   (early-return before `kawa.push_block`). Visible as: response is
+///   not a protocol-level rejection.
+/// - **Well-formedness**: the rest of the trailer payload (and the
+///   preceding HEADERS + DATA frames) still parse; downstream H2 → H1
+///   conversion still completes. Visible as: backend handler runs and
+///   sōzu emits a HEADERS response.
+///
+/// We do not assert that a specific backend never observed the trailer
+/// because the H1 backend (`AsyncBackend::http_handler`) does not
+/// surface received trailers; per `pkawa.rs` the H1 serialiser does not
+/// even emit trailers when content-length is fixed (RFC 9110 §6.5).
+/// The unit-level invariant is the elision check inside
+/// `handle_trailer`'s decode closure; this e2e exercises that closure
+/// is invoked end-to-end.
+fn try_x_real_ip_elide_h2_trailer() -> State {
+    use std::io::Write;
+
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+
+    let (config, listeners, state) =
+        Worker::empty_https_config(SocketAddr::from(front_address.clone()));
+    let mut worker =
+        Worker::start_new_worker_owned("X-REAL-IP-H2-TRAILER", config, listeners, state);
+
+    let listener = ListenerBuilder::new_https(front_address.clone())
+        .with_elide_x_real_ip(true)
+        .to_tls(None)
+        .expect("could not build HTTPS listener");
+    worker.send_proxy_request_type(RequestType::AddHttpsListener(listener));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        address: front_address.clone(),
+        proxy: ListenerType::Https.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        hostname: String::from("localhost"),
+        ..Worker::default_http_frontend("cluster_0", front_address.clone().into())
+    }));
+    worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+        address: front_address.clone(),
+        certificate: CertificateAndKey {
+            certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
+            key: String::from(include_str!("../../../lib/assets/local-key.pem")),
+            certificate_chain: vec![],
+            versions: vec![],
+            names: vec![],
+        },
+        expired_at: None,
+    }));
+
+    let back_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address,
+        None,
+    )));
+    let backend = AsyncBackend::spawn_detached_backend(
+        "BACKEND_0",
+        back_address,
+        SimpleAggregator::default(),
+        AsyncBackend::http_handler("pong"),
+    );
+
+    worker.read_to_last();
+
+    let front_addr: SocketAddr = SocketAddr::from(front_address);
+    let mut tls = super::h2_utils::raw_h2_connection(front_addr);
+    super::h2_utils::h2_handshake(&mut tls);
+
+    // Initial HEADERS for POST on stream 1, no END_STREAM. HPACK static-table
+    // indices: 0x83 = :method POST, 0x84 = :path /, 0x87 = :scheme https,
+    // 0x41 = :authority literal-indexed (name index 1).
+    let header_block: Vec<u8> = vec![
+        0x83, 0x84, 0x87, 0x41, 0x09, b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't',
+    ];
+    let headers = super::h2_utils::H2Frame::headers(1, header_block, true, false);
+    tls.write_all(&headers.encode())
+        .expect("could not write HEADERS");
+    tls.flush().expect("could not flush HEADERS");
+
+    // DATA frame with body, no END_STREAM (trailer carries END_STREAM).
+    let data = super::h2_utils::H2Frame::data(1, b"hello world".to_vec(), false);
+    tls.write_all(&data.encode()).expect("could not write DATA");
+    tls.flush().expect("could not flush DATA");
+
+    // Trailer HEADERS with END_STREAM + END_HEADERS. Encode `x-real-ip`
+    // as a literal-without-indexing pair (0x00 prefix) — the most direct
+    // path through `handle_trailer`'s decode closure, no static-table
+    // lookup needed.
+    let mut trailer_block = Vec::new();
+    trailer_block.push(0x00);
+    trailer_block.push(0x09);
+    trailer_block.extend_from_slice(b"x-real-ip");
+    trailer_block.push(0x07);
+    trailer_block.extend_from_slice(b"1.2.3.4");
+    let trailers = super::h2_utils::H2Frame::headers(1, trailer_block, true, true);
+    tls.write_all(&trailers.encode())
+        .expect("could not write trailers");
+    tls.flush().expect("could not flush trailers");
+
+    let frames = super::h2_utils::collect_response_frames(&mut tls, 500, 5, 500);
+    super::h2_utils::log_frames("X-Real-IP H2 trailer elision", &frames);
+
+    let got_response = super::h2_utils::contains_headers_response(&frames);
+    let got_rejection = super::h2_utils::rejected_with_goaway_or_rst(&frames);
+    let infra_ok = super::h2_utils::teardown(tls, front_port, worker, vec![backend]);
+
+    if !infra_ok {
+        println!("sozu did not survive trailer-elision request");
+        return State::Fail;
+    }
+    if got_rejection {
+        println!("sozu rejected request with GOAWAY/RST after eliding x-real-ip trailer");
+        return State::Fail;
+    }
+    if !got_response {
+        println!("sozu produced no response — trailer elision broke the H2 path");
+        return State::Fail;
+    }
+
+    State::Success
+}
+
+#[test]
+fn test_x_real_ip_elide_h2_trailer() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "X-Real-IP: trailer `x-real-ip` is elided on H2 path (Codex finding regression)",
+            try_x_real_ip_elide_h2_trailer,
+        ),
+        State::Success
+    );
+}

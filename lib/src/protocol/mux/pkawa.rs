@@ -597,12 +597,20 @@ pub fn handle_header<C>(
     end_stream: bool,
     callbacks: &mut C,
     max_header_list_size: u32,
+    elide_x_real_ip: bool,
 ) -> Result<(), (H2Error, bool)>
 where
     C: ParserCallbacks<Checkout>,
 {
     if !kawa.is_initial() {
-        return handle_trailer(kawa, input, end_stream, decoder, max_header_list_size);
+        return handle_trailer(
+            kawa,
+            input,
+            end_stream,
+            decoder,
+            max_header_list_size,
+            elide_x_real_ip,
+        );
     }
     kawa.push_block(Block::StatusLine);
     let max_decoded_bytes = max_header_list_size as usize;
@@ -991,12 +999,25 @@ where
     Ok(())
 }
 
+/// Decode an H2 trailer HEADERS frame and append the validated trailer
+/// pairs to `kawa.blocks`.
+///
+/// The shared `HttpContext::on_request_headers` callback that handles
+/// elision on **initial** HEADERS frames is **not** invoked here, so any
+/// listener-scoped header rewrites must be plumbed in explicitly. Trailer
+/// elision contract:
+///
+/// * `elide_x_real_ip = true` causes `X-Real-IP` trailers to be silently
+///   dropped (matches the initial-HEADERS branch in
+///   `HttpContext::on_request_headers`). Without this an H2 client can
+///   bypass the anti-spoof by sending `x-real-ip` as a trailer.
 pub fn handle_trailer(
     kawa: &mut GenericHttpStream,
     input: &[u8],
     end_stream: bool,
     decoder: &mut loona_hpack::Decoder<'static>,
     max_header_list_size: u32,
+    elide_x_real_ip: bool,
 ) -> Result<(), (H2Error, bool)> {
     if !end_stream {
         return Err((H2Error::ProtocolError, false));
@@ -1037,6 +1058,18 @@ pub fn handle_trailer(
         if let Some(reason) = classify_invalid_h2_header(&k, &v) {
             metric_reject(reason);
             invalid_trailers = true;
+            return;
+        }
+        // Anti-spoofing: when the listener has `elide_x_real_ip = true`
+        // the initial-HEADERS branch in `HttpContext::on_request_headers`
+        // strips client-supplied `X-Real-IP` headers. Trailer HEADERS
+        // frames bypass that callback, so without this branch a naive
+        // H2 client could sneak `x-real-ip` past the anti-spoof by
+        // sending it as a trailer. Keys are already lower-case here:
+        // RFC 9113 §8.2.2 forbids uppercase and `classify_invalid_h2_header`
+        // (above) rejects any violation, so an `eq` against the lower
+        // form is sufficient.
+        if elide_x_real_ip && k.eq_ignore_ascii_case(b"x-real-ip") {
             return;
         }
         let start = kawa.storage.end as u32;
@@ -1423,6 +1456,7 @@ mod tests {
             end_stream,
             &mut callbacks,
             crate::protocol::mux::h2::MAX_HEADER_LIST_SIZE as u32,
+            false,
         );
         assert!(result.is_ok(), "handle_header failed: {:?}", result.err());
         kawa
@@ -1639,6 +1673,7 @@ mod tests {
             end_stream,
             &mut callbacks,
             crate::protocol::mux::h2::MAX_HEADER_LIST_SIZE as u32,
+            false,
         )
     }
 
@@ -1671,6 +1706,7 @@ mod tests {
             end_stream,
             &mut callbacks,
             crate::protocol::mux::h2::MAX_HEADER_LIST_SIZE as u32,
+            false,
         )
     }
 
@@ -2003,6 +2039,7 @@ mod tests {
             true,
             &mut decoder,
             crate::protocol::mux::h2::MAX_HEADER_LIST_SIZE as u32,
+            false,
         );
         assert!(err.is_err(), "LF in trailer value must be rejected");
     }

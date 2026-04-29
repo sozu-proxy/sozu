@@ -610,6 +610,35 @@ pub trait L7ListenerHandler {
         true
     }
 
+    /// Whether to strip any client-supplied `X-Real-IP` header from
+    /// forwarded requests (anti-spoofing).
+    ///
+    /// Defaults to `false` — preserves the historical pass-through
+    /// behaviour. Operators opt in via
+    /// `HttpListenerConfig::elide_x_real_ip = true` (and the equivalent on
+    /// HTTPS listeners). Independent of [`Self::get_send_x_real_ip`]: the
+    /// two flags can be combined freely (anti-spoof only, send only, both,
+    /// or neither). The elision branch lives in
+    /// `HttpContext::on_request_headers`, so it covers H1 and H2 alike.
+    fn get_elide_x_real_ip(&self) -> bool {
+        false
+    }
+
+    /// Whether to append a proxy-generated `X-Real-IP` header carrying the
+    /// connection peer IP (post-PROXY-v2 unwrap, i.e. the original client
+    /// IP) to every forwarded request.
+    ///
+    /// Defaults to `false` — preserves the historical no-injection
+    /// behaviour. Operators opt in via
+    /// `HttpListenerConfig::send_x_real_ip = true` (and the equivalent on
+    /// HTTPS listeners). Independent of [`Self::get_elide_x_real_ip`]: the
+    /// two flags can be combined freely. The injection branch lives next
+    /// to the existing X-Forwarded-For / Forwarded synthesis in
+    /// `HttpContext::on_request_headers`.
+    fn get_send_x_real_ip(&self) -> bool {
+        false
+    }
+
     /// Per-stream idle timeout for H2 connections. An open stream that makes
     /// no forward progress for this duration is cancelled (RST_STREAM / CANCEL).
     /// Mitigates slow-multiplex Slowloris where a client keeps connection-level
