@@ -136,6 +136,27 @@ max_connections = 500
 # value (no HTTP envelope).
 # retry_after = 60
 
+# Upper bound, in bytes, on the **base64-decoded** `Authorization: Basic`
+# payload sōzu is willing to canonicalize per request. Set once at worker
+# boot from `ServerConfig::basic_auth_max_credential_bytes` and read on
+# every Basic-auth probe. The cap protects against per-request memory
+# amplification (a peer sending an oversized Basic token); raise it only
+# if your operator-supplied usernames or passwords legitimately exceed
+# the default. Setting this to `0` keeps the built-in default (4096) —
+# explicitly setting `0` does NOT disable the cap.
+# basic_auth_max_credential_bytes = 4096
+
+# Linux-only kernel-pipe capacity, in bytes, requested for the
+# `splice(2)` zero-copy fast path on TCP listeners (feature `splice`).
+# Larger pipes mean fewer syscalls under bulk-transfer load at the
+# cost of more kernel memory per active session. Realised size may
+# differ: the kernel rounds up to a page boundary and clamps at
+# `/proc/sys/fs/pipe-max-size`. Linux-only; ignored on builds without
+# the `splice` feature. Setting this to `0` keeps the built-in default
+# (65536, matching the historical pre-knob value) — explicitly setting
+# `0` does NOT collapse the pipe to PAGE_SIZE.
+# splice_pipe_capacity_bytes = 65536
+
 # maximum number of buffers in the pool used by the protocol implementations
 # for active connections (ie currently serving a request). For now, you should
 # estimate that max_buffers = number of concurrent requests * 2
