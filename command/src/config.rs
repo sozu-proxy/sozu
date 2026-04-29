@@ -2007,6 +2007,16 @@ pub struct FileConfig {
     /// only. TCP listeners ignore this value (no HTTP envelope).
     #[serde(default)]
     pub retry_after: Option<u32>,
+    /// Requested kernel-pipe capacity, in bytes, for each `splice(2)`
+    /// zero-copy direction (Linux only, `splice` feature). `None` keeps
+    /// the kernel default (64 KiB). Applied via `fcntl(F_SETPIPE_SZ)`;
+    /// the kernel rounds up to a page boundary and clamps at
+    /// `/proc/sys/fs/pipe-max-size` (default 1 MiB unprivileged). The
+    /// realised capacity is read back via `fcntl(F_GETPIPE_SZ)` and
+    /// drives the per-call `len` for `splice_in`. Ignored on non-Linux
+    /// targets and on builds without the `splice` feature.
+    #[serde(default)]
+    pub splice_pipe_capacity_bytes: Option<u64>,
     /// Optional UID allowlist for command-socket requests. `None` (default)
     /// preserves historical behaviour: any same-UID local process can
     /// invoke any verb. When set, requests whose `SO_PEERCRED` UID is not
@@ -2212,6 +2222,7 @@ impl ConfigBuilder {
                 .max_connections_per_ip
                 .unwrap_or(DEFAULT_MAX_CONNECTIONS_PER_IP),
             retry_after: file_config.retry_after.unwrap_or(DEFAULT_RETRY_AFTER),
+            splice_pipe_capacity_bytes: file_config.splice_pipe_capacity_bytes,
             ..Default::default()
         };
 
@@ -2554,6 +2565,14 @@ pub struct Config {
     /// responses. `0` omits the header.
     #[serde(default = "default_retry_after")]
     pub retry_after: u32,
+    /// Requested kernel-pipe capacity, in bytes, for each `splice(2)`
+    /// zero-copy direction. `None` keeps the kernel default of 64 KiB.
+    /// Applied via `fcntl(F_SETPIPE_SZ)` per pipe at `SplicePipe::new`;
+    /// the kernel rounds up to a page boundary and clamps at
+    /// `/proc/sys/fs/pipe-max-size`. Linux-only; ignored on builds
+    /// without the `splice` feature.
+    #[serde(default)]
+    pub splice_pipe_capacity_bytes: Option<u64>,
 }
 
 fn default_front_timeout() -> u32 {
@@ -2949,6 +2968,7 @@ impl From<&Config> for ServerConfig {
             evict_on_queue_full: Some(config.evict_on_queue_full),
             max_connections_per_ip: Some(config.max_connections_per_ip),
             retry_after: Some(config.retry_after),
+            splice_pipe_capacity_bytes: config.splice_pipe_capacity_bytes,
         }
     }
 }

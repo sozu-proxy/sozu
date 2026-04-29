@@ -1351,6 +1351,18 @@ message ServerConfig {
     // this value (no HTTP envelope), but it is still accepted in the
     // proto/config shape for symmetry.
     optional uint32 retry_after = 24 [default = 60];
+    // Requested kernel-pipe capacity, in bytes, for each `splice(2)`
+    // zero-copy direction in the `Pipe` protocol. Applied via
+    // `fcntl(F_SETPIPE_SZ)` per pipe at `SplicePipe::new`; the kernel
+    // rounds up to a page boundary and caps the value at
+    // `/proc/sys/fs/pipe-max-size` (default 1 MiB for unprivileged
+    // processes; CAP_SYS_RESOURCE goes higher). The realised capacity
+    // is read back via `fcntl(F_GETPIPE_SZ)` and used as the per-call
+    // `len` for `splice_in`. `None` keeps the kernel default of 64 KiB.
+    // Larger values amortise syscalls and reduce wakeups for bulk-
+    // transfer workloads at the cost of per-session pinned memory.
+    // Linux-only; ignored on builds without the `splice` feature.
+    optional uint64 splice_pipe_capacity_bytes = 25;
 }
 
 enum ProtobufAccessLogFormat {

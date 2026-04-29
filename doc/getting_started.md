@@ -40,7 +40,7 @@ crypto:
 |---------|----------|--------|
 | `tolerant-http1-parser` | `lib`, `bin` | Relaxes H1 parsing via `kawa/tolerant-parsing`. |
 | `simd` | `lib`, `bin` | Enables `kawa/simd` SIMD acceleration. |
-| `splice` | `lib`, `bin` | Linux-only zero-copy TCP forwarding via `splice(2)`. 64 KiB kernel-pipe per session per direction. Applies to `Protocol::TCP` listeners only. |
+| `splice` | `lib`, `bin` | Linux-only zero-copy TCP forwarding via `splice(2)`. Default 64 KiB kernel-pipe per session per direction; tunable via `splice_pipe_capacity_bytes` (clamped at `/proc/sys/fs/pipe-max-size`). Applies to `Protocol::TCP` listeners only. |
 | `opentelemetry` | `lib`, `bin` | Compiles in OpenTelemetry export. |
 | `logs-debug` | all | Compiles in `DEBUG` logs (release strips them otherwise). |
 | `logs-trace` | all | Compiles in `TRACE` logs (release strips them otherwise). |
