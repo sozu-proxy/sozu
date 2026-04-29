@@ -199,12 +199,13 @@ impl HealthChecker {
         for (cluster_id, config, backends_to_check) in to_check {
             self.last_check_time.insert(cluster_id.to_owned(), now);
 
-            // Sanitize URI: strip CR/LF to prevent HTTP request injection
-            let sanitized_uri: String = config
-                .uri
-                .chars()
-                .filter(|c| *c != '\r' && *c != '\n')
-                .collect();
+            // The URI was validated at the worker `SetHealthCheck`
+            // boundary by `sozu_command::config::validate_health_check_config`
+            // (CR/LF/NUL/C0 rejected, leading `/` enforced). The probe
+            // runtime trusts that contract — no second silent strip
+            // here, no defense-in-depth divergence between what the
+            // operator typed and what hits the wire.
+            let probe_uri = config.uri.as_str();
 
             for (backend_id, address) in backends_to_check {
                 match TcpStream::connect(address) {
@@ -254,11 +255,11 @@ impl HealthChecker {
                             cluster_id
                         );
                         let request_bytes = if config.is_h2c.unwrap_or(false) {
-                            build_h2c_probe_bytes(&sanitized_uri, address)
+                            build_h2c_probe_bytes(probe_uri, address)
                         } else {
                             format!(
                                 "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-                                sanitized_uri,
+                                probe_uri,
                                 address.ip()
                             )
                             .into_bytes()
@@ -663,9 +664,21 @@ fn try_parse_h2c_status(buf: &[u8], config: &HealthCheckConfig) -> Option<bool> 
     None
 }
 
-/// Recover the numeric `:status` from an HPACK header block. Handles
-/// the static-table indexed forms (idx 8..=14) and the
-/// literal-with-indexed-name form for name index 8.
+/// Recover the numeric `:status` from an HPACK header block. Handles:
+///
+/// * Static-table indexed forms 0x88..=0x8E (`:status` 200/204/206/
+///   304/400/404/500).
+/// * Literal-with-incremental-indexing using static-table name index
+///   8 — prefix `01000000` + 6-bit index 8 = `0x48` per RFC 7541 §6.2.1.
+/// * Literal-without-indexing and literal-never-indexed using static
+///   name index 8 — `0x08` and `0x18` respectively (4-bit prefix).
+///
+/// Other HPACK forms in the block (e.g. dynamic-table-size updates,
+/// indexed headers for other pseudo-headers) advance the cursor by
+/// one byte and the loop keeps walking. That's lossy (wrong jump on
+/// multi-byte literals) but bounded — at worst the decoder returns
+/// `None` and the probe is recorded as failed, which only matters
+/// after `unhealthy_threshold` consecutive misses.
 fn decode_h2c_status(block: &[u8]) -> Option<u32> {
     let mut i = 0usize;
     while i < block.len() {
@@ -678,9 +691,13 @@ fn decode_h2c_status(block: &[u8]) -> Option<u32> {
             0x8C => return Some(400),
             0x8D => return Some(404),
             0x8E => return Some(500),
+            // Literal with incremental indexing, name idx 8
+            // (`:status`). 6-bit-prefix integer = 8 fits in the
+            // single-byte form, so the byte is exactly 0x48.
+            0x48 |
             // Literal w/o indexing OR literal never indexed, name in
-            // static table at index 8 (`:status`). Prefix bytes are
-            // 0x08 or 0x18 respectively.
+            // static table at index 8. 4-bit-prefix integer = 8 fits
+            // in single-byte form (max 14 inline).
             0x08 | 0x18 => {
                 let (value_len, len_consumed) = decode_hpack_length(&block[i + 1..])?;
                 let val_start = i + 1 + len_consumed;
@@ -692,14 +709,6 @@ fn decode_h2c_status(block: &[u8]) -> Option<u32> {
                 return s.parse::<u32>().ok();
             }
             _ => {
-                // Skip indexed/literal headers that aren't `:status`.
-                // For pseudo-headers we control the request; in the
-                // response we may see other indexed headers ahead of
-                // `:status`. Cheap conservative skip: advance by one
-                // byte. Wrong on multi-byte literals but the decoder
-                // is bounded by the frame end — at worst it returns
-                // None and the caller fails the probe, which then
-                // marks the backend unhealthy on threshold crossing.
                 i += 1;
                 continue;
             }
@@ -900,6 +909,18 @@ mod tests {
         buf.extend_from_slice(&[0u8; 5]);
         let cfg = h2c_config(0);
         assert_eq!(try_parse_h2c_status(&buf, &cfg), None);
+    }
+
+    #[test]
+    fn h2c_literal_with_incremental_indexing_status_201_matches() {
+        // 0x48 = literal w/ incremental indexing, name idx 8 (:status)
+        let mut block = Vec::new();
+        block.extend_from_slice(&[0x48, 0x03, b'2', b'0', b'1']);
+        let mut buf = Vec::new();
+        buf.extend(h2_frame_header(block.len(), H2_FRAME_TYPE_HEADERS, 0x05, 1));
+        buf.extend_from_slice(&block);
+        let cfg = h2c_config(0); // any 2xx
+        assert_eq!(try_parse_h2c_status(&buf, &cfg), Some(true));
     }
 
     #[test]

@@ -194,6 +194,18 @@ impl ConfigState {
     }
 
     fn set_health_check(&mut self, set: &SetHealthCheck) -> Result<(), StateError> {
+        // Validate before mutating state so an invalid config (zero
+        // thresholds, missing leading `/`, CR/LF/NUL/C0 in URI) cannot
+        // round-trip through SaveState/LoadState. The worker also
+        // validates at the SetHealthCheck handler — this is the
+        // master-side mirror so off-channel TOML reload paths don't
+        // bypass the policy. Codex finding (post-rebase review).
+        if let Err(reason) = crate::config::validate_health_check_config(&set.config) {
+            return Err(StateError::InvalidValue {
+                field: "health_check",
+                reason,
+            });
+        }
         match self.clusters.get_mut(&set.cluster_id) {
             Some(cluster) => {
                 cluster.health_check = Some(set.config.to_owned());

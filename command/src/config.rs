@@ -1522,6 +1522,42 @@ impl FileHealthCheckConfig {
     }
 }
 
+/// Validate a [`HealthCheckConfig`] for the rules every layer relies on:
+/// strict positive thresholds and a URI that cannot smuggle a second
+/// HTTP message on the wire (RFC 9110 §5.1 — request-target). Used by
+/// the CLI request builder and the worker `SetHealthCheck` handler so
+/// off-channel inputs (TOML reload, third-party clients) are
+/// constrained the same way as `sozu cluster health-check set`.
+///
+/// The function is intentionally [`Result<(), &'static str>`] rather
+/// than carrying a structured error: the diagnostics only flow into
+/// CLI output / worker error responses where the message is the value.
+pub fn validate_health_check_config(cfg: &HealthCheckConfig) -> Result<(), &'static str> {
+    if cfg.interval == 0 {
+        return Err("health check interval must be > 0");
+    }
+    if cfg.timeout == 0 {
+        return Err("health check timeout must be > 0");
+    }
+    if cfg.healthy_threshold == 0 {
+        return Err("health check healthy_threshold must be > 0");
+    }
+    if cfg.unhealthy_threshold == 0 {
+        return Err("health check unhealthy_threshold must be > 0");
+    }
+    if !cfg.uri.starts_with('/') {
+        return Err("health check URI must start with '/'");
+    }
+    if cfg
+        .uri
+        .bytes()
+        .any(|b| b == b'\r' || b == b'\n' || b == 0 || (b < 0x20 && b != b'\t'))
+    {
+        return Err("health check URI must not contain CR, LF, NUL, or other C0 control bytes");
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileClusterConfig {

@@ -1433,26 +1433,9 @@ impl Server {
                 //not returning because the message must still be handled by each proxy
             }
             Some(RequestType::SetHealthCheck(ref set)) => {
-                let config = &set.config;
-                if config.interval == 0
-                    || config.timeout == 0
-                    || config.healthy_threshold == 0
-                    || config.unhealthy_threshold == 0
+                if let Err(reason) = sozu_command::config::validate_health_check_config(&set.config)
                 {
-                    push_queue(worker_response_error(
-                        req_id,
-                        "invalid health check config: interval, timeout, and thresholds must be > 0",
-                    ));
-                    return;
-                }
-                if !set.config.uri.starts_with('/')
-                    || set.config.uri.contains('\r')
-                    || set.config.uri.contains('\n')
-                {
-                    push_queue(worker_response_error(
-                        req_id,
-                        "invalid health check URI: must start with '/' and not contain CR/LF",
-                    ));
+                    push_queue(worker_response_error(req_id, reason));
                     return;
                 }
                 self.backends
