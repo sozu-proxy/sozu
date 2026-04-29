@@ -6,7 +6,7 @@
 
 - **Hot configurable:** Sōzu can receive configuration changes at runtime, through secure unix sockets, without having to reload.
 - **Upgrades without restarting:** Sōzu is always-up, meaning it upgrades itself *while still processing requests*.
-- **Handles SSL:** Sōzu works as a TLS endpoint, so your backend servers can focus on what they do best.
+- **Handles SSL:** Sōzu works as a TLS endpoint, so your backend servers can focus on what they do best. Multiple cryptographic backends are supported at compile time: [ring](https://github.com/briansmith/ring) (default), [AWS-LC](https://github.com/aws/aws-lc-rs) (with post-quantum and FIPS 140-3 options), and [OpenSSL](https://www.openssl.org/).
 - **Protects your network:** Sōzu protect backends by shielding them behind the reverse proxy, limiting direct network access. Sōzu uses Rust, a language primed for memory safety. And even if a worker is exploited, Sōzu workers are sandboxed.
 - **Optimize performance:** Sōzu makes the most of Rust's capacity to avoid useless copying and memory usage.
    Two key dependencies have been optimized in this way:

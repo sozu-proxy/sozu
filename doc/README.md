@@ -54,6 +54,8 @@ Sōzu is a reverse proxy for load balancing, written in Rust. Its main job is to
 
 * [H2 Mux LIFECYCLE.md][h2lc] — In-tree state-machine reference, maintained alongside the code
 
+* [Health Checks][hc]
+
 * [Lifetime of a session][li]
 
 ## Testing
@@ -85,6 +87,7 @@ Sōzu is a reverse proxy for load balancing, written in Rust. Its main job is to
 [r]: ./recipes.md
 [h2]: ./h2_mux_internals.md
 [h2lc]: ../lib/src/protocol/mux/LIFECYCLE.md
+[hc]: ./health_checks.md
 [li]: ./lifetime_of_a_session.md
 [ue]: ./upgrade_e2e_tests.md
 [ob]: ./observability.md
