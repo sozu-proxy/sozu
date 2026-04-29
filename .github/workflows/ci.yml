@@ -98,7 +98,13 @@ jobs:
   crypto-providers:
     name: Crypto provider ${{ matrix.provider }}
     runs-on: ubuntu-latest
+    # The e2e step exercises 328 real-listener tests behind rustls; budget
+    # generously so a slow runner does not flake.
+    timeout-minutes: 30
     strategy:
+      # Don't cancel sibling matrix entries on a single-provider failure —
+      # the goal is to know which providers passed and which broke.
+      fail-fast: false
       matrix:
         provider:
           - crypto-ring
@@ -114,10 +120,28 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
+      - name: Install h2spec (for test_h2spec_conformance under e2e)
+        run: |
+          H2SPEC_VERSION=2.6.0
+          curl -fsSL "https://github.com/summerwind/h2spec/releases/download/v${H2SPEC_VERSION}/h2spec_linux_amd64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin h2spec
+          h2spec --version
+      - name: Install nightly toolchain (for cargo-fuzz targets in e2e)
+        run: rustup toolchain install nightly --profile minimal
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
       - name: Build with ${{ matrix.provider }}
         run: cargo build -p sozu -p sozu-lib -p sozu-command-lib --locked --no-default-features --features ${{ matrix.provider }}
-      - name: Test with ${{ matrix.provider }}
+      - name: sozu-lib unit tests with ${{ matrix.provider }}
         run: cargo test -p sozu-lib --locked --no-default-features --features ${{ matrix.provider }} --verbose
+      # Run the full e2e suite against every crypto provider so a
+      # provider-specific regression in TLS handshake, certificate
+      # loading, ALPN selection, or H2 mux integration cannot slip in
+      # behind a green ring-only e2e run. The e2e crate forwards each
+      # provider feature to sozu-lib via its own `[features]` block in
+      # `e2e/Cargo.toml`.
+      - name: sozu-e2e suite with ${{ matrix.provider }}
+        run: cargo test -p sozu-e2e --locked --no-default-features --features ${{ matrix.provider }} --verbose
   doc:
     name: Build documentation
     runs-on: ubuntu-latest
