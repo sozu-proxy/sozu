@@ -989,9 +989,7 @@ impl HttpProxy {
             .remove_http_front(front)
             .map_err(ProxyError::RemoveFrontend)?;
 
-        if !listener.fronts.has_hostname(&hostname) {
-            listener.set_tags(hostname, None);
-        }
+        listener.set_tags(hostname, None);
         Ok(())
     }
 

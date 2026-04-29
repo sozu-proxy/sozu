@@ -16,11 +16,11 @@ use crate::{
         command::{
             AggregatedMetrics, AvailableMetrics, CertificateAndKey, CertificateSummary,
             CertificatesWithFingerprints, ClusterMetrics, CustomHttpAnswers, Event, EventKind,
-            FilteredMetrics, HttpEndpoint, HttpListenerConfig, HttpsListenerConfig,
-            ListOfCertificatesByAddress, ListedFrontends, ListenersList, ProtobufEndpoint,
-            QueryCertificatesFilters, RequestCounts, Response, ResponseContent, ResponseStatus,
-            RunState, SocketAddress, TlsVersion, WorkerInfos, WorkerMetrics, WorkerResponses,
-            filtered_metrics, protobuf_endpoint, request::RequestType,
+            FilteredMetrics, HealthChecksList, HttpEndpoint, HttpListenerConfig,
+            HttpsListenerConfig, ListOfCertificatesByAddress, ListedFrontends, ListenersList,
+            ProtobufEndpoint, QueryCertificatesFilters, RequestCounts, Response, ResponseContent,
+            ResponseStatus, RunState, SocketAddress, TlsVersion, WorkerInfos, WorkerMetrics,
+            WorkerResponses, filtered_metrics, protobuf_endpoint, request::RequestType,
             response_content::ContentType,
         },
     },
@@ -118,6 +118,9 @@ pub fn format_request_type(request_type: &RequestType) -> &str {
         RequestType::UpdateTcpListener(_) => "UpdateTcpListener",
         RequestType::SetMaxConnectionsPerIp(_) => "SetMaxConnectionsPerIp",
         RequestType::QueryMaxConnectionsPerIp(_) => "QueryMaxConnectionsPerIp",
+        RequestType::SetHealthCheck(_) => "SetHealthCheck",
+        RequestType::RemoveHealthCheck(_) => "RemoveHealthCheck",
+        RequestType::QueryHealthChecks(_) => "QueryHealthChecks",
     }
 }
 
@@ -206,6 +209,7 @@ impl ResponseContent {
                 }
                 Ok(())
             }
+            ContentType::HealthChecksList(list) => print_health_checks(list),
             ContentType::Event(_event) => Ok(()), // not event displayed yet!
         }
     }
@@ -954,6 +958,48 @@ fn print_request_counts(request_counts: &RequestCounts) -> Result<(), DisplayErr
     Ok(())
 }
 
+fn print_health_checks(list: &HealthChecksList) -> Result<(), DisplayError> {
+    if list.map.is_empty() {
+        println!("No health checks configured.");
+        return Ok(());
+    }
+
+    let mut table = Table::new();
+    table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
+    table.add_row(row![
+        "cluster",
+        "uri",
+        "interval",
+        "timeout",
+        "healthy threshold",
+        "unhealthy threshold",
+        "expected status"
+    ]);
+
+    let mut entries: Vec<_> = list.map.iter().collect();
+    entries.sort_by_key(|(id, _)| id.as_str());
+
+    for (cluster_id, config) in entries {
+        let expected = if config.expected_status == 0 {
+            "any 2xx".to_owned()
+        } else {
+            config.expected_status.to_string()
+        };
+
+        table.add_row(row![
+            cluster_id,
+            config.uri,
+            format!("{}s", config.interval),
+            format!("{}s", config.timeout),
+            config.healthy_threshold,
+            config.unhealthy_threshold,
+            expected
+        ]);
+    }
+    table.printstd();
+    Ok(())
+}
+
 fn format_tags_to_string(tags: &BTreeMap<String, String>) -> String {
     tags.iter()
         .map(|(k, v)| format!("{k}={v}"))
@@ -1314,6 +1360,8 @@ impl Display for Event {
             EventKind::MainUpgraded => "main upgraded",
             EventKind::WorkerUpgraded => "worker upgraded",
             EventKind::EventsSubscribed => "events subscribed",
+            EventKind::HealthCheckHealthy => "health check: backend healthy",
+            EventKind::HealthCheckUnhealthy => "health check: backend unhealthy",
         };
         let address = match &self.address {
             Some(a) => a.to_string(),

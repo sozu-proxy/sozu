@@ -20,6 +20,7 @@ pub fn main() {
         .message_attribute("ListOfCertificatesByAddress", "#[derive(Hash, Eq)]")
         .message_attribute("CertificatesWithFingerprints", "#[derive(Hash, Eq)]")
         .message_attribute("RequestCounts", "#[derive(Hash, Eq)]")
+        .message_attribute("HealthChecksList", "#[derive(Hash, Eq)]")
         .message_attribute("FilteredMetrics", "#[derive(Hash, Eq)]")
         .message_attribute("ClusterMetrics", "#[derive(Hash, Eq)]")
         .message_attribute("BackendMetrics", "#[derive(Hash, Eq)]")
