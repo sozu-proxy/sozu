@@ -164,15 +164,36 @@ impl Router {
             })
             .unwrap_or((false, false, false, None, None));
 
+        // ── Legacy `cluster.https_redirect` short-circuit ──
+        //
+        // Resolve the legacy HTTP→HTTPS redirect BEFORE per-(cluster,
+        // source-IP) accounting so a redirect-only request never
+        // consumes an IP slot. Otherwise a same-IP client iterating an
+        // HTTP→HTTPS hop could trip 429 ahead of the 301 even though no
+        // backend would have been opened. A duplicate guard that lived
+        // here previously (rebase artefact — two identical
+        // `if frontend_should_redirect_https && …` blocks back-to-back)
+        // is folded into this single early-return.
+        // Frontend-scoped `RedirectPolicy::PERMANENT` already returns
+        // from `route_from_request` with the same error, so this only
+        // handles the legacy cluster-level path that doesn't surface
+        // from `route_from_request`.
+        if frontend_should_redirect_https && matches!(proxy.borrow().kind(), ListenerType::Http) {
+            return Err(BackendConnectionError::RetrieveClusterError(
+                RetrieveClusterError::HttpsRedirect,
+            ));
+        }
+
         // Per-(cluster, source-IP) connection limit gate. Runs AFTER cluster
-        // resolution (so a 401/421/redirect frontend never trips the limit)
-        // and BEFORE any backend selection (so a rejection consumes neither
-        // a backend pool slot nor a retry budget). The check uses the source
-        // IP from the per-stream `HttpContext.session_address`, which is the
-        // proxy-protocol-aware client address when present, falling back to
-        // `peer_addr`. The limit governs distinct **frontend connections**
-        // per `(cluster, ip)`: an H2 session multiplexing N streams to the
-        // same cluster from the same IP still consumes a single slot.
+        // resolution AND legacy redirect emission (so a 401/421/redirect
+        // frontend never trips the limit) and BEFORE any backend selection
+        // (so a rejection consumes neither a backend pool slot nor a retry
+        // budget). The check uses the source IP from the per-stream
+        // `HttpContext.session_address`, which is the proxy-protocol-aware
+        // client address when present, falling back to `peer_addr`. The
+        // limit governs distinct **frontend connections** per
+        // `(cluster, ip)`: an H2 session multiplexing N streams to the same
+        // cluster from the same IP still consumes a single slot.
         let session_ip = stream_context.session_address.map(|sa| sa.ip());
         if let Some(ip) = session_ip {
             // The frontend session is mutably borrowed up the call stack
@@ -205,18 +226,6 @@ impl Router {
             sessions_rc
                 .borrow_mut()
                 .track_cluster_ip(frontend_token, cluster_id.clone(), ip);
-        }
-
-        if frontend_should_redirect_https && matches!(proxy.borrow().kind(), ListenerType::Http) {
-            return Err(BackendConnectionError::RetrieveClusterError(
-                RetrieveClusterError::HttpsRedirect,
-            ));
-        }
-
-        if frontend_should_redirect_https && matches!(proxy.borrow().kind(), ListenerType::Http) {
-            return Err(BackendConnectionError::RetrieveClusterError(
-                RetrieveClusterError::HttpsRedirect,
-            ));
         }
 
         /*
@@ -613,6 +622,7 @@ impl Router {
             cluster_id,
             redirect,
             redirect_scheme,
+            redirect_template,
             rewritten_host,
             rewritten_path,
             rewritten_port,
@@ -661,7 +671,30 @@ impl Router {
         if matches!(redirect, RedirectPolicy::Permanent) {
             let scheme = resolve_redirect_scheme(redirect_scheme, context);
             let port = rewritten_port.map(|p| p as u32).or(https_redirect_port);
-            context.redirect_location = Some(build_redirect_location(scheme, context, port));
+            // Feed the rewritten host AND path into the `Location` URL
+            // when the frontend's RewriteParts populated them. Without
+            // this, a `redirect = permanent` frontend with
+            // `rewrite_host = "new.example.com"` would serve clients
+            // back to the original `Host:` header, defeating the
+            // documented `old → new` shape.
+            // The host_override path also keeps `:port` stripping
+            // intact: `build_redirect_location` removes any `:port` on
+            // the override before reapplying `port_suffix`.
+            context.redirect_location = Some(build_redirect_location(
+                scheme,
+                context,
+                port,
+                rewritten_host.as_deref(),
+                rewritten_path.as_deref(),
+            ));
+            // Stash the frontend's `redirect_template` (when set) so the
+            // 301 default-answer path can render it via
+            // `HttpAnswers::render_inline_301` instead of the listener /
+            // cluster default. Without this stash the field flows into
+            // `RouteResult` only to be dropped by the wildcard
+            // destructure below, so the operator-supplied template has
+            // no observable effect on the rendered redirect.
+            context.frontend_redirect_template = redirect_template;
             return Err(RetrieveClusterError::HttpsRedirect);
         }
 
@@ -672,7 +705,8 @@ impl Router {
         // into a downstream default-answer path.
         if legacy_https_redirect && matches!(proxy.borrow().kind(), ListenerType::Http) {
             let port = https_redirect_port;
-            context.redirect_location = Some(build_redirect_location("https", context, port));
+            context.redirect_location =
+                Some(build_redirect_location("https", context, port, None, None));
         }
 
         // ── 4. Basic auth check (only when `required_auth` was set) ────────
@@ -984,12 +1018,29 @@ fn resolve_redirect_scheme(scheme: RedirectScheme, context: &HttpContext) -> &'s
 /// Build the `Location` URL for a redirect response. Defaults the port
 /// suffix only when the operator provided one or when scheme defaults
 /// would mismatch (port 80 on https / 443 on http stays implicit).
-fn build_redirect_location(scheme: &str, context: &HttpContext, port: Option<u32>) -> String {
-    let authority = context.authority.as_deref().unwrap_or_default();
-    let path = context.path.as_deref().unwrap_or("/");
+///
+/// `host_override` and `path_override` carry the frontend's
+/// `RewriteParts::run` output for `RedirectPolicy::PERMANENT` flows so
+/// the 301 `Location` reflects `rewrite_host` / `rewrite_path` instead
+/// of the original `:authority` / `:path`. The legacy
+/// `cluster.https_redirect` path passes `None` for both — it has no
+/// per-frontend rewrite knobs.
+fn build_redirect_location(
+    scheme: &str,
+    context: &HttpContext,
+    port: Option<u32>,
+    host_override: Option<&str>,
+    path_override: Option<&str>,
+) -> String {
+    let authority = host_override
+        .or(context.authority.as_deref())
+        .unwrap_or_default();
+    let path = path_override.or(context.path.as_deref()).unwrap_or("/");
     // Strip an existing `:port` from the authority — operators typically
     // configure `https_redirect_port` precisely because the listener's
-    // port differs from the redirect target.
+    // port differs from the redirect target. Bracketed IPv6 literals
+    // like `[::1]` survive intact: `rsplit_once(':')` only triggers when
+    // the suffix after the final `:` is entirely ASCII digits.
     let host_only = match authority.rsplit_once(':') {
         Some((host, port_part))
             if !port_part.is_empty() && port_part.bytes().all(|b| b.is_ascii_digit()) =>

@@ -1004,13 +1004,37 @@ where
 ///
 /// The shared `HttpContext::on_request_headers` callback that handles
 /// elision on **initial** HEADERS frames is **not** invoked here, so any
-/// listener-scoped header rewrites must be plumbed in explicitly. Trailer
-/// elision contract:
+/// listener-scoped header rewrites must be plumbed in explicitly.
 ///
-/// * `elide_x_real_ip = true` causes `X-Real-IP` trailers to be silently
-///   dropped (matches the initial-HEADERS branch in
-///   `HttpContext::on_request_headers`). Without this an H2 client can
-///   bypass the anti-spoof by sending `x-real-ip` as a trailer.
+/// ── Spoof-vector elision per RFC 9110 §6.5 ──
+///
+/// RFC 9110 §6.5 forbids trailers from carrying fields that affect
+/// "message framing, message routing, or response semantics." sōzu
+/// rewrites four client-attribution headers on the initial HEADERS pass
+/// (`HttpContext::on_request_headers` in
+/// `lib/src/protocol/kawa_h1/editor.rs`):
+///   * `X-Real-IP` is replaced by the post-PROXY-v2 peer IP when
+///     `send_x_real_ip = true` and stripped client-side when
+///     `elide_x_real_ip = true`.
+///   * `X-Forwarded-For` has the peer IP appended.
+///   * `Forwarded` (RFC 7239) has a `proto=…;for=…;by=…` clause appended.
+///   * `X-Request-Id` is preserved verbatim (de-facto correlation
+///     header used by Envoy/HAProxy/most LBs).
+///
+/// A naive H2 client could otherwise smuggle any of those by sending
+/// them as a trailer block: an H2 backend that merges trailers into
+/// its header view (gRPC-style, or anything that uses
+/// `headers::extend(trailers.iter())`) would observe an attacker-
+/// controlled value. The four elisions below run **unconditionally** —
+/// the spec already prohibits them, the operator gains no observability
+/// or routing signal from a trailer-side copy, and forwarding them is
+/// strictly a spoof vector.
+///
+/// `elide_x_real_ip` is kept as an explicit parameter for symmetry
+/// with the initial-HEADERS path's listener flag, but the trailer-side
+/// elision of `x-real-ip` no longer depends on it — the listener flag
+/// only governs whether sōzu *injects* an `X-Real-IP` header on the
+/// forward, never whether it filters one off the wire.
 pub fn handle_trailer(
     kawa: &mut GenericHttpStream,
     input: &[u8],
@@ -1019,6 +1043,10 @@ pub fn handle_trailer(
     max_header_list_size: u32,
     elide_x_real_ip: bool,
 ) -> Result<(), (H2Error, bool)> {
+    // Acknowledge the parameter; dropping it would force a callsite
+    // change. The elision below covers x-real-ip unconditionally so
+    // the listener flag is no longer a gate for trailer-side defence.
+    let _ = elide_x_real_ip;
     if !end_stream {
         return Err((H2Error::ProtocolError, false));
     }
@@ -1060,16 +1088,23 @@ pub fn handle_trailer(
             invalid_trailers = true;
             return;
         }
-        // Anti-spoofing: when the listener has `elide_x_real_ip = true`
-        // the initial-HEADERS branch in `HttpContext::on_request_headers`
-        // strips client-supplied `X-Real-IP` headers. Trailer HEADERS
-        // frames bypass that callback, so without this branch a naive
-        // H2 client could sneak `x-real-ip` past the anti-spoof by
-        // sending it as a trailer. Keys are already lower-case here:
-        // RFC 9113 §8.2.2 forbids uppercase and `classify_invalid_h2_header`
-        // (above) rejects any violation, so an `eq` against the lower
-        // form is sufficient.
-        if elide_x_real_ip && k.eq_ignore_ascii_case(b"x-real-ip") {
+        // ── Spoof-vector elision per RFC 9110 §6.5 ──
+        //
+        // RFC 9110 §6.5 forbids trailers from carrying message-routing
+        // semantics. The four client-attribution headers below are
+        // rewritten by sōzu on the initial-HEADERS pass; admitting them
+        // as trailers would let a naive H2 client smuggle a spoofed
+        // value to a backend that merges trailers into its header view.
+        // Drop them unconditionally — keys are already lower-case here
+        // (`classify_invalid_h2_header` rejects any uppercase byte per
+        // RFC 9113 §8.2.2), so a byte-equality check is sufficient.
+        // `incr!` records the rejection so dashboards observe the
+        // attempted smuggle without spamming logs.
+        if matches!(
+            k.as_ref(),
+            b"x-real-ip" | b"x-forwarded-for" | b"forwarded" | b"x-request-id"
+        ) {
+            incr!("h2.trailer.spoof_vector_elided");
             return;
         }
         let start = kawa.storage.end as u32;
@@ -2241,6 +2276,110 @@ mod tests {
             "H2→H1 chunked body must emit Transfer-Encoding: chunked for trailer support"
         );
     }
+    // ── handle_trailer: spoof-vector elision per RFC 9110 §6.5 ───────────
+
+    /// Helper: HPACK-encode a set of trailer pairs and run them through
+    /// `handle_trailer`. Returns the kawa stream so the caller can
+    /// inspect which trailer headers landed in `kawa.blocks`.
+    fn decode_trailer(
+        pool: &mut crate::pool::Pool,
+        trailers: &[(&[u8], &[u8])],
+    ) -> GenericHttpStream {
+        let mut encoder = loona_hpack::Encoder::new();
+        let mut encoded = Vec::new();
+        for &(name, value) in trailers {
+            encoder
+                .encode_header_into((name, value), &mut encoded)
+                .unwrap();
+        }
+
+        let mut decoder = loona_hpack::Decoder::new();
+        let mut kawa = make_generic_kawa(pool, Kind::Request);
+
+        let result = handle_trailer(
+            &mut kawa,
+            &encoded,
+            true, // end_stream
+            &mut decoder,
+            crate::protocol::mux::h2::MAX_HEADER_LIST_SIZE as u32,
+            false, // elide_x_real_ip — listener flag, not the trailer-side gate
+        );
+        assert!(result.is_ok(), "handle_trailer failed: {:?}", result.err());
+        kawa
+    }
+
+    /// Returns the lowercased trailer keys that survived the elision filter.
+    fn surviving_trailer_keys(kawa: &GenericHttpStream) -> Vec<Vec<u8>> {
+        let buf = kawa.storage.buffer();
+        kawa.blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::Header(Pair { key, .. }) => Some(key.data(buf).to_vec()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// RFC 9110 §6.5 forbids trailers from carrying message-routing
+    /// fields. The initial-HEADERS path rewrites four client-attribution
+    /// headers (`X-Real-IP`, `X-Forwarded-For`, `Forwarded`,
+    /// `X-Request-Id`). An H2 client must not be able to smuggle a
+    /// spoofed copy as a trailer, since H2 backends that merge trailers
+    /// into their header view would observe the attacker-controlled
+    /// value. Drop them unconditionally.
+    #[test]
+    fn handle_trailer_elides_spoof_vector_headers() {
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        let kawa = decode_trailer(
+            &mut pool,
+            &[
+                (b"x-real-ip", b"1.2.3.4"),
+                (b"x-forwarded-for", b"5.6.7.8"),
+                (b"forwarded", b"for=9.10.11.12"),
+                (b"x-request-id", b"attacker-correlation-id"),
+                (b"x-trailer-keep", b"please-keep-me"),
+            ],
+        );
+        let surviving = surviving_trailer_keys(&kawa);
+        assert_eq!(
+            surviving,
+            vec![b"x-trailer-keep".to_vec()],
+            "only non-spoof trailers must survive the RFC 9110 §6.5 elision"
+        );
+    }
+
+    /// Each of the four spoof-vector headers must be dropped on its own,
+    /// so a single-trailer attempt cannot bypass the filter just because
+    /// the others are absent.
+    #[test]
+    fn handle_trailer_drops_each_spoof_header_individually() {
+        for &name in &[
+            b"x-real-ip" as &[u8],
+            b"x-forwarded-for",
+            b"forwarded",
+            b"x-request-id",
+        ] {
+            let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+            let kawa = decode_trailer(&mut pool, &[(name, b"v")]);
+            let surviving = surviving_trailer_keys(&kawa);
+            assert!(
+                surviving.is_empty(),
+                "trailer with only {} should leave no surviving block",
+                std::str::from_utf8(name).unwrap()
+            );
+        }
+    }
+
+    /// Sanity: an unrelated trailer (e.g. `grpc-status`) is still kept.
+    /// Without this we'd be silently breaking gRPC semantics.
+    #[test]
+    fn handle_trailer_keeps_grpc_status() {
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        let kawa = decode_trailer(&mut pool, &[(b"grpc-status", b"0")]);
+        let surviving = surviving_trailer_keys(&kawa);
+        assert_eq!(surviving, vec![b"grpc-status".to_vec()]);
+    }
+
     /// H2 request declaring Content-Length keeps the Length framing: the
     /// H1 backend cannot receive trailers in this case (RFC 9110 §6.5 —
     /// trailers require chunked transfer-coding), and we document that

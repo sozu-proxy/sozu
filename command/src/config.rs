@@ -17,7 +17,7 @@
 //!
 //! To illustrate:
 //!
-//! ```ignore
+//! ```no_run
 //! use sozu_command_lib::config::{FileConfig, ConfigBuilder};
 //!
 //! let file_config = FileConfig::load_from_path("../config.toml")
@@ -33,7 +33,7 @@
 //!
 //! However, there is a simpler way that combines all this:
 //!
-//! ```ignore
+//! ```no_run
 //! use sozu_command_lib::config::Config;
 //!
 //! let config = Config::load_from_path("../assets/config.toml")

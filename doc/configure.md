@@ -699,8 +699,13 @@ lookup leak through the time spent validating.
 [clusters.MyCluster]
 # Realm rendered into `WWW-Authenticate: Basic realm="…"` on a 401.
 www_authenticate = 'Basic realm="MyCluster"'
-# Each entry is `username:hex(sha256(password))` — generate with
-# `printf 'admin:secret' | sha256sum` then prefix with `admin:`.
+# Each entry is `username:hex(sha256(password))`. The runtime hashes
+# ONLY the password — the username appears verbatim before the colon
+# and is NOT part of the hashed input. Generate the hash for password
+# `secret` with:
+#   printf 'secret' | sha256sum | awk '{print $1}'
+# `printf` (not `echo`) omits the trailing newline so the digest matches
+# the bytes carried in `Authorization: Basic <base64>`.
 authorized_hashes = [
     "admin:2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b",
 ]
