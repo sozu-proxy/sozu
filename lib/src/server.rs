@@ -1532,6 +1532,7 @@ impl Server {
                 .and_then(|n| LoadMetric::try_from(n).ok()),
         );
         backends.set_health_check_config(&cluster.cluster_id, cluster.health_check.to_owned());
+        backends.set_cluster_http2(&cluster.cluster_id, cluster.http2.unwrap_or(false));
     }
 
     fn add_backend(&mut self, req_id: &str, add_backend: &AddBackend) -> WorkerResponse {

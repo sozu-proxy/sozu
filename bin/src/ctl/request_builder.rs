@@ -319,7 +319,6 @@ impl CommandManager {
                 healthy_threshold,
                 unhealthy_threshold,
                 expected_status,
-                h2c,
             } => {
                 let config = HealthCheckConfig {
                     uri,
@@ -328,7 +327,6 @@ impl CommandManager {
                     healthy_threshold,
                     unhealthy_threshold,
                     expected_status,
-                    is_h2c: Some(h2c),
                 };
                 if let Err(reason) = validate_health_check_config(&config) {
                     return Err(CtlError::Failure(reason.to_owned()));

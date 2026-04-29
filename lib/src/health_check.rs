@@ -52,7 +52,17 @@ const HEALTH_CHECK_TOKEN_BASE: usize = 1 << 24;
 /// programmer error and emits an `error!` rather than silently colliding.
 const HEALTH_CHECK_TOKEN_CAPACITY: usize = 1 << 16;
 
-type PendingChecks = Vec<(ClusterId, HealthCheckConfig, Vec<(String, SocketAddr)>)>;
+/// Each pending entry is `(cluster_id, config, h2c, backends_to_check)`.
+/// `h2c` mirrors `cluster.http2` (the same backend-capability hint the
+/// mux router uses) so the probe wire format matches what the proxy
+/// will actually use to reach those backends — no per-cluster
+/// `is_h2c` knob, no risk of probe / data-plane divergence.
+type PendingChecks = Vec<(
+    ClusterId,
+    HealthCheckConfig,
+    bool,
+    Vec<(String, SocketAddr)>,
+)>;
 
 /// Tracks an in-flight health check connection
 #[derive(Debug)]
@@ -68,6 +78,12 @@ struct InFlightCheck {
     write_offset: usize,
     response_buf: Vec<u8>,
     config: HealthCheckConfig,
+    /// Captured at probe-creation time from `BackendMap.cluster_http2`.
+    /// The response parser needs to know whether to walk H2 frames or
+    /// parse an HTTP/1.1 status line; storing it on the in-flight
+    /// record avoids racing the cluster's `http2` flag if the
+    /// operator flips it mid-probe.
+    h2c: bool,
 }
 
 /// Manages health checks across all clusters and backends
@@ -189,14 +205,24 @@ impl HealthChecker {
                     .collect();
 
                 if !backends_to_check.is_empty() {
-                    to_check.push((cluster_id.to_owned(), config.to_owned(), backends_to_check));
+                    let h2c = backend_map
+                        .cluster_http2
+                        .get(cluster_id)
+                        .copied()
+                        .unwrap_or(false);
+                    to_check.push((
+                        cluster_id.to_owned(),
+                        config.to_owned(),
+                        h2c,
+                        backends_to_check,
+                    ));
                 }
             }
         }
 
         drop(backend_map);
 
-        for (cluster_id, config, backends_to_check) in to_check {
+        for (cluster_id, config, h2c, backends_to_check) in to_check {
             self.last_check_time.insert(cluster_id.to_owned(), now);
 
             // The URI was validated at the worker `SetHealthCheck`
@@ -254,7 +280,7 @@ impl HealthChecker {
                             address,
                             cluster_id
                         );
-                        let request_bytes = if config.is_h2c.unwrap_or(false) {
+                        let request_bytes = if h2c {
                             build_h2c_probe_bytes(probe_uri, address)
                         } else {
                             // RFC 9110 §7.2: `Host` MUST carry the
@@ -287,6 +313,7 @@ impl HealthChecker {
                             write_offset: 0,
                             response_buf: Vec::with_capacity(256),
                             config: config.to_owned(),
+                            h2c,
                         });
                     }
                     Err(e) => {
@@ -362,7 +389,8 @@ impl HealthChecker {
             match check.stream.read(&mut buf) {
                 Ok(0) => {
                     let success =
-                        parse_probe_response(&check.response_buf, &check.config).unwrap_or(false);
+                        parse_probe_response(&check.response_buf, &check.config, check.h2c)
+                            .unwrap_or(false);
                     completed.push((idx, success));
                 }
                 Ok(n) => {
@@ -371,7 +399,8 @@ impl HealthChecker {
                         continue;
                     }
                     check.response_buf.extend_from_slice(&buf[..n]);
-                    if let Some(success) = parse_probe_response(&check.response_buf, &check.config)
+                    if let Some(success) =
+                        parse_probe_response(&check.response_buf, &check.config, check.h2c)
                     {
                         completed.push((idx, success));
                     }
@@ -491,8 +520,10 @@ impl HealthChecker {
 
 /// Top-level dispatch: pick the HTTP/1.1 status-line parser or the
 /// HTTP/2 frame walker depending on whether the probe was sent as h2c.
-fn parse_probe_response(buf: &[u8], config: &HealthCheckConfig) -> Option<bool> {
-    if config.is_h2c.unwrap_or(false) {
+/// `h2c` is captured from `BackendMap.cluster_http2` on the
+/// `InFlightCheck` at probe-creation time.
+fn parse_probe_response(buf: &[u8], config: &HealthCheckConfig, h2c: bool) -> Option<bool> {
+    if h2c {
         try_parse_h2c_status(buf, config)
     } else {
         try_parse_status_line(buf, config)
@@ -790,7 +821,6 @@ mod tests {
             healthy_threshold: 3,
             unhealthy_threshold: 3,
             expected_status: 0,
-            is_h2c: Some(false),
         };
 
         let buf = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
@@ -831,7 +861,6 @@ mod tests {
             healthy_threshold: 3,
             unhealthy_threshold: 3,
             expected_status: expected,
-            is_h2c: Some(true),
         }
     }
 
