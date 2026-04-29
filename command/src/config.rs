@@ -1502,6 +1502,10 @@ pub struct FileHealthCheckConfig {
     pub unhealthy_threshold: u32,
     #[serde(default)]
     pub expected_status: u32,
+    /// When true, send an HTTP/2 prior-knowledge (h2c) probe instead of
+    /// HTTP/1.1. Required for h2c-only backends.
+    #[serde(default)]
+    pub is_h2c: bool,
 }
 
 impl FileHealthCheckConfig {
@@ -1513,6 +1517,7 @@ impl FileHealthCheckConfig {
             healthy_threshold: self.healthy_threshold,
             unhealthy_threshold: self.unhealthy_threshold,
             expected_status: self.expected_status,
+            is_h2c: Some(self.is_h2c),
         }
     }
 }

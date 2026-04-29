@@ -319,6 +319,7 @@ impl CommandManager {
                 healthy_threshold,
                 unhealthy_threshold,
                 expected_status,
+                h2c,
             } => {
                 if interval == 0 {
                     return Err(CtlError::Failure("interval must be > 0".to_owned()));
@@ -367,6 +368,7 @@ impl CommandManager {
                             healthy_threshold,
                             unhealthy_threshold,
                             expected_status,
+                            is_h2c: Some(h2c),
                         },
                     })
                     .into(),

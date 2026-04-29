@@ -461,6 +461,12 @@ pub enum HealthCheckCmd {
             default_value = "0"
         )]
         expected_status: u32,
+        #[clap(
+            long = "h2c",
+            help = "Send the probe as HTTP/2 prior-knowledge (h2c) instead of HTTP/1.1. Required for h2c-only backends.",
+            default_value = "false"
+        )]
+        h2c: bool,
     },
     #[clap(name = "remove", about = "Remove the health check from a cluster")]
     Remove {

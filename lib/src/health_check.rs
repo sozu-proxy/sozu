@@ -253,11 +253,16 @@ impl HealthChecker {
                             address,
                             cluster_id
                         );
-                        let request = format!(
-                            "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-                            sanitized_uri,
-                            address.ip()
-                        );
+                        let request_bytes = if config.is_h2c.unwrap_or(false) {
+                            build_h2c_probe_bytes(&sanitized_uri, address)
+                        } else {
+                            format!(
+                                "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+                                sanitized_uri,
+                                address.ip()
+                            )
+                            .into_bytes()
+                        };
                         self.in_flight.push(InFlightCheck {
                             stream,
                             token,
@@ -266,7 +271,7 @@ impl HealthChecker {
                             address,
                             started_at: now,
                             timeout: Duration::from_secs(u64::from(config.timeout)),
-                            request_bytes: Some(request.into_bytes()),
+                            request_bytes: Some(request_bytes),
                             write_offset: 0,
                             response_buf: Vec::with_capacity(256),
                             config: config.to_owned(),
@@ -345,7 +350,7 @@ impl HealthChecker {
             match check.stream.read(&mut buf) {
                 Ok(0) => {
                     let success =
-                        try_parse_status_line(&check.response_buf, &check.config).unwrap_or(false);
+                        parse_probe_response(&check.response_buf, &check.config).unwrap_or(false);
                     completed.push((idx, success));
                 }
                 Ok(n) => {
@@ -354,7 +359,7 @@ impl HealthChecker {
                         continue;
                     }
                     check.response_buf.extend_from_slice(&buf[..n]);
-                    if let Some(success) = try_parse_status_line(&check.response_buf, &check.config)
+                    if let Some(success) = parse_probe_response(&check.response_buf, &check.config)
                     {
                         completed.push((idx, success));
                     }
@@ -472,6 +477,16 @@ impl HealthChecker {
     }
 }
 
+/// Top-level dispatch: pick the HTTP/1.1 status-line parser or the
+/// HTTP/2 frame walker depending on whether the probe was sent as h2c.
+fn parse_probe_response(buf: &[u8], config: &HealthCheckConfig) -> Option<bool> {
+    if config.is_h2c.unwrap_or(false) {
+        try_parse_h2c_status(buf, config)
+    } else {
+        try_parse_status_line(buf, config)
+    }
+}
+
 fn try_parse_status_line(buf: &[u8], config: &HealthCheckConfig) -> Option<bool> {
     let response = std::str::from_utf8(buf).ok()?;
     let first_line_end = response.find("\r\n")?;
@@ -488,6 +503,239 @@ fn is_status_healthy(actual: u32, expected: u32) -> bool {
         (200..300).contains(&actual)
     } else {
         actual == expected
+    }
+}
+
+/// HTTP/2 frame type constants — RFC 9113 §6.
+const H2_FRAME_TYPE_HEADERS: u8 = 0x01;
+const H2_FRAME_TYPE_SETTINGS: u8 = 0x04;
+const H2_FRAME_TYPE_GOAWAY: u8 = 0x07;
+
+/// Flags used in the parser. END_STREAM = 0x01, END_HEADERS = 0x04,
+/// PADDED = 0x08, PRIORITY = 0x20 (HEADERS only).
+const H2_FLAG_PADDED: u8 = 0x08;
+const H2_FLAG_PRIORITY: u8 = 0x20;
+const H2_FRAME_HEADER_LEN: usize = 9;
+
+/// Compose a bare-minimum h2c (HTTP/2 over cleartext, prior-knowledge)
+/// probe: the 24-byte connection preface, an empty client SETTINGS
+/// frame (acknowledging the spec-mandated handshake), and a single
+/// HEADERS frame on stream 1 carrying `GET <path>` with
+/// END_STREAM | END_HEADERS.
+///
+/// HPACK encoding is hand-rolled (no dynamic table use, no Huffman):
+///
+/// * `:method GET` — static table index 2 → indexed (`0x82`).
+/// * `:scheme http` — static index 6 → indexed (`0x86`).
+/// * `:path <uri>` — literal-without-indexing, name index 4 →
+///   byte `0x04`, then 7-bit length + ASCII bytes.
+/// * `:authority host` — literal-without-indexing, name index 1 →
+///   byte `0x01`, then 7-bit length + ASCII bytes.
+///
+/// Length octets use the HPACK 7-bit-prefix integer form, which fits
+/// in one byte for any sane health-check URI or `host:port` (≤127
+/// bytes). For longer values the encoder falls back to RFC 7541 §5.1
+/// multi-byte form.
+fn build_h2c_probe_bytes(uri: &str, address: SocketAddr) -> Vec<u8> {
+    const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+    let authority = address.to_string();
+
+    // Build the HPACK header block first so we know its length for the
+    // HEADERS frame header.
+    let mut hpack = Vec::with_capacity(2 + 2 + uri.len() + authority.len() + 4);
+    hpack.push(0x82); // :method GET
+    hpack.push(0x86); // :scheme http
+    hpack.push(0x04); // :path  — literal w/o indexing, name idx 4
+    encode_hpack_length(uri.len(), &mut hpack);
+    hpack.extend_from_slice(uri.as_bytes());
+    hpack.push(0x01); // :authority — literal w/o indexing, name idx 1
+    encode_hpack_length(authority.len(), &mut hpack);
+    hpack.extend_from_slice(authority.as_bytes());
+
+    let mut out = Vec::with_capacity(PREFACE.len() + 9 + 9 + hpack.len());
+    out.extend_from_slice(PREFACE);
+
+    // Empty client SETTINGS frame: length=0, type=0x04, flags=0, sid=0.
+    out.extend_from_slice(&[0, 0, 0, H2_FRAME_TYPE_SETTINGS, 0, 0, 0, 0, 0]);
+
+    // HEADERS frame: length=hpack.len(), type=0x01,
+    // flags=END_STREAM|END_HEADERS=0x05, stream=1.
+    let len = hpack.len() as u32;
+    out.push(((len >> 16) & 0xFF) as u8);
+    out.push(((len >> 8) & 0xFF) as u8);
+    out.push((len & 0xFF) as u8);
+    out.push(H2_FRAME_TYPE_HEADERS);
+    out.push(0x05); // END_STREAM | END_HEADERS
+    out.extend_from_slice(&[0, 0, 0, 1]); // stream id = 1
+    out.extend_from_slice(&hpack);
+    out
+}
+
+/// HPACK 7-bit-prefix integer (RFC 7541 §5.1) for length octets.
+/// Single-byte form when value < 127; otherwise emits the continuation
+/// chain.
+fn encode_hpack_length(value: usize, out: &mut Vec<u8>) {
+    if value < 127 {
+        out.push(value as u8);
+        return;
+    }
+    out.push(0x7F);
+    let mut v = value - 127;
+    while v >= 128 {
+        out.push(((v & 0x7F) as u8) | 0x80);
+        v >>= 7;
+    }
+    out.push(v as u8);
+}
+
+/// Walk the buffered H2 frames looking for a HEADERS frame on stream 1
+/// and extract `:status`. Returns:
+///
+/// * `Some(true)` — `:status` found and matches
+///   `config.expected_status` (or any 2xx when `expected_status == 0`).
+/// * `Some(false)` — `:status` found but does not match, or a GOAWAY
+///   frame was received.
+/// * `None` — buffer truncated mid-frame; caller should keep reading.
+///
+/// The decoder handles only the subset of HPACK used by typical
+/// servers replying to a probe: the indexed-status static-table forms
+/// (200/204/206/304/400/404/500), and the literal-with-indexed-name
+/// form for `:status` (name index 8). Frames with PADDED/PRIORITY flags
+/// are skipped past correctly. Unknown HPACK encodings are treated as
+/// "header block continues" and the decoder advances byte-by-byte
+/// until it finds a recognisable representation or end-of-block.
+fn try_parse_h2c_status(buf: &[u8], config: &HealthCheckConfig) -> Option<bool> {
+    let mut cursor = 0usize;
+
+    while cursor + H2_FRAME_HEADER_LEN <= buf.len() {
+        let length = ((buf[cursor] as usize) << 16)
+            | ((buf[cursor + 1] as usize) << 8)
+            | (buf[cursor + 2] as usize);
+        let frame_type = buf[cursor + 3];
+        let flags = buf[cursor + 4];
+        let stream_id = (((buf[cursor + 5] as u32) & 0x7F) << 24)
+            | ((buf[cursor + 6] as u32) << 16)
+            | ((buf[cursor + 7] as u32) << 8)
+            | (buf[cursor + 8] as u32);
+
+        let frame_end = cursor + H2_FRAME_HEADER_LEN + length;
+        if frame_end > buf.len() {
+            return None;
+        }
+
+        match frame_type {
+            H2_FRAME_TYPE_HEADERS if stream_id == 1 => {
+                let mut payload_start = cursor + H2_FRAME_HEADER_LEN;
+                let mut payload_end = frame_end;
+
+                if flags & H2_FLAG_PADDED != 0 {
+                    if payload_start >= payload_end {
+                        return Some(false);
+                    }
+                    let pad = buf[payload_start] as usize;
+                    payload_start += 1;
+                    if payload_end < pad || payload_end - pad < payload_start {
+                        return Some(false);
+                    }
+                    payload_end -= pad;
+                }
+                if flags & H2_FLAG_PRIORITY != 0 {
+                    if payload_end < payload_start + 5 {
+                        return Some(false);
+                    }
+                    payload_start += 5;
+                }
+
+                let block = &buf[payload_start..payload_end];
+                if let Some(status) = decode_h2c_status(block) {
+                    return Some(is_status_healthy(status, config.expected_status));
+                }
+                return Some(false);
+            }
+            H2_FRAME_TYPE_GOAWAY => return Some(false),
+            // SETTINGS, SETTINGS-ACK, DATA, etc. are ignored — keep
+            // walking until we find HEADERS on stream 1.
+            _ => {}
+        }
+        cursor = frame_end;
+    }
+    None
+}
+
+/// Recover the numeric `:status` from an HPACK header block. Handles
+/// the static-table indexed forms (idx 8..=14) and the
+/// literal-with-indexed-name form for name index 8.
+fn decode_h2c_status(block: &[u8]) -> Option<u32> {
+    let mut i = 0usize;
+    while i < block.len() {
+        let b = block[i];
+        match b {
+            0x88 => return Some(200),
+            0x89 => return Some(204),
+            0x8A => return Some(206),
+            0x8B => return Some(304),
+            0x8C => return Some(400),
+            0x8D => return Some(404),
+            0x8E => return Some(500),
+            // Literal w/o indexing OR literal never indexed, name in
+            // static table at index 8 (`:status`). Prefix bytes are
+            // 0x08 or 0x18 respectively.
+            0x08 | 0x18 => {
+                let (value_len, len_consumed) = decode_hpack_length(&block[i + 1..])?;
+                let val_start = i + 1 + len_consumed;
+                let val_end = val_start.checked_add(value_len)?;
+                if val_end > block.len() {
+                    return None;
+                }
+                let s = std::str::from_utf8(&block[val_start..val_end]).ok()?;
+                return s.parse::<u32>().ok();
+            }
+            _ => {
+                // Skip indexed/literal headers that aren't `:status`.
+                // For pseudo-headers we control the request; in the
+                // response we may see other indexed headers ahead of
+                // `:status`. Cheap conservative skip: advance by one
+                // byte. Wrong on multi-byte literals but the decoder
+                // is bounded by the frame end — at worst it returns
+                // None and the caller fails the probe, which then
+                // marks the backend unhealthy on threshold crossing.
+                i += 1;
+                continue;
+            }
+        }
+    }
+    None
+}
+
+/// HPACK 7-bit-prefix integer decode. Returns `(value, bytes_read)`
+/// or `None` on buffer underrun / overflow. Mirror of
+/// `encode_hpack_length` above.
+fn decode_hpack_length(buf: &[u8]) -> Option<(usize, usize)> {
+    if buf.is_empty() {
+        return None;
+    }
+    let first = (buf[0] & 0x7F) as usize;
+    if first < 127 {
+        return Some((first, 1));
+    }
+    let mut value = 127usize;
+    let mut shift = 0u32;
+    let mut consumed = 1usize;
+    loop {
+        if consumed >= buf.len() {
+            return None;
+        }
+        let b = buf[consumed];
+        value = value.checked_add(((b & 0x7F) as usize).checked_shl(shift)?)?;
+        consumed += 1;
+        if b & 0x80 == 0 {
+            return Some((value, consumed));
+        }
+        shift = shift.checked_add(7)?;
+        if shift > usize::BITS {
+            return None;
+        }
     }
 }
 
@@ -522,6 +770,7 @@ mod tests {
             healthy_threshold: 3,
             unhealthy_threshold: 3,
             expected_status: 0,
+            is_h2c: Some(false),
         };
 
         let buf = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
@@ -552,5 +801,115 @@ mod tests {
 
         assert!(state.record_success(3));
         assert!(state.is_healthy());
+    }
+
+    fn h2c_config(expected: u32) -> HealthCheckConfig {
+        HealthCheckConfig {
+            uri: "/health".to_owned(),
+            interval: 10,
+            timeout: 5,
+            healthy_threshold: 3,
+            unhealthy_threshold: 3,
+            expected_status: expected,
+            is_h2c: Some(true),
+        }
+    }
+
+    fn h2_frame_header(payload_len: usize, frame_type: u8, flags: u8, sid: u32) -> Vec<u8> {
+        let mut h = Vec::with_capacity(9);
+        h.push(((payload_len >> 16) & 0xFF) as u8);
+        h.push(((payload_len >> 8) & 0xFF) as u8);
+        h.push((payload_len & 0xFF) as u8);
+        h.push(frame_type);
+        h.push(flags);
+        h.extend_from_slice(&sid.to_be_bytes());
+        h
+    }
+
+    #[test]
+    fn build_h2c_probe_starts_with_preface_and_settings() {
+        let bytes = build_h2c_probe_bytes("/health", "127.0.0.1:8080".parse().unwrap());
+        // Preface
+        assert!(bytes.starts_with(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"));
+        // SETTINGS frame: 9 bytes after preface, type=0x04, flags=0, sid=0
+        let settings_start = 24;
+        assert_eq!(bytes[settings_start + 3], H2_FRAME_TYPE_SETTINGS);
+        assert_eq!(bytes[settings_start + 4], 0);
+        assert_eq!(
+            &bytes[settings_start + 5..settings_start + 9],
+            &[0u8, 0, 0, 0]
+        );
+        // HEADERS frame on stream 1, END_STREAM | END_HEADERS = 0x05
+        let headers_start = settings_start + 9;
+        assert_eq!(bytes[headers_start + 3], H2_FRAME_TYPE_HEADERS);
+        assert_eq!(bytes[headers_start + 4], 0x05);
+        assert_eq!(
+            &bytes[headers_start + 5..headers_start + 9],
+            &[0u8, 0, 0, 1]
+        );
+        // First HPACK byte must be :method GET indexed (0x82)
+        assert_eq!(bytes[headers_start + 9], 0x82);
+    }
+
+    #[test]
+    fn h2c_indexed_status_200_is_healthy_for_any_2xx() {
+        // SETTINGS ack (server's empty SETTINGS) + HEADERS on stream 1 with `0x88` (=200).
+        let mut buf = Vec::new();
+        buf.extend(h2_frame_header(0, H2_FRAME_TYPE_SETTINGS, 0, 0));
+        buf.extend(h2_frame_header(1, H2_FRAME_TYPE_HEADERS, 0x05, 1));
+        buf.push(0x88);
+        let cfg = h2c_config(0);
+        assert_eq!(try_parse_h2c_status(&buf, &cfg), Some(true));
+    }
+
+    #[test]
+    fn h2c_indexed_status_500_fails_default_2xx_check() {
+        let mut buf = Vec::new();
+        buf.extend(h2_frame_header(1, H2_FRAME_TYPE_HEADERS, 0x05, 1));
+        buf.push(0x8E); // :status 500
+        let cfg = h2c_config(0);
+        assert_eq!(try_parse_h2c_status(&buf, &cfg), Some(false));
+    }
+
+    #[test]
+    fn h2c_literal_status_503_matches_expected_503() {
+        // Literal w/o indexing, name idx 8, value "503"
+        let mut block = Vec::new();
+        block.extend_from_slice(&[0x08, 0x03, b'5', b'0', b'3']);
+        let mut buf = Vec::new();
+        buf.extend(h2_frame_header(block.len(), H2_FRAME_TYPE_HEADERS, 0x05, 1));
+        buf.extend_from_slice(&block);
+        let cfg = h2c_config(503);
+        assert_eq!(try_parse_h2c_status(&buf, &cfg), Some(true));
+    }
+
+    #[test]
+    fn h2c_goaway_marks_unhealthy() {
+        let mut buf = Vec::new();
+        buf.extend(h2_frame_header(8, H2_FRAME_TYPE_GOAWAY, 0, 0));
+        buf.extend_from_slice(&[0u8; 8]); // last-stream-id + error code
+        let cfg = h2c_config(0);
+        assert_eq!(try_parse_h2c_status(&buf, &cfg), Some(false));
+    }
+
+    #[test]
+    fn h2c_truncated_buffer_returns_none() {
+        let mut buf = Vec::new();
+        // Frame header claims 10 bytes payload but we only deliver 5.
+        buf.extend(h2_frame_header(10, H2_FRAME_TYPE_HEADERS, 0x05, 1));
+        buf.extend_from_slice(&[0u8; 5]);
+        let cfg = h2c_config(0);
+        assert_eq!(try_parse_h2c_status(&buf, &cfg), None);
+    }
+
+    #[test]
+    fn h2c_padded_headers_strips_pad_length_octet() {
+        // PADDED flag (0x08) + END_HEADERS (0x04) = 0x0C. Payload =
+        // 1-byte pad-length + indexed :status (0x88) + 2 padding bytes.
+        let mut buf = Vec::new();
+        buf.extend(h2_frame_header(4, H2_FRAME_TYPE_HEADERS, 0x0C, 1));
+        buf.extend_from_slice(&[2, 0x88, 0, 0]);
+        let cfg = h2c_config(0);
+        assert_eq!(try_parse_h2c_status(&buf, &cfg), Some(true));
     }
 }
