@@ -1080,6 +1080,12 @@ impl Display for HttpListenerConfig {
         if let Some(v) = &self.sozu_id_header {
             table.add_row(row!["Sozu-Id correlation header name", v]);
         }
+        if let Some(v) = self.elide_x_real_ip {
+            table.add_row(row!["elide X-Real-IP (anti-spoof)", v]);
+        }
+        if let Some(v) = self.send_x_real_ip {
+            table.add_row(row!["send X-Real-IP (peer IP)", v]);
+        }
         write!(f, "{table}")
     }
 }
@@ -1153,6 +1159,12 @@ impl Display for HttpsListenerConfig {
         }
         if let Some(v) = &self.sozu_id_header {
             table.add_row(row!["Sozu-Id correlation header name", v]);
+        }
+        if let Some(v) = self.elide_x_real_ip {
+            table.add_row(row!["elide X-Real-IP (anti-spoof)", v]);
+        }
+        if let Some(v) = self.send_x_real_ip {
+            table.add_row(row!["send X-Real-IP (peer IP)", v]);
         }
         write!(f, "{table}")
     }

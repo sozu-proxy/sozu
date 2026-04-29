@@ -449,6 +449,15 @@ pub struct ListenerBuilder {
     /// that omit ALPN entirely) are dropped at handshake instead of
     /// silently downgrading to HTTP/1.1. Default: false.
     pub disable_http11: Option<bool>,
+    /// When true, any client-supplied `X-Real-IP` header is stripped from
+    /// requests before forwarding (anti-spoofing). Independently combinable
+    /// with `send_x_real_ip`. Default: false.
+    pub elide_x_real_ip: Option<bool>,
+    /// When true, a proxy-generated `X-Real-IP` header carrying the
+    /// connection peer IP (post-PROXY-v2 unwrap, i.e. the original client
+    /// IP) is appended to every forwarded request. Independently combinable
+    /// with `elide_x_real_ip`. Default: false.
+    pub send_x_real_ip: Option<bool>,
     /// Per-status HTTP answer templates at listener scope — the **global
     /// default** that fires whenever no cluster-level override matches.
     /// Map key is the HTTP status code (e.g. `"503"`); map value is
@@ -542,6 +551,8 @@ impl ListenerBuilder {
             h2_graceful_shutdown_deadline_seconds: None,
             strict_sni_binding: None,
             disable_http11: None,
+            elide_x_real_ip: None,
+            send_x_real_ip: None,
             answers: None,
         }
     }
@@ -590,6 +601,21 @@ impl ListenerBuilder {
 
     pub fn with_alpn_protocols(&mut self, alpn_protocols: Option<Vec<String>>) -> &mut Self {
         self.alpn_protocols = alpn_protocols;
+        self
+    }
+
+    /// When true, strip any client-supplied `X-Real-IP` header from
+    /// forwarded requests (anti-spoofing). Default: false.
+    pub fn with_elide_x_real_ip(&mut self, elide_x_real_ip: bool) -> &mut Self {
+        self.elide_x_real_ip = Some(elide_x_real_ip);
+        self
+    }
+
+    /// When true, append a proxy-generated `X-Real-IP` header carrying the
+    /// connection peer IP (post-PROXY-v2 unwrap) to every forwarded request.
+    /// Default: false.
+    pub fn with_send_x_real_ip(&mut self, send_x_real_ip: bool) -> &mut Self {
+        self.send_x_real_ip = Some(send_x_real_ip);
         self
     }
 
@@ -783,6 +809,8 @@ impl ListenerBuilder {
             h2_stream_idle_timeout_seconds: self.h2_stream_idle_timeout_seconds,
             h2_graceful_shutdown_deadline_seconds: self.h2_graceful_shutdown_deadline_seconds,
             sozu_id_header: self.sozu_id_header.clone(),
+            elide_x_real_ip: Some(self.elide_x_real_ip.unwrap_or(false)),
+            send_x_real_ip: Some(self.send_x_real_ip.unwrap_or(false)),
             ..Default::default()
         };
 
@@ -953,6 +981,8 @@ impl ListenerBuilder {
             h2_stream_idle_timeout_seconds: self.h2_stream_idle_timeout_seconds,
             h2_graceful_shutdown_deadline_seconds: self.h2_graceful_shutdown_deadline_seconds,
             sozu_id_header: self.sozu_id_header.clone(),
+            elide_x_real_ip: Some(self.elide_x_real_ip.unwrap_or(false)),
+            send_x_real_ip: Some(self.send_x_real_ip.unwrap_or(false)),
         };
 
         Ok(https_listener_config)

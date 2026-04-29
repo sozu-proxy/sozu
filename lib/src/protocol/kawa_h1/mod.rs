@@ -266,6 +266,8 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             None => return Err(AcceptError::BufferCapacityReached),
         };
         let sozu_id_header = listener.borrow().get_sozu_id_header().to_string();
+        let elide_x_real_ip = listener.borrow().get_elide_x_real_ip();
+        let send_x_real_ip = listener.borrow().get_send_x_real_ip();
         Ok(Http {
             answers,
             backend_connection_status: BackendConnectionStatus::NotConnected,
@@ -304,6 +306,8 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 session_address,
                 sticky_name,
                 sozu_id_header,
+                elide_x_real_ip,
+                send_x_real_ip,
             ),
         })
     }
