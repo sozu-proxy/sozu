@@ -72,11 +72,14 @@ use crate::{
     },
 };
 
-/// provides all supported cipher suites exported by Rustls TLS
-/// provider as it support only strongly secure ones.
+/// Authoritative list of default cipher suites for all rustls-based TLS providers.
+///
+/// These use rustls naming conventions and are supported by all three crypto providers
+/// (ring, aws-lc-rs, rustls-openssl). Order follows ANSSI recommendations: AES-256
+/// preferred over AES-128, ECDSA preferred over RSA, TLS 1.3 preferred over TLS 1.2.
 ///
 /// See the [documentation](https://docs.rs/rustls/latest/rustls/static.ALL_CIPHER_SUITES.html)
-pub const DEFAULT_RUSTLS_CIPHER_LIST: [&str; 9] = [
+pub const DEFAULT_CIPHER_LIST: [&str; 9] = [
     // TLS 1.3 cipher suites
     "TLS13_AES_256_GCM_SHA384",
     "TLS13_AES_128_GCM_SHA256",
@@ -88,13 +91,6 @@ pub const DEFAULT_RUSTLS_CIPHER_LIST: [&str; 9] = [
     "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
     "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
     "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
-];
-
-pub const DEFAULT_CIPHER_SUITES: [&str; 4] = [
-    "TLS_AES_256_GCM_SHA384",
-    "TLS_AES_128_GCM_SHA256",
-    "TLS_AES_128_CCM_SHA256",
-    "TLS_CHACHA20_POLY1305_SHA256",
 ];
 
 pub const DEFAULT_SIGNATURE_ALGORITHMS: [&str; 9] = [
@@ -109,7 +105,7 @@ pub const DEFAULT_SIGNATURE_ALGORITHMS: [&str; 9] = [
     "RSA-PSS+SHA512",
 ];
 
-pub const DEFAULT_GROUPS_LIST: [&str; 4] = ["P-521", "P-384", "P-256", "x25519"];
+pub const DEFAULT_GROUPS_LIST: [&str; 4] = ["X25519MLKEM768", "x25519", "P-256", "P-384"];
 
 /// Default ALPN protocols advertised by HTTPS listeners.
 /// Both HTTP/2 and HTTP/1.1 are enabled, allowing clients to negotiate either.
@@ -362,6 +358,7 @@ pub struct ListenerBuilder {
     pub tls_versions: Option<Vec<TlsVersion>>,
     pub cipher_list: Option<Vec<String>>,
     pub cipher_suites: Option<Vec<String>>,
+    pub groups_list: Option<Vec<String>>,
     pub expect_proxy: Option<bool>,
     #[serde(default = "default_sticky_name")]
     pub sticky_name: String,
@@ -519,6 +516,7 @@ impl ListenerBuilder {
             certificate: None,
             cipher_list: None,
             cipher_suites: None,
+            groups_list: None,
             config: None,
             connect_timeout: None,
             expect_proxy: None,
@@ -826,26 +824,24 @@ impl ListenerBuilder {
             });
         }
 
-        let default_cipher_list = DEFAULT_RUSTLS_CIPHER_LIST
-            .into_iter()
-            .map(String::from)
-            .collect();
+        let default_cipher_list = DEFAULT_CIPHER_LIST.into_iter().map(String::from).collect();
 
         let cipher_list = self.cipher_list.clone().unwrap_or(default_cipher_list);
 
-        let default_cipher_suites = DEFAULT_CIPHER_SUITES
-            .into_iter()
-            .map(String::from)
-            .collect();
-
-        let cipher_suites = self.cipher_suites.clone().unwrap_or(default_cipher_suites);
+        let cipher_suites = self
+            .cipher_suites
+            .clone()
+            .unwrap_or_else(|| DEFAULT_CIPHER_LIST.into_iter().map(String::from).collect());
 
         let signature_algorithms: Vec<String> = DEFAULT_SIGNATURE_ALGORITHMS
             .into_iter()
             .map(String::from)
             .collect();
 
-        let groups_list: Vec<String> = DEFAULT_GROUPS_LIST.into_iter().map(String::from).collect();
+        let groups_list = self
+            .groups_list
+            .clone()
+            .unwrap_or_else(|| DEFAULT_GROUPS_LIST.into_iter().map(String::from).collect());
 
         let alpn_protocols: Vec<String> = match &self.alpn_protocols {
             Some(protos) if !protos.is_empty() => {

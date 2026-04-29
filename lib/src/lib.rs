@@ -306,12 +306,14 @@
 
 #[macro_use]
 extern crate sozu_command_lib as sozu_command;
+
 #[macro_use]
 pub mod util;
 #[macro_use]
 pub mod metrics;
 
 pub mod backends;
+pub mod crypto;
 pub mod features;
 pub mod http;
 pub mod load_balancing;

@@ -37,9 +37,9 @@ criterion = { version = "^0.5.1", features = ["html_reports"] }
 quickcheck = "^1.1.0"
 rand = "^0.10.1"
 regex = "^1.12.3"
+rustls-openssl = { version = "^0.3.0", default-features = false, features = ["tls12"] }
 rustls-pemfile = "^2.2.0"
 rustls = { version = "^0.23.38", default-features = false, features = [
-  "ring",
   "logging",
   "std",
   "tls12",
