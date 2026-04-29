@@ -374,6 +374,19 @@ pub struct Context<L: ListenerHandler + L7ListenerHandler> {
     /// at `Context::new` so routing decisions on each stream avoid a
     /// per-stream `listener.borrow()`.
     pub strict_sni_binding: bool,
+    /// Whether the request-side block walk must strip any client-supplied
+    /// `X-Real-IP` header before forwarding (anti-spoofing). Mirrors
+    /// `HttpListenerConfig::elide_x_real_ip` /
+    /// `HttpsListenerConfig::elide_x_real_ip`; captured once at
+    /// `Context::new` so per-stream `HttpContext`s do not need to call
+    /// `listener.borrow()` again. Independent of `send_x_real_ip`.
+    pub elide_x_real_ip: bool,
+    /// Whether `on_request_headers` injects a proxy-generated `X-Real-IP`
+    /// header carrying the connection peer IP (post-PROXY-v2 unwrap).
+    /// Mirrors `HttpListenerConfig::send_x_real_ip` /
+    /// `HttpsListenerConfig::send_x_real_ip`; captured once at
+    /// `Context::new`. Independent of `elide_x_real_ip`.
+    pub send_x_real_ip: bool,
     /// Negotiated TLS protocol version short-form (e.g. `"TLSv1.3"`).
     /// Captured once at handshake completion in `https.rs` and propagated
     /// to every per-stream [`HttpContext`] so the access log can record it
@@ -405,6 +418,8 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
             .get_h2_connection_config()
             .stream_shrink_ratio as usize;
         let strict_sni_binding = listener.borrow().get_strict_sni_binding();
+        let elide_x_real_ip = listener.borrow().get_elide_x_real_ip();
+        let send_x_real_ip = listener.borrow().get_send_x_real_ip();
         Self {
             streams: Vec::new(),
             pending_links: VecDeque::new(),
@@ -418,6 +433,8 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
             h2_stream_shrink_ratio,
             tls_server_name: None,
             strict_sni_binding,
+            elide_x_real_ip,
+            send_x_real_ip,
             tls_version: None,
             tls_cipher: None,
             tls_alpn: None,
@@ -482,6 +499,8 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
                 self.session_address,
                 listener.get_sticky_name().to_string(),
                 listener.get_sozu_id_header().to_string(),
+                self.elide_x_real_ip,
+                self.send_x_real_ip,
             );
             // Propagate the connection-scoped TLS SNI onto every per-stream
             // HttpContext so `route_from_request` can enforce the SNI ↔

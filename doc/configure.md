@@ -512,6 +512,57 @@ sozu_id_header = "Sozu-Id"  # rename the per-request correlation header (default
 
 The `sozu_id_header` knob renames the correlation header Sozu injects on every request AND response. Each request gets a unique ULID whose value is written to both sides — operators can grep the same identifier across client logs, proxy access logs, and backend logs. Default is `Sozu-Id`; a common rebrand is `X-Request-Trace` or `X-Edge-Id`. The value must be a valid HTTP header name (token chars per RFC 9110 §5.1). Applies to both HTTP and HTTPS listeners.
 
+#### `X-Real-IP` injection and anti-spoof elision
+
+Two listener-scoped flags control how Sōzu handles the `X-Real-IP`
+header. They default off (current behaviour: client-supplied value
+passes through, no proxy injection) and are independently combinable:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `elide_x_real_ip` | false | Strip any client-supplied `X-Real-IP` header from forwarded requests before they reach the backend. Anti-spoofing — without this, a client can claim any value and downstream apps that key on `X-Real-IP` trust it verbatim. |
+| `send_x_real_ip` | false | Append a proxy-generated `X-Real-IP` header carrying `session_address.ip()` — the connection peer IP after PROXY-v2 unwrap, i.e. the original client IP. |
+
+The four valid combinations cover the typical use cases:
+
+| `elide_x_real_ip` | `send_x_real_ip` | Behaviour |
+|---|---|---|
+| `false` | `false` | Default. Client header passes through, no proxy injection. |
+| `false` | `true`  | Send-only. Both client and proxy headers reach the backend. **Operator caveat:** backends that read the *first* `X-Real-IP` header (rather than the last) trust the client value over the proxy value. Use `elide_x_real_ip = true` alongside for full anti-spoofing. |
+| `true`  | `false` | Anti-spoof only. Client header stripped, no proxy injection. |
+| `true`  | `true`  | Anti-spoof + send. Client header stripped, proxy header carries the connection peer IP. |
+
+The injected value is the IP of the connection peer **after** PROXY-v2
+unwrap. When the listener has `expect_proxy = true` and the upstream
+sends a PROXY-v2 frame, `session_address` is rewritten to the original
+client IP before this header is generated, so the carried address is
+the real client even with one (or more) PROXY-v2 hops in front of
+Sōzu.
+
+Both flags apply uniformly to HTTP/1 and HTTP/2 because the elision
+and injection live on the shared `HttpContext::on_request_headers`
+callback. The H2 trailer-block code path additionally honours
+`elide_x_real_ip` for trailer HEADERS frames, so an H2 client cannot
+spoof `x-real-ip` as a trailer to bypass the anti-spoof.
+
+Both knobs are runtime-patchable via `UpdateHttpListenerConfig` /
+`UpdateHttpsListenerConfig`. Patches apply immediately to all H1
+sessions and to **new** H2 connections; **already-open H2 connections
+continue using the values captured at their handshake** (same
+connection-scoped-capture semantic as `strict_sni_binding`). Long-lived
+H2 connections (CDN-style, mobile keep-alive) therefore observe a
+delayed flag flip — this is the established mux precedent, not a new
+defect.
+
+```toml
+[[listeners]]
+address = "0.0.0.0:443"
+protocol = "https"
+
+elide_x_real_ip = true   # strip client-supplied X-Real-IP before forwarding
+send_x_real_ip  = true   # inject a proxy-generated X-Real-IP carrying the peer IP
+```
+
 #### TLS handshake log severity cheat-sheet
 
 Sōzu tiers the log severity of every rustls handshake error by root cause so
