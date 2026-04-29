@@ -54,7 +54,6 @@ fn default_health_check_config() -> HealthCheckConfig {
         healthy_threshold: 2,
         unhealthy_threshold: 2,
         expected_status: 0,
-        is_h2c: Some(false),
     }
 }
 

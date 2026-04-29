@@ -240,6 +240,13 @@ pub struct BackendMap {
     pub max_failures: usize,
     pub available: bool,
     pub health_check_configs: HashMap<ClusterId, HealthCheckConfig>,
+    /// Whether the cluster's backends speak HTTP/2 (cluster.http2 = true).
+    /// Mirrors the same backend-capability hint the mux router reads at
+    /// `protocol/mux/router.rs::Router::connect`. The health checker uses
+    /// it to switch the probe wire format from HTTP/1.1 to h2c so an
+    /// h2c-only backend is not probed with an HTTP/1.1 preface that
+    /// would always fail.
+    pub cluster_http2: HashMap<ClusterId, bool>,
 }
 
 impl Default for BackendMap {
@@ -255,6 +262,19 @@ impl BackendMap {
             max_failures: 3,
             available: true,
             health_check_configs: HashMap::new(),
+            cluster_http2: HashMap::new(),
+        }
+    }
+
+    /// Record (or clear) the `cluster.http2` backend-capability hint for
+    /// `cluster_id`. The health checker reads the resulting map at probe
+    /// time so the wire format follows what the mux router will use to
+    /// connect to the same backends.
+    pub fn set_cluster_http2(&mut self, cluster_id: &str, http2: bool) {
+        if http2 {
+            self.cluster_http2.insert(cluster_id.to_owned(), true);
+        } else {
+            self.cluster_http2.remove(cluster_id);
         }
     }
 
