@@ -104,10 +104,20 @@ worker_timeout = 10
 handle_process_affinity = false
 
 # maximum number of connections to a worker. If it reached that number and
-# there are new connections available, the worker will accept and close them
-# immediately to indicate it is too busy to handle traffic
+# there are new connections available, the worker (by default) will accept and
+# close them immediately to indicate it is too busy to handle traffic. See
+# `evict_on_queue_full` below for the alternative mitigation.
 # defaults to 10000 maximum connections
 max_connections = 500
+
+# when the accept queue is full (max_connections reached), evict the
+# least-recently-active sessions to make room for new connections.
+# defaults to false: during a DDoS, existing connections are more likely
+# to be legitimate clients — evicting them would serve attackers instead.
+# enable this if your workload is dominated by normal traffic spikes.
+# At small max_connections (< 100) the 1% eviction batch clamps to 1, so
+# the per-round share grows; the worker logs a config-load warning then.
+# evict_on_queue_full = false
 
 # maximum number of buffers in the pool used by the protocol implementations
 # for active connections (ie currently serving a request). For now, you should

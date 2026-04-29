@@ -1274,6 +1274,10 @@ message ServerConfig {
     // (see config.rs validation). Set once at worker boot via
     // `mux::auth::set_max_decoded_credential_bytes`.
     optional uint64 basic_auth_max_credential_bytes = 21;
+    // when the accept queue is full (max_connections reached), evict the
+    // least recently active sessions to make room for new connections.
+    // Defaults to false: during DDoS, existing connections are likely real clients.
+    optional bool evict_on_queue_full = 22 [default = false];
 }
 
 enum ProtobufAccessLogFormat {
