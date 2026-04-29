@@ -348,9 +348,8 @@ mod tests {
         // 250 bytes of `a` + ":" + 64 hex = 315 bytes total.
         let long_user = "a".repeat(250);
         let stored = format!("{long_user}:{SECRET_SHA256_HEX}");
-        let attacker = format!(
-            "{long_user}:0000000000000000000000000000000000000000000000000000000000000000"
-        );
+        let attacker =
+            format!("{long_user}:0000000000000000000000000000000000000000000000000000000000000000");
         assert!(stored.len() > AUTH_COMPARE_PAD_LEN);
         assert!(attacker.len() > AUTH_COMPARE_PAD_LEN);
         assert_eq!(stored.len(), attacker.len()); // same length suffix

@@ -296,9 +296,8 @@ pub(crate) fn set_default_answer_with_retry_after(
         None
     };
 
-    let (resolved_status, keep_alive, rendered) = inline_override.unwrap_or_else(|| {
-        answers.get(answer, request_id, cluster_id, backend_id, route)
-    });
+    let (resolved_status, keep_alive, rendered) = inline_override
+        .unwrap_or_else(|| answers.get(answer, request_id, cluster_id, backend_id, route));
     // Honour the rendered template's `Connection` header. Most error
     // templates carry `Connection: close`, which flips the frontend
     // keep-alive bit to false; cluster operators can opt back into

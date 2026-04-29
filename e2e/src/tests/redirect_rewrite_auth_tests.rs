@@ -1393,8 +1393,7 @@ fn test_request_header_inject_h2_h2() {
 pub fn try_redirect_permanent_uses_rewrite_host_and_template() -> State {
     let front_address = create_local_address();
     let unused_back = create_unbound_local_address();
-    let mut worker =
-        spawn_worker_with_http_listener("REDIR-TEMPLATE-REWRITE", front_address);
+    let mut worker = spawn_worker_with_http_listener("REDIR-TEMPLATE-REWRITE", front_address);
 
     worker.send_proxy_request(
         RequestType::AddCluster(Cluster {
@@ -1463,18 +1462,14 @@ Content-Length: 0\r\n\r\n"
     // listener default never emits `X-Custom-Redirect`, so this header
     // proves the inline render path took over the answer.
     if !lower.contains("x-custom-redirect: from-template") {
-        eprintln!(
-            "expected X-Custom-Redirect from operator template, got:\n{response}"
-        );
+        eprintln!("expected X-Custom-Redirect from operator template, got:\n{response}");
         return State::Fail;
     }
 
     // Host assertion: the 301 Location uses the rewritten host, not the
     // original `Host: localhost` from the request line.
     if !lower.contains("location: https://new.example.com") {
-        eprintln!(
-            "expected Location to use rewritten host new.example.com, got:\n{response}"
-        );
+        eprintln!("expected Location to use rewritten host new.example.com, got:\n{response}");
         return State::Fail;
     }
 
