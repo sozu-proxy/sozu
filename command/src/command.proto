@@ -908,6 +908,15 @@ message HealthCheckConfig {
     required uint32 healthy_threshold = 4 [default = 3];
     required uint32 unhealthy_threshold = 5 [default = 3];
     required uint32 expected_status = 6 [default = 0];
+    // When true, the probe negotiates HTTP/2 prior-knowledge (h2c)
+    // instead of HTTP/1.1 — useful for backends configured with
+    // `cluster.http2 = true` that do not co-locate an HTTP/1.1 health
+    // endpoint. The probe sends the connection preface, an empty
+    // SETTINGS frame, and a single HEADERS frame for `GET <uri>` with
+    // END_STREAM + END_HEADERS, then parses the response for a HEADERS
+    // frame on stream 1. Default false (HTTP/1.1 probe). The probe is
+    // cleartext — TLS h2 probing is not implemented.
+    optional bool is_h2c = 7 [default = false];
 }
 
 enum LoadBalancingAlgorithms {
