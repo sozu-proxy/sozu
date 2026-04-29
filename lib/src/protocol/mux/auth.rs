@@ -122,8 +122,24 @@ pub fn canonicalize_basic_credentials(value: &[u8]) -> Option<String> {
         return None;
     }
 
+    // ── Pre-decode length cap ──
+    //
+    // base64 expands 3 bytes → 4 characters. The post-decode length check
+    // below would still allocate the full decoded payload before the
+    // rejection runs, so a peer can force a per-attempt allocation up to
+    // the request-buffer cap on every failed Basic-auth probe.
+    // `basic_auth_max_credential_bytes` is meant as a per-request memory
+    // bound; cap the *encoded* size first so `STANDARD.decode` never sees
+    // a payload bigger than the bound it implies. The `+ 4` slack covers
+    // up to two `=` padding characters plus rounding.
+    let max_decoded = max_decoded_credential_bytes();
+    let max_encoded = max_decoded.saturating_mul(4).saturating_add(2) / 3 + 4;
+    if rest.len() > max_encoded {
+        return None;
+    }
+
     let decoded = STANDARD.decode(rest).ok()?;
-    if decoded.len() > max_decoded_credential_bytes() {
+    if decoded.len() > max_decoded {
         return None;
     }
 
@@ -271,6 +287,26 @@ mod tests {
         let payload = "a".repeat(max_decoded_credential_bytes() * 2);
         let token = STANDARD.encode(format!("{payload}:pwd"));
         let header = format!("Basic {token}");
+        assert!(canonicalize_basic_credentials(header.as_bytes()).is_none());
+    }
+
+    /// The post-decode length check used to let `STANDARD.decode` allocate
+    /// the full payload before rejection, so an attacker could force a
+    /// per-attempt allocation up to the request-buffer cap on every
+    /// failed Basic-auth probe. The pre-decode length cap rejects an
+    /// oversized encoded payload before any allocation.
+    ///
+    /// We don't measure the allocator directly here; instead we pass an
+    /// encoded payload that is *much* larger than `max_decoded * 4 / 3`
+    /// and assert `None`. Combined with the source code's pre-decode
+    /// guard, that's enough to pin the contract.
+    #[test]
+    fn canonicalize_rejects_oversized_encoded_payload_before_decode() {
+        // 16× the maximum encoded budget. Without the pre-decode cap,
+        // base64::STANDARD::decode would allocate ~12× max_decoded bytes
+        // before the post-decode rejection ran.
+        let oversize = "A".repeat(max_decoded_credential_bytes() * 16);
+        let header = format!("Basic {oversize}");
         assert!(canonicalize_basic_credentials(header.as_bytes()).is_none());
     }
 
