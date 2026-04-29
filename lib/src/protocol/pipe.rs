@@ -26,7 +26,7 @@ use crate::{
 };
 
 #[cfg(all(target_os = "linux", feature = "splice"))]
-use crate::splice::{self, SPLICE_PIPE_CAPACITY, SplicePipe};
+use crate::splice::{self, SplicePipe};
 
 /// This macro is defined uniquely in this module to help the tracking of
 /// pipelining issues inside Sōzu. Colored output uses bold bright-white
@@ -396,6 +396,14 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
     #[cfg(not(all(target_os = "linux", feature = "splice")))]
     fn splice_out_pending(&self) -> usize {
         0
+    }
+
+    /// Realised kernel-pipe capacity per direction (`0` if splice is
+    /// disabled). Drives the "pipe is full" backpressure check in the
+    /// splice readable methods and the per-call `len` for `splice_in`.
+    #[cfg(all(target_os = "linux", feature = "splice"))]
+    fn splice_capacity(&self) -> usize {
+        self.splice_pipe.as_ref().map(|p| p.capacity).unwrap_or(0)
     }
 
     /// Wether the session should be kept open, depending on endpoints status
@@ -797,7 +805,8 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         self.reset_timeouts();
 
         trace!("{} pipe splice_readable", log_context!(self));
-        if self.splice_in_pending() >= SPLICE_PIPE_CAPACITY {
+        let capacity = self.splice_capacity();
+        if self.splice_in_pending() >= capacity {
             // Pipe is full — stop reading and let the backend drain it.
             self.frontend_readiness.interest.remove(Ready::READABLE);
             self.backend_readiness.interest.insert(Ready::WRITABLE);
@@ -805,7 +814,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         }
 
         let pipe_write_end = self.splice_pipe.as_ref().unwrap().in_pipe[1];
-        let (sz, res) = splice::splice_in(self.frontend.socket_ref(), pipe_write_end);
+        let (sz, res) = splice::splice_in(self.frontend.socket_ref(), pipe_write_end, capacity);
         debug!("{} Spliced {} bytes from frontend", log_context!(self), sz);
 
         if sz > 0 {
@@ -1040,7 +1049,8 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         self.reset_timeouts();
 
         trace!("{} Pipe splice_backend_readable", log_context!(self));
-        if self.splice_out_pending() >= SPLICE_PIPE_CAPACITY {
+        let capacity = self.splice_capacity();
+        if self.splice_out_pending() >= capacity {
             // Pipe is full — stop reading and let the frontend drain it.
             self.backend_readiness.interest.remove(Ready::READABLE);
             self.frontend_readiness.interest.insert(Ready::WRITABLE);
@@ -1049,7 +1059,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
 
         let pipe_write_end = self.splice_pipe.as_ref().unwrap().out_pipe[1];
         let (size, remaining) = match self.backend_socket.as_ref() {
-            Some(b) => splice::splice_in(b, pipe_write_end),
+            Some(b) => splice::splice_in(b, pipe_write_end, capacity),
             None => return SessionResult::Continue,
         };
 
