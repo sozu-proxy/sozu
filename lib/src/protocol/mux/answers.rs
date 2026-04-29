@@ -120,6 +120,7 @@ fn default_answer_for_code(
     code: u16,
     redirect_location: Option<&str>,
     www_authenticate: Option<&str>,
+    retry_after: Option<u32>,
 ) -> DefaultAnswer {
     match code {
         301 => DefaultAnswer::Answer301 {
@@ -145,6 +146,7 @@ fn default_answer_for_code(
             duration: String::new(),
         },
         421 => DefaultAnswer::Answer421 {},
+        429 => DefaultAnswer::Answer429 { retry_after },
         502 => DefaultAnswer::Answer502 {
             message: String::new(),
             phase: kawa::ParsingPhaseMarker::Error,
@@ -174,6 +176,21 @@ pub(crate) fn set_default_answer(
     code: u16,
     answers: &HttpAnswers,
 ) {
+    set_default_answer_with_retry_after(stream, readiness, code, answers, None);
+}
+
+/// Variant of `set_default_answer` that also threads a `Retry-After` value
+/// (in seconds) into the rendered answer for 429 responses. `None` (or
+/// `Some(0)`) instructs the template engine to omit the `Retry-After`
+/// header — `Retry-After: 0` invites an immediate retry that defeats the
+/// per-(cluster, source-IP) limit. Other status codes ignore the value.
+pub(crate) fn set_default_answer_with_retry_after(
+    stream: &mut Stream,
+    readiness: &mut Readiness,
+    code: u16,
+    answers: &HttpAnswers,
+    retry_after: Option<u32>,
+) {
     let context = &mut stream.context;
     let kawa = &mut stream.back;
     kawa.clear();
@@ -186,6 +203,7 @@ pub(crate) fn set_default_answer(
         408 => "http.408.errors",
         413 => "http.413.errors",
         421 => "http.421.errors",
+        429 => "connections.rejected_per_cluster_ip",
         502 => "http.502.errors",
         503 => "http.503.errors",
         504 => "http.504.errors",
@@ -217,8 +235,12 @@ pub(crate) fn set_default_answer(
         }
         None => None,
     };
-    let answer =
-        default_answer_for_code(code, redirect_location, context.www_authenticate.as_deref());
+    let answer = default_answer_for_code(
+        code,
+        redirect_location,
+        context.www_authenticate.as_deref(),
+        retry_after,
+    );
 
     let request_id = context.id.to_string();
     let route = context.get_route();
@@ -309,6 +331,7 @@ mod tests {
             www_authenticate: None,
             original_authority: None,
             headers_response: Vec::new(),
+            retry_after_seconds: None,
         };
         let stream =
             Stream::new(Rc::downgrade(&pool), http_ctx, 65_535).expect("pool checkout failed");

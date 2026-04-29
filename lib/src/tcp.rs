@@ -120,6 +120,15 @@ pub struct TcpSession {
     proxy: Rc<RefCell<TcpProxy>>,
     request_id: Ulid,
     state: TcpStateMachine,
+    /// `true` once `connect_to_backend` has accounted this session
+    /// against the per-(cluster, source-IP) connection counter. Drives
+    /// the symmetric `untrack_all_cluster_ip` call in `close`. The flag
+    /// is per-session, not per-attempt: a TCP session has at most one
+    /// `(cluster, ip)` slot, so the SessionManager-side idempotency
+    /// already covers retries — this flag exists only to short-circuit
+    /// the close path's untrack when the feature is disabled or no
+    /// admit ever ran.
+    cluster_ip_tracked: bool,
 }
 
 impl TcpSession {
@@ -232,7 +241,29 @@ impl TcpSession {
             proxy,
             request_id,
             state,
+            cluster_ip_tracked: false,
         }
+    }
+
+    /// Source-IP for per-(cluster, source-IP) accounting.
+    ///
+    /// Prefer the parsed PROXY-v2 source from whichever upgrade phase is
+    /// in flight, then the post-upgrade `Pipe.session_address`, finally
+    /// the raw TCP `peer_addr` captured at session creation. The
+    /// `Pipe::session_address` itself is already PROXY-v2-aware after
+    /// `expect.rs::into_pipe` and `relay.rs::into_pipe`.
+    fn effective_session_address(&self) -> Option<SocketAddr> {
+        match &self.state {
+            TcpStateMachine::Pipe(pipe) => pipe.get_session_address(),
+            TcpStateMachine::ExpectProxyProtocol(epp) => {
+                epp.addresses.as_ref().and_then(|pa| pa.source())
+            }
+            TcpStateMachine::RelayProxyProtocol(rpp) => {
+                rpp.addresses.as_ref().and_then(|pa| pa.source())
+            }
+            TcpStateMachine::SendProxyProtocol(_) | TcpStateMachine::FailedUpgrade(_) => None,
+        }
+        .or(self.frontend_address)
     }
 
     fn log_request(&self) {
@@ -924,6 +955,43 @@ impl TcpSession {
             return Err(BackendConnectionError::MaxSessionsMemory);
         }
 
+        // Per-(cluster, source-IP) connection limit gate (TCP). The
+        // source IP comes from `effective_session_address`, which folds
+        // a parsed PROXY-v2 source over the raw `peer_addr`. The mux's
+        // Router does the same gate for HTTP/HTTPS sessions; here it
+        // runs for raw TCP. Rejection produces a graceful TCP FIN via
+        // `BackendConnectionError::TooManyConnectionsPerIp` →
+        // `handle_connection_result` → `SessionResult::Close` — TCP has
+        // no HTTP envelope to carry a 429 / `Retry-After`.
+        let cluster_max_connections_per_ip = self
+            .proxy
+            .borrow()
+            .configs
+            .get(&cluster_id)
+            .and_then(|c| c.max_connections_per_ip);
+        if let Some(ip) = self.effective_session_address().map(|sa| sa.ip()) {
+            let sessions_rc = self.proxy.borrow().sessions.clone();
+            let at_limit = sessions_rc.borrow().cluster_ip_at_limit(
+                self.frontend_token,
+                &cluster_id,
+                &ip,
+                cluster_max_connections_per_ip,
+            );
+            if at_limit {
+                debug!(
+                    "{} per-(cluster, source-IP) limit hit for cluster {} from {}",
+                    log_context!(self),
+                    cluster_id,
+                    ip
+                );
+                return Err(BackendConnectionError::TooManyConnectionsPerIp { cluster_id });
+            }
+            sessions_rc
+                .borrow_mut()
+                .track_cluster_ip(self.frontend_token, cluster_id.clone(), ip);
+            self.cluster_ip_tracked = true;
+        }
+
         let (backend, mut stream) = self
             .proxy
             .borrow()
@@ -986,6 +1054,20 @@ impl ProxySession for TcpSession {
         // TODO: the state should handle the timeouts
         trace!("{} Closing TCP session", log_context!(self));
         self.metrics.service_stop();
+
+        // Drain the per-(cluster, source-IP) accounting before any
+        // early-return path below. The fail / non-fail close branches
+        // both count, and the SessionManager-side untrack is idempotent
+        // (no-op when the slot was never tracked) so this is safe even
+        // when `cluster_ip_tracked` is false.
+        if self.cluster_ip_tracked {
+            self.proxy
+                .borrow()
+                .sessions
+                .borrow_mut()
+                .untrack_all_cluster_ip(self.frontend_token);
+            self.cluster_ip_tracked = false;
+        }
 
         // Restore gauges
         match self.state.marker() {
@@ -1283,6 +1365,12 @@ pub struct ClusterConfiguration {
     proxy_protocol: Option<ProxyProtocolConfig>,
     // Uncomment this when implementing new load balancing algorithms
     // load_balancing: LoadBalancingAlgorithms,
+    /// Per-cluster override of the global per-(cluster, source-IP)
+    /// connection limit. `None` inherits the global default,
+    /// `Some(0)` is explicit "unlimited", `Some(n > 0)` overrides.
+    /// Resolved against `SessionManager::effective_max_connections_per_ip`
+    /// at admit time in `connect_to_backend`.
+    pub max_connections_per_ip: Option<u64>,
 }
 
 pub struct TcpProxy {
@@ -1502,6 +1590,7 @@ impl ProxyConfiguration for TcpProxy {
                         .proxy_protocol
                         .and_then(|n| ProxyProtocolConfig::try_from(n).ok()),
                     //load_balancing: cluster.load_balancing,
+                    max_connections_per_ip: cluster.max_connections_per_ip,
                 };
                 self.configs.insert(cluster.cluster_id, config);
                 WorkerResponse::ok(message.id)
