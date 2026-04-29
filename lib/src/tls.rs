@@ -316,11 +316,39 @@ impl CertificateResolver {
         &mut self,
         replace: &ReplaceCertificate,
     ) -> Result<Fingerprint, CertificateResolverError> {
-        let new_fingerprint = self.add_certificate(&AddCertificate {
+        let add = AddCertificate {
             address: replace.address.to_owned(),
             certificate: replace.new_certificate.to_owned(),
             expired_at: replace.new_expired_at.to_owned(),
-        })?;
+        };
+
+        // ── Idempotent-replace short-circuit ──
+        //
+        // Compute the new fingerprint *before* mutating the resolver so we
+        // can compare it with the old one. When `add_certificate` is
+        // called with a fingerprint that already exists it early-returns
+        // (lib/src/tls.rs add_certificate path) without inserting; if we
+        // then unconditionally called `remove_certificate(old)` and old
+        // equalled new, we would delete the entry the caller intended to
+        // *retain*. An idempotent renewal — typical for retry loops, dead
+        // ACME polls, or operator-driven `ReplaceCertificate` requests
+        // that resubmit the same PEM — must therefore short-circuit here.
+        // Any failure to materialise the wrapper (parse, sign-key check)
+        // surfaces as `CertificateResolverError`, identical to the path
+        // through `add_certificate`.
+        let new_cert = CertifiedKeyWrapper::try_from(&add)?;
+        let new_fingerprint = new_cert.fingerprint.to_owned();
+
+        if let Ok(old_fingerprint) = Fingerprint::from_str(&replace.old_fingerprint) {
+            if old_fingerprint == new_fingerprint {
+                // Re-publish the expiration gauge so dashboards observe the
+                // replace request even when the certificate set is unchanged.
+                self.publish_min_expiration_gauge();
+                return Ok(new_fingerprint);
+            }
+        }
+
+        let new_fingerprint = self.add_certificate(&add)?;
 
         match Fingerprint::from_str(&replace.old_fingerprint) {
             Ok(old_fingerprint) => self.remove_certificate(&old_fingerprint)?,
@@ -842,6 +870,61 @@ mod tests {
         assert_eq!(
             resolved.1, new_fingerprint,
             "resolved certificate should be the replacement"
+        );
+
+        Ok(())
+    }
+
+    /// When `ReplaceCertificate` carries the same certificate / fingerprint
+    /// as the existing entry, the previous implementation called
+    /// `add_certificate` (which early-returns on duplicate fingerprint
+    /// without inserting) and then unconditionally removed the old
+    /// fingerprint — i.e. the *current* entry — leaving the resolver
+    /// without a certificate for that name. The fix short-circuits the
+    /// idempotent case and keeps the existing entry in place. An
+    /// idempotent ACME / operator retry must therefore still resolve.
+    #[test]
+    fn replace_certificate_with_same_fingerprint_is_noop()
+    -> Result<(), Box<dyn Error + Send + Sync>> {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8080);
+        let mut resolver = CertificateResolver::default();
+
+        let cert = CertificateAndKey {
+            certificate: String::from(include_str!("../assets/tests/certificate-1y.pem")),
+            key: String::from(include_str!("../assets/tests/key-1y.pem")),
+            ..Default::default()
+        };
+
+        let initial_fingerprint = resolver.add_certificate(&AddCertificate {
+            address,
+            certificate: cert.clone(),
+            expired_at: None,
+        })?;
+
+        // Replace with the SAME PEM/key — identical fingerprint expected.
+        let returned_fingerprint = resolver.replace_certificate(&ReplaceCertificate {
+            address,
+            new_certificate: cert,
+            old_fingerprint: initial_fingerprint.to_string(),
+            new_expired_at: None,
+        })?;
+
+        assert_eq!(
+            returned_fingerprint, initial_fingerprint,
+            "idempotent replace should return the existing fingerprint"
+        );
+
+        assert!(
+            resolver.get_certificate(&initial_fingerprint).is_some(),
+            "idempotent replace must NOT delete the existing certificate"
+        );
+
+        let resolved = resolver
+            .domain_lookup("localhost".as_bytes(), true)
+            .expect("certificate should still resolve after idempotent replace");
+        assert_eq!(
+            resolved.1, initial_fingerprint,
+            "resolver should still hand back the original fingerprint"
         );
 
         Ok(())
