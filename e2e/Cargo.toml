@@ -24,7 +24,7 @@ time = { workspace = true }
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "time"] }
 
 sozu-command-lib = { workspace = true }
-sozu-lib = { workspace = true, features = ["e2e-hooks", "crypto-ring"] }
+sozu-lib = { workspace = true, features = ["e2e-hooks"] }
 tempfile = { workspace = true }
 
 [dev-dependencies]
@@ -44,7 +44,11 @@ serial_test = { workspace = true }
 # or without the feature enabled — CI exercises both configurations.
 splice = ["sozu-lib/splice"]
 # Crypto-provider forwarding so `cargo test -p sozu-e2e --features
-# crypto-aws-lc-rs` etc. exercises the matrix end-to-end.
+# crypto-aws-lc-rs` etc. exercises the matrix end-to-end. The default
+# is `crypto-ring`, matching the `sozu` binary default; CI's matrix
+# job overrides via `--no-default-features --features <provider>`.
+default = ["crypto-ring"]
+crypto-ring = ["sozu-lib/crypto-ring"]
 crypto-aws-lc-rs = ["sozu-lib/crypto-aws-lc-rs"]
 crypto-openssl = ["sozu-lib/crypto-openssl"]
 fips = ["sozu-lib/fips"]

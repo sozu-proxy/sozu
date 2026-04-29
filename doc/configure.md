@@ -984,7 +984,7 @@ full format.
 
 #### Backend health checks
 
-You can optionally configure active HTTP health checks for backends. See [health_checks.md](./health_checks.md) for full details, including the **HTTP/1.1-only** probe limitation when a cluster sets `http2 = true` (h2c backends).
+You can optionally configure active HTTP health checks for backends. See [health_checks.md](./health_checks.md) for full details, including the opt-in `is_h2c = true` flag for clusters with `http2 = true` (cleartext HTTP/2) backends.
 
 ```toml
 [clusters.NameOfYourCluster.health_check]
@@ -994,6 +994,7 @@ timeout = 5
 healthy_threshold = 3
 unhealthy_threshold = 3
 expected_status = 0
+# is_h2c = true   # uncomment for h2c backends — see doc/health_checks.md
 ```
 
 ## Metrics

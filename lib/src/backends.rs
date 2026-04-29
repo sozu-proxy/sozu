@@ -265,6 +265,18 @@ impl BackendMap {
             }
             None => {
                 self.health_check_configs.remove(cluster_id);
+                // When the operator drops the health check, any
+                // previously-recorded `HealthState::Unhealthy` would
+                // otherwise stick — `next_available_backend` keeps
+                // skipping the backend even though we have stopped
+                // probing it. Reset every backend in the cluster to a
+                // pristine healthy state so the load balancer can
+                // route again. Codex finding (post-rebase review).
+                if let Some(backend_list) = self.backends.get(cluster_id) {
+                    for backend in &backend_list.backends {
+                        backend.borrow_mut().health = HealthState::default();
+                    }
+                }
             }
         }
     }

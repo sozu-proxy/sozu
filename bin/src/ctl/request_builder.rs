@@ -4,7 +4,7 @@ use sozu_command_lib::{
     certificate::{
         decode_fingerprint, get_fingerprint_from_certificate_path, load_full_certificate,
     },
-    config::ListenerBuilder,
+    config::{ListenerBuilder, validate_health_check_config},
     proto::command::{
         ActivateListener, AddBackend, AddCertificate, AlpnProtocols, Cluster, CountRequests,
         CustomHttpAnswers, DeactivateListener, FrontendFilters, HardStop, HealthCheckConfig,
@@ -321,55 +321,28 @@ impl CommandManager {
                 expected_status,
                 h2c,
             } => {
-                if interval == 0 {
-                    return Err(CtlError::Failure("interval must be > 0".to_owned()));
+                let config = HealthCheckConfig {
+                    uri,
+                    interval,
+                    timeout,
+                    healthy_threshold,
+                    unhealthy_threshold,
+                    expected_status,
+                    is_h2c: Some(h2c),
+                };
+                if let Err(reason) = validate_health_check_config(&config) {
+                    return Err(CtlError::Failure(reason.to_owned()));
                 }
-                if timeout == 0 {
-                    return Err(CtlError::Failure("timeout must be > 0".to_owned()));
-                }
-                if healthy_threshold == 0 {
-                    return Err(CtlError::Failure(
-                        "healthy-threshold must be > 0".to_owned(),
-                    ));
-                }
-                if unhealthy_threshold == 0 {
-                    return Err(CtlError::Failure(
-                        "unhealthy-threshold must be > 0".to_owned(),
-                    ));
-                }
-                if uri.contains('\r')
-                    || uri.contains('\n')
-                    || uri.contains('\0')
-                    || uri.bytes().any(|b| b < 0x20 && b != b'\t')
-                {
-                    return Err(CtlError::Failure(
-                        "health check URI must not contain CR, LF, NUL, or other C0 control bytes"
-                            .to_owned(),
-                    ));
-                }
-                if !uri.starts_with('/') {
-                    return Err(CtlError::Failure(
-                        "health check URI must start with '/'".to_owned(),
-                    ));
-                }
-                if timeout >= interval {
+                if config.timeout >= config.interval {
                     warn!(
                         "health check timeout ({}s) >= interval ({}s), checks may overlap",
-                        timeout, interval
+                        config.timeout, config.interval
                     );
                 }
                 self.send_request(
                     RequestType::SetHealthCheck(SetHealthCheck {
                         cluster_id: id,
-                        config: HealthCheckConfig {
-                            uri,
-                            interval,
-                            timeout,
-                            healthy_threshold,
-                            unhealthy_threshold,
-                            expected_status,
-                            is_h2c: Some(h2c),
-                        },
+                        config,
                     })
                     .into(),
                 )

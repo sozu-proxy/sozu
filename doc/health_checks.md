@@ -9,8 +9,8 @@ Health checks run inside the main mio event loop using non-blocking TCP connecti
 For each cluster with a health check configured, Sōzu performs the following on every check cycle:
 
 1. Opens a non-blocking TCP connection to each backend in the cluster
-2. Sends a minimal `GET <uri> HTTP/1.1` request with `Connection: close`
-3. Reads the response status line
+2. Sends the configured probe: HTTP/1.1 by default (`GET <uri> HTTP/1.1` with `Connection: close`), or HTTP/2 prior-knowledge (`is_h2c = true`) — connection preface, empty SETTINGS, HEADERS frame on stream 1 carrying `GET <uri>`
+3. Reads the response: HTTP/1.1 status line for the default path, or HTTP/2 frames until a HEADERS frame on stream 1 yields `:status` for h2c
 4. Compares the HTTP status code against the expected value
 5. Updates the backend's health state based on success or failure
 
@@ -68,6 +68,7 @@ expected_status = 0
 | `healthy_threshold`   | u32    | `3`     | Consecutive successes required to transition from unhealthy to healthy.      |
 | `unhealthy_threshold` | u32    | `3`     | Consecutive failures required to transition from healthy to unhealthy.       |
 | `expected_status`     | u32    | `0`     | Expected HTTP status code. `0` means any 2xx is accepted.                   |
+| `is_h2c`              | bool   | `false` | When `true`, send an HTTP/2 prior-knowledge (h2c) probe instead of HTTP/1.1. Use for backends configured with `cluster.http2 = true`. |
 
 ### Command line
 
@@ -155,6 +156,6 @@ Both events include the `cluster_id`, `backend_id`, and backend `address`.
 
 - **Non-blocking**: Health checks share the mio event loop with normal proxy operations. There are no additional threads, and checks never block request processing.
 - **Per-cluster configuration**: Each cluster can have its own health check URI, interval, thresholds, and expected status. Clusters without a `health_check` section are not checked.
-- **No fail-open (yet)**: If all backends in a cluster become unhealthy, Sōzu will **not** route traffic to them — the cluster effectively becomes unavailable. A fail-open mechanism (continuing to route when all backends are down) is planned for a future release. Until then, use conservative thresholds to avoid false positives.
+- **Fail-open routing when ALL backends are unhealthy**: when every backend in a cluster has been marked DOWN by the threshold state machine, Sōzu falls back to routing across all `Normal` backends instead of returning 503 — see `lib/src/load_balancing.rs::BackendList::healthy`. The Amazon health-check paper's reasoning (returning 503 is rarely the right answer when health-check signal itself may be wrong) drives this. A `warn!("fail-open: ...")` is logged when fail-open kicks in, and the `health_check.healthy_backends` gauge drops to 0. Use conservative thresholds and the `health_check.down` counter to alert on sustained outages.
 - **HTTP/1.1 by default; opt-in HTTP/2 prior-knowledge (h2c)**: Health checks send a plain-text HTTP/1.1 request over TCP unless `is_h2c = true` is set. With `is_h2c = true` the probe sends the HTTP/2 connection preface, an empty client SETTINGS frame, and a single HEADERS frame on stream 1 carrying `GET <uri>` with `END_STREAM | END_HEADERS`. The response parser walks the H2 frames looking for HEADERS on stream 1 and decodes `:status` from the static-table indexed forms (200/204/206/304/400/404/500) or the literal-with-indexed-name form (`0x08`/`0x18` + length + ASCII status). PADDED and PRIORITY flags are skipped past correctly. A GOAWAY frame on the connection is treated as a probe failure. Use `is_h2c = true` for h2c-only backends configured with `cluster.http2 = true`. HTTPS probes (h2 over TLS) are still not implemented; backends that only accept TLS connections need either a co-located HTTP/1.1 health endpoint or no `health_check` configuration today.
 - **No persistent state**: Health check state is held in memory. On worker restart, all backends start as healthy and must fail enough consecutive checks to be marked down.

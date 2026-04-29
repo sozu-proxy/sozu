@@ -78,7 +78,13 @@ name = "crypto_provider"
 harness = false
 
 [features]
-default = []
+# `crypto-ring` is enabled by default so `cargo {build,test} -p sozu-lib`
+# (no explicit features) compiles out of the box. Downstream binaries
+# already override via their own `default = ["crypto-ring", ...]` entries
+# in `bin/Cargo.toml`. CI matrix jobs pass `--no-default-features
+# --features <provider>` to pick a specific provider. The precedence
+# chain in `lib/src/crypto.rs` makes `--all-features` resolve to aws-lc-rs.
+default = ["crypto-ring"]
 # Exposes `#[cfg(any(test, feature = "e2e-hooks"))]` test-injection APIs in
 # the mux layer (`Connection::new_h2_client` pool-failure injection,
 # `ConnectionH2::__test_set_last_stream_id`). Consumed by the `sozu-e2e`

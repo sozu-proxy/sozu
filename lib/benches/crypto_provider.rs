@@ -14,7 +14,7 @@ const KEY_PEM: &str = include_str!("../assets/key.pem");
 
 fn bench_default_provider(c: &mut Criterion) {
     c.bench_function("default_provider", |b| {
-        b.iter(|| default_provider());
+        b.iter(default_provider);
     });
 }
 
