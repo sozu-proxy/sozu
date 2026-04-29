@@ -119,6 +119,23 @@ max_connections = 500
 # the per-round share grows; the worker logs a config-load warning then.
 # evict_on_queue_full = false
 
+# Default per-(cluster, source-IP) connection limit. `0` disables the
+# feature (default). The source IP is taken from the parsed PROXY-protocol
+# header when present, else `peer_addr`. When the limit is reached:
+#   - HTTP/HTTPS clients receive `429 Too Many Requests` (with optional
+#     `Retry-After`).
+#   - TCP clients see a graceful FIN before any backend connect.
+# Each cluster may override this default via its own `max_connections_per_ip`
+# field. Counts are kept per `(cluster_id, source_ip)`, so two clusters never
+# share a counter even from the same IP.
+# max_connections_per_ip = 0
+
+# Default `Retry-After` header value (seconds) emitted on HTTP 429
+# responses. `0` omits the header — `Retry-After: 0` invites an
+# immediate retry that defeats the limit. TCP listeners ignore this
+# value (no HTTP envelope).
+# retry_after = 60
+
 # maximum number of buffers in the pool used by the protocol implementations
 # for active connections (ie currently serving a request). For now, you should
 # estimate that max_buffers = number of concurrent requests * 2

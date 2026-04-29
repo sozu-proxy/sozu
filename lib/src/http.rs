@@ -1472,11 +1472,14 @@ impl L7Proxy for HttpProxy {
     }
 
     fn remove_session(&self, token: Token) -> bool {
-        self.sessions
-            .borrow_mut()
-            .slab
-            .try_remove(token.0)
-            .is_some()
+        let mut sessions = self.sessions.borrow_mut();
+        // Drain the session's `(cluster, ip)` accounting before the slab
+        // slot is freed — once the slot is reused for a new session the
+        // token would otherwise alias an unrelated set of entries. No-op
+        // when the session never tracked anything (feature disabled, or
+        // no request reached `Router::connect`).
+        sessions.untrack_all_cluster_ip(token);
+        sessions.slab.try_remove(token.0).is_some()
     }
 
     fn backends(&self) -> Rc<RefCell<BackendMap>> {
@@ -1485,6 +1488,10 @@ impl L7Proxy for HttpProxy {
 
     fn clusters(&self) -> &HashMap<ClusterId, Cluster> {
         &self.clusters
+    }
+
+    fn sessions(&self) -> Rc<RefCell<SessionManager>> {
+        self.sessions.clone()
     }
 }
 

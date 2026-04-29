@@ -2063,11 +2063,11 @@ impl L7Proxy for HttpsProxy {
     }
 
     fn remove_session(&self, token: Token) -> bool {
-        self.sessions
-            .borrow_mut()
-            .slab
-            .try_remove(token.0)
-            .is_some()
+        let mut sessions = self.sessions.borrow_mut();
+        // Mirror of HttpProxy::remove_session — drain the per-(cluster,
+        // source-IP) accounting before the slab slot is reused.
+        sessions.untrack_all_cluster_ip(token);
+        sessions.slab.try_remove(token.0).is_some()
     }
 
     fn backends(&self) -> Rc<RefCell<BackendMap>> {
@@ -2076,6 +2076,10 @@ impl L7Proxy for HttpsProxy {
 
     fn clusters(&self) -> &HashMap<ClusterId, Cluster> {
         &self.clusters
+    }
+
+    fn sessions(&self) -> Rc<RefCell<SessionManager>> {
+        self.sessions.clone()
     }
 }
 

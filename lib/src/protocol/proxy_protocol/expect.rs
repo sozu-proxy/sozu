@@ -239,7 +239,18 @@ impl<Front: SocketHandler> ExpectProxyProtocol<Front> {
         backend_token: Option<Token>,
         listener: Rc<RefCell<TcpListener>>,
     ) -> Pipe<Front, TcpListener> {
-        let addr = self.front_socket().peer_addr().ok();
+        // Prefer the source address parsed from the PROXY-v2 header over
+        // the TCP `peer_addr` so the pipe phase records the real client
+        // — `peer_addr` here is the upstream PROXY-emitter (an LB / edge
+        // proxy / health-check probe), not the originating client.
+        // Falls back to `peer_addr` when the header carried `Command::Local`
+        // (no encapsulated addresses) or when the parser ran with
+        // `AddressFamily::Unspec`.
+        let addr = self
+            .addresses
+            .as_ref()
+            .and_then(|pa| pa.source())
+            .or_else(|| self.front_socket().peer_addr().ok());
 
         let mut pipe = Pipe::new(
             back_buf,

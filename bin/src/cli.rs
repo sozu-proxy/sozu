@@ -188,6 +188,38 @@ pub enum SubCmd {
         about = "receive sozu events about the status of backends"
     )]
     Events,
+    #[clap(
+        name = "connection-limit",
+        about = "manage the per-(cluster, source-IP) connection limit at runtime"
+    )]
+    ConnectionLimit {
+        #[clap(subcommand)]
+        cmd: ConnectionLimitCmd,
+    },
+}
+
+#[derive(Subcommand, PartialEq, Eq, Clone, Debug)]
+pub enum ConnectionLimitCmd {
+    #[clap(
+        name = "set",
+        about = "set the global per-(cluster, source-IP) connection limit. `0` disables the feature."
+    )]
+    Set {
+        #[clap(
+            help = "maximum simultaneous connections per (cluster, source-IP) pair (0 = unlimited)"
+        )]
+        limit: u64,
+    },
+    #[clap(
+        name = "remove",
+        about = "disable the global per-(cluster, source-IP) limit (equivalent to `set 0`)"
+    )]
+    Remove,
+    #[clap(
+        name = "show",
+        about = "show the current global per-(cluster, source-IP) connection limit"
+    )]
+    Show,
 }
 
 #[derive(Subcommand, PartialEq, Eq, Clone, Debug)]
@@ -829,6 +861,11 @@ pub enum HttpListenerCmd {
         answer_413: Option<PathBuf>,
         #[clap(long, help = "path to file for the 421 answer body")]
         answer_421: Option<PathBuf>,
+        #[clap(
+            long,
+            help = "path to file for the 429 answer body (per-(cluster, source-IP) connection limit)"
+        )]
+        answer_429: Option<PathBuf>,
         #[clap(long, help = "path to file for the 502 answer body")]
         answer_502: Option<PathBuf>,
         #[clap(long, help = "path to file for the 503 answer body")]
@@ -1091,6 +1128,11 @@ pub enum HttpsListenerCmd {
         answer_413: Option<PathBuf>,
         #[clap(long, help = "path to file for the 421 answer body")]
         answer_421: Option<PathBuf>,
+        #[clap(
+            long,
+            help = "path to file for the 429 answer body (per-(cluster, source-IP) connection limit)"
+        )]
+        answer_429: Option<PathBuf>,
         #[clap(long, help = "path to file for the 502 answer body")]
         answer_502: Option<PathBuf>,
         #[clap(long, help = "path to file for the 503 answer body")]

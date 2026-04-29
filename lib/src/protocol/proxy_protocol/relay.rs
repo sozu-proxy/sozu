@@ -17,7 +17,7 @@ use crate::{
     pool::Checkout,
     protocol::{
         pipe::{Pipe, WebSocketContext},
-        proxy_protocol::parser::parse_v2_header,
+        proxy_protocol::{header::ProxyAddr, parser::parse_v2_header},
     },
     socket::{SocketHandler, SocketResult},
     sozu_command::ready::Ready,
@@ -70,6 +70,12 @@ pub struct RelayProxyProtocol<Front: SocketHandler> {
     pub frontend: Front,
     pub header_size: Option<usize>,
     pub request_id: Ulid,
+    /// Parsed PROXY-v2 address pair captured from the inbound header.
+    /// `None` until the parser succeeds, or for headers that carry
+    /// `Command::Local` (no encapsulated addresses). The pipe phase
+    /// uses `ProxyAddr::source()` here to attribute the real client
+    /// instead of the upstream PROXY-emitter's `peer_addr`.
+    pub addresses: Option<ProxyAddr>,
 }
 
 impl<Front: SocketHandler> RelayProxyProtocol<Front> {
@@ -100,6 +106,7 @@ impl<Front: SocketHandler> RelayProxyProtocol<Front> {
             frontend,
             header_size: None,
             request_id,
+            addresses: None,
         }
     }
 
@@ -129,9 +136,15 @@ impl<Front: SocketHandler> RelayProxyProtocol<Front> {
             }
 
             let read_sz = match parse_v2_header(self.frontend_buffer.data()) {
-                Ok((rest, _)) => {
+                Ok((rest, header)) => {
                     self.frontend_readiness.interest.remove(Ready::READABLE);
                     self.backend_readiness.interest.insert(Ready::WRITABLE);
+                    // Capture the parsed addresses so the pipe phase can
+                    // attribute traffic to the real client (see
+                    // `into_pipe`). The header bytes themselves are still
+                    // forwarded verbatim onto the backend by
+                    // `back_writable`.
+                    self.addresses = Some(header.addr);
                     self.frontend_buffer.data().offset(rest)
                 }
                 Err(Err::Incomplete(_)) => return SessionResult::Continue,
@@ -222,7 +235,17 @@ impl<Front: SocketHandler> RelayProxyProtocol<Front> {
         listener: Rc<RefCell<TcpListener>>,
     ) -> Pipe<Front, TcpListener> {
         let backend_socket = self.backend.take().unwrap();
-        let addr = self.front_socket().peer_addr().ok();
+        // Same rationale as `ExpectProxyProtocol::into_pipe`: prefer the
+        // PROXY-v2 source over the TCP `peer_addr`. In Relay mode the
+        // upstream emitter is also the TCP peer, so without this fix
+        // the pipe phase records the LB / edge proxy instead of the
+        // real client. Falls back when the header was `Command::Local`
+        // (no addresses) or when the parser ran with `AddressFamily::Unspec`.
+        let addr = self
+            .addresses
+            .as_ref()
+            .and_then(|pa| pa.source())
+            .or_else(|| self.front_socket().peer_addr().ok());
 
         let mut pipe = Pipe::new(
             back_buf,

@@ -1,7 +1,7 @@
 //! event loop management
 use std::{
     cell::RefCell,
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque, hash_map::Entry},
     hash::{DefaultHasher, Hash, Hasher},
     io::Error as IoError,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -168,19 +168,138 @@ pub struct SessionManager {
     pub nb_connections: usize,
     pub can_accept: bool,
     pub slab: Slab<Rc<RefCell<dyn ProxySession>>>,
+    /// Default per-(cluster, source-IP) connection limit. `0` disables
+    /// the feature; cluster-level overrides take precedence at check
+    /// time.
+    pub max_connections_per_ip: u64,
+    /// Default `Retry-After` header value (seconds) for HTTP 429
+    /// responses emitted on per-(cluster, source-IP) limit hit. `0`
+    /// omits the header.
+    pub retry_after: u32,
+    /// Active **frontend connections** per `(cluster_id, source_ip)`.
+    /// Each frontend session contributes AT MOST 1 to the count for any
+    /// given `(cluster, ip)` pair, regardless of how many streams it
+    /// multiplexes to that cluster (an H2 connection serving 100
+    /// streams to cluster X from IP 1.2.3.4 still counts as 1). The
+    /// counter is incremented the first time a session's
+    /// `Router::connect` resolves to a fresh `(cluster, ip)` pair, and
+    /// decremented when the session closes. Empty when the feature is
+    /// unused.
+    connections_per_cluster_ip: HashMap<(String, IpAddr), usize>,
+    /// Reverse index: per-token set of `(cluster, ip)` pairs already
+    /// counted against `connections_per_cluster_ip`. Used to make
+    /// `track_cluster_ip` idempotent within a session (so H2 streams
+    /// to the same cluster from the same client only consume one slot
+    /// in the limit) and to drain a session's contributions on close.
+    cluster_ip_tracks: HashMap<Token, HashSet<(String, IpAddr)>>,
 }
 
 impl SessionManager {
     pub fn new(
         slab: Slab<Rc<RefCell<dyn ProxySession>>>,
         max_connections: usize,
+        max_connections_per_ip: u64,
+        retry_after: u32,
     ) -> Rc<RefCell<Self>> {
         Rc::new(RefCell::new(SessionManager {
             max_connections,
             nb_connections: 0,
             can_accept: true,
             slab,
+            max_connections_per_ip,
+            retry_after,
+            connections_per_cluster_ip: HashMap::new(),
+            cluster_ip_tracks: HashMap::new(),
         }))
+    }
+
+    /// Resolve the effective per-(cluster, source-IP) limit. `override_value`
+    /// is the cluster-level setting from the proto `Cluster` message:
+    /// `None` inherits the global default, `Some(0)` is explicit
+    /// "unlimited", `Some(n > 0)` overrides.
+    pub fn effective_max_connections_per_ip(&self, override_value: Option<u64>) -> u64 {
+        override_value.unwrap_or(self.max_connections_per_ip)
+    }
+
+    /// Resolve the effective `Retry-After` header value. `Some(0)` (or
+    /// the global default of 0) signals "omit the header" — caller
+    /// must skip emission rather than render `Retry-After: 0`.
+    pub fn effective_retry_after(&self, override_value: Option<u32>) -> u32 {
+        override_value.unwrap_or(self.retry_after)
+    }
+
+    /// Returns `true` when admitting `token` to one more connection for
+    /// `(cluster, ip)` would exceed the resolved limit. `0` is treated
+    /// as unlimited. A token that already holds a slot for this
+    /// `(cluster, ip)` is NEVER at the limit — H2 sessions multiplex
+    /// many streams to the same cluster on a single connection, and
+    /// the limit governs distinct frontend connections, not streams.
+    pub fn cluster_ip_at_limit(
+        &self,
+        token: Token,
+        cluster_id: &str,
+        ip: &IpAddr,
+        override_value: Option<u64>,
+    ) -> bool {
+        let limit = self.effective_max_connections_per_ip(override_value);
+        if limit == 0 {
+            return false;
+        }
+        let key = (cluster_id.to_owned(), *ip);
+        if self
+            .cluster_ip_tracks
+            .get(&token)
+            .is_some_and(|s| s.contains(&key))
+        {
+            return false;
+        }
+        self.connections_per_cluster_ip
+            .get(&key)
+            .is_some_and(|c| (*c as u64) >= limit)
+    }
+
+    /// Account `token`'s active connection against `(cluster, ip)`.
+    /// Idempotent within a token: a second call for the same
+    /// `(cluster, ip)` is a no-op so H2 retries / multi-stream opens
+    /// to the same cluster do not double-count.
+    pub fn track_cluster_ip(&mut self, token: Token, cluster_id: String, ip: IpAddr) {
+        let key = (cluster_id, ip);
+        let inserted = self
+            .cluster_ip_tracks
+            .entry(token)
+            .or_default()
+            .insert(key.clone());
+        if inserted {
+            *self.connections_per_cluster_ip.entry(key).or_insert(0) += 1;
+        }
+    }
+
+    /// Drain every `(cluster, ip)` slot held by `token` and apply the
+    /// matching decrements. Called on session teardown only — there is
+    /// no per-stream untrack because the limit is per-connection, not
+    /// per-stream.
+    pub fn untrack_all_cluster_ip(&mut self, token: Token) {
+        let Some(entries) = self.cluster_ip_tracks.remove(&token) else {
+            return;
+        };
+        for key in entries {
+            if let Entry::Occupied(mut entry) = self.connections_per_cluster_ip.entry(key) {
+                let count = entry.get_mut();
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    entry.remove();
+                }
+            }
+        }
+    }
+
+    /// Wipe every per-(cluster, source-IP) accounting bucket. Called by
+    /// the runtime `SetMaxConnectionsPerIp(0)` path so disabling the
+    /// feature does not leave dead bookkeeping behind that a future
+    /// re-enable would consult.
+    pub fn clear_cluster_ip_tracking(&mut self) {
+        self.cluster_ip_tracks.clear();
+        self.connections_per_cluster_ip.clear();
     }
 
     /// The slab is considered at capacity if it contains more sessions than twice max_connections
@@ -378,9 +497,17 @@ impl Server {
 
         // Note: slab_capacity uses 4x multiplier (up from 2x) to account for H2
         // multiplexing where each session can have multiple backend connections.
+        // Newer `optional` proto fields fall through to the
+        // command-lib defaults when an older worker manager omits them.
         let sessions: Rc<RefCell<SessionManager>> = SessionManager::new(
             Slab::with_capacity(config.slab_capacity() as usize),
             config.max_connections as usize,
+            config
+                .max_connections_per_ip
+                .unwrap_or(sozu_command::config::DEFAULT_MAX_CONNECTIONS_PER_IP),
+            config
+                .retry_after
+                .unwrap_or(sozu_command::config::DEFAULT_RETRY_AFTER),
         );
         {
             let mut s = sessions.borrow_mut();
@@ -1155,6 +1282,35 @@ impl Server {
                     })
                     .into(),
                 ));
+            }
+            Some(RequestType::SetMaxConnectionsPerIp(limit)) => {
+                let mut sessions = self.sessions.borrow_mut();
+                let previous = sessions.max_connections_per_ip;
+                sessions.max_connections_per_ip = *limit;
+                // Disabling the feature on the fly should not leave
+                // stale `(cluster, ip)` entries behind: drain the
+                // bookkeeping so a re-enable starts from a clean slate
+                // and `cluster_ip_at_limit` does not consult dead state.
+                if *limit == 0 {
+                    sessions.clear_cluster_ip_tracking();
+                }
+                info!(
+                    "{} updated global max_connections_per_ip from {} to {}",
+                    message.id, previous, limit
+                );
+                push_queue(WorkerResponse::ok(message.id));
+                return;
+            }
+            Some(RequestType::QueryMaxConnectionsPerIp(_)) => {
+                let limit = self.sessions.borrow().max_connections_per_ip;
+                push_queue(WorkerResponse::ok_with_content(
+                    message.id,
+                    ContentType::MaxConnectionsPerIpLimit(
+                        sozu_command::proto::command::MaxConnectionsPerIpLimit { limit },
+                    )
+                    .into(),
+                ));
+                return;
             }
             Some(RequestType::QueryClustersByDomain(domain)) => {
                 let cluster_ids = self

@@ -404,6 +404,25 @@ pub trait ProxySession {
     /// if the session handles HTTP requests, it will not close until the response
     /// is completely sent back to the client
     fn shutting_down(&mut self) -> SessionIsToBeClosed;
+    /// Best-effort identifier of the cluster currently routed to by this
+    /// session. Returns `None` for `ListenSession` (no per-session
+    /// cluster), and for client sessions before routing has resolved.
+    /// H2 sessions multiplex many streams over one frontend token and may
+    /// touch several clusters; the returned value is whichever cluster
+    /// the session most recently keep-alive'd to. Used for log/metric
+    /// attribution, not for accounting (the tracker keeps the canonical
+    /// per-stream `(cluster, IP)` set).
+    fn cluster_id(&self) -> Option<String> {
+        None
+    }
+    /// Source address as observed by Sōzu, with proxy-protocol awareness.
+    /// HTTP/HTTPS/TCP client sessions return the parsed PROXY-protocol
+    /// source when present, else `peer_addr`. `ListenSession` returns
+    /// `None`. Used to attribute per-(cluster, source-IP) tracking and
+    /// access logs to the real client behind a layer-4 PROXY frontend.
+    fn session_address(&self) -> Option<SocketAddr> {
+        None
+    }
 }
 
 #[macro_export]
@@ -655,6 +674,13 @@ pub enum BackendConnectionError {
     RetrieveClusterError(RetrieveClusterError),
     #[error("maximum number of buffers reached")]
     MaxBuffers,
+    /// Per-(cluster, source-IP) connection limit reached. The protocol
+    /// layer translates this into HTTP 429 Too Many Requests (with an
+    /// optional `Retry-After`) for HTTP/HTTPS sessions, or a graceful TCP
+    /// close for raw TCP. The `cluster_id` is included so log/metric
+    /// pipelines can attribute the rejection.
+    #[error("per-(cluster, source-IP) connection limit reached for cluster {cluster_id:?}")]
+    TooManyConnectionsPerIp { cluster_id: String },
 }
 
 /// used in kawa_h1 module for the Http session state
@@ -825,6 +851,12 @@ pub trait L7Proxy {
     fn backends(&self) -> Rc<RefCell<BackendMap>>;
 
     fn clusters(&self) -> &HashMap<ClusterId, Cluster>;
+
+    /// Access the worker's [`SessionManager`] for per-(cluster, source-IP)
+    /// connection-limit accounting. The mux uses this to track / untrack
+    /// stream-granular `(cluster_id, ip)` entries and consult the
+    /// `cluster_ip_at_limit` gate before each backend connect.
+    fn sessions(&self) -> Rc<RefCell<crate::server::SessionManager>>;
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1381,7 +1413,8 @@ pub mod testing {
                 protocol: Protocol::Metrics,
             })));
         }
-        let sessions = SessionManager::new(sessions, max_buffers);
+        // Test fixture: feature disabled (max_connections_per_ip = 0).
+        let sessions = SessionManager::new(sessions, max_buffers, 0, 0);
 
         let registry = event_loop
             .registry()

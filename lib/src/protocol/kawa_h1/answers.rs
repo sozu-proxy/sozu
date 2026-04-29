@@ -610,6 +610,36 @@ Sozu-Id: %REQUEST_ID\r
     )
 }
 
+/// 429 template — emitted when the per-(cluster, source-IP) connection
+/// limit is reached. The `Retry-After` header line uses the
+/// `or-elide-header` placeholder so the engine drops the entire line
+/// when `retry_after` is empty (`Some(0)` or `None`). `Retry-After: 0`
+/// would invite an immediate retry that defeats the limit.
+fn default_429() -> String {
+    String::from(
+        "\
+HTTP/1.1 429 Too Many Requests\r
+Cache-Control: no-cache\r
+Connection: close\r
+Retry-After: %RETRY_AFTER\r
+Sozu-Id: %REQUEST_ID\r
+\r
+<html><head><meta charset='utf-8'><head><body>
+<style>pre{background:#EEE;padding:10px;border:1px solid #AAA;border-radius: 5px;}</style>
+<h1>429 Too Many Requests</h1>
+<pre>
+{
+    \"status_code\": 429,
+    \"route\": \"%ROUTE\",
+    \"request_id\": \"%REQUEST_ID\",
+    \"cluster_id\": \"%CLUSTER_ID\"
+}
+</pre>
+<p>The per-(cluster, source-IP) connection limit for this cluster has been reached. Slow down or retry later.</p>
+<footer>This is an automatic answer by Sōzu.</footer></body></html>",
+    )
+}
+
 fn default_502() -> String {
     String::from(
         "\
@@ -772,6 +802,7 @@ pub fn legacy_to_map(legacy: &CustomHttpAnswers) -> BTreeMap<String, String> {
     insert!("408", answer_408);
     insert!("413", answer_413);
     insert!("421", answer_421);
+    insert!("429", answer_429);
     insert!("502", answer_502);
     insert!("503", answer_503);
     insert!("504", answer_504);
@@ -874,6 +905,17 @@ impl HttpAnswers {
             or_elide_header: true,
             typ: ReplacementType::VariableOnce(0),
         };
+        let retry_after = TemplateVariable {
+            name: "RETRY_AFTER",
+            valid_in_body: false,
+            valid_in_header: true,
+            // empty value → drop the `Retry-After` header line entirely.
+            // `Retry-After: 0` invites an immediate retry that defeats
+            // the per-(cluster, source-IP) limit, so we elide instead of
+            // rendering a literal zero.
+            or_elide_header: true,
+            typ: ReplacementType::VariableOnce(0),
+        };
         let successfully_parsed = TemplateVariable {
             name: "SUCCESSFULLY_PARSED",
             valid_in_body: true,
@@ -932,6 +974,11 @@ impl HttpAnswers {
                 answer,
                 &[route, request_id]
             ),
+            "429" => Template::new(
+                Some(429),
+                answer,
+                &[route, request_id, cluster_id, retry_after],
+            ),
             "502" => Template::new(
                 Some(502),
                 answer,
@@ -988,6 +1035,7 @@ impl HttpAnswers {
             ("408", default_408),
             ("413", default_413),
             ("421", default_421),
+            ("429", default_429),
             ("502", default_502),
             ("503", default_503),
             ("504", default_504),
@@ -1110,6 +1158,22 @@ impl HttpAnswers {
                 variables = vec![route.into(), request_id.into()];
                 variables_once = vec![];
                 "421"
+            }
+            DefaultAnswer::Answer429 { retry_after } => {
+                variables = vec![
+                    route.into(),
+                    request_id.into(),
+                    cluster_id.unwrap_or_default().into(),
+                ];
+                // `None` or `Some(0)` ⇒ empty, which the template engine
+                // turns into a dropped `Retry-After:` line via the
+                // `or_elide_header` flag on the RETRY_AFTER variable.
+                let retry_after_value: Vec<u8> = match retry_after {
+                    Some(v) if v > 0 => v.to_string().into(),
+                    _ => Vec::new(),
+                };
+                variables_once = vec![retry_after_value];
+                "429"
             }
             DefaultAnswer::Answer502 {
                 message,

@@ -93,6 +93,11 @@ impl Router {
         context: &mut Context<L>,
         session: Rc<RefCell<dyn ProxySession>>,
         proxy: Rc<RefCell<dyn L7Proxy>>,
+        // Frontend session token, threaded in from `Mux::ready` so the
+        // per-(cluster, source-IP) accounting can key on it without
+        // re-borrowing `session` — the outer event-loop call chain
+        // already holds a mutable borrow of that cell.
+        frontend_token: Token,
     ) -> Result<(), BackendConnectionError> {
         let stream = &mut context.streams[stream_id];
         // when reused, a stream should be detached from its old connection, if not we could end
@@ -138,7 +143,13 @@ impl Router {
         let stream_context = &mut stream.context;
         stream_context.cluster_id = Some(cluster_id.to_owned());
 
-        let (frontend_should_stick, frontend_should_redirect_https, h2) = proxy
+        let (
+            frontend_should_stick,
+            frontend_should_redirect_https,
+            h2,
+            cluster_max_connections_per_ip,
+            cluster_retry_after,
+        ) = proxy
             .borrow()
             .clusters()
             .get(&cluster_id)
@@ -147,9 +158,60 @@ impl Router {
                     cluster.sticky_session,
                     cluster.https_redirect,
                     cluster.http2.unwrap_or(false),
+                    cluster.max_connections_per_ip,
+                    cluster.retry_after,
                 )
             })
-            .unwrap_or((false, false, false));
+            .unwrap_or((false, false, false, None, None));
+
+        // Per-(cluster, source-IP) connection limit gate. Runs AFTER cluster
+        // resolution (so a 401/421/redirect frontend never trips the limit)
+        // and BEFORE any backend selection (so a rejection consumes neither
+        // a backend pool slot nor a retry budget). The check uses the source
+        // IP from the per-stream `HttpContext.session_address`, which is the
+        // proxy-protocol-aware client address when present, falling back to
+        // `peer_addr`. The limit governs distinct **frontend connections**
+        // per `(cluster, ip)`: an H2 session multiplexing N streams to the
+        // same cluster from the same IP still consumes a single slot.
+        let session_ip = stream_context.session_address.map(|sa| sa.ip());
+        if let Some(ip) = session_ip {
+            // The frontend session is mutably borrowed up the call stack
+            // (`HttpSession::ready` -> `state.ready` -> `Mux::ready` ->
+            // here), so we cannot reach `session.borrow().frontend_token()`.
+            // The token is threaded in by the caller instead.
+            let sessions_rc = proxy.borrow().sessions();
+            let at_limit = sessions_rc.borrow().cluster_ip_at_limit(
+                frontend_token,
+                &cluster_id,
+                &ip,
+                cluster_max_connections_per_ip,
+            );
+            if at_limit {
+                let retry_after = sessions_rc
+                    .borrow()
+                    .effective_retry_after(cluster_retry_after);
+                // Stash the resolved retry value on the stream so the
+                // mux's BackendConnectionError → 429 mapping can render
+                // (or elide) the `Retry-After` header without
+                // re-deriving the override chain.
+                stream_context.retry_after_seconds = Some(retry_after).filter(|v| *v > 0);
+                return Err(BackendConnectionError::TooManyConnectionsPerIp {
+                    cluster_id: cluster_id.to_owned(),
+                });
+            }
+            // Idempotent track — H2 streams to the same `(cluster, ip)`
+            // share a single slot in the per-token set. Decrement happens
+            // wholesale on session close via `untrack_all_cluster_ip`.
+            sessions_rc
+                .borrow_mut()
+                .track_cluster_ip(frontend_token, cluster_id.clone(), ip);
+        }
+
+        if frontend_should_redirect_https && matches!(proxy.borrow().kind(), ListenerType::Http) {
+            return Err(BackendConnectionError::RetrieveClusterError(
+                RetrieveClusterError::HttpsRedirect,
+            ));
+        }
 
         if frontend_should_redirect_https && matches!(proxy.borrow().kind(), ListenerType::Http) {
             return Err(BackendConnectionError::RetrieveClusterError(
