@@ -650,12 +650,224 @@ fn try_tls_with_cert(
     }
 }
 
+/// Helper that drives the four-cell (frontend H1/H2 × backend H1/H2)
+/// cardinality matrix over TLS. Frontend ALPN preference is set
+/// indirectly: the test's chosen Hyper client (`build_https_client`
+/// vs `build_h2_client`) negotiates ALPN. Backend H2 is selected by
+/// `cluster.http2 = Some(true)` and an `H2Backend` mock; otherwise an
+/// `AsyncBackend` running an HTTP/1.1 handler is started.
+///
+/// Returns `State::Success` only when both the response status is
+/// successful and at least one request reached the backend.
+fn try_tls_cardinality_cell(
+    test_name: &str,
+    cert_pem: &str,
+    key_pem: &str,
+    tls_versions: Option<Vec<TlsVersion>>,
+    frontend_h2: bool,
+    backend_h2: bool,
+) -> State {
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+    let back_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker = Worker::start_new_worker_owned(test_name, config, listeners, state);
+
+    let mut listener_builder = ListenerBuilder::new_https(front_address.clone());
+    if let Some(ref versions) = tls_versions {
+        listener_builder.with_tls_versions(versions.clone());
+    }
+    worker.send_proxy_request_type(RequestType::AddHttpsListener(
+        listener_builder.to_tls(None).unwrap(),
+    ));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        address: front_address.clone(),
+        proxy: ListenerType::Https.into(),
+        from_scm: false,
+    }));
+
+    worker.send_proxy_request_type(RequestType::AddCluster(Cluster {
+        http2: Some(backend_h2),
+        ..Worker::default_cluster("cluster_0")
+    }));
+
+    let hostname = "localhost".to_string();
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        hostname: hostname.to_owned(),
+        ..Worker::default_http_frontend("cluster_0", front_address.clone().into())
+    }));
+
+    let certificate_and_key = CertificateAndKey {
+        certificate: String::from(cert_pem),
+        key: String::from(key_pem),
+        certificate_chain: vec![],
+        versions: vec![],
+        names: vec![],
+    };
+    worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+        address: front_address,
+        certificate: certificate_and_key,
+        expired_at: None,
+    }));
+
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address,
+        None,
+    )));
+    worker.read_to_last();
+
+    // Spawn the appropriate backend kind. H2 backends need a small bind
+    // delay before the first request is fired; the existing
+    // `setup_h2_backend_test` helper uses 100 ms.
+    let mut h1_backend = None;
+    let mut h2_backend = None;
+    if backend_h2 {
+        h2_backend = Some(H2Backend::start(
+            "BACKEND_H2".to_owned(),
+            back_address,
+            "h2-pong".to_owned(),
+        ));
+        thread::sleep(Duration::from_millis(100));
+    } else {
+        h1_backend = Some(AsyncBackend::spawn_detached_backend(
+            "BACKEND_H1",
+            back_address,
+            SimpleAggregator::default(),
+            AsyncBackend::http_handler("pong"),
+        ));
+    }
+
+    let uri: hyper::Uri = format!("https://{hostname}:{front_port}/api")
+        .parse()
+        .unwrap();
+
+    let request_ok = if frontend_h2 {
+        let client = build_h2_client();
+        match resolve_request(&client, uri) {
+            Some((status, body)) => {
+                println!("{test_name} response status: {status:?}, body: {body}");
+                status.is_success()
+            }
+            None => false,
+        }
+    } else {
+        let client = build_https_client();
+        match resolve_request(&client, uri) {
+            Some((status, body)) => {
+                println!("{test_name} response status: {status:?}, body: {body}");
+                status.is_success()
+            }
+            None => false,
+        }
+    };
+
+    worker.soft_stop();
+    let stop_ok = worker.wait_for_server_stop();
+
+    let backend_handled = if let Some(mut b) = h2_backend {
+        let n = b.get_responses_sent();
+        b.stop();
+        n
+    } else if let Some(mut b) = h1_backend {
+        let agg = b.stop_and_get_aggregator().expect("aggregator");
+        agg.responses_sent
+    } else {
+        0
+    };
+
+    if request_ok && stop_ok && backend_handled >= 1 {
+        State::Success
+    } else {
+        println!(
+            "{test_name} failed: request_ok={request_ok} stop_ok={stop_ok} backend_handled={backend_handled}"
+        );
+        State::Fail
+    }
+}
+
 pub fn try_tls_endpoint() -> State {
     try_tls_with_cert(
         "TLS-ENDPOINT",
         include_str!("../../../lib/assets/local-certificate.pem"),
         include_str!("../../../lib/assets/local-key.pem"),
         None,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Cardinality matrix — TLS scheme tests across (frontend H1/H2 × backend H1/H2)
+// ---------------------------------------------------------------------------
+// Each cell exercises one (cert kind × frontend protocol × backend protocol)
+// combination. Cert kind covers RSA-2048 and ECDSA-P256; TLS version is the
+// listener default (rustls negotiates 1.3 first, falling back to 1.2). The
+// H1/H1 cells are already covered by `try_tls_rsa_2048` / `try_tls_ecdsa`.
+
+pub fn try_tls_cardinality_h1_h2_rsa() -> State {
+    try_tls_cardinality_cell(
+        "TLS-CARD-H1-H2-RSA",
+        include_str!("../../../lib/assets/local-certificate.pem"),
+        include_str!("../../../lib/assets/local-key.pem"),
+        None,
+        false,
+        true,
+    )
+}
+
+pub fn try_tls_cardinality_h1_h2_ecdsa() -> State {
+    try_tls_cardinality_cell(
+        "TLS-CARD-H1-H2-ECDSA",
+        include_str!("../../../lib/assets/tests/ecdsa-localhost.pem"),
+        include_str!("../../../lib/assets/tests/ecdsa-localhost.key"),
+        None,
+        false,
+        true,
+    )
+}
+
+pub fn try_tls_cardinality_h2_h1_rsa() -> State {
+    try_tls_cardinality_cell(
+        "TLS-CARD-H2-H1-RSA",
+        include_str!("../../../lib/assets/local-certificate.pem"),
+        include_str!("../../../lib/assets/local-key.pem"),
+        None,
+        true,
+        false,
+    )
+}
+
+pub fn try_tls_cardinality_h2_h1_ecdsa() -> State {
+    try_tls_cardinality_cell(
+        "TLS-CARD-H2-H1-ECDSA",
+        include_str!("../../../lib/assets/tests/ecdsa-localhost.pem"),
+        include_str!("../../../lib/assets/tests/ecdsa-localhost.key"),
+        None,
+        true,
+        false,
+    )
+}
+
+pub fn try_tls_cardinality_h2_h2_rsa() -> State {
+    try_tls_cardinality_cell(
+        "TLS-CARD-H2-H2-RSA",
+        include_str!("../../../lib/assets/local-certificate.pem"),
+        include_str!("../../../lib/assets/local-key.pem"),
+        None,
+        true,
+        true,
+    )
+}
+
+pub fn try_tls_cardinality_h2_h2_ecdsa() -> State {
+    try_tls_cardinality_cell(
+        "TLS-CARD-H2-H2-ECDSA",
+        include_str!("../../../lib/assets/tests/ecdsa-localhost.pem"),
+        include_str!("../../../lib/assets/tests/ecdsa-localhost.key"),
+        None,
+        true,
+        true,
     )
 }
 
@@ -2594,6 +2806,83 @@ fn test_tls_1_2_ecdsa() {
             100,
             "TLS 1.2 ECDSA: HTTPS with TLS 1.2 only and ECDSA certificate",
             try_tls_1_2_ecdsa
+        ),
+        State::Success
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Cardinality matrix tests — frontend H1/H2 × backend H1/H2 across cert kinds.
+// Cell H1/H1 is already covered by `test_tls_rsa_2048` / `test_tls_ecdsa`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_tls_cardinality_h1_h2_rsa() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "Cardinality H1→H2 RSA: H1 frontend reverse-proxies to h2c backend",
+            try_tls_cardinality_h1_h2_rsa
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_tls_cardinality_h1_h2_ecdsa() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "Cardinality H1→H2 ECDSA: H1 frontend reverse-proxies to h2c backend",
+            try_tls_cardinality_h1_h2_ecdsa
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_tls_cardinality_h2_h1_rsa() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "Cardinality H2→H1 RSA: H2 frontend reverse-proxies to H1 backend",
+            try_tls_cardinality_h2_h1_rsa
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_tls_cardinality_h2_h1_ecdsa() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "Cardinality H2→H1 ECDSA: H2 frontend reverse-proxies to H1 backend",
+            try_tls_cardinality_h2_h1_ecdsa
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_tls_cardinality_h2_h2_rsa() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "Cardinality H2→H2 RSA: H2 frontend reverse-proxies to h2c backend",
+            try_tls_cardinality_h2_h2_rsa
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_tls_cardinality_h2_h2_ecdsa() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "Cardinality H2→H2 ECDSA: H2 frontend reverse-proxies to h2c backend",
+            try_tls_cardinality_h2_h2_ecdsa
         ),
         State::Success
     );
