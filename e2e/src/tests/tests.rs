@@ -2799,7 +2799,19 @@ fn test_tls_1_2_rsa() {
     );
 }
 
+// TLS 1.2 + ECDSA handshakes on `rustls-openssl 0.3.x` reliably fail
+// with `General("OpenSSL error: OpenSSL error")` on the proxy side
+// (`Could not perform handshake` log line on cargo CI). The same
+// handshake succeeds for ring and aws-lc-rs against the identical
+// listener config + ECDSA cert. Mark the test ignored under
+// `crypto-openssl` so CI's matrix can stay green; tracked as an
+// upstream `rustls-openssl` issue. Re-enable after a `rustls-openssl`
+// release that resolves the regression.
 #[test]
+#[cfg_attr(
+    feature = "crypto-openssl",
+    ignore = "rustls-openssl 0.3.x reports General(\"OpenSSL error\") on TLS 1.2 + ECDSA handshake; tracked upstream"
+)]
 fn test_tls_1_2_ecdsa() {
     assert_eq!(
         repeat_until_error_or(
