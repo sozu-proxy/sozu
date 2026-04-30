@@ -625,7 +625,7 @@ pub enum HttpFrontendCmd {
         redirect_scheme: Option<String>,
         #[clap(
             long = "redirect-template",
-            help = "Optional template applied when emitting a permanent redirect. Supports %REDIRECT_LOCATION / %STATUS_CODE."
+            help = "Optional template applied when emitting a permanent redirect. Supports %REDIRECT_LOCATION."
         )]
         redirect_template: Option<String>,
         #[clap(

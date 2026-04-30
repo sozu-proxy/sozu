@@ -718,7 +718,7 @@ message RequestHttpFrontend {
     // (preserve the request scheme).
     optional RedirectScheme redirect_scheme = 10 [default = USE_SAME];
     // Optional template applied when emitting a permanent redirect. Supports
-    // `%REDIRECT_LOCATION` / `%STATUS_CODE` etc. — see `doc/configure.md`.
+    // `%REDIRECT_LOCATION` and the variables documented in `doc/configure.md`.
     optional string redirect_template = 11;
     // Rewrite host template. Supports `$HOST[n]` / `$PATH[n]` placeholders
     // populated from regex captures collected during routing. When set, both

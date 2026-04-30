@@ -1492,3 +1492,81 @@ fn test_redirect_permanent_uses_rewrite_host_and_template() {
         State::Success,
     );
 }
+
+// ═════════════════════════════════════════════════════════════════════
+// Clusterless `RedirectPolicy::Permanent` — 301 reachable without cluster
+// ═════════════════════════════════════════════════════════════════════
+
+/// A frontend may declare `redirect = permanent` without a backing
+/// cluster — the canonical "this hostname has moved, no backing service
+/// remains" shape from the original proposal in #1161.
+///
+/// Regression: a previous ordering in `Router::route_from_request`
+/// short-circuited every `cluster_id == None` route to 401 BEFORE the
+/// `RedirectPolicy::Permanent` branch, so a clusterless frontend with
+/// `redirect = permanent` returned 401 instead of 301. The fix moves the
+/// `Permanent` branch ahead of the clusterless-deny so the documented
+/// behaviour is reachable.
+pub fn try_clusterless_permanent_redirect_emits_301() -> State {
+    let front_address = create_local_address();
+    let mut worker = spawn_worker_with_http_listener("CLUSTERLESS-REDIR", front_address);
+
+    // No `AddCluster` request — the frontend below is intentionally
+    // detached. The router must still emit 301 because `redirect`
+    // overrides the clusterless-deny.
+    worker.send_proxy_request(
+        RequestType::AddHttpFrontend(RequestHttpFrontend {
+            cluster_id: None,
+            address: front_address.into(),
+            hostname: "old.example.com".to_owned(),
+            path: sozu_command_lib::proto::command::PathRule::prefix(String::from("/")),
+            position: sozu_command_lib::proto::command::RulePosition::Tree.into(),
+            redirect: Some(RedirectPolicy::Permanent as i32),
+            redirect_scheme: Some(RedirectScheme::UseSame as i32),
+            rewrite_host: Some("new.example.com".to_owned()),
+            ..Default::default()
+        })
+        .into(),
+    );
+    worker.read_to_last();
+
+    let mut client = Client::new(
+        "clusterless_redir_client",
+        front_address,
+        http_request("GET", "/path", "ping", "old.example.com"),
+    );
+    client.connect();
+    client.send();
+    let response = client
+        .receive()
+        .expect("frontend must emit a 301 default-answer for the clusterless permanent redirect");
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+
+    let lower = response.to_ascii_lowercase();
+    if !response.contains("301") {
+        eprintln!(
+            "expected 301 for clusterless RedirectPolicy::Permanent (regression on the route ordering); got:\n{response}"
+        );
+        return State::Fail;
+    }
+    if !lower.contains("location: http://new.example.com") {
+        eprintln!(
+            "expected Location to use the rewritten host new.example.com on the same scheme; got:\n{response}"
+        );
+        return State::Fail;
+    }
+    State::Success
+}
+
+#[test]
+fn test_clusterless_permanent_redirect_emits_301() {
+    assert_eq!(
+        repeat_until_error_or(
+            2,
+            "clusterless permanent redirect emits 301 (not 401)",
+            try_clusterless_permanent_redirect_emits_301,
+        ),
+        State::Success,
+    );
+}
