@@ -291,7 +291,7 @@ impl BackendMap {
                 // skipping the backend even though we have stopped
                 // probing it. Reset every backend in the cluster to a
                 // pristine healthy state so the load balancer can
-                // route again. Codex finding (post-rebase review).
+                // route again.
                 if let Some(backend_list) = self.backends.get(cluster_id) {
                     for backend in &backend_list.backends {
                         backend.borrow_mut().health = HealthState::default();
