@@ -213,7 +213,7 @@ impl ConfigState {
         // round-trip through SaveState/LoadState. The worker also
         // validates at the SetHealthCheck handler — this is the
         // master-side mirror so off-channel TOML reload paths don't
-        // bypass the policy. Codex finding (post-rebase review).
+        // bypass the policy.
         if let Err(reason) = crate::config::validate_health_check_config(&set.config) {
             return Err(StateError::InvalidValue {
                 field: "health_check",

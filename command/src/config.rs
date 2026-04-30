@@ -1609,9 +1609,9 @@ pub struct FileClusterConfig {
     /// field for shape uniformity but never emit the header (no HTTP
     /// envelope).
     pub retry_after: Option<u32>,
-    /// Optional HTTP health-check configuration (see `[clusters.<id>.health_check]`).
-    /// Only HTTP/1.1 probes are sent today; backends with `http2 = true` may
-    /// fail probes — see `doc/health_checks.md`.
+    /// Optional HTTP health-check configuration. The probe wire format
+    /// follows `cluster.http2`: HTTP/1.1 when false, HTTP/2 prior-knowledge
+    /// (h2c) when true.
     #[serde(default)]
     pub health_check: Option<FileHealthCheckConfig>,
 }
@@ -1881,7 +1881,9 @@ pub struct HttpClusterConfig {
     /// value (seconds). See [`FileClusterConfig::retry_after`].
     #[serde(default)]
     pub retry_after: Option<u32>,
-    /// Optional HTTP health-check configuration. HTTP/1.1 probes only.
+    /// Optional HTTP health-check configuration. The probe wire format
+    /// follows `cluster.http2`: HTTP/1.1 when false, HTTP/2 prior-knowledge
+    /// (h2c) when true.
     #[serde(default)]
     pub health_check: Option<HealthCheckConfig>,
 }

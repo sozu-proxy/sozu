@@ -113,14 +113,13 @@ message Request {
     // limit. Workers reply with `MaxConnectionsPerIpLimit`.
     QueryMaxConnectionsPerIp query_max_connections_per_ip = 51;
     // set or update the health check configuration for a cluster.
-    // Renumbered from PR #1191's original `47` to avoid collision with
-    // post-1209 `update_http_listener`.
+    // Tags 47-49 carry in-place listener patches (HTTP/HTTPS/TCP) and
+    // 50-51 carry the per-(cluster, source-IP) connection-limit
+    // request/query, so health-check verbs start at 52.
     SetHealthCheck set_health_check = 52;
     // remove the health check configuration from a cluster.
-    // Renumbered from PR #1191's original `48`.
     string remove_health_check = 53;
     // list health check configurations (optional cluster id filter).
-    // Renumbered from PR #1191's original `49`.
     QueryHealthChecks query_health_checks = 54;
   }
 }
@@ -896,8 +895,9 @@ message Cluster {
     // `Some(0)` omits the header.
     optional uint32 retry_after = 14;
     // Optional HTTP health check configuration for backends in this cluster.
-    // Renumbered from PR #1191's original `8` to avoid collision with
-    // `http2` (post-1209 backend H2-capability hint).
+    // Tag 8 in this message is the `http2` backend-capability hint and
+    // tags 9-14 cover answers/redirect/auth/limits, so health-check
+    // configuration occupies tag 15.
     optional HealthCheckConfig health_check = 15;
 }
 
@@ -1133,11 +1133,12 @@ enum EventKind {
     // subscribers observe every control-plane mutation.
     EVENTS_SUBSCRIBED = 26;
     // Backend health-check transitioned to healthy after consecutive successes.
-    // Renumbered from PR #1191's original `4` to avoid collision with
-    // `CLUSTER_ADDED` from the post-1209 audit-trail enum.
+    // Tags 0..3 are the historical backend-state events; 4..26 carry the
+    // control-plane mutation events (cluster, frontend, certificate,
+    // listener, worker, configuration, metrics, state, stop, upgrade,
+    // events). Backend health-check transitions therefore start at 27.
     HEALTH_CHECK_HEALTHY = 27;
     // Backend health-check transitioned to unhealthy after consecutive failures.
-    // Renumbered from PR #1191's original `5` for the same reason as above.
     HEALTH_CHECK_UNHEALTHY = 28;
 }
 
