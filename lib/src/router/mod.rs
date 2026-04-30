@@ -507,7 +507,12 @@ pub enum DomainRule {
 }
 
 fn convert_regex_domain_rule(hostname: &str) -> Option<String> {
-    let mut result = String::new();
+    // Anchor at both ends so `Regex::is_match` only succeeds on a full-host
+    // match. Without `\A` the pattern `/example\.com/` matches any hostname
+    // containing `example.com` as a substring (e.g. `attacker.example.com.evil.org`),
+    // letting an attacker-controlled domain reach a frontend that should only
+    // serve `example.com`.
+    let mut result = String::from("\\A");
 
     let s = hostname.as_bytes();
     let mut index = 0;
@@ -522,6 +527,7 @@ fn convert_regex_domain_rule(hostname: &str) -> Option<String> {
                     }
                     index = i + 1;
                     found = true;
+                    break;
                 }
             }
 
@@ -549,6 +555,7 @@ fn convert_regex_domain_rule(hostname: &str) -> Option<String> {
         }
 
         if index == s.len() {
+            result.push_str("\\z");
             return Some(result);
         } else if s[index] == b'.' {
             result.push_str("\\.");
@@ -1417,27 +1424,29 @@ mod tests {
 
     #[test]
     fn convert_regex() {
+        // Compiled regexes are anchored with `\A` … `\z` so `Regex::is_match`
+        // (unanchored by default) only succeeds on a full-host match.
         assert_eq!(
             convert_regex_domain_rule("www.example.com")
                 .unwrap()
                 .as_str(),
-            "www\\.example\\.com"
+            "\\Awww\\.example\\.com\\z"
         );
         assert_eq!(
             convert_regex_domain_rule("*.example.com").unwrap().as_str(),
-            "*\\.example\\.com"
+            "\\A*\\.example\\.com\\z"
         );
         assert_eq!(
             convert_regex_domain_rule("test.*.example.com")
                 .unwrap()
                 .as_str(),
-            "test\\.*\\.example\\.com"
+            "\\Atest\\.*\\.example\\.com\\z"
         );
         assert_eq!(
             convert_regex_domain_rule("css./cdn[a-z0-9]+/.example.com")
                 .unwrap()
                 .as_str(),
-            "css\\.cdn[a-z0-9]+\\.example\\.com"
+            "\\Acss\\.cdn[a-z0-9]+\\.example\\.com\\z"
         );
 
         assert_eq!(
@@ -1448,6 +1457,32 @@ mod tests {
             convert_regex_domain_rule("css./cdn[a-z0-9]+/a.example.com"),
             None
         );
+    }
+
+    /// Compiled regex rules must reject suffix / prefix matches. Without
+    /// `\A` / `\z` anchors, `Regex::is_match` treats the pattern as
+    /// "match anywhere in the haystack", letting `attacker.example.com.evil.org`
+    /// reach a frontend that only intends to serve `example.com`.
+    #[test]
+    fn regex_domain_rule_rejects_suffix_and_prefix() {
+        let rule: DomainRule = "/example\\.com/".parse().unwrap();
+        assert!(rule.matches(b"example.com"));
+        assert!(!rule.matches(b"attacker.example.com"));
+        assert!(!rule.matches(b"example.com.evil.org"));
+        assert!(!rule.matches(b"prefixexample.com"));
+        assert!(!rule.matches(b"example.commercial"));
+    }
+
+    /// A multi-segment regex hostname (alternating regex and literal
+    /// subdomains) must keep each segment confined: only the first `/`
+    /// after the opening delimiter closes a regex segment. A missing
+    /// `break` collapsed every later `/` into the same segment, swallowing
+    /// the literal `.` separators between them.
+    #[test]
+    fn regex_domain_rule_multi_segment_segments_are_isolated() {
+        let pattern = convert_regex_domain_rule("/seg1/.foo./seg2/.com")
+            .expect("multi-segment regex hostname must compile");
+        assert_eq!(pattern.as_str(), "\\Aseg1\\.foo\\.seg2\\.com\\z");
     }
 
     #[test]
@@ -1464,7 +1499,7 @@ mod tests {
         assert_eq!("test.*.example.com".parse::<DomainRule>(), Err(()));
         assert_eq!(
             "/cdn[0-9]+/.example.com".parse::<DomainRule>().unwrap(),
-            DomainRule::Regex(Regex::new("cdn[0-9]+\\.example\\.com").unwrap())
+            DomainRule::Regex(Regex::new("\\Acdn[0-9]+\\.example\\.com\\z").unwrap())
         );
     }
 

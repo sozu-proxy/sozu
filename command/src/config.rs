@@ -1204,8 +1204,8 @@ pub struct FileClusterFrontendConfig {
     /// `use-https`. Case-insensitive.
     pub redirect_scheme: Option<String>,
     /// Optional template applied to the emitted permanent-redirect response
-    /// body. Supports the `%REDIRECT_LOCATION` / `%STATUS_CODE` etc.
-    /// variables documented in `doc/configure.md`.
+    /// body. Supports the `%REDIRECT_LOCATION` and other variables
+    /// documented in `doc/configure.md`.
     pub redirect_template: Option<String>,
     /// Rewrite host template. Supports `$HOST[n]` / `$PATH[n]` placeholders
     /// populated from regex captures collected during routing.

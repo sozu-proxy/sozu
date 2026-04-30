@@ -711,7 +711,6 @@ optional placeholders. Sōzu substitutes the placeholders at render time:
 
 | Placeholder | Scope | Meaning |
 |-------------|-------|---------|
-| `%STATUS_CODE` | header & body | Resolved HTTP status (e.g. `503`) |
 | `%REQUEST_ID` | header & body | Per-request ULID (matches `Sozu-Id`) |
 | `%CLUSTER_ID` | header & body | Cluster the request was routed to (or empty) |
 | `%BACKEND_ID` | header & body | Backend the request was forwarded to (or empty) |
