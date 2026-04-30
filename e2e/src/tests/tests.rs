@@ -2823,6 +2823,36 @@ fn test_tls_1_2_ecdsa() {
     );
 }
 
+// Companion probe to `test_tls_1_2_ecdsa`. Compiled only when the
+// `crypto-openssl` feature is on, this asserts that the very same
+// handshake the upstream regression breaks STILL fails. As soon as
+// `rustls-openssl` ships a fix, the handshake will succeed and this
+// probe will flip red — at that point:
+//
+//   1. delete this probe
+//   2. drop the `#[cfg_attr(feature = "crypto-openssl", ignore = ...)]`
+//      from `test_tls_1_2_ecdsa` above so the real test runs on every
+//      cell again
+//
+// One iteration is enough because the upstream failure is deterministic
+// (`General("OpenSSL error: OpenSSL error")` on the proxy-side
+// handshake — see the comment on `test_tls_1_2_ecdsa`).
+#[test]
+#[cfg(feature = "crypto-openssl")]
+fn test_tls_1_2_ecdsa_openssl_regression_probe() {
+    assert_ne!(
+        repeat_until_error_or(
+            1,
+            "Probe: TLS 1.2 ECDSA must still fail under crypto-openssl",
+            try_tls_1_2_ecdsa
+        ),
+        State::Success,
+        "rustls-openssl's TLS 1.2 + ECDSA handshake regression appears \
+         resolved — un-ignore `test_tls_1_2_ecdsa` for crypto-openssl \
+         and remove this probe."
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Cardinality matrix tests — frontend H1/H2 × backend H1/H2 across cert kinds.
 // Cell H1/H1 is already covered by `test_tls_rsa_2048` / `test_tls_ecdsa`.
