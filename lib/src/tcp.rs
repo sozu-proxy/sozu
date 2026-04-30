@@ -1887,15 +1887,25 @@ mod tests {
             println!("s2 received {:?}", str::from_utf8(&res[..sz2]));
             assert_eq!(&res[..sz2], &b"pouet pouet"[..]);
 
-            let sz1 = s1
-                .read(&mut res[..])
-                .expect("could not read from socket s1");
+            // Read in a loop: a single read() on a TCP stream is not
+            // guaranteed to return all echoed data if the second write's
+            // round trip (client → proxy → backend → proxy → client) is
+            // still in flight when we poll.
+            let expected = b"hello coucou";
+            let mut total = 0;
+            while total < expected.len() {
+                let sz = s1
+                    .read(&mut res[total..])
+                    .expect("could not read from socket s1");
+                assert!(sz > 0, "connection closed before receiving all data");
+                total += sz;
+            }
             println!(
                 "s1 received again({}): {:?}",
-                sz1,
-                str::from_utf8(&res[..sz1])
+                total,
+                str::from_utf8(&res[..total])
             );
-            assert_eq!(&res[..sz1], &b"hello coucou"[..]);
+            assert_eq!(&res[..total], &expected[..]);
 
             // Signal the echo server to stop
             test_finished.store(true, Ordering::Relaxed);

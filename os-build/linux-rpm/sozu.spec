@@ -19,6 +19,15 @@ BuildRequires: rust
 BuildRequires: cargo
 BuildRequires: protobuf-compiler
 BuildRequires: gcc
+BuildRequires: cmake
+
+# Crypto provider for rustls. Exactly one must be enabled:
+#   crypto_ring      - ring (pure Rust, default)
+#   crypto_aws_lc_rs - aws-lc-rs (needs cmake + go at build time)
+#   crypto_openssl   - OpenSSL via rustls-openssl (needs openssl-devel)
+%bcond crypto_ring 1
+%bcond crypto_aws_lc_rs 0
+%bcond crypto_openssl 0
 
 BuildRoot:	%{_tmppath}/%{name}-%{version}-%{release}-root
 
@@ -29,7 +38,15 @@ BuildRoot:	%{_tmppath}/%{name}-%{version}-%{release}-root
 %setup -n %{name}-%{version}
 
 %build
-cargo build --release
+%if %{with crypto_ring}
+cargo build --release --no-default-features --features jemallocator,crypto-ring
+%endif
+%if %{with crypto_aws_lc_rs}
+cargo build --release --no-default-features --features jemallocator,crypto-aws-lc-rs
+%endif
+%if %{with crypto_openssl}
+cargo build --release --no-default-features --features jemallocator,crypto-openssl
+%endif
 
 %install
 rm -rf %{buildroot}

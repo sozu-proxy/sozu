@@ -112,7 +112,25 @@ message Request {
     // query the current global per-(cluster, source-IP) connection
     // limit. Workers reply with `MaxConnectionsPerIpLimit`.
     QueryMaxConnectionsPerIp query_max_connections_per_ip = 51;
+    // set or update the health check configuration for a cluster.
+    // Tags 47-49 carry in-place listener patches (HTTP/HTTPS/TCP) and
+    // 50-51 carry the per-(cluster, source-IP) connection-limit
+    // request/query, so health-check verbs start at 52.
+    SetHealthCheck set_health_check = 52;
+    // remove the health check configuration from a cluster.
+    string remove_health_check = 53;
+    // list health check configurations (optional cluster id filter).
+    QueryHealthChecks query_health_checks = 54;
   }
+}
+
+message QueryHealthChecks {
+    optional string cluster_id = 1;
+}
+
+message SetHealthCheck {
+    required string cluster_id = 1;
+    required HealthCheckConfig config = 2;
 }
 
 message ListWorkers {}
@@ -876,6 +894,27 @@ message Cluster {
     // (seconds, HTTP 429 only). `None` inherits the global default.
     // `Some(0)` omits the header.
     optional uint32 retry_after = 14;
+    // Optional HTTP health check configuration for backends in this cluster.
+    // Tag 8 in this message is the `http2` backend-capability hint and
+    // tags 9-14 cover answers/redirect/auth/limits, so health-check
+    // configuration occupies tag 15.
+    optional HealthCheckConfig health_check = 15;
+}
+
+message HealthCheckConfig {
+    required string uri = 1;
+    required uint32 interval = 2 [default = 10];
+    required uint32 timeout = 3 [default = 5];
+    required uint32 healthy_threshold = 4 [default = 3];
+    required uint32 unhealthy_threshold = 5 [default = 3];
+    required uint32 expected_status = 6 [default = 0];
+    // The probe wire format is derived from `Cluster.http2` (the same
+    // backend-capability hint the mux router reads). When the cluster
+    // sets `http2 = true`, the probe sends the HTTP/2 connection
+    // preface + empty SETTINGS + HEADERS frame on stream 1; otherwise
+    // HTTP/1.1. There is no per-`HealthCheckConfig` h2c flag — the
+    // probe wire follows the data-plane wire so an h2c-only backend
+    // is never probed with HTTP/1.1 (and vice versa).
 }
 
 enum LoadBalancingAlgorithms {
@@ -997,7 +1036,14 @@ message ResponseContent {
         RequestCounts request_counts = 13;
         // current global per-(cluster, source-IP) connection limit
         MaxConnectionsPerIpLimit max_connections_per_ip_limit = 14;
+        // health check configurations by cluster (renumbered from PR #1191's
+        // original `14` since post-1209 occupies that tag).
+        HealthChecksList health_checks_list = 15;
     }
+}
+
+message HealthChecksList {
+    map<string, HealthCheckConfig> map = 1;
 }
 
 // a map of worker_id -> ResponseContent
@@ -1086,6 +1132,14 @@ enum EventKind {
     // A client subscribed to the SubscribeEvents bus — privileged because
     // subscribers observe every control-plane mutation.
     EVENTS_SUBSCRIBED = 26;
+    // Backend health-check transitioned to healthy after consecutive successes.
+    // Tags 0..3 are the historical backend-state events; 4..26 carry the
+    // control-plane mutation events (cluster, frontend, certificate,
+    // listener, worker, configuration, metrics, state, stop, upgrade,
+    // events). Backend health-check transitions therefore start at 27.
+    HEALTH_CHECK_HEALTHY = 27;
+    // Backend health-check transitioned to unhealthy after consecutive failures.
+    HEALTH_CHECK_UNHEALTHY = 28;
 }
 
 message ClusterHashes {

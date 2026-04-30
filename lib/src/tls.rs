@@ -14,11 +14,12 @@ use std::{
 };
 
 use rustls::{
-    crypto::ring::sign::any_supported_type,
     pki_types::{CertificateDer, PrivateKeyDer},
     server::{ClientHello, ResolvesServerCert},
     sign::CertifiedKey,
 };
+
+use crate::crypto::any_supported_type;
 use sha2::{Digest, Sha256};
 use sozu_command::{
     certificate::{

@@ -22,6 +22,7 @@ include = [
   "Cargo.toml",
   "src/**/*",
   "/examples/*",
+  "benches/**/*",
   "assets/certificate.pem",
   "assets/certificate_chain.pem",
   "assets/key.pem",
@@ -45,6 +46,7 @@ poule = { workspace = true }
 rand = { workspace = true }
 regex = { workspace = true }
 rustls = { workspace = true }
+rustls-openssl = { workspace = true, optional = true }
 rustls-pemfile = { workspace = true }
 rusty_ulid = { workspace = true }
 sha2 = { workspace = true }
@@ -71,8 +73,23 @@ harness = false
 name = "h2_scheduling"
 harness = false
 
+[[bench]]
+name = "crypto_provider"
+harness = false
+
 [features]
-default = []
+# `crypto-ring` is enabled by default so `cargo {build,test} -p sozu-lib`
+# (no explicit features) compiles out of the box. Downstream binaries
+# already override via their own `default = ["crypto-ring", ...]` entries
+# in `bin/Cargo.toml`. CI matrix jobs pass `--no-default-features
+# --features <provider>` to pick a specific provider. When several
+# provider features are enabled at once (e.g. `cargo doc --all-features`,
+# or `cargo build --features fips` layered on top of the default
+# `crypto-ring`), the precedence chain in `lib/src/crypto.rs`
+# (`fips > ring > aws-lc-rs > openssl`) selects deterministically.
+# `fips` always wins so a `--features fips` binary genuinely runs
+# aws-lc-rs in FIPS mode rather than silently falling back to ring.
+default = ["crypto-ring"]
 # Exposes `#[cfg(any(test, feature = "e2e-hooks"))]` test-injection APIs in
 # the mux layer (`Connection::new_h2_client` pool-failure injection,
 # `ConnectionH2::__test_set_last_stream_id`). Consumed by the `sozu-e2e`
@@ -80,9 +97,28 @@ default = []
 # starving the buffer pool or issuing 2³¹ real requests. Must NOT be
 # enabled in production builds.
 e2e-hooks = []
+# Compile-time crypto provider selection. At least one of crypto-ring /
+# crypto-aws-lc-rs / crypto-openssl must be enabled; lib/src/crypto.rs
+# emits compile_error! when none are. When several are enabled at once
+# (notably under `cargo build --all-features` or when `--features fips`
+# is layered on top of the default `crypto-ring`), the precedence chain
+# in crypto.rs (`fips > ring > aws-lc-rs > openssl`) selects
+# deterministically. `fips` implies crypto-aws-lc-rs and enables
+# rustls's FIPS profile via aws-lc-rs's FIPS build (see rustls-0.23.38
+# Cargo.toml: fips = [aws_lc_rs, aws-lc-rs?/fips]); because `fips` wins
+# the chain, a `--features fips` binary always runs aws-lc-rs in FIPS
+# mode regardless of which other provider features are simultaneously
+# enabled.
+crypto-ring = ["rustls/ring"]
+crypto-aws-lc-rs = ["rustls/aws-lc-rs"]
+crypto-openssl = ["dep:rustls-openssl"]
+fips = ["crypto-aws-lc-rs", "rustls/fips"]
 logs-debug = []
 logs-trace = []
 opentelemetry = []
 simd = ["kawa/simd"]
 splice = []
 tolerant-http1-parser = ["kawa/tolerant-parsing"]
+
+[badges]
+travis-ci = { repository = "sozu-proxy/sozu" }

@@ -10,7 +10,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 loona-hpack = "0.4"
-sozu-lib = { path = "../lib" }
+sozu-lib = { path = "../lib", default-features = false, features = ["crypto-ring"] }
 
 # Prevent this from joining the workspace
 [workspace]

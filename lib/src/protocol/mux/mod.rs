@@ -139,7 +139,7 @@ mod h2;
 pub mod parser;
 mod pkawa;
 pub mod router;
-mod serializer;
+pub(crate) mod serializer;
 mod shared;
 pub mod stream;
 
