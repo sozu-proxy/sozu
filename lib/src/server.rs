@@ -1433,9 +1433,7 @@ impl Server {
                 // handler below already runs the same validation; this is the
                 // AddCluster mirror.
                 if let Some(hc) = cluster.health_check.as_ref() {
-                    if let Err(reason) =
-                        sozu_command::config::validate_health_check_config(hc)
-                    {
+                    if let Err(reason) = sozu_command::config::validate_health_check_config(hc) {
                         push_queue(worker_response_error(req_id, reason));
                         return;
                     }

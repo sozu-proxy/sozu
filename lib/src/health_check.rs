@@ -491,7 +491,16 @@ impl HealthChecker {
             count!("health_check.failure", 1);
         }
 
-        // Emit a warning when the healthy backend count is critically low
+        // Emit the healthy-backend gauge on every result update for clusters
+        // with at least one configured backend, including `healthy == 0`. The
+        // gauge is the only documented signal that lets dashboards detect
+        // universal-outage / fail-open. Previously it was gated on
+        // `healthy > 0 && healthy * 2 <= total`, so when all backends went
+        // unhealthy the gauge retained its last non-zero value and operators
+        // could not see fail-open in dashboards.
+        //
+        // The "critically low" warning (≤50% healthy) keeps its original
+        // condition — only the gauge emission is unconditional.
         drop(backend);
         let total = backend_list.backends.len();
         let healthy = backend_list
@@ -499,15 +508,17 @@ impl HealthChecker {
             .iter()
             .filter(|b| b.borrow().health.is_healthy())
             .count();
-        if total > 0 && healthy > 0 && healthy * 2 <= total {
-            warn!(
-                "{} cluster {} has only {}/{} healthy backends",
-                log_context!(),
-                cluster_id,
-                healthy,
-                total
-            );
+        if total > 0 {
             gauge!("health_check.healthy_backends", healthy);
+            if healthy > 0 && healthy * 2 <= total {
+                warn!(
+                    "{} cluster {} has only {}/{} healthy backends",
+                    log_context!(),
+                    cluster_id,
+                    healthy,
+                    total
+                );
+            }
         }
     }
 
