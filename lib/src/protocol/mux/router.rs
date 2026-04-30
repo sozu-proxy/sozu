@@ -653,21 +653,16 @@ impl Router {
                 None => (false, None, Vec::new(), None),
             };
 
-        // ── 1. Explicit `RedirectPolicy::UNAUTHORIZED` or clusterless deny ─
-        if matches!(redirect, RedirectPolicy::Unauthorized) || cluster_id.is_none() {
-            context.www_authenticate = www_authenticate.clone();
-            trace!("{} RouteResult::deny", log_module_context!(context));
-            return Err(RetrieveClusterError::UnauthorizedRoute);
-        }
-
-        let Some(cluster_id) = cluster_id else {
-            // Guarded by the clusterless-deny branch immediately above;
-            // the `is_none()` arm has already returned `UnauthorizedRoute`
-            // by the time control reaches here.
-            unreachable!("cluster_id was checked Some above")
-        };
-
-        // ── 2. Explicit `RedirectPolicy::PERMANENT` ─────────────────────────
+        // ── 1. Explicit `RedirectPolicy::PERMANENT` ─────────────────────────
+        // Resolved BEFORE the clusterless-deny branch so a frontend that
+        // declares `redirect = permanent` emits a 301 even when no cluster
+        // is bound. This is the canonical "moved permanently to a different
+        // system" shape from the original proposal in #1161 and is the only
+        // way to express "this hostname has moved" without standing up a
+        // dummy cluster. The block does not read `cluster_id`; per-cluster
+        // values (`https_redirect_port`, `www_authenticate`, …) default to
+        // safe sentinels at the cluster lookup above when `cluster_id` is
+        // `None`, so the reorder is data-flow-safe.
         if matches!(redirect, RedirectPolicy::Permanent) {
             let scheme = resolve_redirect_scheme(redirect_scheme, context);
             let port = rewritten_port.map(|p| p as u32).or(https_redirect_port);
@@ -697,6 +692,24 @@ impl Router {
             context.frontend_redirect_template = redirect_template;
             return Err(RetrieveClusterError::HttpsRedirect);
         }
+
+        // ── 2. Explicit `RedirectPolicy::UNAUTHORIZED` or clusterless deny ─
+        // Reached when the frontend either explicitly asks for 401 or has
+        // no backing cluster and no `Permanent` redirect to honour. The
+        // `Forward + cluster_id == None` combination collapses here so
+        // legacy clusterless frontends still emit 401 by default.
+        if matches!(redirect, RedirectPolicy::Unauthorized) || cluster_id.is_none() {
+            context.www_authenticate = www_authenticate.clone();
+            trace!("{} RouteResult::deny", log_module_context!(context));
+            return Err(RetrieveClusterError::UnauthorizedRoute);
+        }
+
+        let Some(cluster_id) = cluster_id else {
+            // Guarded by the clusterless-deny branch immediately above;
+            // the `is_none()` arm has already returned `UnauthorizedRoute`
+            // by the time control reaches here.
+            unreachable!("cluster_id was checked Some above")
+        };
 
         // ── 3. Legacy `cluster.https_redirect` (HTTP-only listeners) ───────
         // The caller (`Router::connect`) emits the actual 301 only on
