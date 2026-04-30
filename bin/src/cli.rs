@@ -2,7 +2,6 @@ use std::{collections::BTreeMap, io::IsTerminal, net::SocketAddr, path::PathBuf}
 
 use clap::{ArgAction, CommandFactory, FromArgMatches, Parser, Subcommand};
 use sozu_command_lib::{
-    logging::is_logger_colored,
     proto::command::{LoadBalancingAlgorithms, TlsVersion},
     state::ClusterId as StateClusterId,
 };
@@ -43,12 +42,14 @@ impl paw::ParseArgs for Args {
         const RED: &str = "\x1b[31m";
         const RESET: &str = "\x1b[0m";
 
-        // ANSI escapes are emitted only when stdout is a real TTY AND the
-        // logger is configured for color. Redirected output (`sozu --version
-        // > file`, package-metadata capture, systemd journal) must stay raw
-        // ASCII so scripts and downstream parsers don't ingest escape codes.
+        // ANSI escapes are emitted only when stdout is a real TTY. Redirected
+        // output (`sozu --version > file`, package-metadata capture, systemd
+        // journal) must stay raw ASCII so scripts and downstream parsers do
+        // not ingest escape codes. The logger-colour preference is not
+        // consulted because the logger is initialised after argument parsing,
+        // so its thread-local state is always `false` at this point.
         let plain_features = env!("SOZU_BUILD_FEATURES");
-        let use_color = std::io::stdout().is_terminal() && is_logger_colored();
+        let use_color = std::io::stdout().is_terminal();
         let features: String = if use_color {
             plain_features
                 .split(' ')
