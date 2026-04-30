@@ -22,7 +22,17 @@ use sozu_command::{
     state::ClusterId,
 };
 
-use crate::{backends::BackendMap, server::push_event};
+use crate::{
+    backends::BackendMap,
+    protocol::mux::{
+        parser::{
+            FLAG_END_HEADERS, FLAG_PADDED, FLAG_PRIORITY, FRAME_HEADER_SIZE, FrameType,
+            frame_header,
+        },
+        serializer::H2_PRI,
+    },
+    server::push_event,
+};
 
 /// Canonical log envelope tag for the health-checker. Mirrors the
 /// hyphenated, all-caps `MUX-H2`/`PROXY-RELAY`/`TLS-RESOLVER` convention.
@@ -55,8 +65,7 @@ const HEALTH_CHECK_TOKEN_CAPACITY: usize = 1 << 16;
 /// Each pending entry is `(cluster_id, config, h2c, backends_to_check)`.
 /// `h2c` mirrors `cluster.http2` (the same backend-capability hint the
 /// mux router uses) so the probe wire format matches what the proxy
-/// will actually use to reach those backends — no per-cluster
-/// `is_h2c` knob, no risk of probe / data-plane divergence.
+/// will actually use to reach those backends.
 type PendingChecks = Vec<(
     ClusterId,
     HealthCheckConfig,
@@ -560,244 +569,205 @@ fn is_status_healthy(actual: u32, expected: u32) -> bool {
     }
 }
 
-/// HTTP/2 frame type constants — RFC 9113 §6.
-const H2_FRAME_TYPE_HEADERS: u8 = 0x01;
-const H2_FRAME_TYPE_SETTINGS: u8 = 0x04;
-const H2_FRAME_TYPE_GOAWAY: u8 = 0x07;
-
-/// Flags used in the parser. END_STREAM = 0x01, END_HEADERS = 0x04,
-/// PADDED = 0x08, PRIORITY = 0x20 (HEADERS only).
-const H2_FLAG_PADDED: u8 = 0x08;
-const H2_FLAG_PRIORITY: u8 = 0x20;
-const H2_FRAME_HEADER_LEN: usize = 9;
-
 /// Compose a bare-minimum h2c (HTTP/2 over cleartext, prior-knowledge)
 /// probe: the 24-byte connection preface, an empty client SETTINGS
 /// frame (acknowledging the spec-mandated handshake), and a single
 /// HEADERS frame on stream 1 carrying `GET <path>` with
 /// END_STREAM | END_HEADERS.
 ///
-/// HPACK encoding is hand-rolled (no dynamic table use, no Huffman):
-///
-/// * `:method GET` — static table index 2 → indexed (`0x82`).
-/// * `:scheme http` — static index 6 → indexed (`0x86`).
-/// * `:path <uri>` — literal-without-indexing, name index 4 →
-///   byte `0x04`, then 7-bit length + ASCII bytes.
-/// * `:authority host` — literal-without-indexing, name index 1 →
-///   byte `0x01`, then 7-bit length + ASCII bytes.
-///
-/// Length octets use the HPACK 7-bit-prefix integer form, which fits
-/// in one byte for any sane health-check URI or `host:port` (≤127
-/// bytes). For longer values the encoder falls back to RFC 7541 §5.1
-/// multi-byte form.
+/// HPACK encoding is delegated to `loona_hpack::Encoder` — the same
+/// encoder the H2 mux uses for live traffic (`lib/src/protocol/mux/converter.rs`).
+/// The probe inherits whatever static/dynamic-table behaviour the
+/// encoder picks, including any future Huffman support. The connection
+/// preface comes from `serializer::H2_PRI` so the probe and the live
+/// mux stay in lockstep.
 fn build_h2c_probe_bytes(uri: &str, address: SocketAddr) -> Vec<u8> {
-    const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
-
     let authority = address.to_string();
 
     // Build the HPACK header block first so we know its length for the
-    // HEADERS frame header.
-    let mut hpack = Vec::with_capacity(2 + 2 + uri.len() + authority.len() + 4);
-    hpack.push(0x82); // :method GET
-    hpack.push(0x86); // :scheme http
-    hpack.push(0x04); // :path  — literal w/o indexing, name idx 4
-    encode_hpack_length(uri.len(), &mut hpack);
-    hpack.extend_from_slice(uri.as_bytes());
-    hpack.push(0x01); // :authority — literal w/o indexing, name idx 1
-    encode_hpack_length(authority.len(), &mut hpack);
-    hpack.extend_from_slice(authority.as_bytes());
+    // HEADERS frame header. A fresh encoder per probe keeps things
+    // stateless — we never reuse the dynamic table across probes.
+    let mut encoder = loona_hpack::Encoder::new();
+    let mut hpack: Vec<u8> = Vec::new();
+    let headers: [(&[u8], &[u8]); 4] = [
+        (b":method", b"GET"),
+        (b":scheme", b"http"),
+        (b":path", uri.as_bytes()),
+        (b":authority", authority.as_bytes()),
+    ];
+    // Encoder::encode_into writes to an io::Write. Vec<u8> implements
+    // it infallibly, so the ? cannot fire in practice.
+    if encoder.encode_into(headers, &mut hpack).is_err() {
+        // Defensive: return an empty buffer so the probe records as
+        // failed via the read path instead of panicking.
+        return Vec::new();
+    }
 
-    let mut out = Vec::with_capacity(PREFACE.len() + 9 + 9 + hpack.len());
-    out.extend_from_slice(PREFACE);
+    // Pre-allocate: preface + SETTINGS (9) + HEADERS header (9) + block.
+    let mut out = Vec::with_capacity(H2_PRI.len() + FRAME_HEADER_SIZE * 2 + hpack.len());
+    out.extend_from_slice(H2_PRI.as_bytes());
 
-    // Empty client SETTINGS frame: length=0, type=0x04, flags=0, sid=0.
-    out.extend_from_slice(&[0, 0, 0, H2_FRAME_TYPE_SETTINGS, 0, 0, 0, 0, 0]);
+    // Empty client SETTINGS frame: length=0, type=Settings(0x04), flags=0, sid=0.
+    out.extend_from_slice(&[0, 0, 0, 0x04, 0, 0, 0, 0, 0]);
 
-    // HEADERS frame: length=hpack.len(), type=0x01,
+    // HEADERS frame: length=hpack.len(), type=Headers(0x01),
     // flags=END_STREAM|END_HEADERS=0x05, stream=1.
     let len = hpack.len() as u32;
     out.push(((len >> 16) & 0xFF) as u8);
     out.push(((len >> 8) & 0xFF) as u8);
     out.push((len & 0xFF) as u8);
-    out.push(H2_FRAME_TYPE_HEADERS);
+    out.push(0x01); // HEADERS
     out.push(0x05); // END_STREAM | END_HEADERS
     out.extend_from_slice(&[0, 0, 0, 1]); // stream id = 1
     out.extend_from_slice(&hpack);
     out
 }
 
-/// HPACK 7-bit-prefix integer (RFC 7541 §5.1) for length octets.
-/// Single-byte form when value < 127; otherwise emits the continuation
-/// chain.
-fn encode_hpack_length(value: usize, out: &mut Vec<u8>) {
-    if value < 127 {
-        out.push(value as u8);
-        return;
-    }
-    out.push(0x7F);
-    let mut v = value - 127;
-    while v >= 128 {
-        out.push(((v & 0x7F) as u8) | 0x80);
-        v >>= 7;
-    }
-    out.push(v as u8);
-}
-
-/// Walk the buffered H2 frames looking for a HEADERS frame on stream 1
-/// and extract `:status`. Returns:
+/// Walk the buffered H2 frames looking for a HEADERS frame (plus any
+/// CONTINUATION frames until END_HEADERS) on stream 1, then HPACK-decode
+/// the assembled block via `loona_hpack::Decoder` and pull `:status`.
 ///
-/// * `Some(true)` — `:status` found and matches
+/// Returns:
+///
+/// * `Some(true)` — `:status` decoded and matches
 ///   `config.expected_status` (or any 2xx when `expected_status == 0`).
-/// * `Some(false)` — `:status` found but does not match, or a GOAWAY
-///   frame was received.
+/// * `Some(false)` — `:status` decoded but does not match, the HPACK
+///   block was malformed, or a GOAWAY frame arrived.
 /// * `None` — buffer truncated mid-frame; caller should keep reading.
 ///
-/// The decoder handles only the subset of HPACK used by typical
-/// servers replying to a probe: the indexed-status static-table forms
-/// (200/204/206/304/400/404/500), and the literal-with-indexed-name
-/// form for `:status` (name index 8). Frames with PADDED/PRIORITY flags
-/// are skipped past correctly. Unknown HPACK encodings are treated as
-/// "header block continues" and the decoder advances byte-by-byte
-/// until it finds a recognisable representation or end-of-block.
+/// Frames with PADDED / PRIORITY flags are normalised correctly via the
+/// `mux::parser` flag constants (`FLAG_PADDED` / `FLAG_PRIORITY`). Unknown
+/// HPACK encodings, Huffman-coded values, and CONTINUATION fragmentation
+/// all fall through to the decoder rather than the hand-rolled byte walk
+/// the previous implementation used.
 fn try_parse_h2c_status(buf: &[u8], config: &HealthCheckConfig) -> Option<bool> {
-    let mut cursor = 0usize;
+    // RFC 9113 §4.2: the absolute upper bound for SETTINGS_MAX_FRAME_SIZE
+    // is 2^24 - 1. The probe never advertises a custom limit, so accept
+    // anything within the spec ceiling.
+    const MAX_FRAME_SIZE: u32 = (1 << 24) - 1;
 
-    while cursor + H2_FRAME_HEADER_LEN <= buf.len() {
-        let length = ((buf[cursor] as usize) << 16)
-            | ((buf[cursor + 1] as usize) << 8)
-            | (buf[cursor + 2] as usize);
-        let frame_type = buf[cursor + 3];
-        let flags = buf[cursor + 4];
-        let stream_id = (((buf[cursor + 5] as u32) & 0x7F) << 24)
-            | ((buf[cursor + 6] as u32) << 16)
-            | ((buf[cursor + 7] as u32) << 8)
-            | (buf[cursor + 8] as u32);
+    let mut remaining: &[u8] = buf;
+    // Buffer accumulating HEADERS + CONTINUATION block fragments for
+    // stream 1 until END_HEADERS lands. RFC 9113 §6.10: until the
+    // continuation chain ends, no other frames may arrive on the
+    // connection, but we still tolerate interleaved control frames
+    // for robustness — the decoder only fires on END_HEADERS.
+    let mut headers_block: Option<Vec<u8>> = None;
 
-        let frame_end = cursor + H2_FRAME_HEADER_LEN + length;
-        if frame_end > buf.len() {
+    while !remaining.is_empty() {
+        // The `mux::parser::frame_header` is built from `nom::number::complete`
+        // primitives which emit `Err::Error` (not `Err::Incomplete`) on short
+        // input, so distinguish "header still arriving" from "header arrived
+        // but is malformed" by an explicit length check before parsing.
+        if remaining.len() < FRAME_HEADER_SIZE {
             return None;
         }
+        let (rest, header) = match frame_header(remaining, MAX_FRAME_SIZE) {
+            Ok(parsed) => parsed,
+            // Header bytes are present but parser rejected them: malformed
+            // framing (oversized payload, invalid stream-id parity, etc.).
+            // → probe is unhealthy.
+            Err(_) => return Some(false),
+        };
 
-        match frame_type {
-            H2_FRAME_TYPE_HEADERS if stream_id == 1 => {
-                let mut payload_start = cursor + H2_FRAME_HEADER_LEN;
-                let mut payload_end = frame_end;
+        let payload_len = header.payload_len as usize;
+        if rest.len() < payload_len {
+            // Body of the frame has not arrived yet.
+            return None;
+        }
+        let (payload, after) = rest.split_at(payload_len);
 
-                if flags & H2_FLAG_PADDED != 0 {
-                    if payload_start >= payload_end {
-                        return Some(false);
-                    }
-                    let pad = buf[payload_start] as usize;
-                    payload_start += 1;
-                    if payload_end < pad || payload_end - pad < payload_start {
-                        return Some(false);
-                    }
-                    payload_end -= pad;
+        match header.frame_type {
+            FrameType::Headers if header.stream_id == 1 => {
+                let block = strip_padded_priority(payload, header.flags)?;
+                let mut accumulator = headers_block.take().unwrap_or_default();
+                accumulator.extend_from_slice(block);
+                if header.flags & FLAG_END_HEADERS != 0 {
+                    return Some(decode_status_from_block(&accumulator, config));
                 }
-                if flags & H2_FLAG_PRIORITY != 0 {
-                    if payload_end < payload_start + 5 {
-                        return Some(false);
-                    }
-                    payload_start += 5;
-                }
-
-                let block = &buf[payload_start..payload_end];
-                if let Some(status) = decode_h2c_status(block) {
-                    return Some(is_status_healthy(status, config.expected_status));
-                }
-                return Some(false);
+                headers_block = Some(accumulator);
             }
-            H2_FRAME_TYPE_GOAWAY => return Some(false),
-            // SETTINGS, SETTINGS-ACK, DATA, etc. are ignored — keep
-            // walking until we find HEADERS on stream 1.
+            FrameType::Continuation if header.stream_id == 1 => {
+                // CONTINUATION carries no padding/priority flags; the
+                // payload is a raw block fragment.
+                let Some(mut accumulator) = headers_block.take() else {
+                    // CONTINUATION without a preceding HEADERS is a
+                    // protocol error per RFC 9113 §6.10.
+                    return Some(false);
+                };
+                accumulator.extend_from_slice(payload);
+                if header.flags & FLAG_END_HEADERS != 0 {
+                    return Some(decode_status_from_block(&accumulator, config));
+                }
+                headers_block = Some(accumulator);
+            }
+            FrameType::GoAway => return Some(false),
+            // SETTINGS, SETTINGS-ACK, DATA, PING, etc. — keep walking
+            // until we find HEADERS on stream 1.
             _ => {}
         }
-        cursor = frame_end;
+
+        remaining = after;
     }
     None
 }
 
-/// Recover the numeric `:status` from an HPACK header block. Handles:
-///
-/// * Static-table indexed forms 0x88..=0x8E (`:status` 200/204/206/
-///   304/400/404/500).
-/// * Literal-with-incremental-indexing using static-table name index
-///   8 — prefix `01000000` + 6-bit index 8 = `0x48` per RFC 7541 §6.2.1.
-/// * Literal-without-indexing and literal-never-indexed using static
-///   name index 8 — `0x08` and `0x18` respectively (4-bit prefix).
-///
-/// Other HPACK forms in the block (e.g. dynamic-table-size updates,
-/// indexed headers for other pseudo-headers) advance the cursor by
-/// one byte and the loop keeps walking. That's lossy (wrong jump on
-/// multi-byte literals) but bounded — at worst the decoder returns
-/// `None` and the probe is recorded as failed, which only matters
-/// after `unhealthy_threshold` consecutive misses.
-fn decode_h2c_status(block: &[u8]) -> Option<u32> {
-    let mut i = 0usize;
-    while i < block.len() {
-        let b = block[i];
-        match b {
-            0x88 => return Some(200),
-            0x89 => return Some(204),
-            0x8A => return Some(206),
-            0x8B => return Some(304),
-            0x8C => return Some(400),
-            0x8D => return Some(404),
-            0x8E => return Some(500),
-            // Literal with incremental indexing, name idx 8
-            // (`:status`). 6-bit-prefix integer = 8 fits in the
-            // single-byte form, so the byte is exactly 0x48.
-            0x48 |
-            // Literal w/o indexing OR literal never indexed, name in
-            // static table at index 8. 4-bit-prefix integer = 8 fits
-            // in single-byte form (max 14 inline).
-            0x08 | 0x18 => {
-                let (value_len, len_consumed) = decode_hpack_length(&block[i + 1..])?;
-                let val_start = i + 1 + len_consumed;
-                let val_end = val_start.checked_add(value_len)?;
-                if val_end > block.len() {
-                    return None;
-                }
-                let s = std::str::from_utf8(&block[val_start..val_end]).ok()?;
-                return s.parse::<u32>().ok();
-            }
-            _ => {
-                i += 1;
-                continue;
-            }
+/// Trim the optional 1-byte pad-length prefix and the 5-byte priority
+/// dependency (RFC 9113 §6.2). Returns `None` when the flags claim
+/// padding/priority but the payload is too short to satisfy them — the
+/// caller turns that into `Some(false)` (probe unhealthy).
+fn strip_padded_priority(payload: &[u8], flags: u8) -> Option<&[u8]> {
+    let mut start = 0usize;
+    let mut end = payload.len();
+
+    if flags & FLAG_PADDED != 0 {
+        let &pad_len = payload.first()?;
+        start = 1;
+        let pad = pad_len as usize;
+        // Trailing padding bytes must fit within the remaining payload
+        // (after dropping the 1-byte pad-length prefix) — otherwise the
+        // frame is malformed.
+        let available = end.checked_sub(start)?;
+        if pad > available {
+            return None;
         }
+        end -= pad;
     }
-    None
+    if flags & FLAG_PRIORITY != 0 {
+        let new_start = start.checked_add(5)?;
+        if new_start > end {
+            return None;
+        }
+        start = new_start;
+    }
+    payload.get(start..end)
 }
 
-/// HPACK 7-bit-prefix integer decode. Returns `(value, bytes_read)`
-/// or `None` on buffer underrun / overflow. Mirror of
-/// `encode_hpack_length` above.
-fn decode_hpack_length(buf: &[u8]) -> Option<(usize, usize)> {
-    if buf.is_empty() {
-        return None;
+/// Run `loona_hpack::Decoder` over the assembled HEADERS block and
+/// return whether `:status` matches `config.expected_status`. Unknown
+/// HPACK encodings, malformed integers, Huffman fallbacks, and
+/// `:status` values that fail UTF-8 / numeric parsing all collapse to
+/// `false` — the probe is recorded as unhealthy, never as a panic.
+fn decode_status_from_block(block: &[u8], config: &HealthCheckConfig) -> bool {
+    let mut decoder = loona_hpack::Decoder::new();
+    let mut status: Option<u32> = None;
+    let decode_result = decoder.decode_with_cb(block, |name, value| {
+        if status.is_some() {
+            return;
+        }
+        if name.as_ref() == b":status"
+            && let Ok(s) = std::str::from_utf8(value.as_ref())
+            && let Ok(parsed) = s.parse::<u32>()
+        {
+            status = Some(parsed);
+        }
+    });
+    if decode_result.is_err() {
+        return false;
     }
-    let first = (buf[0] & 0x7F) as usize;
-    if first < 127 {
-        return Some((first, 1));
-    }
-    let mut value = 127usize;
-    let mut shift = 0u32;
-    let mut consumed = 1usize;
-    loop {
-        if consumed >= buf.len() {
-            return None;
-        }
-        let b = buf[consumed];
-        value = value.checked_add(((b & 0x7F) as usize).checked_shl(shift)?)?;
-        consumed += 1;
-        if b & 0x80 == 0 {
-            return Some((value, consumed));
-        }
-        shift = shift.checked_add(7)?;
-        if shift > usize::BITS {
-            return None;
-        }
+    match status {
+        Some(code) => is_status_healthy(code, config.expected_status),
+        None => false,
     }
 }
 
@@ -875,113 +845,213 @@ mod tests {
         }
     }
 
-    fn h2_frame_header(payload_len: usize, frame_type: u8, flags: u8, sid: u32) -> Vec<u8> {
-        let mut h = Vec::with_capacity(9);
-        h.push(((payload_len >> 16) & 0xFF) as u8);
-        h.push(((payload_len >> 8) & 0xFF) as u8);
-        h.push((payload_len & 0xFF) as u8);
-        h.push(frame_type);
-        h.push(flags);
-        h.extend_from_slice(&sid.to_be_bytes());
-        h
+    /// Wrap an HPACK-encoded header block in an H2 frame header with the
+    /// given type, flags and stream id. Frame body bytes live in
+    /// `payload`.
+    fn frame_with_header(frame_type: u8, flags: u8, sid: u32, payload: &[u8]) -> Vec<u8> {
+        let payload_len = payload.len();
+        let mut out = Vec::with_capacity(FRAME_HEADER_SIZE + payload_len);
+        out.push(((payload_len >> 16) & 0xFF) as u8);
+        out.push(((payload_len >> 8) & 0xFF) as u8);
+        out.push((payload_len & 0xFF) as u8);
+        out.push(frame_type);
+        out.push(flags);
+        out.extend_from_slice(&sid.to_be_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// Encode `:status <code>` (plus optional extra response headers) into
+    /// a fresh HPACK block via the same encoder the live mux uses. This
+    /// keeps the tests aligned with whatever loona_hpack picks for static
+    /// vs. literal vs. (future) Huffman encoding instead of pinning bytes.
+    fn encode_response_headers(headers: &[(&[u8], &[u8])]) -> Vec<u8> {
+        let mut encoder = loona_hpack::Encoder::new();
+        let mut out = Vec::new();
+        encoder
+            .encode_into(headers.iter().copied(), &mut out)
+            .unwrap();
+        out
     }
 
     #[test]
-    fn build_h2c_probe_starts_with_preface_and_settings() {
+    fn build_h2c_probe_starts_with_preface_and_frames() {
         let bytes = build_h2c_probe_bytes("/health", "127.0.0.1:8080".parse().unwrap());
-        // Preface
+
+        // Connection preface (24 bytes).
         assert!(bytes.starts_with(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"));
-        // SETTINGS frame: 9 bytes after preface, type=0x04, flags=0, sid=0
+
+        // SETTINGS frame after the preface: empty payload, type=0x04, flags=0, sid=0.
         let settings_start = 24;
-        assert_eq!(bytes[settings_start + 3], H2_FRAME_TYPE_SETTINGS);
-        assert_eq!(bytes[settings_start + 4], 0);
+        assert_eq!(&bytes[settings_start..settings_start + 3], &[0u8, 0, 0]); // length = 0
+        assert_eq!(bytes[settings_start + 3], 0x04); // SETTINGS
+        assert_eq!(bytes[settings_start + 4], 0); // flags
         assert_eq!(
             &bytes[settings_start + 5..settings_start + 9],
             &[0u8, 0, 0, 0]
         );
-        // HEADERS frame on stream 1, END_STREAM | END_HEADERS = 0x05
+
+        // HEADERS frame on stream 1, END_STREAM | END_HEADERS = 0x05.
         let headers_start = settings_start + 9;
-        assert_eq!(bytes[headers_start + 3], H2_FRAME_TYPE_HEADERS);
+        assert_eq!(bytes[headers_start + 3], 0x01); // HEADERS
         assert_eq!(bytes[headers_start + 4], 0x05);
         assert_eq!(
             &bytes[headers_start + 5..headers_start + 9],
             &[0u8, 0, 0, 1]
         );
-        // First HPACK byte must be :method GET indexed (0x82)
-        assert_eq!(bytes[headers_start + 9], 0x82);
+
+        // The HEADERS payload must HPACK-decode back to the four pseudo-headers.
+        let payload_start = headers_start + 9;
+        let mut decoder = loona_hpack::Decoder::new();
+        let mut method = None;
+        let mut scheme = None;
+        let mut path = None;
+        let mut authority = None;
+        decoder
+            .decode_with_cb(&bytes[payload_start..], |name, value| match name.as_ref() {
+                b":method" => method = Some(value.to_vec()),
+                b":scheme" => scheme = Some(value.to_vec()),
+                b":path" => path = Some(value.to_vec()),
+                b":authority" => authority = Some(value.to_vec()),
+                _ => {}
+            })
+            .expect("loona_hpack decodes a freshly-encoded probe");
+        assert_eq!(method.as_deref(), Some(b"GET" as &[u8]));
+        assert_eq!(scheme.as_deref(), Some(b"http" as &[u8]));
+        assert_eq!(path.as_deref(), Some(b"/health" as &[u8]));
+        assert_eq!(authority.as_deref(), Some(b"127.0.0.1:8080" as &[u8]));
     }
 
     #[test]
-    fn h2c_indexed_status_200_is_healthy_for_any_2xx() {
-        // SETTINGS ack (server's empty SETTINGS) + HEADERS on stream 1 with `0x88` (=200).
-        let mut buf = Vec::new();
-        buf.extend(h2_frame_header(0, H2_FRAME_TYPE_SETTINGS, 0, 0));
-        buf.extend(h2_frame_header(1, H2_FRAME_TYPE_HEADERS, 0x05, 1));
-        buf.push(0x88);
+    fn h2c_response_with_status_200_decodes_healthy() {
+        let block = encode_response_headers(&[(b":status", b"200")]);
+        let buf = frame_with_header(0x01, FLAG_END_HEADERS, 1, &block);
         let cfg = h2c_config(0);
         assert_eq!(try_parse_h2c_status(&buf, &cfg), Some(true));
     }
 
     #[test]
-    fn h2c_indexed_status_500_fails_default_2xx_check() {
-        let mut buf = Vec::new();
-        buf.extend(h2_frame_header(1, H2_FRAME_TYPE_HEADERS, 0x05, 1));
-        buf.push(0x8E); // :status 500
+    fn h2c_response_with_status_500_fails_default_2xx_check() {
+        let block = encode_response_headers(&[(b":status", b"500")]);
+        let buf = frame_with_header(0x01, FLAG_END_HEADERS, 1, &block);
         let cfg = h2c_config(0);
         assert_eq!(try_parse_h2c_status(&buf, &cfg), Some(false));
     }
 
     #[test]
-    fn h2c_literal_status_503_matches_expected_503() {
-        // Literal w/o indexing, name idx 8, value "503"
-        let mut block = Vec::new();
-        block.extend_from_slice(&[0x08, 0x03, b'5', b'0', b'3']);
-        let mut buf = Vec::new();
-        buf.extend(h2_frame_header(block.len(), H2_FRAME_TYPE_HEADERS, 0x05, 1));
-        buf.extend_from_slice(&block);
+    fn h2c_response_with_status_503_matches_expected_503() {
+        let block =
+            encode_response_headers(&[(b":status", b"503"), (b"content-type", b"text/plain")]);
+        let buf = frame_with_header(0x01, FLAG_END_HEADERS, 1, &block);
         let cfg = h2c_config(503);
         assert_eq!(try_parse_h2c_status(&buf, &cfg), Some(true));
     }
 
     #[test]
-    fn h2c_goaway_marks_unhealthy() {
-        let mut buf = Vec::new();
-        buf.extend(h2_frame_header(8, H2_FRAME_TYPE_GOAWAY, 0, 0));
-        buf.extend_from_slice(&[0u8; 8]); // last-stream-id + error code
+    fn h2c_response_with_continuation_decodes_status_200_healthy() {
+        // Build one HPACK block, then split it across HEADERS (no
+        // END_HEADERS) + CONTINUATION (END_HEADERS). The hand-rolled
+        // walker that this commit replaces would have refused to assemble
+        // the block and reported the probe as unhealthy.
+        let block = encode_response_headers(&[
+            (b":status", b"200"),
+            (b"x-trace-id", b"abc-123"),
+            (b"server", b"sozu-test"),
+        ]);
+        assert!(block.len() >= 4, "HPACK block needs to be splittable");
+        let split = block.len() / 2;
+        let (head, tail) = block.split_at(split);
+
+        // HEADERS with no END_HEADERS (flags = 0) — block continues.
+        let mut buf = frame_with_header(0x01, 0, 1, head);
+        // CONTINUATION (frame type 0x09) carrying the rest, END_HEADERS set.
+        buf.extend_from_slice(&frame_with_header(0x09, FLAG_END_HEADERS, 1, tail));
+
+        let cfg = h2c_config(0);
+        assert_eq!(try_parse_h2c_status(&buf, &cfg), Some(true));
+    }
+
+    #[test]
+    fn h2c_response_with_padded_priority_headers_decodes_status_200() {
+        // Build a HEADERS frame with both PADDED and PRIORITY flags so the
+        // parser must strip 1 + 5 = 6 bytes before handing the block to
+        // loona_hpack.
+        let block = encode_response_headers(&[(b":status", b"200")]);
+        let pad_len: u8 = 3;
+
+        let mut payload = Vec::new();
+        payload.push(pad_len); // PADDED: 1-byte pad length
+        payload.extend_from_slice(&[0u8, 0, 0, 0, 16]); // PRIORITY: stream-dep + weight
+        payload.extend_from_slice(&block);
+        payload.extend_from_slice(&[0u8; 3]); // padding bytes
+
+        let flags = FLAG_PADDED | FLAG_PRIORITY | FLAG_END_HEADERS;
+        let buf = frame_with_header(0x01, flags, 1, &payload);
+        let cfg = h2c_config(0);
+        assert_eq!(try_parse_h2c_status(&buf, &cfg), Some(true));
+    }
+
+    #[test]
+    fn h2c_response_after_unrelated_settings_frame_decodes_healthy() {
+        // The probe parser must skip over the server's SETTINGS frame
+        // and any other connection-scoped frames before locating the
+        // HEADERS on stream 1.
+        let mut buf = frame_with_header(0x04, 0, 0, &[]); // SETTINGS, empty
+        buf.extend_from_slice(&frame_with_header(0x04, 0x01, 0, &[])); // SETTINGS-ACK
+        let block = encode_response_headers(&[(b":status", b"200")]);
+        buf.extend_from_slice(&frame_with_header(0x01, FLAG_END_HEADERS, 1, &block));
+
+        let cfg = h2c_config(0);
+        assert_eq!(try_parse_h2c_status(&buf, &cfg), Some(true));
+    }
+
+    #[test]
+    fn h2c_goaway_returns_unhealthy() {
+        // GOAWAY: 8-byte payload (last-stream-id + error code).
+        let buf = frame_with_header(0x07, 0, 0, &[0u8; 8]);
         let cfg = h2c_config(0);
         assert_eq!(try_parse_h2c_status(&buf, &cfg), Some(false));
     }
 
     #[test]
-    fn h2c_truncated_buffer_returns_none() {
-        let mut buf = Vec::new();
-        // Frame header claims 10 bytes payload but we only deliver 5.
-        buf.extend(h2_frame_header(10, H2_FRAME_TYPE_HEADERS, 0x05, 1));
-        buf.extend_from_slice(&[0u8; 5]);
+    fn h2c_truncated_frame_returns_none() {
+        // Frame header claims a 10-byte payload but only 5 are present.
+        let mut buf: Vec<u8> = vec![
+            0,                // length high
+            0,                // length mid
+            10,               // length low = 10
+            0x01,             // HEADERS
+            FLAG_END_HEADERS, // flags
+        ];
+        buf.extend_from_slice(&1u32.to_be_bytes()); // stream id = 1
+        buf.extend_from_slice(&[0u8; 5]); // partial payload
         let cfg = h2c_config(0);
         assert_eq!(try_parse_h2c_status(&buf, &cfg), None);
     }
 
     #[test]
-    fn h2c_literal_with_incremental_indexing_status_201_matches() {
-        // 0x48 = literal w/ incremental indexing, name idx 8 (:status)
-        let mut block = Vec::new();
-        block.extend_from_slice(&[0x48, 0x03, b'2', b'0', b'1']);
-        let mut buf = Vec::new();
-        buf.extend(h2_frame_header(block.len(), H2_FRAME_TYPE_HEADERS, 0x05, 1));
-        buf.extend_from_slice(&block);
-        let cfg = h2c_config(0); // any 2xx
-        assert_eq!(try_parse_h2c_status(&buf, &cfg), Some(true));
+    fn h2c_partial_frame_header_returns_none() {
+        // Fewer than 9 bytes: the frame header has not even fully arrived
+        // yet. The probe loop should report `None` so the caller keeps
+        // reading rather than recording the backend as unhealthy.
+        let cfg = h2c_config(0);
+        for partial_len in 0usize..FRAME_HEADER_SIZE {
+            let buf = vec![0u8; partial_len];
+            assert_eq!(
+                try_parse_h2c_status(&buf, &cfg),
+                None,
+                "partial buffer of {partial_len} byte(s) should be 'keep reading'"
+            );
+        }
     }
 
     #[test]
-    fn h2c_padded_headers_strips_pad_length_octet() {
-        // PADDED flag (0x08) + END_HEADERS (0x04) = 0x0C. Payload =
-        // 1-byte pad-length + indexed :status (0x88) + 2 padding bytes.
-        let mut buf = Vec::new();
-        buf.extend(h2_frame_header(4, H2_FRAME_TYPE_HEADERS, 0x0C, 1));
-        buf.extend_from_slice(&[2, 0x88, 0, 0]);
+    fn h2c_continuation_without_preceding_headers_returns_unhealthy() {
+        // CONTINUATION without a HEADERS predecessor is a protocol
+        // error per RFC 9113 §6.10.
+        let block = encode_response_headers(&[(b":status", b"200")]);
+        let buf = frame_with_header(0x09, FLAG_END_HEADERS, 1, &block);
         let cfg = h2c_config(0);
-        assert_eq!(try_parse_h2c_status(&buf, &cfg), Some(true));
+        assert_eq!(try_parse_h2c_status(&buf, &cfg), Some(false));
     }
 }
