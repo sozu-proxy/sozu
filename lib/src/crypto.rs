@@ -1,11 +1,19 @@
-//! Crypto provider abstraction for rustls.
+//! Crypto provider selection.
 //!
-//! This module re-exports the crypto provider selected at compile time via feature flags:
-//! - `crypto-ring`: uses the `ring` crypto provider (default in `sozu` binary)
-//! - `crypto-aws-lc-rs`: uses the `aws-lc-rs` crypto provider (FIPS-capable)
-//! - `crypto-openssl`: uses the `rustls-openssl` crypto provider (OpenSSL-backed)
+//! - `crypto-ring` (default): pure Rust via [ring](https://github.com/briansmith/ring).
+//! - `crypto-aws-lc-rs`: post-quantum-capable [aws-lc-rs](https://github.com/aws/aws-lc-rs).
+//!   Requires `cmake`.
+//! - `crypto-openssl`: system OpenSSL via [rustls-openssl](https://github.com/rustls/rustls-openssl).
+//!   Requires `cmake` + OpenSSL headers.
+//! - `fips`: implies `crypto-aws-lc-rs` plus `rustls/fips` (FIPS 140-3 build).
 //!
-//! Exactly one provider must be active at a time.
+//! At least one provider feature must be enabled. When several are enabled
+//! together (e.g. `cargo build --all-features` in CI, or `--features fips`
+//! on top of the default `crypto-ring`), a deterministic precedence chain
+//! selects one: `fips > ring > aws-lc-rs > openssl`. `fips` always wins, so
+//! a binary built with `--features fips` runs aws-lc-rs in FIPS mode even
+//! when `crypto-ring` is also enabled. Downstream packaging (Dockerfile,
+//! RPM, PKGBUILD) selects exactly one provider explicitly.
 
 use std::sync::LazyLock;
 
@@ -22,24 +30,30 @@ compile_error!(
     "No crypto provider selected. Enable one of: `crypto-ring`, `crypto-aws-lc-rs`, or `crypto-openssl`."
 );
 
-// When more than one provider feature is enabled (notably under
-// `cargo build --all-features` in CI), pick a deterministic precedence
-// rather than failing the build. Order: `ring` > `aws-lc-rs` >
-// `openssl`. Ring is first because it is the binary default in
-// `bin/Cargo.toml` and the library default in `lib/Cargo.toml`, so
-// `--all-features` resolves to the same provider operators get out
-// of the box — keeping default behaviour stable. `fips` is *not* a
-// fourth lane: it implies `crypto-aws-lc-rs` plus `rustls/fips` in
-// `lib/Cargo.toml`, so an `--all-features` build that includes
-// `fips` still resolves to ring through this chain. To select FIPS,
-// turn off ring with `--no-default-features --features fips` (which
-// pulls in `crypto-aws-lc-rs`). The mutual-exclusion semantics
-// operators care about — "you got the provider you asked for in
-// your Dockerfile / RPM build" — are preserved by each downstream
-// packaging surface (`Dockerfile`, `os-build/...`) selecting exactly
-// one feature.
+// `fips` wins. It implies `crypto-aws-lc-rs` plus `rustls/fips`, so the
+// resulting binary uses aws-lc-rs in FIPS mode regardless of which other
+// provider features are enabled by `default` or `--all-features`. This
+// lets `cargo build --features fips` produce a genuine FIPS binary even
+// while the default `crypto-ring` is still active, instead of silently
+// linking ring and emitting a non-FIPS provider in a `+fips`-tagged
+// build. Below `fips`, the precedence chain falls back to `ring >
+// aws-lc-rs > openssl`, matching the binary default. Downstream
+// packaging surfaces (`Dockerfile`, `os-build/...`) still select exactly
+// one feature in production builds.
 
-#[cfg(feature = "crypto-ring")]
+#[cfg(feature = "fips")]
+pub use rustls::crypto::aws_lc_rs::{
+    cipher_suite::{
+        TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+        TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256, TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+        TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384, TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+        TLS13_AES_128_GCM_SHA256, TLS13_AES_256_GCM_SHA384, TLS13_CHACHA20_POLY1305_SHA256,
+    },
+    default_provider,
+    sign::any_supported_type,
+};
+
+#[cfg(all(feature = "crypto-ring", not(feature = "fips")))]
 pub use rustls::crypto::ring::{
     cipher_suite::{
         TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
@@ -51,7 +65,11 @@ pub use rustls::crypto::ring::{
     sign::any_supported_type,
 };
 
-#[cfg(all(feature = "crypto-aws-lc-rs", not(feature = "crypto-ring")))]
+#[cfg(all(
+    feature = "crypto-aws-lc-rs",
+    not(feature = "fips"),
+    not(feature = "crypto-ring")
+))]
 pub use rustls::crypto::aws_lc_rs::{
     cipher_suite::{
         TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
@@ -65,7 +83,9 @@ pub use rustls::crypto::aws_lc_rs::{
 
 #[cfg(all(
     feature = "crypto-openssl",
-    not(any(feature = "crypto-ring", feature = "crypto-aws-lc-rs"))
+    not(feature = "fips"),
+    not(feature = "crypto-ring"),
+    not(feature = "crypto-aws-lc-rs")
 ))]
 pub use rustls_openssl::{
     cipher_suite::{
@@ -83,7 +103,9 @@ pub use rustls_openssl::{
 /// For `rustls-openssl`, this delegates to `KeyProvider::load_private_key`.
 #[cfg(all(
     feature = "crypto-openssl",
-    not(any(feature = "crypto-ring", feature = "crypto-aws-lc-rs"))
+    not(feature = "fips"),
+    not(feature = "crypto-ring"),
+    not(feature = "crypto-aws-lc-rs")
 ))]
 pub fn any_supported_type(
     der: &rustls::pki_types::PrivateKeyDer<'_>,
@@ -273,7 +295,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "crypto-ring")]
+    #[cfg(all(feature = "crypto-ring", not(feature = "fips")))]
     #[test]
     fn ring_has_no_mlkem() {
         let provider = default_provider();
@@ -284,7 +306,12 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "crypto-openssl")]
+    #[cfg(all(
+        feature = "crypto-openssl",
+        not(feature = "fips"),
+        not(feature = "crypto-ring"),
+        not(feature = "crypto-aws-lc-rs")
+    ))]
     #[test]
     fn openssl_pq_kx_depends_on_openssl_version() {
         let provider = default_provider();
@@ -361,7 +388,7 @@ mod tests {
         assert_eq!(group.name(), NamedGroup::X25519MLKEM768);
     }
 
-    #[cfg(feature = "crypto-ring")]
+    #[cfg(all(feature = "crypto-ring", not(feature = "fips")))]
     #[test]
     fn kx_group_by_name_returns_none_for_mlkem_on_ring() {
         assert!(
