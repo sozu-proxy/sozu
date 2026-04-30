@@ -461,6 +461,14 @@ pub struct BackendList {
     pub backends: Vec<Rc<RefCell<Backend>>>,
     pub next_id: u32,
     pub load_balancing: Box<dyn LoadBalancingAlgorithm>,
+    /// Latches the fail-open `warn!`. Set to `true` when fail-open routing
+    /// emits its entry warning so subsequent routing decisions in the same
+    /// regime stay quiet; reset to `false` when a healthy backend is
+    /// available again, so the regime-exit transition is logged exactly once.
+    /// Without this latch the warning fired per request, which under a
+    /// universal outage (the exact scenario fail-open targets) is also the
+    /// highest request-rate scenario — log volume would become catastrophic.
+    fail_open_warned: bool,
 }
 
 impl Default for BackendList {
@@ -475,6 +483,7 @@ impl BackendList {
             backends: Vec::new(),
             next_id: 0,
             load_balancing: Box::new(Random),
+            fail_open_warned: false,
         }
     }
 
@@ -562,27 +571,52 @@ impl BackendList {
             backends = self.available_backends(true);
         }
 
-        if backends.is_empty() {
-            // Fail-open: when all backends are unhealthy, route to all Normal backends
-            // anyway. This prevents a shared dependency outage (e.g., database) from
-            // making the entire cluster unavailable. Ref: Amazon "Implementing Health Checks"
-            backends = self
-                .backends
-                .iter()
-                .filter(|b| b.borrow().status == BackendStatus::Normal)
-                .map(Clone::clone)
-                .collect();
-            if !backends.is_empty() {
-                warn!(
-                    "fail-open: all backends unhealthy, routing to all {} normal backends",
+        if !backends.is_empty() {
+            // Healthy regime: log the fail-open exit transition exactly once.
+            if self.fail_open_warned {
+                info!(
+                    "fail-open: cluster recovered, {} backends now healthy",
                     backends.len()
                 );
+                self.fail_open_warned = false;
             }
+            return self.load_balancing.next_available_backend(&mut backends);
         }
+
+        // Fail-open: when no backend passes the full `can_open()` gate,
+        // route to backends that are administratively `Normal` AND whose
+        // retry policy reports `OKAY` (i.e., not currently in
+        // exponential-backoff). This prevents a shared dependency outage
+        // (e.g., database) from making the entire cluster unavailable while
+        // still respecting the per-backend back-off window — hammering a
+        // backend at line rate during its back-off would defeat the back-off
+        // itself. Ref: Amazon "Implementing Health Checks".
+        backends = self
+            .backends
+            .iter()
+            .filter(|b| {
+                let owned = b.borrow();
+                owned.status == BackendStatus::Normal
+                    && matches!(owned.retry_policy.can_try(), Some(retry::RetryAction::OKAY))
+            })
+            .map(Clone::clone)
+            .collect();
 
         if backends.is_empty() {
             return None;
         }
+
+        // Latched warning + per-decision counter: the warn! fires once on
+        // regime entry; the counter is the operator-visible per-request
+        // signal that does not drown logs under universal outage.
+        if !self.fail_open_warned {
+            warn!(
+                "fail-open: all backends unhealthy, routing to {} normal backends with retry-policy OKAY",
+                backends.len()
+            );
+            self.fail_open_warned = true;
+        }
+        count!("backends.fail_open", 1);
 
         self.load_balancing.next_available_backend(&mut backends)
     }
@@ -795,5 +829,105 @@ mod backends_test {
         ));
 
         assert_eq!(1, backends_list.backends.len());
+    }
+
+    /// Build a backend addressed at 127.0.0.1:port and force it Unhealthy
+    /// without going through the health-check loop.
+    fn unhealthy_backend(id: &str, port: u16) -> Backend {
+        let mut backend = Backend::new(
+            id,
+            format!("127.0.0.1:{port}").parse().unwrap(),
+            None,
+            None,
+            None,
+        );
+        // Threshold = 1 transitions on the first failure.
+        backend.health.record_failure(1);
+        assert!(!backend.health.is_healthy());
+        backend
+    }
+
+    #[test]
+    fn fail_open_picks_normal_backend_in_retry_policy_okay() {
+        // All backends are unhealthy but their retry policy is fresh (OKAY),
+        // so fail-open must select one. A fresh ExponentialBackoffPolicy
+        // returns OKAY on `can_try()` until the first `fail()` arms a wait
+        // window.
+        let mut list = BackendList::new();
+        list.add_backend(unhealthy_backend("b1", 9001));
+        list.add_backend(unhealthy_backend("b2", 9002));
+
+        // Sanity: `available_backends` returns nothing (the regular path).
+        assert!(list.available_backends(false).is_empty());
+        assert!(list.available_backends(true).is_empty());
+
+        let picked = list.next_available_backend();
+        assert!(
+            picked.is_some(),
+            "fail-open must pick a Normal+OKAY backend"
+        );
+        assert!(list.fail_open_warned, "regime entry must latch the warn!");
+    }
+
+    #[test]
+    fn fail_open_skips_backend_in_retry_backoff() {
+        // Same shape as above, but each backend's retry policy is in the
+        // WAIT window after a recorded failure. Fail-open must NOT pick any
+        // of them — hammering a backend at line rate during its back-off
+        // window is exactly what the back-off is protecting against — and
+        // the regime-entry warn! must NOT latch (no log spam either).
+        let mut list = BackendList::new();
+        list.add_backend(unhealthy_backend("b1", 9011));
+        list.add_backend(unhealthy_backend("b2", 9012));
+        for backend_rc in &list.backends {
+            backend_rc.borrow_mut().retry_policy().fail();
+            assert_eq!(
+                Some(retry::RetryAction::WAIT),
+                backend_rc.borrow().retry_policy.can_try(),
+                "test fixture must place retry policy in WAIT"
+            );
+        }
+
+        let picked = list.next_available_backend();
+        assert!(
+            picked.is_none(),
+            "fail-open must skip backends whose retry policy is in WAIT"
+        );
+        assert!(
+            !list.fail_open_warned,
+            "no candidate backends, no regime entry"
+        );
+    }
+
+    #[test]
+    fn fail_open_warn_latched() {
+        // First call enters the regime → latch flips, warn! fires.
+        // Second call stays in the regime → latch stays, no second warn!.
+        // Recovering one backend → latch clears on the next routing call.
+        let mut list = BackendList::new();
+        list.add_backend(unhealthy_backend("b1", 9021));
+        list.add_backend(unhealthy_backend("b2", 9022));
+
+        assert!(list.next_available_backend().is_some());
+        assert!(list.fail_open_warned, "first fail-open must latch");
+
+        assert!(list.next_available_backend().is_some());
+        assert!(
+            list.fail_open_warned,
+            "subsequent fail-open routing keeps the latch"
+        );
+
+        // Heal one backend — the next routing call takes the healthy path
+        // and must clear the latch (regime exit logged once).
+        list.backends[0].borrow_mut().health.status = HealthStatus::Healthy;
+        let picked = list.next_available_backend();
+        assert!(
+            picked.is_some(),
+            "regular path must select the healed backend"
+        );
+        assert!(
+            !list.fail_open_warned,
+            "regime exit must clear the latch so the next entry is logged again"
+        );
     }
 }
