@@ -178,6 +178,20 @@ impl ConfigState {
     }
 
     fn add_cluster(&mut self, cluster: &Cluster) -> Result<(), StateError> {
+        // Validate any inline `cluster.health_check` before mutating state so
+        // an invalid config (zero thresholds, missing leading `/`, CR/LF/NUL/C0
+        // in URI) cannot ride in via the AddCluster path. Without this, TOML
+        // reload, SaveState/LoadState, and direct API AddCluster requests
+        // bypass the SetHealthCheck-side check and let an attacker-controlled
+        // health-check URI smuggle CRLF into outbound HTTP/1.1 probes.
+        if let Some(hc) = cluster.health_check.as_ref() {
+            if let Err(reason) = crate::config::validate_health_check_config(hc) {
+                return Err(StateError::InvalidValue {
+                    field: "health_check",
+                    reason,
+                });
+            }
+        }
         let cluster = cluster.clone();
         self.clusters.insert(cluster.cluster_id.clone(), cluster);
         Ok(())
@@ -3037,6 +3051,50 @@ mod tests {
                 }
             ),
             "expected InvalidValue for flood knob 0, got: {err}"
+        );
+    }
+
+    /// AddCluster: an inline `cluster.health_check` with a CRLF-bearing URI
+    /// must be rejected before the cluster lands in `ConfigState`. Without
+    /// this guard, TOML reload / SaveState / direct API AddCluster requests
+    /// bypass the SetHealthCheck-side check and let an attacker-controlled
+    /// health-check URI smuggle CR/LF into outbound HTTP/1.1 probes.
+    #[test]
+    fn add_cluster_invalid_health_check_uri_rejected() {
+        use crate::proto::command::HealthCheckConfig;
+
+        let mut state = ConfigState::new();
+        let err = state
+            .dispatch(
+                &RequestType::AddCluster(Cluster {
+                    cluster_id: String::from("evil_cluster"),
+                    health_check: Some(HealthCheckConfig {
+                        uri: String::from("/foo\r\nGET /admin"),
+                        interval: 5_000,
+                        timeout: 1_000,
+                        healthy_threshold: 2,
+                        unhealthy_threshold: 2,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                StateError::InvalidValue {
+                    field: "health_check",
+                    ..
+                }
+            ),
+            "expected InvalidValue for CRLF-bearing health-check URI, got: {err}"
+        );
+        assert!(
+            !state.clusters.contains_key("evil_cluster"),
+            "cluster must not be inserted when health_check fails validation",
         );
     }
 
