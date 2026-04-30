@@ -1425,6 +1425,21 @@ impl Server {
 
         match request.content.request_type {
             Some(RequestType::AddCluster(ref cluster)) => {
+                // Mirror the master-side ConfigState::add_cluster check so
+                // off-channel paths (TOML reload, SaveState/LoadState, direct
+                // API) that smuggle a malformed `cluster.health_check` cannot
+                // arm the worker's BackendList::set_health_check_config with
+                // a CRLF/NUL/C0 URI or zero thresholds. The SetHealthCheck
+                // handler below already runs the same validation; this is the
+                // AddCluster mirror.
+                if let Some(hc) = cluster.health_check.as_ref() {
+                    if let Err(reason) =
+                        sozu_command::config::validate_health_check_config(hc)
+                    {
+                        push_queue(worker_response_error(req_id, reason));
+                        return;
+                    }
+                }
                 self.add_cluster(cluster);
                 //not returning because the message must still be handled by each proxy
             }
