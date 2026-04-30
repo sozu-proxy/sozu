@@ -28,10 +28,10 @@ use sozu_command_lib::{
     proto::command::{
         AggregatedMetrics, AvailableMetrics, CertificatesWithFingerprints, ClusterHashes,
         ClusterInformations, Event, EventKind, FrontendFilters, HardStop, MetricsConfiguration,
-        QueryCertificatesFilters, QueryMetricsOptions, Request, ResponseContent, ResponseStatus,
-        RunState, SoftStop, Status, UpdateHttpListenerConfig, UpdateHttpsListenerConfig,
-        UpdateTcpListenerConfig, WorkerInfo, WorkerInfos, WorkerRequest, WorkerResponses,
-        request::RequestType, response_content::ContentType,
+        QueryCertificatesFilters, QueryHealthChecks, QueryMetricsOptions, Request, ResponseContent,
+        ResponseStatus, RunState, SoftStop, Status, UpdateHttpListenerConfig,
+        UpdateHttpsListenerConfig, UpdateTcpListenerConfig, WorkerInfo, WorkerInfos, WorkerRequest,
+        WorkerResponses, request::RequestType, response_content::ContentType,
     },
 };
 use sozu_lib::metrics::METRICS;
@@ -248,7 +248,9 @@ impl Server {
             | RequestType::ReplaceCertificate(_)
             | RequestType::UpdateHttpListener(_)
             | RequestType::UpdateHttpsListener(_)
-            | RequestType::UpdateTcpListener(_) => {
+            | RequestType::UpdateTcpListener(_)
+            | RequestType::SetHealthCheck(_)
+            | RequestType::RemoveHealthCheck(_) => {
                 worker_request(self, client, request_type);
             }
             RequestType::QueryClustersHashes(_)
@@ -265,6 +267,7 @@ impl Server {
                 query_certificates_from_main(self, client, filters)
             }
             RequestType::CountRequests(_) => count_requests(self, client),
+            RequestType::QueryHealthChecks(query) => list_health_checks(self, client, query),
 
             RequestType::LaunchWorker(_) => {} // not yet implemented, nor used, anywhere
             RequestType::ReturnListenSockets(_) => {} // This is only implemented by workers,
@@ -330,6 +333,14 @@ pub fn query_certificates_from_main(
     client.finish_ok_with_content(
         ContentType::CertificatesWithFingerprints(CertificatesWithFingerprints { certs }).into(),
         "Successfully queried certificates from the state of main process",
+    );
+}
+
+fn list_health_checks(server: &mut Server, client: &mut ClientSession, query: QueryHealthChecks) {
+    let health_checks = server.state.list_health_checks(query.cluster_id.as_deref());
+    client.finish_ok_with_content(
+        ContentType::HealthChecksList(health_checks).into(),
+        "Successfully listed health check configurations",
     );
 }
 

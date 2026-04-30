@@ -37,6 +37,7 @@ use crate::{
     AcceptError, Protocol, ProxyConfiguration, ProxySession, SessionIsToBeClosed,
     backends::{Backend, BackendMap},
     features::FEATURES,
+    health_check::HealthChecker,
     http, https,
     metrics::METRICS,
     pool::Pool,
@@ -480,6 +481,7 @@ pub struct Server {
     channel: ProxyChannel,
     config_state: ConfigState,
     current_poll_errors: i32,
+    health_checker: HealthChecker,
     http: Rc<RefCell<http::HttpProxy>>,
     https: Rc<RefCell<https::HttpsProxy>>,
     last_sessions_len: usize,
@@ -688,6 +690,7 @@ impl Server {
             channel,
             config_state: ConfigState::new(),
             current_poll_errors: 0,
+            health_checker: HealthChecker::new(),
             http,
             https,
             last_sessions_len: 0, // to be reset on server run
@@ -862,6 +865,9 @@ impl Server {
                     }),
                     // ListenToken: 1 listener <=> 1 token
                     // ProtocolToken (HTTP/HTTPS/TCP): 1 connection <=> 1 token
+                    token if self.health_checker.owns_token(token) => {
+                        self.health_checker.ready(token);
+                    }
                     token => self.ready(token, Ready::from(event)),
                 }
             }
@@ -880,6 +886,8 @@ impl Server {
             self.should_poll_at = TIMER.with(|timer| timer.borrow().next_poll_date());
 
             self.zombie_check();
+            self.health_checker
+                .poll(&self.backends, self.poll.registry());
 
             let now = time::OffsetDateTime::now_utc();
             // clear the local metrics drain every plain hour (01:00, 02:00, etc.) to prevent memory overuse
@@ -1417,8 +1425,42 @@ impl Server {
 
         match request.content.request_type {
             Some(RequestType::AddCluster(ref cluster)) => {
+                // Mirror the master-side ConfigState::add_cluster check so
+                // off-channel paths (TOML reload, SaveState/LoadState, direct
+                // API) that smuggle a malformed `cluster.health_check` cannot
+                // arm the worker's BackendList::set_health_check_config with
+                // a CRLF/NUL/C0 URI or zero thresholds. The SetHealthCheck
+                // handler below already runs the same validation; this is the
+                // AddCluster mirror.
+                if let Some(hc) = cluster.health_check.as_ref() {
+                    if let Err(reason) = sozu_command::config::validate_health_check_config(hc) {
+                        push_queue(worker_response_error(req_id, reason));
+                        return;
+                    }
+                }
                 self.add_cluster(cluster);
                 //not returning because the message must still be handled by each proxy
+            }
+            Some(RequestType::RemoveCluster(ref cluster_id)) => {
+                self.remove_health_check_state(cluster_id);
+                //not returning because the message must still be handled by each proxy
+            }
+            Some(RequestType::SetHealthCheck(ref set)) => {
+                if let Err(reason) = sozu_command::config::validate_health_check_config(&set.config)
+                {
+                    push_queue(worker_response_error(req_id, reason));
+                    return;
+                }
+                self.backends
+                    .borrow_mut()
+                    .set_health_check_config(&set.cluster_id, Some(set.config.to_owned()));
+                push_queue(WorkerResponse::ok(req_id));
+                return;
+            }
+            Some(RequestType::RemoveHealthCheck(ref cluster_id)) => {
+                self.remove_health_check_state(cluster_id);
+                push_queue(WorkerResponse::ok(req_id));
+                return;
             }
             Some(RequestType::AddBackend(ref backend)) => {
                 push_queue(self.add_backend(&req_id, backend));
@@ -1494,15 +1536,16 @@ impl Server {
     }
 
     fn add_cluster(&mut self, cluster: &Cluster) {
-        self.backends
-            .borrow_mut()
-            .set_load_balancing_policy_for_cluster(
-                &cluster.cluster_id,
-                LoadBalancingAlgorithms::try_from(cluster.load_balancing).unwrap_or_default(),
-                cluster
-                    .load_metric
-                    .and_then(|n| LoadMetric::try_from(n).ok()),
-            );
+        let mut backends = self.backends.borrow_mut();
+        backends.set_load_balancing_policy_for_cluster(
+            &cluster.cluster_id,
+            LoadBalancingAlgorithms::try_from(cluster.load_balancing).unwrap_or_default(),
+            cluster
+                .load_metric
+                .and_then(|n| LoadMetric::try_from(n).ok()),
+        );
+        backends.set_health_check_config(&cluster.cluster_id, cluster.health_check.to_owned());
+        backends.set_cluster_http2(&cluster.cluster_id, cluster.http2.unwrap_or(false));
     }
 
     fn add_backend(&mut self, req_id: &str, add_backend: &AddBackend) -> WorkerResponse {
@@ -1518,6 +1561,14 @@ impl Server {
             .add_backend(&add_backend.cluster_id, new_backend);
 
         WorkerResponse::ok(req_id)
+    }
+
+    fn remove_health_check_state(&mut self, cluster_id: &str) {
+        self.health_checker.remove_cluster(cluster_id);
+        self.backends
+            .borrow_mut()
+            .health_check_configs
+            .remove(cluster_id);
     }
 
     fn remove_backend(&mut self, req_id: &str, backend: &RemoveBackend) -> WorkerResponse {

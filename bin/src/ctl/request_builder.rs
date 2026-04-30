@@ -4,25 +4,25 @@ use sozu_command_lib::{
     certificate::{
         decode_fingerprint, get_fingerprint_from_certificate_path, load_full_certificate,
     },
-    config::ListenerBuilder,
+    config::{ListenerBuilder, validate_health_check_config},
     proto::command::{
         ActivateListener, AddBackend, AddCertificate, AlpnProtocols, Cluster, CountRequests,
-        CustomHttpAnswers, DeactivateListener, FrontendFilters, HardStop, ListListeners,
-        ListenerType, LoadBalancingParams, MetricsConfiguration, PathRule, ProxyProtocolConfig,
-        QueryCertificatesFilters, QueryClusterByDomain, QueryClustersHashes,
-        QueryMaxConnectionsPerIp, RemoveBackend, RemoveCertificate, RemoveListener,
-        ReplaceCertificate, RequestHttpFrontend, RequestTcpFrontend, RulePosition, SocketAddress,
-        SoftStop, Status, SubscribeEvents, TlsVersion, UpdateHttpListenerConfig,
-        UpdateHttpsListenerConfig, UpdateTcpListenerConfig, request::RequestType,
-        response_content::ContentType,
+        CustomHttpAnswers, DeactivateListener, FrontendFilters, HardStop, HealthCheckConfig,
+        ListListeners, ListenerType, LoadBalancingParams, MetricsConfiguration, PathRule,
+        ProxyProtocolConfig, QueryCertificatesFilters, QueryClusterByDomain, QueryClustersHashes,
+        QueryHealthChecks, QueryMaxConnectionsPerIp, RemoveBackend, RemoveCertificate,
+        RemoveListener, ReplaceCertificate, RequestHttpFrontend, RequestTcpFrontend, RulePosition,
+        SetHealthCheck, SocketAddress, SoftStop, Status, SubscribeEvents, TlsVersion,
+        UpdateHttpListenerConfig, UpdateHttpsListenerConfig, UpdateTcpListenerConfig,
+        request::RequestType, response_content::ContentType,
     },
 };
 
 use super::CtlError;
 use crate::{
     cli::{
-        BackendCmd, ClusterCmd, ClusterH2Cmd, ConnectionLimitCmd, HttpFrontendCmd, HttpListenerCmd,
-        HttpsListenerCmd, MetricsCmd, TcpFrontendCmd, TcpListenerCmd,
+        BackendCmd, ClusterCmd, ClusterH2Cmd, ConnectionLimitCmd, HealthCheckCmd, HttpFrontendCmd,
+        HttpListenerCmd, HttpsListenerCmd, MetricsCmd, TcpFrontendCmd, TcpListenerCmd,
     },
     ctl::CommandManager,
 };
@@ -247,6 +247,7 @@ impl CommandManager {
             }
             ClusterCmd::Remove { id } => self.send_request(RequestType::RemoveCluster(id).into()),
             ClusterCmd::H2 { cmd } => self.cluster_h2_command(cmd),
+            ClusterCmd::HealthCheck { cmd } => self.health_check_command(cmd),
             ClusterCmd::List {
                 id: cluster_id,
                 domain,
@@ -306,6 +307,51 @@ impl CommandManager {
         };
 
         self.send_request(RequestType::AddCluster(updated).into())
+    }
+
+    pub fn health_check_command(&mut self, cmd: HealthCheckCmd) -> Result<(), CtlError> {
+        match cmd {
+            HealthCheckCmd::Set {
+                id,
+                uri,
+                interval,
+                timeout,
+                healthy_threshold,
+                unhealthy_threshold,
+                expected_status,
+            } => {
+                let config = HealthCheckConfig {
+                    uri,
+                    interval,
+                    timeout,
+                    healthy_threshold,
+                    unhealthy_threshold,
+                    expected_status,
+                };
+                if let Err(reason) = validate_health_check_config(&config) {
+                    return Err(CtlError::Failure(reason.to_owned()));
+                }
+                if config.timeout >= config.interval {
+                    warn!(
+                        "health check timeout ({}s) >= interval ({}s), checks may overlap",
+                        config.timeout, config.interval
+                    );
+                }
+                self.send_request(
+                    RequestType::SetHealthCheck(SetHealthCheck {
+                        cluster_id: id,
+                        config,
+                    })
+                    .into(),
+                )
+            }
+            HealthCheckCmd::Remove { id } => {
+                self.send_request(RequestType::RemoveHealthCheck(id).into())
+            }
+            HealthCheckCmd::List { id } => self.send_request(
+                RequestType::QueryHealthChecks(QueryHealthChecks { cluster_id: id }).into(),
+            ),
+        }
     }
 
     pub fn tcp_frontend_command(&mut self, cmd: TcpFrontendCmd) -> Result<(), CtlError> {

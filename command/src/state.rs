@@ -19,12 +19,12 @@ use crate::{
         command::{
             ActivateListener, AddBackend, AddCertificate, CertificateAndKey, Cluster,
             ClusterInformation, CustomHttpAnswers, DeactivateListener, FrontendFilters,
-            HttpListenerConfig, HttpsListenerConfig, InitialState, ListedFrontends, ListenerType,
-            ListenersList, PathRule, QueryCertificatesFilters, RemoveBackend, RemoveCertificate,
-            RemoveListener, ReplaceCertificate, Request, RequestCounts, RequestHttpFrontend,
-            RequestTcpFrontend, SocketAddress, TcpListenerConfig, UpdateHttpListenerConfig,
-            UpdateHttpsListenerConfig, UpdateTcpListenerConfig, WorkerRequest,
-            request::RequestType,
+            HealthChecksList, HttpListenerConfig, HttpsListenerConfig, InitialState,
+            ListedFrontends, ListenerType, ListenersList, PathRule, QueryCertificatesFilters,
+            RemoveBackend, RemoveCertificate, RemoveListener, ReplaceCertificate, Request,
+            RequestCounts, RequestHttpFrontend, RequestTcpFrontend, SetHealthCheck, SocketAddress,
+            TcpListenerConfig, UpdateHttpListenerConfig, UpdateHttpsListenerConfig,
+            UpdateTcpListenerConfig, WorkerRequest, request::RequestType,
         },
         display::format_request_type,
     },
@@ -132,6 +132,8 @@ impl ConfigState {
             RequestType::UpdateHttpListener(patch) => self.update_http_listener(patch),
             RequestType::UpdateHttpsListener(patch) => self.update_https_listener(patch),
             RequestType::UpdateTcpListener(patch) => self.update_tcp_listener(patch),
+            RequestType::SetHealthCheck(set) => self.set_health_check(set),
+            RequestType::RemoveHealthCheck(cluster_id) => self.remove_health_check(cluster_id),
 
             // This is to avoid the error message. These request types are
             // worker-only / runtime-only and do not affect the persisted
@@ -176,6 +178,20 @@ impl ConfigState {
     }
 
     fn add_cluster(&mut self, cluster: &Cluster) -> Result<(), StateError> {
+        // Validate any inline `cluster.health_check` before mutating state so
+        // an invalid config (zero thresholds, missing leading `/`, CR/LF/NUL/C0
+        // in URI) cannot ride in via the AddCluster path. Without this, TOML
+        // reload, SaveState/LoadState, and direct API AddCluster requests
+        // bypass the SetHealthCheck-side check and let an attacker-controlled
+        // health-check URI smuggle CRLF into outbound HTTP/1.1 probes.
+        if let Some(hc) = cluster.health_check.as_ref() {
+            if let Err(reason) = crate::config::validate_health_check_config(hc) {
+                return Err(StateError::InvalidValue {
+                    field: "health_check",
+                    reason,
+                });
+            }
+        }
         let cluster = cluster.clone();
         self.clusters.insert(cluster.cluster_id.clone(), cluster);
         Ok(())
@@ -189,6 +205,59 @@ impl ConfigState {
                 id: cluster_id.to_owned(),
             }),
         }
+    }
+
+    fn set_health_check(&mut self, set: &SetHealthCheck) -> Result<(), StateError> {
+        // Validate before mutating state so an invalid config (zero
+        // thresholds, missing leading `/`, CR/LF/NUL/C0 in URI) cannot
+        // round-trip through SaveState/LoadState. The worker also
+        // validates at the SetHealthCheck handler — this is the
+        // master-side mirror so off-channel TOML reload paths don't
+        // bypass the policy.
+        if let Err(reason) = crate::config::validate_health_check_config(&set.config) {
+            return Err(StateError::InvalidValue {
+                field: "health_check",
+                reason,
+            });
+        }
+        match self.clusters.get_mut(&set.cluster_id) {
+            Some(cluster) => {
+                cluster.health_check = Some(set.config.to_owned());
+                Ok(())
+            }
+            None => Err(StateError::NotFound {
+                kind: ObjectKind::Cluster,
+                id: set.cluster_id.to_owned(),
+            }),
+        }
+    }
+
+    fn remove_health_check(&mut self, cluster_id: &str) -> Result<(), StateError> {
+        match self.clusters.get_mut(cluster_id) {
+            Some(cluster) => {
+                cluster.health_check = None;
+                Ok(())
+            }
+            None => Err(StateError::NotFound {
+                kind: ObjectKind::Cluster,
+                id: cluster_id.to_owned(),
+            }),
+        }
+    }
+
+    pub fn list_health_checks(&self, cluster_id: Option<&str>) -> HealthChecksList {
+        let map = self
+            .clusters
+            .iter()
+            .filter(|(id, _)| cluster_id.is_none_or(|filter| filter == id.as_str()))
+            .filter_map(|(id, cluster)| {
+                cluster
+                    .health_check
+                    .as_ref()
+                    .map(|hc| (id.to_owned(), hc.to_owned()))
+            })
+            .collect();
+        HealthChecksList { map }
     }
 
     fn add_http_listener(&mut self, listener: &HttpListenerConfig) -> Result<(), StateError> {
@@ -2982,6 +3051,50 @@ mod tests {
                 }
             ),
             "expected InvalidValue for flood knob 0, got: {err}"
+        );
+    }
+
+    /// AddCluster: an inline `cluster.health_check` with a CRLF-bearing URI
+    /// must be rejected before the cluster lands in `ConfigState`. Without
+    /// this guard, TOML reload / SaveState / direct API AddCluster requests
+    /// bypass the SetHealthCheck-side check and let an attacker-controlled
+    /// health-check URI smuggle CR/LF into outbound HTTP/1.1 probes.
+    #[test]
+    fn add_cluster_invalid_health_check_uri_rejected() {
+        use crate::proto::command::HealthCheckConfig;
+
+        let mut state = ConfigState::new();
+        let err = state
+            .dispatch(
+                &RequestType::AddCluster(Cluster {
+                    cluster_id: String::from("evil_cluster"),
+                    health_check: Some(HealthCheckConfig {
+                        uri: String::from("/foo\r\nGET /admin"),
+                        interval: 5_000,
+                        timeout: 1_000,
+                        healthy_threshold: 2,
+                        unhealthy_threshold: 2,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                StateError::InvalidValue {
+                    field: "health_check",
+                    ..
+                }
+            ),
+            "expected InvalidValue for CRLF-bearing health-check URI, got: {err}"
+        );
+        assert!(
+            !state.clusters.contains_key("evil_cluster"),
+            "cluster must not be inserted when health_check fails validation",
         );
     }
 

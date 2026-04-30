@@ -63,20 +63,23 @@ use crate::{
     logging::AccessLogFormat,
     proto::command::{
         ActivateListener, AddBackend, AddCertificate, CertificateAndKey, Cluster,
-        CustomHttpAnswers, Header, HeaderPosition, HttpListenerConfig, HttpsListenerConfig,
-        ListenerType, LoadBalancingAlgorithms, LoadBalancingParams, LoadMetric, MetricDetail,
-        MetricsConfiguration, PathRule, ProtobufAccessLogFormat, ProxyProtocolConfig,
-        RedirectPolicy, RedirectScheme, Request, RequestHttpFrontend, RequestTcpFrontend,
-        RulePosition, ServerConfig, ServerMetricsConfig, SocketAddress, TcpListenerConfig,
-        TlsVersion, WorkerRequest, request::RequestType,
+        CustomHttpAnswers, Header, HeaderPosition, HealthCheckConfig, HttpListenerConfig,
+        HttpsListenerConfig, ListenerType, LoadBalancingAlgorithms, LoadBalancingParams,
+        LoadMetric, MetricDetail, MetricsConfiguration, PathRule, ProtobufAccessLogFormat,
+        ProxyProtocolConfig, RedirectPolicy, RedirectScheme, Request, RequestHttpFrontend,
+        RequestTcpFrontend, RulePosition, ServerConfig, ServerMetricsConfig, SocketAddress,
+        TcpListenerConfig, TlsVersion, WorkerRequest, request::RequestType,
     },
 };
 
-/// provides all supported cipher suites exported by Rustls TLS
-/// provider as it support only strongly secure ones.
+/// Authoritative list of default cipher suites for all rustls-based TLS providers.
+///
+/// These use rustls naming conventions and are supported by all three crypto providers
+/// (ring, aws-lc-rs, rustls-openssl). Order follows ANSSI recommendations: AES-256
+/// preferred over AES-128, ECDSA preferred over RSA, TLS 1.3 preferred over TLS 1.2.
 ///
 /// See the [documentation](https://docs.rs/rustls/latest/rustls/static.ALL_CIPHER_SUITES.html)
-pub const DEFAULT_RUSTLS_CIPHER_LIST: [&str; 9] = [
+pub const DEFAULT_CIPHER_LIST: [&str; 9] = [
     // TLS 1.3 cipher suites
     "TLS13_AES_256_GCM_SHA384",
     "TLS13_AES_128_GCM_SHA256",
@@ -88,13 +91,6 @@ pub const DEFAULT_RUSTLS_CIPHER_LIST: [&str; 9] = [
     "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
     "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
     "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
-];
-
-pub const DEFAULT_CIPHER_SUITES: [&str; 4] = [
-    "TLS_AES_256_GCM_SHA384",
-    "TLS_AES_128_GCM_SHA256",
-    "TLS_AES_128_CCM_SHA256",
-    "TLS_CHACHA20_POLY1305_SHA256",
 ];
 
 pub const DEFAULT_SIGNATURE_ALGORITHMS: [&str; 9] = [
@@ -109,7 +105,7 @@ pub const DEFAULT_SIGNATURE_ALGORITHMS: [&str; 9] = [
     "RSA-PSS+SHA512",
 ];
 
-pub const DEFAULT_GROUPS_LIST: [&str; 4] = ["P-521", "P-384", "P-256", "x25519"];
+pub const DEFAULT_GROUPS_LIST: [&str; 4] = ["X25519MLKEM768", "x25519", "P-256", "P-384"];
 
 /// Default ALPN protocols advertised by HTTPS listeners.
 /// Both HTTP/2 and HTTP/1.1 are enabled, allowing clients to negotiate either.
@@ -362,6 +358,7 @@ pub struct ListenerBuilder {
     pub tls_versions: Option<Vec<TlsVersion>>,
     pub cipher_list: Option<Vec<String>>,
     pub cipher_suites: Option<Vec<String>>,
+    pub groups_list: Option<Vec<String>>,
     pub expect_proxy: Option<bool>,
     #[serde(default = "default_sticky_name")]
     pub sticky_name: String,
@@ -519,6 +516,7 @@ impl ListenerBuilder {
             certificate: None,
             cipher_list: None,
             cipher_suites: None,
+            groups_list: None,
             config: None,
             connect_timeout: None,
             expect_proxy: None,
@@ -826,26 +824,24 @@ impl ListenerBuilder {
             });
         }
 
-        let default_cipher_list = DEFAULT_RUSTLS_CIPHER_LIST
-            .into_iter()
-            .map(String::from)
-            .collect();
+        let default_cipher_list = DEFAULT_CIPHER_LIST.into_iter().map(String::from).collect();
 
         let cipher_list = self.cipher_list.clone().unwrap_or(default_cipher_list);
 
-        let default_cipher_suites = DEFAULT_CIPHER_SUITES
-            .into_iter()
-            .map(String::from)
-            .collect();
-
-        let cipher_suites = self.cipher_suites.clone().unwrap_or(default_cipher_suites);
+        let cipher_suites = self
+            .cipher_suites
+            .clone()
+            .unwrap_or_else(|| DEFAULT_CIPHER_LIST.into_iter().map(String::from).collect());
 
         let signature_algorithms: Vec<String> = DEFAULT_SIGNATURE_ALGORITHMS
             .into_iter()
             .map(String::from)
             .collect();
 
-        let groups_list: Vec<String> = DEFAULT_GROUPS_LIST.into_iter().map(String::from).collect();
+        let groups_list = self
+            .groups_list
+            .clone()
+            .unwrap_or_else(|| DEFAULT_GROUPS_LIST.into_iter().map(String::from).collect());
 
         let alpn_protocols: Vec<String> = match &self.alpn_protocols {
             Some(protos) if !protos.is_empty() => {
@@ -1482,6 +1478,81 @@ pub enum FileClusterProtocolConfig {
     Tcp,
 }
 
+fn default_health_check_interval() -> u32 {
+    10
+}
+fn default_health_check_timeout() -> u32 {
+    5
+}
+fn default_health_check_threshold() -> u32 {
+    3
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileHealthCheckConfig {
+    pub uri: String,
+    #[serde(default = "default_health_check_interval")]
+    pub interval: u32,
+    #[serde(default = "default_health_check_timeout")]
+    pub timeout: u32,
+    #[serde(default = "default_health_check_threshold")]
+    pub healthy_threshold: u32,
+    #[serde(default = "default_health_check_threshold")]
+    pub unhealthy_threshold: u32,
+    #[serde(default)]
+    pub expected_status: u32,
+}
+
+impl FileHealthCheckConfig {
+    pub fn to_proto(&self) -> HealthCheckConfig {
+        HealthCheckConfig {
+            uri: self.uri.to_owned(),
+            interval: self.interval,
+            timeout: self.timeout,
+            healthy_threshold: self.healthy_threshold,
+            unhealthy_threshold: self.unhealthy_threshold,
+            expected_status: self.expected_status,
+        }
+    }
+}
+
+/// Validate a [`HealthCheckConfig`] for the rules every layer relies on:
+/// strict positive thresholds and a URI that cannot smuggle a second
+/// HTTP message on the wire (RFC 9110 §5.1 — request-target). Used by
+/// the CLI request builder and the worker `SetHealthCheck` handler so
+/// off-channel inputs (TOML reload, third-party clients) are
+/// constrained the same way as `sozu cluster health-check set`.
+///
+/// The function is intentionally [`Result<(), &'static str>`] rather
+/// than carrying a structured error: the diagnostics only flow into
+/// CLI output / worker error responses where the message is the value.
+pub fn validate_health_check_config(cfg: &HealthCheckConfig) -> Result<(), &'static str> {
+    if cfg.interval == 0 {
+        return Err("health check interval must be > 0");
+    }
+    if cfg.timeout == 0 {
+        return Err("health check timeout must be > 0");
+    }
+    if cfg.healthy_threshold == 0 {
+        return Err("health check healthy_threshold must be > 0");
+    }
+    if cfg.unhealthy_threshold == 0 {
+        return Err("health check unhealthy_threshold must be > 0");
+    }
+    if !cfg.uri.starts_with('/') {
+        return Err("health check URI must start with '/'");
+    }
+    if cfg
+        .uri
+        .bytes()
+        .any(|b| b == b'\r' || b == b'\n' || b == 0 || (b < 0x20 && b != b'\t'))
+    {
+        return Err("health check URI must not contain CR, LF, NUL, or other C0 control bytes");
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileClusterConfig {
@@ -1538,6 +1609,11 @@ pub struct FileClusterConfig {
     /// field for shape uniformity but never emit the header (no HTTP
     /// envelope).
     pub retry_after: Option<u32>,
+    /// Optional HTTP health-check configuration. The probe wire format
+    /// follows `cluster.http2`: HTTP/1.1 when false, HTTP/2 prior-knowledge
+    /// (h2c) when true.
+    #[serde(default)]
+    pub health_check: Option<FileHealthCheckConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1617,6 +1693,7 @@ impl FileClusterConfig {
                     www_authenticate: self.www_authenticate,
                     max_connections_per_ip: self.max_connections_per_ip,
                     retry_after: self.retry_after,
+                    health_check: self.health_check.as_ref().map(|hc| hc.to_proto()),
                 }))
             }
             FileClusterProtocolConfig::Http => {
@@ -1656,6 +1733,7 @@ impl FileClusterConfig {
                     www_authenticate: self.www_authenticate,
                     max_connections_per_ip: self.max_connections_per_ip,
                     retry_after: self.retry_after,
+                    health_check: self.health_check.as_ref().map(|hc| hc.to_proto()),
                 }))
             }
         }
@@ -1803,6 +1881,11 @@ pub struct HttpClusterConfig {
     /// value (seconds). See [`FileClusterConfig::retry_after`].
     #[serde(default)]
     pub retry_after: Option<u32>,
+    /// Optional HTTP health-check configuration. The probe wire format
+    /// follows `cluster.http2`: HTTP/1.1 when false, HTTP/2 prior-knowledge
+    /// (h2c) when true.
+    #[serde(default)]
+    pub health_check: Option<HealthCheckConfig>,
 }
 
 impl HttpClusterConfig {
@@ -1823,6 +1906,7 @@ impl HttpClusterConfig {
                 www_authenticate: self.www_authenticate.clone(),
                 max_connections_per_ip: self.max_connections_per_ip,
                 retry_after: self.retry_after,
+                health_check: self.health_check.clone(),
             })
             .into(),
         ];
@@ -1891,6 +1975,11 @@ pub struct TcpClusterConfig {
     /// uniformity with [`HttpClusterConfig`].
     #[serde(default)]
     pub retry_after: Option<u32>,
+    /// Optional HTTP health-check configuration. TCP clusters carry this
+    /// field for shape uniformity with [`HttpClusterConfig`]; probes are
+    /// HTTP/1.1 only and TCP-only backends should leave this absent.
+    #[serde(default)]
+    pub health_check: Option<HealthCheckConfig>,
 }
 
 impl TcpClusterConfig {
@@ -1911,6 +2000,7 @@ impl TcpClusterConfig {
                 www_authenticate: self.www_authenticate.clone(),
                 max_connections_per_ip: self.max_connections_per_ip,
                 retry_after: self.retry_after,
+                health_check: self.health_check.clone(),
             })
             .into(),
         ];

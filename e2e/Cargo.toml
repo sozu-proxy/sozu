@@ -4,13 +4,17 @@ version = "1.1.1"
 rust-version = "1.88.0"
 edition = "2024"
 
+[lints.rust.unexpected_cfgs]
+level = "warn"
+check-cfg = ["cfg(tarpaulin)"]
+
 [dependencies]
 base64 = { workspace = true }
 flate2 = { workspace = true }
 futures = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true, features = ["client", "server", "http1", "http2"] }
-hyper-rustls = { workspace = true, features = ["ring", "webpki-tokio", "http1", "http2", "tls12", "logging"] }
+hyper-rustls = { workspace = true, features = ["webpki-tokio", "http1", "http2", "tls12", "logging"] }
 hyper-util = { workspace = true, features = ["client-legacy", "http1", "http2", "server-auto", "service", "tokio"] }
 libc = { workspace = true }
 mio = { workspace = true }
@@ -39,3 +43,25 @@ serial_test = { workspace = true }
 # in `tests/tcp_tests.rs` are protocol-level and run identically with
 # or without the feature enabled — CI exercises both configurations.
 splice = ["sozu-lib/splice"]
+# Crypto-provider forwarding so `cargo test -p sozu-e2e --features
+# crypto-aws-lc-rs` etc. exercises the matrix end-to-end. The default
+# is `crypto-ring`, matching the `sozu` binary default; CI's matrix
+# job overrides via `--no-default-features --features <provider>`.
+#
+# Each provider feature also forwards the matching `hyper-rustls`
+# feature so the test client and the proxy use the SAME rustls
+# provider in the same process. Without this, hyper-rustls's
+# default `ring` feature would link a second provider into the
+# binary alongside sozu-lib's selection, and rustls 0.23.39's
+# `CryptoProvider::get_default_or_install_from_crate_features()`
+# panics with "Could not automatically determine the process-level
+# CryptoProvider" because two `from_crate_features` candidates
+# match (`crypto/mod.rs:249`). For `crypto-openssl` no
+# hyper-rustls feature is needed: `rustls-openssl` is a separate
+# crate that registers the provider explicitly, so the
+# `from_crate_features` path is not exercised.
+default = ["crypto-ring"]
+crypto-ring = ["sozu-lib/crypto-ring", "hyper-rustls/ring"]
+crypto-aws-lc-rs = ["sozu-lib/crypto-aws-lc-rs", "hyper-rustls/aws-lc-rs"]
+crypto-openssl = ["sozu-lib/crypto-openssl", "hyper-rustls/aws-lc-rs"]
+fips = ["sozu-lib/fips", "hyper-rustls/aws-lc-rs"]
