@@ -161,7 +161,7 @@ jobs:
       # work; running them once under the default `Test` job is
       # sufficient.
       - name: sozu-e2e suite with ${{ matrix.provider }}
-        run: cargo test -p sozu-e2e --locked --no-default-features --features ${{ matrix.provider }} --verbose -- --skip tests::fuzz_tests::
+        run: "cargo test -p sozu-e2e --locked --no-default-features --features ${{ matrix.provider }} --verbose -- --skip tests::fuzz_tests::"
   doc:
     name: Build documentation
     runs-on: ubuntu-latest
