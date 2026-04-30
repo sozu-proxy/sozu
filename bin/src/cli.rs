@@ -1,7 +1,8 @@
-use std::{collections::BTreeMap, net::SocketAddr, path::PathBuf};
+use std::{collections::BTreeMap, io::IsTerminal, net::SocketAddr, path::PathBuf};
 
 use clap::{ArgAction, CommandFactory, FromArgMatches, Parser, Subcommand};
 use sozu_command_lib::{
+    logging::is_logger_colored,
     proto::command::{LoadBalancingAlgorithms, TlsVersion},
     state::ClusterId as StateClusterId,
 };
@@ -42,25 +43,35 @@ impl paw::ParseArgs for Args {
         const RED: &str = "\x1b[31m";
         const RESET: &str = "\x1b[0m";
 
-        let colored_features: String = env!("SOZU_BUILD_FEATURES")
-            .split(' ')
-            .map(|flag| {
-                if let Some(name) = flag.strip_prefix('+') {
-                    format!("{GREEN}+{name}{RESET}")
-                } else if let Some(name) = flag.strip_prefix('-') {
-                    format!("{RED}-{name}{RESET}")
-                } else {
-                    flag.to_owned()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
+        // ANSI escapes are emitted only when stdout is a real TTY AND the
+        // logger is configured for color. Redirected output (`sozu --version
+        // > file`, package-metadata capture, systemd journal) must stay raw
+        // ASCII so scripts and downstream parsers don't ingest escape codes.
+        let plain_features = env!("SOZU_BUILD_FEATURES");
+        let use_color = std::io::stdout().is_terminal() && is_logger_colored();
+        let features: String = if use_color {
+            plain_features
+                .split(' ')
+                .map(|flag| {
+                    if let Some(name) = flag.strip_prefix('+') {
+                        format!("{GREEN}+{name}{RESET}")
+                    } else if let Some(name) = flag.strip_prefix('-') {
+                        format!("{RED}-{name}{RESET}")
+                    } else {
+                        flag.to_owned()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        } else {
+            plain_features.to_owned()
+        };
 
         let long_version = format!(
             "{} ({})\n{}",
             env!("CARGO_PKG_VERSION"),
             env!("SOZU_BUILD_GIT"),
-            colored_features,
+            features,
         );
 
         // clap requires &'static str for long_version. This intentional leak occurs once
