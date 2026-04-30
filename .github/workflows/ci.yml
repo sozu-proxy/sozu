@@ -148,8 +148,20 @@ jobs:
       # behind a green ring-only e2e run. The e2e crate forwards each
       # provider feature to sozu-lib via its own `[features]` block in
       # `e2e/Cargo.toml`.
+      #
+      # Skip `tests::fuzz_tests::*` per provider — those tests shell
+      # out to `cargo fuzz run`, which pulls the `fuzz/` crate's
+      # pinned `crypto-ring` build of `sozu-lib`. Under outer
+      # `crypto-aws-lc-rs` / `fips` builds the inner cache misses,
+      # so each matrix entry recompiles the entire workspace from
+      # scratch and the fuzz step alone exceeds the job timeout
+      # (observed ~31 min still compiling under aws-lc-rs vs ~28 min
+      # for the *whole* matrix entry under ring/openssl). The fuzz
+      # parser and HPACK decoder are provider-agnostic byte-level
+      # work; running them once under the default `Test` job is
+      # sufficient.
       - name: sozu-e2e suite with ${{ matrix.provider }}
-        run: cargo test -p sozu-e2e --locked --no-default-features --features ${{ matrix.provider }} --verbose
+        run: cargo test -p sozu-e2e --locked --no-default-features --features ${{ matrix.provider }} --verbose -- --skip tests::fuzz_tests::
   doc:
     name: Build documentation
     runs-on: ubuntu-latest
