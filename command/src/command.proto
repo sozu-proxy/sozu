@@ -652,6 +652,10 @@ message ListenersList {
 // FORWARD routes to the backend (default).
 // PERMANENT returns 301 with a `Location` header derived from
 // `redirect_scheme`, optional `rewrite_*` fields, and `cluster.https_redirect_port`.
+// FOUND returns 302 — a temporary redirect (RFC 9110 §15.4.3); user agents may
+// rewrite POST to GET on follow.
+// PERMANENT_REDIRECT returns 308 — a permanent redirect (RFC 9110 §15.4.9); the
+// HTTP method MUST be preserved on follow (no GET-rewrite on POST).
 // UNAUTHORIZED returns 401 with `WWW-Authenticate: Basic realm=...`
 // using `cluster.www_authenticate`; suitable for blanket deny-by-default
 // routes that still want to surface a login prompt.
@@ -659,6 +663,8 @@ enum RedirectPolicy {
     FORWARD = 0;
     PERMANENT = 1;
     UNAUTHORIZED = 2;
+    FOUND = 3;
+    PERMANENT_REDIRECT = 4;
 }
 
 // Scheme to use when building the `Location` header for a permanent redirect.
