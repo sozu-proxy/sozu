@@ -54,9 +54,10 @@ logs-debug = []
 logs-trace = []
 
 [dev-dependencies]
-# Used by `sd_notify` unit tests to spawn an ephemeral
-# `UnixDatagram` socket and assert the helper writes the expected
-# protocol payload.
+# `sd_notify` unit tests spawn an ephemeral `UnixDatagram` and run
+# under `#[serial_test::serial(notify_socket)]` because they mutate
+# the process-shared `NOTIFY_SOCKET` env var.
+serial_test = { workspace = true }
 tempfile = { workspace = true }
 
 [build-dependencies]

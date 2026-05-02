@@ -395,7 +395,13 @@ impl CommandHub {
     /// - receive requests from clients and responses from workers
     /// - dispatch these message to the [Server]
     /// - manage timeouts of tasks
-    pub fn run(&mut self) {
+    ///
+    /// Returns `true` when the loop exited because `upgrade_main`
+    /// flipped `Server.upgrading` (binary hand-off to a forked child
+    /// master), `false` on a regular graceful shutdown
+    /// (`SoftStop` / `HardStop`). The bin entry-point uses the
+    /// distinction to decide whether to emit `STOPPING=1` to systemd.
+    pub fn run(&mut self) -> bool {
         let mut events = Events::with_capacity(100);
         debug!("running the command hub: {:?}", self);
 
@@ -432,7 +438,7 @@ impl CommandHub {
                     .retain(|_, s| s.channel.back_buf.available_data() > 0);
                 // when all ClientSession are closed, the CommandServer stops
                 if self.clients.is_empty() {
-                    break;
+                    return self.server.upgrading;
                 }
             }
 
@@ -659,6 +665,15 @@ pub struct Server {
     pub state: ConfigState,
     /// used to shut down gracefully
     pub run_state: ServerState,
+    /// `true` when the run_state transitioned through `upgrade_main`
+    /// (binary hand-off to a forked child master) instead of a
+    /// graceful `SoftStop` / `HardStop`. The bin entry-point reads
+    /// this after `command_hub.run()` returns to decide whether to
+    /// emit `STOPPING=1` to systemd: on the upgrade path we already
+    /// sent `RELOADING=1` and the new master will signal its own
+    /// `READY=1`, so an old-master `STOPPING=1` would race the new
+    /// master's `MAINPID=` notify.
+    pub upgrading: bool,
     /// the UNIX socket on which to receive clients
     unix_listener: UnixListener,
     /// the Sōzu processes running parallel to the main process.
@@ -726,6 +741,7 @@ impl Server {
             queued_tasks: HashMap::new(),
             state: ConfigState::new(),
             run_state: ServerState::Running,
+            upgrading: false,
             unix_listener,
             workers: HashMap::new(),
         })

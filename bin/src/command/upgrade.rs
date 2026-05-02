@@ -381,5 +381,12 @@ pub fn upgrade_main(server: &mut Server, client: &mut ClientSession) {
             "Upgrade successful, closing main process. New main process has pid {new_main_pid}"
         ));
         server.run_state = ServerState::Stopping;
+        // The new master is taking over; the old master must NOT emit
+        // `STOPPING=1` after `command_hub.run()` returns — that race
+        // would arrive at systemd before the new master's MAINPID=
+        // notify and flip the unit to inactive while sozu is still
+        // serving traffic (see `bin/src/command/mod.rs` STOPPING gate
+        // and `os-build/systemd/sozu.service`).
+        server.upgrading = true;
     }
 }
