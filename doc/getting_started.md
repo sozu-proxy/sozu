@@ -29,6 +29,36 @@ Build the sozu executable and command line:
 > The `--locked` flag tells cargo to stick to dependency versions as specified in `Cargo.lock`
 > and thus prevent dependency breaks.
 
+### Run on NixOS
+
+Sōzu is packaged in [nixpkgs][nx]; the latest release is in the
+`nixos-unstable` channel.
+
+Try it without installing:
+
+```bash
+nix-shell -p sozu --run "sozu --version"
+```
+
+Install it into your user profile:
+
+```bash
+nix profile install nixpkgs#sozu
+```
+
+Or add it to a NixOS system configuration:
+
+```nix
+environment.systemPackages = [ pkgs.sozu ];
+```
+
+> The upstream derivation is currently marked `broken` on non-`x86_64`
+> platforms. Run Sōzu on an x86_64 NixOS host or build from source.
+>
+> The derivation does not ship a `services.sozu` NixOS module. To run
+> Sōzu as a daemon, write a `systemd.services.sozu` unit pointing at your
+> `config.toml`; see the [configuration reference](./configure.md).
+
 ### Cargo features
 
 The Cargo features published by the workspace tune behaviour and select the
@@ -128,3 +158,4 @@ cd bin && cargo build --release --locked --no-default-features --features fips
 
 [ru]: https://rustup.rs
 [cr]: https://crates.io/
+[nx]: https://search.nixos.org/packages?channel=unstable&query=sozu
