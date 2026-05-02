@@ -184,6 +184,68 @@ pub unsafe fn get_executable_path() -> Result<String, UtilError> {
     Ok(path_str)
 }
 
+/// Returns a path string suitable for `execve(2)` that is **race-free against
+/// on-disk binary replacement**. Closes [#515].
+///
+/// The motivating bug: when a master forks a worker (or re-execs itself for
+/// hot-upgrade) it calls `Command::new(executable_path).exec()` where
+/// `executable_path` is a string like `/usr/bin/sozu`. If the operator has
+/// replaced the binary on disk between master startup and the exec call
+/// (`cp new-sozu /usr/bin/sozu` followed by `sozuctl upgrade`), `execve(2)`
+/// resolves `/usr/bin/sozu` as a normal path and starts the **new** binary,
+/// which is incompatible with the running master's protocol expectations.
+///
+/// On Linux, `/proc/self/exe` is a magic symlink that always resolves to the
+/// **original** inode the process was started from, regardless of whether
+/// the on-disk file was unlinked or replaced. Opening it with `O_PATH`
+/// returns an fd that pins the inode for the lifetime of the fd; passing
+/// `/proc/self/fd/<n>` to `execve(2)` causes the kernel to resolve the
+/// magic symlink to the original inode, not whatever is currently at the
+/// path string.
+///
+/// We keep the fd open until process exit (the kernel closes it via
+/// `O_CLOEXEC` when exec succeeds; if exec fails, the fd persists harmlessly
+/// for the rest of the master's lifetime — a bounded, per-exec-attempt leak
+/// on a path that is itself a master-in-trouble code path).
+///
+/// On non-Linux platforms (FreeBSD, macOS) we fall back to the historical
+/// path-string approach. The race window is identical to v1.x; the v2.0.0
+/// migration target is Linux operators who hit #515 in production.
+///
+/// [#515]: https://github.com/sozu-proxy/sozu/issues/515
+#[cfg(target_os = "linux")]
+pub fn get_executable_exec_path() -> Result<String, UtilError> {
+    use std::os::fd::IntoRawFd;
+    let owned_fd = nix::fcntl::open(
+        "/proc/self/exe",
+        nix::fcntl::OFlag::O_PATH | nix::fcntl::OFlag::O_CLOEXEC,
+        nix::sys::stat::Mode::empty(),
+    )
+    .map_err(|errno| {
+        UtilError::Read(
+            "/proc/self/exe".to_string(),
+            IoError::from_raw_os_error(errno as i32),
+        )
+    })?;
+    // Convert OwnedFd → RawFd. The fd is intentionally not dropped: it
+    // must remain open until exec(2) consumes it. O_CLOEXEC closes it
+    // automatically on successful exec; on failed exec the fd persists
+    // for the rest of the master's lifetime, which is acceptable on a
+    // master-in-trouble code path.
+    let raw_fd = owned_fd.into_raw_fd();
+    Ok(format!("/proc/self/fd/{raw_fd}"))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn get_executable_exec_path() -> Result<String, UtilError> {
+    // FreeBSD / macOS keep the path-string approach. /proc/self/exe is
+    // not portable; the existing race window is unchanged on these
+    // platforms (out of scope for #515 / v2.0.0).
+    // SAFETY: see `get_executable_path` — the path is the running
+    // executable's filesystem location.
+    unsafe { get_executable_path() }
+}
+
 #[cfg(target_os = "macos")]
 unsafe extern "C" {
     pub fn _NSGetExecutablePath(buf: *mut libc::c_char, size: *mut u32) -> i32;
@@ -259,4 +321,48 @@ pub fn set_process_affinity(pid: pid_t, cpu: usize) {
 
         debug!("Worker {} bound to CPU core {}", pid, cpu);
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Closes [#515]: `get_executable_exec_path` returns a path string that
+    /// resolves to the running binary even when the on-disk file at
+    /// `/proc/self/exe`'s symlink target has been replaced.
+    ///
+    /// This unit test asserts the shape of the returned path and that the
+    /// underlying fd is valid (resolvable via the kernel's `/proc/self/fd`).
+    /// The race-free property under binary replacement is asserted in the
+    /// e2e upgrade-race tests (`e2e/src/tests/upgrade_race_tests.rs` —
+    /// follow-up commit).
+    ///
+    /// [#515]: https://github.com/sozu-proxy/sozu/issues/515
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn get_executable_exec_path_returns_proc_self_fd_on_linux() {
+        let path = get_executable_exec_path().expect("open /proc/self/exe O_PATH");
+        assert!(
+            path.starts_with("/proc/self/fd/"),
+            "expected /proc/self/fd/<n>, got {path}"
+        );
+        // The fd is intentionally leaked for exec, so the path resolves
+        // for the rest of the test process. Verify it points at a regular
+        // file via `std::fs::metadata` which follows the magic symlink to
+        // the original inode.
+        let meta = std::fs::metadata(&path)
+            .unwrap_or_else(|e| panic!("metadata({path}) failed: {e}"));
+        assert!(meta.is_file(), "/proc/self/fd/<n> did not resolve to a regular file");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn get_executable_exec_path_distinct_calls_yield_distinct_fds() {
+        // Each call opens a fresh fd; the path returned is unique per call.
+        // This is intentional: callers leak the fd until exec or process
+        // exit, so we don't multiplex one fd across multiple call sites.
+        let p1 = get_executable_exec_path().expect("first call");
+        let p2 = get_executable_exec_path().expect("second call");
+        assert_ne!(p1, p2, "expected distinct fd paths from two opens, got {p1} and {p2}");
+    }
 }
