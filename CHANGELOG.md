@@ -31,6 +31,13 @@ upgrade. See `doc/upgrade/1.x-to-2.0.md` for the full migration guide.
   internal `DEFAULT_RUSTLS_CIPHER_LIST` renamed to `DEFAULT_CIPHER_LIST`. The
   TOML key (`cipher_list`) is unchanged. `P-521` removed from default
   `groups_list` (rustls 0.23 does not support it).
+- **Renamed metric `http.301.redirect_template.compile_error` → `http.redirect_template.compile_error`**:
+  inline-template compile failures now surface under a single status-agnostic
+  counter (302 and 308 templates can fail the same way; the per-status form
+  would have left those failures unmonitored). Dashboards scraping the old
+  per-status name need updating; the new key is documented in
+  `doc/configure.md` alongside the new `http.302.redirection` and
+  `http.308.redirection` counters.
 
 ### ⛑️ Fixed
 

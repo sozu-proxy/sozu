@@ -673,7 +673,11 @@ impl Router {
             RedirectPolicy::Permanent => Some(301u16),
             RedirectPolicy::Found => Some(302u16),
             RedirectPolicy::PermanentRedirect => Some(308u16),
-            _ => None,
+            // Forward / Unauthorized are handled by other branches
+            // below; keeping them named here forces an exhaustive
+            // match so a future RedirectPolicy variant doesn't
+            // silently fall through to `None`.
+            RedirectPolicy::Forward | RedirectPolicy::Unauthorized => None,
         };
         if let Some(status_code) = redirect_status {
             let scheme = resolve_redirect_scheme(redirect_scheme, context);
