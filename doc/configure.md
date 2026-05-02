@@ -864,7 +864,7 @@ Three top-level knobs drive different policies:
 address  = "0.0.0.0:80"
 hostname = "old.example.com"
 # Force a permanent 301 to the canonical name on a different port.
-redirect        = "permanent"      # forward (default) | permanent | unauthorized
+redirect        = "permanent"      # forward (default) | permanent | found | permanent_redirect | unauthorized
 redirect_scheme = "use-https"      # use-same (default) | use-http | use-https
 rewrite_host    = "new.example.com"
 rewrite_port    = 8443             # paired with `cluster.https_redirect_port`
@@ -873,7 +873,15 @@ rewrite_port    = 8443             # paired with `cluster.https_redirect_port`
 `redirect = "permanent"` returns a 301 with a resolved `Location` URL built
 from `redirect_scheme`, the (optionally rewritten) host, the cluster's
 `https_redirect_port` (or the rewritten `rewrite_port`), and the original
-request path. `redirect = "unauthorized"` returns 401 unconditionally —
+request path. `redirect = "found"` and `redirect = "permanent_redirect"`
+share the same `Location`-resolution machinery and emit 302 (RFC 9110 §15.4.3)
+or 308 (RFC 9110 §15.4.9) respectively. The semantic distinction matters
+to clients: 301 and 302 permit user agents to rewrite POST → GET on follow,
+whereas 308 (and the IETF-modern 307) MUST preserve the request method.
+Pick `permanent_redirect` (308) when you want a stable cacheable redirect
+that keeps method semantics — e.g. an API endpoint relocation. Pick
+`found` (302) for short-lived forwards (login flows, A/B-testing
+gates). `redirect = "unauthorized"` returns 401 unconditionally —
 useful for blanket deny-by-default frontends that still want to surface a
 login prompt with the cluster's `www_authenticate` realm.
 
@@ -1343,7 +1351,10 @@ Incremented when Sōzu generates a default error response instead of proxying:
 
 | Metric | Type | Scope | Description |
 |--------|------|-------|-------------|
-| `http.301.redirection` | counter | proxy | 301 Moved Permanently (HTTP→HTTPS redirect) |
+| `http.301.redirection` | counter | proxy | 301 Moved Permanently (HTTP→HTTPS redirect, `RedirectPolicy::Permanent`) |
+| `http.302.redirection` | counter | proxy | 302 Found (`RedirectPolicy::Found` — UA may rewrite POST → GET) |
+| `http.308.redirection` | counter | proxy | 308 Permanent Redirect (`RedirectPolicy::PermanentRedirect` — method MUST be preserved) |
+| `http.redirect_template.compile_error` | counter | proxy | Operator-supplied per-frontend `redirect_template` failed to compile at request time; the listener default fired instead |
 | `http.400.errors` | counter | proxy | 400 Bad Request (cannot parse hostname) |
 | `http.401.errors` | counter | proxy | 401 Unauthorized |
 | `http.404.errors` | counter | proxy | 404 Not Found (no matching cluster) |
