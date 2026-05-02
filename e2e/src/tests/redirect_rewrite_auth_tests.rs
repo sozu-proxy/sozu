@@ -205,15 +205,29 @@ fn test_redirect_permanent_h1_skips_backend() {
     );
 }
 
+/// Reusable client labels for the H1 redirect helper. Avoids the
+/// `format!(...).leak()` pattern that grew per-call `&'static str`
+/// allocations every time the helper retried via
+/// `repeat_until_error_or` (M5 from the PR #1238 review).
+const REDIR_302_CLIENT: &str = "redir_302_client";
+const REDIR_308_CLIENT: &str = "redir_308_client";
+
 /// Helper: drive a single H1 redirect request through `policy` and assert
-/// the response carries the expected status + a `Location: https://...`.
-/// Used by the 302 / 308 tests below (closes #1009).
-fn try_redirect_emits_status(name: &str, policy: RedirectPolicy, expected_status: u16) -> State {
+/// the response carries the expected status line, a `Location: https://...`
+/// header pointing at the test's frontend authority, and that the entire
+/// response was read from the TCP stream (loop-read until eof per
+/// CLAUDE.md). Used by the 302 / 308 tests below (closes #1009).
+fn try_redirect_emits_status(
+    log_tag: &str,
+    client_label: &'static str,
+    policy: RedirectPolicy,
+    expected_status: u16,
+) -> State {
     let front_address = create_local_address();
     let unused_back = create_unbound_local_address();
-    let cluster_id = format!("redir_{name}_cluster");
-    let back_id = format!("redir_{name}_back_0");
-    let mut worker = spawn_worker_with_http_listener(name, front_address);
+    let cluster_id = format!("redir_{log_tag}_cluster");
+    let back_id = format!("redir_{log_tag}_back_0");
+    let mut worker = spawn_worker_with_http_listener(log_tag, front_address);
 
     worker.send_proxy_request(
         RequestType::AddCluster(Cluster {
@@ -234,25 +248,35 @@ fn try_redirect_emits_status(name: &str, policy: RedirectPolicy, expected_status
     worker.read_to_last();
 
     let mut client = Client::new(
-        format!("{name}_client").leak() as &str,
+        client_label,
         front_address,
         http_request("GET", "/path", "ping", "localhost"),
     );
     client.connect();
     client.send();
     let response = client
-        .receive()
+        .receive_until_eof(Duration::from_millis(SYNC_BACKEND_ACCEPT_BUDGET_MS))
         .expect("frontend must emit a redirect default-answer");
     worker.soft_stop();
     worker.wait_for_server_stop();
 
-    let status_line = format!("{expected_status}");
-    let ok = response.contains(&status_line)
-        && response.to_ascii_lowercase().contains("location: https");
-    if ok {
+    // Status-line prefix check (M3) — `response.contains("302")`
+    // would false-positive on a body or `Sozu-Id` header carrying the
+    // digits.
+    let expected_status_line = format!("HTTP/1.1 {expected_status} ");
+    let status_ok = response.starts_with(&expected_status_line);
+    let lowered = response.to_ascii_lowercase();
+    // Location host must match the request's `Host:` value
+    // (`http_request(..., "localhost")` above) — the redirect engine
+    // preserves the request authority. Asserts against an empty host
+    // (`https://:443/...`) regression.
+    let location_ok = lowered.contains("location: https://localhost");
+    if status_ok && location_ok {
         State::Success
     } else {
-        eprintln!("expected {expected_status} with https Location, got:\n{response}");
+        eprintln!(
+            "expected status line {expected_status_line:?} + Location: https://localhost, got:\n{response}"
+        );
         State::Fail
     }
 }
@@ -260,7 +284,7 @@ fn try_redirect_emits_status(name: &str, policy: RedirectPolicy, expected_status
 /// `RedirectPolicy::Found` emits 302 with the resolved HTTPS `Location`.
 /// Closes #1009 (302 leg).
 pub fn try_redirect_found_h1_emits_302() -> State {
-    try_redirect_emits_status("REDIR-H1-302", RedirectPolicy::Found, 302)
+    try_redirect_emits_status("REDIR-H1-302", REDIR_302_CLIENT, RedirectPolicy::Found, 302)
 }
 
 #[test]
@@ -275,7 +299,12 @@ fn test_redirect_found_h1_emits_302() {
 /// `Location`. Closes #1009 (308 leg). 308 differs from 301 in that the
 /// HTTP method is preserved on follow (no GET-rewrite on POST).
 pub fn try_redirect_permanent_redirect_h1_emits_308() -> State {
-    try_redirect_emits_status("REDIR-H1-308", RedirectPolicy::PermanentRedirect, 308)
+    try_redirect_emits_status(
+        "REDIR-H1-308",
+        REDIR_308_CLIENT,
+        RedirectPolicy::PermanentRedirect,
+        308,
+    )
 }
 
 #[test]
