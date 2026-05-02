@@ -350,9 +350,12 @@ mod tests {
         // for the rest of the test process. Verify it points at a regular
         // file via `std::fs::metadata` which follows the magic symlink to
         // the original inode.
-        let meta = std::fs::metadata(&path)
-            .unwrap_or_else(|e| panic!("metadata({path}) failed: {e}"));
-        assert!(meta.is_file(), "/proc/self/fd/<n> did not resolve to a regular file");
+        let meta =
+            std::fs::metadata(&path).unwrap_or_else(|e| panic!("metadata({path}) failed: {e}"));
+        assert!(
+            meta.is_file(),
+            "/proc/self/fd/<n> did not resolve to a regular file"
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -363,6 +366,9 @@ mod tests {
         // exit, so we don't multiplex one fd across multiple call sites.
         let p1 = get_executable_exec_path().expect("first call");
         let p2 = get_executable_exec_path().expect("second call");
-        assert_ne!(p1, p2, "expected distinct fd paths from two opens, got {p1} and {p2}");
+        assert_ne!(
+            p1, p2,
+            "expected distinct fd paths from two opens, got {p1} and {p2}"
+        );
     }
 }
