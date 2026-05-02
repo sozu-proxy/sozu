@@ -333,7 +333,7 @@ pub fn fork_main_into_worker(
                          vulnerable to on-disk binary replacement race per #515",
                         e
                     );
-                    executable_path.clone()
+                    executable_path.to_owned()
                 }
             };
             let err = Command::new(&exec_path)

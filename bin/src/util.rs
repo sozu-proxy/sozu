@@ -217,10 +217,11 @@ pub unsafe fn get_executable_path() -> Result<String, UtilError> {
 /// operator's whole point is to switch to a different version. There the
 /// path-based `Command::new(executable_path)` is correct.
 ///
-/// We keep the fd open until process exit (the kernel closes it via
-/// `O_CLOEXEC` when exec succeeds; if exec fails, the fd persists harmlessly
-/// for the rest of the master's lifetime — a bounded, per-exec-attempt leak
-/// on a path that is itself a master-in-trouble code path).
+/// On successful exec the kernel closes the fd via `O_CLOEXEC`. On failed
+/// exec the forked child returns `Err(WorkerError::SpawnChild(...))` and
+/// the worker spawn aborts, so the fd cannot accumulate across spawn
+/// attempts — the helper is called inside the child immediately before
+/// `execve(2)`, never in the long-running master.
 ///
 /// On non-Linux platforms (FreeBSD, macOS) we fall back to the historical
 /// path-string approach. The race window is identical to before; the
@@ -245,9 +246,9 @@ pub fn get_executable_exec_path() -> Result<String, UtilError> {
     })?;
     // Convert OwnedFd → RawFd. The fd is intentionally not dropped: it
     // must remain open until exec(2) consumes it. O_CLOEXEC closes it
-    // automatically on successful exec; on failed exec the fd persists
-    // for the rest of the master's lifetime, which is acceptable on a
-    // master-in-trouble code path.
+    // automatically on successful exec; on failed exec the forked child
+    // returns Err and aborts the spawn, so no leak persists on the
+    // long-running master.
     let raw_fd = owned_fd.into_raw_fd();
     Ok(format!("/proc/self/fd/{raw_fd}"))
 }
@@ -349,9 +350,9 @@ mod tests {
     ///
     /// This unit test asserts the shape of the returned path and that the
     /// underlying fd is valid (resolvable via the kernel's `/proc/self/fd`).
-    /// The race-free property under binary replacement is asserted in the
-    /// e2e upgrade-race tests (`e2e/src/tests/upgrade_race_tests.rs` —
-    /// follow-up commit).
+    /// The race-free property under binary replacement follows from the
+    /// kernel-tested magic-symlink semantics of `/proc/self/exe`; this
+    /// unit test asserts the helper's shape only.
     ///
     /// [#515]: https://github.com/sozu-proxy/sozu/issues/515
     #[cfg(target_os = "linux")]
