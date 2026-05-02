@@ -27,33 +27,49 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # MSRV cell: default features (matches `cargo install sozu`).
-          # Hosts the workspace-wide fmt + doc steps; no bench.
+          # MSRV cell: full feature matrix (opentelemetry + splice + simd
+          # on top of default jemallocator). Hosts the workspace-wide
+          # fmt + doc steps; no bench. `default-features` cell below
+          # acts as the bare-default baseline for feature-off breakage.
           - cell: msrv
+            toolchain: '1.88.0'
+            flags: '--features opentelemetry,splice,simd'
+            bench: false
+            experimental: false
+          # `default-features` baseline: nothing beyond the default
+          # `jemallocator` feature. Catches breakage when the optional
+          # features (opentelemetry, splice, simd) are *off* and only
+          # the workspace's default-features path is exercised. Mirrors
+          # `cargo install sozu` behaviour for a fresh user install.
+          - cell: default-features
             toolchain: '1.88.0'
             flags: ''
             bench: false
             experimental: false
-          # The four crypto-provider cells run lint and bench in
-          # addition to build + test, with explicit feature selection.
+          # The four crypto-provider cells now exercise the full
+          # feature matrix (`<crypto>,opentelemetry,splice,simd`) so
+          # the CI cells reflect what release artefacts ship with
+          # (Q16: Docker image build flags). `--no-default-features`
+          # explicitly excludes `jemallocator` (the binary feature)
+          # because the lib-only test runs do not link the bin crate.
           - cell: crypto-ring
             toolchain: '1.88.0'
-            flags: '--no-default-features --features crypto-ring'
+            flags: '--no-default-features --features crypto-ring,opentelemetry,splice,simd'
             bench: true
             experimental: false
           - cell: crypto-aws-lc-rs
             toolchain: '1.88.0'
-            flags: '--no-default-features --features crypto-aws-lc-rs'
+            flags: '--no-default-features --features crypto-aws-lc-rs,opentelemetry,splice,simd'
             bench: true
             experimental: false
           - cell: crypto-openssl
             toolchain: '1.88.0'
-            flags: '--no-default-features --features crypto-openssl'
+            flags: '--no-default-features --features crypto-openssl,opentelemetry,splice,simd'
             bench: true
             experimental: false
           - cell: fips
             toolchain: '1.88.0'
-            flags: '--no-default-features --features fips'
+            flags: '--no-default-features --features fips,opentelemetry,splice,simd'
             bench: true
             experimental: false
           # Toolchain-drift cells: same politics as msrv (default
