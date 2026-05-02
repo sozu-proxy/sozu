@@ -150,7 +150,30 @@ pub fn fork_main_into_new_main(
             // and returns a value type. No invariant beyond "FFI signature
             // matches libc".
             trace!("child({}):\twill spawn a child", unsafe { libc::getpid() });
-            let res = Command::new(executable_path)
+
+            // #515: prefer fd-based exec (`/proc/self/fd/<n>` opened with
+            // `O_PATH` on `/proc/self/exe`) so that a hot-upgrade triggered
+            // after the on-disk binary at `executable_path` was replaced
+            // still re-execs the **original** inode the master was started
+            // from — race-free against `cp new-sozu /usr/bin/sozu` between
+            // master startup and the upgrade verb. On Linux, this returns
+            // `/proc/self/fd/<n>`; on FreeBSD/macOS it falls back to
+            // `executable_path` (out of scope for #515).
+            let exec_path = match crate::util::get_executable_exec_path() {
+                Ok(p) => p,
+                Err(e) => {
+                    // Fail-soft: log and continue with the path-string
+                    // capture. Worst case is the v1.x behaviour, which is
+                    // what we shipped before this fix.
+                    error!(
+                        "could not open /proc/self/exe O_PATH ({}); falling back to path-based exec — \
+                         vulnerable to on-disk binary replacement race per #515",
+                        e
+                    );
+                    executable_path.clone()
+                }
+            };
+            let res = Command::new(&exec_path)
                 .arg("main")
                 .arg("--fd")
                 .arg(new_to_old.as_raw_fd().to_string())

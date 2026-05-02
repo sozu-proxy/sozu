@@ -316,7 +316,27 @@ pub fn fork_main_into_worker(
             // and returns a value type. No invariant beyond "FFI signature
             // matches libc".
             trace!("child({}):\twill spawn a child", unsafe { libc::getpid() });
-            let err = Command::new(executable_path)
+
+            // #515: prefer fd-based exec (`/proc/self/fd/<n>` opened with
+            // `O_PATH` on `/proc/self/exe`) so that a worker spawn after
+            // the on-disk binary at `executable_path` was replaced still
+            // execs the **original** inode the master was started from —
+            // race-free against `cp new-sozu /usr/bin/sozu` between master
+            // startup and worker auto-restart. The forked child inherits
+            // the parent's mmap'd image, so `/proc/self/exe` in the child
+            // resolves to the same original inode.
+            let exec_path = match crate::util::get_executable_exec_path() {
+                Ok(p) => p,
+                Err(e) => {
+                    error!(
+                        "could not open /proc/self/exe O_PATH ({}); falling back to path-based exec — \
+                         vulnerable to on-disk binary replacement race per #515",
+                        e
+                    );
+                    executable_path.clone()
+                }
+            };
+            let err = Command::new(&exec_path)
                 .arg("worker")
                 .arg("--id")
                 .arg(worker_id)
