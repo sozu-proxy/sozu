@@ -1146,6 +1146,10 @@ enum EventKind {
     HEALTH_CHECK_HEALTHY = 27;
     // Backend health-check transitioned to unhealthy after consecutive failures.
     HEALTH_CHECK_UNHEALTHY = 28;
+    // Cluster transitioned from "all backends down" back to "at least one
+    // backend available". Pairs with `NoAvailableBackends` (tag 2) so
+    // dashboards can plot per-cluster recovery.
+    CLUSTER_RECOVERED = 29;
 }
 
 message ClusterHashes {
