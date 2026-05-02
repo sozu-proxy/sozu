@@ -470,6 +470,7 @@ impl HealthChecker {
                     cluster_id
                 );
                 incr!("health_check.up");
+                gauge!("backend.available", 1, Some(cluster_id), Some(backend_id));
                 push_event(Event {
                     kind: EventKind::HealthCheckHealthy as i32,
                     cluster_id: Some(cluster_id.to_owned()),
@@ -490,6 +491,7 @@ impl HealthChecker {
                     cluster_id
                 );
                 incr!("health_check.down");
+                gauge!("backend.available", 0, Some(cluster_id), Some(backend_id));
                 push_event(Event {
                     kind: EventKind::HealthCheckUnhealthy as i32,
                     cluster_id: Some(cluster_id.to_owned()),
@@ -518,7 +520,12 @@ impl HealthChecker {
             .filter(|b| b.borrow().health.is_healthy())
             .count();
         if total > 0 {
-            gauge!("health_check.healthy_backends", healthy);
+            gauge!(
+                "health_check.healthy_backends",
+                healthy,
+                Some(cluster_id),
+                None
+            );
             if healthy > 0 && healthy * 2 <= total {
                 warn!(
                     "{} cluster {} has only {}/{} healthy backends",

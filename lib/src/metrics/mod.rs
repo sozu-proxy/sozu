@@ -424,7 +424,17 @@ macro_rules! gauge (
     $crate::metrics::METRICS.with(|metrics| {
       (*metrics.borrow_mut()).set_gauge($key, v);
     });
-  })
+  });
+  ($key:expr, $value:expr, $cluster_id:expr, $backend_id:expr) => {
+    {
+        use $crate::metrics::Subscriber;
+        let v = $value;
+
+        $crate::metrics::METRICS.with(|metrics| {
+          (*metrics.borrow_mut()).receive_metric($key, $cluster_id, $backend_id, $crate::metrics::MetricValue::Gauge(v as usize));
+        });
+    }
+  }
 );
 
 #[macro_export]

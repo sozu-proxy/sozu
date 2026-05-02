@@ -155,6 +155,17 @@ impl Backend {
         }
     }
 
+    /// Canonical "available" check used by per-backend metrics and cluster
+    /// availability accounting. Mirrors `can_open()` semantics: a backend
+    /// is available iff its active-health state is healthy, its lifecycle
+    /// status is `Normal` (not draining/closed), and its passive retry
+    /// policy is not in backoff.
+    pub fn is_available(&self) -> bool {
+        self.health.is_healthy()
+            && self.status == BackendStatus::Normal
+            && matches!(self.retry_policy.can_try(), Some(retry::RetryAction::OKAY))
+    }
+
     pub fn inc_connections(&mut self) -> Option<usize> {
         if self.status == BackendStatus::Normal {
             self.active_connections += 1;
