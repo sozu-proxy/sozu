@@ -2,7 +2,42 @@
 
 ## [Unreleased]
 
-See milestone [`v1.1.0`](https://github.com/sozu-proxy/sozu/projects/3?card_filter_query=milestone%3Av1.1.0)
+This section consolidates the v1.1.1 → v2.0.0 work that was previously split
+across three separate `Unreleased` blocks (main-scoped, `feat/h2-mux`,
+`feat/answer-templates-rewrite-auth`). All three feature stacks are now on
+`main`; their entries appear below grouped by Keep-a-Changelog category, with
+provenance markers where multiple stacks contributed under the same heading.
+
+### Breaking changes (v1.1.x → v2.0.0)
+
+The v2.0.0 release carries breaking changes that operators must address before
+upgrade. See `doc/upgrade/1.x-to-2.0.md` for the full migration guide.
+
+- **Proto field renumbering for health-check carriers ([#1191](https://github.com/sozu-proxy/sozu/pull/1191))**:
+  `Request.set_health_check` 47→52, `Request.remove_health_check` 48→53,
+  `Request.query_health_checks` 49→54, `Cluster.health_check` 8→15,
+  `ResponseContent.health_checks_list` 14→15, `EventKind.HEALTH_CHECK_HEALTHY`
+  5→27, `EventKind.HEALTH_CHECK_UNHEALTHY` 4→28. External clients hard-coded
+  to the older tags must be rebuilt.
+- **Renamed metrics ([#1196](https://github.com/sozu-proxy/sozu/pull/1196))**:
+  `client.connections_percentage` → `client.connections_percent`;
+  `client.max_connections` → `client.connections_max`; `buffer.number` →
+  `buffer.in_use`. Dashboards scraping the old names need updating.
+- **`http.errors` now labelled with `(cluster_id, backend_id)` ([#1196](https://github.com/sozu-proxy/sozu/pull/1196))**.
+- **Pattern-trie segment regex anchoring**: every segment-level regex inserted
+  into the routing trie is now wrapped with `\A...\z` at insert time. Operators
+  who relied on partial-segment matching (e.g. `cdn[0-9]+` rule inadvertently
+  matching `cdn123xxx`) need to widen their patterns explicitly.
+- **HAProxy-style `del-header` semantic**: empty `Header.val` now removes the
+  named header. Operators who already configured custom headers with the empty
+  string as a value should set a whitespace-only value instead.
+- **Sub-16 393 `buffer_size` rejected at config load when any HTTPS listener
+  advertises H2 ALPN**. Operators wanting a smaller buffer must drop `"h2"` from
+  the affected listeners' `alpn_protocols`.
+- **Cipher list constant rename ([#1191](https://github.com/sozu-proxy/sozu/pull/1191))**:
+  internal `DEFAULT_RUSTLS_CIPHER_LIST` renamed to `DEFAULT_CIPHER_LIST`. The
+  TOML key (`cipher_list`) is unchanged. `P-521` removed from default
+  `groups_list` (rustls 0.23 does not support it).
 
 ### Fixed
 
@@ -73,15 +108,12 @@ See milestone [`v1.1.0`](https://github.com/sozu-proxy/sozu/projects/3?card_filt
 
 - **Worker panic on short hostnames vs `Wildcard` rules ([#1223](https://github.com/sozu-proxy/sozu/issues/1223))**: `DomainRule::Wildcard::matches` in `lib/src/router/mod.rs` computed `hostname.len() - s.len() + 1` unconditionally, panicking with `attempt to subtract with overflow` in debug builds when the incoming hostname was shorter than the configured wildcard pattern (CWE-191 → CWE-754, remote-reachable DoS). In release builds the wrap is masked by the `&&` short-circuit on `ends_with(suffix)`, so the false-positive in §1 of the issue was rare; debug builds always panicked. The arm now uses `<[u8]>::strip_suffix` and validates the leftmost prefix on the returned slice — there is no length arithmetic to underflow, and short hostnames return `false` without panic. Boundary case `hostname == suffix` (empty leftmost label, e.g. `.foo.example.com` against `*.foo.example.com`) is now rejected as an invalid DNS label per RFC 1035 §3.1. Reachable from H1 (`HttpListener::frontend_from_request`, `lib/src/http.rs:658`), H2 (single-byte `:authority`, `lib/src/https.rs:865`), and operator-driven `Router::has_hostname` introspection. Affected versions: all releases including `sozu-lib` 1.1.1 and earlier (bug introduced in `a9dd46e9`, 2019-06-04). Regression tests `match_domain_rule_wildcard_short_hostname_does_not_panic` and `router_lookup_wildcard_pre_rule_short_hostname_does_not_panic` in `lib/src/router/mod.rs`.
 
-## feat/answer-templates-rewrite-auth - Unreleased
+### Added — Answer templates / URL rewrite / Basic auth
 
-Brings the upstream answer-template / URL-rewrite / basic-auth feature stack
-(originally proposed across PRs #1206, #1207, #1208, #1210) onto current `main`
-without unwinding the `feat/h2-mux` work merged in #1209. The features are
-re-implemented at the active `mux/` layer instead of the legacy `kawa_h1/`
-session path the upstream PRs targeted, so every running session benefits.
-
-### 🌟 Added
+The following entries cover the upstream answer-template / URL-rewrite /
+basic-auth feature stack (originally proposed across PRs #1206, #1207, #1208,
+#1210) re-implemented at the active `mux/` layer on `main` instead of the
+legacy `kawa_h1/` session path the upstream PRs targeted.
 
 - **Flexible HTTP answer templates per listener and per cluster**: the proto
   schema for `HttpListenerConfig`, `HttpsListenerConfig`, and `Cluster` gains
@@ -162,7 +194,7 @@ session path the upstream PRs targeted, so every running session benefits.
   `Route::ClusterId` and `Route::Deny` variants remain so existing
   match arms still compile; a follow-up will retire them.
 
-### 🔄 Changed
+### Changed — Answer templates / URL rewrite / Basic auth
 
 - `HttpAnswers::new` now takes `&BTreeMap<String, String>` instead of
   `&Option<CustomHttpAnswers>`. `HttpAnswers::get` returns
@@ -182,7 +214,7 @@ session path the upstream PRs targeted, so every running session benefits.
 - `CachedTags` derives `PartialEq + Eq + Clone` so `RouteResult` can
   derive `PartialEq` for assertions in router unit tests.
 
-### ⚠️ Behaviour-affecting
+### Behaviour-affecting (already in §Breaking changes above)
 
 - Pattern-trie domain regexes now match the entire segment. Operators
   who relied on partial-segment matching (e.g. a `cdn[0-9]+` rule
@@ -196,9 +228,7 @@ session path the upstream PRs targeted, so every running session benefits.
   whitespace-only value instead — though that is malformed per RFC 9110
   §5.5 and should be reviewed.
 
-## feat/h2-mux - Unreleased
-
-### 🌟 Added
+### Added — H2 multiplexer (PR #1209)
 
 - **`sozu listener {http,https,tcp} update` — in-place runtime patch verb**: Operators can now tune non-bind-only listener settings on a running proxy without cycling the listening socket. Patchable fields include H2 flood thresholds (CVE-2023-44487 / CVE-2024-27316 / CVE-2025-8671 mitigations), SNI binding enforcement (`strict_sni_binding`), protocol-downgrade protection (`disable_http11`), ALPN preference, per-stream idle timeout, graceful-shutdown deadline, stream-0 WINDOW_UPDATE cap, correlation-header name (`sozu_id_header`), custom HTTP answers, and all session timeouts. The patch is field-masked: omitted fields are preserved. Existing sessions keep their configuration snapshot; only new sessions, connections, or TLS handshakes pick up the new values. CVE mitigations can now be tightened under attack without any connection disruption.
 
@@ -262,7 +292,7 @@ session path the upstream PRs targeted, so every running session benefits.
 
 - **OpenTelemetry doc rewrite**: the section now correctly identifies the feature as W3C `traceparent` passthrough (no SDK, no spans, no OTLP exporter). The previous `Limitations` text falsely claimed H2 requests were not propagated — verified false against the on-branch source (the H1 editor runs on H2 frames via `pkawa.rs`, then re-encoded by `H2BlockConverter`).
 
-### ✍️ Changed
+### Changed — H2 multiplexer (PR #1209)
 
 - **Backend retry-budget exhaustion no longer emits `ERROR`**: TCP / HTTP/1 / HTTP/2 paths all demote the per-session retry-budget exhaustion (`CONN_RETRIES = 3` consecutive backend-connect failures) from `error!` to `warn!`, aligning the three protocols with the branch severity taxonomy (peer-driven transport conditions stay below `ERROR`). A new `backend.connect.retries_exhausted{cluster_id, backend_id}` counter is emitted at all three gates — operators alerting on this class should rate the counter instead of grepping logs. The TCP caller-echo line (`Error connecting to backend: …`) is deduplicated to `trace!` when caused by `MaxConnectionRetries` (already logged + metered at the gate). Retry budget, session-close, and 503-answer behaviour are unchanged.
 
@@ -284,7 +314,7 @@ session path the upstream PRs targeted, so every running session benefits.
 
 - **Config-load validation rejects sub-16 393 `buffer_size` when any HTTPS listener advertises H2 ALPN**: previously a TOML typo such as `buffer_size = 8192` started Sōzu cleanly and only manifested as an H2 mux deadlock under traffic on full-size frames (no panic, no obvious log). `ConfigBuilder::into_config` now scans `https_listeners` for `"h2"` in `alpn_protocols` and returns `ConfigError::BufferSizeTooSmallForH2 { buffer_size, minimum, listeners }` at boot when the global buffer is below `H2_MIN_BUFFER_SIZE = 16_393` (RFC 9113 §6.5.2 + §4.1: 16 384-byte max frame payload + 9-byte frame header). Operators who deliberately want a smaller buffer must drop `"h2"` from the affected listeners' `alpn_protocols`. Documented in `doc/configure.md` "Buffer size for HTTP/2".
 
-### ⛑️ Fixed
+### Fixed — H2 multiplexer (PR #1209)
 
 - **`command_allowed_uids` UID allowlist on the unix command socket**: the command socket previously authenticated callers via the `0o600` mode alone. The new optional `command_allowed_uids: Vec<u32>` config field rejects `SO_PEERCRED` UIDs not in the list at the top of `Server::handle_client_request`, so operators can restrict mutating verbs to a specific UID even when other same-UID daemons coexist.
 
@@ -354,7 +384,7 @@ session path the upstream PRs targeted, so every running session benefits.
 
 - **Proxy Protocol → TLS readiness transfer**: Fixed the PP → TLS upgrade to transfer the full `Readiness` struct (interest + event) instead of only the event, preventing lost interest bits, see [`9f414492`](https://github.com/sozu-proxy/sozu/commit/9f414492).
 
-### 📚 Documentation
+### Documentation
 
 - **README / RELEASE / CONTRIBUTING refreshed for the post-`sozuctl`, post-Travis, GitHub Actions / `main`-branch reality.** Dead Travis + Gitter badges removed; copyright bumped to 2015-2026; workspace source map regenerated; remaining `sozuctl` / `master/` / `sozu-command-futures` references retired. See [`19828c2f`](https://github.com/sozu-proxy/sozu/commit/19828c2f1b586aa4847dab0fa644a8ff947cd28e), [`338c7d68`](https://github.com/sozu-proxy/sozu/commit/338c7d688a1a948438565530f00280e4814854f8).
 
@@ -372,7 +402,7 @@ session path the upstream PRs targeted, so every running session benefits.
 
 - **Comment-only `sozuctl` → `sozu` rename** across `bin/src/command/{server,sessions,requests}.rs` and the request-builder fixture: `/proc/comm` field strings flip to `"sozu"`; prose mentions become `sozu CLI` or `sozu command-socket client`. No source identifiers or public symbols renamed. See [`cb782a02`](https://github.com/sozu-proxy/sozu/commit/cb782a02).
 
-### 🤖 Continuous Integration
+### CI
 
 - **Replaced archived `actions-rs/toolchain@v1` and `actions-rs/cargo@v1`** (deprecated since 2023) with `dtolnay/rust-toolchain@<channel>` and direct `cargo` invocations across `.github/workflows/ci.yml`. The matrix `test` and `doc` jobs no longer depend on unmaintained third-party actions. See [`0b73c8a1`](https://github.com/sozu-proxy/sozu/commit/0b73c8a1).
 
@@ -386,7 +416,7 @@ session path the upstream PRs targeted, so every running session benefits.
 
 The categorised list below covers every commit in the `main..HEAD` range for `feat/h2-mux` as of this revision (`df500868..9cdf2c22`, 429 entries on 2026-04-27). Bullets in the narrative sections above curate the user-visible behaviour; the bullets below give a one-line per-commit index for code review and bisection.
 
-#### 🌟 Features
+#### Features
 
 - [ [`09029d57`](https://github.com/sozu-proxy/sozu/commit/09029d5743673085edea1226be445975e4f02956) ] feat(command): optional command_allowed_uids enforcement on every verb [`Florentin Dubois`] (`2026-04-25`)
 - [ [`f2a10b85`](https://github.com/sozu-proxy/sozu/commit/f2a10b8502391bcb3dcce7433c48a38f9940ca62) ] feat(config): reject disable_http11=true + http/1.1 ALPN combination [`Florentin Dubois`] (`2026-04-25`)
@@ -448,7 +478,7 @@ The categorised list below covers every commit in the `main..HEAD` range for `fe
 - [ [`9b4e4846`](https://github.com/sozu-proxy/sozu/commit/9b4e4846389dce4b8fa8e9e74cf9456b718bd749) ] feat(h2): integrate mux into HTTP/HTTPS state machines [`Florentin Dubois`] (`2026-03-09`)
 - [ [`dbdec91f`](https://github.com/sozu-proxy/sozu/commit/dbdec91f34409c69dbb86edcda037db9dad704fa) ] feat(h2): extract mux module from mux_v1 branch [`Florentin Dubois`] (`2026-03-09`)
 
-#### ⛑️ Fixed
+#### Fixed
 
 - [ [`9cdf2c22`](https://github.com/sozu-proxy/sozu/commit/9cdf2c22960a931275e3dc61c6e5a5b97be2f27c) ] fix(mux): gate debug event import [`Florentin Dubois`] (`2026-04-27`)
 - [ [`ba144c02`](https://github.com/sozu-proxy/sozu/commit/ba144c0220ec4072fba8b78d61aeb973cb1db757) ] fix(ci): pin clippy to 1.88.0 to match local lint baseline [`Florentin Dubois`] (`2026-04-26`)
@@ -745,13 +775,13 @@ The categorised list below covers every commit in the `main..HEAD` range for `fe
 - [ [`55b8efda`](https://github.com/sozu-proxy/sozu/commit/55b8efda03374122bea3846941c4c89453bcfa99) ] test(e2e): add h2spec HTTP/2 conformance test integration [`Florentin Dubois`] (`2026-03-09`)
 - [ [`0100caf1`](https://github.com/sozu-proxy/sozu/commit/0100caf17a1d31028d7a146a32e440249a6deca7) ] test(e2e): add comprehensive HTTP/2 e2e tests [`Florentin Dubois`] (`2026-03-09`)
 
-#### 🤖 Continuous Integration
+#### Continuous Integration
 
 - [ [`7c3d9a4d`](https://github.com/sozu-proxy/sozu/commit/7c3d9a4d436e6d70e87f4c6cce3295c4f736e45f) ] ci(workflows): modernise GitHub Actions, add fmt + clippy + MSRV gates [`Florentin Dubois`] (`2026-04-26`)
 - [ [`0be2242f`](https://github.com/sozu-proxy/sozu/commit/0be2242f9fb4961790bd45d4bf7307939b2a6c55) ] ci: install nightly + cargo-fuzz so fuzz targets run on every matrix job [`Florentin Dubois`] (`2026-04-24`)
 - [ [`86c54b0e`](https://github.com/sozu-proxy/sozu/commit/86c54b0e4a6877d71860ec6a04769b7e570c5958) ] ci(benchmark): fix rsa-2048 certificate hostname [`Florentin Dubois`] (`2026-04-15`)
 
-#### ✍️ Changed
+#### Refactoring & style
 
 - [ [`c36792a6`](https://github.com/sozu-proxy/sozu/commit/c36792a6d160082aa989fd8c41bb1a7797042c18) ] style: cargo +nightly fmt --all on consolidated review changes [`Florentin Dubois`] (`2026-04-25`)
 - [ [`c5cfe3d7`](https://github.com/sozu-proxy/sozu/commit/c5cfe3d77c065febe60694751934ee90d22b8d76) ] style(kawa_h1): wrap remaining 4 log sites and recognise .log_context() method form [`Florentin Dubois`] (`2026-04-25`)
@@ -788,7 +818,7 @@ The categorised list below covers every commit in the `main..HEAD` range for `fe
 - [ [`49ae3465`](https://github.com/sozu-proxy/sozu/commit/49ae346547c0cb40e0bbee40809f7fe9377f2c5c) ] style: apply cargo fmt to CLI, config, and HTTPS modules [`Florentin Dubois`] (`2026-03-11`)
 - [ [`2dc4b4bd`](https://github.com/sozu-proxy/sozu/commit/2dc4b4bd884ea994221409b1be74eb549bdee2b3) ] style(mux): apply nightly rustfmt formatting [`Florentin Dubois`] (`2026-03-09`)
 
-#### 📚 Documentation
+#### Documentation (commit log)
 
 - [ [`1bd70159`](https://github.com/sozu-proxy/sozu/commit/1bd701591135e8a75c7d1b31f65b3e9f45e11d62) ] docs(changelog): record documentation + CI pass [`Florentin Dubois`] (`2026-04-26`)
 - [ [`865dae18`](https://github.com/sozu-proxy/sozu/commit/865dae18f3e0a63bd597b916ec1737d9fa2fc12c) ] docs(narrative): full rewrite of doc/lifetime_of_a_session.md [`Florentin Dubois`] (`2026-04-26`)
