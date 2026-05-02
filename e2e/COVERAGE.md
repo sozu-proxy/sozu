@@ -78,43 +78,62 @@ actually exercise. The decision matrix:
 When adding a test, declare the applicable cells in a comment and use
 the relevant `try_tls_cardinality_*` wrapper(s).
 
-## Convenience pattern (to be added)
+## Convenience pattern
 
-A future small commit should add a `protocol_pair_matrix!()` macro that
-auto-generates the wrapper functions for a feature:
+`e2e/src/tests/protocol_pair_matrix.rs` exposes a `protocol_pair_matrix!`
+macro that emits the four wrapper functions plus their `#[test]`
+harnesses for a single feature cell function:
 
 ```rust
-// HYPOTHETICAL — not landed yet:
-protocol_pair_matrix! {
-    name = basic_auth,
-    fn = try_basic_auth_cell,
-    cells = [h1_h1, h1_h2, h2_h1, h2_h2],
-    cert_kinds = [rsa, ecdsa],
-}
+// Cell function: takes (frontend_h2, backend_h2), returns State.
+fn try_basic_auth_cell(frontend_h2: bool, backend_h2: bool) -> State { ... }
+
+// Macro emits try_basic_auth_h1_h1 / _h1_h2 / _h2_h1 / _h2_h2 wrappers
+// plus matching test_basic_auth_h1_h1 / _h1_h2 / _h2_h1 / _h2_h2
+// `#[test]` harnesses that wrap the cell in `repeat_until_error_or`.
+protocol_pair_matrix!(basic_auth, try_basic_auth_cell, "basic auth");
 ```
 
-This is a future ergonomics pass. Until then, hand-author the wrappers
-following the existing `try_tls_cardinality_*` shape.
+Hand-authored wrappers (e.g. the cardinality smoke tests in `tests.rs`)
+remain valid for cases that need a custom `repeat` count or a non-cell
+shape. The macro covers the common case where each cell is one
+`(frontend_h2, backend_h2)` boolean pair.
 
-## Priority-1 backfill (follow-up commit)
+## Priority-1 backfill
 
-The features below ship in the upcoming release notes; their e2e
-coverage should pass through every applicable cell before the release
-tag:
+Landed in `e2e/src/tests/protocol_pair_matrix.rs` (16 tests, four cells
+each):
 
-- Basic auth (`required_auth = true` + `authorized_hashes`) ←
-  `redirect_rewrite_auth_tests.rs` already covers H1+TLS; add H2 cells.
-- 301 redirects (`RedirectPolicy::PERMANENT`) ←
-  `redirect_rewrite_auth_tests.rs` covers H1+TLS; add H2 cells.
-- X-Real-IP injection + anti-spoof elision ← H2 cells especially
-  important for trailer-frame elision regression.
-- Per-IP `429` limit ← `cluster_ip_limit_tests.rs` covers H1; add H2.
-- `evict_on_queue_full` ← `eviction_tests.rs`.
-- Custom answer template (`answers."503"`).
+- **Basic auth** (`required_auth = true` + `authorized_hashes`) — three
+  arms per cell: missing header → 401, wrong creds → 401, correct
+  creds → 200 from the backend.
+- **301 redirect** (`RedirectPolicy::Permanent`) — backend never
+  contacted; the response carries `:status 301` (H2) /
+  `HTTP/1.1 301` (H1) plus a `Location` header.
+- **Custom answer template** (`Cluster.answers."503"`) — operator's
+  503 template renders verbatim (verified via load-bearing
+  `X-Sozu-Stamp` header that the listener default does not emit).
+- **X-Real-IP elide + send** (`with_elide_x_real_ip` +
+  `with_send_x_real_ip` on the HTTPS listener) — client-supplied
+  spoof stripped, proxy-generated header reaches the backend.
+  Initial-HEADERS only; H2 trailer-frame elision is a separate
+  targeted test scaffolded at `tests::test_x_real_ip_elide_h2_trailer`.
 
-Each feature × applicable-cell pair gets one test and uses the matching
-wrapper. The check-in commit lists which (feature × cell) combinations
-were verified.
+Deferred from matrix coverage (existing single-cell tests stay
+authoritative until connection-pinning helpers land):
+
+- **Per-IP `429` limit** — `cluster_ip_limit_tests.rs` exercises the
+  H1 cleartext path. Matrix coverage needs sustained TLS + HTTP/2
+  connection holds while a second connection races; the current
+  Hyper client pool reuses connections opaquely, so saturating the
+  per-IP slot from a parallel Hyper client is unreliable.
+- **`evict_on_queue_full`** — `eviction_tests.rs` exercises the H1
+  cleartext path with raw TCP socket holds. Same connection-pinning
+  prerequisite as 429.
+
+Each feature × cell pair runs in `repeat_until_error_or(2, ...)` so a
+single transient failure surfaces as a stable fail — the harness
+matches the existing redirect/auth tests' retry budget.
 
 ## Backend-TLS expansion (preview)
 
