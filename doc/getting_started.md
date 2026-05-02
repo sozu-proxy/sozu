@@ -125,6 +125,40 @@ cd bin && cargo build --release --locked --no-default-features --features fips
 
 > When using `--no-default-features`, the `jemallocator` allocator is also disabled.
 > Add it back explicitly if desired: `--features jemallocator,crypto-aws-lc-rs`.
+>
+> On FreeBSD and NetBSD the bundled jemalloc is never linked, even with the
+> default feature set: the `jemallocator` Cargo dep is filtered out at the
+> manifest level on those targets because libc already provides jemalloc as
+> the system `malloc(3)` (FreeBSD 7.0+, NetBSD 5.0+). Sōzu defers to the
+> system allocator there, and the `--version` banner reports `-jemallocator`
+> to reflect the actual link graph.
+>
+> Tune libc's jemalloc through the standard `MALLOC_CONF` environment
+> variable. A few worked examples relevant to a reverse proxy:
+>
+> ```sh
+> # Hardening: zero freed regions, abort on OOM, fail-fast on bad config.
+> MALLOC_CONF="junk:true,abort_conf:true,confirm_conf:true,xmalloc:true"
+>
+> # Background purging threads + arena count matched to worker count.
+> MALLOC_CONF="background_thread:true,narenas:4"
+>
+> # Faster purging of dirty/muzzy pages on memory-tight hosts (defaults are
+> # 10 s = 10000 ms).
+> MALLOC_CONF="dirty_decay_ms:1000,muzzy_decay_ms:1000"
+>
+> # Opt-in heap profiling, dump on SIGPROF or `mallctl prof.dump`.
+> # Requires libc jemalloc built with `--enable-prof` (FreeBSD/NetBSD
+> # default-on; check `man malloc.conf(5)` / `man jemalloc(3)`).
+> MALLOC_CONF="prof:true,prof_active:false,prof_prefix:/tmp/jeprof,lg_prof_sample:19"
+>
+> # Print stats on exit (debugging only — high overhead).
+> MALLOC_CONF="stats_print:true"
+> ```
+>
+> NetBSD honours the same option names as FreeBSD; both follow the upstream
+> jemalloc 5.x grammar (`man malloc.conf(5)` on FreeBSD, `man jemalloc(3)`
+> on NetBSD).
 
 [ru]: https://rustup.rs
 [cr]: https://crates.io/
