@@ -205,6 +205,91 @@ fn test_redirect_permanent_h1_skips_backend() {
     );
 }
 
+/// Helper: drive a single H1 redirect request through `policy` and assert
+/// the response carries the expected status + a `Location: https://...`.
+/// Used by the 302 / 308 tests below (closes #1009).
+fn try_redirect_emits_status(name: &str, policy: RedirectPolicy, expected_status: u16) -> State {
+    let front_address = create_local_address();
+    let unused_back = create_unbound_local_address();
+    let cluster_id = format!("redir_{name}_cluster");
+    let back_id = format!("redir_{name}_back_0");
+    let mut worker = spawn_worker_with_http_listener(name, front_address);
+
+    worker.send_proxy_request(
+        RequestType::AddCluster(Cluster {
+            https_redirect_port: Some(8443),
+            ..Worker::default_cluster(&cluster_id)
+        })
+        .into(),
+    );
+    worker.send_proxy_request(
+        RequestType::AddHttpFrontend(RequestHttpFrontend {
+            redirect: Some(policy as i32),
+            redirect_scheme: Some(RedirectScheme::UseHttps as i32),
+            ..Worker::default_http_frontend(&cluster_id, front_address)
+        })
+        .into(),
+    );
+    add_backend(&mut worker, &cluster_id, &back_id, unused_back);
+    worker.read_to_last();
+
+    let mut client = Client::new(
+        format!("{name}_client").leak() as &str,
+        front_address,
+        http_request("GET", "/path", "ping", "localhost"),
+    );
+    client.connect();
+    client.send();
+    let response = client
+        .receive()
+        .expect("frontend must emit a redirect default-answer");
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+
+    let status_line = format!("{expected_status}");
+    let ok = response.contains(&status_line)
+        && response.to_ascii_lowercase().contains("location: https");
+    if ok {
+        State::Success
+    } else {
+        eprintln!("expected {expected_status} with https Location, got:\n{response}");
+        State::Fail
+    }
+}
+
+/// `RedirectPolicy::Found` emits 302 with the resolved HTTPS `Location`.
+/// Closes #1009 (302 leg).
+pub fn try_redirect_found_h1_emits_302() -> State {
+    try_redirect_emits_status("REDIR-H1-302", RedirectPolicy::Found, 302)
+}
+
+#[test]
+fn test_redirect_found_h1_emits_302() {
+    assert_eq!(
+        repeat_until_error_or(2, "302 redirect", try_redirect_found_h1_emits_302),
+        State::Success
+    );
+}
+
+/// `RedirectPolicy::PermanentRedirect` emits 308 with the resolved HTTPS
+/// `Location`. Closes #1009 (308 leg). 308 differs from 301 in that the
+/// HTTP method is preserved on follow (no GET-rewrite on POST).
+pub fn try_redirect_permanent_redirect_h1_emits_308() -> State {
+    try_redirect_emits_status("REDIR-H1-308", RedirectPolicy::PermanentRedirect, 308)
+}
+
+#[test]
+fn test_redirect_permanent_redirect_h1_emits_308() {
+    assert_eq!(
+        repeat_until_error_or(
+            2,
+            "308 redirect",
+            try_redirect_permanent_redirect_h1_emits_308
+        ),
+        State::Success
+    );
+}
+
 /// `RedirectPolicy::Unauthorized` returns a 401 even when the cluster
 /// would otherwise route normally. H1 frontend.
 pub fn try_redirect_unauthorized_h1_emits_401() -> State {

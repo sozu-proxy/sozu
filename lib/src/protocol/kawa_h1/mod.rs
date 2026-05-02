@@ -111,6 +111,17 @@ pub enum DefaultAnswer {
     Answer301 {
         location: String,
     },
+    /// RFC 9110 §15.4.3 — temporary redirect; user agents may rewrite POST
+    /// to GET on follow. Surfaced by `RedirectPolicy::Found` (#1009).
+    Answer302 {
+        location: String,
+    },
+    /// RFC 9110 §15.4.9 — permanent redirect that PRESERVES the request
+    /// method on follow (no GET-rewrite on POST). Surfaced by
+    /// `RedirectPolicy::PermanentRedirect` (#1009).
+    Answer308 {
+        location: String,
+    },
     Answer400 {
         message: String,
         phase: kawa::ParsingPhaseMarker,
@@ -170,6 +181,8 @@ impl From<&DefaultAnswer> for u16 {
     fn from(answer: &DefaultAnswer) -> u16 {
         match answer {
             DefaultAnswer::Answer301 { .. } => 301,
+            DefaultAnswer::Answer302 { .. } => 302,
+            DefaultAnswer::Answer308 { .. } => 308,
             DefaultAnswer::Answer400 { .. } => 400,
             DefaultAnswer::Answer401 { .. } => 401,
             DefaultAnswer::Answer404 { .. } => 404,
@@ -1090,6 +1103,16 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             match answer {
                 DefaultAnswer::Answer301 { .. } => incr!(
                     "http.301.redirection",
+                    self.context.cluster_id.as_deref(),
+                    self.context.backend_id.as_deref()
+                ),
+                DefaultAnswer::Answer302 { .. } => incr!(
+                    "http.302.redirection",
+                    self.context.cluster_id.as_deref(),
+                    self.context.backend_id.as_deref()
+                ),
+                DefaultAnswer::Answer308 { .. } => incr!(
+                    "http.308.redirection",
                     self.context.cluster_id.as_deref(),
                     self.context.backend_id.as_deref()
                 ),

@@ -1176,7 +1176,12 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                 set_default_answer(stream, front_readiness, 421, &answers);
                             }
                             BE::RetrieveClusterError(RetrieveClusterError::HttpsRedirect) => {
-                                set_default_answer(stream, front_readiness, 301, &answers);
+                                // Use the redirect status stashed by `Router::route_from_request`
+                                // (#1009). Falls back to 301 for the legacy
+                                // `cluster.https_redirect = true` path that does
+                                // not set the field.
+                                let code = stream.context.redirect_status.unwrap_or(301);
+                                set_default_answer(stream, front_readiness, code, &answers);
                             }
 
                             BE::Backend(ref e) => {

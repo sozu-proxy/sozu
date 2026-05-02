@@ -653,17 +653,29 @@ impl Router {
                 None => (false, None, Vec::new(), None),
             };
 
-        // ── 1. Explicit `RedirectPolicy::PERMANENT` ─────────────────────────
+        // ── 1. Explicit redirect policies (PERMANENT / FOUND / PERMANENT_REDIRECT) ──
         // Resolved BEFORE the clusterless-deny branch so a frontend that
-        // declares `redirect = permanent` emits a 301 even when no cluster
-        // is bound. This is the canonical "moved permanently to a different
-        // system" shape from the original proposal in #1161 and is the only
-        // way to express "this hostname has moved" without standing up a
-        // dummy cluster. The block does not read `cluster_id`; per-cluster
-        // values (`https_redirect_port`, `www_authenticate`, …) default to
-        // safe sentinels at the cluster lookup above when `cluster_id` is
-        // `None`, so the reorder is data-flow-safe.
-        if matches!(redirect, RedirectPolicy::Permanent) {
+        // declares `redirect = permanent | found | permanent_redirect`
+        // emits the matching 3xx even when no cluster is bound. This is
+        // the canonical "moved" shape from the original proposal in
+        // #1161 and is the only way to express "this hostname has moved"
+        // without standing up a dummy cluster. The block does not read
+        // `cluster_id`; per-cluster values (`https_redirect_port`,
+        // `www_authenticate`, …) default to safe sentinels at the cluster
+        // lookup above when `cluster_id` is `None`, so the reorder is
+        // data-flow-safe.
+        //
+        // Status code mapping (closes #1009):
+        //   Permanent          → 301 (RFC 9110 §15.4.2)
+        //   Found              → 302 (RFC 9110 §15.4.3) — UA may rewrite POST→GET
+        //   PermanentRedirect  → 308 (RFC 9110 §15.4.9) — method MUST be preserved
+        let redirect_status = match redirect {
+            RedirectPolicy::Permanent => Some(301u16),
+            RedirectPolicy::Found => Some(302u16),
+            RedirectPolicy::PermanentRedirect => Some(308u16),
+            _ => None,
+        };
+        if let Some(status_code) = redirect_status {
             let scheme = resolve_redirect_scheme(redirect_scheme, context);
             let port = rewritten_port.map(|p| p as u32).or(https_redirect_port);
             // Feed the rewritten host AND path into the `Location` URL
@@ -683,13 +695,18 @@ impl Router {
                 rewritten_path.as_deref(),
             ));
             // Stash the frontend's `redirect_template` (when set) so the
-            // 301 default-answer path can render it via
-            // `HttpAnswers::render_inline_301` instead of the listener /
-            // cluster default. Without this stash the field flows into
-            // `RouteResult` only to be dropped by the wildcard
-            // destructure below, so the operator-supplied template has
-            // no observable effect on the rendered redirect.
+            // 3xx default-answer path can render it via
+            // `HttpAnswers::render_inline_redirect` instead of the
+            // listener / cluster default. Without this stash the field
+            // flows into `RouteResult` only to be dropped by the
+            // wildcard destructure below, so the operator-supplied
+            // template has no observable effect on the rendered
+            // redirect.
             context.frontend_redirect_template = redirect_template;
+            // Stash the resolved status so the answer engine picks the
+            // matching default template (`http.301.redirection` /
+            // `http.302.redirection` / `http.308.redirection`).
+            context.redirect_status = Some(status_code);
             return Err(RetrieveClusterError::HttpsRedirect);
         }
 

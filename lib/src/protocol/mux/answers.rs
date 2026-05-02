@@ -140,6 +140,12 @@ fn default_answer_for_code(
         301 => DefaultAnswer::Answer301 {
             location: redirect_location.unwrap_or_default().to_owned(),
         },
+        302 => DefaultAnswer::Answer302 {
+            location: redirect_location.unwrap_or_default().to_owned(),
+        },
+        308 => DefaultAnswer::Answer308 {
+            location: redirect_location.unwrap_or_default().to_owned(),
+        },
         400 => DefaultAnswer::Answer400 {
             message: String::new(),
             phase: kawa::ParsingPhaseMarker::Error,
@@ -211,6 +217,8 @@ pub(crate) fn set_default_answer_with_retry_after(
     kawa.storage.clear();
     let key = match code {
         301 => "http.301.redirection",
+        302 => "http.302.redirection",
+        308 => "http.308.redirection",
         400 => "http.400.errors",
         401 => "http.401.errors",
         404 => "http.404.errors",
@@ -236,10 +244,11 @@ pub(crate) fn set_default_answer_with_retry_after(
     // computed — this preserves behaviour for the historical
     // `cluster.https_redirect = true` path that did not carry per-frontend
     // policy.
+    let is_redirect = matches!(code, 301 | 302 | 308);
     let fallback_location;
     let redirect_location = match context.redirect_location.as_deref() {
         Some(l) => Some(l),
-        None if code == 301 => {
+        None if is_redirect => {
             fallback_location = format!(
                 "https://{}{}",
                 context.authority.as_deref().unwrap_or_default(),
@@ -261,23 +270,23 @@ pub(crate) fn set_default_answer_with_retry_after(
     let cluster_id = context.cluster_id.as_deref();
     let backend_id = context.backend_id.as_deref();
 
-    // ── Frontend-scoped 301 template override ──
+    // ── Frontend-scoped redirect template override (#1009) ──
     //
-    // A `Frontend` with `redirect = permanent` may carry its own
-    // `redirect_template` body that overrides the persistent
-    // listener / cluster `http.301.redirection` template for this one
-    // request. Compile on demand via
-    // `HttpAnswers::render_inline_301`; on any compile failure (operator
-    // config bug surfacing late) fall through to the regular
-    // `answers.get` path so the request still completes with the
-    // listener default — a rendered fallback is always preferable to a
-    // hung response or 503.
-    let inline_override = if code == 301 {
+    // A `Frontend` with `redirect = permanent | found | permanent_redirect`
+    // may carry its own `redirect_template` body that overrides the
+    // persistent listener / cluster default for this one request.
+    // Compile on demand via `HttpAnswers::render_inline_redirect`; on
+    // any compile failure (operator config bug surfacing late) fall
+    // through to the regular `answers.get` path so the request still
+    // completes with the listener default — a rendered fallback is
+    // always preferable to a hung response or 503.
+    let inline_override = if is_redirect {
         context
             .frontend_redirect_template
             .as_deref()
             .and_then(|template_str| {
-                let result = HttpAnswers::render_inline_301(
+                let result = HttpAnswers::render_inline_redirect(
+                    code,
                     template_str,
                     context.redirect_location.clone(),
                     context.id.to_string(),
@@ -285,10 +294,11 @@ pub(crate) fn set_default_answer_with_retry_after(
                 );
                 if result.is_none() {
                     error!(
-                        "{} frontend redirect_template failed to compile, falling back to default 301 template",
-                        log_module_context!()
+                        "{} frontend redirect_template failed to compile, falling back to default {} template",
+                        log_module_context!(),
+                        code
                     );
-                    incr!("http.301.redirect_template.compile_error");
+                    incr!("http.redirect_template.compile_error");
                 }
                 result
             })
@@ -384,6 +394,7 @@ mod tests {
             headers_response: Vec::new(),
             retry_after_seconds: None,
             frontend_redirect_template: None,
+            redirect_status: None,
         };
         let stream =
             Stream::new(Rc::downgrade(&pool), http_ctx, 65_535).expect("pool checkout failed");

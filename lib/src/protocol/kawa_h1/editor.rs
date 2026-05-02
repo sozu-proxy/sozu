@@ -281,6 +281,12 @@ pub struct HttpContext {
     /// any other status code or for the legacy
     /// `cluster.https_redirect = true` path (which never sets it).
     pub frontend_redirect_template: Option<String>,
+    /// Resolved redirect status code stashed by the routing layer when
+    /// a frontend's `RedirectPolicy` is one of the redirect variants.
+    /// 301 = `Permanent`, 302 = `Found`, 308 = `PermanentRedirect`.
+    /// `None` falls back to 301 for the legacy
+    /// `cluster.https_redirect = true` path. Closes #1009.
+    pub redirect_status: Option<u16>,
 }
 
 /// Owned snapshot of a per-frontend header edit, captured at routing
@@ -359,6 +365,7 @@ impl HttpContext {
             headers_response: Vec::new(),
             retry_after_seconds: None,
             frontend_redirect_template: None,
+            redirect_status: None,
         }
     }
 
