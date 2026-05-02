@@ -15,10 +15,10 @@ document captures **how to use it**, **where to apply it**, and the
 | `h2-h1` | h2 + TLS (ALPN) | h1 cleartext | `AsyncBackend::http_handler` | Covered by `try_tls_cardinality_h2_h1_*`. |
 | `h2-h2c` | h2 + TLS (ALPN) | h2c cleartext | `H2Backend::start` | Covered by `try_tls_cardinality_h2_h2_*`. |
 
-Backend **TLS** (h1-over-TLS, h2-over-TLS) is **not** in v2.0.0; it
-lands in v2.1.0 with [#1218](https://github.com/sozu-proxy/sozu/issues/1218).
-At that point the matrix grows to 8 cells (each backend axis gains a
-TLS variant).
+Backend **TLS** (h1-over-TLS, h2-over-TLS) is **not** in the current
+release; the follow-up enhancement is tracked at
+[#1218](https://github.com/sozu-proxy/sozu/issues/1218). At that point
+the matrix grows to 8 cells (each backend axis gains a TLS variant).
 
 ## How the harness works
 
@@ -69,10 +69,10 @@ actually exercise. The decision matrix:
 | H2 flood detector | ✗ | ✗ | ✓ | ✓ | H2 frontend only. |
 | HTTP/1 pipelining | ✓ | ✓ | ✗ | ✗ | H1 frontend only — H2 multiplexing replaces pipelining. |
 | H2 trailer header elision | ✗ | ✗ | ✓ | ✓ | H2 frontend only — trailers are H2 frames. |
-| RFC 7239 `Forwarded` (v2.1.0) | ✓ | ✓ | ✓ | ✓ | All cells; header semantic is protocol-agnostic. |
-| Backend TLS / mTLS-up (v2.1.0) | (new TLS-axis cells) | | | | Adds 4 TLS-backend cells; matrix grows to 8. |
-| ACME HTTP-01 challenge (v2.2.0) | ✓ | ✓ | ✓ | ✓ | Challenge route is HTTP/1.1 GET on port 80; ALPN-agnostic. |
-| OCSP stapling (v2.2.0) | ✓ | ✓ | ✓ | ✓ | Stapling is TLS-handshake, before HTTP. |
+| RFC 7239 `Forwarded` (planned) | ✓ | ✓ | ✓ | ✓ | All cells; header semantic is protocol-agnostic. |
+| Backend TLS / mTLS-up (planned) | (new TLS-axis cells) | | | | Adds 4 TLS-backend cells; matrix grows to 8. |
+| ACME HTTP-01 challenge (planned) | ✓ | ✓ | ✓ | ✓ | Challenge route is HTTP/1.1 GET on port 80; ALPN-agnostic. |
+| OCSP stapling (planned) | ✓ | ✓ | ✓ | ✓ | Stapling is TLS-handshake, before HTTP. |
 
 When adding a test, declare the applicable cells in a comment and use
 the relevant `try_tls_cardinality_*` wrapper(s).
@@ -92,13 +92,14 @@ protocol_pair_matrix! {
 }
 ```
 
-This is a Week 2+ ergonomics pass. Until then, hand-author the wrappers
+This is a future ergonomics pass. Until then, hand-author the wrappers
 following the existing `try_tls_cardinality_*` shape.
 
-## v2.0.0 priority-1 backfill (Week 2 deliverable)
+## Priority-1 backfill (follow-up commit)
 
-The features below ship in v2.0.0 release notes; their e2e coverage
-should pass through every applicable cell before the v2.0.0 tag:
+The features below ship in the upcoming release notes; their e2e
+coverage should pass through every applicable cell before the release
+tag:
 
 - Basic auth (`required_auth = true` + `authorized_hashes`) ←
   `redirect_rewrite_auth_tests.rs` already covers H1+TLS; add H2 cells.
@@ -114,7 +115,7 @@ Each feature × applicable-cell pair gets one test and uses the matching
 wrapper. The check-in commit lists which (feature × cell) combinations
 were verified.
 
-## v2.1.0 expansion (preview)
+## Backend-TLS expansion (preview)
 
 When backend TLS lands ([#1218](https://github.com/sozu-proxy/sozu/issues/1218)),
 the cardinality helper's `backend_h2: bool` axis grows to a
@@ -140,21 +141,20 @@ Tests opt into mocks that match their target cells. Don't pair
 
 ## Where the matrix lives in CI
 
-The §3.1.g feature-coverage matrix runs each crypto provider × full
-features (`opentelemetry,splice,simd`) over the same e2e suite. The
-4-cell protocol matrix runs **inside each CI cell**. Total:
+The CI feature-coverage matrix at `.github/workflows/ci.yml` runs each
+crypto provider × full features (`opentelemetry,splice,simd`) over the
+same e2e suite. The 4-cell protocol matrix runs **inside each CI cell**.
+Total:
 
 ```
 CI cells × tested protocol-pair cells × applicable-features ⊆ matrix surface
 ```
 
-Coverage gaps are listed in the §v2.0.0 priority-1 backfill table above.
-A test marked "shipped in v2.0.0 release notes" without any matrix
-backfill is a v2.0.0 release-blocker.
+Coverage gaps are listed in the priority-1 backfill table above. A test
+covering a feature that ships in a release without any matrix backfill
+is a release-blocker.
 
 ## Related
 
 - `e2e/src/tests/tests.rs::try_tls_cardinality_cell` — harness implementation.
 - `e2e/src/mock/` — mock backends.
-- `tasks/todo.md` §3.1.h — the spec this document fulfils.
-- consolidated review codex MED-2 — "applicable cells only" rule.
