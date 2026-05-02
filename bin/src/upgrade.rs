@@ -26,6 +26,7 @@ use serde_json::Error as SerdeError;
 use sozu_command_lib::{
     channel::{Channel, ChannelError},
     logging::{LogError, setup_logging_with_config},
+    sd_notify,
 };
 use tempfile::tempfile;
 
@@ -252,7 +253,32 @@ pub fn begin_new_main_process(
         })?;
 
     info!("starting new main loop");
+
+    // #228: tell systemd that the new master pid takes over from the
+    // pre-exec one (`Type=notify` + `NotifyAccess=main` are required
+    // in the unit file for this to be honoured), then signal READY=1
+    // for the post-exec master. No-op when `$NOTIFY_SOCKET` is unset.
+    // SAFETY: `libc::getpid` takes no input pointers, never fails,
+    // and returns a value type. No invariant beyond "FFI signature
+    // matches libc".
+    let new_pid = unsafe { libc::getpid() };
+    if let Err(e) = sd_notify::main_pid(new_pid) {
+        warn!("could not notify systemd MAINPID={}: {}", new_pid, e);
+    }
+    match sd_notify::notify(sd_notify::STATE_READY) {
+        Ok(true) => info!(
+            "notified systemd post-upgrade: MAINPID={}, READY=1",
+            new_pid
+        ),
+        Ok(false) => {}
+        Err(e) => warn!("could not notify systemd READY=1: {}", e),
+    }
+
     command_hub.run();
+
+    if let Err(e) = sd_notify::notify(sd_notify::STATE_STOPPING) {
+        warn!("could not notify systemd STOPPING=1: {}", e);
+    }
 
     info!("main process stopped");
     Ok(())

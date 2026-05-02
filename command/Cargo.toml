@@ -53,5 +53,11 @@ unstable = []
 logs-debug = []
 logs-trace = []
 
+[dev-dependencies]
+# Used by `sd_notify` unit tests to spawn an ephemeral
+# `UnixDatagram` socket and assert the helper writes the expected
+# protocol payload.
+tempfile = { workspace = true }
+
 [build-dependencies]
 prost-build = { workspace = true }

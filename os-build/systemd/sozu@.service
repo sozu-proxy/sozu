@@ -8,7 +8,13 @@ StartLimitIntervalSec=10
 StartLimitBurst=5
 
 [Service]
-Type=simple
+# Type=notify: the master sends READY=1 via $NOTIFY_SOCKET only AFTER
+# its workers are spawned and saved state is replayed (see #228 +
+# `command/src/sd_notify.rs`). NotifyAccess=main restricts which
+# child PIDs systemd accepts notifications from to the master only,
+# matching sozu's master/worker fork model.
+Type=notify
+NotifyAccess=main
 
 RuntimeDirectory=sozu-%i
 PIDFile=/run/sozu/sozu-%i.pid
