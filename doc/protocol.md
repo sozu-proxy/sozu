@@ -232,4 +232,4 @@ the prost-generated `Request` / `Response` types.
 - [`bin/src/command/server.rs`](../bin/src/command/server.rs) — master-side command server
 - [`bin/src/command/LIFECYCLE.md`](../bin/src/command/LIFECYCLE.md) — supervisor lifecycle, audit-log envelope
 - [`doc/observability.md`](observability.md) — audit log schema + retention
-- [`doc/upgrade/1.x-to-2.0.md`](upgrade/1.x-to-2.0.md) — v1.1.x → v2.0.0 proto-tag renumbers
+- [`doc/upgrade/1.x-to-2.0.md`](upgrade/1.x-to-2.0.md) — v1.1.x → v2.0.0 migration guide

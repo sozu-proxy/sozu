@@ -61,7 +61,7 @@ actually exercise. The decision matrix:
 | -------------------------------- | -------------------- | ------ | ----- | ------ | ------------------------------------------------------------------- |
 | HTTP Basic auth                  | ✓                    | ✓      | ✓     | ✓      | All cells; auth gate is router-layer.                               |
 | 301/302/308 redirect             | ✓                    | ✓      | ✓     | ✓      | All cells; redirect renders same answer-template.                   |
-| X-Real-IP injection              | ✓                    | ✓      | ✓     | ✓      | All cells; H2 trailer-elision needs H2 frontend cells specifically. |
+| X-Real-IP injection              | (✓)                  | ✓      | (✓)   | ✓      | H1-backend cells (h1-h1, h2-h1) assert frontend forwarding only — `AsyncBackend` does not currently expose request bytes for the strip/inject assertion (tracked as a future `AsyncBackend` enhancement). H2 trailer-elision needs H2 frontend cells specifically. |
 | Per-IP `429` limit               | ✓                    | ✓      | ✓     | ✓      | All cells; one of each cert kind is enough.                         |
 | `evict_on_queue_full`            | ✓                    | ✓      | ✓     | ✓      | All cells.                                                          |
 | Custom answer template           | ✓                    | ✓      | ✓     | ✓      | All cells.                                                          |
@@ -143,7 +143,7 @@ the cardinality helper's `backend_h2: bool` axis grows to a
 variant. Tests already opting into the matrix get the new axis "for
 free" via the macro proposed above.
 
-## Mock backend taxonomy (codex MED-2 — applicable cells only)
+## Mock backend taxonomy
 
 | Mock                    | h1-h1 | h1-h2c | h2-h1 | h2-h2c | Notes                                                            |
 | ----------------------- | ----- | ------ | ----- | ------ | ---------------------------------------------------------------- |
@@ -153,7 +153,6 @@ free" via the macro proposed above.
 | `RawH2ResponseBackend`  | ✗     | ✓      | ✗     | ✓      | Adversarial H2 — for security tests, not protocol-pair backfill. |
 | `ChunkedFlushH1Backend` | ✓     | ✗      | ✓     | ✗      | H1-only chunked-encoding repros.                                 |
 | `SingleReadH1Backend`   | ✓     | ✗      | ✓     | ✗      | H1-only single-read repros.                                      |
-| `RawH2ResponseBackend`  | ✗     | ✓      | ✗     | ✓      | Already listed; here for ✗-symmetry.                             |
 
 Tests opt into mocks that match their target cells. Don't pair
 `H2Backend` with an `h1-h1` cell — the cluster still has
