@@ -161,6 +161,14 @@ pub fn fork_main_into_new_main(
             // a worker that respawns mid-package-install must match the
             // running master's version (race-free), but the master that
             // hot-upgrades is by design switching to a different version.
+            //
+            // Operator-driven schema mismatch on `upgrade-main` (the new
+            // binary's proto schema being incompatible with the running
+            // master's `UpgradeData` payload written via
+            // `serde_json::to_string` above) is a separate concern: the
+            // newly-execed master will fail to parse the inherited state
+            // and the upgrade aborts cleanly. Operators must verify
+            // proto compatibility before swapping the on-disk binary.
             let res = Command::new(executable_path)
                 .arg("main")
                 .arg("--fd")
