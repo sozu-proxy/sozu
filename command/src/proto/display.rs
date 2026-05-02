@@ -1362,6 +1362,7 @@ impl Display for Event {
             EventKind::EventsSubscribed => "events subscribed",
             EventKind::HealthCheckHealthy => "health check: backend healthy",
             EventKind::HealthCheckUnhealthy => "health check: backend unhealthy",
+            EventKind::ClusterRecovered => "cluster recovered",
         };
         let address = match &self.address {
             Some(a) => a.to_string(),
