@@ -732,6 +732,36 @@ Path filtering in Sōzu is **frontend-level**, not backend-level. Backends
 inside a cluster cannot be restricted to a path; if you need different
 backend pools for `/` and `/some-path` on the same hostname, declare two
 clusters that share the hostname and differ on the frontend `path` rule.
+For example, sending `example.com` to one backend pool and
+`example.com/instance` to another:
+
+```toml
+[clusters.example-main]
+protocol = "http"
+frontends = [
+  { address = "0.0.0.0:443", hostname = "example.com" },
+]
+backends = [
+  { address = "127.0.0.1:8001" },
+  { address = "127.0.0.1:8002" },
+]
+
+[clusters.example-instance]
+protocol = "http"
+frontends = [
+  { address = "0.0.0.0:443", hostname = "example.com", path = "/instance" },
+]
+backends = [
+  { address = "127.0.0.1:8011" },
+  { address = "127.0.0.1:8012" },
+]
+```
+
+A request to `https://example.com/instance/foo` matches the longer prefix
+`/instance` and lands on `example-instance`; everything else falls back
+to the empty-prefix frontend on `example-main`. Per-frontend
+`certificate` / `key` / `certificate_chain` fields are omitted here for
+brevity but are valid on each frontend entry.
 
 When multiple frontends share the same `(address, hostname)` tuple and
 differ only on `path` / `path_type`, the lookup picks the most
