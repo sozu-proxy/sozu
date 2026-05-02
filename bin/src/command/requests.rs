@@ -33,6 +33,7 @@ use sozu_command_lib::{
         UpdateHttpsListenerConfig, UpdateTcpListenerConfig, WorkerInfo, WorkerInfos, WorkerRequest,
         WorkerResponses, request::RequestType, response_content::ContentType,
     },
+    sd_notify,
 };
 use sozu_lib::metrics::METRICS;
 
@@ -178,6 +179,53 @@ macro_rules! audit_log_context {
     }};
 }
 
+/// Operator-issued verbs that change cluster / listener / certificate
+/// state, the saved state file, or the master/worker fleet topology.
+/// `true` here brackets the dispatch with `RELOADING=1` / `READY=1`
+/// systemd notifications so unit-state-watching tooling can serialise
+/// against the change. Read-only verbs (Status / List* / Query* /
+/// CountRequests / SubscribeEvents / QueryMaxConnectionsPerIp) return
+/// `false` because they're dashboard polls, not transitions.
+fn is_mutating_verb(req: &RequestType) -> bool {
+    matches!(
+        req,
+        RequestType::SaveState(_)
+            | RequestType::LoadState(_)
+            | RequestType::ReloadConfiguration(_)
+            | RequestType::UpgradeMain(_)
+            | RequestType::UpgradeWorker(_)
+            | RequestType::AddCluster(_)
+            | RequestType::ActivateListener(_)
+            | RequestType::AddBackend(_)
+            | RequestType::AddCertificate(_)
+            | RequestType::AddHttpFrontend(_)
+            | RequestType::AddHttpListener(_)
+            | RequestType::AddHttpsFrontend(_)
+            | RequestType::AddHttpsListener(_)
+            | RequestType::AddTcpFrontend(_)
+            | RequestType::AddTcpListener(_)
+            | RequestType::ConfigureMetrics(_)
+            | RequestType::DeactivateListener(_)
+            | RequestType::RemoveBackend(_)
+            | RequestType::RemoveCertificate(_)
+            | RequestType::RemoveCluster(_)
+            | RequestType::RemoveHttpFrontend(_)
+            | RequestType::RemoveHttpsFrontend(_)
+            | RequestType::RemoveListener(_)
+            | RequestType::RemoveTcpFrontend(_)
+            | RequestType::ReplaceCertificate(_)
+            | RequestType::UpdateHttpListener(_)
+            | RequestType::UpdateHttpsListener(_)
+            | RequestType::UpdateTcpListener(_)
+            | RequestType::SetHealthCheck(_)
+            | RequestType::RemoveHealthCheck(_)
+            | RequestType::SoftStop(_)
+            | RequestType::HardStop(_)
+            | RequestType::Logging(_)
+            | RequestType::SetMaxConnectionsPerIp(_)
+    )
+}
+
 impl Server {
     pub fn handle_client_request(&mut self, client: &mut ClientSession, request: Request) {
         let request_type = match request.request_type {
@@ -213,6 +261,31 @@ impl Server {
                 return;
             }
         }
+
+        // #228: bracket every operator-issued command with
+        // `RELOADING=1` / `READY=1`. Mutating verbs (LoadState,
+        // ReloadConfiguration, AddCluster / Backend / Certificate /
+        // Frontend / Listener, Remove*, Replace*, Update*,
+        // SetHealthCheck, SetMaxConnectionsPerIp, UpgradeMain,
+        // UpgradeWorker) move the master through a brief reload
+        // window where downstream tooling watching the unit state
+        // can serialise against in-flight changes. Read-only verbs
+        // (Status, ListWorkers, ListListeners, ListFrontends,
+        // QueryClusters*, QueryMetrics, QueryCertificates*,
+        // CountRequests, QueryHealthChecks, SubscribeEvents,
+        // QueryMaxConnectionsPerIp) skip the bracketing — those are
+        // dashboard polls, not state transitions.
+        //
+        // Helper is a no-op when `$NOTIFY_SOCKET` is unset, so the
+        // cost is one env-var lookup per command in non-systemd
+        // deployments.
+        let mutating = is_mutating_verb(&request_type);
+        if mutating {
+            if let Err(e) = sd_notify::notify(sd_notify::STATE_RELOADING) {
+                warn!("could not notify systemd RELOADING=1: {}", e);
+            }
+        }
+
         match request_type {
             RequestType::SaveState(path) => save_state(self, client, &path),
             RequestType::LoadState(path) => load_state(self, Some(client), &path),
@@ -278,6 +351,12 @@ impl Server {
             // generic worker fan-out path.
             RequestType::SetMaxConnectionsPerIp(_) | RequestType::QueryMaxConnectionsPerIp(_) => {
                 worker_request(self, client, request_type);
+            }
+        }
+
+        if mutating {
+            if let Err(e) = sd_notify::notify(sd_notify::STATE_READY) {
+                warn!("could not notify systemd READY=1: {}", e);
             }
         }
     }
