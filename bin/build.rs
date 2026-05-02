@@ -51,11 +51,45 @@ fn main() {
         ("UNSTABLE", "unstable"),
     ];
 
+    // Crypto-provider features follow the runtime precedence chain
+    // implemented in `lib/src/crypto.rs::default_provider()`:
+    // `fips > ring > aws-lc-rs > openssl`. Several can be active in the
+    // same build (the canonical case being `cargo build --features fips`
+    // with the default `crypto-ring` still active), but at runtime only
+    // one provider is wired into rustls. Mirror that in the `--version`
+    // banner: report the effective provider as `+` and force the losers
+    // to `-`, so operators reading the banner see the provider they will
+    // actually be talking to instead of the literal Cargo feature set.
+    //
+    // `fips` is a build-mode layered on top of `crypto-aws-lc-rs` (per
+    // `lib/Cargo.toml: fips = ["crypto-aws-lc-rs", "rustls/fips"]`), so
+    // when `fips` wins the chain `crypto-aws-lc-rs` is also reported as
+    // `+` — aws-lc-rs is genuinely the underlying library, just driven
+    // through rustls's FIPS profile. The other two providers stay `-`.
+    let active = |suffix: &str| -> bool { env::var(format!("CARGO_FEATURE_{suffix}")).is_ok() };
+    let crypto_effective: &[&str] = if active("FIPS") {
+        &["FIPS", "CRYPTO_AWS_LC_RS"]
+    } else if active("CRYPTO_RING") {
+        &["CRYPTO_RING"]
+    } else if active("CRYPTO_AWS_LC_RS") {
+        &["CRYPTO_AWS_LC_RS"]
+    } else if active("CRYPTO_OPENSSL") {
+        &["CRYPTO_OPENSSL"]
+    } else {
+        &[]
+    };
+    const CRYPTO_PROVIDER_SUFFIXES: &[&str] =
+        &["CRYPTO_RING", "CRYPTO_AWS_LC_RS", "CRYPTO_OPENSSL", "FIPS"];
+
     let flags: Vec<String> = features
         .iter()
         .map(|(env_suffix, display)| {
-            let key = format!("CARGO_FEATURE_{env_suffix}");
-            if env::var(&key).is_ok() {
+            let on = if CRYPTO_PROVIDER_SUFFIXES.contains(env_suffix) {
+                crypto_effective.contains(env_suffix)
+            } else {
+                active(env_suffix)
+            };
+            if on {
                 format!("+{display}")
             } else {
                 format!("-{display}")
