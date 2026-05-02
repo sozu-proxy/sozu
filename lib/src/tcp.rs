@@ -582,6 +582,12 @@ impl TcpSession {
                         self.cluster_id.as_deref(),
                         self.metrics.backend_id.as_deref()
                     );
+                    gauge!(
+                        "backend.available",
+                        1,
+                        self.cluster_id.as_deref(),
+                        self.metrics.backend_id.as_deref()
+                    );
                     info!(
                         "{} backend server {} at {} is up",
                         log_context!(self),
@@ -636,6 +642,12 @@ impl TcpSession {
                 );
                 incr!(
                     "backend.down",
+                    self.cluster_id.as_deref(),
+                    self.metrics.backend_id.as_deref()
+                );
+                gauge!(
+                    "backend.available",
+                    0,
                     self.cluster_id.as_deref(),
                     self.metrics.backend_id.as_deref()
                 );

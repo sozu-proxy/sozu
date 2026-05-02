@@ -1686,6 +1686,12 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                         self.context.cluster_id.as_deref(),
                         metrics.backend_id.as_deref()
                     );
+                    gauge!(
+                        "backend.available",
+                        1,
+                        self.context.cluster_id.as_deref(),
+                        metrics.backend_id.as_deref()
+                    );
 
                     info!(
                         "{} backend server {} at {} is up",
@@ -1737,6 +1743,12 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
                 incr!(
                     "backend.down",
+                    self.context.cluster_id.as_deref(),
+                    metrics.backend_id.as_deref()
+                );
+                gauge!(
+                    "backend.available",
+                    0,
                     self.context.cluster_id.as_deref(),
                     metrics.backend_id.as_deref()
                 );

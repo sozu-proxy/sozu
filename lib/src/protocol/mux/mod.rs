@@ -829,6 +829,12 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                         Some(cluster_id),
                                         Some(&backend_borrow.backend_id)
                                     );
+                                    gauge!(
+                                        "backend.available",
+                                        1,
+                                        Some(cluster_id),
+                                        Some(&backend_borrow.backend_id)
+                                    );
                                     push_event(Event {
                                         kind: EventKind::BackendUp as i32,
                                         backend_id: Some(backend_borrow.backend_id.to_owned()),
@@ -954,6 +960,12 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                     );
                                     incr!(
                                         "backend.down",
+                                        Some(cluster_id),
+                                        Some(&backend_borrow.backend_id)
+                                    );
+                                    gauge!(
+                                        "backend.available",
+                                        0,
                                         Some(cluster_id),
                                         Some(&backend_borrow.backend_id)
                                     );
