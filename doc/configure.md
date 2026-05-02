@@ -679,6 +679,123 @@ Operators monitoring logs should expect the following classification:
 
 In particular, the recurring `Could not look up a certificate for server name "<name>"` line (issue #774) is emitted at `warn` when the `rustls::server::ClientHello` SNI does not match any configured frontend — the usual culprit is a generic scanner (Shodan, ssllabs, Censys) probing `default.example` or an IP-only hello. No action required unless the name matches a frontend you expect to serve.
 
+## Frontend matching: pairing, precedence, and patterns
+
+This section covers operator-facing rules that surfaced as
+[#1220](https://github.com/sozu-proxy/sozu/issues/1220),
+[#1221](https://github.com/sozu-proxy/sozu/issues/1221), and
+[#1222](https://github.com/sozu-proxy/sozu/issues/1222).
+
+### HTTPS listener pairing — frontends and cluster protocol
+
+A `protocol = "https"` listener terminates TLS at the listener boundary.
+After termination, the request is plaintext HTTP/1.1 or HTTP/2 (the
+listener decides via ALPN), and the routed cluster sees it as `protocol
+= "http"`. Frontends bound to an HTTPS listener address therefore
+declare `protocol = "http"` on the cluster — there is no separate
+`protocol = "https"` cluster mode.
+
+Working configuration (one HTTP listener, one HTTPS listener, both
+routing to the same backend pool):
+
+```toml
+[[listeners]]
+protocol = "http"
+address = "[::]:80"
+
+[[listeners]]
+protocol = "https"
+address = "[::]:443"
+# Certificates are loaded via the runtime API or [listeners.https.certificates]
+# (see "Listeners" §Certificates and TLS).
+
+[clusters.example]
+protocol = "http"  # plaintext after TLS termination at the listener
+frontends = [
+  { address = "[::]:80",  hostname = "subdomain.domain.tld" },
+  { address = "[::]:443", hostname = "subdomain.domain.tld" },
+]
+backends = [
+  { address = "[::1]:8080" },
+]
+```
+
+Sōzu refuses to start when an HTTPS listener has no matching frontend —
+no graceful fallback. The listener-end-to-end design is intentional:
+TLS settings (cipher list, ALPN, SNI binding, X-Real-IP elision) live
+on the listener; per-cluster TLS-to-backend remains a separate v2.1.0
+feature ([#1218](https://github.com/sozu-proxy/sozu/issues/1218)).
+
+### Path matching precedence within a frontend
+
+When multiple frontends share the same `(address, hostname)` tuple and
+differ only on `path` / `path_type`, the lookup picks the most
+specific rule using this fixed precedence:
+
+1. `path_type = "EQUALS"` — exact match wins first.
+2. `path_type = "REGEX"` — anchored at both ends (`\A...\z`) since
+   v2.0.0; longer literal substrings within the regex are not weighted,
+   so multiple regex rules competing on the same authority produce
+   undefined ordering between them.
+3. `path_type = "PREFIX"` — fall-through default. Longest prefix wins
+   among PREFIX rules.
+
+Operators wanting to route `/.well-known/acme-challenge` separately from
+`/` on the same hostname should declare:
+
+```toml
+[[clusters.acme-helper.frontends]]
+address = "[::]:80"
+hostname = "mail.example.tld"
+path = "/.well-known/acme-challenge"
+path_type = "PREFIX"
+
+[[clusters.mail-server.frontends]]
+address = "[::]:80"
+hostname = "mail.example.tld"
+path = "/"
+path_type = "PREFIX"
+```
+
+Both PREFIX rules match a request, but the longer prefix
+(`/.well-known/acme-challenge`) wins per the longest-match rule above.
+**Configuration order does not affect routing**: lookup is by trie
+specificity, not declaration order.
+
+### Regex limitations — no look-around
+
+Sōzu uses the standard Rust [`regex`](https://docs.rs/regex/) crate
+which does not support look-around (negative or positive lookahead /
+lookbehind). Patterns like `^(?!\/\.well-known\/acme-challenge)` will
+not compile or will be rejected at frontend registration.
+
+If you need "match all paths except X", decompose into two PREFIX
+rules per the example above and rely on the longest-prefix rule, or
+declare an explicit list of EQUALS rules.
+
+The
+[`fancy-regex`](https://docs.rs/fancy-regex/) crate supports
+look-around but is not currently a Sōzu dependency.
+[#1222](https://github.com/sozu-proxy/sozu/issues/1222) tracks the
+discussion if look-around becomes a real operator constraint.
+
+### `send_proxy` and `expect_proxy` apply to TCP only
+
+The PROXY-protocol forwarding/expecting flags `send_proxy = true` and
+`expect_proxy = true` on a backend or frontend are valid **only** for
+clusters with `protocol = "tcp"`. HTTP/HTTPS clusters use the
+forwarding HTTP headers (`X-Forwarded-For`, `X-Real-IP`, and — once
+v2.1.0 lands — RFC 7239 `Forwarded`) instead.
+
+Setting `send_proxy = true` on an HTTP/HTTPS cluster is silently
+ignored at runtime. This contradicts a literal reading of
+[#1221](https://github.com/sozu-proxy/sozu/issues/1221); the
+documentation tracks reality but operators upgrading from older configs
+should remove the no-op flag from HTTP cluster definitions.
+
+See [#PROXY Protocol](#proxy-protocol) below for the supported
+TCP-mode shape.
+
 ## Custom HTTP answer templates
 
 Sōzu lets operators replace any default error response with a templated body.
