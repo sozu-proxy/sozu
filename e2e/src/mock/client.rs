@@ -1,8 +1,8 @@
 use std::{
-    io::{Read, Write},
+    io::{ErrorKind, Read, Write},
     net::{SocketAddr, TcpStream},
     str::from_utf8,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crate::BUFFER_SIZE;
@@ -121,6 +121,44 @@ impl Client {
             }
         }
         None
+    }
+
+    /// Loop-read until either the upstream half-closes the TCP stream
+    /// (read returns 0 — the canonical end-of-response on a
+    /// `Connection: close` default-answer like the redirect templates)
+    /// or `deadline` elapses.
+    ///
+    /// Replaces the single-`receive()` pattern for assertions on small
+    /// default-answer payloads. CLAUDE.md: "Always `loop_read_*` when
+    /// asserting on TCP responses. A single `read()` sees one segment
+    /// under load." Returns the accumulated UTF-8 bytes, or `None` if
+    /// the deadline elapsed before any byte was read.
+    pub fn receive_until_eof(&mut self, deadline: Duration) -> Option<String> {
+        let stream = self.stream.as_mut()?;
+        let started = Instant::now();
+        let mut acc: Vec<u8> = Vec::with_capacity(BUFFER_SIZE);
+        loop {
+            let mut buf = [0u8; BUFFER_SIZE];
+            match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => acc.extend_from_slice(&buf[..n]),
+                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                    if started.elapsed() >= deadline {
+                        break;
+                    }
+                    continue;
+                }
+                Err(_) => break,
+            }
+            if started.elapsed() >= deadline {
+                break;
+            }
+        }
+        if acc.is_empty() {
+            return None;
+        }
+        self.responses_received += 1;
+        Some(from_utf8(&acc).ok()?.to_string())
     }
 
     pub fn set_request<S1: Into<String>>(&mut self, request: S1) {
