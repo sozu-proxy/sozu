@@ -36,7 +36,11 @@ No CI clippy/fmt job runs automatically — run both locally before pushing. CI 
 
 | Flag | Crate | Effect |
 |---|---|---|
-| `default = ["jemallocator"]` | `bin` | jemalloc as global allocator |
+| `default = ["jemallocator", "crypto-ring"]` | `bin` | jemalloc as global allocator + ring crypto provider |
+| `crypto-ring` (default) | bin, lib | rustls + ring crypto provider |
+| `crypto-aws-lc-rs` | bin, lib | rustls + aws-lc-rs crypto provider |
+| `crypto-openssl` | bin, lib | rustls + openssl crypto provider (`rustls-openssl`) |
+| `fips` | bin, lib | implies `crypto-aws-lc-rs` + activates `rustls/fips`. Precedence chain `fips > ring > aws-lc-rs > openssl` when several are enabled together |
 | `e2e-hooks` | `lib` | Exposes test-injection APIs. **Never enable in production builds.** |
 | `logs-debug`, `logs-trace` | all | Compile in `DEBUG`/`TRACE` levels (release strips them otherwise) |
 | `tolerant-http1-parser` | lib, bin | Relaxes H1 parsing via `kawa/tolerant-parsing` |
@@ -44,7 +48,7 @@ No CI clippy/fmt job runs automatically — run both locally before pushing. CI 
 | `splice` | lib | Linux `splice(2)` fast path |
 | `opentelemetry` | lib, bin | OTel export |
 
-`doc/getting_started.md` lists `crypto-ring`/`crypto-aws-lc-rs`/`crypto-openssl` features — these do not exist in this workspace. rustls is wired to `ring` via workspace deps. Trust `Cargo.toml` over `doc/` prose.
+Crypto-provider features live in `bin/Cargo.toml` + `lib/Cargo.toml`; CI exercises all four cells (`crypto-ring`, `crypto-aws-lc-rs`, `crypto-openssl`, `fips`) plus the bare default-features baseline. Provider precedence at runtime is resolved in `lib/src/crypto.rs::default_provider()`.
 
 # Code style
 
@@ -103,7 +107,7 @@ Conservative changes + tests required in:
 - `command/src/channel.rs`, `command/src/scm_socket.rs`, `command/src/command.proto`, `bin/src/command/` — message framing, buffer sizing, FD passing, state replay.
 - Metrics / logs — never leak sensitive values; counters/gauges must stay correct on error paths and shutdown.
 
-`doc/getting_started.md` is stale on crypto providers — do not copy its assertions into new instructions; fix the doc instead.
+Crypto-provider features (`crypto-ring`, `crypto-aws-lc-rs`, `crypto-openssl`, `fips`) live in `bin/Cargo.toml` + `lib/Cargo.toml`; CI exercises all four cells.
 
 # Branching & commits
 
