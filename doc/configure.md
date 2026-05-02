@@ -728,6 +728,11 @@ feature ([#1218](https://github.com/sozu-proxy/sozu/issues/1218)).
 
 ### Path matching precedence within a frontend
 
+Path filtering in Sōzu is **frontend-level**, not backend-level. Backends
+inside a cluster cannot be restricted to a path; if you need different
+backend pools for `/` and `/some-path` on the same hostname, declare two
+clusters that share the hostname and differ on the frontend `path` rule.
+
 When multiple frontends share the same `(address, hostname)` tuple and
 differ only on `path` / `path_type`, the lookup picks the most
 specific rule using this fixed precedence:
