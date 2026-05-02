@@ -122,31 +122,20 @@ impl TryFrom<&AddCertificate> for CertifiedKeyWrapper {
 
         let fingerprint = Fingerprint(Sha256::digest(&pem.contents).iter().cloned().collect());
 
-        // The leaf cert is at index 0; each subsequent entry is a CA in
-        // the issuing chain. Many ACME clients (Certbot's default
-        // `fullchain.pem`, lego, acme.sh) emit the leaf at the START of
-        // the chain file, so without dedup the on-wire chain becomes
-        // `[leaf, leaf, intermediate, root]` — accepted by browsers but
-        // rejected by stricter validators (e.g. Node.js → `UNABLE_TO_
-        // VERIFY_LEAF_SIGNATURE`, see #1148). Two robustness passes:
-        //
-        // 1. Each `cert.certificate_chain` entry is split through
-        //    `split_certificate_chain` so a single string carrying
-        //    multiple PEM blocks (operators concatenating fullchain
-        //    contents into one chain entry, common via the runtime
-        //    API) is fanned out into one entry per CA before parsing.
-        //    Without the split, `parse_pem` only consumes the first
-        //    PEM block in the string and silently drops the rest.
-        // 2. Each split entry's DER bytes are compared against the
-        //    leaf's DER and dropped on match — robust against any
-        //    chain shape that includes the leaf (start, end, repeated).
-        //
-        // Closes #1135 / #1148.
+        // The leaf is at index 0; chain entries follow. ACME clients
+        // emitting `fullchain.pem` (Certbot default, lego, acme.sh)
+        // place the leaf at the start, which would store
+        // `[leaf, leaf, intermediate, root]` and fail strict
+        // validators (Node.js `UNABLE_TO_VERIFY_LEAF_SIGNATURE`).
+        // Each entry is split through `split_certificate_chain` so a
+        // single multi-PEM string fans out (`parse_pem` would
+        // otherwise stop at the first block); each split entry is
+        // dedup'd against the leaf's DER bytes.
         let leaf_der = pem.contents;
-        let mut chain = vec![CertificateDer::from(leaf_der.clone())];
+        let mut chain = vec![CertificateDer::from(leaf_der.to_owned())];
         let mut dropped_duplicates = 0usize;
         for cert in &cert.certificate_chain {
-            for split_pem in split_certificate_chain(cert.clone()) {
+            for split_pem in split_certificate_chain(cert.to_owned()) {
                 let chain_link = parse_pem(split_pem.as_bytes())
                     .map_err(CertificateResolverError::ParsePem)?
                     .contents;
@@ -159,8 +148,8 @@ impl TryFrom<&AddCertificate> for CertifiedKeyWrapper {
             }
         }
         if dropped_duplicates > 0 {
-            info!(
-                "{} dropped {} duplicate leaf certificate(s) from the supplied chain (closes #1135)",
+            debug!(
+                "{} dropped {} duplicate leaf certificate(s) from the supplied chain",
                 log_module_context!(),
                 dropped_duplicates
             );
