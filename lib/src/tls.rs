@@ -24,6 +24,7 @@ use sha2::{Digest, Sha256};
 use sozu_command::{
     certificate::{
         CertificateError, Fingerprint, get_cn_and_san_attributes, parse_pem, parse_x509,
+        split_certificate_chain,
     },
     logging::ansi_palette,
     proto::command::{AddCertificate, CertificateAndKey, ReplaceCertificate, SocketAddress},
@@ -121,13 +122,48 @@ impl TryFrom<&AddCertificate> for CertifiedKeyWrapper {
 
         let fingerprint = Fingerprint(Sha256::digest(&pem.contents).iter().cloned().collect());
 
-        let mut chain = vec![CertificateDer::from(pem.contents)];
+        // The leaf cert is at index 0; each subsequent entry is a CA in
+        // the issuing chain. Many ACME clients (Certbot's default
+        // `fullchain.pem`, lego, acme.sh) emit the leaf at the START of
+        // the chain file, so without dedup the on-wire chain becomes
+        // `[leaf, leaf, intermediate, root]` — accepted by browsers but
+        // rejected by stricter validators (e.g. Node.js → `UNABLE_TO_
+        // VERIFY_LEAF_SIGNATURE`, see #1148). Two robustness passes:
+        //
+        // 1. Each `cert.certificate_chain` entry is split through
+        //    `split_certificate_chain` so a single string carrying
+        //    multiple PEM blocks (operators concatenating fullchain
+        //    contents into one chain entry, common via the runtime
+        //    API) is fanned out into one entry per CA before parsing.
+        //    Without the split, `parse_pem` only consumes the first
+        //    PEM block in the string and silently drops the rest.
+        // 2. Each split entry's DER bytes are compared against the
+        //    leaf's DER and dropped on match — robust against any
+        //    chain shape that includes the leaf (start, end, repeated).
+        //
+        // Closes #1135 / #1148.
+        let leaf_der = pem.contents;
+        let mut chain = vec![CertificateDer::from(leaf_der.clone())];
+        let mut dropped_duplicates = 0usize;
         for cert in &cert.certificate_chain {
-            let chain_link = parse_pem(cert.as_bytes())
-                .map_err(CertificateResolverError::ParsePem)?
-                .contents;
+            for split_pem in split_certificate_chain(cert.clone()) {
+                let chain_link = parse_pem(split_pem.as_bytes())
+                    .map_err(CertificateResolverError::ParsePem)?
+                    .contents;
 
-            chain.push(CertificateDer::from(chain_link));
+                if chain_link == leaf_der {
+                    dropped_duplicates += 1;
+                    continue;
+                }
+                chain.push(CertificateDer::from(chain_link));
+            }
+        }
+        if dropped_duplicates > 0 {
+            info!(
+                "{} dropped {} duplicate leaf certificate(s) from the supplied chain (closes #1135)",
+                log_module_context!(),
+                dropped_duplicates
+            );
         }
 
         let mut key_reader = BufReader::new(cert.key.as_bytes());
@@ -974,6 +1010,108 @@ mod tests {
                 "name_fingerprint_idx should not contain empty entry for '{name}' after removal"
             );
         }
+
+        Ok(())
+    }
+
+    /// Many ACME clients (Certbot's `fullchain.pem`, lego, acme.sh) emit
+    /// the leaf certificate at the START of the chain file. Without
+    /// dedup, the resolver previously stored `[leaf, leaf, ...]` and
+    /// the on-wire TLS handshake replayed the leaf twice — accepted by
+    /// browsers but rejected by stricter validators (Node.js,
+    /// `UNABLE_TO_VERIFY_LEAF_SIGNATURE`). The fix in
+    /// `TryFrom<&AddCertificate> for CertifiedKeyWrapper` drops any
+    /// chain entry whose DER bytes match the leaf. Closes #1135 / #1148.
+    ///
+    /// This test passes the SAME leaf PEM as both `certificate` and the
+    /// sole `certificate_chain` entry (the `fullchain.pem` shape). The
+    /// stored chain length must be `1` (leaf only), not `2`
+    /// (`[leaf, leaf]`).
+    #[test]
+    fn certificate_chain_dedup_drops_duplicate_leaf() -> Result<(), Box<dyn Error + Send + Sync>> {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8080);
+        let mut resolver = CertificateResolver::default();
+
+        let leaf_pem = String::from(include_str!("../assets/certificate.pem"));
+
+        let cert_with_duplicated_leaf = CertificateAndKey {
+            certificate: leaf_pem.clone(),
+            certificate_chain: vec![leaf_pem],
+            key: String::from(include_str!("../assets/key.pem")),
+            ..Default::default()
+        };
+
+        let fingerprint = resolver.add_certificate(&AddCertificate {
+            address,
+            certificate: cert_with_duplicated_leaf,
+            expired_at: None,
+        })?;
+
+        let stored = resolver
+            .get_certificate(&fingerprint)
+            .ok_or("resolver lost the certificate after add")?;
+
+        assert_eq!(
+            stored.inner.cert.len(),
+            1,
+            "expected dedup to drop the duplicate leaf, got chain of {} cert(s)",
+            stored.inner.cert.len()
+        );
+
+        Ok(())
+    }
+
+    /// When an operator passes the entire `fullchain.pem` content as a
+    /// SINGLE chain entry (one string containing multiple
+    /// `-----BEGIN CERTIFICATE-----` blocks back-to-back), the previous
+    /// code called `parse_pem` once on the multi-PEM string, which only
+    /// consumes the first PEM block and silently drops the rest. The
+    /// fix splits each chain entry through
+    /// `split_certificate_chain` so multi-PEM strings fan out into one
+    /// entry per CA before parsing.
+    ///
+    /// This test concatenates two PEM blocks into a single chain entry
+    /// (the leaf duplicated, so dedup also kicks in). The stored chain
+    /// must end up with length 1 — the leaf — proving (a) the multi-PEM
+    /// entry was split correctly, (b) the duplicate leaf was dropped.
+    #[test]
+    fn certificate_chain_handles_multi_pem_single_entry() -> Result<(), Box<dyn Error + Send + Sync>>
+    {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8080);
+        let mut resolver = CertificateResolver::default();
+
+        let leaf_pem = String::from(include_str!("../assets/certificate.pem"));
+        // Two PEM blocks concatenated into one string; both are the
+        // leaf so dedup brings the result back to length 1.
+        let multi_pem_chain_entry = format!("{leaf_pem}\n{leaf_pem}");
+
+        let cert = CertificateAndKey {
+            certificate: leaf_pem,
+            certificate_chain: vec![multi_pem_chain_entry],
+            key: String::from(include_str!("../assets/key.pem")),
+            ..Default::default()
+        };
+
+        let fingerprint = resolver.add_certificate(&AddCertificate {
+            address,
+            certificate: cert,
+            expired_at: None,
+        })?;
+
+        let stored = resolver
+            .get_certificate(&fingerprint)
+            .ok_or("resolver lost the certificate after add")?;
+
+        // Without the split, `parse_pem` would only consume the first
+        // PEM block and drop the second; with the split + dedup, both
+        // get fanned out, both get recognised as the leaf, both get
+        // dropped — leaving the original leaf at index 0 only.
+        assert_eq!(
+            stored.inner.cert.len(),
+            1,
+            "expected split + dedup to leave only the leaf, got chain of {} cert(s)",
+            stored.inner.cert.len()
+        );
 
         Ok(())
     }
