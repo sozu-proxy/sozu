@@ -452,6 +452,32 @@ Sozu-Id: %REQUEST_ID\r
     )
 }
 
+/// RFC 9110 §15.4.3 — temporary redirect. UAs may rewrite POST → GET on
+/// follow. Closes #1009.
+fn default_302() -> String {
+    String::from(
+        "\
+HTTP/1.1 302 Found\r
+Location: %REDIRECT_LOCATION\r
+Connection: close\r
+Sozu-Id: %REQUEST_ID\r
+\r\n",
+    )
+}
+
+/// RFC 9110 §15.4.9 — permanent redirect; the HTTP method MUST be
+/// preserved on follow (no GET-rewrite on POST). Closes #1009.
+fn default_308() -> String {
+    String::from(
+        "\
+HTTP/1.1 308 Permanent Redirect\r
+Location: %REDIRECT_LOCATION\r
+Connection: close\r
+Sozu-Id: %REQUEST_ID\r
+\r\n",
+    )
+}
+
 fn default_400() -> String {
     String::from(
         "\
@@ -948,6 +974,16 @@ impl HttpAnswers {
                 answer,
                 &[route, request_id, location]
             ),
+            "302" => Template::new(
+                Some(302),
+                answer,
+                &[route, request_id, location]
+            ),
+            "308" => Template::new(
+                Some(308),
+                answer,
+                &[route, request_id, location]
+            ),
             "400" => Template::new(
                 Some(400),
                 answer,
@@ -1033,6 +1069,8 @@ impl HttpAnswers {
         let mut listener_answers = Self::templates(answers)?;
         let expected_defaults: &[(&str, DefaultBuilder)] = &[
             ("301", default_301),
+            ("302", default_302),
+            ("308", default_308),
             ("400", default_400),
             ("401", default_401),
             ("404", default_404),
@@ -1121,9 +1159,37 @@ impl HttpAnswers {
         request_id: String,
         route: String,
     ) -> Option<(u16, bool, DefaultAnswerStream)> {
-        let template = Self::template("301", answer_str).ok()?;
-        // Variable order must match the `DefaultAnswer::Answer301` arm of
-        // `HttpAnswers::get`: `(ROUTE, REQUEST_ID)` are persistent
+        Self::render_inline_redirect(301, answer_str, location, request_id, route)
+    }
+
+    /// Compile + render an operator-supplied template as a 301 / 302 / 308
+    /// redirect (#1009). Same shape as `render_inline_301` (which is now a
+    /// thin wrapper) — the variable order is fixed `(ROUTE, REQUEST_ID,
+    /// REDIRECT_LOCATION)` regardless of the redirect status.
+    ///
+    /// Returns `None` when compilation fails, when the supplied `code` is
+    /// not a recognised redirect status, or when the parsed template's
+    /// status header doesn't match the requested code (operator config bug:
+    /// the answer engine downstream expects `template.status == code`).
+    pub fn render_inline_redirect(
+        code: u16,
+        answer_str: &str,
+        location: Option<String>,
+        request_id: String,
+        route: String,
+    ) -> Option<(u16, bool, DefaultAnswerStream)> {
+        // Each redirect status has its own template name in the registry
+        // (`"301"`, `"302"`, `"308"`); reject anything else early so a
+        // miswired call site does not silently render the wrong status.
+        let name = match code {
+            301 => "301",
+            302 => "302",
+            308 => "308",
+            _ => return None,
+        };
+        let template = Self::template(name, answer_str).ok()?;
+        // Variable order must match the matching `DefaultAnswer::Answer{301,302,308}`
+        // arm of `HttpAnswers::get`: `(ROUTE, REQUEST_ID)` are persistent
         // `Variable` slots, `REDIRECT_LOCATION` is the once slot.
         let variables: Vec<Vec<u8>> = vec![route.into(), request_id.into()];
         let mut variables_once: Vec<Vec<u8>> = vec![location.unwrap_or_default().into()];
@@ -1150,6 +1216,16 @@ impl HttpAnswers {
                 variables = vec![route.into(), request_id.into()];
                 variables_once = vec![location.into()];
                 "301"
+            }
+            DefaultAnswer::Answer302 { location } => {
+                variables = vec![route.into(), request_id.into()];
+                variables_once = vec![location.into()];
+                "302"
+            }
+            DefaultAnswer::Answer308 { location } => {
+                variables = vec![route.into(), request_id.into()];
+                variables_once = vec![location.into()];
+                "308"
             }
             DefaultAnswer::Answer400 {
                 message,
