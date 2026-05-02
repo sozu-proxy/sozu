@@ -1,9 +1,10 @@
 # Sōzu unix-socket protocol
 
 This document describes the wire format used between Sōzu's master process
-and its CLI clients (`sozu` binary in client mode, `sozu-client` Rust SDK,
-`sozu-prometheus-connector`, `loadbalancer-agent`, `clever-operator`, etc.)
-over the `command_socket` unix domain socket configured in the main TOML.
+and its CLI clients over the `command_socket` unix domain socket configured
+in the main TOML. The reference client is the `sozu` binary itself in
+client mode; third-party clients can be written against the protobuf
+schema using any language with a `prost`-compatible code generator.
 
 It addresses [#1155](https://github.com/sozu-proxy/sozu/issues/1155).
 
@@ -83,9 +84,9 @@ message Request {
 }
 ```
 
-The `id` field is operator-supplied (`sozu-client` uses a UUIDv4 by
-default). The master echoes it on every response that correlates back to
-this request.
+The `id` field is operator-supplied (a UUIDv4 is a sensible default).
+The master echoes it on every response that correlates back to this
+request.
 
 ### Master → client (`Response`)
 
@@ -153,11 +154,10 @@ fan-out is not cancellable mid-flight) but the response is dropped.
 
 ## Auto-generated reference (planned)
 
-The plan tracked at `tasks/todo.md` §3.1.f calls for `protoc-gen-doc` to
-emit a reference document from `command/src/command.proto` so that the
-auto-generated `command/src/proto/command.rs` file is paired with a
-fresh wire-level reference. That step lands as a separate `docs:`
-commit in the v2.0.0 cut window.
+A follow-up commit can run `protoc-gen-doc` against
+`command/src/command.proto` so the auto-generated
+`command/src/proto/command.rs` is paired with a fresh wire-level
+reference document.
 
 Until then, the canonical wire reference is `command/src/command.proto`
 itself; this document covers the framing, lifecycle, and auth that are
@@ -199,15 +199,16 @@ while True:
 
 The `sozu_command_pb2` module is generated from `command.proto` via
 `protoc --python_out=...`; pin the schema to a specific Sōzu release
-to avoid mid-upgrade tag mismatches (proto-tag renumbers are rare but
-do occur — see `doc/upgrade/1.x-to-2.0.md` for the v1.1.x → v2.0.0
-example).
+to avoid mid-upgrade mismatches.
 
-### Rust (sozu-client)
+### Rust
 
-The blessed Rust client is `sozu-client` at
-<https://github.com/CleverCloud/sozu-client>. It wraps the framing,
-correlation, and PROCESSING aggregation behind a typed API.
+A typed Rust client can be built directly on top of `sozu-command-lib`
+(the same crate the binary uses). For an external project the pattern
+is: depend on `sozu-command-lib`, build a `Channel<Request, Response>`
+over `UnixStream`, call `write_message` / `read_message`. The crate
+already exposes `Channel::generate(buffer_size, max_buffer_size)` and
+the prost-generated `Request` / `Response` types.
 
 ## Hardening / observability
 

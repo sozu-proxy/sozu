@@ -8,17 +8,18 @@ across three separate `Unreleased` blocks (main-scoped, `feat/h2-mux`,
 `main`; their entries appear below grouped by Keep-a-Changelog category, with
 provenance markers where multiple stacks contributed under the same heading.
 
-### Breaking changes (v1.1.x → v2.0.0)
+### Breaking changes (1.1.x → 2.0.0)
 
-The v2.0.0 release carries breaking changes that operators must address before
+The 2.0.0 release carries breaking changes that operators must address before
 upgrade. See `doc/upgrade/1.x-to-2.0.md` for the full migration guide.
 
-- **Proto field renumbering for health-check carriers ([#1191](https://github.com/sozu-proxy/sozu/pull/1191))**:
-  `Request.set_health_check` 47→52, `Request.remove_health_check` 48→53,
-  `Request.query_health_checks` 49→54, `Cluster.health_check` 8→15,
-  `ResponseContent.health_checks_list` 14→15, `EventKind.HEALTH_CHECK_HEALTHY`
-  5→27, `EventKind.HEALTH_CHECK_UNHEALTHY` 4→28. External clients hard-coded
-  to the older tags must be rebuilt.
+The proto field renumbering for the health-check carriers in PR #1191
+(`Request.set_health_check` 47→52, `Cluster.health_check` 8→15, etc.) is
+**not** in this list — those tags only existed on the unreleased PR #1191
+branch and are not on any released 1.x tag. Operators upgrading from a
+released 1.1.x binary do not see those tags, so the renumber is internal
+to the development line, not a 1.1.x → 2.0.0 break.
+
 - **Renamed metrics ([#1196](https://github.com/sozu-proxy/sozu/pull/1196))**:
   `client.connections_percentage` → `client.connections_percent`;
   `client.max_connections` → `client.connections_max`; `buffer.number` →

@@ -65,3 +65,10 @@ crypto-ring = ["sozu-lib/crypto-ring", "hyper-rustls/ring"]
 crypto-aws-lc-rs = ["sozu-lib/crypto-aws-lc-rs", "hyper-rustls/aws-lc-rs"]
 crypto-openssl = ["sozu-lib/crypto-openssl", "hyper-rustls/aws-lc-rs"]
 fips = ["sozu-lib/fips", "hyper-rustls/aws-lc-rs"]
+# Forward `opentelemetry` and `simd` pass-throughs so a CI cell that
+# passes both flags via `cargo test -p sozu-e2e --features ...` does
+# not fail with "Package `sozu-e2e` does not have feature `<name>`".
+# The features only affect `sozu-lib` internals; the e2e suite does
+# not itself observe behaviour differences.
+opentelemetry = ["sozu-lib/opentelemetry"]
+simd = ["sozu-lib/simd"]
