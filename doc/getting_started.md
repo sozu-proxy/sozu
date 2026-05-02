@@ -31,10 +31,12 @@ Build the sozu executable and command line:
 
 ### Cargo features
 
-`rustls` is wired to the `ring` crypto provider via the workspace `Cargo.toml`,
-and there is no provider-pluggable surface today — the build links exactly one
-backend. The Cargo features published by the workspace tune behaviour, not
-crypto:
+The Cargo features published by the workspace tune behaviour and select the
+TLS crypto provider. Crypto-provider selection is documented in detail under
+[Choosing a crypto provider](#choosing-a-crypto-provider) below; the four
+providers (`crypto-ring`, `crypto-aws-lc-rs`, `crypto-openssl`, `fips`) are
+mutually exclusive at runtime via the precedence chain in
+`lib/src/crypto.rs::default_provider()`.
 
 | Feature | Crate(s) | Effect |
 |---------|----------|--------|
