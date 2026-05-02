@@ -27,21 +27,21 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # MSRV cell: full feature matrix (opentelemetry + splice + simd
-          # on top of default jemallocator). Hosts the workspace-wide
-          # fmt + doc steps; no bench. `default-features` cell below
-          # acts as the bare-default baseline for feature-off breakage.
-          - cell: msrv
+          # `msrv-full` cell: full feature matrix (opentelemetry + splice
+          # + simd on top of default jemallocator). Hosts the
+          # workspace-wide fmt + doc steps; no bench. `msrv-bare` below
+          # is the bare-default baseline for feature-off breakage.
+          - cell: msrv-full
             toolchain: '1.88.0'
             flags: '--features opentelemetry,splice,simd'
             bench: false
             experimental: false
-          # `default-features` baseline: nothing beyond the default
-          # `jemallocator` feature. Catches breakage when the optional
-          # features (opentelemetry, splice, simd) are *off* and only
-          # the workspace's default-features path is exercised. Mirrors
-          # `cargo install sozu` behaviour for a fresh user install.
-          - cell: default-features
+          # `msrv-bare` baseline: only the workspace defaults
+          # (`jemallocator + crypto-ring`). Catches breakage when the
+          # optional features (`opentelemetry`, `splice`, `simd`) are
+          # *off* and only the default-features path is built. Mirrors
+          # `cargo install sozu` for a fresh user install.
+          - cell: msrv-bare
             toolchain: '1.88.0'
             flags: ''
             bench: false
@@ -49,9 +49,10 @@ jobs:
           # The four crypto-provider cells now exercise the full
           # feature matrix (`<crypto>,opentelemetry,splice,simd`) so
           # the CI cells reflect what release artefacts ship with
-          # (Q16: Docker image build flags). `--no-default-features`
-          # explicitly excludes `jemallocator` (the binary feature)
-          # because the lib-only test runs do not link the bin crate.
+          # (matches the feature flags the published Docker image is
+          # built with). `--no-default-features` explicitly excludes
+          # `jemallocator` (the binary feature) because the lib-only
+          # test runs do not link the bin crate.
           - cell: crypto-ring
             toolchain: '1.88.0'
             flags: '--no-default-features --features crypto-ring,opentelemetry,splice,simd'
@@ -116,10 +117,10 @@ jobs:
           components: clippy
 
       # rustfmt.toml uses the unstable `ignore = [...]` key, so the
-      # format check must run on nightly. Only the msrv cell hosts
-      # the fmt step (provider-agnostic, single run is enough).
-      - name: Install nightly rustfmt (msrv cell only)
-        if: matrix.cell == 'msrv'
+      # format check must run on nightly. Only the msrv-full cell
+      # hosts the fmt step (provider-agnostic, single run is enough).
+      - name: Install nightly rustfmt (msrv-full cell only)
+        if: matrix.cell == 'msrv-full'
         run: |
           rustup toolchain install nightly --profile minimal
           rustup component add rustfmt --toolchain nightly
@@ -133,14 +134,14 @@ jobs:
       - name: Build
         run: cargo build --locked ${{ matrix.flags }}
 
-      # Format and doc both run only on the msrv cell to avoid
+      # Format and doc both run only on the msrv-full cell to avoid
       # repeating provider-agnostic checks 5+ times in the matrix.
       - name: Format check
-        if: matrix.cell == 'msrv'
+        if: matrix.cell == 'msrv-full'
         run: cargo +nightly fmt --all -- --check
 
       - name: Build documentation
-        if: matrix.cell == 'msrv'
+        if: matrix.cell == 'msrv-full'
         run: cargo doc --no-deps --all-features --locked
 
       # Lint runs on every 1.88 cell so feature-specific lints
