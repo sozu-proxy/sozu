@@ -15,6 +15,23 @@
 
 To get started check out our [documentation](./doc/README.md) !
 
+## Installation
+
+- **Pre-built binaries** for Linux are attached to every tagged release on the [GitHub Releases page](https://github.com/sozu-proxy/sozu/releases). The matrix covers `x86_64-unknown-linux-{gnu,musl}` and `aarch64-unknown-linux-{gnu,musl}`. Each release also carries a `SHA256SUMS` file:
+
+  ```sh
+  curl -LO https://github.com/sozu-proxy/sozu/releases/download/<VERSION>/sozu-<VERSION>-<TARGET>.tar.gz
+  curl -LO https://github.com/sozu-proxy/sozu/releases/download/<VERSION>/SHA256SUMS
+  sha256sum -c SHA256SUMS --ignore-missing
+  tar -xzf sozu-<VERSION>-<TARGET>.tar.gz
+  ```
+
+  Pre-release tags (`X.Y.Z-rc.N`) are published as GitHub pre-releases.
+
+- **Docker** images are published to [Docker Hub](https://hub.docker.com/r/clevercloud/sozu/) for every tagged release as `clevercloud/sozu:<VERSION>` and `clevercloud/sozu:latest` (stable tags only).
+
+- **From source.** See [`doc/getting_started.md`](./doc/getting_started.md) for compilation prerequisites (`protoc`, Rust toolchain pinned via `rust-toolchain`).
+
 ## Exploring the source
 
 The Cargo workspace ships four crates (Rust 2024 edition, MSRV 1.88):

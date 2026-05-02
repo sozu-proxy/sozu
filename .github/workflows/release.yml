@@ -1,0 +1,270 @@
+---
+name: Release
+
+on:
+  push:
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+'
+      - '[0-9]+.[0-9]+.[0-9]+-rc.[0-9]+'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to (re-)build a release for'
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    name: Preflight (resolve tag, validate Cargo.toml)
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+      prerelease: ${{ steps.resolve.outputs.prerelease }}
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
+      - name: Resolve tag
+        id: resolve
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          echo "Resolved tag: ${TAG}"
+          if ! echo "${TAG}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$'; then
+            echo "::error::Tag '${TAG}' does not match the release pattern."
+            exit 1
+          fi
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+          echo "version=${TAG}" >> "${GITHUB_OUTPUT}"
+          if echo "${TAG}" | grep -q '\-rc\.'; then
+            echo "prerelease=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "prerelease=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Assert per-crate Cargo.toml versions match tag
+        env:
+          EXPECTED: ${{ steps.resolve.outputs.version }}
+        run: |
+          # The repo has no `[workspace.package]` table; each crate pins
+          # its own `[package].version`. Validate every workspace member
+          # so a partial bump cannot ship.
+          set -eu
+          fail=0
+          for manifest in bin/Cargo.toml lib/Cargo.toml command/Cargo.toml e2e/Cargo.toml; do
+            v=$(awk '/^\[package\]/{flag=1; next} /^\[/{flag=0} flag && /^version[[:space:]]*=/ {gsub(/[",]/, "", $3); print $3; exit}' "${manifest}")
+            echo "${manifest}: ${v}"
+            if [ "${v}" != "${EXPECTED}" ]; then
+              echo "::error file=${manifest}::version ${v} does not match tag ${EXPECTED}"
+              fail=1
+            fi
+          done
+          if [ "${fail}" -ne 0 ]; then
+            exit 1
+          fi
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: preflight
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # `fail-fast: false` so a single cell failure does NOT cancel the
+      # other in-flight cells — maximises diagnostic surface on the
+      # first attempt. The `release` job uses `needs: [preflight,
+      # build]` so any cell failure still prevents publication; partial
+      # release is structurally impossible.
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            apt: protobuf-compiler cmake
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            apt: protobuf-compiler cmake musl-tools
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            apt: protobuf-compiler cmake
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            apt: protobuf-compiler cmake musl-tools
+    steps:
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.apt }}
+
+      - name: Checkout sources
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.preflight.outputs.tag }}
+
+      - name: Install rust 1.88.0
+        uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo target
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-all-crates: true
+          prefix-key: release-${{ matrix.target }}
+
+      - name: Build sozu (release)
+        run: |
+          cargo build --locked --release -p sozu \
+            --no-default-features --features jemallocator,crypto-ring \
+            --target ${{ matrix.target }}
+
+      - name: Strip binary
+        run: strip target/${{ matrix.target }}/release/sozu
+
+      - name: Stage tarball contents
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          STAGE="sozu-${VERSION}-${TARGET}"
+          mkdir -p "${STAGE}"
+          cp "target/${TARGET}/release/sozu" "${STAGE}/sozu"
+          cp LICENSE "${STAGE}/LICENSE-AGPL3"
+          cp README.md "${STAGE}/README.md"
+          cp CHANGELOG.md "${STAGE}/CHANGELOG.md"
+          cp bin/config.toml "${STAGE}/config.toml"
+          cp os-build/systemd/sozu.service "${STAGE}/sozu.service"
+          cp os-build/systemd/sozu@.service "${STAGE}/sozu@.service"
+          # Corresponding-source pointer for downstream redistributors who
+          # mirror only the tarball (AGPL §6, LGPL §4). The GitHub Release
+          # auto-attaches a source archive; this pointer survives mirror.
+          cat > "${STAGE}/SOURCE.txt" <<EOF
+          Sōzu source code corresponding to this binary tarball is available at:
+
+            https://github.com/sozu-proxy/sozu/releases/tag/${VERSION}
+            https://github.com/sozu-proxy/sozu (commit tagged ${VERSION})
+
+          The 'sozu' binary contains:
+            - sozu-lib (lib/) and sozu (bin/) — AGPL-3.0-or-later
+            - sozu-command-lib (command/) — LGPL-3.0-or-later
+
+          The full AGPL-3.0 license text is in this archive as LICENSE-AGPL3.
+          The LGPL-3.0 license is available at https://www.gnu.org/licenses/lgpl-3.0.txt
+          EOF
+          tar -czf "${STAGE}.tar.gz" "${STAGE}"
+          sha256sum "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256"
+
+      - name: Upload artefact
+        uses: actions/upload-artifact@v7
+        with:
+          name: sozu-${{ needs.preflight.outputs.version }}-${{ matrix.target }}
+          path: |
+            sozu-${{ needs.preflight.outputs.version }}-${{ matrix.target }}.tar.gz
+            sozu-${{ needs.preflight.outputs.version }}-${{ matrix.target }}.tar.gz.sha256
+          retention-days: 7
+
+  release:
+    name: Publish GitHub Release (draft)
+    needs: [preflight, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.preflight.outputs.tag }}
+
+      - name: Download all artefacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Aggregate SHA256SUMS
+        working-directory: dist
+        run: |
+          cat ./*.sha256 > SHA256SUMS
+          rm -f ./*.sha256
+          cat SHA256SUMS
+
+      - name: Extract changelog section
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          # Extract the `## [VERSION]` section into RELEASE_BODY.md and
+          # pass it to action-gh-release via `body_path` (heredoc-safe).
+          # If the section is missing, emit a `::warning::` so the run
+          # page surfaces the silent skip — operators can still edit the
+          # draft before publishing — but DO NOT fail the workflow:
+          # missing changelog stanzas should not block a real release.
+          awk -v ver="${VERSION}" '
+            BEGIN { in_section = 0 }
+            /^## \[/ {
+              if (in_section) exit
+              if ($0 ~ ("^## \\[" ver "\\]")) { in_section = 1; next }
+            }
+            in_section { print }
+          ' CHANGELOG.md > RELEASE_BODY.md
+          if [ ! -s RELEASE_BODY.md ]; then
+            echo "::warning::CHANGELOG.md has no '## [${VERSION}]' section; the draft release body falls back to a placeholder. Edit the draft before publishing."
+            {
+              echo "Pre-built binaries for ${VERSION}."
+              echo ""
+              echo "Verify with: \`sha256sum -c SHA256SUMS\`."
+              echo ""
+              echo "_NOTE_: this body was auto-generated because the maintainer did not move the \`## [Unreleased]\` block into a \`## [${VERSION}]\` section before tagging. Edit before publishing."
+            } > RELEASE_BODY.md
+          fi
+          cat RELEASE_BODY.md
+
+      - name: Create GitHub Release (draft)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.preflight.outputs.tag }}
+          name: ${{ needs.preflight.outputs.version }}
+          draft: true
+          prerelease: ${{ needs.preflight.outputs.prerelease }}
+          body_path: RELEASE_BODY.md
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+
+  docker-release:
+    name: Docker Hub (tagged image)
+    # Gate on `build` so a tarball failure also blocks the version-pinned
+    # Docker push — keeps binary and image artefacts consistent. The
+    # `:latest` alias must never move when the matching tarballs do not
+    # exist on the GitHub Release page.
+    needs: [preflight, build]
+    if: needs.preflight.outputs.prerelease == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.preflight.outputs.tag }}
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: 'true'
+          tags: |
+            clevercloud/sozu:${{ needs.preflight.outputs.version }}
+            clevercloud/sozu:latest

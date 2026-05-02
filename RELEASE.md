@@ -39,7 +39,7 @@ Move the contents of `## [Unreleased]` into a new release section and reset the 
 
 ## Publish the new version
 
-Update the version in the workspace-root `Cargo.toml` (the `[workspace.package]` table) so that every workspace member inherits the bump. If a crate still pins a private version under its own `[package]` table, update it there as well.
+Update `version` in each per-crate `[package]` table — `bin/Cargo.toml`, `lib/Cargo.toml`, `command/Cargo.toml`, `e2e/Cargo.toml` — keeping all four in lockstep. The release workflow's preflight job (`.github/workflows/release.yml`) validates that all four match the pushed tag and aborts the release if any drift remains.
 
 The four workspace crates currently published from this repository are:
 
@@ -53,6 +53,16 @@ Run `cargo build --locked` at the root of the project to refresh `Cargo.lock`.
 Commit the `Cargo.toml` and `Cargo.lock` changes.
 
 Wait for the GitHub Actions build to pass (<https://github.com/sozu-proxy/sozu/actions>).
+
+## Pre-built binaries
+
+After the tag triggers `.github/workflows/release.yml`, four `sozu-${VERSION}-${TARGET}.tar.gz` archives plus a `SHA256SUMS` file land on a GitHub draft release. The matrix covers `x86_64-unknown-linux-{gnu,musl}` and `aarch64-unknown-linux-{gnu,musl}`. Each tarball contains the stripped `sozu` binary, `LICENSE-AGPL3`, `README.md`, `CHANGELOG.md`, the default `config.toml`, both shipped systemd units, and a `SOURCE.txt` corresponding-source pointer.
+
+For stable tags (`X.Y.Z`), the workflow also pushes `clevercloud/sozu:${VERSION}` and `clevercloud/sozu:latest` to Docker Hub. RC tags (`X.Y.Z-rc.N`) are marked as GitHub prereleases and skip the `:latest` move; they also do not push a tagged Docker image.
+
+The pre-existing `dockerhub` job in `.github/workflows/ci.yml` is gated off on tag pushes — version-pinned and `:latest` images come exclusively from the release workflow. Branch and PR pushes still produce `clevercloud/sozu:${SHA}` aliases as before.
+
+Verify the Docker Hub tag, then click 'Publish' on the draft release.
 
 ## Following checks
 
