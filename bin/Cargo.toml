@@ -28,7 +28,6 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { workspace = true, features = ["derive"] }
-jemallocator = { workspace = true, optional = true }
 libc = { workspace = true }
 log = { workspace = true }
 mio = { workspace = true, features = ["os-poll", "net"] }
@@ -50,8 +49,20 @@ sozu-lib = { workspace = true }
 [dev-dependencies]
 regex = { workspace = true }
 
-[target.'cfg(target_os="linux")'.dependencies]
+[target.'cfg(target_os = "linux")'.dependencies]
 num_cpus = { workspace = true }
+
+# FreeBSD's libc has shipped jemalloc as the default `malloc(3)` since
+# FreeBSD 7.0 (2008); NetBSD has done the same since NetBSD 5.0 (2009).
+# Linking a second jemalloc through `jemallocator` on those platforms is
+# pure redundancy — two jemalloc heaps in one process, ~190 KiB of dead
+# binary text, plus the cost of compiling vendored jemalloc-sys (~47 MiB
+# `libjemalloc.a`). Gate the dep off so a default build on FreeBSD/NetBSD
+# defers to libc's jemalloc. Closes #1076. Other BSDs (DragonFly nmalloc,
+# OpenBSD's own slab malloc) stay in scope of the bundled allocator since
+# their libc isn't jemalloc.
+[target.'cfg(not(any(target_os = "freebsd", target_os = "netbsd")))'.dependencies]
+jemallocator = { workspace = true, optional = true }
 
 [features]
 default = ["jemallocator", "crypto-ring"]

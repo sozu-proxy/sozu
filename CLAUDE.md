@@ -36,7 +36,7 @@ No CI clippy/fmt job runs automatically — run both locally before pushing. CI 
 
 | Flag | Crate | Effect |
 |---|---|---|
-| `default = ["jemallocator", "crypto-ring"]` | `bin` | jemalloc as global allocator + ring crypto provider |
+| `default = ["jemallocator", "crypto-ring"]` | `bin` | jemalloc as global allocator (filtered out on FreeBSD/NetBSD where libc malloc is jemalloc; bundled on Linux/macOS/OpenBSD/DragonFly/Windows) + ring crypto provider |
 | `crypto-ring` (default) | bin, lib | rustls + ring crypto provider |
 | `crypto-aws-lc-rs` | bin, lib | rustls + aws-lc-rs crypto provider |
 | `crypto-openssl` | bin, lib | rustls + openssl crypto provider (`rustls-openssl`) |

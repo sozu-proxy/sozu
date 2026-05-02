@@ -30,7 +30,11 @@ extern crate sozu_command_lib;
 #[cfg(target_os = "linux")]
 extern crate num_cpus;
 
-#[cfg(feature = "jemallocator")]
+// FreeBSD/NetBSD libc malloc is already jemalloc; the bundled `jemallocator`
+// dep is filtered out of the build graph in `bin/Cargo.toml`. The
+// `libc_jemalloc` cfg is emitted by `bin/build.rs` for those targets; without
+// the cfg here, rustc would expand the binding to an unresolved crate.
+#[cfg(all(feature = "jemallocator", not(libc_jemalloc)))]
 #[global_allocator]
 static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
