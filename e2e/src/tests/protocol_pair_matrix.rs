@@ -509,14 +509,24 @@ protocol_pair_matrix!(basic_auth, try_basic_auth_cell, "basic auth");
 // still run them to confirm the redirect remains independent of
 // `cluster.http2`.
 
-fn try_redirect_permanent_cell(frontend_h2: bool, backend_h2: bool) -> State {
-    let cluster_id = "matrix_redir_cluster";
+/// Common redirect-cell shape: spawn an HTTPS worker with `policy` on the
+/// frontend, send a single `GET`, assert the response carries
+/// `expected_status` plus an `https://` `Location` header. The backend is
+/// intentionally unbound — a redirect MUST short-circuit before the
+/// upstream connect, so a registry-bound port would mask a regression.
+///
+/// Used by the Permanent (301), Found (302), and PermanentRedirect (308)
+/// matrix cells (closes #1009 with full 4-cell coverage per status).
+fn try_redirect_cell_inner(
+    log_tag: &str,
+    cluster_id: &str,
+    frontend_h2: bool,
+    backend_h2: bool,
+    policy: RedirectPolicy,
+    expected_status: u16,
+) -> State {
     let (mut worker, front_address, front_port) =
-        bring_up_https_listener("MATRIX-REDIR", ListenerOpts::default());
-    // Backend is intentionally unbound: a Permanent redirect must
-    // emit 301 without contacting the upstream. A registry-bound port
-    // would silently complete the TCP handshake, masking a regression
-    // that bypasses the redirect short-circuit.
+        bring_up_https_listener(log_tag, ListenerOpts::default());
     let back_address = create_unbound_local_address();
     install_cluster_and_frontend(
         &mut worker,
@@ -527,7 +537,7 @@ fn try_redirect_permanent_cell(frontend_h2: bool, backend_h2: bool) -> State {
             ..c
         },
         RequestHttpFrontend {
-            redirect: Some(RedirectPolicy::Permanent as i32),
+            redirect: Some(policy as i32),
             redirect_scheme: Some(RedirectScheme::UseHttps as i32),
             ..Worker::default_http_frontend(cluster_id, front_address)
         },
@@ -547,11 +557,11 @@ fn try_redirect_permanent_cell(frontend_h2: bool, backend_h2: bool) -> State {
     let stop_ok = worker.wait_for_server_stop();
 
     let Some((status, headers, _)) = outcome else {
-        eprintln!("redirect cell: client did not resolve a response");
+        eprintln!("{log_tag}: client did not resolve a response");
         return State::Fail;
     };
-    if status != 301 {
-        eprintln!("redirect cell: expected 301, got {status}");
+    if status != expected_status {
+        eprintln!("{log_tag}: expected {expected_status}, got {status}");
         return State::Fail;
     }
     let location = headers
@@ -561,12 +571,12 @@ fn try_redirect_permanent_cell(frontend_h2: bool, backend_h2: bool) -> State {
     let location = match location {
         Some(loc) => loc,
         None => {
-            eprintln!("redirect cell: response missing Location header");
+            eprintln!("{log_tag}: response missing Location header");
             return State::Fail;
         }
     };
     if !location.to_ascii_lowercase().starts_with("https://") {
-        eprintln!("redirect cell: expected https Location, got {location}");
+        eprintln!("{log_tag}: expected https Location, got {location}");
         return State::Fail;
     }
     if !stop_ok {
@@ -575,10 +585,51 @@ fn try_redirect_permanent_cell(frontend_h2: bool, backend_h2: bool) -> State {
     State::Success
 }
 
+fn try_redirect_permanent_cell(frontend_h2: bool, backend_h2: bool) -> State {
+    try_redirect_cell_inner(
+        "MATRIX-REDIR-301",
+        "matrix_redir_301_cluster",
+        frontend_h2,
+        backend_h2,
+        RedirectPolicy::Permanent,
+        301,
+    )
+}
+
 protocol_pair_matrix!(
     redirect_permanent,
     try_redirect_permanent_cell,
     "redirect permanent"
+);
+
+fn try_redirect_found_cell(frontend_h2: bool, backend_h2: bool) -> State {
+    try_redirect_cell_inner(
+        "MATRIX-REDIR-302",
+        "matrix_redir_302_cluster",
+        frontend_h2,
+        backend_h2,
+        RedirectPolicy::Found,
+        302,
+    )
+}
+
+protocol_pair_matrix!(redirect_found, try_redirect_found_cell, "redirect 302");
+
+fn try_redirect_permanent_redirect_cell(frontend_h2: bool, backend_h2: bool) -> State {
+    try_redirect_cell_inner(
+        "MATRIX-REDIR-308",
+        "matrix_redir_308_cluster",
+        frontend_h2,
+        backend_h2,
+        RedirectPolicy::PermanentRedirect,
+        308,
+    )
+}
+
+protocol_pair_matrix!(
+    redirect_permanent_redirect,
+    try_redirect_permanent_redirect_cell,
+    "redirect 308"
 );
 
 // ═════════════════════════════════════════════════════════════════════
