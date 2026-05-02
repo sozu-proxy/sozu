@@ -81,11 +81,25 @@ fn main() {
     const CRYPTO_PROVIDER_SUFFIXES: &[&str] =
         &["CRYPTO_RING", "CRYPTO_AWS_LC_RS", "CRYPTO_OPENSSL", "FIPS"];
 
+    // FreeBSD/NetBSD libc IS jemalloc; we filter the bundled `jemallocator`
+    // dep out of the build graph (see `bin/Cargo.toml`). Emit a custom cfg
+    // so `bin/src/main.rs` can gate the `static ALLOC` binding without
+    // restating the OS list, and force `-jemallocator` in the `--version`
+    // banner so the link graph is reported truthfully.
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let libc_jemalloc = matches!(target_os.as_str(), "freebsd" | "netbsd");
+    println!("cargo::rustc-check-cfg=cfg(libc_jemalloc)");
+    if libc_jemalloc {
+        println!("cargo::rustc-cfg=libc_jemalloc");
+    }
+
     let flags: Vec<String> = features
         .iter()
         .map(|(env_suffix, display)| {
             let on = if CRYPTO_PROVIDER_SUFFIXES.contains(env_suffix) {
                 crypto_effective.contains(env_suffix)
+            } else if env_suffix == &"JEMALLOCATOR" && libc_jemalloc {
+                false
             } else {
                 active(env_suffix)
             };
