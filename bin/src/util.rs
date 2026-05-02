@@ -185,23 +185,37 @@ pub unsafe fn get_executable_path() -> Result<String, UtilError> {
 }
 
 /// Returns a path string suitable for `execve(2)` that is **race-free against
-/// on-disk binary replacement**. Closes [#515].
+/// on-disk binary replacement**. Used by the **worker auto-restart** path
+/// only. Closes [#515].
 ///
-/// The motivating bug: when a master forks a worker (or re-execs itself for
-/// hot-upgrade) it calls `Command::new(executable_path).exec()` where
-/// `executable_path` is a string like `/usr/bin/sozu`. If the operator has
-/// replaced the binary on disk between master startup and the exec call
-/// (`cp new-sozu /usr/bin/sozu` followed by `sozuctl upgrade`), `execve(2)`
-/// resolves `/usr/bin/sozu` as a normal path and starts the **new** binary,
-/// which is incompatible with the running master's protocol expectations.
+/// **Scope** — read this before adding a new call site.
 ///
-/// On Linux, `/proc/self/exe` is a magic symlink that always resolves to the
-/// **original** inode the process was started from, regardless of whether
-/// the on-disk file was unlinked or replaced. Opening it with `O_PATH`
-/// returns an fd that pins the inode for the lifetime of the fd; passing
-/// `/proc/self/fd/<n>` to `execve(2)` causes the kernel to resolve the
-/// magic symlink to the original inode, not whatever is currently at the
-/// path string.
+/// Sōzu has two `Command::new(...).exec()` sites that re-launch the binary:
+///
+/// | Site | Intent | Should use this helper? |
+/// |------|--------|-------------------------|
+/// | [`bin/src/worker.rs`] worker auto-restart | spawn a worker matching the **running master's** version | **YES** — race-free fd-based exec |
+/// | [`bin/src/upgrade.rs`] master hot-upgrade | switch to the **new** on-disk binary the operator just installed | **NO** — path-based exec is the operator's intent |
+///
+/// The motivating bug: a master at version A spawned a worker via
+/// `Command::new(executable_path).exec()` where `executable_path` was a
+/// string like `/usr/bin/sozu`. If a package upgrade had replaced the
+/// on-disk binary with version B between master startup and a worker
+/// auto-restart, `execve(2)` resolved `/usr/bin/sozu` as a normal path and
+/// started version B, incompatible with the master at version A.
+///
+/// The fix on Linux: `/proc/self/exe` is a magic symlink that always
+/// resolves to the **original** inode the process was started from,
+/// regardless of whether the on-disk file was unlinked or replaced.
+/// Opening it with `O_PATH` returns an fd that pins the inode for the
+/// lifetime of the fd; passing `/proc/self/fd/<n>` to `execve(2)` causes
+/// the kernel to resolve the magic symlink to the original inode, not
+/// whatever is currently at the path string. Workers spawned via this
+/// helper therefore always match the running master's version.
+///
+/// The master hot-upgrade path deliberately skips this helper because the
+/// operator's whole point is to switch to a different version. There the
+/// path-based `Command::new(executable_path)` is correct.
 ///
 /// We keep the fd open until process exit (the kernel closes it via
 /// `O_CLOEXEC` when exec succeeds; if exec fails, the fd persists harmlessly
@@ -209,10 +223,12 @@ pub unsafe fn get_executable_path() -> Result<String, UtilError> {
 /// on a path that is itself a master-in-trouble code path).
 ///
 /// On non-Linux platforms (FreeBSD, macOS) we fall back to the historical
-/// path-string approach. The race window is identical to v1.x; the v2.0.0
+/// path-string approach. The race window is identical to before; the
 /// migration target is Linux operators who hit #515 in production.
 ///
 /// [#515]: https://github.com/sozu-proxy/sozu/issues/515
+/// [`bin/src/worker.rs`]: ../worker/index.html
+/// [`bin/src/upgrade.rs`]: ../upgrade/index.html
 #[cfg(target_os = "linux")]
 pub fn get_executable_exec_path() -> Result<String, UtilError> {
     use std::os::fd::IntoRawFd;
