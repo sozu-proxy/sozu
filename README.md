@@ -17,16 +17,28 @@ To get started check out our [documentation](./doc/README.md) !
 
 ## Installation
 
-- **Pre-built binaries** for Linux are attached to every tagged release on the [GitHub Releases page](https://github.com/sozu-proxy/sozu/releases). The matrix covers `x86_64-unknown-linux-{gnu,musl}` and `aarch64-unknown-linux-{gnu,musl}`. Each release also carries a `SHA256SUMS` file:
+- **Pre-built binaries** for Linux are attached to every tagged release on the [GitHub Releases page](https://github.com/sozu-proxy/sozu/releases). The matrix covers `x86_64-unknown-linux-{gnu,musl}` and `aarch64-unknown-linux-{gnu,musl}`. Each release also carries a `SHA256SUMS` file, a sigstore keyless signature pair (`SHA256SUMS.sig` + `SHA256SUMS.pem`), and SLSA build-provenance attestations:
 
   ```sh
   curl -LO https://github.com/sozu-proxy/sozu/releases/download/<VERSION>/sozu-<VERSION>-<TARGET>.tar.gz
   curl -LO https://github.com/sozu-proxy/sozu/releases/download/<VERSION>/SHA256SUMS
+  curl -LO https://github.com/sozu-proxy/sozu/releases/download/<VERSION>/SHA256SUMS.sig
+  curl -LO https://github.com/sozu-proxy/sozu/releases/download/<VERSION>/SHA256SUMS.pem
+
+  # Verify the signature was produced by this repository's release workflow:
+  cosign verify-blob \
+    --certificate SHA256SUMS.pem \
+    --signature SHA256SUMS.sig \
+    --certificate-identity-regexp 'https://github.com/sozu-proxy/sozu/.*' \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    SHA256SUMS
+
+  # Verify the tarball matches the signed sums:
   sha256sum -c SHA256SUMS --ignore-missing
   tar -xzf sozu-<VERSION>-<TARGET>.tar.gz
   ```
 
-  Pre-release tags (`X.Y.Z-rc.N`) are published as GitHub pre-releases.
+  Build provenance can be inspected with `gh attestation verify sozu-<VERSION>-<TARGET>.tar.gz --owner sozu-proxy`. Pre-release tags (`X.Y.Z-rc.N`) are published as GitHub pre-releases.
 
 - **Docker** images are published to [Docker Hub](https://hub.docker.com/r/clevercloud/sozu/) for every tagged release as `clevercloud/sozu:<VERSION>` and `clevercloud/sozu:latest` (stable tags only).
 

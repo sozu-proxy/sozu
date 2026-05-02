@@ -124,7 +124,20 @@ jobs:
           cache-all-crates: true
           prefix-key: release-${{ matrix.target }}
 
+      - name: Resolve SOURCE_DATE_EPOCH from tag commit
+        id: sde
+        run: |
+          # Reproducibility best-effort: pin the build clock to the
+          # tagged commit's committer time so any timestamp written
+          # into the binary by toolchain steps that honour
+          # SOURCE_DATE_EPOCH is deterministic across reruns and
+          # across matrix cells.
+          SDE=$(git log -1 --format=%ct HEAD)
+          echo "epoch=${SDE}" >> "${GITHUB_OUTPUT}"
+
       - name: Build sozu (release)
+        env:
+          SOURCE_DATE_EPOCH: ${{ steps.sde.outputs.epoch }}
         run: |
           cargo build --locked --release -p sozu \
             --no-default-features --features jemallocator,crypto-ring \
@@ -137,11 +150,13 @@ jobs:
         env:
           VERSION: ${{ needs.preflight.outputs.version }}
           TARGET: ${{ matrix.target }}
+          SOURCE_DATE_EPOCH: ${{ steps.sde.outputs.epoch }}
         run: |
           STAGE="sozu-${VERSION}-${TARGET}"
           mkdir -p "${STAGE}"
           cp "target/${TARGET}/release/sozu" "${STAGE}/sozu"
           cp LICENSE "${STAGE}/LICENSE-AGPL3"
+          cp LICENSE-LGPL3 "${STAGE}/LICENSE-LGPL3"
           cp README.md "${STAGE}/README.md"
           cp CHANGELOG.md "${STAGE}/CHANGELOG.md"
           cp bin/config.toml "${STAGE}/config.toml"
@@ -161,9 +176,13 @@ jobs:
             - sozu-command-lib (command/) — LGPL-3.0-or-later
 
           The full AGPL-3.0 license text is in this archive as LICENSE-AGPL3.
-          The LGPL-3.0 license is available at https://www.gnu.org/licenses/lgpl-3.0.txt
+          The full LGPL-3.0 license text is in this archive as LICENSE-LGPL3.
           EOF
-          tar -czf "${STAGE}.tar.gz" "${STAGE}"
+          # Reproducibility best-effort: pin tar mtimes to
+          # SOURCE_DATE_EPOCH and use a stable owner/sort.
+          tar --sort=name --owner=0 --group=0 --numeric-owner \
+              --mtime="@${SOURCE_DATE_EPOCH}" \
+              -czf "${STAGE}.tar.gz" "${STAGE}"
           sha256sum "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256"
 
       - name: Upload artefact
@@ -181,6 +200,12 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      # `id-token: write` allows cosign to obtain a sigstore OIDC token
+      # for keyless signing (no maintainer GPG key is stored anywhere).
+      # `attestations: write` lets `actions/attest-build-provenance`
+      # record SLSA build provenance against the artefacts.
+      id-token: write
+      attestations: write
     steps:
       - name: Checkout sources
         uses: actions/checkout@v6
@@ -199,6 +224,35 @@ jobs:
           cat ./*.sha256 > SHA256SUMS
           rm -f ./*.sha256
           cat SHA256SUMS
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign SHA256SUMS (keyless via sigstore)
+        working-directory: dist
+        env:
+          COSIGN_YES: 'true'
+        run: |
+          # Keyless signing — no static secret. The OIDC token
+          # presented by `id-token: write` is exchanged with sigstore's
+          # Fulcio for a short-lived signing certificate; the signature
+          # and certificate are recorded in Rekor and emitted as side
+          # files. Operators verify with:
+          #   cosign verify-blob \
+          #     --certificate SHA256SUMS.pem \
+          #     --signature SHA256SUMS.sig \
+          #     --certificate-identity-regexp 'https://github.com/sozu-proxy/sozu/.*' \
+          #     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+          #     SHA256SUMS
+          cosign sign-blob \
+            --output-signature SHA256SUMS.sig \
+            --output-certificate SHA256SUMS.pem \
+            SHA256SUMS
+
+      - name: Generate SLSA build provenance
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: 'dist/sozu-*.tar.gz'
 
       - name: Extract changelog section
         env:
@@ -241,6 +295,8 @@ jobs:
           files: |
             dist/*.tar.gz
             dist/SHA256SUMS
+            dist/SHA256SUMS.sig
+            dist/SHA256SUMS.pem
 
   docker-release:
     name: Docker Hub (tagged image)
