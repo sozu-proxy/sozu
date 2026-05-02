@@ -8,12 +8,12 @@ document captures **how to use it**, **where to apply it**, and the
 
 ## The matrix
 
-| Cell | Frontend | Backend | Mock backend | Notes |
-|---|---|---|---|---|
-| `h1-h1` | h1 + TLS | h1 cleartext | `AsyncBackend::http_handler` | Baseline; covered by `try_tls_endpoint`, `try_tls_rsa_2048`, `try_tls_ecdsa`. |
-| `h1-h2c` | h1 + TLS | h2c cleartext | `H2Backend::start` | Covered by `try_tls_cardinality_h1_h2_*`. |
-| `h2-h1` | h2 + TLS (ALPN) | h1 cleartext | `AsyncBackend::http_handler` | Covered by `try_tls_cardinality_h2_h1_*`. |
-| `h2-h2c` | h2 + TLS (ALPN) | h2c cleartext | `H2Backend::start` | Covered by `try_tls_cardinality_h2_h2_*`. |
+| Cell     | Frontend        | Backend       | Mock backend                 | Notes                                                                         |
+| -------- | --------------- | ------------- | ---------------------------- | ----------------------------------------------------------------------------- |
+| `h1-h1`  | h1 + TLS        | h1 cleartext  | `AsyncBackend::http_handler` | Baseline; covered by `try_tls_endpoint`, `try_tls_rsa_2048`, `try_tls_ecdsa`. |
+| `h1-h2c` | h1 + TLS        | h2c cleartext | `H2Backend::start`           | Covered by `try_tls_cardinality_h1_h2_*`.                                     |
+| `h2-h1`  | h2 + TLS (ALPN) | h1 cleartext  | `AsyncBackend::http_handler` | Covered by `try_tls_cardinality_h2_h1_*`.                                     |
+| `h2-h2c` | h2 + TLS (ALPN) | h2c cleartext | `H2Backend::start`           | Covered by `try_tls_cardinality_h2_h2_*`.                                     |
 
 Backend **TLS** (h1-over-TLS, h2-over-TLS) is **not** in the current
 release; the follow-up enhancement is tracked at
@@ -35,6 +35,7 @@ pub fn try_tls_cardinality_cell(
 ```
 
 For each cell:
+
 - Frontend ALPN preference is set indirectly via the chosen Hyper client
   (`build_https_client` for H1, `build_h2_client` for H2). rustls
   negotiates the cell's protocol.
@@ -56,23 +57,23 @@ covers it.
 Not every test makes sense in every cell. Tests opt into the cells they
 actually exercise. The decision matrix:
 
-| Feature under test | h1-h1 | h1-h2c | h2-h1 | h2-h2c | Notes |
-|---|---|---|---|---|---|
-| HTTP Basic auth | ✓ | ✓ | ✓ | ✓ | All cells; auth gate is router-layer. |
-| 301/302/308 redirect | ✓ | ✓ | ✓ | ✓ | All cells; redirect renders same answer-template. |
-| X-Real-IP injection | ✓ | ✓ | ✓ | ✓ | All cells; H2 trailer-elision needs H2 frontend cells specifically. |
-| Per-IP `429` limit | ✓ | ✓ | ✓ | ✓ | All cells; one of each cert kind is enough. |
-| `evict_on_queue_full` | ✓ | ✓ | ✓ | ✓ | All cells. |
-| Custom answer template | ✓ | ✓ | ✓ | ✓ | All cells. |
-| RFC 9218 priority | ✗ | ✗ | ✓ | ✓ | H2 frontend only — RFC 9218 is HTTP/2 priorities. |
-| HPACK rejection counters | ✗ | ✗ | ✓ | ✓ | H2 frontend only — HPACK is H2 wire. |
-| H2 flood detector | ✗ | ✗ | ✓ | ✓ | H2 frontend only. |
-| HTTP/1 pipelining | ✓ | ✓ | ✗ | ✗ | H1 frontend only — H2 multiplexing replaces pipelining. |
-| H2 trailer header elision | ✗ | ✗ | ✓ | ✓ | H2 frontend only — trailers are H2 frames. |
-| RFC 7239 `Forwarded` (planned) | ✓ | ✓ | ✓ | ✓ | All cells; header semantic is protocol-agnostic. |
-| Backend TLS / mTLS-up (planned) | (new TLS-axis cells) | | | | Adds 4 TLS-backend cells; matrix grows to 8. |
-| ACME HTTP-01 challenge (planned) | ✓ | ✓ | ✓ | ✓ | Challenge route is HTTP/1.1 GET on port 80; ALPN-agnostic. |
-| OCSP stapling (planned) | ✓ | ✓ | ✓ | ✓ | Stapling is TLS-handshake, before HTTP. |
+| Feature under test               | h1-h1                | h1-h2c | h2-h1 | h2-h2c | Notes                                                               |
+| -------------------------------- | -------------------- | ------ | ----- | ------ | ------------------------------------------------------------------- |
+| HTTP Basic auth                  | ✓                    | ✓      | ✓     | ✓      | All cells; auth gate is router-layer.                               |
+| 301/302/308 redirect             | ✓                    | ✓      | ✓     | ✓      | All cells; redirect renders same answer-template.                   |
+| X-Real-IP injection              | ✓                    | ✓      | ✓     | ✓      | All cells; H2 trailer-elision needs H2 frontend cells specifically. |
+| Per-IP `429` limit               | ✓                    | ✓      | ✓     | ✓      | All cells; one of each cert kind is enough.                         |
+| `evict_on_queue_full`            | ✓                    | ✓      | ✓     | ✓      | All cells.                                                          |
+| Custom answer template           | ✓                    | ✓      | ✓     | ✓      | All cells.                                                          |
+| RFC 9218 priority                | ✗                    | ✗      | ✓     | ✓      | H2 frontend only — RFC 9218 is HTTP/2 priorities.                   |
+| HPACK rejection counters         | ✗                    | ✗      | ✓     | ✓      | H2 frontend only — HPACK is H2 wire.                                |
+| H2 flood detector                | ✗                    | ✗      | ✓     | ✓      | H2 frontend only.                                                   |
+| HTTP/1 pipelining                | ✓                    | ✓      | ✗     | ✗      | H1 frontend only — H2 multiplexing replaces pipelining.             |
+| H2 trailer header elision        | ✗                    | ✗      | ✓     | ✓      | H2 frontend only — trailers are H2 frames.                          |
+| RFC 7239 `Forwarded` (planned)   | ✓                    | ✓      | ✓     | ✓      | All cells; header semantic is protocol-agnostic.                    |
+| Backend TLS / mTLS-up (planned)  | (new TLS-axis cells) |        |       |        | Adds 4 TLS-backend cells; matrix grows to 8.                        |
+| ACME HTTP-01 challenge (planned) | ✓                    | ✓      | ✓     | ✓      | Challenge route is HTTP/1.1 GET on port 80; ALPN-agnostic.          |
+| OCSP stapling (planned)          | ✓                    | ✓      | ✓     | ✓      | Stapling is TLS-handshake, before HTTP.                             |
 
 When adding a test, declare the applicable cells in a comment and use
 the relevant `try_tls_cardinality_*` wrapper(s).
@@ -125,15 +126,15 @@ free" via the macro proposed above.
 
 ## Mock backend taxonomy (codex MED-2 — applicable cells only)
 
-| Mock | h1-h1 | h1-h2c | h2-h1 | h2-h2c | Notes |
-|---|---|---|---|---|---|
-| `AsyncBackend` | ✓ | ✗ | ✓ | ✗ | H1 only on the wire. |
-| `SyncBackend` | ✓ | ✗ | ✓ | ✗ | Synchronous H1. |
-| `H2Backend` | ✗ | ✓ | ✗ | ✓ | h2c only. |
-| `RawH2ResponseBackend` | ✗ | ✓ | ✗ | ✓ | Adversarial H2 — for security tests, not protocol-pair backfill. |
-| `ChunkedFlushH1Backend` | ✓ | ✗ | ✓ | ✗ | H1-only chunked-encoding repros. |
-| `SingleReadH1Backend` | ✓ | ✗ | ✓ | ✗ | H1-only single-read repros. |
-| `RawH2ResponseBackend` | ✗ | ✓ | ✗ | ✓ | Already listed; here for ✗-symmetry. |
+| Mock                    | h1-h1 | h1-h2c | h2-h1 | h2-h2c | Notes                                                            |
+| ----------------------- | ----- | ------ | ----- | ------ | ---------------------------------------------------------------- |
+| `AsyncBackend`          | ✓     | ✗      | ✓     | ✗      | H1 only on the wire.                                             |
+| `SyncBackend`           | ✓     | ✗      | ✓     | ✗      | Synchronous H1.                                                  |
+| `H2Backend`             | ✗     | ✓      | ✗     | ✓      | h2c only.                                                        |
+| `RawH2ResponseBackend`  | ✗     | ✓      | ✗     | ✓      | Adversarial H2 — for security tests, not protocol-pair backfill. |
+| `ChunkedFlushH1Backend` | ✓     | ✗      | ✓     | ✗      | H1-only chunked-encoding repros.                                 |
+| `SingleReadH1Backend`   | ✓     | ✗      | ✓     | ✗      | H1-only single-read repros.                                      |
+| `RawH2ResponseBackend`  | ✗     | ✓      | ✗     | ✓      | Already listed; here for ✗-symmetry.                             |
 
 Tests opt into mocks that match their target cells. Don't pair
 `H2Backend` with an `h1-h1` cell — the cluster still has
