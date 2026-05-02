@@ -49,6 +49,14 @@ Finally you have to create a frontend to allow sozu to send traffic from the lis
 sozu --config /etc/sozu/config.toml frontend http add --address 0.0.0.0:80 --hostname <my_cluster_hostname> id <my_cluster_id>
 ```
 
+To route only a sub-path of a hostname to this cluster, add `--path-prefix`
+(use `--path-regex` or `--path-equals` for the other matching modes — see
+"Path matching precedence within a frontend" in `doc/configure.md`):
+
+```bash
+sozu --config /etc/sozu/config.toml frontend http add --address 0.0.0.0:80 --hostname <my_cluster_hostname> --path-prefix /api id <my_cluster_id>
+```
+
 ### Add https frontend
 
 And an https listener:
