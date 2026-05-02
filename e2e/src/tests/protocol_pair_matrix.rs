@@ -575,8 +575,19 @@ fn try_redirect_cell_inner(
             return State::Fail;
         }
     };
-    if !location.to_ascii_lowercase().starts_with("https://") {
+    let lowered = location.to_ascii_lowercase();
+    if !lowered.starts_with("https://") {
         eprintln!("{log_tag}: expected https Location, got {location}");
+        return State::Fail;
+    }
+    // Catch the regressions a `starts_with("https://")` check would
+    // miss: empty host (`https://:443/...`) or cross-tenant bleed
+    // from a state-replay ordering bug. The frontend binds via
+    // `bring_up_https_listener` whose hostname is `localhost`
+    // (HOST_NAME is the SAN baked into the test certs); the
+    // redirect URL preserves the request's `Host:` verbatim.
+    if !lowered.contains("localhost") {
+        eprintln!("{log_tag}: expected Location host localhost, got {location}");
         return State::Fail;
     }
     if !stop_ok {
