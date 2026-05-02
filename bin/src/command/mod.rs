@@ -20,6 +20,7 @@ use mio::net::UnixListener;
 use sozu_command_lib::{
     config::{Config, ConfigError},
     logging::{LogError, setup_logging_with_config},
+    sd_notify,
 };
 
 use self::server::{HubError, ServerError};
@@ -121,7 +122,21 @@ pub fn begin_main_process(args: &Args) -> Result<(), StartError> {
         requests::load_state(&mut command_hub.server, None, &path);
     }
 
+    // #228: tell systemd the master is ready (Type=notify). No-op when
+    // `$NOTIFY_SOCKET` is unset (not running under systemd).
+    match sd_notify::notify(sd_notify::STATE_READY) {
+        Ok(true) => info!("notified systemd: READY=1"),
+        Ok(false) => {}
+        Err(e) => warn!("could not notify systemd READY=1: {}", e),
+    }
+
     command_hub.run();
+
+    // #228: graceful shutdown signal — systemd suppresses the
+    // "abnormal exit" treatment when STOPPING=1 was observed.
+    if let Err(e) = sd_notify::notify(sd_notify::STATE_STOPPING) {
+        warn!("could not notify systemd STOPPING=1: {}", e);
+    }
 
     info!("main process stopped");
     Ok(())

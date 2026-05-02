@@ -67,6 +67,8 @@ pub mod request;
 pub mod response;
 /// sockets used to pass file descriptors
 pub mod scm_socket;
+/// systemd `sd_notify` integration (READY=1 / STOPPING=1 / etc.)
+pub mod sd_notify;
 /// A representation of Sōzu's state
 pub mod state;
 /// A writer used for logging
