@@ -1069,7 +1069,11 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
     }
 
     pub fn log_default_answer_success(&self, metrics: &SessionMetrics) {
-        self.log_request(metrics, false, None);
+        // Surface the timeout discriminator (set by `timeout()` before
+        // `set_answer`) on the access-log `message` field. Non-timeout
+        // default-answer paths leave `access_log_message` as `None` and
+        // emit `message: None` exactly as before.
+        self.log_request(metrics, false, self.context.access_log_message);
     }
     pub fn log_request_error(&self, metrics: &mut SessionMetrics, message: &str) {
         // Labelled with `(cluster_id, backend_id)` so per-cluster dashboards
@@ -2123,6 +2127,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> SessionState 
             return match self.timeout_status() {
                 // we do not have a complete answer
                 TimeoutStatus::Request => {
+                    self.context.access_log_message = Some("client_timeout");
                     self.set_answer(DefaultAnswer::Answer408 {
                         duration: self.container_frontend_timeout.to_string(),
                     });
@@ -2132,6 +2137,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> SessionState 
                 TimeoutStatus::WaitingForResponse => {
                     // this case is ambiguous, as it is the frontend timeout that triggers while we were waiting for response
                     // the timeout responsibility should have switched before
+                    self.context.access_log_message = Some("client_timeout_during_response");
                     self.set_answer(DefaultAnswer::Answer504 {
                         duration: self.container_backend_timeout.to_string(),
                     });
@@ -2154,12 +2160,18 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> SessionState 
                         "{} got backend timeout while waiting for a request, this should not happen",
                         log_context!(self)
                     );
+                    // Operator-visible cause is the same as the regular
+                    // backend-timeout arm — backend silent before we
+                    // could send the request. The error! above keeps the
+                    // internal-invariant signal for sozu maintainers.
+                    self.context.access_log_message = Some("backend_timeout");
                     self.set_answer(DefaultAnswer::Answer504 {
                         duration: self.container_backend_timeout.to_string(),
                     });
                     self.writable(metrics)
                 }
                 TimeoutStatus::WaitingForResponse => {
+                    self.context.access_log_message = Some("backend_timeout");
                     self.set_answer(DefaultAnswer::Answer504 {
                         duration: self.container_backend_timeout.to_string(),
                     });
@@ -2170,6 +2182,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> SessionState 
                         "backend {:?} timeout while receiving response (cluster {:?})",
                         self.context.backend_id, self.context.cluster_id
                     );
+                    self.context.access_log_message = Some("backend_response_timeout");
                     StateResult::CloseSession
                 }
                 // in keep-alive, we place responsibility of timeout on the frontend, so we ignore this

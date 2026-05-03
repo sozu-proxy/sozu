@@ -287,6 +287,17 @@ pub struct HttpContext {
     /// `None` falls back to 301 for the legacy
     /// `cluster.https_redirect = true` path. Closes #1009.
     pub redirect_status: Option<u16>,
+    /// Stable, structured discriminator surfaced as the access-log
+    /// `message` field when the session terminates on a timeout. Set by
+    /// the timeout handlers in `kawa_h1::timeout` and `MuxState::timeout`
+    /// **before** the default-answer or `forcefully_terminate_answer`
+    /// path consumes it. The vocabulary is operator-visible API once
+    /// shipped — see the access-log section of `doc/configure.md` for
+    /// the full token list (`client_timeout`,
+    /// `client_timeout_during_response`, `backend_timeout`,
+    /// `backend_response_timeout`). `None` for non-timeout sessions, in
+    /// which case the access log emits `message: None` as before.
+    pub access_log_message: Option<&'static str>,
 }
 
 /// Owned snapshot of a per-frontend header edit, captured at routing
@@ -366,6 +377,7 @@ impl HttpContext {
             retry_after_seconds: None,
             frontend_redirect_template: None,
             redirect_status: None,
+            access_log_message: None,
         }
     }
 
