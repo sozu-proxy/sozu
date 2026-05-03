@@ -653,6 +653,26 @@ pub enum HttpFrontendCmd {
             help = "Header mutation, format: <position>=<name>=<value>. Position is 'request', 'response', or 'both'. Empty <value> deletes the header (HAProxy del-header parity). Repeatable. To replace a header, pass it twice: first with an empty value (deletes the existing one), then with the new value (sets it). The runtime applies all deletes before any sets."
         )]
         header: Vec<String>,
+        #[clap(
+            long = "hsts-max-age",
+            help = "HSTS (RFC 6797) `max-age` directive in seconds. Setting any of the --hsts-* flags enables HSTS on this frontend. Defaults to 31536000 (1 year, HSTS preload list minimum) when --hsts-max-age is omitted but another --hsts-* flag is set. `0` is the RFC 6797 §11.4 kill switch."
+        )]
+        hsts_max_age: Option<u32>,
+        #[clap(
+            long = "hsts-include-subdomains",
+            help = "Append `; includeSubDomains` to the rendered HSTS header. Implies HSTS enabled."
+        )]
+        hsts_include_subdomains: bool,
+        #[clap(
+            long = "hsts-preload",
+            help = "Append `; preload` to the rendered HSTS header (Chrome HSTS preload list — see https://hstspreload.org/). Implies HSTS enabled. Opt-in only; once submitted, removal from the preload list is slow and partial (RFC 6797 §14.2)."
+        )]
+        hsts_preload: bool,
+        #[clap(
+            long = "hsts-disabled",
+            help = "Explicitly disable HSTS on this frontend, suppressing any inherited listener-default HSTS. Mutually exclusive with --hsts-max-age / --hsts-include-subdomains / --hsts-preload."
+        )]
+        hsts_disabled: bool,
     },
     #[clap(name = "remove")]
     Remove {
