@@ -1343,13 +1343,16 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                         if !front_is_h2 {
                             let answers = answers_rc.borrow();
                             let stream = &mut self.context.streams[stream_id];
+                            stream.context.access_log_message = Some("client_timeout");
                             set_default_answer(stream, front_readiness, 408, &answers);
                             should_write = true;
                         }
                     }
                     StreamState::Link => {
                         // This is an unusual case, as we have both a complete request and no
-                        // available backend yet. For now, we answer with 503
+                        // available backend yet. For now, we answer with 503.
+                        // Not a timeout-driven outcome from the operator's
+                        // perspective — leave access_log_message as None.
                         let answers = answers_rc.borrow();
                         let stream = &mut self.context.streams[stream_id];
                         set_default_answer(stream, front_readiness, 503, &answers);
@@ -1363,6 +1366,8 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                             self.context.unlink_stream(stream_id);
                             let answers = answers_rc.borrow();
                             let stream = &mut self.context.streams[stream_id];
+                            stream.context.access_log_message =
+                                Some("client_timeout_during_response");
                             set_default_answer(stream, front_readiness, 504, &answers);
                             should_write = true;
                         } else if self.context.streams[stream_id].back.is_completed() {
@@ -1377,6 +1382,8 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                             // Partial response in progress — forcefully terminate
                             self.context.unlink_stream(stream_id);
                             let stream = &mut self.context.streams[stream_id];
+                            stream.context.access_log_message =
+                                Some("client_timeout_during_response");
                             forcefully_terminate_answer(
                                 stream,
                                 front_readiness,
@@ -1456,6 +1463,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                     self.context.unlink_stream(stream_id);
                     let answers = answers_rc.borrow();
                     let stream = &mut self.context.streams[stream_id];
+                    stream.context.access_log_message = Some("backend_timeout");
                     set_default_answer(stream, front_readiness, 504, &answers);
                     should_write = true;
                 } else {
@@ -1465,6 +1473,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                     );
                     self.context.unlink_stream(stream_id);
                     let stream = &mut self.context.streams[stream_id];
+                    stream.context.access_log_message = Some("backend_response_timeout");
                     forcefully_terminate_answer(stream, front_readiness, H2Error::InternalError);
                     should_write = true;
                 }

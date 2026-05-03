@@ -543,7 +543,11 @@ impl HealthChecker {
         // passive-only recoveries — a cluster whose backends came back via
         // successful HC probes but whose retry policies haven't been
         // touched by any session.
-        drop(backend_list);
+        // `backend_list` is a `&BackendList` reborrowed from
+        // `backend_map.backends.get(cluster_id)` above. The `&backend_map`
+        // borrow it depends on lasts until the next use of `backend_map`,
+        // so we just stop using `backend_list` and call the helper, which
+        // re-takes its own `&self` borrow internally.
         backend_map.record_cluster_availability(cluster_id);
     }
 

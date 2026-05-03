@@ -395,6 +395,7 @@ mod tests {
             retry_after_seconds: None,
             frontend_redirect_template: None,
             redirect_status: None,
+            access_log_message: None,
         };
         let stream =
             Stream::new(Rc::downgrade(&pool), http_ctx, 65_535).expect("pool checkout failed");
