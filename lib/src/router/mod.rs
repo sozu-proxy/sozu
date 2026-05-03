@@ -240,7 +240,6 @@ impl Router {
                 front.rewrite_port.and_then(|p| u16::try_from(p).ok()),
                 &front.headers,
                 front.required_auth.unwrap_or(false),
-                front.hsts.as_ref(),
             )?;
             Route::Frontend(Rc::new(frontend))
         } else {
@@ -1074,8 +1073,11 @@ impl Frontend {
         rewrite_port: Option<u16>,
         headers: &[sozu_command::proto::command::Header],
         required_auth: bool,
-        hsts: Option<&HstsConfig>,
     ) -> Result<Self, RouterError> {
+        // HSTS is read from `front.hsts` directly inside the function;
+        // an explicit parameter would be redundant since `front` is
+        // already in scope and the field is the single source of truth.
+        let hsts = front.hsts.as_ref();
         let cluster_id = front.cluster_id.clone();
         let tags = front
             .tags

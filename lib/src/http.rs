@@ -951,7 +951,14 @@ impl HttpProxy {
         // `command/src/config.rs`; sites that build a `RequestHttpFrontend`
         // outside the TOML path (`sozu frontend http add`, programmatic
         // IPC senders) are caught here.
-        if matches!(front.hsts.as_ref().and_then(|h| h.enabled), Some(true)) {
+        // Reject ANY hsts field on a plain-HTTP frontend, not just
+        // `enabled = true`. There is no listener-default HSTS to inherit
+        // on an HTTP listener (the field doesn't exist on
+        // `HttpListenerConfig`), so the explicit-disable signal
+        // (`enabled = false`) has nothing to suppress on this surface.
+        // Carrying any `hsts` field here is a misconfiguration rather
+        // than a deliberate choice.
+        if front.hsts.is_some() {
             incr!("http.hsts.suppressed_plaintext");
             return Err(ProxyError::HstsOnPlainHttp(front.address.into()));
         }

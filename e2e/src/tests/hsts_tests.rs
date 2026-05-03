@@ -125,15 +125,16 @@ fn test_hsts_on_http_frontend_rejected() {
 }
 
 // ═════════════════════════════════════════════════════════════════════
-// Explicit disable signal on HTTP — accepted, no §7.2 reject
+// Explicit disable signal on HTTP — also rejected
 // ═════════════════════════════════════════════════════════════════════
 
-/// `hsts.enabled = Some(false)` is the explicit-disable signal: it must
-/// NOT trip the §7.2 reject (the worker's predicate keys on
-/// `enabled == Some(true)`). Operators use this shape on plain-HTTP
-/// frontends to surface "we know HSTS is off here on purpose" in the
-/// configuration without semantic ambiguity.
-pub fn try_hsts_explicit_disable_on_http_accepted() -> State {
+/// `hsts.enabled = Some(false)` (the explicit-disable signal) on a
+/// plain-HTTP frontend is also rejected by `add_http_frontend`. There
+/// is no listener-default HSTS to inherit on an HTTP listener (the
+/// field doesn't exist on `HttpListenerConfig`), so the
+/// explicit-disable shape has nothing to suppress on this surface —
+/// carrying any `hsts` block here is treated as a misconfiguration.
+pub fn try_hsts_explicit_disable_on_http_rejected() -> State {
     let front_address = create_local_address();
     let _unused_back = create_unbound_local_address();
     let mut worker = spawn_worker_with_http_listener("HSTS-7.2-DISABLE", front_address);
@@ -155,16 +156,16 @@ pub fn try_hsts_explicit_disable_on_http_accepted() -> State {
     let resp = worker
         .read_proxy_response()
         .expect("worker must respond to AddHttpFrontend");
-    let accepted = resp.status == ResponseStatus::Ok as i32;
+    let rejected = resp.status == ResponseStatus::Failure as i32;
 
     worker.soft_stop();
     worker.wait_for_server_stop();
 
-    if accepted {
+    if rejected {
         State::Success
     } else {
         eprintln!(
-            "expected ResponseStatus::Ok for hsts.enabled = false on HTTP \
+            "expected ResponseStatus::Failure for hsts.enabled = false on HTTP \
              frontend, got status={} message={:?}",
             resp.status, resp.message
         );
@@ -173,12 +174,12 @@ pub fn try_hsts_explicit_disable_on_http_accepted() -> State {
 }
 
 #[test]
-fn test_hsts_explicit_disable_on_http_accepted() {
+fn test_hsts_explicit_disable_on_http_rejected() {
     assert_eq!(
         repeat_until_error_or(
             2,
-            "HSTS enabled = false on HTTP frontend accepted",
-            try_hsts_explicit_disable_on_http_accepted
+            "HSTS enabled = false on HTTP frontend rejected",
+            try_hsts_explicit_disable_on_http_rejected
         ),
         State::Success
     );
