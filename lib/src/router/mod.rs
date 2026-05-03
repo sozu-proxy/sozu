@@ -1215,14 +1215,32 @@ impl Frontend {
         // which only copies `headers_response` for HTTPS-served requests.
         if let Some(cfg) = hsts
             && matches!(cfg.enabled, Some(true))
-            && let Some(rendered) = render_hsts(cfg)
         {
-            headers_response.push(HeaderEdit {
-                key: Rc::from(&b"strict-transport-security"[..]),
-                val: rendered.into_bytes().into(),
-                mode: HeaderEditMode::SetIfAbsent,
-            });
-            crate::incr!("http.hsts.frontend_added");
+            if let Some(rendered) = render_hsts(cfg) {
+                headers_response.push(HeaderEdit {
+                    key: Rc::from(&b"strict-transport-security"[..]),
+                    val: rendered.into_bytes().into(),
+                    mode: HeaderEditMode::SetIfAbsent,
+                });
+                crate::incr!("http.hsts.frontend_added");
+            } else {
+                // Both upstream config layers (FileHstsConfig::to_proto and
+                // build_hsts_from_cli) substitute DEFAULT_HSTS_MAX_AGE when
+                // enabled = Some(true) && max_age = None, so reaching this
+                // branch means a programmatic IPC sender produced an
+                // ill-formed HstsConfig. Surface it loudly rather than
+                // silently emitting no header — operators inspecting their
+                // dashboards for http.hsts.unrendered will catch the bug.
+                warn!(
+                    "{} HSTS enabled = true on frontend {:?} but render_hsts \
+                     returned None (max_age missing). Frontend will not emit \
+                     Strict-Transport-Security; the config layer that built \
+                     this HstsConfig must substitute DEFAULT_HSTS_MAX_AGE.",
+                    log_module_context!(),
+                    cluster_id,
+                );
+                crate::incr!("http.hsts.unrendered");
+            }
         }
 
         Ok(Frontend {
