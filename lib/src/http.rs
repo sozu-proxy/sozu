@@ -944,6 +944,17 @@ impl HttpProxy {
     }
 
     pub fn add_http_frontend(&mut self, front: RequestHttpFrontend) -> Result<(), ProxyError> {
+        // RFC 6797 §7.2: `Strict-Transport-Security` MUST NOT be sent over
+        // plaintext HTTP. Reject any AddHttpFrontend that ships an enabled
+        // HSTS policy before it ever touches the routing trie. This is
+        // defense in depth on top of the TOML config-load reject in
+        // `command/src/config.rs`; sites that build a `RequestHttpFrontend`
+        // outside the TOML path (`sozu frontend http add`, programmatic
+        // IPC senders) are caught here.
+        if matches!(front.hsts.as_ref().and_then(|h| h.enabled), Some(true)) {
+            return Err(ProxyError::HstsOnPlainHttp(front.address.into()));
+        }
+
         let front = front.clone().to_frontend().map_err(|request_error| {
             ProxyError::WrongInputFrontend {
                 front: Box::new(front),
