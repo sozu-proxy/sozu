@@ -1936,6 +1936,7 @@ mod tests {
                 rewrite_port: None,
                 required_auth: None,
                 headers: Vec::new(),
+                hsts: None,
             })
             .expect("Could not add http frontend");
         fronts
@@ -1955,6 +1956,7 @@ mod tests {
                 rewrite_port: None,
                 required_auth: None,
                 headers: Vec::new(),
+                hsts: None,
             })
             .expect("Could not add http frontend");
         fronts
@@ -1974,6 +1976,7 @@ mod tests {
                 rewrite_port: None,
                 required_auth: None,
                 headers: Vec::new(),
+                hsts: None,
             })
             .expect("Could not add http frontend");
         fronts
@@ -1993,6 +1996,7 @@ mod tests {
                 rewrite_port: None,
                 required_auth: None,
                 headers: Vec::new(),
+                hsts: None,
             })
             .expect("Could not add http frontend");
 

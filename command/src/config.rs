@@ -63,12 +63,12 @@ use crate::{
     logging::AccessLogFormat,
     proto::command::{
         ActivateListener, AddBackend, AddCertificate, CertificateAndKey, Cluster,
-        CustomHttpAnswers, Header, HeaderPosition, HealthCheckConfig, HttpListenerConfig,
-        HttpsListenerConfig, ListenerType, LoadBalancingAlgorithms, LoadBalancingParams,
-        LoadMetric, MetricDetail, MetricsConfiguration, PathRule, ProtobufAccessLogFormat,
-        ProxyProtocolConfig, RedirectPolicy, RedirectScheme, Request, RequestHttpFrontend,
-        RequestTcpFrontend, RulePosition, ServerConfig, ServerMetricsConfig, SocketAddress,
-        TcpListenerConfig, TlsVersion, WorkerRequest, request::RequestType,
+        CustomHttpAnswers, Header, HeaderPosition, HealthCheckConfig, HstsConfig,
+        HttpListenerConfig, HttpsListenerConfig, ListenerType, LoadBalancingAlgorithms,
+        LoadBalancingParams, LoadMetric, MetricDetail, MetricsConfiguration, PathRule,
+        ProtobufAccessLogFormat, ProxyProtocolConfig, RedirectPolicy, RedirectScheme, Request,
+        RequestHttpFrontend, RequestTcpFrontend, RulePosition, ServerConfig, ServerMetricsConfig,
+        SocketAddress, TcpListenerConfig, TlsVersion, WorkerRequest, request::RequestType,
     },
 };
 
@@ -134,6 +134,14 @@ pub const DEFAULT_ZOMBIE_CHECK_INTERVAL: u32 = 1_800;
 
 /// timeout to accept connection events in the accept queue (60 seconds)
 pub const DEFAULT_ACCEPT_QUEUE_TIMEOUT: u32 = 60;
+
+/// Default `Strict-Transport-Security: max-age` value (1 year, 31_536_000
+/// seconds) substituted at config-load when an [hsts] block sets
+/// `enabled = true` but omits `max_age`. Matches the HSTS preload list
+/// minimum (https://hstspreload.org/) and the Caddy / Nginx community
+/// recommendation. Operators can override with any `u32`; `max_age = 0`
+/// is the RFC 6797 §11.4 kill switch and is allowed silently.
+pub const DEFAULT_HSTS_MAX_AGE: u32 = 31_536_000;
 
 /// whether to evict least-recently-active sessions when the accept queue is
 /// saturated (false). Defaults to false because during a DDoS the existing
@@ -328,6 +336,27 @@ pub enum ConfigError {
          (NUL / CR / LF / other C0) are forbidden in header keys and values"
     )]
     InvalidHeaderBytes { index: usize, field: &'static str },
+    /// An `[hsts]` block populated `max_age`, `include_subdomains`, or
+    /// `preload` but did not set `enabled`. The TOML representation requires
+    /// `enabled` to be present whenever the block is — that single field
+    /// disambiguates "preserve current" / "explicit disable" / "enable" on
+    /// hot-reconfig partial updates.
+    #[error("invalid HSTS config at {0}: `enabled` is required when an [hsts] block is present")]
+    HstsEnabledRequired(String),
+    /// An `[hsts]` block on an HTTP-only listener or frontend. RFC 6797
+    /// §7.2 forbids emitting `Strict-Transport-Security` over plaintext
+    /// HTTP; sozu rejects the configuration at load time so the
+    /// non-conformant policy never ships to a worker.
+    #[error(
+        "invalid HSTS config at {0}: HSTS is only valid on HTTPS listeners and frontends \
+         (RFC 6797 §7.2 forbids the header over plaintext HTTP)"
+    )]
+    HstsOnPlainHttp(String),
+    /// An `[hsts]` field carries an out-of-range or otherwise nonsensical
+    /// value (e.g. negative `max_age`, although `u32` rules that out at
+    /// type level — kept for forward compatibility with future fields).
+    #[error("invalid HSTS config at {scope}: {reason}")]
+    InvalidHstsConfig { scope: String, reason: String },
 }
 
 /// An HTTP, HTTPS or TCP listener as parsed from the `Listeners` section in the toml
@@ -470,6 +499,12 @@ pub struct ListenerBuilder {
     /// for backwards compatibility but are equivalent to a one-line entry
     /// in this map; new configs should prefer `[listeners.answers]`.
     pub answers: Option<BTreeMap<String, String>>,
+    /// Listener-default HSTS (RFC 6797) policy. When set, every HTTPS
+    /// frontend on this listener that does not declare its own `[hsts]`
+    /// block inherits this value. Per RFC 6797 §7.2 HSTS is rejected on
+    /// HTTP listeners at config-load time; this field is only meaningful
+    /// for HTTPS listeners. Defaults to `None` (no HSTS).
+    pub hsts: Option<FileHstsConfig>,
 }
 
 pub fn default_sticky_name() -> String {
@@ -552,6 +587,7 @@ impl ListenerBuilder {
             elide_x_real_ip: None,
             send_x_real_ip: None,
             answers: None,
+            hsts: None,
         }
     }
 
@@ -979,7 +1015,10 @@ impl ListenerBuilder {
             sozu_id_header: self.sozu_id_header.clone(),
             elide_x_real_ip: Some(self.elide_x_real_ip.unwrap_or(false)),
             send_x_real_ip: Some(self.send_x_real_ip.unwrap_or(false)),
-            hsts: None,
+            hsts: match self.hsts.as_ref() {
+                Some(h) => Some(h.to_proto("listener")?),
+                None => None,
+            },
         };
 
         Ok(https_listener_config)
@@ -1223,6 +1262,11 @@ pub struct FileClusterFrontendConfig {
     /// this frontend. See [`HeaderEditConfig`] for the empty-value-deletes
     /// semantics (HAProxy `del-header` parity).
     pub headers: Option<Vec<HeaderEditConfig>>,
+    /// Per-frontend HSTS (RFC 6797) policy. When set, overrides any
+    /// listener-default HSTS for this frontend. Set `enabled = false`
+    /// to suppress an inherited listener default. Per RFC 6797 §7.2,
+    /// HSTS is rejected on plain-HTTP frontends at config-load time.
+    pub hsts: Option<FileHstsConfig>,
 }
 
 /// A single header mutation as serialised under
@@ -1237,6 +1281,106 @@ pub struct HeaderEditConfig {
     pub position: String,
     pub key: String,
     pub value: String,
+}
+
+/// HSTS (HTTP Strict Transport Security, RFC 6797) policy as serialised
+/// under `[https.listeners.default.hsts]` (listener default) or
+/// `[clusters.<id>.frontends.hsts]` (per-frontend override).
+///
+/// `enabled` is REQUIRED whenever the block is present — its presence vs
+/// absence disambiguates "preserve current" / "explicit disable" / "enable"
+/// on hot-reconfig partial updates.
+///
+/// When `enabled = true` and `max_age` is omitted, sozu substitutes
+/// [`DEFAULT_HSTS_MAX_AGE`] (1 year) at config-load time.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileHstsConfig {
+    /// REQUIRED. `true` enables HSTS for this scope; `false` suppresses
+    /// any inherited listener default (explicit-disable signal).
+    pub enabled: Option<bool>,
+    /// `Strict-Transport-Security: max-age=<seconds>`. Optional —
+    /// defaults to [`DEFAULT_HSTS_MAX_AGE`] when `enabled = true`.
+    /// `max_age = 0` is the RFC 6797 §11.4 kill switch and is allowed
+    /// silently; `0 < max_age < 86400` warns at config-load.
+    pub max_age: Option<u32>,
+    /// Append `; includeSubDomains` to the rendered header.
+    pub include_subdomains: Option<bool>,
+    /// Append `; preload` to the rendered header. Opt-in only — see RFC
+    /// 6797 §14.2 and <https://hstspreload.org/>.
+    pub preload: Option<bool>,
+}
+
+impl FileHstsConfig {
+    /// Validate and convert the file-level [`FileHstsConfig`] into the
+    /// proto [`HstsConfig`]. `scope` is a human-readable string (e.g.
+    /// "listener" or "frontend api/example.com") surfaced into errors
+    /// and warnings so the operator can pinpoint the offending block.
+    ///
+    /// Validation:
+    /// - `enabled` is required when any other field is set
+    ///   (`HstsEnabledRequired`); the parser returns the typed error so
+    ///   callers can fail fast.
+    /// - `enabled = true && max_age = None` substitutes
+    ///   [`DEFAULT_HSTS_MAX_AGE`].
+    /// - `0 < max_age < 86400` warns (likely misconfig — sub-day max-age
+    ///   is useful only for testing).
+    /// - `preload = true` with `max_age < DEFAULT_HSTS_MAX_AGE` or
+    ///   `include_subdomains != Some(true)` warns (the Chrome HSTS
+    ///   preload list will reject the host).
+    /// - `max_age = 0` is allowed silently (RFC 6797 §11.4 kill switch).
+    pub fn to_proto(&self, scope: &str) -> Result<HstsConfig, ConfigError> {
+        let enabled = match self.enabled {
+            Some(v) => v,
+            None => return Err(ConfigError::HstsEnabledRequired(scope.to_owned())),
+        };
+
+        let max_age = match (enabled, self.max_age) {
+            (true, None) => Some(DEFAULT_HSTS_MAX_AGE),
+            (_, m) => m,
+        };
+
+        if let Some(value) = max_age
+            && value > 0
+            && value < 86_400
+        {
+            warn!(
+                "HSTS max_age = {}s on {} is below 1 day — this is almost certainly a \
+                 misconfiguration. RFC 6797 §11.4 reserves max_age = 0 as the explicit kill \
+                 switch.",
+                value, scope
+            );
+        }
+
+        let include_subdomains = self.include_subdomains;
+        let preload = self.preload;
+
+        if matches!(preload, Some(true)) {
+            let max_age_value = max_age.unwrap_or(0);
+            if max_age_value < DEFAULT_HSTS_MAX_AGE {
+                warn!(
+                    "HSTS preload = true on {} with max_age = {}s; the Chrome HSTS preload \
+                     list requires max_age >= {} (https://hstspreload.org/).",
+                    scope, max_age_value, DEFAULT_HSTS_MAX_AGE
+                );
+            }
+            if include_subdomains != Some(true) {
+                warn!(
+                    "HSTS preload = true on {} without include_subdomains = true; the Chrome \
+                     HSTS preload list requires includeSubDomains \
+                     (https://hstspreload.org/).",
+                    scope
+                );
+            }
+        }
+
+        Ok(HstsConfig {
+            enabled: Some(enabled),
+            max_age,
+            include_subdomains,
+            preload,
+        })
+    }
 }
 
 impl FileClusterFrontendConfig {
@@ -1331,6 +1475,11 @@ impl FileClusterFrontendConfig {
             None => Vec::new(),
         };
 
+        let hsts = match self.hsts.as_ref() {
+            Some(h) => Some(h.to_proto(&format!("frontend {_cluster_id}/{hostname}"))?),
+            None => None,
+        };
+
         Ok(HttpFrontendConfig {
             address: self.address,
             hostname,
@@ -1350,6 +1499,7 @@ impl FileClusterFrontendConfig {
             rewrite_port: self.rewrite_port,
             required_auth: self.required_auth,
             headers,
+            hsts,
         })
     }
 }
@@ -1776,6 +1926,10 @@ pub struct HttpFrontendConfig {
     /// this frontend. Empty by default.
     #[serde(default)]
     pub headers: Vec<Header>,
+    /// Resolved per-frontend HSTS (RFC 6797) policy. `None` means inherit
+    /// the listener default at frontend-add time in the worker.
+    #[serde(default)]
+    pub hsts: Option<HstsConfig>,
 }
 
 impl HttpFrontendConfig {
@@ -1821,7 +1975,7 @@ impl HttpFrontendConfig {
                     rewrite_path: self.rewrite_path.clone(),
                     rewrite_port: self.rewrite_port,
                     headers: self.headers.clone(),
-                    hsts: None,
+                    hsts: self.hsts,
                 })
                 .into(),
             );
@@ -1844,7 +1998,7 @@ impl HttpFrontendConfig {
                     rewrite_path: self.rewrite_path.clone(),
                     rewrite_port: self.rewrite_port,
                     headers: self.headers.clone(),
-                    hsts: None,
+                    hsts: self.hsts,
                 })
                 .into(),
             );
