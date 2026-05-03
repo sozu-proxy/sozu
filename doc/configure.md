@@ -218,6 +218,96 @@ sticky_name = "SOZUBALANCEID"
 tls_versions = ["TLS_V12", "TLS_V13"]
 ```
 
+#### HSTS — HTTP Strict Transport Security (RFC 6797)
+
+HSTS = HTTP Strict Transport Security ([RFC 6797](https://datatracker.ietf.org/doc/html/rfc6797)). When configured on an HTTPS listener or frontend, Sōzu emits the `Strict-Transport-Security` response header so conformant browsers refuse to talk to the host over plaintext HTTP for the configured `max-age` duration.
+
+A `[hsts]` block under an HTTPS listener is the operator-default; per-frontend overrides live under `[clusters.<id>.frontends.hsts]`. Per-frontend `enabled = true` overrides the listener default; per-frontend `enabled = false` explicitly suppresses an inherited listener default for that frontend.
+
+Per RFC 6797 §7.2 the `Strict-Transport-Security` header MUST NOT appear on plaintext-HTTP responses. Sōzu enforces this in three layers: (1) TOML config-load rejects `[hsts]` on a plain-HTTP listener (`ConfigError::HstsOnPlainHttp`), (2) the worker IPC entry rejects `AddHttpFrontend` carrying an enabled HSTS (`ProxyError::HstsOnPlainHttp` and the `http.hsts.suppressed_plaintext` counter), and (3) the runtime per-stream snapshot copy is gated on `context.protocol == Protocol::HTTPS` so plaintext connections never apply HSTS edits even when one slips through.
+
+```toml
+# Listener-level default — every HTTPS frontend on this listener
+# inherits unless it declares its own [hsts] block.
+[hsts]
+# REQUIRED whenever the [hsts] block is present. `false` is the
+# explicit-disable signal on a partial-update; new TOML deployments
+# will normally set `true`.
+enabled = true
+# `Strict-Transport-Security: max-age=<seconds>`. When omitted with
+# `enabled = true`, sozu substitutes 31_536_000 seconds (1 year — the
+# Chrome HSTS preload list minimum) at config-load.
+max_age = 31536000
+# Append `; includeSubDomains` to the rendered header.
+include_subdomains = true
+# Append `; preload` to the rendered header. Opt-in only — once
+# submitted to https://hstspreload.org/, removal is slow and partial
+# (RFC 6797 §14.2). NEVER default-true.
+preload = false
+```
+
+Per-frontend override or explicit disable:
+
+```toml
+[[clusters.api.frontends]]
+address  = "0.0.0.0:443"
+hostname = "api.example.com"
+
+# Override the listener default with a longer 2-year max-age and
+# opt the host into the preload list.
+[clusters.api.frontends.hsts]
+enabled            = true
+max_age            = 63072000
+include_subdomains = true
+preload            = true
+
+# Suppress the inherited listener default for a legacy frontend that
+# cannot commit to HSTS yet:
+[[clusters.legacy.frontends]]
+address  = "0.0.0.0:443"
+hostname = "legacy.example.com"
+
+[clusters.legacy.frontends.hsts]
+enabled = false
+```
+
+##### Validation matrix
+
+| Configuration                                                 | Outcome                                                                                                                                                  |
+|---------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `[hsts]` block without `enabled`                              | **Error** `HstsEnabledRequired` at config-load. `enabled` is the explicit-disambiguator between disable / enable on partial updates.                     |
+| `[hsts]` on a plain-HTTP listener or frontend                 | **Error** `HstsOnPlainHttp` at config-load (and `ProxyError::HstsOnPlainHttp` if it slipped through to the worker). RFC 6797 §7.2.                       |
+| `enabled = true`, `max_age` omitted                           | Substituted to `DEFAULT_HSTS_MAX_AGE = 31_536_000` (1 year). Matches the HSTS preload list minimum.                                                      |
+| `max_age = 0`                                                 | **Allowed silently** — RFC 6797 §11.4 kill switch. Conformant UAs stop treating the host as a Known HSTS Host.                                           |
+| `0 < max_age < 86_400`                                        | **Warning** at config-load (likely misconfiguration — sub-day HSTS only makes sense for testing).                                                        |
+| `preload = true` with `max_age < 31_536_000`                  | **Warning** at config-load. The Chrome HSTS preload list rejects hosts below the minimum.                                                                |
+| `preload = true` without `include_subdomains = true`          | **Warning** at config-load. Same preload-list rejection.                                                                                                 |
+| Backend emits its own `Strict-Transport-Security`             | Pass-through unchanged. Sōzu's HSTS edit uses `HeaderEditMode::SetIfAbsent` so a single header reaches the wire (RFC 6797 §6.1).                         |
+| HTTPS-served default answer (3xx redirect, 401, 503)          | Carries the HSTS header per RFC 6797 §8.1. The per-stream snapshot copy fires before the early returns in `mux/router.rs`, gated on `Protocol::HTTPS`.    |
+
+##### Runtime CLI surface
+
+```
+sozu frontend https add \
+  --address 0.0.0.0:443 \
+  --hostname api.example.com \
+  --hsts-max-age 31536000 \
+  --hsts-include-subdomains
+```
+
+`--hsts-disabled` is mutually exclusive with `--hsts-max-age` / `--hsts-include-subdomains` / `--hsts-preload`; combining them surfaces `CtlError::ArgsNeeded` rather than a silent pick.
+
+##### Hot-reconfig partial-update
+
+`UpdateHttpsListenerConfig.hsts` follows full-object replacement semantics: when present in the patch, the entire HSTS block replaces the listener's current value. `enabled` is REQUIRED whenever `hsts` is present (`ListenerError::HstsEnabledRequired` rejects an `enabled = None` block). Absent `hsts` field on the patch preserves the current value.
+
+##### Metrics
+
+| Metric                              | Kind    | Emitted when                                                                                       |
+|-------------------------------------|---------|----------------------------------------------------------------------------------------------------|
+| `http.hsts.frontend_added`          | counter | A frontend is added with `hsts.enabled = true` and the HSTS edit is materialised in `headers_response`. |
+| `http.hsts.suppressed_plaintext`    | counter | An `AddHttpFrontend` IPC was rejected because it carried an enabled HSTS policy (RFC 6797 §7.2 defense in depth). |
+
 #### Options specific to Rustls based HTTPS listeners
 
 ##### Cipher suites
@@ -984,6 +1074,62 @@ value    = ""                      # empty value DELETES the header by name
 HAProxy parallels: `http-request redirect` (permanent / scheme), `set-uri` and
 `set-path` (rewrite), `http-request set-header` and `http-request del-header`
 (custom headers).
+
+### HSTS for the HTTPS counterpart of an automatic redirect
+
+When an HTTP listener carries a `redirect_scheme = "use-https"` frontend
+that pushes traffic to an HTTPS counterpart, HSTS belongs on the **HTTPS**
+side, **never** on the redirect itself. RFC 6797 §7.2 forbids
+`Strict-Transport-Security` on plaintext-HTTP responses; conformant browsers
+ignore the header on plain-HTTP and Sōzu refuses the configuration at
+load time on HTTP listeners.
+
+The recommended pattern is two paired frontends with HSTS attached to
+the HTTPS one:
+
+```toml
+# Plain-HTTP frontend that pushes everything to HTTPS via 301.
+[[clusters.api.frontends]]
+address         = "0.0.0.0:80"
+hostname        = "api.example.com"
+redirect        = "permanent"     # 301 (or "permanent_redirect" for 308)
+redirect_scheme = "use-https"
+# NO [hsts] block here — Sōzu would reject it (RFC §7.2).
+
+# HTTPS counterpart that serves traffic and pins HSTS.
+[[clusters.api.frontends]]
+address  = "0.0.0.0:443"
+hostname = "api.example.com"
+
+[clusters.api.frontends.hsts]
+enabled            = true
+max_age            = 31536000     # 1 year — preload list minimum
+include_subdomains = true
+preload            = false        # opt-in only
+```
+
+For convenience, declare HSTS once at the listener default and let every
+HTTPS frontend inherit:
+
+```toml
+[[listeners]]
+protocol = "https"
+address  = "0.0.0.0:443"
+
+[hsts]
+enabled            = true
+max_age            = 31536000
+include_subdomains = true
+```
+
+Per-frontend `hsts.enabled = false` suppresses the inherited default for
+a single frontend that cannot commit to HSTS yet.
+
+The header is emitted on every successful HTTPS response, including
+proxy-generated 3xx redirects (e.g. `redirect_scheme = "use-https"` from
+an HTTPS frontend, or a `redirect = "permanent"` shape served on the
+HTTPS side), 401 auth-deny, and 502 / 503 / 504 default answers — RFC
+6797 §8.1 requires HSTS on every response code from the host.
 
 ## HTTP Basic authentication on a frontend
 
