@@ -1,4 +1,10 @@
-use std::{cell::RefCell, collections::HashMap, net::SocketAddr, rc::Rc, time::Duration};
+use std::{
+    cell::{Cell, RefCell},
+    collections::HashMap,
+    net::SocketAddr,
+    rc::Rc,
+    time::Duration,
+};
 
 use mio::net::TcpStream;
 use sozu_command::{
@@ -44,6 +50,19 @@ pub enum BackendStatus {
 pub enum HealthStatus {
     Healthy,
     Unhealthy,
+}
+
+/// Per-cluster availability state, owned by `BackendList`. Flips between
+/// `Available` (≥1 backend can serve traffic) and `AllDown` (every backend
+/// fails the `health.is_healthy() && !retry_policy.is_down()` predicate)
+/// every time `BackendMap::record_cluster_availability` is invoked.
+/// Empty clusters never report `AllDown` to avoid log spam during cluster
+/// bootstrap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ClusterAvailability {
+    #[default]
+    Available,
+    AllDown,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -249,7 +268,6 @@ impl std::ops::Drop for Backend {
 pub struct BackendMap {
     pub backends: HashMap<ClusterId, BackendList>,
     pub max_failures: usize,
-    pub available: bool,
     pub health_check_configs: HashMap<ClusterId, HealthCheckConfig>,
     /// Whether the cluster's backends speak HTTP/2 (cluster.http2 = true).
     /// Mirrors the same backend-capability hint the mux router reads at
@@ -271,9 +289,77 @@ impl BackendMap {
         BackendMap {
             backends: HashMap::new(),
             max_failures: 3,
-            available: true,
             health_check_configs: HashMap::new(),
             cluster_http2: HashMap::new(),
+        }
+    }
+
+    /// Re-evaluate the availability of `cluster_id`, publish the
+    /// `cluster.available_backends` / `cluster.total_backends` gauges,
+    /// and emit the transition log + counter + `Event` exactly when the
+    /// per-cluster state flips between `Available` and `AllDown`.
+    ///
+    /// Empty clusters (`total == 0`) never report `AllDown` — avoids log
+    /// spam during cluster bootstrap when backends are still being
+    /// registered. The (0, 0) gauges are still published so dashboards
+    /// see "cluster exists, zero backends configured" as a distinct
+    /// state from "cluster doesn't exist".
+    ///
+    /// Takes `&self` so callers that already hold `&mut BackendMap`
+    /// can drop their `&mut BackendList` borrow before invoking it
+    /// without re-borrowing.
+    pub(crate) fn record_cluster_availability(&self, cluster_id: &str) {
+        let Some(list) = self.backends.get(cluster_id) else {
+            return;
+        };
+
+        let (available, total) = list.evaluate_availability();
+        gauge!(
+            "cluster.available_backends",
+            available,
+            Some(cluster_id),
+            None
+        );
+        gauge!("cluster.total_backends", total, Some(cluster_id), None);
+
+        let new_state = if total > 0 && available == 0 {
+            ClusterAvailability::AllDown
+        } else {
+            ClusterAvailability::Available
+        };
+
+        let prev = list.availability.replace(new_state);
+        if prev == new_state {
+            return;
+        }
+        match (prev, new_state) {
+            (ClusterAvailability::Available, ClusterAvailability::AllDown) => {
+                error!(
+                    "cluster {}: all {} backends are down",
+                    cluster_id, total
+                );
+                incr!("cluster.no_available_backends", Some(cluster_id), None);
+                push_event(Event {
+                    kind: EventKind::NoAvailableBackends as i32,
+                    cluster_id: Some(cluster_id.to_owned()),
+                    backend_id: None,
+                    address: None,
+                });
+            }
+            (ClusterAvailability::AllDown, ClusterAvailability::Available) => {
+                info!(
+                    "cluster {}: backends recovered ({}/{} available)",
+                    cluster_id, available, total
+                );
+                incr!("cluster.available_recovered", Some(cluster_id), None);
+                push_event(Event {
+                    kind: EventKind::ClusterRecovered as i32,
+                    cluster_id: Some(cluster_id.to_owned()),
+                    backend_id: None,
+                    address: None,
+                });
+            }
+            _ => {}
         }
     }
 
@@ -330,6 +416,11 @@ impl BackendMap {
             .entry(cluster_id.to_string())
             .or_default()
             .add_backend(backend);
+        // Publish initial gauges and surface the corner case where a fresh
+        // cluster's first backend is already down (e.g. registered with a
+        // pre-existing failed retry policy). For an `Available` initial
+        // backend this is just a (1, 1) gauge emission with no transition.
+        self.record_cluster_availability(cluster_id);
     }
 
     // TODO: return <Result, BackendError>, log the error downstream
@@ -341,7 +432,12 @@ impl BackendMap {
                 "Backend was already removed: cluster id {}, address {:?}",
                 cluster_id, backend_address
             );
+            return;
         }
+        // Re-evaluate so removing the last backend logs an explicit
+        // `AllDown` transition (or, with `total == 0`, drops back to
+        // silent gauges).
+        self.record_cluster_availability(cluster_id);
     }
 
     // TODO: return <Result, BackendError>, log the error downstream
@@ -370,48 +466,60 @@ impl BackendMap {
             .ok_or(BackendError::NoBackendForCluster(cluster_id.to_owned()))?;
 
         if cluster_backends.backends.is_empty() {
-            self.available = false;
+            // Drop the &mut BackendList borrow before the &self helper call.
+            // `total == 0` falls into the "never report AllDown" branch in
+            // record_cluster_availability, so this just publishes the (0, 0)
+            // gauges.
+            let _ = cluster_backends;
+            self.record_cluster_availability(cluster_id);
             return Err(BackendError::NoBackendForCluster(cluster_id.to_owned()));
         }
 
         let next_backend = match cluster_backends.next_available_backend() {
             Some(nb) => nb,
             None => {
-                if self.available {
-                    self.available = false;
-
-                    push_event(Event {
-                        kind: EventKind::NoAvailableBackends as i32,
-                        cluster_id: Some(cluster_id.to_owned()),
-                        backend_id: None,
-                        address: None,
-                    });
-                }
+                // Drop the &mut BackendList before the &self helper call.
+                // The helper observes (available=0, total>0) and emits the
+                // Available -> AllDown transition (log + counter + Event)
+                // exactly once per regime entry. Subsequent calls in the
+                // same AllDown regime are no-ops.
+                let _ = cluster_backends;
+                self.record_cluster_availability(cluster_id);
                 return Err(BackendError::NoBackendForCluster(cluster_id.to_owned()));
             }
         };
 
-        let mut borrowed_backend = next_backend.borrow_mut();
+        let tcp_stream = {
+            let mut borrowed_backend = next_backend.borrow_mut();
 
-        debug!(
-            "Connecting {} -> {:?}",
-            cluster_id,
-            (
-                borrowed_backend.address,
-                borrowed_backend.active_connections,
-                borrowed_backend.failures
-            )
-        );
+            debug!(
+                "Connecting {} -> {:?}",
+                cluster_id,
+                (
+                    borrowed_backend.address,
+                    borrowed_backend.active_connections,
+                    borrowed_backend.failures
+                )
+            );
 
-        let tcp_stream = borrowed_backend.try_connect().map_err(|backend_error| {
-            BackendError::ConnectionFailures {
-                cluster_id: cluster_id.to_owned(),
-                backend_address: borrowed_backend.address,
-                failures: borrowed_backend.failures,
-                error: backend_error.to_string(),
-            }
-        })?;
-        self.available = true;
+            borrowed_backend
+                .try_connect()
+                .map_err(|backend_error| BackendError::ConnectionFailures {
+                    cluster_id: cluster_id.to_owned(),
+                    backend_address: borrowed_backend.address,
+                    failures: borrowed_backend.failures,
+                    error: backend_error.to_string(),
+                })?
+        };
+
+        // Connection succeeded: re-evaluate so we capture an
+        // AllDown -> Available recovery transition the moment a request
+        // first hits a healthy backend after an outage. `next_backend` is
+        // not borrowed here (the inner block dropped `borrowed_backend`),
+        // so the helper's `BackendList::evaluate_availability` walk is
+        // free to call `borrow()` on every backend.
+        let _ = cluster_backends;
+        self.record_cluster_availability(cluster_id);
 
         Ok((next_backend.clone(), tcp_stream))
     }
@@ -480,6 +588,11 @@ pub struct BackendList {
     /// universal outage (the exact scenario fail-open targets) is also the
     /// highest request-rate scenario — log volume would become catastrophic.
     fail_open_warned: bool,
+    /// Per-cluster availability latched by `BackendMap::record_cluster_availability`.
+    /// `Cell` (not `RefCell`) because the receiver is `&self` and the
+    /// state is `Copy`. Worker runtime is single-threaded, so a `Cell` is
+    /// sound — no synchronisation needed.
+    pub(crate) availability: Cell<ClusterAvailability>,
 }
 
 impl Default for BackendList {
@@ -495,7 +608,30 @@ impl BackendList {
             next_id: 0,
             load_balancing: Box::new(Random),
             fail_open_warned: false,
+            availability: Cell::new(ClusterAvailability::Available),
         }
+    }
+
+    /// Count `(available, total)` for this cluster. A backend is *available*
+    /// iff it is administratively `Normal` AND its health state is `Healthy`
+    /// AND its retry policy is not `is_down()`. This mirrors `Backend::can_open`
+    /// minus the per-call retry-budget gate (`retry_policy.can_try() == OKAY`):
+    /// a backend currently in exponential-backoff is still counted as
+    /// available because the next call after the back-off window will
+    /// route to it without operator intervention.
+    pub(crate) fn evaluate_availability(&self) -> (usize, usize) {
+        let total = self.backends.len();
+        let available = self
+            .backends
+            .iter()
+            .filter(|b| {
+                let owned = b.borrow();
+                owned.status == BackendStatus::Normal
+                    && owned.health.is_healthy()
+                    && !owned.retry_policy.is_down()
+            })
+            .count();
+        (available, total)
     }
 
     pub fn import_configuration_state(

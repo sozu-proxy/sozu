@@ -536,6 +536,15 @@ impl HealthChecker {
                 );
             }
         }
+        // Re-evaluate per-cluster availability so an `Available -> AllDown`
+        // or `AllDown -> Available` transition driven purely by health-check
+        // results (no failed routing call to observe it) still emits the
+        // log + counter + Event. This is the only path that catches
+        // passive-only recoveries — a cluster whose backends came back via
+        // successful HC probes but whose retry policies haven't been
+        // touched by any session.
+        drop(backend_list);
+        backend_map.record_cluster_availability(cluster_id);
     }
 
     pub fn remove_cluster(&mut self, cluster_id: &str) {
