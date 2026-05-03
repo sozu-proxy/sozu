@@ -143,6 +143,14 @@ Sōzu exposes the following health check metrics:
 | `health_check.failure`  | counter | Total number of failed health check attempts.       |
 | `health_check.up`       | counter | Number of healthy transitions (unhealthy → healthy).|
 | `health_check.down`     | counter | Number of unhealthy transitions (healthy → unhealthy).|
+| `health_check.healthy_backends` | gauge | Healthy backends per cluster — labelled with `cluster_id`. Updated after every probe-result update for clusters with at least one configured backend (including `0` when all backends are unhealthy, so dashboards can detect universal-outage / fail-open). The label was missing in earlier releases and per-cluster values overwrote each other. |
+
+The cross-cluster availability story (`cluster.available_backends`,
+`cluster.total_backends`, `cluster.no_available_backends`,
+`cluster.available_recovered`, `backend.available`) lives in
+[`configure.md` § Cluster availability](configure.md#cluster-availability)
+because those signals are not driven exclusively by health checks — they
+also fold in retry-policy state observed on the data path.
 
 ## Events
 
@@ -150,8 +158,12 @@ Health state transitions emit events that can be consumed by subscribers (via `s
 
 - `HealthCheckHealthy` — a backend transitioned to healthy
 - `HealthCheckUnhealthy` — a backend transitioned to unhealthy
+- `NoAvailableBackends` — a cluster transitioned to `Available → AllDown` (every backend fails the availability predicate; not exclusive to health-check failure — retry-policy backoff also counts)
+- `ClusterRecovered` — a cluster transitioned back to `AllDown → Available` (proto tag 29). Pairs with `NoAvailableBackends` so subscribers track all-down and recovery without polling
 
-Both events include the `cluster_id`, `backend_id`, and backend `address`.
+The first two events include the `cluster_id`, `backend_id`, and backend
+`address`. The cluster-availability events carry only `cluster_id`
+(backend identity is moot — the event is about the cluster as a whole).
 
 ## Design considerations
 

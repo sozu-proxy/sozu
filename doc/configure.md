@@ -1141,6 +1141,31 @@ structured audit log line at `info!` level in the MUX `Session(...)` layout.
 See [`observability.md`](observability.md#control-plane-audit-trail) for the
 full format.
 
+The same bus carries `EventKind::ClusterRecovered` (proto tag 29) on the
+`AllDown → Available` transition for any cluster that previously emitted
+`EventKind::NoAvailableBackends`. Subscribers that already track the
+all-down event get the recovery side for free without polling
+`cluster.available_backends`.
+
+#### Access-log `message` field on timeout
+
+When a session terminates on a timeout, Sōzu populates the access-log
+`message` field with a stable, structured token so dashboards and
+log-pipeline rules can attribute the outcome without inspecting the HTTP
+status. The vocabulary is closed (operator-visible API once shipped):
+
+| Token | Trigger | Status seen by client |
+|---|---|---|
+| `client_timeout` | Frontend timer fired while waiting for the request to arrive (`TimeoutStatus::Request` in the H1 path; `StreamState::Idle` in the mux path) | `408 Request Timeout` |
+| `client_timeout_during_response` | Frontend timer fired while the backend was still composing the response — ambiguous case where timeout responsibility should already have switched. Mapped to gateway-timeout for client clarity | `504 Gateway Timeout` |
+| `backend_timeout` | Backend timer fired before any response byte arrived — connection-level slowness or backend stuck pre-headers. The H1 invariant-break arm (`TimeoutStatus::Request` on the backend) collapses into the same token because the operator-visible cause is identical; the internal `error!` log keeps the diagnostic signal for sozu maintainers | `504 Gateway Timeout` |
+| `backend_response_timeout` | Backend timer fired while the response body was streaming — partial response in flight. Mux replies with `RST_STREAM` (`H2Error::InternalError`); H1 forcibly closes the session because no default-answer can replace an in-flight response body | `RST_STREAM` (mux) / connection close (H1) |
+
+Non-timeout default-answer paths (e.g. 503 from `Router::route_from_request`,
+401 from auth, 301 from redirects) leave the field as `None` and the
+access log emits `message: None` exactly as before. Sessions that complete
+normally are also unaffected.
+
 #### Backend health checks
 
 You can optionally configure active HTTP health checks for backends. See [health_checks.md](./health_checks.md) for full details.
@@ -1297,6 +1322,27 @@ require runtime `Box::leak` of unbounded strings or a fixed bucket cap. We
 chose the per-protocol breakdown (3 keys + aggregate) instead. Operators
 needing per-listener-address attribution should run distinct workers per
 listener or correlate via access logs.
+
+#### Cluster availability
+
+Per-cluster signals that pair the existing `EventKind::NoAvailableBackends`
+with `EventKind::ClusterRecovered`. Latched on `BackendList` so the log +
+counter + event fire exactly once per `Available` ↔ `AllDown` transition,
+not once per request. Empty clusters (`total == 0`) emit the gauges but
+never log a transition — avoids spam during cluster bootstrap when
+backends are still being registered.
+
+| Metric | Type | Scope | Description |
+|--------|------|-------|-------------|
+| `cluster.available_backends` | gauge | cluster | Backends currently passing the availability predicate (`status == Normal && health.is_healthy() && !retry_policy.is_down()`). Updated on every routing decision and every health-check tick |
+| `cluster.total_backends` | gauge | cluster | Backends configured for the cluster, regardless of state. Pairs with `cluster.available_backends` so dashboards can compute health ratios per cluster |
+| `cluster.no_available_backends` | counter | cluster | Incremented exactly once per `Available → AllDown` transition. Pairs with the existing `EventKind::NoAvailableBackends` event and the `error!` log line `cluster X: all N backends are down` |
+| `cluster.available_recovered` | counter | cluster | Incremented exactly once per `AllDown → Available` transition. Pairs with `EventKind::ClusterRecovered` (proto tag 29) and the `info!` log line `cluster X: backends recovered (i/N available)` |
+| `backend.available` | gauge | backend | `1` when the backend passes `is_available()` (health + retry policy + status), `0` after a transition to unavailable. Emitted at the up/down transition sites in `health_check.rs`, `kawa_h1`, `mux`, and `tcp` — not per-request, so the cardinality cost is bounded by transition frequency |
+
+The `health_check.healthy_backends` gauge is now labelled with `cluster_id`;
+prior emissions overwrote each other across clusters because the unlabelled
+key collapsed every cluster's value into a single bucket.
 
 #### Event loop
 
