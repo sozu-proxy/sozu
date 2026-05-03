@@ -20,7 +20,7 @@ use crate::{
     BackendConnectionError, L7ListenerHandler, L7Proxy, ListenerHandler, ProxySession, Readiness,
     RetrieveClusterError,
     backends::{Backend, BackendError},
-    protocol::http::editor::{HeaderEditMode, HeaderEditSnapshot, HttpContext},
+    protocol::http::editor::{HeaderEditSnapshot, HttpContext},
     router::{HeaderEdit, RouteResult},
     server::CONN_RETRIES,
     socket::SessionTcpStream,
@@ -632,6 +632,34 @@ impl Router {
             ..
         } = route;
 
+        // ── HSTS (RFC 6797) snapshot hoist for HTTPS ──────────────────────
+        // Stash the response-side header edits early so HTTPS-served
+        // default answers (3xx redirects, 401 auth-deny, 5xx defaults from
+        // `set_default_answer_with_retry_after`) carry per-frontend HSTS
+        // (and any operator-supplied response headers). RFC 6797 §8.1
+        // requires HSTS on every response code.
+        //
+        // Plain-HTTP listeners DO NOT take this branch: per RFC 6797 §7.2
+        // the `Strict-Transport-Security` header MUST NOT appear on
+        // plaintext-HTTP responses. The HTTP forward path falls back to
+        // the post-forward copy below at the end of the function so
+        // operator response headers still apply on backend-served
+        // responses (their pre-existing scope), without ever leaking HSTS
+        // to a 301 emitted by the HTTP-listener `redirect_scheme=use-https`
+        // path. This is defense in depth on top of the config-load reject
+        // in `command/src/config.rs::FileHstsConfig::to_proto` for HSTS
+        // attached to an HTTP listener.
+        if matches!(context.protocol, crate::Protocol::HTTPS) {
+            context.headers_response.clear();
+            for edit in headers_response.iter() {
+                context.headers_response.push(HeaderEditSnapshot {
+                    key: edit.key.to_vec(),
+                    val: edit.val.to_vec(),
+                    mode: edit.mode,
+                });
+            }
+        }
+
         // Look up cluster-side policy knobs once. The values we need are:
         //  - `https_redirect` (legacy) and `https_redirect_port` for the 301 location URL
         //  - `authorized_hashes` and `www_authenticate` for the 401 path
@@ -776,14 +804,18 @@ impl Router {
 
         // Stash the response-side header edits for the emission path
         // (`mux/h1.rs::writable`, `mux/h2.rs::write_streams`) to apply
-        // before `kawa.prepare(...)`.
-        context.headers_response.clear();
-        for edit in headers_response.iter() {
-            context.headers_response.push(HeaderEditSnapshot {
-                key: edit.key.to_vec(),
-                val: edit.val.to_vec(),
-                mode: HeaderEditMode::Append,
-            });
+        // before `kawa.prepare(...)`. HTTPS listeners already had this
+        // done at the top of `route_from_request` so default answers
+        // also receive the snapshot — skip the redundant copy here.
+        if matches!(context.protocol, crate::Protocol::HTTP) {
+            context.headers_response.clear();
+            for edit in headers_response.iter() {
+                context.headers_response.push(HeaderEditSnapshot {
+                    key: edit.key.to_vec(),
+                    val: edit.val.to_vec(),
+                    mode: edit.mode,
+                });
+            }
         }
 
         Ok(cluster_id)

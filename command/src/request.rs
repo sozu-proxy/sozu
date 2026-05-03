@@ -190,6 +190,7 @@ impl RequestHttpFrontend {
             rewrite_port: self.rewrite_port,
             required_auth: self.required_auth,
             headers: self.headers,
+            hsts: self.hsts,
         })
     }
 }

@@ -2,9 +2,9 @@ use std::{cmp::Ordering, collections::BTreeMap, fmt, net::SocketAddr};
 
 use crate::{
     proto::command::{
-        AddBackend, FilteredTimeSerie, Header, LoadBalancingParams, PathRule, PathRuleKind,
-        RequestHttpFrontend, RequestTcpFrontend, Response, ResponseContent, ResponseStatus,
-        RulePosition, RunState, WorkerResponse,
+        AddBackend, FilteredTimeSerie, Header, HstsConfig, LoadBalancingParams, PathRule,
+        PathRuleKind, RequestHttpFrontend, RequestTcpFrontend, Response, ResponseContent,
+        ResponseStatus, RulePosition, RunState, WorkerResponse,
     },
     state::ClusterId,
 };
@@ -68,6 +68,11 @@ pub struct HttpFrontend {
     #[serde(default)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub headers: Vec<Header>,
+    /// Resolved per-frontend HSTS (RFC 6797) policy. `None` means inherit
+    /// the listener default at frontend-add time in the worker.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hsts: Option<HstsConfig>,
 }
 
 impl From<HttpFrontend> for RequestHttpFrontend {
@@ -88,7 +93,7 @@ impl From<HttpFrontend> for RequestHttpFrontend {
             rewrite_port: val.rewrite_port,
             required_auth: val.required_auth,
             headers: val.headers,
-            hsts: None,
+            hsts: val.hsts,
         }
     }
 }
