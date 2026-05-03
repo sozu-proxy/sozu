@@ -105,25 +105,22 @@ pub(super) fn drain_tls_close_notify<S: SocketHandler>(
 /// - [`HeaderEditMode::Append`] with a non-empty `val` → append the
 ///   header before the `end_header` flag block.
 /// - [`HeaderEditMode::Append`] with an empty `val` → fall back to the
-///   legacy delete encoding (HAProxy `del-header` parity). Pre-existing
-///   call sites that have not migrated to the explicit
-///   [`HeaderEditMode::Delete`] continue to work unchanged.
-/// - [`HeaderEditMode::Delete`] → remove every existing header with the
-///   matching name from `kawa.blocks`. Equivalent to the legacy empty-
-///   `val` Append shape but explicit at the call site.
+///   legacy delete encoding (HAProxy `del-header` parity).
 /// - [`HeaderEditMode::SetIfAbsent`] → append the header only when no
 ///   non-elided header with the same name already exists on the
 ///   response (RFC 6797 §6.1 single-`Strict-Transport-Security`
 ///   requirement, generalised to any operator-supplied
 ///   set-only-when-missing edit). The presence check runs against the
-///   pre-edit response state so a `SetIfAbsent` does NOT race against a
-///   `Delete` issued in the same batch.
+///   pre-edit response state, so a `SetIfAbsent` does NOT race against
+///   a sibling `Set` (or empty-`val` Append) issued in the same batch.
+/// - [`HeaderEditMode::Set`] → remove every existing header with the
+///   matching name from `kawa.blocks`, then append the new value.
+///   Used by typed policies that want to override a backend-supplied
+///   header unconditionally (e.g. HSTS with
+///   `force_replace_backend = true`).
 ///
 /// Both H1 and H2 emission paths funnel through here so the on-wire
-/// header set stays consistent. Per-edit set/replace semantics that
-/// need an unconditional overwrite are expressed as two entries: one
-/// `Delete` (or empty-`val` Append) followed by an `Append` with the
-/// new value.
+/// header set stays consistent.
 pub(super) fn apply_response_header_edits<T: AsBuffer>(
     kawa: &mut kawa::Kawa<T>,
     edits: &[HeaderEditSnapshot],
@@ -162,9 +159,10 @@ pub(super) fn apply_response_header_edits<T: AsBuffer>(
     let keys_to_drop: Vec<Vec<u8>> = edits
         .iter()
         .filter(|e| {
-            // Explicit Delete OR legacy empty-`val` Append (preserved
-            // for callers still using the implicit encoding).
-            matches!(e.mode, HeaderEditMode::Delete)
+            // Explicit `Set` (delete-then-insert in one entry) OR legacy
+            // empty-`val` Append (delete encoding preserved for callers
+            // still using the implicit shape).
+            matches!(e.mode, HeaderEditMode::Set)
                 || (matches!(e.mode, HeaderEditMode::Append) && e.val.is_empty())
         })
         .map(|e| e.key.iter().map(u8::to_ascii_lowercase).collect())
@@ -202,11 +200,8 @@ pub(super) fn apply_response_header_edits<T: AsBuffer>(
     let mut to_insert: Vec<Block> = Vec::new();
     for edit in edits {
         match edit.mode {
-            // Explicit delete is materialised by the retain pass above;
-            // nothing to insert. Same for the legacy empty-`val` Append
-            // shape, which we route through the delete branch for
-            // backwards compatibility.
-            HeaderEditMode::Delete => continue,
+            // Empty-`val` Append is the legacy delete shape — the
+            // retain pass above already removed any matching headers.
             HeaderEditMode::Append if edit.val.is_empty() => continue,
             HeaderEditMode::Append => {}
             HeaderEditMode::SetIfAbsent => {
@@ -221,6 +216,11 @@ pub(super) fn apply_response_header_edits<T: AsBuffer>(
                     continue;
                 }
             }
+            // `Set` is delete-then-insert: the retain pass above has
+            // already dropped any pre-existing header with the same
+            // name, and this branch falls through to the insert below
+            // unconditionally (no presence check).
+            HeaderEditMode::Set => {}
         }
         to_insert.push(Block::Header(Pair {
             key: Store::from_slice(&edit.key),
@@ -544,5 +544,75 @@ mod tests {
             ),
             "end_header flag must remain the last block"
         );
+    }
+
+    #[test]
+    fn test_response_edit_set_replaces_existing_header() {
+        // `HeaderEditMode::Set` is delete-then-insert: a pre-existing
+        // header with the matching name (case-insensitive) must be
+        // dropped, and the new value inserted exactly once.
+        let mut buf = vec![0u8; 4096];
+        let mut kawa = make_kawa(&mut buf);
+        kawa.blocks.push_back(Block::Header(Pair {
+            key: Store::Static(b"Strict-Transport-Security"),
+            val: Store::Static(b"max-age=300"),
+        }));
+        kawa.blocks.push_back(Block::Flags(Flags {
+            end_body: false,
+            end_chunk: false,
+            end_header: true,
+            end_stream: false,
+        }));
+
+        apply_response_header_edits(
+            &mut kawa,
+            &[HeaderEditSnapshot {
+                key: b"strict-transport-security".to_vec(),
+                val: b"max-age=31536000; includeSubDomains".to_vec(),
+                mode: HeaderEditMode::Set,
+            }],
+        );
+
+        let pairs = pretty_blocks(&kawa);
+        assert_eq!(
+            pairs.len(),
+            1,
+            "Set must drop the pre-existing header and insert exactly one"
+        );
+        assert_eq!(pairs[0].0, b"strict-transport-security");
+        assert_eq!(pairs[0].1, b"max-age=31536000; includeSubDomains");
+    }
+
+    #[test]
+    fn test_response_edit_set_inserts_when_absent() {
+        // `Set` with no pre-existing header must still insert the new
+        // value (the retain pass is a no-op when nothing matches).
+        let mut buf = vec![0u8; 4096];
+        let mut kawa = make_kawa(&mut buf);
+        kawa.blocks.push_back(Block::Header(Pair {
+            key: Store::Static(b"server"),
+            val: Store::Static(b"sozu"),
+        }));
+        kawa.blocks.push_back(Block::Flags(Flags {
+            end_body: false,
+            end_chunk: false,
+            end_header: true,
+            end_stream: false,
+        }));
+
+        apply_response_header_edits(
+            &mut kawa,
+            &[HeaderEditSnapshot {
+                key: b"strict-transport-security".to_vec(),
+                val: b"max-age=31536000".to_vec(),
+                mode: HeaderEditMode::Set,
+            }],
+        );
+
+        let pairs = pretty_blocks(&kawa);
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0].0, b"server");
+        assert_eq!(pairs[1].0, b"strict-transport-security");
+        assert_eq!(pairs[1].1, b"max-age=31536000");
     }
 }

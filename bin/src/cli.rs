@@ -673,6 +673,11 @@ pub enum HttpFrontendCmd {
             help = "Explicitly disable HSTS on this frontend, suppressing any inherited listener-default HSTS. Mutually exclusive with --hsts-max-age / --hsts-include-subdomains / --hsts-preload."
         )]
         hsts_disabled: bool,
+        #[clap(
+            long = "hsts-force-replace-backend",
+            help = "Override any backend-supplied `Strict-Transport-Security` header with sozu's typed policy instead of preserving it (RFC 6797 §6.1 backend-wins is the default). Use when upstream backends emit a stale or weak HSTS policy that the operator wants to harden centrally. Implies HSTS enabled."
+        )]
+        hsts_force_replace_backend: bool,
     },
     #[clap(name = "remove")]
     Remove {

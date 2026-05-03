@@ -1316,6 +1316,14 @@ pub struct FileHstsConfig {
     /// Append `; preload` to the rendered header. Opt-in only — see RFC
     /// 6797 §14.2 and <https://hstspreload.org/>.
     pub preload: Option<bool>,
+    /// Operator opt-in to override any backend-supplied
+    /// `Strict-Transport-Security` header. RFC 6797 §6.1 default
+    /// behaviour is to PRESERVE the backend's value (sozu's edit uses
+    /// `HeaderEditMode::SetIfAbsent`). Set this to `true` to harden a
+    /// stale or weak upstream HSTS policy centrally — the materialiser
+    /// then uses `HeaderEditMode::Set`, replacing any backend STS with
+    /// sozu's rendered value.
+    pub force_replace_backend: Option<bool>,
 }
 
 impl FileHstsConfig {
@@ -1386,6 +1394,7 @@ impl FileHstsConfig {
             max_age,
             include_subdomains,
             preload,
+            force_replace_backend: self.force_replace_backend,
         })
     }
 }
@@ -3254,6 +3263,7 @@ mod tests {
             max_age: None,
             include_subdomains: None,
             preload: None,
+            force_replace_backend: None,
         };
         let proto = cfg.to_proto("test").expect("should validate");
         assert_eq!(proto.enabled, Some(true));
@@ -3267,6 +3277,7 @@ mod tests {
             max_age: Some(63_072_000),
             include_subdomains: Some(true),
             preload: Some(true),
+            force_replace_backend: None,
         };
         let proto = cfg.to_proto("test").expect("should validate");
         assert_eq!(proto.max_age, Some(63_072_000));
@@ -3284,6 +3295,7 @@ mod tests {
             max_age: None,
             include_subdomains: None,
             preload: None,
+            force_replace_backend: None,
         };
         let proto = cfg.to_proto("test").expect("should validate");
         assert_eq!(proto.enabled, Some(false));
@@ -3299,6 +3311,7 @@ mod tests {
             max_age: Some(0),
             include_subdomains: None,
             preload: None,
+            force_replace_backend: None,
         };
         let proto = cfg.to_proto("test").expect("kill-switch must validate");
         assert_eq!(proto.max_age, Some(0));
@@ -3311,6 +3324,7 @@ mod tests {
             max_age: Some(31_536_000),
             include_subdomains: None,
             preload: None,
+            force_replace_backend: None,
         };
         match cfg.to_proto("test").unwrap_err() {
             ConfigError::HstsEnabledRequired(scope) => assert_eq!(scope, "test"),
@@ -3333,6 +3347,7 @@ mod tests {
             max_age: Some(31_536_000),
             include_subdomains: None,
             preload: None,
+            force_replace_backend: None,
         });
         match listener.to_http(None).unwrap_err() {
             ConfigError::HstsOnPlainHttp(scope) => assert!(
@@ -3375,6 +3390,7 @@ mod tests {
                 max_age: Some(31_536_000),
                 include_subdomains: None,
                 preload: None,
+                force_replace_backend: None,
             }),
         };
         match frontend.to_http_front("api").unwrap_err() {

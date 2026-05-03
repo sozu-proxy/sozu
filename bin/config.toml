@@ -362,6 +362,11 @@ address = "0.0.0.0:8443"
 # max_age = 31536000
 # include_subdomains = true
 # preload = false
+# # Operator opt-in to override any backend-supplied
+# # `Strict-Transport-Security` header (instead of preserving it per
+# # RFC 6797 §6.1). Use when upstream backends emit a stale or weak
+# # HSTS policy that the operator wants to harden centrally.
+# force_replace_backend = false
 
 # Supported TLS versions. Possible values are "SSL_V2", "SSL_V3", "TLSv1", "TLS_V11", "TLS_V12", "TLS_V13".
 # Defaults to `["TLS_V12", "TLS_V13"]`. Besides, `rustls` tls provider only support "TLS_V12" and "TLS_V13" values.
