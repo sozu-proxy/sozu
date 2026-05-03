@@ -300,14 +300,44 @@ pub struct HttpContext {
     pub access_log_message: Option<&'static str>,
 }
 
+/// How `apply_response_header_edits` should interpret a per-edit value.
+///
+/// Today the implicit encoding is: empty `val` → delete; non-empty `val`
+/// → append. The explicit `Append`/`Delete`/`SetIfAbsent` mode lets HSTS
+/// (and future RFC-correct response policies) opt into "skip the insert
+/// when an upstream-supplied header with the same name is already on the
+/// response". This preserves operator-controlled fallback when the
+/// backend already emits its own `Strict-Transport-Security` (RFC 6797
+/// §6.1 single-header requirement).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HeaderEditMode {
+    /// Append the header before the end-of-headers flag. Empty `val`
+    /// is interpreted as a delete (legacy behaviour preserved).
+    #[default]
+    Append,
+    /// Remove every existing header whose name matches `key`
+    /// case-insensitively.
+    Delete,
+    /// Skip the insert if `kawa.blocks` already contains a non-elided
+    /// header whose name matches `key` case-insensitively. Otherwise
+    /// behave like `Append`.
+    SetIfAbsent,
+}
+
 /// Owned snapshot of a per-frontend header edit, captured at routing
 /// time so the emission boundary can apply set/replace/delete without
-/// touching the routing layer's `Rc<[HeaderEdit]>` slices. Empty `val`
-/// deletes the header by name (HAProxy `del-header` parity).
+/// touching the routing layer's `Rc<[HeaderEdit]>` slices.
+///
+/// `mode` chooses between explicit Append/Delete/SetIfAbsent semantics.
+/// For backwards compatibility `mode = Append` paired with an empty
+/// `val` is still treated as a delete by `apply_response_header_edits`
+/// (HAProxy `del-header` parity), so callers that have not yet migrated
+/// to the explicit `HeaderEditMode::Delete` keep working unchanged.
 #[derive(Debug, Clone)]
 pub struct HeaderEditSnapshot {
     pub key: Vec<u8>,
     pub val: Vec<u8>,
+    pub mode: HeaderEditMode,
 }
 
 impl kawa::h1::ParserCallbacks<Checkout> for HttpContext {
@@ -987,6 +1017,7 @@ mod tests {
         ctx.headers_response.push(HeaderEditSnapshot {
             key: b"X-Cache".to_vec(),
             val: b"HIT".to_vec(),
+            mode: HeaderEditMode::Append,
         });
 
         ctx.reset();

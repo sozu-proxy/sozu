@@ -88,6 +88,7 @@ impl From<HttpFrontend> for RequestHttpFrontend {
             rewrite_port: val.rewrite_port,
             required_auth: val.required_auth,
             headers: val.headers,
+            hsts: None,
         }
     }
 }

@@ -317,6 +317,14 @@ message UpdateHttpsListenerConfig {
     // When true, a proxy-generated `X-Real-IP` header carrying the connection
     // peer IP is appended to every forwarded request. See HttpsListenerConfig.
     optional bool send_x_real_ip                    = 40;
+    // Listener-default HSTS policy (RFC 6797). Full-object replacement on
+    // partial update — when this field is `Some`, the supplied
+    // `HstsConfig` overwrites whatever the listener currently holds; when
+    // absent, the existing policy is preserved. Use
+    // `Some(HstsConfig { enabled: Some(false), .. })` to explicitly
+    // disable HSTS via partial update. Cites RFC 6797 §6.1 (single
+    // header) and §7.2 (HTTPS-only).
+    optional HstsConfig hsts                        = 41;
 }
 
 // Partial-update patch for a running TCP listener.
@@ -569,6 +577,13 @@ message HttpsListenerConfig {
     // to every forwarded request. Independently combinable with
     // `elide_x_real_ip`. Default: false.
     optional bool send_x_real_ip = 45 [default = false];
+    // Listener-default HSTS (HTTP Strict Transport Security, RFC 6797)
+    // policy. When set, every successful response on this listener gains
+    // a `Strict-Transport-Security` header derived from the materialised
+    // policy (RFC 6797 §6.1 single-header requirement, §7.2 HTTPS-only
+    // emission, §8.1 host scope, §11.4 max-age=0 kill-switch). A
+    // per-frontend `RequestHttpFrontend.hsts` overrides this default.
+    optional HstsConfig hsts = 46;
 }
 
 // details of an TCP listener
@@ -584,6 +599,41 @@ message TcpListenerConfig {
     required uint32 connect_timeout = 6 [default = 3];
     // wether the listener is actively listening on its socket
     required bool active = 7 [default = false];
+}
+
+// HSTS (HTTP Strict Transport Security, RFC 6797) policy attached to
+// an HTTPS listener default or per-frontend. The materialised
+// `Strict-Transport-Security: max-age=N[; includeSubDomains][; preload]`
+// header is injected on every successful HTTPS response (including
+// proxy-generated 3xx/401/5xx default answers). Per RFC 6797 §7.2 the
+// header MUST NOT be emitted on plaintext-HTTP responses; sozu rejects
+// HSTS configured on an HttpListenerConfig at config-load time and gates
+// the runtime injection on `context.protocol == Protocol::HTTPS`.
+//
+// Validation:
+// - `enabled = true` with `max_age = None` defaults `max_age` to
+//  31536000 seconds (1 year) at config-load.
+// - `max_age = 0` is the RFC 6797 §11.4 kill-switch and is allowed
+//  silently; `0 < max_age < 86400` warns.
+// - `preload = true` with `max_age < 31536000` or
+//  `include_subdomains != true` warns (Chrome HSTS preload list
+//  prerequisites at https://hstspreload.org/).
+// - `preload` is opt-in only; never default-true (RFC 6797 §14.2 —
+//  removal from the preload list is slow and partial).
+message HstsConfig {
+    // Whether HSTS is enabled for this scope. Required whenever the
+    // parent message includes an HstsConfig — the partial-update path
+    // treats `enabled = false` as the explicit-disable signal.
+    optional bool enabled = 1;
+    // Strict-Transport-Security `max-age` directive in seconds. When
+    // `enabled = true` and this is unset, sozu substitutes 31536000
+    // (1 year, HSTS preload list minimum) at config-load.
+    optional uint32 max_age = 2;
+    // Append `; includeSubDomains` to the rendered header.
+    optional bool include_subdomains = 3;
+    // Append `; preload` to the rendered header. Opt-in only — see
+    // RFC 6797 §14.2 and https://hstspreload.org/.
+    optional bool preload = 4;
 }
 
 // custom HTTP answers, useful for 404, 503 pages
@@ -737,6 +787,16 @@ message RequestHttpFrontend {
     // Header mutations applied to requests and/or responses passing through
     // this frontend. See `Header` for delete semantics.
     repeated Header headers = 15;
+    // Per-frontend HSTS (RFC 6797) override. When `Some`, this entire
+    // policy replaces the listener-default `HttpsListenerConfig.hsts`
+    // for matched requests; when absent, the listener default applies.
+    // Honours RFC 6797 §6.1 (single Strict-Transport-Security header on
+    // the response) and §8.1 (HSTS host scope tied to the receiving
+    // host). On HTTP-only frontends the value is rejected at config-load
+    // (RFC 6797 §7.2). The §11.4 `max-age=0` kill-switch is honoured
+    // verbatim so an operator can shadow a listener-wide HSTS for one
+    // hostname.
+    optional HstsConfig hsts = 16;
 }
 
 message RequestTcpFrontend {
