@@ -1317,11 +1317,34 @@ impl HttpsListener {
         // HSTS block, refuse the patch — `enabled` is the explicit
         // disambiguator between "disable" and "enable" semantics, and the
         // operator must signal one or the other on every update.
+        //
+        // Inheritance refresh limitation: the routing trie (`self.fronts`)
+        // stores each frontend's materialised `headers_response` snapshot,
+        // built at `add_https_front` time from the listener-default that
+        // was current then. The trie does NOT carry the original
+        // `Option<HstsConfig>` ProtoBuf, so we cannot distinguish
+        // "inheriting" frontends from "explicit override" frontends after
+        // the fact — refreshing them in place would risk overwriting an
+        // operator's explicit per-frontend HSTS with the new listener
+        // default. The conservative behaviour is to update the listener
+        // default for FUTURE frontend adds and tell the operator to
+        // remove + re-add any existing frontend that should inherit the
+        // new value. The `incr!("http.hsts.listener_default_patched")`
+        // counter pairs with the `warn!` so dashboards can surface the
+        // pending operator action.
         if let Some(new_hsts) = patch.hsts {
             if new_hsts.enabled.is_none() {
                 return Err(ListenerError::HstsEnabledRequired);
             }
             self.config.hsts = Some(new_hsts);
+            warn!(
+                "{} HTTPS listener {:?} HSTS default patched. Existing frontends keep their \
+                 materialised HSTS edit until the operator removes + re-adds them; new \
+                 frontends inherit the new value.",
+                log_module_context!(),
+                self.config.address,
+            );
+            crate::incr!("http.hsts.listener_default_patched");
         }
 
         Ok(())
