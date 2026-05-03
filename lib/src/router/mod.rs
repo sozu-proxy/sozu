@@ -11,15 +11,15 @@ use regex::bytes::Regex;
 use sozu_command::{
     logging::CachedTags,
     proto::command::{
-        HeaderPosition, PathRule as CommandPathRule, PathRuleKind, RedirectPolicy, RedirectScheme,
-        RulePosition,
+        HeaderPosition, HstsConfig, PathRule as CommandPathRule, PathRuleKind, RedirectPolicy,
+        RedirectScheme, RulePosition,
     },
     response::HttpFrontend,
     state::ClusterId,
 };
 
 use crate::{
-    protocol::http::parser::Method,
+    protocol::{http::editor::HeaderEditMode, http::parser::Method},
     router::pattern_trie::{TrieMatches, TrieNode, TrieSubMatch},
     sozu_command::logging::ansi_palette,
 };
@@ -208,7 +208,8 @@ impl Router {
             || front.rewrite_path.is_some()
             || front.rewrite_port.is_some()
             || front.required_auth.unwrap_or(false)
-            || !front.headers.is_empty();
+            || !front.headers.is_empty()
+            || front.hsts.is_some();
 
         let domain =
             front
@@ -239,6 +240,7 @@ impl Router {
                 front.rewrite_port.and_then(|p| u16::try_from(p).ok()),
                 &front.headers,
                 front.required_auth.unwrap_or(false),
+                front.hsts.as_ref(),
             )?;
             Route::Frontend(Rc::new(frontend))
         } else {
@@ -763,23 +765,55 @@ pub enum Route {
     Frontend(Rc<Frontend>),
 }
 
+/// Render an [`HstsConfig`] into a canonical RFC 6797 §6.1
+/// `Strict-Transport-Security` header value: `max-age=N` first, then
+/// optional `; includeSubDomains`, then optional `; preload`. No
+/// trailing semicolon. `includeSubDomains` is the RFC §6.1 spelling
+/// (camelCase); `preload` is lowercase per the de-facto Chrome/HSTS
+/// preload-list convention (https://hstspreload.org/).
+///
+/// Returns `None` when the config has no `max_age` (the caller should
+/// have substituted the default at config-load via
+/// `command/src/config.rs::FileHstsConfig::to_proto` before reaching
+/// this site; if it didn't, a `None` here suppresses the emission so a
+/// malformed wire frame can't leak `max-age=0` accidentally).
+pub fn render_hsts(cfg: &HstsConfig) -> Option<String> {
+    let max_age = cfg.max_age?;
+    let mut s = format!("max-age={max_age}");
+    if matches!(cfg.include_subdomains, Some(true)) {
+        s.push_str("; includeSubDomains");
+    }
+    if matches!(cfg.preload, Some(true)) {
+        s.push_str("; preload");
+    }
+    Some(s)
+}
+
 /// A single header mutation collected from a [`Frontend`] configuration.
 ///
 /// `key` and `val` are owned via [`Rc`] so a `Frontend` can be held by many
 /// routing entries (pre, tree, post) without copying the underlying bytes.
-/// An empty `val` deletes the header by name (HAProxy `del-header` parity).
+///
+/// `mode` controls how the per-stream `apply_response_header_edits` pass
+/// emits the entry on the wire — see [`HeaderEditMode`]. Operator-supplied
+/// `[[...frontends.headers]]` entries default to [`HeaderEditMode::Append`]
+/// (preserving the legacy empty-val-deletes encoding); typed policies
+/// (HSTS, future RFC-correct response policies) opt into
+/// [`HeaderEditMode::SetIfAbsent`].
 #[derive(Clone, PartialEq, Eq)]
 pub struct HeaderEdit {
     pub key: Rc<[u8]>,
     pub val: Rc<[u8]>,
+    pub mode: HeaderEditMode,
 }
 
 impl Debug for HeaderEdit {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_fmt(format_args!(
-            "({:?}, {:?})",
+            "({:?}, {:?}, {:?})",
             String::from_utf8_lossy(&self.key),
-            String::from_utf8_lossy(&self.val)
+            String::from_utf8_lossy(&self.val),
+            self.mode,
         ))
     }
 }
@@ -1040,6 +1074,7 @@ impl Frontend {
         rewrite_port: Option<u16>,
         headers: &[sozu_command::proto::command::Header],
         required_auth: bool,
+        hsts: Option<&HstsConfig>,
     ) -> Result<Self, RouterError> {
         let cluster_id = front.cluster_id.clone();
         let tags = front
@@ -1146,6 +1181,7 @@ impl Frontend {
             let edit = HeaderEdit {
                 key: header.key.as_bytes().into(),
                 val: header.val.as_bytes().into(),
+                mode: HeaderEditMode::Append,
             };
             match header.position() {
                 HeaderPosition::Request => headers_request.push(edit),
@@ -1168,6 +1204,24 @@ impl Frontend {
                     );
                 }
             }
+        }
+
+        // Materialise HSTS (RFC 6797) into the response-side header
+        // collection as a single `SetIfAbsent` edit so an upstream-emitted
+        // `Strict-Transport-Security` survives unchanged (RFC 6797 §6.1
+        // single-header requirement). `enabled = Some(false)` is the
+        // explicit-disable signal — emit nothing. The §7.2 "no STS over
+        // plaintext HTTP" gate is enforced by the runtime snapshot site,
+        // which only copies `headers_response` for HTTPS-served requests.
+        if let Some(cfg) = hsts
+            && matches!(cfg.enabled, Some(true))
+            && let Some(rendered) = render_hsts(cfg)
+        {
+            headers_response.push(HeaderEdit {
+                key: Rc::from(&b"strict-transport-security"[..]),
+                val: rendered.into_bytes().into(),
+                mode: HeaderEditMode::SetIfAbsent,
+            });
         }
 
         Ok(Frontend {
