@@ -1311,6 +1311,19 @@ impl HttpsListener {
             *self.answers.borrow_mut() = rebuilt;
         }
 
+        // HSTS: full-object replacement when present in the patch. Absent
+        // patch field preserves current value (matches the rest of this
+        // partial-update handler). When `enabled` is missing on a present
+        // HSTS block, refuse the patch — `enabled` is the explicit
+        // disambiguator between "disable" and "enable" semantics, and the
+        // operator must signal one or the other on every update.
+        if let Some(new_hsts) = patch.hsts {
+            if new_hsts.enabled.is_none() {
+                return Err(ListenerError::HstsEnabledRequired);
+            }
+            self.config.hsts = Some(new_hsts);
+        }
+
         Ok(())
     }
 

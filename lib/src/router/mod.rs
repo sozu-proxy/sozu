@@ -1222,6 +1222,7 @@ impl Frontend {
                 val: rendered.into_bytes().into(),
                 mode: HeaderEditMode::SetIfAbsent,
             });
+            crate::incr!("http.hsts.frontend_added");
         }
 
         Ok(Frontend {
