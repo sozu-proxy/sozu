@@ -979,6 +979,7 @@ impl ListenerBuilder {
             sozu_id_header: self.sozu_id_header.clone(),
             elide_x_real_ip: Some(self.elide_x_real_ip.unwrap_or(false)),
             send_x_real_ip: Some(self.send_x_real_ip.unwrap_or(false)),
+            hsts: None,
         };
 
         Ok(https_listener_config)
@@ -1820,6 +1821,7 @@ impl HttpFrontendConfig {
                     rewrite_path: self.rewrite_path.clone(),
                     rewrite_port: self.rewrite_port,
                     headers: self.headers.clone(),
+                    hsts: None,
                 })
                 .into(),
             );
@@ -1842,6 +1844,7 @@ impl HttpFrontendConfig {
                     rewrite_path: self.rewrite_path.clone(),
                     rewrite_port: self.rewrite_port,
                     headers: self.headers.clone(),
+                    hsts: None,
                 })
                 .into(),
             );

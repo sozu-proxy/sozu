@@ -20,7 +20,7 @@ use crate::{
     BackendConnectionError, L7ListenerHandler, L7Proxy, ListenerHandler, ProxySession, Readiness,
     RetrieveClusterError,
     backends::{Backend, BackendError},
-    protocol::http::editor::{HeaderEditSnapshot, HttpContext},
+    protocol::http::editor::{HeaderEditMode, HeaderEditSnapshot, HttpContext},
     router::{HeaderEdit, RouteResult},
     server::CONN_RETRIES,
     socket::SessionTcpStream,
@@ -782,6 +782,7 @@ impl Router {
             context.headers_response.push(HeaderEditSnapshot {
                 key: edit.key.to_vec(),
                 val: edit.val.to_vec(),
+                mode: HeaderEditMode::Append,
             });
         }
 
