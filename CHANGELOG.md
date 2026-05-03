@@ -258,9 +258,10 @@ upgrade. See `doc/upgrade/1.x-to-2.0.md` for the full migration guide.
   copies it into every binary tarball as `LICENSE-LGPL3` so AGPL §6 / LGPL §4
   obligations are satisfied without an external URL fetch.
 - **Typed HSTS (HTTP Strict Transport Security, RFC 6797) policy with
-  listener-default + per-frontend override**: a new `[hsts]` block under
-  `[https.listeners.default]` (listener default) or
-  `[clusters.<id>.frontends]` (per-frontend override) lets operators emit
+  listener-default + per-frontend override**: a new `[hsts]` block under an
+  HTTPS `[[listeners]]` entry (listener default) or
+  `[clusters.<cluster>.frontends.hsts]` (per-frontend override) lets operators
+  emit
   `Strict-Transport-Security: max-age=N[; includeSubDomains][; preload]` on
   every HTTPS response — backend-served, redirect 3xx, auth-deny 401, and
   proxy-generated 5xx alike. Knobs: `enabled` (required when the block is

@@ -263,7 +263,12 @@ hostname = "api.example.com"
 
 ```toml
 # Listener-level default — every HTTPS frontend on this listener
-# inherits unless it declares its own [hsts] block.
+# inherits unless it declares its own [hsts] block. The `[hsts]`
+# table nests under the enclosing `[[listeners]]` entry.
+[[listeners]]
+protocol = "https"
+address  = "0.0.0.0:443"
+
 [hsts]
 # REQUIRED whenever the [hsts] block is present. `false` is the
 # explicit-disable signal on a partial-update; new TOML deployments
