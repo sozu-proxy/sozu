@@ -1077,4 +1077,138 @@ mod backends_test {
             "regime exit must clear the latch so the next entry is logged again"
         );
     }
+
+    // ── #892: per-cluster availability tracker ──────────────────────────
+
+    /// Build a backend that passes the `evaluate_availability` predicate
+    /// (`status == Normal && health.is_healthy() && !retry_policy.is_down()`).
+    /// A `Backend::new` returns Normal/Healthy with a fresh
+    /// ExponentialBackoffPolicy that reports `is_down() == false` until the
+    /// first `fail()`, so this is just `Backend::new` with a stable address.
+    fn healthy_backend(id: &str, port: u16) -> Backend {
+        Backend::new(
+            id,
+            format!("127.0.0.1:{port}").parse().unwrap(),
+            None,
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn evaluate_availability_empty_list_returns_zero_zero() {
+        let list = BackendList::new();
+        assert_eq!((0, 0), list.evaluate_availability());
+    }
+
+    #[test]
+    fn evaluate_availability_counts_only_healthy_normal_not_in_backoff() {
+        let mut list = BackendList::new();
+        list.add_backend(healthy_backend("b-ok-1", 9101));
+        list.add_backend(healthy_backend("b-ok-2", 9102));
+        list.add_backend(unhealthy_backend("b-bad", 9103));
+        let (available, total) = list.evaluate_availability();
+        assert_eq!(3, total, "every configured backend counts toward total");
+        assert_eq!(
+            2, available,
+            "only the two healthy backends pass the predicate"
+        );
+    }
+
+    #[test]
+    fn evaluate_availability_excludes_retry_policy_down() {
+        let mut list = BackendList::new();
+        list.add_backend(healthy_backend("b-fresh", 9111));
+        list.add_backend(healthy_backend("b-fail", 9112));
+        // Drive the second backend's retry policy into is_down() by failing
+        // it past `max_retries`. ExponentialBackoffPolicy::is_down() only
+        // returns true after the budget is exhausted; we hit that with a
+        // tight loop of `fail()` calls (default budget is small).
+        for _ in 0..32 {
+            list.backends[1].borrow_mut().retry_policy.fail();
+        }
+        let (available, total) = list.evaluate_availability();
+        assert_eq!(2, total);
+        assert_eq!(
+            1, available,
+            "retry-policy is_down() backend must be excluded even when health.is_healthy()"
+        );
+    }
+
+    #[test]
+    fn record_cluster_availability_flips_to_alldown_then_idempotent() {
+        let mut map = BackendMap::new();
+        let cluster_id = "c-flap";
+        map.add_backend(cluster_id, unhealthy_backend("b1", 9201));
+        // After add_backend the helper has run; total=1, available=0,
+        // so the cell must already be AllDown.
+        let list = map.backends.get(cluster_id).expect("cluster present");
+        assert_eq!(
+            ClusterAvailability::AllDown,
+            list.availability.get(),
+            "single unhealthy backend must drive the cell to AllDown"
+        );
+        // Calling again in the same regime is a no-op (Cell already AllDown).
+        map.record_cluster_availability(cluster_id);
+        let list = map.backends.get(cluster_id).expect("cluster present");
+        assert_eq!(
+            ClusterAvailability::AllDown,
+            list.availability.get(),
+            "repeat call must keep the cell at AllDown without flipping"
+        );
+    }
+
+    #[test]
+    fn record_cluster_availability_recovers_to_available() {
+        let mut map = BackendMap::new();
+        let cluster_id = "c-recover";
+        map.add_backend(cluster_id, unhealthy_backend("b1", 9301));
+        assert_eq!(
+            ClusterAvailability::AllDown,
+            map.backends.get(cluster_id).unwrap().availability.get()
+        );
+        // Heal the backend in place and re-evaluate. Without going through
+        // a routing call the helper still fires from add_backend / HC, so
+        // here we drive it manually.
+        map.backends
+            .get_mut(cluster_id)
+            .unwrap()
+            .backends[0]
+            .borrow_mut()
+            .health
+            .status = HealthStatus::Healthy;
+        map.record_cluster_availability(cluster_id);
+        assert_eq!(
+            ClusterAvailability::Available,
+            map.backends.get(cluster_id).unwrap().availability.get(),
+            "healed backend must flip the cell back to Available"
+        );
+    }
+
+    #[test]
+    fn record_cluster_availability_empty_cluster_stays_available() {
+        let mut map = BackendMap::new();
+        let cluster_id = "c-empty";
+        map.backends
+            .insert(cluster_id.to_owned(), BackendList::new());
+        // total == 0 path: never report AllDown — avoids log spam during
+        // cluster bootstrap when backends are still being registered.
+        map.record_cluster_availability(cluster_id);
+        assert_eq!(
+            ClusterAvailability::Available,
+            map.backends.get(cluster_id).unwrap().availability.get(),
+            "empty cluster must keep the cell at the default Available"
+        );
+    }
+
+    #[test]
+    fn record_cluster_availability_missing_cluster_is_noop() {
+        let map = BackendMap::new();
+        // No panic, no insert — just an early return.
+        map.record_cluster_availability("c-absent");
+        assert!(
+            !map.backends.contains_key("c-absent"),
+            "helper must not insert a BackendList for an unknown cluster_id"
+        );
+    }
 }
