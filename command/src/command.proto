@@ -634,6 +634,23 @@ message HstsConfig {
     // Append `; preload` to the rendered header. Opt-in only — see
     // RFC 6797 §14.2 and https://hstspreload.org/.
     optional bool preload = 4;
+    // Operator opt-in to override any backend-supplied
+    // `Strict-Transport-Security` header with sozu's typed policy.
+    //
+    // RFC 6797 §6.1 default behaviour is to PRESERVE a backend-emitted
+    // STS header when one is already present (sozu's HSTS edit uses
+    // `HeaderEditMode::SetIfAbsent`). That keeps the backend's intent
+    // intact for upstreams that ship their own HSTS policy.
+    //
+    // Set this to `true` for the harden-centrally case: backends behind
+    // sozu emit a stale or weak HSTS policy (e.g. legacy `max-age=300`)
+    // and the operator wants to enforce a stronger policy at the proxy
+    // edge unconditionally. The materialiser then uses
+    // `HeaderEditMode::Set` instead of `SetIfAbsent`, replacing every
+    // backend-supplied STS header with sozu's rendered value.
+    //
+    // Cite: https://datatracker.ietf.org/doc/html/rfc6797#section-6.1
+    optional bool force_replace_backend = 5;
 }
 
 // custom HTTP answers, useful for 404, 503 pages
