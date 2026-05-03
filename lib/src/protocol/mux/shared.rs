@@ -135,8 +135,16 @@ pub(super) fn apply_response_header_edits<T: AsBuffer>(
     // response BEFORE any edit runs. Used by `SetIfAbsent` to honour
     // upstream-supplied headers (e.g. backend already sent its own
     // `Strict-Transport-Security`) without racing against a sibling
-    // `Delete` edit in the same batch.
-    let existing_keys: Vec<Vec<u8>> = {
+    // `Set` edit in the same batch.
+    //
+    // Skip the scan when the batch contains no `SetIfAbsent` entry —
+    // `Append` and `Set` never consult `existing_keys`, so the
+    // common operator-defined response-header path (Append-only)
+    // pays zero allocation overhead.
+    let needs_existing_snapshot = edits
+        .iter()
+        .any(|e| matches!(e.mode, HeaderEditMode::SetIfAbsent));
+    let existing_keys: Vec<Vec<u8>> = if needs_existing_snapshot {
         let buf = kawa.storage.buffer();
         kawa.blocks
             .iter()
@@ -154,6 +162,8 @@ pub(super) fn apply_response_header_edits<T: AsBuffer>(
                 }
             })
             .collect()
+    } else {
+        Vec::new()
     };
 
     let keys_to_drop: Vec<Vec<u8>> = edits
