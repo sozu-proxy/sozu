@@ -226,6 +226,41 @@ A `[hsts]` block under an HTTPS listener is the operator-default; per-frontend o
 
 Per RFC 6797 §7.2 the `Strict-Transport-Security` header MUST NOT appear on plaintext-HTTP responses. Sōzu enforces this in three layers: (1) TOML config-load rejects `[hsts]` on a plain-HTTP listener (`ConfigError::HstsOnPlainHttp`), (2) the worker IPC entry rejects `AddHttpFrontend` carrying an enabled HSTS (`ProxyError::HstsOnPlainHttp` and the `http.hsts.suppressed_plaintext` counter), and (3) the runtime per-stream snapshot copy is gated on `context.protocol == Protocol::HTTPS` so plaintext connections never apply HSTS edits even when one slips through.
 
+##### Is the `[hsts]` block required?
+
+**No** — it is optional everywhere. Omitting the block on every listener and every frontend is a fully valid configuration: no `Strict-Transport-Security` header is ever emitted.
+
+| Surface                                                       | Required? | Notes                                                                                                                       |
+|---------------------------------------------------------------|-----------|-----------------------------------------------------------------------------------------------------------------------------|
+| `[hsts]` under a plain-HTTP listener / frontend               | **N/A**   | The field does not exist on the HTTP listener proto. Setting it on an HTTP frontend is rejected at config-load (RFC §7.2).  |
+| `[hsts]` under an HTTPS listener (operator default)           | Optional  | Omit the block and no listener-default HSTS is set. HTTPS frontends without their own block then carry no HSTS.             |
+| `[hsts]` under a per-frontend section                         | Optional  | Omit and the frontend inherits the listener default (or nothing if the listener has none).                                  |
+| `[hsts]` is **not** a cluster-level field                     | **N/A**   | HSTS lives on frontends (Caddy / Traefik shape), not on clusters.                                                           |
+| `UpdateHttpsListenerConfig.hsts` (hot-reconfig partial patch) | Optional  | Absent in the patch preserves the current listener HSTS value. Present = full-object replacement (see below).               |
+
+The only **conditional** required-field rule is inside the block itself: when the `[hsts]` block is present (TOML or partial-update patch), the `enabled` field must also be present. This disambiguates three otherwise-conflated semantics:
+
+| TOML / patch shape                          | Meaning                                                                                |
+|---------------------------------------------|----------------------------------------------------------------------------------------|
+| Block omitted                               | Inherit listener default (or no HSTS if the listener has none).                        |
+| `[hsts]` with `enabled = true`              | Explicitly enable HSTS at this scope. `max_age` defaults to `31_536_000` if omitted.   |
+| `[hsts]` with `enabled = false`             | Explicitly disable HSTS at this scope, suppressing any inherited listener default.     |
+| `[hsts]` without `enabled`                  | **Error** — `ConfigError::HstsEnabledRequired` (TOML) or `ListenerError::HstsEnabledRequired` (partial update). |
+
+A minimal HTTPS deployment with no HSTS is therefore just:
+
+```toml
+[[listeners]]
+protocol = "https"
+address  = "0.0.0.0:443"
+# no [hsts] block — fine
+
+[[clusters.api.frontends]]
+address  = "0.0.0.0:443"
+hostname = "api.example.com"
+# no [hsts] block — fine
+```
+
 ```toml
 # Listener-level default — every HTTPS frontend on this listener
 # inherits unless it declares its own [hsts] block.
