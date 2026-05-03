@@ -222,6 +222,14 @@ impl Stream {
         L: ListenerHandler + L7ListenerHandler,
     {
         let context = &self.context;
+        // Fall back to the per-stream timeout discriminator
+        // (`access_log_message`) when the caller did not supply an explicit
+        // `message`. The discriminator is set by `MuxState::timeout` before
+        // `set_default_answer` / `forcefully_terminate_answer` so the
+        // access log can distinguish a timeout-driven 408/504 from a
+        // backend-error 504. Caller-supplied `message` (e.g. parsing
+        // errors) takes precedence when both are present.
+        let message = message.or(context.access_log_message);
         if self.request_counted {
             gauge_add!("http.active_requests", -1);
             self.request_counted = false;
