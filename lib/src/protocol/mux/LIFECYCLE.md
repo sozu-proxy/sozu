@@ -449,6 +449,17 @@ configured per listener.
 - Handling: `Mux::timeout` inspects each stream's state (`mod.rs:1193`)
   and either writes a default 408/503/504 answer, forcefully terminates,
   or keeps draining.
+- Access-log discriminator: before each `set_default_answer` or
+  `forcefully_terminate_answer`, the arm sets
+  `stream.context.access_log_message` to a stable token surfaced via
+  `Stream::generate_access_log` (`stream.rs:194`):
+  `client_timeout` for the H1 `Idle` 408 arm (mux H2 `Idle` is silently
+  ignored, not a timeout from the operator's view), and
+  `client_timeout_during_response` for both the `Linked` 504 arm and the
+  `Linked` `forcefully_terminate_answer(InternalError)` arm. The 503
+  arm in `StreamState::Link` (no backend resolved yet) is not a timeout
+  and leaves `access_log_message = None`. See `doc/configure.md` §
+  "Access log message field" for the full vocabulary.
 
 ### 7.2 Per-stream idle timeout (slow-multiplex guard)
 
@@ -477,6 +488,13 @@ configured per listener.
   forcefully terminate, or keep draining — see `mod.rs:1292-1326`. The
   timeout is re-armed if the session stays alive (`mod.rs:1332`) to
   avoid the "immortal zombie" state.
+- Access-log discriminator: the "response not started" arm sets
+  `stream.context.access_log_message = Some("backend_timeout")`; the
+  "response in progress" `forcefully_terminate_answer(InternalError)`
+  arm sets it to `Some("backend_response_timeout")`. Both tokens map
+  the same `MuxState::timeout` branch onto stable, HAProxy-aligned
+  strings on the access-log `message` field — see
+  `doc/configure.md` § "Access log message field".
 
 ### 7.4 Interaction order on a loaded connection
 
