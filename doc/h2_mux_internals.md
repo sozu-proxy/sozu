@@ -316,11 +316,20 @@ is distributed to the stream's `SessionMetrics` before the access log is emitted
 
 ```rust
 self.distribute_overhead(&mut stream.metrics, byte_totals);
-stream.generate_access_log(false, Some("H2::Complete"), listener);
+let (client_rtt, server_rtt) = self.snapshot_rtts(&endpoint, stream.linked_token());
+stream.generate_access_log(
+    false,
+    Some("H2::Complete"),
+    listener,
+    client_rtt,
+    server_rtt,
+);
 ```
 
 This ensures `metrics.bin` and `metrics.bout` in the access log include the
-stream's proportional share of connection overhead.
+stream's proportional share of connection overhead, and that the
+TCP_INFO-derived `client_rtt` / `server_rtt` cells are populated from
+the live frontend/backend sockets at emission time.
 
 ---
 

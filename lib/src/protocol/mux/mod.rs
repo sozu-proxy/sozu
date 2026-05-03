@@ -153,7 +153,7 @@ use crate::{
     protocol::{SessionState, http::editor::HttpContext},
     retry::RetryPolicy,
     server::push_event,
-    socket::{FrontRustls, SessionTcpStream, SocketHandler, SocketResult},
+    socket::{FrontRustls, SessionTcpStream, SocketHandler, SocketResult, stats::socket_rtt},
 };
 
 pub(crate) use crate::protocol::mux::answers::{
@@ -270,6 +270,18 @@ pub enum MuxResult {
 pub trait Endpoint: Debug {
     fn readiness(&self, token: Token) -> &Readiness;
     fn readiness_mut(&mut self, token: Token) -> &mut Readiness;
+    /// Returns the underlying TCP socket for the peer side of a stream.
+    ///
+    /// Used by access-log emission to capture TCP_INFO RTT for the side the
+    /// caller does NOT own directly: a frontend connection (Position::Server)
+    /// reads the backend socket through this method, and a backend connection
+    /// (Position::Client) reads the frontend socket the same way. `token` is
+    /// ignored by [`super::connection::EndpointServer`] (which has a single
+    /// frontend connection) and used as a key by
+    /// [`super::connection::EndpointClient`] (which keys backends by token).
+    /// Returns `None` when the token doesn't resolve, mirroring the existing
+    /// fallback paths in `readiness`/`readiness_mut`.
+    fn socket(&self, token: Token) -> Option<&TcpStream>;
     /// If end_stream is called on a client it means the stream has PROPERLY finished,
     /// the server has completed serving the response and informs the endpoint that this stream won't be used anymore.
     /// If end_stream is called on a server it means the stream was BROKEN, the client was most likely disconnected or encountered an error
@@ -1628,6 +1640,10 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         // Generate access logs for in-flight streams on session teardown.
         // Skip streams that already had their access log emitted (metrics.start is
         // set to None by metrics.reset() after generate_access_log in the happy path).
+        // Frontend RTT is the same for every stream on this session — snapshot
+        // it once outside the loop instead of paying one TCP_INFO syscall per
+        // open stream.
+        let client_rtt = socket_rtt(self.frontend.socket());
         for stream in &mut self.context.streams {
             if stream.state.is_open() && stream.metrics.start.is_some() {
                 stream.metrics.bin += share_in;
@@ -1640,10 +1656,18 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 // (kawa parse error, backend error). Normal timeouts, client disconnects,
                 // and graceful connection closures are not errors.
                 let is_error = stream.front.is_error() || stream.back.is_error();
+                let server_rtt = stream.linked_token().and_then(|token| {
+                    self.router
+                        .backends
+                        .get(&token)
+                        .and_then(|c| socket_rtt(c.socket()))
+                });
                 stream.generate_access_log(
                     is_error,
                     Some("session close"),
                     self.context.listener.clone(),
+                    client_rtt,
+                    server_rtt,
                 );
                 stream.state = StreamState::Recycle;
             }

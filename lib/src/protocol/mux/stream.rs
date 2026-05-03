@@ -9,6 +9,7 @@ use std::{
     cell::RefCell,
     fmt::Debug,
     rc::{Rc, Weak},
+    time::Duration,
 };
 
 use mio::Token;
@@ -156,6 +157,16 @@ impl Stream {
             metrics: SessionMetrics::new(None),
         })
     }
+    /// Convenience accessor for the backend token when the stream is `Linked`.
+    /// Used by access-log emission sites to look up the backend socket on the
+    /// owning `Endpoint`/`Router` without re-pattern-matching `state` inline.
+    pub fn linked_token(&self) -> Option<Token> {
+        match self.state {
+            StreamState::Linked(token) => Some(token),
+            _ => None,
+        }
+    }
+
     /// Returns true when both front and back kawa buffers are in a terminal
     /// or initial state with no pending data. Used during shutdown to skip
     /// streams that have already completed their work.
@@ -191,11 +202,22 @@ impl Stream {
             },
         }
     }
+    /// Emit the access log for this stream.
+    ///
+    /// `client_rtt`/`server_rtt` are passed in by the caller because the
+    /// `Stream` does not own a socket reference — the frontend socket lives
+    /// on the parent `Mux`/connection and the backend socket lives on
+    /// `Router.backends.get(token)`. Each caller snapshots the two
+    /// `getsockopt(TCP_INFO)` values from the sockets it can reach, mirroring
+    /// the inline pattern used by the `kawa_h1`, `pipe`, and TCP-frontend
+    /// access-log sites.
     pub fn generate_access_log<L>(
         &mut self,
         error: bool,
         message: Option<&str>,
         listener: Rc<RefCell<L>>,
+        client_rtt: Option<Duration>,
+        server_rtt: Option<Duration>,
     ) where
         L: ListenerHandler + L7ListenerHandler,
     {
@@ -286,8 +308,8 @@ impl Stream {
             protocol,
             endpoint,
             tags,
-            client_rtt: None, //socket_rtt(self.front_socket()),
-            server_rtt: None, //self.backend_socket.as_ref().and_then(socket_rtt),
+            client_rtt,
+            server_rtt,
             service_time: self.metrics.service_time(),
             response_time: self.metrics.backend_response_time(),
             request_time: self.metrics.request_time(),
