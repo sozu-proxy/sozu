@@ -1392,10 +1392,14 @@ fn build_http_frontend_add(cmd: HttpFrontendCmd) -> Result<RequestHttpFrontend, 
 /// Combine the four `--hsts-*` CLI flags into an `Option<HstsConfig>`.
 /// `None` = inherit listener default; `Some(HstsConfig { enabled: Some(false), .. })`
 /// = explicit disable (suppresses listener default); `Some(HstsConfig { enabled: Some(true), .. })`
-/// = explicit enable with the specified knobs (worker substitutes the default
-/// `max-age = 31_536_000` when omitted). `--hsts-disabled` mutually excludes
-/// the three enabling flags; the function returns a typed `CtlError::ArgsNeeded`
-/// rather than silently picking an interpretation.
+/// = explicit enable with the specified knobs (the helper substitutes the
+/// canonical `DEFAULT_HSTS_MAX_AGE = 31_536_000` here so the IPC payload
+/// is self-contained — the worker no longer needs to apply a default for
+/// CLI-built frontends; only the TOML loader path still substitutes there
+/// because `FileHstsConfig` carries the typed `Option<u32>` shape).
+/// `--hsts-disabled` mutually excludes the three enabling flags; the
+/// function returns a typed `CtlError::ArgsNeeded` rather than silently
+/// picking an interpretation.
 fn build_hsts_from_cli(
     max_age: Option<u32>,
     include_subdomains: bool,
@@ -1425,10 +1429,70 @@ fn build_hsts_from_cli(
     }
     Ok(Some(HstsConfig {
         enabled: Some(true),
-        max_age,
+        // Substitute the canonical default at CLI-build time so the
+        // resulting IPC payload renders end-to-end without the worker
+        // having to re-apply a default. Mirrors the TOML loader's
+        // substitution in `FileHstsConfig::to_proto`.
+        max_age: max_age.or(Some(sozu_command_lib::config::DEFAULT_HSTS_MAX_AGE)),
         include_subdomains: if include_subdomains { Some(true) } else { None },
         preload: if preload { Some(true) } else { None },
     }))
+}
+
+#[cfg(test)]
+mod hsts_cli_tests {
+    use super::*;
+    use sozu_command_lib::config::DEFAULT_HSTS_MAX_AGE;
+
+    #[test]
+    fn no_flags_returns_none() {
+        // No `--hsts-*` flags = inherit listener default.
+        assert!(matches!(
+            build_hsts_from_cli(None, false, false, false),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn disabled_only_returns_some_disabled() {
+        let out = build_hsts_from_cli(None, false, false, true)
+            .expect("should validate")
+            .expect("should be Some");
+        assert_eq!(out.enabled, Some(false));
+        assert_eq!(out.max_age, None);
+        assert_eq!(out.include_subdomains, None);
+        assert_eq!(out.preload, None);
+    }
+
+    #[test]
+    fn partial_enabling_substitutes_default_max_age() {
+        // Operator opted into HSTS via --hsts-include-subdomains alone;
+        // helper must substitute the canonical default so the worker
+        // does not see a `max_age = None` and silently no-op the render.
+        let out = build_hsts_from_cli(None, true, false, false)
+            .expect("should validate")
+            .expect("should be Some");
+        assert_eq!(out.enabled, Some(true));
+        assert_eq!(out.max_age, Some(DEFAULT_HSTS_MAX_AGE));
+        assert_eq!(out.include_subdomains, Some(true));
+    }
+
+    #[test]
+    fn explicit_max_age_kept() {
+        let out = build_hsts_from_cli(Some(63_072_000), true, true, false)
+            .expect("should validate")
+            .expect("should be Some");
+        assert_eq!(out.max_age, Some(63_072_000));
+        assert_eq!(out.preload, Some(true));
+    }
+
+    #[test]
+    fn disabled_with_enabling_flags_returns_args_needed() {
+        match build_hsts_from_cli(Some(31_536_000), false, false, true).unwrap_err() {
+            CtlError::ArgsNeeded(_, _) => {}
+            other => panic!("expected ArgsNeeded, got {other:?}"),
+        }
+    }
 }
 
 /// Reject NUL / CR / LF / other C0 controls in a header value. HTAB

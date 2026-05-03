@@ -347,6 +347,7 @@ sozu frontend https add \
 |-------------------------------------|---------|----------------------------------------------------------------------------------------------------|
 | `http.hsts.frontend_added`          | counter | A frontend is added with `hsts.enabled = true` and the HSTS edit is materialised in `headers_response`. |
 | `http.hsts.suppressed_plaintext`    | counter | An `AddHttpFrontend` IPC was rejected because it carried an enabled HSTS policy (RFC 6797 §7.2 defense in depth). |
+| `http.hsts.unrendered`              | counter | Defense-in-depth: a frontend reached `Frontend::new` with `hsts.enabled = true` but `render_hsts` returned `None` (max_age missing). The TOML loader and the CLI helper both substitute `DEFAULT_HSTS_MAX_AGE` so this counter only fires when a programmatic IPC sender ships an ill-formed `HstsConfig`. |
 
 #### Options specific to Rustls based HTTPS listeners
 
