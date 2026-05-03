@@ -35,7 +35,7 @@ For minor and patch releases, the upgrade process must always pass correctly.
 
 ### Update the changelog
 
-Move the contents of `## [Unreleased]` into a new release section and reset the unreleased block.
+Move the contents of `## [Unreleased]` into a new release section and reset the unreleased block. Do this **before** pushing the tag — the release workflow's `awk` extractor at `.github/workflows/release.yml` needs a `## [VERSION]` section to exist at tag time. If the section is missing, the draft release body falls back to a placeholder and the workflow emits a `::warning::`.
 
 ## Publish the new version
 
@@ -56,9 +56,9 @@ Wait for the GitHub Actions build to pass (<https://github.com/sozu-proxy/sozu/a
 
 ## Pre-built binaries
 
-After the tag triggers `.github/workflows/release.yml`, four `sozu-${VERSION}-${TARGET}.tar.gz` archives plus a `SHA256SUMS` file land on a GitHub draft release. The matrix covers `x86_64-unknown-linux-{gnu,musl}` and `aarch64-unknown-linux-{gnu,musl}`. Each tarball contains the stripped `sozu` binary, `LICENSE-AGPL3`, `README.md`, `CHANGELOG.md`, the default `config.toml`, both shipped systemd units, and a `SOURCE.txt` corresponding-source pointer.
+After the tag triggers `.github/workflows/release.yml`, four `sozu-${VERSION}-${TARGET}.tar.gz` archives plus a `SHA256SUMS` file (signed with sigstore cosign keyless — `SHA256SUMS.sig` + `SHA256SUMS.pem`) land on a GitHub draft release alongside SLSA build provenance. The matrix covers `x86_64-unknown-linux-{gnu,musl}` and `aarch64-unknown-linux-{gnu,musl}`. Each tarball contains the stripped `sozu` binary, `LICENSE-AGPL3`, `LICENSE-LGPL3`, `README.md`, `CHANGELOG.md`, the production-shaped `os-build/config.toml`, both shipped systemd units, and a `SOURCE.txt` corresponding-source pointer.
 
-For stable tags (`X.Y.Z`), the workflow also pushes `clevercloud/sozu:${VERSION}` and `clevercloud/sozu:latest` to Docker Hub. RC tags (`X.Y.Z-rc.N`) are marked as GitHub prereleases and skip the `:latest` move; they also do not push a tagged Docker image.
+For stable tags (`X.Y.Z`), the workflow also pushes `clevercloud/sozu:${VERSION}` and `clevercloud/sozu:latest` to Docker Hub. RC tags (`X.Y.Z-rc.N`) are marked as GitHub prereleases and skip the `:latest` move; they also do not push a tagged Docker image. `workflow_dispatch` rebuilds of an existing stable tag publish only `clevercloud/sozu:${VERSION}` and do **not** move `clevercloud/sozu:latest`. To deliberately move `:latest` you must push the corresponding git tag (force-push of an immutable tag is blocked by repo policy — bump the patch version instead).
 
 The pre-existing `dockerhub` job in `.github/workflows/ci.yml` is gated off on tag pushes — version-pinned and `:latest` images come exclusively from the release workflow. Branch and PR pushes still produce `clevercloud/sozu:${SHA}` aliases as before.
 
