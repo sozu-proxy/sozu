@@ -847,6 +847,20 @@ pub enum ProxyError {
     RegisterListener(std::io::Error),
     #[error("the listener is not activated")]
     UnactivatedListener,
+    /// HSTS (RFC 6797) was attached to a frontend on a plain-HTTP
+    /// listener. RFC 6797 §7.2 forbids `Strict-Transport-Security` on
+    /// plaintext-HTTP responses; the worker rejects the request rather
+    /// than ship a non-conformant policy. The TOML loader rejects the
+    /// same shape at config-load time
+    /// (`command/src/config.rs::ConfigError::HstsOnPlainHttp`); this
+    /// arm catches the same misconfiguration when the request reaches
+    /// the worker over the IPC channel without going through the TOML
+    /// path (e.g. via `sozu frontend http add`).
+    #[error(
+        "HSTS is only valid on HTTPS frontends; rejecting AddHttpFrontend with hsts.enabled = \
+         true on address {0:?} (RFC 6797 §7.2)"
+    )]
+    HstsOnPlainHttp(SocketAddr),
 }
 
 use self::server::ListenToken;

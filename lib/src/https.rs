@@ -1656,7 +1656,7 @@ impl HttpsProxy {
         &mut self,
         front: RequestHttpFrontend,
     ) -> Result<Option<ResponseContent>, ProxyError> {
-        let front = front.clone().to_frontend().map_err(|request_error| {
+        let mut front = front.clone().to_frontend().map_err(|request_error| {
             ProxyError::WrongInputFrontend {
                 front: Box::new(front),
                 error: request_error.to_string(),
@@ -1669,6 +1669,16 @@ impl HttpsProxy {
             .find(|l| l.borrow().address == front.address)
             .ok_or(ProxyError::NoListenerFound(front.address))?
             .borrow_mut();
+
+        // ── HSTS listener-default → frontend inheritance ─────────────────
+        // When the frontend declares no `hsts` block, fall back to the
+        // listener default so the operator can opt into HSTS once at the
+        // listener and have every HTTPS frontend inherit it.
+        // `enabled = Some(false)` on the frontend is the explicit-disable
+        // signal: it stays as-is and suppresses the inherited default.
+        if front.hsts.is_none() {
+            front.hsts = listener.config.hsts;
+        }
 
         listener.set_tags(front.hostname.to_owned(), front.tags.to_owned());
         listener
