@@ -3227,6 +3227,77 @@ mod tests {
     use super::*;
 
     #[test]
+    fn hsts_to_proto_enabled_substitutes_default_max_age() {
+        let cfg = FileHstsConfig {
+            enabled: Some(true),
+            max_age: None,
+            include_subdomains: None,
+            preload: None,
+        };
+        let proto = cfg.to_proto("test").expect("should validate");
+        assert_eq!(proto.enabled, Some(true));
+        assert_eq!(proto.max_age, Some(DEFAULT_HSTS_MAX_AGE));
+    }
+
+    #[test]
+    fn hsts_to_proto_explicit_max_age_kept() {
+        let cfg = FileHstsConfig {
+            enabled: Some(true),
+            max_age: Some(63_072_000),
+            include_subdomains: Some(true),
+            preload: Some(true),
+        };
+        let proto = cfg.to_proto("test").expect("should validate");
+        assert_eq!(proto.max_age, Some(63_072_000));
+        assert_eq!(proto.include_subdomains, Some(true));
+        assert_eq!(proto.preload, Some(true));
+    }
+
+    #[test]
+    fn hsts_to_proto_disabled_keeps_zero_intent() {
+        // `enabled = false` means "explicit disable" — the materialiser
+        // in `Frontend::new` won't append an edit, so the proto still
+        // round-trips with `enabled = Some(false)`.
+        let cfg = FileHstsConfig {
+            enabled: Some(false),
+            max_age: None,
+            include_subdomains: None,
+            preload: None,
+        };
+        let proto = cfg.to_proto("test").expect("should validate");
+        assert_eq!(proto.enabled, Some(false));
+    }
+
+    #[test]
+    fn hsts_to_proto_kill_switch_max_age_zero_allowed() {
+        // RFC 6797 §11.4: `max-age=0` instructs the UA to "cease
+        // regarding the host as a Known HSTS Host". Explicit operator
+        // intent — must NOT warn or fail.
+        let cfg = FileHstsConfig {
+            enabled: Some(true),
+            max_age: Some(0),
+            include_subdomains: None,
+            preload: None,
+        };
+        let proto = cfg.to_proto("test").expect("kill-switch must validate");
+        assert_eq!(proto.max_age, Some(0));
+    }
+
+    #[test]
+    fn hsts_to_proto_missing_enabled_errors() {
+        let cfg = FileHstsConfig {
+            enabled: None,
+            max_age: Some(31_536_000),
+            include_subdomains: None,
+            preload: None,
+        };
+        match cfg.to_proto("test").unwrap_err() {
+            ConfigError::HstsEnabledRequired(scope) => assert_eq!(scope, "test"),
+            other => panic!("expected HstsEnabledRequired, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn serialize() {
         let http = ListenerBuilder::new(
             SocketAddress::new_v4(127, 0, 0, 1, 8080),

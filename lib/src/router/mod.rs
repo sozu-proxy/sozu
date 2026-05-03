@@ -1477,6 +1477,90 @@ mod tests {
     use super::*;
 
     #[test]
+    fn render_hsts_max_age_only() {
+        let cfg = HstsConfig {
+            enabled: Some(true),
+            max_age: Some(31_536_000),
+            include_subdomains: None,
+            preload: None,
+        };
+        assert_eq!(render_hsts(&cfg), Some("max-age=31536000".to_owned()));
+    }
+
+    #[test]
+    fn render_hsts_with_include_subdomains() {
+        let cfg = HstsConfig {
+            enabled: Some(true),
+            max_age: Some(31_536_000),
+            include_subdomains: Some(true),
+            preload: None,
+        };
+        assert_eq!(
+            render_hsts(&cfg),
+            Some("max-age=31536000; includeSubDomains".to_owned())
+        );
+    }
+
+    #[test]
+    fn render_hsts_with_preload_only() {
+        let cfg = HstsConfig {
+            enabled: Some(true),
+            max_age: Some(63_072_000),
+            include_subdomains: None,
+            preload: Some(true),
+        };
+        assert_eq!(
+            render_hsts(&cfg),
+            Some("max-age=63072000; preload".to_owned())
+        );
+    }
+
+    #[test]
+    fn render_hsts_full() {
+        let cfg = HstsConfig {
+            enabled: Some(true),
+            max_age: Some(31_536_000),
+            include_subdomains: Some(true),
+            preload: Some(true),
+        };
+        assert_eq!(
+            render_hsts(&cfg),
+            Some("max-age=31536000; includeSubDomains; preload".to_owned())
+        );
+    }
+
+    #[test]
+    fn render_hsts_kill_switch_max_age_zero() {
+        let cfg = HstsConfig {
+            enabled: Some(true),
+            max_age: Some(0),
+            include_subdomains: Some(true),
+            preload: None,
+        };
+        // `max_age = 0` is the RFC 6797 §11.4 kill switch and renders
+        // verbatim — UA receives it and stops treating the host as a
+        // Known HSTS Host.
+        assert_eq!(
+            render_hsts(&cfg),
+            Some("max-age=0; includeSubDomains".to_owned())
+        );
+    }
+
+    #[test]
+    fn render_hsts_omitted_when_max_age_missing() {
+        let cfg = HstsConfig {
+            enabled: Some(true),
+            max_age: None,
+            include_subdomains: Some(true),
+            preload: None,
+        };
+        // The TOML loader substitutes the default at config-load; if the
+        // field reaches `render_hsts` as `None`, suppress emission so a
+        // malformed wire frame can't accidentally render `max-age=`.
+        assert_eq!(render_hsts(&cfg), None);
+    }
+
+    #[test]
     fn convert_regex() {
         // Compiled regexes are anchored with `\A` … `\z` so `Regex::is_match`
         // (unanchored by default) only succeeds on a full-host match.
