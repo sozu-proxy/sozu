@@ -13,7 +13,7 @@ use std::{
     cmp::min,
     collections::{HashMap, HashSet},
     io::{IoSlice, Write as _},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 /// Compile-time guard: `payload_len as usize` casts in the H2 parser assume at
@@ -38,7 +38,7 @@ use crate::{
         shared::{EndStreamAction, drain_tls_close_notify, end_stream_decision},
         update_readiness_after_read, update_readiness_after_write,
     },
-    socket::{SocketHandler, SocketResult},
+    socket::{SocketHandler, SocketResult, stats::socket_rtt},
     timer::TimeoutContainer,
 };
 
@@ -2311,6 +2311,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 && kawa.is_completed()
                 && !Self::handle_1xx_reset(kawa, stream_state, &mut endpoint)
             {
+                let (client_rtt, server_rtt) = Self::snapshot_rtts(
+                    &self.position,
+                    &self.socket,
+                    &endpoint,
+                    stream.linked_token(),
+                );
+
                 if let Some((dead_id, token)) = Self::try_recycle_server_stream(
                     &self.position,
                     &mut self.bytes,
@@ -2321,6 +2328,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     byte_totals,
                     &mut context.debug,
                     context.listener.clone(),
+                    client_rtt,
+                    server_rtt,
                 ) {
                     // Remove the recycled stream from the connection maps
                     // before endpoint.end_stream() can trigger teardown.
@@ -2626,6 +2635,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             {
                 let close_frontend =
                     matches!(self.position, Position::Server) && !parts.context.keep_alive_frontend;
+                let (client_rtt, server_rtt) = Self::snapshot_rtts(
+                    &self.position,
+                    &self.socket,
+                    &endpoint,
+                    stream.linked_token(),
+                );
+
                 if let Some((dead_id, token)) = Self::try_recycle_server_stream(
                     &self.position,
                     &mut self.bytes,
@@ -2636,6 +2652,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     byte_totals,
                     &mut context.debug,
                     context.listener.clone(),
+                    client_rtt,
+                    server_rtt,
                 ) {
                     completed_streams.push((dead_id, global_stream_id, token, close_frontend));
                     // LIFECYCLE §9 invariant 17: decrement INSIDE 'outer so
@@ -3268,6 +3286,42 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         }
     }
 
+    /// Snapshot the access-log RTTs for the local frontend and the linked backend.
+    ///
+    /// `Position::Server`-only. On a backend H2 connection (`Position::Client`)
+    /// the snapshot would write swapped values onto the shared `Stream.metrics`:
+    /// the connection's `socket` is the upstream and the corresponding
+    /// `EndpointServer::socket` returns the frontend, so the per-stream
+    /// `client_rtt`/`server_rtt` cells would be populated with mislabelled
+    /// values. Gating keeps backend H2 from poisoning the access-log metric
+    /// for the matching frontend stream.
+    ///
+    /// Callers must invoke this BEFORE `endpoint.end_stream(...)` on reset
+    /// paths so the backend lookup does not depend on
+    /// `EndpointClient::end_stream` continuing to leave entries in
+    /// `Router.backends`.
+    ///
+    /// Takes individual field references (not `&self`) for the same reason
+    /// `try_recycle_server_stream` does — to avoid borrow conflicts with the
+    /// `H2BlockConverter` that holds `&mut self.encoder` during the per-stream
+    /// write loop.
+    fn snapshot_rtts<E: Endpoint>(
+        position: &Position,
+        socket: &Front,
+        endpoint: &E,
+        linked_token: Option<mio::Token>,
+    ) -> (Option<Duration>, Option<Duration>) {
+        if !position.is_server() {
+            return (None, None);
+        }
+        (
+            socket_rtt(socket.socket_ref()),
+            linked_token
+                .and_then(|t| endpoint.socket(t))
+                .and_then(socket_rtt),
+        )
+    }
+
     /// Try to recycle a completed server-side stream by distributing overhead,
     /// generating access logs, and transitioning the stream to `Recycle` state.
     ///
@@ -3277,6 +3331,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     ///
     /// Takes individual field references instead of `&mut self` to avoid borrow
     /// conflicts when the H2 block converter holds `&mut self.encoder`.
+    /// `client_rtt`/`server_rtt` are snapshotted by the caller (which still
+    /// owns `&self.socket` and `&endpoint`) and forwarded into the access log.
     #[allow(clippy::too_many_arguments)]
     fn try_recycle_server_stream<L>(
         position: &Position,
@@ -3288,6 +3344,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         byte_totals: (usize, usize),
         debug: &mut DebugHistory,
         listener: std::rc::Rc<std::cell::RefCell<L>>,
+        client_rtt: Option<Duration>,
+        server_rtt: Option<Duration>,
     ) -> Option<(StreamId, Option<mio::Token>)>
     where
         L: ListenerHandler + L7ListenerHandler,
@@ -3333,7 +3391,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     log_module_context!(),
                     global_stream_id
                 );
-                let token = Self::complete_server_stream(stream, listener);
+                let token = Self::complete_server_stream(stream, listener, client_rtt, server_rtt);
                 Some((stream_id, token))
             }
         }
@@ -3351,13 +3409,21 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     fn complete_server_stream<L>(
         stream: &mut crate::protocol::mux::Stream,
         listener: std::rc::Rc<std::cell::RefCell<L>>,
+        client_rtt: Option<Duration>,
+        server_rtt: Option<Duration>,
     ) -> Option<mio::Token>
     where
         L: ListenerHandler + L7ListenerHandler,
     {
         incr!("http.e2e.h2");
         stream.metrics.backend_stop();
-        stream.generate_access_log(false, Some("H2::Complete"), listener);
+        stream.generate_access_log(
+            false,
+            Some("H2::Complete"),
+            listener,
+            client_rtt,
+            server_rtt,
+        );
         stream.metrics.reset();
         let state = std::mem::replace(&mut stream.state, StreamState::Recycle);
         if let StreamState::Linked(token) = state {
@@ -3613,14 +3679,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 }
                 // Check if stream is linked to a backend — borrow must be scoped
                 // so end_stream can take &mut context.
-                let linked_token = {
-                    let stream = &context.streams[global_stream_id];
-                    if let StreamState::Linked(token) = stream.state {
-                        Some(token)
-                    } else {
-                        None
-                    }
-                };
+                let linked_token = context.streams[global_stream_id].linked_token();
+                let (client_rtt, server_rtt) =
+                    Self::snapshot_rtts(&self.position, &self.socket, &*endpoint, linked_token);
                 if let Some(token) = linked_token {
                     endpoint.end_stream(token, global_stream_id, context);
                 }
@@ -3639,6 +3700,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                             true,
                             Some("H2::IdleTimeout"),
                             context.listener.clone(),
+                            client_rtt,
+                            server_rtt,
                         );
                         stream.state = StreamState::Recycle;
                     }
@@ -4814,7 +4877,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         if let Some(global_stream_id) = self.streams.get(&rst_stream.stream_id).copied() {
             let stream = &mut context.streams[global_stream_id];
             self.attribute_bytes_to_stream(&mut stream.metrics);
-            if let StreamState::Linked(token) = stream.state {
+            let linked_token = stream.linked_token();
+            let (client_rtt, server_rtt) =
+                Self::snapshot_rtts(&self.position, &self.socket, &endpoint, linked_token);
+            if let Some(token) = linked_token {
                 endpoint.end_stream(token, global_stream_id, context);
             }
             let stream = &mut context.streams[global_stream_id];
@@ -4839,6 +4905,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         true,
                         Some("H2::ResetFrame"),
                         context.listener.clone(),
+                        client_rtt,
+                        server_rtt,
                     );
                     stream.state = StreamState::Recycle;
                 }
@@ -5493,7 +5561,14 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         );
         let old_state = std::mem::replace(&mut stream.state, StreamState::Unlinked);
         forcefully_terminate_answer(stream, &mut self.readiness, error);
-        if let StreamState::Linked(token) = old_state {
+        let linked_token = if let StreamState::Linked(token) = old_state {
+            Some(token)
+        } else {
+            None
+        };
+        let (client_rtt, server_rtt) =
+            Self::snapshot_rtts(&self.position, &self.socket, &endpoint, linked_token);
+        if let Some(token) = linked_token {
             endpoint.end_stream(token, stream_id, context);
         }
         // Emit access log for server-side resets on streams that had active requests
@@ -5503,7 +5578,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             let stream = &mut context.streams[stream_id];
             self.distribute_overhead(&mut stream.metrics, reset_byte_totals);
             stream.metrics.backend_stop();
-            stream.generate_access_log(true, Some("H2::Reset"), context.listener.clone());
+            stream.generate_access_log(
+                true,
+                Some("H2::Reset"),
+                context.listener.clone(),
+                client_rtt,
+                server_rtt,
+            );
             stream.metrics.reset();
         }
         // Queue the RST for wire emission. Independent of the owning stream

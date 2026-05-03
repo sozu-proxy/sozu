@@ -1698,6 +1698,29 @@ TLS fields are connection-scoped: they are stamped once on the mux
 multiplexing N streams pays the cost once. The labels are `&'static str`
 borrows into rustls's static label tables — no per-request allocation.
 
+#### Round-trip-time fields on access logs
+
+`client_rtt` and `server_rtt` carry the kernel-measured TCP round-trip
+time on each side of the proxy at the moment the access log is emitted.
+Source: `getsockopt(TCP_INFO)` (Linux `SOL_TCP`, BSD `IPPROTO_TCP`,
+Darwin `IPPROTO_TCP` opt `0x106`) wrapped in
+`lib/src/socket.rs::stats::socket_rtt`. Unit on the wire: microseconds
+(`uint64`); on Darwin the kernel reports `tcpi_srtt` in milliseconds and
+the helper multiplies by 1000 before exposing the same `Duration`.
+
+| Access-log field | Wire tag | Populated on |
+|---|---|---|
+| `client_rtt` | `ProtobufAccessLog.client_rtt` #9 (`optional uint64`) | every protocol path: H1 (`kawa_h1`), H2 (`mux`), Pipe (TCP/WS), TCP frontend |
+| `server_rtt` | `ProtobufAccessLog.server_rtt` #10 (`optional uint64`) | every protocol path that has a backend socket; `None` for the TCP frontend (no upstream) |
+
+Capture is at access-log emission time and is cheap (one
+`getsockopt(TCP_INFO)` syscall per side), so the cell reflects the most
+recent kernel SRTT estimate rather than a session-wide average. `None`
+on AF_UNIX or any FSM state where `TCP_INFO` is not usable
+(pre-handshake, dead socket). Real implementations exist for Linux,
+FreeBSD, NetBSD, OpenBSD, DragonFly, macOS and iOS; non-Unix stub
+builds short-circuit to `None`.
+
 #### HTTP/2 flood mitigations
 
 Incremented once per connection at the moment the H2 flood detector trips its
