@@ -175,14 +175,19 @@ impl Backend {
     }
 
     /// Canonical "available" check used by per-backend metrics and cluster
-    /// availability accounting. Mirrors `can_open()` semantics: a backend
-    /// is available iff its active-health state is healthy, its lifecycle
-    /// status is `Normal` (not draining/closed), and its passive retry
-    /// policy is not in backoff.
+    /// availability accounting. Slightly more permissive than `can_open()`:
+    /// a backend currently in an exponential-backoff *wait window* still
+    /// counts as available because the next call after the window ends
+    /// will route to it without operator intervention. The dashboard
+    /// reading must reflect "operationally up, not exhausted" rather than
+    /// "ready to receive *this* request" — flicking the gauge to 0 on
+    /// every transient backoff would drown out genuine `is_down()`
+    /// transitions. Pairs with `BackendList::evaluate_availability`,
+    /// which applies the same predicate cluster-wide.
     pub fn is_available(&self) -> bool {
         self.health.is_healthy()
             && self.status == BackendStatus::Normal
-            && matches!(self.retry_policy.can_try(), Some(retry::RetryAction::OKAY))
+            && !self.retry_policy.is_down()
     }
 
     pub fn inc_connections(&mut self) -> Option<usize> {
@@ -334,10 +339,7 @@ impl BackendMap {
         }
         match (prev, new_state) {
             (ClusterAvailability::Available, ClusterAvailability::AllDown) => {
-                error!(
-                    "cluster {}: all {} backends are down",
-                    cluster_id, total
-                );
+                error!("cluster {}: all {} backends are down", cluster_id, total);
                 incr!("cluster.no_available_backends", Some(cluster_id), None);
                 push_event(Event {
                     kind: EventKind::NoAvailableBackends as i32,
@@ -502,14 +504,14 @@ impl BackendMap {
                 )
             );
 
-            borrowed_backend
-                .try_connect()
-                .map_err(|backend_error| BackendError::ConnectionFailures {
+            borrowed_backend.try_connect().map_err(|backend_error| {
+                BackendError::ConnectionFailures {
                     cluster_id: cluster_id.to_owned(),
                     backend_address: borrowed_backend.address,
                     failures: borrowed_backend.failures,
                     error: backend_error.to_string(),
-                })?
+                }
+            })?
         };
 
         // Connection succeeded: re-evaluate so we capture an
@@ -612,24 +614,15 @@ impl BackendList {
         }
     }
 
-    /// Count `(available, total)` for this cluster. A backend is *available*
-    /// iff it is administratively `Normal` AND its health state is `Healthy`
-    /// AND its retry policy is not `is_down()`. This mirrors `Backend::can_open`
-    /// minus the per-call retry-budget gate (`retry_policy.can_try() == OKAY`):
-    /// a backend currently in exponential-backoff is still counted as
-    /// available because the next call after the back-off window will
-    /// route to it without operator intervention.
+    /// Count `(available, total)` for this cluster. Delegates to
+    /// `Backend::is_available` so the per-cluster aggregate and the
+    /// per-backend `backend.available` gauge stay in lock-step.
     pub(crate) fn evaluate_availability(&self) -> (usize, usize) {
         let total = self.backends.len();
         let available = self
             .backends
             .iter()
-            .filter(|b| {
-                let owned = b.borrow();
-                owned.status == BackendStatus::Normal
-                    && owned.health.is_healthy()
-                    && !owned.retry_policy.is_down()
-            })
+            .filter(|b| b.borrow().is_available())
             .count();
         (available, total)
     }
@@ -1096,6 +1089,42 @@ mod backends_test {
     }
 
     #[test]
+    fn is_available_requires_health_status_and_retry_policy() {
+        // Fresh backend: Healthy + Normal + retry_policy fresh (OKAY).
+        let mut backend = Backend::new("b", "127.0.0.1:9050".parse().unwrap(), None, None, None);
+        assert!(backend.is_available(), "fresh backend must be available");
+
+        // Unhealthy fails the predicate even with everything else OK.
+        backend.health.record_failure(1);
+        assert!(!backend.is_available(), "unhealthy must not be available");
+
+        // Restore health, then drive retry policy into the exhausted-budget
+        // state via the test-only helper. Calling `fail()` in a tight loop
+        // would early-return on the second invocation because the
+        // exponential-backoff window has not elapsed yet, so the natural
+        // path needs real-time sleeps the unit test cannot afford.
+        backend.health.status = HealthStatus::Healthy;
+        assert!(backend.is_available());
+        backend.retry_policy.force_down();
+        assert!(
+            backend.retry_policy.is_down(),
+            "test setup: retry policy budget must be exhausted",
+        );
+        assert!(
+            !backend.is_available(),
+            "retry-policy backoff must fail the predicate"
+        );
+
+        // Reset retry, switch lifecycle to Closing.
+        backend.retry_policy.succeed();
+        backend.set_closing();
+        assert!(
+            !backend.is_available(),
+            "Closing lifecycle status must fail the predicate"
+        );
+    }
+
+    #[test]
     fn evaluate_availability_empty_list_returns_zero_zero() {
         let list = BackendList::new();
         assert_eq!((0, 0), list.evaluate_availability());
@@ -1120,13 +1149,11 @@ mod backends_test {
         let mut list = BackendList::new();
         list.add_backend(healthy_backend("b-fresh", 9111));
         list.add_backend(healthy_backend("b-fail", 9112));
-        // Drive the second backend's retry policy into is_down() by failing
-        // it past `max_retries`. ExponentialBackoffPolicy::is_down() only
-        // returns true after the budget is exhausted; we hit that with a
-        // tight loop of `fail()` calls (default budget is small).
-        for _ in 0..32 {
-            list.backends[1].borrow_mut().retry_policy.fail();
-        }
+        // Drive the second backend's retry policy into is_down() via the
+        // test-only force_down() helper. A natural exhaustion would
+        // require waiting through the exponential-backoff windows
+        // (`fail()` early-returns when called inside one).
+        list.backends[1].borrow_mut().retry_policy.force_down();
         let (available, total) = list.evaluate_availability();
         assert_eq!(2, total);
         assert_eq!(
@@ -1170,10 +1197,7 @@ mod backends_test {
         // Heal the backend in place and re-evaluate. Without going through
         // a routing call the helper still fires from add_backend / HC, so
         // here we drive it manually.
-        map.backends
-            .get_mut(cluster_id)
-            .unwrap()
-            .backends[0]
+        map.backends.get_mut(cluster_id).unwrap().backends[0]
             .borrow_mut()
             .health
             .status = HealthStatus::Healthy;

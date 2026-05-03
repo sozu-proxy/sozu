@@ -103,6 +103,30 @@ impl RetryPolicy for ExponentialBackoffPolicy {
     }
 }
 
+#[cfg(test)]
+impl ExponentialBackoffPolicy {
+    /// Test-only helper that drives the policy directly to the
+    /// "exhausted-budget" state. The natural path requires `max_tries`
+    /// successive `fail()` calls separated by the exponential-backoff
+    /// wait window (up to 32+ s with the default `max_tries = 6`), which
+    /// is not practical inside a unit test. This helper forces
+    /// `current_tries == max_tries`, so `is_down()` returns true and
+    /// `Backend::is_available()` flips off without sleeping.
+    pub(crate) fn force_down(&mut self) {
+        self.current_tries = self.max_tries;
+    }
+}
+
+#[cfg(test)]
+impl RetryPolicyWrapper {
+    /// Test-only forwarder for [`ExponentialBackoffPolicy::force_down`].
+    pub(crate) fn force_down(&mut self) {
+        match self {
+            RetryPolicyWrapper::ExponentialBackoff(p) => p.force_down(),
+        }
+    }
+}
+
 impl From<ExponentialBackoffPolicy> for RetryPolicyWrapper {
     fn from(val: ExponentialBackoffPolicy) -> Self {
         RetryPolicyWrapper::ExponentialBackoff(val)
