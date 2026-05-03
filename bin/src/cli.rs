@@ -670,7 +670,8 @@ pub enum HttpFrontendCmd {
         hsts_preload: bool,
         #[clap(
             long = "hsts-disabled",
-            help = "Explicitly disable HSTS on this frontend, suppressing any inherited listener-default HSTS. Mutually exclusive with --hsts-max-age / --hsts-include-subdomains / --hsts-preload."
+            conflicts_with_all = ["hsts_max_age", "hsts_include_subdomains", "hsts_preload", "hsts_force_replace_backend"],
+            help = "Explicitly disable HSTS on this frontend, suppressing any inherited listener-default HSTS. Mutually exclusive with --hsts-max-age / --hsts-include-subdomains / --hsts-preload / --hsts-force-replace-backend."
         )]
         hsts_disabled: bool,
         #[clap(
