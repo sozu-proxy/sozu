@@ -334,6 +334,35 @@ address = "0.0.0.0:8443"
 # `elide_x_real_ip`. Default: false.
 # send_x_real_ip = false
 
+# HSTS = HTTP Strict Transport Security (RFC 6797). Listener-level default
+# inherited by every HTTPS frontend on this listener that does not declare
+# its own `[hsts]` block. Per RFC 6797 §7.2 this section is only valid on
+# HTTPS listeners — sozu refuses HSTS on a plain-HTTP listener at config
+# load. Per-frontend overrides live under
+# `[clusters.<id>.frontends.hsts]`.
+#
+# `enabled` is REQUIRED whenever the block is present so partial-update
+# semantics can distinguish "preserve current" / "explicit disable" /
+# "enable" on hot-reconfig.
+#
+# When `enabled = true` and `max_age` is omitted, sozu substitutes
+# 31_536_000 seconds (1 year) — the HSTS preload list minimum.
+#
+# `max_age = 0` is the RFC 6797 §11.4 kill switch and instructs the UA to
+# stop treating the host as a Known HSTS Host. Allowed silently.
+#
+# `preload = true` is opt-in only; it appends `; preload` so the host can
+# be submitted to the Chrome HSTS preload list (https://hstspreload.org/).
+# Sozu warns at config load when `preload = true` is paired with
+# `include_subdomains != true` or with `max_age < 31_536_000` because the
+# preload list will reject the host.
+#
+# [hsts]
+# enabled = true
+# max_age = 31536000
+# include_subdomains = true
+# preload = false
+
 # Supported TLS versions. Possible values are "SSL_V2", "SSL_V3", "TLSv1", "TLS_V11", "TLS_V12", "TLS_V13".
 # Defaults to `["TLS_V12", "TLS_V13"]`. Besides, `rustls` tls provider only support "TLS_V12" and "TLS_V13" values.
 tls_versions = ["TLS_V12", "TLS_V13"]

@@ -257,6 +257,35 @@ upgrade. See `doc/upgrade/1.x-to-2.0.md` for the full migration guide.
   GitHub source archive carries it in `command/`, and the release workflow
   copies it into every binary tarball as `LICENSE-LGPL3` so AGPL §6 / LGPL §4
   obligations are satisfied without an external URL fetch.
+- **Typed HSTS (HTTP Strict Transport Security, RFC 6797) policy with
+  listener-default + per-frontend override**: a new `[hsts]` block under
+  `[https.listeners.default]` (listener default) or
+  `[clusters.<id>.frontends]` (per-frontend override) lets operators emit
+  `Strict-Transport-Security: max-age=N[; includeSubDomains][; preload]` on
+  every HTTPS response — backend-served, redirect 3xx, auth-deny 401, and
+  proxy-generated 5xx alike. Knobs: `enabled` (required when the block is
+  present so partial-update semantics distinguish preserve / explicit-disable
+  / enable), `max_age` (defaults to `31_536_000` = 1 year, matches the HSTS
+  preload list minimum), `include_subdomains`, `preload`. Validation refuses
+  HSTS on plain-HTTP listeners (RFC 6797 §7.2 — at TOML config-load via
+  `ConfigError::HstsOnPlainHttp` and at the worker IPC entry via
+  `ProxyError::HstsOnPlainHttp`), allows `max_age = 0` silently as the §11.4
+  kill switch, and warns on sub-day `max_age` and on `preload = true` without
+  `include_subdomains` or with insufficient `max_age` (Chrome HSTS preload
+  list rules). Per-frontend `enabled = false` explicitly suppresses an
+  inherited listener default. Backend-supplied `Strict-Transport-Security`
+  headers pass through unchanged via the new `HeaderEditMode::SetIfAbsent`
+  semantics on `apply_response_header_edits` so RFC 6797 §6.1 single-header
+  expectations hold. Implementation: new `HstsConfig` proto message attached
+  to `HttpsListenerConfig` (tag 46), `UpdateHttpsListenerConfig` (tag 41),
+  and `RequestHttpFrontend` (tag 16); `Frontend::new` materialises a single
+  `HeaderEdit` with key `strict-transport-security`, value `render_hsts(cfg)`,
+  and mode `SetIfAbsent` into `headers_response` at routing-table-build time;
+  the `mux/router.rs` snapshot copy is hoisted above the redirect / auth-deny
+  early returns and gated on `context.protocol == Protocol::HTTPS` so
+  HTTPS-served default answers carry HSTS (RFC 6797 §8.1) while plaintext HTTP
+  listeners can never leak the header (defense in depth on top of config-load
+  validation).
 - **Per-cluster availability surface
   ([#892](https://github.com/sozu-proxy/sozu/issues/892))**: closes the
   long-standing observability gap in which a cluster losing every backend
