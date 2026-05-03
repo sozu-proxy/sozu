@@ -20,7 +20,7 @@ use crate::{
     BackendConnectionError, L7ListenerHandler, L7Proxy, ListenerHandler, ProxySession, Readiness,
     RetrieveClusterError,
     backends::{Backend, BackendError},
-    protocol::http::editor::{HeaderEditSnapshot, HttpContext},
+    protocol::http::editor::{HeaderEditMode, HeaderEditSnapshot, HttpContext},
     router::{HeaderEdit, RouteResult},
     server::CONN_RETRIES,
     socket::SessionTcpStream,
@@ -633,31 +633,31 @@ impl Router {
         } = route;
 
         // ── HSTS (RFC 6797) snapshot hoist for HTTPS ──────────────────────
-        // Stash the response-side header edits early so HTTPS-served
-        // default answers (3xx redirects, 401 auth-deny, 5xx defaults from
-        // `set_default_answer_with_retry_after`) carry per-frontend HSTS
-        // (and any operator-supplied response headers). RFC 6797 §8.1
-        // requires HSTS on every response code.
+        // The response snapshot is built in two passes so HSTS reaches
+        // every HTTPS response code (RFC 6797 §8.1 — including
+        // proxy-generated 3xx / 401 / 5xx default answers) WITHOUT
+        // changing the pre-PR scope of operator-defined `Append`
+        // response headers (which only apply on the regular forward
+        // path).
         //
-        // Plain-HTTP listeners DO NOT take this branch: per RFC 6797 §7.2
-        // the `Strict-Transport-Security` header MUST NOT appear on
-        // plaintext-HTTP responses. The HTTP forward path falls back to
-        // the post-forward copy below at the end of the function so
-        // operator response headers still apply on backend-served
-        // responses (their pre-existing scope), without ever leaking HSTS
-        // to a 301 emitted by the HTTP-listener `redirect_scheme=use-https`
-        // path. This is defense in depth on top of the config-load reject
-        // in `command/src/config.rs::FileHstsConfig::to_proto` for HSTS
-        // attached to an HTTP listener.
+        // Pass 1 (here, before any early return): for HTTPS only, copy
+        // ONLY the HSTS-class typed edits (`SetIfAbsent | Set`). These
+        // need to land on default answers — `set_default_answer_with_retry_after`
+        // bypasses the post-forward copy below.
+        //
+        // Pass 2 (post-forward, end of function): copy EVERY edit
+        // (including operator `Append` headers). Runs only on the
+        // regular forward path because the early returns short-circuit
+        // before reaching it.
+        //
+        // Plain-HTTP listeners are skipped here per RFC 6797 §7.2 (no
+        // STS over plaintext) — defense in depth on top of the
+        // TOML-time `ConfigError::HstsOnPlainHttp` and the worker IPC
+        // `ProxyError::HstsOnPlainHttp` rejects.
         if matches!(context.protocol, crate::Protocol::HTTPS) {
-            context.headers_response.clear();
-            for edit in headers_response.iter() {
-                context.headers_response.push(HeaderEditSnapshot {
-                    key: edit.key.to_vec(),
-                    val: edit.val.to_vec(),
-                    mode: edit.mode,
-                });
-            }
+            snapshot_response_edits(&mut context.headers_response, &headers_response, |e| {
+                matches!(e.mode, HeaderEditMode::SetIfAbsent | HeaderEditMode::Set)
+            });
         }
 
         // Look up cluster-side policy knobs once. The values we need are:
@@ -802,21 +802,14 @@ impl Router {
             &headers_request,
         );
 
-        // Stash the response-side header edits for the emission path
-        // (`mux/h1.rs::writable`, `mux/h2.rs::write_streams`) to apply
-        // before `kawa.prepare(...)`. HTTPS listeners already had this
-        // done at the top of `route_from_request` so default answers
-        // also receive the snapshot — skip the redundant copy here.
-        if matches!(context.protocol, crate::Protocol::HTTP) {
-            context.headers_response.clear();
-            for edit in headers_response.iter() {
-                context.headers_response.push(HeaderEditSnapshot {
-                    key: edit.key.to_vec(),
-                    val: edit.val.to_vec(),
-                    mode: edit.mode,
-                });
-            }
-        }
+        // Pass 2 of the response-snapshot copy (see the HSTS hoist
+        // above). Runs unconditionally on the regular forward path
+        // (the early returns above bypass this site, which keeps the
+        // default-answer scope as HSTS-only). Copies EVERY edit so
+        // operator-defined `Append` response headers reach
+        // backend-served responses on both HTTP and HTTPS listeners,
+        // preserving their pre-PR scope.
+        snapshot_response_edits(&mut context.headers_response, &headers_response, |_| true);
 
         Ok(cluster_id)
     }
@@ -1062,6 +1055,25 @@ fn apply_request_rewrites_and_headers(
         for (offset, block) in to_insert.into_iter().enumerate() {
             kawa.blocks.insert(insert_at + offset, block);
         }
+    }
+}
+
+/// Copy a per-frontend response-edit slice into the per-stream
+/// `HttpContext.headers_response` snapshot, applying `filter` to each
+/// edit. The snapshot is cleared before the copy so a second pass on
+/// the same context (the HSTS hoist + post-forward pattern in
+/// `route_from_request`) overrides any earlier partial copy.
+fn snapshot_response_edits<F>(target: &mut Vec<HeaderEditSnapshot>, src: &[HeaderEdit], filter: F)
+where
+    F: Fn(&HeaderEdit) -> bool,
+{
+    target.clear();
+    for edit in src.iter().filter(|e| filter(e)) {
+        target.push(HeaderEditSnapshot {
+            key: edit.key.to_vec(),
+            val: edit.val.to_vec(),
+            mode: edit.mode,
+        });
     }
 }
 
