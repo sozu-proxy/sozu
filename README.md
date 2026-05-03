@@ -25,12 +25,15 @@ To get started check out our [documentation](./doc/README.md) !
   curl -LO https://github.com/sozu-proxy/sozu/releases/download/<VERSION>/SHA256SUMS.sig
   curl -LO https://github.com/sozu-proxy/sozu/releases/download/<VERSION>/SHA256SUMS.pem
 
-  # Verify the signature was produced by this repository's release workflow:
+  # Verify the signature was produced by this repository's release workflow.
+  # Requires cosign >= 2.4.1 (GHSA-whqx-f9j3-ch6m).
   cosign verify-blob \
     --certificate SHA256SUMS.pem \
     --signature SHA256SUMS.sig \
-    --certificate-identity-regexp 'https://github.com/sozu-proxy/sozu/.*' \
+    --certificate-identity-regexp '^https://github\.com/sozu-proxy/sozu/\.github/workflows/release\.yml@refs/tags/[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$' \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    --certificate-github-workflow-repository sozu-proxy/sozu \
+    --certificate-github-workflow-ref refs/tags/<VERSION> \
     SHA256SUMS
 
   # Verify the tarball matches the signed sums:
@@ -41,6 +44,8 @@ To get started check out our [documentation](./doc/README.md) !
   Build provenance can be inspected with `gh attestation verify sozu-<VERSION>-<TARGET>.tar.gz --owner sozu-proxy`. Pre-release tags (`X.Y.Z-rc.N`) are published as GitHub pre-releases.
 
 - **Docker** images are published to [Docker Hub](https://hub.docker.com/r/clevercloud/sozu/) for every tagged release as `clevercloud/sozu:<VERSION>` and `clevercloud/sozu:latest` (stable tags only).
+
+  **Note on Docker images vs. signed tarballs.** `clevercloud/sozu:<VERSION>` is built from source by the same release workflow (`.github/workflows/release.yml`) but inside an Alpine builder stage that uses the distro's `cargo` and `rust` packages, not the `dtolnay/rust-toolchain@1.88.0` pin used for the Linux tarballs. The image therefore links musl libc and is **not** byte-equivalent to either the `gnu` or `musl` tarballs verified by the cosign-signed `SHA256SUMS`. SLSA build provenance currently covers the tarballs only. If you need the cosign-attested binary, extract `sozu-<VERSION>-x86_64-unknown-linux-musl.tar.gz` and run `sozu` directly. A from-tarball Docker image is tracked as a follow-up.
 
 - **From source.** See [`doc/getting_started.md`](./doc/getting_started.md) for compilation prerequisites (`protoc`, Rust toolchain pinned via `rust-toolchain`).
 

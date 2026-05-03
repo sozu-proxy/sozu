@@ -33,13 +33,14 @@ jobs:
       prerelease: ${{ steps.resolve.outputs.prerelease }}
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
 
       - name: Resolve tag
         id: resolve
         run: |
+          set -euo pipefail
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             TAG="${{ inputs.tag }}"
           else
@@ -65,10 +66,10 @@ jobs:
           # The repo has no `[workspace.package]` table; each crate pins
           # its own `[package].version`. Validate every workspace member
           # so a partial bump cannot ship.
-          set -eu
+          set -euo pipefail
           fail=0
           for manifest in bin/Cargo.toml lib/Cargo.toml command/Cargo.toml e2e/Cargo.toml; do
-            v=$(awk '/^\[package\]/{flag=1; next} /^\[/{flag=0} flag && /^version[[:space:]]*=/ {gsub(/[",]/, "", $3); print $3; exit}' "${manifest}")
+            v=$(grep -m1 -oP '^[[:space:]]*version[[:space:]]*=[[:space:]]*"\K[^"]+' "${manifest}" || true)
             echo "${manifest}: ${v}"
             if [ "${v}" != "${EXPECTED}" ]; then
               echo "::error file=${manifest}::version ${v} does not match tag ${EXPECTED}"
@@ -94,32 +95,36 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
-            apt: protobuf-compiler cmake
+            apt: protobuf-compiler
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-latest
-            apt: protobuf-compiler cmake musl-tools
+            apt: protobuf-compiler musl-tools
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
-            apt: protobuf-compiler cmake
+            apt: protobuf-compiler
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
-            apt: protobuf-compiler cmake musl-tools
+            apt: protobuf-compiler musl-tools
     steps:
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y ${{ matrix.apt }}
 
       - name: Checkout sources
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
         with:
           ref: ${{ needs.preflight.outputs.tag }}
 
       - name: Install rust 1.88.0
-        uses: dtolnay/rust-toolchain@1.88.0
+        # SHA pin keeps the action at a known revision; `with.toolchain`
+        # makes the rustc version explicit (the action otherwise keys off
+        # `github.action_ref`, which a SHA ref does not carry).
+        uses: dtolnay/rust-toolchain@98e1b82157cd469e843cb7f524c1313b4ad9492c  # branch 1.88.0
         with:
+          toolchain: 1.88.0
           targets: ${{ matrix.target }}
 
       - name: Cache cargo target
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae  # v2
         with:
           cache-all-crates: true
           prefix-key: release-${{ matrix.target }}
@@ -132,6 +137,7 @@ jobs:
           # into the binary by toolchain steps that honour
           # SOURCE_DATE_EPOCH is deterministic across reruns and
           # across matrix cells.
+          set -euo pipefail
           SDE=$(git log -1 --format=%ct HEAD)
           echo "epoch=${SDE}" >> "${GITHUB_OUTPUT}"
 
@@ -152,6 +158,7 @@ jobs:
           TARGET: ${{ matrix.target }}
           SOURCE_DATE_EPOCH: ${{ steps.sde.outputs.epoch }}
         run: |
+          set -euo pipefail
           STAGE="sozu-${VERSION}-${TARGET}"
           mkdir -p "${STAGE}"
           cp "target/${TARGET}/release/sozu" "${STAGE}/sozu"
@@ -159,7 +166,11 @@ jobs:
           cp LICENSE-LGPL3 "${STAGE}/LICENSE-LGPL3"
           cp README.md "${STAGE}/README.md"
           cp CHANGELOG.md "${STAGE}/CHANGELOG.md"
-          cp bin/config.toml "${STAGE}/config.toml"
+          # Use the packaging variant — `bin/config.toml` is the developer
+          # testing config and references `../lib/assets/*` paths absent
+          # from the tarball; `os-build/config.toml` is the production-shaped
+          # default already used by the Dockerfile.
+          cp os-build/config.toml "${STAGE}/config.toml"
           cp os-build/systemd/sozu.service "${STAGE}/sozu.service"
           cp os-build/systemd/sozu@.service "${STAGE}/sozu@.service"
           # Corresponding-source pointer for downstream redistributors who
@@ -183,15 +194,13 @@ jobs:
           tar --sort=name --owner=0 --group=0 --numeric-owner \
               --mtime="@${SOURCE_DATE_EPOCH}" \
               -czf "${STAGE}.tar.gz" "${STAGE}"
-          sha256sum "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256"
 
       - name: Upload artefact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
         with:
           name: sozu-${{ needs.preflight.outputs.version }}-${{ matrix.target }}
           path: |
             sozu-${{ needs.preflight.outputs.version }}-${{ matrix.target }}.tar.gz
-            sozu-${{ needs.preflight.outputs.version }}-${{ matrix.target }}.tar.gz.sha256
           retention-days: 7
 
   release:
@@ -208,49 +217,71 @@ jobs:
       attestations: write
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
         with:
           ref: ${{ needs.preflight.outputs.tag }}
 
       - name: Download all artefacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8
         with:
           path: dist
           merge-multiple: true
 
+      - name: Verify all four tarballs landed
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          # Defensive count assertion — catches silent collisions if
+          # `download-artifact merge-multiple: true` ever flattens two
+          # cells into the same name.
+          count=$(find . -maxdepth 1 -name 'sozu-*.tar.gz' | wc -l)
+          if [ "${count}" -ne 4 ]; then
+            echo "::error::expected 4 tarballs in dist/, found ${count}"
+            ls -la
+            exit 1
+          fi
+          echo "Found ${count} tarballs:"
+          ls -la sozu-*.tar.gz
+
       - name: Aggregate SHA256SUMS
         working-directory: dist
         run: |
-          cat ./*.sha256 > SHA256SUMS
-          rm -f ./*.sha256
+          set -euo pipefail
+          sha256sum sozu-*.tar.gz > SHA256SUMS
           cat SHA256SUMS
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@f713795cb21599bc4e5c4b58cbad1da852d7eeb9  # v3
 
       - name: Sign SHA256SUMS (keyless via sigstore)
         working-directory: dist
         env:
           COSIGN_YES: 'true'
         run: |
-          # Keyless signing — no static secret. The OIDC token
-          # presented by `id-token: write` is exchanged with sigstore's
-          # Fulcio for a short-lived signing certificate; the signature
-          # and certificate are recorded in Rekor and emitted as side
-          # files. Operators verify with:
+          set -euo pipefail
+          # Keyless signing — no static secret. The OIDC token presented
+          # by `id-token: write` is exchanged with sigstore's Fulcio for
+          # a short-lived signing certificate; the signature and
+          # certificate are recorded in Rekor and emitted as side files.
+          # Operators verify with cosign >= 2.4.1 (GHSA-whqx-f9j3-ch6m):
           #   cosign verify-blob \
           #     --certificate SHA256SUMS.pem \
           #     --signature SHA256SUMS.sig \
-          #     --certificate-identity-regexp 'https://github.com/sozu-proxy/sozu/.*' \
+          #     --certificate-identity-regexp '^https://github\.com/sozu-proxy/sozu/\.github/workflows/release\.yml@refs/tags/[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$' \
           #     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+          #     --certificate-github-workflow-repository sozu-proxy/sozu \
+          #     --certificate-github-workflow-ref 'refs/tags/${VERSION}' \
           #     SHA256SUMS
+          # The anchored regex pins the issuing workflow to release.yml
+          # at a release-shaped tag, so a future helper workflow with
+          # id-token:write cannot act as a signing oracle for SHA256SUMS.
           cosign sign-blob \
             --output-signature SHA256SUMS.sig \
             --output-certificate SHA256SUMS.pem \
             SHA256SUMS
 
       - name: Generate SLSA build provenance
-        uses: actions/attest-build-provenance@v3
+        uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661  # v3
         with:
           subject-path: 'dist/sozu-*.tar.gz'
 
@@ -258,6 +289,7 @@ jobs:
         env:
           VERSION: ${{ needs.preflight.outputs.version }}
         run: |
+          set -euo pipefail
           # Extract the `## [VERSION]` section into RELEASE_BODY.md and
           # pass it to action-gh-release via `body_path` (heredoc-safe).
           # If the section is missing, emit a `::warning::` so the run
@@ -285,7 +317,7 @@ jobs:
           cat RELEASE_BODY.md
 
       - name: Create GitHub Release (draft)
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2
         with:
           tag_name: ${{ needs.preflight.outputs.tag }}
           name: ${{ needs.preflight.outputs.version }}
@@ -300,27 +332,32 @@ jobs:
 
   docker-release:
     name: Docker Hub (tagged image)
-    # Gate on `build` so a tarball failure also blocks the version-pinned
-    # Docker push — keeps binary and image artefacts consistent. The
-    # `:latest` alias must never move when the matching tarballs do not
-    # exist on the GitHub Release page.
-    needs: [preflight, build]
+    # Gate on `release` so a cosign / SLSA / softprops/action-gh-release
+    # failure also blocks the version-pinned Docker push — keeps binary,
+    # image, and the GitHub Release page consistent. The `:latest` alias
+    # must never move when the matching tarballs are not yet published
+    # on the GitHub Release page.
+    needs: [preflight, build, release]
     if: needs.preflight.outputs.prerelease == 'false'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
         with:
           ref: ${{ needs.preflight.outputs.tag }}
-      - uses: docker/setup-qemu-action@v4
-      - uses: docker/setup-buildx-action@v4
-      - uses: docker/login-action@v4
+      - uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a  # v4
+      - uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd  # v4
+      - uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121  # v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-      - uses: docker/build-push-action@v7
+      - uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f  # v7
         with:
           context: .
           push: 'true'
+          # `:latest` is only updated for tag-push events (the canonical
+          # release path). `workflow_dispatch` rebuilds of older stable
+          # tags publish only the version-pinned image and never roll
+          # `:latest` backward.
           tags: |
             clevercloud/sozu:${{ needs.preflight.outputs.version }}
-            clevercloud/sozu:latest
+            ${{ github.event_name == 'push' && 'clevercloud/sozu:latest' || '' }}
