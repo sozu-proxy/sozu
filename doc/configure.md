@@ -1344,6 +1344,42 @@ The `health_check.healthy_backends` gauge is now labelled with `cluster_id`;
 prior emissions overwrote each other across clusters because the unlabelled
 key collapsed every cluster's value into a single bucket.
 
+##### Works without an active health check
+
+The tracker is driven by **both** the data-plane connect path and the active
+health-check tick. Clusters that have **not** configured a
+`[clusters.<id>.health_check]` block still see the full `cluster.*` and
+`backend.available` surface — transitions are detected through the per-backend
+retry policy as TCP connect attempts succeed or fail.
+
+- Every TCP connect failure on the data path (`lib/src/tcp.rs`,
+  `lib/src/protocol/kawa_h1/mod.rs::fail_backend_connection`,
+  `lib/src/protocol/mux/mod.rs`) calls `Backend::retry_policy.fail()`, arming an
+  exponential-backoff window. After `max_tries` consecutive failures (default
+  `6`) the policy reports `is_down() == true`. When every backend in the cluster
+  reaches that state, the next routing call observes
+  `available == 0 && total > 0`, flips the cell to `AllDown`, and emits the
+  `error!` log line + `cluster.no_available_backends` counter +
+  `EventKind::NoAvailableBackends` event.
+- Every successful TCP connect calls `Backend::retry_policy.succeed()`, which
+  clears `is_down()` immediately. The success arm of the routing call then
+  re-evaluates and flips the cell back to `Available`, emitting the `info!` log
+  line + `cluster.available_recovered` counter + `EventKind::ClusterRecovered`
+  event.
+
+Backends in the brief `WAIT` window (post-fail, pre-budget-exhaustion) are
+intentionally counted as `available` because the predicate is
+`!retry_policy.is_down()`, not `Backend::can_open()`. This avoids flapping
+`AllDown ↔ Available` when every backend happens to be in a 1-second backoff at
+the same instant. The `WAIT` state is transient by design; the cluster is still
+healthy from the operator's perspective, just briefly throttled. Only budget
+exhaustion (`current_tries >= max_tries`) drives the cell to `AllDown`.
+
+Configuring an active health check on top of the data-plane signal adds a second
+observation cadence — useful when a cluster is idle (no requests, so no passive
+observations) but you still want timely up/down detection — but is not required
+for the per-cluster availability surface to function.
+
 #### Event loop
 
 | Metric | Type | Scope | Description |
