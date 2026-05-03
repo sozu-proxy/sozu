@@ -20,7 +20,7 @@ use crate::{
         shared::{EndStreamAction, drain_tls_close_notify, end_stream_decision},
         update_readiness_after_read, update_readiness_after_write,
     },
-    socket::{SocketHandler, SocketResult},
+    socket::{SocketHandler, SocketResult, stats::socket_rtt},
     timer::TimeoutContainer,
 };
 
@@ -477,10 +477,17 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                         kawa::StatusLine::Response { code: 101, .. } => {
                             debug!("{} ============== HANDLE UPGRADE!", log_context!(self));
                             stream.metrics.backend_stop();
+                            let client_rtt = socket_rtt(self.socket.socket_ref());
+                            let server_rtt = stream
+                                .linked_token()
+                                .and_then(|t| endpoint.socket(t))
+                                .and_then(socket_rtt);
                             stream.generate_access_log(
                                 false,
                                 Some("H1::Upgrade"),
                                 context.listener.clone(),
+                                client_rtt,
+                                server_rtt,
                             );
                             return MuxResult::Upgrade;
                         }
@@ -518,10 +525,17 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                                 return MuxResult::Continue;
                             } else {
                                 stream.metrics.backend_stop();
+                                let client_rtt = socket_rtt(self.socket.socket_ref());
+                                let server_rtt = stream
+                                    .linked_token()
+                                    .and_then(|t| endpoint.socket(t))
+                                    .and_then(socket_rtt);
                                 stream.generate_access_log(
                                     false,
                                     Some("H1::EarlyHint"),
                                     context.listener.clone(),
+                                    client_rtt,
+                                    server_rtt,
                                 );
                                 return self.defer_close_for_tls_flush("early-hint");
                             }
@@ -530,10 +544,17 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                     }
                     incr!("http.e2e.http11");
                     stream.metrics.backend_stop();
+                    let client_rtt = socket_rtt(self.socket.socket_ref());
+                    let server_rtt = stream
+                        .linked_token()
+                        .and_then(|t| endpoint.socket(t))
+                        .and_then(socket_rtt);
                     stream.generate_access_log(
                         false,
                         Some("H1::Complete"),
                         context.listener.clone(),
+                        client_rtt,
+                        server_rtt,
                     );
                     stream.metrics.reset();
                     let old_state = std::mem::replace(&mut stream.state, StreamState::Unlinked);

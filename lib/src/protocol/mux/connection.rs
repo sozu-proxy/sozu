@@ -464,6 +464,9 @@ impl<Front: SocketHandler + Debug> Endpoint for EndpointServer<'_, Front> {
     fn readiness_mut(&mut self, _token: Token) -> &mut Readiness {
         self.0.readiness_mut()
     }
+    fn socket(&self, _token: Token) -> Option<&TcpStream> {
+        Some(self.0.socket())
+    }
 
     fn end_stream<L>(&mut self, _token: Token, stream: GlobalStreamId, context: &mut Context<L>)
     where
@@ -515,6 +518,9 @@ impl Endpoint for EndpointClient<'_> {
                 &mut self.0.fallback_readiness
             }
         }
+    }
+    fn socket(&self, token: Token) -> Option<&TcpStream> {
+        self.0.backends.get(&token).map(|c| c.socket())
     }
 
     fn end_stream<L>(&mut self, token: Token, stream: GlobalStreamId, context: &mut Context<L>)
