@@ -1217,10 +1217,20 @@ impl Frontend {
             && matches!(cfg.enabled, Some(true))
         {
             if let Some(rendered) = render_hsts(cfg) {
+                // RFC 6797 §6.1 default: PRESERVE backend-supplied STS
+                // (SetIfAbsent). Operator opts into harden-centrally
+                // override via `force_replace_backend = true`, which
+                // selects `Set` (delete-then-insert) so any backend
+                // STS is replaced with sozu's rendered policy.
+                let mode = if matches!(cfg.force_replace_backend, Some(true)) {
+                    HeaderEditMode::Set
+                } else {
+                    HeaderEditMode::SetIfAbsent
+                };
                 headers_response.push(HeaderEdit {
                     key: Rc::from(&b"strict-transport-security"[..]),
                     val: rendered.into_bytes().into(),
-                    mode: HeaderEditMode::SetIfAbsent,
+                    mode,
                 });
                 crate::incr!("http.hsts.frontend_added");
             } else {
@@ -1502,6 +1512,7 @@ mod tests {
             max_age: Some(31_536_000),
             include_subdomains: None,
             preload: None,
+            force_replace_backend: None,
         };
         assert_eq!(render_hsts(&cfg), Some("max-age=31536000".to_owned()));
     }
@@ -1513,6 +1524,7 @@ mod tests {
             max_age: Some(31_536_000),
             include_subdomains: Some(true),
             preload: None,
+            force_replace_backend: None,
         };
         assert_eq!(
             render_hsts(&cfg),
@@ -1527,6 +1539,7 @@ mod tests {
             max_age: Some(63_072_000),
             include_subdomains: None,
             preload: Some(true),
+            force_replace_backend: None,
         };
         assert_eq!(
             render_hsts(&cfg),
@@ -1541,6 +1554,7 @@ mod tests {
             max_age: Some(31_536_000),
             include_subdomains: Some(true),
             preload: Some(true),
+            force_replace_backend: None,
         };
         assert_eq!(
             render_hsts(&cfg),
@@ -1555,6 +1569,7 @@ mod tests {
             max_age: Some(0),
             include_subdomains: Some(true),
             preload: None,
+            force_replace_backend: None,
         };
         // `max_age = 0` is the RFC 6797 §11.4 kill switch and renders
         // verbatim — UA receives it and stops treating the host as a
@@ -1572,6 +1587,7 @@ mod tests {
             max_age: None,
             include_subdomains: Some(true),
             preload: None,
+            force_replace_backend: None,
         };
         // The TOML loader substitutes the default at config-load; if the
         // field reaches `render_hsts` as `None`, suppress emission so a

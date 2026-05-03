@@ -302,26 +302,35 @@ pub struct HttpContext {
 
 /// How `apply_response_header_edits` should interpret a per-edit value.
 ///
-/// Today the implicit encoding is: empty `val` → delete; non-empty `val`
-/// → append. The explicit `Append`/`Delete`/`SetIfAbsent` mode lets HSTS
-/// (and future RFC-correct response policies) opt into "skip the insert
-/// when an upstream-supplied header with the same name is already on the
-/// response". This preserves operator-controlled fallback when the
-/// backend already emits its own `Strict-Transport-Security` (RFC 6797
-/// §6.1 single-header requirement).
+/// The implicit empty-`val` Append → delete encoding is still supported
+/// (so legacy operator-supplied `[[...frontends.headers]]` entries work
+/// unchanged); the explicit modes give typed policies finer control:
+///
+/// - `Append`: drop the legacy delete shortcut for empty `val`, and
+///   append every other entry before the end-of-headers flag.
+/// - `SetIfAbsent`: skip the insert when `kawa.blocks` already carries
+///   a non-elided header with the same name (case-insensitive). HSTS
+///   uses this by default to preserve a backend-supplied
+///   `Strict-Transport-Security` (RFC 6797 §6.1 single-header
+///   requirement).
+/// - `Set`: delete every existing header with the matching name, then
+///   insert the new entry. Use when the operator wants their typed
+///   policy to override any backend-supplied value (the
+///   `force_replace_backend = true` HSTS shape, for example).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum HeaderEditMode {
     /// Append the header before the end-of-headers flag. Empty `val`
     /// is interpreted as a delete (legacy behaviour preserved).
     #[default]
     Append,
-    /// Remove every existing header whose name matches `key`
-    /// case-insensitively.
-    Delete,
     /// Skip the insert if `kawa.blocks` already contains a non-elided
     /// header whose name matches `key` case-insensitively. Otherwise
     /// behave like `Append`.
     SetIfAbsent,
+    /// Delete every existing header with the matching name, then
+    /// insert the new value. Equivalent to two operator-defined edits
+    /// (delete + append) but safer to express as one typed entry.
+    Set,
 }
 
 /// Owned snapshot of a per-frontend header edit, captured at routing

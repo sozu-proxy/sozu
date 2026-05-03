@@ -322,7 +322,7 @@ enabled = false
 | `0 < max_age < 86_400`                                        | **Warning** at config-load (likely misconfiguration — sub-day HSTS only makes sense for testing).                                                        |
 | `preload = true` with `max_age < 31_536_000`                  | **Warning** at config-load. The Chrome HSTS preload list rejects hosts below the minimum.                                                                |
 | `preload = true` without `include_subdomains = true`          | **Warning** at config-load. Same preload-list rejection.                                                                                                 |
-| Backend emits its own `Strict-Transport-Security`             | Pass-through unchanged. Sōzu's HSTS edit uses `HeaderEditMode::SetIfAbsent` so a single header reaches the wire (RFC 6797 §6.1).                         |
+| Backend emits its own `Strict-Transport-Security`             | Pass-through unchanged by default. Sōzu's HSTS edit uses `HeaderEditMode::SetIfAbsent` so a single header reaches the wire (RFC 6797 §6.1). Set `force_replace_backend = true` to override the backend value with sōzu's typed policy (`HeaderEditMode::Set` — delete-then-insert).  |
 | HTTPS-served default answer (3xx redirect, 401, 503)          | Carries the HSTS header per RFC 6797 §8.1. The per-stream snapshot copy fires before the early returns in `mux/router.rs`, gated on `Protocol::HTTPS`.    |
 
 ##### Runtime CLI surface

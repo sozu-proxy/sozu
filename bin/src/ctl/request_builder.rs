@@ -1236,6 +1236,7 @@ fn build_http_frontend_add(cmd: HttpFrontendCmd) -> Result<RequestHttpFrontend, 
         hsts_include_subdomains,
         hsts_preload,
         hsts_disabled,
+        hsts_force_replace_backend,
     } = cmd
     else {
         return Err(CtlError::ArgsNeeded(
@@ -1367,6 +1368,7 @@ fn build_http_frontend_add(cmd: HttpFrontendCmd) -> Result<RequestHttpFrontend, 
         hsts_include_subdomains,
         hsts_preload,
         hsts_disabled,
+        hsts_force_replace_backend,
     )?;
 
     Ok(RequestHttpFrontend {
@@ -1405,13 +1407,14 @@ fn build_hsts_from_cli(
     include_subdomains: bool,
     preload: bool,
     disabled: bool,
+    force_replace_backend: bool,
 ) -> Result<Option<sozu_command_lib::proto::command::HstsConfig>, CtlError> {
     use sozu_command_lib::proto::command::HstsConfig;
 
-    let any_enabling = max_age.is_some() || include_subdomains || preload;
+    let any_enabling = max_age.is_some() || include_subdomains || preload || force_replace_backend;
     if disabled && any_enabling {
         return Err(CtlError::ArgsNeeded(
-            "either --hsts-disabled OR (--hsts-max-age | --hsts-include-subdomains | --hsts-preload) — not both"
+            "either --hsts-disabled OR (--hsts-max-age | --hsts-include-subdomains | --hsts-preload | --hsts-force-replace-backend) — not both"
                 .to_owned(),
             "got --hsts-disabled together with one of the enabling flags".to_owned(),
         ));
@@ -1422,6 +1425,7 @@ fn build_hsts_from_cli(
             max_age: None,
             include_subdomains: None,
             preload: None,
+            force_replace_backend: None,
         }));
     }
     if !any_enabling {
@@ -1436,6 +1440,11 @@ fn build_hsts_from_cli(
         max_age: max_age.or(Some(sozu_command_lib::config::DEFAULT_HSTS_MAX_AGE)),
         include_subdomains: if include_subdomains { Some(true) } else { None },
         preload: if preload { Some(true) } else { None },
+        force_replace_backend: if force_replace_backend {
+            Some(true)
+        } else {
+            None
+        },
     }))
 }
 
@@ -1448,20 +1457,21 @@ mod hsts_cli_tests {
     fn no_flags_returns_none() {
         // No `--hsts-*` flags = inherit listener default.
         assert!(matches!(
-            build_hsts_from_cli(None, false, false, false),
+            build_hsts_from_cli(None, false, false, false, false),
             Ok(None)
         ));
     }
 
     #[test]
     fn disabled_only_returns_some_disabled() {
-        let out = build_hsts_from_cli(None, false, false, true)
+        let out = build_hsts_from_cli(None, false, false, true, false)
             .expect("should validate")
             .expect("should be Some");
         assert_eq!(out.enabled, Some(false));
         assert_eq!(out.max_age, None);
         assert_eq!(out.include_subdomains, None);
         assert_eq!(out.preload, None);
+        assert_eq!(out.force_replace_backend, None);
     }
 
     #[test]
@@ -1469,17 +1479,18 @@ mod hsts_cli_tests {
         // Operator opted into HSTS via --hsts-include-subdomains alone;
         // helper must substitute the canonical default so the worker
         // does not see a `max_age = None` and silently no-op the render.
-        let out = build_hsts_from_cli(None, true, false, false)
+        let out = build_hsts_from_cli(None, true, false, false, false)
             .expect("should validate")
             .expect("should be Some");
         assert_eq!(out.enabled, Some(true));
         assert_eq!(out.max_age, Some(DEFAULT_HSTS_MAX_AGE));
         assert_eq!(out.include_subdomains, Some(true));
+        assert_eq!(out.force_replace_backend, None);
     }
 
     #[test]
     fn explicit_max_age_kept() {
-        let out = build_hsts_from_cli(Some(63_072_000), true, true, false)
+        let out = build_hsts_from_cli(Some(63_072_000), true, true, false, false)
             .expect("should validate")
             .expect("should be Some");
         assert_eq!(out.max_age, Some(63_072_000));
@@ -1487,8 +1498,29 @@ mod hsts_cli_tests {
     }
 
     #[test]
+    fn force_replace_backend_alone_enables_with_default_max_age() {
+        // Setting --hsts-force-replace-backend on its own is also an
+        // enabling flag — operator wants override semantics; the
+        // canonical default max-age applies.
+        let out = build_hsts_from_cli(None, false, false, false, true)
+            .expect("should validate")
+            .expect("should be Some");
+        assert_eq!(out.enabled, Some(true));
+        assert_eq!(out.max_age, Some(DEFAULT_HSTS_MAX_AGE));
+        assert_eq!(out.force_replace_backend, Some(true));
+    }
+
+    #[test]
+    fn disabled_with_force_replace_returns_args_needed() {
+        match build_hsts_from_cli(None, false, false, true, true).unwrap_err() {
+            CtlError::ArgsNeeded(_, _) => {}
+            other => panic!("expected ArgsNeeded, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn disabled_with_enabling_flags_returns_args_needed() {
-        match build_hsts_from_cli(Some(31_536_000), false, false, true).unwrap_err() {
+        match build_hsts_from_cli(Some(31_536_000), false, false, true, false).unwrap_err() {
             CtlError::ArgsNeeded(_, _) => {}
             other => panic!("expected ArgsNeeded, got {other:?}"),
         }

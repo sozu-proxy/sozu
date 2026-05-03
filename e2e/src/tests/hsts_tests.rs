@@ -86,6 +86,7 @@ pub fn try_hsts_on_http_frontend_rejected() -> State {
         max_age: Some(31_536_000),
         include_subdomains: Some(true),
         preload: Some(false),
+        force_replace_backend: None,
     });
     worker.send_proxy_request_type(RequestType::AddHttpFrontend(frontend));
     let resp = worker
@@ -148,6 +149,7 @@ pub fn try_hsts_explicit_disable_on_http_accepted() -> State {
         max_age: None,
         include_subdomains: None,
         preload: None,
+        force_replace_backend: None,
     });
     worker.send_proxy_request_type(RequestType::AddHttpFrontend(frontend));
     let resp = worker
