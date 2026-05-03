@@ -952,6 +952,7 @@ impl HttpProxy {
         // outside the TOML path (`sozu frontend http add`, programmatic
         // IPC senders) are caught here.
         if matches!(front.hsts.as_ref().and_then(|h| h.enabled), Some(true)) {
+            incr!("http.hsts.suppressed_plaintext");
             return Err(ProxyError::HstsOnPlainHttp(front.address.into()));
         }
 

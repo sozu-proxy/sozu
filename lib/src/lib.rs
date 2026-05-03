@@ -773,6 +773,16 @@ pub enum ListenerError {
         field: &'static str,
         reason: &'static str,
     },
+    /// `UpdateHttpsListenerConfig.hsts` was present but its `enabled`
+    /// field was unset. Per the partial-update contract, `enabled` is
+    /// the explicit-disambiguator between "explicit disable" (false) and
+    /// "explicit enable" (true); the patch handler refuses an
+    /// `enabled = None` block rather than silently picking one.
+    #[error(
+        "UpdateHttpsListenerConfig.hsts is present but `enabled` is unset; the partial-update \
+         contract requires `enabled` whenever the `hsts` block is present"
+    )]
+    HstsEnabledRequired,
 }
 
 /// Lift control-plane validation errors into listener-level errors so the

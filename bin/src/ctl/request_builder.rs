@@ -1232,6 +1232,10 @@ fn build_http_frontend_add(cmd: HttpFrontendCmd) -> Result<RequestHttpFrontend, 
         rewrite_port,
         required_auth,
         header,
+        hsts_max_age,
+        hsts_include_subdomains,
+        hsts_preload,
+        hsts_disabled,
     } = cmd
     else {
         return Err(CtlError::ArgsNeeded(
@@ -1348,6 +1352,23 @@ fn build_http_frontend_add(cmd: HttpFrontendCmd) -> Result<RequestHttpFrontend, 
         });
     }
 
+    // Build the typed HSTS block from the four `--hsts-*` flags. Layering:
+    // - `--hsts-disabled` is mutually exclusive with the enabling flags;
+    //   if combined we error rather than silently picking one (operator
+    //   intent is ambiguous).
+    // - any of `--hsts-max-age`, `--hsts-include-subdomains`,
+    //   `--hsts-preload` flips the frontend into "explicit enable"; the
+    //   worker substitutes `DEFAULT_HSTS_MAX_AGE = 31_536_000` if
+    //   `--hsts-max-age` is omitted (matching the TOML semantics in
+    //   `command/src/config.rs::FileHstsConfig::to_proto`).
+    // - none of the flags = `None` = inherit listener default.
+    let hsts_proto = build_hsts_from_cli(
+        hsts_max_age,
+        hsts_include_subdomains,
+        hsts_preload,
+        hsts_disabled,
+    )?;
+
     Ok(RequestHttpFrontend {
         cluster_id: route.into(),
         address: address.into(),
@@ -1364,8 +1385,50 @@ fn build_http_frontend_add(cmd: HttpFrontendCmd) -> Result<RequestHttpFrontend, 
         rewrite_port,
         required_auth: if required_auth { Some(true) } else { None },
         headers: headers_proto,
-        hsts: None,
+        hsts: hsts_proto,
     })
+}
+
+/// Combine the four `--hsts-*` CLI flags into an `Option<HstsConfig>`.
+/// `None` = inherit listener default; `Some(HstsConfig { enabled: Some(false), .. })`
+/// = explicit disable (suppresses listener default); `Some(HstsConfig { enabled: Some(true), .. })`
+/// = explicit enable with the specified knobs (worker substitutes the default
+/// `max-age = 31_536_000` when omitted). `--hsts-disabled` mutually excludes
+/// the three enabling flags; the function returns a typed `CtlError::ArgsNeeded`
+/// rather than silently picking an interpretation.
+fn build_hsts_from_cli(
+    max_age: Option<u32>,
+    include_subdomains: bool,
+    preload: bool,
+    disabled: bool,
+) -> Result<Option<sozu_command_lib::proto::command::HstsConfig>, CtlError> {
+    use sozu_command_lib::proto::command::HstsConfig;
+
+    let any_enabling = max_age.is_some() || include_subdomains || preload;
+    if disabled && any_enabling {
+        return Err(CtlError::ArgsNeeded(
+            "either --hsts-disabled OR (--hsts-max-age | --hsts-include-subdomains | --hsts-preload) — not both"
+                .to_owned(),
+            "got --hsts-disabled together with one of the enabling flags".to_owned(),
+        ));
+    }
+    if disabled {
+        return Ok(Some(HstsConfig {
+            enabled: Some(false),
+            max_age: None,
+            include_subdomains: None,
+            preload: None,
+        }));
+    }
+    if !any_enabling {
+        return Ok(None);
+    }
+    Ok(Some(HstsConfig {
+        enabled: Some(true),
+        max_age,
+        include_subdomains: if include_subdomains { Some(true) } else { None },
+        preload: if preload { Some(true) } else { None },
+    }))
 }
 
 /// Reject NUL / CR / LF / other C0 controls in a header value. HTAB
