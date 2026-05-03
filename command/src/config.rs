@@ -352,11 +352,6 @@ pub enum ConfigError {
          (RFC 6797 §7.2 forbids the header over plaintext HTTP)"
     )]
     HstsOnPlainHttp(String),
-    /// An `[hsts]` field carries an out-of-range or otherwise nonsensical
-    /// value (e.g. negative `max_age`, although `u32` rules that out at
-    /// type level — kept for forward compatibility with future fields).
-    #[error("invalid HSTS config at {scope}: {reason}")]
-    InvalidHstsConfig { scope: String, reason: String },
 }
 
 /// An HTTP, HTTPS or TCP listener as parsed from the `Listeners` section in the toml
@@ -805,6 +800,18 @@ impl ListenerBuilder {
                 expected: ListenerProtocol::Http,
                 found: self.protocol.to_owned(),
             });
+        }
+
+        // RFC 6797 §7.2: `Strict-Transport-Security` MUST NOT appear on
+        // plaintext-HTTP responses. Reject an `[hsts]` block on an HTTP
+        // listener at config-load — `HttpListenerConfig` has no `hsts`
+        // field, so silently dropping the operator's intent would be a
+        // worse failure mode than a typed error here.
+        if self.hsts.is_some() {
+            return Err(ConfigError::HstsOnPlainHttp(format!(
+                "HTTP listener {}",
+                self.address
+            )));
         }
 
         if let Some(config) = config {
@@ -1475,8 +1482,22 @@ impl FileClusterFrontendConfig {
             None => Vec::new(),
         };
 
+        // RFC 6797 §7.2: `Strict-Transport-Security` MUST NOT appear on
+        // plaintext-HTTP responses. A frontend without a key+certificate
+        // pair generates `RequestType::AddHttpFrontend` in
+        // `HttpFrontendConfig::generate_requests`, so HSTS configured
+        // there would silently target an HTTP frontend. Reject at
+        // config-load before the cert-presence branch can consume it.
+        let frontend_serves_https = key_opt.is_some() && certificate_opt.is_some();
         let hsts = match self.hsts.as_ref() {
-            Some(h) => Some(h.to_proto(&format!("frontend {_cluster_id}/{hostname}"))?),
+            Some(h) => {
+                if !frontend_serves_https {
+                    return Err(ConfigError::HstsOnPlainHttp(format!(
+                        "frontend {_cluster_id}/{hostname}"
+                    )));
+                }
+                Some(h.to_proto(&format!("frontend {_cluster_id}/{hostname}"))?)
+            }
             None => None,
         };
 
@@ -3294,6 +3315,76 @@ mod tests {
         match cfg.to_proto("test").unwrap_err() {
             ConfigError::HstsEnabledRequired(scope) => assert_eq!(scope, "test"),
             other => panic!("expected HstsEnabledRequired, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hsts_rejected_on_http_listener() {
+        // RFC 6797 §7.2: an [hsts] block on an HTTP listener must be
+        // rejected at TOML config-load — `HttpListenerConfig` carries no
+        // `hsts` field and silently dropping the operator's intent
+        // would be a worse failure mode than a typed error.
+        let mut listener = ListenerBuilder::new(
+            SocketAddress::new_v4(127, 0, 0, 1, 8080),
+            ListenerProtocol::Http,
+        );
+        listener.hsts = Some(FileHstsConfig {
+            enabled: Some(true),
+            max_age: Some(31_536_000),
+            include_subdomains: None,
+            preload: None,
+        });
+        match listener.to_http(None).unwrap_err() {
+            ConfigError::HstsOnPlainHttp(scope) => assert!(
+                scope.contains("HTTP listener"),
+                "expected scope to mention 'HTTP listener', got {scope:?}"
+            ),
+            other => panic!("expected HstsOnPlainHttp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hsts_rejected_on_http_frontend() {
+        // A `FileClusterFrontendConfig` without a key+certificate pair
+        // generates `RequestType::AddHttpFrontend` in
+        // `HttpFrontendConfig::generate_requests`. RFC 6797 §7.2 forbids
+        // HSTS on plaintext HTTP, so an `[hsts]` block on a cert-less
+        // (HTTP-bound) frontend must be rejected at TOML config-load.
+        let frontend = FileClusterFrontendConfig {
+            address: "127.0.0.1:8080".parse().unwrap(),
+            hostname: Some("example.com".to_owned()),
+            path: None,
+            path_type: None,
+            method: None,
+            certificate: None,
+            key: None,
+            certificate_chain: None,
+            tls_versions: vec![],
+            position: RulePosition::Tree,
+            tags: None,
+            redirect: None,
+            redirect_scheme: None,
+            redirect_template: None,
+            rewrite_host: None,
+            rewrite_path: None,
+            rewrite_port: None,
+            required_auth: None,
+            headers: None,
+            hsts: Some(FileHstsConfig {
+                enabled: Some(true),
+                max_age: Some(31_536_000),
+                include_subdomains: None,
+                preload: None,
+            }),
+        };
+        match frontend.to_http_front("api").unwrap_err() {
+            ConfigError::HstsOnPlainHttp(scope) => {
+                assert!(
+                    scope.contains("api") && scope.contains("example.com"),
+                    "expected scope to mention 'api' and 'example.com', got {scope:?}"
+                );
+            }
+            other => panic!("expected HstsOnPlainHttp, got {other:?}"),
         }
     }
 
