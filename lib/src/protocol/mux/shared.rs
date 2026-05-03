@@ -9,7 +9,7 @@
 use kawa::AsBuffer;
 
 use crate::{
-    protocol::http::editor::HeaderEditSnapshot,
+    protocol::http::editor::{HeaderEditMode, HeaderEditSnapshot},
     socket::{SocketHandler, SocketResult},
 };
 
@@ -100,17 +100,30 @@ pub(super) fn drain_tls_close_notify<S: SocketHandler>(
 /// Apply per-frontend response-side header edits to a response kawa
 /// just before [`kawa::Kawa::prepare`] runs. Mirrors the request-side
 /// pass that `Router::route_from_request` runs against the front kawa
-/// at routing time:
+/// at routing time. Each edit's [`HeaderEditMode`] selects the action:
 ///
-/// - empty `val` → remove every existing header with the matching name
-///   from `kawa.blocks` (HAProxy `del-header` parity);
-/// - non-empty `val` → append the header before the `end_header` flag
-///   block.
+/// - [`HeaderEditMode::Append`] with a non-empty `val` → append the
+///   header before the `end_header` flag block.
+/// - [`HeaderEditMode::Append`] with an empty `val` → fall back to the
+///   legacy delete encoding (HAProxy `del-header` parity). Pre-existing
+///   call sites that have not migrated to the explicit
+///   [`HeaderEditMode::Delete`] continue to work unchanged.
+/// - [`HeaderEditMode::Delete`] → remove every existing header with the
+///   matching name from `kawa.blocks`. Equivalent to the legacy empty-
+///   `val` Append shape but explicit at the call site.
+/// - [`HeaderEditMode::SetIfAbsent`] → append the header only when no
+///   non-elided header with the same name already exists on the
+///   response (RFC 6797 §6.1 single-`Strict-Transport-Security`
+///   requirement, generalised to any operator-supplied
+///   set-only-when-missing edit). The presence check runs against the
+///   pre-edit response state so a `SetIfAbsent` does NOT race against a
+///   `Delete` issued in the same batch.
 ///
 /// Both H1 and H2 emission paths funnel through here so the on-wire
-/// header set stays consistent. Per-edit set/replace semantics are
-/// expressed as two entries: one with empty `val` (delete) followed by
-/// one with the new value (set).
+/// header set stays consistent. Per-edit set/replace semantics that
+/// need an unconditional overwrite are expressed as two entries: one
+/// `Delete` (or empty-`val` Append) followed by an `Append` with the
+/// new value.
 pub(super) fn apply_response_header_edits<T: AsBuffer>(
     kawa: &mut kawa::Kawa<T>,
     edits: &[HeaderEditSnapshot],
@@ -121,9 +134,39 @@ pub(super) fn apply_response_header_edits<T: AsBuffer>(
         return;
     }
 
+    // Snapshot the lowercased header names already present on the
+    // response BEFORE any edit runs. Used by `SetIfAbsent` to honour
+    // upstream-supplied headers (e.g. backend already sent its own
+    // `Strict-Transport-Security`) without racing against a sibling
+    // `Delete` edit in the same batch.
+    let existing_keys: Vec<Vec<u8>> = {
+        let buf = kawa.storage.buffer();
+        kawa.blocks
+            .iter()
+            .filter_map(|block| {
+                if let Block::Header(Pair { key, val: _ }) = block {
+                    // Skip elided headers — see `Store::Empty` note below
+                    // in the retain pass for the panic rationale.
+                    if matches!(key, Store::Empty) {
+                        None
+                    } else {
+                        Some(key.data(buf).iter().map(u8::to_ascii_lowercase).collect())
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
+
     let keys_to_drop: Vec<Vec<u8>> = edits
         .iter()
-        .filter(|e| e.val.is_empty())
+        .filter(|e| {
+            // Explicit Delete OR legacy empty-`val` Append (preserved
+            // for callers still using the implicit encoding).
+            matches!(e.mode, HeaderEditMode::Delete)
+                || (matches!(e.mode, HeaderEditMode::Append) && e.val.is_empty())
+        })
         .map(|e| e.key.iter().map(u8::to_ascii_lowercase).collect())
         .collect();
     if !keys_to_drop.is_empty() {
@@ -158,8 +201,26 @@ pub(super) fn apply_response_header_edits<T: AsBuffer>(
 
     let mut to_insert: Vec<Block> = Vec::new();
     for edit in edits {
-        if edit.val.is_empty() {
-            continue;
+        match edit.mode {
+            // Explicit delete is materialised by the retain pass above;
+            // nothing to insert. Same for the legacy empty-`val` Append
+            // shape, which we route through the delete branch for
+            // backwards compatibility.
+            HeaderEditMode::Delete => continue,
+            HeaderEditMode::Append if edit.val.is_empty() => continue,
+            HeaderEditMode::Append => {}
+            HeaderEditMode::SetIfAbsent => {
+                let key_lower: Vec<u8> = edit.key.iter().map(u8::to_ascii_lowercase).collect();
+                if existing_keys
+                    .iter()
+                    .any(|k| k.as_slice() == key_lower.as_slice())
+                {
+                    // Upstream already supplied this header — honour
+                    // the operator's "set only when missing" intent and
+                    // skip the insert (RFC 6797 §6.1).
+                    continue;
+                }
+            }
         }
         to_insert.push(Block::Header(Pair {
             key: Store::from_slice(&edit.key),
@@ -204,7 +265,7 @@ pub(super) fn end_of_headers_index<T: AsBuffer>(kawa: &kawa::Kawa<T>) -> Option<
 #[cfg(test)]
 mod tests {
     use super::apply_response_header_edits;
-    use crate::protocol::http::editor::HeaderEditSnapshot;
+    use crate::protocol::http::editor::{HeaderEditMode, HeaderEditSnapshot};
     use kawa::{
         AsBuffer, Block, Buffer, Flags, Kawa, Kind, Pair, SliceBuffer, StatusLine, Store, Version,
     };
@@ -273,10 +334,12 @@ mod tests {
                 HeaderEditSnapshot {
                     key: b"x-frame-options".to_vec(),
                     val: b"DENY".to_vec(),
+                    mode: HeaderEditMode::Append,
                 },
                 HeaderEditSnapshot {
                     key: b"x-content-type-options".to_vec(),
                     val: b"nosniff".to_vec(),
+                    mode: HeaderEditMode::Append,
                 },
             ],
         );
@@ -338,6 +401,7 @@ mod tests {
             &[HeaderEditSnapshot {
                 key: b"X-Internal".to_vec(),
                 val: Vec::new(),
+                mode: HeaderEditMode::Append,
             }],
         );
 
@@ -373,10 +437,12 @@ mod tests {
                 HeaderEditSnapshot {
                     key: b"Cache-Control".to_vec(),
                     val: Vec::new(),
+                    mode: HeaderEditMode::Append,
                 },
                 HeaderEditSnapshot {
                     key: b"Cache-Control".to_vec(),
                     val: b"no-store".to_vec(),
+                    mode: HeaderEditMode::Append,
                 },
             ],
         );
@@ -385,5 +451,98 @@ mod tests {
         assert_eq!(pairs.len(), 1, "only the replacement header must remain");
         assert_eq!(pairs[0].0, b"Cache-Control");
         assert_eq!(pairs[0].1, b"no-store");
+    }
+
+    /// `SetIfAbsent` MUST NOT add a second header when the upstream
+    /// response already carries one with the same name. This is the
+    /// HSTS-on-listener-default contract: if the backend already
+    /// emitted its own `Strict-Transport-Security`, the operator's
+    /// listener-default policy steps aside (RFC 6797 §6.1).
+    #[test]
+    fn test_response_edit_set_if_absent_skips_when_present() {
+        let mut buf = vec![0u8; 4096];
+        let mut kawa = make_kawa(&mut buf);
+        kawa.blocks.push_back(Block::Header(Pair {
+            key: Store::Static(b"strict-transport-security"),
+            val: Store::Static(b"max-age=12345"),
+        }));
+        kawa.blocks.push_back(Block::Flags(Flags {
+            end_body: false,
+            end_chunk: false,
+            end_header: true,
+            end_stream: false,
+        }));
+
+        apply_response_header_edits(
+            &mut kawa,
+            &[HeaderEditSnapshot {
+                key: b"strict-transport-security".to_vec(),
+                val: b"max-age=31536000".to_vec(),
+                mode: HeaderEditMode::SetIfAbsent,
+            }],
+        );
+
+        let pairs = pretty_blocks(&kawa);
+        assert_eq!(
+            pairs.len(),
+            1,
+            "SetIfAbsent must not duplicate an existing header"
+        );
+        assert_eq!(pairs[0].0, b"strict-transport-security");
+        assert_eq!(
+            pairs[0].1, b"max-age=12345",
+            "the upstream-supplied STS value must be preserved unchanged"
+        );
+    }
+
+    /// `SetIfAbsent` MUST insert the new header when no upstream
+    /// header with the same name is present. The new entry lands
+    /// before the end-of-headers flag (same insertion point as a
+    /// regular `Append`).
+    #[test]
+    fn test_response_edit_set_if_absent_inserts_when_absent() {
+        let mut buf = vec![0u8; 4096];
+        let mut kawa = make_kawa(&mut buf);
+        kawa.blocks.push_back(Block::Header(Pair {
+            key: Store::Static(b"server"),
+            val: Store::Static(b"sozu"),
+        }));
+        kawa.blocks.push_back(Block::Flags(Flags {
+            end_body: false,
+            end_chunk: false,
+            end_header: true,
+            end_stream: false,
+        }));
+
+        apply_response_header_edits(
+            &mut kawa,
+            &[HeaderEditSnapshot {
+                key: b"strict-transport-security".to_vec(),
+                val: b"max-age=31536000".to_vec(),
+                mode: HeaderEditMode::SetIfAbsent,
+            }],
+        );
+
+        let pairs = pretty_blocks(&kawa);
+        assert_eq!(
+            pairs.len(),
+            2,
+            "SetIfAbsent must insert exactly one new header when absent"
+        );
+        assert_eq!(pairs[0].0, b"server");
+        assert_eq!(pairs[1].0, b"strict-transport-security");
+        assert_eq!(pairs[1].1, b"max-age=31536000");
+
+        // The end-of-headers flag must remain the final block.
+        assert!(
+            matches!(
+                kawa.blocks.back(),
+                Some(Block::Flags(Flags {
+                    end_header: true,
+                    ..
+                }))
+            ),
+            "end_header flag must remain the last block"
+        );
     }
 }

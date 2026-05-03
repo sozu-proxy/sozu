@@ -1364,6 +1364,7 @@ fn build_http_frontend_add(cmd: HttpFrontendCmd) -> Result<RequestHttpFrontend, 
         rewrite_port,
         required_auth: if required_auth { Some(true) } else { None },
         headers: headers_proto,
+        hsts: None,
     })
 }
 
