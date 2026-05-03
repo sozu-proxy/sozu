@@ -36,6 +36,7 @@ mod h2_security_sni;
 mod h2_security_tests;
 mod h2_tests;
 pub(crate) mod h2_utils;
+mod hsts_tests;
 mod listener_update_tests;
 mod mux_tests;
 mod protocol_pair_matrix;
