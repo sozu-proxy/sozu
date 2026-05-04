@@ -1,17 +1,21 @@
 ---
 name: CI
 
-on: [push, pull_request]
+on:
+  push:
+    branches: [main]
+    tags: ['**']
+  pull_request:
 
 env:
   CARGO_TERM_COLOR: always
 
-# Cancel superseded push+PR runs on feature branches; preserve runs on
-# `main` so artefacts produced under one SHA aren't lost when a newer
-# push lands.
+# Cancel superseded PR runs only. `main` pushes and tag pushes are
+# preserved so artefacts produced under one SHA aren't lost when a
+# newer push lands (and release tags must complete).
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   # ┌──────────────────────────────────────────────────────────────┐
