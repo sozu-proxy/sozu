@@ -17,10 +17,25 @@ To get started check out our [documentation](./doc/README.md) !
 
 ## Installation
 
-- **Pre-built binaries** for Linux are attached to every tagged release on the [GitHub Releases page](https://github.com/sozu-proxy/sozu/releases). The matrix covers `x86_64-unknown-linux-{gnu,musl}` and `aarch64-unknown-linux-{gnu,musl}`. Each release also carries a `SHA256SUMS` file, a sigstore keyless signature pair (`SHA256SUMS.sig` + `SHA256SUMS.pem`), and SLSA build-provenance attestations:
+- **Pre-built binaries** for Linux are attached to every tagged release on the [GitHub Releases page](https://github.com/sozu-proxy/sozu/releases). 12 tarballs cover the cross-product of:
+
+  - **target** (4): `x86_64-unknown-linux-{gnu,musl}` and `aarch64-unknown-linux-{gnu,musl}`
+  - **crypto provider feature** (3-4 per target):
+    - `crypto-ring` (default — ring backend, all 4 targets)
+    - `crypto-aws-lc-rs` (post-quantum capable, AWS-LC backend, all 4 targets)
+    - `crypto-openssl` (system OpenSSL backend, gnu targets only)
+    - `fips` (aws-lc-rs in FIPS-validated mode, no SLA per project policy, gnu targets only)
+
+  Tarball names follow `sozu-<VERSION>-<TARGET>-<PROVIDER>.tar.gz`. Each release also carries a `SHA256SUMS` file covering all 12 tarballs, a sigstore keyless signature pair (`SHA256SUMS.sig` + `SHA256SUMS.pem`), and SLSA build-provenance attestations.
 
   ```sh
-  curl -LO https://github.com/sozu-proxy/sozu/releases/download/<VERSION>/sozu-<VERSION>-<TARGET>.tar.gz
+  # Pick the (target, provider) combination you need. The default for
+  # operators who don't have a specific compliance constraint is
+  # crypto-ring on linux-gnu.
+  TARGET=x86_64-unknown-linux-gnu
+  PROVIDER=crypto-ring
+
+  curl -LO https://github.com/sozu-proxy/sozu/releases/download/<VERSION>/sozu-<VERSION>-${TARGET}-${PROVIDER}.tar.gz
   curl -LO https://github.com/sozu-proxy/sozu/releases/download/<VERSION>/SHA256SUMS
   curl -LO https://github.com/sozu-proxy/sozu/releases/download/<VERSION>/SHA256SUMS.sig
   curl -LO https://github.com/sozu-proxy/sozu/releases/download/<VERSION>/SHA256SUMS.pem
@@ -38,10 +53,10 @@ To get started check out our [documentation](./doc/README.md) !
 
   # Verify the tarball matches the signed sums:
   sha256sum -c SHA256SUMS --ignore-missing
-  tar -xzf sozu-<VERSION>-<TARGET>.tar.gz
+  tar -xzf sozu-<VERSION>-${TARGET}-${PROVIDER}.tar.gz
   ```
 
-  Build provenance can be inspected with `gh attestation verify sozu-<VERSION>-<TARGET>.tar.gz --owner sozu-proxy`. Pre-release tags (`X.Y.Z-rc.N`) are published as GitHub pre-releases.
+  Build provenance can be inspected with `gh attestation verify sozu-<VERSION>-<TARGET>-<PROVIDER>.tar.gz --owner sozu-proxy`. Pre-release tags (`X.Y.Z-rc.N`) are published as GitHub pre-releases.
 
 - **Docker** images are published to [Docker Hub](https://hub.docker.com/r/clevercloud/sozu/) for every tagged release as `clevercloud/sozu:<VERSION>` and `clevercloud/sozu:latest` (stable tags only).
 
