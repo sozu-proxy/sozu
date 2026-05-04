@@ -43,6 +43,40 @@ upgrade. See `doc/upgrade/1.x-to-2.0.md` for the full migration guide.
 
 ### ⛑️ Fixed
 
+- **Response-side header edits no longer re-injected on every prepare
+  cycle (`H2BlockConverter::finalize` "out buffer not empty" leak)**:
+  `apply_response_header_edits` was called inconditionally before
+  every `kawa.prepare(...)` pass for a stream
+  (`lib/src/protocol/mux/h2.rs` and `lib/src/protocol/mux/h1.rs`).
+  When `write_streams` re-entered the same stream for a follow-on
+  body chunk (multi-frame body, flow-control yield, RFC 9218
+  same-urgency round-robin), the helper re-injected each
+  `headers_response` edit AFTER the
+  `Block::Flags { end_header: true }` anchor had already been
+  consumed — `end_of_headers_index` returned `None` and the helper
+  fell back to `kawa.blocks.len()`, appending the edit past every
+  remaining DATA block. The next prepare cycle encoded the orphan
+  `Block::Header` into `H2BlockConverter.out` with no closing flags
+  block to flush it as a HEADERS frame, and `finalize` tripped the
+  "out buffer not empty (38 bytes remaining), clearing"
+  defense-in-depth log on every re-entry. 38 bytes is the
+  static-table HPACK encoding of a typical
+  `strict-transport-security: max-age=…; includeSubDomains` header,
+  which is how the symptom surfaced in production once
+  listener-default HSTS reached a non-trivial share of frontends on
+  a Clever Cloud `cleverapps.io` shared node. Beyond the spam, the
+  orphan encode also mutated the HPACK encoder's dynamic table
+  without the peer ever receiving the matching wire frame —
+  silent decoder desync that would have manifested as decode errors
+  on subsequent requests sharing the H2 connection. On H1 the same
+  pattern would have surfaced as duplicate `Strict-Transport-Security`
+  headers on the wire (RFC 6797 §6.1 — UAs MAY ignore the response
+  when more than one STS header is present). The fix drains
+  `parts.context.headers_response` via `mem::take` at both apply
+  sites so the injection runs exactly once per response. Regression
+  test in `e2e/src/tests/hsts_tests.rs::try_hsts_multi_frame_body_no_leak_no_duplicate_sts`
+  asserts a 256 KiB body (~16 H2 DATA frames) returns intact and
+  carries STS exactly once.
 - **Listener-default HSTS now refreshes "no policy" frontends too**:
   `Router::refresh_inheriting_hsts` (`lib/src/router/mod.rs`) previously
   walked only `Route::Frontend` entries — but the routing fast path in

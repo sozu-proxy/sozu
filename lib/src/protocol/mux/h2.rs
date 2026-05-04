@@ -2538,13 +2538,32 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 // position; the back-side H2 client (when sozu speaks
                 // H2 to a backend) is a request emission and was
                 // already mutated by Router::route_from_request.
+                //
+                // The snapshot is **drained** via `mem::take` so the
+                // injection runs exactly once per response. Without
+                // this, a re-entry of `write_streams` for the same
+                // stream (multi-frame body, flow-control yield, or
+                // RFC 9218 same-urgency round-robin) would re-call
+                // `apply_response_header_edits` after `kawa.prepare`
+                // had already consumed the `Block::Flags{end_header}`
+                // anchor — the helper falls back to
+                // `kawa.blocks.len()` and appends the edit AFTER all
+                // remaining DATA blocks. The next prepare cycle then
+                // encodes that orphan `Block::Header` into
+                // `H2BlockConverter.out` with no closing
+                // `Block::Flags{end_header}` to flush it as a HEADERS
+                // frame, and `H2BlockConverter::finalize` trips the
+                // "out buffer not empty (38 bytes remaining), clearing"
+                // defense-in-depth log on every re-entry. 38 bytes is
+                // the static-table HPACK encoding of a typical HSTS
+                // header, which is how the symptom surfaces in
+                // production once the listener-default HSTS reaches a
+                // non-trivial share of frontends.
                 if matches!(self.position, super::Position::Server)
                     && !parts.context.headers_response.is_empty()
                 {
-                    super::shared::apply_response_header_edits(
-                        kawa,
-                        &parts.context.headers_response,
-                    );
+                    let edits = std::mem::take(&mut parts.context.headers_response);
+                    super::shared::apply_response_header_edits(kawa, &edits);
                 }
                 kawa.prepare(&mut converter);
                 // The pre-prepare gate at line 2483 only inserts into
