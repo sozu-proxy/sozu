@@ -43,6 +43,34 @@ upgrade. See `doc/upgrade/1.x-to-2.0.md` for the full migration guide.
 
 ### ⛑️ Fixed
 
+- **`LoadState` accepts JSON state files from older `sozu-command-lib` clients
+  (`1.1.1` forward-compat)**: `bin/src/command/requests.rs::load_state` reads
+  each `\n\0`-separated JSON record via
+  `command::parser::parse_several_requests::<WorkerRequest>`, which calls
+  `serde_json::from_slice` per record. The `command/build.rs` prost-build config
+  attaches `Serialize`/`Deserialize` derives to every generated message but did
+  not attach `#[serde(default)]` anywhere, so missing `repeated`/`map` fields
+  rejected the record (`Vec<T>` and `BTreeMap<K, V>` are required-by-serde
+  without an explicit default). Post-1.1.1 schema additions (`Cluster.answers`,
+  `Cluster.authorized_hashes`, `RequestHttpFrontend.headers` from #1231;
+  `HttpListenerConfig.answers`, `HttpsListenerConfig.alpn_protocols` /
+  `answers`, `TcpListenerConfig.answers` from the same wave) therefore broke
+  `LoadState` for any older client (e.g. `proxy-manager` pinned to
+  `sozu-command-lib = "1.1.1"`): the first `AddCluster` or `AddHttpFrontend`
+  failed to deserialize, `parse_several_requests`'s `many0(complete(...))` left
+  the unparsed bytes as the remainder, and the read loop in `load_state`
+  reported `"Error consuming load state message"` to the client at EOF. Each
+  post-1.1.1 `repeated`/`map` field on a state-file-emittable message now
+  carries `#[serde(default)]` via `command/build.rs` `field_attribute(...)`, so
+  missing fields default to empty (mirroring the protobuf wire-format default)
+  while required scalars stay strict. Without strictness on scalars,
+  `ConfigState::add_cluster` would silently insert a `""`-keyed entry — the
+  field-level annotation preserves that defense-in-depth. Forward additions are
+  guarded by `command/tests/state_compat_v1_1_1.rs`, which pins both the 1.1.1
+  fixture round-trip and the missing-required-scalar rejection contract; a
+  documentation comment at the top of `command/src/command.proto` and at the
+  relevant block in `command/build.rs` codifies the new rule for future
+  `repeated`/`map` field additions.
 - **Certificate chain dedup: drop the leaf when ACME `fullchain.pem` is supplied
   as the chain ([#1135](https://github.com/sozu-proxy/sozu/issues/1135),
   [#1148](https://github.com/sozu-proxy/sozu/issues/1148))**:

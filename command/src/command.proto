@@ -1,6 +1,21 @@
 syntax = "proto2";
 package command;
 
+// JSON state-file forward compat: `SaveState`/`LoadState` write
+// `WorkerRequest`s as `\n\0`-separated JSON records. Older clients (e.g.
+// `sozu-command-lib = "1.1.1"`) emit only the field set their schema knew,
+// so missing `repeated` / `map` fields must default to empty when the
+// current schema deserializes them. New schema rules:
+//   - new fields must be additive — proto2 `optional`, or `repeated`/`map`,
+//   - never rename or change the type of an existing field,
+//   - when adding a `repeated` or `map` field to a message that appears in
+//     a state file (anything emitted by `ConfigState::generate_requests` or
+//     carried in a `RequestType` an external client may build), add the
+//     matching `field_attribute(... "#[serde(default)]")` line in
+//     `command/build.rs`. Required scalars stay strict on purpose so
+//     malformed records still fail before dispatch.
+// Regression guard: `command/tests/state_compat_v1_1_1.rs`.
+
 // A message received by Sōzu to change its state or query information
 message Request {
   oneof request_type {

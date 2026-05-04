@@ -41,6 +41,29 @@ pub fn main() {
         .message_attribute("HttpsListenerConfig", "#[derive(Hash, Eq)]")
         .message_attribute("UpdateHttpListenerConfig", "#[derive(Hash, Eq)]")
         .message_attribute("UpdateHttpsListenerConfig", "#[derive(Hash, Eq)]")
+        // JSON state-file forward compat: `SaveState`/`LoadState` files are
+        // JSON-encoded `WorkerRequest` records. Without `#[serde(default)]`,
+        // serde rejects records that don't carry every `Vec`/`map` field — so
+        // a payload written by an older `sozu-command-lib` (e.g. 1.1.1) fails
+        // to deserialize once a new `repeated`/`map` field lands on a message
+        // that older clients still emit. The annotations below mirror the
+        // protobuf wire-format default (empty repeated, empty map) for the
+        // post-1.1.1 additions on every state-file-emittable message.
+        // Required scalars stay strict on purpose: `add_cluster` keys the
+        // cluster map by `cluster_id` without a non-empty check, so a
+        // struct-level blanket would silently insert a bogus `""`-keyed
+        // entry. Whenever a new `repeated`/`map` field is added to a message
+        // that appears in `ConfigState::generate_requests` (or in any
+        // `RequestType` an external client builds and feeds through
+        // `LoadState`), append the matching `field_attribute` line here.
+        // Regression guard: `command/tests/state_compat_v1_1_1.rs`.
+        .field_attribute("Cluster.answers", "#[serde(default)]")
+        .field_attribute("Cluster.authorized_hashes", "#[serde(default)]")
+        .field_attribute("RequestHttpFrontend.headers", "#[serde(default)]")
+        .field_attribute("HttpListenerConfig.answers", "#[serde(default)]")
+        .field_attribute("HttpsListenerConfig.alpn_protocols", "#[serde(default)]")
+        .field_attribute("HttpsListenerConfig.answers", "#[serde(default)]")
+        .field_attribute("TcpListenerConfig.answers", "#[serde(default)]")
         .enum_attribute(".", "#[serde(rename_all = \"SCREAMING_SNAKE_CASE\")]")
         .enum_attribute(
             "ResponseContent.content_type",
