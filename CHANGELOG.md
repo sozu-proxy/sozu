@@ -315,6 +315,24 @@ upgrade. See `doc/upgrade/1.x-to-2.0.md` for the full migration guide.
   HTTPS-served default answers carry HSTS (RFC 6797 §8.1) while plaintext HTTP
   listeners can never leak the header (defense in depth on top of config-load
   validation).
+- **`sozu listener https update` exposes the HSTS knobs**: the
+  `UpdateHttpsListenerConfig.hsts` partial-update path is now reachable from
+  the CLI without crafting a typed IPC message. `bin/src/cli.rs` adds
+  `--hsts-max-age`, `--hsts-include-subdomains`, `--hsts-preload`,
+  `--hsts-force-replace-backend`, and the kill-switch `--hsts-disabled` (with
+  `conflicts_with_all` against the four enabling flags) on
+  `HttpsListenerCmd::Update`; the request builder reuses the existing
+  `build_hsts_from_cli` helper so mutual-exclusion validation and the
+  `DEFAULT_HSTS_MAX_AGE = 31_536_000` substitution stay in lock-step with
+  `frontend https add`. Supplying any flag flips the listener's policy and
+  triggers the existing `Router::refresh_inheriting_hsts` reflow on every
+  frontend that did not declare a per-frontend `[hsts]` block at add time;
+  `--hsts-disabled` substitutes the `enabled = Some(false)` block. Coverage:
+  five new clap-parse tests under `bin/src/cli.rs::tests` cover the
+  enabling-flags happy path, the `--hsts-disabled`-alone path, the
+  no-flag-at-all sanity case (existing surface unchanged), and the two
+  conflict cases (`--hsts-disabled` with `--hsts-max-age` /
+  `--hsts-force-replace-backend`).
 - **Per-cluster availability surface
   ([#892](https://github.com/sozu-proxy/sozu/issues/892))**: closes the
   long-standing observability gap in which a cluster losing every backend

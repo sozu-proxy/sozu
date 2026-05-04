@@ -1273,6 +1273,41 @@ pub enum HttpsListenerCmd {
         answer_504: Option<PathBuf>,
         #[clap(long, help = "path to file for the 507 answer body")]
         answer_507: Option<PathBuf>,
+
+        // ── HSTS (RFC 6797) listener-default knobs ──
+        // Same surface as `frontend https add`. The full `HstsConfig`
+        // patch follows the documented full-object replacement
+        // semantics on `UpdateHttpsListenerConfig.hsts`: when any of
+        // these flags is supplied the listener's HSTS policy is
+        // replaced wholesale, and `Router::refresh_inheriting_hsts`
+        // reflows the new policy onto every frontend that inherits
+        // from this listener (no per-frontend override).
+        #[clap(
+            long = "hsts-max-age",
+            help = "HSTS (RFC 6797) `max-age` directive in seconds. Setting any of the --hsts-* flags replaces the listener's HSTS policy and refreshes inheriting frontends. Defaults to 31536000 (1 year, HSTS preload list minimum) when --hsts-max-age is omitted but another --hsts-* flag is set. `0` is the RFC 6797 §11.4 kill switch."
+        )]
+        hsts_max_age: Option<u32>,
+        #[clap(
+            long = "hsts-include-subdomains",
+            help = "Append `; includeSubDomains` to the rendered HSTS header. Implies HSTS enabled."
+        )]
+        hsts_include_subdomains: bool,
+        #[clap(
+            long = "hsts-preload",
+            help = "Append `; preload` to the rendered HSTS header (Chrome HSTS preload list — see https://hstspreload.org/). Implies HSTS enabled. Opt-in only; once submitted, removal from the preload list is slow and partial (RFC 6797 §14.2)."
+        )]
+        hsts_preload: bool,
+        #[clap(
+            long = "hsts-disabled",
+            conflicts_with_all = ["hsts_max_age", "hsts_include_subdomains", "hsts_preload", "hsts_force_replace_backend"],
+            help = "Explicitly disable the listener-default HSTS, suppressing it for inheriting frontends. Mutually exclusive with --hsts-max-age / --hsts-include-subdomains / --hsts-preload / --hsts-force-replace-backend."
+        )]
+        hsts_disabled: bool,
+        #[clap(
+            long = "hsts-force-replace-backend",
+            help = "Override any backend-supplied `Strict-Transport-Security` header with sōzu's typed policy instead of preserving it (RFC 6797 §6.1 backend-wins is the default). Implies HSTS enabled."
+        )]
+        hsts_force_replace_backend: bool,
     },
 }
 
@@ -1516,5 +1551,165 @@ mod tests {
             ])),
             parse_tags(tags_to_parse)
         );
+    }
+
+    // ── HSTS flags on `sozu listener https update` ──
+    // Validates the clap surface exposed for the hot listener-default
+    // HSTS patch path (UpdateHttpsListenerConfig.hsts). The destructure
+    // has to stay in lock-step with `request_builder.rs::https_listener_command`
+    // — these tests catch a missed field rename or a forgotten dispatch
+    // arg the next time clap-derive grows another `Update` knob.
+
+    fn extract_https_update(args: super::Args) -> super::HttpsListenerCmd {
+        match args.cmd {
+            super::SubCmd::Listener {
+                cmd: super::ListenerCmd::Https { cmd },
+            } => cmd,
+            other => panic!("expected listener https subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn listener_https_update_parses_hsts_enabling_flags() {
+        use super::*;
+
+        let args = Args::try_parse_from([
+            "sozu",
+            "listener",
+            "https",
+            "update",
+            "-a",
+            "127.0.0.1:443",
+            "--hsts-max-age",
+            "31536000",
+            "--hsts-include-subdomains",
+            "--hsts-force-replace-backend",
+        ])
+        .expect("clap should accept --hsts-* on listener https update");
+
+        let HttpsListenerCmd::Update {
+            hsts_max_age,
+            hsts_include_subdomains,
+            hsts_preload,
+            hsts_disabled,
+            hsts_force_replace_backend,
+            ..
+        } = extract_https_update(args)
+        else {
+            panic!("expected HttpsListenerCmd::Update");
+        };
+        assert_eq!(hsts_max_age, Some(31_536_000));
+        assert!(hsts_include_subdomains);
+        assert!(!hsts_preload);
+        assert!(!hsts_disabled);
+        assert!(hsts_force_replace_backend);
+    }
+
+    #[test]
+    fn listener_https_update_parses_hsts_disabled_alone() {
+        use super::*;
+
+        let args = Args::try_parse_from([
+            "sozu",
+            "listener",
+            "https",
+            "update",
+            "-a",
+            "127.0.0.1:443",
+            "--hsts-disabled",
+        ])
+        .expect("clap should accept --hsts-disabled on listener https update");
+
+        let HttpsListenerCmd::Update {
+            hsts_disabled,
+            hsts_max_age,
+            hsts_include_subdomains,
+            hsts_preload,
+            hsts_force_replace_backend,
+            ..
+        } = extract_https_update(args)
+        else {
+            panic!("expected HttpsListenerCmd::Update");
+        };
+        assert!(hsts_disabled);
+        assert_eq!(hsts_max_age, None);
+        assert!(!hsts_include_subdomains);
+        assert!(!hsts_preload);
+        assert!(!hsts_force_replace_backend);
+    }
+
+    #[test]
+    fn listener_https_update_no_hsts_flags_inherits_listener_default() {
+        use super::*;
+
+        // Sanity: the new flags are all optional and the existing
+        // surface still parses with no `--hsts-*` argument at all.
+        let args = Args::try_parse_from([
+            "sozu",
+            "listener",
+            "https",
+            "update",
+            "-a",
+            "127.0.0.1:443",
+            "--front-timeout",
+            "120",
+        ])
+        .expect("clap should accept the existing listener-update surface unchanged");
+
+        let HttpsListenerCmd::Update {
+            hsts_max_age,
+            hsts_include_subdomains,
+            hsts_preload,
+            hsts_disabled,
+            hsts_force_replace_backend,
+            front_timeout,
+            ..
+        } = extract_https_update(args)
+        else {
+            panic!("expected HttpsListenerCmd::Update");
+        };
+        assert_eq!(hsts_max_age, None);
+        assert!(!hsts_include_subdomains);
+        assert!(!hsts_preload);
+        assert!(!hsts_disabled);
+        assert!(!hsts_force_replace_backend);
+        assert_eq!(front_timeout, Some(120));
+    }
+
+    #[test]
+    fn listener_https_update_hsts_disabled_conflicts_with_max_age() {
+        use super::*;
+
+        let err = Args::try_parse_from([
+            "sozu",
+            "listener",
+            "https",
+            "update",
+            "-a",
+            "127.0.0.1:443",
+            "--hsts-disabled",
+            "--hsts-max-age",
+            "31536000",
+        ])
+        .expect_err("clap should reject --hsts-disabled with --hsts-max-age");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn listener_https_update_hsts_disabled_conflicts_with_force_replace_backend() {
+        use super::*;
+
+        let err = Args::try_parse_from([
+            "sozu",
+            "listener",
+            "https",
+            "update",
+            "-a",
+            "127.0.0.1:443",
+            "--hsts-disabled",
+            "--hsts-force-replace-backend",
+        ])
+        .expect_err("clap should reject --hsts-disabled with --hsts-force-replace-backend");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 }

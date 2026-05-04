@@ -518,6 +518,11 @@ impl CommandManager {
                 answer_503,
                 answer_504,
                 answer_507,
+                hsts_max_age,
+                hsts_include_subdomains,
+                hsts_preload,
+                hsts_disabled,
+                hsts_force_replace_backend,
             } => self.update_https_listener_command(
                 address,
                 public_address,
@@ -563,6 +568,11 @@ impl CommandManager {
                 answer_503,
                 answer_504,
                 answer_507,
+                hsts_max_age,
+                hsts_include_subdomains,
+                hsts_preload,
+                hsts_disabled,
+                hsts_force_replace_backend,
             ),
         }
     }
@@ -874,6 +884,11 @@ impl CommandManager {
         answer_503: Option<PathBuf>,
         answer_504: Option<PathBuf>,
         answer_507: Option<PathBuf>,
+        hsts_max_age: Option<u32>,
+        hsts_include_subdomains: bool,
+        hsts_preload: bool,
+        hsts_disabled: bool,
+        hsts_force_replace_backend: bool,
     ) -> Result<(), CtlError> {
         let expect_proxy = if expect_proxy_flag {
             Some(true)
@@ -913,6 +928,18 @@ impl CommandManager {
             answer_502, answer_503, answer_504, answer_507,
         )?;
 
+        // Reuses the same builder as `frontend https add` so the
+        // mutual-exclusion rules and the canonical
+        // `DEFAULT_HSTS_MAX_AGE` substitution stay in lock-step
+        // between the two CLI surfaces.
+        let hsts = build_hsts_from_cli(
+            hsts_max_age,
+            hsts_include_subdomains,
+            hsts_preload,
+            hsts_disabled,
+            hsts_force_replace_backend,
+        )?;
+
         let patch = UpdateHttpsListenerConfig {
             address: address.into(),
             public_address: public_address.map(|a| a.into()),
@@ -944,6 +971,7 @@ impl CommandManager {
             h2_graceful_shutdown_deadline_seconds,
             h2_max_window_update_stream0_per_window,
             sozu_id_header,
+            hsts,
             ..Default::default()
         };
         self.send_request(RequestType::UpdateHttpsListener(patch).into())
