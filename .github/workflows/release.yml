@@ -170,7 +170,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Cache cargo target
-        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae  # v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
         with:
           cache-all-crates: true
           prefix-key: release-${{ matrix.target }}-${{ matrix.provider }}
@@ -304,7 +304,7 @@ jobs:
           cat SHA256SUMS
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@f713795cb21599bc4e5c4b58cbad1da852d7eeb9  # v3
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac  # v3
 
       - name: Sign SHA256SUMS (keyless via sigstore)
         working-directory: dist
@@ -334,7 +334,7 @@ jobs:
             SHA256SUMS
 
       - name: Generate SLSA build provenance
-        uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661  # v3
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a  # v3
         with:
           subject-path: 'dist/sozu-*.tar.gz'
 
@@ -370,7 +370,7 @@ jobs:
           cat RELEASE_BODY.md
 
       - name: Create GitHub Release (draft)
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda  # v3.0.0
         with:
           tag_name: ${{ needs.preflight.outputs.tag }}
           name: ${{ needs.preflight.outputs.version }}
