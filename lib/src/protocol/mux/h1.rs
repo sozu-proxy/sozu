@@ -430,8 +430,18 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         // touches the response back-kawa; the Client-position pass
         // (writing the request to the backend) has already had its
         // edits applied in `Router::route_from_request`.
+        //
+        // Drained via `mem::take` so the injection runs exactly once
+        // per response. H1 keep-alive can re-enter this writable path
+        // for the same stream when the backend response spans more
+        // than one TCP read; without the take, the second pass would
+        // re-insert the same headers (typically as duplicate STS lines
+        // on the wire — RFC 6797 §6.1 expects a single header). On H2
+        // the same multi-prepare-cycle pattern surfaces as a
+        // `H2BlockConverter::finalize` "out buffer not empty" leak.
         if matches!(self.position, Position::Server) && !parts.context.headers_response.is_empty() {
-            super::shared::apply_response_header_edits(kawa, &parts.context.headers_response);
+            let edits = std::mem::take(&mut parts.context.headers_response);
+            super::shared::apply_response_header_edits(kawa, &edits);
         }
         kawa.prepare(&mut kawa::h1::BlockConverter);
         let mut io_slices = Vec::new();
