@@ -121,6 +121,48 @@ pub fn resolve_request(client: &HttpsClient, uri: hyper::Uri) -> Option<(StatusC
     resolve_request_timeout(client, uri, Duration::from_secs(10))
 }
 
+/// Variant of [`resolve_request`] that also returns the response
+/// `HeaderMap`. Used by the HSTS e2e tests to assert on
+/// `Strict-Transport-Security` (and any other response-side header
+/// emitted by sozu) rather than relying on the body. Same 10 s
+/// timeout as [`resolve_request`]; the inner future does not follow
+/// redirects so 3xx default answers stay as-is for the assertion.
+pub fn resolve_request_with_headers(
+    client: &HttpsClient,
+    uri: hyper::Uri,
+) -> Option<(StatusCode, hyper::HeaderMap, String)> {
+    let rt = tokio::runtime::Runtime::new().expect("Could not create Runtime");
+    rt.block_on(async {
+        let fut = async {
+            let response = match client.get(uri).await {
+                Ok(response) => response,
+                Err(error) => {
+                    println!("Could not get response: {error}");
+                    return None;
+                }
+            };
+            let status = response.status();
+            let headers = response.headers().clone();
+            let body_bytes = match response.into_body().collect().await {
+                Ok(collected) => collected.to_bytes(),
+                Err(error) => {
+                    println!("Could not get body: {error}");
+                    return Some((status, headers, String::new()));
+                }
+            };
+            let body = String::from_utf8(body_bytes.to_vec()).unwrap_or_default();
+            Some((status, headers, body))
+        };
+        match tokio::time::timeout(Duration::from_secs(10), fut).await {
+            Ok(result) => result,
+            Err(_) => {
+                println!("resolve_request_with_headers timed out after 10s");
+                None
+            }
+        }
+    })
+}
+
 pub fn resolve_request_timeout(
     client: &HttpsClient,
     uri: hyper::Uri,

@@ -1255,6 +1255,31 @@ impl Frontend {
             _ => false,
         };
         if deny {
+            // The Unauthorized policy zeroes out request rewrites and
+            // header injections (the request never reaches a backend),
+            // but RFC 6797 §8.1 still requires HSTS on the 401 default
+            // answer when the frontend is on an HTTPS listener. Build
+            // the HSTS edit (when configured) so the per-stream
+            // snapshot copy in `mux/router.rs` carries it through to
+            // `set_default_answer_with_retry_after`.
+            let mut deny_headers_response: Vec<HeaderEdit> = Vec::new();
+            if let Some(cfg) = hsts
+                && matches!(cfg.enabled, Some(true))
+                && let Some(rendered) = render_hsts(cfg)
+            {
+                let mode = if matches!(cfg.force_replace_backend, Some(true)) {
+                    HeaderEditMode::Set
+                } else {
+                    HeaderEditMode::SetIfAbsent
+                };
+                deny_headers_response.push(HeaderEdit {
+                    key: Rc::from(&b"strict-transport-security"[..]),
+                    val: rendered.into_bytes().into(),
+                    mode,
+                });
+                crate::incr!("http.hsts.frontend_added");
+            }
+
             return Ok(Self {
                 cluster_id,
                 redirect: RedirectPolicy::Unauthorized,
@@ -1266,16 +1291,9 @@ impl Frontend {
                 rewrite_path: None,
                 rewrite_port: None,
                 headers_request: Rc::new([]),
-                headers_response: Rc::new([]),
+                headers_response: deny_headers_response.into(),
                 required_auth,
                 tags,
-                // Unauthorized branch never emits HSTS — no headers reach
-                // the wire that aren't the proxy's typed default-answer
-                // 401, which goes through `set_default_answer` and reads
-                // `headers_response` separately. Carry the inheritance
-                // bit through anyway so a later listener-default patch
-                // recognises the entry as inheriting (refresh is a no-op
-                // because `headers_response` is empty).
                 inherits_listener_hsts,
             });
         }
@@ -1528,6 +1546,11 @@ impl RouteResult {
     ) -> Self {
         // Unauthorized short-circuit: skip the path-capture extraction
         // entirely — the response will not consume any rewrite output.
+        // `headers_response` IS preserved here (unlike `headers_request`)
+        // so the per-stream snapshot copy in `mux/router.rs` can still
+        // pick up the per-frontend HSTS edit and inject it on the 401
+        // default answer (RFC 6797 §8.1 — HSTS applies to all response
+        // codes, including the proxy's typed unauthorized answer).
         if frontend.redirect == RedirectPolicy::Unauthorized {
             return Self {
                 cluster_id: frontend.cluster_id.clone(),
@@ -1538,7 +1561,7 @@ impl RouteResult {
                 rewritten_path: None,
                 rewritten_port: None,
                 headers_request: Rc::new([]),
-                headers_response: Rc::new([]),
+                headers_response: frontend.headers_response.clone(),
                 required_auth: frontend.required_auth,
                 tags: frontend.tags.clone(),
             };
