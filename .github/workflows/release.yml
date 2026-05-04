@@ -81,7 +81,7 @@ jobs:
           fi
 
   build:
-    name: Build ${{ matrix.target }}
+    name: Build ${{ matrix.target }} (${{ matrix.provider }})
     needs: preflight
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -92,19 +92,65 @@ jobs:
       # release is structurally impossible.
       fail-fast: false
       matrix:
+        # 12 cells = 4 ring + 4 aws-lc-rs + 2 openssl-gnu + 2 fips-gnu.
+        # `crypto-openssl` is gnu-only because rustls-openssl pulls in
+        # `openssl-sys`, which on musl needs `openssl/vendored` to link
+        # cleanly — out of scope here. `fips` is gnu-only because the
+        # aws-lc-fips-sys precompiled FIPS module assumes glibc; cmake
+        # is required for the aws-lc-rs C bindings (incl. fips).
         include:
+          # crypto-ring (default, ring backend) — all 4 targets
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
+            provider: crypto-ring
             apt: protobuf-compiler
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-latest
+            provider: crypto-ring
             apt: protobuf-compiler musl-tools
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
+            provider: crypto-ring
             apt: protobuf-compiler
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
+            provider: crypto-ring
             apt: protobuf-compiler musl-tools
+          # crypto-aws-lc-rs (post-quantum capable, AWS-LC backend) — all 4 targets
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            provider: crypto-aws-lc-rs
+            apt: protobuf-compiler cmake
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            provider: crypto-aws-lc-rs
+            apt: protobuf-compiler cmake musl-tools
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            provider: crypto-aws-lc-rs
+            apt: protobuf-compiler cmake
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            provider: crypto-aws-lc-rs
+            apt: protobuf-compiler cmake musl-tools
+          # crypto-openssl (system OpenSSL backend) — gnu only
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            provider: crypto-openssl
+            apt: protobuf-compiler libssl-dev pkg-config
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            provider: crypto-openssl
+            apt: protobuf-compiler libssl-dev pkg-config
+          # fips (aws-lc-rs in FIPS mode, no SLA per project policy) — gnu only
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            provider: fips
+            apt: protobuf-compiler cmake
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            provider: fips
+            apt: protobuf-compiler cmake
     steps:
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y ${{ matrix.apt }}
@@ -127,7 +173,7 @@ jobs:
         uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae  # v2
         with:
           cache-all-crates: true
-          prefix-key: release-${{ matrix.target }}
+          prefix-key: release-${{ matrix.target }}-${{ matrix.provider }}
 
       - name: Resolve SOURCE_DATE_EPOCH from tag commit
         id: sde
@@ -146,7 +192,7 @@ jobs:
           SOURCE_DATE_EPOCH: ${{ steps.sde.outputs.epoch }}
         run: |
           cargo build --locked --release -p sozu \
-            --no-default-features --features jemallocator,crypto-ring \
+            --no-default-features --features jemallocator,${{ matrix.provider }} \
             --target ${{ matrix.target }}
 
       - name: Strip binary
@@ -156,10 +202,11 @@ jobs:
         env:
           VERSION: ${{ needs.preflight.outputs.version }}
           TARGET: ${{ matrix.target }}
+          PROVIDER: ${{ matrix.provider }}
           SOURCE_DATE_EPOCH: ${{ steps.sde.outputs.epoch }}
         run: |
           set -euo pipefail
-          STAGE="sozu-${VERSION}-${TARGET}"
+          STAGE="sozu-${VERSION}-${TARGET}-${PROVIDER}"
           mkdir -p "${STAGE}"
           cp "target/${TARGET}/release/sozu" "${STAGE}/sozu"
           cp LICENSE "${STAGE}/LICENSE-AGPL3"
@@ -188,6 +235,11 @@ jobs:
 
           The full AGPL-3.0 license text is in this archive as LICENSE-AGPL3.
           The full LGPL-3.0 license text is in this archive as LICENSE-LGPL3.
+
+          Build configuration:
+            - target: ${TARGET}
+            - crypto provider feature: ${PROVIDER}
+            - cargo features: jemallocator,${PROVIDER}
           EOF
           # Reproducibility best-effort: pin tar mtimes to
           # SOURCE_DATE_EPOCH and use a stable owner/sort.
@@ -198,9 +250,9 @@ jobs:
       - name: Upload artefact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
         with:
-          name: sozu-${{ needs.preflight.outputs.version }}-${{ matrix.target }}
+          name: sozu-${{ needs.preflight.outputs.version }}-${{ matrix.target }}-${{ matrix.provider }}
           path: |
-            sozu-${{ needs.preflight.outputs.version }}-${{ matrix.target }}.tar.gz
+            sozu-${{ needs.preflight.outputs.version }}-${{ matrix.target }}-${{ matrix.provider }}.tar.gz
           retention-days: 7
 
   release:
@@ -227,16 +279,17 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Verify all four tarballs landed
+      - name: Verify all 12 tarballs landed
         working-directory: dist
         run: |
           set -euo pipefail
           # Defensive count assertion — catches silent collisions if
           # `download-artifact merge-multiple: true` ever flattens two
-          # cells into the same name.
+          # cells into the same name. 12 = 4 ring + 4 aws-lc-rs + 2
+          # openssl-gnu + 2 fips-gnu (matches the build matrix above).
           count=$(find . -maxdepth 1 -name 'sozu-*.tar.gz' | wc -l)
-          if [ "${count}" -ne 4 ]; then
-            echo "::error::expected 4 tarballs in dist/, found ${count}"
+          if [ "${count}" -ne 12 ]; then
+            echo "::error::expected 12 tarballs in dist/, found ${count}"
             ls -la
             exit 1
           fi
