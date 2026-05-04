@@ -1,35 +1,50 @@
 //! End-to-end coverage for the typed HSTS (RFC 6797) policy.
 //!
-//! Wire-level positive coverage (HTTPS frontend emits the
-//! `Strict-Transport-Security` header on backend-served responses,
-//! redirect-default answers, and 5xx default answers) is intentionally
-//! deferred — those tests need a full TLS stack (cert generation,
-//! `https_client::build_https_client`, `H2Backend`) and the per-test
-//! setup is heavier than the §7.2 reject path covered here. The
-//! unit tests in `lib/src/router/mod.rs::tests::render_hsts_*` and
-//! `lib/src/protocol/mux/shared.rs::tests` exercise the rendering and
-//! `apply_response_header_edits` SetIfAbsent paths exhaustively.
-//!
-//! What this module covers:
+//! Plain-HTTP §7.2 reject paths:
 //! - **§7.2 reject at the worker IPC entry point**: `AddHttpFrontend`
 //!   carrying `hsts.enabled = true` is rejected with `ResponseStatus::Failure`
 //!   (the `ProxyError::HstsOnPlainHttp` arm). Defense in depth on top of the
 //!   TOML config-load reject.
-//! - **`hsts.enabled = false` on plain HTTP is accepted**: the explicit
-//!   disable signal must NOT trip the §7.2 reject — it's the operator's
-//!   way of suppressing an inherited listener default.
+//! - **`hsts.enabled = false` on plain HTTP is also rejected**: there is no
+//!   listener-default HSTS to inherit on an HTTP listener (the field doesn't
+//!   exist on `HttpListenerConfig`), so the explicit-disable signal has
+//!   nothing to suppress on this surface.
+//!
+//! Wire-level HTTPS positive paths (`Strict-Transport-Security` reaches
+//! the client on every response code per RFC 6797 §8.1):
+//! - **HSTS on a backend-served 200 response** through an HTTPS frontend.
+//! - **HSTS on a 301 redirect default answer** rendered when the frontend
+//!   carries `redirect = permanent` + `redirect_scheme = use-https`.
+//! - **HSTS on a 401 unauthorized default answer** rendered when the
+//!   frontend carries `redirect = unauthorized`.
+//! - **HSTS on a 503 default answer** rendered when the configured backend
+//!   is unreachable. Confirms the snapshot-copy hoist in `mux/router.rs`
+//!   and the `set_default_answer_with_retry_after` chokepoint both
+//!   thread the per-frontend HSTS edit through to the wire.
+//!
+//! All HTTPS tests use the `local-certificate.pem` shipped under
+//! `lib/assets/`, the `build_h2_or_h1_client` Hyper client, and the
+//! `resolve_request_with_headers` helper so the assertion sees both
+//! the status line and the `Strict-Transport-Security` header.
 
 use sozu_command_lib::{
     config::ListenerBuilder,
     proto::command::{
-        ActivateListener, HstsConfig, ListenerType, Request, ResponseStatus, request::RequestType,
+        ActivateListener, AddCertificate, CertificateAndKey, HstsConfig, ListenerType,
+        RedirectPolicy, RedirectScheme, Request, RequestHttpFrontend, ResponseStatus,
+        SocketAddress, request::RequestType,
     },
 };
 
 use crate::{
+    mock::{
+        aggregator::SimpleAggregator,
+        async_backend::BackendHandle as AsyncBackend,
+        https_client::{build_h2_or_h1_client, resolve_request_with_headers},
+    },
     sozu::worker::Worker,
     tests::{
-        State, repeat_until_error_or,
+        State, provide_port, repeat_until_error_or,
         tests::{create_local_address, create_unbound_local_address},
     },
 };
@@ -180,6 +195,373 @@ fn test_hsts_explicit_disable_on_http_rejected() {
             2,
             "HSTS enabled = false on HTTP frontend rejected",
             try_hsts_explicit_disable_on_http_rejected
+        ),
+        State::Success
+    );
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// Wire-level HTTPS positives — HSTS on every response code (RFC §8.1)
+// ═════════════════════════════════════════════════════════════════════
+
+/// Canonical HSTS rendered value used by every HTTPS positive test
+/// below. Matches the default `max_age = 31_536_000` (1 year, the HSTS
+/// preload list minimum) plus `includeSubDomains` set by the operator.
+/// Asserting on the exact value keeps the test honest — a regression in
+/// `render_hsts` that, e.g., reordered the directives or dropped
+/// `includeSubDomains` would surface as a string mismatch instead of a
+/// generic header-presence pass.
+const EXPECTED_HSTS_VALUE: &str = "max-age=31536000; includeSubDomains";
+
+/// Build a typed HSTS block: `enabled = true`, `max_age = 31_536_000`,
+/// `include_subdomains = true`, `preload = false`. Used by the four
+/// positive tests below so the assertion can compare against
+/// [`EXPECTED_HSTS_VALUE`] verbatim.
+fn make_hsts_default() -> HstsConfig {
+    HstsConfig {
+        enabled: Some(true),
+        max_age: Some(31_536_000),
+        include_subdomains: Some(true),
+        preload: None,
+        force_replace_backend: None,
+    }
+}
+
+/// Spawn an HTTPS worker with a single TLS listener at `front_address`
+/// and the local-only `localhost` certificate attached. Returns the
+/// worker. The caller layers cluster + frontend + backends on top.
+///
+/// Mirrors the setup in `tls_tests.rs::try_tls_sni_routing` so the HSTS
+/// e2e tests reuse the existing TLS scaffold (cert generation,
+/// `provide_port`, `Worker::empty_https_config`).
+fn spawn_https_worker(name: &str, front_address: SocketAddress) -> Worker {
+    let (config, listeners, state) = Worker::empty_https_config(front_address.into());
+    let mut worker = Worker::start_new_worker_owned(name, config, listeners, state);
+
+    worker.send_proxy_request_type(RequestType::AddHttpsListener(
+        ListenerBuilder::new_https(front_address.clone())
+            .to_tls(None)
+            .expect("default HTTPS listener must build"),
+    ));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        address: front_address.clone(),
+        proxy: ListenerType::Https.into(),
+        from_scm: false,
+    }));
+
+    let certificate_and_key = CertificateAndKey {
+        certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
+        key: String::from(include_str!("../../../lib/assets/local-key.pem")),
+        certificate_chain: vec![],
+        versions: vec![],
+        names: vec![],
+    };
+    worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+        address: front_address,
+        certificate: certificate_and_key,
+        expired_at: None,
+    }));
+
+    worker
+}
+
+/// HTTPS frontend with `hsts.enabled = true` returns the
+/// `Strict-Transport-Security` header on a backend-served 200 response.
+/// The canonical positive case — RFC 6797 §8.1 says HSTS applies to
+/// every response code, but the 2xx Forward path is the most common
+/// production shape and the one operators primarily care about.
+pub fn try_hsts_on_https_backend_200() -> State {
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+    let back_address = create_local_address();
+    let mut worker = spawn_https_worker("HSTS-HTTPS-200", front_address.clone());
+
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "hsts_https_200",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        hostname: "localhost".to_owned(),
+        hsts: Some(make_hsts_default()),
+        ..Worker::default_http_frontend("hsts_https_200", front_address.clone().into())
+    }));
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "hsts_https_200",
+        "hsts_https_200-0",
+        back_address,
+        None,
+    )));
+
+    let mut backend = AsyncBackend::spawn_detached_backend(
+        "BACKEND_200",
+        back_address,
+        SimpleAggregator::default(),
+        AsyncBackend::http_handler("pong-hsts"),
+    );
+    worker.read_to_last();
+
+    let client = build_h2_or_h1_client();
+    let uri: hyper::Uri = format!("https://localhost:{front_port}/")
+        .parse()
+        .expect("valid uri");
+    let resp = resolve_request_with_headers(&client, uri);
+
+    worker.soft_stop();
+    let _ = worker.wait_for_server_stop();
+    let _ = backend.stop_and_get_aggregator();
+
+    match resp {
+        Some((status, headers, body)) => {
+            let sts = headers.get("strict-transport-security");
+            let ok = status.is_success()
+                && body.contains("pong-hsts")
+                && sts.is_some_and(|v| v.as_bytes() == EXPECTED_HSTS_VALUE.as_bytes());
+            if ok {
+                State::Success
+            } else {
+                eprintln!(
+                    "expected 2xx + body 'pong-hsts' + STS = {EXPECTED_HSTS_VALUE:?}, got \
+                     status={status}, sts={sts:?}, body={body:?}"
+                );
+                State::Fail
+            }
+        }
+        None => {
+            eprintln!("HTTPS request failed entirely");
+            State::Fail
+        }
+    }
+}
+
+#[test]
+fn test_hsts_on_https_backend_200() {
+    assert_eq!(
+        repeat_until_error_or(
+            2,
+            "HSTS on HTTPS backend-served 200",
+            try_hsts_on_https_backend_200
+        ),
+        State::Success
+    );
+}
+
+/// HTTPS frontend with `hsts.enabled = true` AND
+/// `redirect = permanent` + `redirect_scheme = use-https` returns the
+/// `Strict-Transport-Security` header on the proxy-generated 301
+/// default answer. Exercises the snapshot-copy hoist in
+/// `lib/src/protocol/mux/router.rs` — without the hoist, the
+/// `set_default_answer_with_retry_after` path bypasses
+/// `apply_response_header_edits` and the 301 ships without HSTS
+/// (RFC 6797 §8.1 violation).
+pub fn try_hsts_on_https_redirect_301() -> State {
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+    let unused_back = create_unbound_local_address();
+    let mut worker = spawn_https_worker("HSTS-HTTPS-301", front_address.clone());
+
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "hsts_https_301",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        hostname: "localhost".to_owned(),
+        redirect: Some(RedirectPolicy::Permanent as i32),
+        redirect_scheme: Some(RedirectScheme::UseHttps as i32),
+        hsts: Some(make_hsts_default()),
+        ..Worker::default_http_frontend("hsts_https_301", front_address.clone().into())
+    }));
+    // Backend never contacted but required so cluster has a backend
+    // pool — sozu's redirect short-circuits before backend connect.
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "hsts_https_301",
+        "hsts_https_301-0",
+        unused_back,
+        None,
+    )));
+    worker.read_to_last();
+
+    let client = build_h2_or_h1_client();
+    let uri: hyper::Uri = format!("https://localhost:{front_port}/")
+        .parse()
+        .expect("valid uri");
+    let resp = resolve_request_with_headers(&client, uri);
+
+    worker.soft_stop();
+    let _ = worker.wait_for_server_stop();
+
+    match resp {
+        Some((status, headers, _body)) => {
+            let sts = headers.get("strict-transport-security");
+            let ok = status.as_u16() == 301
+                && sts.is_some_and(|v| v.as_bytes() == EXPECTED_HSTS_VALUE.as_bytes());
+            if ok {
+                State::Success
+            } else {
+                eprintln!(
+                    "expected 301 + STS = {EXPECTED_HSTS_VALUE:?}, got status={status}, sts={sts:?}"
+                );
+                State::Fail
+            }
+        }
+        None => {
+            eprintln!("HTTPS redirect request failed entirely");
+            State::Fail
+        }
+    }
+}
+
+#[test]
+fn test_hsts_on_https_redirect_301() {
+    assert_eq!(
+        repeat_until_error_or(
+            2,
+            "HSTS on HTTPS 301 default answer",
+            try_hsts_on_https_redirect_301
+        ),
+        State::Success
+    );
+}
+
+/// HTTPS frontend with `hsts.enabled = true` AND
+/// `redirect = unauthorized` returns the `Strict-Transport-Security`
+/// header on the proxy-generated 401 default answer. Same hoist path
+/// as the 301 test above; covers the auth-deny early return at
+/// `mux/router.rs:762` separately because the 301 short-circuit lives
+/// at `:714` and the snapshot must precede both.
+pub fn try_hsts_on_https_unauthorized_401() -> State {
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+    let unused_back = create_unbound_local_address();
+    let mut worker = spawn_https_worker("HSTS-HTTPS-401", front_address.clone());
+
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "hsts_https_401",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        hostname: "localhost".to_owned(),
+        redirect: Some(RedirectPolicy::Unauthorized as i32),
+        hsts: Some(make_hsts_default()),
+        ..Worker::default_http_frontend("hsts_https_401", front_address.clone().into())
+    }));
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "hsts_https_401",
+        "hsts_https_401-0",
+        unused_back,
+        None,
+    )));
+    worker.read_to_last();
+
+    let client = build_h2_or_h1_client();
+    let uri: hyper::Uri = format!("https://localhost:{front_port}/")
+        .parse()
+        .expect("valid uri");
+    let resp = resolve_request_with_headers(&client, uri);
+
+    worker.soft_stop();
+    let _ = worker.wait_for_server_stop();
+
+    match resp {
+        Some((status, headers, _body)) => {
+            let sts = headers.get("strict-transport-security");
+            let ok = status.as_u16() == 401
+                && sts.is_some_and(|v| v.as_bytes() == EXPECTED_HSTS_VALUE.as_bytes());
+            if ok {
+                State::Success
+            } else {
+                eprintln!(
+                    "expected 401 + STS = {EXPECTED_HSTS_VALUE:?}, got status={status}, sts={sts:?}"
+                );
+                State::Fail
+            }
+        }
+        None => {
+            eprintln!("HTTPS unauthorized request failed entirely");
+            State::Fail
+        }
+    }
+}
+
+#[test]
+fn test_hsts_on_https_unauthorized_401() {
+    assert_eq!(
+        repeat_until_error_or(
+            2,
+            "HSTS on HTTPS 401 default answer",
+            try_hsts_on_https_unauthorized_401
+        ),
+        State::Success
+    );
+}
+
+/// HTTPS frontend with `hsts.enabled = true` and a backend at an
+/// unbound address returns the `Strict-Transport-Security` header on
+/// the proxy-generated 503 default answer. Exercises the
+/// `set_default_answer_with_retry_after` chokepoint at `mux/answers.rs`
+/// — the snapshot-copy hoist runs on the Forward path before the
+/// backend-connect attempt fails, so the per-stream
+/// `headers_response` is already populated when the 503 default
+/// answer is rendered.
+pub fn try_hsts_on_https_unreachable_503() -> State {
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+    let unbound_back = create_unbound_local_address();
+    let mut worker = spawn_https_worker("HSTS-HTTPS-503", front_address.clone());
+
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "hsts_https_503",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        hostname: "localhost".to_owned(),
+        hsts: Some(make_hsts_default()),
+        ..Worker::default_http_frontend("hsts_https_503", front_address.clone().into())
+    }));
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "hsts_https_503",
+        "hsts_https_503-0",
+        unbound_back,
+        None,
+    )));
+    worker.read_to_last();
+
+    let client = build_h2_or_h1_client();
+    let uri: hyper::Uri = format!("https://localhost:{front_port}/")
+        .parse()
+        .expect("valid uri");
+    let resp = resolve_request_with_headers(&client, uri);
+
+    worker.soft_stop();
+    let _ = worker.wait_for_server_stop();
+
+    match resp {
+        Some((status, headers, _body)) => {
+            let sts = headers.get("strict-transport-security");
+            // The exact 5xx code depends on whether the backend connect
+            // refuses (503) or times out (504). Either is a valid
+            // proxy-generated 5xx default answer; HSTS must accompany
+            // both.
+            let is_5xx = status.is_server_error();
+            let ok = is_5xx && sts.is_some_and(|v| v.as_bytes() == EXPECTED_HSTS_VALUE.as_bytes());
+            if ok {
+                State::Success
+            } else {
+                eprintln!(
+                    "expected 5xx + STS = {EXPECTED_HSTS_VALUE:?}, got status={status}, sts={sts:?}"
+                );
+                State::Fail
+            }
+        }
+        None => {
+            eprintln!("HTTPS unreachable-backend request failed entirely");
+            State::Fail
+        }
+    }
+}
+
+#[test]
+fn test_hsts_on_https_unreachable_503() {
+    assert_eq!(
+        repeat_until_error_or(
+            2,
+            "HSTS on HTTPS 5xx default answer",
+            try_hsts_on_https_unreachable_503
         ),
         State::Success
     );
