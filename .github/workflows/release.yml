@@ -163,7 +163,7 @@ jobs:
           mkdir -p "${STAGE}"
           cp "target/${TARGET}/release/sozu" "${STAGE}/sozu"
           cp LICENSE "${STAGE}/LICENSE-AGPL3"
-          cp LICENSE-LGPL3 "${STAGE}/LICENSE-LGPL3"
+          cp command/LICENSE-LGPL3 "${STAGE}/LICENSE-LGPL3"
           cp README.md "${STAGE}/README.md"
           cp CHANGELOG.md "${STAGE}/CHANGELOG.md"
           # Use the packaging variant — `bin/config.toml` is the developer
