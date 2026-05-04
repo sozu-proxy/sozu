@@ -438,15 +438,20 @@ impl Router {
     /// counted, since "no HSTS" is a no-op on the lightweight shape.
     pub fn refresh_inheriting_hsts(&mut self, new_hsts: Option<&HstsConfig>) -> usize {
         let mut refreshed = 0usize;
-        // Pre-compute whether a promotion is worth doing on lightweight
-        // routes — `would_emit_hsts` mirrors the gate inside
-        // `rebuild_with_listener_hsts` so we don't allocate a Frontend
-        // just to discover its `headers_response` is empty.
-        let promote_lightweight = would_emit_hsts(new_hsts);
+        // Pre-compute the listener-default HSTS edit ONCE so every
+        // visited frontend in this patch shares the same `Rc`-backed
+        // key / val allocation. `Some(_)` doubles as the "promote
+        // lightweight routes" gate — there is no point allocating a
+        // promoted Frontend just to hold an empty headers_response.
+        // See `build_listener_hsts_edit`'s rustdoc for the
+        // ~1.5 M-allocation-per-worker savings on cleverapps.io.
+        let new_edit = build_listener_hsts_edit(new_hsts);
+        let new_edit_ref = new_edit.as_ref();
+        let promote_lightweight = new_edit_ref.is_some();
         let mut visit = |route: &mut Route| match route {
             Route::Frontend(rc) => {
                 if rc.inherits_listener_hsts {
-                    let new_frontend = rebuild_with_listener_hsts(rc, new_hsts);
+                    let new_frontend = rebuild_with_listener_hsts(rc, new_edit_ref);
                     *rc = Rc::new(new_frontend);
                     refreshed += 1;
                 }
@@ -455,7 +460,7 @@ impl Router {
                 if promote_lightweight {
                     let promoted = rebuild_with_listener_hsts(
                         &Frontend::minimal_forward(id.clone()),
-                        new_hsts,
+                        new_edit_ref,
                     );
                     *route = Route::Frontend(Rc::new(promoted));
                     refreshed += 1;
@@ -463,7 +468,8 @@ impl Router {
             }
             Route::Deny => {
                 if promote_lightweight {
-                    let promoted = rebuild_with_listener_hsts(&Frontend::minimal_deny(), new_hsts);
+                    let promoted =
+                        rebuild_with_listener_hsts(&Frontend::minimal_deny(), new_edit_ref);
                     *route = Route::Frontend(Rc::new(promoted));
                     refreshed += 1;
                 }
@@ -876,37 +882,66 @@ pub enum Route {
     Frontend(Rc<Frontend>),
 }
 
-/// Whether the supplied listener-default HSTS would render a non-empty
-/// `Strict-Transport-Security` header. Mirrors the gate inside
-/// [`rebuild_with_listener_hsts`] (`enabled = Some(true)` AND
-/// `render_hsts` returns `Some`). Used by
-/// [`Router::refresh_inheriting_hsts`] to decide whether promoting a
-/// lightweight `Route::ClusterId` / `Route::Deny` to `Route::Frontend`
-/// would actually result in any HSTS being emitted; if not, the
-/// promotion is skipped to avoid leaking empty Frontend allocations on
-/// disable patches.
-fn would_emit_hsts(new_hsts: Option<&HstsConfig>) -> bool {
-    new_hsts
-        .filter(|cfg| matches!(cfg.enabled, Some(true)))
-        .and_then(render_hsts)
-        .is_some()
+/// Materialise the listener-default HSTS into a single shareable
+/// [`HeaderEdit`] when the supplied policy resolves to a non-empty
+/// `Strict-Transport-Security` header.
+///
+/// Returns `None` when the listener has no HSTS configured
+/// (`new_hsts.is_none()`), when HSTS is explicitly disabled
+/// (`enabled = Some(false)`), or when the render fails because of a
+/// missing `max_age` (`enabled = Some(true)` with `max_age = None`,
+/// the malformed-IPC defense-in-depth gate). Mirrors the gate
+/// previously embedded in `rebuild_with_listener_hsts`.
+///
+/// Used by [`Router::refresh_inheriting_hsts`] to:
+/// - decide whether promoting a lightweight `Route::ClusterId` /
+///   `Route::Deny` to `Route::Frontend` is worth doing (`Some` =
+///   promote + counted; `None` = lightweight route untouched, no
+///   allocation created just to hold an empty edit), AND
+/// - **share the same `Rc`-backed `key` / `val` allocation across
+///   every visited frontend in this patch**. Without sharing, each
+///   refreshed frontend would allocate a fresh
+///   `Rc::from(b"strict-transport-security")` and a fresh
+///   `Rc::from(rendered.into_bytes())` — on a 91 k-frontend
+///   `cleverapps.io` shared listener × 8 workers, one HSTS-enable
+///   patch produces ~1.5 M identical-content `Rc` allocations per
+///   worker. With sharing the cost collapses to one allocation per
+///   patch plus a refcount bump on each frontend (`HeaderEdit::clone`
+///   is two `Rc::clone`s + a byte copy).
+fn build_listener_hsts_edit(new_hsts: Option<&HstsConfig>) -> Option<HeaderEdit> {
+    let cfg = new_hsts?;
+    if !matches!(cfg.enabled, Some(true)) {
+        return None;
+    }
+    let rendered = render_hsts(cfg)?;
+    let mode = if matches!(cfg.force_replace_backend, Some(true)) {
+        HeaderEditMode::Set
+    } else {
+        HeaderEditMode::SetIfAbsent
+    };
+    Some(HeaderEdit {
+        key: Rc::from(&b"strict-transport-security"[..]),
+        val: rendered.into_bytes().into(),
+        mode,
+    })
 }
 
 /// Build a new [`Frontend`] cloned from `frontend`, with its
-/// `headers_response` re-materialised against `new_hsts` (the new
-/// listener-default HSTS). Used by [`Router::refresh_inheriting_hsts`].
+/// `headers_response` re-materialised against `new_edit` — the
+/// shared listener-default HSTS edit pre-built by
+/// [`build_listener_hsts_edit`]. Used by
+/// [`Router::refresh_inheriting_hsts`].
 ///
 /// Preserves every operator-defined response-header edit (`Append`,
 /// `Set`, legacy empty-`val`-Append delete) and replaces any existing
-/// `Strict-Transport-Security` entry with the fresh render. When the
-/// new policy resolves to "no HSTS" (`enabled = Some(false)` or no
-/// rendered output), the function strips the existing entry and adds
-/// nothing.
+/// `Strict-Transport-Security` entry with `new_edit`. When `new_edit`
+/// is `None` (listener-default HSTS resolves to "no HSTS"), the
+/// function strips the existing STS entry and adds nothing.
 ///
-/// Always preserves the `inherits_listener_hsts = true` marker on the
-/// rebuilt frontend so subsequent listener-default patches keep
-/// refreshing it.
-fn rebuild_with_listener_hsts(frontend: &Frontend, new_hsts: Option<&HstsConfig>) -> Frontend {
+/// Preserves the existing `inherits_listener_hsts` marker; callers
+/// ensure it is `true` before invoking this helper (the function
+/// uses `..frontend.clone()` so it inherits whatever the input has).
+fn rebuild_with_listener_hsts(frontend: &Frontend, new_edit: Option<&HeaderEdit>) -> Frontend {
     // Strip any existing Strict-Transport-Security entry.
     let mut headers_response: Vec<HeaderEdit> = frontend
         .headers_response
@@ -915,23 +950,10 @@ fn rebuild_with_listener_hsts(frontend: &Frontend, new_hsts: Option<&HstsConfig>
         .cloned()
         .collect();
 
-    // Re-render against the new listener default. Same gates as
-    // `Frontend::new`'s materialiser: `enabled = Some(true)` and a
-    // non-`None` `render_hsts` output.
-    if let Some(cfg) = new_hsts
-        && matches!(cfg.enabled, Some(true))
-        && let Some(rendered) = render_hsts(cfg)
-    {
-        let mode = if matches!(cfg.force_replace_backend, Some(true)) {
-            HeaderEditMode::Set
-        } else {
-            HeaderEditMode::SetIfAbsent
-        };
-        headers_response.push(HeaderEdit {
-            key: Rc::from(&b"strict-transport-security"[..]),
-            val: rendered.into_bytes().into(),
-            mode,
-        });
+    // `HeaderEdit::clone` here is two `Rc::clone`s on the shared
+    // key/val plus a one-byte `mode` copy — no buffer allocation.
+    if let Some(edit) = new_edit {
+        headers_response.push(edit.clone());
     }
 
     Frontend {
@@ -1918,7 +1940,8 @@ mod tests {
             preload: None,
             force_replace_backend: None,
         };
-        let rebuilt = rebuild_with_listener_hsts(&frontend, Some(&new_hsts));
+        let new_edit = build_listener_hsts_edit(Some(&new_hsts));
+        let rebuilt = rebuild_with_listener_hsts(&frontend, new_edit.as_ref());
 
         let response: Vec<_> = rebuilt.headers_response.iter().collect();
         assert_eq!(response.len(), 2, "x-cache + new STS, no leftover STS");
@@ -1962,7 +1985,8 @@ mod tests {
             tags: None,
             inherits_listener_hsts: true,
         };
-        let rebuilt = rebuild_with_listener_hsts(&frontend, None);
+        let new_edit = build_listener_hsts_edit(None);
+        let rebuilt = rebuild_with_listener_hsts(&frontend, new_edit.as_ref());
         let response: Vec<_> = rebuilt.headers_response.iter().collect();
         assert_eq!(response.len(), 1);
         assert_eq!(&*response[0].key, b"x-cache");
@@ -1999,7 +2023,8 @@ mod tests {
             preload: None,
             force_replace_backend: None,
         };
-        let rebuilt = rebuild_with_listener_hsts(&frontend, Some(&new_hsts));
+        let new_edit = build_listener_hsts_edit(Some(&new_hsts));
+        let rebuilt = rebuild_with_listener_hsts(&frontend, new_edit.as_ref());
         assert_eq!(rebuilt.headers_response.len(), 0);
     }
 
@@ -2373,6 +2398,62 @@ mod tests {
             rc.headers_response.len(),
             0,
             "disable patch must strip the STS edit from the promoted entry"
+        );
+    }
+
+    #[test]
+    fn refresh_inheriting_hsts_promotes_clusterid_in_trie_on_enable() {
+        // Trie-leaf coverage for path 2: the existing five tests
+        // exercise the `pre`/`post` Vecs only, but the same `visit`
+        // closure runs for tree leaves through
+        // `tree.for_each_value_mut`. Assert that a `Route::ClusterId`
+        // sitting in the trie is promoted in place on an enable
+        // patch, with routing semantics preserved.
+        use crate::router::pattern_trie::TrieNode;
+        let mut router = Router {
+            pre: Vec::new(),
+            tree: TrieNode::root(),
+            post: Vec::new(),
+        };
+        let path_rule = PathRule::Prefix("/".to_owned());
+        let method_rule = MethodRule::new(None);
+        assert!(router.add_tree_rule(
+            b"example.com",
+            &path_rule,
+            &method_rule,
+            &Route::ClusterId("api".to_owned()),
+        ));
+
+        let new_hsts = HstsConfig {
+            enabled: Some(true),
+            max_age: Some(31_536_000),
+            include_subdomains: Some(true),
+            preload: None,
+            force_replace_backend: None,
+        };
+        let count = router.refresh_inheriting_hsts(Some(&new_hsts));
+        assert_eq!(
+            count, 1,
+            "trie-resident ClusterId must be promoted + counted"
+        );
+
+        let (_, paths) = router
+            .tree
+            .domain_lookup_mut(b"example.com", false)
+            .expect("trie leaf still present after refresh");
+        assert_eq!(paths.len(), 1);
+        let Route::Frontend(rc) = &paths[0].2 else {
+            panic!("trie leaf should now be Route::Frontend, not Route::ClusterId");
+        };
+        assert_eq!(rc.cluster_id.as_deref(), Some("api"));
+        assert_eq!(rc.redirect, RedirectPolicy::Forward);
+        assert!(rc.inherits_listener_hsts);
+        let response: Vec<_> = rc.headers_response.iter().collect();
+        assert_eq!(response.len(), 1);
+        assert_eq!(&*response[0].key, b"strict-transport-security");
+        assert_eq!(
+            &*response[0].val,
+            b"max-age=31536000; includeSubDomains".as_slice()
         );
     }
 
