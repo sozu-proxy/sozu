@@ -126,7 +126,7 @@ jobs:
           rustup component add rustfmt --toolchain nightly
 
       - name: Cache cargo target
-        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae  # v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
         with:
           cache-all-crates: true
           prefix-key: ci-${{ matrix.cell }}
@@ -197,7 +197,7 @@ jobs:
         uses: dtolnay/rust-toolchain@nightly
 
       - name: Cache cargo target
-        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae  # v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
         with:
           cache-all-crates: true
           prefix-key: ci-fuzz
@@ -266,7 +266,7 @@ jobs:
           repository: CleverCloud/lagging_server
           path: .
 
-      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae  # v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
         with:
           cache-all-crates: true
           prefix-key: lagging_server
@@ -294,7 +294,7 @@ jobs:
 
       # Reuse the crypto-ring pipeline cache so the example build is
       # incremental over its compiled deps.
-      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae  # v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
         with:
           cache-all-crates: true
           prefix-key: ci-crypto-ring
@@ -331,7 +331,7 @@ jobs:
 
       # Restore the per-provider pipeline cache so the release build
       # of `sozu` is incremental over warm registry + compiled deps.
-      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae  # v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
         with:
           cache-all-crates: true
           prefix-key: ci-${{ matrix.provider }}
@@ -420,7 +420,7 @@ jobs:
 
       # Reuse the crypto-ring pipeline cache for the release sozu
       # build that the logger bench drives.
-      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae  # v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
         with:
           cache-all-crates: true
           prefix-key: ci-crypto-ring
