@@ -191,7 +191,27 @@ impl Router {
         })
     }
 
+    /// Add an HTTP/HTTPS frontend whose `hsts` field (if any) came from
+    /// the per-frontend configuration directly. Equivalent to
+    /// [`Self::add_http_front_with_hsts_origin`] called with
+    /// [`HstsOrigin::Explicit`]. The default for callers that don't
+    /// know about listener-default inheritance — e.g. plain HTTP
+    /// listeners (`HttpListenerConfig` has no HSTS field) and tests.
     pub fn add_http_front(&mut self, front: &HttpFrontend) -> Result<(), RouterError> {
+        self.add_http_front_with_hsts_origin(front, HstsOrigin::Explicit)
+    }
+
+    /// Add an HTTP/HTTPS frontend, recording whether the resolved
+    /// `front.hsts` was inherited from the listener default. The
+    /// inheritance bit is preserved on the resulting [`Frontend`] so a
+    /// later `UpdateHttpsListenerConfig.hsts` patch can reflow the new
+    /// default onto inheriting entries without disturbing explicit
+    /// per-frontend overrides.
+    pub fn add_http_front_with_hsts_origin(
+        &mut self,
+        front: &HttpFrontend,
+        hsts_origin: HstsOrigin,
+    ) -> Result<(), RouterError> {
         let path_rule = PathRule::from_config(front.path.clone())
             .ok_or(RouterError::InvalidPathRule(front.path.to_string()))?;
 
@@ -240,6 +260,7 @@ impl Router {
                 front.rewrite_port.and_then(|p| u16::try_from(p).ok()),
                 &front.headers,
                 front.required_auth.unwrap_or(false),
+                hsts_origin,
             )?;
             Route::Frontend(Rc::new(frontend))
         } else {
@@ -370,6 +391,49 @@ impl Router {
             }
             Err(_) => false,
         }
+    }
+
+    /// Walk every route and re-materialise the response-side HSTS edit
+    /// on frontends that inherited from the listener default. Operator
+    /// per-frontend HSTS overrides (`inherits_listener_hsts == false`)
+    /// are left untouched.
+    ///
+    /// Called from `lib/src/https.rs::HttpsListener::update_config` when
+    /// an `UpdateHttpsListenerConfig.hsts` patch is applied. The
+    /// per-frontend `headers_response: Rc<[HeaderEdit]>` is rebuilt by
+    /// dropping any existing `Strict-Transport-Security` entry and
+    /// appending a freshly rendered one when `new_hsts` resolves to an
+    /// enabled value (`enabled = Some(true)`). The existing operator
+    /// `Append`/`Set` response headers stay in place.
+    ///
+    /// Returns the number of frontends touched. Inheriting frontends
+    /// where the new policy resolves to "no HSTS" (e.g.
+    /// `enabled = Some(false)`) are still touched — the existing HSTS
+    /// edit is stripped — and counted.
+    pub fn refresh_inheriting_hsts(&mut self, new_hsts: Option<&HstsConfig>) -> usize {
+        let mut refreshed = 0usize;
+        let mut visit = |route: &mut Route| {
+            if let Route::Frontend(rc) = route {
+                if rc.inherits_listener_hsts {
+                    let new_frontend = rebuild_with_listener_hsts(rc, new_hsts);
+                    *rc = Rc::new(new_frontend);
+                    refreshed += 1;
+                }
+            }
+        };
+
+        for (_, _, _, route) in self.pre.iter_mut() {
+            visit(route);
+        }
+        self.tree.for_each_value_mut(&mut |paths| {
+            for (_, _, route) in paths.iter_mut() {
+                visit(route);
+            }
+        });
+        for (_, _, _, route) in self.post.iter_mut() {
+            visit(route);
+        }
+        refreshed
     }
 
     pub fn add_pre_rule(
@@ -764,6 +828,55 @@ pub enum Route {
     Frontend(Rc<Frontend>),
 }
 
+/// Build a new [`Frontend`] cloned from `frontend`, with its
+/// `headers_response` re-materialised against `new_hsts` (the new
+/// listener-default HSTS). Used by [`Router::refresh_inheriting_hsts`].
+///
+/// Preserves every operator-defined response-header edit (`Append`,
+/// `Set`, legacy empty-`val`-Append delete) and replaces any existing
+/// `Strict-Transport-Security` entry with the fresh render. When the
+/// new policy resolves to "no HSTS" (`enabled = Some(false)` or no
+/// rendered output), the function strips the existing entry and adds
+/// nothing.
+///
+/// Always preserves the `inherits_listener_hsts = true` marker on the
+/// rebuilt frontend so subsequent listener-default patches keep
+/// refreshing it.
+fn rebuild_with_listener_hsts(frontend: &Frontend, new_hsts: Option<&HstsConfig>) -> Frontend {
+    // Strip any existing Strict-Transport-Security entry.
+    let mut headers_response: Vec<HeaderEdit> = frontend
+        .headers_response
+        .iter()
+        .filter(|edit| !edit.key.eq_ignore_ascii_case(b"strict-transport-security"))
+        .cloned()
+        .collect();
+
+    // Re-render against the new listener default. Same gates as
+    // `Frontend::new`'s materialiser: `enabled = Some(true)` and a
+    // non-`None` `render_hsts` output.
+    if let Some(cfg) = new_hsts
+        && matches!(cfg.enabled, Some(true))
+        && let Some(rendered) = render_hsts(cfg)
+    {
+        let mode = if matches!(cfg.force_replace_backend, Some(true)) {
+            HeaderEditMode::Set
+        } else {
+            HeaderEditMode::SetIfAbsent
+        };
+        headers_response.push(HeaderEdit {
+            key: Rc::from(&b"strict-transport-security"[..]),
+            val: rendered.into_bytes().into(),
+            mode,
+        });
+    }
+
+    Frontend {
+        headers_response: headers_response.into(),
+        // every other field is unchanged
+        ..frontend.clone()
+    }
+}
+
 /// Render an [`HstsConfig`] into a canonical RFC 6797 §6.1
 /// `Strict-Transport-Security` header value: `max-age=N` first, then
 /// optional `; includeSubDomains`, then optional `; preload`. No
@@ -988,6 +1101,36 @@ pub struct Frontend {
     pub headers_response: Rc<[HeaderEdit]>,
     pub required_auth: bool,
     pub tags: Option<Rc<CachedTags>>,
+    /// `true` when the materialised HSTS edit (if any) in
+    /// [`Self::headers_response`] came from the listener-default
+    /// `HttpsListenerConfig.hsts` rather than the per-frontend
+    /// `RequestHttpFrontend.hsts` block. Consulted by
+    /// [`Router::refresh_inheriting_hsts`] so a
+    /// `UpdateHttpsListenerConfig.hsts` patch reflows the new default
+    /// onto inheriting frontends without overwriting explicit
+    /// per-frontend HSTS overrides.
+    pub inherits_listener_hsts: bool,
+}
+
+/// Origin of the per-frontend HSTS policy carried by an
+/// [`HttpFrontend`] when the router materialises it into a
+/// [`Frontend`]. Tracked separately because the resolved
+/// `HttpFrontend.hsts` field is the same shape regardless of how it
+/// was filled in — the inheritance bit lets later listener-default
+/// patches refresh inheriting frontends without disturbing explicit
+/// per-frontend overrides.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum HstsOrigin {
+    /// `front.hsts` came from the per-frontend configuration directly
+    /// (operator wrote `[clusters.<id>.frontends.hsts]` in TOML or
+    /// passed `--hsts-*` on the CLI). Listener-default patches do NOT
+    /// refresh this entry.
+    Explicit,
+    /// `front.hsts` was filled in by `add_https_frontend` from the
+    /// listener-default `HttpsListenerConfig.hsts`. A future
+    /// `UpdateHttpsListenerConfig.hsts` patch will refresh this entry
+    /// via [`Router::refresh_inheriting_hsts`].
+    InheritedFromListenerDefault,
 }
 
 impl PartialEq for Frontend {
@@ -1073,11 +1216,17 @@ impl Frontend {
         rewrite_port: Option<u16>,
         headers: &[sozu_command::proto::command::Header],
         required_auth: bool,
+        hsts_origin: HstsOrigin,
     ) -> Result<Self, RouterError> {
         // HSTS is read from `front.hsts` directly inside the function;
         // an explicit parameter would be redundant since `front` is
         // already in scope and the field is the single source of truth.
+        // The `hsts_origin` parameter records *where* `front.hsts` came
+        // from so [`Router::refresh_inheriting_hsts`] can reflow listener
+        // defaults without disturbing explicit per-frontend overrides.
         let hsts = front.hsts.as_ref();
+        let inherits_listener_hsts =
+            matches!(hsts_origin, HstsOrigin::InheritedFromListenerDefault) && hsts.is_some();
         let cluster_id = front.cluster_id.clone();
         let tags = front
             .tags
@@ -1120,6 +1269,14 @@ impl Frontend {
                 headers_response: Rc::new([]),
                 required_auth,
                 tags,
+                // Unauthorized branch never emits HSTS — no headers reach
+                // the wire that aren't the proxy's typed default-answer
+                // 401, which goes through `set_default_answer` and reads
+                // `headers_response` separately. Carry the inheritance
+                // bit through anyway so a later listener-default patch
+                // recognises the entry as inheriting (refresh is a no-op
+                // because `headers_response` is empty).
+                inherits_listener_hsts,
             });
         }
 
@@ -1269,6 +1426,7 @@ impl Frontend {
             headers_response: headers_response.into(),
             required_auth,
             tags,
+            inherits_listener_hsts,
         })
     }
 
@@ -1290,6 +1448,7 @@ impl Frontend {
             headers_response: Rc::new([]),
             required_auth: false,
             tags: None,
+            inherits_listener_hsts: false,
         }
     }
 }
@@ -1595,6 +1754,226 @@ mod tests {
         // field reaches `render_hsts` as `None`, suppress emission so a
         // malformed wire frame can't accidentally render `max-age=`.
         assert_eq!(render_hsts(&cfg), None);
+    }
+
+    #[test]
+    fn rebuild_with_listener_hsts_replaces_existing_entry() {
+        // An inheriting frontend whose listener-default HSTS changed
+        // from 1y → 2y must end up with the 2y entry on its
+        // headers_response, with no leftover 1y entry.
+        let frontend = Frontend {
+            cluster_id: Some("api".to_owned()),
+            redirect: RedirectPolicy::Forward,
+            redirect_scheme: RedirectScheme::UseSame,
+            redirect_template: None,
+            capture_cap_host: 0,
+            capture_cap_path: 0,
+            rewrite_host: None,
+            rewrite_path: None,
+            rewrite_port: None,
+            headers_request: Rc::new([]),
+            headers_response: Rc::from(vec![
+                HeaderEdit {
+                    key: Rc::from(&b"x-cache"[..]),
+                    val: Rc::from(&b"hit"[..]),
+                    mode: HeaderEditMode::Append,
+                },
+                HeaderEdit {
+                    key: Rc::from(&b"strict-transport-security"[..]),
+                    val: Rc::from(&b"max-age=31536000"[..]),
+                    mode: HeaderEditMode::SetIfAbsent,
+                },
+            ]),
+            required_auth: false,
+            tags: None,
+            inherits_listener_hsts: true,
+        };
+        let new_hsts = HstsConfig {
+            enabled: Some(true),
+            max_age: Some(63_072_000),
+            include_subdomains: Some(true),
+            preload: None,
+            force_replace_backend: None,
+        };
+        let rebuilt = rebuild_with_listener_hsts(&frontend, Some(&new_hsts));
+
+        let response: Vec<_> = rebuilt.headers_response.iter().collect();
+        assert_eq!(response.len(), 2, "x-cache + new STS, no leftover STS");
+        assert_eq!(&*response[0].key, b"x-cache");
+        assert_eq!(&*response[1].key, b"strict-transport-security");
+        assert_eq!(
+            &*response[1].val,
+            b"max-age=63072000; includeSubDomains".as_slice()
+        );
+        assert!(rebuilt.inherits_listener_hsts);
+    }
+
+    #[test]
+    fn rebuild_with_listener_hsts_strips_when_none() {
+        // Listener-default HSTS removed → strip the existing STS edit
+        // and add nothing. Operator response headers stay in place.
+        let frontend = Frontend {
+            cluster_id: Some("api".to_owned()),
+            redirect: RedirectPolicy::Forward,
+            redirect_scheme: RedirectScheme::UseSame,
+            redirect_template: None,
+            capture_cap_host: 0,
+            capture_cap_path: 0,
+            rewrite_host: None,
+            rewrite_path: None,
+            rewrite_port: None,
+            headers_request: Rc::new([]),
+            headers_response: Rc::from(vec![
+                HeaderEdit {
+                    key: Rc::from(&b"x-cache"[..]),
+                    val: Rc::from(&b"hit"[..]),
+                    mode: HeaderEditMode::Append,
+                },
+                HeaderEdit {
+                    key: Rc::from(&b"strict-transport-security"[..]),
+                    val: Rc::from(&b"max-age=31536000"[..]),
+                    mode: HeaderEditMode::SetIfAbsent,
+                },
+            ]),
+            required_auth: false,
+            tags: None,
+            inherits_listener_hsts: true,
+        };
+        let rebuilt = rebuild_with_listener_hsts(&frontend, None);
+        let response: Vec<_> = rebuilt.headers_response.iter().collect();
+        assert_eq!(response.len(), 1);
+        assert_eq!(&*response[0].key, b"x-cache");
+    }
+
+    #[test]
+    fn rebuild_with_listener_hsts_disabled_strips() {
+        // `enabled = Some(false)` is the explicit-disable signal; the
+        // existing STS entry is dropped and no new one is added.
+        let frontend = Frontend {
+            cluster_id: Some("api".to_owned()),
+            redirect: RedirectPolicy::Forward,
+            redirect_scheme: RedirectScheme::UseSame,
+            redirect_template: None,
+            capture_cap_host: 0,
+            capture_cap_path: 0,
+            rewrite_host: None,
+            rewrite_path: None,
+            rewrite_port: None,
+            headers_request: Rc::new([]),
+            headers_response: Rc::from(vec![HeaderEdit {
+                key: Rc::from(&b"strict-transport-security"[..]),
+                val: Rc::from(&b"max-age=31536000"[..]),
+                mode: HeaderEditMode::SetIfAbsent,
+            }]),
+            required_auth: false,
+            tags: None,
+            inherits_listener_hsts: true,
+        };
+        let new_hsts = HstsConfig {
+            enabled: Some(false),
+            max_age: None,
+            include_subdomains: None,
+            preload: None,
+            force_replace_backend: None,
+        };
+        let rebuilt = rebuild_with_listener_hsts(&frontend, Some(&new_hsts));
+        assert_eq!(rebuilt.headers_response.len(), 0);
+    }
+
+    #[test]
+    fn refresh_inheriting_hsts_skips_explicit_overrides() {
+        // Two frontends: one inheriting (gets refreshed), one explicit
+        // override (must NOT change). `Router::refresh_inheriting_hsts`
+        // returns the count of refreshed entries.
+        use crate::router::pattern_trie::TrieNode;
+        let mut router = Router {
+            pre: Vec::new(),
+            tree: TrieNode::root(),
+            post: Vec::new(),
+        };
+        let inheriting = Frontend {
+            cluster_id: Some("api".to_owned()),
+            redirect: RedirectPolicy::Forward,
+            redirect_scheme: RedirectScheme::UseSame,
+            redirect_template: None,
+            capture_cap_host: 0,
+            capture_cap_path: 0,
+            rewrite_host: None,
+            rewrite_path: None,
+            rewrite_port: None,
+            headers_request: Rc::new([]),
+            headers_response: Rc::from(vec![HeaderEdit {
+                key: Rc::from(&b"strict-transport-security"[..]),
+                val: Rc::from(&b"max-age=31536000"[..]),
+                mode: HeaderEditMode::SetIfAbsent,
+            }]),
+            required_auth: false,
+            tags: None,
+            inherits_listener_hsts: true,
+        };
+        let explicit = Frontend {
+            cluster_id: Some("legacy".to_owned()),
+            redirect: RedirectPolicy::Forward,
+            redirect_scheme: RedirectScheme::UseSame,
+            redirect_template: None,
+            capture_cap_host: 0,
+            capture_cap_path: 0,
+            rewrite_host: None,
+            rewrite_path: None,
+            rewrite_port: None,
+            headers_request: Rc::new([]),
+            headers_response: Rc::from(vec![HeaderEdit {
+                key: Rc::from(&b"strict-transport-security"[..]),
+                val: Rc::from(&b"max-age=300"[..]),
+                mode: HeaderEditMode::SetIfAbsent,
+            }]),
+            required_auth: false,
+            tags: None,
+            inherits_listener_hsts: false,
+        };
+        router.pre.push((
+            DomainRule::Any,
+            PathRule::Prefix("/api".to_owned()),
+            MethodRule::new(None),
+            Route::Frontend(Rc::new(inheriting)),
+        ));
+        router.post.push((
+            DomainRule::Any,
+            PathRule::Prefix("/legacy".to_owned()),
+            MethodRule::new(None),
+            Route::Frontend(Rc::new(explicit)),
+        ));
+
+        let new_hsts = HstsConfig {
+            enabled: Some(true),
+            max_age: Some(63_072_000),
+            include_subdomains: Some(true),
+            preload: None,
+            force_replace_backend: None,
+        };
+        let count = router.refresh_inheriting_hsts(Some(&new_hsts));
+        assert_eq!(count, 1, "only the inheriting frontend should refresh");
+
+        if let Route::Frontend(rc) = &router.pre[0].3 {
+            let response: Vec<_> = rc.headers_response.iter().collect();
+            assert_eq!(
+                &*response.last().unwrap().val,
+                b"max-age=63072000; includeSubDomains".as_slice(),
+                "inheriting frontend's STS must reflect the new listener default"
+            );
+        } else {
+            panic!("pre[0] should be Route::Frontend");
+        }
+        if let Route::Frontend(rc) = &router.post[0].3 {
+            let response: Vec<_> = rc.headers_response.iter().collect();
+            assert_eq!(
+                &*response.last().unwrap().val,
+                b"max-age=300".as_slice(),
+                "explicit override must be preserved unchanged"
+            );
+        } else {
+            panic!("post[0] should be Route::Frontend");
+        }
     }
 
     #[test]

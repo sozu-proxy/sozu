@@ -492,6 +492,26 @@ impl<V: Debug + Clone> TrieNode<V> {
         }
     }
 
+    /// Visit every stored value in the trie (the literal `key_value` and
+    /// the leftmost `wildcard` slot of every node, plus all
+    /// regex-subtree leaves) and invoke `f` on each. Used by the router
+    /// to walk all routes for cross-cutting refreshes (e.g. listener-
+    /// default HSTS reflow) without rebuilding the trie.
+    pub fn for_each_value_mut<F: FnMut(&mut V)>(&mut self, f: &mut F) {
+        if let Some((_, ref mut value)) = self.key_value {
+            f(value);
+        }
+        if let Some((_, ref mut value)) = self.wildcard {
+            f(value);
+        }
+        for child in self.children.values_mut() {
+            child.for_each_value_mut(f);
+        }
+        for (_, child) in self.regexps.iter_mut() {
+            child.for_each_value_mut(f);
+        }
+    }
+
     pub fn domain_insert(&mut self, key: Key, value: V) -> InsertResult {
         self.insert(key, value)
     }
