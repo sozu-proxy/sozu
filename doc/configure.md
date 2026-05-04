@@ -341,7 +341,7 @@ sozu frontend https add \
 
 `UpdateHttpsListenerConfig.hsts` follows full-object replacement semantics: when present in the patch, the entire HSTS block replaces the listener's current value. `enabled` is REQUIRED whenever `hsts` is present (`ListenerError::HstsEnabledRequired` rejects an `enabled = None` block). Absent `hsts` field on the patch preserves the current value.
 
-**Inheritance refresh limitation.** Patching the listener-default HSTS updates `HttpsListenerConfig.hsts` for FUTURE frontend adds; existing frontends keep their materialised HSTS edit (the value that was the listener default at frontend-add time). To re-flow the new default onto an inheriting frontend, the operator must remove + re-add the frontend. A `warn!` log line and the `http.hsts.listener_default_patched` counter fire on every patch so the pending operator action is surfaced. Per-frontend explicit overrides are unaffected.
+**Inheriting frontends are refreshed automatically.** Patching the listener-default HSTS reflows the new policy onto every existing frontend that inherited from the listener (i.e. has no per-frontend `[hsts]` block at add time). `Router::refresh_inheriting_hsts` walks the routing trie, identifies inheriting entries via the `Frontend.inherits_listener_hsts` marker, and rebuilds their `headers_response` against the new value — stripping any prior `Strict-Transport-Security` entry and appending a freshly rendered one. Per-frontend explicit overrides (`inherits_listener_hsts == false`) are left untouched. The `http.hsts.listener_default_patched` counter fires once per patch and `http.hsts.frontend_refreshed` increments per refreshed frontend, so dashboards can correlate the rate of patches with the size of the affected fleet.
 
 ##### Metrics
 
@@ -350,7 +350,8 @@ sozu frontend https add \
 | `http.hsts.frontend_added`          | counter | A frontend is added with `hsts.enabled = true` and the HSTS edit is materialised in `headers_response`. |
 | `http.hsts.suppressed_plaintext`    | counter | An `AddHttpFrontend` IPC was rejected because it carried an enabled HSTS policy (RFC 6797 §7.2 defense in depth). |
 | `http.hsts.unrendered`              | counter | Defense-in-depth: a frontend reached `Frontend::new` with `hsts.enabled = true` but `render_hsts` returned `None` (max_age missing). The TOML loader and the CLI helper both substitute `DEFAULT_HSTS_MAX_AGE` so this counter only fires when a programmatic IPC sender ships an ill-formed `HstsConfig`. |
-| `http.hsts.listener_default_patched`| counter | A `UpdateHttpsListenerConfig.hsts` patch was applied. Pairs with a `warn!` reminding the operator to remove + re-add inheriting frontends so they pick up the new default. |
+| `http.hsts.listener_default_patched`| counter | A `UpdateHttpsListenerConfig.hsts` patch was applied. Fires once per patch. |
+| `http.hsts.frontend_refreshed`      | counter | An inheriting frontend was refreshed during a listener-default HSTS patch (one increment per refreshed entry). Sum across a patch interval = number of frontends touched by that patch. |
 
 #### Options specific to Rustls based HTTPS listeners
 

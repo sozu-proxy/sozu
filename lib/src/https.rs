@@ -1318,31 +1318,34 @@ impl HttpsListener {
         // disambiguator between "disable" and "enable" semantics, and the
         // operator must signal one or the other on every update.
         //
-        // Inheritance refresh limitation: the routing trie (`self.fronts`)
-        // stores each frontend's materialised `headers_response` snapshot,
-        // built at `add_https_front` time from the listener-default that
-        // was current then. The trie does NOT carry the original
-        // `Option<HstsConfig>` ProtoBuf, so we cannot distinguish
-        // "inheriting" frontends from "explicit override" frontends after
-        // the fact — refreshing them in place would risk overwriting an
-        // operator's explicit per-frontend HSTS with the new listener
-        // default. The conservative behaviour is to update the listener
-        // default for FUTURE frontend adds and tell the operator to
-        // remove + re-add any existing frontend that should inherit the
-        // new value. The `incr!("http.hsts.listener_default_patched")`
-        // counter pairs with the `warn!` so dashboards can surface the
-        // pending operator action.
+        // Inheriting frontends are refreshed in place via
+        // `Router::refresh_inheriting_hsts`: every frontend whose HSTS
+        // came from the previous listener default
+        // (`Frontend.inherits_listener_hsts == true`) gets its
+        // `headers_response` re-materialised against the new value.
+        // Explicit per-frontend overrides
+        // (`inherits_listener_hsts == false`) are untouched. The
+        // `http.hsts.listener_default_patched` counter still fires so
+        // dashboards can correlate patches with the new
+        // `http.hsts.frontend_refreshed` counter (sum of refreshed
+        // frontends from this patch).
         if let Some(new_hsts) = patch.hsts {
             if new_hsts.enabled.is_none() {
                 return Err(ListenerError::HstsEnabledRequired);
             }
             self.config.hsts = Some(new_hsts);
-            warn!(
-                "{} HTTPS listener {:?} HSTS default patched. Existing frontends keep their \
-                 materialised HSTS edit until the operator removes + re-adds them; new \
-                 frontends inherit the new value.",
+            let refreshed = self
+                .fronts
+                .refresh_inheriting_hsts(self.config.hsts.as_ref());
+            for _ in 0..refreshed {
+                crate::incr!("http.hsts.frontend_refreshed");
+            }
+            info!(
+                "{} HTTPS listener {:?} HSTS default patched; refreshed {} inheriting \
+                 frontend(s). Explicit per-frontend overrides untouched.",
                 log_module_context!(),
                 self.config.address,
+                refreshed,
             );
             crate::incr!("http.hsts.listener_default_patched");
         }
@@ -1351,8 +1354,22 @@ impl HttpsListener {
     }
 
     pub fn add_https_front(&mut self, tls_front: HttpFrontend) -> Result<(), ListenerError> {
+        self.add_https_front_with_hsts_origin(tls_front, crate::router::HstsOrigin::Explicit)
+    }
+
+    /// Variant of [`Self::add_https_front`] that records the origin of
+    /// `tls_front.hsts` so listener-default patches can reflow inheriting
+    /// frontends without disturbing explicit per-frontend overrides. The
+    /// caller passes [`HstsOrigin::InheritedFromListenerDefault`] when
+    /// the value was filled in from `self.config.hsts` rather than from
+    /// the operator's per-frontend configuration.
+    pub fn add_https_front_with_hsts_origin(
+        &mut self,
+        tls_front: HttpFrontend,
+        hsts_origin: crate::router::HstsOrigin,
+    ) -> Result<(), ListenerError> {
         self.fronts
-            .add_http_front(&tls_front)
+            .add_http_front_with_hsts_origin(&tls_front, hsts_origin)
             .map_err(ListenerError::AddFrontend)
     }
 
@@ -1712,13 +1729,22 @@ impl HttpsProxy {
         // listener and have every HTTPS frontend inherit it.
         // `enabled = Some(false)` on the frontend is the explicit-disable
         // signal: it stays as-is and suppresses the inherited default.
-        if front.hsts.is_none() {
+        //
+        // The `hsts_origin` flag is passed through to the router so the
+        // resulting `Frontend` carries the inheritance bit; a later
+        // `UpdateHttpsListenerConfig.hsts` patch will then refresh this
+        // entry via `Router::refresh_inheriting_hsts` without disturbing
+        // explicit per-frontend overrides.
+        let hsts_origin = if front.hsts.is_none() && listener.config.hsts.is_some() {
             front.hsts = listener.config.hsts;
-        }
+            crate::router::HstsOrigin::InheritedFromListenerDefault
+        } else {
+            crate::router::HstsOrigin::Explicit
+        };
 
         listener.set_tags(front.hostname.to_owned(), front.tags.to_owned());
         listener
-            .add_https_front(front)
+            .add_https_front_with_hsts_origin(front, hsts_origin)
             .map_err(ProxyError::AddFrontend)?;
         Ok(None)
     }
