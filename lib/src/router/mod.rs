@@ -399,24 +399,72 @@ impl Router {
     /// are left untouched.
     ///
     /// Called from `lib/src/https.rs::HttpsListener::update_config` when
-    /// an `UpdateHttpsListenerConfig.hsts` patch is applied. The
-    /// per-frontend `headers_response: Rc<[HeaderEdit]>` is rebuilt by
-    /// dropping any existing `Strict-Transport-Security` entry and
-    /// appending a freshly rendered one when `new_hsts` resolves to an
-    /// enabled value (`enabled = Some(true)`). The existing operator
-    /// `Append`/`Set` response headers stay in place.
+    /// an `UpdateHttpsListenerConfig.hsts` patch is applied.
     ///
-    /// Returns the number of frontends touched. Inheriting frontends
-    /// where the new policy resolves to "no HSTS" (e.g.
-    /// `enabled = Some(false)`) are still touched — the existing HSTS
-    /// edit is stripped — and counted.
+    /// Two refresh paths:
+    ///
+    /// 1. **`Route::Frontend(rc)` with `inherits_listener_hsts == true`**:
+    ///    rebuild `headers_response` by dropping any existing
+    ///    `Strict-Transport-Security` entry and appending a freshly
+    ///    rendered one when `new_hsts` resolves to an enabled value
+    ///    (`enabled = Some(true)`). The existing operator
+    ///    `Append`/`Set` response headers stay in place.
+    ///
+    /// 2. **`Route::ClusterId(id)` and `Route::Deny`** (lightweight
+    ///    "no policy" shapes): when `new_hsts` resolves to enabled,
+    ///    promote in place to a minimal `Route::Frontend(rc)` carrying
+    ///    just the HSTS edit on `headers_response` (and
+    ///    `inherits_listener_hsts == true` so subsequent patches keep
+    ///    refreshing the entry). Routing semantics are preserved — the
+    ///    promoted Frontend forwards / denies identically to the
+    ///    original variant — and the promoted entry now participates
+    ///    in path 1 on every later patch. When `new_hsts` resolves to
+    ///    "no HSTS" (None / disabled), lightweight routes are left
+    ///    untouched (no allocation is created just to hold an empty
+    ///    HSTS edit).
+    ///
+    /// Path 2 fixes the case where a frontend was added without any
+    /// per-frontend policy field (the routing fast path stores it as
+    /// `Route::ClusterId` / `Route::Deny`, NOT `Route::Frontend`). Before
+    /// this two-path walk, listener-default HSTS patches silently
+    /// skipped every such "no-policy" frontend — which on a typical
+    /// Clever Cloud `cleverapps.io` shared listener was 99 % of the
+    /// frontends.
+    ///
+    /// Returns the number of frontends touched. For path 1, refreshed
+    /// frontends where the new policy resolves to "no HSTS" are still
+    /// counted (the existing HSTS edit is stripped). For path 2, only
+    /// frontends actually promoted (i.e. `new_hsts` enabled) are
+    /// counted, since "no HSTS" is a no-op on the lightweight shape.
     pub fn refresh_inheriting_hsts(&mut self, new_hsts: Option<&HstsConfig>) -> usize {
         let mut refreshed = 0usize;
-        let mut visit = |route: &mut Route| {
-            if let Route::Frontend(rc) = route {
+        // Pre-compute whether a promotion is worth doing on lightweight
+        // routes — `would_emit_hsts` mirrors the gate inside
+        // `rebuild_with_listener_hsts` so we don't allocate a Frontend
+        // just to discover its `headers_response` is empty.
+        let promote_lightweight = would_emit_hsts(new_hsts);
+        let mut visit = |route: &mut Route| match route {
+            Route::Frontend(rc) => {
                 if rc.inherits_listener_hsts {
                     let new_frontend = rebuild_with_listener_hsts(rc, new_hsts);
                     *rc = Rc::new(new_frontend);
+                    refreshed += 1;
+                }
+            }
+            Route::ClusterId(id) => {
+                if promote_lightweight {
+                    let promoted = rebuild_with_listener_hsts(
+                        &Frontend::minimal_forward(id.clone()),
+                        new_hsts,
+                    );
+                    *route = Route::Frontend(Rc::new(promoted));
+                    refreshed += 1;
+                }
+            }
+            Route::Deny => {
+                if promote_lightweight {
+                    let promoted = rebuild_with_listener_hsts(&Frontend::minimal_deny(), new_hsts);
+                    *route = Route::Frontend(Rc::new(promoted));
                     refreshed += 1;
                 }
             }
@@ -826,6 +874,22 @@ pub enum Route {
     /// configuration; supersedes the legacy variants once Wave 1c migrates
     /// the in-memory frontend wiring.
     Frontend(Rc<Frontend>),
+}
+
+/// Whether the supplied listener-default HSTS would render a non-empty
+/// `Strict-Transport-Security` header. Mirrors the gate inside
+/// [`rebuild_with_listener_hsts`] (`enabled = Some(true)` AND
+/// `render_hsts` returns `Some`). Used by
+/// [`Router::refresh_inheriting_hsts`] to decide whether promoting a
+/// lightweight `Route::ClusterId` / `Route::Deny` to `Route::Frontend`
+/// would actually result in any HSTS being emitted; if not, the
+/// promotion is skipped to avoid leaking empty Frontend allocations on
+/// disable patches.
+fn would_emit_hsts(new_hsts: Option<&HstsConfig>) -> bool {
+    new_hsts
+        .filter(|cfg| matches!(cfg.enabled, Some(true)))
+        .and_then(render_hsts)
+        .is_some()
 }
 
 /// Build a new [`Frontend`] cloned from `frontend`, with its
@@ -1448,10 +1512,17 @@ impl Frontend {
         })
     }
 
-    /// Test-only constructor: build a Frontend that simply forwards to
-    /// `cluster_id`, with no rewrite/header/auth configuration.
-    #[cfg(test)]
-    pub fn forward(cluster_id: ClusterId) -> Self {
+    /// Build a minimal Frontend that simply forwards to `cluster_id`,
+    /// with no rewrite / header / auth configuration. Equivalent to a
+    /// `Route::ClusterId(cluster_id)` lookup-wise (lookup short-circuits
+    /// to `RouteResult::forward(id)` for both shapes), with the added
+    /// ability to carry response-header edits — used by
+    /// [`Router::refresh_inheriting_hsts`] to promote a lightweight
+    /// `Route::ClusterId` to a `Route::Frontend` carrying just the
+    /// listener-default HSTS edit. The `inherits_listener_hsts = true`
+    /// marker lets subsequent listener-default patches keep refreshing
+    /// the promoted entry.
+    pub(crate) fn minimal_forward(cluster_id: ClusterId) -> Self {
         Self {
             cluster_id: Some(cluster_id),
             redirect: RedirectPolicy::Forward,
@@ -1466,7 +1537,36 @@ impl Frontend {
             headers_response: Rc::new([]),
             required_auth: false,
             tags: None,
-            inherits_listener_hsts: false,
+            inherits_listener_hsts: true,
+        }
+    }
+
+    /// Build a minimal clusterless Frontend with the
+    /// [`RedirectPolicy::Unauthorized`] policy. Equivalent to a
+    /// `Route::Deny` lookup-wise (both yield a 401 default answer),
+    /// with the added ability to carry response-header edits — used by
+    /// [`Router::refresh_inheriting_hsts`] to promote `Route::Deny`
+    /// entries when the listener-default HSTS becomes enabled, so the
+    /// 401 default answer carries the `Strict-Transport-Security`
+    /// header per RFC 6797 §8.1. The `inherits_listener_hsts = true`
+    /// marker lets subsequent listener-default patches keep refreshing
+    /// the promoted entry.
+    pub(crate) fn minimal_deny() -> Self {
+        Self {
+            cluster_id: None,
+            redirect: RedirectPolicy::Unauthorized,
+            redirect_scheme: RedirectScheme::UseSame,
+            redirect_template: None,
+            capture_cap_host: 0,
+            capture_cap_path: 0,
+            rewrite_host: None,
+            rewrite_path: None,
+            rewrite_port: None,
+            headers_request: Rc::new([]),
+            headers_response: Rc::new([]),
+            required_auth: false,
+            tags: None,
+            inherits_listener_hsts: true,
         }
     }
 }
@@ -1997,6 +2097,283 @@ mod tests {
         } else {
             panic!("post[0] should be Route::Frontend");
         }
+    }
+
+    #[test]
+    fn refresh_inheriting_hsts_promotes_clusterid_on_enable() {
+        // The "no policy" frontend case observed on cleverapps.io shared
+        // (91k+ frontends, 99 % stored as `Route::ClusterId` with no
+        // policy fields). Before the fix, `refresh_inheriting_hsts`
+        // walked only `Route::Frontend` entries and silently skipped
+        // these — leaving HSTS unapplied across the entire fleet.
+        // Now the lightweight route is promoted in place to a
+        // `Route::Frontend` carrying just the HSTS edit; subsequent
+        // patches refresh the promoted entry through the normal
+        // `inherits_listener_hsts == true` path.
+        use crate::router::pattern_trie::TrieNode;
+        let mut router = Router {
+            pre: Vec::new(),
+            tree: TrieNode::root(),
+            post: vec![(
+                DomainRule::Any,
+                PathRule::Prefix("/".to_owned()),
+                MethodRule::new(None),
+                Route::ClusterId("api".to_owned()),
+            )],
+        };
+
+        let new_hsts = HstsConfig {
+            enabled: Some(true),
+            max_age: Some(31_536_000),
+            include_subdomains: Some(true),
+            preload: None,
+            force_replace_backend: None,
+        };
+        let count = router.refresh_inheriting_hsts(Some(&new_hsts));
+        assert_eq!(count, 1, "the ClusterId entry must be promoted + counted");
+
+        let Route::Frontend(rc) = &router.post[0].3 else {
+            panic!("post[0] should now be Route::Frontend, not the original Route::ClusterId");
+        };
+        assert_eq!(rc.cluster_id.as_deref(), Some("api"));
+        assert_eq!(
+            rc.redirect,
+            RedirectPolicy::Forward,
+            "promoted entry must keep Forward semantics so lookup yields the same backend"
+        );
+        assert!(
+            rc.inherits_listener_hsts,
+            "promoted entry must mark itself inheriting so the next patch refreshes it"
+        );
+        let response: Vec<_> = rc.headers_response.iter().collect();
+        assert_eq!(
+            response.len(),
+            1,
+            "promoted entry carries exactly one STS edit, no operator headers"
+        );
+        assert_eq!(&*response[0].key, b"strict-transport-security");
+        assert_eq!(
+            &*response[0].val,
+            b"max-age=31536000; includeSubDomains".as_slice()
+        );
+    }
+
+    #[test]
+    fn refresh_inheriting_hsts_promotes_deny_on_enable() {
+        // RFC 6797 §8.1: HSTS applies to ALL HTTPS responses, including
+        // proxy-generated 401s. A `Route::Deny` with no policy field at
+        // add-time would, before the fix, never get HSTS injected onto
+        // the 401 default answer even when the listener default
+        // declared HSTS.
+        use crate::router::pattern_trie::TrieNode;
+        let mut router = Router {
+            pre: Vec::new(),
+            tree: TrieNode::root(),
+            post: vec![(
+                DomainRule::Any,
+                PathRule::Prefix("/forbidden".to_owned()),
+                MethodRule::new(None),
+                Route::Deny,
+            )],
+        };
+
+        let new_hsts = HstsConfig {
+            enabled: Some(true),
+            max_age: Some(31_536_000),
+            include_subdomains: None,
+            preload: None,
+            force_replace_backend: None,
+        };
+        let count = router.refresh_inheriting_hsts(Some(&new_hsts));
+        assert_eq!(count, 1);
+
+        let Route::Frontend(rc) = &router.post[0].3 else {
+            panic!("post[0] should now be Route::Frontend, not the original Route::Deny");
+        };
+        assert_eq!(rc.cluster_id, None, "promoted Deny stays clusterless");
+        assert_eq!(
+            rc.redirect,
+            RedirectPolicy::Unauthorized,
+            "promoted Deny must keep Unauthorized so lookup yields a 401"
+        );
+        assert!(rc.inherits_listener_hsts);
+        let response: Vec<_> = rc.headers_response.iter().collect();
+        assert_eq!(response.len(), 1);
+        assert_eq!(&*response[0].key, b"strict-transport-security");
+        assert_eq!(&*response[0].val, b"max-age=31536000".as_slice());
+    }
+
+    #[test]
+    fn refresh_inheriting_hsts_skips_lightweight_on_disable() {
+        // No HSTS to emit → no allocation of a Route::Frontend just to
+        // hold an empty headers_response. The lightweight route is
+        // preserved as-is. Three sub-cases cover the disable surface:
+        //   - new_hsts == None (operator omitted the field — preserve current… but
+        //     this function is called only when the patch DID carry a value, so
+        //     None here represents "block was not present"; lightweight stays).
+        //   - new_hsts == Some(enabled = Some(false)) (explicit kill switch).
+        //   - new_hsts == Some(enabled = Some(true), max_age = None) (malformed
+        //     enable — render_hsts returns None, defense-in-depth gate).
+        use crate::router::pattern_trie::TrieNode;
+        let make_router = || Router {
+            pre: vec![(
+                DomainRule::Any,
+                PathRule::Prefix("/".to_owned()),
+                MethodRule::new(None),
+                Route::ClusterId("api".to_owned()),
+            )],
+            tree: TrieNode::root(),
+            post: vec![(
+                DomainRule::Any,
+                PathRule::Prefix("/forbidden".to_owned()),
+                MethodRule::new(None),
+                Route::Deny,
+            )],
+        };
+
+        for (label, hsts) in [
+            ("none", None),
+            (
+                "disabled",
+                Some(HstsConfig {
+                    enabled: Some(false),
+                    max_age: None,
+                    include_subdomains: None,
+                    preload: None,
+                    force_replace_backend: None,
+                }),
+            ),
+            (
+                "enabled-without-max-age",
+                Some(HstsConfig {
+                    enabled: Some(true),
+                    max_age: None,
+                    include_subdomains: None,
+                    preload: None,
+                    force_replace_backend: None,
+                }),
+            ),
+        ] {
+            let mut router = make_router();
+            let count = router.refresh_inheriting_hsts(hsts.as_ref());
+            assert_eq!(count, 0, "no promotion expected for {label}");
+            assert!(
+                matches!(router.pre[0].3, Route::ClusterId(_)),
+                "{label}: ClusterId must stay lightweight"
+            );
+            assert!(
+                matches!(router.post[0].3, Route::Deny),
+                "{label}: Deny must stay lightweight"
+            );
+        }
+    }
+
+    #[test]
+    fn refresh_inheriting_hsts_promoted_entry_refreshes_on_subsequent_patches() {
+        // First patch promotes ClusterId → Route::Frontend with HSTS.
+        // Second patch with a different max-age must refresh the
+        // promoted entry through the normal path-1 branch (no double
+        // STS edit, no second promotion of an already-promoted entry).
+        use crate::router::pattern_trie::TrieNode;
+        let mut router = Router {
+            pre: Vec::new(),
+            tree: TrieNode::root(),
+            post: vec![(
+                DomainRule::Any,
+                PathRule::Prefix("/".to_owned()),
+                MethodRule::new(None),
+                Route::ClusterId("api".to_owned()),
+            )],
+        };
+
+        let first_patch = HstsConfig {
+            enabled: Some(true),
+            max_age: Some(31_536_000),
+            include_subdomains: None,
+            preload: None,
+            force_replace_backend: None,
+        };
+        assert_eq!(router.refresh_inheriting_hsts(Some(&first_patch)), 1);
+
+        let second_patch = HstsConfig {
+            enabled: Some(true),
+            max_age: Some(63_072_000),
+            include_subdomains: Some(true),
+            preload: None,
+            force_replace_backend: None,
+        };
+        assert_eq!(
+            router.refresh_inheriting_hsts(Some(&second_patch)),
+            1,
+            "the previously promoted entry must be re-counted via the path-1 branch"
+        );
+
+        let Route::Frontend(rc) = &router.post[0].3 else {
+            panic!("post[0] should still be Route::Frontend after the second patch");
+        };
+        let response: Vec<_> = rc.headers_response.iter().collect();
+        assert_eq!(
+            response.len(),
+            1,
+            "second patch must REPLACE the existing STS edit, not append a duplicate"
+        );
+        assert_eq!(
+            &*response[0].val,
+            b"max-age=63072000; includeSubDomains".as_slice()
+        );
+    }
+
+    #[test]
+    fn refresh_inheriting_hsts_promoted_entry_loses_hsts_on_disable_patch() {
+        // After a promotion, a disable patch must strip the STS edit
+        // through the path-1 branch. The Route::Frontend wrapper stays
+        // (we don't demote back to Route::ClusterId — the small per-
+        // request overhead of running through `from_frontend` instead
+        // of the short-circuit is acceptable, and demotion would
+        // require carrying additional state).
+        use crate::router::pattern_trie::TrieNode;
+        let mut router = Router {
+            pre: vec![(
+                DomainRule::Any,
+                PathRule::Prefix("/".to_owned()),
+                MethodRule::new(None),
+                Route::ClusterId("api".to_owned()),
+            )],
+            tree: TrieNode::root(),
+            post: Vec::new(),
+        };
+
+        let enable = HstsConfig {
+            enabled: Some(true),
+            max_age: Some(31_536_000),
+            include_subdomains: None,
+            preload: None,
+            force_replace_backend: None,
+        };
+        assert_eq!(router.refresh_inheriting_hsts(Some(&enable)), 1);
+
+        let disable = HstsConfig {
+            enabled: Some(false),
+            max_age: None,
+            include_subdomains: None,
+            preload: None,
+            force_replace_backend: None,
+        };
+        assert_eq!(
+            router.refresh_inheriting_hsts(Some(&disable)),
+            1,
+            "the promoted entry must still be touched on disable to strip its STS edit"
+        );
+
+        let Route::Frontend(rc) = &router.pre[0].3 else {
+            panic!("pre[0] should still be Route::Frontend (no demotion)");
+        };
+        assert_eq!(rc.cluster_id.as_deref(), Some("api"));
+        assert_eq!(
+            rc.headers_response.len(),
+            0,
+            "disable patch must strip the STS edit from the promoted entry"
+        );
     }
 
     #[test]

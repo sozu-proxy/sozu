@@ -43,6 +43,39 @@ upgrade. See `doc/upgrade/1.x-to-2.0.md` for the full migration guide.
 
 ### ⛑️ Fixed
 
+- **Listener-default HSTS now refreshes "no policy" frontends too**:
+  `Router::refresh_inheriting_hsts` (`lib/src/router/mod.rs`) previously
+  walked only `Route::Frontend` entries — but the routing fast path in
+  `add_http_front_with_hsts_origin` stores frontends without ANY
+  per-frontend policy field (no redirect, no rewrite, no headers, no
+  auth, no `[hsts]` block) under the lightweight `Route::ClusterId` /
+  `Route::Deny` shapes, NOT as `Route::Frontend`. As a result, an
+  `UpdateHttpsListenerConfig.hsts` patch silently skipped every
+  "no-policy" inheriting frontend on the listener — observed on a
+  Clever Cloud `cleverapps.io` shared node where only ~60 of 91 k+
+  inheriting frontends were refreshed per patch (~0.07 % of the
+  fleet), leaving 99 %+ of HTTPS responses without the
+  `Strict-Transport-Security` header that the operator had just
+  configured. The walk now visits all three `Route` variants: existing
+  `Route::Frontend` entries follow the original path-1 rebuild, and
+  `Route::ClusterId(id)` / `Route::Deny` entries are promoted in place
+  to a minimal `Route::Frontend` carrying just the listener-default
+  HSTS edit (`Frontend::minimal_forward` / `Frontend::minimal_deny`)
+  with `inherits_listener_hsts = true` so subsequent patches keep
+  refreshing them. Routing semantics are preserved — the promoted
+  `Frontend` forwards (resp. denies) identically to the lightweight
+  variant. Promotion is gated on `would_emit_hsts(new_hsts)` so a
+  patch that resolves to "no HSTS" (None / `enabled = Some(false)` /
+  malformed `enabled = true` with no `max_age`) is a no-op on
+  lightweight routes — no allocation is created just to hold an empty
+  edit. `http.hsts.frontend_refreshed` now counts path-1 refreshes +
+  path-2 promotions combined. Regression tests in
+  `lib/src/router/mod.rs::tests`:
+  `refresh_inheriting_hsts_promotes_clusterid_on_enable`,
+  `refresh_inheriting_hsts_promotes_deny_on_enable`,
+  `refresh_inheriting_hsts_skips_lightweight_on_disable`,
+  `refresh_inheriting_hsts_promoted_entry_refreshes_on_subsequent_patches`,
+  `refresh_inheriting_hsts_promoted_entry_loses_hsts_on_disable_patch`.
 - **`LoadState` accepts JSON state files from older `sozu-command-lib` clients
   (`1.1.1` forward-compat)**: `bin/src/command/requests.rs::load_state` reads
   each `\n\0`-separated JSON record via
