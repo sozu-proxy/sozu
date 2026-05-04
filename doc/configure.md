@@ -327,6 +327,8 @@ enabled = false
 
 ##### Runtime CLI surface
 
+Per-frontend override (replaces the listener default for one frontend):
+
 ```
 sozu frontend https add \
   --address 0.0.0.0:443 \
@@ -335,11 +337,20 @@ sozu frontend https add \
   --hsts-include-subdomains
 ```
 
-`--hsts-disabled` is mutually exclusive with `--hsts-max-age` / `--hsts-include-subdomains` / `--hsts-preload`; combining them surfaces `CtlError::ArgsNeeded` rather than a silent pick.
+Listener-default patch (replaces the policy for every frontend that inherits from the listener):
+
+```
+sozu listener https update \
+  -a 0.0.0.0:443 \
+  --hsts-max-age 31536000 \
+  --hsts-include-subdomains
+```
+
+Both surfaces share the same flag set: `--hsts-max-age`, `--hsts-include-subdomains`, `--hsts-preload`, `--hsts-force-replace-backend`, and the kill-switch `--hsts-disabled`. The latter is mutually exclusive with the four enabling flags on either path; combining them surfaces `CtlError::ArgsNeeded` from the shared `build_hsts_from_cli` helper rather than a silent pick.
 
 ##### Hot-reconfig partial-update
 
-`UpdateHttpsListenerConfig.hsts` follows full-object replacement semantics: when present in the patch, the entire HSTS block replaces the listener's current value. `enabled` is REQUIRED whenever `hsts` is present (`ListenerError::HstsEnabledRequired` rejects an `enabled = None` block). Absent `hsts` field on the patch preserves the current value.
+`UpdateHttpsListenerConfig.hsts` follows full-object replacement semantics: when present in the patch, the entire HSTS block replaces the listener's current value. `enabled` is REQUIRED whenever `hsts` is present (`ListenerError::HstsEnabledRequired` rejects an `enabled = None` block). Absent `hsts` field on the patch preserves the current value. The CLI surface above (`sozu listener https update --hsts-*`) feeds this same partial-update message; supplying any `--hsts-*` flag on the command line replaces the listener's HSTS policy and supplying `--hsts-disabled` substitutes the explicit-disable block (`enabled = Some(false)`).
 
 **Inheriting frontends are refreshed automatically.** Patching the listener-default HSTS reflows the new policy onto every existing frontend that inherited from the listener (i.e. has no per-frontend `[hsts]` block at add time). `Router::refresh_inheriting_hsts` walks the routing trie, identifies inheriting entries via the `Frontend.inherits_listener_hsts` marker, and rebuilds their `headers_response` against the new value — stripping any prior `Strict-Transport-Security` entry and appending a freshly rendered one. Per-frontend explicit overrides (`inherits_listener_hsts == false`) are left untouched. The `http.hsts.listener_default_patched` counter fires once per patch and `http.hsts.frontend_refreshed` increments per refreshed frontend, so dashboards can correlate the rate of patches with the size of the affected fleet.
 
