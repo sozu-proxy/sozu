@@ -134,10 +134,14 @@ impl MetricValue {
                 changed
             }
             (&mut MetricValue::Gauge(ref mut v1), MetricValue::GaugeAdd(v2)) => {
-                debug_assert!(
-                    *v1 as i64 + v2 >= 0,
-                    "metric {key} underflow: previous value: {v1}, adding: {v2}"
-                );
+                // Saturating clamp + `error!` log on underflow, symmetric
+                // with `AggregatedMetric::update` in `local_drain.rs`. The
+                // `debug_assert!` that lived here previously made debug
+                // builds panic while release silently clamped; H2
+                // `ConnectionH2::Drop` rebalance + the saturating clamps
+                // make underflow structurally impossible from live code,
+                // and a panic on a metric mismatch is too aggressive — the
+                // log line names the offending key for observability.
                 let changed = v2 != 0;
                 let res = *v1 as i64 + v2;
                 *v1 = if res >= 0 {
@@ -645,6 +649,28 @@ impl Aggregator {
 
     pub fn configure(&mut self, config: &MetricsConfiguration) {
         self.local.configure(config);
+    }
+
+    /// Drop all metric storage for a cluster across BOTH drains. Called from
+    /// the worker IPC dispatch on [`RequestType::RemoveCluster`] so retired
+    /// clusters do not leak per-cluster keys after the wall-clock hourly
+    /// clear was removed. Network-side draining the queued `MetricLine`s
+    /// produces immediate silence on the wire (any unsent statsd interval
+    /// for the cluster is discarded).
+    pub fn remove_cluster(&mut self, cluster_id: &str) {
+        if let Some(ref mut net) = self.network.as_mut() {
+            net.remove_cluster(cluster_id);
+        }
+        self.local.remove_cluster(cluster_id);
+    }
+
+    /// Drop all metric storage for one backend across BOTH drains. Called
+    /// from the worker IPC dispatch on [`RequestType::RemoveBackend`].
+    pub fn remove_backend(&mut self, cluster_id: &str, backend_id: &str) {
+        if let Some(ref mut net) = self.network.as_mut() {
+            net.remove_backend(cluster_id, backend_id);
+        }
+        self.local.remove_backend(cluster_id, backend_id);
     }
 }
 

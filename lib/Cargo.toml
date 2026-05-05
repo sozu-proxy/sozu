@@ -53,7 +53,6 @@ slab = { workspace = true }
 socket2 = { workspace = true, features = ["all"] }
 subtle = { workspace = true }
 thiserror = { workspace = true }
-time = { workspace = true }
 
 sozu-command-lib = { workspace = true }
 

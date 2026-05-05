@@ -64,6 +64,36 @@ impl NetworkDrain {
         self.is_writable = true;
     }
 
+    /// Drop all wire-side metric storage for a cluster: stored counters /
+    /// gauges in `cluster_metrics` + `backend_metrics`, and any queued
+    /// `MetricLine` carrying the cluster id. Called from
+    /// [`super::Aggregator::remove_cluster`] on `RequestType::RemoveCluster`.
+    /// Any unsent statsd interval for the cluster is **dropped**, not
+    /// emitted: there is no final flush. Operators that need per-removal
+    /// delta accuracy must trigger a flush before the IPC. In practice
+    /// cluster-removal events are rare and the loss is bounded by the
+    /// metrics send cadence (typically ≤1 second).
+    pub fn remove_cluster(&mut self, cluster_id: &str) {
+        self.cluster_metrics.retain(|(c, _), _| c != cluster_id);
+        self.backend_metrics.retain(|(c, _, _), _| c != cluster_id);
+        self.queue
+            .retain(|m| m.cluster_id.as_deref() != Some(cluster_id));
+    }
+
+    /// Drop all wire-side metric storage for one backend: stored counters
+    /// in `backend_metrics` and any queued `MetricLine` for that backend.
+    /// Called from [`super::Aggregator::remove_backend`] on
+    /// `RequestType::RemoveBackend`. Same final-delta-loss caveat as
+    /// [`Self::remove_cluster`].
+    pub fn remove_backend(&mut self, cluster_id: &str, backend_id: &str) {
+        self.backend_metrics
+            .retain(|(c, b, _), _| !(c == cluster_id && b == backend_id));
+        self.queue.retain(|m| {
+            !(m.cluster_id.as_deref() == Some(cluster_id)
+                && m.backend_id.as_deref() == Some(backend_id))
+        });
+    }
+
     pub fn send_metrics(&mut self) {
         let now = Instant::now();
         let secs = Duration::new(1, 0);
@@ -499,5 +529,172 @@ impl Subscriber for NetworkDrain {
         if let Some(stored_metric) = self.proxy_metrics.get_mut(key) {
             stored_metric.update(key, metric);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+
+    use mio::net::UdpSocket;
+
+    use super::{MetricLine, NetworkDrain, StoredMetricValue};
+    use crate::metrics::MetricValue;
+
+    fn loopback_drain() -> NetworkDrain {
+        let socket = UdpSocket::bind(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))
+            .expect("bind loopback UDP for test");
+        let local = socket.local_addr().expect("local_addr");
+        NetworkDrain::new("test".to_string(), socket, local)
+    }
+
+    fn seed_cluster(drain: &mut NetworkDrain, cluster: &str, key: &str, count: i64) {
+        drain.cluster_metrics.insert(
+            (cluster.to_string(), key.to_string()),
+            StoredMetricValue::new(drain.created, MetricValue::Count(count)),
+        );
+    }
+
+    fn seed_backend(drain: &mut NetworkDrain, cluster: &str, backend: &str, key: &str, count: i64) {
+        drain.backend_metrics.insert(
+            (cluster.to_string(), backend.to_string(), key.to_string()),
+            StoredMetricValue::new(drain.created, MetricValue::Count(count)),
+        );
+    }
+
+    fn queue_line(cluster: Option<&str>, backend: Option<&str>) -> MetricLine {
+        MetricLine {
+            label: "test_metric",
+            cluster_id: cluster.map(str::to_string),
+            backend_id: backend.map(str::to_string),
+            duration: 0,
+        }
+    }
+
+    #[test]
+    fn network_drain_remove_cluster_drops_cluster_and_backend_keys() {
+        let mut drain = loopback_drain();
+
+        seed_cluster(&mut drain, "cluster-a", "metric_a", 1);
+        seed_cluster(&mut drain, "cluster-b", "metric_a", 2);
+        seed_backend(&mut drain, "cluster-a", "backend-1", "metric_b", 3);
+        seed_backend(&mut drain, "cluster-b", "backend-2", "metric_b", 4);
+
+        drain.remove_cluster("cluster-a");
+
+        assert!(
+            !drain
+                .cluster_metrics
+                .contains_key(&("cluster-a".to_string(), "metric_a".to_string())),
+            "cluster-a stored counter must be gone"
+        );
+        assert!(
+            !drain.backend_metrics.contains_key(&(
+                "cluster-a".to_string(),
+                "backend-1".to_string(),
+                "metric_b".to_string()
+            )),
+            "cluster-a backend stored counter must be gone"
+        );
+        assert!(
+            drain
+                .cluster_metrics
+                .contains_key(&("cluster-b".to_string(), "metric_a".to_string())),
+            "cluster-b counter must survive"
+        );
+        assert!(
+            drain.backend_metrics.contains_key(&(
+                "cluster-b".to_string(),
+                "backend-2".to_string(),
+                "metric_b".to_string()
+            )),
+            "cluster-b backend counter must survive"
+        );
+    }
+
+    #[test]
+    fn network_drain_remove_cluster_drains_queue_for_that_cluster() {
+        let mut drain = loopback_drain();
+
+        drain.queue.push_back(queue_line(Some("cluster-a"), None));
+        drain
+            .queue
+            .push_back(queue_line(Some("cluster-a"), Some("backend-1")));
+        drain.queue.push_back(queue_line(Some("cluster-b"), None));
+        drain.queue.push_back(queue_line(None, None));
+
+        drain.remove_cluster("cluster-a");
+
+        let remaining: Vec<_> = drain.queue.iter().map(|m| m.cluster_id.clone()).collect();
+        assert_eq!(remaining.len(), 2, "two non-cluster-a lines must survive");
+        assert!(
+            remaining.iter().all(|c| c.as_deref() != Some("cluster-a")),
+            "no cluster-a line must remain in queue"
+        );
+    }
+
+    #[test]
+    fn network_drain_remove_backend_drops_only_one_backend() {
+        let mut drain = loopback_drain();
+
+        seed_cluster(&mut drain, "cluster-a", "metric_a", 1);
+        seed_backend(&mut drain, "cluster-a", "backend-1", "metric_b", 2);
+        seed_backend(&mut drain, "cluster-a", "backend-2", "metric_b", 3);
+
+        drain.remove_backend("cluster-a", "backend-1");
+
+        assert!(
+            !drain.backend_metrics.contains_key(&(
+                "cluster-a".to_string(),
+                "backend-1".to_string(),
+                "metric_b".to_string()
+            )),
+            "backend-1 stored counter must be gone"
+        );
+        assert!(
+            drain.backend_metrics.contains_key(&(
+                "cluster-a".to_string(),
+                "backend-2".to_string(),
+                "metric_b".to_string()
+            )),
+            "backend-2 stored counter must survive"
+        );
+        assert!(
+            drain
+                .cluster_metrics
+                .contains_key(&("cluster-a".to_string(), "metric_a".to_string())),
+            "cluster-level entry must survive a backend removal"
+        );
+    }
+
+    #[test]
+    fn network_drain_remove_backend_drains_only_that_backend_from_queue() {
+        let mut drain = loopback_drain();
+
+        drain
+            .queue
+            .push_back(queue_line(Some("cluster-a"), Some("backend-1")));
+        drain
+            .queue
+            .push_back(queue_line(Some("cluster-a"), Some("backend-2")));
+        drain.queue.push_back(queue_line(Some("cluster-a"), None));
+        drain
+            .queue
+            .push_back(queue_line(Some("cluster-b"), Some("backend-1")));
+
+        drain.remove_backend("cluster-a", "backend-1");
+
+        let remaining: Vec<_> = drain
+            .queue
+            .iter()
+            .map(|m| (m.cluster_id.clone(), m.backend_id.clone()))
+            .collect();
+        assert_eq!(remaining.len(), 3, "only the targeted line must drop");
+        assert!(
+            remaining.iter().all(|(c, b)| {
+                !(c.as_deref() == Some("cluster-a") && b.as_deref() == Some("backend-1"))
+            }),
+            "no (cluster-a, backend-1) line must remain"
+        );
     }
 }

@@ -1458,11 +1458,11 @@ Metrics are collected via thread-local storage macros (`count!`, `gauge!`,
 
 Metric types:
 
-| Type    | Macro                      | StatsD suffix | Description                                                        |
-| ------- | -------------------------- | ------------- | ------------------------------------------------------------------ |
-| Counter | `count!`, `incr!`, `decr!` | `\|c`         | Monotonically increasing value, reset to 0 after each network send |
-| Gauge   | `gauge!`, `gauge_add!`     | `\|g`         | Snapshot value (absolute or delta)                                 |
-| Time    | `time!`                    | `\|ms`        | Latency in milliseconds, stored as HDR histogram locally           |
+| Type    | Macro                      | StatsD suffix | Description                                                                                                                                         |
+| ------- | -------------------------- | ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Counter | `count!`, `incr!`, `decr!` | `\|c`         | Monotonically increasing. Network drain: zeroed after each successful UDP send (per-interval delta). Local drain: cumulative since worker start.    |
+| Gauge   | `gauge!`, `gauge_add!`     | `\|g`         | Snapshot value (absolute or delta). Last-value-wins; never automatically reset.                                                                     |
+| Time    | `time!`                    | `\|ms`        | Latency in milliseconds. Local drain stores an HDR histogram (`Histogram<u64>`, sigfig=3); samples accumulate since worker start.                   |
 
 Metrics have three scopes:
 
@@ -1489,6 +1489,28 @@ address = "127.0.0.1:8125"
 Metrics are sent at most once per second per key (if updated). Cluster/backend
 metrics that have not been updated for 10 minutes are automatically dropped from
 the network drain.
+
+#### Metrics scopes (local CLI vs network drain)
+
+- The **network drain** (StatsD UDP) sends per-second deltas; counters are
+  zeroed after each successful send. On `RemoveCluster` / `RemoveBackend`,
+  the drain immediately drops the cluster's `cluster_metrics`,
+  `backend_metrics`, and queued `MetricLine` entries — any unsent statsd
+  interval for the cluster is discarded (no final flush). Without an
+  explicit `RemoveCluster`, the existing 10-minute idle GC still applies.
+- The **local drain** (queryable via `sozu metrics`) is **cumulative since
+  worker start** for both `proxy_metrics` and per-cluster /
+  per-backend `cluster_metrics`. There is no implicit hourly reset.
+  Operators reset it explicitly with `sozu metrics clear`, which wipes
+  everything (counts, gauges, histograms, proxy-wide and per-cluster, AND
+  the master-process `main_metrics` aggregator).
+- Per-cluster local-drain entries are dropped on `RemoveCluster` /
+  `RemoveBackend` so the keyspace is bounded by the live configuration.
+- Implication for dashboards: counters in `sozu metrics` output are
+  monotonic. Charts must compute `rate()` / `irate()` rather than treat
+  successive snapshots as windowed counts. Histograms accumulate every
+  sample since worker start, so percentiles in the CLI snapshot are
+  lifetime values, not windowed.
 
 #### Cardinality knob (`metrics.detail`)
 
