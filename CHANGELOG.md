@@ -185,6 +185,26 @@ upgrade. See `doc/upgrade/1.x-to-2.0.md` for the full migration guide.
   Dashboards scraping the old per-status name need updating; the new key is
   documented in `doc/configure.md` alongside the new `http.302.redirection` and
   `http.308.redirection` counters.
+- **Per-cluster local-drain metrics are now cumulative since worker start**
+  (`lib/src/metrics/local_drain.rs`, `lib/src/server.rs`). The previous
+  behaviour reset `Count` and `Time` entries in `cluster_metrics` at every UTC
+  hour boundary; that wall-clock timer is gone. `proxy_metrics` was already
+  cumulative, so this aligns the two map shapes. Operator dashboards that
+  consumed `sozu metrics` snapshots and assumed an hourly window must wrap
+  the counter in `rate()` / `irate()` (or take a successive-snapshot diff
+  client-side). The CLI verb `sozu metrics clear`
+  (`MetricsConfiguration::Clear`) now wipes everything (counts, gauges,
+  histograms, proxy-wide and per-cluster, AND the master-process
+  `main_metrics`) — formerly it preserved gauges and never touched
+  `proxy_metrics` or `main_metrics`. On cluster removal, the cluster is
+  dropped immediately from both the local drain and the StatsD
+  `network_drain` (`cluster_metrics`, `backend_metrics`, queued
+  `MetricLine`s); any unsent statsd interval for the cluster is discarded
+  rather than emitted. Formerly the cluster lingered for up to 10 minutes
+  via the idle GC. The StatsD wire format is unchanged (per-second deltas
+  as before). `Time` histograms are widened from `Histogram<u32>` to
+  `Histogram<u64>` so per-bucket counters do not saturate under sustained
+  high-RPS traffic; memory cost is roughly 2× per histogram, bounded.
 - **Removed the `proto_version` capability handshake**.
   `WorkerInfo.proto_version` (proto tag 4) and
   `MetricDetailStatus.unsupported_workers` (proto tag 5) are now
@@ -731,6 +751,23 @@ upgrade. See `doc/upgrade/1.x-to-2.0.md` for the full migration guide.
   dashboards configured for the unlabelled metric keep working at `Process`
   detail. Closes [#892](https://github.com/sozu-proxy/sozu/issues/892)
   (alongside the new cluster-availability surface listed under `### 🌟 Added`).
+- **No more hourly drop-to-zero on per-cluster counters and percentiles**
+  (`lib/src/server.rs`, `lib/src/metrics/local_drain.rs`). The wall-clock
+  block at the run-loop tail (`if now.minute() == 0 && now.second() == 0`)
+  that called `LocalDrain::clear` every hour produced apparent spikes and
+  inconsistent values in `sozu metrics` snapshots taken near the top of the
+  hour. Removed. The memory bound is now provided by explicit
+  cluster-removal lifecycle hooks (`Aggregator::remove_cluster`,
+  `Aggregator::remove_backend`) wired into the worker IPC dispatch for
+  `RequestType::RemoveCluster` and `RequestType::RemoveBackend`. Master-side
+  `main_metrics` is also wiped by `MetricsConfiguration::Clear` (formerly
+  scattered to workers but never applied locally, so `sozu metrics` would
+  still report the master's stale view).
+- **`MetricValue::update` no longer panics on gauge underflow in debug
+  builds** (`lib/src/metrics/mod.rs`). The `debug_assert!` is gone;
+  saturating clamp to 0 + `error!` log is now the single, symmetric
+  behaviour across both `MetricValue::update` and
+  `AggregatedMetric::update`, in debug and release.
 
 ### 🌟 Added
 

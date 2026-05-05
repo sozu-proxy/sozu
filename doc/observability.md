@@ -71,10 +71,12 @@ teardown after this exact bug went unnoticed for a while.
 ### Gauge underflow
 
 Past production incidents (`a650ad69`, `d2f01ed4`) all came from
-`gauge_add!(-1)` running without a paired `+1` having run earlier.
-`MetricValue::update` panics in debug builds (and clamps to zero in release)
-on underflow, but the metric is wrong either way. Two patterns prevent this
-class of bug:
+`gauge_add!(-1)` running without a paired `+1` having run earlier. Both
+`MetricValue::update` and `AggregatedMetric::update` saturate the value to
+0 and emit a single `error!` log line on underflow, in both debug and
+release builds; neither panics. The metric is still wrong on the next
+snapshot, but the process keeps running and the log line names the
+offending key. Two patterns prevent this class of bug:
 
 1. **Co-locate increments and decrements with the state being tracked.** If
    the gauge measures "active backend connections", emit the `+1` at the same
@@ -100,6 +102,51 @@ StatsD (UDP) is forgiving but Prometheus / influxdb is not. Two rules:
    `process | frontend | cluster | backend`. Mirrors HAProxy's
    `extra-counters` opt-in. New label dimensions should respect this knob;
    the wiring layer is a follow-up MR.
+
+### Local drain reset cadence
+
+The local drain (`LocalDrain` in `lib/src/metrics/local_drain.rs`) keeps two
+maps: `proxy_metrics` (proxy-wide) and `cluster_metrics` (per-cluster +
+per-backend). **Both are cumulative since worker start.** There is no
+automatic timer that resets them — the wall-clock `if now.minute() == 0
+&& now.second() == 0` block that used to clear `cluster_metrics` every UTC
+hour was removed because it produced apparent spikes / drops to zero in
+operator dashboards, and because gauges had to be preserved across the
+clear anyway (long-lived H2 sessions could close after the clear and
+underflow the gauge counter). Operators who want to reset issue
+`sozu metrics clear` (proto: `MetricsConfiguration::Clear`), which wipes
+both maps in one shot AND wipes the master process's own `main_metrics`.
+Per-cluster entries are also dropped on `RemoveCluster` /
+`RemoveBackend` IPC so retired clusters do not leak metric keys; on the
+StatsD `network_drain` the same two events drop the cluster's
+`cluster_metrics`, `backend_metrics`, and queued `MetricLine`s, so the
+wire side goes silent immediately (any unsent statsd interval for the
+cluster is discarded — bounded by `metrics_send_interval`, typically
+≤1 second).
+
+Late session emissions can briefly recreate ghost rows in
+`cluster_metrics` after a `RemoveCluster` — `LocalDrain::receive_cluster_metric`
+calls `entry().or_default()`, so a teardown that fires after the IPC
+inserts a stub cluster row. The single-threaded mio worker makes this
+trivially benign (no real race); the row sits idle until the next
+`RemoveCluster`, the next `AddCluster` for the same id, or the next
+operator clear.
+
+Implication for dashboards: counters in `sozu metrics` output are
+monotonic; charts should compute `rate()` / `irate()` rather than
+treating successive snapshots as windowed counts. Histograms accumulate
+every sample since worker start, so `Percentiles.p_99` is the lifetime
+p99, not a windowed one. Per-bucket counters are `u64` so saturation is
+not a concern under realistic uptime / RPS combinations.
+
+Operator clear caveat: issuing `sozu metrics clear` during live traffic
+resets in-flight gauge accuracy. Sessions that opened before the clear
+and decrement gauges on close (e.g. `connections_per_backend`) land on
+the saturating-to-zero path and emit one `error!` log line per
+occurrence, naming the offending key. This is intentional; the gauge
+recovers as new sessions arrive. Operators who want to reset counts but
+keep live gauges intact should not use `sozu metrics clear` — wait for
+the cumulative counters to roll over in their dashboard math instead.
 
 ## Log primitives
 

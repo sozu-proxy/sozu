@@ -1375,7 +1375,6 @@ dependencies = [
  "sozu-command-lib",
  "subtle",
  "thiserror 2.0.18",
- "time",
 ]
 
 [[package]]

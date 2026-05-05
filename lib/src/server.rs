@@ -950,15 +950,6 @@ impl Server {
             self.health_checker
                 .poll(&self.backends, self.poll.registry());
 
-            let now = time::OffsetDateTime::now_utc();
-            // clear the local metrics drain every plain hour (01:00, 02:00, etc.) to prevent memory overuse
-            // TODO: have one-hour-lasting metrics instead
-            if now.minute() == 00 && now.second() == 0 {
-                METRICS.with(|metrics| {
-                    (*metrics.borrow_mut()).clear_local();
-                });
-            }
-
             // Frontend session gauges. `client.connections` keeps the
             // per-event signal from `SessionManager::incr/decr`; the rest
             // follow the once-per-iteration batching contract this run loop
@@ -1794,6 +1785,9 @@ impl Server {
             }
             Some(RequestType::RemoveCluster(ref cluster_id)) => {
                 self.remove_health_check_state(cluster_id);
+                METRICS.with(|metrics| {
+                    (*metrics.borrow_mut()).remove_cluster(cluster_id);
+                });
                 //not returning because the message must still be handled by each proxy
             }
             Some(RequestType::SetHealthCheck(ref set)) => {
@@ -1927,6 +1921,9 @@ impl Server {
         self.backends
             .borrow_mut()
             .remove_backend(&backend.cluster_id, &address);
+        METRICS.with(|metrics| {
+            (*metrics.borrow_mut()).remove_backend(&backend.cluster_id, &backend.backend_id);
+        });
 
         WorkerResponse::ok(req_id)
     }

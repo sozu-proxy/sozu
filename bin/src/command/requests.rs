@@ -1914,15 +1914,20 @@ pub fn worker_request(
     let started_at = Instant::now();
 
     // Special-case ConfigureMetrics — the proto payload is an i32 enum (no
-    // dedicated message), so we synthesise the audit entry inline.
-    let metrics_target = if let RequestType::ConfigureMetrics(value) = &request_content {
-        Some(format!(
-            "metrics:{:?}",
-            MetricsConfiguration::try_from(*value).unwrap_or(MetricsConfiguration::Disabled)
-        ))
+    // dedicated message), so we synthesise the audit entry inline. The
+    // resolved enum value is reused below to clear the main-process METRICS
+    // aggregator on `MetricsConfiguration::Clear` (workers see the clear
+    // through the scatter; without this the master's own `main_metrics`
+    // returned by `dump_local_proxy_metrics` would survive the operator
+    // clear and `sozu metrics` would still report stale values).
+    let metrics_configuration = if let RequestType::ConfigureMetrics(value) = &request_content {
+        Some(MetricsConfiguration::try_from(*value).unwrap_or(MetricsConfiguration::Disabled))
     } else {
         None
     };
+    let metrics_target = metrics_configuration
+        .as_ref()
+        .map(|cfg| format!("metrics:{cfg:?}"));
 
     // Special-case SetMetricDetail — the same shape as ConfigureMetrics above
     // (no dedicated audit factory in `audit_entry_for`), so we synthesise the
@@ -2070,6 +2075,17 @@ pub fn worker_request(
             AuditResult::Ok,
             extras,
         );
+    }
+
+    // Master-side clear: the main process keeps its own `main_metrics`
+    // aggregator (read by `dump_local_proxy_metrics` at this file's
+    // metrics-query handler) that is NOT reached by the worker scatter.
+    // Apply the clear locally before fanning out so master and workers
+    // are wiped consistently.
+    if metrics_configuration == Some(MetricsConfiguration::Clear) {
+        METRICS.with(|metrics| {
+            (*metrics.borrow_mut()).clear_local();
+        });
     }
 
     client.return_processing("Processing worker request...");
