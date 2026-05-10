@@ -238,6 +238,84 @@ pub enum SubCmd {
         #[clap(subcommand)]
         cmd: ConnectionLimitCmd,
     },
+    /// Live operator TUI: btop/htop-style overview of clusters, backends,
+    /// listeners, and H2 health. Built behind the `tui` Cargo feature so
+    /// production binaries stay lean. v1 is read-only; the cardinality lease
+    /// is auto-applied (DETAIL_BACKEND, TTL ~60s) and self-clears on exit.
+    #[cfg(feature = "tui")]
+    #[clap(
+        name = "top",
+        about = "live operator TUI (btop/htop-style) for clusters, backends, listeners, H2"
+    )]
+    Top {
+        /// Data poll interval in milliseconds; the render loop is capped
+        /// independently at 30 fps regardless of this value.
+        #[clap(long = "refresh-ms", default_value_t = 1000)]
+        refresh_ms: u64,
+        /// Disable ANSI colour output (auto-detected by default; honours
+        /// `NO_COLOR` and `TERM=dumb`).
+        #[clap(long = "no-color")]
+        no_color: bool,
+        /// Disable mouse capture. Useful inside multiplexers that mis-route
+        /// SGR mouse events.
+        #[clap(long = "no-mouse")]
+        no_mouse: bool,
+        /// Skin name. Looked up under `$XDG_CONFIG_HOME/sozu/skins/<name>.toml`;
+        /// `SOZU_TOP_SKIN` env var takes precedence when both are set.
+        #[clap(long = "skin")]
+        skin: Option<String>,
+        /// Override the cardinality lease level. Default: `Backend`
+        /// (auto-elevate, lease self-expires server-side).
+        #[clap(long = "detail", value_enum)]
+        detail: Option<TopDetail>,
+        /// Lease TTL in seconds; the renewer halves this for renewals.
+        /// Server clamps at 300s.
+        #[clap(long = "lease-ttl-seconds", default_value_t = 60)]
+        lease_ttl_seconds: u32,
+        /// Render N frames to stdout and exit (test affordance, no terminal
+        /// control). Mutually exclusive with interactive mode.
+        #[clap(long = "snapshot")]
+        snapshot: Option<u32>,
+        /// Drive one data tick + one render tick and exit (test affordance).
+        #[clap(long = "tick-once")]
+        tick_once: bool,
+        /// Path for internal TUI logs (avoids stomping the rendered screen).
+        #[clap(long = "log-file")]
+        log_file: Option<std::path::PathBuf>,
+        /// Force a glyph mode; auto-detect by default
+        /// (Braille → Block → TTY-ASCII).
+        #[clap(long = "glyphs", value_enum)]
+        glyphs: Option<TopGlyphs>,
+    },
+}
+
+/// `--detail` clap value enum for `sozu top`. Mirrors `MetricDetailLevel`
+/// without leaking the proto-generated type into the CLI surface.
+#[cfg(feature = "tui")]
+#[derive(clap::ValueEnum, PartialEq, Eq, Clone, Copy, Debug)]
+pub enum TopDetail {
+    /// Proxy-only counters (smallest keyspace).
+    Process,
+    /// Adds per-listener (frontend) breakdown.
+    Frontend,
+    /// Adds per-cluster aggregation (current Sōzu default).
+    Cluster,
+    /// Adds per-backend aggregation (cluster + backend, highest cardinality).
+    Backend,
+}
+
+/// `--glyphs` clap value enum for `sozu top`. Three modes mirroring btop:
+/// Braille (highest density), Block (compatible Unicode), TTY-ASCII fallback.
+#[cfg(feature = "tui")]
+#[derive(clap::ValueEnum, PartialEq, Eq, Clone, Copy, Debug)]
+pub enum TopGlyphs {
+    /// Highest-density Unicode Braille mosaics. Default when the terminal
+    /// reports Unicode-capable locale + adequate font.
+    Braille,
+    /// Plain Unicode block elements; broadest Unicode terminal compatibility.
+    Block,
+    /// 7-bit ASCII fallback for `linux`/`dumb` TERMs and serial consoles.
+    Tty,
 }
 
 #[derive(Subcommand, PartialEq, Eq, Clone, Debug)]

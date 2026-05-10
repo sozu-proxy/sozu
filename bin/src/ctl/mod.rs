@@ -3,6 +3,8 @@
 
 mod command;
 mod request_builder;
+#[cfg(feature = "tui")]
+mod top;
 
 use std::time::Duration;
 
@@ -213,6 +215,30 @@ impl CommandManager {
             SubCmd::Config { cmd: _ } => Ok(()), // noop, handled at the beginning of the method
             SubCmd::Events => self.events(),
             SubCmd::ConnectionLimit { cmd } => self.connection_limit_command(cmd),
+            #[cfg(feature = "tui")]
+            SubCmd::Top {
+                refresh_ms,
+                no_color,
+                no_mouse,
+                skin,
+                detail,
+                lease_ttl_seconds,
+                snapshot,
+                tick_once,
+                log_file,
+                glyphs,
+            } => self.run_top(top::TopArgs {
+                refresh_ms,
+                no_color,
+                no_mouse,
+                skin,
+                detail,
+                lease_ttl_seconds,
+                snapshot,
+                tick_once,
+                log_file,
+                glyphs,
+            }),
             rest => {
                 panic!("that command should have been handled earlier: {rest:x?}")
             }
