@@ -35,6 +35,10 @@
 //! See `tasks/todo.md` for the full plan, including the Codex cross-check
 //! and the audited approval gates.
 
+mod cardinality;
+mod theme;
+mod transport;
+
 use std::path::PathBuf;
 
 use crate::cli::{TopDetail, TopGlyphs};
