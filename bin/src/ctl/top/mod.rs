@@ -36,6 +36,9 @@ mod render;
 mod theme;
 mod transport;
 
+#[cfg(test)]
+mod snapshot_tests;
+
 use std::path::PathBuf;
 
 use crate::cli::{TopDetail, TopGlyphs};
