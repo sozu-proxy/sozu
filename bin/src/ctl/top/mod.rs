@@ -96,6 +96,7 @@ impl CommandManager {
             tick_once: args.tick_once,
             snapshot_frames: args.snapshot,
             skin: args.skin.clone(),
+            glyphs: args.glyphs,
         };
         let result = render::run(render_cfg, snapshot_rx, events_rx, listeners_rx);
 

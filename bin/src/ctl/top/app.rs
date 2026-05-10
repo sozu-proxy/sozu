@@ -22,6 +22,7 @@ use std::time::Instant;
 
 use sozu_command_lib::proto::command::{AggregatedMetrics, FilteredMetrics, filtered_metrics};
 
+use super::theme::GlyphMode;
 use super::transport::{ListenersSnapshot, Snapshot, TopEvent};
 
 /// Default ring depth for the on-screen sparkline series. 60 samples = one
@@ -424,6 +425,12 @@ pub struct App {
     /// "What changed" tracker — surfaces disappearing clusters and newly-
     /// unhealthy backends as a short-lived row tint.
     pub pulse: PulseTracker,
+    /// Resolved glyph mode (Braille / Block / TTY-ASCII). Set once at
+    /// startup by `GlyphMode::resolve(cfg.glyphs)`. Panes that draw
+    /// sparkline-adjacent custom glyphs read this to pick a ramp; the
+    /// rest of the UI uses ratatui's built-in `Sparkline` widget which
+    /// has its own internal ramp.
+    pub glyphs: GlyphMode,
     rates: RateCalculator,
 }
 
@@ -501,6 +508,7 @@ impl App {
             backend_sort: BackendSortKey::Bandwidth,
             backend_sort_reverse: false,
             pulse: PulseTracker::default(),
+            glyphs: GlyphMode::Block,
             rates: RateCalculator::default(),
         }
     }

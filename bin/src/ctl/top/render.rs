@@ -33,7 +33,7 @@ use tui_big_text::{BigText, PixelSize};
 
 use super::app::{ActiveTab, App};
 use super::panes;
-use super::theme::Skin;
+use super::theme::{GlyphMode, Skin};
 use super::transport::{ListenersSnapshot, Snapshot, TopEvent};
 
 /// Cap the redraw rate at 30 fps regardless of how often new snapshots /
@@ -49,6 +49,9 @@ pub struct RenderConfig {
     /// the renderer can call `Skin::resolve` once at startup. `None`
     /// resolves to the built-in default unless `SOZU_TOP_SKIN` overrides.
     pub skin: Option<String>,
+    /// Optional `--glyphs` clap override. `None` runs `GlyphMode::resolve`
+    /// auto-detect against `TERM` / `LC_ALL` / `LC_CTYPE` / `LANG`.
+    pub glyphs: Option<crate::cli::TopGlyphs>,
 }
 
 /// Drive the TUI to completion. Returns when the user quits, the data
@@ -70,6 +73,8 @@ pub fn run(
 
     let mut app = App::new();
     let (skin, skin_status) = Skin::resolve(cfg.skin.as_deref());
+    let glyphs = GlyphMode::resolve(cfg.glyphs);
+    app.glyphs = glyphs;
     if let Some(msg) = skin_status {
         // Surface the diagnostic in the status bar so the operator sees
         // *why* their override didn't take effect (typo'd name, parse
