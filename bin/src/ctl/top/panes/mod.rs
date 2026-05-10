@@ -8,6 +8,7 @@
 //! consistent "(week 3)" notice instead of a blank pane.
 
 pub mod clusters;
+pub mod events;
 pub mod overview;
 
 use ratatui::Frame;
