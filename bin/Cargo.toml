@@ -65,6 +65,7 @@ tui-tree-widget      = { workspace = true, optional = true }
 
 [dev-dependencies]
 regex = { workspace = true }
+tempfile = { workspace = true }
 # `insta` is gated to `cfg(feature = "tui")` snapshot tests under `bin/src/ctl/top/`.
 # Auditor-locked: keep it on `[dev-dependencies]` only — never a production dep.
 # Tests run without `cargo insta review`; snapshots fail loudly the first time.
