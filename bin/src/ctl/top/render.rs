@@ -30,6 +30,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Tabs};
 use tui_big_text::{BigText, PixelSize};
+use tui_input::backend::crossterm::EventHandler;
 
 use super::app::{ActiveTab, App};
 use super::panes;
@@ -160,7 +161,26 @@ pub fn run(
 }
 
 fn handle_key(app: &mut App, key: KeyEvent) {
+    // Palette mode swallows almost every key so the operator can type
+    // command text freely. Only Enter / Escape / Ctrl-C escape back to
+    // the normal handler.
+    if app.palette_open {
+        match key.code {
+            KeyCode::Enter => app.apply_palette(),
+            KeyCode::Esc => app.cancel_palette(),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.cancel_palette()
+            }
+            _ => {
+                // Forward editing keys (backspace, arrows, character input)
+                // to the tui-input widget so it maintains its own cursor.
+                app.palette_input.handle_event(&CtEvent::Key(key));
+            }
+        }
+        return;
+    }
     match key.code {
+        KeyCode::Char(':') => app.open_palette(),
         KeyCode::Char('q') | KeyCode::Char('Q') => app.should_quit = true,
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.should_quit = true
@@ -306,10 +326,17 @@ fn draw_pane(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, skin: &Skin) {
 }
 
 fn draw_fkey_bar(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, skin: &Skin) {
+    // Palette mode replaces the F-key bar with a one-line input so the
+    // operator types `:cluster` / `:backend` / … inline. Drop back to
+    // the htop-style strip otherwise.
+    if app.palette_open {
+        draw_palette(f, area, app, skin);
+        return;
+    }
     // htop-style F-key strip: alternating label/action so muscle memory
     // works without reading the keys explicitly. The actions wired today
-    // are F1 Help, F10 Quit, Tab cycle; the rest reserve their slots so
-    // future panes can plug in without re-laying-out the bar.
+    // are F1 Help, F10 Quit, Tab cycle, `:` palette; the rest reserve
+    // their slots so future panes can plug in without re-laying out.
     let bindings: &[(&str, &str)] = &[
         ("F1", "Help"),
         ("F2", "Theme"),
@@ -328,14 +355,60 @@ fn draw_fkey_bar(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, skin: &Skin)
         spans.push(Span::styled(format!(" {a} "), skin.fkey_action()));
     }
     spans.push(Span::raw("  "));
-    spans.push(Span::styled(
-        format!(" sort: {} ", app.cluster_sort.label()),
-        Style::default()
-            .fg(skin.accent)
-            .add_modifier(Modifier::BOLD),
-    ));
+    if let Some(err) = app.palette_error.as_ref() {
+        spans.push(Span::styled(
+            format!(" {err} "),
+            Style::default().fg(skin.hot).add_modifier(Modifier::BOLD),
+        ));
+    } else {
+        spans.push(Span::styled(
+            " : palette ",
+            Style::default()
+                .fg(skin.accent)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            format!(" sort: {} ", app.cluster_sort.label()),
+            Style::default()
+                .fg(skin.accent)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     let para = Paragraph::new(Line::from(spans)).alignment(Alignment::Left);
     f.render_widget(para, area);
+}
+
+fn draw_palette(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, skin: &Skin) {
+    // Single-line `:cmd_here_` input. Prefixed `:` is implicit (the
+    // operator presses `:` to enter palette mode, so the rendered text
+    // does NOT include the colon — `apply_palette` strips any leading
+    // colon defensively so paste-from-clipboard still works).
+    let value = app.palette_input.value();
+    let line = Line::from(vec![
+        Span::styled(
+            " :",
+            Style::default()
+                .fg(skin.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            value.to_owned(),
+            Style::default()
+                .fg(skin.primary)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "_  ", // poor man's cursor; ratatui doesn't render the OS cursor
+            Style::default()
+                .fg(skin.accent)
+                .add_modifier(Modifier::SLOW_BLINK),
+        ),
+        Span::styled(
+            "Enter apply · Esc cancel · :cluster :backend :listener :cert :h2 :event :help :quit",
+            Style::default().fg(skin.secondary),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(line).alignment(Alignment::Left), area);
 }
 
 /// RAII guard that restores the terminal on drop, panic, or signal exit.
