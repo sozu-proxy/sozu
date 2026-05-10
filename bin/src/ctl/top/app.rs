@@ -113,7 +113,7 @@ impl SparkRing {
         self.samples.push_back(value);
     }
 
-    pub fn samples(&self) -> impl Iterator<Item = &u64> {
+    pub fn samples(&self) -> std::collections::vec_deque::Iter<'_, u64> {
         self.samples.iter()
     }
 
@@ -211,10 +211,56 @@ pub struct App {
     pub events: VecDeque<TopEvent>,
     pub thresholds: ThresholdTable,
     pub last_snapshot_at: Option<Instant>,
+    /// Most recent `AggregatedMetrics` retained verbatim so panes that need
+    /// the live cluster / backend / listener map (CLUSTERS, BACKENDS, …)
+    /// don't have to maintain their own derivation. The OVERVIEW pane
+    /// reads ring buffers, not this; this is for table-shaped panes.
+    pub last_metrics: Option<AggregatedMetrics>,
     pub status: String,
     pub should_quit: bool,
     pub help_visible: bool,
+    /// Cluster-table sort column. Default surfaces unhealthy/error-rate
+    /// first, then RPS — matches Codex's recommendation in the cross-check.
+    pub cluster_sort: ClusterSortKey,
+    /// Reverse the cluster-table sort ordering when `true`.
+    pub cluster_sort_reverse: bool,
     rates: RateCalculator,
+}
+
+/// Columns the CLUSTERS pane can sort by. Cycled with `s`; reversed with
+/// `S`. Default: `ErrorRate` desc → unhealthy clusters surface first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClusterSortKey {
+    ClusterId,
+    Rps,
+    ErrorRate,
+    LatencyP99,
+    BackendsAvailable,
+}
+
+impl ClusterSortKey {
+    pub const ALL: &'static [Self] = &[
+        Self::ErrorRate,
+        Self::Rps,
+        Self::LatencyP99,
+        Self::BackendsAvailable,
+        Self::ClusterId,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ClusterId => "id",
+            Self::Rps => "rps",
+            Self::ErrorRate => "err%",
+            Self::LatencyP99 => "p99",
+            Self::BackendsAvailable => "backends",
+        }
+    }
+
+    pub fn cycle(self) -> Self {
+        let idx = Self::ALL.iter().position(|k| *k == self).unwrap_or(0);
+        Self::ALL[(idx + 1) % Self::ALL.len()]
+    }
 }
 
 #[derive(Debug, Default)]
@@ -245,9 +291,12 @@ impl App {
             events: VecDeque::with_capacity(EVENT_RING_DEPTH),
             thresholds: ThresholdTable::default(),
             last_snapshot_at: None,
+            last_metrics: None,
             status: String::new(),
             should_quit: false,
             help_visible: false,
+            cluster_sort: ClusterSortKey::ErrorRate,
+            cluster_sort_reverse: false,
             rates: RateCalculator::default(),
         }
     }
@@ -258,6 +307,85 @@ impl App {
     pub fn ingest_snapshot(&mut self, snap: &Snapshot) {
         self.last_snapshot_at = Some(snap.received_at);
         self.fold_overview(&snap.metrics, snap.received_at);
+        // Keep the latest `AggregatedMetrics` for the CLUSTERS / BACKENDS
+        // panes. Cloning isn't cheap for very-high-cardinality fleets
+        // (>1000 clusters), but in practice the master already paid this
+        // cost on the wire; revisit only if profile data justifies it.
+        self.last_metrics = Some(snap.metrics.clone());
+    }
+
+    /// Build the per-cluster summary rows for the CLUSTERS pane. Computed
+    /// on demand (renderer call) rather than cached so the sort + reverse
+    /// state can change between frames without a full re-fold.
+    pub fn cluster_rows(&self) -> Vec<ClusterRow> {
+        let metrics = match self.last_metrics.as_ref() {
+            Some(m) => m,
+            None => return Vec::new(),
+        };
+        let mut rows: Vec<ClusterRow> = metrics
+            .clusters
+            .iter()
+            .map(|(id, cm)| {
+                let requests = count_value(cm.cluster.get("requests")).unwrap_or(0);
+                let errors_5xx: i64 = [
+                    "http.status.500",
+                    "http.status.502",
+                    "http.status.503",
+                    "http.status.504",
+                    "http.status.507",
+                ]
+                .iter()
+                .filter_map(|k| count_value(cm.cluster.get(*k)))
+                .sum();
+                let p99_ms =
+                    percentile_p99_ms(cm.cluster.get("backend_response_time")).unwrap_or(0);
+                let p50_ms =
+                    percentile_p50_ms(cm.cluster.get("backend_response_time")).unwrap_or(0);
+                // Backends-up vs backends-total; both are gauges and so
+                // survive the hourly counter clear.
+                let backends_total =
+                    gauge_value(cm.cluster.get("cluster.total_backends")).unwrap_or(0) as u32;
+                let backends_available =
+                    gauge_value(cm.cluster.get("backend.available")).unwrap_or(0) as u32;
+                let error_rate_pct = if requests > 0 {
+                    (errors_5xx as f64 / requests as f64) * 100.0
+                } else {
+                    0.0
+                };
+                ClusterRow {
+                    cluster_id: id.clone(),
+                    requests_total: requests as u64,
+                    errors_5xx_total: errors_5xx as u64,
+                    error_rate_pct,
+                    p50_ms,
+                    p99_ms,
+                    backends_total,
+                    backends_available,
+                }
+            })
+            .collect();
+        rows.sort_by(|a, b| {
+            use std::cmp::Ordering;
+            let ord = match self.cluster_sort {
+                ClusterSortKey::ClusterId => a.cluster_id.cmp(&b.cluster_id),
+                ClusterSortKey::Rps => a.requests_total.cmp(&b.requests_total).reverse(),
+                ClusterSortKey::ErrorRate => a
+                    .error_rate_pct
+                    .partial_cmp(&b.error_rate_pct)
+                    .unwrap_or(Ordering::Equal)
+                    .reverse(),
+                ClusterSortKey::LatencyP99 => a.p99_ms.cmp(&b.p99_ms).reverse(),
+                ClusterSortKey::BackendsAvailable => {
+                    a.backends_available.cmp(&b.backends_available)
+                }
+            };
+            if self.cluster_sort_reverse {
+                ord.reverse()
+            } else {
+                ord
+            }
+        });
+        rows
     }
 
     fn fold_overview(&mut self, m: &AggregatedMetrics, sampled_at: Instant) {
@@ -273,7 +401,13 @@ impl App {
                 total_requests = total_requests.saturating_add(v);
                 total_requests_observed = total_requests_observed.saturating_add(v);
             }
-            for code in &["http.status.500", "http.status.502", "http.status.503", "http.status.504", "http.status.507"] {
+            for code in &[
+                "http.status.500",
+                "http.status.502",
+                "http.status.503",
+                "http.status.504",
+                "http.status.507",
+            ] {
                 if let Some(v) = count_value(cm.cluster.get(*code)) {
                     total_errors_5xx = total_errors_5xx.saturating_add(v);
                 }
@@ -311,9 +445,7 @@ impl App {
         };
         // SparkRing is `u64`; multiply by 100 to keep two-decimal precision
         // (the renderer divides back when printing the big numeral).
-        self.overview
-            .error_ratio_pct
-            .push((err_pct * 100.0) as u64);
+        self.overview.error_ratio_pct.push((err_pct * 100.0) as u64);
 
         // Latency p99 — sum of cluster `backend_response_time` percentiles
         // is not meaningful (you cannot average percentiles), so we take
@@ -384,6 +516,28 @@ fn percentile_p99_ms(metric: Option<&FilteredMetrics>) -> Option<u64> {
         filtered_metrics::Inner::Percentiles(p) => Some(p.p_99),
         _ => None,
     }
+}
+
+fn percentile_p50_ms(metric: Option<&FilteredMetrics>) -> Option<u64> {
+    let inner = metric?.inner.as_ref()?;
+    match inner {
+        filtered_metrics::Inner::Percentiles(p) => Some(p.p_50),
+        _ => None,
+    }
+}
+
+/// Per-cluster row produced by `App::cluster_rows`. Pure data; the renderer
+/// turns this into a `Row` widget. Pulse-tint state comes in week 3.
+#[derive(Debug, Clone)]
+pub struct ClusterRow {
+    pub cluster_id: String,
+    pub requests_total: u64,
+    pub errors_5xx_total: u64,
+    pub error_rate_pct: f64,
+    pub p50_ms: u64,
+    pub p99_ms: u64,
+    pub backends_total: u32,
+    pub backends_available: u32,
 }
 
 #[cfg(test)]
