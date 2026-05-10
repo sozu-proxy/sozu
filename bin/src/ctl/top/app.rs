@@ -435,6 +435,15 @@ pub struct App {
     /// rest of the UI uses ratatui's built-in `Sparkline` widget which
     /// has its own internal ramp.
     pub glyphs: GlyphMode,
+    /// k9s-style colon palette state. When `palette_open` is true the
+    /// renderer replaces the function-key bar with a one-line input
+    /// box; `palette_input` carries the in-progress text.
+    pub palette_open: bool,
+    pub palette_input: tui_input::Input,
+    /// Last unknown command or recoverable error from the palette. The
+    /// renderer surfaces this on the function-key bar so the operator
+    /// sees why their command bounced.
+    pub palette_error: Option<String>,
     rates: RateCalculator,
 }
 
@@ -514,6 +523,9 @@ impl App {
             backend_sort_reverse: false,
             pulse: PulseTracker::default(),
             glyphs: GlyphMode::Block,
+            palette_open: false,
+            palette_input: tui_input::Input::default(),
+            palette_error: None,
             rates: RateCalculator::default(),
         }
     }
@@ -786,6 +798,60 @@ impl App {
     /// Replace the cached certificate inventory with a fresh snapshot.
     pub fn ingest_certs(&mut self, snap: CertsSnapshot) {
         self.last_certs = Some(snap);
+    }
+
+    /// Open the colon palette and clear any pending error. Called by the
+    /// renderer when the operator presses `:`.
+    pub fn open_palette(&mut self) {
+        self.palette_open = true;
+        self.palette_input = tui_input::Input::default();
+        self.palette_error = None;
+    }
+
+    /// Close the palette without applying the in-progress command.
+    /// Called on Escape / Ctrl-C while the palette is open.
+    pub fn cancel_palette(&mut self) {
+        self.palette_open = false;
+        self.palette_input = tui_input::Input::default();
+    }
+
+    /// Apply the in-progress palette command. Recognised commands:
+    ///
+    /// - `:overview` / `:o` — jump to OVERVIEW.
+    /// - `:cluster` / `:clusters` / `:c` — jump to CLUSTERS.
+    /// - `:backend` / `:backends` / `:b` — jump to BACKENDS.
+    /// - `:listener` / `:listeners` / `:l` — jump to LISTENERS.
+    /// - `:cert` / `:certs` — jump to CERTS.
+    /// - `:h2` — jump to H2.
+    /// - `:event` / `:events` / `:e` — jump to EVENTS.
+    /// - `:help` / `:h` / `:?` — toggle help.
+    /// - `:quit` / `:q` — exit cleanly.
+    ///
+    /// Unknown commands flip `palette_error`; the renderer surfaces
+    /// the message on the function-key bar.
+    pub fn apply_palette(&mut self) {
+        let raw = self.palette_input.value().trim().to_owned();
+        let cmd = raw.trim_start_matches(':');
+        match cmd {
+            "overview" | "o" => self.active_tab = ActiveTab::Overview,
+            "cluster" | "clusters" | "c" => self.active_tab = ActiveTab::Clusters,
+            "backend" | "backends" | "b" => self.active_tab = ActiveTab::Backends,
+            "listener" | "listeners" | "l" => self.active_tab = ActiveTab::Listeners,
+            "cert" | "certs" => self.active_tab = ActiveTab::Certs,
+            "h2" => self.active_tab = ActiveTab::H2,
+            "event" | "events" | "e" => self.active_tab = ActiveTab::Events,
+            "help" | "h" | "?" => self.help_visible = !self.help_visible,
+            "quit" | "q" => self.should_quit = true,
+            "" => {} // empty command — just close the palette
+            other => {
+                self.palette_error = Some(format!("unknown command: :{other}"));
+                self.palette_open = false;
+                return;
+            }
+        }
+        self.palette_open = false;
+        self.palette_input = tui_input::Input::default();
+        self.palette_error = None;
     }
 }
 
