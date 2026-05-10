@@ -46,8 +46,28 @@ thiserror = { workspace = true }
 sozu-command-lib = { workspace = true }
 sozu-lib = { workspace = true }
 
+# `sozu top` TUI dependencies. All optional; activated only by the `tui` Cargo
+# feature below. Default `sozu` builds do not pull any of these in, keeping the
+# production binary lean. See `tasks/todo.md` for the rationale on each pin and
+# the explicit decision to NOT introduce `tokio` in v1.
+color-eyre           = { workspace = true, optional = true }
+crossbeam-channel    = { workspace = true, optional = true }
+crossterm            = { workspace = true, optional = true, features = ["events", "bracketed-paste"] }
+ctrlc                = { workspace = true, optional = true }
+ratatui              = { workspace = true, optional = true, features = ["crossterm", "macros", "underline-color"] }
+throbber-widgets-tui = { workspace = true, optional = true }
+tui-big-text         = { workspace = true, optional = true }
+tui-input            = { workspace = true, optional = true }
+tui-popup            = { workspace = true, optional = true }
+tui-scrollview       = { workspace = true, optional = true }
+tui-tree-widget      = { workspace = true, optional = true }
+
 [dev-dependencies]
 regex = { workspace = true }
+# `insta` is gated to `cfg(feature = "tui")` snapshot tests under `bin/src/ctl/top/`.
+# Auditor-locked: keep it on `[dev-dependencies]` only — never a production dep.
+# Tests run without `cargo insta review`; snapshots fail loudly the first time.
+insta = { version = "^1.43.2", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 num_cpus = { workspace = true }
@@ -77,3 +97,22 @@ opentelemetry = ["sozu-lib/opentelemetry"]
 tolerant-http1-parser = ["sozu-lib/tolerant-http1-parser"]
 simd = ["sozu-lib/simd"]
 splice = ["sozu-lib/splice"]
+
+# `sozu top` btop/htop-style TUI subcommand. Opt-in: production builds typically
+# omit this. Pulls ratatui + crossterm + crossbeam-channel + ctrlc + a curated
+# set of TUI polish crates. Deliberately does NOT pull `tokio` — the TUI runs on
+# two synchronous threads (collector + events) plus the UI thread, matching the
+# existing `bin/` style and avoiding an async runtime for v1.
+tui = [
+  "dep:color-eyre",
+  "dep:crossbeam-channel",
+  "dep:crossterm",
+  "dep:ctrlc",
+  "dep:ratatui",
+  "dep:throbber-widgets-tui",
+  "dep:tui-big-text",
+  "dep:tui-input",
+  "dep:tui-popup",
+  "dep:tui-scrollview",
+  "dep:tui-tree-widget",
+]
