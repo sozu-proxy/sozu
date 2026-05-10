@@ -153,6 +153,12 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('S') if app.active_tab == ActiveTab::Clusters => {
             app.cluster_sort_reverse = !app.cluster_sort_reverse;
         }
+        KeyCode::Char('s') if app.active_tab == ActiveTab::Backends => {
+            app.backend_sort = app.backend_sort.cycle();
+        }
+        KeyCode::Char('S') if app.active_tab == ActiveTab::Backends => {
+            app.backend_sort_reverse = !app.backend_sort_reverse;
+        }
         _ => {}
     }
 }
@@ -215,7 +221,7 @@ fn draw_pane(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, skin: &Skin) {
     match app.active_tab {
         ActiveTab::Overview => panes::overview::render(f, area, app, skin),
         ActiveTab::Clusters => panes::clusters::render(f, area, app, skin),
-        ActiveTab::Backends => panes::render_placeholder(f, area, skin, "BACKENDS"),
+        ActiveTab::Backends => panes::backends::render(f, area, app, skin),
         ActiveTab::Listeners => panes::render_placeholder(f, area, skin, "LISTENERS"),
         ActiveTab::Certs => panes::render_placeholder(f, area, skin, "CERTS"),
         ActiveTab::H2 => panes::h2::render(f, area, app, skin),
