@@ -299,15 +299,54 @@ pub enum GlyphMode {
 }
 
 impl GlyphMode {
-    /// Collapse the optional clap override to a concrete mode. Auto-detect
-    /// (when `override_` is `None`) currently picks `Block`; the proper
-    /// `LANG`/`TERM` cascade lands in week 3 alongside the skin loader.
+    /// Collapse the optional clap override to a concrete mode. When the
+    /// operator passed `--glyphs`, honour the explicit choice. Otherwise
+    /// the auto-detect cascade walks three terminal capability signals:
+    ///
+    /// 1. `TERM` reports `dumb`, `linux`, `xterm-old`, or any `*-mono*`
+    ///    variant — fall back to 7-bit ASCII (`Tty`). These terminals
+    ///    typically render Unicode glyphs as `?` / boxes.
+    /// 2. The active locale (`LC_ALL` / `LC_CTYPE` / `LANG`) ends in
+    ///    `UTF-8` / `UTF8` AND isn't `C` / `POSIX` — Braille mosaics
+    ///    are safe.
+    /// 3. Otherwise default to `Block` (broadest Unicode terminal
+    ///    compatibility — every Unicode-capable TTY ships block
+    ///    elements `▁..▇█` even without nerd-font support).
     pub fn resolve(override_: Option<TopGlyphs>) -> Self {
-        match override_ {
-            Some(TopGlyphs::Braille) => Self::Braille,
-            Some(TopGlyphs::Block) => Self::Block,
-            Some(TopGlyphs::Tty) => Self::Tty,
-            None => Self::Block,
+        if let Some(forced) = override_ {
+            return match forced {
+                TopGlyphs::Braille => Self::Braille,
+                TopGlyphs::Block => Self::Block,
+                TopGlyphs::Tty => Self::Tty,
+            };
+        }
+        Self::autodetect()
+    }
+
+    fn autodetect() -> Self {
+        let term = std::env::var("TERM").unwrap_or_default();
+        let term_lower = term.to_ascii_lowercase();
+        if term_lower.is_empty()
+            || term_lower == "dumb"
+            || term_lower == "linux"
+            || term_lower == "xterm-old"
+            || term_lower.ends_with("-mono")
+            || term_lower.contains("-mono-")
+        {
+            return Self::Tty;
+        }
+        let locale = std::env::var("LC_ALL")
+            .or_else(|_| std::env::var("LC_CTYPE"))
+            .or_else(|_| std::env::var("LANG"))
+            .unwrap_or_default();
+        let locale_upper = locale.to_ascii_uppercase();
+        let is_c_locale =
+            locale_upper == "C" || locale_upper == "POSIX" || locale_upper.starts_with("C.");
+        let is_utf8 = locale_upper.contains("UTF-8") || locale_upper.contains("UTF8");
+        if is_utf8 && !is_c_locale {
+            Self::Braille
+        } else {
+            Self::Block
         }
     }
 
@@ -389,5 +428,21 @@ mod tests {
     fn skin_lookup_rejects_traversal() {
         assert!(Skin::lookup_paths("../etc/passwd").is_empty());
         assert!(Skin::lookup_paths("foo/bar").is_empty());
+    }
+
+    #[test]
+    fn glyph_mode_explicit_override_wins() {
+        assert!(matches!(
+            GlyphMode::resolve(Some(TopGlyphs::Tty)),
+            GlyphMode::Tty
+        ));
+        assert!(matches!(
+            GlyphMode::resolve(Some(TopGlyphs::Braille)),
+            GlyphMode::Braille
+        ));
+        assert!(matches!(
+            GlyphMode::resolve(Some(TopGlyphs::Block)),
+            GlyphMode::Block
+        ));
     }
 }
