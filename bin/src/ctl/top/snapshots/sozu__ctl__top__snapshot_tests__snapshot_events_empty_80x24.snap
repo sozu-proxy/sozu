@@ -1,0 +1,28 @@
+---
+source: bin/src/ctl/top/snapshot_tests.rs
+expression: out
+---
+╭ EVENTS · 0 retained ─────────────────────────────────────────────────────────╮
+│No events yet. The events thread subscribes on startup; the first BACKEND_UP /│
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+╰──────────────────────────────────────────────────────────────────────────────╯
