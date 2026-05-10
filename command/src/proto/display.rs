@@ -18,10 +18,10 @@ use crate::{
             CertificatesWithFingerprints, ClusterMetrics, CustomHttpAnswers, Event, EventKind,
             FilteredMetrics, HealthChecksList, HttpEndpoint, HttpListenerConfig,
             HttpsListenerConfig, ListOfCertificatesByAddress, ListedFrontends, ListenersList,
-            ProtobufEndpoint, QueryCertificatesFilters, RequestCounts, Response, ResponseContent,
-            ResponseStatus, RunState, SocketAddress, TlsVersion, WorkerInfos, WorkerMetrics,
-            WorkerResponses, filtered_metrics, protobuf_endpoint, request::RequestType,
-            response_content::ContentType,
+            MetricDetailStatus, ProtobufEndpoint, QueryCertificatesFilters, RequestCounts,
+            Response, ResponseContent, ResponseStatus, RunState, SocketAddress, TlsVersion,
+            WorkerInfos, WorkerMetrics, WorkerResponses, filtered_metrics, protobuf_endpoint,
+            request::RequestType, response_content::ContentType,
         },
     },
 };
@@ -121,6 +121,7 @@ pub fn format_request_type(request_type: &RequestType) -> &str {
         RequestType::SetHealthCheck(_) => "SetHealthCheck",
         RequestType::RemoveHealthCheck(_) => "RemoveHealthCheck",
         RequestType::QueryHealthChecks(_) => "QueryHealthChecks",
+        RequestType::SetMetricDetail(_) => "SetMetricDetail",
     }
 }
 
@@ -198,6 +199,7 @@ impl ResponseContent {
             }
             ContentType::Clusters(_) | ContentType::ClusterHashes(_) => Ok(()), // not displayed directly, see print_cluster_responses
             ContentType::CertificatesByAddress(certs) => print_certificates_by_address(certs),
+            ContentType::MetricDetailStatus(status) => print_metric_detail_status(status),
             ContentType::MaxConnectionsPerIpLimit(limit_info) => {
                 if limit_info.limit == 0 {
                     println!("Max connections per (cluster, source-IP): unlimited (0)");
@@ -946,6 +948,40 @@ fn print_certificates_by_address(list: &ListOfCertificatesByAddress) -> Result<(
     Ok(())
 }
 
+fn print_metric_detail_status(status: &MetricDetailStatus) -> Result<(), DisplayError> {
+    let mut table = Table::new();
+    table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
+    table.add_row(row![
+        "scope",
+        "configured",
+        "previous effective",
+        "effective",
+        "active leases"
+    ]);
+    table.add_row(row!(
+        "main",
+        status.configured().as_str_name(),
+        status.previous_effective().as_str_name(),
+        status.effective().as_str_name(),
+        "—",
+    ));
+    for (worker_id, w) in &status.workers {
+        table.add_row(row!(
+            format!("worker:{worker_id}"),
+            w.configured().as_str_name(),
+            w.previous_effective().as_str_name(),
+            w.effective().as_str_name(),
+            w.active_lease_count,
+        ));
+    }
+    if !status.unsupported_workers.is_empty() {
+        let joined = status.unsupported_workers.join(", ");
+        table.add_row(row!("unsupported workers", joined, "—", "—", "—"));
+    }
+    table.printstd();
+    Ok(())
+}
+
 fn print_request_counts(request_counts: &RequestCounts) -> Result<(), DisplayError> {
     let mut table = Table::new();
     table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
@@ -1363,6 +1399,7 @@ impl Display for Event {
             EventKind::HealthCheckHealthy => "health check: backend healthy",
             EventKind::HealthCheckUnhealthy => "health check: backend unhealthy",
             EventKind::ClusterRecovered => "cluster recovered",
+            EventKind::MetricDetailChanged => "metric detail changed",
         };
         let address = match &self.address {
             Some(a) => a.to_string(),
