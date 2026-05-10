@@ -219,7 +219,7 @@ fn draw_pane(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, skin: &Skin) {
         ActiveTab::Listeners => panes::render_placeholder(f, area, skin, "LISTENERS"),
         ActiveTab::Certs => panes::render_placeholder(f, area, skin, "CERTS"),
         ActiveTab::H2 => panes::render_placeholder(f, area, skin, "H2"),
-        ActiveTab::Events => panes::render_placeholder(f, area, skin, "EVENTS"),
+        ActiveTab::Events => panes::events::render(f, area, app, skin),
     }
 }
 
