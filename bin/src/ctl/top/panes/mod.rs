@@ -9,6 +9,7 @@
 
 pub mod clusters;
 pub mod events;
+pub mod h2;
 pub mod overview;
 
 use ratatui::Frame;
