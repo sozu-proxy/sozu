@@ -223,6 +223,7 @@ fn is_mutating_verb(req: &RequestType) -> bool {
             | RequestType::HardStop(_)
             | RequestType::Logging(_)
             | RequestType::SetMaxConnectionsPerIp(_)
+            | RequestType::SetMetricDetail(_)
     )
 }
 
@@ -350,6 +351,15 @@ impl Server {
             // master's `ConfigState`), so we hand them off to the
             // generic worker fan-out path.
             RequestType::SetMaxConnectionsPerIp(_) | RequestType::QueryMaxConnectionsPerIp(_) => {
+                worker_request(self, client, request_type);
+            }
+            // `sozu top`'s runtime cardinality lease verb. Each worker maintains
+            // its own lease table and recomputes the effective `MetricDetail` as
+            // `max(configured, max(active leases))`. The master fans the verb
+            // out via the generic worker_request path; lease bookkeeping +
+            // `MetricDetailStatus` aggregation live in the worker's `notify`
+            // arm and the upcoming `set_metric_detail()` aggregator (Step 4).
+            RequestType::SetMetricDetail(_) => {
                 worker_request(self, client, request_type);
             }
         }

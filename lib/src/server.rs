@@ -18,12 +18,13 @@ use mio::{
 use slab::Slab;
 use sozu_command::{
     channel::Channel,
+    config::MetricDetailLevel,
     logging,
     proto::command::{
         ActivateListener, AddBackend, CertificatesWithFingerprints, Cluster, ClusterHashes,
         ClusterInformations, DeactivateListener, Event, HttpListenerConfig, HttpsListenerConfig,
-        InitialState, ListenerType, LoadBalancingAlgorithms, LoadMetric, MetricsConfiguration,
-        RemoveBackend, Request, ResponseStatus, ServerConfig,
+        InitialState, ListenerType, LoadBalancingAlgorithms, LoadMetric, MetricDetail,
+        MetricsConfiguration, RemoveBackend, Request, ResponseStatus, ServerConfig,
         TcpListenerConfig as CommandTcpListener, UpdateHttpListenerConfig,
         UpdateHttpsListenerConfig, UpdateTcpListenerConfig, WorkerRequest, WorkerResponse,
         request::RequestType, response_content::ContentType,
@@ -1281,6 +1282,22 @@ impl Server {
     }
 
     fn notify(&mut self, message: WorkerRequest) {
+        // Polled lease-expiry janitor: SetMetricDetail leases self-expire after
+        // their TTL so a crashed `sozu top` cannot permanently elevate metrics
+        // cardinality. The janitor runs at most every LEASE_TICK_INTERVAL,
+        // gated by `lease_tick_due` so the hot path of `notify` doesn't pay
+        // the HashMap walk on every iteration. Single-threaded worker, so
+        // `borrow_mut` is safe here.
+        let now = std::time::Instant::now();
+        METRICS.with(|metrics| {
+            let mut m = metrics.borrow_mut();
+            if m.lease_tick_due(now) {
+                let _previous = m.lease_tick(now);
+                // TODO(sozu-top week 2): emit METRIC_DETAIL_CHANGED audit
+                // event when `_previous` is `Some` (effective level moved
+                // because at least one lease expired).
+            }
+        });
         match &message.content.request_type {
             Some(RequestType::ConfigureMetrics(configuration)) => {
                 match MetricsConfiguration::try_from(*configuration) {
@@ -1306,6 +1323,60 @@ impl Server {
                             push_queue(WorkerResponse::error(message.id, e))
                         }
                     }
+                });
+                return;
+            }
+            // Runtime cardinality lease verb — apply, renew, or clear a lease
+            // on this worker's `Aggregator`. The lease bumps `effective` to
+            // `max(configured, max(active leases))`; expiry runs on the polled
+            // janitor below. Master-side aggregation into `MetricDetailStatus`
+            // lands in a follow-up; for now the worker acks with a bare OK so
+            // the existing `worker_request` fan-out path can collect.
+            Some(RequestType::SetMetricDetail(req)) => {
+                if req.clear.unwrap_or(false) {
+                    METRICS.with(|metrics| {
+                        let _previous = metrics.borrow_mut().lease_clear(&req.client_id);
+                        // TODO(sozu-top week 2): emit METRIC_DETAIL_CHANGED
+                        // audit event when `_previous != effective`.
+                        push_queue(WorkerResponse::ok(message.id.clone()));
+                    });
+                    return;
+                }
+                let detail_proto = match req.detail {
+                    Some(d) => d,
+                    None => {
+                        let msg = format!(
+                            "SetMetricDetail without `detail` and without `clear` (client_id={})",
+                            req.client_id
+                        );
+                        error!("{}", msg);
+                        push_queue(WorkerResponse::error(message.id.clone(), msg));
+                        return;
+                    }
+                };
+                let detail_enum = match MetricDetail::try_from(detail_proto) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        let msg =
+                            format!("SetMetricDetail: invalid MetricDetail variant {detail_proto}");
+                        error!("{}: {}", msg, e);
+                        push_queue(WorkerResponse::error(message.id.clone(), msg));
+                        return;
+                    }
+                };
+                let level = MetricDetailLevel::from(detail_enum);
+                let ttl_seconds = req
+                    .ttl_seconds
+                    .filter(|&t| t > 0)
+                    .unwrap_or(crate::metrics::LEASE_TTL_DEFAULT.as_secs() as u32);
+                let ttl = std::time::Duration::from_secs(ttl_seconds.into());
+                METRICS.with(|metrics| {
+                    let _ = metrics
+                        .borrow_mut()
+                        .lease_apply(req.client_id.clone(), level, ttl);
+                    // TODO(sozu-top week 2): emit METRIC_DETAIL_CHANGED audit
+                    // event when the previous != new effective level.
+                    push_queue(WorkerResponse::ok(message.id.clone()));
                 });
                 return;
             }
