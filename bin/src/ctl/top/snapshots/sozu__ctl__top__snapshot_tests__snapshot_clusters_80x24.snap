@@ -1,0 +1,28 @@
+---
+source: bin/src/ctl/top/snapshot_tests.rs
+expression: out
+---
+╭ CLUSTERS · sort: err% desc · 3 clusters ─────────────────────────────────────╮
+│cluster_id                          rps      err % ▼  p50    p99    backends  │
+│api-prod                            1000     0.30     20     180    2/2       │
+│static-cdn                          1500     0.27     20     200    2/2       │
+│queue-worker                        2000     0.25     20     220    0/2       │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+╰──────────────────────────────────────────────────────────────────────────────╯
