@@ -41,6 +41,12 @@ pub fn main() {
         .message_attribute("HttpsListenerConfig", "#[derive(Hash, Eq)]")
         .message_attribute("UpdateHttpListenerConfig", "#[derive(Hash, Eq)]")
         .message_attribute("UpdateHttpsListenerConfig", "#[derive(Hash, Eq)]")
+        // Re-attach Hash/Eq for the `sozu top` runtime cardinality lease
+        // status message: it carries `map<string, WorkerMetricDetailStatus>`,
+        // which strips prost's auto-derive. Without this the
+        // `Request.request_type` and `ResponseContent.content_type` oneofs
+        // can't derive their own Hash/Eq either.
+        .message_attribute("MetricDetailStatus", "#[derive(Hash, Eq)]")
         // JSON state-file forward compat: `SaveState`/`LoadState` files are
         // JSON-encoded `WorkerRequest` records. Without `#[serde(default)]`,
         // serde rejects records that don't carry every `Vec`/`map` field — so

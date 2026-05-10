@@ -136,6 +136,13 @@ message Request {
     string remove_health_check = 53;
     // list health check configurations (optional cluster id filter).
     QueryHealthChecks query_health_checks = 54;
+    // Apply, renew, or release a runtime cardinality lease on the metrics
+    // drain. `sozu top` (and any future TUI client) leases DETAIL_BACKEND
+    // for the duration of an interactive session; the worker's effective
+    // detail is `max(configured, max(active leases))`. Leases self-expire
+    // server-side after `ttl_seconds` so a crashed client never permanently
+    // elevates cardinality. See doc/configure.md for the full semantics.
+    SetMetricDetail set_metric_detail = 55;
   }
 }
 
@@ -1137,6 +1144,10 @@ message ResponseContent {
         // health check configurations by cluster (renumbered from PR #1191's
         // original `14` since post-1209 occupies that tag).
         HealthChecksList health_checks_list = 15;
+        // Aggregated outcome of a `SetMetricDetail` fan-out: per-worker
+        // configured/effective/previous_effective levels plus the list of
+        // workers that could not decode the verb (mixed-version safety).
+        MetricDetailStatus metric_detail_status = 16;
     }
 }
 
@@ -1242,6 +1253,12 @@ enum EventKind {
     // backend available". Pairs with `NoAvailableBackends` (tag 2) so
     // dashboards can plot per-cluster recovery.
     CLUSTER_RECOVERED = 29;
+    // The worker's effective `MetricDetail` changed because a runtime
+    // lease was applied, renewed, expired, or cleared. Emitted by every
+    // worker whose effective level moved. Pairs with `MetricsConfigured`
+    // (tag 17) but distinct: that one fires for `MetricsConfiguration`
+    // (Enabled/Disabled/Clear), this one fires for cardinality changes.
+    METRIC_DETAIL_CHANGED = 30;
 }
 
 message ClusterHashes {
@@ -1429,6 +1446,97 @@ enum MetricDetail {
     DETAIL_CLUSTER = 2;
     // adds per-backend aggregation (cluster + backend, highest cardinality)
     DETAIL_BACKEND = 3;
+}
+
+// Apply, renew, or release a runtime cardinality lease on the metrics drain.
+//
+// Leasing model: `sozu top` (and any future TUI client) leases a higher
+// `MetricDetail` for the duration of an interactive session. The worker's
+// effective detail is `max(configured, max(active leases))`, where
+// `configured` is `MetricsConfig.detail` from the static configuration.
+// Multiple clients can lease independently; the worker keeps a `client_id`-
+// keyed table and uses the maximum across active entries.
+//
+// Lifecycle:
+// 1. Apply: send `SetMetricDetail{ client_id, detail, ttl_seconds, reason }`.
+// The worker stores `(client_id) -> (detail, expires_at = now + ttl)`. If a
+// lease for `client_id` already exists, it is REPLACED (acts as a renewal).
+// The renewer client is expected to re-send every `ttl/2`.
+// 2. Expire: leases self-expire server-side at `expires_at`. The worker's
+// janitor (5s polled tick at the top of `notify`) prunes expired leases and
+// recomputes effective. Crash safety: a dead client is forgotten.
+// 3. Clear: send `SetMetricDetail{ client_id, clear: true }` for explicit
+// revocation. `client_id` must match the leased entry; mismatched IDs are
+// silently ignored (other clients' leases are not affected).
+//
+// Audit
+// =====
+// Every effective-level transition emits an `EventKind::METRIC_DETAIL_CHANGED`
+// event on `SubscribeEvents` with the previous and new effective levels and
+// the requesting `client_id` plus optional `reason` text. Renewal-no-op (same
+// effective level) is NOT emitted.
+//
+// Backwards compatibility
+// =======================
+// Workers that pre-date this verb cannot decode `SetMetricDetail`; the master
+// reports them in `MetricDetailStatus.unsupported_workers`. The master itself
+// also leases (mirroring the symmetric `setup_metrics` path) so the audit log
+// has a single canonical row when an operator flips detail across the fleet.
+message SetMetricDetail {
+    // Stable identifier for the leasing client (`sozu top` uses
+    // `top:<pid>:<random>`). Required so multiple TUIs / scrapers / other
+    // tooling can lease independently.
+    required string client_id = 1;
+    // Target detail for the lease. Required when `clear` is false/absent.
+    optional MetricDetail detail = 2;
+    // Time-to-live for the lease in seconds. The worker rejects (FAILURE)
+    // values larger than 300s to bound the worst-case effect of a stuck
+    // renewer. Defaults server-side to 60s when absent (the master treats
+    // 0 as "use default" and emits a warning).
+    optional uint32 ttl_seconds = 3;
+    // When true, releases the lease for `client_id` instead of applying.
+    // `detail` and `ttl_seconds` are ignored when `clear` is true.
+    optional bool clear = 4;
+    // Optional human-readable provenance for the audit log
+    // (e.g. `"sozu top --detail backend"`, `"prometheus-scraper:sozu-1"`).
+    optional string reason = 5;
+}
+
+// Per-worker outcome of a `SetMetricDetail` fan-out. Reported back to the
+// requesting client so it can decide whether the elevation actually took
+// effect (e.g. all workers acknowledged) or whether degraded operation
+// (some workers too old) is in play.
+message WorkerMetricDetailStatus {
+    // The worker's static `MetricsConfig.detail` (or DETAIL_CLUSTER if
+    // unset). Independent of leases.
+    required MetricDetail configured = 1;
+    // Effective level AFTER processing this verb: `max(configured, leases)`.
+    required MetricDetail effective = 2;
+    // Effective level BEFORE the verb. Equal to `effective` for a no-op.
+    required MetricDetail previous_effective = 3;
+    // Number of active leases on this worker (post-prune). Useful to
+    // surface "another client is still leasing this level" in the TUI.
+    required uint32 active_lease_count = 4;
+}
+
+// Aggregated `SetMetricDetail` outcome across the fleet. Returned by the
+// master to the requesting client (no `WorkerResponses` indirection needed
+// because the schema is symmetric per-worker).
+message MetricDetailStatus {
+    // The master's own `configured` view (mirrors a worker's view since the
+    // master also runs the metrics aggregator).
+    required MetricDetail configured = 1;
+    // Master's effective level AFTER the verb.
+    required MetricDetail effective = 2;
+    // Master's effective level BEFORE the verb.
+    required MetricDetail previous_effective = 3;
+    // Per-worker status. Map keyed by worker_id (string form for parity
+    // with `WorkerResponses`).
+    map<string, WorkerMetricDetailStatus> workers = 4;
+    // worker_ids that could not decode `SetMetricDetail` (mixed-version
+    // fleet during a rolling upgrade). The TUI surfaces these in the
+    // status bar; the rest of the fleet still applies normally.
+    repeated string unsupported_workers = 5;
 }
 
 // intended to workers

@@ -77,6 +77,7 @@ impl Request {
 
             // handled at worker level prior to this call
             RequestType::ConfigureMetrics(_)
+            | RequestType::SetMetricDetail(_)
             | RequestType::QueryMetrics(_)
             | RequestType::Logging(_)
             | RequestType::QueryClustersHashes(_)
