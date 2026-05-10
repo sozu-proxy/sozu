@@ -7,6 +7,7 @@
 //! placeholder `render_placeholder` is shared so unfinished tabs show a
 //! consistent "(week 3)" notice instead of a blank pane.
 
+pub mod backends;
 pub mod clusters;
 pub mod events;
 pub mod h2;
