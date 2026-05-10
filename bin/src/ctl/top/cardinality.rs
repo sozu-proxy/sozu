@@ -224,7 +224,9 @@ fn send_set_detail(
             reason: reason.map(|r| r.to_owned()),
         })),
     };
-    channel.write_message(&req).map_err(CtlError::WriteRequest)?;
+    channel
+        .write_message(&req)
+        .map_err(CtlError::WriteRequest)?;
     // Drain processing replies until the terminal Ok/Failure. SetMetricDetail
     // is a quick fan-out; 5 s gives enough headroom for a slow worker.
     loop {
