@@ -358,6 +358,39 @@ impl Default for ThresholdTable {
     }
 }
 
+impl ThresholdTable {
+    /// Return a short critical-banner headline if any of the configured
+    /// thresholds is currently crossed. Used by the renderer to drive the
+    /// big-text alert overlay. `None` means "everything's fine"; the
+    /// renderer skips the banner row in that case.
+    pub fn critical_message(&self, overview: &OverviewState) -> Option<&'static str> {
+        if overview
+            .latency_p99_ms
+            .last()
+            .is_some_and(|v| v as f64 >= self.latency_p99_critical_ms)
+        {
+            return Some("HIGH LATENCY");
+        }
+        if overview
+            .error_ratio_pct
+            .last()
+            // error_ratio_pct stored as integer × 100 (two decimals), so
+            // the threshold needs the same scaling for the comparison.
+            .is_some_and(|v| (v as f64 / 100.0) >= self.error_ratio_critical_pct)
+        {
+            return Some("ERROR SURGE");
+        }
+        if overview
+            .saturation_pct
+            .last()
+            .is_some_and(|v| v as f64 >= self.slab_critical_pct)
+        {
+            return Some("SATURATION");
+        }
+        None
+    }
+}
+
 /// Top-level UI state. Pure data; the render loop snapshots it for each
 /// frame and the transport threads push into it via `App::ingest_*`.
 #[derive(Debug)]
