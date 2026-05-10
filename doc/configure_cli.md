@@ -131,3 +131,36 @@ sozu --config /path/to/config.toml events
 
 listens to events sent by Sōzu workers whenever a backend is down, up again,
 or when no backend is available.
+
+## Live operator TUI (`sozu top`)
+
+The `top` subcommand is a btop/htop-style live dashboard. Build with the
+optional `tui` Cargo feature (`cargo build -p sozu --features tui --release`);
+`sozu --version` reports `+tui` when the subcommand is linked in. See
+[`doc/sozu-top.md`](sozu-top.md) for the full operator guide (panes, key
+bindings, skin format, threshold tuning).
+
+```bash
+sozu --config /path/to/config.toml top
+```
+
+Common flags:
+
+| Flag | Effect |
+|------|--------|
+| `--refresh-ms <N>` | Data poll cadence in milliseconds (default `1000`). |
+| `--detail <DETAIL>` | Cardinality lease level (`process|frontend|cluster|backend`, default `backend`). |
+| `--lease-ttl-seconds <N>` | Lease TTL; auto-renewed at half-TTL (default `60`, server clamps at `300`). |
+| `--skin <NAME>` | Resolve `$XDG_CONFIG_HOME/sozu/skins/<NAME>.toml` (`SOZU_TOP_SKIN` env wins). |
+| `--glyphs <MODE>` | Force a glyph mode (`braille|block|tty`); auto-detect by default. |
+| `--no-color`, `--no-mouse` | Opt out of ANSI colour / SGR mouse capture. |
+| `--snapshot <N>`, `--tick-once` | Render N frames / one tick and exit (test affordances). |
+| `--log-file <PATH>` | Ship internal TUI logs here so they don't stomp the screen. |
+
+Key bindings (operator quick reference; see `doc/sozu-top.md` for the
+full list):
+
+- `1`-`7` jumps to OVERVIEW · CLUSTERS · BACKENDS · LISTENERS · CERTS · H2 · EVENTS.
+- `Tab` / `Shift-Tab` cycles tabs forward / backward.
+- `s` / `S` cycles / reverses the sort column on CLUSTERS and BACKENDS.
+- `q` / `Q` / `Ctrl-C` / `F10` quits, `?` / `F1` toggles help.
