@@ -35,6 +35,7 @@
 //! See `tasks/todo.md` for the full plan, including the Codex cross-check
 //! and the audited approval gates.
 
+mod app;
 mod cardinality;
 mod theme;
 mod transport;
