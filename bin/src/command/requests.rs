@@ -1609,6 +1609,25 @@ struct WorkerTask {
     /// and target. `None` for non-audited verbs (same filter as
     /// `audit_entry_for`).
     audit: Option<AuditEntry>,
+    /// Inline-audit target for verbs whose audit factory does not produce
+    /// a full `AuditEntry` (`ConfigureMetrics`, `SetMetricDetail`). The
+    /// completion handler emits a second `audit_emit_inline` line with
+    /// fan-out outcome attached. `None` for verbs that already carry an
+    /// `AuditEntry` in `audit`.
+    inline_audit: Option<InlineAuditTarget>,
+}
+
+/// Carry the per-verb metadata needed to emit a completion-time audit
+/// row for verbs that don't go through `audit_entry_for`. Mirrors the
+/// shape `audit_emit_inline` expects (both `verb` and `counter` are
+/// `&'static str` produced together by the `audit_verb!` macro so they
+/// can never drift).
+#[derive(Debug)]
+struct InlineAuditTarget {
+    kind: EventKind,
+    verb: &'static str,
+    counter: &'static str,
+    target: String,
 }
 
 pub fn worker_request(
@@ -1717,6 +1736,30 @@ pub fn worker_request(
         cloned.extras.request_sha256 = Some(request_sha256.clone());
         cloned
     });
+    // Stash an inline-audit target for the completion handler when the
+    // verb doesn't carry a full `AuditEntry`. The attempt-time line below
+    // emits with `AuditResult::Ok` (state.dispatch accepted); on_finish
+    // re-emits with the worker fan-out outcome.
+    let inline_audit = if let Some(target) = metrics_target.as_ref() {
+        let (verb, counter) = audit_verb!("metrics_configured");
+        Some(InlineAuditTarget {
+            kind: EventKind::MetricsConfigured,
+            verb,
+            counter,
+            target: target.clone(),
+        })
+    } else {
+        metric_detail_target.as_ref().map(|target| {
+            let (verb, counter) = audit_verb!("metric_detail_changed");
+            InlineAuditTarget {
+                kind: EventKind::MetricDetailChanged,
+                verb,
+                counter,
+                target: target.clone(),
+            }
+        })
+    };
+
     if let Some(mut entry) = audit {
         entry.extras.request_sha256 = Some(request_sha256);
         audit_emit(server, client, entry, AuditResult::Ok);
@@ -1755,6 +1798,7 @@ pub fn worker_request(
             gatherer: DefaultGatherer::default(),
             started_at,
             audit: audit_for_task,
+            inline_audit,
         }),
         Timeout::Default,
         None,
@@ -1796,26 +1840,28 @@ impl GatheringTask for WorkerTask {
             AuditResult::Ok
         };
 
+        let fanout_status = if timed_out {
+            FanoutStatus::Timeout
+        } else if errors > 0 {
+            FanoutStatus::Partial
+        } else if expected == 0 {
+            FanoutStatus::LocalOnly
+        } else {
+            FanoutStatus::Ok
+        };
+        let fanout_summary = FanoutSummary {
+            status: fanout_status,
+            workers_ok: u32::try_from(ok).unwrap_or(u32::MAX),
+            workers_err: u32::try_from(errors).unwrap_or(u32::MAX),
+            workers_expected: u32::try_from(expected).unwrap_or(u32::MAX),
+        };
+
         // Completion-time audit: attributes the same verb as the attempt-time
         // line but with fanout / worker counts / elapsed_ms filled in. Skip
         // when the client disconnected or the verb is not audited.
         if let (Some(client_ref), Some(mut entry)) = (client.as_deref(), self.audit) {
-            let fanout_status = if timed_out {
-                FanoutStatus::Timeout
-            } else if errors > 0 {
-                FanoutStatus::Partial
-            } else if expected == 0 {
-                FanoutStatus::LocalOnly
-            } else {
-                FanoutStatus::Ok
-            };
             entry.extras.elapsed_ms = Some(elapsed_ms(self.started_at));
-            entry.extras.fanout = Some(FanoutSummary {
-                status: fanout_status,
-                workers_ok: u32::try_from(ok).unwrap_or(u32::MAX),
-                workers_err: u32::try_from(errors).unwrap_or(u32::MAX),
-                workers_expected: u32::try_from(expected).unwrap_or(u32::MAX),
-            });
+            entry.extras.fanout = Some(fanout_summary);
             if matches!(result, AuditResult::Err) {
                 entry.extras.error_code = Some(if timed_out {
                     AuditErrorCode::WorkerTimeout
@@ -1825,6 +1871,34 @@ impl GatheringTask for WorkerTask {
                 entry.extras.reason = Some(messages.join(", "));
             }
             audit_emit(server, client_ref, entry, result);
+        } else if let (Some(client_ref), Some(inline)) = (client.as_deref(), self.inline_audit) {
+            // Completion-time inline audit for ConfigureMetrics +
+            // SetMetricDetail. Same shape as the entry-bearing arm above
+            // but routed through `audit_emit_inline` since these verbs
+            // don't synthesise a full `AuditEntry` at attempt time.
+            let mut extras = AuditExtras {
+                elapsed_ms: Some(elapsed_ms(self.started_at)),
+                fanout: Some(fanout_summary),
+                ..Default::default()
+            };
+            if matches!(result, AuditResult::Err) {
+                extras.error_code = Some(if timed_out {
+                    AuditErrorCode::WorkerTimeout
+                } else {
+                    AuditErrorCode::WorkerFailure
+                });
+                extras.reason = Some(messages.join(", "));
+            }
+            audit_emit_inline(
+                server,
+                client_ref,
+                inline.kind,
+                inline.verb,
+                inline.counter,
+                inline.target,
+                result,
+                extras,
+            );
         }
 
         if errors > 0 || timed_out {
