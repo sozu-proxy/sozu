@@ -12,11 +12,11 @@ mod writer;
 
 use std::{
     cell::RefCell,
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     io::{self, Write},
     net::SocketAddr,
     str,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use mio::net::UdpSocket;
@@ -231,6 +231,19 @@ pub trait Subscriber {
     );
 }
 
+/// How often `lease_tick` actually does work; cheaper than recomputing the
+/// effective level on every metric emission. Polled at the top of the worker's
+/// `notify` loop, so the cadence floats with traffic but is bounded by this.
+const LEASE_TICK_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Hard cap on lease TTL, mirroring the proto comment on `SetMetricDetail`.
+/// Bounds the worst-case effect of a stuck renewer.
+pub const LEASE_TTL_MAX: Duration = Duration::from_secs(300);
+
+/// Default lease TTL applied when the proto request omits `ttl_seconds` (or
+/// passes `0`). Matches the proto comment.
+pub const LEASE_TTL_DEFAULT: Duration = Duration::from_secs(60);
+
 pub struct Aggregator {
     /// appended to metric keys, usually "sozu-"
     prefix: String,
@@ -238,21 +251,36 @@ pub struct Aggregator {
     network: Option<NetworkDrain>,
     /// gather metrics locally, queried by the CLI
     local: LocalDrain,
-    /// Cardinality knob — filters `(cluster_id, backend_id)` labels at
-    /// emission time. Defaults to `Cluster` to preserve the historical
-    /// pre-knob behaviour (cluster-scoped metrics emitted, backend-scoped
-    /// labels dropped before this knob existed only when the macros didn't
-    /// pass them).
-    detail: MetricDetailLevel,
+    /// Static cardinality knob — set once at boot from `MetricsConfig.detail`.
+    /// Filters `(cluster_id, backend_id)` labels at emission time. Each level
+    /// is a SUPERSET of the previous one (`Process ⊆ Frontend ⊆ Cluster ⊆ Backend`).
+    configured: MetricDetailLevel,
+    /// Effective cardinality knob actually applied at emission. Equal to
+    /// `max(configured, max(active leases))`. Recomputed only when leases
+    /// change, so the hot path (`receive_metric`) reads a single field.
+    effective: MetricDetailLevel,
+    /// Active TTL leases keyed by `client_id` from `SetMetricDetail`. A live
+    /// lease holds the worker's effective level at-or-above its requested
+    /// detail until it expires or is explicitly cleared. Multiple clients
+    /// (e.g. several `sozu top` sessions) lease independently.
+    leases: HashMap<String, (MetricDetailLevel, Instant)>,
+    /// Wall-clock anchor for the polled lease janitor. Updated on every
+    /// `lease_tick` call regardless of whether expiry happened, so the
+    /// caller's "is it time to tick?" check stays cheap.
+    last_lease_tick: Instant,
 }
 
 impl Aggregator {
     pub fn new(prefix: String) -> Aggregator {
+        let default_detail = MetricDetailLevel::default();
         Aggregator {
             prefix: prefix.clone(),
             network: None,
             local: LocalDrain::new(prefix),
-            detail: MetricDetailLevel::default(),
+            configured: default_detail,
+            effective: default_detail,
+            leases: HashMap::new(),
+            last_lease_tick: Instant::now(),
         }
     }
 
@@ -276,10 +304,111 @@ impl Aggregator {
         }
     }
 
-    /// Cardinality knob — see [`MetricDetailLevel`] and
-    /// [`filter_labels_for_detail`] for the per-level filtering rules.
+    /// Set the static cardinality floor (`MetricsConfig.detail` from the TOML
+    /// configuration). Live leases applied via [`Self::lease_apply`] can
+    /// elevate the effective level at runtime; the configured floor is the
+    /// lower bound the worker falls back to when no lease is active.
+    ///
+    /// See [`MetricDetailLevel`] and [`filter_labels_for_detail`] for the
+    /// per-level filtering rules.
     pub fn set_up_detail(&mut self, detail: MetricDetailLevel) {
-        self.detail = detail;
+        self.configured = detail;
+        self.recompute_effective();
+    }
+
+    /// Returns the static (configured) cardinality floor. Independent of
+    /// runtime leases.
+    pub fn detail_configured(&self) -> MetricDetailLevel {
+        self.configured
+    }
+
+    /// Returns the cardinality level actually applied to emissions. Equal to
+    /// `max(configured, max(active leases))`.
+    pub fn detail_effective(&self) -> MetricDetailLevel {
+        self.effective
+    }
+
+    /// Apply or renew a runtime cardinality lease for `client_id`. If a lease
+    /// for the same client already exists it is REPLACED (used for renewals).
+    /// `ttl` is clamped to [`LEASE_TTL_MAX`]. Returns `(previous_effective,
+    /// new_effective)` so callers can decide whether to emit a
+    /// `MetricDetailChanged` audit event.
+    pub fn lease_apply(
+        &mut self,
+        client_id: String,
+        level: MetricDetailLevel,
+        ttl: Duration,
+    ) -> (MetricDetailLevel, MetricDetailLevel) {
+        let bounded_ttl = ttl.min(LEASE_TTL_MAX);
+        let expires_at = Instant::now() + bounded_ttl;
+        self.leases.insert(client_id, (level, expires_at));
+        let previous = self.effective;
+        self.recompute_effective();
+        (previous, self.effective)
+    }
+
+    /// Explicitly release a lease keyed by `client_id`. Returns the previous
+    /// effective level on a hit (so callers can emit an audit event), or
+    /// `None` when no lease was held by that id (silent no-op).
+    pub fn lease_clear(&mut self, client_id: &str) -> Option<MetricDetailLevel> {
+        if self.leases.remove(client_id).is_some() {
+            let previous = self.effective;
+            self.recompute_effective();
+            Some(previous)
+        } else {
+            None
+        }
+    }
+
+    /// Returns the number of active (non-expired-as-of-last-tick) leases.
+    /// Surfaced in `WorkerMetricDetailStatus` so the TUI can show
+    /// "another client is still leasing this level".
+    pub fn lease_count(&self) -> u32 {
+        self.leases.len() as u32
+    }
+
+    /// Polled lease-expiry janitor. Called from the worker's `notify` loop
+    /// (and from periodic timers); cheap when nothing has expired. Returns
+    /// `Some(previous_effective)` when at least one lease expired AND that
+    /// expiry actually moved the effective level (so the caller can emit a
+    /// `MetricDetailChanged` audit event), or `None` for the no-change path.
+    ///
+    /// `now` is parameterised so unit tests can advance the clock
+    /// deterministically without sleeping.
+    pub fn lease_tick(&mut self, now: Instant) -> Option<MetricDetailLevel> {
+        self.last_lease_tick = now;
+        let before = self.leases.len();
+        self.leases.retain(|_, (_, expires_at)| *expires_at > now);
+        if self.leases.len() == before {
+            return None;
+        }
+        let previous = self.effective;
+        self.recompute_effective();
+        if previous != self.effective {
+            Some(previous)
+        } else {
+            None
+        }
+    }
+
+    /// True when at least [`LEASE_TICK_INTERVAL`] has passed since the last
+    /// `lease_tick`. Use to gate the polled janitor at the top of `notify`
+    /// without paying a HashMap walk on every event-loop iteration.
+    pub fn lease_tick_due(&self, now: Instant) -> bool {
+        now.duration_since(self.last_lease_tick) >= LEASE_TICK_INTERVAL
+    }
+
+    /// Recompute `effective = max(configured, max(active leases))`. Cheap (one
+    /// linear pass over the lease table) and only called on apply/clear/tick,
+    /// never on the metric-emission hot path.
+    fn recompute_effective(&mut self) {
+        let mut max_lease = self.configured;
+        for (_, (level, _)) in self.leases.iter() {
+            if *level > max_lease {
+                max_lease = *level;
+            }
+        }
+        self.effective = max_lease;
     }
 
     pub fn socket(&self) -> Option<&UdpSocket> {
@@ -343,9 +472,11 @@ impl Subscriber for Aggregator {
     ) {
         // Apply the cardinality knob BEFORE handing the metric to either
         // drain. Both drains see the same filtered labels, keeping the local
-        // CLI view consistent with what statsd receives on the wire.
+        // CLI view consistent with what statsd receives on the wire. Reads
+        // `effective` (max of the configured floor and any active leases),
+        // which is recomputed off the hot path.
         let (cluster_id, backend_id) =
-            filter_labels_for_detail(self.detail, cluster_id, backend_id);
+            filter_labels_for_detail(self.effective, cluster_id, backend_id);
         if let Some(ref mut net) = self.network.as_mut() {
             net.receive_metric(label, cluster_id, backend_id, metric.to_owned());
         }
@@ -557,6 +688,145 @@ mod tests {
         // Pre-knob behaviour preserved: if a worker / process never calls
         // `set_up_detail`, cluster-scoped metrics still reach the drains.
         let agg = Aggregator::new("sozu".to_owned());
-        assert_eq!(agg.detail, MetricDetailLevel::Cluster);
+        assert_eq!(agg.detail_configured(), MetricDetailLevel::Cluster);
+        assert_eq!(agg.detail_effective(), MetricDetailLevel::Cluster);
+        assert_eq!(agg.lease_count(), 0);
+    }
+
+    #[test]
+    fn lease_apply_elevates_effective_above_configured() {
+        // Configured floor stays at Cluster; a lease for Backend lifts the
+        // effective level until the lease expires or is cleared.
+        let mut agg = Aggregator::new("sozu".to_owned());
+        agg.set_up_detail(MetricDetailLevel::Cluster);
+        let (prev, new) = agg.lease_apply(
+            "test:1".to_owned(),
+            MetricDetailLevel::Backend,
+            Duration::from_secs(60),
+        );
+        assert_eq!(prev, MetricDetailLevel::Cluster);
+        assert_eq!(new, MetricDetailLevel::Backend);
+        assert_eq!(agg.detail_configured(), MetricDetailLevel::Cluster);
+        assert_eq!(agg.detail_effective(), MetricDetailLevel::Backend);
+        assert_eq!(agg.lease_count(), 1);
+    }
+
+    #[test]
+    fn lease_apply_below_configured_does_not_lower_effective() {
+        // A lease can only ELEVATE the floor, never push below `configured`.
+        let mut agg = Aggregator::new("sozu".to_owned());
+        agg.set_up_detail(MetricDetailLevel::Backend);
+        let (prev, new) = agg.lease_apply(
+            "test:1".to_owned(),
+            MetricDetailLevel::Cluster,
+            Duration::from_secs(60),
+        );
+        assert_eq!(prev, MetricDetailLevel::Backend);
+        assert_eq!(new, MetricDetailLevel::Backend);
+    }
+
+    #[test]
+    fn lease_apply_renewal_replaces_previous_for_same_client() {
+        // The renewer client re-sends with the same `client_id`; the entry
+        // is REPLACED (not duplicated). Lease count stays at 1.
+        let mut agg = Aggregator::new("sozu".to_owned());
+        let _ = agg.lease_apply(
+            "renewer".to_owned(),
+            MetricDetailLevel::Backend,
+            Duration::from_secs(30),
+        );
+        let _ = agg.lease_apply(
+            "renewer".to_owned(),
+            MetricDetailLevel::Backend,
+            Duration::from_secs(60),
+        );
+        assert_eq!(agg.lease_count(), 1);
+    }
+
+    #[test]
+    fn lease_apply_max_merge_two_clients() {
+        // Two clients, two levels: effective = max(both leases, configured).
+        // Use `Process` as the floor so the Frontend lease is observable
+        // after the Backend lease is cleared (otherwise the configured
+        // Cluster floor would mask the Frontend lease).
+        let mut agg = Aggregator::new("sozu".to_owned());
+        agg.set_up_detail(MetricDetailLevel::Process);
+        let _ = agg.lease_apply(
+            "scraper".to_owned(),
+            MetricDetailLevel::Frontend,
+            Duration::from_secs(60),
+        );
+        let _ = agg.lease_apply(
+            "topcli".to_owned(),
+            MetricDetailLevel::Backend,
+            Duration::from_secs(60),
+        );
+        assert_eq!(agg.detail_effective(), MetricDetailLevel::Backend);
+        assert_eq!(agg.lease_count(), 2);
+        // Clearing the higher lease drops effective back to the lower one.
+        let prev = agg.lease_clear("topcli").unwrap();
+        assert_eq!(prev, MetricDetailLevel::Backend);
+        assert_eq!(agg.detail_effective(), MetricDetailLevel::Frontend);
+        assert_eq!(agg.lease_count(), 1);
+    }
+
+    #[test]
+    fn lease_clear_unknown_id_is_silent_noop() {
+        // Mismatched IDs are silently ignored (other clients' leases unaffected).
+        let mut agg = Aggregator::new("sozu".to_owned());
+        let _ = agg.lease_apply(
+            "real".to_owned(),
+            MetricDetailLevel::Backend,
+            Duration::from_secs(60),
+        );
+        assert!(agg.lease_clear("ghost").is_none());
+        assert_eq!(agg.detail_effective(), MetricDetailLevel::Backend);
+        assert_eq!(agg.lease_count(), 1);
+    }
+
+    #[test]
+    fn lease_tick_expires_only_past_due_leases() {
+        // `lease_tick(now)` parameterises the clock so we can test expiry
+        // without sleeping. Setup: one lease past due, one still active.
+        // Use `Process` as the floor so the surviving Frontend lease drives
+        // the effective level after the Backend lease expires (otherwise
+        // the Cluster floor would mask it).
+        let mut agg = Aggregator::new("sozu".to_owned());
+        agg.set_up_detail(MetricDetailLevel::Process);
+        let now = Instant::now();
+        // Inject directly into the table to control expires_at deterministically.
+        agg.leases.insert(
+            "expired".to_owned(),
+            (MetricDetailLevel::Backend, now - Duration::from_secs(1)),
+        );
+        agg.leases.insert(
+            "live".to_owned(),
+            (MetricDetailLevel::Frontend, now + Duration::from_secs(60)),
+        );
+        agg.recompute_effective();
+        assert_eq!(agg.detail_effective(), MetricDetailLevel::Backend);
+        let prev = agg.lease_tick(now);
+        assert_eq!(prev, Some(MetricDetailLevel::Backend));
+        assert_eq!(agg.detail_effective(), MetricDetailLevel::Frontend);
+        assert_eq!(agg.lease_count(), 1);
+    }
+
+    #[test]
+    fn lease_tick_no_change_returns_none() {
+        // No leases -> no-op tick, no audit signal.
+        let mut agg = Aggregator::new("sozu".to_owned());
+        assert!(agg.lease_tick(Instant::now()).is_none());
+    }
+
+    #[test]
+    fn lease_apply_clamps_ttl_to_max() {
+        // Stuck renewer protection: TTL larger than LEASE_TTL_MAX is clamped.
+        let mut agg = Aggregator::new("sozu".to_owned());
+        let too_long = Duration::from_secs(LEASE_TTL_MAX.as_secs() * 4);
+        let now = Instant::now();
+        let _ = agg.lease_apply("greedy".to_owned(), MetricDetailLevel::Backend, too_long);
+        let (_, expires_at) = agg.leases.get("greedy").unwrap();
+        // Stored expiry should not exceed `now + LEASE_TTL_MAX + a small slop`.
+        assert!(*expires_at <= now + LEASE_TTL_MAX + Duration::from_millis(50));
     }
 }
