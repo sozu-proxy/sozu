@@ -116,6 +116,10 @@ pub fn run(
         // last paint. Synchronized output wraps the draw to give tmux a
         // single atomic frame.
         if last_render.elapsed() >= RENDER_INTERVAL {
+            // Age each active pulse before the paint so the tint fades
+            // one frame at a time. Skipping this would freeze pulses on
+            // screen between snapshots.
+            app.tick_pulses();
             execute!(io::stdout(), BeginSynchronizedUpdate)?;
             terminal.draw(|f| draw(f, &app, &skin))?;
             execute!(io::stdout(), EndSynchronizedUpdate)?;

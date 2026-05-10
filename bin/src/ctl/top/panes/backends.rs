@@ -11,7 +11,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table};
 
-use super::super::app::{App, BackendSortKey};
+use super::super::app::{App, BackendSortKey, PulseKind};
 use super::super::theme::Skin;
 
 pub fn render(f: &mut Frame<'_>, area: Rect, app: &App, skin: &Skin) {
@@ -65,10 +65,13 @@ pub fn render(f: &mut Frame<'_>, area: Rect, app: &App, skin: &Skin) {
         .iter()
         .map(|row| {
             let critical = row.p99_ms as f64 >= app.thresholds.latency_p99_critical_ms;
-            let row_style = if critical {
-                skin.row_critical()
-            } else {
-                Style::default().fg(skin.secondary)
+            // Pulse takes precedence over the steady tint so transitions
+            // catch the eye even on rows that are already red.
+            let row_style = match app.pulse.backend_pulse(&row.cluster_id, &row.backend_id) {
+                Some(PulseKind::WentDown) | Some(PulseKind::Disappeared) => skin.pulse_hot(),
+                Some(PulseKind::Appeared) => skin.pulse_cool(),
+                None if critical => skin.row_critical(),
+                None => Style::default().fg(skin.secondary),
             };
             Row::new(vec![
                 Cell::from(row.cluster_id.clone()),
