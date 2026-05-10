@@ -27,11 +27,12 @@ use sozu_command_lib::{
     parser::parse_several_requests,
     proto::command::{
         AggregatedMetrics, AvailableMetrics, CertificatesWithFingerprints, ClusterHashes,
-        ClusterInformations, Event, EventKind, FrontendFilters, HardStop, MetricsConfiguration,
-        QueryCertificatesFilters, QueryHealthChecks, QueryMetricsOptions, Request, ResponseContent,
-        ResponseStatus, RunState, SoftStop, Status, UpdateHttpListenerConfig,
-        UpdateHttpsListenerConfig, UpdateTcpListenerConfig, WorkerInfo, WorkerInfos, WorkerRequest,
-        WorkerResponses, request::RequestType, response_content::ContentType,
+        ClusterInformations, Event, EventKind, FrontendFilters, HardStop, MetricDetail,
+        MetricsConfiguration, QueryCertificatesFilters, QueryHealthChecks, QueryMetricsOptions,
+        Request, ResponseContent, ResponseStatus, RunState, SoftStop, Status,
+        UpdateHttpListenerConfig, UpdateHttpsListenerConfig, UpdateTcpListenerConfig, WorkerInfo,
+        WorkerInfos, WorkerRequest, WorkerResponses, request::RequestType,
+        response_content::ContentType,
     },
     sd_notify,
 };
@@ -1632,6 +1633,30 @@ pub fn worker_request(
         None
     };
 
+    // Special-case SetMetricDetail — the same shape as ConfigureMetrics above
+    // (no dedicated audit factory in `audit_entry_for`), so we synthesise the
+    // entry inline against the new `EventKind::MetricDetailChanged` variant.
+    // Captures the client_id, the requested level (or `clear`), and the
+    // optional reason so audit consumers can identify which TUI / scraper
+    // touched the lease.
+    let metric_detail_target = if let RequestType::SetMetricDetail(req) = &request_content {
+        let level = if req.clear.unwrap_or(false) {
+            "clear".to_owned()
+        } else {
+            req.detail
+                .and_then(|d| MetricDetail::try_from(d).ok())
+                .map(|d| format!("{d:?}"))
+                .unwrap_or_else(|| "<invalid>".into())
+        };
+        let reason = req.reason.clone().unwrap_or_default();
+        Some(format!(
+            "metric_detail:{level}:client_id={}:reason={reason}",
+            req.client_id
+        ))
+    } else {
+        None
+    };
+
     let request: sozu_command_lib::proto::command::Request = request_content.into();
     let request_sha256 = compute_request_sha256(&request);
 
@@ -1649,6 +1674,23 @@ pub fn worker_request(
                 server,
                 client,
                 EventKind::MetricsConfigured,
+                verb,
+                counter,
+                target,
+                AuditResult::Err,
+                AuditExtras {
+                    elapsed_ms: Some(elapsed_ms(started_at)),
+                    error_code: Some(AuditErrorCode::DispatchError),
+                    reason: Some(reason.clone()),
+                    ..Default::default()
+                },
+            );
+        } else if let Some(target) = metric_detail_target.clone() {
+            let (verb, counter) = audit_verb!("metric_detail_changed");
+            audit_emit_inline(
+                server,
+                client,
+                EventKind::MetricDetailChanged,
                 verb,
                 counter,
                 target,
@@ -1684,6 +1726,18 @@ pub fn worker_request(
             server,
             client,
             EventKind::MetricsConfigured,
+            verb,
+            counter,
+            target,
+            AuditResult::Ok,
+            AuditExtras::default(),
+        );
+    } else if let Some(target) = metric_detail_target {
+        let (verb, counter) = audit_verb!("metric_detail_changed");
+        audit_emit_inline(
+            server,
+            client,
+            EventKind::MetricDetailChanged,
             verb,
             counter,
             target,
