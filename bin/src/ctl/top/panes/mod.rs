@@ -11,6 +11,7 @@ pub mod backends;
 pub mod clusters;
 pub mod events;
 pub mod h2;
+pub mod listeners;
 pub mod overview;
 
 use ratatui::Frame;

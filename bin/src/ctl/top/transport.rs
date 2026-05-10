@@ -28,8 +28,9 @@ use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use sozu_command_lib::{
     config::Config,
     proto::command::{
-        AggregatedMetrics, Event, QueryMetricsOptions, Request, Response, ResponseStatus,
-        SubscribeEvents, request::RequestType, response_content::ContentType,
+        AggregatedMetrics, Event, ListListeners, ListenersList, QueryMetricsOptions, Request,
+        Response, ResponseStatus, SubscribeEvents, request::RequestType,
+        response_content::ContentType,
     },
 };
 
@@ -52,6 +53,16 @@ pub struct Snapshot {
 #[derive(Debug, Clone)]
 pub struct TopEvent {
     pub event: Event,
+    pub received_at: Instant,
+}
+
+/// Listener inventory snapshot pushed by the listeners-collector thread.
+/// Refreshed at a slower cadence than metrics (5 s default) because listener
+/// state changes are operator-paced — adds, removes, activates, deactivates
+/// all flow via control-plane mutations that the EVENTS pane already shows.
+#[derive(Debug, Clone)]
+pub struct ListenersSnapshot {
+    pub list: ListenersList,
     pub received_at: Instant,
 }
 
@@ -186,6 +197,92 @@ fn poll_metrics(
                     }
                 },
                 None => return Err("QueryMetrics OK with no content".into()),
+            },
+        }
+    }
+}
+
+/// Cadence of the listeners poll. Operator-paced; 5 s matches the brief's
+/// "cold subjects" tier and HAProxy hatop's documented `show stat` cadence.
+const LISTENERS_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Spawn the listeners-collector thread. Polls `RequestType::ListListeners`
+/// every `LISTENERS_INTERVAL` over its own `Channel` and pushes a
+/// `ListenersSnapshot` into a `bounded(1)` newest-wins channel. Same
+/// shape as `spawn_collector`.
+pub fn spawn_listeners(
+    config: Config,
+) -> Result<(Receiver<ListenersSnapshot>, std::thread::JoinHandle<()>), CtlError> {
+    let mut channel = create_channel(&config)?;
+    let (tx, rx) = bounded::<ListenersSnapshot>(SNAPSHOT_CAP);
+    let handle = std::thread::Builder::new()
+        .name("sozu-top-listeners".into())
+        .spawn(move || listeners_loop(&mut channel, tx))
+        .expect("spawn sozu-top listeners");
+    Ok((rx, handle))
+}
+
+fn listeners_loop(
+    channel: &mut sozu_command_lib::channel::Channel<Request, Response>,
+    tx: Sender<ListenersSnapshot>,
+) {
+    loop {
+        let started = Instant::now();
+        match poll_listeners(channel) {
+            Ok(list) => {
+                let snap = ListenersSnapshot {
+                    list,
+                    received_at: Instant::now(),
+                };
+                match tx.try_send(snap) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(snap)) => {
+                        if tx.try_send(snap).is_err() {
+                            return;
+                        }
+                    }
+                    Err(TrySendError::Disconnected(_)) => return,
+                }
+            }
+            Err(err) => {
+                eprintln!("sozu top: listeners poll error: {err}");
+            }
+        }
+        let elapsed = started.elapsed();
+        if elapsed < LISTENERS_INTERVAL {
+            std::thread::sleep(LISTENERS_INTERVAL - elapsed);
+        }
+    }
+}
+
+fn poll_listeners(
+    channel: &mut sozu_command_lib::channel::Channel<Request, Response>,
+) -> Result<ListenersList, String> {
+    let req = Request {
+        request_type: Some(RequestType::ListListeners(ListListeners {})),
+    };
+    channel
+        .write_message(&req)
+        .map_err(|e| format!("write ListListeners: {e}"))?;
+    loop {
+        let resp = channel
+            .read_message_blocking_timeout(Some(Duration::from_secs(5)))
+            .map_err(|e| format!("read ListListeners response: {e}"))?;
+        match resp.status() {
+            ResponseStatus::Processing => continue,
+            ResponseStatus::Failure => {
+                return Err(format!("ListListeners failed: {}", resp.message));
+            }
+            ResponseStatus::Ok => match resp.content {
+                Some(content) => match content.content_type {
+                    Some(ContentType::ListenersList(l)) => return Ok(l),
+                    other => {
+                        return Err(format!(
+                            "unexpected content variant for ListListeners: {other:?}"
+                        ));
+                    }
+                },
+                None => return Err("ListListeners OK with no content".into()),
             },
         }
     }
