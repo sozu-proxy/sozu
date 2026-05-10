@@ -63,6 +63,22 @@ tokio = "^1.52.1"
 toml = { version = "^1.1.2", features = ["preserve_order"] }
 x509-parser = "^0.18.1"
 
+# Dependencies for the `sozu top` TUI subcommand. All gated behind the
+# opt-in `tui` Cargo feature on `bin/`; default `sozu` builds do not pull
+# any of them in. Versions Codex-pinned 2026-05-10 against crates.io HEAD;
+# bump the patch component locally if cargo update lands a fix.
+color-eyre           = "^0.6.5"
+crossbeam-channel    = "^0.5.15"
+crossterm            = { version = "^0.29.0", default-features = false }
+ctrlc                = "^3.4.5"
+ratatui              = { version = "^0.30.0", default-features = false }
+throbber-widgets-tui = "^0.11.0"
+tui-big-text         = "^0.8.4"
+tui-input            = "^0.15.3"
+tui-popup            = "^0.7.4"
+tui-scrollview       = "^0.6.4"
+tui-tree-widget      = "^0.24.0"
+
 [profile.release]
 lto = true
 codegen-units = 1
