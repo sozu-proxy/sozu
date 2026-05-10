@@ -49,6 +49,11 @@ fn main() {
         ("LOGS_DEBUG", "logs-debug"),
         ("LOGS_TRACE", "logs-trace"),
         ("UNSTABLE", "unstable"),
+        // `tui` gates the `sozu top` btop/htop-style subcommand. Surfaced in
+        // `--version` so operators can spot whether ratatui/crossterm and the
+        // polish crates were linked in (it materially changes the binary
+        // size and dep graph).
+        ("TUI", "tui"),
     ];
 
     // Crypto-provider features follow the runtime precedence chain
