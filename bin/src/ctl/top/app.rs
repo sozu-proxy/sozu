@@ -224,6 +224,10 @@ pub struct App {
     pub cluster_sort: ClusterSortKey,
     /// Reverse the cluster-table sort ordering when `true`.
     pub cluster_sort_reverse: bool,
+    /// Backend-table sort column. Default `Bandwidth` (busiest backend at
+    /// the top).
+    pub backend_sort: BackendSortKey,
+    pub backend_sort_reverse: bool,
     rates: RateCalculator,
 }
 
@@ -297,6 +301,8 @@ impl App {
             help_visible: false,
             cluster_sort: ClusterSortKey::ErrorRate,
             cluster_sort_reverse: false,
+            backend_sort: BackendSortKey::Bandwidth,
+            backend_sort_reverse: false,
             rates: RateCalculator::default(),
         }
     }
@@ -385,6 +391,69 @@ impl App {
                 ord
             }
         });
+        rows
+    }
+
+    /// Build the per-backend rows for the BACKENDS pane. Flattens every
+    /// `(cluster_id, BackendMetrics)` pair across the freshest snapshot.
+    /// Sorted per `backend_sort` / `backend_sort_reverse`.
+    pub fn backend_rows(&self) -> Vec<BackendRow> {
+        let metrics = match self.last_metrics.as_ref() {
+            Some(m) => m,
+            None => return Vec::new(),
+        };
+        let mut rows: Vec<BackendRow> = Vec::new();
+        for (cluster_id, cm) in &metrics.clusters {
+            for bm in &cm.backends {
+                rows.push(BackendRow {
+                    cluster_id: cluster_id.clone(),
+                    backend_id: bm.backend_id.clone(),
+                    bytes_in: count_value(bm.metrics.get("bytes_in")).unwrap_or(0) as u64,
+                    bytes_out: count_value(bm.metrics.get("bytes_out")).unwrap_or(0) as u64,
+                    back_bytes_in: count_value(bm.metrics.get("back_bytes_in")).unwrap_or(0) as u64,
+                    back_bytes_out: count_value(bm.metrics.get("back_bytes_out")).unwrap_or(0)
+                        as u64,
+                    connections: gauge_value(bm.metrics.get("connections_per_backend"))
+                        .unwrap_or(0),
+                    p50_ms: percentile_p50_ms(bm.metrics.get("backend_response_time")).unwrap_or(0),
+                    p99_ms: percentile_p99_ms(bm.metrics.get("backend_response_time")).unwrap_or(0),
+                    requests_total: count_value(bm.metrics.get("requests")).unwrap_or(0) as u64,
+                });
+            }
+        }
+        rows.sort_by(|a, b| {
+            use std::cmp::Ordering;
+            let ord = match self.backend_sort {
+                BackendSortKey::ClusterId => a
+                    .cluster_id
+                    .cmp(&b.cluster_id)
+                    .then(a.backend_id.cmp(&b.backend_id)),
+                BackendSortKey::BackendId => a.backend_id.cmp(&b.backend_id),
+                BackendSortKey::Bandwidth => {
+                    let abw = a.back_bytes_in + a.back_bytes_out;
+                    let bbw = b.back_bytes_in + b.back_bytes_out;
+                    abw.cmp(&bbw).reverse()
+                }
+                BackendSortKey::Connections => a.connections.cmp(&b.connections).reverse(),
+                BackendSortKey::LatencyP99 => a.p99_ms.cmp(&b.p99_ms).reverse(),
+                BackendSortKey::Requests => a.requests_total.cmp(&b.requests_total).reverse(),
+            };
+            // `Ordering::reverse` chains nicely with `.then()` above; if all
+            // primary keys tie we drop to (cluster_id, backend_id) lex order
+            // for a deterministic on-screen layout.
+            ord.then_with(|| a.cluster_id.cmp(&b.cluster_id))
+                .then_with(|| a.backend_id.cmp(&b.backend_id))
+                .then_with(|| {
+                    if self.backend_sort_reverse {
+                        Ordering::Greater
+                    } else {
+                        Ordering::Equal
+                    }
+                })
+        });
+        if self.backend_sort_reverse {
+            rows.reverse();
+        }
         rows
     }
 
@@ -538,6 +607,61 @@ pub struct ClusterRow {
     pub p99_ms: u64,
     pub backends_total: u32,
     pub backends_available: u32,
+}
+
+/// Per-backend row produced by `App::backend_rows`. Flattens every
+/// `(cluster_id, BackendMetrics)` pair into a single sortable list.
+#[derive(Debug, Clone)]
+pub struct BackendRow {
+    pub cluster_id: String,
+    pub backend_id: String,
+    pub bytes_in: u64,
+    pub bytes_out: u64,
+    pub back_bytes_in: u64,
+    pub back_bytes_out: u64,
+    pub connections: u64,
+    pub p50_ms: u64,
+    pub p99_ms: u64,
+    pub requests_total: u64,
+}
+
+/// Sort columns for the BACKENDS pane. Default `Bandwidth` (back_bytes_out
+/// — the most operationally-loaded backend at the top).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendSortKey {
+    ClusterId,
+    BackendId,
+    Bandwidth,
+    Connections,
+    LatencyP99,
+    Requests,
+}
+
+impl BackendSortKey {
+    pub const ALL: &'static [Self] = &[
+        Self::Bandwidth,
+        Self::LatencyP99,
+        Self::Connections,
+        Self::Requests,
+        Self::ClusterId,
+        Self::BackendId,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ClusterId => "cluster",
+            Self::BackendId => "backend",
+            Self::Bandwidth => "bw",
+            Self::Connections => "conn",
+            Self::LatencyP99 => "p99",
+            Self::Requests => "req",
+        }
+    }
+
+    pub fn cycle(self) -> Self {
+        let idx = Self::ALL.iter().position(|k| *k == self).unwrap_or(0);
+        Self::ALL[(idx + 1) % Self::ALL.len()]
+    }
 }
 
 #[cfg(test)]
