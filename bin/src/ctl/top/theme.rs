@@ -88,6 +88,25 @@ impl Skin {
         Style::default().fg(self.hot).add_modifier(Modifier::BOLD)
     }
 
+    /// Background tint for a row whose subject just disappeared (cluster
+    /// or backend went away). Hot foreground + muted background so the
+    /// row remains readable while still catching the eye.
+    pub fn pulse_hot(&self) -> Style {
+        Style::default()
+            .fg(self.hot)
+            .bg(self.muted)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    /// Background tint for a row whose subject just appeared (new cluster
+    /// rolled out). Lower-priority cue than `pulse_hot`.
+    pub fn pulse_cool(&self) -> Style {
+        Style::default()
+            .fg(self.cool)
+            .bg(self.muted)
+            .add_modifier(Modifier::BOLD)
+    }
+
     /// Style for the function-key bar at the bottom of the screen.
     pub fn fkey_label(&self) -> Style {
         Style::default()

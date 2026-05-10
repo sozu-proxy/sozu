@@ -17,7 +17,7 @@
 //!   threshold (5xx ratio > 1 %, slab.usage_percent > 80, h2 flood counters
 //!   non-zero) the relevant pane flips to a warning/critical hue.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
 use sozu_command_lib::proto::command::{AggregatedMetrics, FilteredMetrics, filtered_metrics};
@@ -35,6 +35,12 @@ pub const SPARKLINE_DEPTH: usize = 60;
 /// so the UI can keep an audit-style scrollback without forcing the
 /// transport to back-pressure on its own bound.
 pub const EVENT_RING_DEPTH: usize = 200;
+
+/// Number of consecutive renders a pulse stays visible. 4 ticks at the
+/// default 1 s data tick = ~4 s of background-tint emphasis. Long enough
+/// to catch the eye even when an operator looked away for a moment;
+/// short enough that a flurry of changes doesn't tint everything.
+pub const PULSE_DURATION_TICKS: u32 = 4;
 
 /// Top-level pane selector mirrored to numbered tabs at the top of the
 /// screen. Numbers match the keymap (`1 OVERVIEW`, `2 CLUSTERS`, …) so
@@ -172,6 +178,156 @@ impl RateCalculator {
     }
 }
 
+/// What-changed pulse tracker. Snapshot-to-snapshot diffs surface as a
+/// short-lived tint on the affected rows so the eye catches transitions
+/// even when the operator looked away for a moment. Codex called this out
+/// as a premium-touch in the cross-check (`tasks/todo.md`).
+///
+/// Three classes of pulse:
+///
+/// - `ClusterDisappeared(cluster_id)` fires when a cluster id present in
+///   the previous `AggregatedMetrics.clusters` map is absent in the new
+///   one. Operationally meaningful: the master reconfig dropped a
+///   cluster, or the worker fleet went silent on it.
+/// - `BackendWentDown(cluster_id, backend_id)` fires when a backend's
+///   `backend.available` gauge transitioned from `>= 1` to `0`. The
+///   companion `EventKind::BackendDown` event lands in the EVENTS pane;
+///   this pulse highlights the BACKENDS row in lockstep.
+/// - `ClusterAppeared(cluster_id)` fires when a new cluster id arrives —
+///   surfaces fresh additions without burying them at the bottom of the
+///   sort order. Lower-priority pulse (uses `cool` tier, not `hot`).
+#[derive(Debug, Default)]
+pub struct PulseTracker {
+    cluster_disappeared: HashMap<String, u32>,
+    cluster_appeared: HashMap<String, u32>,
+    backend_down: HashMap<(String, String), u32>,
+    last_clusters: HashSet<String>,
+    last_backend_up: HashSet<(String, String)>,
+}
+
+impl PulseTracker {
+    /// Decrement every active pulse by one render frame. Drop entries that
+    /// reach zero. Called once per render tick by `App::tick_pulses`.
+    fn tick(&mut self) {
+        Self::tick_one(&mut self.cluster_disappeared);
+        Self::tick_one(&mut self.cluster_appeared);
+        let to_drop: Vec<_> = self
+            .backend_down
+            .iter_mut()
+            .filter_map(|(k, v)| {
+                if *v == 0 {
+                    Some(k.clone())
+                } else {
+                    *v -= 1;
+                    None
+                }
+            })
+            .collect();
+        for k in to_drop {
+            self.backend_down.remove(&k);
+        }
+    }
+
+    fn tick_one(map: &mut HashMap<String, u32>) {
+        let to_drop: Vec<_> = map
+            .iter_mut()
+            .filter_map(|(k, v)| {
+                if *v == 0 {
+                    Some(k.clone())
+                } else {
+                    *v -= 1;
+                    None
+                }
+            })
+            .collect();
+        for k in to_drop {
+            map.remove(&k);
+        }
+    }
+
+    /// Diff a new snapshot against the previous seen set and emit fresh
+    /// pulses for every transition. Called from `App::ingest_snapshot`
+    /// BEFORE the snapshot replaces `last_metrics`.
+    fn diff(&mut self, m: &AggregatedMetrics) {
+        let mut new_clusters: HashSet<String> = HashSet::new();
+        let mut new_backend_up: HashSet<(String, String)> = HashSet::new();
+        for (cluster_id, cm) in &m.clusters {
+            new_clusters.insert(cluster_id.clone());
+            for bm in &cm.backends {
+                let available = bm
+                    .metrics
+                    .get("backend.available")
+                    .and_then(|m| match m.inner.as_ref()? {
+                        filtered_metrics::Inner::Gauge(v) => Some(*v),
+                        _ => None,
+                    })
+                    .unwrap_or(0);
+                if available >= 1 {
+                    new_backend_up.insert((cluster_id.clone(), bm.backend_id.clone()));
+                }
+            }
+        }
+        // Cluster disappear: in last set, not in new set. Skip on the very
+        // first snapshot to avoid pulsing for "every cluster appeared" on
+        // startup (the first `diff` runs against an empty last_clusters).
+        if !self.last_clusters.is_empty() {
+            for missing in self.last_clusters.difference(&new_clusters) {
+                self.cluster_disappeared
+                    .insert(missing.clone(), PULSE_DURATION_TICKS);
+            }
+            // Cluster appear: in new set, not in last set.
+            for fresh in new_clusters.difference(&self.last_clusters) {
+                self.cluster_appeared
+                    .insert(fresh.clone(), PULSE_DURATION_TICKS);
+            }
+        }
+        // Backend down: was up in last snapshot, not up in new snapshot
+        // (either backend.available dropped to 0 OR the backend row went
+        // missing). Both cases surface as "this backend can't take traffic
+        // right now" so they share a pulse class.
+        for prev_up in &self.last_backend_up {
+            if !new_backend_up.contains(prev_up) {
+                self.backend_down
+                    .insert(prev_up.clone(), PULSE_DURATION_TICKS);
+            }
+        }
+        self.last_clusters = new_clusters;
+        self.last_backend_up = new_backend_up;
+    }
+
+    pub fn cluster_pulse(&self, cluster_id: &str) -> Option<PulseKind> {
+        if self.cluster_disappeared.contains_key(cluster_id) {
+            Some(PulseKind::Disappeared)
+        } else if self.cluster_appeared.contains_key(cluster_id) {
+            Some(PulseKind::Appeared)
+        } else {
+            None
+        }
+    }
+
+    pub fn backend_pulse(&self, cluster_id: &str, backend_id: &str) -> Option<PulseKind> {
+        if self
+            .backend_down
+            .contains_key(&(cluster_id.to_owned(), backend_id.to_owned()))
+        {
+            Some(PulseKind::WentDown)
+        } else {
+            None
+        }
+    }
+}
+
+/// Visual class of a pulse, mapped to a skin tier by the renderer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PulseKind {
+    /// Cluster row vanished — operationally surprising. Hot tier.
+    Disappeared,
+    /// Cluster row appeared. Cool tier.
+    Appeared,
+    /// Backend transitioned from up to down. Hot tier.
+    WentDown,
+}
+
 /// Threshold table used by the colour-coding rules. Each field is the
 /// boundary above which the relevant pane flips its row/cell into a
 /// warning/critical hue. Defaults are documented in `doc/sozu-top.md`
@@ -232,6 +388,9 @@ pub struct App {
     /// the top).
     pub backend_sort: BackendSortKey,
     pub backend_sort_reverse: bool,
+    /// "What changed" tracker — surfaces disappearing clusters and newly-
+    /// unhealthy backends as a short-lived row tint.
+    pub pulse: PulseTracker,
     rates: RateCalculator,
 }
 
@@ -308,6 +467,7 @@ impl App {
             cluster_sort_reverse: false,
             backend_sort: BackendSortKey::Bandwidth,
             backend_sort_reverse: false,
+            pulse: PulseTracker::default(),
             rates: RateCalculator::default(),
         }
     }
@@ -318,11 +478,22 @@ impl App {
     pub fn ingest_snapshot(&mut self, snap: &Snapshot) {
         self.last_snapshot_at = Some(snap.received_at);
         self.fold_overview(&snap.metrics, snap.received_at);
+        // Diff vs the last seen snapshot BEFORE replacing it, so the
+        // pulse tracker can emit ClusterDisappeared / BackendWentDown
+        // transitions against the previous set.
+        self.pulse.diff(&snap.metrics);
         // Keep the latest `AggregatedMetrics` for the CLUSTERS / BACKENDS
         // panes. Cloning isn't cheap for very-high-cardinality fleets
         // (>1000 clusters), but in practice the master already paid this
         // cost on the wire; revisit only if profile data justifies it.
         self.last_metrics = Some(snap.metrics.clone());
+    }
+
+    /// Advance the pulse tracker by one render frame. Called from the
+    /// render loop's draw step so pulses decay even when no new snapshot
+    /// arrived this frame.
+    pub fn tick_pulses(&mut self) {
+        self.pulse.tick();
     }
 
     /// Build the per-cluster summary rows for the CLUSTERS pane. Computed

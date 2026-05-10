@@ -11,7 +11,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Cell, Row, Table};
 
-use super::super::app::{App, ClusterSortKey};
+use super::super::app::{App, ClusterSortKey, PulseKind};
 use super::super::theme::Skin;
 
 pub fn render(f: &mut Frame<'_>, area: Rect, app: &App, skin: &Skin) {
@@ -66,10 +66,13 @@ pub fn render(f: &mut Frame<'_>, area: Rect, app: &App, skin: &Skin) {
             let row_critical = row.error_rate_pct >= app.thresholds.error_ratio_critical_pct
                 || row.p99_ms as f64 >= app.thresholds.latency_p99_critical_ms
                 || (row.backends_total > 0 && row.backends_available == 0);
-            let row_style = if row_critical {
-                skin.row_critical()
-            } else {
-                Style::default().fg(skin.secondary)
+            // Pulse takes precedence over the steady "critical" tint so a
+            // transition catches the eye even on a row that's already red.
+            let row_style = match app.pulse.cluster_pulse(&row.cluster_id) {
+                Some(PulseKind::Disappeared) | Some(PulseKind::WentDown) => skin.pulse_hot(),
+                Some(PulseKind::Appeared) => skin.pulse_cool(),
+                None if row_critical => skin.row_critical(),
+                None => Style::default().fg(skin.secondary),
             };
             Row::new(vec![
                 Cell::from(row.cluster_id.clone()),
