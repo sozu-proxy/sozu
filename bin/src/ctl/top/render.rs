@@ -34,7 +34,7 @@ use tui_big_text::{BigText, PixelSize};
 use super::app::{ActiveTab, App};
 use super::panes;
 use super::theme::{GlyphMode, Skin};
-use super::transport::{ListenersSnapshot, Snapshot, TopEvent};
+use super::transport::{CertsSnapshot, ListenersSnapshot, Snapshot, TopEvent};
 
 /// Cap the redraw rate at 30 fps regardless of how often new snapshots /
 /// events arrive. Higher rates only burn CPU on tmux + non-Sixel
@@ -61,6 +61,7 @@ pub fn run(
     snapshots: Receiver<Snapshot>,
     events: Receiver<TopEvent>,
     listeners: Receiver<ListenersSnapshot>,
+    certs: Receiver<CertsSnapshot>,
 ) -> io::Result<()> {
     // SIGINT/SIGTERM handler: flips a shared flag the loop checks every
     // tick. The terminal restore happens via `RawModeGuard::Drop` regardless
@@ -105,6 +106,9 @@ pub fn run(
         }
         while let Ok(listeners) = listeners.try_recv() {
             app.ingest_listeners(listeners);
+        }
+        while let Ok(certs) = certs.try_recv() {
+            app.ingest_certs(certs);
         }
 
         // Poll for input or sleep until the next render tick. The timeout
@@ -295,7 +299,7 @@ fn draw_pane(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, skin: &Skin) {
         ActiveTab::Clusters => panes::clusters::render(f, area, app, skin),
         ActiveTab::Backends => panes::backends::render(f, area, app, skin),
         ActiveTab::Listeners => panes::listeners::render(f, area, app, skin),
-        ActiveTab::Certs => panes::render_placeholder(f, area, skin, "CERTS"),
+        ActiveTab::Certs => panes::certs::render(f, area, app, skin),
         ActiveTab::H2 => panes::h2::render(f, area, app, skin),
         ActiveTab::Events => panes::events::render(f, area, app, skin),
     }

@@ -45,7 +45,7 @@ use crate::cli::{TopDetail, TopGlyphs};
 
 use self::cardinality::DetailGuard;
 use self::render::RenderConfig;
-use self::transport::{spawn_collector, spawn_events, spawn_listeners};
+use self::transport::{spawn_certs, spawn_collector, spawn_events, spawn_listeners};
 
 use super::{CommandManager, CtlError};
 
@@ -77,6 +77,7 @@ impl CommandManager {
         let (snapshot_rx, _collector) = spawn_collector(self.config.clone(), args.refresh_ms)?;
         let (events_rx, _events) = spawn_events(self.config.clone())?;
         let (listeners_rx, _listeners) = spawn_listeners(self.config.clone())?;
+        let (certs_rx, _certs) = spawn_certs(self.config.clone())?;
 
         // Apply the runtime cardinality lease. If the master/worker is too
         // old to decode `SetMetricDetail`, we surface the failure but keep
@@ -101,7 +102,7 @@ impl CommandManager {
             skin: args.skin.clone(),
             glyphs: args.glyphs,
         };
-        let result = render::run(render_cfg, snapshot_rx, events_rx, listeners_rx);
+        let result = render::run(render_cfg, snapshot_rx, events_rx, listeners_rx, certs_rx);
 
         // Drop order: lease first (issues the best-effort `clear`), then
         // the transport thread handles fall out of scope when this
