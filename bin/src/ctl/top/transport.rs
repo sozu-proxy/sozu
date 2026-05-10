@@ -28,9 +28,9 @@ use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use sozu_command_lib::{
     config::Config,
     proto::command::{
-        AggregatedMetrics, Event, ListListeners, ListenersList, QueryMetricsOptions, Request,
-        Response, ResponseStatus, SubscribeEvents, request::RequestType,
-        response_content::ContentType,
+        AggregatedMetrics, Event, ListListeners, ListOfCertificatesByAddress, ListenersList,
+        QueryCertificatesFilters, QueryMetricsOptions, Request, Response, ResponseStatus,
+        SubscribeEvents, request::RequestType, response_content::ContentType,
     },
 };
 
@@ -63,6 +63,16 @@ pub struct TopEvent {
 #[derive(Debug, Clone)]
 pub struct ListenersSnapshot {
     pub list: ListenersList,
+    pub received_at: Instant,
+}
+
+/// Certificate inventory snapshot pushed by the certs-collector thread.
+/// Polled at 30 s — even slower than listeners because cert lifecycle is
+/// operator-driven (add, remove, replace via the master's state) and every
+/// transition already lands as a CERTIFICATE_* event on the EVENTS pane.
+#[derive(Debug, Clone)]
+pub struct CertsSnapshot {
+    pub list: ListOfCertificatesByAddress,
     pub received_at: Instant,
 }
 
@@ -206,6 +216,11 @@ fn poll_metrics(
 /// "cold subjects" tier and HAProxy hatop's documented `show stat` cadence.
 const LISTENERS_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Cadence of the certs poll. Operator-paced and lower-priority than
+/// listeners; cert mutations also flow through the EVENTS pane in
+/// real-time, so the 30 s refresh is enough to keep the table fresh.
+const CERTS_INTERVAL: Duration = Duration::from_secs(30);
+
 /// Spawn the listeners-collector thread. Polls `RequestType::ListListeners`
 /// every `LISTENERS_INTERVAL` over its own `Channel` and pushes a
 /// `ListenersSnapshot` into a `bounded(1)` newest-wins channel. Same
@@ -283,6 +298,98 @@ fn poll_listeners(
                     }
                 },
                 None => return Err("ListListeners OK with no content".into()),
+            },
+        }
+    }
+}
+
+/// Spawn the certs-collector thread. Polls `RequestType::QueryCertificates
+/// FromTheState` every `CERTS_INTERVAL` over its own `Channel` and pushes a
+/// `CertsSnapshot` into a `bounded(1)` newest-wins channel. The "from the
+/// state" variant (vs `QueryCertificatesFromWorkers`) reads the master's
+/// `ConfigState` — the canonical cert inventory — without paying the
+/// worker-fan-out cost on every poll.
+pub fn spawn_certs(
+    config: Config,
+) -> Result<(Receiver<CertsSnapshot>, std::thread::JoinHandle<()>), CtlError> {
+    let mut channel = create_channel(&config)?;
+    let (tx, rx) = bounded::<CertsSnapshot>(SNAPSHOT_CAP);
+    let handle = std::thread::Builder::new()
+        .name("sozu-top-certs".into())
+        .spawn(move || certs_loop(&mut channel, tx))
+        .expect("spawn sozu-top certs");
+    Ok((rx, handle))
+}
+
+fn certs_loop(
+    channel: &mut sozu_command_lib::channel::Channel<Request, Response>,
+    tx: Sender<CertsSnapshot>,
+) {
+    loop {
+        let started = Instant::now();
+        match poll_certs(channel) {
+            Ok(list) => {
+                let snap = CertsSnapshot {
+                    list,
+                    received_at: Instant::now(),
+                };
+                match tx.try_send(snap) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(snap)) => {
+                        if tx.try_send(snap).is_err() {
+                            return;
+                        }
+                    }
+                    Err(TrySendError::Disconnected(_)) => return,
+                }
+            }
+            Err(err) => {
+                eprintln!("sozu top: certs poll error: {err}");
+            }
+        }
+        let elapsed = started.elapsed();
+        if elapsed < CERTS_INTERVAL {
+            std::thread::sleep(CERTS_INTERVAL - elapsed);
+        }
+    }
+}
+
+fn poll_certs(
+    channel: &mut sozu_command_lib::channel::Channel<Request, Response>,
+) -> Result<ListOfCertificatesByAddress, String> {
+    let req = Request {
+        request_type: Some(RequestType::QueryCertificatesFromTheState(
+            QueryCertificatesFilters {
+                domain: None,
+                fingerprint: None,
+            },
+        )),
+    };
+    channel
+        .write_message(&req)
+        .map_err(|e| format!("write QueryCertificatesFromTheState: {e}"))?;
+    loop {
+        let resp = channel
+            .read_message_blocking_timeout(Some(Duration::from_secs(5)))
+            .map_err(|e| format!("read QueryCertificatesFromTheState response: {e}"))?;
+        match resp.status() {
+            ResponseStatus::Processing => continue,
+            ResponseStatus::Failure => {
+                return Err(format!(
+                    "QueryCertificatesFromTheState failed: {}",
+                    resp.message
+                ));
+            }
+            ResponseStatus::Ok => match resp.content {
+                Some(content) => match content.content_type {
+                    Some(ContentType::CertificatesByAddress(l)) => return Ok(l),
+                    other => {
+                        return Err(format!(
+                            "unexpected content variant for QueryCertificatesFromTheState: {other:?}"
+                        ));
+                    }
+                },
+                None => return Err("QueryCertificatesFromTheState OK with no content".into()),
             },
         }
     }

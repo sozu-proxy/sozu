@@ -23,7 +23,7 @@ use std::time::Instant;
 use sozu_command_lib::proto::command::{AggregatedMetrics, FilteredMetrics, filtered_metrics};
 
 use super::theme::GlyphMode;
-use super::transport::{ListenersSnapshot, Snapshot, TopEvent};
+use super::transport::{CertsSnapshot, ListenersSnapshot, Snapshot, TopEvent};
 
 /// Default ring depth for the on-screen sparkline series. 60 samples = one
 /// minute of history at the default 1 s data tick. Matches the proto
@@ -410,6 +410,10 @@ pub struct App {
     /// Polled at a slower cadence than metrics (5 s) because listener
     /// state changes are operator-paced.
     pub last_listeners: Option<ListenersSnapshot>,
+    /// Most recent certificate inventory from the certs-collector thread.
+    /// Polled every 30 s — cert mutations flow through the EVENTS pane
+    /// in real time, so the slow refresh is fine for the inventory view.
+    pub last_certs: Option<CertsSnapshot>,
     pub status: String,
     pub should_quit: bool,
     pub help_visible: bool,
@@ -500,6 +504,7 @@ impl App {
             last_snapshot_at: None,
             last_metrics: None,
             last_listeners: None,
+            last_certs: None,
             status: String::new(),
             should_quit: false,
             help_visible: false,
@@ -776,6 +781,11 @@ impl App {
     /// Replace the cached listener inventory with a fresh snapshot.
     pub fn ingest_listeners(&mut self, snap: ListenersSnapshot) {
         self.last_listeners = Some(snap);
+    }
+
+    /// Replace the cached certificate inventory with a fresh snapshot.
+    pub fn ingest_certs(&mut self, snap: CertsSnapshot) {
+        self.last_certs = Some(snap);
     }
 }
 
