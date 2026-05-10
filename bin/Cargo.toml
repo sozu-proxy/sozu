@@ -56,6 +56,7 @@ crossterm            = { workspace = true, optional = true, features = ["events"
 ctrlc                = { workspace = true, optional = true }
 ratatui              = { workspace = true, optional = true, features = ["crossterm", "macros", "underline-color"] }
 throbber-widgets-tui = { workspace = true, optional = true }
+toml                 = { workspace = true, optional = true }
 tui-big-text         = { workspace = true, optional = true }
 tui-input            = { workspace = true, optional = true }
 tui-popup            = { workspace = true, optional = true }
@@ -110,6 +111,7 @@ tui = [
   "dep:ctrlc",
   "dep:ratatui",
   "dep:throbber-widgets-tui",
+  "dep:toml",
   "dep:tui-big-text",
   "dep:tui-input",
   "dep:tui-popup",

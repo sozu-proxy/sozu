@@ -45,6 +45,10 @@ pub struct RenderConfig {
     pub mouse: bool,
     pub tick_once: bool,
     pub snapshot_frames: Option<u32>,
+    /// Optional `--skin <name>` override, threaded through from clap so
+    /// the renderer can call `Skin::resolve` once at startup. `None`
+    /// resolves to the built-in default unless `SOZU_TOP_SKIN` overrides.
+    pub skin: Option<String>,
 }
 
 /// Drive the TUI to completion. Returns when the user quits, the data
@@ -65,7 +69,13 @@ pub fn run(
     });
 
     let mut app = App::new();
-    let skin = Skin::default_dark();
+    let (skin, skin_status) = Skin::resolve(cfg.skin.as_deref());
+    if let Some(msg) = skin_status {
+        // Surface the diagnostic in the status bar so the operator sees
+        // *why* their override didn't take effect (typo'd name, parse
+        // error, etc.) rather than silently rendering with the default.
+        app.status = msg;
+    }
 
     let _guard = RawModeGuard::install(cfg.mouse)?;
     let backend = CrosstermBackend::new(io::stdout());
