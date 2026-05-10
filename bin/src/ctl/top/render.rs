@@ -29,6 +29,7 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Tabs};
+use tui_big_text::{BigText, PixelSize};
 
 use super::app::{ActiveTab, App};
 use super::panes;
@@ -173,18 +174,66 @@ fn handle_key(app: &mut App, key: KeyEvent) {
 
 fn draw(f: &mut ratatui::Frame<'_>, app: &App, skin: &Skin) {
     let area = f.area();
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
+    let alert = app.thresholds.critical_message(&app.overview);
+    let constraints: Vec<Constraint> = match alert {
+        Some(_) => vec![
             Constraint::Length(3), // tabs row
+            Constraint::Length(5), // big-text alert banner
             Constraint::Min(8),    // active pane
             Constraint::Length(1), // function-key bar
-        ])
+        ],
+        None => vec![
+            Constraint::Length(3),
+            Constraint::Min(8),
+            Constraint::Length(1),
+        ],
+    };
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
         .split(area);
 
     draw_tabs(f, chunks[0], app, skin);
-    draw_pane(f, chunks[1], app, skin);
-    draw_fkey_bar(f, chunks[2], app, skin);
+    if let Some(headline) = alert {
+        draw_alert(f, chunks[1], skin, headline);
+        draw_pane(f, chunks[2], app, skin);
+        draw_fkey_bar(f, chunks[3], app, skin);
+    } else {
+        draw_pane(f, chunks[1], app, skin);
+        draw_fkey_bar(f, chunks[2], app, skin);
+    }
+}
+
+fn draw_alert(f: &mut ratatui::Frame<'_>, area: Rect, skin: &Skin, headline: &str) {
+    // Two-column layout: big-text headline on the left, narrow context
+    // strip on the right with the headline label so screen-readers /
+    // tmux-buffer scrollers still get a copyable string.
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
+        .split(area);
+    let big = BigText::builder()
+        .pixel_size(PixelSize::Quadrant)
+        .style(Style::default().fg(skin.hot).add_modifier(Modifier::BOLD))
+        .lines(vec![Line::from(headline.to_owned())])
+        .build();
+    f.render_widget(big, cols[0]);
+    let side = Paragraph::new(vec![
+        Line::from(Span::styled(
+            "ALERT",
+            Style::default().fg(skin.hot).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            headline.to_owned(),
+            Style::default().fg(skin.primary),
+        )),
+        Line::from(Span::styled(
+            "see OVERVIEW for context",
+            Style::default().fg(skin.secondary),
+        )),
+    ])
+    .alignment(Alignment::Left);
+    f.render_widget(side, cols[1]);
 }
 
 fn draw_tabs(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, skin: &Skin) {
