@@ -12,6 +12,7 @@
    Two key dependencies have been optimized in this way:
    - [Kawa](https://github.com/CleverCloud/kawa) is a generic HTTP representation library that parses and translates HTTP messages with zero copy
    - [Rustls](https://github.com/rustls/rustls) is a TLS library that encrypts/decrypts TLS traffic with as little intermediate memory usage as it gets
+- **Live operator TUI:** `sozu top` (build with `--features tui`) is a btop/htop-style live dashboard over the existing command socket — sparklines, sortable cluster + backend tables, H2 flood-mitigation counters, and a colour-coded event tail in a single screen. See [`doc/sozu-top.md`](doc/sozu-top.md).
 
 To get started check out our [documentation](./doc/README.md) !
 

@@ -346,6 +346,42 @@ upgrade. See `doc/upgrade/1.x-to-2.0.md` for the full migration guide.
 
 ### 🌟 Added
 
+- **`sozu top` btop/htop-style live operator TUI**: a new clap subcommand
+  gated by the optional `tui` Cargo feature on `bin/`
+  (default builds remain lean — `sozu --version` reports `+tui` when the
+  subcommand is linked in). Surfaces metrics that Sōzu already emits in
+  six panes — OVERVIEW (sparklines + big numerals), CLUSTERS / BACKENDS
+  (sortable tables), LISTENERS (5 s ListListeners poll), H2 (streams +
+  flow control + CVE flood mitigations), EVENTS (colour-coded
+  SubscribeEvents tail). Built on `ratatui = "0.30"` + `crossterm =
+  "0.29"` over three synchronous transport threads (no `tokio` runtime
+  in v1 by design); render loop is capped at 30 fps with DEC-mode-2026
+  synchronized output for tmux-free flicker. The TUI auto-elevates
+  metric cardinality via a `SetMetricDetail` TTL lease (`client_id`-
+  keyed; default 60 s TTL, server clamp 300 s; auto-renewed at half-TTL;
+  self-expires server-side on crash). A 4-tick pulse tint surfaces
+  cluster appearance / disappearance / backend-went-down transitions
+  visually. A `tui-big-text` alert banner overlays the active pane when
+  the threshold table fires (p99 > 500 ms / 5xx > 1 % / saturation >
+  80 %). `--skin <name>` (with `SOZU_TOP_SKIN` env override) resolves
+  TOML skins under `$XDG_CONFIG_HOME/sozu/skins/`. Default Okabe-Ito
+  colour-blind safe categorical + Viridis-shaped continuous ramp;
+  trend glyphs `▲ ▼ ●` back up the colour cue. Three glyph modes
+  (Braille / Block / TTY-ASCII) auto-detect against `TERM` / `LANG`.
+  Full operator guide: [`doc/sozu-top.md`](doc/sozu-top.md).
+
+- **`SetMetricDetail` runtime cardinality verb**
+  (`command/src/command.proto:55`, `ResponseContent::MetricDetailStatus =
+  16`, `EventKind::METRIC_DETAIL_CHANGED = 30`): operators (and any TUI
+  client) can elevate the worker's `MetricDetail` floor at runtime via
+  a TTL-bounded lease. Multiple clients lease independently — the
+  effective level is `max(configured, max(active leases))`. Leases
+  self-expire server-side after `ttl_seconds` so a crashed client
+  cannot permanently elevate cardinality. Mixed-version fleets where
+  one or more workers can't decode the verb surface in
+  `MetricDetailStatus.unsupported_workers[]`. Full semantics in
+  `command.proto`'s `SetMetricDetail` doc comment.
+
 - **Pre-built binaries for tagged releases
   ([#1089](https://github.com/sozu-proxy/sozu/issues/1089))**: a new
   `.github/workflows/release.yml` triggers on tag push (`X.Y.Z` and
