@@ -22,7 +22,7 @@ use std::time::Instant;
 
 use sozu_command_lib::proto::command::{AggregatedMetrics, FilteredMetrics, filtered_metrics};
 
-use super::transport::{Snapshot, TopEvent};
+use super::transport::{ListenersSnapshot, Snapshot, TopEvent};
 
 /// Default ring depth for the on-screen sparkline series. 60 samples = one
 /// minute of history at the default 1 s data tick. Matches the proto
@@ -216,6 +216,10 @@ pub struct App {
     /// don't have to maintain their own derivation. The OVERVIEW pane
     /// reads ring buffers, not this; this is for table-shaped panes.
     pub last_metrics: Option<AggregatedMetrics>,
+    /// Most recent `ListenersList` from the listeners-collector thread.
+    /// Polled at a slower cadence than metrics (5 s) because listener
+    /// state changes are operator-paced.
+    pub last_listeners: Option<ListenersSnapshot>,
     pub status: String,
     pub should_quit: bool,
     pub help_visible: bool,
@@ -296,6 +300,7 @@ impl App {
             thresholds: ThresholdTable::default(),
             last_snapshot_at: None,
             last_metrics: None,
+            last_listeners: None,
             status: String::new(),
             should_quit: false,
             help_visible: false,
@@ -554,6 +559,11 @@ impl App {
             self.events.pop_front();
         }
         self.events.push_back(event);
+    }
+
+    /// Replace the cached listener inventory with a fresh snapshot.
+    pub fn ingest_listeners(&mut self, snap: ListenersSnapshot) {
+        self.last_listeners = Some(snap);
     }
 }
 
