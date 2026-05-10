@@ -1,13 +1,19 @@
 //! Theme + glyph mode for `sozu top`.
 //!
-//! Week-2 scope is intentionally narrow: a single hard-coded `Skin` with
-//! Okabe-Ito categorical defaults + Viridis-shaped continuous ramps and three
-//! glyph modes (Braille / Block / TTY-ASCII). The `--skin <name>` /
-//! `SOZU_TOP_SKIN` lookup, capability auto-detection (`COLORTERM=truecolor`,
-//! `tput colors`, `LANG`, `TERM=linux/dumb`), and TOML-encoded user skins land
-//! in week 3 once the renderer is in place.
+//! Defaults to a hard-coded `Skin` with Okabe-Ito categorical palette plus
+//! Viridis-shaped continuous ramps and three glyph modes (Braille / Block /
+//! TTY-ASCII). The `--skin <name>` flag (with `SOZU_TOP_SKIN` env override,
+//! k9s parity) resolves to a TOML file under `$XDG_CONFIG_HOME/sozu/skins/
+//! <name>.toml`, falling back to `/etc/sozu/skins/` for system-wide skins.
+//! Auto-detection of terminal capabilities (`COLORTERM=truecolor`, `tput
+//! colors`, `LANG`, `TERM=linux/dumb`) lands separately in the glyph
+//! cascade follow-up.
+
+use std::env;
+use std::path::{Path, PathBuf};
 
 use ratatui::style::{Color, Modifier, Style};
+use serde::Deserialize;
 
 use crate::cli::TopGlyphs;
 
@@ -37,12 +43,15 @@ pub struct Skin {
     /// the cluster count exceeds the palette length. Okabe-Ito 7-colour set
     /// extended with two Viridis points at the warm end for cluster counts
     /// above 7.
-    pub categorical: &'static [Color],
+    pub categorical: Vec<Color>,
 }
 
 impl Skin {
-    /// Hard-coded default skin. Replaced by `Skin::from_toml` lookup in week 3.
-    pub const fn default_dark() -> Self {
+    /// Hard-coded default skin used when no `--skin` / `SOZU_TOP_SKIN`
+    /// override resolves. Okabe-Ito categorical (colour-blind safe in
+    /// isolation; pairs distinguishable across the three dichromatic types
+    /// per Okabe & Ito 2002) plus a Viridis-shaped continuous ramp.
+    pub fn default_dark() -> Self {
         Self {
             primary: Color::Rgb(232, 232, 240),
             secondary: Color::Rgb(180, 184, 192),
@@ -51,8 +60,71 @@ impl Skin {
             warm: Color::Rgb(245, 191, 79),
             hot: Color::Rgb(232, 84, 90),
             muted: Color::Rgb(96, 100, 112),
-            categorical: OKABE_ITO_PLUS,
+            categorical: OKABE_ITO_PLUS.to_vec(),
         }
+    }
+
+    /// Resolve the operator's skin choice. Precedence:
+    ///
+    /// 1. `SOZU_TOP_SKIN` env var (k9s parity) — set to `default` or
+    ///    `none` to keep the built-in palette regardless of `--skin`.
+    /// 2. `--skin <name>` clap argument.
+    /// 3. The built-in `default_dark()` palette.
+    ///
+    /// Lookup paths: `$XDG_CONFIG_HOME/sozu/skins/<name>.toml` (defaulting
+    /// to `$HOME/.config/sozu/skins/<name>.toml`), then
+    /// `/etc/sozu/skins/<name>.toml`. Returns `(skin, status_message)`
+    /// where the status string is `None` on success (built-in or loaded
+    /// cleanly) or `Some(diagnostic)` when a lookup failed; the renderer
+    /// surfaces this in the status bar so the operator sees why their
+    /// override didn't take effect.
+    pub fn resolve(name: Option<&str>) -> (Self, Option<String>) {
+        let env_choice = env::var("SOZU_TOP_SKIN").ok();
+        let effective = env_choice.as_deref().or(name);
+        let choice = match effective {
+            Some("") | Some("default") | Some("none") | None => {
+                return (Self::default_dark(), None);
+            }
+            Some(other) => other,
+        };
+        match Self::lookup_paths(choice).into_iter().find(|p| p.is_file()) {
+            Some(path) => match Self::from_toml(&path) {
+                Ok(skin) => (skin, None),
+                Err(e) => (
+                    Self::default_dark(),
+                    Some(format!("skin `{choice}` parse error: {e}; using default")),
+                ),
+            },
+            None => (
+                Self::default_dark(),
+                Some(format!("skin `{choice}` not found; using default")),
+            ),
+        }
+    }
+
+    /// Read + parse a skin TOML file. Public so unit tests can exercise
+    /// the path without poking at `$XDG_CONFIG_HOME`.
+    pub fn from_toml(path: &Path) -> Result<Self, SkinError> {
+        let body = std::fs::read_to_string(path).map_err(SkinError::Io)?;
+        let raw: RawSkin = toml::from_str(&body).map_err(|e| SkinError::Parse(e.to_string()))?;
+        raw.into_skin().map_err(SkinError::Validate)
+    }
+
+    fn lookup_paths(name: &str) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        // Reject `..` / path-separators to keep `--skin` from escaping the
+        // skins directory; treat malformed names as "not found".
+        if name.contains('/') || name.contains('\\') || name.contains("..") {
+            return paths;
+        }
+        let xdg = env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")));
+        if let Some(base) = xdg {
+            paths.push(base.join("sozu").join("skins").join(format!("{name}.toml")));
+        }
+        paths.push(PathBuf::from("/etc/sozu/skins").join(format!("{name}.toml")));
+        paths
     }
 
     /// Style for the focused tab label in the numbered tab row.
@@ -120,6 +192,79 @@ impl Skin {
     }
 }
 
+/// Errors surfaced by `Skin::from_toml`. Kept narrow so the renderer can
+/// stringify them into a status-bar diagnostic without leaking IO details.
+#[derive(Debug, thiserror::Error)]
+pub enum SkinError {
+    #[error("read skin: {0}")]
+    Io(std::io::Error),
+    #[error("parse skin: {0}")]
+    Parse(String),
+    #[error("validate skin: {0}")]
+    Validate(String),
+}
+
+#[derive(Debug, Deserialize)]
+struct RawSkin {
+    primary: String,
+    secondary: String,
+    accent: String,
+    cool: String,
+    warm: String,
+    hot: String,
+    muted: String,
+    #[serde(default)]
+    categorical: Vec<String>,
+}
+
+impl RawSkin {
+    fn into_skin(self) -> Result<Skin, String> {
+        let primary = parse_hex(&self.primary, "primary")?;
+        let secondary = parse_hex(&self.secondary, "secondary")?;
+        let accent = parse_hex(&self.accent, "accent")?;
+        let cool = parse_hex(&self.cool, "cool")?;
+        let warm = parse_hex(&self.warm, "warm")?;
+        let hot = parse_hex(&self.hot, "hot")?;
+        let muted = parse_hex(&self.muted, "muted")?;
+        let categorical: Vec<Color> = if self.categorical.is_empty() {
+            OKABE_ITO_PLUS.to_vec()
+        } else {
+            self.categorical
+                .iter()
+                .enumerate()
+                .map(|(i, s)| parse_hex(s, &format!("categorical[{i}]")))
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        Ok(Skin {
+            primary,
+            secondary,
+            accent,
+            cool,
+            warm,
+            hot,
+            muted,
+            categorical,
+        })
+    }
+}
+
+fn parse_hex(s: &str, field: &str) -> Result<Color, String> {
+    let raw = s.trim_start_matches('#');
+    if raw.len() != 6 {
+        return Err(format!(
+            "field `{field}`: expected #RRGGBB hex colour, got `{s}`"
+        ));
+    }
+    let bytes = match u32::from_str_radix(raw, 16) {
+        Ok(n) => n,
+        Err(_) => return Err(format!("field `{field}`: `{s}` is not hex")),
+    };
+    let r = ((bytes >> 16) & 0xff) as u8;
+    let g = ((bytes >> 8) & 0xff) as u8;
+    let b = (bytes & 0xff) as u8;
+    Ok(Color::Rgb(r, g, b))
+}
+
 /// Okabe-Ito 7-colour categorical palette + 2 Viridis high-end points to
 /// extend headroom for >7 clusters in the heatmap. Each `Color::Rgb` value
 /// is colour-blind safe in isolation; pairs are distinguishable across the
@@ -183,3 +328,66 @@ impl GlyphMode {
 pub const GLYPH_RISING: &str = "▲";
 pub const GLYPH_FALLING: &str = "▼";
 pub const GLYPH_STEADY: &str = "●";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_hex_accepts_hash_prefix_and_bare() {
+        assert_eq!(
+            parse_hex("#56c0f0", "x").unwrap(),
+            Color::Rgb(0x56, 0xc0, 0xf0)
+        );
+        assert_eq!(
+            parse_hex("56c0f0", "x").unwrap(),
+            Color::Rgb(0x56, 0xc0, 0xf0)
+        );
+    }
+
+    #[test]
+    fn parse_hex_rejects_wrong_length() {
+        assert!(parse_hex("#abc", "x").is_err());
+        assert!(parse_hex("#abcdefgg", "x").is_err());
+    }
+
+    #[test]
+    fn skin_from_toml_round_trip() {
+        let toml = r##"
+            primary   = "#e8e8f0"
+            secondary = "#b4b8c0"
+            accent    = "#56c0f0"
+            cool      = "#39ad98"
+            warm      = "#f5bf4f"
+            hot       = "#e8545a"
+            muted     = "#606470"
+            categorical = ["#009e73", "#56b4e9"]
+        "##;
+        let raw: RawSkin = toml::from_str(toml).expect("parse");
+        let skin = raw.into_skin().expect("validate");
+        assert_eq!(skin.hot, Color::Rgb(0xe8, 0x54, 0x5a));
+        assert_eq!(skin.categorical.len(), 2);
+    }
+
+    #[test]
+    fn skin_from_toml_empty_categorical_uses_default() {
+        let toml = r##"
+            primary   = "#e8e8f0"
+            secondary = "#b4b8c0"
+            accent    = "#56c0f0"
+            cool      = "#39ad98"
+            warm      = "#f5bf4f"
+            hot       = "#e8545a"
+            muted     = "#606470"
+        "##;
+        let raw: RawSkin = toml::from_str(toml).unwrap();
+        let skin = raw.into_skin().unwrap();
+        assert_eq!(skin.categorical.len(), OKABE_ITO_PLUS.len());
+    }
+
+    #[test]
+    fn skin_lookup_rejects_traversal() {
+        assert!(Skin::lookup_paths("../etc/passwd").is_empty());
+        assert!(Skin::lookup_paths("foo/bar").is_empty());
+    }
+}

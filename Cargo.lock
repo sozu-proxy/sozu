@@ -3134,6 +3134,7 @@ dependencies = [
  "termion",
  "thiserror 2.0.18",
  "throbber-widgets-tui",
+ "toml",
  "tui-big-text",
  "tui-input",
  "tui-popup",
