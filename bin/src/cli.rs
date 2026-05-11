@@ -252,10 +252,6 @@ pub enum SubCmd {
         /// independently at 30 fps regardless of this value.
         #[clap(long = "refresh-ms", default_value_t = 1000)]
         refresh_ms: u64,
-        /// Disable ANSI colour output (auto-detected by default; honours
-        /// `NO_COLOR` and `TERM=dumb`).
-        #[clap(long = "no-color")]
-        no_color: bool,
         /// Disable mouse capture. Useful inside multiplexers that mis-route
         /// SGR mouse events.
         #[clap(long = "no-mouse")]
@@ -279,9 +275,6 @@ pub enum SubCmd {
         /// Drive one data tick + one render tick and exit (test affordance).
         #[clap(long = "tick-once")]
         tick_once: bool,
-        /// Path for internal TUI logs (avoids stomping the rendered screen).
-        #[clap(long = "log-file")]
-        log_file: Option<std::path::PathBuf>,
         /// Force a glyph mode; auto-detect by default
         /// (Braille → Block → TTY-ASCII).
         #[clap(long = "glyphs", value_enum)]
