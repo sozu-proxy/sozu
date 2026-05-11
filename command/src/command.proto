@@ -1467,15 +1467,15 @@ enum MetricDetail {
 //
 // Lifecycle:
 // 1. Apply: send `SetMetricDetail{ client_id, detail, ttl_seconds, reason }`.
-// The worker stores `(client_id) -> (detail, expires_at = now + ttl)`. If a
-// lease for `client_id` already exists, it is REPLACED (acts as a renewal).
-// The renewer client is expected to re-send every `ttl/2`.
+//   The worker stores `(client_id) -> (detail, expires_at = now + ttl)`. If
+//   a lease for `client_id` already exists, it is REPLACED (acts as a
+//   renewal). The renewer client is expected to re-send every `ttl/2`.
 // 2. Expire: leases self-expire server-side at `expires_at`. The worker's
-// janitor (5s polled tick at the top of `notify`) prunes expired leases and
-// recomputes effective. Crash safety: a dead client is forgotten.
+//   janitor (5s polled tick at the top of `notify`) prunes expired leases
+//   and recomputes effective. Crash safety: a dead client is forgotten.
 // 3. Clear: send `SetMetricDetail{ client_id, clear: true }` for explicit
-// revocation. `client_id` must match the leased entry; mismatched IDs are
-// silently ignored (other clients' leases are not affected).
+//   revocation. `client_id` must match the leased entry; mismatched IDs
+//   are silently ignored (other clients' leases are not affected).
 //
 // Audit
 // =====
