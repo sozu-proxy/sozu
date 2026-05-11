@@ -394,8 +394,7 @@ impl Server {
             // before fan-out, synthesises a `MetricDetailStatus` reply
             // populating `unsupported_workers` for any worker whose
             // recorded proto_version is below the minimum required for
-            // `SetMetricDetail`. Closes the PR #1256 follow-up gap where
-            // the proto field was wired but no dispatcher consumed it.
+            // `SetMetricDetail`.
             RequestType::SetMetricDetail(req) => {
                 set_metric_detail_request(self, client, req);
             }
