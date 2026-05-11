@@ -91,6 +91,22 @@ impl ActiveTab {
         Self::ALL.get(d.checked_sub(1)? as usize).copied()
     }
 
+    /// Resolve a `:command-palette` alias to a tab. Centralises the
+    /// alias table so adding a new tab only touches `ActiveTab` (label +
+    /// from_alias) instead of also patching `apply_palette`.
+    pub fn from_alias(alias: &str) -> Option<Self> {
+        match alias {
+            "overview" | "o" => Some(Self::Overview),
+            "cluster" | "clusters" | "c" => Some(Self::Clusters),
+            "backend" | "backends" | "b" => Some(Self::Backends),
+            "listener" | "listeners" | "l" => Some(Self::Listeners),
+            "cert" | "certs" => Some(Self::Certs),
+            "h2" => Some(Self::H2),
+            "event" | "events" | "e" => Some(Self::Events),
+            _ => None,
+        }
+    }
+
     pub fn cycle(self, forward: bool) -> Self {
         let idx = Self::ALL.iter().position(|t| *t == self).unwrap_or(0);
         let len = Self::ALL.len();
@@ -222,38 +238,29 @@ impl PulseTracker {
     fn tick(&mut self) {
         Self::tick_one(&mut self.cluster_disappeared);
         Self::tick_one(&mut self.cluster_appeared);
-        let to_drop: Vec<_> = self
-            .backend_down
-            .iter_mut()
-            .filter_map(|(k, v)| {
-                if *v == 0 {
-                    Some(k.clone())
-                } else {
-                    *v -= 1;
-                    None
-                }
-            })
-            .collect();
-        for k in to_drop {
-            self.backend_down.remove(&k);
-        }
+        // In-place retain drops the previous two-pass `Vec<K> + remove`
+        // shape: zero-aged entries are filtered out and the survivors
+        // decrement by one. Same semantics as before; no `String` clones
+        // for the keys in the dropped set.
+        self.backend_down.retain(|_, v| {
+            if *v == 0 {
+                false
+            } else {
+                *v -= 1;
+                true
+            }
+        });
     }
 
     fn tick_one(map: &mut HashMap<String, u32>) {
-        let to_drop: Vec<_> = map
-            .iter_mut()
-            .filter_map(|(k, v)| {
-                if *v == 0 {
-                    Some(k.clone())
-                } else {
-                    *v -= 1;
-                    None
-                }
-            })
-            .collect();
-        for k in to_drop {
-            map.remove(&k);
-        }
+        map.retain(|_, v| {
+            if *v == 0 {
+                false
+            } else {
+                *v -= 1;
+                true
+            }
+        });
     }
 
     /// Diff a new snapshot against the previous seen set and emit fresh
@@ -890,21 +897,18 @@ impl App {
     pub fn apply_palette(&mut self) {
         let raw = self.palette_input.value().trim().to_owned();
         let cmd = raw.trim_start_matches(':');
-        match cmd {
-            "overview" | "o" => self.active_tab = ActiveTab::Overview,
-            "cluster" | "clusters" | "c" => self.active_tab = ActiveTab::Clusters,
-            "backend" | "backends" | "b" => self.active_tab = ActiveTab::Backends,
-            "listener" | "listeners" | "l" => self.active_tab = ActiveTab::Listeners,
-            "cert" | "certs" => self.active_tab = ActiveTab::Certs,
-            "h2" => self.active_tab = ActiveTab::H2,
-            "event" | "events" | "e" => self.active_tab = ActiveTab::Events,
-            "help" | "h" | "?" => self.help_visible = !self.help_visible,
-            "quit" | "q" => self.should_quit = true,
-            "" => {} // empty command — just close the palette
-            other => {
-                self.palette_error = Some(format!("unknown command: :{other}"));
-                self.palette_open = false;
-                return;
+        if let Some(tab) = ActiveTab::from_alias(cmd) {
+            self.active_tab = tab;
+        } else {
+            match cmd {
+                "help" | "h" | "?" => self.help_visible = !self.help_visible,
+                "quit" | "q" => self.should_quit = true,
+                "" => {} // empty command — just close the palette
+                other => {
+                    self.palette_error = Some(format!("unknown command: :{other}"));
+                    self.palette_open = false;
+                    return;
+                }
             }
         }
         self.palette_open = false;
