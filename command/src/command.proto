@@ -1515,6 +1515,19 @@ message SetMetricDetail {
     // Optional human-readable provenance for the audit log
     // (e.g. `"sozu top --detail backend"`, `"prometheus-scraper:sozu-1"`).
     optional string reason = 5;
+    // Master-populated peer binding. These fields are NOT set by clients —
+    // the master fills them in `bin/src/command/requests.rs::worker_request`
+    // from the connecting `ClientSession` (`actor_pid` + `session_ulid`)
+    // before forwarding to workers. The worker stores the binding
+    // alongside the lease and rejects subsequent `clear` requests whose
+    // binding does not match the apply-time binding. Prevents one same-UID
+    // operator from accidentally (or deliberately) clearing another
+    // operator's lease by guessing the `client_id` format. A `None` value
+    // means "binding not available" — the worker accepts any matching
+    // `client_id` clear, preserving compat with pre-binding callers and
+    // with platforms whose unix socket peer credentials are unavailable.
+    optional int32 peer_pid = 6;
+    optional string peer_session_ulid = 7;
 }
 
 // Per-worker outcome of a `SetMetricDetail` fan-out. Reported back to the
