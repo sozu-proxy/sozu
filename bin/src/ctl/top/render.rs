@@ -84,17 +84,24 @@ pub fn run(
 
     // SIGINT/SIGTERM handler: flips a shared flag the loop checks every
     // tick. The terminal restore happens via `RawModeGuard::Drop` regardless
-    // of how we exit (clean quit, panic, or signal-driven exit). Failure
-    // to install must be loud — a silent fallback would leave the operator
-    // unable to Ctrl-C cleanly out of the TUI on the rare host where
-    // `ctrlc::set_handler` errors (e.g. a prior process already installed
-    // a handler in the same address space).
+    // of how we exit (clean quit, panic, or signal-driven exit). A failed
+    // install is degraded gracefully — the crossterm event loop already
+    // observes Ctrl-C as a keypress, so the handler is belt-and-braces
+    // rather than the primary path. The previous `.expect` aborted the
+    // TUI on programmatic re-entry (a second `run` in the same process
+    // address space returned `MultipleHandlers`); falling through with a
+    // status-bar note preserves Ctrl-C-as-keypress and keeps embedded
+    // callers viable.
     let signal_quit = Arc::new(AtomicBool::new(false));
-    ctrlc::set_handler({
+    let mut signal_handler_status: Option<String> = None;
+    if let Err(err) = ctrlc::set_handler({
         let signal_quit = Arc::clone(&signal_quit);
         move || signal_quit.store(true, Ordering::SeqCst)
-    })
-    .expect("ctrlc handler not previously installed");
+    }) {
+        signal_handler_status = Some(format!(
+            "ctrlc handler install failed ({err}); Ctrl-C via keypress still works"
+        ));
+    }
 
     let mut app = App::new();
     let (skin, skin_status) = Skin::resolve(cfg.skin.as_deref());
@@ -105,9 +112,15 @@ pub fn run(
     // pre-seeded lease diagnostic; otherwise the lease-elevation note
     // wins. Either way we never reach `enable_raw_mode` without a
     // chance to surface the message on frame one.
+    // Precedence: skin status > lease-elevation note > signal-handler
+    // diagnostic. Status-bar real estate is one line; we surface the
+    // signal-handler issue only when nothing more operator-relevant is
+    // queued.
     if let Some(msg) = skin_status {
         app.status = msg;
     } else if let Some(msg) = cfg.initial_status {
+        app.status = msg;
+    } else if let Some(msg) = signal_handler_status {
         app.status = msg;
     }
 
