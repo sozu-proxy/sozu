@@ -1148,6 +1148,16 @@ message ResponseContent {
         // configured/effective/previous_effective levels plus the list of
         // workers that could not decode the verb (mixed-version safety).
         MetricDetailStatus metric_detail_status = 16;
+        // Per-worker status payload returned by a single worker in
+        // response to `SetMetricDetail`. The master collects these
+        // across the fan-out and assembles them into
+        // `MetricDetailStatus.workers[<worker_id>]`. Carries the
+        // worker's own `(configured, effective, previous_effective,
+        // active_lease_count)` quartet — distinct from the master-side
+        // view rendered in `MetricDetailStatus.{configured,effective,
+        // previous_effective}` because each worker holds its own
+        // `Aggregator` with an independent lease table.
+        WorkerMetricDetailStatus worker_metric_detail_status = 17;
     }
 }
 

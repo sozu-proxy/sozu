@@ -213,6 +213,14 @@ impl ResponseContent {
             }
             ContentType::HealthChecksList(list) => print_health_checks(list),
             ContentType::Event(_event) => Ok(()), // not event displayed yet!
+            // Per-worker SetMetricDetail status payload. The aggregated
+            // MetricDetailStatus is what operators read at the
+            // `sozu` CLI surface; the per-worker variant flows
+            // master-side only (collected by SetMetricDetailTask) and
+            // is never printed directly. Silent OK keeps the match
+            // exhaustive without surfacing internal IPC payloads on
+            // the operator's terminal.
+            ContentType::WorkerMetricDetailStatus(_) => Ok(()),
         }
     }
 }
