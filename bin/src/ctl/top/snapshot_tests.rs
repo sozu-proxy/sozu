@@ -5,7 +5,7 @@
 //! `insta::assert_snapshot!` compares against the on-disk snapshot under
 //! `bin/src/ctl/top/snapshots/`.
 //!
-//! Three canonical sizes per Codex's recommendation in `tasks/todo.md`:
+//! Three canonical sizes cover the realistic operator-terminal envelope:
 //!
 //! - 80x24  — htop's default and the lower-bound modern terminal.
 //! - 120x40 — typical full-screen SSH session.

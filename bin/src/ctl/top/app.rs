@@ -192,8 +192,7 @@ impl RateCalculator {
 
 /// What-changed pulse tracker. Snapshot-to-snapshot diffs surface as a
 /// short-lived tint on the affected rows so the eye catches transitions
-/// even when the operator looked away for a moment. Codex called this out
-/// as a premium-touch in the cross-check (`tasks/todo.md`).
+/// even when the operator looked away for a moment.
 ///
 /// Three classes of pulse:
 ///
@@ -436,7 +435,8 @@ pub struct App {
     pub should_quit: bool,
     pub help_visible: bool,
     /// Cluster-table sort column. Default surfaces unhealthy/error-rate
-    /// first, then RPS — matches Codex's recommendation in the cross-check.
+    /// first, then RPS — operators want the failing clusters at the top of
+    /// the pane so the eye lands on them without scrolling.
     pub cluster_sort: ClusterSortKey,
     /// Reverse the cluster-table sort ordering when `true`.
     pub cluster_sort_reverse: bool,
@@ -575,15 +575,15 @@ impl App {
         // pulse tracker can emit ClusterDisappeared / BackendWentDown
         // transitions against the previous set.
         self.pulse.diff(&snap.metrics);
-        // Trim the rate calculator's history to the keys present in the
-        // current snapshot. Removed clusters / backends would otherwise
-        // accumulate forever (each (cluster_id, "requests") key plus the
-        // per-cluster 5xx series), turning the HashMap into a long-lived
-        // memory leak proportional to fleet churn.
-        let mut live_keys: HashSet<&str> = HashSet::new();
-        live_keys.insert("__overview.requests");
-        live_keys.insert("__overview.errors_5xx");
-        self.rates.retain(|k| live_keys.contains(k));
+        // The rate calculator currently only carries the two overview-
+        // aggregate keys recorded by `fold_overview` below. The retain
+        // here is a defence-in-depth no-op while that invariant holds; if
+        // per-cluster series get added later (each (cluster_id, "requests")
+        // key plus the per-cluster 5xx series) this is the spot to widen
+        // `live_keys` so removed clusters / backends do not accumulate
+        // forever.
+        let live_keys: [&str; 2] = ["__overview.requests", "__overview.errors_5xx"];
+        self.rates.retain(|k| live_keys.contains(&k));
         // Keep the latest `AggregatedMetrics` for the CLUSTERS / BACKENDS
         // panes. Cloning isn't cheap for very-high-cardinality fleets
         // (>1000 clusters), but in practice the master already paid this
@@ -708,7 +708,6 @@ impl App {
             }
         }
         rows.sort_by(|a, b| {
-            use std::cmp::Ordering;
             let ord = match self.backend_sort {
                 BackendSortKey::ClusterId => a
                     .cluster_id
@@ -726,16 +725,12 @@ impl App {
             };
             // `Ordering::reverse` chains nicely with `.then()` above; if all
             // primary keys tie we drop to (cluster_id, backend_id) lex order
-            // for a deterministic on-screen layout.
+            // for a deterministic on-screen layout. The comparator MUST
+            // return `Equal` on full-tie; the reverse direction is applied
+            // by `rows.reverse()` after the sort. Returning `Greater` on
+            // self-comparison would violate strict-weak-ordering.
             ord.then_with(|| a.cluster_id.cmp(&b.cluster_id))
                 .then_with(|| a.backend_id.cmp(&b.backend_id))
-                .then_with(|| {
-                    if self.backend_sort_reverse {
-                        Ordering::Greater
-                    } else {
-                        Ordering::Equal
-                    }
-                })
         });
         if self.backend_sort_reverse {
             rows.reverse();

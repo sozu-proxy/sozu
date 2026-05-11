@@ -171,9 +171,10 @@ even after a hard crash.
   StatsD scrapers see the change. The configured floor is restored
   on lease expiry (TTL) or explicit revoke (clean exit).
 - `MetricDetail = Backend` can balloon the per-backend keyspace on
-  high-cardinality fleets. Codex flagged this in the cross-check; if
-  you see operator-side metric pipelines saturate, override with
-  `--detail cluster` and lease at the lower tier.
+  high-cardinality fleets — every backend gets its own labelled time
+  series at the StatsD / Prometheus sink. If you see operator-side
+  metric pipelines saturate, override with `--detail cluster` and
+  lease at the lower tier.
 - The render loop pauses redraws when state is unchanged AND no
   pulse is active; on a quiet system `sozu top` consumes ~2-3 % of
   one core on a Linux 6.x kernel + alacritty.
