@@ -17,6 +17,7 @@ use sozu_command::{
 };
 
 use super::{header::ProxyAddr, parser::parse_v2_header};
+use crate::metrics::names;
 use crate::{
     Protocol, Readiness, SessionMetrics, StateResult,
     pool::Checkout,
@@ -135,7 +136,7 @@ impl<Front: SocketHandler> ExpectProxyProtocol<Front> {
         if sz > 0 {
             self.index += sz;
 
-            count!("bytes_in", sz as i64);
+            count!(names::backend::BYTES_IN, sz as i64);
             metrics.bin += sz;
 
             if self.index == self.frontend_buffer.len() {
@@ -153,7 +154,7 @@ impl<Front: SocketHandler> ExpectProxyProtocol<Front> {
                     metrics.bin,
                     metrics.bout
                 );
-                incr!("proxy_protocol.errors");
+                incr!(names::proxy_protocol::ERRORS);
                 self.frontend_readiness.reset();
                 return SessionResult::Close;
             }
@@ -206,7 +207,7 @@ impl<Front: SocketHandler> ExpectProxyProtocol<Front> {
                                 "{} proxy protocol header exceeds maximum size (232 bytes), closing",
                                 log_context!(self)
                             );
-                            incr!("proxy_protocol.errors");
+                            incr!(names::proxy_protocol::ERRORS);
                             self.frontend_readiness.reset();
                             return SessionResult::Close;
                         }
@@ -220,7 +221,7 @@ impl<Front: SocketHandler> ExpectProxyProtocol<Front> {
                     log_context!(self),
                     e.input.to_hex(16)
                 );
-                incr!("proxy_protocol.errors");
+                incr!(names::proxy_protocol::ERRORS);
                 self.frontend_readiness.reset();
                 SessionResult::Close
             }
@@ -339,7 +340,7 @@ impl<Front: SocketHandler> SessionState for ExpectProxyProtocol<Front> {
                 log_context!(self),
                 MAX_LOOP_ITERATIONS
             );
-            incr!("http.infinite_loop.error");
+            incr!(names::http::INFINITE_LOOP_ERROR);
 
             self.print_state("");
 

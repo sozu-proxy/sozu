@@ -14,6 +14,7 @@ use kawa::{
 };
 use sozu_command::logging::ansi_palette;
 
+use crate::metrics::names;
 use crate::protocol::{
     http::parser::compare_no_case,
     mux::{
@@ -443,7 +444,7 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                         self.window,
                         data.len()
                     );
-                    incr!("h2.flow_control_stall");
+                    incr!(names::h2::FLOW_CONTROL_STALL);
                     if self.position_is_client {
                         // Direction-scoped counterpart: the proxy → backend
                         // write was paused because the backend's HTTP/2
@@ -453,7 +454,7 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                         // updates, so the stall metric is the only signal
                         // available without plumbing an explicit boundary
                         // through `flush_stream_out`.
-                        incr!("backend.flow_control.paused");
+                        incr!(names::backend::FLOW_CONTROL_PAUSED);
                     }
                     kawa.blocks.push_front(Block::Chunk(Chunk { data }));
                     return false;
@@ -477,7 +478,7 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                 }
                 kawa.push_out(Store::from_slice(&header));
                 kawa.push_out(data);
-                incr!("h2.frames.tx.data");
+                incr!(names::h2::FRAMES_TX_DATA);
                 // kawa.push_delimiter();
                 // RFC 9218 §4: incremental streams yield to the scheduler
                 // after every DATA frame so same-urgency incremental peers
@@ -547,7 +548,7 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                         }
                         kawa.push_out(Store::from_slice(&header));
                         kawa.push_out(Store::from_vec(payload));
-                        incr!("h2.frames.tx.headers");
+                        incr!(names::h2::FRAMES_TX_HEADERS);
                         true
                     } else {
                         let chunks = payload.chunks(self.max_frame_size);
@@ -577,7 +578,7 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                                     );
                                     return false;
                                 }
-                                incr!("h2.frames.tx.headers");
+                                incr!(names::h2::FRAMES_TX_HEADERS);
                             } else if let Err(e) = gen_frame_header(
                                 &mut header,
                                 &FrameHeader {
@@ -594,7 +595,7 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                                 );
                                 return false;
                             } else {
-                                incr!("h2.frames.tx.continuation");
+                                incr!(names::h2::FRAMES_TX_CONTINUATION);
                             }
                             kawa.push_out(Store::from_slice(&header));
                             kawa.push_out(Store::from_slice(chunk));
@@ -623,7 +624,7 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                         return false;
                     }
                     kawa.push_out(Store::from_slice(&header));
-                    incr!("h2.frames.tx.data");
+                    incr!(names::h2::FRAMES_TX_DATA);
                 }
             }
         }
@@ -671,7 +672,7 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
             // path) would still try to encode headers/data after our RST.
             kawa.blocks.clear();
             self.out.clear();
-            incr!("h2.headers.rejected.budget_overrun");
+            incr!(names::h2::HEADERS_REJECTED_BUDGET_OVERRUN);
             return;
         }
         if !self.out.is_empty() {

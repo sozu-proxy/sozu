@@ -144,6 +144,7 @@ pub(crate) mod serializer;
 mod shared;
 pub mod stream;
 
+use crate::metrics::names;
 use crate::{
     BackendConnectionError, L7ListenerHandler, L7Proxy, ListenerHandler, ProxySession, Readiness,
     RetrieveClusterError, SessionIsToBeClosed, SessionMetrics, SessionResult, StateResult,
@@ -223,16 +224,16 @@ impl Position {
     /// Increment the global `count!()` counter for bytes read on this side.
     pub fn count_bytes_in_counter(&self, size: usize) {
         match self {
-            Position::Client(..) => count!("back_bytes_in", size as i64),
-            Position::Server => count!("bytes_in", size as i64),
+            Position::Client(..) => count!(names::backend::BACK_BYTES_IN, size as i64),
+            Position::Server => count!(names::backend::BYTES_IN, size as i64),
         }
     }
 
     /// Increment the global `count!()` counter for bytes written on this side.
     pub fn count_bytes_out_counter(&self, size: usize) {
         match self {
-            Position::Client(..) => count!("back_bytes_out", size as i64),
-            Position::Server => count!("bytes_out", size as i64),
+            Position::Client(..) => count!(names::backend::BACK_BYTES_OUT, size as i64),
+            Position::Server => count!(names::backend::BYTES_OUT, size as i64),
         }
     }
 
@@ -846,7 +847,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                         Some(&backend_borrow.backend_id)
                                     );
                                     gauge!(
-                                        "backend.available",
+                                        names::backend::AVAILABLE,
                                         1,
                                         Some(cluster_id),
                                         Some(&backend_borrow.backend_id)
@@ -980,7 +981,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                         Some(&backend_borrow.backend_id)
                                     );
                                     gauge!(
-                                        "backend.available",
+                                        names::backend::AVAILABLE,
                                         0,
                                         Some(cluster_id),
                                         Some(&backend_borrow.backend_id)
@@ -1135,7 +1136,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
 
                 counter += 1;
                 if counter >= MAX_LOOP_ITERATIONS {
-                    incr!("http.infinite_loop.error");
+                    incr!(names::http::INFINITE_LOOP_ERROR);
                     if self.frontend.has_pending_write() {
                         debug!(
                             "{} Mux loop budget exhausted while frontend flush pending: {:?}",
@@ -1663,7 +1664,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                     stream.context.status,
                 );
             }
-            incr!("h2.close_with_active_streams");
+            incr!(names::h2::CLOSE_WITH_ACTIVE_STREAMS);
         }
 
         // Distribute H2 connection-level overhead (control frames) across in-flight
@@ -1751,7 +1752,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 Position::Client(cluster_id, backend, _) => {
                     let mut backend_borrow = backend.borrow_mut();
                     backend_borrow.dec_connections();
-                    gauge_add!("backend.connections", -1);
+                    gauge_add!(names::backend::CONNECTIONS, -1);
                     // Second `-1` site for `backend.pool.size` (the first is
                     // in `connection.rs::pre_close_client_bookkeeping`). This
                     // path runs during session teardown when the frontend
@@ -1761,9 +1762,9 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                     // matching `backend.connections, -1` calls already
                     // present here, so symmetry follows from
                     // `backend.connections` correctness.
-                    gauge_add!("backend.pool.size", -1);
+                    gauge_add!(names::backend::POOL_SIZE, -1);
                     gauge_add!(
-                        "connections_per_backend",
+                        names::backend::CONNECTIONS_PER_BACKEND,
                         -1,
                         Some(cluster_id),
                         Some(&backend_borrow.backend_id)

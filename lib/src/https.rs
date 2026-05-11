@@ -48,6 +48,7 @@ use sozu_command::{
     },
 };
 
+use crate::metrics::names;
 use crate::{
     AcceptError, CachedTags, FrontendFromRequestError, L7ListenerHandler, L7Proxy, ListenerError,
     ListenerHandler, Protocol, ProxyConfiguration, ProxyError, ProxySession, SessionIsToBeClosed,
@@ -170,13 +171,13 @@ impl HttpsSession {
 
         let state = if expect_proxy {
             trace!("{} starting in expect proxy state", log_module_context!());
-            gauge_add!("protocol.proxy.expect", 1);
+            gauge_add!(names::protocol::PROXY_EXPECT, 1);
             HttpsStateMachine::Expect(
                 ExpectProxyProtocol::new(container_frontend_timeout, sock, token, request_id),
                 rustls_details,
             )
         } else {
-            gauge_add!("protocol.tls.handshake", 1);
+            gauge_add!(names::protocol::TLS_HANDSHAKE, 1);
             HttpsStateMachine::Handshake(TlsHandshake::new(
                 container_frontend_timeout,
                 rustls_details,
@@ -267,8 +268,8 @@ impl HttpsSession {
                 handshake.frontend_readiness = readiness;
                 handshake.frontend_readiness.event.insert(Ready::READABLE);
 
-                gauge_add!("protocol.proxy.expect", -1);
-                gauge_add!("protocol.tls.handshake", 1);
+                gauge_add!(names::protocol::PROXY_EXPECT, -1);
+                gauge_add!(names::protocol::TLS_HANDSHAKE, 1);
                 return Some(HttpsStateMachine::Handshake(handshake));
             }
         }
@@ -327,7 +328,7 @@ impl HttpsSession {
         let (alpn, alpn_label): (AlpnProtocol, Option<&'static str>) = match alpn {
             Some("http/1.1") => {
                 if disable_http11 {
-                    incr!("https.alpn.rejected.http11_disabled");
+                    incr!(names::https::ALPN_REJECTED_HTTP11_DISABLED);
                     warn!(
                         "{} rejecting TLS connection: listener is H2-only but client negotiated http/1.1",
                         log_context!(self)
@@ -344,7 +345,7 @@ impl HttpsSession {
                 // bleeding through some misconfiguration). Add a dedicated
                 // counter so the SOC's "ALPN refusal" ratebar matches the
                 // sum of the labelled buckets.
-                incr!("https.alpn.rejected.unsupported");
+                incr!(names::https::ALPN_REJECTED_UNSUPPORTED);
                 error!(
                     "{} unsupported ALPN protocol: {}",
                     log_context!(self),
@@ -357,7 +358,7 @@ impl HttpsSession {
             // listener we instead drop the connection.
             None => {
                 if disable_http11 {
-                    incr!("https.alpn.rejected.http11_disabled");
+                    incr!(names::https::ALPN_REJECTED_HTTP11_DISABLED);
                     warn!(
                         "{} rejecting TLS connection: listener is H2-only but client did not negotiate ALPN",
                         log_context!(self)
@@ -387,7 +388,7 @@ impl HttpsSession {
             incr!(rustls_ciphersuite_str(cipher));
         };
 
-        gauge_add!("protocol.tls.handshake", -1);
+        gauge_add!(names::protocol::TLS_HANDSHAKE, -1);
 
         let session_ulid = rusty_ulid::Ulid::generate();
         let front_stream = FrontRustls {
@@ -502,7 +503,7 @@ impl HttpsSession {
         context.tls_alpn = alpn_label;
         let mut frontend = match alpn {
             AlpnProtocol::Http11 => {
-                incr!("http.alpn.http11");
+                incr!(names::http::ALPN_HTTP11);
                 context.create_stream(handshake.request_id, 1 << 16)?;
                 mux::Connection::new_h1_server(
                     session_ulid,
@@ -511,7 +512,7 @@ impl HttpsSession {
                 )
             }
             AlpnProtocol::H2 => {
-                incr!("http.alpn.h2");
+                incr!(names::http::ALPN_H2);
                 let flood_config = self.listener.borrow().get_h2_flood_config();
                 let connection_config = self.listener.borrow().get_h2_connection_config();
                 let stream_idle_timeout = self.listener.borrow().get_h2_stream_idle_timeout();
@@ -542,7 +543,7 @@ impl HttpsSession {
             .event
             .insert(Ready::READABLE | Ready::WRITABLE);
 
-        gauge_add!("protocol.https", 1);
+        gauge_add!(names::protocol::HTTPS, 1);
         Some(HttpsStateMachine::Mux(Mux {
             configured_frontend_timeout: self.configured_frontend_timeout,
             frontend_token: self.frontend_token,
@@ -668,9 +669,9 @@ impl HttpsSession {
 
         // http.active_requests was already decremented by generate_access_log()
         // in h1.rs when the 101 response was written (before MuxResult::Upgrade).
-        gauge_add!("protocol.https", -1);
-        gauge_add!("protocol.wss", 1);
-        gauge_add!("websocket.active_requests", 1);
+        gauge_add!(names::protocol::HTTPS, -1);
+        gauge_add!(names::protocol::WSS, 1);
+        gauge_add!(names::websocket::ACTIVE_REQUESTS, 1);
         Some(HttpsStateMachine::WebSocket(pipe))
     }
 
@@ -698,21 +699,21 @@ impl ProxySession for HttpsSession {
 
         // Restore gauges
         match self.state.marker() {
-            StateMarker::Expect => gauge_add!("protocol.proxy.expect", -1),
-            StateMarker::Handshake => gauge_add!("protocol.tls.handshake", -1),
-            StateMarker::Mux => gauge_add!("protocol.https", -1),
+            StateMarker::Expect => gauge_add!(names::protocol::PROXY_EXPECT, -1),
+            StateMarker::Handshake => gauge_add!(names::protocol::TLS_HANDSHAKE, -1),
+            StateMarker::Mux => gauge_add!(names::protocol::HTTPS, -1),
             StateMarker::WebSocket => {
-                gauge_add!("protocol.wss", -1);
-                gauge_add!("websocket.active_requests", -1);
+                gauge_add!(names::protocol::WSS, -1);
+                gauge_add!(names::websocket::ACTIVE_REQUESTS, -1);
             }
         }
 
         if self.state.failed() {
             match self.state.marker() {
-                StateMarker::Expect => incr!("https.upgrade.expect.failed"),
-                StateMarker::Handshake => incr!("https.upgrade.handshake.failed"),
-                StateMarker::Mux => incr!("https.upgrade.mux.failed"),
-                StateMarker::WebSocket => incr!("https.upgrade.wss.failed"),
+                StateMarker::Expect => incr!(names::https::UPGRADE_EXPECT_FAILED),
+                StateMarker::Handshake => incr!(names::https::UPGRADE_HANDSHAKE_FAILED),
+                StateMarker::Mux => incr!(names::https::UPGRADE_MUX_FAILED),
+                StateMarker::WebSocket => incr!(names::https::UPGRADE_WSS_FAILED),
             }
             // FailedUpgrade means the socket was consumed by a failed upgrade
             // attempt, so we can only close the state (no-op) and remove the
@@ -933,14 +934,18 @@ impl L7ListenerHandler for HttpsListener {
         let host = unsafe { from_utf8_unchecked(hostname) };
 
         let route = self.fronts.lookup(host, uri, method).map_err(|e| {
-            incr!("http.failed_backend_matching");
+            incr!(names::http::FAILED_BACKEND_MATCHING);
             FrontendFromRequestError::NoClusterFound(e)
         })?;
 
         let now = Instant::now();
 
         if let Some(cluster) = route.cluster_id.as_deref() {
-            time!("frontend_matching_time", cluster, (now - start).as_millis());
+            time!(
+                names::event_loop::FRONTEND_MATCHING_TIME,
+                cluster,
+                (now - start).as_millis()
+            );
         }
 
         Ok(route)
@@ -1429,7 +1434,7 @@ impl HttpsListener {
                 .fronts
                 .refresh_inheriting_hsts(self.config.hsts.as_ref());
             for _ in 0..refreshed {
-                crate::incr!("http.hsts.frontend_refreshed");
+                crate::incr!(names::http::HSTS_FRONTEND_REFRESHED);
             }
             info!(
                 "{} HTTPS listener {:?} HSTS default patched; refreshed {} inheriting \
@@ -1438,7 +1443,7 @@ impl HttpsListener {
                 self.config.address,
                 refreshed,
             );
-            crate::incr!("http.hsts.listener_default_patched");
+            crate::incr!(names::http::HSTS_LISTENER_DEFAULT_PATCHED);
         }
 
         Ok(())

@@ -14,6 +14,7 @@ use kawa::{
 };
 use sozu_command::logging::ansi_palette;
 
+use crate::metrics::names;
 use crate::{
     pool::Checkout,
     protocol::{
@@ -308,7 +309,7 @@ macro_rules! reject_metric_key {
 /// request) keeps the totals in lockstep with the breakdown — easier to
 /// reconcile when a single request piles up several rejections.
 fn metric_reject(reason: RejectReason) {
-    incr!("h2.headers.rejected.total");
+    incr!(names::h2::HEADERS_REJECTED_TOTAL);
     incr!(reject_metric_key!("h2.headers.rejected", reason));
 }
 
@@ -1104,7 +1105,7 @@ pub fn handle_trailer(
             k.as_ref(),
             b"x-real-ip" | b"x-forwarded-for" | b"forwarded" | b"x-request-id"
         ) {
-            incr!("h2.trailer.spoof_vector_elided");
+            incr!(names::h2::TRAILER_SPOOF_VECTOR_ELIDED);
             return;
         }
         let start = kawa.storage.end as u32;
@@ -1160,7 +1161,7 @@ pub fn handle_trailer(
              delivery to upgrade framing to chunked.",
             log_module_context!()
         );
-        incr!("h2.trailers_dropped_content_length");
+        incr!(names::h2::TRAILERS_DROPPED_CONTENT_LENGTH);
     }
 
     kawa.push_block(Block::Flags(Flags {

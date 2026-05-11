@@ -15,6 +15,7 @@ use mio::{Token, net::TcpStream};
 use rusty_ulid::Ulid;
 use sozu_command::logging::ansi_palette;
 
+use crate::metrics::names;
 use crate::{
     BackendConnectionStatus, Protocol, Readiness, SessionMetrics, SessionResult,
     pool::Checkout,
@@ -136,7 +137,7 @@ impl<Front: SocketHandler> SendProxyProtocol<Front> {
                     match socket.write(&header[self.cursor_header..]) {
                         Ok(sz) => {
                             self.cursor_header += sz;
-                            count!("back_bytes_out", sz as i64);
+                            count!(names::backend::BACK_BYTES_OUT, sz as i64);
                             metrics.backend_bout += sz;
 
                             if self.cursor_header == header.len() {
@@ -150,7 +151,7 @@ impl<Front: SocketHandler> SendProxyProtocol<Front> {
                                 return SessionResult::Continue;
                             }
                             e => {
-                                incr!("proxy_protocol.errors");
+                                incr!(names::proxy_protocol::ERRORS);
                                 debug!("{} write error: {:?}", log_context!(self), e);
                                 return SessionResult::Close;
                             }

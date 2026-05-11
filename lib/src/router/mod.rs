@@ -18,6 +18,7 @@ use sozu_command::{
     state::ClusterId,
 };
 
+use crate::metrics::names;
 use crate::{
     protocol::{http::editor::HeaderEditMode, http::parser::Method},
     router::pattern_trie::{TrieMatches, TrieNode, TrieSubMatch},
@@ -700,7 +701,10 @@ impl DomainRule {
                 let start = Instant::now();
                 let is_a_match = r.is_match(hostname);
                 let now = Instant::now();
-                time!("regex_matching_time", (now - start).as_millis());
+                time!(
+                    names::event_loop::REGEX_MATCHING_TIME,
+                    (now - start).as_millis()
+                );
                 is_a_match
             }
         }
@@ -780,7 +784,10 @@ impl PathRule {
                 let start = Instant::now();
                 let is_a_match = regex.is_match(path);
                 let now = Instant::now();
-                time!("regex_matching_time", (now - start).as_millis());
+                time!(
+                    names::event_loop::REGEX_MATCHING_TIME,
+                    (now - start).as_millis()
+                );
 
                 if is_a_match {
                     PathRuleResult::Regex
@@ -1363,7 +1370,7 @@ impl Frontend {
                     val: rendered.into_bytes().into(),
                     mode,
                 });
-                crate::incr!("http.hsts.frontend_added");
+                crate::incr!(names::http::HSTS_FRONTEND_ADDED);
             }
 
             return Ok(Self {
@@ -1495,7 +1502,7 @@ impl Frontend {
                     val: rendered.into_bytes().into(),
                     mode,
                 });
-                crate::incr!("http.hsts.frontend_added");
+                crate::incr!(names::http::HSTS_FRONTEND_ADDED);
             } else {
                 // Both upstream config layers (FileHstsConfig::to_proto and
                 // build_hsts_from_cli) substitute DEFAULT_HSTS_MAX_AGE when
@@ -1512,7 +1519,7 @@ impl Frontend {
                     log_module_context!(),
                     cluster_id,
                 );
-                crate::incr!("http.hsts.unrendered");
+                crate::incr!(names::http::HSTS_UNRENDERED);
             }
         }
 

@@ -28,6 +28,7 @@ use sozu_command::{
 };
 
 // use time::{Duration, Instant};
+use crate::metrics::names;
 use crate::{
     AcceptError, BackendConnectAction, BackendConnectionError, BackendConnectionStatus,
     L7ListenerHandler, L7Proxy, ListenerHandler, Protocol, ProxySession, Readiness,
@@ -339,7 +340,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         self.request_stream.clear();
         response_stream.clear();
         self.keepalive_count += 1;
-        gauge_add!("http.active_requests", -1);
+        gauge_add!(names::http::ACTIVE_REQUESTS, -1);
 
         if let Some(backend) = &mut self.backend {
             let mut backend = backend.borrow_mut();
@@ -433,7 +434,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
         if size > 0 {
             self.request_stream.storage.fill(size);
-            count!("bytes_in", size as i64);
+            count!(names::backend::BYTES_IN, size as i64);
             metrics.bin += size;
             // if self.kawa_request.storage.is_full() {
             //     self.frontend_readiness.interest.remove(Ready::READABLE);
@@ -487,12 +488,12 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             // requests on this connection, we can wait a bit more
             self.container_frontend_timeout
                 .set_duration(self.configured_frontend_timeout);
-            gauge_add!("http.active_requests", 1);
-            incr!("http.requests");
+            gauge_add!(names::http::ACTIVE_REQUESTS, 1);
+            incr!(names::http::REQUESTS);
         }
 
         if let kawa::ParsingPhase::Error { marker, kind } = self.request_stream.parsing_phase {
-            incr!("http.frontend_parse_errors");
+            incr!(names::http::FRONTEND_PARSE_ERRORS);
             warn!(
                 "{} Parsing request error in {:?}: {}",
                 log_context!(self, Some(response_stream.parsing_phase)),
@@ -572,7 +573,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
         if size > 0 {
             response_stream.consume(size);
-            count!("bytes_out", size as i64);
+            count!(names::backend::BYTES_OUT, size as i64);
             metrics.bout += size;
             self.backend_readiness.interest.insert(Ready::READABLE);
         }
@@ -644,7 +645,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                     "{} Response terminated before request, this case is not handled properly yet",
                     log_context!(self)
                 );
-                incr!("http.early_response_close");
+                incr!(names::http::EARLY_RESPONSE_CLOSE);
                 // FIXME: this will cause problems with pipelining
                 // return StateResult::CloseSession;
             }
@@ -700,7 +701,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         let bufs = response_stream.as_io_slice();
         let (size, socket_state) = self.frontend_socket.socket_write_vectored(&bufs);
 
-        count!("bytes_out", size as i64);
+        count!(names::backend::BYTES_OUT, size as i64);
         metrics.bout += size;
         response_stream.consume(size);
 
@@ -760,7 +761,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
         if size > 0 {
             self.request_stream.consume(size);
-            count!("back_bytes_out", size as i64);
+            count!(names::backend::BACK_BYTES_OUT, size as i64);
             metrics.backend_bout += size;
             self.frontend_readiness.interest.insert(Ready::READABLE);
             self.backend_readiness.interest.insert(Ready::READABLE);
@@ -859,7 +860,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
         if size > 0 {
             response_stream.storage.fill(size);
-            count!("back_bytes_in", size as i64);
+            count!(names::backend::BACK_BYTES_IN, size as i64);
             metrics.backend_bin += size;
             // if self.kawa_response.storage.is_full() {
             //     self.backend_readiness.interest.remove(Ready::READABLE);
@@ -904,7 +905,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         // kawa::debug_kawa(&self.response_stream);
 
         if let kawa::ParsingPhase::Error { marker, kind } = response_stream.parsing_phase {
-            incr!("http.backend_parse_errors");
+            incr!(names::http::BACKEND_PARSE_ERRORS);
             warn!(
                 "{} Parsing response error in {:?}: {}",
                 log_context!(self, Some(response_stream.parsing_phase)),
@@ -1034,7 +1035,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
         log_access! {
             error,
-            on_failure: { incr!("unsent-access-logs") },
+            on_failure: { incr!(names::access_logs::UNSENT) },
             message,
             context,
             session_address: self.get_session_address(),
@@ -1120,13 +1121,13 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                     self.context.cluster_id.as_deref(),
                     self.context.backend_id.as_deref()
                 ),
-                DefaultAnswer::Answer400 { .. } => incr!("http.400.errors"),
+                DefaultAnswer::Answer400 { .. } => incr!(names::http::ERR_400),
                 DefaultAnswer::Answer401 { .. } => incr!(
                     "http.401.errors",
                     self.context.cluster_id.as_deref(),
                     self.context.backend_id.as_deref()
                 ),
-                DefaultAnswer::Answer404 { .. } => incr!("http.404.errors"),
+                DefaultAnswer::Answer404 { .. } => incr!(names::http::ERR_404),
                 DefaultAnswer::Answer408 { .. } => incr!(
                     "http.408.errors",
                     self.context.cluster_id.as_deref(),
@@ -1310,9 +1311,9 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             }
 
             if self.backend_connection_status == BackendConnectionStatus::Connected {
-                gauge_add!("backend.connections", -1);
+                gauge_add!(names::backend::CONNECTIONS, -1);
                 gauge_add!(
-                    "connections_per_backend",
+                    names::backend::CONNECTIONS_PER_BACKEND,
                     -1,
                     self.context.cluster_id.as_deref(),
                     metrics.backend_id.as_deref()
@@ -1664,9 +1665,9 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         self.backend_connection_status = connected;
 
         if connected == BackendConnectionStatus::Connected {
-            gauge_add!("backend.connections", 1);
+            gauge_add!(names::backend::CONNECTIONS, 1);
             gauge_add!(
-                "connections_per_backend",
+                names::backend::CONNECTIONS_PER_BACKEND,
                 1,
                 self.context.cluster_id.as_deref(),
                 metrics.backend_id.as_deref()
@@ -1691,7 +1692,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                         metrics.backend_id.as_deref()
                     );
                     gauge!(
-                        "backend.available",
+                        names::backend::AVAILABLE,
                         1,
                         self.context.cluster_id.as_deref(),
                         metrics.backend_id.as_deref()
@@ -1751,7 +1752,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                     metrics.backend_id.as_deref()
                 );
                 gauge!(
-                    "backend.available",
+                    names::backend::AVAILABLE,
                     0,
                     self.context.cluster_id.as_deref(),
                     metrics.backend_id.as_deref()
@@ -2044,7 +2045,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 MAX_LOOP_ITERATIONS
             );
 
-            incr!("http.infinite_loop.error");
+            incr!(names::http::INFINITE_LOOP_ERROR);
             self.print_state(self.protocol_string());
 
             return SessionResult::Close;
@@ -2111,7 +2112,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> SessionState 
 
         //if the state was initial, the connection was already reset
         if !self.request_stream.is_initial() {
-            gauge_add!("http.active_requests", -1);
+            gauge_add!(names::http::ACTIVE_REQUESTS, -1);
 
             if let Some(b) = self.backend.as_mut() {
                 let mut backend = b.borrow_mut();
@@ -2268,23 +2269,43 @@ fn save_http_status_metric(status: Option<u16>, context: LogContext) {
     if let Some(status) = status {
         match status {
             100..=199 => {
-                incr!("http.status.1xx", context.cluster_id, context.backend_id);
+                incr!(
+                    names::http::STATUS_1XX,
+                    context.cluster_id,
+                    context.backend_id
+                );
             }
             200..=299 => {
-                incr!("http.status.2xx", context.cluster_id, context.backend_id);
+                incr!(
+                    names::http::STATUS_2XX,
+                    context.cluster_id,
+                    context.backend_id
+                );
             }
             300..=399 => {
-                incr!("http.status.3xx", context.cluster_id, context.backend_id);
+                incr!(
+                    names::http::STATUS_3XX,
+                    context.cluster_id,
+                    context.backend_id
+                );
             }
             400..=499 => {
-                incr!("http.status.4xx", context.cluster_id, context.backend_id);
+                incr!(
+                    names::http::STATUS_4XX,
+                    context.cluster_id,
+                    context.backend_id
+                );
             }
             500..=599 => {
-                incr!("http.status.5xx", context.cluster_id, context.backend_id);
+                incr!(
+                    names::http::STATUS_5XX,
+                    context.cluster_id,
+                    context.backend_id
+                );
             }
             _ => {
                 // http responses with other codes (protocol error)
-                incr!("http.status.other");
+                incr!(names::http::STATUS_OTHER);
             }
         }
 

@@ -16,6 +16,7 @@ use std::{
 use rusty_ulid::Ulid;
 use sozu_command_lib::logging::LogContext;
 
+use crate::metrics::names;
 use crate::{
     Protocol, RetrieveClusterError,
     pool::Checkout,
@@ -523,10 +524,10 @@ impl HttpContext {
                     } else if compare_no_case(key, b"X-Forwarded-Proto") {
                         has_x_proto = true;
                         // header.val = kawa::Store::Static(proto.as_bytes());
-                        incr!("http.trusting.x_proto");
+                        incr!(names::http::TRUSTING_X_PROTO);
                         let val = header.val.data(buf);
                         if !compare_no_case(val, proto.as_bytes()) {
-                            incr!("http.trusting.x_proto.diff");
+                            incr!(names::http::TRUSTING_X_PROTO_DIFF);
                             debug!(
                                 "{} Trusting X-Forwarded-Proto for {:?} even though {:?} != {}",
                                 self.log_context(),
@@ -538,12 +539,12 @@ impl HttpContext {
                     } else if compare_no_case(key, b"X-Forwarded-Port") {
                         has_x_port = true;
                         // header.val = kawa::Store::from_string(public_port.to_string());
-                        incr!("http.trusting.x_port");
+                        incr!(names::http::TRUSTING_X_PORT);
                         let val = header.val.data(buf);
                         let mut port_buf = itoa::Buffer::new();
                         let expected = port_buf.format(public_port);
                         if !compare_no_case(val, expected.as_bytes()) {
-                            incr!("http.trusting.x_port.diff");
+                            incr!(names::http::TRUSTING_X_PORT_DIFF);
                             debug!(
                                 "{} Trusting X-Forwarded-Port for {:?} even though {:?} != {}",
                                 self.log_context(),
@@ -733,7 +734,7 @@ impl HttpContext {
         // Either way, `self.x_request_id` is populated so the access log
         // records the exact value forwarded to the backend.
         if has_x_request_id {
-            incr!("http.x_request_id.propagated");
+            incr!(names::http::X_REQUEST_ID_PROPAGATED);
         } else {
             let value = self.id.to_string();
             request.push_block(kawa::Block::Header(kawa::Pair {
@@ -741,7 +742,7 @@ impl HttpContext {
                 val: kawa::Store::from_string(value.clone()),
             }));
             self.x_request_id = Some(value);
-            incr!("http.x_request_id.generated");
+            incr!(names::http::X_REQUEST_ID_GENERATED);
         }
 
         // Create a custom correlation header (defaults to "Sozu-Id", can be
