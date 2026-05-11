@@ -34,8 +34,8 @@ use sozu_command_lib::{
     channel::Channel,
     config::Config,
     proto::command::{
-        Event, Request, ResponseContent, ResponseStatus, RunState, Status, WorkerRequest,
-        WorkerResponse, request::RequestType, response_content::ContentType,
+        Event, EventKind, Request, ResponseContent, ResponseStatus, RunState, Status,
+        WorkerRequest, WorkerResponse, request::RequestType, response_content::ContentType,
     },
     ready::Ready,
     scm_socket::{Listeners, ScmSocket, ScmSocketError},
@@ -546,6 +546,23 @@ impl CommandHub {
             content_type: Some(ContentType::Event(event)),
         }) = response.content
         {
+            // Worker-local METRIC_DETAIL_CHANGED transitions (lease tick
+            // expiry, worker arm apply/clear) are emitted by the worker
+            // via the same `Event` channel that carries backend health
+            // signals; the master folds them into the audit log here
+            // alongside operator-initiated transitions audited from
+            // `requests.rs::worker_request`. Without this, the worker's
+            // polled janitor expiring a lease left no audit trail —
+            // exactly the gap flagged in PR #1256 review.
+            if event.kind == EventKind::MetricDetailChanged as i32 {
+                if let Some(transition) = event.metric_detail.as_ref() {
+                    crate::command::requests::audit_worker_metric_detail_transition(
+                        &mut self.server,
+                        worker_id,
+                        transition,
+                    );
+                }
+            }
             for client_token in &self.server.event_subscribers {
                 if let Some(client) = self.clients.get_mut(client_token) {
                     client.return_processing_with_content(

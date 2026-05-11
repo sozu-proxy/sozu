@@ -600,6 +600,7 @@ impl TcpSession {
                         backend_id: Some(backend.backend_id.to_owned()),
                         address: Some(backend.address.into()),
                         cluster_id: None,
+                            metric_detail: None,
                     });
                 }
 
@@ -658,6 +659,7 @@ impl TcpSession {
                     backend_id: Some(backend.backend_id.to_owned()),
                     address: Some(backend.address.into()),
                     cluster_id: None,
+                            metric_detail: None,
                 });
             }
         }

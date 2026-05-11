@@ -1710,6 +1710,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                         backend_id: Some(backend.backend_id.to_owned()),
                         address: Some(backend.address.into()),
                         cluster_id: None,
+                            metric_detail: None,
                     });
                 }
 
@@ -1763,6 +1764,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                     backend_id: Some(backend.backend_id.to_owned()),
                     address: Some(backend.address.into()),
                     cluster_id: None,
+                            metric_detail: None,
                 });
             }
         }

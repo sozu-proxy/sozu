@@ -1474,7 +1474,137 @@ fn audit_emit(server: &mut Server, client: &ClientSession, entry: AuditEntry, re
         cluster_id: entry.cluster_id,
         backend_id: entry.backend_id,
         address: entry.address,
+        // Master-emitted audit events do not carry the
+        // `metric_detail` transition; that field is populated by
+        // workers via `WorkerResponse::Event` on lease-tick / worker-
+        // arm transitions only. See `command.proto`'s `Event` and
+        // `MetricDetailTransition` comments.
+        metric_detail: None,
     });
+}
+
+/// Audit a worker-local `METRIC_DETAIL_CHANGED` transition. Workers emit
+/// these via the `Event` channel when the polled lease janitor retires a
+/// lease, or when the worker arm of `SetMetricDetail` applies / clears a
+/// lease. The master folds them into the same audit log used for
+/// operator-initiated transitions so SOC tooling sees a complete picture
+/// of cardinality changes regardless of origin.
+///
+/// Distinct from [`audit_emit`] / [`audit_emit_inline`] because there is
+/// no `ClientSession` behind the event: the actor is the worker itself.
+/// The line uses a `worker_id=<id>` field in place of the
+/// `actor_uid` / `actor_pid` / `client_id` block; everything else
+/// (timestamps, sozu_version, fan-out to subscribers) matches the
+/// canonical envelope. Both the text sink and the JSON sink receive a
+/// record so SIEM ingest stays unified.
+pub fn audit_worker_metric_detail_transition(
+    server: &mut Server,
+    worker_id: crate::command::server::WorkerId,
+    transition: &sozu_command_lib::proto::command::MetricDetailTransition,
+) {
+    use sozu_command_lib::proto::command::MetricDetail;
+
+    let (verb, counter) = audit_verb!("metric_detail_changed_worker_local");
+    count!(counter, 1);
+
+    let prev_label = MetricDetail::try_from(transition.previous_effective)
+        .map(|m| format!("{m:?}"))
+        .unwrap_or_else(|_| "<invalid>".into());
+    let eff_label = MetricDetail::try_from(transition.effective)
+        .map(|m| format!("{m:?}"))
+        .unwrap_or_else(|_| "<invalid>".into());
+    let kind_sanitized = sanitize_for_audit_kv(&transition.transition_kind);
+    let target = format!("metric_detail:{prev_label}->{eff_label}");
+    let now_ts = rfc3339_utc(std::time::SystemTime::now());
+
+    // Truncate the optional lease client_id with the same cap used in the
+    // operator-initiated audit line so SIEM consumers see a consistent
+    // upper bound.
+    let lease_id = transition.client_id.as_deref().map(|c| {
+        let sanitized = sanitize_for_audit_kv(c);
+        let truncated: String = sanitized.chars().take(AUDIT_LEASE_ID_MAX_CHARS).collect();
+        truncated
+    });
+
+    // Render the text-sink line. Match the operator-initiated envelope's
+    // KV shape so a SOC analyst can correlate worker-local and operator
+    // lines with a single regex. `worker_id` stands in for the
+    // `client_id=<connection_id>` block since the worker is its own
+    // actor.
+    let mut text = format!(
+        "[worker:{worker_id} request:- cluster:- backend:-]\tAUDIT\tCommand(ts={now_ts}, verb={verb}, \
+         actor_uid=-, actor_gid=-, actor_pid=-, actor_role=worker, actor_user=sozu-worker, \
+         actor_comm=sozu-worker, worker_id={worker_id}, socket=(worker-ipc), \
+         target={target}, result=ok, transition_kind={kind_sanitized}",
+    );
+    if let Some(id) = lease_id.as_deref() {
+        text.push_str(&format!(", lease_id={id}"));
+    }
+    text.push_str(&format!(
+        ", sozu_version={SOZU_VERSION}, build_git_sha={SOZU_BUILD_GIT_SHA}, boot_generation={})",
+        server.boot_generation,
+    ));
+    info!("{}", text);
+    server.append_audit_line(&text);
+
+    if server.audit_log_json_writer.is_some() {
+        let mut record = serde_json::Map::new();
+        record.insert(
+            "ts".to_owned(),
+            serde_json::Value::String(now_ts.clone()),
+        );
+        record.insert(
+            "boot_generation".to_owned(),
+            serde_json::json!(server.boot_generation),
+        );
+        record.insert(
+            "verb".to_owned(),
+            serde_json::Value::String(verb.to_owned()),
+        );
+        record.insert(
+            "worker_id".to_owned(),
+            serde_json::json!(worker_id.to_string()),
+        );
+        record.insert(
+            "actor".to_owned(),
+            serde_json::json!({
+                "role": "worker",
+                "comm": "sozu-worker",
+            }),
+        );
+        record.insert(
+            "target".to_owned(),
+            serde_json::Value::String(target.clone()),
+        );
+        record.insert(
+            "result".to_owned(),
+            serde_json::Value::String("ok".to_owned()),
+        );
+        record.insert(
+            "transition_kind".to_owned(),
+            serde_json::Value::String(kind_sanitized.clone()),
+        );
+        record.insert(
+            "previous_effective".to_owned(),
+            serde_json::Value::String(prev_label.clone()),
+        );
+        record.insert(
+            "effective".to_owned(),
+            serde_json::Value::String(eff_label.clone()),
+        );
+        if let Some(id) = lease_id {
+            record.insert("lease_id".to_owned(), serde_json::Value::String(id));
+        }
+        record.insert(
+            "sozu_version".to_owned(),
+            serde_json::Value::String(SOZU_VERSION.to_owned()),
+        );
+        record.insert(
+            "build_git_sha".to_owned(),
+            serde_json::Value::String(SOZU_BUILD_GIT_SHA.to_owned()),
+        );
+        server.append_audit_json(&serde_json::Value::Object(record).to_string());
+    }
 }
 
 /// Build a single-line JSON record mirroring the audit line. Schema is
