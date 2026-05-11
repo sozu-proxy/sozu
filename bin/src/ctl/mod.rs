@@ -218,25 +218,21 @@ impl CommandManager {
             #[cfg(feature = "tui")]
             SubCmd::Top {
                 refresh_ms,
-                no_color,
                 no_mouse,
                 skin,
                 detail,
                 lease_ttl_seconds,
                 snapshot,
                 tick_once,
-                log_file,
                 glyphs,
             } => self.run_top(top::TopArgs {
                 refresh_ms,
-                no_color,
                 no_mouse,
                 skin,
                 detail,
                 lease_ttl_seconds,
                 snapshot,
                 tick_once,
-                log_file,
                 glyphs,
             }),
             rest => {

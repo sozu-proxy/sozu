@@ -44,8 +44,6 @@ mod transport;
 #[cfg(test)]
 mod snapshot_tests;
 
-use std::path::PathBuf;
-
 use crate::cli::{TopDetail, TopGlyphs};
 
 use self::cardinality::DetailGuard;
@@ -58,24 +56,23 @@ use super::{CommandManager, CtlError};
 #[derive(Debug, Clone)]
 pub struct TopArgs {
     pub refresh_ms: u64,
-    pub no_color: bool,
     pub no_mouse: bool,
     pub skin: Option<String>,
     pub detail: Option<TopDetail>,
     pub lease_ttl_seconds: u32,
     pub snapshot: Option<u32>,
     pub tick_once: bool,
-    pub log_file: Option<PathBuf>,
     pub glyphs: Option<TopGlyphs>,
 }
 
 impl CommandManager {
     /// Entry point for the `sozu top` subcommand.
     ///
-    /// Spins up the two transport threads, applies the cardinality lease,
-    /// installs the SIGINT/SIGTERM + panic-hook restore guards, and runs
-    /// the render loop until the user quits or a snapshot/tick budget
-    /// exhausts. Returns once the terminal is restored.
+    /// Spins up the four transport threads (collector, events, listeners,
+    /// certs), applies the cardinality lease, installs the SIGINT/SIGTERM
+    /// + panic-hook restore guards, and runs the render loop until the
+    /// user quits or a snapshot/tick budget exhausts. Returns once the
+    /// terminal is restored.
     pub fn run_top(&mut self, args: TopArgs) -> Result<(), CtlError> {
         // Transport threads own their own `Channel` connections — see the
         // module-level docs for why we don't reuse `self.channel`.
