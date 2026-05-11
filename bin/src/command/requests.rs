@@ -1877,6 +1877,30 @@ pub fn worker_request(
     if let RequestType::SetMetricDetail(req) = &mut request_content {
         req.peer_pid = client.actor_pid;
         req.peer_session_ulid = Some(client.session_ulid.to_string());
+        // Master-side pre-validation: reject obviously bogus inputs
+        // BEFORE fan-out so a malicious or buggy caller cannot fan its
+        // mistake across every worker (N rejected fan-outs + N audit
+        // lines per request). The worker dispatch path still enforces
+        // these limits as defence-in-depth, but failing fast here saves
+        // the audit-noise amplifier and gives the operator a single
+        // clear error rather than N.
+        if req.client_id.len() > sozu_lib::metrics::LEASE_CLIENT_ID_MAX_BYTES {
+            client.finish_failure(format!(
+                "SetMetricDetail: client_id length {} exceeds {} bytes",
+                req.client_id.len(),
+                sozu_lib::metrics::LEASE_CLIENT_ID_MAX_BYTES,
+            ));
+            return;
+        }
+        if let Some(t) = req.ttl_seconds
+            && u64::from(t) > sozu_lib::metrics::LEASE_TTL_MAX.as_secs()
+        {
+            client.finish_failure(format!(
+                "SetMetricDetail: ttl_seconds={t} exceeds LEASE_TTL_MAX={}",
+                sozu_lib::metrics::LEASE_TTL_MAX.as_secs(),
+            ));
+            return;
+        }
     }
     // Snapshot the audit entry before consuming `request_content` so we can
     // emit even when `state.dispatch` rejects the request AND so the

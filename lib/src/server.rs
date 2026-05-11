@@ -1490,7 +1490,7 @@ impl Server {
                     .filter(|&t| t > 0)
                     .unwrap_or(crate::metrics::LEASE_TTL_DEFAULT.as_secs() as u32);
                 let ttl = std::time::Duration::from_secs(ttl_seconds.into());
-                let (previous, effective) = METRICS.with(|metrics| {
+                let outcome = METRICS.with(|metrics| {
                     metrics.borrow_mut().lease_apply(
                         req.client_id.clone(),
                         level,
@@ -1498,13 +1498,54 @@ impl Server {
                         presented_binding,
                     )
                 });
-                push_metric_detail_transition(
-                    previous,
-                    effective,
-                    "lease_apply",
-                    Some(req.client_id.clone()),
-                );
-                push_queue(WorkerResponse::ok(message.id.clone()));
+                match outcome {
+                    crate::metrics::LeaseApplyOutcome::Applied {
+                        previous_effective,
+                        new_effective,
+                    } => {
+                        push_metric_detail_transition(
+                            previous_effective,
+                            new_effective,
+                            "lease_apply",
+                            Some(req.client_id.clone()),
+                        );
+                        push_queue(WorkerResponse::ok(message.id.clone()));
+                    }
+                    crate::metrics::LeaseApplyOutcome::ClientIdTooLong => {
+                        let msg = format!(
+                            "SetMetricDetail: client_id length {} exceeds {} bytes",
+                            req.client_id.len(),
+                            crate::metrics::LEASE_CLIENT_ID_MAX_BYTES,
+                        );
+                        error!("{}", msg);
+                        push_queue(WorkerResponse::error(message.id.clone(), msg));
+                    }
+                    crate::metrics::LeaseApplyOutcome::TableFull => {
+                        let msg = format!(
+                            "SetMetricDetail: lease table at capacity ({} entries); reject new \
+                             apply for client_id={} — operators must retry after an active \
+                             lease expires or is cleared",
+                            crate::metrics::LEASE_TABLE_CAP,
+                            req.client_id,
+                        );
+                        error!("{}", msg);
+                        push_queue(WorkerResponse::error(message.id.clone(), msg));
+                    }
+                    crate::metrics::LeaseApplyOutcome::TtlOutOfRange => {
+                        // Unreachable in the normal flow: the dispatch-time
+                        // gate above already rejected ttl > LEASE_TTL_MAX.
+                        // Surface explicitly so any future bypass (proto
+                        // fuzzing, internal callers) fails loud rather
+                        // than silently capping the lessor's intent.
+                        let msg = format!(
+                            "SetMetricDetail: ttl exceeds LEASE_TTL_MAX={} (internal contract \
+                             violation: dispatch gate should have rejected)",
+                            crate::metrics::LEASE_TTL_MAX.as_secs(),
+                        );
+                        error!("{}", msg);
+                        push_queue(WorkerResponse::error(message.id.clone(), msg));
+                    }
+                }
                 return;
             }
             Some(RequestType::Logging(logging_filter)) => {
