@@ -1439,8 +1439,8 @@ impl Server {
                     // `MetricDetailStatus.workers[<worker_id>]`. Without
                     // this payload the master used its own view as a
                     // stand-in for the worker's per-aggregator state.
-                    let (outcome, effective_after, configured_after, lease_count_after) =
-                        METRICS.with(|metrics| {
+                    let (outcome, effective_after, configured_after, lease_count_after) = METRICS
+                        .with(|metrics| {
                             let mut m = metrics.borrow_mut();
                             let outcome = m.lease_clear(&req.client_id, presented_binding);
                             (
@@ -1548,12 +1548,8 @@ impl Server {
                 let ttl = std::time::Duration::from_secs(ttl_seconds.into());
                 let (outcome, configured_after, lease_count_after) = METRICS.with(|metrics| {
                     let mut m = metrics.borrow_mut();
-                    let outcome = m.lease_apply(
-                        req.client_id.clone(),
-                        level,
-                        ttl,
-                        presented_binding,
-                    );
+                    let outcome =
+                        m.lease_apply(req.client_id.clone(), level, ttl, presented_binding);
                     (outcome, m.detail_configured(), m.lease_count())
                 });
                 match outcome {
