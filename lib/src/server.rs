@@ -1486,10 +1486,15 @@ impl Server {
                     push_queue(WorkerResponse::error(message.id.clone(), msg));
                     return;
                 }
-                let ttl_seconds = req
-                    .ttl_seconds
-                    .filter(|&t| t > 0)
-                    .unwrap_or(crate::metrics::LEASE_TTL_DEFAULT.as_secs() as u32);
+                let ttl_seconds = req.ttl_seconds.filter(|&t| t > 0).unwrap_or_else(|| {
+                    // The default fits in a u32 by construction
+                    // (LEASE_TTL_DEFAULT = 60 s); the lossy `as u32` cast
+                    // is replaced with a checked conversion so any
+                    // future tweak past `u32::MAX` seconds (≈ 136 years)
+                    // can't silently truncate. Falls through to 60 s on
+                    // the theoretical overflow path.
+                    u32::try_from(crate::metrics::LEASE_TTL_DEFAULT.as_secs()).unwrap_or(60)
+                });
                 let ttl = std::time::Duration::from_secs(ttl_seconds.into());
                 let outcome = METRICS.with(|metrics| {
                     metrics.borrow_mut().lease_apply(
