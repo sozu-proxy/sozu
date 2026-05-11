@@ -245,6 +245,48 @@ pub const LEASE_TTL_MAX: Duration = Duration::from_secs(300);
 /// passes `0`). Matches the proto comment.
 pub const LEASE_TTL_DEFAULT: Duration = Duration::from_secs(60);
 
+/// Hard cap on the number of simultaneous leases held by the aggregator.
+/// `lease_apply` rejects new entries (with [`LeaseApplyOutcome::Capped`])
+/// once the table reaches this size. Bounds the lease table's memory and
+/// neutralises the CWE-770 vector where a same-UID attacker rolls
+/// `client_id` faster than expiry to grow the map unbounded. 64 is well
+/// above any plausible TUI fleet (one TUI per operator + a handful of
+/// metric scrapers); legitimate callers renewing the same `client_id`
+/// REPLACE rather than insert and therefore don't bump the count.
+pub const LEASE_TABLE_CAP: usize = 64;
+
+/// Hard cap on `client_id` length accepted by `lease_apply`. The TUI
+/// uses `top:<pid>:<8 hex chars>` ≤ 24 bytes; 64 leaves headroom for
+/// other operator-side scrapers while keeping the lease table's per-
+/// entry memory bounded and the audit-log lease_id column small.
+pub const LEASE_CLIENT_ID_MAX_BYTES: usize = 64;
+
+/// Outcome of [`Aggregator::lease_apply`]. The success arm returns the
+/// `(previous_effective, new_effective)` pair the caller can use to
+/// decide whether to emit a `MetricDetailChanged` audit event; the
+/// failure arms surface bounded-input rejections.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeaseApplyOutcome {
+    /// Lease inserted / renewed.
+    Applied {
+        previous_effective: MetricDetailLevel,
+        new_effective: MetricDetailLevel,
+    },
+    /// `client_id` length exceeds [`LEASE_CLIENT_ID_MAX_BYTES`].
+    ClientIdTooLong,
+    /// Lease table is at [`LEASE_TABLE_CAP`] and the request is a new
+    /// insert (not a renewal). Callers MUST surface this as a `FAILURE`
+    /// to the wire so the lessor can back off.
+    TableFull,
+    /// The requested TTL exceeds [`LEASE_TTL_MAX`]. This arm is
+    /// theoretically unreachable in the normal flow because the
+    /// dispatch site rejects out-of-range values before reaching the
+    /// aggregator; surfacing it explicitly catches callers that bypass
+    /// dispatch (proto fuzzing, future internal use) instead of
+    /// silently clamping their intent.
+    TtlOutOfRange,
+}
+
 /// Master-populated peer binding stored alongside each lease so subsequent
 /// `clear` requests can be authorised against the apply-time owner. The
 /// binding pairs an OS pid (from `SO_PEERCRED` on Linux, captured by the
@@ -401,19 +443,35 @@ impl Aggregator {
     /// The proto contract on `SetMetricDetail.ttl_seconds` is that the worker
     /// **rejects** out-of-range values with a `FAILURE` response — that
     /// enforcement lives at the dispatch site in `lib/src/server.rs::notify`.
-    /// This clamp is defence-in-depth for callers that bypass the dispatch
-    /// (proto fuzzing, future internal use); a request that survives the
-    /// rejection gate is by construction within bounds, so the clamp is a
-    /// no-op on the happy path.
+    /// `lease_apply` itself returns [`LeaseApplyOutcome::TtlOutOfRange`]
+    /// when called with `ttl > LEASE_TTL_MAX` so callers that bypass the
+    /// dispatch site (proto fuzzing, future internal use) see a loud
+    /// rejection instead of silently capped semantics. Same shape for
+    /// over-long `client_id` and a full lease table — see
+    /// [`LeaseApplyOutcome`] for the failure arms.
     pub fn lease_apply(
         &mut self,
         client_id: String,
         level: MetricDetailLevel,
         ttl: Duration,
         binding: PeerBinding,
-    ) -> (MetricDetailLevel, MetricDetailLevel) {
-        let bounded_ttl = ttl.min(LEASE_TTL_MAX);
-        let expires_at = Instant::now() + bounded_ttl;
+    ) -> LeaseApplyOutcome {
+        if client_id.len() > LEASE_CLIENT_ID_MAX_BYTES {
+            return LeaseApplyOutcome::ClientIdTooLong;
+        }
+        if ttl > LEASE_TTL_MAX {
+            return LeaseApplyOutcome::TtlOutOfRange;
+        }
+        // Cap the table size BEFORE the insert, but only when the caller
+        // is inserting a fresh entry. Renewals (same `client_id` already
+        // present) REPLACE the existing entry and therefore keep the
+        // count stable — they must always succeed so an active operator
+        // never loses their lease just because the table is full.
+        let is_renewal = self.leases.contains_key(&client_id);
+        if !is_renewal && self.leases.len() >= LEASE_TABLE_CAP {
+            return LeaseApplyOutcome::TableFull;
+        }
+        let expires_at = Instant::now() + ttl;
         self.leases.insert(
             client_id,
             LeaseEntry {
@@ -422,9 +480,12 @@ impl Aggregator {
                 binding,
             },
         );
-        let previous = self.effective;
+        let previous_effective = self.effective;
         self.recompute_effective();
-        (previous, self.effective)
+        LeaseApplyOutcome::Applied {
+            previous_effective,
+            new_effective: self.effective,
+        }
     }
 
     /// Explicitly release a lease keyed by `client_id`. The clear is
@@ -808,18 +869,31 @@ mod tests {
         }
     }
 
+    /// Extract `(previous_effective, new_effective)` from a successful
+    /// `lease_apply`; panics on any failure arm so tests that don't care
+    /// about the failure paths stay compact.
+    fn unwrap_applied(outcome: LeaseApplyOutcome) -> (MetricDetailLevel, MetricDetailLevel) {
+        match outcome {
+            LeaseApplyOutcome::Applied {
+                previous_effective,
+                new_effective,
+            } => (previous_effective, new_effective),
+            other => panic!("expected LeaseApplyOutcome::Applied, got {other:?}"),
+        }
+    }
+
     #[test]
     fn lease_apply_elevates_effective_above_configured() {
         // Configured floor stays at Cluster; a lease for Backend lifts the
         // effective level until the lease expires or is cleared.
         let mut agg = Aggregator::new("sozu".to_owned());
         agg.set_up_detail(MetricDetailLevel::Cluster);
-        let (prev, new) = agg.lease_apply(
+        let (prev, new) = unwrap_applied(agg.lease_apply(
             "test:1".to_owned(),
             MetricDetailLevel::Backend,
             Duration::from_secs(60),
             PeerBinding::default(),
-        );
+        ));
         assert_eq!(prev, MetricDetailLevel::Cluster);
         assert_eq!(new, MetricDetailLevel::Backend);
         assert_eq!(agg.detail_configured(), MetricDetailLevel::Cluster);
@@ -832,14 +906,90 @@ mod tests {
         // A lease can only ELEVATE the floor, never push below `configured`.
         let mut agg = Aggregator::new("sozu".to_owned());
         agg.set_up_detail(MetricDetailLevel::Backend);
-        let (prev, new) = agg.lease_apply(
+        let (prev, new) = unwrap_applied(agg.lease_apply(
             "test:1".to_owned(),
             MetricDetailLevel::Cluster,
             Duration::from_secs(60),
             PeerBinding::default(),
-        );
+        ));
         assert_eq!(prev, MetricDetailLevel::Backend);
         assert_eq!(new, MetricDetailLevel::Backend);
+    }
+
+    #[test]
+    fn lease_apply_rejects_client_id_over_cap() {
+        // Defence-in-depth: even if dispatch lets a too-long id through,
+        // the aggregator refuses to store it.
+        let mut agg = Aggregator::new("sozu".to_owned());
+        let too_long = "x".repeat(LEASE_CLIENT_ID_MAX_BYTES + 1);
+        assert_eq!(
+            agg.lease_apply(
+                too_long,
+                MetricDetailLevel::Backend,
+                Duration::from_secs(60),
+                PeerBinding::default(),
+            ),
+            LeaseApplyOutcome::ClientIdTooLong
+        );
+        assert_eq!(agg.lease_count(), 0);
+    }
+
+    #[test]
+    fn lease_apply_rejects_when_table_is_full() {
+        // Fill the table to capacity with distinct client_ids; one more
+        // insert is refused. A RENEWAL of an existing entry must still
+        // succeed (replaces in place, count unchanged).
+        let mut agg = Aggregator::new("sozu".to_owned());
+        for i in 0..LEASE_TABLE_CAP {
+            assert!(matches!(
+                agg.lease_apply(
+                    format!("client:{i:02}"),
+                    MetricDetailLevel::Backend,
+                    Duration::from_secs(60),
+                    PeerBinding::default(),
+                ),
+                LeaseApplyOutcome::Applied { .. }
+            ));
+        }
+        assert_eq!(agg.lease_count() as usize, LEASE_TABLE_CAP);
+        // New distinct client → rejected.
+        assert_eq!(
+            agg.lease_apply(
+                "newcomer".to_owned(),
+                MetricDetailLevel::Backend,
+                Duration::from_secs(60),
+                PeerBinding::default(),
+            ),
+            LeaseApplyOutcome::TableFull,
+        );
+        assert_eq!(agg.lease_count() as usize, LEASE_TABLE_CAP);
+        // Renewal of an existing entry → still accepted.
+        assert!(matches!(
+            agg.lease_apply(
+                "client:00".to_owned(),
+                MetricDetailLevel::Backend,
+                Duration::from_secs(120),
+                PeerBinding::default(),
+            ),
+            LeaseApplyOutcome::Applied { .. }
+        ));
+        assert_eq!(agg.lease_count() as usize, LEASE_TABLE_CAP);
+    }
+
+    #[test]
+    fn lease_apply_rejects_ttl_over_max() {
+        // The aggregator no longer silently clamps oversize TTLs.
+        let mut agg = Aggregator::new("sozu".to_owned());
+        assert_eq!(
+            agg.lease_apply(
+                "client:0".to_owned(),
+                MetricDetailLevel::Backend,
+                LEASE_TTL_MAX + Duration::from_secs(1),
+                PeerBinding::default(),
+            ),
+            LeaseApplyOutcome::TtlOutOfRange,
+        );
+        assert_eq!(agg.lease_count(), 0);
     }
 
     #[test]
@@ -1017,19 +1167,19 @@ mod tests {
     }
 
     #[test]
-    fn lease_apply_clamps_ttl_to_max() {
-        // Stuck renewer protection: TTL larger than LEASE_TTL_MAX is clamped.
+    fn lease_apply_at_max_ttl_succeeds() {
+        // Boundary: exactly LEASE_TTL_MAX is allowed; LEASE_TTL_MAX + 1ns is
+        // rejected (covered by lease_apply_rejects_ttl_over_max above).
         let mut agg = Aggregator::new("sozu".to_owned());
-        let too_long = Duration::from_secs(LEASE_TTL_MAX.as_secs() * 4);
         let now = Instant::now();
-        let _ = agg.lease_apply(
-            "greedy".to_owned(),
+        let outcome = agg.lease_apply(
+            "max".to_owned(),
             MetricDetailLevel::Backend,
-            too_long,
+            LEASE_TTL_MAX,
             PeerBinding::default(),
         );
-        let entry = agg.leases.get("greedy").unwrap();
-        // Stored expiry should not exceed `now + LEASE_TTL_MAX + a small slop`.
+        assert!(matches!(outcome, LeaseApplyOutcome::Applied { .. }));
+        let entry = agg.leases.get("max").unwrap();
         assert!(entry.expires_at <= now + LEASE_TTL_MAX + Duration::from_millis(50));
     }
 }

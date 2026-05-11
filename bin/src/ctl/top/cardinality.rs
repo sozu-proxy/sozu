@@ -227,23 +227,32 @@ fn send_set_detail(
     }
 }
 
-/// 8 hex chars used as the random portion of the lease `client_id`. Reads
-/// 4 bytes from `/dev/urandom` (Linux/BSD/macOS) instead of the previous
-/// `subsec_nanos()` seed: pid reuse on a busy host plus PID modulo
-/// SystemTime collisions made that source weak under `sozu top` mass-launch
-/// (e.g. tmux scripted dashboards). The kernel CSPRNG is non-blocking on
-/// every platform Sōzu builds on after first boot; if the read fails for
-/// any reason we fall back to the nanosecond seed so the TUI still starts.
+/// 8 hex chars used as the random portion of the lease `client_id`. On
+/// Linux uses the `getrandom(2)` syscall directly via the `libc` crate
+/// (already in the workspace), which is non-blocking, has no fs
+/// dependency, and surfaces failure modes (`EAGAIN` while the entropy
+/// pool is uninitialised, `ENOSYS` on ancient kernels) as a `-1` return.
+/// On non-Linux Unix targets we fall back to a `/dev/urandom` read;
+/// `getrandom`'s shape is OS-specific (FreeBSD: `getrandom(2)`, OpenBSD:
+/// `getentropy(2)`, macOS: `SecRandomCopyBytes`) and the fs path is the
+/// portable lowest common denominator.
+///
+/// Endianness: we use `u32::from_le_bytes` for cross-arch reproducibility
+/// of the rendered hex, independent of which source actually delivered
+/// the bytes.
+///
+/// On total entropy failure (`getrandom` returned `-1` AND the
+/// `/dev/urandom` read failed) the function falls back to
+/// `SystemTime::now().subsec_nanos()` and the caller observes the
+/// degraded mode via the `app.status` line surfaced by `DetailGuard`.
 /// Cryptographic strength is not required — the value only needs to be
 /// unguessable enough to avoid lease-id collisions across concurrent
-/// instances — so we don't pull `getrandom` as a new direct dependency.
+/// `sozu top` instances. See PR #1256 review L-009 / M-3 for the
+/// design rationale.
 fn short_random_suffix() -> String {
-    use std::io::Read;
     let mut buf = [0u8; 4];
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom")
-        && f.read_exact(&mut buf).is_ok()
-    {
-        let n = u32::from_ne_bytes(buf);
+    if read_csprng_bytes(&mut buf) {
+        let n = u32::from_le_bytes(buf);
         return format!("{n:08x}");
     }
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -252,4 +261,50 @@ fn short_random_suffix() -> String {
         .map(|d| d.subsec_nanos())
         .unwrap_or(0);
     format!("{nanos:08x}")
+}
+
+/// Fill `buf` from the kernel CSPRNG. Returns `true` on success, `false`
+/// on any error so the caller can fall through to the `subsec_nanos`
+/// fallback.
+///
+/// Linux: `libc::getrandom(buf, len, GRND_NONBLOCK)`. The flag asks the
+/// kernel to return `EAGAIN` rather than block when the entropy pool is
+/// not yet initialised — extraordinarily rare on real hosts but matters
+/// inside fresh containers and at boot. We treat any short read or
+/// negative return as failure and fall through.
+///
+/// Non-Linux Unix targets (macOS / *BSD): `getrandom(2)` exists under
+/// different ABIs (e.g. OpenBSD's `getentropy(2)` caps at 256 bytes;
+/// FreeBSD's `getrandom(2)` has the same signature as Linux's but
+/// belongs to `<sys/random.h>` rather than `<linux/random.h>`). For
+/// portability across the platforms Sōzu builds on, fall back to a
+/// `/dev/urandom` read — present and readable on every supported
+/// non-Linux Unix target.
+fn read_csprng_bytes(buf: &mut [u8]) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: `libc::getrandom` accepts a mutable byte pointer + length
+        // and writes up to `len` bytes. We pass our owned `buf`'s pointer
+        // and full length; both are valid for the duration of the call.
+        // The `GRND_NONBLOCK` flag is `0x0001`, well-defined on Linux.
+        let ret = unsafe {
+            libc::getrandom(
+                buf.as_mut_ptr().cast::<libc::c_void>(),
+                buf.len(),
+                libc::GRND_NONBLOCK,
+            )
+        };
+        if ret as usize == buf.len() {
+            return true;
+        }
+        // fall through to `/dev/urandom` below; some kernels (very old
+        // 3.x or seccomp-restricted sandboxes) refuse the syscall.
+    }
+    use std::io::Read;
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom")
+        && f.read_exact(buf).is_ok()
+    {
+        return true;
+    }
+    false
 }
