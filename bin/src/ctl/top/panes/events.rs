@@ -65,8 +65,8 @@ pub fn render(f: &mut Frame<'_>, area: Rect, app: &App, skin: &Skin) {
             Row::new(vec![
                 Cell::from(format_relative_age(now, topev.received_at)),
                 Cell::from(kind_label.to_owned()),
-                Cell::from(topev.event.cluster_id.clone().unwrap_or_default()),
-                Cell::from(topev.event.backend_id.clone().unwrap_or_default()),
+                Cell::from(topev.event.cluster_id.as_deref().unwrap_or("").to_owned()),
+                Cell::from(topev.event.backend_id.as_deref().unwrap_or("").to_owned()),
                 Cell::from(
                     topev
                         .event

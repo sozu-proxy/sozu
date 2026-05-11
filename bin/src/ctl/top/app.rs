@@ -416,6 +416,19 @@ impl ThresholdTable {
     }
 }
 
+/// HTTP 5xx error-status counters Sōzu synthesises as default answers
+/// (500, 502, 503, 504, 507). Hoisted out of the cluster_rows /
+/// fold_overview iterators so both call sites share one source of
+/// truth for "what counts as a 5xx error in operator dashboards" and a
+/// new error variant can be added in one place.
+const ERRORS_5XX: [&str; 5] = [
+    names::http_status::S500,
+    names::http_status::S502,
+    names::http_status::S503,
+    names::http_status::S504,
+    names::http_status::S507,
+];
+
 /// Top-level UI state. Pure data; the render loop snapshots it for each
 /// frame and the transport threads push into it via `App::ingest_*`.
 #[derive(Debug)]
@@ -632,16 +645,10 @@ impl App {
             .iter()
             .map(|(id, cm)| {
                 let requests = count_value(cm.cluster.get("requests")).unwrap_or(0);
-                let errors_5xx: i64 = [
-                    names::http_status::S500,
-                    names::http_status::S502,
-                    names::http_status::S503,
-                    names::http_status::S504,
-                    names::http_status::S507,
-                ]
-                .iter()
-                .filter_map(|k| count_value(cm.cluster.get(*k)))
-                .sum();
+                let errors_5xx: i64 = ERRORS_5XX
+                    .iter()
+                    .filter_map(|k| count_value(cm.cluster.get(*k)))
+                    .sum();
                 let p99_ms =
                     percentile_p99_ms(cm.cluster.get(names::backend::RESPONSE_TIME)).unwrap_or(0);
                 let p50_ms =
@@ -766,14 +773,8 @@ impl App {
                 total_requests = total_requests.saturating_add(v);
                 total_requests_observed = total_requests_observed.saturating_add(v);
             }
-            for code in &[
-                names::http_status::S500,
-                names::http_status::S502,
-                names::http_status::S503,
-                names::http_status::S504,
-                names::http_status::S507,
-            ] {
-                if let Some(v) = count_value(cm.cluster.get(*code)) {
+            for code in ERRORS_5XX {
+                if let Some(v) = count_value(cm.cluster.get(code)) {
                     total_errors_5xx = total_errors_5xx.saturating_add(v);
                 }
             }
@@ -907,6 +908,11 @@ impl App {
                 other => {
                     self.palette_error = Some(format!("unknown command: :{other}"));
                     self.palette_open = false;
+                    // Clear the input on the unknown-command path too so
+                    // the next `:` keypress opens a fresh palette rather
+                    // than re-populating with the operator's previous
+                    // typo. Mirrors the success path (line below).
+                    self.palette_input = tui_input::Input::default();
                     return;
                 }
             }
