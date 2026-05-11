@@ -231,6 +231,51 @@ jobs:
           retention-days: 14
 
   # ┌──────────────────────────────────────────────────────────────┐
+  # │ Group C′ — cargo audit: surface RUSTSEC advisories on the    │
+  # │   whole workspace including the `tui` feature surface, which │
+  # │   pulls 12 optional crates (color-eyre, crossterm, ratatui,  │
+  # │   tui-input, tui-big-text, …) outside the default build's    │
+  # │   coverage. Treats every advisory as a warning; the job      │
+  # │   fails only on `--deny warnings` so a maintainer can react  │
+  # │   before the next release lands.                              │
+  # └──────────────────────────────────────────────────────────────┘
+  cargo-audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Checkout sources
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+
+      - name: Install rust 1.88.0
+        uses: dtolnay/rust-toolchain@1.88.0
+
+      - name: Cache cargo target
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        with:
+          cache-all-crates: true
+          prefix-key: ci-audit
+          workspaces: . -> target/
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Run cargo audit (default features)
+        run: cargo audit --deny warnings
+
+      - name: Run cargo audit (all features incl. tui)
+        run: |
+          # `cargo audit` reads `Cargo.lock`, which already includes the
+          # `tui`-feature transitive deps since this PR landed them as
+          # workspace-locked entries. Re-running with the same lockfile
+          # produces a consistent advisory set; the duplicate invocation
+          # is kept symmetrical with the per-feature build matrix above.
+          cargo audit --deny warnings
+
+  # ┌──────────────────────────────────────────────────────────────┐
   # │ Group D — Bombardier load benches (folded from benchmark.yml) │
   # └──────────────────────────────────────────────────────────────┘
   build-bombardier:
