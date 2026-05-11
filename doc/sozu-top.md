@@ -16,16 +16,15 @@ sozu --version       # reports `+tui` when the subcommand is linked
 
 ## Architecture at a glance
 
-- Two synchronous transport threads poll the master over the existing
-  unix command socket:
+- Four synchronous transport threads poll the master over the existing
+  unix command socket, each on its own dedicated connection:
   - **Collector** sends `QueryMetrics` every `--refresh-ms`
     (default 1 s) and pushes each `AggregatedMetrics` into a
-    bounded-1 channel with newest-wins semantics.
+    bounded-1 channel with publish-or-skip-on-backpressure semantics.
   - **Events** subscribes to the control-plane event stream (backend
-    up/down, cluster added/removed, certificate added/removed, …) on
-    a separate connection.
-  - **Listeners** polls `ListListeners` every 5 s on a third
-    connection.
+    up/down, cluster added/removed, certificate added/removed, …).
+  - **Listeners** polls `ListListeners` every 5 s.
+  - **Certs** polls `QueryCertificatesFromTheState` every 30 s.
 - A single UI thread owns the terminal, polls crossterm input on a
   30 fps cap, and synchronises frame output via DEC mode 2026
   (`BeginSynchronizedUpdate` / `EndSynchronizedUpdate`) so tmux and
@@ -46,7 +45,7 @@ Numbered tabs at the top of the screen; key digits map directly.
 | `2` | CLUSTERS | Sortable per-cluster table (cluster_id, rps, err%, p50, p99, backends_available/total). Default sort: error-rate desc. |
 | `3` | BACKENDS | Sortable per-backend table (cluster, backend, bw down/up, connections, p50, p99, requests). Default sort: bandwidth desc. |
 | `4` | LISTENERS | HTTP / HTTPS / TCP listener inventory; refreshed every 5 s. |
-| `5` | CERTS | _(reserved — lands in a follow-up; see EVENTS for cert lifecycle in the meantime.)_ |
+| `5` | CERTS | Certificate inventory by listener address + fingerprint + names; refreshed every 30 s. |
 | `6` | H2 | Active streams, ALPN H2 share, flow-control gauges, frame counters, and CVE flood-mitigation counters (`h2.flood.violation.*`). |
 | `7` | EVENTS | Colour-coded tail of `SubscribeEvents`. BACKEND_DOWN / NO_AVAILABLE_BACKENDS / WORKER_KILLED in hot, BACKEND_UP / CLUSTER_RECOVERED in cool, METRIC_DETAIL_CHANGED in accent. |
 
