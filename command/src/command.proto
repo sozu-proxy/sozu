@@ -1324,6 +1324,16 @@ message WorkerInfo {
     required uint32 id = 1;
     required int32 pid = 2;
     required RunState run_state = 3;
+    // Numeric proto-capability version, populated by the master from the
+    // SOZU_PROTO_VERSION constant baked into the worker binary at fork
+    // time. Bumped any time a new wire-affecting RequestType (or proto
+    // field) lands that callers need to gate on. Mixed-version fleets
+    // surfacing during a `UpgradeMain` flow keep their pre-upgrade
+    // version here until the worker is itself upgraded via
+    // `UpgradeWorker`. Currently captured at fork only — inherited
+    // workers' versions are NOT re-queried after `UpgradeMain`; see the
+    // `MetricDetailStatus.unsupported_workers` doc for the implication.
+    optional uint32 proto_version = 4;
 }
 
 // Runstate of a worker
@@ -1598,6 +1608,21 @@ message MetricDetailStatus {
     // worker_ids that could not decode `SetMetricDetail` (mixed-version
     // fleet during a rolling upgrade). The TUI surfaces these in the
     // status bar; the rest of the fleet still applies normally.
+    //
+    // Capability gate: the master compares each worker's recorded
+    // `WorkerInfo.proto_version` against the minimum proto version that
+    // ships `SetMetricDetail` (the master computes this from
+    // `sozu_command_lib::SOZU_PROTO_VERSION` at the dispatch site). The
+    // worker's proto version is snapshotted at fork time from the
+    // worker binary's `SOZU_PROTO_VERSION` constant; after a
+    // `UpgradeMain` re-exec the new master inherits the old worker
+    // channels but does NOT yet re-query their actual versions, so
+    // inherited workers retain the new master's compile-time version.
+    // Operators running across an `UpgradeMain` must therefore treat the
+    // `unsupported_workers` list as "best-effort during the
+    // post-UpgradeMain window" — a follow-up will add a per-worker
+    // capability handshake on Status reply. The proto field itself is
+    // wire-stable.
     repeated string unsupported_workers = 5;
 }
 
