@@ -88,18 +88,56 @@ impl Skin {
             Some(other) => other,
         };
         match Self::lookup_paths(choice).into_iter().find(|p| p.is_file()) {
-            Some(path) => match Self::from_toml(&path) {
-                Ok(skin) => (skin, None),
-                Err(e) => (
-                    Self::default_dark(),
-                    Some(format!("skin `{choice}` parse error: {e}; using default")),
-                ),
-            },
+            Some(path) => {
+                // Defence-in-depth on top of the literal-string filter in
+                // `lookup_paths`: canonicalize both the chosen file and the
+                // anchor skins directory, then require the file to live
+                // under the anchor. Defeats symlink-based escapes (a
+                // `<xdg>/sozu/skins/<name>.toml` symlink pointing at
+                // `/etc/shadow`) and TOCTOU races between `is_file()` and
+                // `from_toml`. Returning the default with a diagnostic
+                // keeps `--skin` behaviour predictable when the operator
+                // mis-set the lookup path or hit a packaging bug.
+                let Ok(resolved) = path.canonicalize() else {
+                    return (
+                        Self::default_dark(),
+                        Some(format!(
+                            "skin `{choice}` canonicalize failed; using default"
+                        )),
+                    );
+                };
+                if let Some(anchor) = Self::skins_anchor(&path)
+                    && !resolved.starts_with(&anchor)
+                {
+                    return (
+                        Self::default_dark(),
+                        Some(format!(
+                            "skin `{choice}` resolved outside skins dir; using default"
+                        )),
+                    );
+                }
+                match Self::from_toml(&resolved) {
+                    Ok(skin) => (skin, None),
+                    Err(e) => (
+                        Self::default_dark(),
+                        Some(format!("skin `{choice}` parse error: {e}; using default")),
+                    ),
+                }
+            }
             None => (
                 Self::default_dark(),
                 Some(format!("skin `{choice}` not found; using default")),
             ),
         }
+    }
+
+    /// Canonicalize the parent skins directory of a candidate skin path so
+    /// the caller can confine the resolved file underneath it. Returns
+    /// `None` when the parent cannot be canonicalized (e.g. the candidate
+    /// itself disappeared between `is_file()` and here); the caller then
+    /// falls back to the default skin with a diagnostic.
+    fn skins_anchor(candidate: &Path) -> Option<PathBuf> {
+        candidate.parent()?.canonicalize().ok()
     }
 
     /// Read + parse a skin TOML file. Public so unit tests can exercise
@@ -347,17 +385,6 @@ impl GlyphMode {
             Self::Braille
         } else {
             Self::Block
-        }
-    }
-
-    /// Eight-step ramp character set for sparkline cells. The ratatui
-    /// `Sparkline` widget pulls these via `BarSet`; we expose the strings
-    /// directly so panes that build their own column heatmap can match.
-    pub fn ramp(self) -> &'static [&'static str] {
-        match self {
-            Self::Braille => &["⠀", "⡀", "⣀", "⣄", "⣤", "⣦", "⣶", "⣷", "⣿"],
-            Self::Block => &[" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"],
-            Self::Tty => &[" ", ".", ":", "-", "=", "+", "*", "#", "@"],
         }
     }
 }
