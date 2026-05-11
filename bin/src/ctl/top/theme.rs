@@ -97,9 +97,10 @@ impl Skin {
                 // under the anchor. Defeats symlink-based escapes (a
                 // `<xdg>/sozu/skins/<name>.toml` symlink pointing at
                 // `/etc/shadow`) and TOCTOU races between `is_file()` and
-                // `from_toml`. Returning the default with a diagnostic
-                // keeps `--skin` behaviour predictable when the operator
-                // mis-set the lookup path or hit a packaging bug.
+                // `from_open_file`. Returning the default with a
+                // diagnostic keeps `--skin` behaviour predictable when
+                // the operator mis-set the lookup path or hit a
+                // packaging bug.
                 let Ok(resolved) = path.canonicalize() else {
                     return (
                         Self::default_dark(),
@@ -108,9 +109,20 @@ impl Skin {
                         )),
                     );
                 };
-                if let Some(anchor) = Self::skins_anchor(&path)
-                    && !resolved.starts_with(&anchor)
-                {
+                // Fail closed when the parent anchor cannot be resolved.
+                // The previous shape skipped the confinement check on
+                // anchor failure (race-delete of the parent, weird
+                // /proc paths, unusual fs mounts) and parsed the bare
+                // resolved file — defeating the defence-in-depth check.
+                let Some(anchor) = Self::skins_anchor(&path) else {
+                    return (
+                        Self::default_dark(),
+                        Some(format!(
+                            "skin `{choice}` anchor resolve failed; using default"
+                        )),
+                    );
+                };
+                if !resolved.starts_with(&anchor) {
                     return (
                         Self::default_dark(),
                         Some(format!(
@@ -118,7 +130,14 @@ impl Skin {
                         )),
                     );
                 }
-                match Self::from_toml(&resolved) {
+                // Close the TOCTOU window: open the file once and read
+                // through the `File` handle so the kernel can't swap a
+                // symlink target between `canonicalize` and the read.
+                // `read_to_string(&Path)` would re-resolve the path, so
+                // an attacker who controls the skins dir could swap a
+                // symlink in the gap. Going through `File::open` +
+                // `Read::read_to_string` removes that gap.
+                match Self::from_open_file(&resolved) {
                     Ok(skin) => (skin, None),
                     Err(e) => (
                         Self::default_dark(),
@@ -142,10 +161,16 @@ impl Skin {
         candidate.parent()?.canonicalize().ok()
     }
 
-    /// Read + parse a skin TOML file. Public so unit tests can exercise
-    /// the path without poking at `$XDG_CONFIG_HOME`.
-    pub fn from_toml(path: &Path) -> Result<Self, SkinError> {
-        let body = std::fs::read_to_string(path).map_err(SkinError::Io)?;
+    /// Read + parse a skin TOML file via an explicit `File::open` +
+    /// `Read::read_to_string` so the kernel cannot swap a symlink target
+    /// between `canonicalize` and the read (the gap a `read_to_string(&Path)`
+    /// helper would leave open by re-resolving the path). Called from
+    /// `resolve` after the parent-anchor confinement check.
+    pub fn from_open_file(path: &Path) -> Result<Self, SkinError> {
+        use std::io::Read;
+        let mut file = std::fs::File::open(path).map_err(SkinError::Io)?;
+        let mut body = String::new();
+        file.read_to_string(&mut body).map_err(SkinError::Io)?;
         let raw: RawSkin = toml::from_str(&body).map_err(|e| SkinError::Parse(e.to_string()))?;
         raw.into_skin().map_err(SkinError::Validate)
     }
@@ -232,7 +257,7 @@ impl Skin {
     }
 }
 
-/// Errors surfaced by `Skin::from_toml`. Kept narrow so the renderer can
+/// Errors surfaced by `Skin::from_open_file`. Kept narrow so the renderer can
 /// stringify them into a status-bar diagnostic without leaking IO details.
 #[derive(Debug, thiserror::Error)]
 pub enum SkinError {
