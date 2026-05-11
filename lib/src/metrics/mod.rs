@@ -245,6 +245,69 @@ pub const LEASE_TTL_MAX: Duration = Duration::from_secs(300);
 /// passes `0`). Matches the proto comment.
 pub const LEASE_TTL_DEFAULT: Duration = Duration::from_secs(60);
 
+/// Master-populated peer binding stored alongside each lease so subsequent
+/// `clear` requests can be authorised against the apply-time owner. The
+/// binding pairs an OS pid (from `SO_PEERCRED` on Linux, captured by the
+/// master at command-socket accept time) with the master-side connection
+/// session ULID. A clear request must present BOTH values matching the
+/// apply-time binding. A binding of `(None, None)` ("unknown") at apply
+/// time means the connection had no peer credentials available — the
+/// worker then accepts any clear for that `client_id` to preserve compat
+/// with non-Linux callers and intermediate proxies. See the proto comment
+/// on `SetMetricDetail.peer_pid` for the trust model.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PeerBinding {
+    pub pid: Option<i32>,
+    /// Session ULID rendered as a `u128` (the master's session anchor).
+    /// Stored as the raw u128 rather than the original `Ulid` to avoid
+    /// dragging that crate into the metrics-aggregator dependencies.
+    pub session_ulid: Option<u128>,
+}
+
+impl PeerBinding {
+    /// `true` when both halves are known. A fully-known binding is the
+    /// only one against which `clear` may be authorised; partial bindings
+    /// (one half `None`) degrade to "accept any clear" per the proto
+    /// contract on `SetMetricDetail.peer_pid` / `peer_session_ulid`.
+    pub fn is_known(&self) -> bool {
+        self.pid.is_some() && self.session_ulid.is_some()
+    }
+
+    /// True when `self` and `other` are compatible (same `pid` + same
+    /// `session_ulid`) AND `self.is_known()`. Used by `lease_clear` to
+    /// reject mismatched clears.
+    pub fn matches(&self, other: &PeerBinding) -> bool {
+        self.is_known() && self.pid == other.pid && self.session_ulid == other.session_ulid
+    }
+}
+
+/// One lease entry kept inside [`Aggregator::leases`]. Carries the
+/// requested cardinality level, the absolute expiry instant, and the
+/// master-supplied [`PeerBinding`] captured at apply time.
+#[derive(Clone, Copy, Debug)]
+struct LeaseEntry {
+    level: MetricDetailLevel,
+    expires_at: Instant,
+    binding: PeerBinding,
+}
+
+/// Outcome of [`Aggregator::lease_clear`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeaseClearOutcome {
+    /// The lease was found, the binding matched (or was unknown at apply
+    /// time), and the entry has been removed. Carries the worker's
+    /// previous effective level so the caller can decide whether to
+    /// emit a `MetricDetailChanged` audit event.
+    Cleared { previous_effective: MetricDetailLevel },
+    /// No lease was held by the requested `client_id`. Silent no-op.
+    NotFound,
+    /// A lease existed but the peer binding presented with the clear did
+    /// not match the apply-time binding. The lease is left intact. The
+    /// worker MUST surface this as a `FAILURE` response to discourage
+    /// guessing attacks against another operator's lease.
+    Unauthorized,
+}
+
 pub struct Aggregator {
     /// appended to metric keys, usually "sozu-"
     prefix: String,
@@ -264,7 +327,7 @@ pub struct Aggregator {
     /// lease holds the worker's effective level at-or-above its requested
     /// detail until it expires or is explicitly cleared. Multiple clients
     /// (e.g. several `sozu top` sessions) lease independently.
-    leases: HashMap<String, (MetricDetailLevel, Instant)>,
+    leases: HashMap<String, LeaseEntry>,
     /// Wall-clock anchor for the polled lease janitor. Updated on every
     /// `lease_tick` call regardless of whether expiry happened, so the
     /// caller's "is it time to tick?" check stays cheap.
@@ -347,25 +410,51 @@ impl Aggregator {
         client_id: String,
         level: MetricDetailLevel,
         ttl: Duration,
+        binding: PeerBinding,
     ) -> (MetricDetailLevel, MetricDetailLevel) {
         let bounded_ttl = ttl.min(LEASE_TTL_MAX);
         let expires_at = Instant::now() + bounded_ttl;
-        self.leases.insert(client_id, (level, expires_at));
+        self.leases.insert(
+            client_id,
+            LeaseEntry {
+                level,
+                expires_at,
+                binding,
+            },
+        );
         let previous = self.effective;
         self.recompute_effective();
         (previous, self.effective)
     }
 
-    /// Explicitly release a lease keyed by `client_id`. Returns the previous
-    /// effective level on a hit (so callers can emit an audit event), or
-    /// `None` when no lease was held by that id (silent no-op).
-    pub fn lease_clear(&mut self, client_id: &str) -> Option<MetricDetailLevel> {
-        if self.leases.remove(client_id).is_some() {
-            let previous = self.effective;
-            self.recompute_effective();
-            Some(previous)
-        } else {
-            None
+    /// Explicitly release a lease keyed by `client_id`. The clear is
+    /// authorised against the apply-time [`PeerBinding`] when one was
+    /// recorded — see [`LeaseClearOutcome`] for the three result states.
+    /// A clear request with `presented = PeerBinding::default()` matches
+    /// only leases whose apply-time binding was also unknown, preserving
+    /// compat with pre-binding callers and platforms without
+    /// `SO_PEERCRED`.
+    pub fn lease_clear(
+        &mut self,
+        client_id: &str,
+        presented: PeerBinding,
+    ) -> LeaseClearOutcome {
+        let Some(entry) = self.leases.get(client_id) else {
+            return LeaseClearOutcome::NotFound;
+        };
+        // If the apply-time binding is fully known we MUST authorise the
+        // clear against it; presenting `default()` (an empty binding) is
+        // a mismatch. If the apply-time binding is unknown (a pre-binding
+        // caller, or a non-Linux peer with no credentials), we permit
+        // any clear — there is nothing to authorise against.
+        if entry.binding.is_known() && !entry.binding.matches(&presented) {
+            return LeaseClearOutcome::Unauthorized;
+        }
+        self.leases.remove(client_id);
+        let previous = self.effective;
+        self.recompute_effective();
+        LeaseClearOutcome::Cleared {
+            previous_effective: previous,
         }
     }
 
@@ -387,7 +476,7 @@ impl Aggregator {
     pub fn lease_tick(&mut self, now: Instant) -> Option<MetricDetailLevel> {
         self.last_lease_tick = now;
         let before = self.leases.len();
-        self.leases.retain(|_, (_, expires_at)| *expires_at > now);
+        self.leases.retain(|_, entry| entry.expires_at > now);
         if self.leases.len() == before {
             return None;
         }
@@ -412,9 +501,9 @@ impl Aggregator {
     /// never on the metric-emission hot path.
     fn recompute_effective(&mut self) {
         let mut max_lease = self.configured;
-        for (_, (level, _)) in self.leases.iter() {
-            if *level > max_lease {
-                max_lease = *level;
+        for entry in self.leases.values() {
+            if entry.level > max_lease {
+                max_lease = entry.level;
             }
         }
         self.effective = max_lease;
@@ -702,6 +791,23 @@ mod tests {
         assert_eq!(agg.lease_count(), 0);
     }
 
+    /// Fully-known binding used by tests that don't otherwise care about the
+    /// peer-binding mechanic. Two distinct values (`OWNER_*` / `OTHER_*`)
+    /// let `lease_clear` tests assert authorised vs unauthorised paths.
+    fn owner_binding() -> PeerBinding {
+        PeerBinding {
+            pid: Some(1234),
+            session_ulid: Some(0x0123_4567_89ab_cdef_0123_4567_89ab_cdefu128),
+        }
+    }
+
+    fn other_binding() -> PeerBinding {
+        PeerBinding {
+            pid: Some(5678),
+            session_ulid: Some(0xfedc_ba98_7654_3210_fedc_ba98_7654_3210u128),
+        }
+    }
+
     #[test]
     fn lease_apply_elevates_effective_above_configured() {
         // Configured floor stays at Cluster; a lease for Backend lifts the
@@ -712,6 +818,7 @@ mod tests {
             "test:1".to_owned(),
             MetricDetailLevel::Backend,
             Duration::from_secs(60),
+            PeerBinding::default(),
         );
         assert_eq!(prev, MetricDetailLevel::Cluster);
         assert_eq!(new, MetricDetailLevel::Backend);
@@ -729,6 +836,7 @@ mod tests {
             "test:1".to_owned(),
             MetricDetailLevel::Cluster,
             Duration::from_secs(60),
+            PeerBinding::default(),
         );
         assert_eq!(prev, MetricDetailLevel::Backend);
         assert_eq!(new, MetricDetailLevel::Backend);
@@ -743,11 +851,13 @@ mod tests {
             "renewer".to_owned(),
             MetricDetailLevel::Backend,
             Duration::from_secs(30),
+            PeerBinding::default(),
         );
         let _ = agg.lease_apply(
             "renewer".to_owned(),
             MetricDetailLevel::Backend,
             Duration::from_secs(60),
+            PeerBinding::default(),
         );
         assert_eq!(agg.lease_count(), 1);
     }
@@ -764,17 +874,24 @@ mod tests {
             "scraper".to_owned(),
             MetricDetailLevel::Frontend,
             Duration::from_secs(60),
+            PeerBinding::default(),
         );
         let _ = agg.lease_apply(
             "topcli".to_owned(),
             MetricDetailLevel::Backend,
             Duration::from_secs(60),
+            PeerBinding::default(),
         );
         assert_eq!(agg.detail_effective(), MetricDetailLevel::Backend);
         assert_eq!(agg.lease_count(), 2);
         // Clearing the higher lease drops effective back to the lower one.
-        let prev = agg.lease_clear("topcli").unwrap();
-        assert_eq!(prev, MetricDetailLevel::Backend);
+        let outcome = agg.lease_clear("topcli", PeerBinding::default());
+        assert_eq!(
+            outcome,
+            LeaseClearOutcome::Cleared {
+                previous_effective: MetricDetailLevel::Backend,
+            }
+        );
         assert_eq!(agg.detail_effective(), MetricDetailLevel::Frontend);
         assert_eq!(agg.lease_count(), 1);
     }
@@ -787,10 +904,74 @@ mod tests {
             "real".to_owned(),
             MetricDetailLevel::Backend,
             Duration::from_secs(60),
+            PeerBinding::default(),
         );
-        assert!(agg.lease_clear("ghost").is_none());
+        assert_eq!(
+            agg.lease_clear("ghost", PeerBinding::default()),
+            LeaseClearOutcome::NotFound
+        );
         assert_eq!(agg.detail_effective(), MetricDetailLevel::Backend);
         assert_eq!(agg.lease_count(), 1);
+    }
+
+    #[test]
+    fn lease_clear_with_matching_binding_authorised() {
+        // Apply with a known binding, clear with the same binding -> Cleared.
+        let mut agg = Aggregator::new("sozu".to_owned());
+        let _ = agg.lease_apply(
+            "owner-lease".to_owned(),
+            MetricDetailLevel::Backend,
+            Duration::from_secs(60),
+            owner_binding(),
+        );
+        let outcome = agg.lease_clear("owner-lease", owner_binding());
+        assert!(matches!(outcome, LeaseClearOutcome::Cleared { .. }));
+        assert_eq!(agg.lease_count(), 0);
+    }
+
+    #[test]
+    fn lease_clear_with_mismatched_binding_is_unauthorized() {
+        // Apply with one binding, attempt clear with a different binding ->
+        // Unauthorized; lease left intact.
+        let mut agg = Aggregator::new("sozu".to_owned());
+        let _ = agg.lease_apply(
+            "owner-lease".to_owned(),
+            MetricDetailLevel::Backend,
+            Duration::from_secs(60),
+            owner_binding(),
+        );
+        let outcome = agg.lease_clear("owner-lease", other_binding());
+        assert_eq!(outcome, LeaseClearOutcome::Unauthorized);
+        assert_eq!(agg.lease_count(), 1);
+    }
+
+    #[test]
+    fn lease_clear_unknown_apply_binding_accepts_any_clear() {
+        // Pre-binding / non-Linux apply -> any clear authorised.
+        let mut agg = Aggregator::new("sozu".to_owned());
+        let _ = agg.lease_apply(
+            "legacy".to_owned(),
+            MetricDetailLevel::Backend,
+            Duration::from_secs(60),
+            PeerBinding::default(),
+        );
+        let outcome = agg.lease_clear("legacy", owner_binding());
+        assert!(matches!(outcome, LeaseClearOutcome::Cleared { .. }));
+        assert_eq!(agg.lease_count(), 0);
+    }
+
+    #[test]
+    fn lease_clear_known_apply_rejects_default_clear() {
+        // Known apply binding -> a default ("unknown") clear is rejected.
+        let mut agg = Aggregator::new("sozu".to_owned());
+        let _ = agg.lease_apply(
+            "owner-lease".to_owned(),
+            MetricDetailLevel::Backend,
+            Duration::from_secs(60),
+            owner_binding(),
+        );
+        let outcome = agg.lease_clear("owner-lease", PeerBinding::default());
+        assert_eq!(outcome, LeaseClearOutcome::Unauthorized);
     }
 
     #[test]
@@ -806,11 +987,19 @@ mod tests {
         // Inject directly into the table to control expires_at deterministically.
         agg.leases.insert(
             "expired".to_owned(),
-            (MetricDetailLevel::Backend, now - Duration::from_secs(1)),
+            LeaseEntry {
+                level: MetricDetailLevel::Backend,
+                expires_at: now - Duration::from_secs(1),
+                binding: PeerBinding::default(),
+            },
         );
         agg.leases.insert(
             "live".to_owned(),
-            (MetricDetailLevel::Frontend, now + Duration::from_secs(60)),
+            LeaseEntry {
+                level: MetricDetailLevel::Frontend,
+                expires_at: now + Duration::from_secs(60),
+                binding: PeerBinding::default(),
+            },
         );
         agg.recompute_effective();
         assert_eq!(agg.detail_effective(), MetricDetailLevel::Backend);
@@ -833,9 +1022,14 @@ mod tests {
         let mut agg = Aggregator::new("sozu".to_owned());
         let too_long = Duration::from_secs(LEASE_TTL_MAX.as_secs() * 4);
         let now = Instant::now();
-        let _ = agg.lease_apply("greedy".to_owned(), MetricDetailLevel::Backend, too_long);
-        let (_, expires_at) = agg.leases.get("greedy").unwrap();
+        let _ = agg.lease_apply(
+            "greedy".to_owned(),
+            MetricDetailLevel::Backend,
+            too_long,
+            PeerBinding::default(),
+        );
+        let entry = agg.leases.get("greedy").unwrap();
         // Stored expiry should not exceed `now + LEASE_TTL_MAX + a small slop`.
-        assert!(*expires_at <= now + LEASE_TTL_MAX + Duration::from_millis(50));
+        assert!(entry.expires_at <= now + LEASE_TTL_MAX + Duration::from_millis(50));
     }
 }
