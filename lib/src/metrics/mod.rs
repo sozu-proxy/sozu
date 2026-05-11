@@ -333,6 +333,14 @@ impl Aggregator {
     /// `ttl` is clamped to [`LEASE_TTL_MAX`]. Returns `(previous_effective,
     /// new_effective)` so callers can decide whether to emit a
     /// `MetricDetailChanged` audit event.
+    ///
+    /// The proto contract on `SetMetricDetail.ttl_seconds` is that the worker
+    /// **rejects** out-of-range values with a `FAILURE` response — that
+    /// enforcement lives at the dispatch site in `lib/src/server.rs::notify`.
+    /// This clamp is defence-in-depth for callers that bypass the dispatch
+    /// (proto fuzzing, future internal use); a request that survives the
+    /// rejection gate is by construction within bounds, so the clamp is a
+    /// no-op on the happy path.
     pub fn lease_apply(
         &mut self,
         client_id: String,
