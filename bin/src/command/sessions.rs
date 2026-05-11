@@ -356,6 +356,15 @@ pub struct WorkerSession {
     /// meant to send listeners to the worker upon start
     pub scm_socket: ScmSocket,
     pub token: Token,
+    /// Numeric proto-capability version of this worker, recorded at fork
+    /// time from the binary's compile-time [`sozu_command_lib::SOZU_PROTO_VERSION`]
+    /// constant. After a `UpgradeMain` the new master inherits the old
+    /// workers' channels but does not re-query their proto version, so
+    /// this field reflects the *new* master's compile-time value rather
+    /// than the actual worker's. Callers consulting it for capability
+    /// gating must treat that residual as "version unknown" — see the
+    /// proto comment on `MetricDetailStatus.unsupported_workers`.
+    pub proto_version: u32,
 }
 
 /// The return type of the ready method
@@ -382,6 +391,10 @@ impl WorkerSession {
             run_state: RunState::Running,
             scm_socket,
             token,
+            // Fork-time snapshot of the binary's compile-time proto
+            // version. See the struct field doc for the inherited-after-
+            // UpgradeMain caveat.
+            proto_version: sozu_command_lib::SOZU_PROTO_VERSION,
         }
     }
 
@@ -428,6 +441,7 @@ impl WorkerSession {
             id: self.id,
             pid: self.pid,
             run_state: run_state as i32,
+            proto_version: Some(self.proto_version),
         }
     }
 
