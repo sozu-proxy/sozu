@@ -88,9 +88,11 @@ harnesses for a single feature cell function:
 // Cell function: takes (frontend_h2, backend_h2), returns State.
 fn try_basic_auth_cell(frontend_h2: bool, backend_h2: bool) -> State { ... }
 
-// Macro emits try_basic_auth_h1_h1 / _h1_h2 / _h2_h1 / _h2_h2 wrappers
-// plus matching test_basic_auth_h1_h1 / _h1_h2 / _h2_h1 / _h2_h2
+// Macro emits `pub mod basic_auth { ... }` containing
+// try_h1_h1 / try_h1_h2 / try_h2_h1 / try_h2_h2 wrappers plus
+// matching test_h1_h1 / test_h1_h2 / test_h2_h1 / test_h2_h2
 // `#[test]` harnesses that wrap the cell in `repeat_until_error_or`.
+// `cargo test basic_auth` filters all four cells.
 protocol_pair_matrix!(basic_auth, try_basic_auth_cell, "basic auth");
 ```
 
