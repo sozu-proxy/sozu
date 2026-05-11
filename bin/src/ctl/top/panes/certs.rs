@@ -60,12 +60,12 @@ pub fn render(f: &mut Frame<'_>, area: Rect, app: &App, skin: &Skin) {
                 let tail = summary.fingerprint.len() - 12;
                 format!("…{}", &summary.fingerprint[tail..])
             } else {
-                summary.fingerprint.clone()
+                summary.fingerprint.to_owned()
             };
             rows.push(
                 Row::new(vec![
-                    Cell::from(addr.clone()),
-                    Cell::from(summary.domain.clone()),
+                    Cell::from(addr.to_owned()),
+                    Cell::from(summary.domain.to_owned()),
                     Cell::from(fp_suffix),
                 ])
                 .style(Style::default().fg(skin.secondary)),

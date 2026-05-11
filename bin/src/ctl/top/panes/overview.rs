@@ -166,9 +166,9 @@ fn format_pct_simple(ring: &super::super::app::SparkRing) -> String {
 fn subtitle_for_rps(app: &App) -> String {
     let trend = trend_glyph(&app.overview.rps);
     format!(
-        "{} client conns · {} active sessions",
+        "{} client conns · {} active sessions · {trend} 60 s",
         app.overview.client_connections, app.overview.active_sessions,
-    ) + &format!(" · {trend} 60 s")
+    )
 }
 
 fn subtitle_for_latency(app: &App) -> String {

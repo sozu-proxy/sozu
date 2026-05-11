@@ -51,7 +51,7 @@ pub fn render(f: &mut Frame<'_>, area: Rect, app: &App, skin: &Skin) {
     for (addr, cfg) in &listeners.http_listeners {
         rows.push(Row::new(vec![
             Cell::from("HTTP"),
-            Cell::from(addr.clone()),
+            Cell::from(addr.to_owned()),
             Cell::from(format!("active={}", cfg.active)),
         ]));
     }
@@ -61,7 +61,7 @@ pub fn render(f: &mut Frame<'_>, area: Rect, app: &App, skin: &Skin) {
         rows.push(
             Row::new(vec![
                 Cell::from("HTTPS"),
-                Cell::from(addr.clone()),
+                Cell::from(addr.to_owned()),
                 Cell::from(format!("active={} · alpn={}", cfg.active, alpn)),
             ])
             .style(Style::default().fg(skin.secondary)),
@@ -71,7 +71,7 @@ pub fn render(f: &mut Frame<'_>, area: Rect, app: &App, skin: &Skin) {
         rows.push(
             Row::new(vec![
                 Cell::from("TCP"),
-                Cell::from(addr.clone()),
+                Cell::from(addr.to_owned()),
                 Cell::from(format!("active={}", cfg.active)),
             ])
             .style(Style::default().fg(skin.secondary)),
