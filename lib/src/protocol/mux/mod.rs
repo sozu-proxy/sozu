@@ -857,6 +857,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                         backend_id: Some(backend_borrow.backend_id.to_owned()),
                                         address: Some(backend_borrow.address.into()),
                                         cluster_id: Some(cluster_id.to_owned()),
+                            metric_detail: None,
                                     });
                                 }
 
@@ -991,6 +992,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                         backend_id: Some(backend_borrow.backend_id.to_owned()),
                                         address: Some(backend_borrow.address.into()),
                                         cluster_id: Some(cluster_id.to_owned()),
+                            metric_detail: None,
                                     });
                                 }
                                 trace!(

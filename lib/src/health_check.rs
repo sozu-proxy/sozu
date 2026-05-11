@@ -482,6 +482,7 @@ impl HealthChecker {
                     cluster_id: Some(cluster_id.to_owned()),
                     backend_id: Some(backend_id.to_owned()),
                     address: Some(address.into()),
+                            metric_detail: None,
                 });
             }
             count!(names::health_check::SUCCESS, 1);
@@ -508,6 +509,7 @@ impl HealthChecker {
                     cluster_id: Some(cluster_id.to_owned()),
                     backend_id: Some(backend_id.to_owned()),
                     address: Some(address.into()),
+                            metric_detail: None,
                 });
             }
             count!(names::health_check::FAILURE, 1);
