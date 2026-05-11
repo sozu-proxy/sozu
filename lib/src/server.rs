@@ -1293,9 +1293,7 @@ impl Server {
             let mut m = metrics.borrow_mut();
             if m.lease_tick_due(now) {
                 let _previous = m.lease_tick(now);
-                // TODO(sozu-top week 2): emit METRIC_DETAIL_CHANGED audit
-                // event when `_previous` is `Some` (effective level moved
-                // because at least one lease expired).
+                // Worker-local transition; not audited (see SetMetricDetail proto doc).
             }
         });
         match &message.content.request_type {
@@ -1336,8 +1334,7 @@ impl Server {
                 if req.clear.unwrap_or(false) {
                     METRICS.with(|metrics| {
                         let _previous = metrics.borrow_mut().lease_clear(&req.client_id);
-                        // TODO(sozu-top week 2): emit METRIC_DETAIL_CHANGED
-                        // audit event when `_previous != effective`.
+                        // Worker-local transition; not audited (see SetMetricDetail proto doc).
                         push_queue(WorkerResponse::ok(message.id.clone()));
                     });
                     return;
@@ -1365,6 +1362,25 @@ impl Server {
                     }
                 };
                 let level = MetricDetailLevel::from(detail_enum);
+                // Bound the worst case BEFORE we touch the aggregator: the
+                // proto contract on `SetMetricDetail.ttl_seconds` says the
+                // worker rejects values larger than `LEASE_TTL_MAX` so a
+                // stuck operator-side renewer (or a buggy third-party client)
+                // cannot lock the worker into elevated cardinality. The
+                // `Aggregator::lease_apply` clamp is still in place as a
+                // defence-in-depth net for code paths that bypass this
+                // dispatch (proto fuzzing, future internal callers).
+                if let Some(t) = req.ttl_seconds
+                    && u64::from(t) > crate::metrics::LEASE_TTL_MAX.as_secs()
+                {
+                    let msg = format!(
+                        "SetMetricDetail: ttl_seconds={t} exceeds LEASE_TTL_MAX={}",
+                        crate::metrics::LEASE_TTL_MAX.as_secs()
+                    );
+                    error!("{}", msg);
+                    push_queue(WorkerResponse::error(message.id.clone(), msg));
+                    return;
+                }
                 let ttl_seconds = req
                     .ttl_seconds
                     .filter(|&t| t > 0)
@@ -1374,8 +1390,7 @@ impl Server {
                     let _ = metrics
                         .borrow_mut()
                         .lease_apply(req.client_id.clone(), level, ttl);
-                    // TODO(sozu-top week 2): emit METRIC_DETAIL_CHANGED audit
-                    // event when the previous != new effective level.
+                    // Worker-local transition; not audited (see SetMetricDetail proto doc).
                     push_queue(WorkerResponse::ok(message.id.clone()));
                 });
                 return;
