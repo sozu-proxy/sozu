@@ -16,6 +16,7 @@ use sozu_command::{
     logging::{LogContext, ansi_palette},
 };
 
+use crate::metrics::names;
 use crate::{
     Readiness, Ready, SessionMetrics, SessionResult, StateResult, protocol::SessionState,
     timer::TimeoutContainer,
@@ -190,7 +191,7 @@ impl TlsHandshake {
                 self.frontend_readiness.event.insert(Ready::READABLE);
                 self.frontend_readiness.interest.insert(Ready::WRITABLE);
                 if let Some(elapsed_ms) = self.record_handshake_duration_ms() {
-                    time!("tls.handshake_ms", elapsed_ms);
+                    time!(names::tls::HANDSHAKE_MS, elapsed_ms);
                 }
                 SessionResult::Upgrade
             }
@@ -251,14 +252,14 @@ impl TlsHandshake {
         } else if self.session.wants_read() {
             self.frontend_readiness.interest.insert(Ready::READABLE);
             if let Some(elapsed_ms) = self.record_handshake_duration_ms() {
-                time!("tls.handshake_ms", elapsed_ms);
+                time!(names::tls::HANDSHAKE_MS, elapsed_ms);
             }
             SessionResult::Upgrade
         } else {
             self.frontend_readiness.interest.insert(Ready::WRITABLE);
             self.frontend_readiness.interest.insert(Ready::READABLE);
             if let Some(elapsed_ms) = self.record_handshake_duration_ms() {
-                time!("tls.handshake_ms", elapsed_ms);
+                time!(names::tls::HANDSHAKE_MS, elapsed_ms);
             }
             SessionResult::Upgrade
         }
@@ -400,7 +401,7 @@ impl SessionState for TlsHandshake {
                 MAX_LOOP_ITERATIONS
             );
 
-            incr!("http.infinite_loop.error");
+            incr!(names::http::INFINITE_LOOP_ERROR);
             self.print_state("HTTPS");
 
             return SessionResult::Close;

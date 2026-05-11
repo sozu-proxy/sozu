@@ -15,6 +15,7 @@ use sozu_command::{
     logging::{EndpointRecord, LogContext, ansi_palette},
 };
 
+use crate::metrics::names;
 use crate::{
     L7Proxy, ListenerHandler, Protocol, Readiness, SessionMetrics, SessionResult, StateResult,
     backends::Backend,
@@ -311,7 +312,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         metrics.register_end_of_session(&context);
         log_access!(
             error,
-            on_failure: { incr!("unsent-access-logs") },
+            on_failure: { incr!(names::access_logs::UNSENT) },
             message,
             context,
             session_address: self.get_session_address(),
@@ -346,7 +347,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
     }
 
     pub fn log_request_error(&self, metrics: &SessionMetrics, message: &str) {
-        incr!("pipe.errors");
+        incr!(names::pipe::ERRORS);
         error!(
             "{} Could not process request properly got: {}",
             log_context!(self),
@@ -507,7 +508,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             //FIXME: replace with copy()
             self.frontend_buffer.fill(sz);
 
-            count!("bytes_in", sz as i64);
+            count!(names::backend::BYTES_IN, sz as i64);
             metrics.bin += sz;
 
             if self.frontend_buffer.available_space() == 0 {
@@ -575,7 +576,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         while res == SocketResult::Continue {
             // no more data in buffer, stop here
             if self.backend_buffer.available_data() == 0 {
-                count!("bytes_out", sz as i64);
+                count!(names::backend::BYTES_OUT, sz as i64);
                 metrics.bout += sz;
                 self.backend_readiness.interest.insert(Ready::READABLE);
                 self.frontend_readiness.interest.remove(Ready::WRITABLE);
@@ -596,7 +597,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
 
             if !self.check_connections() {
                 metrics.bout += sz;
-                count!("bytes_out", sz as i64);
+                count!(names::backend::BYTES_OUT, sz as i64);
                 self.frontend_readiness.reset();
                 self.backend_readiness.reset();
                 self.log_request_success(metrics);
@@ -605,7 +606,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         }
 
         if sz > 0 {
-            count!("bytes_out", sz as i64);
+            count!(names::backend::BYTES_OUT, sz as i64);
             self.backend_readiness.interest.insert(Ready::READABLE);
             metrics.bout += sz;
         }
@@ -665,7 +666,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
                 if self.frontend_buffer.available_data() == 0 {
                     self.frontend_readiness.interest.insert(Ready::READABLE);
                     self.backend_readiness.interest.remove(Ready::WRITABLE);
-                    count!("back_bytes_out", sz as i64);
+                    count!(names::backend::BACK_BYTES_OUT, sz as i64);
                     metrics.backend_bout += sz;
                     return SessionResult::Continue;
                 }
@@ -685,7 +686,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             }
         }
 
-        count!("back_bytes_out", sz as i64);
+        count!(names::backend::BACK_BYTES_OUT, sz as i64);
         metrics.backend_bout += sz;
 
         if !self.check_connections() {
@@ -749,7 +750,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             }
             if size > 0 {
                 self.frontend_readiness.interest.insert(Ready::WRITABLE);
-                count!("back_bytes_in", size as i64);
+                count!(names::backend::BACK_BYTES_IN, size as i64);
                 metrics.backend_bin += size;
             }
 
@@ -819,7 +820,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
 
         if sz > 0 {
             self.splice_pipe.as_mut().unwrap().in_pipe_pending += sz;
-            count!("bytes_in", sz as i64);
+            count!(names::backend::BYTES_IN, sz as i64);
             metrics.bin += sz;
             self.backend_readiness.interest.insert(Ready::WRITABLE);
         } else {
@@ -883,7 +884,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             let pending = self.splice_out_pending();
             // no more data in pipe, stop here
             if pending == 0 {
-                count!("bytes_out", sz as i64);
+                count!(names::backend::BYTES_OUT, sz as i64);
                 metrics.bout += sz;
                 self.backend_readiness.interest.insert(Ready::READABLE);
                 self.frontend_readiness.interest.remove(Ready::WRITABLE);
@@ -909,7 +910,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
 
             if !self.check_connections() {
                 metrics.bout += sz;
-                count!("bytes_out", sz as i64);
+                count!(names::backend::BYTES_OUT, sz as i64);
                 self.frontend_readiness.reset();
                 self.backend_readiness.reset();
                 self.log_request_success(metrics);
@@ -918,7 +919,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         }
 
         if sz > 0 {
-            count!("bytes_out", sz as i64);
+            count!(names::backend::BYTES_OUT, sz as i64);
             self.backend_readiness.interest.insert(Ready::READABLE);
             metrics.bout += sz;
         }
@@ -976,7 +977,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             if pending == 0 {
                 self.frontend_readiness.interest.insert(Ready::READABLE);
                 self.backend_readiness.interest.remove(Ready::WRITABLE);
-                count!("back_bytes_out", sz as i64);
+                count!(names::backend::BACK_BYTES_OUT, sz as i64);
                 metrics.backend_bout += sz;
                 return SessionResult::Continue;
             }
@@ -1001,7 +1002,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             }
         }
 
-        count!("back_bytes_out", sz as i64);
+        count!(names::backend::BACK_BYTES_OUT, sz as i64);
         metrics.backend_bout += sz;
 
         if !self.check_connections() {
@@ -1071,7 +1072,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         if size > 0 {
             self.splice_pipe.as_mut().unwrap().out_pipe_pending += size;
             self.frontend_readiness.interest.insert(Ready::WRITABLE);
-            count!("back_bytes_in", size as i64);
+            count!(names::backend::BACK_BYTES_IN, size as i64);
             metrics.backend_bin += size;
         }
 
@@ -1231,7 +1232,7 @@ impl<Front: SocketHandler, L: ListenerHandler> SessionState for Pipe<Front, L> {
                 MAX_LOOP_ITERATIONS
             );
 
-            incr!("http.infinite_loop.error");
+            incr!(names::http::INFINITE_LOOP_ERROR);
             self.print_state(self.protocol_string());
 
             return SessionResult::Close;

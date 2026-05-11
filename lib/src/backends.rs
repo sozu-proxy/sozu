@@ -15,6 +15,7 @@ use sozu_command::{
     state::ClusterId,
 };
 
+use crate::metrics::names;
 use crate::{
     PeakEWMA,
     load_balancing::{LeastLoaded, LoadBalancingAlgorithm, PowerOfTwo, Random, RoundRobin},
@@ -325,7 +326,12 @@ impl BackendMap {
             Some(cluster_id),
             None
         );
-        gauge!("cluster.total_backends", total, Some(cluster_id), None);
+        gauge!(
+            names::cluster::TOTAL_BACKENDS,
+            total,
+            Some(cluster_id),
+            None
+        );
 
         let new_state = if total > 0 && available == 0 {
             ClusterAvailability::AllDown
@@ -340,7 +346,11 @@ impl BackendMap {
         match (prev, new_state) {
             (ClusterAvailability::Available, ClusterAvailability::AllDown) => {
                 error!("cluster {}: all {} backends are down", cluster_id, total);
-                incr!("cluster.no_available_backends", Some(cluster_id), None);
+                incr!(
+                    names::cluster::NO_AVAILABLE_BACKENDS,
+                    Some(cluster_id),
+                    None
+                );
                 push_event(Event {
                     kind: EventKind::NoAvailableBackends as i32,
                     cluster_id: Some(cluster_id.to_owned()),
@@ -353,7 +363,7 @@ impl BackendMap {
                     "cluster {}: backends recovered ({}/{} available)",
                     cluster_id, available, total
                 );
-                incr!("cluster.available_recovered", Some(cluster_id), None);
+                incr!(names::cluster::AVAILABLE_RECOVERED, Some(cluster_id), None);
                 push_event(Event {
                     kind: EventKind::ClusterRecovered as i32,
                     cluster_id: Some(cluster_id.to_owned()),
@@ -756,7 +766,7 @@ impl BackendList {
             );
             self.fail_open_warned = true;
         }
-        count!("backends.fail_open", 1);
+        count!(names::backend::FAIL_OPEN, 1);
 
         self.load_balancing.next_available_backend(&mut backends)
     }

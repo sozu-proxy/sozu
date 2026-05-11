@@ -34,6 +34,7 @@ use sozu_command::{
     state::ConfigState,
 };
 
+use crate::metrics::names;
 use crate::{
     AcceptError, Protocol, ProxyConfiguration, ProxySession, SessionIsToBeClosed,
     backends::{Backend, BackendMap},
@@ -372,7 +373,7 @@ impl SessionManager {
     pub fn check_limits(&mut self) -> bool {
         if self.nb_connections >= self.max_connections {
             error!("max number of session connection reached, flushing the accept queue");
-            gauge!("accept_queue.backpressure", 1);
+            gauge!(names::accept_queue::BACKPRESSURE, 1);
             self.can_accept = false;
             return false;
         }
@@ -383,7 +384,7 @@ impl SessionManager {
                 "nb_connections: {}, max_connections: {}",
                 self.nb_connections, self.max_connections
             );
-            gauge!("accept_queue.backpressure", 1);
+            gauge!(names::accept_queue::BACKPRESSURE, 1);
             self.can_accept = false;
 
             return false;
@@ -404,7 +405,7 @@ impl SessionManager {
         // `server.live` so all proxy gauges advance in lock-step. Keeping
         // `client.connections` per-event preserves the high-resolution
         // signal scrapers expect.
-        gauge!("client.connections", self.nb_connections);
+        gauge!(names::client::CONNECTIONS, self.nb_connections);
     }
 
     /// Decrements the number of sessions, start accepting new connections
@@ -412,7 +413,7 @@ impl SessionManager {
     pub fn decr(&mut self) {
         assert!(self.nb_connections != 0);
         self.nb_connections -= 1;
-        gauge!("client.connections", self.nb_connections);
+        gauge!(names::client::CONNECTIONS, self.nb_connections);
 
         // do not be ready to accept right away, wait until we get back to 10% capacity
         if !self.can_accept && self.nb_connections < self.max_connections * 90 / 100 {
@@ -420,7 +421,7 @@ impl SessionManager {
                 "nb_connections = {}, max_connections = {}, starting to accept again",
                 self.nb_connections, self.max_connections
             );
-            gauge!("accept_queue.backpressure", 0);
+            gauge!(names::accept_queue::BACKPRESSURE, 0);
             self.can_accept = true;
         }
     }
@@ -806,7 +807,10 @@ impl Server {
             }
 
             let after_epoll = Instant::now();
-            time!("epoll_time", (after_epoll - self.loop_start).as_millis());
+            time!(
+                names::event_loop::EPOLL_TIME,
+                (after_epoll - self.loop_start).as_millis()
+            );
             self.loop_start = after_epoll;
 
             self.send_queue();
@@ -919,8 +923,8 @@ impl Server {
                 let slab_capacity = sessions.slab.capacity();
                 let accept_threshold = sessions.accept_slab_threshold();
 
-                gauge!("client.connections", nb_connections);
-                gauge!("client.connections_max", max_connections);
+                gauge!(names::client::CONNECTIONS, nb_connections);
+                gauge!(names::client::CONNECTIONS_MAX, max_connections);
                 if max_connections > 0 {
                     gauge!(
                         "client.connections_percent",
@@ -928,10 +932,10 @@ impl Server {
                     );
                 }
 
-                gauge!("slab.entries", slab_len);
-                gauge!("slab.capacity", slab_capacity);
+                gauge!(names::slab::ENTRIES, slab_len);
+                gauge!(names::slab::CAPACITY, slab_capacity);
                 if slab_capacity > 0 {
-                    gauge!("slab.usage_percent", slab_len * 100 / slab_capacity);
+                    gauge!(names::slab::USAGE_PERCENT, slab_len * 100 / slab_capacity);
                 }
                 if accept_threshold > 0 {
                     gauge!(
@@ -949,10 +953,10 @@ impl Server {
                 let pool = self.pool.borrow();
                 let used = pool.inner.used();
                 let capacity = pool.inner.capacity();
-                gauge!("buffer.in_use", used);
-                gauge!("buffer.capacity", capacity);
+                gauge!(names::buffer::IN_USE, used);
+                gauge!(names::buffer::CAPACITY, capacity);
                 if capacity > 0 {
-                    gauge!("buffer.usage_percent", used * 100 / capacity);
+                    gauge!(names::buffer::USAGE_PERCENT, used * 100 / capacity);
                 }
             }
             // 1Hz tick for `accept_queue.saturated_seconds`. Increments once
@@ -965,7 +969,7 @@ impl Server {
             let now = Instant::now();
             if now.duration_since(self.last_saturation_tick) >= ACCEPT_SATURATION_TICK {
                 if !self.sessions.borrow().can_accept {
-                    incr!("accept_queue.saturated_seconds");
+                    incr!(names::accept_queue::SATURATED_SECONDS);
                 }
                 self.last_saturation_tick = now;
             }
@@ -1009,7 +1013,10 @@ impl Server {
 
     fn reset_loop_time_and_get_timeout(&mut self) -> Option<Duration> {
         let now = Instant::now();
-        time!("event_loop_time", (now - self.loop_start).as_millis());
+        time!(
+            names::event_loop::EVENT_LOOP_TIME,
+            (now - self.loop_start).as_millis()
+        );
 
         let mut timeout = match self.should_poll_at.as_ref() {
             None => self.poll_timeout,
@@ -1130,7 +1137,7 @@ impl Server {
         }
 
         let zombie_count = zombie_tokens.len() as i64;
-        count!("zombies", zombie_count);
+        count!(names::misc::ZOMBIES, zombie_count);
 
         let remaining_count = self.shut_down_sessions_by_frontend_tokens(zombie_tokens);
         info!(
@@ -2145,7 +2152,7 @@ impl Server {
                     // peer raced to close — recorded as `None` and silently
                     // skipped for the per-source counter.
                     let peer = sock.peer_addr().ok();
-                    incr!("listener.accepted.total");
+                    incr!(names::listener::ACCEPTED_TOTAL);
                     incr!(proto_key);
                     if let Some(peer_addr) = peer.as_ref() {
                         incr!(per_source_bucket(peer_addr));
@@ -2173,15 +2180,15 @@ impl Server {
             }
         }
 
-        gauge!("accept_queue.connections", self.accept_queue.len());
+        gauge!(names::accept_queue::CONNECTIONS, self.accept_queue.len());
     }
 
     pub fn create_sessions(&mut self) {
         while let Some((sock, token, protocol, timestamp, _peer)) = self.accept_queue.pop_back() {
             let wait_time = Instant::now() - timestamp;
-            time!("accept_queue.wait_time", wait_time.as_millis());
+            time!(names::accept_queue::WAIT_TIME, wait_time.as_millis());
             if wait_time > self.accept_queue_timeout {
-                incr!("accept_queue.timeout");
+                incr!(names::accept_queue::TIMEOUT);
                 continue;
             }
 
@@ -2191,7 +2198,7 @@ impl Server {
                 // `listener.connection_capped` counts the popped socket so
                 // the counter aligns with `check_limits` invocations rather
                 // than with queue depth at the time of refusal.
-                incr!("listener.connection_capped");
+                incr!(names::listener::CONNECTION_CAPPED);
 
                 if !self.evict_on_queue_full {
                     break;
@@ -2224,7 +2231,7 @@ impl Server {
                     break;
                 }
 
-                count!("sessions.evicted", evicted as i64);
+                count!(names::sessions::EVICTED, evicted as i64);
                 warn!(
                     "evicted {} least recently active sessions to make room",
                     evicted
@@ -2276,7 +2283,7 @@ impl Server {
             self.sessions.borrow_mut().incr();
         }
 
-        gauge!("accept_queue.connections", self.accept_queue.len());
+        gauge!(names::accept_queue::CONNECTIONS, self.accept_queue.len());
     }
 
     pub fn ready(&mut self, token: Token, events: Ready) {

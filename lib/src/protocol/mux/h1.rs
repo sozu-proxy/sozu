@@ -10,6 +10,7 @@ use std::{io::IoSlice, time::Instant};
 use rusty_ulid::Ulid;
 use sozu_command::{logging::ansi_palette, ready::Ready};
 
+use crate::metrics::names;
 use crate::{
     L7ListenerHandler, ListenerHandler, Readiness,
     protocol::mux::{
@@ -171,7 +172,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                 log_module_context!(),
                 stream_id
             );
-            incr!("h1.backend_eof_before_message_complete");
+            incr!(names::h1::BACKEND_EOF_BEFORE_MESSAGE_COMPLETE);
             kawa.parsing_phase
                 .error(kawa::ParsingErrorKind::Processing {
                     message: "INTERNAL_ERROR",
@@ -269,7 +270,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         if kawa.is_error() {
             match self.position {
                 Position::Client(..) => {
-                    incr!("http.backend_parse_errors");
+                    incr!(names::http::BACKEND_PARSE_ERRORS);
                     let StreamState::Linked(token) = stream.state else {
                         error!(
                             "{} client stream in error is not in Linked state",
@@ -282,7 +283,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                     endpoint.end_stream(token, global_stream_id, context);
                 }
                 Position::Server => {
-                    incr!("http.frontend_parse_errors");
+                    incr!(names::http::FRONTEND_PARSE_ERRORS);
                     let answers = answers_rc.borrow();
                     set_default_answer(stream, &mut self.readiness, 400, &answers);
                 }
@@ -356,8 +357,8 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                 }
                 self.requests += 1;
                 trace!("{} REQUESTS: {}", log_context!(self), self.requests);
-                incr!("http.requests");
-                gauge_add!("http.active_requests", 1);
+                incr!(names::http::REQUESTS);
+                gauge_add!(names::http::ACTIVE_REQUESTS, 1);
                 parts.metrics.service_start();
                 // Set request_counted after the last use of `parts` to satisfy the borrow checker
                 stream.request_counted = true;
@@ -552,7 +553,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                         }
                         _ => {}
                     }
-                    incr!("http.e2e.http11");
+                    incr!(names::http::E2E_HTTP11);
                     stream.metrics.backend_stop();
                     let client_rtt = socket_rtt(self.socket.socket_ref());
                     let server_rtt = stream
@@ -606,8 +607,8 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                                 set_default_answer(stream, &mut self.readiness, 400, &answers);
                             } else if is_main {
                                 self.requests += 1;
-                                incr!("http.requests");
-                                gauge_add!("http.active_requests", 1);
+                                incr!(names::http::REQUESTS);
+                                gauge_add!(names::http::ACTIVE_REQUESTS, 1);
                                 stream.metrics.service_start();
                                 stream.request_counted = true;
                                 stream.state = StreamState::Link;

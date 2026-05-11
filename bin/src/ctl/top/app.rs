@@ -21,6 +21,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
 use sozu_command_lib::proto::command::{AggregatedMetrics, FilteredMetrics, filtered_metrics};
+use sozu_lib::metrics::names;
 
 use super::theme::GlyphMode;
 use super::transport::{CertsSnapshot, ListenersSnapshot, Snapshot, TopEvent};
@@ -267,7 +268,7 @@ impl PulseTracker {
             for bm in &cm.backends {
                 let available = bm
                     .metrics
-                    .get("backend.available")
+                    .get(names::backend::AVAILABLE)
                     .and_then(|m| match m.inner.as_ref()? {
                         filtered_metrics::Inner::Gauge(v) => Some(*v),
                         _ => None,
@@ -617,25 +618,25 @@ impl App {
             .map(|(id, cm)| {
                 let requests = count_value(cm.cluster.get("requests")).unwrap_or(0);
                 let errors_5xx: i64 = [
-                    "http.status.500",
-                    "http.status.502",
-                    "http.status.503",
-                    "http.status.504",
-                    "http.status.507",
+                    names::http_status::S500,
+                    names::http_status::S502,
+                    names::http_status::S503,
+                    names::http_status::S504,
+                    names::http_status::S507,
                 ]
                 .iter()
                 .filter_map(|k| count_value(cm.cluster.get(*k)))
                 .sum();
                 let p99_ms =
-                    percentile_p99_ms(cm.cluster.get("backend_response_time")).unwrap_or(0);
+                    percentile_p99_ms(cm.cluster.get(names::backend::RESPONSE_TIME)).unwrap_or(0);
                 let p50_ms =
-                    percentile_p50_ms(cm.cluster.get("backend_response_time")).unwrap_or(0);
+                    percentile_p50_ms(cm.cluster.get(names::backend::RESPONSE_TIME)).unwrap_or(0);
                 // Backends-up vs backends-total; both are gauges and so
                 // survive the hourly counter clear.
                 let backends_total =
-                    gauge_value(cm.cluster.get("cluster.total_backends")).unwrap_or(0) as u32;
+                    gauge_value(cm.cluster.get(names::cluster::TOTAL_BACKENDS)).unwrap_or(0) as u32;
                 let backends_available =
-                    gauge_value(cm.cluster.get("backend.available")).unwrap_or(0) as u32;
+                    gauge_value(cm.cluster.get(names::backend::AVAILABLE)).unwrap_or(0) as u32;
                 let error_rate_pct = if requests > 0 {
                     (errors_5xx as f64 / requests as f64) * 100.0
                 } else {
@@ -690,13 +691,18 @@ impl App {
                 rows.push(BackendRow {
                     cluster_id: cluster_id.clone(),
                     backend_id: bm.backend_id.clone(),
-                    back_bytes_in: count_value(bm.metrics.get("back_bytes_in")).unwrap_or(0) as u64,
-                    back_bytes_out: count_value(bm.metrics.get("back_bytes_out")).unwrap_or(0)
-                        as u64,
-                    connections: gauge_value(bm.metrics.get("connections_per_backend"))
+                    back_bytes_in: count_value(bm.metrics.get(names::backend::BACK_BYTES_IN))
+                        .unwrap_or(0) as u64,
+                    back_bytes_out: count_value(bm.metrics.get(names::backend::BACK_BYTES_OUT))
+                        .unwrap_or(0) as u64,
+                    connections: gauge_value(
+                        bm.metrics.get(names::backend::CONNECTIONS_PER_BACKEND),
+                    )
+                    .unwrap_or(0),
+                    p50_ms: percentile_p50_ms(bm.metrics.get(names::backend::RESPONSE_TIME))
                         .unwrap_or(0),
-                    p50_ms: percentile_p50_ms(bm.metrics.get("backend_response_time")).unwrap_or(0),
-                    p99_ms: percentile_p99_ms(bm.metrics.get("backend_response_time")).unwrap_or(0),
+                    p99_ms: percentile_p99_ms(bm.metrics.get(names::backend::RESPONSE_TIME))
+                        .unwrap_or(0),
                     requests_total: count_value(bm.metrics.get("requests")).unwrap_or(0) as u64,
                 });
             }
@@ -751,11 +757,11 @@ impl App {
                 total_requests_observed = total_requests_observed.saturating_add(v);
             }
             for code in &[
-                "http.status.500",
-                "http.status.502",
-                "http.status.503",
-                "http.status.504",
-                "http.status.507",
+                names::http_status::S500,
+                names::http_status::S502,
+                names::http_status::S503,
+                names::http_status::S504,
+                names::http_status::S507,
             ] {
                 if let Some(v) = count_value(cm.cluster.get(*code)) {
                     total_errors_5xx = total_errors_5xx.saturating_add(v);
@@ -802,7 +808,7 @@ impl App {
         // "is anyone slow?" not "average latency".
         let mut max_p99_ms: u64 = 0;
         for cm in m.clusters.values() {
-            if let Some(p99) = percentile_p99_ms(cm.cluster.get("backend_response_time")) {
+            if let Some(p99) = percentile_p99_ms(cm.cluster.get(names::backend::RESPONSE_TIME)) {
                 if p99 > max_p99_ms {
                     max_p99_ms = p99;
                 }
@@ -814,16 +820,16 @@ impl App {
         // `client.connections` / `client.connections_max` ratio when the
         // gauge isn't surfaced. Both are gauges so they survive the hourly
         // counter clear unchanged.
-        let saturation = gauge_value(m.proxying.get("slab.usage_percent"))
-            .or_else(|| gauge_value(m.proxying.get("buffer.usage_percent")))
+        let saturation = gauge_value(m.proxying.get(names::slab::USAGE_PERCENT))
+            .or_else(|| gauge_value(m.proxying.get(names::buffer::USAGE_PERCENT)))
             .map(|v| v.min(100))
             .unwrap_or(0);
         self.overview.saturation_pct.push(saturation as u64);
 
         self.overview.active_sessions =
-            gauge_value(m.proxying.get("http.active_requests")).unwrap_or(0) as u64;
+            gauge_value(m.proxying.get(names::http::ACTIVE_REQUESTS)).unwrap_or(0) as u64;
         self.overview.client_connections =
-            gauge_value(m.proxying.get("client.connections")).unwrap_or(0) as u64;
+            gauge_value(m.proxying.get(names::client::CONNECTIONS)).unwrap_or(0) as u64;
     }
 
     /// Append a transport-published `TopEvent` into the recent-events ring.

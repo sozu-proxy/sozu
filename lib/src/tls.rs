@@ -30,6 +30,7 @@ use sozu_command::{
     proto::command::{AddCertificate, CertificateAndKey, ReplaceCertificate, SocketAddress},
 };
 
+use crate::metrics::names;
 use crate::router::pattern_trie::{Key, KeyValue, TrieNode};
 
 /// Module-level prefix used on every log line emitted from this module.
@@ -237,7 +238,7 @@ impl CertificateResolver {
             return;
         };
         let clamped = min_expiration.max(0) as usize;
-        gauge!("tls.cert.min_expires_at_seconds", clamped);
+        gauge!(names::tls::CERT_MIN_EXPIRES_AT_SECONDS, clamped);
     }
 
     /// persist a certificate, after ensuring validity, and checking if it can replace another certificate.
@@ -529,7 +530,7 @@ impl ResolvesServerCert for MutexCertificateResolver {
             log_module_context!(),
             name
         );
-        incr!("tls.default_cert_used");
+        incr!(names::tls::DEFAULT_CERT_USED);
         DEFAULT_CERTIFICATE.clone()
     }
 }

@@ -22,6 +22,7 @@ use sozu_command::{
     state::ClusterId,
 };
 
+use crate::metrics::names;
 use crate::{
     backends::BackendMap,
     protocol::mux::{
@@ -469,8 +470,13 @@ impl HealthChecker {
                     config.healthy_threshold,
                     cluster_id
                 );
-                incr!("health_check.up");
-                gauge!("backend.available", 1, Some(cluster_id), Some(backend_id));
+                incr!(names::health_check::UP);
+                gauge!(
+                    names::backend::AVAILABLE,
+                    1,
+                    Some(cluster_id),
+                    Some(backend_id)
+                );
                 push_event(Event {
                     kind: EventKind::HealthCheckHealthy as i32,
                     cluster_id: Some(cluster_id.to_owned()),
@@ -478,7 +484,7 @@ impl HealthChecker {
                     address: Some(address.into()),
                 });
             }
-            count!("health_check.success", 1);
+            count!(names::health_check::SUCCESS, 1);
         } else {
             let transitioned = backend.health.record_failure(config.unhealthy_threshold);
             if transitioned {
@@ -490,8 +496,13 @@ impl HealthChecker {
                     config.unhealthy_threshold,
                     cluster_id
                 );
-                incr!("health_check.down");
-                gauge!("backend.available", 0, Some(cluster_id), Some(backend_id));
+                incr!(names::health_check::DOWN);
+                gauge!(
+                    names::backend::AVAILABLE,
+                    0,
+                    Some(cluster_id),
+                    Some(backend_id)
+                );
                 push_event(Event {
                     kind: EventKind::HealthCheckUnhealthy as i32,
                     cluster_id: Some(cluster_id.to_owned()),
@@ -499,7 +510,7 @@ impl HealthChecker {
                     address: Some(address.into()),
                 });
             }
-            count!("health_check.failure", 1);
+            count!(names::health_check::FAILURE, 1);
         }
 
         // Emit the healthy-backend gauge on every result update for clusters

@@ -12,6 +12,7 @@ use nom::{Err, Offset};
 use rusty_ulid::Ulid;
 use sozu_command::logging::ansi_palette;
 
+use crate::metrics::names;
 use crate::{
     Protocol, Readiness, SessionMetrics, SessionResult,
     pool::Checkout,
@@ -117,7 +118,7 @@ impl<Front: SocketHandler> RelayProxyProtocol<Front> {
         if sz > 0 {
             self.frontend_buffer.fill(sz);
 
-            count!("bytes_in", sz as i64);
+            count!(names::backend::BYTES_IN, sz as i64);
             metrics.bin += sz;
 
             if res == SocketResult::Error {
@@ -125,7 +126,7 @@ impl<Front: SocketHandler> RelayProxyProtocol<Front> {
                     "{} front socket error, closing the connection",
                     log_context!(self)
                 );
-                incr!("proxy_protocol.errors");
+                incr!(names::proxy_protocol::ERRORS);
                 self.frontend_readiness.reset();
                 self.backend_readiness.reset();
                 return SessionResult::Close;
@@ -178,7 +179,7 @@ impl<Front: SocketHandler> RelayProxyProtocol<Front> {
                         Ok(sz) => {
                             self.cursor_header += sz;
 
-                            count!("back_bytes_out", sz as i64);
+                            count!(names::backend::BACK_BYTES_OUT, sz as i64);
                             metrics.backend_bout += sz;
                             self.frontend_buffer.consume(sz);
 
@@ -188,7 +189,7 @@ impl<Front: SocketHandler> RelayProxyProtocol<Front> {
                             }
                         }
                         Err(e) => {
-                            incr!("proxy_protocol.errors");
+                            incr!(names::proxy_protocol::ERRORS);
                             self.frontend_readiness.reset();
                             self.backend_readiness.reset();
                             debug!("{} write error: {}", log_context!(self), e);

@@ -42,6 +42,8 @@ use sozu_command_lib::{
     state::ConfigState,
 };
 
+use sozu_lib::metrics::names;
+
 use super::upgrade::SerializedWorkerSession;
 use crate::{
     command::{
@@ -877,9 +879,12 @@ impl Server {
 
     /// count backends and frontends in the cache, update gauge metrics
     pub fn update_counts(&mut self) {
-        gauge!("configuration.clusters", self.state.clusters.len());
-        gauge!("configuration.backends", self.state.count_backends());
-        gauge!("configuration.frontends", self.state.count_frontends());
+        gauge!(names::configuration::CLUSTERS, self.state.clusters.len());
+        gauge!(names::configuration::BACKENDS, self.state.count_backends());
+        gauge!(
+            names::configuration::FRONTENDS,
+            self.state.count_frontends()
+        );
     }
 
     /// Queue an audit event for fan-out to subscribed clients. Drained by
@@ -1328,9 +1333,9 @@ mod tests {
 
         // initially empty
         server.update_counts();
-        assert_eq!(read_gauge("configuration.clusters"), Some(0));
-        assert_eq!(read_gauge("configuration.backends"), Some(0));
-        assert_eq!(read_gauge("configuration.frontends"), Some(0));
+        assert_eq!(read_gauge(names::configuration::CLUSTERS), Some(0));
+        assert_eq!(read_gauge(names::configuration::BACKENDS), Some(0));
+        assert_eq!(read_gauge(names::configuration::FRONTENDS), Some(0));
 
         // add a cluster
         server
@@ -1390,12 +1395,12 @@ mod tests {
             .expect("Could not add TCP frontend");
 
         // gauges are still stale until update_counts() is called
-        assert_eq!(read_gauge("configuration.clusters"), Some(0));
+        assert_eq!(read_gauge(names::configuration::CLUSTERS), Some(0));
 
         // update_counts should refresh gauges
         server.update_counts();
-        assert_eq!(read_gauge("configuration.clusters"), Some(1));
-        assert_eq!(read_gauge("configuration.backends"), Some(3));
-        assert_eq!(read_gauge("configuration.frontends"), Some(2));
+        assert_eq!(read_gauge(names::configuration::CLUSTERS), Some(1));
+        assert_eq!(read_gauge(names::configuration::BACKENDS), Some(3));
+        assert_eq!(read_gauge(names::configuration::FRONTENDS), Some(2));
     }
 }
