@@ -8,18 +8,23 @@
 //!
 //! # Architecture
 //!
-//! Two synchronous transport threads (no `tokio` runtime in v1, by design
-//! — see `tasks/todo.md` and the Codex cross-check that locked it):
+//! Four synchronous transport threads (no `tokio` runtime in v1, by design):
 //!
-//! 1. The collector thread polls `RequestType::QueryMetrics` on the
+//! 1. The **collector** thread polls `RequestType::QueryMetrics` on the
 //!    `--refresh-ms` ticker over its own `Channel` and pushes each
 //!    `AggregatedMetrics` into a `crossbeam_channel::bounded::<Snapshot>(1)`.
-//! 2. The events thread subscribes to `RequestType::SubscribeEvents` over
-//!    a SEPARATE `Channel` (the unix `Channel` has no message-id
+//! 2. The **events** thread subscribes to `RequestType::SubscribeEvents`
+//!    over a SEPARATE `Channel` (the unix `Channel` has no message-id
 //!    correlation; multiplexing query and subscribe on one socket is
 //!    unsafe) and forwards each `Event` into a `bounded::<TopEvent>(64)`.
-//! 3. The UI thread (this thread) owns the terminal, drives crossterm
-//!    event polling on a 30-fps cap, and consumes both channels.
+//! 3. The **listeners-collector** thread polls `RequestType::ListListeners`
+//!    every 5 s over its own channel into a `bounded::<ListenersSnapshot>(1)`.
+//! 4. The **certs-collector** thread polls
+//!    `RequestType::QueryCertificatesFromTheState` every 30 s over its own
+//!    channel into a `bounded::<CertsSnapshot>(1)`.
+//!
+//! The UI thread (this thread) owns the terminal, drives crossterm event
+//! polling on a 30-fps cap, and consumes all four channels.
 //!
 //! Cardinality elevation is automatic: on startup the TUI sends
 //! `SetMetricDetail{ client_id, detail = Backend, ttl_seconds = 60 }`. A
@@ -83,16 +88,24 @@ impl CommandManager {
         // old to decode `SetMetricDetail`, we surface the failure but keep
         // the TUI running — operators on degraded fleets still get the
         // cluster-level data the worker is already emitting.
+        //
+        // The failure path stashes a diagnostic into a string that the
+        // renderer surfaces via `App.status`, rather than writing to
+        // `stderr` directly: an `eprintln!` from this site would land
+        // *between* the spawn calls above and `enable_raw_mode` inside the
+        // renderer, leaving a one-line warning the operator never sees
+        // (alt-screen wipes it on entry) and that pollutes the shell
+        // scrollback on exit.
         let detail = args.detail.unwrap_or(TopDetail::Backend);
-        let lease =
+        let (lease, lease_status) =
             match DetailGuard::apply(&self.config, detail, args.lease_ttl_seconds, "sozu top") {
-                Ok(g) => Some(g),
-                Err(e) => {
-                    eprintln!(
-                        "sozu top: could not elevate metric detail (continuing without lease): {e}"
-                    );
-                    None
-                }
+                Ok(g) => (Some(g), None),
+                Err(e) => (
+                    None,
+                    Some(format!(
+                        "could not elevate metric detail (continuing without lease): {e}"
+                    )),
+                ),
             };
 
         let render_cfg = RenderConfig {
@@ -101,6 +114,7 @@ impl CommandManager {
             snapshot_frames: args.snapshot,
             skin: args.skin.clone(),
             glyphs: args.glyphs,
+            initial_status: lease_status,
         };
         let result = render::run(render_cfg, snapshot_rx, events_rx, listeners_rx, certs_rx);
 
