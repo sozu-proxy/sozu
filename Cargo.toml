@@ -65,8 +65,8 @@ x509-parser = "^0.18.1"
 
 # Dependencies for the `sozu top` TUI subcommand. All gated behind the
 # opt-in `tui` Cargo feature on `bin/`; default `sozu` builds do not pull
-# any of them in. Versions Codex-pinned 2026-05-10 against crates.io HEAD;
-# bump the patch component locally if cargo update lands a fix.
+# any of them in. Versions pinned 2026-05-10 against crates.io HEAD; bump
+# the patch component locally if cargo update lands a fix.
 color-eyre           = "^0.6.5"
 crossbeam-channel    = "^0.5.15"
 crossterm            = { version = "^0.29.0", default-features = false }

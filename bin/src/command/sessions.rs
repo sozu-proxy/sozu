@@ -197,6 +197,34 @@ pub fn sanitize_for_audit(s: &str) -> String {
         .collect()
 }
 
+/// Strict sanitiser for audit-log fields whose values participate in
+/// column-boundary parsing, i.e. anything rendered as `, key={value}` in
+/// the text sink. On top of [`sanitize_for_audit`]'s control-byte strip,
+/// this also replaces `,` and `=` with `?` so an attacker-controlled value
+/// cannot forge a fake adjacent KV pair when a SIEM splits on `, ` /  `=`.
+///
+/// Use this for any audit field whose source is operator-controlled
+/// (request-derived strings) rather than master-controlled metadata.
+/// Does NOT strip `:` because legitimate values (e.g. `target=address:...`)
+/// use `:` as an in-value separator.
+pub fn sanitize_for_audit_kv(s: &str) -> String {
+    if s
+        .bytes()
+        .all(|b| b >= 0x20 && b != 0x7f && b != b',' && b != b'=')
+    {
+        return s.to_owned();
+    }
+    s.chars()
+        .map(|c| {
+            if (c as u32) < 0x20 || c == '\x7f' || c == ',' || c == '=' {
+                '?'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
 /// QW8 helper: render `Option<T>` for audit output. `Some(v)` becomes
 /// `v.to_string()`, `None` becomes the literal `"unknown"`. Used by the
 /// `actor_*_display` accessors on `ClientSession` so the five near-
