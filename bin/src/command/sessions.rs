@@ -208,8 +208,7 @@ pub fn sanitize_for_audit(s: &str) -> String {
 /// Does NOT strip `:` because legitimate values (e.g. `target=address:...`)
 /// use `:` as an in-value separator.
 pub fn sanitize_for_audit_kv(s: &str) -> String {
-    if s
-        .bytes()
+    if s.bytes()
         .all(|b| b >= 0x20 && b != 0x7f && b != b',' && b != b'=')
     {
         return s.to_owned();

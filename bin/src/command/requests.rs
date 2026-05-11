@@ -1550,10 +1550,7 @@ pub fn audit_worker_metric_detail_transition(
 
     if server.audit_log_json_writer.is_some() {
         let mut record = serde_json::Map::new();
-        record.insert(
-            "ts".to_owned(),
-            serde_json::Value::String(now_ts.clone()),
-        );
+        record.insert("ts".to_owned(), serde_json::Value::String(now_ts.clone()));
         record.insert(
             "boot_generation".to_owned(),
             serde_json::json!(server.boot_generation),
