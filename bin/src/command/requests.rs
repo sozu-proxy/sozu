@@ -31,8 +31,8 @@ use sozu_command_lib::{
         MetricDetailStatus, MetricsConfiguration, QueryCertificatesFilters, QueryHealthChecks,
         QueryMetricsOptions, Request, ResponseContent, ResponseStatus, RunState, SetMetricDetail,
         SoftStop, Status, UpdateHttpListenerConfig, UpdateHttpsListenerConfig,
-        UpdateTcpListenerConfig, WorkerInfo, WorkerInfos, WorkerMetricDetailStatus, WorkerRequest,
-        WorkerResponses, request::RequestType, response_content::ContentType,
+        UpdateTcpListenerConfig, WorkerInfo, WorkerInfos, WorkerRequest, WorkerResponses,
+        request::RequestType, response_content::ContentType,
     },
     sd_notify,
 };
@@ -2474,30 +2474,29 @@ impl GatheringTask for SetMetricDetailTask {
         client: &mut OptionalClient,
         timed_out: bool,
     ) {
-        // Per-worker status: today we report ACK/no-ACK via the response
-        // status because the worker arm in lib/src/server.rs answers OK
-        // without a content payload. The per-worker `(configured,
-        // effective, previous_effective, active_lease_count)` quartet in
-        // `WorkerMetricDetailStatus` is populated with the master's view
-        // as a best-effort placeholder so the wire schema stays
-        // populated; a follow-up will plumb the actual per-worker view
-        // through a new ResponseContent variant.
+        // Per-worker status: each worker now returns its own
+        // `WorkerMetricDetailStatus` payload via
+        // `ContentType::WorkerMetricDetailStatus` in the SetMetricDetail
+        // ok-with-content response (lib/src/server.rs::notify). Pull
+        // each worker's actual quartet — workers hold independent
+        // `Aggregator`s, so the master's view is NOT a reliable
+        // stand-in for the per-worker state. Workers that returned an
+        // error (e.g. peer-binding refusal) get skipped; the operator
+        // sees `MetricDetailStatus.workers` populated only for the
+        // ACK'd subset.
         let mut workers_map = BTreeMap::new();
         for (worker_id, response) in &self.gatherer.responses {
-            if matches!(
+            if !matches!(
                 ResponseStatus::try_from(response.status),
                 Ok(ResponseStatus::Ok)
             ) {
-                workers_map.insert(
-                    worker_id.to_string(),
-                    WorkerMetricDetailStatus {
-                        configured: self.master_configured as i32,
-                        effective: METRICS
-                            .with(|m| MetricDetail::from(m.borrow().detail_effective()) as i32),
-                        previous_effective: self.master_previous_effective as i32,
-                        active_lease_count: METRICS.with(|m| m.borrow().lease_count()),
-                    },
-                );
+                continue;
+            }
+            if let Some(ResponseContent {
+                content_type: Some(ContentType::WorkerMetricDetailStatus(status)),
+            }) = response.content.as_ref()
+            {
+                workers_map.insert(worker_id.to_string(), status.clone());
             }
         }
 

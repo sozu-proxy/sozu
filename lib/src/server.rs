@@ -25,10 +25,10 @@ use sozu_command::{
         ActivateListener, AddBackend, CertificatesWithFingerprints, Cluster, ClusterHashes,
         ClusterInformations, DeactivateListener, Event, EventKind, HttpListenerConfig,
         HttpsListenerConfig, InitialState, ListenerType, LoadBalancingAlgorithms, LoadMetric,
-        MetricDetail, MetricsConfiguration, RemoveBackend, Request, ResponseStatus, ServerConfig,
-        TcpListenerConfig as CommandTcpListener, UpdateHttpListenerConfig,
-        UpdateHttpsListenerConfig, UpdateTcpListenerConfig, WorkerRequest, WorkerResponse,
-        request::RequestType, response_content::ContentType,
+        MetricDetail, MetricsConfiguration, RemoveBackend, Request, ResponseContent,
+        ResponseStatus, ServerConfig, TcpListenerConfig as CommandTcpListener,
+        UpdateHttpListenerConfig, UpdateHttpsListenerConfig, UpdateTcpListenerConfig,
+        WorkerRequest, WorkerResponse, request::RequestType, response_content::ContentType,
     },
     ready::Ready,
     scm_socket::{Listeners, ScmSocket, ScmSocketError},
@@ -136,6 +136,28 @@ pub fn push_event(event: Event) {
             content: Some(ContentType::Event(event).into()),
         });
     });
+}
+
+/// Build the `WorkerMetricDetailStatus` content payload returned in
+/// every successful `SetMetricDetail` worker response. The master
+/// collects these across the fan-out and assembles them into
+/// `MetricDetailStatus.workers[<worker_id>]` so the TUI sees each
+/// worker's actual aggregator state instead of the master's view as a
+/// stand-in. See PR #1256 round-4 follow-through.
+fn worker_metric_detail_status_content(
+    configured: MetricDetailLevel,
+    effective: MetricDetailLevel,
+    previous_effective: MetricDetailLevel,
+    active_lease_count: u32,
+) -> ResponseContent {
+    use sozu_command::proto::command::WorkerMetricDetailStatus;
+    ContentType::WorkerMetricDetailStatus(WorkerMetricDetailStatus {
+        configured: MetricDetail::from(configured) as i32,
+        effective: MetricDetail::from(effective) as i32,
+        previous_effective: MetricDetail::from(previous_effective) as i32,
+        active_lease_count,
+    })
+    .into()
 }
 
 /// Build a `METRIC_DETAIL_CHANGED` event carrying the worker-local
@@ -1410,27 +1432,55 @@ impl Server {
                     }),
                 };
                 if req.clear.unwrap_or(false) {
-                    // Capture transition fields before releasing the
-                    // borrow so we can emit an Event after.
-                    let outcome = METRICS.with(|metrics| {
-                        let mut m = metrics.borrow_mut();
-                        let outcome = m.lease_clear(&req.client_id, presented_binding);
-                        let effective_after = m.detail_effective();
-                        (outcome, effective_after)
-                    });
-                    match outcome.0 {
+                    // Capture transition fields + post-clear snapshot
+                    // before releasing the borrow so we can emit an
+                    // Event after AND build the WorkerMetricDetailStatus
+                    // payload that the master folds into
+                    // `MetricDetailStatus.workers[<worker_id>]`. Without
+                    // this payload the master used its own view as a
+                    // stand-in for the worker's per-aggregator state.
+                    let (outcome, effective_after, configured_after, lease_count_after) =
+                        METRICS.with(|metrics| {
+                            let mut m = metrics.borrow_mut();
+                            let outcome = m.lease_clear(&req.client_id, presented_binding);
+                            (
+                                outcome,
+                                m.detail_effective(),
+                                m.detail_configured(),
+                                m.lease_count(),
+                            )
+                        });
+                    match outcome {
                         crate::metrics::LeaseClearOutcome::Cleared { previous_effective } => {
                             push_metric_detail_transition(
                                 previous_effective,
-                                outcome.1,
+                                effective_after,
                                 "lease_clear",
                                 Some(req.client_id.clone()),
                             );
-                            push_queue(WorkerResponse::ok(message.id.clone()));
+                            push_queue(WorkerResponse::ok_with_content(
+                                message.id.clone(),
+                                worker_metric_detail_status_content(
+                                    configured_after,
+                                    effective_after,
+                                    previous_effective,
+                                    lease_count_after,
+                                ),
+                            ));
                         }
                         crate::metrics::LeaseClearOutcome::NotFound => {
-                            // Silent no-op: no lease existed for that id.
-                            push_queue(WorkerResponse::ok(message.id.clone()));
+                            // Silent no-op: no lease existed for that
+                            // id. The worker's state is unchanged so
+                            // previous_effective == effective.
+                            push_queue(WorkerResponse::ok_with_content(
+                                message.id.clone(),
+                                worker_metric_detail_status_content(
+                                    configured_after,
+                                    effective_after,
+                                    effective_after,
+                                    lease_count_after,
+                                ),
+                            ));
                         }
                         crate::metrics::LeaseClearOutcome::Unauthorized => {
                             let msg = format!(
@@ -1496,13 +1546,15 @@ impl Server {
                     u32::try_from(crate::metrics::LEASE_TTL_DEFAULT.as_secs()).unwrap_or(60)
                 });
                 let ttl = std::time::Duration::from_secs(ttl_seconds.into());
-                let outcome = METRICS.with(|metrics| {
-                    metrics.borrow_mut().lease_apply(
+                let (outcome, configured_after, lease_count_after) = METRICS.with(|metrics| {
+                    let mut m = metrics.borrow_mut();
+                    let outcome = m.lease_apply(
                         req.client_id.clone(),
                         level,
                         ttl,
                         presented_binding,
-                    )
+                    );
+                    (outcome, m.detail_configured(), m.lease_count())
                 });
                 match outcome {
                     crate::metrics::LeaseApplyOutcome::Applied {
@@ -1515,7 +1567,15 @@ impl Server {
                             "lease_apply",
                             Some(req.client_id.clone()),
                         );
-                        push_queue(WorkerResponse::ok(message.id.clone()));
+                        push_queue(WorkerResponse::ok_with_content(
+                            message.id.clone(),
+                            worker_metric_detail_status_content(
+                                configured_after,
+                                new_effective,
+                                previous_effective,
+                                lease_count_after,
+                            ),
+                        ));
                     }
                     crate::metrics::LeaseApplyOutcome::ClientIdTooLong => {
                         let msg = format!(
