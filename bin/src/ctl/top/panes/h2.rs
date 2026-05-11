@@ -21,6 +21,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table};
 use sozu_command_lib::proto::command::{AggregatedMetrics, FilteredMetrics, filtered_metrics};
+use sozu_lib::metrics::names;
 
 use super::super::app::App;
 use super::super::theme::Skin;
@@ -67,9 +68,9 @@ pub fn render(f: &mut Frame<'_>, area: Rect, app: &App, skin: &Skin) {
 }
 
 fn render_streams(f: &mut Frame<'_>, area: Rect, app: &App, skin: &Skin, m: &AggregatedMetrics) {
-    let active_streams = gauge(m.proxying.get("h2.connection.active_streams")).unwrap_or(0);
-    let alpn_h2 = count(m.proxying.get("http.alpn.h2")).unwrap_or(0);
-    let alpn_http11 = count(m.proxying.get("http.alpn.http11")).unwrap_or(0);
+    let active_streams = gauge(m.proxying.get(names::h2::CONNECTION_ACTIVE_STREAMS)).unwrap_or(0);
+    let alpn_h2 = count(m.proxying.get(names::http::ALPN_H2)).unwrap_or(0);
+    let alpn_http11 = count(m.proxying.get(names::http::ALPN_HTTP11)).unwrap_or(0);
     let total_alpn = alpn_h2 + alpn_http11;
     let h2_pct = if total_alpn > 0 {
         (alpn_h2 as f64 / total_alpn as f64) * 100.0
@@ -157,37 +158,49 @@ fn render_flow(f: &mut Frame<'_>, area: Rect, skin: &Skin, m: &AggregatedMetrics
     let rows = [
         gauge_row(
             "connection.window_bytes",
-            "h2.connection.window_bytes",
+            names::h2::CONNECTION_WINDOW_BYTES,
             m,
             skin,
             false,
         ),
         gauge_row(
             "pending_window_updates",
-            "h2.connection.pending_window_updates",
+            names::h2::CONNECTION_PENDING_WINDOW_UPDATES,
             m,
             skin,
             false,
         ),
-        count_row("flow_control_stall", "h2.flow_control_stall", m, skin, true),
+        count_row(
+            "flow_control_stall",
+            names::h2::FLOW_CONTROL_STALL,
+            m,
+            skin,
+            true,
+        ),
         count_row(
             "frames.tx.window_update",
-            "h2.frames.tx.window_update",
+            names::h2::FRAMES_TX_WINDOW_UPDATE,
             m,
             skin,
             false,
         ),
         count_row(
             "frames.tx.rst_stream",
-            "h2.frames.tx.rst_stream",
+            names::h2::FRAMES_TX_RST_STREAM,
             m,
             skin,
             true,
         ),
-        count_row("frames.tx.goaway", "h2.frames.tx.goaway", m, skin, true),
+        count_row(
+            "frames.tx.goaway",
+            names::h2::FRAMES_TX_GOAWAY,
+            m,
+            skin,
+            true,
+        ),
         count_row(
             "headers.rejected.budget_overrun",
-            "h2.headers.rejected.budget_overrun",
+            names::h2::HEADERS_REJECTED_BUDGET_OVERRUN,
             m,
             skin,
             true,
@@ -218,15 +231,27 @@ fn render_floods(f: &mut Frame<'_>, area: Rect, skin: &Skin, m: &AggregatedMetri
     );
 
     let candidates = [
-        ("h2.flood.violation.glitch_window", "glitch_window"),
-        ("h2.flood.violation.rapid_reset", "rapid_reset"),
-        ("h2.flood.violation.continuation", "continuation_flood"),
-        ("h2.flood.violation.made_you_reset", "made_you_reset"),
-        ("h2.flood.violation.ping", "ping_flood"),
-        ("h2.flood.violation.settings", "settings_flood"),
-        ("h2.flood.violation.priority", "priority_flood"),
-        ("h2.window_update_dropped", "window_update_dropped"),
-        ("h2.close_with_active_streams", "close_with_active_streams"),
+        (names::h2::FLOOD_VIOLATION_GLITCH_WINDOW, "glitch_window"),
+        (names::h2::FLOOD_VIOLATION_RAPID_RESET, "rapid_reset"),
+        (
+            names::h2::FLOOD_VIOLATION_CONTINUATION,
+            "continuation_flood",
+        ),
+        (
+            names::h2::FLOOD_VIOLATION_MADE_YOU_RESET,
+            "made_you_reset",
+        ),
+        (names::h2::FLOOD_VIOLATION_PING, "ping_flood"),
+        (names::h2::FLOOD_VIOLATION_SETTINGS, "settings_flood"),
+        (names::h2::FLOOD_VIOLATION_PRIORITY, "priority_flood"),
+        (
+            names::h2::WINDOW_UPDATE_DROPPED,
+            "window_update_dropped",
+        ),
+        (
+            names::h2::CLOSE_WITH_ACTIVE_STREAMS,
+            "close_with_active_streams",
+        ),
     ];
 
     let rows: Vec<Row<'_>> = candidates
