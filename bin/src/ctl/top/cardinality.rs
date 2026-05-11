@@ -20,6 +20,7 @@
 //!   channel of its own and drops it on exit.
 
 use std::process;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -36,6 +37,47 @@ use crate::cli::TopDetail;
 use crate::ctl::create_channel;
 
 use super::CtlError;
+
+/// Shared status slot used by background threads (renewer, transport
+/// collectors) to surface error / degraded-mode notes to the operator.
+/// The render loop drains it once per tick and copies the most recent
+/// message into `App::status` so the F-key bar shows it on the next
+/// frame. Wrapped in `Arc<Mutex<...>>` because the writers (background
+/// threads) and the reader (render-loop thread) live in different
+/// scheduling contexts; contention is rare (one write on error, one
+/// read per tick) so the lock is uncontended in practice.
+pub type StatusSlot = Arc<Mutex<Option<String>>>;
+
+/// Build an empty shared status slot.
+pub fn new_status_slot() -> StatusSlot {
+    Arc::new(Mutex::new(None))
+}
+
+/// Atomically take the latest pending status message, if any. Used by
+/// the render loop's per-tick drain. Returns `None` when no background
+/// thread has published since the last drain. Silently passes a poisoned
+/// lock through `into_inner` — a poisoned mutex here means a background
+/// thread panicked while holding it, and we want to surface the residual
+/// message rather than swallow it.
+pub fn take_status(slot: &StatusSlot) -> Option<String> {
+    match slot.lock() {
+        Ok(mut g) => g.take(),
+        Err(poison) => poison.into_inner().take(),
+    }
+}
+
+/// Publish a status message from a background thread. Drops the
+/// previous message if it had not yet been drained — render-loop
+/// cadence (~30 fps) is much faster than realistic background-thread
+/// error rates so overwriting is the right policy. A poisoned lock is
+/// recovered the same way as `take_status`.
+fn publish_status(slot: &StatusSlot, msg: String) {
+    let mut g = match slot.lock() {
+        Ok(g) => g,
+        Err(poison) => poison.into_inner(),
+    };
+    *g = Some(msg);
+}
 
 /// RAII guard that holds a runtime cardinality lease while the TUI runs.
 /// Drop clears the lease (best-effort) so the worker drops back to its
@@ -62,6 +104,16 @@ pub struct DetailGuard {
     /// Reason text echoed in the audit `EventKind::MetricDetailChanged`
     /// trail. Defaults to `"sozu top"`.
     reason: String,
+    /// Shared status slot the renewer thread publishes degraded-mode
+    /// messages into. The caller (`crate::ctl::top::mod`) holds the
+    /// other `Arc<...>` end and threads it through `RenderConfig` so
+    /// the render loop drains it via the free `take_status` function
+    /// once per tick. Stored on the guard so it stays alive for the
+    /// renewer thread's lifetime; read accesses live in the render
+    /// loop, not on this struct (hence the `dead_code`-style read
+    /// pattern). See PR #1256 review M-7 for the motivating gap.
+    #[allow(dead_code)]
+    status: StatusSlot,
 }
 
 impl DetailGuard {
@@ -69,12 +121,15 @@ impl DetailGuard {
     /// `SetMetricDetail` apply, and spawn the renewer. Returns `Ok` once
     /// the master acknowledges; if the master rejects (e.g. mixed-version
     /// fleet without the verb) `Err` is returned and the caller shows the
-    /// "lease unsupported" warning in the status bar.
+    /// "lease unsupported" warning in the status bar. The `status` slot
+    /// is shared with the render loop so the renewer can surface
+    /// degraded-mode messages without writing to the wiped alt-screen.
     pub fn apply(
         config: &Config,
         detail: TopDetail,
         ttl_seconds: u32,
         reason: impl Into<String>,
+        status: StatusSlot,
     ) -> Result<Self, CtlError> {
         let client_id = format!("top:{}:{}", process::id(), short_random_suffix());
         let proto_detail = match detail {
@@ -102,6 +157,7 @@ impl DetailGuard {
             ttl_seconds,
             reason.clone(),
             shutdown_rx,
+            Arc::clone(&status),
         )?;
         Ok(Self {
             client_id,
@@ -109,6 +165,7 @@ impl DetailGuard {
             renewer: Some(renewer),
             final_channel: Some(channel),
             reason,
+            status,
         })
     }
 }
@@ -146,6 +203,7 @@ fn spawn_renewer(
     ttl_seconds: u32,
     reason: String,
     shutdown_rx: Receiver<()>,
+    status: StatusSlot,
 ) -> Result<JoinHandle<()>, CtlError> {
     let renew_after = Duration::from_secs((ttl_seconds.max(2) / 2) as u64);
     let handle = std::thread::Builder::new()
@@ -157,7 +215,10 @@ fn spawn_renewer(
             let mut channel = match create_channel(&config) {
                 Ok(ch) => ch,
                 Err(e) => {
-                    eprintln!("sozu top: renewer channel: {e:?}");
+                    publish_status(
+                        &status,
+                        format!("renewer channel open failed: {e}; cardinality will lapse at TTL"),
+                    );
                     return;
                 }
             };
@@ -173,7 +234,12 @@ fn spawn_renewer(
                             Some(&format!("{reason} (renew)")),
                             false,
                         ) {
-                            eprintln!("sozu top: renewer send error: {e:?}");
+                            publish_status(
+                                &status,
+                                format!(
+                                    "renewer dropped: {e}; cardinality lapses in ≤ {ttl_seconds}s"
+                                ),
+                            );
                             return;
                         }
                     }
