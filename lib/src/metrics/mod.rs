@@ -340,7 +340,9 @@ pub enum LeaseClearOutcome {
     /// time), and the entry has been removed. Carries the worker's
     /// previous effective level so the caller can decide whether to
     /// emit a `MetricDetailChanged` audit event.
-    Cleared { previous_effective: MetricDetailLevel },
+    Cleared {
+        previous_effective: MetricDetailLevel,
+    },
     /// No lease was held by the requested `client_id`. Silent no-op.
     NotFound,
     /// A lease existed but the peer binding presented with the clear did
@@ -495,11 +497,7 @@ impl Aggregator {
     /// only leases whose apply-time binding was also unknown, preserving
     /// compat with pre-binding callers and platforms without
     /// `SO_PEERCRED`.
-    pub fn lease_clear(
-        &mut self,
-        client_id: &str,
-        presented: PeerBinding,
-    ) -> LeaseClearOutcome {
+    pub fn lease_clear(&mut self, client_id: &str, presented: PeerBinding) -> LeaseClearOutcome {
         let Some(entry) = self.leases.get(client_id) else {
             return LeaseClearOutcome::NotFound;
         };

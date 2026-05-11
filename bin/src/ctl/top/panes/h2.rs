@@ -237,17 +237,11 @@ fn render_floods(f: &mut Frame<'_>, area: Rect, skin: &Skin, m: &AggregatedMetri
             names::h2::FLOOD_VIOLATION_CONTINUATION,
             "continuation_flood",
         ),
-        (
-            names::h2::FLOOD_VIOLATION_MADE_YOU_RESET,
-            "made_you_reset",
-        ),
+        (names::h2::FLOOD_VIOLATION_MADE_YOU_RESET, "made_you_reset"),
         (names::h2::FLOOD_VIOLATION_PING, "ping_flood"),
         (names::h2::FLOOD_VIOLATION_SETTINGS, "settings_flood"),
         (names::h2::FLOOD_VIOLATION_PRIORITY, "priority_flood"),
-        (
-            names::h2::WINDOW_UPDATE_DROPPED,
-            "window_update_dropped",
-        ),
+        (names::h2::WINDOW_UPDATE_DROPPED, "window_update_dropped"),
         (
             names::h2::CLOSE_WITH_ACTIVE_STREAMS,
             "close_with_active_streams",
