@@ -186,7 +186,6 @@ fn fixture_app() -> App {
     app.ingest_snapshot(&snap);
     app.ingest_listeners(ListenersSnapshot {
         list: fixture_listeners(),
-        received_at: Instant::now(),
     });
     app
 }
