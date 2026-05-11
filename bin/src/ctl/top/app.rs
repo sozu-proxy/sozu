@@ -37,11 +37,15 @@ pub const SPARKLINE_DEPTH: usize = 60;
 /// transport to back-pressure on its own bound.
 pub const EVENT_RING_DEPTH: usize = 200;
 
-/// Number of consecutive renders a pulse stays visible. 4 ticks at the
-/// default 1 s data tick = ~4 s of background-tint emphasis. Long enough
-/// to catch the eye even when an operator looked away for a moment;
-/// short enough that a flurry of changes doesn't tint everything.
-pub const PULSE_DURATION_TICKS: u32 = 4;
+/// Number of consecutive frames a pulse stays visible. The tick decrement
+/// is `if value == 0 { drop } else { value -= 1 }`, so a pulse inserted
+/// with `N` visits `N → N-1 → … → 1 → 0` (dropped on the next tick).
+/// That is `N + 1` rendered frames; `5` renders ~5 s of background tint
+/// at the default 1 s data-tick cadence — long enough to catch the eye
+/// without monopolising the colour-coding when multiple events land
+/// close together. The name reflects the observed frame count rather
+/// than the seed value to avoid the off-by-one trap.
+pub const PULSE_PERSIST_FRAMES: u32 = 5;
 
 /// Top-level pane selector mirrored to numbered tabs at the top of the
 /// screen. Numbers match the keymap (`1 OVERVIEW`, `2 CLUSTERS`, …) so
@@ -132,10 +136,6 @@ impl SparkRing {
         self.samples.iter().copied().max().unwrap_or(0)
     }
 
-    pub fn len(&self) -> usize {
-        self.samples.len()
-    }
-
     pub fn is_empty(&self) -> bool {
         self.samples.is_empty()
     }
@@ -176,6 +176,16 @@ impl RateCalculator {
         };
         self.history.insert(key.to_owned(), (value, sampled_at));
         result
+    }
+
+    /// Drop history entries whose key the predicate rejects. Called from
+    /// `App::ingest_snapshot` with the set of keys present in the freshest
+    /// snapshot so a cluster / backend that disappears doesn't leave its
+    /// `(prev_value, prev_at)` lingering forever — the `HashMap` would
+    /// otherwise grow with fleet churn without ever shrinking back, since
+    /// `record` only `insert`s and never `remove`s.
+    pub fn retain<F: FnMut(&str) -> bool>(&mut self, mut keep: F) {
+        self.history.retain(|k, _| keep(k.as_str()));
     }
 }
 
@@ -274,12 +284,12 @@ impl PulseTracker {
         if !self.last_clusters.is_empty() {
             for missing in self.last_clusters.difference(&new_clusters) {
                 self.cluster_disappeared
-                    .insert(missing.clone(), PULSE_DURATION_TICKS);
+                    .insert(missing.clone(), PULSE_PERSIST_FRAMES);
             }
             // Cluster appear: in new set, not in last set.
             for fresh in new_clusters.difference(&self.last_clusters) {
                 self.cluster_appeared
-                    .insert(fresh.clone(), PULSE_DURATION_TICKS);
+                    .insert(fresh.clone(), PULSE_PERSIST_FRAMES);
             }
         }
         // Backend down: was up in last snapshot, not up in new snapshot
@@ -289,7 +299,7 @@ impl PulseTracker {
         for prev_up in &self.last_backend_up {
             if !new_backend_up.contains(prev_up) {
                 self.backend_down
-                    .insert(prev_up.clone(), PULSE_DURATION_TICKS);
+                    .insert(prev_up.clone(), PULSE_PERSIST_FRAMES);
             }
         }
         self.last_clusters = new_clusters;
@@ -315,6 +325,17 @@ impl PulseTracker {
         } else {
             None
         }
+    }
+
+    /// True when at least one pulse is still animating. The render loop
+    /// uses this together with `App::take_dirty` to decide whether to
+    /// repaint on a frame that received no fresh snapshot or event —
+    /// without it, the fading background tint would freeze on screen
+    /// between snapshots.
+    pub fn has_active(&self) -> bool {
+        !self.cluster_disappeared.is_empty()
+            || !self.cluster_appeared.is_empty()
+            || !self.backend_down.is_empty()
     }
 }
 
@@ -444,6 +465,14 @@ pub struct App {
     /// renderer surfaces this on the function-key bar so the operator
     /// sees why their command bounced.
     pub palette_error: Option<String>,
+    /// Dirty flag for the render loop: set whenever an `ingest_*` call
+    /// folds new data into the state OR a pulse decrements in
+    /// `tick_pulses`. The renderer checks this via `take_dirty` and
+    /// skips the synchronized-update + draw cycle when neither path
+    /// produced a visible change AND no pulse is mid-animation. Avoids
+    /// burning ~2-3 % of one core for an idle TUI on a quiet system.
+    /// Initialised `true` so the first frame paints unconditionally.
+    is_dirty: bool,
     rates: RateCalculator,
 }
 
@@ -526,8 +555,17 @@ impl App {
             palette_open: false,
             palette_input: tui_input::Input::default(),
             palette_error: None,
+            is_dirty: true,
             rates: RateCalculator::default(),
         }
+    }
+
+    /// Read-and-clear the dirty flag for the renderer. Returns `true` when
+    /// the App folded new data or aged a pulse since the last frame; the
+    /// renderer combines this with `PulseTracker::has_active()` to decide
+    /// whether to repaint.
+    pub fn take_dirty(&mut self) -> bool {
+        std::mem::replace(&mut self.is_dirty, false)
     }
 
     /// Fold an inbound transport `Snapshot` into the ring buffers. Called by
@@ -540,17 +578,32 @@ impl App {
         // pulse tracker can emit ClusterDisappeared / BackendWentDown
         // transitions against the previous set.
         self.pulse.diff(&snap.metrics);
+        // Trim the rate calculator's history to the keys present in the
+        // current snapshot. Removed clusters / backends would otherwise
+        // accumulate forever (each (cluster_id, "requests") key plus the
+        // per-cluster 5xx series), turning the HashMap into a long-lived
+        // memory leak proportional to fleet churn.
+        let mut live_keys: HashSet<&str> = HashSet::new();
+        live_keys.insert("__overview.requests");
+        live_keys.insert("__overview.errors_5xx");
+        self.rates.retain(|k| live_keys.contains(k));
         // Keep the latest `AggregatedMetrics` for the CLUSTERS / BACKENDS
         // panes. Cloning isn't cheap for very-high-cardinality fleets
         // (>1000 clusters), but in practice the master already paid this
         // cost on the wire; revisit only if profile data justifies it.
         self.last_metrics = Some(snap.metrics.clone());
+        self.is_dirty = true;
     }
 
     /// Advance the pulse tracker by one render frame. Called from the
     /// render loop's draw step so pulses decay even when no new snapshot
-    /// arrived this frame.
+    /// arrived this frame. Sets the dirty flag when at least one pulse
+    /// was still active before the tick so the next frame paints the
+    /// fading tint instead of freezing it on screen.
     pub fn tick_pulses(&mut self) {
+        if self.pulse.has_active() {
+            self.is_dirty = true;
+        }
         self.pulse.tick();
     }
 
@@ -699,7 +752,7 @@ impl App {
         let mut total_requests: i64 = 0;
         let mut total_errors_5xx: i64 = 0;
         let mut total_requests_observed: i64 = 0;
-        for (_cluster_id, cm) in &m.clusters {
+        for cm in m.clusters.values() {
             if let Some(v) = count_value(cm.cluster.get("requests")) {
                 total_requests = total_requests.saturating_add(v);
                 total_requests_observed = total_requests_observed.saturating_add(v);
@@ -755,7 +808,7 @@ impl App {
         // the max p99 across clusters. Operators reading the OVERVIEW want
         // "is anyone slow?" not "average latency".
         let mut max_p99_ms: u64 = 0;
-        for (_cluster_id, cm) in &m.clusters {
+        for cm in m.clusters.values() {
             if let Some(p99) = percentile_p99_ms(cm.cluster.get("backend_response_time")) {
                 if p99 > max_p99_ms {
                     max_p99_ms = p99;
@@ -788,16 +841,19 @@ impl App {
             self.events.pop_front();
         }
         self.events.push_back(event);
+        self.is_dirty = true;
     }
 
     /// Replace the cached listener inventory with a fresh snapshot.
     pub fn ingest_listeners(&mut self, snap: ListenersSnapshot) {
         self.last_listeners = Some(snap);
+        self.is_dirty = true;
     }
 
     /// Replace the cached certificate inventory with a fresh snapshot.
     pub fn ingest_certs(&mut self, snap: CertsSnapshot) {
         self.last_certs = Some(snap);
+        self.is_dirty = true;
     }
 
     /// Open the colon palette and clear any pending error. Called by the
