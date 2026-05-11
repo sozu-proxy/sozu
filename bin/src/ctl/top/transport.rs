@@ -221,7 +221,8 @@ fn poll_metrics(
                     Some(ContentType::Metrics(m)) => return Ok(m),
                     other => {
                         return Err(format!(
-                            "unexpected content variant for QueryMetrics: {other:?}"
+                            "unexpected content variant for QueryMetrics: {}",
+                            content_type_name(other.as_ref()),
                         ));
                     }
                 },
@@ -283,7 +284,8 @@ fn poll_listeners(
                     Some(ContentType::ListenersList(l)) => return Ok(l),
                     other => {
                         return Err(format!(
-                            "unexpected content variant for ListListeners: {other:?}"
+                            "unexpected content variant for ListListeners: {}",
+                            content_type_name(other.as_ref()),
                         ));
                     }
                 },
@@ -344,15 +346,106 @@ fn poll_certs(
             ResponseStatus::Ok => match resp.content {
                 Some(content) => match content.content_type {
                     Some(ContentType::CertificatesByAddress(l)) => return Ok(l),
+                    Some(ContentType::CertificatesWithFingerprints(map)) => {
+                        // `query_certificates_from_main` answers with the
+                        // fingerprint-keyed map (the same shape `sozu
+                        // certificate query` consumes). The CERTS pane
+                        // wants per-address rows; synthesise them here,
+                        // dropping the PEM + private-key fields
+                        // immediately because the TUI only needs the
+                        // (domain, fingerprint) pair. NEVER let the key
+                        // material flow further than this conversion —
+                        // an `eprintln!` / log line downstream would
+                        // otherwise leak the operator's private key to
+                        // the renderer's alt-screen or scrollback.
+                        return Ok(certs_from_fingerprint_map(map));
+                    }
                     other => {
                         return Err(format!(
-                            "unexpected content variant for QueryCertificatesFromTheState: {other:?}"
+                            "unexpected content variant for QueryCertificatesFromTheState: {}",
+                            content_type_name(other.as_ref()),
                         ));
                     }
                 },
                 None => return Err("QueryCertificatesFromTheState OK with no content".into()),
             },
         }
+    }
+}
+
+/// Convert the fingerprint-keyed `CertificatesWithFingerprints` payload
+/// (which carries cert PEM + private key) into the by-address
+/// `ListOfCertificatesByAddress` shape the CERTS pane consumes (which
+/// carries only the `(domain, fingerprint)` pair). Drops the key + cert
+/// PEM fields IMMEDIATELY so private-key material never reaches the
+/// renderer, the error log, the alt-screen scrollback, or any
+/// downstream `eprintln!`. The address is synthesised because the
+/// fingerprint-keyed response doesn't carry one; `0.0.0.0:0` renders
+/// as `0.0.0.0:0` in the table and signals "no per-address grouping
+/// available". A follow-up could plumb the actual listener address
+/// from the state, but the inventory shape is correct.
+fn certs_from_fingerprint_map(
+    payload: sozu_command_lib::proto::command::CertificatesWithFingerprints,
+) -> ListOfCertificatesByAddress {
+    use sozu_command_lib::proto::command::{
+        CertificateSummary, CertificatesByAddress, SocketAddress,
+    };
+    let mut summaries: Vec<CertificateSummary> = Vec::with_capacity(payload.certs.len());
+    for (fingerprint, cert) in payload.certs {
+        // The cert's first SNI is the operator-facing identifier. If
+        // `names` is empty (legacy certs without an SNI override)
+        // fall back to a `<unknown>` placeholder so the row still
+        // shows up rather than disappearing silently.
+        let domain = cert
+            .names
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| "<unknown>".to_owned());
+        summaries.push(CertificateSummary {
+            fingerprint,
+            domain,
+        });
+        // `cert.certificate`, `cert.certificate_chain`, `cert.key`
+        // drop here as `cert` goes out of scope — never copied
+        // forward, never logged.
+    }
+    ListOfCertificatesByAddress {
+        certificates: vec![CertificatesByAddress {
+            address: SocketAddress {
+                ip: sozu_command_lib::proto::command::IpAddress {
+                    inner: Some(sozu_command_lib::proto::command::ip_address::Inner::V4(0)),
+                },
+                port: 0,
+            },
+            certificate_summaries: summaries,
+        }],
+    }
+}
+
+/// Stable short name for a `ContentType` variant, used in error
+/// messages to identify which variant arrived without `Debug`-printing
+/// its payload (private keys, large blobs). Returns `<none>` for
+/// `None` (no content_type set in the response).
+fn content_type_name(ct: Option<&ContentType>) -> &'static str {
+    match ct {
+        None => "<none>",
+        Some(ContentType::Workers(_)) => "Workers",
+        Some(ContentType::Metrics(_)) => "Metrics",
+        Some(ContentType::WorkerResponses(_)) => "WorkerResponses",
+        Some(ContentType::Event(_)) => "Event",
+        Some(ContentType::FrontendList(_)) => "FrontendList",
+        Some(ContentType::ListenersList(_)) => "ListenersList",
+        Some(ContentType::WorkerMetrics(_)) => "WorkerMetrics",
+        Some(ContentType::AvailableMetrics(_)) => "AvailableMetrics",
+        Some(ContentType::Clusters(_)) => "Clusters",
+        Some(ContentType::ClusterHashes(_)) => "ClusterHashes",
+        Some(ContentType::CertificatesByAddress(_)) => "CertificatesByAddress",
+        Some(ContentType::CertificatesWithFingerprints(_)) => "CertificatesWithFingerprints",
+        Some(ContentType::RequestCounts(_)) => "RequestCounts",
+        Some(ContentType::MaxConnectionsPerIpLimit(_)) => "MaxConnectionsPerIpLimit",
+        Some(ContentType::HealthChecksList(_)) => "HealthChecksList",
+        Some(ContentType::MetricDetailStatus(_)) => "MetricDetailStatus",
+        Some(ContentType::WorkerMetricDetailStatus(_)) => "WorkerMetricDetailStatus",
     }
 }
 
