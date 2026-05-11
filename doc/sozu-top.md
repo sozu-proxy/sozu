@@ -178,3 +178,19 @@ even after a hard crash.
 - The render loop pauses redraws when state is unchanged AND no
   pulse is active; on a quiet system `sozu top` consumes ~2-3 % of
   one core on a Linux 6.x kernel + alacritty.
+- Transport layout: four synchronous threads (snapshots, listeners,
+  certs, events) open six unix-socket connections to the master per
+  invocation. The four polling threads keep one connection each; the
+  cardinality renewer holds a fifth for its half-TTL apply renewals
+  and a sixth parked for the final clear-on-exit. Sized for a single
+  operator on one terminal; spawning many concurrent `sozu top`
+  invocations from a wrapper script saturates the master's accept
+  backlog (`listen(2)` default = 128).
+- Privacy: whatever you type in `--reason` lands in the audit log
+  (text + JSON sinks) AND fans out via `SubscribeEvents` to any
+  same-UID subscriber. Avoid embedding PII, customer IDs, or ticket
+  references that should not leave the host's audit boundary.
+  `client_id` and `reason` are length-capped server-side (64 / 256
+  bytes) and stripped of `,`/`=`/control bytes before being rendered
+  into the audit columns, so the values cannot smuggle adjacent KV
+  columns into a SIEM that ingests on `, ` / `=`.
