@@ -8,11 +8,11 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Cell, Row, Table};
 
 use super::super::app::{App, ClusterSortKey, PulseKind};
 use super::super::theme::Skin;
+use super::sort_header;
 
 pub fn render(f: &mut Frame<'_>, area: Rect, app: &App, skin: &Skin) {
     let rows = app.cluster_rows();
@@ -46,13 +46,25 @@ pub fn render(f: &mut Frame<'_>, area: Rect, app: &App, skin: &Skin) {
         return;
     }
 
+    let reverse = app.cluster_sort_reverse;
+    let active = |key: ClusterSortKey| app.cluster_sort == key;
     let header = Row::new(vec![
-        sort_header("cluster_id", ClusterSortKey::ClusterId, app, skin),
-        sort_header("rps", ClusterSortKey::Rps, app, skin),
-        sort_header("err %", ClusterSortKey::ErrorRate, app, skin),
-        sort_header("p50", ClusterSortKey::LatencyP99, app, skin),
-        sort_header("p99", ClusterSortKey::LatencyP99, app, skin),
-        sort_header("backends", ClusterSortKey::BackendsAvailable, app, skin),
+        sort_header(
+            "cluster_id",
+            active(ClusterSortKey::ClusterId),
+            reverse,
+            skin,
+        ),
+        sort_header("rps", active(ClusterSortKey::Rps), reverse, skin),
+        sort_header("err %", active(ClusterSortKey::ErrorRate), reverse, skin),
+        sort_header("p50", active(ClusterSortKey::LatencyP99), reverse, skin),
+        sort_header("p99", active(ClusterSortKey::LatencyP99), reverse, skin),
+        sort_header(
+            "backends",
+            active(ClusterSortKey::BackendsAvailable),
+            reverse,
+            skin,
+        ),
     ])
     .style(
         Style::default()
@@ -96,25 +108,4 @@ pub fn render(f: &mut Frame<'_>, area: Rect, app: &App, skin: &Skin) {
     ];
     let table = Table::new(body, widths).header(header).block(block);
     f.render_widget(table, area);
-}
-
-fn sort_header(label: &str, column_key: ClusterSortKey, app: &App, skin: &Skin) -> Cell<'static> {
-    if app.cluster_sort == column_key {
-        let arrow = if app.cluster_sort_reverse {
-            "▲"
-        } else {
-            "▼"
-        };
-        Cell::from(Line::from(vec![Span::styled(
-            format!("{label} {arrow}"),
-            Style::default()
-                .fg(skin.accent)
-                .add_modifier(Modifier::BOLD),
-        )]))
-    } else {
-        Cell::from(Line::from(Span::styled(
-            label.to_owned(),
-            Style::default().fg(skin.secondary),
-        )))
-    }
 }
