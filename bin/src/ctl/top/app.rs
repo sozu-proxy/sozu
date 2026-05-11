@@ -923,7 +923,7 @@ impl Default for App {
     }
 }
 
-fn count_value(metric: Option<&FilteredMetrics>) -> Option<i64> {
+pub(super) fn count_value(metric: Option<&FilteredMetrics>) -> Option<i64> {
     let inner = metric?.inner.as_ref()?;
     match inner {
         filtered_metrics::Inner::Count(v) => Some(*v),
@@ -931,7 +931,7 @@ fn count_value(metric: Option<&FilteredMetrics>) -> Option<i64> {
     }
 }
 
-fn gauge_value(metric: Option<&FilteredMetrics>) -> Option<u64> {
+pub(super) fn gauge_value(metric: Option<&FilteredMetrics>) -> Option<u64> {
     let inner = metric?.inner.as_ref()?;
     match inner {
         filtered_metrics::Inner::Gauge(v) => Some(*v),

@@ -20,10 +20,10 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table};
-use sozu_command_lib::proto::command::{AggregatedMetrics, FilteredMetrics, filtered_metrics};
+use sozu_command_lib::proto::command::AggregatedMetrics;
 use sozu_lib::metrics::names;
 
-use super::super::app::App;
+use super::super::app::{App, count_value as count, gauge_value as gauge};
 use super::super::theme::Skin;
 
 pub fn render(f: &mut Frame<'_>, area: Rect, app: &App, skin: &Skin) {
@@ -307,18 +307,7 @@ fn row_style(skin: &Skin, warn: bool) -> Style {
     }
 }
 
-fn gauge(metric: Option<&FilteredMetrics>) -> Option<u64> {
-    let inner = metric?.inner.as_ref()?;
-    match inner {
-        filtered_metrics::Inner::Gauge(v) => Some(*v),
-        _ => None,
-    }
-}
-
-fn count(metric: Option<&FilteredMetrics>) -> Option<i64> {
-    let inner = metric?.inner.as_ref()?;
-    match inner {
-        filtered_metrics::Inner::Count(v) => Some(*v),
-        _ => None,
-    }
-}
+// `gauge` / `count` helpers come from `super::super::app` (renamed at
+// import time) so the H2 pane and the App-side rate calculators share
+// one source of truth for `FilteredMetrics -> Option<{i64,u64}>`
+// extraction. Closes PR #1256 simplify A3.
