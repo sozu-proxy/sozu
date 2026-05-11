@@ -151,6 +151,7 @@ impl ConfigState {
             | RequestType::QueryMetrics(_)
             | RequestType::QueryClustersHashes(_)
             | RequestType::ConfigureMetrics(_)
+            | RequestType::SetMetricDetail(_)
             | RequestType::ReturnListenSockets(_)
             | RequestType::SetMaxConnectionsPerIp(_)
             | RequestType::QueryMaxConnectionsPerIp(_)
