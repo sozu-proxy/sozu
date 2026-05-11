@@ -1403,9 +1403,10 @@ impl Server {
                     // `None` — the lease store treats that as "binding
                     // unknown" per the proto contract.
                     session_ulid: req.peer_session_ulid.as_deref().and_then(|s| {
-                        rusty_ulid::Ulid::from_str(s).map(u128::from).ok().or_else(|| {
-                            u128::from_str_radix(s.trim_start_matches("0x"), 16).ok()
-                        })
+                        rusty_ulid::Ulid::from_str(s)
+                            .map(u128::from)
+                            .ok()
+                            .or_else(|| u128::from_str_radix(s.trim_start_matches("0x"), 16).ok())
                     }),
                 };
                 if req.clear.unwrap_or(false) {
