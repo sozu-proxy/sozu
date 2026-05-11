@@ -147,6 +147,17 @@ pub mod h2 {
     pub const TRAILERS_DROPPED_CONTENT_LENGTH: &str = "h2.trailers_dropped_content_length";
     pub const TRAILER_SPOOF_VECTOR_ELIDED: &str = "h2.trailer.spoof_vector_elided";
     pub const WINDOW_UPDATE_DROPPED: &str = "h2.window_update_dropped";
+
+    // Flood-mitigation violation counters — one per flood class the H2
+    // mux's `H2FloodDetector` recognises. Surfaced in the TUI's H2 pane
+    // so operators can spot a flood-pattern before it pages.
+    pub const FLOOD_VIOLATION_CONTINUATION: &str = "h2.flood.violation.continuation";
+    pub const FLOOD_VIOLATION_GLITCH_WINDOW: &str = "h2.flood.violation.glitch_window";
+    pub const FLOOD_VIOLATION_MADE_YOU_RESET: &str = "h2.flood.violation.made_you_reset";
+    pub const FLOOD_VIOLATION_PING: &str = "h2.flood.violation.ping";
+    pub const FLOOD_VIOLATION_PRIORITY: &str = "h2.flood.violation.priority";
+    pub const FLOOD_VIOLATION_RAPID_RESET: &str = "h2.flood.violation.rapid_reset";
+    pub const FLOOD_VIOLATION_SETTINGS: &str = "h2.flood.violation.settings";
 }
 
 /// HTTP counters (H1 + H2 share these); see `https` for the HTTPS-specific
