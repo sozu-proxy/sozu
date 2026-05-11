@@ -2202,12 +2202,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "paste"
-version = "1.0.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
-
-[[package]]
 name = "paw"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2829,15 +2823,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rustls-pemfile"
-version = "2.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dce314e5fee3f39953d46bb63bb8a46d40c2f8fb7cc5a3b6cab2bde9721d6e50"
-dependencies = [
- "rustls-pki-types",
-]
-
-[[package]]
 name = "rustls-pki-types"
 version = "1.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3184,7 +3169,6 @@ dependencies = [
  "hyper-util",
  "libc",
  "mio",
- "paste",
  "rustls",
  "serial_test",
  "sha2 0.11.0",
@@ -3219,7 +3203,6 @@ dependencies = [
  "regex",
  "rustls",
  "rustls-openssl",
- "rustls-pemfile",
  "rusty_ulid",
  "serial_test",
  "sha2 0.11.0",

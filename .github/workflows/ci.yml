@@ -264,19 +264,7 @@ jobs:
         run: cargo install cargo-audit --locked
 
       - name: Run cargo audit (default features)
-        # Pre-existing `unmaintained` transitives are ignored to keep
-        # the gate focused on actual CVEs:
-        # - RUSTSEC-2024-0436 — `paste` 1.0.15 (test-only via `sozu-e2e`);
-        #   maintainer archived the crate but it has no known vuln.
-        # - RUSTSEC-2025-0134 — `rustls-pemfile` 2.2.0 (transitively
-        #   via `sozu-lib`); functionality is folded into `rustls-pki-types`,
-        #   no known vuln in the meantime.
-        # Drop these ignores once the upstream chains migrate.
-        run: |
-          cargo audit \
-            --deny warnings \
-            --ignore RUSTSEC-2024-0436 \
-            --ignore RUSTSEC-2025-0134
+        run: cargo audit --deny warnings
 
       - name: Run cargo audit (all features incl. tui)
         run: |
@@ -285,11 +273,7 @@ jobs:
           # workspace-locked entries. Re-running with the same lockfile
           # produces a consistent advisory set; the duplicate invocation
           # is kept symmetrical with the per-feature build matrix above.
-          # See the previous step for the per-ID ignore rationale.
-          cargo audit \
-            --deny warnings \
-            --ignore RUSTSEC-2024-0436 \
-            --ignore RUSTSEC-2025-0134
+          cargo audit --deny warnings
 
   # ┌──────────────────────────────────────────────────────────────┐
   # │ Group D — Bombardier load benches (folded from benchmark.yml) │
