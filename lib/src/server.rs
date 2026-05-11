@@ -142,8 +142,7 @@ pub fn push_event(event: Event) {
 /// every successful `SetMetricDetail` worker response. The master
 /// collects these across the fan-out and assembles them into
 /// `MetricDetailStatus.workers[<worker_id>]` so the TUI sees each
-/// worker's actual aggregator state instead of the master's view as a
-/// stand-in. See PR #1256 round-4 follow-through.
+/// worker's actual aggregator state instead of the master's view.
 fn worker_metric_detail_status_content(
     configured: MetricDetailLevel,
     effective: MetricDetailLevel,

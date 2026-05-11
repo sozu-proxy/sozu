@@ -552,8 +552,8 @@ impl CommandHub {
             // signals; the master folds them into the audit log here
             // alongside operator-initiated transitions audited from
             // `requests.rs::worker_request`. Without this, the worker's
-            // polled janitor expiring a lease left no audit trail —
-            // exactly the gap flagged in PR #1256 review.
+            // polled janitor expiring a lease would leave no audit
+            // trail, masking implicit cardinality changes from SOC tools.
             if event.kind == EventKind::MetricDetailChanged as i32 {
                 if let Some(transition) = event.metric_detail.as_ref() {
                     crate::command::requests::audit_worker_metric_detail_transition(

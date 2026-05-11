@@ -91,8 +91,8 @@ impl Skin {
         };
         // Helper for the five fail-closed paths below: every diagnostic
         // returns the built-in default paired with an operator-facing
-        // status string. Keeps the policy from commit 5b098d9b
-        // (fail-closed on every lookup defect) in a single spelling.
+        // status string. Keeps the fail-closed-on-every-lookup-defect
+        // policy in a single spelling.
         let default_with = |msg: String| (Self::default_dark(), Some(msg));
         match Self::lookup_paths(choice).into_iter().find(|p| p.is_file()) {
             Some(path) => {

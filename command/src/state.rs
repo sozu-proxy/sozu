@@ -3425,12 +3425,11 @@ mod tests {
         );
     }
 
-    /// Regression guard for the C1 fix on PR #1256. `ConfigState::dispatch`
-    /// MUST treat `SetMetricDetail` as a runtime-only verb (no persisted
-    /// state mutation). A future refactor that drops the variant from the
-    /// no-op match arm and falls through to the catch-all would silently
-    /// re-break the SetMetricDetail dispatch path with `UndispatchableRequest`,
-    /// the bug that initially blocked TUI cardinality elevation entirely.
+    /// `ConfigState::dispatch` MUST treat `SetMetricDetail` as a
+    /// runtime-only verb (no persisted state mutation). A future
+    /// refactor that drops the variant from the no-op match arm and
+    /// falls through to the catch-all would silently re-break the
+    /// SetMetricDetail dispatch path with `UndispatchableRequest`.
     #[test]
     fn dispatch_passes_through_set_metric_detail() {
         use crate::proto::command::{MetricDetail, SetMetricDetail};
