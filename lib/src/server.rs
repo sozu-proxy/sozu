@@ -23,9 +23,9 @@ use sozu_command::{
     logging,
     proto::command::{
         ActivateListener, AddBackend, CertificatesWithFingerprints, Cluster, ClusterHashes,
-        ClusterInformations, DeactivateListener, Event, HttpListenerConfig, HttpsListenerConfig,
-        InitialState, ListenerType, LoadBalancingAlgorithms, LoadMetric, MetricDetail,
-        MetricsConfiguration, RemoveBackend, Request, ResponseStatus, ServerConfig,
+        ClusterInformations, DeactivateListener, Event, EventKind, HttpListenerConfig,
+        HttpsListenerConfig, InitialState, ListenerType, LoadBalancingAlgorithms, LoadMetric,
+        MetricDetail, MetricsConfiguration, RemoveBackend, Request, ResponseStatus, ServerConfig,
         TcpListenerConfig as CommandTcpListener, UpdateHttpListenerConfig,
         UpdateHttpsListenerConfig, UpdateTcpListenerConfig, WorkerRequest, WorkerResponse,
         request::RequestType, response_content::ContentType,
@@ -135,6 +135,40 @@ pub fn push_event(event: Event) {
             status: ResponseStatus::Processing.into(),
             content: Some(ContentType::Event(event).into()),
         });
+    });
+}
+
+/// Build a `METRIC_DETAIL_CHANGED` event carrying the worker-local
+/// transition payload (previous/effective levels + transition kind).
+/// `client_id` is `Some(_)` for explicit apply/clear, `None` for the
+/// polled janitor's bulk expiry. The master folds this Event into the
+/// audit log alongside operator-initiated transitions emitted at the
+/// dispatch site in `bin/src/command/requests.rs::worker_request`.
+fn push_metric_detail_transition(
+    previous: MetricDetailLevel,
+    effective: MetricDetailLevel,
+    transition_kind: &'static str,
+    client_id: Option<String>,
+) {
+    use sozu_command::proto::command::MetricDetailTransition;
+    // No-op when nothing actually changed. Defence-in-depth — every
+    // caller already gates on `previous != effective`, but
+    // double-checking here means future call sites can't accidentally
+    // emit a "ghost" transition.
+    if previous == effective {
+        return;
+    }
+    push_event(Event {
+        kind: EventKind::MetricDetailChanged as i32,
+        cluster_id: None,
+        backend_id: None,
+        address: None,
+        metric_detail: Some(MetricDetailTransition {
+            previous_effective: MetricDetail::from(previous) as i32,
+            effective: MetricDetail::from(effective) as i32,
+            transition_kind: transition_kind.to_owned(),
+            client_id,
+        }),
     });
 }
 
@@ -1297,13 +1331,29 @@ impl Server {
         // the HashMap walk on every iteration. Single-threaded worker, so
         // `borrow_mut` is safe here.
         let now = std::time::Instant::now();
-        METRICS.with(|metrics| {
+        // Capture (previous, effective) before releasing the borrow so we
+        // can emit an Event afterwards. Holding `METRICS.borrow_mut`
+        // across `push_event` would re-enter the same thread-local from
+        // inside `QUEUE.with` (safe but conceptually noisy); the
+        // two-step split keeps the borrow scopes minimal.
+        let lease_tick_transition = METRICS.with(|metrics| {
             let mut m = metrics.borrow_mut();
-            if m.lease_tick_due(now) {
-                let _previous = m.lease_tick(now);
-                // Worker-local transition; not audited (see SetMetricDetail proto doc).
+            if !m.lease_tick_due(now) {
+                return None;
             }
+            let previous = m.lease_tick(now)?;
+            let effective = m.detail_effective();
+            Some((previous, effective))
         });
+        if let Some((previous, effective)) = lease_tick_transition {
+            // The janitor retired one or more leases AND the effective
+            // level moved. Surface the worker-local transition as an
+            // Event so the master folds it into the audit log (closes
+            // the gap where TUI-crashed lease expiry was previously
+            // silent). `client_id` is `None` because the janitor may
+            // have retired multiple leases at once.
+            push_metric_detail_transition(previous, effective, "lease_tick_expired", None);
+        }
         match &message.content.request_type {
             Some(RequestType::ConfigureMetrics(configuration)) => {
                 match MetricsConfiguration::try_from(*configuration) {
@@ -1359,28 +1409,38 @@ impl Server {
                     }),
                 };
                 if req.clear.unwrap_or(false) {
-                    METRICS.with(|metrics| {
-                        match metrics
-                            .borrow_mut()
-                            .lease_clear(&req.client_id, presented_binding)
-                        {
-                            crate::metrics::LeaseClearOutcome::Cleared { .. }
-                            | crate::metrics::LeaseClearOutcome::NotFound => {
-                                // Worker-local transition; not audited
-                                // (see SetMetricDetail proto doc).
-                                push_queue(WorkerResponse::ok(message.id.clone()));
-                            }
-                            crate::metrics::LeaseClearOutcome::Unauthorized => {
-                                let msg = format!(
-                                    "SetMetricDetail: clear refused for client_id={} \
-                                     (peer binding does not match the apply-time owner)",
-                                    req.client_id
-                                );
-                                error!("{}", msg);
-                                push_queue(WorkerResponse::error(message.id.clone(), msg));
-                            }
-                        }
+                    // Capture transition fields before releasing the
+                    // borrow so we can emit an Event after.
+                    let outcome = METRICS.with(|metrics| {
+                        let mut m = metrics.borrow_mut();
+                        let outcome = m.lease_clear(&req.client_id, presented_binding);
+                        let effective_after = m.detail_effective();
+                        (outcome, effective_after)
                     });
+                    match outcome.0 {
+                        crate::metrics::LeaseClearOutcome::Cleared { previous_effective } => {
+                            push_metric_detail_transition(
+                                previous_effective,
+                                outcome.1,
+                                "lease_clear",
+                                Some(req.client_id.clone()),
+                            );
+                            push_queue(WorkerResponse::ok(message.id.clone()));
+                        }
+                        crate::metrics::LeaseClearOutcome::NotFound => {
+                            // Silent no-op: no lease existed for that id.
+                            push_queue(WorkerResponse::ok(message.id.clone()));
+                        }
+                        crate::metrics::LeaseClearOutcome::Unauthorized => {
+                            let msg = format!(
+                                "SetMetricDetail: clear refused for client_id={} \
+                                 (peer binding does not match the apply-time owner)",
+                                req.client_id
+                            );
+                            error!("{}", msg);
+                            push_queue(WorkerResponse::error(message.id.clone(), msg));
+                        }
+                    }
                     return;
                 }
                 let detail_proto = match req.detail {
@@ -1430,16 +1490,21 @@ impl Server {
                     .filter(|&t| t > 0)
                     .unwrap_or(crate::metrics::LEASE_TTL_DEFAULT.as_secs() as u32);
                 let ttl = std::time::Duration::from_secs(ttl_seconds.into());
-                METRICS.with(|metrics| {
-                    let _ = metrics.borrow_mut().lease_apply(
+                let (previous, effective) = METRICS.with(|metrics| {
+                    metrics.borrow_mut().lease_apply(
                         req.client_id.clone(),
                         level,
                         ttl,
                         presented_binding,
-                    );
-                    // Worker-local transition; not audited (see SetMetricDetail proto doc).
-                    push_queue(WorkerResponse::ok(message.id.clone()));
+                    )
                 });
+                push_metric_detail_transition(
+                    previous,
+                    effective,
+                    "lease_apply",
+                    Some(req.client_id.clone()),
+                );
+                push_queue(WorkerResponse::ok(message.id.clone()));
                 return;
             }
             Some(RequestType::Logging(logging_filter)) => {

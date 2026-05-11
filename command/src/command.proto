@@ -1187,6 +1187,40 @@ message Event {
     optional string cluster_id = 2;
     optional string backend_id = 3;
     optional SocketAddress address = 4;
+    // Set only when `kind == METRIC_DETAIL_CHANGED` and the worker is
+    // surfacing a worker-local lease transition (apply, clear, or polled
+    // expiry). Operator-initiated transitions are audited at the master
+    // dispatch site and DO emit this event for the SubscribeEvents bus,
+    // but the audit-log line for those is generated master-side and
+    // duplicates of `metric_detail` should be ignored by SOC tooling.
+    // See the `EventKind::METRIC_DETAIL_CHANGED` doc and the
+    // `MetricDetailTransition` message below for the trust model.
+    optional MetricDetailTransition metric_detail = 5;
+}
+
+// Worker-emitted cardinality-lease transition. Populates the
+// `Event.metric_detail` field when a worker's `effective` level changes
+// because a lease was applied, renewed, expired (TTL janitor), or
+// cleared. The master folds these into the audit log alongside the
+// operator-initiated transitions emitted from
+// `bin/src/command/requests.rs::worker_request`, closing the gap where
+// worker-local expiries previously left no audit trail.
+message MetricDetailTransition {
+    // The worker's effective cardinality level BEFORE the transition.
+    required MetricDetail previous_effective = 1;
+    // The worker's effective cardinality level AFTER the transition.
+    required MetricDetail effective = 2;
+    // What caused the transition. Stable strings: "lease_tick_expired"
+    // (janitor retired one or more leases), "lease_apply" (worker arm
+    // applied a lease), "lease_clear" (worker arm cleared a lease).
+    // Operator-initiated apply/clear emit master-side; the worker still
+    // emits this Event so the SubscribeEvents bus has one canonical
+    // signal for cardinality changes regardless of origin.
+    required string transition_kind = 3;
+    // Operator-supplied lease key (`SetMetricDetail.client_id`) when the
+    // transition was triggered by an explicit apply/clear. Empty for
+    // janitor expiries, which clear many leases at once.
+    optional string client_id = 4;
 }
 
 enum EventKind {

@@ -266,6 +266,7 @@ impl std::ops::Drop for Backend {
             backend_id: Some(self.backend_id.to_owned()),
             address: Some(self.address.into()),
             cluster_id: None,
+                            metric_detail: None,
         });
     }
 }
@@ -356,6 +357,7 @@ impl BackendMap {
                     cluster_id: Some(cluster_id.to_owned()),
                     backend_id: None,
                     address: None,
+                            metric_detail: None,
                 });
             }
             (ClusterAvailability::AllDown, ClusterAvailability::Available) => {
@@ -369,6 +371,7 @@ impl BackendMap {
                     cluster_id: Some(cluster_id.to_owned()),
                     backend_id: None,
                     address: None,
+                            metric_detail: None,
                 });
             }
             _ => {}
