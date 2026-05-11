@@ -14,9 +14,10 @@
 //! - The renewer thread sleeps on a `crossbeam_channel::after(ttl/2)` and
 //!   re-sends a renewal each tick. A "shutdown" sender wakes it early so
 //!   `Drop` returns fast.
-//! - The drop path takes the channel back via `Mutex<Option<...>>` so the
-//!   renewer thread can exit cleanly + the drop path can issue the final
-//!   `clear` request without owning a long-lived connection.
+//! - The drop path owns its own pre-opened channel (`final_channel`)
+//!   parked behind a `Mutex<Option<...>>`, used exclusively for the
+//!   best-effort `clear` request. The renewer thread keeps a separate
+//!   channel of its own and drops it on exit.
 
 use std::process;
 use std::sync::{Arc, Mutex};
@@ -52,9 +53,11 @@ pub struct DetailGuard {
     /// Renewer-thread join handle. Joined on Drop after the shutdown signal
     /// fires so we exit deterministically.
     renewer: Option<JoinHandle<()>>,
-    /// One-shot channel that owns the dedicated revoke connection. The
-    /// renewer thread parks the channel here on its way out so `Drop` can
-    /// re-use it for the final `clear` request.
+    /// Pre-opened channel reserved for the final `clear` request. Parked
+    /// behind a `Mutex<Option<...>>` so `Drop` can take it without
+    /// blocking on contention. The renewer thread is NOT involved with
+    /// this slot — it keeps its own dedicated channel and drops it on
+    /// shutdown — so a renewer crash never strands the revoke path.
     final_channel: Arc<Mutex<Option<Channel<Request, Response>>>>,
     /// Reason text echoed in the audit `EventKind::MetricDetailChanged`
     /// trail. Defaults to `"sozu top"`.
@@ -100,7 +103,6 @@ impl DetailGuard {
             ttl_seconds,
             reason.clone(),
             shutdown_rx,
-            Arc::clone(&final_channel),
         )?;
         Ok(Self {
             client_id,
@@ -109,12 +111,6 @@ impl DetailGuard {
             final_channel,
             reason,
         })
-    }
-
-    /// Identifier used in `SetMetricDetail.client_id`. Surfaced for the
-    /// status bar / audit reads.
-    pub fn client_id(&self) -> &str {
-        &self.client_id
     }
 }
 
@@ -153,16 +149,14 @@ fn spawn_renewer(
     ttl_seconds: u32,
     reason: String,
     shutdown_rx: Receiver<()>,
-    saved_channel: Arc<Mutex<Option<Channel<Request, Response>>>>,
 ) -> Result<JoinHandle<()>, CtlError> {
     let renew_after = Duration::from_secs((ttl_seconds.max(2) / 2) as u64);
     let handle = std::thread::Builder::new()
         .name("sozu-top-detail-renewer".into())
         .spawn(move || {
-            // Open the renewer's own channel so the drop path can reuse the
-            // pre-open one without contention. The renewer keeps its
-            // channel for the duration of its loop; on shutdown it drops
-            // it implicitly on thread exit.
+            // Open the renewer's own channel; the drop path keeps a
+            // separate pre-opened one for its `clear` request. The
+            // renewer's channel drops implicitly on thread exit.
             let mut channel = match create_channel(&config) {
                 Ok(ch) => ch,
                 Err(e) => {
@@ -183,23 +177,10 @@ fn spawn_renewer(
                             false,
                         ) {
                             eprintln!("sozu top: renewer send error: {e:?}");
-                            // Park the original `apply` channel back so the
-                            // drop path doesn't lose its handle. Best-effort.
                             return;
                         }
                     }
-                    recv(shutdown_rx) -> _ => {
-                        // Park the renewer's channel so the drop path could
-                        // re-use it if the original one was lost. Currently
-                        // unused (drop path keeps `final_channel`), but
-                        // makes future failover trivial.
-                        if let Ok(mut slot) = saved_channel.lock() {
-                            if slot.is_none() {
-                                *slot = Some(channel);
-                            }
-                        }
-                        return;
-                    }
+                    recv(shutdown_rx) -> _ => return,
                 }
             }
         })
@@ -241,10 +222,25 @@ fn send_set_detail(
     }
 }
 
-/// 8 hex chars from a process-time-derived seed. We don't need cryptographic
-/// uniqueness; collision with another `top:<pid>:<rand>` issued by the same
-/// pid in the same nanosecond is implausible. Avoids pulling `rand`.
+/// 8 hex chars used as the random portion of the lease `client_id`. Reads
+/// 4 bytes from `/dev/urandom` (Linux/BSD/macOS) instead of the previous
+/// `subsec_nanos()` seed: pid reuse on a busy host plus PID modulo
+/// SystemTime collisions made that source weak under `sozu top` mass-launch
+/// (e.g. tmux scripted dashboards). The kernel CSPRNG is non-blocking on
+/// every platform Sōzu builds on after first boot; if the read fails for
+/// any reason we fall back to the nanosecond seed so the TUI still starts.
+/// Cryptographic strength is not required — the value only needs to be
+/// unguessable enough to avoid lease-id collisions across concurrent
+/// instances — so we don't pull `getrandom` as a new direct dependency.
 fn short_random_suffix() -> String {
+    use std::io::Read;
+    let mut buf = [0u8; 4];
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom")
+        && f.read_exact(&mut buf).is_ok()
+    {
+        let n = u32::from_ne_bytes(buf);
+        return format!("{n:08x}");
+    }
     use std::time::{SystemTime, UNIX_EPOCH};
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
