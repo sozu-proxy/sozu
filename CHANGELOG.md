@@ -380,7 +380,11 @@ upgrade. See `doc/upgrade/1.x-to-2.0.md` for the full migration guide.
   cannot permanently elevate cardinality. Mixed-version fleets where
   one or more workers can't decode the verb surface in
   `MetricDetailStatus.unsupported_workers[]`. Full semantics in
-  `command.proto`'s `SetMetricDetail` doc comment.
+  `command.proto`'s `SetMetricDetail` doc comment. Audit-scope
+  caveat: operator-initiated transitions emit
+  `EventKind::METRIC_DETAIL_CHANGED` via the master-side audit log;
+  worker-local lease transitions (janitor expiry, post-fan-out
+  apply/clear) are not yet emitted to the audit log.
 
 - **Pre-built binaries for tagged releases
   ([#1089](https://github.com/sozu-proxy/sozu/issues/1089))**: a new
