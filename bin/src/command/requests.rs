@@ -1733,8 +1733,20 @@ impl MetricDetailAuditFields {
 pub fn worker_request(
     server: &mut Server,
     client: &mut ClientSession,
-    request_content: RequestType,
+    mut request_content: RequestType,
 ) {
+    // Master-only enrichment: populate `SetMetricDetail`'s peer binding
+    // from the connecting `ClientSession` so the worker can authorise
+    // subsequent `clear` requests against the apply-time owner. Clients
+    // never set these fields themselves — see the proto comment on
+    // `SetMetricDetail.peer_pid` / `peer_session_ulid` for the trust
+    // model. A `None` actor_pid (non-Linux build, missing SO_PEERCRED)
+    // degrades to "binding unknown" on the worker side, which accepts
+    // any clear for backward compat.
+    if let RequestType::SetMetricDetail(req) = &mut request_content {
+        req.peer_pid = client.actor_pid;
+        req.peer_session_ulid = Some(client.session_ulid.to_string());
+    }
     // Snapshot the audit entry before consuming `request_content` so we can
     // emit even when `state.dispatch` rejects the request AND so the
     // completion handler can re-emit with fanout + elapsed_ms.

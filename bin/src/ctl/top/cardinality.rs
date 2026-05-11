@@ -203,6 +203,11 @@ fn send_set_detail(
             ttl_seconds,
             clear: Some(clear),
             reason: reason.map(|r| r.to_owned()),
+            // Master-populated fields; clients leave them empty. The
+            // master fills them in `worker_request` before fan-out from
+            // the connecting `ClientSession`.
+            peer_pid: None,
+            peer_session_ulid: None,
         })),
     };
     channel

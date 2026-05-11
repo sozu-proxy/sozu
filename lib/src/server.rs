@@ -7,6 +7,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     os::unix::io::{AsRawFd, FromRawFd},
     rc::Rc,
+    str::FromStr,
     sync::LazyLock,
     time::{Duration, Instant},
 };
@@ -1338,11 +1339,47 @@ impl Server {
             // lands in a follow-up; for now the worker acks with a bare OK so
             // the existing `worker_request` fan-out path can collect.
             Some(RequestType::SetMetricDetail(req)) => {
+                // Master populates the peer binding from the connecting
+                // `ClientSession` before fan-out (`bin/src/command/
+                // requests.rs::worker_request`). A pre-binding caller or a
+                // platform without `SO_PEERCRED` yields `PeerBinding::default()`
+                // — clears against that lease are accepted from anyone, per
+                // the proto contract on `SetMetricDetail.peer_pid`.
+                let presented_binding = crate::metrics::PeerBinding {
+                    pid: req.peer_pid,
+                    // Master sends Crockford-base32 ULIDs (`Ulid::to_string`);
+                    // accept those, with a fallback hex parse for callers that
+                    // happen to send `0x…` form. A failed parse degrades to
+                    // `None` — the lease store treats that as "binding
+                    // unknown" per the proto contract.
+                    session_ulid: req.peer_session_ulid.as_deref().and_then(|s| {
+                        rusty_ulid::Ulid::from_str(s).map(u128::from).ok().or_else(|| {
+                            u128::from_str_radix(s.trim_start_matches("0x"), 16).ok()
+                        })
+                    }),
+                };
                 if req.clear.unwrap_or(false) {
                     METRICS.with(|metrics| {
-                        let _previous = metrics.borrow_mut().lease_clear(&req.client_id);
-                        // Worker-local transition; not audited (see SetMetricDetail proto doc).
-                        push_queue(WorkerResponse::ok(message.id.clone()));
+                        match metrics
+                            .borrow_mut()
+                            .lease_clear(&req.client_id, presented_binding)
+                        {
+                            crate::metrics::LeaseClearOutcome::Cleared { .. }
+                            | crate::metrics::LeaseClearOutcome::NotFound => {
+                                // Worker-local transition; not audited
+                                // (see SetMetricDetail proto doc).
+                                push_queue(WorkerResponse::ok(message.id.clone()));
+                            }
+                            crate::metrics::LeaseClearOutcome::Unauthorized => {
+                                let msg = format!(
+                                    "SetMetricDetail: clear refused for client_id={} \
+                                     (peer binding does not match the apply-time owner)",
+                                    req.client_id
+                                );
+                                error!("{}", msg);
+                                push_queue(WorkerResponse::error(message.id.clone(), msg));
+                            }
+                        }
                     });
                     return;
                 }
@@ -1394,9 +1431,12 @@ impl Server {
                     .unwrap_or(crate::metrics::LEASE_TTL_DEFAULT.as_secs() as u32);
                 let ttl = std::time::Duration::from_secs(ttl_seconds.into());
                 METRICS.with(|metrics| {
-                    let _ = metrics
-                        .borrow_mut()
-                        .lease_apply(req.client_id.clone(), level, ttl);
+                    let _ = metrics.borrow_mut().lease_apply(
+                        req.client_id.clone(),
+                        level,
+                        ttl,
+                        presented_binding,
+                    );
                     // Worker-local transition; not audited (see SetMetricDetail proto doc).
                     push_queue(WorkerResponse::ok(message.id.clone()));
                 });
