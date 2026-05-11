@@ -106,50 +106,47 @@ const EVENTS_CAP: usize = 64;
 /// receiver's slot.
 const SNAPSHOT_CAP: usize = 1;
 
-/// Spawn the snapshot-collector thread. Returns the `Snapshot` receiver and
-/// a join handle. Thread exits when the receiver is dropped or the channel
-/// returns a permanent socket error.
-pub fn spawn_collector(
-    config: Config,
-    refresh_ms: u64,
-) -> Result<(Receiver<Snapshot>, std::thread::JoinHandle<()>), CtlError> {
-    // Open the dedicated polling channel up-front so a connection failure
-    // surfaces synchronously (operator gets `CtlError::CreateChannel`)
-    // rather than silently spinning behind the spawned thread.
-    let mut channel = create_channel(&config)?;
-    let (tx, rx) = bounded::<Snapshot>(SNAPSHOT_CAP);
-    let interval = Duration::from_millis(refresh_ms);
-    let handle = std::thread::Builder::new()
-        .name("sozu-top-collector".into())
-        .spawn(move || collector_loop(&mut channel, tx, interval))
-        .expect("spawn sozu-top collector");
-    Ok((rx, handle))
-}
-
-fn collector_loop(
-    channel: &mut sozu_command_lib::channel::Channel<Request, Response>,
-    tx: Sender<Snapshot>,
+/// Shared polling skeleton for the three `bounded(1)` collector threads
+/// (`spawn_collector`, `spawn_listeners`, `spawn_certs`).
+///
+/// The threading topology (one OS thread per pane, owning its own `Channel`,
+/// `bounded(1)` publish-or-skip on backpressure) is locked by design and is
+/// not abstracted here — only the per-tick polling shape is shared:
+///
+/// 1. record `Instant::now()`
+/// 2. call the per-thread `poll` closure
+/// 3. on `Ok(v)`: `try_send(v)` — `Full` is dropped (publish-or-skip),
+///    `Disconnected` exits the thread cleanly when the UI drops `rx`
+/// 4. on `Err(_)`: `eprintln!` and keep going (a transient socket error
+///    never kills the thread; the next tick reconnects via the shared
+///    `Channel` retry path inside `poll`)
+/// 5. sleep the remainder of `interval` if the round-trip was faster
+///
+/// The events thread (`spawn_events`) has a different shape (single
+/// `SubscribeEvents` write + open-ended drain loop) and intentionally does
+/// not reuse this helper.
+fn poll_loop<T, F>(
+    label: &'static str,
     interval: Duration,
-) {
+    tx: Sender<T>,
+    mut channel: sozu_command_lib::channel::Channel<Request, Response>,
+    mut poll: F,
+) where
+    F: FnMut(&mut sozu_command_lib::channel::Channel<Request, Response>) -> Result<T, String>,
+{
     loop {
         let started = Instant::now();
-        match poll_metrics(channel) {
-            Ok(metrics) => {
-                let snap = Snapshot {
-                    metrics,
-                    received_at: Instant::now(),
-                };
-                match tx.try_send(snap) {
-                    Ok(()) => {}
-                    // Publish-or-skip: if the UI hasn't drained the previous
-                    // snapshot, skip this one rather than killing the thread.
-                    // The next poll will produce a fresher snapshot anyway.
-                    Err(TrySendError::Full(_)) => {}
-                    Err(TrySendError::Disconnected(_)) => return,
-                }
-            }
+        match poll(&mut channel) {
+            Ok(v) => match tx.try_send(v) {
+                Ok(()) => {}
+                // Publish-or-skip: if the UI hasn't drained the previous
+                // value, skip this one rather than killing the thread. The
+                // next poll produces a fresher value anyway.
+                Err(TrySendError::Full(_)) => {}
+                Err(TrySendError::Disconnected(_)) => return,
+            },
             Err(err) => {
-                eprintln!("sozu top: snapshot poll error: {err}");
+                eprintln!("sozu top: {label} poll error: {err}");
             }
         }
         // Sleep the remaining slice of the configured interval so we don't
@@ -160,6 +157,33 @@ fn collector_loop(
             std::thread::sleep(interval - elapsed);
         }
     }
+}
+
+/// Spawn the snapshot-collector thread. Returns the `Snapshot` receiver and
+/// a join handle. Thread exits when the receiver is dropped or the channel
+/// returns a permanent socket error.
+pub fn spawn_collector(
+    config: Config,
+    refresh_ms: u64,
+) -> Result<(Receiver<Snapshot>, std::thread::JoinHandle<()>), CtlError> {
+    // Open the dedicated polling channel up-front so a connection failure
+    // surfaces synchronously (operator gets `CtlError::CreateChannel`)
+    // rather than silently spinning behind the spawned thread.
+    let channel = create_channel(&config)?;
+    let (tx, rx) = bounded::<Snapshot>(SNAPSHOT_CAP);
+    let interval = Duration::from_millis(refresh_ms);
+    let handle = std::thread::Builder::new()
+        .name("sozu-top-collector".into())
+        .spawn(move || {
+            poll_loop("snapshot", interval, tx, channel, |ch| {
+                poll_metrics(ch).map(|metrics| Snapshot {
+                    metrics,
+                    received_at: Instant::now(),
+                })
+            })
+        })
+        .expect("spawn sozu-top collector");
+    Ok((rx, handle))
 }
 
 fn poll_metrics(
@@ -223,40 +247,17 @@ const CERTS_INTERVAL: Duration = Duration::from_secs(30);
 pub fn spawn_listeners(
     config: Config,
 ) -> Result<(Receiver<ListenersSnapshot>, std::thread::JoinHandle<()>), CtlError> {
-    let mut channel = create_channel(&config)?;
+    let channel = create_channel(&config)?;
     let (tx, rx) = bounded::<ListenersSnapshot>(SNAPSHOT_CAP);
     let handle = std::thread::Builder::new()
         .name("sozu-top-listeners".into())
-        .spawn(move || listeners_loop(&mut channel, tx))
+        .spawn(move || {
+            poll_loop("listeners", LISTENERS_INTERVAL, tx, channel, |ch| {
+                poll_listeners(ch).map(|list| ListenersSnapshot { list })
+            })
+        })
         .expect("spawn sozu-top listeners");
     Ok((rx, handle))
-}
-
-fn listeners_loop(
-    channel: &mut sozu_command_lib::channel::Channel<Request, Response>,
-    tx: Sender<ListenersSnapshot>,
-) {
-    loop {
-        let started = Instant::now();
-        match poll_listeners(channel) {
-            Ok(list) => {
-                let snap = ListenersSnapshot { list };
-                match tx.try_send(snap) {
-                    Ok(()) => {}
-                    // Publish-or-skip on backpressure: see SNAPSHOT_CAP doc.
-                    Err(TrySendError::Full(_)) => {}
-                    Err(TrySendError::Disconnected(_)) => return,
-                }
-            }
-            Err(err) => {
-                eprintln!("sozu top: listeners poll error: {err}");
-            }
-        }
-        let elapsed = started.elapsed();
-        if elapsed < LISTENERS_INTERVAL {
-            std::thread::sleep(LISTENERS_INTERVAL - elapsed);
-        }
-    }
 }
 
 fn poll_listeners(
@@ -301,40 +302,17 @@ fn poll_listeners(
 pub fn spawn_certs(
     config: Config,
 ) -> Result<(Receiver<CertsSnapshot>, std::thread::JoinHandle<()>), CtlError> {
-    let mut channel = create_channel(&config)?;
+    let channel = create_channel(&config)?;
     let (tx, rx) = bounded::<CertsSnapshot>(SNAPSHOT_CAP);
     let handle = std::thread::Builder::new()
         .name("sozu-top-certs".into())
-        .spawn(move || certs_loop(&mut channel, tx))
+        .spawn(move || {
+            poll_loop("certs", CERTS_INTERVAL, tx, channel, |ch| {
+                poll_certs(ch).map(|list| CertsSnapshot { list })
+            })
+        })
         .expect("spawn sozu-top certs");
     Ok((rx, handle))
-}
-
-fn certs_loop(
-    channel: &mut sozu_command_lib::channel::Channel<Request, Response>,
-    tx: Sender<CertsSnapshot>,
-) {
-    loop {
-        let started = Instant::now();
-        match poll_certs(channel) {
-            Ok(list) => {
-                let snap = CertsSnapshot { list };
-                match tx.try_send(snap) {
-                    Ok(()) => {}
-                    // Publish-or-skip on backpressure: see SNAPSHOT_CAP doc.
-                    Err(TrySendError::Full(_)) => {}
-                    Err(TrySendError::Disconnected(_)) => return,
-                }
-            }
-            Err(err) => {
-                eprintln!("sozu top: certs poll error: {err}");
-            }
-        }
-        let elapsed = started.elapsed();
-        if elapsed < CERTS_INTERVAL {
-            std::thread::sleep(CERTS_INTERVAL - elapsed);
-        }
-    }
 }
 
 fn poll_certs(
