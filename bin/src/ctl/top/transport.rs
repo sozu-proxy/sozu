@@ -1,23 +1,33 @@
 //! Transport layer for `sozu top` — synchronous threads over the existing
-//! unix command socket. No async runtime in v1 by design (see Codex
-//! cross-check in `tasks/todo.md`).
+//! unix command socket. No async runtime in v1 by design.
 //!
-//! Two `Channel` connections to the master:
+//! Four `Channel` connections to the master, each owned by its own thread:
 //!
-//! - **Snapshot collector** (`spawn_collector`): polls `RequestType::
-//!   QueryMetrics` on the configurable `--refresh-ms` ticker and pushes each
-//!   `AggregatedMetrics` (plus a wall-clock sample anchor) into a
-//!   `crossbeam_channel::bounded::<Snapshot>(1)` with newest-wins overwrite,
-//!   so a slow UI tick never queues a fan-out pile-up. The thread also
-//!   serves the initial `ListWorkers` and `ListListeners` sidebar queries.
-//! - **Events stream** (`spawn_events`): opens `RequestType::SubscribeEvents`
-//!   once and forwards every inbound `Event` into a `crossbeam_channel::
-//!   bounded::<TopEvent>(64)`. The unix `Channel<W,R>` is a single framed
-//!   socket without message-id correlation, so multiplexing this stream
-//!   with the discrete `QueryMetrics` round-trip on one socket is unsafe —
-//!   we open a separate connection.
+//! 1. **Snapshot collector** (`spawn_collector`): polls `RequestType::
+//!    QueryMetrics` on the configurable `--refresh-ms` ticker and pushes
+//!    each `AggregatedMetrics` (plus a wall-clock sample anchor) into a
+//!    `crossbeam_channel::bounded::<Snapshot>(1)`.
+//! 2. **Events stream** (`spawn_events`): opens `RequestType::
+//!    SubscribeEvents` once and forwards every inbound `Event` into a
+//!    `crossbeam_channel::bounded::<TopEvent>(64)`. The unix `Channel<W,R>`
+//!    is a single framed socket without message-id correlation, so
+//!    multiplexing this stream with the discrete `QueryMetrics` round-trip
+//!    on one socket is unsafe — we open a separate connection.
+//! 3. **Listeners collector** (`spawn_listeners`): polls
+//!    `RequestType::ListListeners` every 5 s into a `bounded(1)` channel.
+//! 4. **Certs collector** (`spawn_certs`): polls
+//!    `RequestType::QueryCertificatesFromTheState` every 30 s into a
+//!    `bounded(1)` channel.
 //!
-//! Both threads exit cleanly when their `crossbeam_channel` peer is dropped
+//! All snapshot threads use **publish-or-skip on backpressure**: when the
+//! `bounded(1)` channel is already populated (the UI hasn't drained yet),
+//! the fresh snapshot is dropped rather than the thread blocking or dying.
+//! The next poll produces a fresher snapshot anyway, so dropping an
+//! in-flight one is correct: it preserves "newest-wins" without needing
+//! the sender to peek into the receiver's slot. The events thread uses the
+//! same shape, just with a `bounded(64)` buffer for burst tolerance.
+//!
+//! All threads exit cleanly when their `crossbeam_channel` peer is dropped
 //! (the UI thread owns the rx ends; tearing down the App drops the senders).
 //! Errors are logged via `eprintln!` and the thread shuts down — we never
 //! crash the UI because of a transient socket error.
@@ -60,20 +70,25 @@ pub struct TopEvent {
 /// Refreshed at a slower cadence than metrics (5 s default) because listener
 /// state changes are operator-paced — adds, removes, activates, deactivates
 /// all flow via control-plane mutations that the EVENTS pane already shows.
+///
+/// Unlike `Snapshot`, there is no `received_at` anchor: the listeners pane
+/// renders the absolute set, never per-tick rates, so the wall-clock would
+/// have nothing to discriminate against.
 #[derive(Debug, Clone)]
 pub struct ListenersSnapshot {
     pub list: ListenersList,
-    pub received_at: Instant,
 }
 
 /// Certificate inventory snapshot pushed by the certs-collector thread.
 /// Polled at 30 s — even slower than listeners because cert lifecycle is
 /// operator-driven (add, remove, replace via the master's state) and every
 /// transition already lands as a CERTIFICATE_* event on the EVENTS pane.
+///
+/// Same shape as `ListenersSnapshot`: no `received_at` because the certs
+/// pane renders the absolute set without per-tick rates.
 #[derive(Debug, Clone)]
 pub struct CertsSnapshot {
     pub list: ListOfCertificatesByAddress,
-    pub received_at: Instant,
 }
 
 /// Capacity of the events channel. 64 is generous for the operator-pace
@@ -83,10 +98,12 @@ pub struct CertsSnapshot {
 /// memory bounded if the UI freezes momentarily.
 const EVENTS_CAP: usize = 64;
 
-/// `Snapshot` channel capacity. 1 + newest-wins overwrite is intentional:
-/// while the UI is rendering a frame, a fresh snapshot replaces a stale
-/// one in flight rather than queueing both. Confirms Codex's cadence
-/// recommendation in `tasks/todo.md`.
+/// `Snapshot` channel capacity. 1 with publish-or-skip on backpressure is
+/// intentional: while the UI is rendering a frame, a fresh snapshot is
+/// dropped rather than queueing behind the stale one. The next poll
+/// produces a newer snapshot anyway, so the cadence stays "as fresh as
+/// the UI can consume" without the sender having to peek into the
+/// receiver's slot.
 const SNAPSHOT_CAP: usize = 1;
 
 /// Spawn the snapshot-collector thread. Returns the `Snapshot` receiver and
@@ -122,19 +139,12 @@ fn collector_loop(
                     metrics,
                     received_at: Instant::now(),
                 };
-                // Newest-wins overwrite: if the UI still hasn't drained the
-                // last snapshot we replace it. `try_send` returns `Full` on
-                // a populated bounded(1) channel; we drain + retry once.
                 match tx.try_send(snap) {
                     Ok(()) => {}
-                    Err(TrySendError::Full(snap)) => {
-                        // Drain stale + retry; both errors here mean the
-                        // peer was dropped, so we exit.
-                        let _ = rx_drain_one(&tx);
-                        if tx.try_send(snap).is_err() {
-                            return;
-                        }
-                    }
+                    // Publish-or-skip: if the UI hasn't drained the previous
+                    // snapshot, skip this one rather than killing the thread.
+                    // The next poll will produce a fresher snapshot anyway.
+                    Err(TrySendError::Full(_)) => {}
                     Err(TrySendError::Disconnected(_)) => return,
                 }
             }
@@ -150,21 +160,6 @@ fn collector_loop(
             std::thread::sleep(interval - elapsed);
         }
     }
-}
-
-/// `try_send` on a `bounded(1)` channel needs the receiver side to drain.
-/// Mirror the behaviour without the receiver: we re-construct the sender's
-/// view by dropping the value. The sender API doesn't expose a "drop oldest"
-/// directly so we get there via a paired channel handshake.
-fn rx_drain_one<T>(_tx: &Sender<T>) -> Option<T> {
-    // No public Sender API to peek the slot; the UI thread owns the rx end
-    // and drains as it consumes. From the sender's side, a `Full` retry
-    // after `try_send` means the slot still has the prior value because the
-    // UI hasn't consumed it yet — accept the in-flight overwrite by simply
-    // dropping the new value on a single-shot retry. The resulting cadence
-    // is "publish-or-skip", which matches the documented newest-wins
-    // semantics in `tasks/todo.md`.
-    None
 }
 
 fn poll_metrics(
@@ -245,17 +240,11 @@ fn listeners_loop(
         let started = Instant::now();
         match poll_listeners(channel) {
             Ok(list) => {
-                let snap = ListenersSnapshot {
-                    list,
-                    received_at: Instant::now(),
-                };
+                let snap = ListenersSnapshot { list };
                 match tx.try_send(snap) {
                     Ok(()) => {}
-                    Err(TrySendError::Full(snap)) => {
-                        if tx.try_send(snap).is_err() {
-                            return;
-                        }
-                    }
+                    // Publish-or-skip on backpressure: see SNAPSHOT_CAP doc.
+                    Err(TrySendError::Full(_)) => {}
                     Err(TrySendError::Disconnected(_)) => return,
                 }
             }
@@ -329,17 +318,11 @@ fn certs_loop(
         let started = Instant::now();
         match poll_certs(channel) {
             Ok(list) => {
-                let snap = CertsSnapshot {
-                    list,
-                    received_at: Instant::now(),
-                };
+                let snap = CertsSnapshot { list };
                 match tx.try_send(snap) {
                     Ok(()) => {}
-                    Err(TrySendError::Full(snap)) => {
-                        if tx.try_send(snap).is_err() {
-                            return;
-                        }
-                    }
+                    // Publish-or-skip on backpressure: see SNAPSHOT_CAP doc.
+                    Err(TrySendError::Full(_)) => {}
                     Err(TrySendError::Disconnected(_)) => return,
                 }
             }
