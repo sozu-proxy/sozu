@@ -56,12 +56,7 @@ pub fn render(f: &mut Frame<'_>, area: Rect, app: &App, skin: &Skin) {
         ]));
     }
     for (addr, cfg) in &listeners.https_listeners {
-        let alpn = cfg
-            .alpn_protocols
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(",");
+        let alpn = cfg.alpn_protocols.to_vec().join(",");
         let alpn = if alpn.is_empty() { "—".into() } else { alpn };
         rows.push(
             Row::new(vec![
