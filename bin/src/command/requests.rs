@@ -28,11 +28,11 @@ use sozu_command_lib::{
     proto::command::{
         AggregatedMetrics, AvailableMetrics, CertificatesWithFingerprints, ClusterHashes,
         ClusterInformations, Event, EventKind, FrontendFilters, HardStop, MetricDetail,
-        MetricsConfiguration, QueryCertificatesFilters, QueryHealthChecks, QueryMetricsOptions,
-        Request, ResponseContent, ResponseStatus, RunState, SoftStop, Status,
-        UpdateHttpListenerConfig, UpdateHttpsListenerConfig, UpdateTcpListenerConfig, WorkerInfo,
-        WorkerInfos, WorkerRequest, WorkerResponses, request::RequestType,
-        response_content::ContentType,
+        MetricDetailStatus, MetricsConfiguration, QueryCertificatesFilters, QueryHealthChecks,
+        QueryMetricsOptions, Request, ResponseContent, ResponseStatus, RunState, SetMetricDetail,
+        SoftStop, Status, UpdateHttpListenerConfig, UpdateHttpsListenerConfig,
+        UpdateTcpListenerConfig, WorkerInfo, WorkerInfos, WorkerMetricDetailStatus, WorkerRequest,
+        WorkerResponses, request::RequestType, response_content::ContentType,
     },
     sd_notify,
 };
@@ -390,10 +390,14 @@ impl Server {
             // its own lease table and recomputes the effective `MetricDetail` as
             // `max(configured, max(active leases))`. The master fans the verb
             // out via the generic worker_request path; lease bookkeeping +
-            // `MetricDetailStatus` aggregation live in the worker's `notify`
-            // arm and the upcoming `set_metric_detail()` aggregator (Step 4).
-            RequestType::SetMetricDetail(_) => {
-                worker_request(self, client, request_type);
+            // Capability-aware dispatch: filters workers by proto_version
+            // before fan-out, synthesises a `MetricDetailStatus` reply
+            // populating `unsupported_workers` for any worker whose
+            // recorded proto_version is below the minimum required for
+            // `SetMetricDetail`. Closes the PR #1256 follow-up gap where
+            // the proto field was wired but no dispatcher consumed it.
+            RequestType::SetMetricDetail(req) => {
+                set_metric_detail_request(self, client, req);
             }
         }
 
@@ -2242,6 +2246,333 @@ fn clone_entry(entry: &AuditEntry) -> AuditEntry {
         address: entry.address,
         target: entry.target.clone(),
         extras: entry.extras.clone(),
+    }
+}
+
+// =========================================================
+// SetMetricDetail — capability-aware dispatch.
+//
+// Pre-filters workers by their recorded `proto_version` against the
+// minimum required to decode `SetMetricDetail` (tag 55 +
+// `peer_pid`/`peer_session_ulid` fields), skipping inherited-from-
+// before-UpgradeMain workers whose `WorkerSession.proto_version` is
+// below the master's compile-time `SOZU_PROTO_VERSION`. Capable workers
+// are scattered to one-by-one via `scatter_on`; unsupported workers
+// are reported in `MetricDetailStatus.unsupported_workers[]` without
+// the round-trip cost of a doomed fan-out.
+//
+// The minimum proto version required for `SetMetricDetail` is the
+// constant exported by `sozu_command_lib`. When new wire-affecting
+// `RequestType` variants land that need separate gating, declare a
+// dedicated `MIN_PROTO_VERSION_FOR_<verb>` constant here so the gate
+// stays per-verb rather than coupled to the global SOZU_PROTO_VERSION
+// monotonic bump.
+const MIN_PROTO_VERSION_FOR_SET_METRIC_DETAIL: u32 = 1;
+
+/// Gathers per-worker `SetMetricDetail` responses, synthesises a
+/// `MetricDetailStatus` reply for the client, and audits the
+/// completion alongside operator-initiated transitions. Wraps the
+/// generic worker-task fields (`audit`, `inline_audit`,
+/// `metric_detail_audit`) so the existing audit pipeline keeps
+/// emitting the same shape it does for any other audited verb.
+#[derive(Debug)]
+struct SetMetricDetailTask {
+    pub client_token: Token,
+    pub gatherer: DefaultGatherer,
+    started_at: Instant,
+    /// Master-side `(configured, effective_before)` captured pre-apply
+    /// so the response can carry the `previous_effective` field that
+    /// `MetricDetailStatus` advertises. The master also runs an
+    /// `Aggregator`; its `effective` participates in operator-visible
+    /// cardinality alongside per-worker leases.
+    master_configured: MetricDetail,
+    master_previous_effective: MetricDetail,
+    /// Worker ids the master refused to scatter to because their
+    /// recorded `proto_version` was below
+    /// `MIN_PROTO_VERSION_FOR_SET_METRIC_DETAIL`. Surfaced verbatim in
+    /// the `unsupported_workers[]` field of the synthesised reply.
+    unsupported_workers: Vec<String>,
+    /// Completion-time inline-audit target so the post-fanout audit
+    /// row carries the same `target` / verb shape as the attempt-time
+    /// line. Cloned from the `inline_audit` slot the generic
+    /// `worker_request` path uses.
+    inline_audit: InlineAuditTarget,
+    /// Operator-controlled audit fields (lease_id + reason) carried
+    /// into the completion-time `AuditExtras` so the post-fan-out
+    /// audit row also surfaces the lease key + free-form note in
+    /// their dedicated columns.
+    metric_detail_audit: MetricDetailAuditFields,
+}
+
+/// Dispatch a `SetMetricDetail` request through the capability-aware
+/// path. Performs the same length / TTL pre-validation that
+/// `worker_request` does, populates the peer binding from the
+/// connecting `ClientSession`, emits the attempt-time audit row, then
+/// fans out only to workers whose `proto_version` satisfies
+/// `MIN_PROTO_VERSION_FOR_SET_METRIC_DETAIL`. Workers below that bar
+/// land in `MetricDetailStatus.unsupported_workers[]`.
+pub fn set_metric_detail_request(
+    server: &mut Server,
+    client: &mut ClientSession,
+    mut req: SetMetricDetail,
+) {
+    // Master-side enrichment + pre-validation (mirrors `worker_request`).
+    req.peer_pid = client.actor_pid;
+    req.peer_session_ulid = Some(client.session_ulid.to_string());
+    if req.client_id.len() > sozu_lib::metrics::LEASE_CLIENT_ID_MAX_BYTES {
+        client.finish_failure(format!(
+            "SetMetricDetail: client_id length {} exceeds {} bytes",
+            req.client_id.len(),
+            sozu_lib::metrics::LEASE_CLIENT_ID_MAX_BYTES,
+        ));
+        return;
+    }
+    if let Some(t) = req.ttl_seconds
+        && u64::from(t) > sozu_lib::metrics::LEASE_TTL_MAX.as_secs()
+    {
+        client.finish_failure(format!(
+            "SetMetricDetail: ttl_seconds={t} exceeds LEASE_TTL_MAX={}",
+            sozu_lib::metrics::LEASE_TTL_MAX.as_secs(),
+        ));
+        return;
+    }
+
+    // Capture master-side cardinality view BEFORE we touch anything.
+    let (master_configured, master_previous_effective) = METRICS.with(|m| {
+        let m = m.borrow();
+        (
+            MetricDetail::from(m.detail_configured()),
+            MetricDetail::from(m.detail_effective()),
+        )
+    });
+
+    // Build the audit-field skeleton used by both the attempt-time and
+    // completion-time emissions. Mirrors `worker_request`.
+    let level_label = if req.clear.unwrap_or(false) {
+        "clear".to_owned()
+    } else {
+        req.detail
+            .and_then(|d| MetricDetail::try_from(d).ok())
+            .map(|d| format!("{d:?}"))
+            .unwrap_or_else(|| "<invalid>".into())
+    };
+    let metric_detail_audit = MetricDetailAuditFields {
+        target: format!("metric_detail:{level_label}"),
+        lease_id: req.client_id.clone(),
+        reason: req.reason.clone().filter(|s| !s.is_empty()),
+    };
+
+    let started_at = Instant::now();
+    let request: Request = RequestType::SetMetricDetail(req).into();
+
+    // Attempt-time dispatch gate (mirrors `state.dispatch` in worker_request).
+    if let Err(error) = server.state.dispatch(&request) {
+        let reason = error.to_string();
+        let (verb, counter) = audit_verb!("metric_detail_changed");
+        let target = metric_detail_audit.target.clone();
+        let mut extras = metric_detail_audit.into_extras();
+        extras.elapsed_ms = Some(elapsed_ms(started_at));
+        extras.error_code = Some(AuditErrorCode::DispatchError);
+        extras.reason = Some(reason.clone());
+        audit_emit_inline(
+            server,
+            client,
+            EventKind::MetricDetailChanged,
+            verb,
+            counter,
+            target,
+            AuditResult::Err,
+            extras,
+        );
+        client.finish_failure(format!(
+            "could not dispatch request on the main process state: {error}",
+        ));
+        return;
+    }
+
+    // Attempt-time audit Ok.
+    let (verb, counter) = audit_verb!("metric_detail_changed");
+    {
+        let target = metric_detail_audit.target.clone();
+        let extras = metric_detail_audit.clone().into_extras();
+        audit_emit_inline(
+            server,
+            client,
+            EventKind::MetricDetailChanged,
+            verb,
+            counter,
+            target,
+            AuditResult::Ok,
+            extras,
+        );
+    }
+
+    // Capability filter: split workers by proto_version. We need a
+    // snapshot of capable worker ids before issuing scatter_on calls
+    // because the iteration borrows `server.workers` and `scatter_on`
+    // mutates the same map.
+    let mut supported_worker_ids = Vec::new();
+    let mut unsupported_workers = Vec::new();
+    for worker in server.workers.values() {
+        if worker.run_state == RunState::Stopped {
+            continue;
+        }
+        if worker.proto_version >= MIN_PROTO_VERSION_FOR_SET_METRIC_DETAIL {
+            supported_worker_ids.push(worker.id);
+        } else {
+            unsupported_workers.push(worker.id.to_string());
+        }
+    }
+
+    client.return_processing("Processing SetMetricDetail...");
+
+    let inline_audit = InlineAuditTarget {
+        kind: EventKind::MetricDetailChanged,
+        verb,
+        counter,
+        target: metric_detail_audit.target.clone(),
+    };
+
+    // Create the gathering task. If there are zero capable workers (the
+    // master is alone, or every worker is below the bar) we still want
+    // to synthesise a MetricDetailStatus reply so the client sees its
+    // `unsupported_workers[]` list. Drive the task by calling
+    // `new_task` then `scatter_on` per worker — same shape as
+    // `server.scatter` but with the per-worker filter.
+    let task = Box::new(SetMetricDetailTask {
+        client_token: client.token,
+        gatherer: DefaultGatherer::default(),
+        started_at,
+        master_configured,
+        master_previous_effective,
+        unsupported_workers,
+        inline_audit,
+        metric_detail_audit,
+    });
+    let task_id = server.new_task(task, Timeout::Default);
+    for worker_id in supported_worker_ids {
+        server.scatter_on(request.clone(), task_id, 0, Some(worker_id));
+    }
+    // If `supported_worker_ids` was empty `scatter_on` never ran and the
+    // task's `expected_responses` stays at 0. The gatherer treats that
+    // as immediate completion on the next `tick`, so `on_finish` fires
+    // with an empty `responses` map and the synthesis still happens.
+}
+
+impl GatheringTask for SetMetricDetailTask {
+    fn client_token(&self) -> Option<Token> {
+        Some(self.client_token)
+    }
+
+    fn get_gatherer(&mut self) -> &mut dyn Gatherer {
+        &mut self.gatherer
+    }
+
+    fn on_finish(
+        self: Box<Self>,
+        server: &mut Server,
+        client: &mut OptionalClient,
+        timed_out: bool,
+    ) {
+        // Per-worker status: today we report ACK/no-ACK via the response
+        // status because the worker arm in lib/src/server.rs answers OK
+        // without a content payload. The per-worker `(configured,
+        // effective, previous_effective, active_lease_count)` quartet in
+        // `WorkerMetricDetailStatus` is populated with the master's view
+        // as a best-effort placeholder so the wire schema stays
+        // populated; a follow-up will plumb the actual per-worker view
+        // through a new ResponseContent variant.
+        let mut workers_map = BTreeMap::new();
+        for (worker_id, response) in &self.gatherer.responses {
+            if matches!(
+                ResponseStatus::try_from(response.status),
+                Ok(ResponseStatus::Ok)
+            ) {
+                workers_map.insert(
+                    worker_id.to_string(),
+                    WorkerMetricDetailStatus {
+                        configured: self.master_configured as i32,
+                        effective: METRICS
+                            .with(|m| MetricDetail::from(m.borrow().detail_effective()) as i32),
+                        previous_effective: self.master_previous_effective as i32,
+                        active_lease_count: METRICS.with(|m| m.borrow().lease_count()),
+                    },
+                );
+            }
+        }
+
+        let master_effective = METRICS.with(|m| MetricDetail::from(m.borrow().detail_effective()));
+        let status = MetricDetailStatus {
+            configured: self.master_configured as i32,
+            effective: master_effective as i32,
+            previous_effective: self.master_previous_effective as i32,
+            workers: workers_map,
+            unsupported_workers: self.unsupported_workers.clone(),
+        };
+
+        // Completion-time audit row. Same shape as the generic WorkerTask
+        // completion path; reuses `metric_detail_audit` for the
+        // `lease_id` / `metric_detail_reason` columns and folds the
+        // fan-out summary on top.
+        let errors = self.gatherer.errors;
+        let ok = self.gatherer.ok;
+        let expected = self.gatherer.expected_responses;
+        let result = if errors > 0 || timed_out {
+            AuditResult::Err
+        } else {
+            AuditResult::Ok
+        };
+        let fanout_status = if timed_out {
+            FanoutStatus::Timeout
+        } else if errors > 0 {
+            FanoutStatus::Partial
+        } else if expected == 0 {
+            FanoutStatus::LocalOnly
+        } else {
+            FanoutStatus::Ok
+        };
+        let fanout_summary = FanoutSummary {
+            status: fanout_status,
+            workers_ok: u32::try_from(ok).unwrap_or(u32::MAX),
+            workers_err: u32::try_from(errors).unwrap_or(u32::MAX),
+            workers_expected: u32::try_from(expected).unwrap_or(u32::MAX),
+        };
+        if let Some(client_ref) = client.as_deref() {
+            let mut extras = self.metric_detail_audit.into_extras();
+            extras.elapsed_ms = Some(elapsed_ms(self.started_at));
+            extras.fanout = Some(fanout_summary);
+            if matches!(result, AuditResult::Err) {
+                extras.error_code = Some(if timed_out {
+                    AuditErrorCode::WorkerTimeout
+                } else {
+                    AuditErrorCode::WorkerFailure
+                });
+                let mut msgs = Vec::new();
+                for (worker_id, response) in &self.gatherer.responses {
+                    msgs.push(format!("{worker_id}: {}", response.message));
+                }
+                extras.reason = Some(msgs.join(", "));
+            }
+            audit_emit_inline(
+                server,
+                client_ref,
+                self.inline_audit.kind,
+                self.inline_audit.verb,
+                self.inline_audit.counter,
+                self.inline_audit.target,
+                result,
+                extras,
+            );
+        }
+
+        client.finish_ok_with_content(
+            ContentType::MetricDetailStatus(status).into(),
+            if errors > 0 || timed_out {
+                "SetMetricDetail completed with worker errors"
+            } else {
+                "Successfully applied SetMetricDetail to all capable workers"
+            },
+        );
     }
 }
 
