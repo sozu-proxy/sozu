@@ -565,6 +565,14 @@ impl App {
         std::mem::replace(&mut self.is_dirty, false)
     }
 
+    /// Force the next frame to redraw. Used by the render loop when it
+    /// drains an out-of-band status message (renewer error) into
+    /// `App::status` and the operator needs the F-key bar repainted on
+    /// the next tick even though no snapshot landed.
+    pub fn mark_dirty(&mut self) {
+        self.is_dirty = true;
+    }
+
     /// Fold an inbound transport `Snapshot` into the ring buffers. Called by
     /// the render loop on every drain of the `crossbeam_channel`. Cheap (one
     /// linear scan over the proxy / cluster maps).
