@@ -62,8 +62,7 @@ pub struct RenderConfig {
     /// four transport collectors) push degraded-mode notes into. The
     /// render loop drains it once per tick and feeds `App::status` so
     /// the operator sees the message on the F-key bar instead of the
-    /// wiped alt-screen. See `cardinality::StatusSlot` for the type +
-    /// PR #1256 review M-7 for the motivating gap.
+    /// wiped alt-screen. See `cardinality::StatusSlot` for the type.
     pub lease_status: crate::ctl::top::cardinality::StatusSlot,
 }
 

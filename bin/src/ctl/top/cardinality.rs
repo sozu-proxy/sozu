@@ -111,7 +111,8 @@ pub struct DetailGuard {
     /// once per tick. Stored on the guard so it stays alive for the
     /// renewer thread's lifetime; read accesses live in the render
     /// loop, not on this struct (hence the `dead_code`-style read
-    /// pattern). See PR #1256 review M-7 for the motivating gap.
+    /// pattern). Without this slot the renewer's `eprintln!` errors
+    /// land on a wiped alt-screen and the operator never sees them.
     #[allow(dead_code)]
     status: StatusSlot,
 }
@@ -310,8 +311,7 @@ fn send_set_detail(
 /// degraded mode via the `app.status` line surfaced by `DetailGuard`.
 /// Cryptographic strength is not required — the value only needs to be
 /// unguessable enough to avoid lease-id collisions across concurrent
-/// `sozu top` instances. See PR #1256 review L-009 / M-3 for the
-/// design rationale.
+/// `sozu top` instances on the same host.
 fn short_random_suffix() -> String {
     let mut buf = [0u8; 4];
     if read_csprng_bytes(&mut buf) {

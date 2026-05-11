@@ -310,4 +310,4 @@ fn row_style(skin: &Skin, warn: bool) -> Style {
 // `gauge` / `count` helpers come from `super::super::app` (renamed at
 // import time) so the H2 pane and the App-side rate calculators share
 // one source of truth for `FilteredMetrics -> Option<{i64,u64}>`
-// extraction. Closes PR #1256 simplify A3.
+// extraction.
