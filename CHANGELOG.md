@@ -352,11 +352,12 @@ upgrade. See `doc/upgrade/1.x-to-2.0.md` for the full migration guide.
   subcommand is linked in). Surfaces metrics that Sōzu already emits in
   six panes — OVERVIEW (sparklines + big numerals), CLUSTERS / BACKENDS
   (sortable tables), LISTENERS (5 s ListListeners poll), H2 (streams +
-  flow control + CVE flood mitigations), EVENTS (colour-coded
-  SubscribeEvents tail). Built on `ratatui = "0.30"` + `crossterm =
-  "0.29"` over three synchronous transport threads (no `tokio` runtime
-  in v1 by design); render loop is capped at 30 fps with DEC-mode-2026
-  synchronized output for tmux-free flicker. The TUI auto-elevates
+  flow control + CVE flood mitigations), CERTS (15 s certificates
+  poll), EVENTS (colour-coded SubscribeEvents tail). Built on
+  `ratatui = "0.30"` + `crossterm = "0.29"` over four synchronous
+  transport threads (snapshots, listeners, certs, events — no `tokio`
+  runtime in v1 by design); render loop is capped at 30 fps with
+  DEC-mode-2026 synchronized output for tmux-free flicker. The TUI auto-elevates
   metric cardinality via a `SetMetricDetail` TTL lease (`client_id`-
   keyed; default 60 s TTL, server clamp 300 s; auto-renewed at half-TTL;
   self-expires server-side on crash). A 4-tick pulse tint surfaces
@@ -379,12 +380,20 @@ upgrade. See `doc/upgrade/1.x-to-2.0.md` for the full migration guide.
   self-expire server-side after `ttl_seconds` so a crashed client
   cannot permanently elevate cardinality. Mixed-version fleets where
   one or more workers can't decode the verb surface in
-  `MetricDetailStatus.unsupported_workers[]`. Full semantics in
-  `command.proto`'s `SetMetricDetail` doc comment. Audit-scope
-  caveat: operator-initiated transitions emit
-  `EventKind::METRIC_DETAIL_CHANGED` via the master-side audit log;
-  worker-local lease transitions (janitor expiry, post-fan-out
-  apply/clear) are not yet emitted to the audit log.
+  `MetricDetailStatus.unsupported_workers[]` once the per-worker
+  proto-version handshake gates the dispatch (the proto field +
+  `WorkerInfo.proto_version` snapshot land in this release; the
+  capability-aware dispatch is tracked as follow-up — workers without a
+  recorded version today are presumed compatible). Full semantics in
+  `command.proto`'s `SetMetricDetail` doc comment. Audit-scope: every
+  cardinality transition emits `EventKind::METRIC_DETAIL_CHANGED` —
+  operator-initiated transitions are logged by the master at the
+  dispatch site, AND the worker now emits the same event for janitor-
+  driven lease expiries and post-fan-out worker-arm apply/clear via
+  the new worker→master audit IPC, so the audit log carries the full
+  history regardless of origin. Lease ownership is bound to the
+  connecting peer's PID + session ULID (`SO_PEERCRED`-derived);
+  cross-operator `clear` requests are refused at the worker.
 
 - **Pre-built binaries for tagged releases
   ([#1089](https://github.com/sozu-proxy/sozu/issues/1089))**: a new
