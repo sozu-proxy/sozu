@@ -3424,4 +3424,29 @@ mod tests {
             "expected NotFound, got: {err}"
         );
     }
+
+    /// Regression guard for the C1 fix on PR #1256. `ConfigState::dispatch`
+    /// MUST treat `SetMetricDetail` as a runtime-only verb (no persisted
+    /// state mutation). A future refactor that drops the variant from the
+    /// no-op match arm and falls through to the catch-all would silently
+    /// re-break the SetMetricDetail dispatch path with `UndispatchableRequest`,
+    /// the bug that initially blocked TUI cardinality elevation entirely.
+    #[test]
+    fn dispatch_passes_through_set_metric_detail() {
+        use crate::proto::command::{MetricDetail, SetMetricDetail};
+        let mut state = ConfigState::new();
+        let req: Request = RequestType::SetMetricDetail(SetMetricDetail {
+            client_id: "test:1".to_owned(),
+            detail: Some(MetricDetail::DetailBackend as i32),
+            ttl_seconds: Some(60),
+            clear: Some(false),
+            reason: Some("regression-guard".to_owned()),
+            peer_pid: None,
+            peer_session_ulid: None,
+        })
+        .into();
+        state
+            .dispatch(&req)
+            .expect("SetMetricDetail must traverse dispatch without UndispatchableRequest");
+    }
 }
