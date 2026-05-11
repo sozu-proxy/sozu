@@ -58,6 +58,13 @@ pub struct RenderConfig {
     /// through here so the renderer surfaces it on the first frame
     /// instead of writing to `stderr` (which the alt-screen wipes).
     pub initial_status: Option<String>,
+    /// Shared status slot the lease renewer (and, in the future, the
+    /// four transport collectors) push degraded-mode notes into. The
+    /// render loop drains it once per tick and feeds `App::status` so
+    /// the operator sees the message on the F-key bar instead of the
+    /// wiped alt-screen. See `cardinality::StatusSlot` for the type +
+    /// PR #1256 review M-7 for the motivating gap.
+    pub lease_status: crate::ctl::top::cardinality::StatusSlot,
 }
 
 /// Drive the TUI to completion. Returns when the user quits, the data
@@ -150,6 +157,15 @@ pub fn run(
         }
         while let Ok(certs) = certs.try_recv() {
             app.ingest_certs(certs);
+        }
+
+        // Drain any renewer-published status. The renewer thread writes
+        // here when its channel open fails or its send loop errors; the
+        // operator sees the resulting message on the F-key bar instead
+        // of the wiped alt-screen.
+        if let Some(msg) = crate::ctl::top::cardinality::take_status(&cfg.lease_status) {
+            app.status = msg;
+            app.mark_dirty();
         }
 
         // Poll for input or sleep until the next render tick. The timeout

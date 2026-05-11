@@ -94,16 +94,27 @@ impl CommandManager {
         // (alt-screen wipes it on entry) and that pollutes the shell
         // scrollback on exit.
         let detail = args.detail.unwrap_or(TopDetail::Backend);
-        let (lease, lease_status) =
-            match DetailGuard::apply(&self.config, detail, args.lease_ttl_seconds, "sozu top") {
-                Ok(g) => (Some(g), None),
-                Err(e) => (
-                    None,
-                    Some(format!(
-                        "could not elevate metric detail (continuing without lease): {e}"
-                    )),
-                ),
-            };
+        // Shared status slot the renewer publishes degraded-mode notes
+        // into. The render loop drains it once per tick (see
+        // `DetailGuard::take_status`) and the renderer also keeps a
+        // clone for post-`apply` lifetime so the F-key bar can surface
+        // late renewer failures.
+        let lease_status_slot = cardinality::new_status_slot();
+        let (lease, lease_status) = match DetailGuard::apply(
+            &self.config,
+            detail,
+            args.lease_ttl_seconds,
+            "sozu top",
+            std::sync::Arc::clone(&lease_status_slot),
+        ) {
+            Ok(g) => (Some(g), None),
+            Err(e) => (
+                None,
+                Some(format!(
+                    "could not elevate metric detail (continuing without lease): {e}"
+                )),
+            ),
+        };
 
         let render_cfg = RenderConfig {
             mouse: !args.no_mouse,
@@ -112,6 +123,7 @@ impl CommandManager {
             skin: args.skin.clone(),
             glyphs: args.glyphs,
             initial_status: lease_status,
+            lease_status: lease_status_slot,
         };
         let result = render::run(render_cfg, snapshot_rx, events_rx, listeners_rx, certs_rx);
 
