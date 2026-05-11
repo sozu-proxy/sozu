@@ -20,7 +20,6 @@
 //!   channel of its own and drops it on exit.
 
 use std::process;
-use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -53,12 +52,13 @@ pub struct DetailGuard {
     /// Renewer-thread join handle. Joined on Drop after the shutdown signal
     /// fires so we exit deterministically.
     renewer: Option<JoinHandle<()>>,
-    /// Pre-opened channel reserved for the final `clear` request. Parked
-    /// behind a `Mutex<Option<...>>` so `Drop` can take it without
-    /// blocking on contention. The renewer thread is NOT involved with
-    /// this slot — it keeps its own dedicated channel and drops it on
-    /// shutdown — so a renewer crash never strands the revoke path.
-    final_channel: Arc<Mutex<Option<Channel<Request, Response>>>>,
+    /// Pre-opened channel reserved for the final `clear` request. The
+    /// renewer thread keeps its own dedicated channel and never touches
+    /// this slot, so contention is impossible by construction: `Drop`
+    /// is the sole consumer, `apply` is the sole producer. A direct
+    /// `Option<...>` is therefore enough — no Arc, no Mutex, no
+    /// silently-swallowed lock-poison branch.
+    final_channel: Option<Channel<Request, Response>>,
     /// Reason text echoed in the audit `EventKind::MetricDetailChanged`
     /// trail. Defaults to `"sozu top"`.
     reason: String,
@@ -94,7 +94,6 @@ impl DetailGuard {
             false,
         )?;
 
-        let final_channel = Arc::new(Mutex::new(Some(channel)));
         let (shutdown_tx, shutdown_rx) = bounded::<()>(0);
         let renewer = spawn_renewer(
             config.clone(),
@@ -108,7 +107,7 @@ impl DetailGuard {
             client_id,
             shutdown_tx: Some(shutdown_tx),
             renewer: Some(renewer),
-            final_channel,
+            final_channel: Some(channel),
             reason,
         })
     }
@@ -127,17 +126,15 @@ impl Drop for DetailGuard {
             // thread panicked we still want to issue the revoke.
             let _ = handle.join();
         }
-        if let Ok(mut slot) = self.final_channel.lock() {
-            if let Some(mut channel) = slot.take() {
-                let _ = send_set_detail(
-                    &mut channel,
-                    &self.client_id,
-                    None,
-                    None,
-                    Some(&format!("{} (clear)", self.reason)),
-                    true,
-                );
-            }
+        if let Some(mut channel) = self.final_channel.take() {
+            let _ = send_set_detail(
+                &mut channel,
+                &self.client_id,
+                None,
+                None,
+                Some(&format!("{} (clear)", self.reason)),
+                true,
+            );
         }
     }
 }
