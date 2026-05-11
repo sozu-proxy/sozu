@@ -2495,7 +2495,10 @@ impl GatheringTask for SetMetricDetailTask {
                 content_type: Some(ContentType::WorkerMetricDetailStatus(status)),
             }) = response.content.as_ref()
             {
-                workers_map.insert(worker_id.to_string(), status.clone());
+                // `WorkerMetricDetailStatus` is `Copy` (four `i32`s +
+                // one `u32`); dereferencing avoids the `clippy::clone_on_copy`
+                // lint that CI's `-D warnings` rejects.
+                workers_map.insert(worker_id.to_string(), *status);
             }
         }
 
