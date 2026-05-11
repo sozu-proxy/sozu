@@ -1254,10 +1254,18 @@ enum EventKind {
     // dashboards can plot per-cluster recovery.
     CLUSTER_RECOVERED = 29;
     // The worker's effective `MetricDetail` changed because a runtime
-    // lease was applied, renewed, expired, or cleared. Emitted by every
-    // worker whose effective level moved. Pairs with `MetricsConfigured`
-    // (tag 17) but distinct: that one fires for `MetricsConfiguration`
-    // (Enabled/Disabled/Clear), this one fires for cardinality changes.
+    // lease was applied, renewed, expired, or cleared. Pairs with
+    // `MetricsConfigured` (tag 17) but distinct: that one fires for
+    // `MetricsConfiguration` (Enabled/Disabled/Clear), this one fires
+    // for cardinality changes.
+    //
+    // Emitter scope: operator-initiated transitions emit
+    // `METRIC_DETAIL_CHANGED` via the master-side audit log (see
+    // `bin/src/command/requests.rs` around the `SetMetricDetail`
+    // success path). Worker-local transitions — the polled janitor
+    // expiring a lease, or a worker-local clear/apply after a master
+    // fan-out — are not yet surfaced because the worker has no direct
+    // IPC path to the master's audit sink; follow-up tracked separately.
     METRIC_DETAIL_CHANGED = 30;
 }
 
@@ -1471,10 +1479,17 @@ enum MetricDetail {
 //
 // Audit
 // =====
-// Every effective-level transition emits an `EventKind::METRIC_DETAIL_CHANGED`
-// event on `SubscribeEvents` with the previous and new effective levels and
-// the requesting `client_id` plus optional `reason` text. Renewal-no-op (same
-// effective level) is NOT emitted.
+// Every operator-initiated effective-level transition emits an
+// `EventKind::METRIC_DETAIL_CHANGED` event on `SubscribeEvents` with the
+// previous and new effective levels and the requesting `client_id` plus
+// optional `reason` text. Renewal-no-op (same effective level) is NOT
+// emitted.
+//
+// Emitter scope: operator-initiated transitions emit
+// `METRIC_DETAIL_CHANGED` via the master-side audit log. Worker-local
+// transitions — the polled janitor expiring a lease, or a worker-local
+// clear/apply after a master fan-out — are not yet surfaced; follow-up
+// tracked separately.
 //
 // Backwards compatibility
 // =======================
