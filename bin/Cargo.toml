@@ -48,8 +48,9 @@ sozu-lib = { workspace = true }
 
 # `sozu top` TUI dependencies. All optional; activated only by the `tui` Cargo
 # feature below. Default `sozu` builds do not pull any of these in, keeping the
-# production binary lean. See `tasks/todo.md` for the rationale on each pin and
-# the explicit decision to NOT introduce `tokio` in v1.
+# production binary lean. None of these crates pull in a `tokio` runtime — the
+# TUI is intentionally built on synchronous transport threads + crossterm
+# events to stay aligned with Sōzu's no-`async` lib/ posture.
 color-eyre           = { workspace = true, optional = true }
 crossbeam-channel    = { workspace = true, optional = true }
 crossterm            = { workspace = true, optional = true, features = ["events", "bracketed-paste"] }

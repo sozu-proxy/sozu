@@ -43,7 +43,7 @@ use crate::command::{
         DefaultGatherer, Gatherer, GatheringTask, MessageClient, Server, ServerState, Timeout,
         WorkerId,
     },
-    sessions::{ClientSession, OptionalClient, sanitize_for_audit},
+    sessions::{ClientSession, OptionalClient, sanitize_for_audit, sanitize_for_audit_kv},
     upgrade::{upgrade_main, upgrade_worker},
 };
 
@@ -85,7 +85,7 @@ macro_rules! audit_verb {
 /// second audit line.
 macro_rules! audit_log_context {
     ($server:expr, $client:expr, $request_id:expr, $entry:expr, $result:expr) => {{
-        use $crate::command::sessions::sanitize_for_audit;
+        use $crate::command::sessions::{sanitize_for_audit, sanitize_for_audit_kv};
         let (open, reset, grey, gray, white) = ::sozu_command_lib::logging::ansi_palette();
         let log_ctx = ::sozu_command_lib::logging::LogContext {
             session_id: $client.session_ulid,
@@ -147,6 +147,38 @@ macro_rules! audit_log_context {
                 reset = reset,
                 white = white,
                 hash = hash,
+            ));
+        }
+        if let Some(lease_id) = $entry.extras.metric_detail_lease_id.as_deref() {
+            let sanitized = sanitize_for_audit_kv(lease_id);
+            let truncated = if sanitized.chars().count() > AUDIT_LEASE_ID_MAX_CHARS {
+                let cut: String = sanitized.chars().take(AUDIT_LEASE_ID_MAX_CHARS).collect();
+                format!("{cut}…")
+            } else {
+                sanitized
+            };
+            extras.push_str(&format!(
+                ", {gray}lease_id{reset}={white}{value}{reset}",
+                gray = gray,
+                reset = reset,
+                white = white,
+                value = truncated,
+            ));
+        }
+        if let Some(detail_reason) = $entry.extras.metric_detail_reason.as_deref() {
+            let sanitized = sanitize_for_audit_kv(detail_reason);
+            let truncated = if sanitized.chars().count() > AUDIT_REASON_MAX_CHARS {
+                let cut: String = sanitized.chars().take(AUDIT_REASON_MAX_CHARS).collect();
+                format!("{cut}…")
+            } else {
+                sanitized
+            };
+            extras.push_str(&format!(
+                ", {gray}metric_detail_reason{reset}={white}{value}{reset}",
+                gray = gray,
+                reset = reset,
+                white = white,
+                value = truncated,
             ));
         }
         let now_ts = rfc3339_utc(std::time::SystemTime::now());
@@ -988,6 +1020,17 @@ pub(crate) struct AuditExtras {
     /// Set for verbs that flow through `worker_request`; `None` for inline
     /// verbs that don't carry a payload worth hashing.
     pub(crate) request_sha256: Option<String>,
+    /// Operator-supplied `SetMetricDetail.client_id` (the lease key). Set
+    /// only for the `MetricDetailChanged` audit verb. Distinct from the
+    /// connection-scoped `ClientSession.id` rendered in the outer audit
+    /// envelope: this one identifies the lease, that one identifies the
+    /// command-socket caller. Rendered as a dedicated `lease_id=…` field
+    /// so attacker-supplied `:` / `=` cannot smuggle a fake column.
+    pub(crate) metric_detail_lease_id: Option<String>,
+    /// Operator-supplied `SetMetricDetail.reason`. Free-form human note.
+    /// Sanitised via [`sanitize_for_audit_kv`] (control bytes + `,` + `=`
+    /// stripped) and truncated to [`AUDIT_REASON_MAX_CHARS`].
+    pub(crate) metric_detail_reason: Option<String>,
 }
 
 /// A control-plane mutation, broken down into the pieces the audit trail
@@ -1020,6 +1063,12 @@ struct AuditEntry {
 /// Truncated SHA-256 request fingerprint for dedupe / correlation.
 /// Render-only helper; see [`audit_log_context!`] for inclusion.
 const AUDIT_REASON_MAX_CHARS: usize = 256;
+
+/// Hard cap on the rendered length of `lease_id` (operator-supplied
+/// `SetMetricDetail.client_id`) in the audit log. The legitimate TUI
+/// format is `top:<pid>:<8-hex>` ≤ 24 bytes; 64 leaves headroom for
+/// other operator-side scrapers while keeping the audit line bounded.
+const AUDIT_LEASE_ID_MAX_CHARS: usize = 64;
 
 /// Compile-time sozu version tag — rendered in every audit line so
 /// operators correlate which binary emitted which log during upgrades.
@@ -1493,6 +1542,19 @@ fn audit_record_to_json(
         if let Some(hash) = entry.extras.request_sha256.as_deref() {
             map.insert("request_sha256".to_owned(), Value::String(hash.to_owned()));
         }
+        if let Some(lease_id) = entry.extras.metric_detail_lease_id.as_deref() {
+            // Operator-controlled. Sanitise with the strict KV helper and
+            // truncate so JSON consumers that re-emit flat (TSV/CSV) cannot
+            // forge an adjacent column.
+            let sanitized = sanitize_for_audit_kv(lease_id);
+            let truncated: String = sanitized.chars().take(AUDIT_LEASE_ID_MAX_CHARS).collect();
+            map.insert("lease_id".to_owned(), Value::String(truncated));
+        }
+        if let Some(detail_reason) = entry.extras.metric_detail_reason.as_deref() {
+            let sanitized = sanitize_for_audit_kv(detail_reason);
+            let truncated: String = sanitized.chars().take(AUDIT_REASON_MAX_CHARS).collect();
+            map.insert("metric_detail_reason".to_owned(), Value::String(truncated));
+        }
         Value::Object(map)
     };
     // INFO-1: free-form attacker-influenced fields go through
@@ -1615,6 +1677,13 @@ struct WorkerTask {
     /// fan-out outcome attached. `None` for verbs that already carry an
     /// `AuditEntry` in `audit`.
     inline_audit: Option<InlineAuditTarget>,
+    /// Operator-controlled SetMetricDetail audit fields (lease_id,
+    /// reason) folded into the completion-time `AuditExtras` so the
+    /// post-fanout audit row also carries the operator-supplied lease key
+    /// and human note in their dedicated columns rather than smuggling
+    /// them through `target`. `None` for any verb that is not
+    /// `SetMetricDetail`.
+    metric_detail_audit: Option<MetricDetailAuditFields>,
 }
 
 /// Carry the per-verb metadata needed to emit a completion-time audit
@@ -1628,6 +1697,37 @@ struct InlineAuditTarget {
     verb: &'static str,
     counter: &'static str,
     target: String,
+}
+
+/// Captured audit fields for `SetMetricDetail` whose operator-controlled
+/// values flow into dedicated audit extras (NOT into `target`) so that
+/// `:` / `=` / `,` smuggled by an attacker cannot forge an adjacent
+/// audit column. `target` itself is kept master-controlled
+/// (`metric_detail:<level>` only).
+#[derive(Debug, Clone)]
+struct MetricDetailAuditFields {
+    /// `metric_detail:<level>` — fully master-controlled (level is an enum).
+    target: String,
+    /// Operator-supplied `SetMetricDetail.client_id`. Sanitised at render
+    /// time via [`sanitize_for_audit_kv`] and truncated to
+    /// [`AUDIT_LEASE_ID_MAX_CHARS`].
+    lease_id: String,
+    /// Operator-supplied `SetMetricDetail.reason` (free-form human note).
+    /// Sanitised + truncated at render time.
+    reason: Option<String>,
+}
+
+impl MetricDetailAuditFields {
+    /// Build an `AuditExtras` skeleton carrying the operator fields. The
+    /// caller layers `elapsed_ms` / `error_code` / `reason` (failure
+    /// reason — distinct from `metric_detail_reason`) on top as needed.
+    fn into_extras(self) -> AuditExtras {
+        AuditExtras {
+            metric_detail_lease_id: Some(self.lease_id),
+            metric_detail_reason: self.reason,
+            ..Default::default()
+        }
+    }
 }
 
 pub fn worker_request(
@@ -1655,10 +1755,13 @@ pub fn worker_request(
     // Special-case SetMetricDetail — the same shape as ConfigureMetrics above
     // (no dedicated audit factory in `audit_entry_for`), so we synthesise the
     // entry inline against the new `EventKind::MetricDetailChanged` variant.
-    // Captures the client_id, the requested level (or `clear`), and the
-    // optional reason so audit consumers can identify which TUI / scraper
-    // touched the lease.
-    let metric_detail_target = if let RequestType::SetMetricDetail(req) = &request_content {
+    //
+    // The `target` field captures the level only (`metric_detail:Backend` /
+    // `metric_detail:clear`); the operator-supplied `client_id` (lease key)
+    // and free-form `reason` flow into dedicated audit extras
+    // (`metric_detail_lease_id`, `metric_detail_reason`) so attacker-supplied
+    // `:` / `=` / `,` cannot smuggle a forged column into the audit log.
+    let metric_detail_audit = if let RequestType::SetMetricDetail(req) = &request_content {
         let level = if req.clear.unwrap_or(false) {
             "clear".to_owned()
         } else {
@@ -1667,11 +1770,11 @@ pub fn worker_request(
                 .map(|d| format!("{d:?}"))
                 .unwrap_or_else(|| "<invalid>".into())
         };
-        let reason = req.reason.clone().unwrap_or_default();
-        Some(format!(
-            "metric_detail:{level}:client_id={}:reason={reason}",
-            req.client_id
-        ))
+        Some(MetricDetailAuditFields {
+            target: format!("metric_detail:{level}"),
+            lease_id: req.client_id.clone(),
+            reason: req.reason.clone().filter(|s| !s.is_empty()),
+        })
     } else {
         None
     };
@@ -1704,8 +1807,13 @@ pub fn worker_request(
                     ..Default::default()
                 },
             );
-        } else if let Some(target) = metric_detail_target.clone() {
+        } else if let Some(fields) = metric_detail_audit.clone() {
             let (verb, counter) = audit_verb!("metric_detail_changed");
+            let target = fields.target.clone();
+            let mut extras = fields.into_extras();
+            extras.elapsed_ms = Some(elapsed_ms(started_at));
+            extras.error_code = Some(AuditErrorCode::DispatchError);
+            extras.reason = Some(reason.clone());
             audit_emit_inline(
                 server,
                 client,
@@ -1714,12 +1822,7 @@ pub fn worker_request(
                 counter,
                 target,
                 AuditResult::Err,
-                AuditExtras {
-                    elapsed_ms: Some(elapsed_ms(started_at)),
-                    error_code: Some(AuditErrorCode::DispatchError),
-                    reason: Some(reason.clone()),
-                    ..Default::default()
-                },
+                extras,
             );
         }
         client.finish_failure(format!(
@@ -1749,16 +1852,22 @@ pub fn worker_request(
             target: target.clone(),
         })
     } else {
-        metric_detail_target.as_ref().map(|target| {
+        metric_detail_audit.as_ref().map(|fields| {
             let (verb, counter) = audit_verb!("metric_detail_changed");
             InlineAuditTarget {
                 kind: EventKind::MetricDetailChanged,
                 verb,
                 counter,
-                target: target.clone(),
+                target: fields.target.clone(),
             }
         })
     };
+    // Operator-controlled SetMetricDetail fields (lease_id + reason) we
+    // need to thread into both the attempt-time Ok line below and the
+    // completion-time line in `on_finish`. Cloning once keeps the
+    // emission sites symmetric without re-deriving from `request_content`
+    // (already moved into `request: sozu_command_lib...::Request` above).
+    let metric_detail_audit_completion = metric_detail_audit.clone();
 
     if let Some(mut entry) = audit {
         entry.extras.request_sha256 = Some(request_sha256);
@@ -1775,8 +1884,10 @@ pub fn worker_request(
             AuditResult::Ok,
             AuditExtras::default(),
         );
-    } else if let Some(target) = metric_detail_target {
+    } else if let Some(fields) = metric_detail_audit {
         let (verb, counter) = audit_verb!("metric_detail_changed");
+        let target = fields.target.clone();
+        let extras = fields.into_extras();
         audit_emit_inline(
             server,
             client,
@@ -1785,7 +1896,7 @@ pub fn worker_request(
             counter,
             target,
             AuditResult::Ok,
-            AuditExtras::default(),
+            extras,
         );
     }
 
@@ -1799,6 +1910,7 @@ pub fn worker_request(
             started_at,
             audit: audit_for_task,
             inline_audit,
+            metric_detail_audit: metric_detail_audit_completion,
         }),
         Timeout::Default,
         None,
@@ -1875,12 +1987,17 @@ impl GatheringTask for WorkerTask {
             // Completion-time inline audit for ConfigureMetrics +
             // SetMetricDetail. Same shape as the entry-bearing arm above
             // but routed through `audit_emit_inline` since these verbs
-            // don't synthesise a full `AuditEntry` at attempt time.
-            let mut extras = AuditExtras {
-                elapsed_ms: Some(elapsed_ms(self.started_at)),
-                fanout: Some(fanout_summary),
-                ..Default::default()
-            };
+            // don't synthesise a full `AuditEntry` at attempt time. The
+            // operator-supplied `SetMetricDetail` lease_id / reason live
+            // in their own audit columns (see `MetricDetailAuditFields`);
+            // pre-fill them when present, then layer the completion
+            // metadata on top.
+            let mut extras = self
+                .metric_detail_audit
+                .map(MetricDetailAuditFields::into_extras)
+                .unwrap_or_default();
+            extras.elapsed_ms = Some(elapsed_ms(self.started_at));
+            extras.fanout = Some(fanout_summary);
             if matches!(result, AuditResult::Err) {
                 extras.error_code = Some(if timed_out {
                     AuditErrorCode::WorkerTimeout
@@ -2664,8 +2781,9 @@ mod audit_format_tests {
     //! empty strings and the rendered line is ANSI-free — stable to match
     //! with a plain regex.
     use super::{
-        AUDIT_REASON_MAX_CHARS, AuditEntry, AuditErrorCode, AuditExtras, AuditResult, FanoutStatus,
-        FanoutSummary, SOZU_BUILD_GIT_SHA, SOZU_VERSION, actor_role, rfc3339_utc,
+        AUDIT_LEASE_ID_MAX_CHARS, AUDIT_REASON_MAX_CHARS, AuditEntry, AuditErrorCode, AuditExtras,
+        AuditResult, FanoutStatus, FanoutSummary, SOZU_BUILD_GIT_SHA, SOZU_VERSION, actor_role,
+        rfc3339_utc,
     };
     use regex::Regex;
     use rusty_ulid::Ulid;

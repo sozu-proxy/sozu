@@ -2,8 +2,8 @@
 //! Default sort: 5xx error rate descending, then RPS — operators want the
 //! unhealthy clusters at the top so the eye lands on them first.
 //!
-//! Pulse-tint on cluster disappearance / new-unhealthy-backend transitions
-//! lands in week 3 (see `PulseTracker` in `tasks/todo.md`).
+//! Pulse-tint on cluster disappearance and new-unhealthy-backend transitions
+//! is driven by [`crate::ctl::top::app::PulseTracker`].
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Rect};
