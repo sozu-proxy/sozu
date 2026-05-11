@@ -70,7 +70,7 @@ impl CommandManager {
     ///
     /// Spins up the four transport threads (collector, events, listeners,
     /// certs), applies the cardinality lease, installs the SIGINT/SIGTERM
-    /// + panic-hook restore guards, and runs the render loop until the
+    /// and panic-hook restore guards, then runs the render loop until the
     /// user quits or a snapshot/tick budget exhausts. Returns once the
     /// terminal is restored.
     pub fn run_top(&mut self, args: TopArgs) -> Result<(), CtlError> {
