@@ -89,6 +89,11 @@ impl Skin {
             }
             Some(other) => other,
         };
+        // Helper for the five fail-closed paths below: every diagnostic
+        // returns the built-in default paired with an operator-facing
+        // status string. Keeps the policy from commit 5b098d9b
+        // (fail-closed on every lookup defect) in a single spelling.
+        let default_with = |msg: String| (Self::default_dark(), Some(msg));
         match Self::lookup_paths(choice).into_iter().find(|p| p.is_file()) {
             Some(path) => {
                 // Defence-in-depth on top of the literal-string filter in
@@ -102,12 +107,9 @@ impl Skin {
                 // the operator mis-set the lookup path or hit a
                 // packaging bug.
                 let Ok(resolved) = path.canonicalize() else {
-                    return (
-                        Self::default_dark(),
-                        Some(format!(
-                            "skin `{choice}` canonicalize failed; using default"
-                        )),
-                    );
+                    return default_with(format!(
+                        "skin `{choice}` canonicalize failed; using default"
+                    ));
                 };
                 // Fail closed when the parent anchor cannot be resolved.
                 // The previous shape skipped the confinement check on
@@ -115,20 +117,14 @@ impl Skin {
                 // /proc paths, unusual fs mounts) and parsed the bare
                 // resolved file — defeating the defence-in-depth check.
                 let Some(anchor) = Self::skins_anchor(&path) else {
-                    return (
-                        Self::default_dark(),
-                        Some(format!(
-                            "skin `{choice}` anchor resolve failed; using default"
-                        )),
-                    );
+                    return default_with(format!(
+                        "skin `{choice}` anchor resolve failed; using default"
+                    ));
                 };
                 if !resolved.starts_with(&anchor) {
-                    return (
-                        Self::default_dark(),
-                        Some(format!(
-                            "skin `{choice}` resolved outside skins dir; using default"
-                        )),
-                    );
+                    return default_with(format!(
+                        "skin `{choice}` resolved outside skins dir; using default"
+                    ));
                 }
                 // Close the TOCTOU window: open the file once and read
                 // through the `File` handle so the kernel can't swap a
@@ -139,16 +135,12 @@ impl Skin {
                 // `Read::read_to_string` removes that gap.
                 match Self::from_open_file(&resolved) {
                     Ok(skin) => (skin, None),
-                    Err(e) => (
-                        Self::default_dark(),
-                        Some(format!("skin `{choice}` parse error: {e}; using default")),
-                    ),
+                    Err(e) => {
+                        default_with(format!("skin `{choice}` parse error: {e}; using default"))
+                    }
                 }
             }
-            None => (
-                Self::default_dark(),
-                Some(format!("skin `{choice}` not found; using default")),
-            ),
+            None => default_with(format!("skin `{choice}` not found; using default")),
         }
     }
 
