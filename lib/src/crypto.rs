@@ -400,19 +400,11 @@ mod tests {
     #[test]
     fn can_load_rsa_private_key() {
         use rustls::pki_types::PrivateKeyDer;
-        use std::io::BufReader;
+        use rustls::pki_types::pem::PemObject;
 
         let key_pem = include_str!("../assets/key.pem");
-        let mut reader = BufReader::new(key_pem.as_bytes());
-        let item = rustls_pemfile::read_one(&mut reader)
-            .expect("failed to read PEM")
-            .expect("no PEM item found");
-        let private_key = match item {
-            rustls_pemfile::Item::Pkcs1Key(k) => PrivateKeyDer::from(k),
-            rustls_pemfile::Item::Pkcs8Key(k) => PrivateKeyDer::from(k),
-            rustls_pemfile::Item::Sec1Key(k) => PrivateKeyDer::from(k),
-            _ => panic!("unexpected key type"),
-        };
+        let private_key =
+            PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).expect("failed to parse PEM key");
         any_supported_type(&private_key).expect("provider must be able to load RSA private key");
     }
 

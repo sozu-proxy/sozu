@@ -88,10 +88,10 @@ const H2_BACKEND_RECORD_POLL_MS: u64 = 25;
 
 // ── protocol_pair_matrix! macro ─────────────────────────────────────────
 //
-// Emits four `pub fn try_<name>_<cell>()` wrappers and their matching
-// `#[test] fn test_<name>_<cell>()` harnesses for a feature cell function
-// of the shape `fn try_<name>_cell(frontend_h2: bool, backend_h2: bool)
-// -> State`.
+// Emits a `pub mod <name> { ... }` carrying four `pub fn try_h{1,2}_h{1,2}()`
+// wrappers and four matching `#[test] fn test_h{1,2}_h{1,2}()` harnesses
+// for a feature cell function of the shape
+// `fn try_<name>_cell(frontend_h2: bool, backend_h2: bool) -> State`.
 //
 // Usage:
 //
@@ -99,63 +99,77 @@ const H2_BACKEND_RECORD_POLL_MS: u64 = 25;
 // fn try_basic_auth_cell(frontend_h2: bool, backend_h2: bool) -> State { ... }
 // protocol_pair_matrix!(basic_auth, try_basic_auth_cell, "basic auth");
 // ```
+//
+// The matrix is then reachable as `protocol_pair_matrix::basic_auth::test_h1_h1`,
+// `..::test_h1_h2`, `..::test_h2_h1`, `..::test_h2_h2`. `cargo test
+// basic_auth` filters all four cells.
 
+/// Emit the four `(frontend_h{1,2}, backend_h{1,2})` `try_*` wrappers
+/// and the four matching `#[test]` cells. Identifiers are kept stable
+/// by nesting the per-matrix functions inside a child module named
+/// after `$name` — `macro_rules!` cannot concatenate identifiers
+/// natively, so the module hop replaces what `paste!{ [<try_ $name …>] }`
+/// used to do. The test harness still discovers each `#[test]` via the
+/// `protocol_pair_matrix::$name::test_h{1,2}_h{1,2}` path; `cargo test
+/// $name` filters them as before. No external code calls the generated
+/// function names directly (verified by grep over `e2e/`), so the
+/// nesting is invisible outside this file.
 macro_rules! protocol_pair_matrix {
     ($name:ident, $cell:ident, $description:literal) => {
-        paste::paste! {
-            pub fn [<try_ $name _h1_h1>]() -> $crate::tests::State {
-                $cell(false, false)
+        pub mod $name {
+            pub fn try_h1_h1() -> $crate::tests::State {
+                super::$cell(false, false)
             }
-            pub fn [<try_ $name _h1_h2>]() -> $crate::tests::State {
-                $cell(false, true)
+            pub fn try_h1_h2() -> $crate::tests::State {
+                super::$cell(false, true)
             }
-            pub fn [<try_ $name _h2_h1>]() -> $crate::tests::State {
-                $cell(true, false)
+            pub fn try_h2_h1() -> $crate::tests::State {
+                super::$cell(true, false)
             }
-            pub fn [<try_ $name _h2_h2>]() -> $crate::tests::State {
-                $cell(true, true)
+            pub fn try_h2_h2() -> $crate::tests::State {
+                super::$cell(true, true)
             }
 
             #[test]
-            fn [<test_ $name _h1_h1>]() {
+            fn test_h1_h1() {
                 assert_eq!(
                     $crate::tests::repeat_until_error_or(
                         2,
                         concat!($description, " h1↔h1"),
-                        [<try_ $name _h1_h1>],
+                        try_h1_h1,
                     ),
                     $crate::tests::State::Success,
                 );
             }
             #[test]
-            fn [<test_ $name _h1_h2>]() {
+            fn test_h1_h2() {
                 assert_eq!(
                     $crate::tests::repeat_until_error_or(
                         2,
                         concat!($description, " h1↔h2c"),
-                        [<try_ $name _h1_h2>],
+                        try_h1_h2,
                     ),
                     $crate::tests::State::Success,
                 );
             }
             #[test]
-            fn [<test_ $name _h2_h1>]() {
+            fn test_h2_h1() {
                 assert_eq!(
                     $crate::tests::repeat_until_error_or(
                         2,
                         concat!($description, " h2↔h1"),
-                        [<try_ $name _h2_h1>],
+                        try_h2_h1,
                     ),
                     $crate::tests::State::Success,
                 );
             }
             #[test]
-            fn [<test_ $name _h2_h2>]() {
+            fn test_h2_h2() {
                 assert_eq!(
                     $crate::tests::repeat_until_error_or(
                         2,
                         concat!($description, " h2↔h2c"),
-                        [<try_ $name _h2_h2>],
+                        try_h2_h2,
                     ),
                     $crate::tests::State::Success,
                 );

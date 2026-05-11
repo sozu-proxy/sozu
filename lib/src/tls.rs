@@ -8,13 +8,12 @@ use std::collections::HashSet;
 use std::{
     collections::HashMap,
     fmt,
-    io::BufReader,
     str::FromStr,
     sync::{Arc, LazyLock, Mutex},
 };
 
 use rustls::{
-    pki_types::{CertificateDer, PrivateKeyDer},
+    pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject},
     server::{ClientHello, ResolvesServerCert},
     sign::CertifiedKey,
 };
@@ -156,21 +155,16 @@ impl TryFrom<&AddCertificate> for CertifiedKeyWrapper {
             );
         }
 
-        let mut key_reader = BufReader::new(cert.key.as_bytes());
-
-        let item = match rustls_pemfile::read_one(&mut key_reader)
-            .map_err(|_| CertificateResolverError::EmptyKeys)?
-        {
-            Some(item) => item,
-            None => return Err(CertificateResolverError::EmptyKeys),
-        };
-
-        let private_key = match item {
-            rustls_pemfile::Item::Pkcs1Key(rsa_key) => PrivateKeyDer::from(rsa_key),
-            rustls_pemfile::Item::Pkcs8Key(pkcs8_key) => PrivateKeyDer::from(pkcs8_key),
-            rustls_pemfile::Item::Sec1Key(ec_key) => PrivateKeyDer::from(ec_key),
-            _ => return Err(CertificateResolverError::EmptyKeys),
-        };
+        // Parse the PEM-encoded private key into a `PrivateKeyDer` via
+        // `rustls-pki-types`'s `PemObject` trait. `from_pem_slice` accepts
+        // PKCS1 / PKCS8 / SEC1 key formats the same way the old
+        // `rustls-pemfile::read_one` + per-variant `From::from` chain did,
+        // and folds the empty-input / no-PEM-object / unsupported-format
+        // cases into a single `Err` we surface as `EmptyKeys` (the
+        // existing variant covers any failure to extract a key from the
+        // supplied PEM blob).
+        let private_key = PrivateKeyDer::from_pem_slice(cert.key.as_bytes())
+            .map_err(|_| CertificateResolverError::EmptyKeys)?;
 
         match any_supported_type(&private_key) {
             Ok(signing_key) => {

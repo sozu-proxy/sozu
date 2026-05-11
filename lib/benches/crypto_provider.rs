@@ -37,16 +37,9 @@ fn bench_certificate_loading(c: &mut Criterion) {
 
 fn bench_private_key_signing(c: &mut Criterion) {
     use rustls::pki_types::PrivateKeyDer;
-    use std::io::BufReader;
+    use rustls::pki_types::pem::PemObject;
 
-    let mut reader = BufReader::new(KEY_PEM.as_bytes());
-    let item = rustls_pemfile::read_one(&mut reader).unwrap().unwrap();
-    let private_key = match item {
-        rustls_pemfile::Item::Pkcs1Key(k) => PrivateKeyDer::from(k),
-        rustls_pemfile::Item::Pkcs8Key(k) => PrivateKeyDer::from(k),
-        rustls_pemfile::Item::Sec1Key(k) => PrivateKeyDer::from(k),
-        _ => panic!("unexpected key type"),
-    };
+    let private_key = PrivateKeyDer::from_pem_slice(KEY_PEM.as_bytes()).unwrap();
 
     c.bench_function("private_key_load", |b| {
         b.iter(|| any_supported_type(&private_key).unwrap());

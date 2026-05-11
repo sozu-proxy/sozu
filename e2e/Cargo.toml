@@ -36,10 +36,6 @@ tempfile = { workspace = true }
 # request consume the failure injection that FIX-18 just armed,
 # producing the wrong response code for both tests on CI.
 serial_test = { workspace = true }
-# Identifier-concatenation macro used by the `protocol_pair_matrix!`
-# helper in `tests/protocol_pair_matrix.rs`. `paste` is dev-only — the
-# generated wrappers are pure test scaffolding.
-paste = "1.0"
 
 [features]
 # Forward sozu-lib's `splice` feature so the dependency-tree compiles

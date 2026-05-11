@@ -47,7 +47,6 @@ rand = { workspace = true }
 regex = { workspace = true }
 rustls = { workspace = true }
 rustls-openssl = { workspace = true, optional = true }
-rustls-pemfile = { workspace = true }
 rusty_ulid = { workspace = true }
 sha2 = { workspace = true }
 slab = { workspace = true }
