@@ -362,9 +362,6 @@ pub struct ThresholdTable {
     pub error_ratio_critical_pct: f64,
     /// `slab.usage_percent` value above which the saturation sparkline goes hot.
     pub slab_critical_pct: f64,
-    /// `client.connections` / `client.connections_max` ratio above which
-    /// the saturation cell goes warm.
-    pub conn_warn_pct: f64,
     /// p99 in ms above which the latency sparkline goes hot.
     pub latency_p99_critical_ms: f64,
 }
@@ -374,7 +371,6 @@ impl Default for ThresholdTable {
         Self {
             error_ratio_critical_pct: 1.0,
             slab_critical_pct: 80.0,
-            conn_warn_pct: 70.0,
             latency_p99_critical_ms: 500.0,
         }
     }
@@ -648,7 +644,6 @@ impl App {
                 ClusterRow {
                     cluster_id: id.clone(),
                     requests_total: requests as u64,
-                    errors_5xx_total: errors_5xx as u64,
                     error_rate_pct,
                     p50_ms,
                     p99_ms,
@@ -695,8 +690,6 @@ impl App {
                 rows.push(BackendRow {
                     cluster_id: cluster_id.clone(),
                     backend_id: bm.backend_id.clone(),
-                    bytes_in: count_value(bm.metrics.get("bytes_in")).unwrap_or(0) as u64,
-                    bytes_out: count_value(bm.metrics.get("bytes_out")).unwrap_or(0) as u64,
                     back_bytes_in: count_value(bm.metrics.get("back_bytes_in")).unwrap_or(0) as u64,
                     back_bytes_out: count_value(bm.metrics.get("back_bytes_out")).unwrap_or(0)
                         as u64,
@@ -955,7 +948,6 @@ fn percentile_p50_ms(metric: Option<&FilteredMetrics>) -> Option<u64> {
 pub struct ClusterRow {
     pub cluster_id: String,
     pub requests_total: u64,
-    pub errors_5xx_total: u64,
     pub error_rate_pct: f64,
     pub p50_ms: u64,
     pub p99_ms: u64,
@@ -969,8 +961,6 @@ pub struct ClusterRow {
 pub struct BackendRow {
     pub cluster_id: String,
     pub backend_id: String,
-    pub bytes_in: u64,
-    pub bytes_out: u64,
     pub back_bytes_in: u64,
     pub back_bytes_out: u64,
     pub connections: u64,

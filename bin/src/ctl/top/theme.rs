@@ -42,7 +42,9 @@ pub struct Skin {
     /// Categorical palette assigned in cluster-table-row order. Cycles when
     /// the cluster count exceeds the palette length. Okabe-Ito 7-colour set
     /// extended with two Viridis points at the warm end for cluster counts
-    /// above 7.
+    /// above 7. Not yet consumed by a pane; reserved for cluster-row tinting
+    /// when the CLUSTERS pane gets categorical row colours.
+    #[allow(dead_code)]
     pub categorical: Vec<Color>,
 }
 
