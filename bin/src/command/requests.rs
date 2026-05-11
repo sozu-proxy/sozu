@@ -495,6 +495,7 @@ fn list_workers(server: &mut Server, client: &mut ClientSession) {
             id: worker.id,
             pid: worker.pid,
             run_state: worker.run_state as i32,
+            proto_version: Some(worker.proto_version),
         })
         .collect();
 
