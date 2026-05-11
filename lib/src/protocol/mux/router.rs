@@ -27,6 +27,8 @@ use crate::{
     timer::TimeoutContainer,
 };
 
+use crate::metrics::names;
+
 /// Module-level prefix used on every log line emitted from the router.
 ///
 /// Two arms:
@@ -312,7 +314,7 @@ impl Router {
             // with `backend.pool.miss` below — together they describe the
             // pool's hit/miss ratio. Counted before any commit so the metric
             // is consistent with the trace log.
-            incr!("backend.pool.hit");
+            incr!(names::backend::POOL_HIT);
             trace!(
                 "{} reused backend: {:#?}",
                 log_module_context!(stream_context),
@@ -368,7 +370,7 @@ impl Router {
         // we did not save. The dial itself may still fail
         // (BackendConnectionError::*), in which case `backend.pool.size` is
         // never bumped (see the gauge below) but the miss is already counted.
-        incr!("backend.pool.miss");
+        incr!(names::backend::POOL_MISS);
         let token = {
             //
             // SECURITY (CWE-400): defer every stateful side-effect
@@ -468,16 +470,16 @@ impl Router {
             let stream = &mut context.streams[stream_id];
             stream.metrics.backend_start();
             stream.metrics.backend_id = stream.context.backend_id.to_owned();
-            gauge_add!("backend.connections", 1);
+            gauge_add!(names::backend::CONNECTIONS, 1);
             // `backend.pool.size` mirrors `backend.connections` exactly: one
             // entry per `Router::backends` token. The `-1` partner lives in
             // `connection.rs::pre_close_client_bookkeeping` (graceful close)
             // and `mod.rs::close_backend` (session teardown). Symmetric
             // pairing with both decrement sites is the only defence against
             // the gauge underflow class of bug fixed by a650ad69 / d2f01ed4.
-            gauge_add!("backend.pool.size", 1);
+            gauge_add!(names::backend::POOL_SIZE, 1);
             gauge_add!(
-                "connections_per_backend",
+                names::backend::CONNECTIONS_PER_BACKEND,
                 1,
                 Some(&cluster_id),
                 Some(&backend_id_for_gauge)
@@ -508,10 +510,10 @@ impl Router {
                         e
                     );
                     // Undo the gauge increments committed above.
-                    gauge_add!("backend.connections", -1);
-                    gauge_add!("backend.pool.size", -1);
+                    gauge_add!(names::backend::CONNECTIONS, -1);
+                    gauge_add!(names::backend::POOL_SIZE, -1);
                     gauge_add!(
-                        "connections_per_backend",
+                        names::backend::CONNECTIONS_PER_BACKEND,
                         -1,
                         Some(&cluster_id),
                         Some(&backend_id_for_gauge)
@@ -593,7 +595,7 @@ impl Router {
             .filter(|_| context.strict_sni_binding)
         {
             let matched: Option<&str> = match context.tls_cert_names.as_deref() {
-                Some(names) => authority_matched_cert_name(host, names),
+                Some(cert_names) => authority_matched_cert_name(host, cert_names),
                 None => {
                     if authority_matches_sni(host, sni) {
                         Some(sni)
@@ -618,7 +620,7 @@ impl Router {
                     // same predicate doesn't silently double-count
                     // sequential `Host:` reuse as "coalescing".
                     if !authority_matches_sni(host, sni) && context.tls_alpn == Some("h2") {
-                        incr!("h2.coalescing.accepted");
+                        incr!(names::h2::COALESCING_ACCEPTED);
                         debug!(
                             "{} accepted coalesced authority {:?} (SNI {:?}, matched SAN {:?})",
                             log_module_context!(context),
@@ -629,7 +631,7 @@ impl Router {
                     }
                 }
                 None => {
-                    incr!("http.sni_authority_mismatch");
+                    incr!(names::http::SNI_AUTHORITY_MISMATCH);
                     warn!(
                         "{} rejecting request: TLS cert SANs do not cover :authority {:?} (SNI {:?})",
                         log_module_context!(context),

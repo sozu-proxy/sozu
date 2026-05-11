@@ -7,6 +7,7 @@
 use sozu_command::logging::ansi_palette;
 
 use super::{GenericHttpStream, H2Error, Readiness, Stream, StreamState};
+use crate::metrics::names;
 use crate::protocol::http::{DefaultAnswer, answers::HttpAnswers};
 
 /// Module-level prefix used on every log line emitted from the mux
@@ -219,9 +220,9 @@ pub(crate) fn set_default_answer_with_retry_after(
         301 => "http.301.redirection",
         302 => "http.302.redirection",
         308 => "http.308.redirection",
-        400 => "http.400.errors",
+        400 => names::http::ERR_400,
         401 => "http.401.errors",
-        404 => "http.404.errors",
+        404 => names::http::ERR_404,
         408 => "http.408.errors",
         413 => "http.413.errors",
         421 => "http.421.errors",
@@ -298,7 +299,7 @@ pub(crate) fn set_default_answer_with_retry_after(
                         log_module_context!(),
                         code
                     );
-                    incr!("http.redirect_template.compile_error");
+                    incr!(names::http::REDIRECT_TEMPLATE_COMPILE_ERROR);
                 }
                 result
             })
@@ -323,7 +324,7 @@ pub(crate) fn set_default_answer_with_retry_after(
     context.status = Some(resolved_status);
     stream.state = StreamState::Unlinked;
     readiness.arm_writable();
-    incr!("h2.signal.writable.rearmed.default_answer");
+    incr!(names::h2::SIGNAL_WRITABLE_REARMED_DEFAULT_ANSWER);
 }
 
 /// Forcefully terminates a kawa message by setting the "end_stream" flag and setting the parsing_phase to Error.
@@ -339,7 +340,7 @@ pub(crate) fn forcefully_terminate_answer(
     kawa.parsing_phase.error(error.as_str().into());
     stream.state = StreamState::Unlinked;
     readiness.arm_writable();
-    incr!("h2.signal.writable.rearmed.forcefully_terminate_answer");
+    incr!(names::h2::SIGNAL_WRITABLE_REARMED_FORCEFULLY_TERMINATE_ANSWER);
 }
 
 #[cfg(test)]

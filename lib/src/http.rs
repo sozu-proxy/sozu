@@ -26,6 +26,7 @@ use sozu_command::{
     state::{ClusterId, validate_h2_flood_knobs_http, validate_sozu_id_header},
 };
 
+use crate::metrics::names;
 use crate::{
     AcceptError, FrontendFromRequestError, L7ListenerHandler, L7Proxy, ListenerError,
     ListenerHandler, Protocol, ProxyConfiguration, ProxyError, ProxySession, SessionIsToBeClosed,
@@ -136,7 +137,7 @@ impl HttpSession {
 
         let state = if expect_proxy {
             trace!("{} starting in expect proxy state", log_module_context!());
-            gauge_add!("protocol.proxy.expect", 1);
+            gauge_add!(names::protocol::PROXY_EXPECT, 1);
 
             HttpStateMachine::Expect(ExpectProxyProtocol::new(
                 container_frontend_timeout,
@@ -145,7 +146,7 @@ impl HttpSession {
                 request_id,
             ))
         } else {
-            gauge_add!("protocol.http", 1);
+            gauge_add!(names::protocol::HTTP, 1);
             let session_address = sock.peer_addr().ok();
             let session_ulid = rusty_ulid::Ulid::generate();
             let sock = crate::socket::SessionTcpStream::new(sock, session_ulid, session_address);
@@ -266,8 +267,8 @@ impl HttpSession {
                 };
                 mux.frontend.readiness_mut().event = expect.frontend_readiness.event;
 
-                gauge_add!("protocol.proxy.expect", -1);
-                gauge_add!("protocol.http", 1);
+                gauge_add!(names::protocol::PROXY_EXPECT, -1);
+                gauge_add!(names::protocol::HTTP, 1);
                 Some(HttpStateMachine::Mux(mux))
             }
             _ => {
@@ -387,9 +388,9 @@ impl HttpSession {
 
         // http.active_requests was already decremented by generate_access_log()
         // in h1.rs when the 101 response was written (before MuxResult::Upgrade).
-        gauge_add!("protocol.http", -1);
-        gauge_add!("protocol.ws", 1);
-        gauge_add!("websocket.active_requests", 1);
+        gauge_add!(names::protocol::HTTP, -1);
+        gauge_add!(names::protocol::WS, 1);
+        gauge_add!(names::websocket::ACTIVE_REQUESTS, 1);
         Some(HttpStateMachine::WebSocket(pipe))
     }
 
@@ -417,19 +418,19 @@ impl ProxySession for HttpSession {
 
         // Restore gauges
         match self.state.marker() {
-            StateMarker::Expect => gauge_add!("protocol.proxy.expect", -1),
-            StateMarker::Mux => gauge_add!("protocol.http", -1),
+            StateMarker::Expect => gauge_add!(names::protocol::PROXY_EXPECT, -1),
+            StateMarker::Mux => gauge_add!(names::protocol::HTTP, -1),
             StateMarker::WebSocket => {
-                gauge_add!("protocol.ws", -1);
-                gauge_add!("websocket.active_requests", -1);
+                gauge_add!(names::protocol::WS, -1);
+                gauge_add!(names::websocket::ACTIVE_REQUESTS, -1);
             }
         }
 
         if self.state.failed() {
             match self.state.marker() {
-                StateMarker::Expect => incr!("http.upgrade.expect.failed"),
-                StateMarker::Mux => incr!("http.upgrade.mux.failed"),
-                StateMarker::WebSocket => incr!("http.upgrade.ws.failed"),
+                StateMarker::Expect => incr!(names::http::UPGRADE_EXPECT_FAILED),
+                StateMarker::Mux => incr!(names::http::UPGRADE_MUX_FAILED),
+                StateMarker::WebSocket => incr!(names::http::UPGRADE_WS_FAILED),
             }
             // FailedUpgrade means the socket was consumed by a failed upgrade
             // attempt, so we can only close the state (no-op) and remove the
@@ -656,14 +657,18 @@ impl L7ListenerHandler for HttpListener {
         let host = unsafe { from_utf8_unchecked(hostname) };
 
         let route = self.fronts.lookup(host, uri, method).map_err(|e| {
-            incr!("http.failed_backend_matching");
+            incr!(names::http::FAILED_BACKEND_MATCHING);
             FrontendFromRequestError::NoClusterFound(e)
         })?;
 
         let now = Instant::now();
 
         if let Some(cluster) = route.cluster_id.as_deref() {
-            time!("frontend_matching_time", cluster, (now - start).as_millis());
+            time!(
+                names::event_loop::FRONTEND_MATCHING_TIME,
+                cluster,
+                (now - start).as_millis()
+            );
         }
 
         Ok(route)
@@ -959,7 +964,7 @@ impl HttpProxy {
         // Carrying any `hsts` field here is a misconfiguration rather
         // than a deliberate choice.
         if front.hsts.is_some() {
-            incr!("http.hsts.suppressed_plaintext");
+            incr!(names::http::HSTS_SUPPRESSED_PLAINTEXT);
             return Err(ProxyError::HstsOnPlainHttp(front.address.into()));
         }
 

@@ -16,6 +16,7 @@ use mio::Token;
 use sozu_command::logging::ansi_palette;
 
 use super::{GenericHttpStream, Position};
+use crate::metrics::names;
 use crate::{
     L7ListenerHandler, ListenerHandler, Protocol, SessionMetrics, pool::Pool,
     protocol::http::editor::HttpContext,
@@ -64,7 +65,7 @@ pub struct Stream {
     pub front_data_received: usize,
     /// Tracks total DATA payload bytes received on the backend for content-length validation (RFC 9113 §8.1.1)
     pub back_data_received: usize,
-    /// True when `gauge_add!("http.active_requests", 1)` was emitted for this stream.
+    /// True when `gauge_add!(names::http::ACTIVE_REQUESTS, 1)` was emitted for this stream.
     /// Prevents underflow when `generate_access_log` is called for streams that never
     /// had their request fully parsed (idle timeouts, malformed requests).
     pub request_counted: bool,
@@ -231,7 +232,7 @@ impl Stream {
         // errors) takes precedence when both are present.
         let message = message.or(context.access_log_message);
         if self.request_counted {
-            gauge_add!("http.active_requests", -1);
+            gauge_add!(names::http::ACTIVE_REQUESTS, -1);
             self.request_counted = false;
         }
         if error {
@@ -263,12 +264,12 @@ impl Stream {
         // the short-list shared with the H1 path (`save_http_status_metric`).
         let bucket_key = if let Some(status) = context.status {
             match status {
-                100..=199 => "http.status.1xx",
-                200..=299 => "http.status.2xx",
-                300..=399 => "http.status.3xx",
-                400..=499 => "http.status.4xx",
-                500..=599 => "http.status.5xx",
-                _ => "http.status.other",
+                100..=199 => names::http::STATUS_1XX,
+                200..=299 => names::http::STATUS_2XX,
+                300..=399 => names::http::STATUS_3XX,
+                400..=499 => names::http::STATUS_4XX,
+                500..=599 => names::http::STATUS_5XX,
+                _ => names::http::STATUS_OTHER,
             }
         } else {
             "http.status.none"
@@ -308,7 +309,7 @@ impl Stream {
 
         log_access! {
             error,
-            on_failure: { incr!("unsent-access-logs") },
+            on_failure: { incr!(names::access_logs::UNSENT) },
             message,
             context: context.log_context(),
             session_address: context.session_address,

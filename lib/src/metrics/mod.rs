@@ -7,6 +7,7 @@
 //! correctness bug (saturating clamp + warn log), not a rounding artefact.
 
 mod local_drain;
+pub mod names;
 mod network_drain;
 mod writer;
 

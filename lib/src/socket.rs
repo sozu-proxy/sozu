@@ -18,6 +18,8 @@ use rusty_ulid::Ulid;
 use socket2::{Domain, Protocol, Socket, Type};
 use sozu_command::{config::MAX_LOOP_ITERATIONS, logging::ansi_palette};
 
+use crate::metrics::names;
+
 #[derive(thiserror::Error, Debug)]
 pub enum ServerBindError {
     #[error("could not set bind to socket: {0}")]
@@ -181,7 +183,7 @@ fn tcp_socket_read(
                 "{} MAX_LOOP_ITERATION reached in TcpStream::socket_read",
                 log_socket_module_prefix(stream, session_ulid, configured_peer)
             );
-            incr!("socket.read.infinite_loop.error");
+            incr!(names::socket::READ_INFINITE_LOOP_ERROR);
             return (size, SocketResult::Error);
         }
         if size == buf.len() {
@@ -248,7 +250,7 @@ fn tcp_socket_write(
                 "{} MAX_LOOP_ITERATION reached in TcpStream::socket_write",
                 log_socket_module_prefix(stream, session_ulid, configured_peer)
             );
-            incr!("socket.write.infinite_loop.error");
+            incr!(names::socket::WRITE_INFINITE_LOOP_ERROR);
             return (size, SocketResult::Error);
         }
         if size == buf.len() {
@@ -263,7 +265,7 @@ fn tcp_socket_write(
                 | ErrorKind::ConnectionAborted
                 | ErrorKind::BrokenPipe
                 | ErrorKind::ConnectionRefused => {
-                    incr!("tcp.write.error");
+                    incr!(names::tcp::WRITE_ERROR);
                     return (size, SocketResult::Closed);
                 }
                 // Noisy-expected transport failures (see `tcp_socket_read`
@@ -279,7 +281,7 @@ fn tcp_socket_write(
                         log_socket_module_prefix(stream, session_ulid, configured_peer),
                         e
                     );
-                    incr!("tcp.write.error");
+                    incr!(names::tcp::WRITE_ERROR);
                     return (size, SocketResult::Error);
                 }
                 _ => {
@@ -289,7 +291,7 @@ fn tcp_socket_write(
                         log_socket_module_prefix(stream, session_ulid, configured_peer),
                         e
                     );
-                    incr!("tcp.write.error");
+                    incr!(names::tcp::WRITE_ERROR);
                     return (size, SocketResult::Error);
                 }
             },
@@ -311,7 +313,7 @@ fn tcp_socket_write_vectored(
             | ErrorKind::ConnectionAborted
             | ErrorKind::BrokenPipe
             | ErrorKind::ConnectionRefused => {
-                incr!("tcp.write.error");
+                incr!(names::tcp::WRITE_ERROR);
                 (0, SocketResult::Closed)
             }
             // Noisy-expected transport failures (see `tcp_socket_read` for
@@ -325,7 +327,7 @@ fn tcp_socket_write_vectored(
                     log_socket_module_prefix(stream, session_ulid, configured_peer),
                     e
                 );
-                incr!("tcp.write.error");
+                incr!(names::tcp::WRITE_ERROR);
                 (0, SocketResult::Error)
             }
             _ => {
@@ -335,7 +337,7 @@ fn tcp_socket_write_vectored(
                     log_socket_module_prefix(stream, session_ulid, configured_peer),
                     e
                 );
-                incr!("tcp.write.error");
+                incr!(names::tcp::WRITE_ERROR);
                 (0, SocketResult::Error)
             }
         },
@@ -368,11 +370,11 @@ impl SocketHandler for TcpStream {
     }
 
     fn read_error(&self) {
-        incr!("tcp.read.error");
+        incr!(names::tcp::READ_ERROR);
     }
 
     fn write_error(&self) {
-        incr!("tcp.write.error");
+        incr!(names::tcp::WRITE_ERROR);
     }
 }
 
@@ -452,11 +454,11 @@ impl SocketHandler for SessionTcpStream {
     }
 
     fn read_error(&self) {
-        incr!("tcp.read.error");
+        incr!(names::tcp::READ_ERROR);
     }
 
     fn write_error(&self) {
-        incr!("tcp.write.error");
+        incr!(names::tcp::WRITE_ERROR);
     }
 
     fn session_ulid(&self) -> Option<Ulid> {
@@ -502,7 +504,7 @@ impl SocketHandler for FrontRustls {
                     "{} MAX_LOOP_ITERATION reached in FrontRustls::socket_read",
                     log_socket_context!(self)
                 );
-                incr!("rustls.read.infinite_loop.error");
+                incr!(names::rustls::READ_INFINITE_LOOP_ERROR);
                 is_error = true;
                 break;
             }
@@ -639,7 +641,7 @@ impl SocketHandler for FrontRustls {
                     "{} MAX_LOOP_ITERATION reached in FrontRustls::socket_write",
                     log_socket_context!(self)
                 );
-                incr!("rustls.write.infinite_loop.error");
+                incr!(names::rustls::WRITE_INFINITE_LOOP_ERROR);
                 is_error = true;
                 break;
             }
@@ -665,7 +667,7 @@ impl SocketHandler for FrontRustls {
                     | ErrorKind::ConnectionAborted
                     | ErrorKind::BrokenPipe => {
                         //FIXME: this should probably not happen here
-                        incr!("rustls.write.error");
+                        incr!(names::rustls::WRITE_ERROR);
                         is_closed = true;
                         self.peer_reset = true;
                         break;
@@ -676,7 +678,7 @@ impl SocketHandler for FrontRustls {
                             log_socket_context!(self),
                             e
                         );
-                        incr!("rustls.write.error");
+                        incr!(names::rustls::WRITE_ERROR);
                         is_error = true;
                         break;
                     }
@@ -698,7 +700,7 @@ impl SocketHandler for FrontRustls {
                         ErrorKind::ConnectionReset
                         | ErrorKind::ConnectionAborted
                         | ErrorKind::BrokenPipe => {
-                            incr!("rustls.write.error");
+                            incr!(names::rustls::WRITE_ERROR);
                             is_closed = true;
                             self.peer_reset = true;
                             break;
@@ -709,7 +711,7 @@ impl SocketHandler for FrontRustls {
                                 log_socket_context!(self),
                                 e
                             );
-                            incr!("rustls.write.error");
+                            incr!(names::rustls::WRITE_ERROR);
                             is_error = true;
                             break;
                         }
@@ -736,7 +738,7 @@ impl SocketHandler for FrontRustls {
                         ErrorKind::ConnectionReset
                         | ErrorKind::ConnectionAborted
                         | ErrorKind::BrokenPipe => {
-                            incr!("rustls.write.error");
+                            incr!(names::rustls::WRITE_ERROR);
                             is_closed = true;
                             self.peer_reset = true;
                             break;
@@ -747,7 +749,7 @@ impl SocketHandler for FrontRustls {
                                 log_socket_context!(self),
                                 e
                             );
-                            incr!("rustls.write.error");
+                            incr!(names::rustls::WRITE_ERROR);
                             is_error = true;
                             break;
                         }
@@ -802,7 +804,7 @@ impl SocketHandler for FrontRustls {
                     "{} MAX_LOOP_ITERATION reached in FrontRustls::socket_write_vectored",
                     log_socket_context!(self)
                 );
-                incr!("rustls.write.infinite_loop.error");
+                incr!(names::rustls::WRITE_INFINITE_LOOP_ERROR);
                 is_error = true;
                 break;
             }
@@ -829,7 +831,7 @@ impl SocketHandler for FrontRustls {
                         ErrorKind::ConnectionReset
                         | ErrorKind::ConnectionAborted
                         | ErrorKind::BrokenPipe => {
-                            incr!("rustls.write.error");
+                            incr!(names::rustls::WRITE_ERROR);
                             is_closed = true;
                             self.peer_reset = true;
                             break;
@@ -840,7 +842,7 @@ impl SocketHandler for FrontRustls {
                                 log_socket_context!(self),
                                 e
                             );
-                            incr!("rustls.write.error");
+                            incr!(names::rustls::WRITE_ERROR);
                             is_error = true;
                             break;
                         }
@@ -865,7 +867,7 @@ impl SocketHandler for FrontRustls {
                             ErrorKind::ConnectionReset
                             | ErrorKind::ConnectionAborted
                             | ErrorKind::BrokenPipe => {
-                                incr!("rustls.write.error");
+                                incr!(names::rustls::WRITE_ERROR);
                                 is_closed = true;
                                 self.peer_reset = true;
                                 break;
@@ -876,7 +878,7 @@ impl SocketHandler for FrontRustls {
                                     log_socket_context!(self),
                                     e
                                 );
-                                incr!("rustls.write.error");
+                                incr!(names::rustls::WRITE_ERROR);
                                 is_error = true;
                                 break;
                             }
@@ -900,7 +902,7 @@ impl SocketHandler for FrontRustls {
                         ErrorKind::ConnectionReset
                         | ErrorKind::ConnectionAborted
                         | ErrorKind::BrokenPipe => {
-                            incr!("rustls.write.error");
+                            incr!(names::rustls::WRITE_ERROR);
                             is_closed = true;
                             self.peer_reset = true;
                             break;
@@ -911,7 +913,7 @@ impl SocketHandler for FrontRustls {
                                 log_socket_context!(self),
                                 e
                             );
-                            incr!("rustls.write.error");
+                            incr!(names::rustls::WRITE_ERROR);
                             is_error = true;
                             break;
                         }
@@ -933,7 +935,7 @@ impl SocketHandler for FrontRustls {
                         ErrorKind::ConnectionReset
                         | ErrorKind::ConnectionAborted
                         | ErrorKind::BrokenPipe => {
-                            incr!("rustls.write.error");
+                            incr!(names::rustls::WRITE_ERROR);
                             is_closed = true;
                             self.peer_reset = true;
                             break;
@@ -944,7 +946,7 @@ impl SocketHandler for FrontRustls {
                                 log_socket_context!(self),
                                 e
                             );
-                            incr!("rustls.write.error");
+                            incr!(names::rustls::WRITE_ERROR);
                             is_error = true;
                             break;
                         }
@@ -998,11 +1000,11 @@ impl SocketHandler for FrontRustls {
     }
 
     fn read_error(&self) {
-        incr!("rustls.read.error");
+        incr!(names::rustls::READ_ERROR);
     }
 
     fn write_error(&self) {
-        incr!("rustls.write.error");
+        incr!(names::rustls::WRITE_ERROR);
     }
 
     fn session_ulid(&self) -> Option<Ulid> {

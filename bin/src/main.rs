@@ -30,6 +30,8 @@ extern crate sozu_command_lib;
 #[cfg(target_os = "linux")]
 extern crate num_cpus;
 
+use sozu_lib::metrics::names;
+
 // FreeBSD/NetBSD libc malloc is already jemalloc; the bundled `jemallocator`
 // dep is filtered out of the build graph in `bin/Cargo.toml`. The
 // `libc_jemalloc` cfg is emitted by `bin/build.rs` for those targets; without
@@ -140,7 +142,7 @@ fn register_panic_hook() {
     let original_panic_hook = panic::take_hook();
 
     panic::set_hook(Box::new(move |panic_info| {
-        incr!("panic");
+        incr!(names::misc::PANIC);
         METRICS.with(|metrics| {
             (*metrics.borrow_mut()).send_data();
         });

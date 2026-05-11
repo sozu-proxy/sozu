@@ -27,6 +27,7 @@ const _: () = assert!(
 use rusty_ulid::Ulid;
 use sozu_command::{logging::ansi_palette, ready::Ready};
 
+use crate::metrics::names;
 use crate::{
     L7ListenerHandler, ListenerHandler, Protocol, Readiness, SessionMetrics,
     protocol::mux::{
@@ -2094,7 +2095,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 match serializer::gen_settings(kawa.storage.space(), &self.local_settings) {
                     Ok((_, size)) => {
                         kawa.storage.fill(size);
-                        incr!("h2.frames.tx.settings");
+                        incr!(names::h2::FRAMES_TX_SETTINGS);
                         // RFC 9113 §6.5: start tracking SETTINGS ACK timeout
                         self.settings_sent_at = Some(Instant::now());
                     }
@@ -2210,13 +2211,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         let ds = snapshot.1 as i64 - prev.1 as i64;
         let du = snapshot.2 as i64 - prev.2 as i64;
         if dw != 0 {
-            gauge_add!("h2.connection.window_bytes", dw);
+            gauge_add!(names::h2::CONNECTION_WINDOW_BYTES, dw);
         }
         if ds != 0 {
-            gauge_add!("h2.connection.active_streams", ds);
+            gauge_add!(names::h2::CONNECTION_ACTIVE_STREAMS, ds);
         }
         if du != 0 {
-            gauge_add!("h2.connection.pending_window_updates", du);
+            gauge_add!(names::h2::CONNECTION_PENDING_WINDOW_UPDATES, du);
         }
         self.last_gauge_snapshot = Some(snapshot);
     }
@@ -2231,13 +2232,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     fn release_connection_gauges(&mut self) {
         if let Some((w, s, u)) = self.last_gauge_snapshot.take() {
             if w != 0 {
-                gauge_add!("h2.connection.window_bytes", -(w as i64));
+                gauge_add!(names::h2::CONNECTION_WINDOW_BYTES, -(w as i64));
             }
             if s != 0 {
-                gauge_add!("h2.connection.active_streams", -(s as i64));
+                gauge_add!(names::h2::CONNECTION_ACTIVE_STREAMS, -(s as i64));
             }
             if u != 0 {
-                gauge_add!("h2.connection.pending_window_updates", -(u as i64));
+                gauge_add!(names::h2::CONNECTION_PENDING_WINDOW_UPDATES, -(u as i64));
             }
         }
     }
@@ -3014,7 +3015,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     "finalize_write: retained WRITABLE (control queue non-empty)".to_owned(),
                 ));
                 self.readiness.arm_writable();
-                incr!("h2.signal.writable.rearmed.control_queue");
+                incr!(names::h2::SIGNAL_WRITABLE_REARMED_CONTROL_QUEUE);
             } else {
                 // We wrote everything
                 #[cfg(debug_assertions)]
@@ -3087,7 +3088,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     Ok((_, size)) => {
                         offset += size;
                         written_ids.push(stream_id);
-                        incr!("h2.frames.tx.window_update");
+                        incr!(names::h2::FRAMES_TX_WINDOW_UPDATE);
                     }
                     Err(_) => {
                         // Buffer full — stop here, remaining entries stay in the map
@@ -3246,7 +3247,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 match serializer::gen_settings(kawa.storage.space(), &self.local_settings) {
                     Ok((_, size)) => {
                         kawa.storage.fill(size);
-                        incr!("h2.frames.tx.settings");
+                        incr!(names::h2::FRAMES_TX_SETTINGS);
                         // RFC 9113 §6.5: start tracking SETTINGS ACK timeout
                         self.settings_sent_at = Some(Instant::now());
                     }
@@ -3434,7 +3435,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     where
         L: ListenerHandler + L7ListenerHandler,
     {
-        incr!("http.e2e.h2");
+        incr!(names::http::E2E_H2);
         stream.metrics.backend_stop();
         stream.generate_access_log(
             false,
@@ -3540,7 +3541,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 stream_id,
                 increment
             );
-            incr!("h2.window_update_dropped");
+            incr!(names::h2::WINDOW_UPDATE_DROPPED);
         }
         self.readiness.arm_writable();
     }
@@ -3805,7 +3806,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// with that result — the flood detector tripped its lifetime cap
     /// and converted to a connection-wide GOAWAY.
     fn account_emitted_rst(&mut self, error: H2Error) -> Option<MuxResult> {
-        incr!("h2.frames.tx.rst_stream");
+        incr!(names::h2::FRAMES_TX_RST_STREAM);
         count!(metric_for_rst_stream_sent(error), 1);
         if !matches!(error, H2Error::NoError) {
             if let Some(violation) = self.flood_detector.record_rst_emitted() {
@@ -4038,7 +4039,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         match serializer::gen_goaway(kawa.storage.space(), self.highest_peer_stream_id, error) {
             Ok((_, size)) => {
                 kawa.storage.fill(size);
-                incr!("h2.frames.tx.goaway");
+                incr!(names::h2::FRAMES_TX_GOAWAY);
                 self.state = H2State::GoAway;
                 self.expect_write = Some(H2StreamId::Zero);
                 self.readiness.interest = Ready::WRITABLE | Ready::HUP | Ready::ERROR;
@@ -4098,7 +4099,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         match serializer::gen_goaway(kawa.storage.space(), STREAM_ID_MAX, H2Error::NoError) {
             Ok((_, size)) => {
                 kawa.storage.fill(size);
-                incr!("h2.frames.tx.goaway");
+                incr!(names::h2::FRAMES_TX_GOAWAY);
                 // Stay in the current state so the connection can continue processing
                 // existing streams. The second GOAWAY will transition to GoAway state.
                 // Keep READABLE so in-flight request bodies can still be received
@@ -4560,7 +4561,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 // just pushed into stream.back; the synthetic event is the
                 // only wake path. LIFECYCLE invariant 15.
                 endpoint.readiness_mut(token).arm_writable();
-                incr!("h2.signal.writable.rearmed.peer_data");
+                incr!(names::h2::SIGNAL_WRITABLE_REARMED_PEER_DATA);
             }
         }
         MuxResult::Continue
@@ -4606,7 +4607,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 log_context!(self),
                 self
             );
-            incr!("h2.headers_no_stream.error");
+            incr!(names::h2::HEADERS_NO_STREAM_ERROR);
             self.attribute_bytes_to_overhead();
             return self.force_disconnect();
         };
@@ -4654,8 +4655,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         kawa.storage.clear();
         if let Err((error, global)) = status {
             match self.position {
-                Position::Client(..) => incr!("http.backend_parse_errors"),
-                Position::Server => incr!("http.frontend_parse_errors"),
+                Position::Client(..) => incr!(names::http::BACKEND_PARSE_ERRORS),
+                Position::Server => incr!(names::http::FRONTEND_PARSE_ERRORS),
             }
             if global {
                 error!(
@@ -4701,12 +4702,12 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         if let StreamState::Linked(token) = stream.state {
             // Mirror of handle_data_frame's rearm. LIFECYCLE invariant 15.
             endpoint.readiness_mut(token).arm_writable();
-            incr!("h2.signal.writable.rearmed.peer_headers");
+            incr!(names::h2::SIGNAL_WRITABLE_REARMED_PEER_HEADERS);
         }
         // was_initial prevents trailers from triggering connection
         if was_initial && self.position.is_server() {
-            incr!("http.requests");
-            gauge_add!("http.active_requests", 1);
+            incr!(names::http::REQUESTS);
+            gauge_add!(names::http::ACTIVE_REQUESTS, 1);
             stream.metrics.service_start();
             stream.request_counted = true;
             stream.state = StreamState::Link;
@@ -4826,7 +4827,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // stripped WRITABLE, the scheduler won't re-run without a synthetic
         // wake — pair the interest insert with signal_pending_write.
         self.readiness.arm_writable();
-        incr!("h2.signal.writable.rearmed.priority_update");
+        incr!(names::h2::SIGNAL_WRITABLE_REARMED_PRIORITY_UPDATE);
         MuxResult::Continue
     }
 
@@ -4882,7 +4883,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // so the SOC can alert on the rate of pre-response RSTs without
         // having to differentiate by error code.
         if !response_started {
-            count!("h2.rst_stream.received.pre_response_start", 1);
+            count!(names::h2::RST_STREAM_RECEIVED_PRE_RESPONSE_START, 1);
         }
         debug!(
             "{} RstStream({} -> {})",
@@ -5076,7 +5077,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         match serializer::gen_ping_acknowledgement(kawa.storage.space(), &ping.payload) {
             Ok((_, size)) => {
                 kawa.storage.fill(size);
-                incr!("h2.frames.tx.ping_ack");
+                incr!(names::h2::FRAMES_TX_PING_ACK);
             }
             Err(error) => {
                 error!(
@@ -5662,7 +5663,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                             if buf.len() >= frame.len() {
                                 buf[..frame.len()].copy_from_slice(&frame);
                                 kawa.storage.fill(frame.len());
-                                incr!("h2.frames.tx.rst_stream");
+                                incr!(names::h2::FRAMES_TX_RST_STREAM);
                                 count!(metric_for_rst_stream_sent(H2Error::Cancel), 1);
                                 self.readiness.arm_writable();
                                 self.rst_sent.insert(id);
@@ -6361,7 +6362,7 @@ mod tests {
         keys.push(metric_for_goaway_received(unknown_code));
         keys.push(metric_for_rst_stream_received(unknown_code));
         // …and the dedicated Rapid Reset signature counter.
-        keys.push("h2.rst_stream.received.pre_response_start");
+        keys.push(names::h2::RST_STREAM_RECEIVED_PRE_RESPONSE_START);
 
         for key in &keys {
             assert!(

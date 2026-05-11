@@ -676,19 +676,20 @@ mod tests {
     use sozu_command::proto::command::{FilteredMetrics, filtered_metrics::Inner};
 
     use super::*;
+    use crate::metrics::names;
 
     #[test]
     fn receive_and_yield_backend_metrics() {
         let mut local_drain = LocalDrain::new("prefix".to_string());
 
         local_drain.receive_metric(
-            "connections_per_backend",
+            names::backend::CONNECTIONS_PER_BACKEND,
             Some("test-cluster"),
             Some("test-backend-1"),
             MetricValue::Count(1),
         );
         local_drain.receive_metric(
-            "connections_per_backend",
+            names::backend::CONNECTIONS_PER_BACKEND,
             Some("test-cluster"),
             Some("test-backend-1"),
             MetricValue::Count(1),
@@ -696,7 +697,7 @@ mod tests {
 
         let mut expected_metrics_1 = BTreeMap::new();
         expected_metrics_1.insert(
-            "connections_per_backend".to_string(),
+            names::backend::CONNECTIONS_PER_BACKEND.to_string(),
             FilteredMetrics {
                 inner: Some(Inner::Count(2)),
             },
@@ -712,7 +713,7 @@ mod tests {
             local_drain
                 .metrics_of_one_backend(
                     "test-backend-1",
-                    ["connections_per_backend".to_string()].as_ref(),
+                    [names::backend::CONNECTIONS_PER_BACKEND.to_string()].as_ref(),
                 )
                 .expect("could not query metrics for this backend")
         )
@@ -787,7 +788,7 @@ mod tests {
         let mut local_drain = LocalDrain::new("prefix".to_string());
 
         local_drain.receive_metric(
-            "connections_per_backend",
+            names::backend::CONNECTIONS_PER_BACKEND,
             Some("test-cluster"),
             Some("test-backend-1"),
             MetricValue::GaugeAdd(-1),
@@ -796,13 +797,13 @@ mod tests {
         let result = local_drain
             .metrics_of_one_backend(
                 "test-backend-1",
-                ["connections_per_backend".to_string()].as_ref(),
+                [names::backend::CONNECTIONS_PER_BACKEND.to_string()].as_ref(),
             )
             .expect("could not query metrics for this backend");
 
         let gauge_value = match result
             .metrics
-            .get("connections_per_backend")
+            .get(names::backend::CONNECTIONS_PER_BACKEND)
             .and_then(|m| m.inner.as_ref())
         {
             Some(Inner::Gauge(v)) => *v,
@@ -822,13 +823,13 @@ mod tests {
 
         // First, create the gauge with a positive value then bring it to 0.
         local_drain.receive_metric(
-            "connections_per_backend",
+            names::backend::CONNECTIONS_PER_BACKEND,
             Some("test-cluster"),
             Some("test-backend-1"),
             MetricValue::GaugeAdd(1),
         );
         local_drain.receive_metric(
-            "connections_per_backend",
+            names::backend::CONNECTIONS_PER_BACKEND,
             Some("test-cluster"),
             Some("test-backend-1"),
             MetricValue::GaugeAdd(-1),
@@ -836,7 +837,7 @@ mod tests {
 
         // Now apply a second -1, which should clamp to 0 (the underflow case).
         local_drain.receive_metric(
-            "connections_per_backend",
+            names::backend::CONNECTIONS_PER_BACKEND,
             Some("test-cluster"),
             Some("test-backend-1"),
             MetricValue::GaugeAdd(-1),
@@ -845,13 +846,13 @@ mod tests {
         let result = local_drain
             .metrics_of_one_backend(
                 "test-backend-1",
-                ["connections_per_backend".to_string()].as_ref(),
+                [names::backend::CONNECTIONS_PER_BACKEND.to_string()].as_ref(),
             )
             .expect("could not query metrics for this backend");
 
         let gauge_value = match result
             .metrics
-            .get("connections_per_backend")
+            .get(names::backend::CONNECTIONS_PER_BACKEND)
             .and_then(|m| m.inner.as_ref())
         {
             Some(Inner::Gauge(v)) => *v,
@@ -869,7 +870,7 @@ mod tests {
 
         // Add a gauge (connections_per_backend) for a backend.
         local_drain.receive_metric(
-            "connections_per_backend",
+            names::backend::CONNECTIONS_PER_BACKEND,
             Some("test-cluster"),
             Some("test-backend-1"),
             MetricValue::GaugeAdd(3),
@@ -890,7 +891,7 @@ mod tests {
             .metrics_of_one_backend(
                 "test-backend-1",
                 [
-                    "connections_per_backend".to_string(),
+                    names::backend::CONNECTIONS_PER_BACKEND.to_string(),
                     "backend.connections.error".to_string(),
                 ]
                 .as_ref(),
@@ -900,7 +901,7 @@ mod tests {
         // Gauge should still be 3.
         let gauge_value = match result
             .metrics
-            .get("connections_per_backend")
+            .get(names::backend::CONNECTIONS_PER_BACKEND)
             .and_then(|m| m.inner.as_ref())
         {
             Some(Inner::Gauge(v)) => *v,
@@ -924,7 +925,7 @@ mod tests {
 
         // Connection opens: gauge goes to 1.
         local_drain.receive_metric(
-            "connections_per_backend",
+            names::backend::CONNECTIONS_PER_BACKEND,
             Some("test-cluster"),
             Some("test-backend-1"),
             MetricValue::GaugeAdd(1),
@@ -935,7 +936,7 @@ mod tests {
 
         // Connection closes: gauge goes from 1 to 0 (not 0 to -1).
         local_drain.receive_metric(
-            "connections_per_backend",
+            names::backend::CONNECTIONS_PER_BACKEND,
             Some("test-cluster"),
             Some("test-backend-1"),
             MetricValue::GaugeAdd(-1),
@@ -944,13 +945,13 @@ mod tests {
         let result = local_drain
             .metrics_of_one_backend(
                 "test-backend-1",
-                ["connections_per_backend".to_string()].as_ref(),
+                [names::backend::CONNECTIONS_PER_BACKEND.to_string()].as_ref(),
             )
             .expect("could not query metrics for this backend");
 
         let gauge_value = match result
             .metrics
-            .get("connections_per_backend")
+            .get(names::backend::CONNECTIONS_PER_BACKEND)
             .and_then(|m| m.inner.as_ref())
         {
             Some(Inner::Gauge(v)) => *v,
@@ -974,20 +975,20 @@ mod tests {
 
         for _ in 0..2 {
             local_drain.receive_metric(
-                "http.status.2xx",
+                names::http::STATUS_2XX,
                 Some("test-cluster"),
                 Some("test-backend"),
                 MetricValue::Count(1),
             );
             local_drain.receive_metric(
-                "http.status.200",
+                names::http_status::S200,
                 Some("test-cluster"),
                 Some("test-backend"),
                 MetricValue::Count(1),
             );
         }
         local_drain.receive_metric(
-            "http.status.404",
+            names::http_status::S404,
             Some("test-cluster"),
             Some("test-backend"),
             MetricValue::Count(1),
@@ -997,28 +998,28 @@ mod tests {
             .metrics_of_one_backend(
                 "test-backend",
                 [
-                    "http.status.2xx".to_string(),
-                    "http.status.200".to_string(),
-                    "http.status.404".to_string(),
+                    names::http::STATUS_2XX.to_string(),
+                    names::http_status::S200.to_string(),
+                    names::http_status::S404.to_string(),
                 ]
                 .as_ref(),
             )
             .expect("could not query metrics for this backend");
 
         assert_eq!(
-            backend_metrics.metrics.get("http.status.2xx"),
+            backend_metrics.metrics.get(names::http::STATUS_2XX),
             Some(&FilteredMetrics {
                 inner: Some(Inner::Count(2)),
             })
         );
         assert_eq!(
-            backend_metrics.metrics.get("http.status.200"),
+            backend_metrics.metrics.get(names::http_status::S200),
             Some(&FilteredMetrics {
                 inner: Some(Inner::Count(2)),
             })
         );
         assert_eq!(
-            backend_metrics.metrics.get("http.status.404"),
+            backend_metrics.metrics.get(names::http_status::S404),
             Some(&FilteredMetrics {
                 inner: Some(Inner::Count(1)),
             })

@@ -21,6 +21,7 @@ use sozu_command::{
     proto::command::request::RequestType,
 };
 
+use crate::metrics::names;
 use crate::{
     AcceptError, BackendConnectAction, BackendConnectionError, BackendConnectionStatus, CachedTags,
     ListenerError, ListenerHandler, Protocol, ProxyConfiguration, ProxyError, ProxySession,
@@ -161,7 +162,7 @@ impl TcpSession {
         let state = match proxy_protocol {
             Some(ProxyProtocolConfig::RelayHeader) => {
                 backend_buffer_session = Some(backend_buffer);
-                gauge_add!("protocol.proxy.relay", 1);
+                gauge_add!(names::protocol::PROXY_RELAY, 1);
                 TcpStateMachine::RelayProxyProtocol(RelayProxyProtocol::new(
                     socket,
                     frontend_token,
@@ -173,7 +174,7 @@ impl TcpSession {
             Some(ProxyProtocolConfig::ExpectHeader) => {
                 frontend_buffer_session = Some(frontend_buffer);
                 backend_buffer_session = Some(backend_buffer);
-                gauge_add!("protocol.proxy.expect", 1);
+                gauge_add!(names::protocol::PROXY_EXPECT, 1);
                 TcpStateMachine::ExpectProxyProtocol(ExpectProxyProtocol::new(
                     container_frontend_timeout.clone(),
                     socket,
@@ -184,7 +185,7 @@ impl TcpSession {
             Some(ProxyProtocolConfig::SendHeader) => {
                 frontend_buffer_session = Some(frontend_buffer);
                 backend_buffer_session = Some(backend_buffer);
-                gauge_add!("protocol.proxy.send", 1);
+                gauge_add!(names::protocol::PROXY_SEND, 1);
                 TcpStateMachine::SendProxyProtocol(SendProxyProtocol::new(
                     socket,
                     frontend_token,
@@ -193,7 +194,7 @@ impl TcpSession {
                 ))
             }
             None => {
-                gauge_add!("protocol.tcp", 1);
+                gauge_add!(names::protocol::TCP, 1);
                 let mut pipe = Pipe::new(
                     backend_buffer,
                     backend_id.clone(),
@@ -271,7 +272,7 @@ impl TcpSession {
         let context = self.log_context();
         self.metrics.register_end_of_session(&context);
         info_access!(
-            on_failure: { incr!("unsent-access-logs") },
+            on_failure: { incr!(names::access_logs::UNSENT) },
             message: None,
             context,
             session_address: self.frontend_address,
@@ -433,8 +434,8 @@ impl TcpSession {
             );
 
             pipe.set_cluster_id(self.cluster_id.clone());
-            gauge_add!("protocol.proxy.send", -1);
-            gauge_add!("protocol.tcp", 1);
+            gauge_add!(names::protocol::PROXY_SEND, -1);
+            gauge_add!(names::protocol::TCP, 1);
             return Some(TcpStateMachine::Pipe(pipe));
         }
 
@@ -450,8 +451,8 @@ impl TcpSession {
             let mut pipe =
                 rpp.into_pipe(self.backend_buffer.take().unwrap(), self.listener.clone());
             pipe.set_cluster_id(self.cluster_id.clone());
-            gauge_add!("protocol.proxy.relay", -1);
-            gauge_add!("protocol.tcp", 1);
+            gauge_add!(names::protocol::PROXY_RELAY, -1);
+            gauge_add!(names::protocol::TCP, 1);
             return Some(TcpStateMachine::Pipe(pipe));
         }
 
@@ -476,8 +477,8 @@ impl TcpSession {
             );
 
             pipe.set_cluster_id(self.cluster_id.clone());
-            gauge_add!("protocol.proxy.expect", -1);
-            gauge_add!("protocol.tcp", 1);
+            gauge_add!(names::protocol::PROXY_EXPECT, -1);
+            gauge_add!(names::protocol::TCP, 1);
             return Some(TcpStateMachine::Pipe(pipe));
         }
 
@@ -555,9 +556,9 @@ impl TcpSession {
         self.backend_connected = status;
 
         if status == BackendConnectionStatus::Connected {
-            gauge_add!("backend.connections", 1);
+            gauge_add!(names::backend::CONNECTIONS, 1);
             gauge_add!(
-                "connections_per_backend",
+                names::backend::CONNECTIONS_PER_BACKEND,
                 1,
                 self.cluster_id.as_deref(),
                 self.metrics.backend_id.as_deref()
@@ -583,7 +584,7 @@ impl TcpSession {
                         self.metrics.backend_id.as_deref()
                     );
                     gauge!(
-                        "backend.available",
+                        names::backend::AVAILABLE,
                         1,
                         self.cluster_id.as_deref(),
                         self.metrics.backend_id.as_deref()
@@ -646,7 +647,7 @@ impl TcpSession {
                     self.metrics.backend_id.as_deref()
                 );
                 gauge!(
-                    "backend.available",
+                    names::backend::AVAILABLE,
                     0,
                     self.cluster_id.as_deref(),
                     self.metrics.backend_id.as_deref()
@@ -851,7 +852,7 @@ impl TcpSession {
                 MAX_LOOP_ITERATIONS
             );
 
-            incr!("tcp.infinite_loop.error");
+            incr!(names::tcp::INFINITE_LOOP_ERROR);
 
             let front_interest = self.front_readiness().interest & self.front_readiness().event;
             let back_interest = self
@@ -922,9 +923,9 @@ impl TcpSession {
         }
 
         if back_connected == BackendConnectionStatus::Connected {
-            gauge_add!("backend.connections", -1);
+            gauge_add!(names::backend::CONNECTIONS, -1);
             gauge_add!(
-                "connections_per_backend",
+                names::backend::CONNECTIONS_PER_BACKEND,
                 -1,
                 self.cluster_id.as_deref(),
                 self.metrics.backend_id.as_deref()
@@ -1083,18 +1084,18 @@ impl ProxySession for TcpSession {
 
         // Restore gauges
         match self.state.marker() {
-            StateMarker::Pipe => gauge_add!("protocol.tcp", -1),
-            StateMarker::SendProxyProtocol => gauge_add!("protocol.proxy.send", -1),
-            StateMarker::RelayProxyProtocol => gauge_add!("protocol.proxy.relay", -1),
-            StateMarker::ExpectProxyProtocol => gauge_add!("protocol.proxy.expect", -1),
+            StateMarker::Pipe => gauge_add!(names::protocol::TCP, -1),
+            StateMarker::SendProxyProtocol => gauge_add!(names::protocol::PROXY_SEND, -1),
+            StateMarker::RelayProxyProtocol => gauge_add!(names::protocol::PROXY_RELAY, -1),
+            StateMarker::ExpectProxyProtocol => gauge_add!(names::protocol::PROXY_EXPECT, -1),
         }
 
         if self.state.failed() {
             match self.state.marker() {
-                StateMarker::Pipe => incr!("tcp.upgrade.pipe.failed"),
-                StateMarker::SendProxyProtocol => incr!("tcp.upgrade.send.failed"),
-                StateMarker::RelayProxyProtocol => incr!("tcp.upgrade.relay.failed"),
-                StateMarker::ExpectProxyProtocol => incr!("tcp.upgrade.expect.failed"),
+                StateMarker::Pipe => incr!(names::tcp::UPGRADE_PIPE_FAILED),
+                StateMarker::SendProxyProtocol => incr!(names::tcp::UPGRADE_SEND_FAILED),
+                StateMarker::RelayProxyProtocol => incr!(names::tcp::UPGRADE_RELAY_FAILED),
+                StateMarker::ExpectProxyProtocol => incr!(names::tcp::UPGRADE_EXPECT_FAILED),
             }
             return;
         }
@@ -1680,7 +1681,7 @@ impl ProxyConfiguration for TcpProxy {
                     "{} Buffer capacity has been reached, stopping to accept new connections for now",
                     log_module_context!()
                 );
-                gauge!("accept_queue.backpressure", 1);
+                gauge!(names::accept_queue::BACKPRESSURE, 1);
                 self.sessions.borrow_mut().can_accept = false;
 
                 return Err(AcceptError::BufferCapacityReached);
@@ -1743,7 +1744,7 @@ impl ProxyConfiguration for TcpProxy {
             frontend_sock,
             wait_time,
         );
-        incr!("tcp.requests");
+        incr!(names::tcp::REQUESTS);
 
         let session = Rc::new(RefCell::new(session));
         entry.insert(session);

@@ -31,6 +31,7 @@ use super::{
     Position, Router,
     h2::{self, H2StreamId},
 };
+use crate::metrics::names;
 use crate::{
     L7ListenerHandler, ListenerHandler, Readiness, backends::Backend, pool::Pool,
     socket::SocketHandler, timer::TimeoutContainer,
@@ -371,14 +372,14 @@ impl<Front: SocketHandler> Connection<Front> {
         if let Position::Client(cluster_id, backend, _) = self.position() {
             let mut backend_borrow = backend.borrow_mut();
             backend_borrow.dec_connections();
-            gauge_add!("backend.connections", -1);
+            gauge_add!(names::backend::CONNECTIONS, -1);
             // Pair with the `+1` at `router.rs::connect` (new-dial path).
             // This is the graceful-close decrement, used both by the dead
             // backend path in `mod.rs::back_readable` (which routes through
             // `client.close()`) and by any explicit Connection::close.
-            gauge_add!("backend.pool.size", -1);
+            gauge_add!(names::backend::POOL_SIZE, -1);
             gauge_add!(
-                "connections_per_backend",
+                names::backend::CONNECTIONS_PER_BACKEND,
                 -1,
                 Some(cluster_id),
                 Some(&backend_borrow.backend_id)

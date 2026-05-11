@@ -361,7 +361,7 @@ use sozu_command::{
 };
 use tls::CertificateResolverError;
 
-use crate::{backends::BackendMap, router::RouteResult};
+use crate::{backends::BackendMap, metrics::names, router::RouteResult};
 
 /// Anything that can be registered in mio (subscribe to kernel events)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1295,11 +1295,19 @@ impl SessionMetrics {
         let service_time = self.service_time();
 
         if let Some(cluster_id) = context.cluster_id {
-            time!("request_time", cluster_id, request_time.as_millis());
-            time!("service_time", cluster_id, service_time.as_millis());
+            time!(
+                names::event_loop::REQUEST_TIME,
+                cluster_id,
+                request_time.as_millis()
+            );
+            time!(
+                names::event_loop::SERVICE_TIME,
+                cluster_id,
+                service_time.as_millis()
+            );
         }
-        time!("request_time", request_time.as_millis());
-        time!("service_time", service_time.as_millis());
+        time!(names::event_loop::REQUEST_TIME, request_time.as_millis());
+        time!(names::event_loop::SERVICE_TIME, service_time.as_millis());
 
         if let Some(backend_id) = self.backend_id.as_ref() {
             if let Some(backend_response_time) = self.backend_response_time() {
@@ -1314,7 +1322,11 @@ impl SessionMetrics {
             }
         }
 
-        incr!("access_logs.count", context.cluster_id, context.backend_id);
+        incr!(
+            names::access_logs::COUNT,
+            context.cluster_id,
+            context.backend_id
+        );
     }
 }
 
