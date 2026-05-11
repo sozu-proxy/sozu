@@ -8,11 +8,11 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table};
 
 use super::super::app::{App, BackendSortKey, PulseKind};
 use super::super::theme::Skin;
+use super::sort_header;
 
 pub fn render(f: &mut Frame<'_>, area: Rect, app: &App, skin: &Skin) {
     let rows = app.backend_rows();
@@ -46,14 +46,21 @@ pub fn render(f: &mut Frame<'_>, area: Rect, app: &App, skin: &Skin) {
         return;
     }
 
+    let reverse = app.backend_sort_reverse;
+    let active = |key: BackendSortKey| app.backend_sort == key;
     let header = Row::new(vec![
-        sort_header("cluster", BackendSortKey::ClusterId, app, skin),
-        sort_header("backend", BackendSortKey::BackendId, app, skin),
-        sort_header("bw down/up B", BackendSortKey::Bandwidth, app, skin),
-        sort_header("conn", BackendSortKey::Connections, app, skin),
-        sort_header("p50", BackendSortKey::LatencyP99, app, skin),
-        sort_header("p99", BackendSortKey::LatencyP99, app, skin),
-        sort_header("req", BackendSortKey::Requests, app, skin),
+        sort_header("cluster", active(BackendSortKey::ClusterId), reverse, skin),
+        sort_header("backend", active(BackendSortKey::BackendId), reverse, skin),
+        sort_header(
+            "bw down/up B",
+            active(BackendSortKey::Bandwidth),
+            reverse,
+            skin,
+        ),
+        sort_header("conn", active(BackendSortKey::Connections), reverse, skin),
+        sort_header("p50", active(BackendSortKey::LatencyP99), reverse, skin),
+        sort_header("p99", active(BackendSortKey::LatencyP99), reverse, skin),
+        sort_header("req", active(BackendSortKey::Requests), reverse, skin),
     ])
     .style(
         Style::default()
@@ -101,27 +108,6 @@ pub fn render(f: &mut Frame<'_>, area: Rect, app: &App, skin: &Skin) {
     ];
     let table = Table::new(body, widths).header(header).block(block);
     f.render_widget(table, area);
-}
-
-fn sort_header(label: &str, column_key: BackendSortKey, app: &App, skin: &Skin) -> Cell<'static> {
-    if app.backend_sort == column_key {
-        let arrow = if app.backend_sort_reverse {
-            "▲"
-        } else {
-            "▼"
-        };
-        Cell::from(Line::from(vec![Span::styled(
-            format!("{label} {arrow}"),
-            Style::default()
-                .fg(skin.accent)
-                .add_modifier(Modifier::BOLD),
-        )]))
-    } else {
-        Cell::from(Line::from(Span::styled(
-            label.to_owned(),
-            Style::default().fg(skin.secondary),
-        )))
-    }
 }
 
 fn format_bytes(bytes: u64) -> String {
