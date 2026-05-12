@@ -79,6 +79,21 @@ upgrade. See `doc/upgrade/1.x-to-2.0.md` for the full migration guide.
   handles one worker (the relocation loop runs once) and zero workers (no-op).
   Regression test `merge_relocates_single_worker_to_top_level` in
   `command/src/proto/mod.rs` pins the contract.
+- **`sozu top` OVERVIEW and CLUSTERS read counters under backend-detail
+  filing**: the TUI auto-leases `MetricDetail::Backend` on startup so the
+  BACKENDS pane has per-row data, which routes every per-cluster counter
+  (`requests`, `http.status.5xx`, `backend_response_time`) into the worker's
+  `clusters[<id>].backends[<id>].metrics` map rather than `clusters[<id>].cluster`.
+  The OVERVIEW and CLUSTERS panes were reading the cluster-level map
+  exclusively, so the REQUESTS / SEC big-numeral, 5xx ratio, latency p99, and
+  every per-cluster row read 0 the moment the lease elevated detail. New
+  helpers in `bin/src/ctl/top/app.rs` (`cluster_count_total`, `cluster_p99_max`,
+  `cluster_p50_max`) sum across both filings; magic-string keys are replaced
+  with `sozu_lib::metrics::names::*` constants so a future name rename cannot
+  silently zero the TUI again. The `proxying` fallback now uses
+  `names::http::REQUESTS` (`http.requests`, incremented at request-receive
+  time) so traffic surfaces even before the first backend round-trip
+  completes.
 - **`SetMetricDetail` no longer flaps systemd `RELOADING=1` every TTL/2**: the
   cardinality-lease verb was in the `is_mutating_verb` allowlist
   (`bin/src/command/requests.rs`), which brackets each call with
