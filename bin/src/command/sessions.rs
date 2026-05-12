@@ -183,17 +183,11 @@ impl ClientSession {
 /// audit field contains a literal `\t` or `\n`. Applied at render time by
 /// the `audit_log_context!` macro.
 pub fn sanitize_for_audit(s: &str) -> String {
-    if s.bytes().all(|b| b >= 0x20 && b != 0x7f) {
+    if s.chars().all(|c| !is_unsafe_line(c)) {
         return s.to_owned();
     }
     s.chars()
-        .map(|c| {
-            if (c as u32) < 0x20 || c == '\x7f' {
-                '?'
-            } else {
-                c
-            }
-        })
+        .map(|c| if is_unsafe_line(c) { '?' } else { c })
         .collect()
 }
 
@@ -208,20 +202,34 @@ pub fn sanitize_for_audit(s: &str) -> String {
 /// Does NOT strip `:` because legitimate values (e.g. `target=address:...`)
 /// use `:` as an in-value separator.
 pub fn sanitize_for_audit_kv(s: &str) -> String {
-    if s.bytes()
-        .all(|b| b >= 0x20 && b != 0x7f && b != b',' && b != b'=')
-    {
+    if s.chars().all(|c| !is_unsafe_kv(c)) {
         return s.to_owned();
     }
     s.chars()
-        .map(|c| {
-            if (c as u32) < 0x20 || c == '\x7f' || c == ',' || c == '=' {
-                '?'
-            } else {
-                c
-            }
-        })
+        .map(|c| if is_unsafe_kv(c) { '?' } else { c })
         .collect()
+}
+
+/// Characters that would break the audit log's row-or-line shape if they
+/// reached the text sink unsanitised. Covers the full Unicode control
+/// category (`char::is_control()` matches C0, DEL, and C1 — NEL/CSI are in
+/// C1 and would otherwise survive a byte-only `< 0x20 || == 0x7f` check),
+/// plus three non-control codepoints that some SIEM normalisers treat as
+/// line breaks: U+FEFF (BOM), U+2028 (LINE SEPARATOR), U+2029 (PARAGRAPH
+/// SEPARATOR). The byte-based fast path is gone on purpose: every
+/// problematic codepoint above U+007F is multi-byte UTF-8 with every byte
+/// `>= 0x80`, so a byte-only `>= 0x20` check would let them through.
+#[inline]
+fn is_unsafe_line(c: char) -> bool {
+    c.is_control() || c == '\u{feff}' || c == '\u{2028}' || c == '\u{2029}'
+}
+
+/// Strict variant: line-unsafe characters plus the column separators (`,`
+/// and `=`) that a SIEM consumer splits on. Does NOT strip `:` — see
+/// [`sanitize_for_audit_kv`] for the legitimate-value rationale.
+#[inline]
+fn is_unsafe_kv(c: char) -> bool {
+    is_unsafe_line(c) || c == ',' || c == '='
 }
 
 /// QW8 helper: render `Option<T>` for audit output. `Some(v)` becomes
@@ -477,4 +485,136 @@ where
 pub fn wants_to_tick<Tx, Rx>(channel: &Channel<Tx, Rx>) -> bool {
     (channel.readiness.is_writable() && channel.back_buf.available_data() > 0)
         || (channel.readiness.is_hup() || channel.readiness.is_error())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{sanitize_for_audit, sanitize_for_audit_kv};
+
+    // -----------------------------------------------------------------
+    // sanitize_for_audit_kv: strict, used for column-boundary fields
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn kv_strips_column_comma() {
+        // Comma is the row-separator a SIEM splits the audit line on; an
+        // operator-supplied value containing `,` would forge a sibling KV
+        // pair against `, key=value` parsers.
+        assert_eq!(sanitize_for_audit_kv("x,y"), "x?y");
+    }
+
+    #[test]
+    fn kv_strips_column_equals() {
+        // Equals is the column separator inside a `key=value` pair.
+        assert_eq!(sanitize_for_audit_kv("x=y"), "x?y");
+    }
+
+    #[test]
+    fn kv_strips_c1_nel() {
+        // U+0085 NEL is a C1 control byte some normalisers treat as a
+        // line break. A byte-only `< 0x20 || == 0x7f` predicate would let
+        // it through because UTF-8 encodes NEL as `c2 85` (both >= 0x80).
+        assert_eq!(sanitize_for_audit_kv("x\u{0085}y"), "x?y");
+    }
+
+    #[test]
+    fn kv_strips_c1_csi() {
+        // U+009B CSI is the ANSI escape introducer — terminals interpret
+        // it as the start of a control sequence. Same C1 / byte-only-
+        // predicate trap as NEL above.
+        assert_eq!(sanitize_for_audit_kv("x\u{009B}y"), "x?y");
+    }
+
+    #[test]
+    fn kv_strips_bom() {
+        // U+FEFF is non-control by category but some pipelines treat a
+        // leading BOM as a delimiter; reject it conservatively.
+        assert_eq!(sanitize_for_audit_kv("x\u{FEFF}y"), "x?y");
+    }
+
+    #[test]
+    fn kv_strips_line_separator() {
+        // U+2028 LINE SEPARATOR splits the audit row in any consumer that
+        // honours the Unicode line-break property.
+        assert_eq!(sanitize_for_audit_kv("x\u{2028}y"), "x?y");
+    }
+
+    #[test]
+    fn kv_strips_paragraph_separator() {
+        // U+2029 PARAGRAPH SEPARATOR — same rationale as LINE SEPARATOR.
+        assert_eq!(sanitize_for_audit_kv("x\u{2029}y"), "x?y");
+    }
+
+    #[test]
+    fn kv_preserves_safe_ascii() {
+        // No control / column-boundary / line-break character present:
+        // the fast path returns the original string unchanged.
+        assert_eq!(sanitize_for_audit_kv("safe-id_42"), "safe-id_42");
+    }
+
+    #[test]
+    fn kv_preserves_in_value_colon() {
+        // `:` is not a column separator at the audit-line level (legit
+        // values like `target=host:8080` rely on it).
+        assert_eq!(sanitize_for_audit_kv("host:8080"), "host:8080");
+    }
+
+    // -----------------------------------------------------------------
+    // sanitize_for_audit: line-only, no column-boundary stripping
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn line_keeps_comma() {
+        // The weak variant feeds fields rendered outside the `, key=value`
+        // shape (the `reason=` column is one big quoted blob), so `,` is
+        // legal text and must survive sanitisation.
+        assert_eq!(sanitize_for_audit("x,y"), "x,y");
+    }
+
+    #[test]
+    fn line_keeps_equals() {
+        // Same reasoning as `line_keeps_comma`: `=` is legal text inside
+        // a quoted reason payload.
+        assert_eq!(sanitize_for_audit("x=y"), "x=y");
+    }
+
+    #[test]
+    fn line_strips_c1_nel() {
+        // The weak sanitiser MUST still catch C1 controls — the prior
+        // byte-only predicate let them through.
+        assert_eq!(sanitize_for_audit("x\u{0085}y"), "x?y");
+    }
+
+    #[test]
+    fn line_strips_c1_csi() {
+        assert_eq!(sanitize_for_audit("x\u{009B}y"), "x?y");
+    }
+
+    #[test]
+    fn line_strips_bom() {
+        assert_eq!(sanitize_for_audit("x\u{FEFF}y"), "x?y");
+    }
+
+    #[test]
+    fn line_strips_line_separator() {
+        assert_eq!(sanitize_for_audit("x\u{2028}y"), "x?y");
+    }
+
+    #[test]
+    fn line_strips_paragraph_separator() {
+        assert_eq!(sanitize_for_audit("x\u{2029}y"), "x?y");
+    }
+
+    #[test]
+    fn line_strips_c0_control() {
+        // C0 controls (tab, LF, NUL, etc.) were the original target of
+        // the byte-based predicate; the rewrite must keep covering them.
+        assert_eq!(sanitize_for_audit("x\ty\nz\0"), "x?y?z?");
+    }
+
+    #[test]
+    fn line_strips_del() {
+        // DEL (U+007F) is `char::is_control()` true.
+        assert_eq!(sanitize_for_audit("x\u{007F}y"), "x?y");
+    }
 }
