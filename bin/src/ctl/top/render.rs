@@ -246,7 +246,13 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             _ => {
                 // Forward editing keys (backspace, arrows, character input)
                 // to the tui-input widget so it maintains its own cursor.
+                // The widget mutates its internal buffer (palette_input)
+                // without setting our dirty flag; mark dirty unconditionally
+                // so the next frame repaints the typed text instead of
+                // waiting for the next snapshot tick (~1 s on a quiet
+                // system).
                 app.palette_input.handle_event(&CtEvent::Key(key));
+                app.mark_dirty();
             }
         }
         return;
@@ -258,7 +264,10 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             app.should_quit = true
         }
         KeyCode::F(10) => app.should_quit = true,
-        KeyCode::Char('?') | KeyCode::F(1) => app.help_visible = !app.help_visible,
+        KeyCode::Char('?') | KeyCode::F(1) => {
+            app.help_visible = !app.help_visible;
+            app.mark_dirty();
+        }
         // F2 Theme: cycle the resolved glyph mode (Block → Braille → Tty).
         // The skin's gradient colours don't have a CLI override yet, so the
         // closest visible "theme switch" is the bar alphabet.
@@ -290,25 +299,36 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             }
             _ => {}
         },
-        KeyCode::Tab => app.active_tab = app.active_tab.cycle(true),
-        KeyCode::BackTab => app.active_tab = app.active_tab.cycle(false),
+        KeyCode::Tab => {
+            app.active_tab = app.active_tab.cycle(true);
+            app.mark_dirty();
+        }
+        KeyCode::BackTab => {
+            app.active_tab = app.active_tab.cycle(false);
+            app.mark_dirty();
+        }
         KeyCode::Char(c @ '1'..='7') => {
             if let Some(tab) = ActiveTab::from_digit(c.to_digit(10).unwrap_or(0) as u8) {
                 app.active_tab = tab;
+                app.mark_dirty();
             }
         }
         // CLUSTERS sort cycle / reverse; mirror procs / k9s muscle memory.
         KeyCode::Char('s') if app.active_tab == ActiveTab::Clusters => {
             app.cluster_sort = app.cluster_sort.cycle();
+            app.mark_dirty();
         }
         KeyCode::Char('S') if app.active_tab == ActiveTab::Clusters => {
             app.cluster_sort_reverse = !app.cluster_sort_reverse;
+            app.mark_dirty();
         }
         KeyCode::Char('s') if app.active_tab == ActiveTab::Backends => {
             app.backend_sort = app.backend_sort.cycle();
+            app.mark_dirty();
         }
         KeyCode::Char('S') if app.active_tab == ActiveTab::Backends => {
             app.backend_sort_reverse = !app.backend_sort_reverse;
+            app.mark_dirty();
         }
         // Pause toggle via 'p' as well, matching htop / btop muscle memory.
         KeyCode::Char('p') | KeyCode::Char('P') => {
