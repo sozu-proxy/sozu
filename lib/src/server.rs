@@ -1642,6 +1642,21 @@ impl Server {
                         error!("{}", msg);
                         push_queue(WorkerResponse::error(message.id.clone(), msg));
                     }
+                    crate::metrics::LeaseApplyOutcome::Unauthorized => {
+                        // A renewal arrived against an existing lease whose
+                        // apply-time peer binding does not match the
+                        // presented one. The `client_id` is intentionally
+                        // omitted from the error string — the audit-log
+                        // row already carries it in the dedicated
+                        // `lease_id` column, and echoing it here would
+                        // route operator-controlled bytes through the
+                        // freeform reason field.
+                        let msg = "SetMetricDetail: renewal refused (peer binding does not \
+                                   match the apply-time owner)"
+                            .to_owned();
+                        error!("{}", msg);
+                        push_queue(WorkerResponse::error(message.id.clone(), msg));
+                    }
                 }
                 return;
             }
