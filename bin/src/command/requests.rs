@@ -219,6 +219,15 @@ macro_rules! audit_log_context {
 /// against the change. Read-only verbs (Status / List* / Query* /
 /// CountRequests / SubscribeEvents / QueryMaxConnectionsPerIp) return
 /// `false` because they're dashboard polls, not transitions.
+///
+/// `SetMetricDetail` is deliberately excluded: it is a runtime
+/// observability knob, not a state transition, and the `sozu top` TUI
+/// renews its lease every `ttl/2` seconds (≈ 30 s by default). Including
+/// it in this set would flap the systemd unit through `reloading`
+/// every renewal for the whole TUI session lifetime. The audit trail
+/// for the verb still flows through the special-case inline emission
+/// (`EventKind::MetricDetailChanged`, proto tag 30) so SOC visibility
+/// is preserved without flapping the unit state.
 fn is_mutating_verb(req: &RequestType) -> bool {
     matches!(
         req,
@@ -256,7 +265,6 @@ fn is_mutating_verb(req: &RequestType) -> bool {
             | RequestType::HardStop(_)
             | RequestType::Logging(_)
             | RequestType::SetMaxConnectionsPerIp(_)
-            | RequestType::SetMetricDetail(_)
     )
 }
 
@@ -2613,7 +2621,7 @@ impl GatheringTask for QueryMetricsTask {
 
     fn on_finish(
         self: Box<Self>,
-        server: &mut Server,
+        _server: &mut Server,
         client: &mut OptionalClient,
         _timed_out: bool,
     ) {
@@ -2672,7 +2680,14 @@ impl GatheringTask for QueryMetricsTask {
             proxying: BTreeMap::new(),
         };
 
-        if !self.options.workers && server.workers.len() > 1 {
+        // Always fold when the caller asked for merged data, regardless of
+        // worker count. `merge_metrics` relocates each worker's `clusters`
+        // and `proxying` into the top-level maps via `std::mem::take`; the
+        // previous `> 1` guard left single-worker fleets with empty
+        // top-level maps and stranded the per-worker data in `workers`,
+        // which silently zeroed every CLI/TUI consumer that reads
+        // `m.clusters` / `m.proxying`.
+        if !self.options.workers {
             aggregated_metrics.merge_metrics();
         }
 
@@ -3499,6 +3514,35 @@ mod audit_format_tests {
         assert!(
             s == "unknown" || (s.len() == 12 && s.chars().all(|c| c.is_ascii_hexdigit())),
             "unexpected SOZU_BUILD_GIT_SHA: {s:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod mutating_verb_policy_tests {
+    //! Regression guard for the systemd `RELOADING=1` bracket policy:
+    //! `is_mutating_verb` must NOT include `SetMetricDetail`. The TUI
+    //! auto-renews its cardinality lease every `ttl/2` seconds, and a
+    //! mutating-verb bracket on each renewal would flap the systemd
+    //! unit state every 30 s for the whole TUI session lifetime.
+    use super::is_mutating_verb;
+    use sozu_command_lib::proto::command::{MetricDetail, SetMetricDetail, request::RequestType};
+
+    #[test]
+    fn set_metric_detail_is_not_mutating() {
+        let req = RequestType::SetMetricDetail(SetMetricDetail {
+            client_id: "top:1:abcdef01".to_owned(),
+            detail: Some(MetricDetail::DetailBackend as i32),
+            ttl_seconds: Some(60),
+            reason: Some("operator dashboard".to_owned()),
+            clear: Some(false),
+            peer_pid: None,
+            peer_session_ulid: None,
+        });
+        assert!(
+            !is_mutating_verb(&req),
+            "SetMetricDetail is an observability knob, not a state transition; \
+             keeping it out of is_mutating_verb prevents RELOADING flap on lease renewal"
         );
     }
 }

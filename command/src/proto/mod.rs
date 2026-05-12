@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use command::{
-    AggregatedMetrics, BackendMetrics, Bucket, FilteredHistogram, FilteredMetrics,
+    AggregatedMetrics, BackendMetrics, Bucket, FilteredHistogram, FilteredMetrics, Percentiles,
     filtered_metrics::Inner,
 };
 use prost::UnknownEnumValue;
@@ -148,25 +148,116 @@ impl FilteredMetrics {
                     })),
                 };
             }
+            (Some(Inner::Percentiles(a)), Some(Inner::Percentiles(b))) => {
+                // You cannot statistically merge two percentile summaries
+                // without the underlying samples. The companion
+                // `<name>_histogram` Inner::Histogram value is the source
+                // of truth for accurate aggregation and merges correctly
+                // above. We still propagate the percentile shape so legacy
+                // consumers reading it observe at least the worst-case
+                // upper bound across workers — element-wise max preserves
+                // the "is anyone slow?" intent. `samples` and `sum` add so
+                // the totals reflect cross-worker volume.
+                *self = Self {
+                    inner: Some(Inner::Percentiles(Percentiles {
+                        samples: a.samples + b.samples,
+                        p_50: a.p_50.max(b.p_50),
+                        p_90: a.p_90.max(b.p_90),
+                        p_99: a.p_99.max(b.p_99),
+                        p_99_9: a.p_99_9.max(b.p_99_9),
+                        p_99_99: a.p_99_99.max(b.p_99_99),
+                        p_99_999: a.p_99_999.max(b.p_99_999),
+                        p_100: a.p_100.max(b.p_100),
+                        sum: a.sum + b.sum,
+                    })),
+                };
+            }
             _ => {}
         }
     }
 
     fn is_mergeable(&self) -> bool {
         match &self.inner {
-            Some(Inner::Gauge(_)) | Some(Inner::Count(_)) | Some(Inner::Histogram(_)) => true,
+            Some(Inner::Gauge(_))
+            | Some(Inner::Count(_))
+            | Some(Inner::Histogram(_))
+            | Some(Inner::Percentiles(_)) => true,
             // Inner::Time and Inner::Timeserie are never used in Sōzu
-            Some(Inner::Time(_))
-            | Some(Inner::Percentiles(_))
-            | Some(Inner::TimeSerie(_))
-            | None => false,
+            Some(Inner::Time(_)) | Some(Inner::TimeSerie(_)) | None => false,
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::command::{Bucket, FilteredHistogram, FilteredMetrics, filtered_metrics::Inner};
+    use std::collections::BTreeMap;
+
+    use super::AggregatedMetrics;
+    use super::command::{
+        Bucket, ClusterMetrics, FilteredHistogram, FilteredMetrics, Percentiles, WorkerMetrics,
+        filtered_metrics::Inner,
+    };
+
+    #[test]
+    fn merge_relocates_single_worker_to_top_level() {
+        // Regression: a one-worker fleet must populate `clusters` and
+        // `proxying` so CLI/TUI consumers reading those maps see the
+        // worker's data. `std::mem::take(&mut self.workers)` empties the
+        // per-worker map after relocation, which is the documented
+        // contract when the caller asked for the merged shape.
+        let mut worker = WorkerMetrics {
+            proxy: BTreeMap::new(),
+            clusters: BTreeMap::new(),
+        };
+        worker.proxy.insert(
+            "requests".to_owned(),
+            FilteredMetrics {
+                inner: Some(Inner::Count(42)),
+            },
+        );
+        let mut cluster = ClusterMetrics {
+            cluster: BTreeMap::new(),
+            backends: Vec::new(),
+        };
+        cluster.cluster.insert(
+            "requests".to_owned(),
+            FilteredMetrics {
+                inner: Some(Inner::Count(7)),
+            },
+        );
+        worker.clusters.insert("cluster-a".to_owned(), cluster);
+
+        let mut agg = AggregatedMetrics {
+            main: BTreeMap::new(),
+            workers: BTreeMap::from([("0".to_owned(), worker)]),
+            clusters: BTreeMap::new(),
+            proxying: BTreeMap::new(),
+        };
+
+        agg.merge_metrics();
+
+        assert!(
+            agg.workers.is_empty(),
+            "merge takes ownership of the per-worker map"
+        );
+        assert_eq!(
+            agg.proxying.get("requests"),
+            Some(&FilteredMetrics {
+                inner: Some(Inner::Count(42)),
+            }),
+            "single worker's proxy counter must surface in proxying"
+        );
+        let cluster_a = agg
+            .clusters
+            .get("cluster-a")
+            .expect("cluster row must surface in top-level clusters");
+        assert_eq!(
+            cluster_a.cluster.get("requests"),
+            Some(&FilteredMetrics {
+                inner: Some(Inner::Count(7)),
+            })
+        );
+    }
 
     #[test]
     fn merge_counts_and_gauges() {
@@ -199,6 +290,56 @@ mod tests {
             count_a,
             FilteredMetrics {
                 inner: Some(Inner::Count(6)),
+            }
+        );
+    }
+
+    #[test]
+    fn merge_percentiles_takes_max_per_quantile() {
+        // Multi-worker percentile aggregation propagates the worst-case
+        // quantile across workers and accumulates samples + sum so the
+        // surfaced summary remains the "is anyone slow?" upper bound.
+        let mut left = FilteredMetrics {
+            inner: Some(Inner::Percentiles(Percentiles {
+                samples: 100,
+                p_50: 5,
+                p_90: 20,
+                p_99: 100,
+                p_99_9: 200,
+                p_99_99: 250,
+                p_99_999: 300,
+                p_100: 400,
+                sum: 12_000,
+            })),
+        };
+        let right = FilteredMetrics {
+            inner: Some(Inner::Percentiles(Percentiles {
+                samples: 50,
+                p_50: 7,
+                p_90: 15,
+                p_99: 80,
+                p_99_9: 240,
+                p_99_99: 245,
+                p_99_999: 290,
+                p_100: 380,
+                sum: 6_000,
+            })),
+        };
+        left.merge(&right);
+        assert_eq!(
+            left,
+            FilteredMetrics {
+                inner: Some(Inner::Percentiles(Percentiles {
+                    samples: 150,
+                    p_50: 7,
+                    p_90: 20,
+                    p_99: 100,
+                    p_99_9: 240,
+                    p_99_99: 250,
+                    p_99_999: 300,
+                    p_100: 400,
+                    sum: 18_000,
+                })),
             }
         );
     }
