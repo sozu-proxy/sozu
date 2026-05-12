@@ -42,21 +42,32 @@ fn sozu_top_help_lists_every_flag() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
+    // Flag set per `bin/src/cli.rs::SubCmd::Top`. `--no-color` and
+    // `--log-file` were dropped (commit ddce50e4) once they ceased to
+    // influence behaviour; the help text mustn't regress that. If a flag
+    // lands or leaves the surface, this list and the operator docs in
+    // `doc/configure_cli.md` + `doc/sozu-top.md` move together.
     for flag in [
         "--refresh-ms",
-        "--no-color",
         "--no-mouse",
         "--skin",
         "--detail",
         "--lease-ttl-seconds",
         "--snapshot",
         "--tick-once",
-        "--log-file",
         "--glyphs",
     ] {
         assert!(
             stdout.contains(flag),
             "sozu top --help missing flag `{flag}`. output:\n{stdout}",
+        );
+    }
+    // Flags that used to exist but were intentionally removed — assert
+    // they stay gone so a future regression can't quietly resurface them.
+    for removed in ["--no-color", "--log-file"] {
+        assert!(
+            !stdout.contains(removed),
+            "sozu top --help unexpectedly carries removed flag `{removed}`. output:\n{stdout}",
         );
     }
 }
