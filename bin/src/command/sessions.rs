@@ -214,14 +214,25 @@ pub fn sanitize_for_audit_kv(s: &str) -> String {
 /// reached the text sink unsanitised. Covers the full Unicode control
 /// category (`char::is_control()` matches C0, DEL, and C1 — NEL/CSI are in
 /// C1 and would otherwise survive a byte-only `< 0x20 || == 0x7f` check),
-/// plus three non-control codepoints that some SIEM normalisers treat as
-/// line breaks: U+FEFF (BOM), U+2028 (LINE SEPARATOR), U+2029 (PARAGRAPH
-/// SEPARATOR). The byte-based fast path is gone on purpose: every
-/// problematic codepoint above U+007F is multi-byte UTF-8 with every byte
-/// `>= 0x80`, so a byte-only `>= 0x20` check would let them through.
+/// three non-control codepoints that some SIEM normalisers treat as line
+/// breaks (U+FEFF BOM, U+2028 LINE SEPARATOR, U+2029 PARAGRAPH SEPARATOR),
+/// and the bidirectional override / isolate controls U+202A..=U+202E +
+/// U+2066..=U+2069. The bidi class is Trojan-Source-flavoured (CVE-2021-
+/// 42574): a Right-to-Left Override inside an audit value visually
+/// reverses the bytes that follow when an operator tails the log in a
+/// Unicode-aware terminal (`less`, `cat` under a UTF-8 locale,
+/// `journalctl`), so the row appears to attribute the action to a
+/// different field than it actually carries. The byte-based fast path
+/// is gone on purpose: every problematic codepoint above U+007F is
+/// multi-byte UTF-8 with every byte `>= 0x80`, so a byte-only `>= 0x20`
+/// check would let them through.
 #[inline]
 fn is_unsafe_line(c: char) -> bool {
-    c.is_control() || c == '\u{feff}' || c == '\u{2028}' || c == '\u{2029}'
+    c.is_control()
+        || c == '\u{feff}'
+        || c == '\u{2028}'
+        || c == '\u{2029}'
+        || matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
 }
 
 /// Strict variant: line-unsafe characters plus the column separators (`,`
@@ -602,5 +613,50 @@ mod tests {
     fn line_strips_del() {
         // DEL (U+007F) is `char::is_control()` true.
         assert_eq!(sanitize_for_audit("x\u{007F}y"), "x?y");
+    }
+
+    // -----------------------------------------------------------------
+    // bidirectional override / isolate class — Trojan-Source defence
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn line_strips_rtl_override() {
+        // U+202E RIGHT-TO-LEFT OVERRIDE visually reverses the bytes that
+        // follow when an operator tails the audit log in a Unicode-aware
+        // terminal. The CVE-2021-42574 class — strip before render.
+        assert_eq!(sanitize_for_audit("a\u{202E}b"), "a?b");
+        assert_eq!(sanitize_for_audit_kv("a\u{202E}b"), "a?b");
+    }
+
+    #[test]
+    fn line_strips_bidi_override_range() {
+        // U+202A..=U+202E are the bidi override controls (LRE, RLE, PDF,
+        // LRO, RLO). All have the same audit-row reorder hazard.
+        for c in ['\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}'] {
+            let input = format!("a{c}b");
+            assert_eq!(sanitize_for_audit(&input), "a?b");
+            assert_eq!(sanitize_for_audit_kv(&input), "a?b");
+        }
+    }
+
+    #[test]
+    fn line_strips_bidi_isolate_range() {
+        // U+2066..=U+2069 are the bidi isolate controls (LRI, RLI, FSI,
+        // PDI). Same hazard as the override class.
+        for c in ['\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}'] {
+            let input = format!("a{c}b");
+            assert_eq!(sanitize_for_audit(&input), "a?b");
+            assert_eq!(sanitize_for_audit_kv(&input), "a?b");
+        }
+    }
+
+    #[test]
+    fn line_preserves_legitimate_bidi_text() {
+        // Plain RTL script content (Hebrew / Arabic) must round-trip
+        // through both sanitisers — only the explicit override / isolate
+        // controls are rejected.
+        let input = "héllo שלום مرحبا";
+        assert_eq!(sanitize_for_audit(input), input);
+        assert_eq!(sanitize_for_audit_kv(input), input);
     }
 }
