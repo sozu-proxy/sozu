@@ -322,7 +322,7 @@ impl BackendMap {
 
         let (available, total) = list.evaluate_availability();
         gauge!(
-            "cluster.available_backends",
+            names::cluster::AVAILABLE_BACKENDS,
             available,
             Some(cluster_id),
             None

@@ -67,6 +67,7 @@ pub mod client {
 
 /// Per-cluster aggregate gauges.
 pub mod cluster {
+    pub const AVAILABLE_BACKENDS: &str = "cluster.available_backends";
     pub const AVAILABLE_RECOVERED: &str = "cluster.available_recovered";
     pub const NO_AVAILABLE_BACKENDS: &str = "cluster.no_available_backends";
     pub const TOTAL_BACKENDS: &str = "cluster.total_backends";
