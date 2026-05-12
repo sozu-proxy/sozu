@@ -1482,11 +1482,19 @@ impl Server {
                             ));
                         }
                         crate::metrics::LeaseClearOutcome::Unauthorized => {
-                            let msg = format!(
-                                "SetMetricDetail: clear refused for client_id={} \
-                                 (peer binding does not match the apply-time owner)",
-                                req.client_id
-                            );
+                            // Do NOT echo `req.client_id` here: the operator-
+                            // supplied bytes flow back through the master's
+                            // worker→reason aggregation into the audit line's
+                            // `reason=` column, which is sanitised for control
+                            // bytes only. The dedicated `lease_id=` audit
+                            // column already carries the operator string
+                            // through `sanitize_for_audit_kv`, so re-embedding
+                            // it here would let a value containing `,` or `=`
+                            // forge a sibling KV pair against SIEM consumers
+                            // that split on `, key=value`.
+                            let msg = "SetMetricDetail: clear refused (peer \
+                                 binding does not match the apply-time owner)"
+                                .to_owned();
                             error!("{}", msg);
                             push_queue(WorkerResponse::error(message.id.clone(), msg));
                         }
@@ -1496,10 +1504,13 @@ impl Server {
                 let detail_proto = match req.detail {
                     Some(d) => d,
                     None => {
-                        let msg = format!(
-                            "SetMetricDetail without `detail` and without `clear` (client_id={})",
-                            req.client_id
-                        );
+                        // Operator-supplied `client_id` is intentionally
+                        // omitted from the reason string: the dedicated
+                        // `lease_id=` audit column carries it through the
+                        // strict KV sanitiser. See the matching comment on
+                        // the `Unauthorized` arm above for the column-
+                        // smuggling rationale.
+                        let msg = "SetMetricDetail without `detail` and without `clear`".to_owned();
                         error!("{}", msg);
                         push_queue(WorkerResponse::error(message.id.clone(), msg));
                         return;
@@ -1582,12 +1593,17 @@ impl Server {
                         push_queue(WorkerResponse::error(message.id.clone(), msg));
                     }
                     crate::metrics::LeaseApplyOutcome::TableFull => {
+                        // Same audit-column-smuggling guard as the
+                        // `Unauthorized` and missing-detail arms: the
+                        // operator-supplied `client_id` is already rendered
+                        // safely through the strict KV sanitiser in the
+                        // audit envelope's `lease_id=` column, so we keep
+                        // it out of the reason string.
                         let msg = format!(
                             "SetMetricDetail: lease table at capacity ({} entries); reject new \
-                             apply for client_id={} — operators must retry after an active \
-                             lease expires or is cleared",
+                             apply — operators must retry after an active lease expires or is \
+                             cleared",
                             crate::metrics::LEASE_TABLE_CAP,
-                            req.client_id,
                         );
                         error!("{}", msg);
                         push_queue(WorkerResponse::error(message.id.clone(), msg));
