@@ -62,6 +62,12 @@ pub enum CtlError {
     SetupLogging(LogError),
     #[error("could not resolve path for {0} : {1}")]
     ResolvePath(String, std::io::Error),
+    #[error("failed to spawn thread `{label}`: {source}")]
+    SpawnFailed {
+        label: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 pub struct CommandManager {
