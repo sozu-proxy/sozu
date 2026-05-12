@@ -196,6 +196,14 @@ impl RateCalculator {
         self.history.insert(key.to_owned(), (value, sampled_at));
         result
     }
+
+    /// Drop history entries whose key the predicate rejects. Called from
+    /// `App::ingest_snapshot` after recording with the per-cluster keys
+    /// present in the freshest snapshot so disappearing clusters do not
+    /// leave `(prev_value, prev_at)` lingering forever.
+    pub fn retain<F: FnMut(&str) -> bool>(&mut self, mut keep: F) {
+        self.history.retain(|k, _| keep(k.as_str()));
+    }
 }
 
 /// What-changed pulse tracker. Snapshot-to-snapshot diffs surface as a
@@ -377,13 +385,11 @@ impl ThresholdTable {
             return Some("HIGH LATENCY");
         }
         if overview
-            .error_ratio_pct
+            .service_time_p99_ms
             .last()
-            // error_ratio_pct stored as integer × 100 (two decimals), so
-            // the threshold needs the same scaling for the comparison.
-            .is_some_and(|v| (v as f64 / 100.0) >= self.error_ratio_critical_pct)
+            .is_some_and(|v| v as f64 >= self.latency_p99_critical_ms)
         {
-            return Some("ERROR SURGE");
+            return Some("SOZU SLOW");
         }
         if overview
             .saturation_pct
@@ -408,6 +414,63 @@ const ERRORS_5XX: [&str; 5] = [
     names::http_status::S504,
     names::http_status::S507,
 ];
+
+/// Synthetic `RateCalculator` key for the aggregate overview RPS.
+/// Namespaced so it cannot collide with the per-cluster keys
+/// `cluster_rate_key` produces. Hidden from operator-facing surfaces.
+const OVERVIEW_REQUESTS_KEY: &str = "__overview.requests";
+
+/// Build the `RateCalculator` key for a cluster's requests counter.
+/// Same `__cluster.` namespace as other future per-cluster series.
+fn cluster_rate_key(cluster_id: &str) -> String {
+    format!("__cluster.{cluster_id}.requests")
+}
+
+/// Proxy-level metric keys the H2 pane plots in its trend column.
+/// Kept in one place so a key rename in `lib::metrics::names` cannot
+/// silently drop a sparkline from the pane.
+const H2_TRACKED_KEYS: &[&str] = &[
+    names::h2::CONNECTION_ACTIVE_STREAMS,
+    names::http::ALPN_H2,
+    names::http::ALPN_HTTP11,
+    names::client::CONNECTIONS,
+    names::h2::CONNECTION_WINDOW_BYTES,
+    names::h2::CONNECTION_PENDING_WINDOW_UPDATES,
+    names::h2::FLOW_CONTROL_STALL,
+    names::h2::FRAMES_TX_WINDOW_UPDATE,
+    names::h2::FRAMES_TX_RST_STREAM,
+    names::h2::FRAMES_TX_GOAWAY,
+    names::h2::HEADERS_REJECTED_BUDGET_OVERRUN,
+    names::h2::FLOOD_VIOLATION_GLITCH_WINDOW,
+    names::h2::FLOOD_VIOLATION_RAPID_RESET,
+    names::h2::FLOOD_VIOLATION_CONTINUATION,
+    names::h2::FLOOD_VIOLATION_MADE_YOU_RESET,
+    names::h2::FLOOD_VIOLATION_PING,
+    names::h2::FLOOD_VIOLATION_SETTINGS,
+    names::h2::FLOOD_VIOLATION_PRIORITY,
+    names::h2::WINDOW_UPDATE_DROPPED,
+    names::h2::CLOSE_WITH_ACTIVE_STREAMS,
+];
+
+/// Inline sparkline as a Unicode-bar string. Used in table cells where
+/// the ratatui `Sparkline` widget is overkill. Eight discrete bar
+/// heights, scaled to the ring's max sample so a flat-zero series prints
+/// as the minimum-height bar on every position.
+fn render_spark_bars<I: IntoIterator<Item = u64>>(samples: I) -> String {
+    const BARS: &[char] = &['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let samples: Vec<u64> = samples.into_iter().collect();
+    if samples.is_empty() {
+        return "—".to_owned();
+    }
+    let max = samples.iter().copied().max().unwrap_or(0).max(1);
+    samples
+        .iter()
+        .map(|v| {
+            let idx = ((v * (BARS.len() as u64 - 1)) / max) as usize;
+            BARS[idx.min(BARS.len() - 1)]
+        })
+        .collect()
+}
 
 /// Top-level UI state. Pure data; the render loop snapshots it for each
 /// frame and the transport threads push into it via `App::ingest_*`.
@@ -471,6 +534,16 @@ pub struct App {
     /// Initialised `true` so the first frame paints unconditionally.
     is_dirty: bool,
     rates: RateCalculator,
+    /// Per-cluster requests-per-second derived from `names::backend::REQUESTS`
+    /// counters. Computed once per `ingest_snapshot` via `RateCalculator`
+    /// and consumed by `cluster_rows` so the CLUSTERS pane shows a rate,
+    /// not a cumulative counter.
+    cluster_rps: HashMap<String, u64>,
+    /// Per-metric sample rings driving the H2 pane's trend column.
+    /// Populated by `fold_h2_trends` once per `ingest_snapshot`. Keys
+    /// are the canonical `names::*` strings the pane reads, so a key
+    /// rename can never silently freeze a trend column.
+    h2_trends: HashMap<&'static str, SparkRing>,
 }
 
 /// Columns the CLUSTERS pane can sort by. Cycled with `s`; reversed with
@@ -513,7 +586,10 @@ impl ClusterSortKey {
 pub struct OverviewState {
     pub rps: SparkRing,
     pub latency_p99_ms: SparkRing,
-    pub error_ratio_pct: SparkRing,
+    /// p99 of sozu's own `service_time` (request processing inside the
+    /// proxy, NOT including the backend round-trip). Sparkline kept as
+    /// raw milliseconds for direct comparison with `latency_p99_ms`.
+    pub service_time_p99_ms: SparkRing,
     pub saturation_pct: SparkRing,
     /// Active session gauge (`http.active_requests` or fallback). Surfaced
     /// as a big numeral above the saturation sparkline.
@@ -554,6 +630,8 @@ impl App {
             palette_error: None,
             is_dirty: true,
             rates: RateCalculator::default(),
+            cluster_rps: HashMap::new(),
+            h2_trends: HashMap::new(),
         }
     }
 
@@ -579,22 +657,45 @@ impl App {
     pub fn ingest_snapshot(&mut self, snap: &Snapshot) {
         self.last_snapshot_at = Some(snap.received_at);
         self.fold_overview(&snap.metrics, snap.received_at);
+        self.fold_h2_trends(&snap.metrics);
         // Diff vs the last seen snapshot BEFORE replacing it, so the
         // pulse tracker can emit ClusterDisappeared / BackendWentDown
         // transitions against the previous set.
         self.pulse.diff(&snap.metrics);
-        // The rate calculator's history is bounded to the two overview-
-        // aggregate keys recorded by `fold_overview` below, so no live-
-        // key sweep is needed. When per-cluster rates land, `record(...)`
-        // will start populating per-cluster keys and the matching `retain`
-        // belongs alongside that change so removed clusters / backends do
-        // not accumulate forever.
         // Keep the latest `AggregatedMetrics` for the CLUSTERS / BACKENDS
         // panes. Cloning isn't cheap for very-high-cardinality fleets
         // (>1000 clusters), but in practice the master already paid this
         // cost on the wire; revisit only if profile data justifies it.
         self.last_metrics = Some(snap.metrics.clone());
         self.is_dirty = true;
+    }
+
+    /// Push the latest sample for every H2-pane-tracked metric into its
+    /// SparkRing. Reads gauges and counters uniformly so flow-control
+    /// gauges and frame counters share one trend renderer. New keys are
+    /// allocated on first observation; the SparkRing rolls a 60-sample
+    /// window forward as snapshots arrive.
+    fn fold_h2_trends(&mut self, m: &AggregatedMetrics) {
+        for key in H2_TRACKED_KEYS {
+            let value = gauge_value(m.proxying.get(*key))
+                .or_else(|| count_value(m.proxying.get(*key)).map(|c| c.max(0) as u64))
+                .unwrap_or(0);
+            self.h2_trends
+                .entry(*key)
+                .or_insert_with(|| SparkRing::new(SPARKLINE_DEPTH))
+                .push(value);
+        }
+    }
+
+    /// Render the trend bars for an H2-pane metric. Returns "—" when no
+    /// samples have landed (cold start). Otherwise produces a string of
+    /// Unicode block characters scaled to the largest sample in the ring
+    /// so a flat-line zero series prints as the minimum-height bar.
+    pub fn h2_trend_bars(&self, key: &str) -> String {
+        match self.h2_trends.get(key) {
+            Some(ring) if !ring.is_empty() => render_spark_bars(ring.samples().copied()),
+            _ => "—".to_owned(),
+        }
     }
 
     /// Advance the pulse tracker by one render frame. Called from the
@@ -625,21 +726,29 @@ impl App {
                 let errors_5xx: i64 = ERRORS_5XX.iter().map(|k| cluster_count_total(cm, k)).sum();
                 let p99_ms = cluster_p99_max(cm);
                 let p50_ms = cluster_p50_max(cm);
-                // Backends-up vs backends-total; both are gauges. The total
-                // is published at cluster level; per-backend availability
-                // either rolls up to the cluster gauge (cluster detail) or
-                // appears as one entry per backend (backend detail).
+                // Backends-up vs backends-total. The "total" is the
+                // per-cluster `cluster.total_backends` gauge updated by
+                // `BackendsByCluster::notify_availability` whenever a
+                // backend is added / removed. The "up" rollup is the
+                // companion `cluster.available_backends` gauge written
+                // by the same code path — that gauge is the authoritative
+                // per-cluster aggregate and refreshes every health-check
+                // tick. Per-backend `backend.available` (under backend-
+                // detail filing) is a fallback for the very first
+                // snapshot after worker boot, when the rollup may not
+                // yet have landed.
                 let backends_total =
                     gauge_value(cm.cluster.get(names::cluster::TOTAL_BACKENDS)).unwrap_or(0) as u32;
-                let cluster_available =
-                    gauge_value(cm.cluster.get(names::backend::AVAILABLE)).unwrap_or(0) as u32;
+                let cluster_available_rollup =
+                    gauge_value(cm.cluster.get(names::cluster::AVAILABLE_BACKENDS)).unwrap_or(0)
+                        as u32;
                 let backend_available_sum: u32 = cm
                     .backends
                     .iter()
                     .filter_map(|b| gauge_value(b.metrics.get(names::backend::AVAILABLE)))
                     .map(|v| v as u32)
                     .sum();
-                let backends_available = cluster_available.max(backend_available_sum);
+                let backends_available = cluster_available_rollup.max(backend_available_sum);
                 let error_rate_pct = if requests > 0 {
                     (errors_5xx as f64 / requests as f64) * 100.0
                 } else {
@@ -647,7 +756,7 @@ impl App {
                 };
                 ClusterRow {
                     cluster_id: id.clone(),
-                    requests_total: requests as u64,
+                    rps: self.cluster_rps.get(id).copied().unwrap_or(0),
                     error_rate_pct,
                     p50_ms,
                     p99_ms,
@@ -660,7 +769,7 @@ impl App {
             use std::cmp::Ordering;
             let ord = match self.cluster_sort {
                 ClusterSortKey::ClusterId => a.cluster_id.cmp(&b.cluster_id),
-                ClusterSortKey::Rps => a.requests_total.cmp(&b.requests_total).reverse(),
+                ClusterSortKey::Rps => a.rps.cmp(&b.rps).reverse(),
                 ClusterSortKey::ErrorRate => a
                     .error_rate_pct
                     .partial_cmp(&b.error_rate_pct)
@@ -751,21 +860,34 @@ impl App {
         // both filings transparently so the OVERVIEW stays correct regardless
         // of the active detail level.
         let mut total_requests: i64 = 0;
-        let mut total_errors_5xx: i64 = 0;
         let mut total_requests_observed: i64 = 0;
-        for cm in m.clusters.values() {
+        // Per-cluster RPS via the same RateCalculator. Stored on
+        // `cluster_rps` so the CLUSTERS pane can render rates without
+        // re-deriving from the cumulative counter. Keys are namespaced
+        // `__cluster.<id>.requests` to keep them separate from the
+        // overview-aggregate keys.
+        self.cluster_rps.clear();
+        let mut live_rate_keys: HashSet<String> = HashSet::new();
+        live_rate_keys.insert(OVERVIEW_REQUESTS_KEY.to_owned());
+        for (id, cm) in &m.clusters {
             let cluster_requests = cluster_count_total(cm, names::backend::REQUESTS);
             if cluster_requests > 0 {
                 total_requests = total_requests.saturating_add(cluster_requests);
                 total_requests_observed = total_requests_observed.saturating_add(cluster_requests);
             }
-            for code in ERRORS_5XX {
-                let v = cluster_count_total(cm, code);
-                if v > 0 {
-                    total_errors_5xx = total_errors_5xx.saturating_add(v);
-                }
-            }
+            let key = cluster_rate_key(id);
+            let rate = self
+                .rates
+                .record(&key, cluster_requests, sampled_at)
+                .unwrap_or(0.0)
+                .max(0.0);
+            self.cluster_rps.insert(id.clone(), rate as u64);
+            live_rate_keys.insert(key);
         }
+        // Drop history entries for clusters that disappeared this tick;
+        // otherwise `RateCalculator.history` would accumulate stale
+        // `(prev_value, prev_at)` for every cluster ever seen.
+        self.rates.retain(|k| live_rate_keys.contains(k));
         // Final fallback when no per-cluster counter is populated yet (no
         // backend round-trip completed since the worker started, OR
         // `metric_detail = process` strips both labels). `http.requests` is
@@ -783,25 +905,18 @@ impl App {
         // before we have a baseline).
         let rps = self
             .rates
-            .record("__overview.requests", total_requests, sampled_at)
+            .record(OVERVIEW_REQUESTS_KEY, total_requests, sampled_at)
             .unwrap_or(0.0)
             .max(0.0);
         self.overview.rps.push(rps as u64);
 
-        // Error ratio (5xx as percent of requests over the same delta).
-        let err_rate = self
-            .rates
-            .record("__overview.errors_5xx", total_errors_5xx, sampled_at)
-            .unwrap_or(0.0)
-            .max(0.0);
-        let err_pct = if rps > 0.0 {
-            (err_rate / rps) * 100.0
-        } else {
-            0.0
-        };
-        // SparkRing is `u64`; multiply by 100 to keep two-decimal precision
-        // (the renderer divides back when printing the big numeral).
-        self.overview.error_ratio_pct.push((err_pct * 100.0) as u64);
+        // Sozu's own request-processing time (`service_time`, distinct
+        // from `backend_response_time`). p99 milliseconds matches the
+        // shape of the LATENCY p99 cell so operators can compare the
+        // two at a glance.
+        let service_p99 =
+            percentile_p99_ms(m.proxying.get(names::event_loop::SERVICE_TIME)).unwrap_or(0);
+        self.overview.service_time_p99_ms.push(service_p99);
 
         // Latency p99 — sum of cluster `backend_response_time` percentiles
         // is not meaningful (you cannot average percentiles), so we take
@@ -999,7 +1114,10 @@ fn cluster_p50_max(cm: &ClusterMetrics) -> u64 {
 #[derive(Debug, Clone)]
 pub struct ClusterRow {
     pub cluster_id: String,
-    pub requests_total: u64,
+    /// Per-cluster requests-per-second derived once on `ingest_snapshot`
+    /// via the shared `RateCalculator` and cached on `App.cluster_rps`.
+    /// `0` until two snapshots have landed for this cluster.
+    pub rps: u64,
     pub error_rate_pct: f64,
     pub p50_ms: u64,
     pub p99_ms: u64,

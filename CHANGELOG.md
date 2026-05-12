@@ -79,6 +79,42 @@ upgrade. See `doc/upgrade/1.x-to-2.0.md` for the full migration guide.
   handles one worker (the relocation loop runs once) and zero workers (no-op).
   Regression test `merge_relocates_single_worker_to_top_level` in
   `command/src/proto/mod.rs` pins the contract.
+- **`sozu top` CLUSTERS column now shows req/s, not cumulative counter**:
+  the column header was `rps` but the cell rendered the cumulative
+  `names::backend::REQUESTS` count, which only changes when a backend
+  responds. Per-cluster `RateCalculator` keyed by `__cluster.<id>.requests`
+  derives the per-second delta once per ingest and the renderer prints
+  `<rps> req/s`. Stale cluster keys are pruned on each snapshot so the
+  rate history cannot grow unbounded as clusters churn.
+- **`sozu top` BACKENDS up/total now reads the cluster rollup gauge**:
+  the renderer was reading `names::backend::AVAILABLE` (a per-backend
+  gauge set on backend up/down transitions) at the cluster level, which
+  was always `0` because the gauge is keyed `(cluster, backend)` and
+  only fires on transitions. A new `names::cluster::AVAILABLE_BACKENDS`
+  constant captures the canonical per-cluster rollup (`available`
+  argument of `gauge!` in `lib/src/backends.rs::notify_availability`),
+  which is the authoritative aggregate and refreshes every health-check
+  tick. Per-backend `backend.available` (under backend-detail filing)
+  remains a fallback for the very first snapshot.
+- **`sozu top` OVERVIEW replaces 5xx panel with sozu service-time
+  p99**: the 5xx cell duplicated the LATENCY p99 cell's intent (both
+  read worst-case quality). Operators want sozu's own request-processing
+  time distinct from backend latency, so the bottom-left OVERVIEW cell
+  now plots p99 of `names::event_loop::SERVICE_TIME` from the proxy
+  map. The critical-banner threshold reuses `latency_p99_critical_ms`
+  with the `SOZU SLOW` headline so a stalled event loop still trips
+  the alert overlay.
+- **`sozu top` CERTS pane renders addresses as `ip:port`**: the address
+  column was printing `{:?}` of the proto `SocketAddress` (`SocketAddress
+  { ip: IpAddress { … } }`), which is unreadable. The pane now goes
+  through the existing `From<SocketAddress> for SocketAddr` conversion
+  so v4 prints as `1.2.3.4:443` and v6 as `[::1]:443`.
+- **`sozu top` H2 pane trend column actually plots a trend**: the
+  trend cells rendered as `"—"` placeholders. Each H2-pane metric now
+  has a 60-sample `SparkRing` populated by `App::fold_h2_trends` per
+  ingest; the renderer prints Unicode bars (`▁▂▃▄▅▆▇█`) scaled to the
+  ring's max sample so even zero-flat series stay distinguishable from
+  the cold-start placeholder.
 - **`sozu top` OVERVIEW and CLUSTERS read counters under backend-detail
   filing**: the TUI auto-leases `MetricDetail::Backend` on startup so the
   BACKENDS pane has per-row data, which routes every per-cluster counter

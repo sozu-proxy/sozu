@@ -52,11 +52,11 @@ pub fn render(f: &mut Frame<'_>, area: Rect, app: &App, skin: &Skin) {
         f,
         bot[0],
         skin,
-        "5xx ERRORS",
-        &format_err_pct(&app.overview.error_ratio_pct),
-        &subtitle_for_errors(app),
-        &app.overview.error_ratio_pct.to_vec(),
-        SparkScale::FixedMax(10_000), // 100.00 % stored ×100
+        "SERVICE TIME p99 (ms)",
+        &format_latency(&app.overview.service_time_p99_ms),
+        &subtitle_for_service_time(app),
+        &app.overview.service_time_p99_ms.to_vec(),
+        SparkScale::FixedMax(scale_for_service_time(app)),
     );
     render_cell(
         f,
@@ -148,12 +148,22 @@ fn format_latency(ring: &super::super::app::SparkRing) -> String {
     }
 }
 
-fn format_err_pct(ring: &super::super::app::SparkRing) -> String {
-    // We store err% as integer ×100 (two decimal places of precision).
-    match ring.last() {
-        Some(v) => format!("{:.2} %", v as f64 / 100.0),
-        None => "—".into(),
+fn subtitle_for_service_time(app: &App) -> String {
+    let trend = trend_glyph(&app.overview.service_time_p99_ms);
+    if app.overview.service_time_p99_ms.is_empty() {
+        "no samples".into()
+    } else {
+        format!("sozu request-processing p99 · {trend}")
     }
+}
+
+fn scale_for_service_time(app: &App) -> u64 {
+    // Anchor the sparkline's max at the latency threshold so service-time
+    // spikes peg the cell the same way backend-latency spikes peg the
+    // sibling cell. Floors at 50 ms so a quiet system doesn't make the
+    // sparkline jitter on rounding noise.
+    let threshold = app.thresholds.latency_p99_critical_ms.max(50.0) as u64;
+    threshold.max(app.overview.service_time_p99_ms.max())
 }
 
 fn format_pct_simple(ring: &super::super::app::SparkRing) -> String {
@@ -181,14 +191,6 @@ fn subtitle_for_latency(app: &App) -> String {
             app.thresholds.latency_p99_critical_ms
         )
     }
-}
-
-fn subtitle_for_errors(app: &App) -> String {
-    let trend = trend_glyph(&app.overview.error_ratio_pct);
-    format!(
-        "5xx ratio threshold {:.2} % · {trend}",
-        app.thresholds.error_ratio_critical_pct
-    )
 }
 
 fn subtitle_for_saturation(app: &App) -> String {

@@ -1,13 +1,13 @@
 ---
 source: bin/src/ctl/top/snapshot_tests.rs
-assertion_line: 221
+assertion_line: 232
 expression: out
 ---
 ╭ CLUSTERS · sort: err% desc · 3 clusters ─────────────────────────────────────╮
 │cluster_id                          rps      err % ▼  p50    p99    backends  │
-│api-prod                            1768     0.17     35     180    2/2       │
-│static-cdn                          3036     0.13     35     200    2/2       │
-│queue-worker                        4304     0.12     35     220    0/2       │
+│api-prod                            0 req/s  0.17     35     180    2/2       │
+│static-cdn                          0 req/s  0.13     35     200    2/2       │
+│queue-worker                        0 req/s  0.12     35     220    0/2       │
 │                                                                              │
 │                                                                              │
 │                                                                              │
