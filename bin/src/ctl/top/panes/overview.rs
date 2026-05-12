@@ -14,7 +14,8 @@ use super::super::theme::{GLYPH_FALLING, GLYPH_RISING, GLYPH_STEADY, Skin};
 /// Render the four-sparkline OVERVIEW grid into `area`. The layout is
 /// `2 lines big-numeral header` × `flex sparkline body` per cell.
 pub fn render(f: &mut Frame<'_>, area: Rect, app: &App, skin: &Skin) {
-    // 2x2 grid: top row RPS + p99, bottom row err% + saturation.
+    let bar_set = app.glyphs.sparkline_set();
+    // 2x2 grid: top row RPS + p99, bottom row service-time + saturation.
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -37,6 +38,7 @@ pub fn render(f: &mut Frame<'_>, area: Rect, app: &App, skin: &Skin) {
         &subtitle_for_rps(app),
         &app.overview.rps.to_vec(),
         SparkScale::Auto,
+        &bar_set,
     );
     render_cell(
         f,
@@ -47,6 +49,7 @@ pub fn render(f: &mut Frame<'_>, area: Rect, app: &App, skin: &Skin) {
         &subtitle_for_latency(app),
         &app.overview.latency_p99_ms.to_vec(),
         SparkScale::FixedMax(scale_for_latency(app)),
+        &bar_set,
     );
     render_cell(
         f,
@@ -57,6 +60,7 @@ pub fn render(f: &mut Frame<'_>, area: Rect, app: &App, skin: &Skin) {
         &subtitle_for_service_time(app),
         &app.overview.service_time_p99_ms.to_vec(),
         SparkScale::FixedMax(scale_for_service_time(app)),
+        &bar_set,
     );
     render_cell(
         f,
@@ -67,6 +71,7 @@ pub fn render(f: &mut Frame<'_>, area: Rect, app: &App, skin: &Skin) {
         &subtitle_for_saturation(app),
         &app.overview.saturation_pct.to_vec(),
         SparkScale::FixedMax(100),
+        &bar_set,
     );
 }
 
@@ -84,6 +89,7 @@ fn render_cell(
     subtitle: &str,
     samples: &[u64],
     scale: SparkScale,
+    bar_set: &ratatui::symbols::bar::Set<'_>,
 ) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -130,6 +136,7 @@ fn render_cell(
     let spark = Sparkline::default()
         .data(samples)
         .max(max)
+        .bar_set(bar_set.clone())
         .style(Style::default().fg(skin.spark_color(pos)));
     f.render_widget(spark, chunks[2]);
 }
