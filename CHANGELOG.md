@@ -69,6 +69,37 @@ upgrade. See `doc/upgrade/1.x-to-2.0.md` for the full migration guide.
   `*.com`) is intentionally not implemented — that is a browser-policy
   concern, not a reverse-proxy responsibility.
 
+- **`QueryMetrics` now folds single-worker fleets correctly**: the master's
+  `QueryMetricsTask::on_finish` (`bin/src/command/requests.rs`) used to gate
+  `AggregatedMetrics::merge_metrics()` on `server.workers.len() > 1`, leaving
+  one-worker setups with empty `clusters` / `proxying` maps and stranding all
+  per-worker data in `workers`. Every CLI/TUI consumer that reads the merged
+  shape (`sozu metrics get` without `--workers`, every `sozu top` pane) silently
+  showed zero data. The fix drops the `> 1` guard — `merge_metrics()` correctly
+  handles one worker (the relocation loop runs once) and zero workers (no-op).
+  Regression test `merge_relocates_single_worker_to_top_level` in
+  `command/src/proto/mod.rs` pins the contract.
+- **`SetMetricDetail` no longer flaps systemd `RELOADING=1` every TTL/2**: the
+  cardinality-lease verb was in the `is_mutating_verb` allowlist
+  (`bin/src/command/requests.rs`), which brackets each call with
+  `sd_notify(STATE_RELOADING)` / `READY=1`. The TUI auto-renews its lease every
+  `ttl/2` seconds (≈ 30 s by default) to keep the lease alive, so a long-lived
+  `sozu top` session caused the unit to flap `reloading`/`active` every 30 s in
+  `systemctl status` and external monitors. `SetMetricDetail` is now excluded:
+  it does not change cluster/listener/cert state or fleet topology, so it does
+  not belong in the systemd bracket set. The audit-log trail
+  (`EventKind::METRIC_DETAIL_CHANGED`, proto tag 30) still records every apply,
+  clear, and TTL expiry, so SOC visibility is unaffected. Regression test
+  `set_metric_detail_is_not_mutating` in `bin/src/command/requests.rs` pins
+  membership.
+- **Cross-worker `Percentiles` aggregation no longer silently drops on
+  `merge_metrics()`**: `command/src/proto/mod.rs::is_mergeable` returned `false`
+  for `Inner::Percentiles`, so any cluster metric emitted in percentile shape
+  (notably `backend_response_time`) was discarded when more than one worker
+  contributed. The merge now propagates the element-wise max per quantile and
+  accumulates `samples` + `sum`, preserving the "worst observed quantile"
+  upper bound across workers. The companion `<name>_histogram` value remains
+  the source of truth for statistically accurate aggregation.
 - **Response-side header edits no longer re-injected on every prepare
   cycle (`H2BlockConverter::finalize` "out buffer not empty" leak)**:
   `apply_response_header_edits` was called inconditionally before
