@@ -36,3 +36,12 @@ reconfig fan-out, FD-passing for hot upgrades — is planned alongside the
 in-tree code in `bin/src/command/`. Until that lands the canonical sources are
 the module-level comments in `bin/src/command/{mod,server,sessions}.rs` and the
 control-plane audit-log section of `doc/observability.md`.
+
+## `sozu top` — live operator TUI
+
+Build with `--features tui` to get a btop/htop-style live console. `sozu top`
+talks to the same command socket as the rest of the CLI and renders clusters,
+backends, listeners, certificates, H2 flood counters, and a `SubscribeEvents`
+tail in a single screen. The TUI is read-only and self-clears its cardinality
+lease on exit. See [`../doc/sozu-top.md`](../doc/sozu-top.md) and the flag
+reference in [`../doc/configure_cli.md`](../doc/configure_cli.md).

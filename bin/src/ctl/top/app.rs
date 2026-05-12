@@ -800,19 +800,17 @@ impl App {
                 } else {
                     cm.backends.len() as u32
                 };
-                let backends_available = rollup_available
-                    .max(backend_available_sum)
-                    // Final fallback: if the rollup gauge hasn't been
-                    // published yet and no per-backend gauge is
-                    // present either, assume every backend the worker
-                    // has observed is up. The first health-check
-                    // failure / `record_cluster_availability` call
-                    // refreshes this with the authoritative value.
-                    .max(if rollup_total == 0 && backend_available_sum == 0 {
-                        cm.backends.len() as u32
-                    } else {
-                        0
-                    });
+                // Final fallback: if the rollup gauge hasn't been
+                // published yet and no per-backend gauge is
+                // present either, assume every backend the worker
+                // has observed is up. The first health-check
+                // failure / `record_cluster_availability` call
+                // refreshes this with the authoritative value.
+                let backends_available = if rollup_total == 0 && backend_available_sum == 0 {
+                    cm.backends.len() as u32
+                } else {
+                    rollup_available.max(backend_available_sum)
+                };
                 let error_rate_pct = if requests > 0 {
                     (errors_5xx as f64 / requests as f64) * 100.0
                 } else {
