@@ -63,8 +63,8 @@ pub fn render(f: &mut Frame<'_>, area: Rect, app: &App, skin: &Skin) {
         .split(inner);
 
     render_streams(f, chunks[0], app, skin, metrics);
-    render_flow(f, chunks[1], skin, metrics);
-    render_floods(f, chunks[2], skin, metrics);
+    render_flow(f, chunks[1], app, skin, metrics);
+    render_floods(f, chunks[2], app, skin, metrics);
 }
 
 fn render_streams(f: &mut Frame<'_>, area: Rect, app: &App, skin: &Skin, m: &AggregatedMetrics) {
@@ -100,32 +100,33 @@ fn render_streams(f: &mut Frame<'_>, area: Rect, app: &App, skin: &Skin, m: &Agg
             .fg(skin.primary)
             .add_modifier(Modifier::BOLD),
     );
-    // Sparkline trend belongs to OVERVIEW; the H2 pane sticks to gauges
-    // + counters in week 3. The trend column is reserved so a future
-    // commit can plug per-row sparklines without re-laying out.
+    // Trend columns render a Unicode-bar sparkline from the per-key
+    // SparkRing populated each snapshot by `App::fold_h2_trends`. The
+    // first sample lands as a single bar; the ring fills out to the
+    // 60-sample width as more snapshots arrive.
     let rows = [
         Row::new(vec![
             Cell::from("active streams"),
             Cell::from(format!("{active_streams}")),
-            Cell::from("—"),
+            Cell::from(app.h2_trend_bars(names::h2::CONNECTION_ACTIVE_STREAMS)),
         ])
         .style(Style::default().fg(skin.secondary)),
         Row::new(vec![
             Cell::from("H2 connections accepted"),
             Cell::from(format!("{alpn_h2}")),
-            Cell::from("—"),
+            Cell::from(app.h2_trend_bars(names::http::ALPN_H2)),
         ])
         .style(Style::default().fg(skin.secondary)),
         Row::new(vec![
             Cell::from("HTTP/1.1 accepted"),
             Cell::from(format!("{alpn_http11}")),
-            Cell::from("—"),
+            Cell::from(app.h2_trend_bars(names::http::ALPN_HTTP11)),
         ])
         .style(Style::default().fg(skin.secondary)),
         Row::new(vec![
             Cell::from("client.connections (gauge)"),
             Cell::from(format!("{}", app.overview.client_connections)),
-            Cell::from("—"),
+            Cell::from(app.h2_trend_bars(names::client::CONNECTIONS)),
         ])
         .style(Style::default().fg(skin.secondary)),
     ];
@@ -149,8 +150,8 @@ fn render_streams(f: &mut Frame<'_>, area: Rect, app: &App, skin: &Skin, m: &Agg
     );
 }
 
-fn render_flow(f: &mut Frame<'_>, area: Rect, skin: &Skin, m: &AggregatedMetrics) {
-    let header = Row::new(vec!["flow control", "value"]).style(
+fn render_flow(f: &mut Frame<'_>, area: Rect, app: &App, skin: &Skin, m: &AggregatedMetrics) {
+    let header = Row::new(vec!["flow control", "value", "trend (60 s)"]).style(
         Style::default()
             .fg(skin.primary)
             .add_modifier(Modifier::BOLD),
@@ -161,53 +162,68 @@ fn render_flow(f: &mut Frame<'_>, area: Rect, skin: &Skin, m: &AggregatedMetrics
         metric_row(
             "connection.window_bytes",
             gauge_at(names::h2::CONNECTION_WINDOW_BYTES),
+            app.h2_trend_bars(names::h2::CONNECTION_WINDOW_BYTES),
             skin,
             false,
         ),
         metric_row(
             "pending_window_updates",
             gauge_at(names::h2::CONNECTION_PENDING_WINDOW_UPDATES),
+            app.h2_trend_bars(names::h2::CONNECTION_PENDING_WINDOW_UPDATES),
             skin,
             false,
         ),
         metric_row(
             "flow_control_stall",
             count_at(names::h2::FLOW_CONTROL_STALL),
+            app.h2_trend_bars(names::h2::FLOW_CONTROL_STALL),
             skin,
             true,
         ),
         metric_row(
             "frames.tx.window_update",
             count_at(names::h2::FRAMES_TX_WINDOW_UPDATE),
+            app.h2_trend_bars(names::h2::FRAMES_TX_WINDOW_UPDATE),
             skin,
             false,
         ),
         metric_row(
             "frames.tx.rst_stream",
             count_at(names::h2::FRAMES_TX_RST_STREAM),
+            app.h2_trend_bars(names::h2::FRAMES_TX_RST_STREAM),
             skin,
             true,
         ),
         metric_row(
             "frames.tx.goaway",
             count_at(names::h2::FRAMES_TX_GOAWAY),
+            app.h2_trend_bars(names::h2::FRAMES_TX_GOAWAY),
             skin,
             true,
         ),
         metric_row(
             "headers.rejected.budget_overrun",
             count_at(names::h2::HEADERS_REJECTED_BUDGET_OVERRUN),
+            app.h2_trend_bars(names::h2::HEADERS_REJECTED_BUDGET_OVERRUN),
             skin,
             true,
         ),
     ];
     f.render_widget(
-        Table::new(rows, [Constraint::Min(36), Constraint::Length(16)]).header(header),
+        Table::new(
+            rows,
+            [
+                Constraint::Min(36),
+                Constraint::Length(16),
+                Constraint::Min(16),
+            ],
+        )
+        .header(header),
         area,
     );
 }
 
-fn render_floods(f: &mut Frame<'_>, area: Rect, skin: &Skin, m: &AggregatedMetrics) {
+fn render_floods(f: &mut Frame<'_>, area: Rect, app: &App, skin: &Skin, m: &AggregatedMetrics) {
     // Critical-tier counters: any non-zero value is a documented attack
     // mitigation firing. Keep them in their own block with a hot-tier title
     // so the eye is drawn here when it should be.
@@ -219,7 +235,7 @@ fn render_floods(f: &mut Frame<'_>, area: Rect, skin: &Skin, m: &AggregatedMetri
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let header = Row::new(vec!["counter", "value"]).style(
+    let header = Row::new(vec!["counter", "value", "trend (60 s)"]).style(
         Style::default()
             .fg(skin.primary)
             .add_modifier(Modifier::BOLD),
@@ -252,12 +268,25 @@ fn render_floods(f: &mut Frame<'_>, area: Rect, skin: &Skin, m: &AggregatedMetri
             } else {
                 Style::default().fg(skin.secondary)
             };
-            Row::new(vec![Cell::from(*label), Cell::from(format!("{v}"))]).style(style)
+            Row::new(vec![
+                Cell::from(*label),
+                Cell::from(format!("{v}")),
+                Cell::from(app.h2_trend_bars(key)),
+            ])
+            .style(style)
         })
         .collect();
 
     f.render_widget(
-        Table::new(rows, [Constraint::Min(28), Constraint::Length(16)]).header(header),
+        Table::new(
+            rows,
+            [
+                Constraint::Min(28),
+                Constraint::Length(16),
+                Constraint::Min(16),
+            ],
+        )
+        .header(header),
         inner,
     );
 }
@@ -265,11 +294,14 @@ fn render_floods(f: &mut Frame<'_>, area: Rect, skin: &Skin, m: &AggregatedMetri
 /// Render one numeric metric as a labelled table row. `value` is pre-
 /// extracted (`gauge(...)` for gauges, `count(...)` for counters) and
 /// widened to `i64` so the helper does not need to know the underlying
-/// variant. `warn_when_nonzero` flips the row to the critical tint when
-/// the value is a flood / error counter the operator should see.
+/// variant. `trend_bars` is a Unicode-bar sparkline string produced by
+/// `App::h2_trend_bars`. `warn_when_nonzero` flips the row to the
+/// critical tint when the value is a flood / error counter the
+/// operator should see.
 fn metric_row<'a>(
     label: &'a str,
     value: Option<i64>,
+    trend_bars: String,
     skin: &Skin,
     warn_when_nonzero: bool,
 ) -> Row<'a> {
@@ -277,6 +309,7 @@ fn metric_row<'a>(
     Row::new(vec![
         Cell::from(label),
         Cell::from(value.map(|v| format!("{v}")).unwrap_or_else(|| "—".into())),
+        Cell::from(trend_bars),
     ])
     .style(style)
 }
