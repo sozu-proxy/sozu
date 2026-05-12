@@ -81,12 +81,14 @@ pub fn run(
     // the hook here means the panic banner lands in the operator's normal
     // shell scrollback instead of inside the alt-screen (which the OS
     // discards when the program exits).
-    let prior_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
+    //
+    // `PanicHookGuard` restores the prior hook on clean return so repeated
+    // `run` calls in the same process (tests, embedded callers) do not
+    // stack hook layers indefinitely.
+    let _panic_guard = PanicHookGuard::install(|| {
         let _ = disable_raw_mode();
         let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
-        prior_hook(info);
-    }));
+    });
 
     // SIGINT/SIGTERM handler: flips a shared flag the loop checks every
     // tick. The terminal restore happens via `RawModeGuard::Drop` regardless
@@ -133,6 +135,13 @@ pub fn run(
     let _guard = RawModeGuard::install(cfg.mouse)?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
+
+    // Opt-out for terminals that don't speak DEC mode 2026 synchronised
+    // output. `SOZU_TOP_SYNC=0` skips the `BeginSynchronizedUpdate` /
+    // `EndSynchronizedUpdate` frame wrap; the default behaviour stays
+    // wrapped because every modern terminal either honours the
+    // sequence or silently ignores it.
+    let sync_output = std::env::var("SOZU_TOP_SYNC").ok().as_deref() != Some("0");
 
     let mut last_render = Instant::now() - RENDER_INTERVAL;
     let mut frames_drawn: u32 = 0;
@@ -213,9 +222,13 @@ pub fn run(
             if !dirty {
                 continue;
             }
-            execute!(io::stdout(), BeginSynchronizedUpdate)?;
+            if sync_output {
+                execute!(io::stdout(), BeginSynchronizedUpdate)?;
+            }
             terminal.draw(|f| draw(f, &app, &skin))?;
-            execute!(io::stdout(), EndSynchronizedUpdate)?;
+            if sync_output {
+                execute!(io::stdout(), EndSynchronizedUpdate)?;
+            }
             last_render = Instant::now();
             frames_drawn += 1;
 
@@ -588,5 +601,45 @@ impl Drop for RawModeGuard {
             let _ = execute!(out, Show, LeaveAlternateScreen);
         }
         let _ = disable_raw_mode();
+    }
+}
+
+type BoxedPanicHook = Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync + 'static>;
+
+/// RAII guard around `std::panic::set_hook` so that repeated calls to
+/// `render::run` in the same process (tests, embedded callers) do not
+/// stack hook layers indefinitely. The installed hook chains the prior
+/// hook for banner emission, and Drop restores the prior hook so the
+/// next install starts from the same baseline.
+struct PanicHookGuard {
+    prior: std::sync::Arc<std::sync::Mutex<Option<BoxedPanicHook>>>,
+}
+
+impl PanicHookGuard {
+    fn install<F>(restore: F) -> Self
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        let prior = std::sync::Arc::new(std::sync::Mutex::new(Some(std::panic::take_hook())));
+        let prior_for_hook = std::sync::Arc::clone(&prior);
+        std::panic::set_hook(Box::new(move |info| {
+            restore();
+            if let Ok(g) = prior_for_hook.lock()
+                && let Some(h) = g.as_ref()
+            {
+                h(info);
+            }
+        }));
+        Self { prior }
+    }
+}
+
+impl Drop for PanicHookGuard {
+    fn drop(&mut self) {
+        if let Ok(mut g) = self.prior.lock()
+            && let Some(prior) = g.take()
+        {
+            std::panic::set_hook(prior);
+        }
     }
 }
