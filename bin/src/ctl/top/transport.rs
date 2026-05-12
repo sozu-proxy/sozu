@@ -35,8 +35,10 @@
 //! the socket. It exits on an `Arc<AtomicBool>` shutdown flag owned by
 //! `run_top` and a bounded `EVENTS_READ_TIMEOUT` per read.
 //!
-//! Errors are logged via `eprintln!` and the thread shuts down — we never
-//! crash the UI because of a transient socket error.
+//! Transient errors are surfaced via a shared `StatusSlot` (the same
+//! mailbox the lease renewer uses); the render loop drains it once per
+//! tick and shows the message in the status bar. The threads continue
+//! running — a single transient socket error never crashes the UI.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -56,6 +58,7 @@ use sozu_command_lib::{
 use crate::ctl::create_channel;
 
 use super::CtlError;
+use super::cardinality::{StatusSlot, publish_status};
 
 /// Bundle published by the collector thread on every successful poll.
 /// Owns `AggregatedMetrics` outright so the UI can rebuild ring buffers
@@ -147,6 +150,7 @@ fn poll_loop<T, F>(
     label: &'static str,
     interval: Duration,
     tx: Sender<T>,
+    status: StatusSlot,
     mut channel: sozu_command_lib::channel::Channel<Request, Response>,
     mut poll: F,
 ) where
@@ -164,7 +168,7 @@ fn poll_loop<T, F>(
                 Err(TrySendError::Disconnected(_)) => return,
             },
             Err(err) => {
-                eprintln!("sozu top: {label} poll error: {err}");
+                publish_status(&status, format!("{label} poll error: {err}"));
             }
         }
         // Sleep the remaining slice of the configured interval so we don't
@@ -183,6 +187,7 @@ fn poll_loop<T, F>(
 pub fn spawn_collector(
     config: Config,
     refresh_ms: u64,
+    status: StatusSlot,
 ) -> Result<(Receiver<Snapshot>, std::thread::JoinHandle<()>), CtlError> {
     // Open the dedicated polling channel up-front so a connection failure
     // surfaces synchronously (operator gets `CtlError::CreateChannel`)
@@ -193,7 +198,7 @@ pub fn spawn_collector(
     let handle = std::thread::Builder::new()
         .name("sozu-top-collector".into())
         .spawn(move || {
-            poll_loop("snapshot", interval, tx, channel, |ch| {
+            poll_loop("snapshot", interval, tx, status, channel, |ch| {
                 poll_metrics(ch).map(|metrics| Snapshot {
                     metrics,
                     received_at: Instant::now(),
@@ -268,13 +273,14 @@ const CERTS_INTERVAL: Duration = Duration::from_secs(30);
 /// shape as `spawn_collector`.
 pub fn spawn_listeners(
     config: Config,
+    status: StatusSlot,
 ) -> Result<(Receiver<ListenersSnapshot>, std::thread::JoinHandle<()>), CtlError> {
     let channel = create_channel(&config)?;
     let (tx, rx) = bounded::<ListenersSnapshot>(SNAPSHOT_CAP);
     let handle = std::thread::Builder::new()
         .name("sozu-top-listeners".into())
         .spawn(move || {
-            poll_loop("listeners", LISTENERS_INTERVAL, tx, channel, |ch| {
+            poll_loop("listeners", LISTENERS_INTERVAL, tx, status, channel, |ch| {
                 poll_listeners(ch).map(|list| ListenersSnapshot { list })
             })
         })
@@ -327,13 +333,14 @@ fn poll_listeners(
 /// worker-fan-out cost on every poll.
 pub fn spawn_certs(
     config: Config,
+    status: StatusSlot,
 ) -> Result<(Receiver<CertsSnapshot>, std::thread::JoinHandle<()>), CtlError> {
     let channel = create_channel(&config)?;
     let (tx, rx) = bounded::<CertsSnapshot>(SNAPSHOT_CAP);
     let handle = std::thread::Builder::new()
         .name("sozu-top-certs".into())
         .spawn(move || {
-            poll_loop("certs", CERTS_INTERVAL, tx, channel, |ch| {
+            poll_loop("certs", CERTS_INTERVAL, tx, status, channel, |ch| {
                 poll_certs(ch).map(|list| CertsSnapshot { list })
             })
         })
@@ -489,12 +496,13 @@ fn content_type_name(ct: Option<&ContentType>) -> &'static str {
 pub fn spawn_events(
     config: Config,
     shutdown: Arc<AtomicBool>,
+    status: StatusSlot,
 ) -> Result<(Receiver<TopEvent>, std::thread::JoinHandle<()>), CtlError> {
     let mut channel = create_channel(&config)?;
     let (tx, rx) = bounded::<TopEvent>(EVENTS_CAP);
     let handle = std::thread::Builder::new()
         .name("sozu-top-events".into())
-        .spawn(move || events_loop(&mut channel, tx, shutdown))
+        .spawn(move || events_loop(&mut channel, tx, shutdown, status))
         .map_err(|source| CtlError::SpawnFailed {
             label: "sozu-top-events",
             source,
@@ -506,12 +514,13 @@ fn events_loop(
     channel: &mut sozu_command_lib::channel::Channel<Request, Response>,
     tx: Sender<TopEvent>,
     shutdown: Arc<AtomicBool>,
+    status: StatusSlot,
 ) {
     let req = Request {
         request_type: Some(RequestType::SubscribeEvents(SubscribeEvents {})),
     };
     if let Err(e) = channel.write_message(&req) {
-        eprintln!("sozu top: SubscribeEvents write error: {e}");
+        publish_status(&status, format!("events: SubscribeEvents write error: {e}"));
         return;
     }
     while !shutdown.load(Ordering::Relaxed) {
@@ -522,7 +531,7 @@ fn events_loop(
             // on a quiet master, not an error.
             Err(ChannelError::TimeoutReached(_)) => continue,
             Err(e) => {
-                eprintln!("sozu top: events read error: {e}");
+                publish_status(&status, format!("events: read error: {e}"));
                 return;
             }
         };
