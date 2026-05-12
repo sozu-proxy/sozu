@@ -200,7 +200,10 @@ pub fn spawn_collector(
                 })
             })
         })
-        .expect("spawn sozu-top collector");
+        .map_err(|source| CtlError::SpawnFailed {
+            label: "sozu-top-collector",
+            source,
+        })?;
     Ok((rx, handle))
 }
 
@@ -275,7 +278,10 @@ pub fn spawn_listeners(
                 poll_listeners(ch).map(|list| ListenersSnapshot { list })
             })
         })
-        .expect("spawn sozu-top listeners");
+        .map_err(|source| CtlError::SpawnFailed {
+            label: "sozu-top-listeners",
+            source,
+        })?;
     Ok((rx, handle))
 }
 
@@ -331,7 +337,10 @@ pub fn spawn_certs(
                 poll_certs(ch).map(|list| CertsSnapshot { list })
             })
         })
-        .expect("spawn sozu-top certs");
+        .map_err(|source| CtlError::SpawnFailed {
+            label: "sozu-top-certs",
+            source,
+        })?;
     Ok((rx, handle))
 }
 
@@ -486,7 +495,10 @@ pub fn spawn_events(
     let handle = std::thread::Builder::new()
         .name("sozu-top-events".into())
         .spawn(move || events_loop(&mut channel, tx, shutdown))
-        .expect("spawn sozu-top events");
+        .map_err(|source| CtlError::SpawnFailed {
+            label: "sozu-top-events",
+            source,
+        })?;
     Ok((rx, handle))
 }
 
