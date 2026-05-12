@@ -426,6 +426,13 @@ fn cluster_rate_key(cluster_id: &str) -> String {
     format!("__cluster.{cluster_id}.requests")
 }
 
+/// Build the `RateCalculator` key for a per-(cluster, backend) counter.
+/// `suffix` distinguishes `bytes_in` vs `bytes_out` so both rates share
+/// one namespace without aliasing.
+fn backend_rate_key(cluster_id: &str, backend_id: &str, suffix: &str) -> String {
+    format!("__backend.{cluster_id}.{backend_id}.{suffix}")
+}
+
 /// Proxy-level metric keys the H2 pane plots in its trend column.
 /// Kept in one place so a key rename in `lib::metrics::names` cannot
 /// silently drop a sparkline from the pane.
@@ -540,6 +547,15 @@ pub struct App {
     /// and consumed by `cluster_rows` so the CLUSTERS pane shows a rate,
     /// not a cumulative counter.
     cluster_rps: HashMap<String, u64>,
+    /// Per-(cluster, backend) bytes-per-second download rate derived
+    /// from cumulative `names::backend::BYTES_IN` counters. Stored as
+    /// bytes/sec; the renderer scales to bits/sec at format time so
+    /// the column reads in Kbps / Mbps / Gbps. Cleared and rebuilt on
+    /// every `ingest_snapshot`.
+    backend_rate_in_bps: HashMap<(String, String), f64>,
+    /// Per-(cluster, backend) bytes-per-second upload rate derived
+    /// from cumulative `names::backend::BYTES_OUT`.
+    backend_rate_out_bps: HashMap<(String, String), f64>,
     /// Per-metric sample rings driving the H2 pane's trend column.
     /// Populated by `fold_h2_trends` once per `ingest_snapshot`. Keys
     /// are the canonical `names::*` strings the pane reads, so a key
@@ -637,6 +653,8 @@ impl App {
             is_dirty: true,
             rates: RateCalculator::default(),
             cluster_rps: HashMap::new(),
+            backend_rate_in_bps: HashMap::new(),
+            backend_rate_out_bps: HashMap::new(),
             h2_trends: HashMap::new(),
             paused: false,
         }
@@ -846,23 +864,18 @@ impl App {
         let mut rows: Vec<BackendRow> = Vec::new();
         for (cluster_id, cm) in &metrics.clusters {
             for bm in &cm.backends {
+                // Per-second rate from the cumulative `BYTES_IN`/`OUT`
+                // counters. The rate map is populated by `fold_overview`
+                // on every snapshot so the lookup is constant-time and
+                // the row stays in lock-step with the freshest poll.
+                let key = (cluster_id.clone(), bm.backend_id.clone());
+                let bw_in_bps = self.backend_rate_in_bps.get(&key).copied().unwrap_or(0.0);
+                let bw_out_bps = self.backend_rate_out_bps.get(&key).copied().unwrap_or(0.0);
                 rows.push(BackendRow {
                     cluster_id: cluster_id.clone(),
                     backend_id: bm.backend_id.clone(),
-                    // `BACK_BYTES_IN`/`OUT` are no-label proxy-level
-                    // counters emitted from `pipe.rs`, `kawa_h1.rs`, and
-                    // `mux/mod.rs` via `count!(key, value)` — they never
-                    // land per-backend. The cumulative backend-socket
-                    // bytes flow through `record_backend_metrics!` at
-                    // request end with `(cluster_id, backend_id)`
-                    // labels under the keys `BYTES_IN` / `BYTES_OUT`
-                    // (`lib/src/metrics/mod.rs::receive_metric`, called
-                    // from `lib/src/lib.rs::end_of_session`). Read from
-                    // there so the BACKENDS row shows real bandwidth.
-                    back_bytes_in: count_value(bm.metrics.get(names::backend::BYTES_IN))
-                        .unwrap_or(0) as u64,
-                    back_bytes_out: count_value(bm.metrics.get(names::backend::BYTES_OUT))
-                        .unwrap_or(0) as u64,
+                    bw_in_bps,
+                    bw_out_bps,
                     connections: gauge_value(
                         bm.metrics.get(names::backend::CONNECTIONS_PER_BACKEND),
                     )
@@ -877,6 +890,7 @@ impl App {
             }
         }
         rows.sort_by(|a, b| {
+            use std::cmp::Ordering;
             let ord = match self.backend_sort {
                 BackendSortKey::ClusterId => a
                     .cluster_id
@@ -884,9 +898,9 @@ impl App {
                     .then(a.backend_id.cmp(&b.backend_id)),
                 BackendSortKey::BackendId => a.backend_id.cmp(&b.backend_id),
                 BackendSortKey::Bandwidth => {
-                    let abw = a.back_bytes_in + a.back_bytes_out;
-                    let bbw = b.back_bytes_in + b.back_bytes_out;
-                    abw.cmp(&bbw).reverse()
+                    let abw = a.bw_in_bps + a.bw_out_bps;
+                    let bbw = b.bw_in_bps + b.bw_out_bps;
+                    abw.partial_cmp(&bbw).unwrap_or(Ordering::Equal).reverse()
                 }
                 BackendSortKey::Connections => a.connections.cmp(&b.connections).reverse(),
                 BackendSortKey::LatencyP99 => a.p99_ms.cmp(&b.p99_ms).reverse(),
@@ -923,6 +937,8 @@ impl App {
         // `__cluster.<id>.requests` to keep them separate from the
         // overview-aggregate keys.
         self.cluster_rps.clear();
+        self.backend_rate_in_bps.clear();
+        self.backend_rate_out_bps.clear();
         let mut live_rate_keys: HashSet<String> = HashSet::new();
         live_rate_keys.insert(OVERVIEW_REQUESTS_KEY.to_owned());
         for (id, cm) in &m.clusters {
@@ -939,10 +955,40 @@ impl App {
                 .max(0.0);
             self.cluster_rps.insert(id.clone(), rate as u64);
             live_rate_keys.insert(key);
+            // Per-backend bytes-in / bytes-out rates. `record_backend_metrics!`
+            // (`lib/src/metrics/mod.rs`) emits the cumulative byte counters
+            // per (cluster, backend) at request end; the RateCalculator
+            // turns those cumulative counts into a per-second delta the
+            // BACKENDS pane renders as Mbps. First observation returns
+            // `None` so the row prints `0.00 / 0.00` until the second
+            // snapshot lands — matches the cluster_rps shape.
+            for bm in &cm.backends {
+                let bid = &bm.backend_id;
+                let bytes_in = count_value(bm.metrics.get(names::backend::BYTES_IN)).unwrap_or(0);
+                let bytes_out = count_value(bm.metrics.get(names::backend::BYTES_OUT)).unwrap_or(0);
+                let in_key = backend_rate_key(id, bid, "bytes_in");
+                let out_key = backend_rate_key(id, bid, "bytes_out");
+                let rate_in = self
+                    .rates
+                    .record(&in_key, bytes_in, sampled_at)
+                    .unwrap_or(0.0)
+                    .max(0.0);
+                let rate_out = self
+                    .rates
+                    .record(&out_key, bytes_out, sampled_at)
+                    .unwrap_or(0.0)
+                    .max(0.0);
+                let map_key = (id.clone(), bid.clone());
+                self.backend_rate_in_bps.insert(map_key.clone(), rate_in);
+                self.backend_rate_out_bps.insert(map_key, rate_out);
+                live_rate_keys.insert(in_key);
+                live_rate_keys.insert(out_key);
+            }
         }
-        // Drop history entries for clusters that disappeared this tick;
-        // otherwise `RateCalculator.history` would accumulate stale
-        // `(prev_value, prev_at)` for every cluster ever seen.
+        // Drop history entries for clusters / backends that disappeared
+        // this tick; otherwise `RateCalculator.history` would accumulate
+        // stale `(prev_value, prev_at)` for every (cluster, backend)
+        // tuple ever seen.
         self.rates.retain(|k| live_rate_keys.contains(k));
         // Final fallback when no per-cluster counter is populated yet (no
         // backend round-trip completed since the worker started, OR
@@ -1187,8 +1233,14 @@ pub struct ClusterRow {
 pub struct BackendRow {
     pub cluster_id: String,
     pub backend_id: String,
-    pub back_bytes_in: u64,
-    pub back_bytes_out: u64,
+    /// Per-second bytes received from the backend (`BYTES_IN`). The
+    /// renderer scales `× 8` to bits/sec and formats with a Kbps /
+    /// Mbps / Gbps suffix. `0.0` on the first observation and after
+    /// the hourly counter clear (the RateCalculator emits `Some(0.0)`
+    /// on monotonic decrease rather than a negative spike).
+    pub bw_in_bps: f64,
+    /// Per-second bytes sent to the backend (`BYTES_OUT`).
+    pub bw_out_bps: f64,
     pub connections: u64,
     pub p50_ms: u64,
     pub p99_ms: u64,

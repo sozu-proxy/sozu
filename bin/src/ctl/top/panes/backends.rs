@@ -52,7 +52,7 @@ pub fn render(f: &mut Frame<'_>, area: Rect, app: &App, skin: &Skin) {
         sort_header("cluster", active(BackendSortKey::ClusterId), reverse, skin),
         sort_header("backend", active(BackendSortKey::BackendId), reverse, skin),
         sort_header(
-            "bw down/up B",
+            "bw down/up Mbps",
             active(BackendSortKey::Bandwidth),
             reverse,
             skin,
@@ -85,8 +85,8 @@ pub fn render(f: &mut Frame<'_>, area: Rect, app: &App, skin: &Skin) {
                 Cell::from(row.backend_id.clone()),
                 Cell::from(format!(
                     "{}/{}",
-                    format_bytes(row.back_bytes_in),
-                    format_bytes(row.back_bytes_out),
+                    format_rate_bps(row.bw_in_bps),
+                    format_rate_bps(row.bw_out_bps),
                 )),
                 Cell::from(format!("{}", row.connections)),
                 Cell::from(format!("{}", row.p50_ms)),
@@ -110,17 +110,25 @@ pub fn render(f: &mut Frame<'_>, area: Rect, app: &App, skin: &Skin) {
     f.render_widget(table, area);
 }
 
-fn format_bytes(bytes: u64) -> String {
-    const KIB: u64 = 1024;
-    const MIB: u64 = 1024 * KIB;
-    const GIB: u64 = 1024 * MIB;
-    if bytes >= GIB {
-        format!("{:.1}G", bytes as f64 / GIB as f64)
-    } else if bytes >= MIB {
-        format!("{:.1}M", bytes as f64 / MIB as f64)
-    } else if bytes >= KIB {
-        format!("{:.1}K", bytes as f64 / KIB as f64)
+/// Render bytes/sec as a per-second bit rate scaled to the largest
+/// unit the value crosses cleanly. Networking-convention base-1000 —
+/// 1 Mbps = 1_000_000 bps — so the column matches what operators read
+/// off nload / iftop / Grafana panels. Sub-millibit traffic collapses
+/// to `0.00` rather than `0.001M` so the column stays compact.
+fn format_rate_bps(bytes_per_sec: f64) -> String {
+    let bps = bytes_per_sec.max(0.0) * 8.0;
+    let gbps = bps / 1_000_000_000.0;
+    let mbps = bps / 1_000_000.0;
+    let kbps = bps / 1_000.0;
+    if gbps >= 1.0 {
+        format!("{gbps:.2}G")
+    } else if mbps >= 0.1 {
+        format!("{mbps:.2}")
+    } else if kbps >= 1.0 {
+        format!("{kbps:.1}K")
+    } else if bps >= 1.0 {
+        format!("{bps:.0}b")
     } else {
-        format!("{bytes}")
+        "0.00".to_owned()
     }
 }

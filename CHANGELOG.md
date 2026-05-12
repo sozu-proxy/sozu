@@ -79,6 +79,26 @@ upgrade. See `doc/upgrade/1.x-to-2.0.md` for the full migration guide.
   handles one worker (the relocation loop runs once) and zero workers (no-op).
   Regression test `merge_relocates_single_worker_to_top_level` in
   `command/src/proto/mod.rs` pins the contract.
+- **`sozu top` BACKENDS bandwidth column shows a per-second rate in Mbps**:
+  the column was previously a cumulative byte count since worker start —
+  `1.4G/5.6G` after a few hours, monotonically increasing, almost never
+  what an operator needs while monitoring live traffic. Mirror the
+  cluster-RPS pattern: the shared `RateCalculator` derives per-second
+  deltas from the cumulative `BYTES_IN`/`OUT` counters under
+  `__backend.<cluster>.<backend>.<bytes_in|bytes_out>` keys, the App
+  caches the rates on `backend_rate_in_bps` / `backend_rate_out_bps`,
+  and the renderer formats `bytes/sec × 8` as Kbps / Mbps / Gbps
+  base-1000 to match the networking convention (`nload`, `iftop`,
+  Grafana panels). Stale per-backend keys are pruned on every snapshot
+  alongside the cluster-RPS sweep so `RateCalculator.history` cannot
+  grow unbounded as a fleet churns. Column header changes from
+  `bw down/up B` to `bw down/up Mbps`; the BACKENDS-sort `Bandwidth`
+  comparator now uses the rate.
+- **`sozu top` CLUSTERS rps column auto-scales to K/M/G**: dashboards
+  with traffic over 1k req/s were truncating the `rps` cell at the
+  8-character width. The column is now 14 wide and the value renders
+  with a base-1000 suffix (`94.8K req/s`, `1.20M req/s`) so the cell
+  stays readable for any cluster scale.
 - **`sozu top` BACKENDS pane "bw down/up B" now populates**: the renderer
   was reading `names::backend::BACK_BYTES_IN` / `BACK_BYTES_OUT` from the
   per-backend filing, but those keys are emitted as no-label proxy
