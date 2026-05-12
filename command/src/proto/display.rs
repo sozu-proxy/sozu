@@ -982,10 +982,6 @@ fn print_metric_detail_status(status: &MetricDetailStatus) -> Result<(), Display
             w.active_lease_count,
         ));
     }
-    if !status.unsupported_workers.is_empty() {
-        let joined = status.unsupported_workers.join(", ");
-        table.add_row(row!("unsupported workers", joined, "—", "—", "—"));
-    }
     table.printstd();
     Ok(())
 }
