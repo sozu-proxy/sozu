@@ -79,6 +79,32 @@ upgrade. See `doc/upgrade/1.x-to-2.0.md` for the full migration guide.
   handles one worker (the relocation loop runs once) and zero workers (no-op).
   Regression test `merge_relocates_single_worker_to_top_level` in
   `command/src/proto/mod.rs` pins the contract.
+- **`sozu top` BACKENDS pane "bw down/up B" now populates**: the renderer
+  was reading `names::backend::BACK_BYTES_IN` / `BACK_BYTES_OUT` from the
+  per-backend filing, but those keys are emitted as no-label proxy
+  counters via `count!(key, value)` at every byte-flow site in
+  `lib/src/protocol/{pipe,kawa_h1/mod,mux/mod,proxy_protocol/{send,relay}}.rs`
+  — they land in `worker.proxy[…]` and are never tagged
+  `(cluster_id, backend_id)`. The per-backend cumulative bytes flow
+  through `record_backend_metrics!` (`lib/src/metrics/mod.rs`) at request
+  end under the keys `BYTES_IN` / `BYTES_OUT` with `$bin` / `$bout`
+  sourced from `SessionMetrics.backend_bin` / `backend_bout` — i.e.
+  the same backend-socket accumulators. The TUI now reads those.
+- **`sozu top` overview sparklines fill the full pane width**: the
+  default `RenderDirection::LeftToRight` left-anchored samples, which
+  made the graph appear to use only the left half of its cell until
+  the ring filled out to column-width. Switch to `RightToLeft` so the
+  newest sample sits on the right edge and history scrolls leftward
+  as new ticks arrive — the familiar `vmstat` / `htop` direction.
+- **`sozu top` F-key bar actually does things**: F1 Help and F10 Quit
+  were wired but F2-F9 were placeholders. F2 cycles the resolved
+  glyph mode (Block → Braille → Tty); F3 and F4 open the colon
+  palette so operators can type `:cluster <id>` etc.; F5 (also `p`)
+  pauses snapshot ingest without dropping the transport lease so the
+  TUI freezes on the last frame for closer inspection, and the label
+  flips to "Resume" while paused; F6 cycles the active pane's sort
+  column. F7/F8/F9 remain reserved slots (`·`) so the bar width
+  stays stable across builds.
 - **`sozu top` CLUSTERS column now shows req/s, not cumulative counter**:
   the column header was `rps` but the cell rendered the cumulative
   `names::backend::REQUESTS` count, which only changes when a backend

@@ -6,7 +6,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Sparkline};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph, RenderDirection, Sparkline};
 
 use super::super::app::App;
 use super::super::theme::{GLYPH_FALLING, GLYPH_RISING, GLYPH_STEADY, Skin};
@@ -133,10 +133,17 @@ fn render_cell(
     // week 3 once the Canvas-backed renderer is in place.
     let last = samples.last().copied().unwrap_or(0);
     let pos = (last as f32 / max as f32).clamp(0.0, 1.0);
+    // RightToLeft anchors the newest sample on the right edge so the
+    // sparkline scrolls history leftward as new ticks arrive. The
+    // default LeftToRight left-anchors and leaves the right side empty
+    // until the ring reaches column-width samples — looks like the
+    // graph is filling only half its pane on the operator's first
+    // minute of monitoring.
     let spark = Sparkline::default()
         .data(samples)
         .max(max)
         .bar_set(bar_set.clone())
+        .direction(RenderDirection::RightToLeft)
         .style(Style::default().fg(skin.spark_color(pos)));
     f.render_widget(spark, chunks[2]);
 }

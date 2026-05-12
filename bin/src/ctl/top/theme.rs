@@ -407,6 +407,17 @@ impl GlyphMode {
         }
     }
 
+    /// Rotate through the three modes in a fixed order. Used by F2 so
+    /// the operator can switch alphabets at runtime without restarting
+    /// `sozu top`.
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::Block => Self::Braille,
+            Self::Braille => Self::Tty,
+            Self::Tty => Self::Block,
+        }
+    }
+
     /// Collapse the optional clap override to a concrete mode. When the
     /// operator passed `--glyphs`, honour the explicit choice. Otherwise
     /// the auto-detect cascade walks three terminal capability signals:

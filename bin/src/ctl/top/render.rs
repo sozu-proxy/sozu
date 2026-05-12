@@ -259,6 +259,37 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::F(10) => app.should_quit = true,
         KeyCode::Char('?') | KeyCode::F(1) => app.help_visible = !app.help_visible,
+        // F2 Theme: cycle the resolved glyph mode (Block → Braille → Tty).
+        // The skin's gradient colours don't have a CLI override yet, so the
+        // closest visible "theme switch" is the bar alphabet.
+        KeyCode::F(2) => {
+            app.glyphs = app.glyphs.cycle();
+            app.mark_dirty();
+        }
+        // F3 Find / F4 Filter — both open the colon palette so the
+        // operator can type `:cluster <id>` / `:backend <id>` / `:help`.
+        // No dedicated find/filter widget yet; the palette is the
+        // closest behaviour and matches the rest of the binding.
+        KeyCode::F(3) | KeyCode::F(4) => app.open_palette(),
+        // F5 Pause: hold the snapshot ingest in place. Transport keeps
+        // polling so we don't drop the lease, but the App ignores
+        // incoming snapshots until F5 is pressed again.
+        KeyCode::F(5) => {
+            app.paused = !app.paused;
+            app.mark_dirty();
+        }
+        // F6 Sort: cycle the active pane's sort column. Mirrors `s`.
+        KeyCode::F(6) => match app.active_tab {
+            ActiveTab::Clusters => {
+                app.cluster_sort = app.cluster_sort.cycle();
+                app.mark_dirty();
+            }
+            ActiveTab::Backends => {
+                app.backend_sort = app.backend_sort.cycle();
+                app.mark_dirty();
+            }
+            _ => {}
+        },
         KeyCode::Tab => app.active_tab = app.active_tab.cycle(true),
         KeyCode::BackTab => app.active_tab = app.active_tab.cycle(false),
         KeyCode::Char(c @ '1'..='7') => {
@@ -278,6 +309,11 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Char('S') if app.active_tab == ActiveTab::Backends => {
             app.backend_sort_reverse = !app.backend_sort_reverse;
+        }
+        // Pause toggle via 'p' as well, matching htop / btop muscle memory.
+        KeyCode::Char('p') | KeyCode::Char('P') => {
+            app.paused = !app.paused;
+            app.mark_dirty();
         }
         _ => {}
     }
@@ -406,19 +442,21 @@ fn draw_fkey_bar(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, skin: &Skin)
         return;
     }
     // htop-style F-key strip: alternating label/action so muscle memory
-    // works without reading the keys explicitly. The actions wired today
-    // are F1 Help, F10 Quit, Tab cycle, `:` palette; the rest reserve
-    // their slots so future panes can plug in without re-laying out.
+    // works without reading the keys explicitly. Labels match the keys
+    // wired in `handle_key`: F1 Help, F2 Glyphs (cycle Block/Braille/Tty),
+    // F3/F4 Palette (open `:`), F5 Pause (also `p`), F6 Sort (per active
+    // pane), F10 Quit. F7/F8/F9 remain visible as reserved slots so the
+    // bar width stays stable across builds; they are no-ops today.
     let bindings: &[(&str, &str)] = &[
         ("F1", "Help"),
-        ("F2", "Theme"),
+        ("F2", "Glyphs"),
         ("F3", "Find"),
         ("F4", "Filter"),
-        ("F5", "Pause"),
+        ("F5", if app.paused { "Resume" } else { "Pause" }),
         ("F6", "Sort"),
-        ("F7", "Detail-"),
-        ("F8", "Detail+"),
-        ("F9", "Config"),
+        ("F7", "·"),
+        ("F8", "·"),
+        ("F9", "·"),
         ("F10", "Quit"),
     ];
     let mut spans: Vec<Span<'_>> = Vec::new();
