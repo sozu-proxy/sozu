@@ -88,7 +88,7 @@ pub fn render(f: &mut Frame<'_>, area: Rect, app: &App, skin: &Skin) {
             };
             Row::new(vec![
                 Cell::from(row.cluster_id.clone()),
-                Cell::from(format!("{}", row.requests_total)),
+                Cell::from(format!("{} req/s", row.rps)),
                 Cell::from(format!("{:.2}", row.error_rate_pct)),
                 Cell::from(format!("{}", row.p50_ms)),
                 Cell::from(format!("{}", row.p99_ms)),

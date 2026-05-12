@@ -26,6 +26,7 @@ use sozu_command_lib::proto::command::{
     AggregatedMetrics, BackendMetrics, ClusterMetrics, FilteredMetrics, ListenersList, Percentiles,
     filtered_metrics,
 };
+use sozu_lib::metrics::names;
 
 use super::app::App;
 use super::panes;
@@ -71,19 +72,26 @@ where
 /// that trip the threshold table without firing the alert banner.
 fn fixture_metrics() -> AggregatedMetrics {
     let mut proxying: BTreeMap<String, FilteredMetrics> = BTreeMap::new();
-    proxying.insert("slab.usage_percent".into(), gauge(45));
-    proxying.insert("client.connections".into(), gauge(312));
-    proxying.insert("http.active_requests".into(), gauge(87));
-    proxying.insert("h2.connection.active_streams".into(), gauge(24));
-    proxying.insert("http.alpn.h2".into(), count(1_000));
-    proxying.insert("http.alpn.http11".into(), count(500));
-    proxying.insert("h2.connection.window_bytes".into(), gauge(65_535));
-    proxying.insert("h2.connection.pending_window_updates".into(), gauge(0));
-    proxying.insert("h2.flow_control_stall".into(), count(2));
-    proxying.insert("h2.frames.tx.window_update".into(), count(42));
-    proxying.insert("h2.frames.tx.rst_stream".into(), count(0));
-    proxying.insert("h2.frames.tx.goaway".into(), count(0));
-    proxying.insert("h2.headers.rejected.budget_overrun".into(), count(0));
+    proxying.insert(names::slab::USAGE_PERCENT.into(), gauge(45));
+    proxying.insert(names::client::CONNECTIONS.into(), gauge(312));
+    proxying.insert(names::http::ACTIVE_REQUESTS.into(), gauge(87));
+    proxying.insert(names::h2::CONNECTION_ACTIVE_STREAMS.into(), gauge(24));
+    proxying.insert(names::http::ALPN_H2.into(), count(1_000));
+    proxying.insert(names::http::ALPN_HTTP11.into(), count(500));
+    proxying.insert(names::h2::CONNECTION_WINDOW_BYTES.into(), gauge(65_535));
+    proxying.insert(
+        names::h2::CONNECTION_PENDING_WINDOW_UPDATES.into(),
+        gauge(0),
+    );
+    proxying.insert(names::h2::FLOW_CONTROL_STALL.into(), count(2));
+    proxying.insert(names::h2::FRAMES_TX_WINDOW_UPDATE.into(), count(42));
+    proxying.insert(names::h2::FRAMES_TX_RST_STREAM.into(), count(0));
+    proxying.insert(names::h2::FRAMES_TX_GOAWAY.into(), count(0));
+    proxying.insert(names::h2::HEADERS_REJECTED_BUDGET_OVERRUN.into(), count(0));
+    proxying.insert(
+        names::event_loop::SERVICE_TIME.into(),
+        percentiles(3, 8, 12),
+    );
 
     let mut clusters: BTreeMap<String, ClusterMetrics> = BTreeMap::new();
     for (i, id) in ["api-prod", "static-cdn", "queue-worker"]
@@ -91,16 +99,19 @@ fn fixture_metrics() -> AggregatedMetrics {
         .enumerate()
     {
         let mut cluster: BTreeMap<String, FilteredMetrics> = BTreeMap::new();
-        cluster.insert("requests".into(), count(1_000 + i as i64 * 500));
-        cluster.insert("http.status.500".into(), count(2 + i as i64));
-        cluster.insert("http.status.503".into(), count(1));
         cluster.insert(
-            "backend_response_time".into(),
+            names::backend::REQUESTS.into(),
+            count(1_000 + i as i64 * 500),
+        );
+        cluster.insert(names::http_status::S500.into(), count(2 + i as i64));
+        cluster.insert(names::http_status::S503.into(), count(1));
+        cluster.insert(
+            names::backend::RESPONSE_TIME.into(),
             percentiles(20, 80, 180 + i as u64 * 20),
         );
-        cluster.insert("cluster.total_backends".into(), gauge(2));
+        cluster.insert(names::cluster::TOTAL_BACKENDS.into(), gauge(2));
         cluster.insert(
-            "backend.available".into(),
+            names::cluster::AVAILABLE_BACKENDS.into(),
             gauge(if i == 2 { 0 } else { 2 }),
         );
         let backends = vec![
@@ -156,16 +167,22 @@ fn percentiles(p50: u64, p90: u64, p99: u64) -> FilteredMetrics {
 
 fn backend_metrics(id: String, bytes: u64, p50: u64, p99: u64) -> BackendMetrics {
     let mut metrics: BTreeMap<String, FilteredMetrics> = BTreeMap::new();
-    metrics.insert("bytes_in".into(), count(bytes as i64));
-    metrics.insert("bytes_out".into(), count((bytes * 4) as i64));
-    metrics.insert("back_bytes_in".into(), count((bytes * 8) as i64));
-    metrics.insert("back_bytes_out".into(), count((bytes * 16) as i64));
-    metrics.insert("connections_per_backend".into(), gauge(12));
+    metrics.insert(names::backend::BYTES_IN.into(), count(bytes as i64));
+    metrics.insert(names::backend::BYTES_OUT.into(), count((bytes * 4) as i64));
     metrics.insert(
-        "backend_response_time".into(),
+        names::backend::BACK_BYTES_IN.into(),
+        count((bytes * 8) as i64),
+    );
+    metrics.insert(
+        names::backend::BACK_BYTES_OUT.into(),
+        count((bytes * 16) as i64),
+    );
+    metrics.insert(names::backend::CONNECTIONS_PER_BACKEND.into(), gauge(12));
+    metrics.insert(
+        names::backend::RESPONSE_TIME.into(),
         percentiles(p50, p50 + 30, p99),
     );
-    metrics.insert("requests".into(), count(bytes as i64 / 4));
+    metrics.insert(names::backend::REQUESTS.into(), count(bytes as i64 / 4));
     BackendMetrics {
         backend_id: id,
         metrics,

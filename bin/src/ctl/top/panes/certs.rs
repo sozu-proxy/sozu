@@ -7,10 +7,13 @@
 //! address, the SNI it serves, and a truncated fingerprint suffix the
 //! operator can match against `sozu certificate list` output.
 
+use std::net::SocketAddr;
+
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table};
+use sozu_command_lib::proto::command::SocketAddress;
 
 use super::super::app::App;
 use super::super::theme::Skin;
@@ -54,7 +57,7 @@ pub fn render(f: &mut Frame<'_>, area: Rect, app: &App, skin: &Skin) {
     let mut rows: Vec<Row<'_>> = Vec::new();
     let mut total_certs = 0u32;
     for by_address in &certs.certificates {
-        let addr = format!("{:?}", by_address.address);
+        let addr = format_socket_address(&by_address.address);
         for summary in &by_address.certificate_summaries {
             let fp_suffix = if summary.fingerprint.len() > 12 {
                 let tail = summary.fingerprint.len() - 12;
@@ -101,4 +104,14 @@ pub fn render(f: &mut Frame<'_>, area: Rect, app: &App, skin: &Skin) {
     ];
     let table = Table::new(rows, widths).header(header).block(block);
     f.render_widget(table, area);
+}
+
+/// Render a proto `SocketAddress` as the familiar `ip:port` shape. The
+/// proto carries an IP oneof and a port; falling back to `Debug` would
+/// dump the proto struct fields (`SocketAddress { ip: IpAddress { … } }`)
+/// which is unreadable. `From<SocketAddress> for SocketAddr` already
+/// exists in `command/src/request.rs` and prints v4 as `1.2.3.4:443`
+/// and v6 as `[::1]:443`.
+fn format_socket_address(address: &SocketAddress) -> String {
+    SocketAddr::from(*address).to_string()
 }
