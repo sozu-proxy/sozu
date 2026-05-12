@@ -17,7 +17,7 @@
 //! adding regression value.
 
 use std::collections::BTreeMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -67,17 +67,23 @@ where
     out
 }
 
-/// Build a synthetic `AggregatedMetrics` payload that exercises every pane:
-/// three clusters, two backends each, a smattering of gauges and counters
-/// that trip the threshold table without firing the alert banner.
-fn fixture_metrics() -> AggregatedMetrics {
+/// Build a synthetic `AggregatedMetrics` payload at a synthetic `tick`.
+/// Three clusters, two backends each, a smattering of gauges and
+/// counters that trip the threshold table without firing the alert
+/// banner. Cumulative counters scale linearly with `tick` so two
+/// ingestions at `tick=0` then `tick=1` (one second apart) make the
+/// `RateCalculator` emit a stable delta matching the cumulative
+/// scaling — the snapshot then shows realistic Mbps / req-per-s
+/// values rather than a flat 0 from a first-observation `None`.
+fn fixture_metrics_at(tick: u64) -> AggregatedMetrics {
+    let tick = tick as i64;
     let mut proxying: BTreeMap<String, FilteredMetrics> = BTreeMap::new();
     proxying.insert(names::slab::USAGE_PERCENT.into(), gauge(45));
     proxying.insert(names::client::CONNECTIONS.into(), gauge(312));
     proxying.insert(names::http::ACTIVE_REQUESTS.into(), gauge(87));
     proxying.insert(names::h2::CONNECTION_ACTIVE_STREAMS.into(), gauge(24));
-    proxying.insert(names::http::ALPN_H2.into(), count(1_000));
-    proxying.insert(names::http::ALPN_HTTP11.into(), count(500));
+    proxying.insert(names::http::ALPN_H2.into(), count(1_000 + 100 * tick));
+    proxying.insert(names::http::ALPN_HTTP11.into(), count(500 + 50 * tick));
     proxying.insert(names::h2::CONNECTION_WINDOW_BYTES.into(), gauge(65_535));
     proxying.insert(
         names::h2::CONNECTION_PENDING_WINDOW_UPDATES.into(),
@@ -99,11 +105,12 @@ fn fixture_metrics() -> AggregatedMetrics {
         .enumerate()
     {
         let mut cluster: BTreeMap<String, FilteredMetrics> = BTreeMap::new();
+        let i64_i = i as i64;
         cluster.insert(
             names::backend::REQUESTS.into(),
-            count(1_000 + i as i64 * 500),
+            count((1_000 + i64_i * 500) * tick),
         );
-        cluster.insert(names::http_status::S500.into(), count(2 + i as i64));
+        cluster.insert(names::http_status::S500.into(), count(2 + i64_i));
         cluster.insert(names::http_status::S503.into(), count(1));
         cluster.insert(
             names::backend::RESPONSE_TIME.into(),
@@ -114,9 +121,20 @@ fn fixture_metrics() -> AggregatedMetrics {
             names::cluster::AVAILABLE_BACKENDS.into(),
             gauge(if i == 2 { 0 } else { 2 }),
         );
+        let tick_u64 = tick as u64;
         let backends = vec![
-            backend_metrics(format!("{id}-1"), 1_024 * (i as u64 + 1), 30, 110),
-            backend_metrics(format!("{id}-2"), 2_048 * (i as u64 + 1), 35, 120),
+            backend_metrics(
+                format!("{id}-1"),
+                125_000 * (i as u64 + 1) * tick_u64,
+                30,
+                110,
+            ),
+            backend_metrics(
+                format!("{id}-2"),
+                250_000 * (i as u64 + 1) * tick_u64,
+                35,
+                120,
+            ),
         ];
         clusters.insert((*id).into(), ClusterMetrics { cluster, backends });
     }
@@ -186,18 +204,23 @@ fn backend_metrics(id: String, bytes: u64, p50: u64, p99: u64) -> BackendMetrics
     }
 }
 
-/// Fresh fixture App at OVERVIEW + a single synthetic snapshot already
-/// ingested. The render-time clock is set to `Instant::now()` so trend
-/// glyphs / age formatting depend only on the wall clock at render time,
-/// which insta sees through the trimmed buffer. Acceptable: trend glyphs
-/// only flip when a second sample lands, and our fixture only pushes one.
+/// Fresh fixture App at OVERVIEW with two synthetic snapshots already
+/// ingested, one second apart. The `RateCalculator` returns `None` on
+/// the first observation, so a single ingestion would show a flat 0 in
+/// every rate-derived column (cluster RPS, backend bandwidth) — the
+/// double ingest exercises the rate path so the snapshot reflects real
+/// per-second values.
 fn fixture_app() -> App {
     let mut app = App::new();
-    let snap = Snapshot {
-        metrics: fixture_metrics(),
-        received_at: Instant::now(),
-    };
-    app.ingest_snapshot(&snap);
+    let t0 = Instant::now();
+    app.ingest_snapshot(&Snapshot {
+        metrics: fixture_metrics_at(0),
+        received_at: t0,
+    });
+    app.ingest_snapshot(&Snapshot {
+        metrics: fixture_metrics_at(1),
+        received_at: t0 + Duration::from_secs(1),
+    });
     app.ingest_listeners(ListenersSnapshot {
         list: fixture_listeners(),
     });
