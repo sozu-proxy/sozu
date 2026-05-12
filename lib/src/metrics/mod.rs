@@ -438,9 +438,11 @@ impl Aggregator {
 
     /// Apply or renew a runtime cardinality lease for `client_id`. If a lease
     /// for the same client already exists it is REPLACED (used for renewals).
-    /// `ttl` is clamped to [`LEASE_TTL_MAX`]. Returns `(previous_effective,
-    /// new_effective)` so callers can decide whether to emit a
-    /// `MetricDetailChanged` audit event.
+    /// `ttl` values above [`LEASE_TTL_MAX`] are **rejected** with
+    /// [`LeaseApplyOutcome::TtlOutOfRange`] (NOT clamped); callers must
+    /// handle that arm or pre-validate the TTL. On success the call returns
+    /// `(previous_effective, new_effective)` so callers can decide whether
+    /// to emit a `MetricDetailChanged` audit event.
     ///
     /// The proto contract on `SetMetricDetail.ttl_seconds` is that the worker
     /// **rejects** out-of-range values with a `FAILURE` response — that

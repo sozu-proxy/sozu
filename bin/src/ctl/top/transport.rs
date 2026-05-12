@@ -105,9 +105,10 @@ pub struct CertsSnapshot {
 
 /// Capacity of the events channel. 64 is generous for the operator-pace
 /// event stream (BACKEND_UP/DOWN, control-plane mutations, the new
-/// METRIC_DETAIL_CHANGED audit). Bursts above 64 drop oldest at the UI
-/// side via `recv_deadline` not the channel itself; the bound just keeps
-/// memory bounded if the UI freezes momentarily.
+/// METRIC_DETAIL_CHANGED audit). Bursts above 64 follow the publish-or-skip
+/// contract used by every other snapshot channel: `try_send` on a full
+/// bounded channel drops the newest sample (the 64 oldest stay queued for
+/// the UI). The bound keeps memory bounded if the UI freezes momentarily.
 const EVENTS_CAP: usize = 64;
 
 /// Per-read deadline for the events loop. We do NOT want an unbounded
@@ -542,10 +543,11 @@ fn events_loop(
                         event: ev,
                         received_at: Instant::now(),
                     };
-                    // Drop oldest semantics on overflow: we never block the
-                    // events thread on a stuck UI. A `try_send` failure on a
-                    // populated bounded channel is acceptable (the UI is
-                    // already showing 64 recent events; one more drops).
+                    // Publish-or-skip on overflow: we never block the events
+                    // thread on a stuck UI. A `try_send` failure on a full
+                    // bounded channel drops the newest sample (the 64
+                    // oldest stay queued for the UI). Documented contract
+                    // shared with the snapshot channels above.
                     let _ = tx.try_send(topev);
                 }
             }

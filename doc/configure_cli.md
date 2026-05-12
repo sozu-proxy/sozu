@@ -153,9 +153,8 @@ Common flags:
 | `--lease-ttl-seconds <N>` | Lease TTL; auto-renewed at half-TTL (default `60`, server clamps at `300`). |
 | `--skin <NAME>` | Resolve `$XDG_CONFIG_HOME/sozu/skins/<NAME>.toml` (`SOZU_TOP_SKIN` env wins). |
 | `--glyphs <MODE>` | Force a glyph mode (`braille|block|tty`); auto-detect by default. |
-| `--no-color`, `--no-mouse` | Opt out of ANSI colour / SGR mouse capture. |
+| `--no-mouse` | Disable SGR mouse capture (helps with multiplexers that mis-route mouse events). |
 | `--snapshot <N>`, `--tick-once` | Render N frames / one tick and exit (test affordances). |
-| `--log-file <PATH>` | Ship internal TUI logs here so they don't stomp the screen. |
 
 Key bindings (operator quick reference; see `doc/sozu-top.md` for the
 full list):
