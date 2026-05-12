@@ -1069,18 +1069,24 @@ impl App {
     }
 
     /// Open the colon palette and clear any pending error. Called by the
-    /// renderer when the operator presses `:`.
+    /// renderer when the operator presses `:`. Marks the App dirty so the
+    /// render loop's dirty-gate paints the palette line on the next frame
+    /// instead of waiting for the next snapshot tick (~1 s on a quiet
+    /// system).
     pub fn open_palette(&mut self) {
         self.palette_open = true;
         self.palette_input = tui_input::Input::default();
         self.palette_error = None;
+        self.is_dirty = true;
     }
 
     /// Close the palette without applying the in-progress command.
-    /// Called on Escape / Ctrl-C while the palette is open.
+    /// Called on Escape / Ctrl-C while the palette is open. Marks dirty
+    /// so the F-key bar redraws over the dismissed palette immediately.
     pub fn cancel_palette(&mut self) {
         self.palette_open = false;
         self.palette_input = tui_input::Input::default();
+        self.is_dirty = true;
     }
 
     /// Apply the in-progress palette command. Recognised commands:
@@ -1115,6 +1121,10 @@ impl App {
                     // than re-populating with the operator's previous
                     // typo. Mirrors the success path (line below).
                     self.palette_input = tui_input::Input::default();
+                    // palette_error is rendered on the F-key bar; the
+                    // dirty-gate would otherwise hide the message until
+                    // the next snapshot or pulse-tick.
+                    self.is_dirty = true;
                     return;
                 }
             }
@@ -1122,6 +1132,10 @@ impl App {
         self.palette_open = false;
         self.palette_input = tui_input::Input::default();
         self.palette_error = None;
+        // Apply always mutates visible state (active_tab / help_visible /
+        // should_quit / palette_error), so the next frame must repaint
+        // regardless of which branch ran above.
+        self.is_dirty = true;
     }
 }
 
