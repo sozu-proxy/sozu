@@ -54,7 +54,7 @@ sozu-lib = { workspace = true }
 color-eyre           = { workspace = true, optional = true }
 crossbeam-channel    = { workspace = true, optional = true }
 crossterm            = { workspace = true, optional = true, features = ["events", "bracketed-paste"] }
-ctrlc                = { workspace = true, optional = true }
+ctrlc                = { workspace = true, optional = true, features = ["termination"] }
 ratatui              = { workspace = true, optional = true, features = ["crossterm", "macros", "underline-color"] }
 throbber-widgets-tui = { workspace = true, optional = true }
 toml                 = { workspace = true, optional = true }
