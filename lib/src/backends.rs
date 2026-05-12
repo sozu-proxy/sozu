@@ -1299,7 +1299,9 @@ mod backends_test {
             })
             .expect("metrics query succeeds");
         let cluster_metrics = match response.content_type {
-            Some(sozu_command_lib::proto::command::response_content::ContentType::WorkerMetrics(wm)) => wm,
+            Some(
+                sozu_command_lib::proto::command::response_content::ContentType::WorkerMetrics(wm),
+            ) => wm,
             other => panic!("expected WorkerMetrics, got {other:?}"),
         };
         let cm = cluster_metrics
