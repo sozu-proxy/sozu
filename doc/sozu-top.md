@@ -84,9 +84,12 @@ The TUI auto-applies a `Backend`-level lease on startup so the
 BACKENDS / per-backend rows on CLUSTERS and OVERVIEW carry real
 data. The lease appears as an `EventKind::METRIC_DETAIL_CHANGED` event
 in the EVENTS pane. Override with `--detail process|frontend|cluster|
-backend` or `--lease-ttl-seconds N`. Mixed-version fleets where one or
-more workers don't speak the verb surface in the status bar (the
-remaining workers still apply the lease normally).
+backend` or `--lease-ttl-seconds N`. Workers that pre-date the verb
+(e.g. inherited from a prior master across an `UpgradeMain`) reply
+with the standard `unknown request type` error; the remaining workers
+still apply the lease normally. Production deployments keep master
+and workers in sync via the upgrade path, so this mixed-version state
+is transient.
 
 ## Skins
 

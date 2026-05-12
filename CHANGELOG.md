@@ -506,14 +506,12 @@ upgrade. See `doc/upgrade/1.x-to-2.0.md` for the full migration guide.
   a TTL-bounded lease. Multiple clients lease independently — the
   effective level is `max(configured, max(active leases))`. Leases
   self-expire server-side after `ttl_seconds` so a crashed client
-  cannot permanently elevate cardinality. Mixed-version fleets where
-  one or more workers can't decode the verb surface in
-  `MetricDetailStatus.unsupported_workers[]` once the per-worker
-  proto-version handshake gates the dispatch (the proto field +
-  `WorkerInfo.proto_version` snapshot land in this release; the
-  capability-aware dispatch is tracked as follow-up — workers without a
-  recorded version today are presumed compatible). Full semantics in
-  `command.proto`'s `SetMetricDetail` doc comment. Audit-scope: every
+  cannot permanently elevate cardinality. Workers that pre-date the
+  verb return the standard `unknown request type` error, which surfaces
+  in the normal fan-out error tally on `MetricDetailStatus`; production
+  deployments keep master + workers in sync via the `UpgradeMain`
+  hot-upgrade flow, so this mixed-version state is transient. Full
+  semantics in `command.proto`'s `SetMetricDetail` doc comment. Audit-scope: every
   cardinality transition emits `EventKind::METRIC_DETAIL_CHANGED` —
   operator-initiated transitions are logged by the master at the
   dispatch site, AND the worker now emits the same event for janitor-

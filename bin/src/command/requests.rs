@@ -396,13 +396,11 @@ impl Server {
             }
             // `sozu top`'s runtime cardinality lease verb. Each worker maintains
             // its own lease table and recomputes the effective `MetricDetail` as
-            // `max(configured, max(active leases))`. The master fans the verb
-            // out via the generic worker_request path; lease bookkeeping +
-            // Capability-aware dispatch: filters workers by proto_version
-            // before fan-out, synthesises a `MetricDetailStatus` reply
-            // populating `unsupported_workers` for any worker whose
-            // recorded proto_version is below the minimum required for
-            // `SetMetricDetail`.
+            // `max(configured, max(active leases))`. The master fans the verb out
+            // through a dedicated dispatcher that synthesises the aggregate
+            // `MetricDetailStatus` reply, captures the master's own
+            // configured/effective view, and emits the attempt-time + completion
+            // audit rows alongside the per-worker fan-out.
             RequestType::SetMetricDetail(req) => {
                 set_metric_detail_request(self, client, req);
             }
@@ -506,7 +504,6 @@ fn list_workers(server: &mut Server, client: &mut ClientSession) {
             id: worker.id,
             pid: worker.pid,
             run_state: worker.run_state as i32,
-            proto_version: Some(worker.proto_version),
         })
         .collect();
 
@@ -2257,24 +2254,18 @@ fn clone_entry(entry: &AuditEntry) -> AuditEntry {
 }
 
 // =========================================================
-// SetMetricDetail — capability-aware dispatch.
+// SetMetricDetail — dedicated dispatcher.
 //
-// Pre-filters workers by their recorded `proto_version` against the
-// minimum required to decode `SetMetricDetail` (tag 55 +
-// `peer_pid`/`peer_session_ulid` fields), skipping inherited-from-
-// before-UpgradeMain workers whose `WorkerSession.proto_version` is
-// below the master's compile-time `SOZU_PROTO_VERSION`. Capable workers
-// are scattered to one-by-one via `scatter_on`; unsupported workers
-// are reported in `MetricDetailStatus.unsupported_workers[]` without
-// the round-trip cost of a doomed fan-out.
-//
-// The minimum proto version required for `SetMetricDetail` is the
-// constant exported by `sozu_command_lib`. When new wire-affecting
-// `RequestType` variants land that need separate gating, declare a
-// dedicated `MIN_PROTO_VERSION_FOR_<verb>` constant here so the gate
-// stays per-verb rather than coupled to the global SOZU_PROTO_VERSION
-// monotonic bump.
-const MIN_PROTO_VERSION_FOR_SET_METRIC_DETAIL: u32 = 1;
+// Performs master-side length / TTL pre-validation that mirrors
+// `worker_request`, populates the peer binding from the connecting
+// `ClientSession`, emits the attempt-time audit row, and fans the
+// request out to every worker via the standard scatter path. Workers
+// that pre-date this verb return `WorkerResponse::error("unknown
+// request type")` which folds into the standard fan-out error tally
+// (`extras.fanout.workers_err`); operators see "succeeded with errors"
+// rather than a dedicated capability-skip list. Production keeps
+// master + workers in sync via `UpgradeMain`, so the mixed-version
+// state is transient.
 
 /// Gathers per-worker `SetMetricDetail` responses, synthesises a
 /// `MetricDetailStatus` reply for the client, and audits the
@@ -2294,11 +2285,6 @@ struct SetMetricDetailTask {
     /// cardinality alongside per-worker leases.
     master_configured: MetricDetail,
     master_previous_effective: MetricDetail,
-    /// Worker ids the master refused to scatter to because their
-    /// recorded `proto_version` was below
-    /// `MIN_PROTO_VERSION_FOR_SET_METRIC_DETAIL`. Surfaced verbatim in
-    /// the `unsupported_workers[]` field of the synthesised reply.
-    unsupported_workers: Vec<String>,
     /// Completion-time inline-audit target so the post-fanout audit
     /// row carries the same `target` / verb shape as the attempt-time
     /// line. Cloned from the `inline_audit` slot the generic
@@ -2311,13 +2297,11 @@ struct SetMetricDetailTask {
     metric_detail_audit: MetricDetailAuditFields,
 }
 
-/// Dispatch a `SetMetricDetail` request through the capability-aware
-/// path. Performs the same length / TTL pre-validation that
-/// `worker_request` does, populates the peer binding from the
-/// connecting `ClientSession`, emits the attempt-time audit row, then
-/// fans out only to workers whose `proto_version` satisfies
-/// `MIN_PROTO_VERSION_FOR_SET_METRIC_DETAIL`. Workers below that bar
-/// land in `MetricDetailStatus.unsupported_workers[]`.
+/// Dispatch a `SetMetricDetail` request. Performs the same length /
+/// TTL pre-validation that `worker_request` does, populates the peer
+/// binding from the connecting `ClientSession`, emits the attempt-time
+/// audit row, and fans out unconditionally to every worker through the
+/// standard scatter path.
 pub fn set_metric_detail_request(
     server: &mut Server,
     client: &mut ClientSession,
@@ -2414,23 +2398,6 @@ pub fn set_metric_detail_request(
         );
     }
 
-    // Capability filter: split workers by proto_version. We need a
-    // snapshot of capable worker ids before issuing scatter_on calls
-    // because the iteration borrows `server.workers` and `scatter_on`
-    // mutates the same map.
-    let mut supported_worker_ids = Vec::new();
-    let mut unsupported_workers = Vec::new();
-    for worker in server.workers.values() {
-        if worker.run_state == RunState::Stopped {
-            continue;
-        }
-        if worker.proto_version >= MIN_PROTO_VERSION_FOR_SET_METRIC_DETAIL {
-            supported_worker_ids.push(worker.id);
-        } else {
-            unsupported_workers.push(worker.id.to_string());
-        }
-    }
-
     client.return_processing("Processing SetMetricDetail...");
 
     let inline_audit = InlineAuditTarget {
@@ -2440,30 +2407,21 @@ pub fn set_metric_detail_request(
         target: metric_detail_audit.target.clone(),
     };
 
-    // Create the gathering task. If there are zero capable workers (the
-    // master is alone, or every worker is below the bar) we still want
-    // to synthesise a MetricDetailStatus reply so the client sees its
-    // `unsupported_workers[]` list. Drive the task by calling
-    // `new_task` then `scatter_on` per worker — same shape as
-    // `server.scatter` but with the per-worker filter.
+    // Fan out unconditionally to every worker through the standard
+    // scatter path. Workers that pre-date `SetMetricDetail` reply with
+    // `WorkerResponse::error("unknown request type")` which folds into
+    // the standard fan-out error tally; `on_finish` surfaces them via
+    // the existing fanout summary rather than a dedicated skip list.
     let task = Box::new(SetMetricDetailTask {
         client_token: client.token,
         gatherer: DefaultGatherer::default(),
         started_at,
         master_configured,
         master_previous_effective,
-        unsupported_workers,
         inline_audit,
         metric_detail_audit,
     });
-    let task_id = server.new_task(task, Timeout::Default);
-    for worker_id in supported_worker_ids {
-        server.scatter_on(request.clone(), task_id, 0, Some(worker_id));
-    }
-    // If `supported_worker_ids` was empty `scatter_on` never ran and the
-    // task's `expected_responses` stays at 0. The gatherer treats that
-    // as immediate completion on the next `tick`, so `on_finish` fires
-    // with an empty `responses` map and the synthesis still happens.
+    server.scatter(request, task, Timeout::Default, None);
 }
 
 impl GatheringTask for SetMetricDetailTask {
@@ -2516,7 +2474,6 @@ impl GatheringTask for SetMetricDetailTask {
             effective: master_effective as i32,
             previous_effective: self.master_previous_effective as i32,
             workers: workers_map,
-            unsupported_workers: self.unsupported_workers.clone(),
         };
 
         // Completion-time audit row. Same shape as the generic WorkerTask
@@ -2579,7 +2536,7 @@ impl GatheringTask for SetMetricDetailTask {
             if errors > 0 || timed_out {
                 "SetMetricDetail completed with worker errors"
             } else {
-                "Successfully applied SetMetricDetail to all capable workers"
+                "Successfully applied SetMetricDetail to all workers"
             },
         );
     }

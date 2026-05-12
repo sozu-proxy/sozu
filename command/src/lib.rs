@@ -1,17 +1,5 @@
 //! Tools and types used to communicate with Sōzu.
 
-/// Numeric proto-capability version baked into every Sōzu binary at
-/// compile time. Bumped any time a new wire-affecting `RequestType` (or
-/// proto field) lands that callers need to gate on. Surfaced to the
-/// master via [`proto::command::WorkerInfo::proto_version`] so that
-/// mixed-version fleets surviving a `UpgradeMain` flow can be detected.
-///
-/// Version timeline:
-/// - `1`: introduced alongside `SetMetricDetail` (tag 55),
-///   `METRIC_DETAIL_CHANGED` (EventKind tag 30), the worker→master audit
-///   IPC, and the per-lease peer-credential binding.
-pub const SOZU_PROTO_VERSION: u32 = 1;
-
 #[macro_use]
 extern crate serde;
 
