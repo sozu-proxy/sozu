@@ -20,7 +20,9 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
-use sozu_command_lib::proto::command::{AggregatedMetrics, FilteredMetrics, filtered_metrics};
+use sozu_command_lib::proto::command::{
+    AggregatedMetrics, ClusterMetrics, FilteredMetrics, filtered_metrics,
+};
 use sozu_lib::metrics::names;
 
 use super::theme::GlyphMode;
@@ -619,21 +621,25 @@ impl App {
             .clusters
             .iter()
             .map(|(id, cm)| {
-                let requests = count_value(cm.cluster.get("requests")).unwrap_or(0);
-                let errors_5xx: i64 = ERRORS_5XX
-                    .iter()
-                    .filter_map(|k| count_value(cm.cluster.get(*k)))
-                    .sum();
-                let p99_ms =
-                    percentile_p99_ms(cm.cluster.get(names::backend::RESPONSE_TIME)).unwrap_or(0);
-                let p50_ms =
-                    percentile_p50_ms(cm.cluster.get(names::backend::RESPONSE_TIME)).unwrap_or(0);
-                // Backends-up vs backends-total; both are gauges and so
-                // survive the hourly counter clear.
+                let requests = cluster_count_total(cm, names::backend::REQUESTS);
+                let errors_5xx: i64 = ERRORS_5XX.iter().map(|k| cluster_count_total(cm, k)).sum();
+                let p99_ms = cluster_p99_max(cm);
+                let p50_ms = cluster_p50_max(cm);
+                // Backends-up vs backends-total; both are gauges. The total
+                // is published at cluster level; per-backend availability
+                // either rolls up to the cluster gauge (cluster detail) or
+                // appears as one entry per backend (backend detail).
                 let backends_total =
                     gauge_value(cm.cluster.get(names::cluster::TOTAL_BACKENDS)).unwrap_or(0) as u32;
-                let backends_available =
+                let cluster_available =
                     gauge_value(cm.cluster.get(names::backend::AVAILABLE)).unwrap_or(0) as u32;
+                let backend_available_sum: u32 = cm
+                    .backends
+                    .iter()
+                    .filter_map(|b| gauge_value(b.metrics.get(names::backend::AVAILABLE)))
+                    .map(|v| v as u32)
+                    .sum();
+                let backends_available = cluster_available.max(backend_available_sum);
                 let error_rate_pct = if requests > 0 {
                     (errors_5xx as f64 / requests as f64) * 100.0
                 } else {
@@ -700,7 +706,8 @@ impl App {
                         .unwrap_or(0),
                     p99_ms: percentile_p99_ms(bm.metrics.get(names::backend::RESPONSE_TIME))
                         .unwrap_or(0),
-                    requests_total: count_value(bm.metrics.get("requests")).unwrap_or(0) as u64,
+                    requests_total: count_value(bm.metrics.get(names::backend::REQUESTS))
+                        .unwrap_or(0) as u64,
                 });
             }
         }
@@ -736,29 +743,37 @@ impl App {
     }
 
     fn fold_overview(&mut self, m: &AggregatedMetrics, sampled_at: Instant) {
-        // Sōzu emits `proxying` (per-cluster aggregated across workers) and
-        // `main` (master process). For the OVERVIEW we want the global rate
-        // of incoming requests; sum across clusters. The `requests` counter
-        // is the canonical RPS source — see `lib/src/metrics/mod.rs`.
+        // Sōzu emits the canonical per-request counter (`names::backend::REQUESTS`)
+        // from `record_backend_metrics!`. The cardinality knob routes the
+        // counter to either `cm.cluster[REQUESTS]` (detail = cluster, default)
+        // or `cm.backends[i].metrics[REQUESTS]` (detail = backend, the level
+        // `sozu top` auto-leases on startup). `cluster_count_total` handles
+        // both filings transparently so the OVERVIEW stays correct regardless
+        // of the active detail level.
         let mut total_requests: i64 = 0;
         let mut total_errors_5xx: i64 = 0;
         let mut total_requests_observed: i64 = 0;
         for cm in m.clusters.values() {
-            if let Some(v) = count_value(cm.cluster.get("requests")) {
-                total_requests = total_requests.saturating_add(v);
-                total_requests_observed = total_requests_observed.saturating_add(v);
+            let cluster_requests = cluster_count_total(cm, names::backend::REQUESTS);
+            if cluster_requests > 0 {
+                total_requests = total_requests.saturating_add(cluster_requests);
+                total_requests_observed = total_requests_observed.saturating_add(cluster_requests);
             }
             for code in ERRORS_5XX {
-                if let Some(v) = count_value(cm.cluster.get(code)) {
+                let v = cluster_count_total(cm, code);
+                if v > 0 {
                     total_errors_5xx = total_errors_5xx.saturating_add(v);
                 }
             }
         }
-        // Fall back to `proxying` if no cluster metrics are exposed (the
-        // worker has `MetricDetail::Process` configured; OVERVIEW should
-        // still show *something*).
+        // Final fallback when no per-cluster counter is populated yet (no
+        // backend round-trip completed since the worker started, OR
+        // `metric_detail = process` strips both labels). `http.requests` is
+        // incremented at request-receive time without cluster_id, so it
+        // surfaces traffic the user is generating even before the first
+        // response cycle finishes.
         if total_requests_observed == 0 {
-            if let Some(v) = count_value(m.proxying.get("requests")) {
+            if let Some(v) = count_value(m.proxying.get(names::http::REQUESTS)) {
                 total_requests = total_requests.saturating_add(v);
             }
         }
@@ -791,15 +806,10 @@ impl App {
         // Latency p99 — sum of cluster `backend_response_time` percentiles
         // is not meaningful (you cannot average percentiles), so we take
         // the max p99 across clusters. Operators reading the OVERVIEW want
-        // "is anyone slow?" not "average latency".
-        let mut max_p99_ms: u64 = 0;
-        for cm in m.clusters.values() {
-            if let Some(p99) = percentile_p99_ms(cm.cluster.get(names::backend::RESPONSE_TIME)) {
-                if p99 > max_p99_ms {
-                    max_p99_ms = p99;
-                }
-            }
-        }
+        // "is anyone slow?" not "average latency". `cluster_p99_max` also
+        // walks per-backend filings so the answer holds under any detail
+        // level.
+        let max_p99_ms = m.clusters.values().map(cluster_p99_max).max().unwrap_or(0);
         self.overview.latency_p99_ms.push(max_p99_ms);
 
         // Saturation: prefer `slab.usage_percent`; fall back to
@@ -934,6 +944,54 @@ fn percentile_p50_ms(metric: Option<&FilteredMetrics>) -> Option<u64> {
         filtered_metrics::Inner::Percentiles(p) => Some(p.p_50),
         _ => None,
     }
+}
+
+/// Sum a count counter across both filings of the cardinality knob: the
+/// cluster-level entry (`metric_detail = cluster`, default) AND the
+/// per-backend entries (`metric_detail = backend`, the level the TUI
+/// auto-elevates to on startup). The two filings are disjoint under any
+/// given detail level — only one is populated at a time — so summing
+/// both yields the correct cluster-wide total in either configuration.
+fn cluster_count_total(cm: &ClusterMetrics, key: &str) -> i64 {
+    let cluster_level = count_value(cm.cluster.get(key)).unwrap_or(0);
+    let backend_sum: i64 = cm
+        .backends
+        .iter()
+        .filter_map(|b| count_value(b.metrics.get(key)))
+        .sum();
+    cluster_level.saturating_add(backend_sum)
+}
+
+/// Max of the cluster-level percentile and every per-backend percentile.
+/// Under cluster-detail the backends list is empty; under backend-detail
+/// only the per-backend entries are populated. Taking the max matches
+/// "is anyone slow?" — the operator-facing intent of the OVERVIEW pane.
+fn cluster_p99_max(cm: &ClusterMetrics) -> u64 {
+    let cluster_level = percentile_p99_ms(cm.cluster.get(names::backend::RESPONSE_TIME));
+    let backend_max = cm
+        .backends
+        .iter()
+        .filter_map(|b| percentile_p99_ms(b.metrics.get(names::backend::RESPONSE_TIME)))
+        .max();
+    cluster_level
+        .into_iter()
+        .chain(backend_max)
+        .max()
+        .unwrap_or(0)
+}
+
+fn cluster_p50_max(cm: &ClusterMetrics) -> u64 {
+    let cluster_level = percentile_p50_ms(cm.cluster.get(names::backend::RESPONSE_TIME));
+    let backend_max = cm
+        .backends
+        .iter()
+        .filter_map(|b| percentile_p50_ms(b.metrics.get(names::backend::RESPONSE_TIME)))
+        .max();
+    cluster_level
+        .into_iter()
+        .chain(backend_max)
+        .max()
+        .unwrap_or(0)
 }
 
 /// Per-cluster row produced by `App::cluster_rows`. Pure data; the renderer
