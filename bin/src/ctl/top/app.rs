@@ -545,6 +545,11 @@ pub struct App {
     /// are the canonical `names::*` strings the pane reads, so a key
     /// rename can never silently freeze a trend column.
     h2_trends: HashMap<&'static str, SparkRing>,
+    /// Snapshot ingest is suspended when `true`. The transport keeps
+    /// polling and the cardinality lease keeps renewing, but the App
+    /// ignores incoming `Snapshot`s so the visible state is frozen on
+    /// the last frame. Toggled by F5 / `p`.
+    pub paused: bool,
 }
 
 /// Columns the CLUSTERS pane can sort by. Cycled with `s`; reversed with
@@ -633,6 +638,7 @@ impl App {
             rates: RateCalculator::default(),
             cluster_rps: HashMap::new(),
             h2_trends: HashMap::new(),
+            paused: false,
         }
     }
 
@@ -656,6 +662,12 @@ impl App {
     /// the render loop on every drain of the `crossbeam_channel`. Cheap (one
     /// linear scan over the proxy / cluster maps).
     pub fn ingest_snapshot(&mut self, snap: &Snapshot) {
+        if self.paused {
+            // F5 / `p` freezes the visible state without dropping the
+            // transport lease. Skip the entire fold so sparklines and
+            // tables stay on the last frame instead of advancing.
+            return;
+        }
         self.last_snapshot_at = Some(snap.received_at);
         self.fold_overview(&snap.metrics, snap.received_at);
         self.fold_h2_trends(&snap.metrics);
@@ -837,9 +849,19 @@ impl App {
                 rows.push(BackendRow {
                     cluster_id: cluster_id.clone(),
                     backend_id: bm.backend_id.clone(),
-                    back_bytes_in: count_value(bm.metrics.get(names::backend::BACK_BYTES_IN))
+                    // `BACK_BYTES_IN`/`OUT` are no-label proxy-level
+                    // counters emitted from `pipe.rs`, `kawa_h1.rs`, and
+                    // `mux/mod.rs` via `count!(key, value)` — they never
+                    // land per-backend. The cumulative backend-socket
+                    // bytes flow through `record_backend_metrics!` at
+                    // request end with `(cluster_id, backend_id)`
+                    // labels under the keys `BYTES_IN` / `BYTES_OUT`
+                    // (`lib/src/metrics/mod.rs::receive_metric`, called
+                    // from `lib/src/lib.rs::end_of_session`). Read from
+                    // there so the BACKENDS row shows real bandwidth.
+                    back_bytes_in: count_value(bm.metrics.get(names::backend::BYTES_IN))
                         .unwrap_or(0) as u64,
-                    back_bytes_out: count_value(bm.metrics.get(names::backend::BACK_BYTES_OUT))
+                    back_bytes_out: count_value(bm.metrics.get(names::backend::BYTES_OUT))
                         .unwrap_or(0) as u64,
                     connections: gauge_value(
                         bm.metrics.get(names::backend::CONNECTIONS_PER_BACKEND),
