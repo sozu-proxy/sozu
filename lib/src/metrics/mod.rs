@@ -285,6 +285,16 @@ pub enum LeaseApplyOutcome {
     /// dispatch (proto fuzzing, future internal use) instead of
     /// silently clamping their intent.
     TtlOutOfRange,
+    /// A renewal request was presented with a [`PeerBinding`] that
+    /// disagrees with the existing lease's apply-time binding. Returned
+    /// only when the existing binding is fully known (per
+    /// [`PeerBinding::is_known`]); unknown-binding leases (no
+    /// `SO_PEERCRED` available, pre-binding callers) continue to
+    /// accept any renewer. Closes the same-UID `client_id`-collision
+    /// takeover where an attacker re-applies a lease against a
+    /// victim's id and replaces the binding to lock the victim out of
+    /// their own clear.
+    Unauthorized,
 }
 
 /// Master-populated peer binding stored alongside each lease so subsequent
@@ -474,6 +484,23 @@ impl Aggregator {
         let is_renewal = self.leases.contains_key(&client_id);
         if !is_renewal && self.leases.len() >= LEASE_TABLE_CAP {
             return LeaseApplyOutcome::TableFull;
+        }
+        // Renewal-binding gate: when a lease already exists for this
+        // `client_id` and its apply-time binding is fully known, the
+        // renewer's presented binding MUST match. Without this check
+        // any same-UID caller that learns the `client_id` (PID from
+        // /proc, suffix from audit log) could re-apply against it,
+        // overwriting the binding to point at the attacker's session
+        // and then driving the victim's Drop-time `clear` into
+        // `Unauthorized`. Unknown apply-time bindings continue to
+        // accept any renewer per the proto contract on
+        // `SetMetricDetail.peer_pid` / `peer_session_ulid`.
+        if is_renewal
+            && let Some(entry) = self.leases.get(&client_id)
+            && entry.binding.is_known()
+            && !entry.binding.matches(&binding)
+        {
+            return LeaseApplyOutcome::Unauthorized;
         }
         let expires_at = Instant::now() + ttl;
         self.leases.insert(
@@ -996,6 +1023,7 @@ mod tests {
     fn lease_apply_renewal_replaces_previous_for_same_client() {
         // The renewer client re-sends with the same `client_id`; the entry
         // is REPLACED (not duplicated). Lease count stays at 1.
+        // Unknown bindings on both sides skip the renewal-binding gate.
         let mut agg = Aggregator::new("sozu".to_owned());
         let _ = agg.lease_apply(
             "renewer".to_owned(),
@@ -1010,6 +1038,83 @@ mod tests {
             PeerBinding::default(),
         );
         assert_eq!(agg.lease_count(), 1);
+    }
+
+    #[test]
+    fn lease_apply_renewal_rejects_foreign_binding() {
+        // Same-UID `client_id` collision attack: the victim applies with
+        // a known binding; an attacker that learns the `client_id`
+        // attempts to renew under a different (pid, session_ulid). The
+        // renewal must be refused so the victim's apply-time binding
+        // remains the sole authoritative owner — both for subsequent
+        // renewals AND for the victim's own Drop-time `clear`.
+        let mut agg = Aggregator::new("sozu".to_owned());
+        let victim = PeerBinding {
+            pid: Some(4242),
+            session_ulid: Some(0x0123_4567_89AB_CDEF_FEDC_BA98_7654_3210),
+        };
+        let outcome = agg.lease_apply(
+            "topcli".to_owned(),
+            MetricDetailLevel::Backend,
+            Duration::from_secs(60),
+            victim,
+        );
+        assert!(
+            matches!(outcome, LeaseApplyOutcome::Applied { .. }),
+            "victim's initial apply must succeed"
+        );
+        let attacker = PeerBinding {
+            pid: Some(9999),
+            session_ulid: Some(0xDEAD_BEEF_DEAD_BEEF_DEAD_BEEF_DEAD_BEEF),
+        };
+        let outcome = agg.lease_apply(
+            "topcli".to_owned(),
+            MetricDetailLevel::Backend,
+            Duration::from_secs(60),
+            attacker,
+        );
+        assert_eq!(
+            outcome,
+            LeaseApplyOutcome::Unauthorized,
+            "renewal with a mismatched known binding must be refused"
+        );
+        // The victim can still clear their own lease — proof the
+        // refused attempt did not corrupt the stored binding.
+        let clear = agg.lease_clear("topcli", victim);
+        assert!(
+            matches!(clear, LeaseClearOutcome::Cleared { .. }),
+            "victim's original binding must still clear cleanly after \
+             the foreign-binding renewal was refused"
+        );
+    }
+
+    #[test]
+    fn lease_apply_renewal_with_matching_binding_succeeds() {
+        // Symmetry case: the legitimate owner re-applies with the same
+        // (pid, session_ulid). The renewal must succeed so the TUI's
+        // own renewer thread keeps the lease alive across its TTL.
+        let mut agg = Aggregator::new("sozu".to_owned());
+        let owner = PeerBinding {
+            pid: Some(1234),
+            session_ulid: Some(0xAAAA_BBBB_CCCC_DDDD_EEEE_FFFF_0000_1111),
+        };
+        let _ = agg.lease_apply(
+            "topcli".to_owned(),
+            MetricDetailLevel::Backend,
+            Duration::from_secs(30),
+            owner,
+        );
+        let outcome = agg.lease_apply(
+            "topcli".to_owned(),
+            MetricDetailLevel::Backend,
+            Duration::from_secs(60),
+            owner,
+        );
+        assert!(
+            matches!(outcome, LeaseApplyOutcome::Applied { .. }),
+            "renewal with matching binding must succeed (otherwise the \
+             TUI's own renewer thread would be locked out)"
+        );
     }
 
     #[test]
