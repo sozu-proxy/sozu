@@ -182,7 +182,13 @@ pub fn run(
                     handle_key(&mut app, key);
                 }
                 CtEvent::Resize(_, _) => {
-                    // No-op: ratatui re-queries the size on the next draw.
+                    // ratatui re-queries the size on the next draw, but the
+                    // render loop's dirty-gate (`take_dirty || pulse.has_active`)
+                    // would otherwise skip that draw on a quiet system — the
+                    // resize event itself does not advance the snapshot tick
+                    // or any pulse. Mark the App dirty so the next frame
+                    // re-flows every pane into the new terminal area.
+                    app.mark_dirty();
                 }
                 _ => {}
             }
