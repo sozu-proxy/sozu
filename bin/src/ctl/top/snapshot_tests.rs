@@ -167,16 +167,13 @@ fn percentiles(p50: u64, p90: u64, p99: u64) -> FilteredMetrics {
 
 fn backend_metrics(id: String, bytes: u64, p50: u64, p99: u64) -> BackendMetrics {
     let mut metrics: BTreeMap<String, FilteredMetrics> = BTreeMap::new();
+    // `BYTES_IN` / `BYTES_OUT` are the per-backend backend-socket
+    // counters published by `record_backend_metrics!`; the BACKENDS pane
+    // reads them as "bw down/up". `BACK_BYTES_IN` / `BACK_BYTES_OUT` are
+    // emitted as no-label proxy counters and never land per-backend, so
+    // the fixture must not pretend otherwise.
     metrics.insert(names::backend::BYTES_IN.into(), count(bytes as i64));
     metrics.insert(names::backend::BYTES_OUT.into(), count((bytes * 4) as i64));
-    metrics.insert(
-        names::backend::BACK_BYTES_IN.into(),
-        count((bytes * 8) as i64),
-    );
-    metrics.insert(
-        names::backend::BACK_BYTES_OUT.into(),
-        count((bytes * 16) as i64),
-    );
     metrics.insert(names::backend::CONNECTIONS_PER_BACKEND.into(), gauge(12));
     metrics.insert(
         names::backend::RESPONSE_TIME.into(),
