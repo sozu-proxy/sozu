@@ -143,9 +143,6 @@ types. Critical/warm/cool tiers are always backed up by a redundant
 glyph (`▲ ▼ ●` on the OVERVIEW pane, `▲ ▼` on sortable column
 headers) so the colour signal isn't load-bearing on its own.
 
-Set `NO_COLOR=1` (recognised by the cascade) or pass `--no-color` to
-fall back to monochrome.
-
 ## Mouse capture
 
 Mouse is on by default. Some multiplexers mis-route SGR mouse events
