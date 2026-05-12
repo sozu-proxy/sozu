@@ -76,10 +76,17 @@ impl CommandManager {
     pub fn run_top(&mut self, args: TopArgs) -> Result<(), CtlError> {
         // Transport threads own their own `Channel` connections — see the
         // module-level docs for why we don't reuse `self.channel`.
-        let (snapshot_rx, _collector) = spawn_collector(self.config.clone(), args.refresh_ms)?;
-        let (events_rx, _events) = spawn_events(self.config.clone())?;
-        let (listeners_rx, _listeners) = spawn_listeners(self.config.clone())?;
-        let (certs_rx, _certs) = spawn_certs(self.config.clone())?;
+        //
+        // The shutdown flag is the canonical wake-up for the events thread:
+        // dropping its `Receiver<TopEvent>` cannot propagate across the
+        // unix socket. The three poll-driven threads still exit on
+        // receiver-drop, but we join them all on the way out for symmetry.
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (snapshot_rx, collector) = spawn_collector(self.config.clone(), args.refresh_ms)?;
+        let (events_rx, events) =
+            spawn_events(self.config.clone(), std::sync::Arc::clone(&shutdown))?;
+        let (listeners_rx, listeners) = spawn_listeners(self.config.clone())?;
+        let (certs_rx, certs) = spawn_certs(self.config.clone())?;
 
         // Apply the runtime cardinality lease. If the master/worker is too
         // old to decode `SetMetricDetail`, we surface the failure but keep
@@ -128,10 +135,16 @@ impl CommandManager {
         let result = render::run(render_cfg, snapshot_rx, events_rx, listeners_rx, certs_rx);
 
         // Drop order: lease first (issues the best-effort `clear`), then
-        // the transport thread handles fall out of scope when this
-        // function returns. Both transport threads exit when their
-        // receivers are dropped at the end of `render::run`.
+        // flip the shutdown flag so the events thread observes it on the
+        // next bounded read, then join all four transport handles so we
+        // never return with background threads still queueing into a
+        // detached aggregator.
         drop(lease);
+        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = collector.join();
+        let _ = listeners.join();
+        let _ = certs.join();
+        let _ = events.join();
 
         result.map_err(|e| {
             CtlError::ResolvePath("sozu top render loop".to_owned(), std::io::Error::other(e))
