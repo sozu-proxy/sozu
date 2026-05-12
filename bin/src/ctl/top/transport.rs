@@ -505,8 +505,7 @@ fn events_loop(
 }
 
 fn unwrap_event(resp: Response) -> Option<Event> {
-    let content = resp.content?;
-    match content.content_type? {
+    match resp.content?.content_type? {
         ContentType::Event(ev) => Some(ev),
         _ => None,
     }
