@@ -1431,6 +1431,26 @@ impl Server {
                     }),
                 };
                 if req.clear.unwrap_or(false) {
+                    // Defense-in-depth: the master pre-validates `client_id`
+                    // length at the dispatch site, but worker IPC is not
+                    // master-only — fuzz harnesses, serial_test-flagged
+                    // integration tests, and future internal callers can
+                    // issue an oversized clear directly. Mirror the apply
+                    // path's `ClientIdTooLong` arm so an unbounded HashMap
+                    // lookup is never driven by an operator-supplied string
+                    // here either. The reason string echoes the byte length
+                    // but not the operator bytes themselves (symmetric with
+                    // the audit-column-smuggling guard on the apply path).
+                    if req.client_id.len() > crate::metrics::LEASE_CLIENT_ID_MAX_BYTES {
+                        let msg = format!(
+                            "SetMetricDetail: clear client_id length {} exceeds {} bytes",
+                            req.client_id.len(),
+                            crate::metrics::LEASE_CLIENT_ID_MAX_BYTES,
+                        );
+                        error!("{}", msg);
+                        push_queue(WorkerResponse::error(message.id.clone(), msg));
+                        return;
+                    }
                     // Capture transition fields + post-clear snapshot
                     // before releasing the borrow so we can emit an
                     // Event after AND build the WorkerMetricDetailStatus
