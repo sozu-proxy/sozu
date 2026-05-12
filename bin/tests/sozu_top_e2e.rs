@@ -161,7 +161,6 @@ buffer_size = 16393
             "--snapshot",
             "1",
             "--no-mouse",
-            "--no-color",
         ])
         .output()
         .expect("spawn sozu top --snapshot 1");
