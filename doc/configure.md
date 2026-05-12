@@ -1514,6 +1514,56 @@ the SCM socket as a proto enum (`MetricDetail`); old binaries on either side
 fall back to `cluster` so a mixed-version rollout keeps emitting the historical
 metric shape.
 
+#### Runtime cardinality lease
+
+Operators can elevate a worker's effective `metric_detail` for the lifetime of
+an interactive session without rewriting `config.toml`. `sozu top` uses this
+mechanism to enable `backend` detail while the TUI is attached, and reverts it
+on exit. Other tooling (per-host scraper agents, ad-hoc debugging) can use the
+same surface.
+
+The lease is keyed by an operator-supplied `client_id` and stored on each
+worker. The effective level is `max(configured, max(active leases))`, so a
+lease never *lowers* the configured detail; it only elevates. When the last
+lease expires (TTL pop) or is explicitly cleared, the effective level falls
+back to the configured value.
+
+The proto verb that exposes this surface is `SetMetricDetail` (request tag
+`55`); the response shape is `MetricDetailStatus` carrying the master's
+`(configured, effective, previous_effective)` triple plus a per-worker
+`WorkerMetricDetailStatus` map. Every apply, clear, and TTL expiry emits an
+audit-log event of kind `MetricDetailChanged` (`EventKind::METRIC_DETAIL_CHANGED`,
+tag `30`) on the text and JSON sinks, with `lease_id=` and
+`metric_detail_reason=` as dedicated columns so operator-supplied strings
+cannot smuggle a forged adjacent column.
+
+Server-side caps and defaults (all defined in `lib/src/metrics/mod.rs`):
+
+| Knob                          | Default | Cap      | Notes                                                                                                                                                                                                                                                                                                                              |
+| ----------------------------- | ------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ttl_seconds`                 | `60`    | `300`    | Lease lifetime. The TUI renews every `ttl/2` seconds; on TUI crash the lease self-expires after at most one `ttl` window. The master rejects out-of-range TTLs before fan-out so a buggy or malicious request cannot N×amplify worker-side rejections.                                                                            |
+| `LEASE_TABLE_CAP`             | —       | `64`     | Maximum number of simultaneous leases per worker. Renewals of existing entries always succeed; only new inserts are subject to this cap. Mitigates the CWE-770 vector where a misbehaving client rolls `client_id` faster than expiry.                                                                                              |
+| `LEASE_CLIENT_ID_MAX_BYTES`   | —       | `64`     | Maximum `client_id` length. Operator tooling should pick a stable identifier (the TUI uses `top:<pid>:<8-hex>`); arbitrary user input must be capped at this length before submission.                                                                                                                                              |
+
+Trust model: the lease records the connecting peer's PID and master session
+ULID (from `SO_PEERCRED` on Linux). Subsequent `clear` requests are
+authorised against the apply-time binding — a different operator on the same
+host cannot clear another operator's lease even if they guess the
+`client_id`. Pre-binding callers and platforms without `SO_PEERCRED` degrade
+to "binding unknown" → accept any clear. Clients NEVER set the peer fields
+themselves; the master populates them from the `ClientSession` before
+fan-out.
+
+Reversibility: leases self-expire, so a crashed dashboard does not leave a
+worker permanently emitting at elevated cardinality. The audit-log trail
+records every transition; SOC tooling can reconstruct the cardinality
+posture of every worker at any point in time without polling.
+
+Renewals are not state transitions — `SetMetricDetail` is deliberately
+*not* in the systemd `RELOADING=1` / `READY=1` bracket set, so a long-lived
+TUI session does not flap the unit state. The audit-log event remains the
+authoritative trail for cardinality changes.
+
 #### StatsD wire format
 
 **Untagged** (default, `tagged_metrics = false`):
