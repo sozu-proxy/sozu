@@ -2110,7 +2110,19 @@ impl GatheringTask for WorkerTask {
             match ResponseStatus::try_from(response.status) {
                 Ok(ResponseStatus::Ok) => messages.push(format!("{worker_id}: OK")),
                 Ok(ResponseStatus::Failure) | Ok(ResponseStatus::Processing) | Err(_) => {
-                    messages.push(format!("{worker_id}: {}", response.message))
+                    // Worker error strings are partially operator-
+                    // influenced (request-derived fields, IPC payloads).
+                    // Run them through the column-boundary-aware
+                    // sanitiser before joining into `extras.reason` so
+                    // a `,` / `=` inside one worker's message cannot
+                    // forge an additional audit-row column when a SIEM
+                    // splits on `, ` / `=`. The strict variant also
+                    // strips the bidi class so a Trojan-Source-flavoured
+                    // payload cannot visually reorder the reason field.
+                    messages.push(format!(
+                        "{worker_id}: {}",
+                        sanitize_for_audit_kv(&response.message)
+                    ))
                 }
             }
         }
@@ -2515,7 +2527,16 @@ impl GatheringTask for SetMetricDetailTask {
                 });
                 let mut msgs = Vec::new();
                 for (worker_id, response) in &self.gatherer.responses {
-                    msgs.push(format!("{worker_id}: {}", response.message));
+                    // Same column-boundary sanitisation as
+                    // `WorkerTask::on_finish` above.
+                    // `SetMetricDetail` is itself the
+                    // operator-controlled verb most likely to be probed
+                    // for SIEM column smuggling, so this site is the
+                    // higher-leverage of the two reason-join paths.
+                    msgs.push(format!(
+                        "{worker_id}: {}",
+                        sanitize_for_audit_kv(&response.message)
+                    ));
                 }
                 extras.reason = Some(msgs.join(", "));
             }
@@ -3472,6 +3493,36 @@ mod audit_format_tests {
             s == "unknown" || (s.len() == 12 && s.chars().all(|c| c.is_ascii_hexdigit())),
             "unexpected SOZU_BUILD_GIT_SHA: {s:?}"
         );
+    }
+
+    #[test]
+    fn worker_message_join_sanitises_smuggled_kv_pair() {
+        // Both `WorkerTask::on_finish` and `SetMetricDetailTask::on_finish`
+        // route each worker's `response.message` through
+        // `sanitize_for_audit_kv` before joining into `extras.reason`.
+        // Verify the call-site shape catches the canonical SIEM-column-
+        // smuggling attempt — `,` and `=` inside the operator-influenced
+        // worker payload — without relying on a full Server / Gatherer
+        // ceremony to drive the on_finish path end-to-end.
+        let worker_id = 7u32;
+        let attacker_payload = "x,actor_user=mallory,sozu_version=hijacked";
+        let formatted = format!(
+            "{worker_id}: {}",
+            super::sanitize_for_audit_kv(attacker_payload)
+        );
+        assert!(
+            !formatted.contains("actor_user=mallory"),
+            "sanitised worker message must not propagate `=` into the \
+             reason column (column-boundary forge defence)"
+        );
+        assert!(
+            !formatted.contains(",actor_user"),
+            "sanitised worker message must not propagate `,` into the \
+             reason column (column-boundary forge defence)"
+        );
+        // The replacement character does survive — operators still see
+        // SOMETHING in the slot so the failure mode is visible.
+        assert!(formatted.contains('?'));
     }
 }
 
