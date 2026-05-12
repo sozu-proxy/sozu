@@ -47,6 +47,7 @@ pub mod backend {
     pub const POOL_MISS: &str = "backend.pool.miss";
     pub const POOL_SIZE: &str = "backend.pool.size";
     pub const CONNECTIONS_PER_BACKEND: &str = "connections_per_backend";
+    pub const CONNECTION_TIME: &str = "backend_connection_time";
     pub const RESPONSE_TIME: &str = "backend_response_time";
     pub const REQUESTS: &str = "requests";
     pub const FAIL_OPEN: &str = "backends.fail_open";
