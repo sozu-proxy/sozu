@@ -356,6 +356,57 @@ pub enum GlyphMode {
 }
 
 impl GlyphMode {
+    /// Bar `Set` consumed by ratatui's `Sparkline` widget. Each tier picks
+    /// a glyph alphabet matched to the resolved terminal capability:
+    ///
+    /// - `Block` keeps ratatui's default `▁▂▃▄▅▆▇█` ramp.
+    /// - `Braille` swaps to dot mosaics (`⡀⡄⡆⡇⣇⣧⣷⣿`) that look denser
+    ///   on font-stacks that anti-alias the block ramp into a single
+    ///   solid bar.
+    /// - `Tty` falls back to 7-bit ASCII so a `linux`/`dumb` console
+    ///   renders the sparkline as `. , - = + #` instead of `?` boxes.
+    pub fn sparkline_set(self) -> ratatui::symbols::bar::Set<'static> {
+        use ratatui::symbols::bar::{NINE_LEVELS, Set};
+        match self {
+            Self::Block => NINE_LEVELS,
+            Self::Braille => Set {
+                full: "⣿",
+                seven_eighths: "⣷",
+                three_quarters: "⣧",
+                five_eighths: "⣇",
+                half: "⡇",
+                three_eighths: "⡆",
+                one_quarter: "⡄",
+                one_eighth: "⡀",
+                empty: " ",
+            },
+            Self::Tty => Set {
+                full: "#",
+                seven_eighths: "#",
+                three_quarters: "+",
+                five_eighths: "+",
+                half: "=",
+                three_eighths: "-",
+                one_quarter: "-",
+                one_eighth: ".",
+                empty: " ",
+            },
+        }
+    }
+
+    /// Alphabet for inline trend strings rendered by `App::h2_trend_bars`.
+    /// One character per sample, ordered from lowest to highest. The
+    /// renderer maps each sample to an index in this slice based on the
+    /// ring's max sample, so a flat-zero series prints as the first
+    /// character on every position.
+    pub fn trend_alphabet(self) -> &'static [char] {
+        match self {
+            Self::Block => &['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'],
+            Self::Braille => &['⡀', '⡄', '⡆', '⡇', '⣇', '⣧', '⣷', '⣿'],
+            Self::Tty => &['.', ',', '-', '=', '+', '*', 'o', '#'],
+        }
+    }
+
     /// Collapse the optional clap override to a concrete mode. When the
     /// operator passed `--glyphs`, honour the explicit choice. Otherwise
     /// the auto-detect cascade walks three terminal capability signals:

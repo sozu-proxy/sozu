@@ -452,22 +452,23 @@ const H2_TRACKED_KEYS: &[&str] = &[
     names::h2::CLOSE_WITH_ACTIVE_STREAMS,
 ];
 
-/// Inline sparkline as a Unicode-bar string. Used in table cells where
-/// the ratatui `Sparkline` widget is overkill. Eight discrete bar
-/// heights, scaled to the ring's max sample so a flat-zero series prints
-/// as the minimum-height bar on every position.
-fn render_spark_bars<I: IntoIterator<Item = u64>>(samples: I) -> String {
-    const BARS: &[char] = &['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+/// Inline sparkline as a single-line glyph string. Used in table cells
+/// where the ratatui `Sparkline` widget is overkill. `alphabet` is the
+/// glyph ramp from `GlyphMode::trend_alphabet` (Block / Braille / Tty);
+/// samples are scaled to the ring's max so a flat-zero series prints
+/// as the lowest glyph on every position.
+fn render_spark_bars<I: IntoIterator<Item = u64>>(samples: I, alphabet: &[char]) -> String {
     let samples: Vec<u64> = samples.into_iter().collect();
-    if samples.is_empty() {
+    if samples.is_empty() || alphabet.is_empty() {
         return "—".to_owned();
     }
     let max = samples.iter().copied().max().unwrap_or(0).max(1);
+    let last_idx = alphabet.len() - 1;
     samples
         .iter()
         .map(|v| {
-            let idx = ((v * (BARS.len() as u64 - 1)) / max) as usize;
-            BARS[idx.min(BARS.len() - 1)]
+            let idx = ((v * last_idx as u64) / max) as usize;
+            alphabet[idx.min(last_idx)]
         })
         .collect()
 }
@@ -689,11 +690,14 @@ impl App {
 
     /// Render the trend bars for an H2-pane metric. Returns "—" when no
     /// samples have landed (cold start). Otherwise produces a string of
-    /// Unicode block characters scaled to the largest sample in the ring
-    /// so a flat-line zero series prints as the minimum-height bar.
+    /// characters from the resolved `GlyphMode` alphabet, scaled to the
+    /// largest sample in the ring so a flat-line zero series prints as
+    /// the minimum-height character.
     pub fn h2_trend_bars(&self, key: &str) -> String {
         match self.h2_trends.get(key) {
-            Some(ring) if !ring.is_empty() => render_spark_bars(ring.samples().copied()),
+            Some(ring) if !ring.is_empty() => {
+                render_spark_bars(ring.samples().copied(), self.glyphs.trend_alphabet())
+            }
             _ => "—".to_owned(),
         }
     }
@@ -726,20 +730,33 @@ impl App {
                 let errors_5xx: i64 = ERRORS_5XX.iter().map(|k| cluster_count_total(cm, k)).sum();
                 let p99_ms = cluster_p99_max(cm);
                 let p50_ms = cluster_p50_max(cm);
-                // Backends-up vs backends-total. The "total" is the
-                // per-cluster `cluster.total_backends` gauge updated by
-                // `BackendsByCluster::notify_availability` whenever a
-                // backend is added / removed. The "up" rollup is the
-                // companion `cluster.available_backends` gauge written
-                // by the same code path — that gauge is the authoritative
-                // per-cluster aggregate and refreshes every health-check
-                // tick. Per-backend `backend.available` (under backend-
-                // detail filing) is a fallback for the very first
-                // snapshot after worker boot, when the rollup may not
-                // yet have landed.
-                let backends_total =
+                // Backends-up vs backends-total. Three reading paths,
+                // tried in order, so the column populates whatever
+                // metric_detail level or worker lifecycle stage the
+                // operator is in.
+                //
+                // 1. `cluster.total_backends` / `cluster.available_backends`
+                //    cluster-level rollup gauges. These are the
+                //    authoritative per-cluster aggregates published by
+                //    `BackendMap::record_cluster_availability` whenever a
+                //    backend registers, transitions, or first serves a
+                //    request. Survives the hourly counter clear.
+                // 2. Per-backend `backend.available` gauge summed across
+                //    `cm.backends[].metrics`. Populated under backend-
+                //    detail filing whenever a backend up/down event
+                //    fires. Independent of the cluster-level rollup so a
+                //    fresh worker before the first `record_cluster_…`
+                //    call still surfaces something.
+                // 3. `cm.backends.len()` as a last-resort total. Under
+                //    backend-detail every backend that emitted any
+                //    metric (bytes, response_time, requests) lands in
+                //    this Vec, so the cardinality is a useful lower
+                //    bound on "backends the worker has seen this
+                //    minute" even before any cluster-level gauge
+                //    arrives.
+                let rollup_total =
                     gauge_value(cm.cluster.get(names::cluster::TOTAL_BACKENDS)).unwrap_or(0) as u32;
-                let cluster_available_rollup =
+                let rollup_available =
                     gauge_value(cm.cluster.get(names::cluster::AVAILABLE_BACKENDS)).unwrap_or(0)
                         as u32;
                 let backend_available_sum: u32 = cm
@@ -748,7 +765,24 @@ impl App {
                     .filter_map(|b| gauge_value(b.metrics.get(names::backend::AVAILABLE)))
                     .map(|v| v as u32)
                     .sum();
-                let backends_available = cluster_available_rollup.max(backend_available_sum);
+                let backends_total = if rollup_total > 0 {
+                    rollup_total
+                } else {
+                    cm.backends.len() as u32
+                };
+                let backends_available = rollup_available
+                    .max(backend_available_sum)
+                    // Final fallback: if the rollup gauge hasn't been
+                    // published yet and no per-backend gauge is
+                    // present either, assume every backend the worker
+                    // has observed is up. The first health-check
+                    // failure / `record_cluster_availability` call
+                    // refreshes this with the authoritative value.
+                    .max(if rollup_total == 0 && backend_available_sum == 0 {
+                        cm.backends.len() as u32
+                    } else {
+                        0
+                    });
                 let error_rate_pct = if requests > 0 {
                     (errors_5xx as f64 / requests as f64) * 100.0
                 } else {
