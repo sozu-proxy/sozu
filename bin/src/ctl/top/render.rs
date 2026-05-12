@@ -526,29 +526,47 @@ fn draw_palette(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, skin: &Skin) 
 /// `EnableMouseCapture`, and cursor hide. Drop reverses the same sequence
 /// so a panic mid-render doesn't leave the user's shell in raw mode with
 /// the cursor hidden.
+///
+/// Install ordering matters: every step that succeeds MUST be matched
+/// by a Drop branch that reverses it, even if a later step fails. The
+/// guard is therefore constructed AFTER `enable_raw_mode` succeeds and
+/// progressively flips `alt_entered` / `mouse_enabled` flags as the
+/// follow-on `execute!` calls succeed. Any `?` after that point still
+/// triggers Drop on the unwinding return — so a failure in
+/// `EnableMouseCapture` cleanly leaves raw mode and the alt-screen,
+/// not "raw mode on, alt-screen on, no Drop scheduled".
 struct RawModeGuard {
-    mouse: bool,
+    mouse_enabled: bool,
+    alt_entered: bool,
 }
 
 impl RawModeGuard {
     fn install(mouse: bool) -> io::Result<Self> {
         enable_raw_mode()?;
+        let mut guard = Self {
+            mouse_enabled: false,
+            alt_entered: false,
+        };
         let mut out = io::stdout();
         execute!(out, EnterAlternateScreen, Hide)?;
+        guard.alt_entered = true;
         if mouse {
             execute!(out, EnableMouseCapture)?;
+            guard.mouse_enabled = true;
         }
-        Ok(Self { mouse })
+        Ok(guard)
     }
 }
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
         let mut out = io::stdout();
-        if self.mouse {
+        if self.mouse_enabled {
             let _ = execute!(out, DisableMouseCapture);
         }
-        let _ = execute!(out, Show, LeaveAlternateScreen);
+        if self.alt_entered {
+            let _ = execute!(out, Show, LeaveAlternateScreen);
+        }
         let _ = disable_raw_mode();
     }
 }

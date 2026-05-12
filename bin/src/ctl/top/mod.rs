@@ -29,10 +29,13 @@
 //! Cardinality elevation is automatic: on startup the TUI sends
 //! `SetMetricDetail{ client_id, detail = Backend, ttl_seconds = 60 }`. A
 //! renewer re-sends every `ttl/2` seconds. On exit (Drop, panic, SIGINT,
-//! SIGTERM) the TUI sends a best-effort `SetMetricDetail{ client_id, clear:
-//! true }`. Crash safety: the lease self-expires server-side after
-//! `ttl_seconds` so a dead `sozu top` cannot permanently elevate
-//! cardinality.
+//! SIGTERM, SIGHUP) the TUI sends a best-effort `SetMetricDetail{
+//! client_id, clear: true }`. SIGTERM and SIGHUP coverage requires the
+//! `termination` feature of the `ctrlc` crate — without it `set_handler`
+//! catches SIGINT only and `kill -TERM` would leave the terminal in
+//! alt-screen + raw mode. Crash safety: the lease self-expires
+//! server-side after `ttl_seconds` so a dead `sozu top` cannot
+//! permanently elevate cardinality.
 
 mod app;
 mod cardinality;
