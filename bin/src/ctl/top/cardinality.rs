@@ -93,7 +93,7 @@ pub fn take_status(slot: &StatusSlot) -> Option<String> {
 /// cadence (~30 fps) is much faster than realistic background-thread
 /// error rates so overwriting is the right policy. A poisoned lock is
 /// recovered the same way as `take_status`.
-fn publish_status(slot: &StatusSlot, msg: String) {
+pub(super) fn publish_status(slot: &StatusSlot, msg: String) {
     let mut g = match slot.lock() {
         Ok(g) => g,
         Err(poison) => poison.into_inner(),

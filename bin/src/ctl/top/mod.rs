@@ -85,11 +85,30 @@ impl CommandManager {
         // unix socket. The three poll-driven threads still exit on
         // receiver-drop, but we join them all on the way out for symmetry.
         let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (snapshot_rx, collector) = spawn_collector(self.config.clone(), args.refresh_ms)?;
-        let (events_rx, events) =
-            spawn_events(self.config.clone(), std::sync::Arc::clone(&shutdown))?;
-        let (listeners_rx, listeners) = spawn_listeners(self.config.clone())?;
-        let (certs_rx, certs) = spawn_certs(self.config.clone())?;
+        // Shared status slot every background thread (lease renewer +
+        // four transport collectors) publishes degraded-mode notes
+        // into. The render loop drains it once per tick (see
+        // `cardinality::take_status`) and surfaces the message on the
+        // F-key bar instead of the wiped alt-screen.
+        let lease_status_slot = cardinality::new_status_slot();
+        let (snapshot_rx, collector) = spawn_collector(
+            self.config.clone(),
+            args.refresh_ms,
+            std::sync::Arc::clone(&lease_status_slot),
+        )?;
+        let (events_rx, events) = spawn_events(
+            self.config.clone(),
+            std::sync::Arc::clone(&shutdown),
+            std::sync::Arc::clone(&lease_status_slot),
+        )?;
+        let (listeners_rx, listeners) = spawn_listeners(
+            self.config.clone(),
+            std::sync::Arc::clone(&lease_status_slot),
+        )?;
+        let (certs_rx, certs) = spawn_certs(
+            self.config.clone(),
+            std::sync::Arc::clone(&lease_status_slot),
+        )?;
 
         // Apply the runtime cardinality lease. If the master/worker is too
         // old to decode `SetMetricDetail`, we surface the failure but keep
@@ -104,12 +123,6 @@ impl CommandManager {
         // (alt-screen wipes it on entry) and that pollutes the shell
         // scrollback on exit.
         let detail = args.detail.unwrap_or(TopDetail::Backend);
-        // Shared status slot the renewer publishes degraded-mode notes
-        // into. The render loop drains it once per tick (see
-        // `DetailGuard::take_status`) and the renderer also keeps a
-        // clone for post-`apply` lifetime so the F-key bar can surface
-        // late renewer failures.
-        let lease_status_slot = cardinality::new_status_slot();
         let (lease, lease_status) = match DetailGuard::apply(
             &self.config,
             detail,
