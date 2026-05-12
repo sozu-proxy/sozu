@@ -62,6 +62,7 @@ pub enum CtlError {
     SetupLogging(LogError),
     #[error("could not resolve path for {0} : {1}")]
     ResolvePath(String, std::io::Error),
+    #[cfg(feature = "tui")]
     #[error("failed to spawn thread `{label}`: {source}")]
     SpawnFailed {
         label: &'static str,
