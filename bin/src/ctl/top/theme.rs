@@ -126,13 +126,18 @@ impl Skin {
                         "skin `{choice}` resolved outside skins dir; using default"
                     ));
                 }
-                // Close the TOCTOU window: open the file once and read
-                // through the `File` handle so the kernel can't swap a
-                // symlink target between `canonicalize` and the read.
-                // `read_to_string(&Path)` would re-resolve the path, so
-                // an attacker who controls the skins dir could swap a
-                // symlink in the gap. Going through `File::open` +
-                // `Read::read_to_string` removes that gap.
+                // Close the TOCTOU window on the leaf: the second open
+                // sets `O_NOFOLLOW`, so the kernel refuses with `ELOOP`
+                // if the resolved file has been swapped for a symlink
+                // between `canonicalize` and the open. Intermediate
+                // path components still resolve normally, but a swap
+                // there cannot escape the canonicalised anchor because
+                // `resolved.starts_with(&anchor)` was already verified
+                // above, and any swap to a non-existent path simply
+                // errors on `File::open`. A bare `read_to_string(&Path)`
+                // would re-resolve the leaf symlink and read the wrong
+                // target; the explicit `OpenOptions` + `O_NOFOLLOW`
+                // path forbids that.
                 match Self::from_open_file(&resolved) {
                     Ok(skin) => (skin, None),
                     Err(e) => {
@@ -153,14 +158,25 @@ impl Skin {
         candidate.parent()?.canonicalize().ok()
     }
 
-    /// Read + parse a skin TOML file via an explicit `File::open` +
-    /// `Read::read_to_string` so the kernel cannot swap a symlink target
-    /// between `canonicalize` and the read (the gap a `read_to_string(&Path)`
-    /// helper would leave open by re-resolving the path). Called from
-    /// `resolve` after the parent-anchor confinement check.
+    /// Read + parse a skin TOML file. The leaf component is opened with
+    /// `O_NOFOLLOW` so the kernel refuses the open with `ELOOP` if the
+    /// resolved file has been swapped for a symlink between the
+    /// `canonicalize` step in `resolve` and this open. A bare
+    /// `read_to_string(&Path)` (or `File::open(&Path)` without
+    /// `O_NOFOLLOW`) would re-resolve the leaf symlink and read the
+    /// wrong target — the gap that the previous shape of this helper
+    /// left open. Intermediate path components still resolve normally;
+    /// the anchor confinement check in `resolve`
+    /// (`resolved.starts_with(&anchor)`) keeps any intermediate-component
+    /// race from escaping the skins directory.
     pub fn from_open_file(path: &Path) -> Result<Self, SkinError> {
         use std::io::Read;
-        let mut file = std::fs::File::open(path).map_err(SkinError::Io)?;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(SkinError::Io)?;
         let mut body = String::new();
         file.read_to_string(&mut body).map_err(SkinError::Io)?;
         let raw: RawSkin = toml::from_str(&body).map_err(|e| SkinError::Parse(e.to_string()))?;
@@ -552,5 +568,43 @@ mod tests {
             GlyphMode::resolve(Some(TopGlyphs::Block)),
             GlyphMode::Block
         ));
+    }
+
+    /// `from_open_file` must refuse to follow a leaf symlink. The TOCTOU
+    /// guard in `resolve` rests on the second open failing closed when
+    /// the resolved path has been swapped for a symlink between
+    /// `canonicalize` and the actual read. We plant a symlink under a
+    /// temp skins dir pointing at a real file outside it (`/etc/hostname`
+    /// is portable on Linux/BSD/macOS dev hosts and CI runners) and
+    /// assert the loader returns an `Io` error — `O_NOFOLLOW` surfaces
+    /// as `ELOOP` from the kernel and the loader does not read the
+    /// symlink target.
+    #[test]
+    fn from_open_file_refuses_leaf_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("create temp skins dir");
+        let link = tmp.path().join("evil.toml");
+        // Skip the test if the symlink target does not exist on this
+        // platform (e.g. minimal sandboxes without `/etc/hostname`).
+        let target = Path::new("/etc/hostname");
+        if !target.exists() {
+            return;
+        }
+        symlink(target, &link).expect("plant symlink");
+
+        let err = Skin::from_open_file(&link).expect_err("must refuse symlink leaf");
+        match err {
+            SkinError::Io(io) => {
+                // The kernel reports `ELOOP` for `O_NOFOLLOW` on a
+                // symlink; some libc wrappers translate it differently
+                // but the error kind is always `Other` / `InvalidInput`
+                // / `FilesystemLoop` (Rust 1.86+). All that matters for
+                // the regression guard is that the read did not
+                // succeed.
+                let _ = io;
+            }
+            other => panic!("expected Io(ELOOP) error, got {other:?}"),
+        }
     }
 }
