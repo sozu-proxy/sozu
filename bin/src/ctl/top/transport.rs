@@ -27,15 +27,24 @@
 //! the sender to peek into the receiver's slot. The events thread uses the
 //! same shape, just with a `bounded(64)` buffer for burst tolerance.
 //!
-//! All threads exit cleanly when their `crossbeam_channel` peer is dropped
-//! (the UI thread owns the rx ends; tearing down the App drops the senders).
+//! The three poll-driven threads exit cleanly when their `crossbeam_channel`
+//! peer is dropped (the UI thread owns the rx ends; tearing down the App
+//! drops the senders so `try_send` returns `Disconnected`). The events
+//! thread does NOT see receiver-drop — its read blocks on the unix socket
+//! and dropping the crossbeam `Receiver<TopEvent>` cannot propagate across
+//! the socket. It exits on an `Arc<AtomicBool>` shutdown flag owned by
+//! `run_top` and a bounded `EVENTS_READ_TIMEOUT` per read.
+//!
 //! Errors are logged via `eprintln!` and the thread shuts down — we never
 //! crash the UI because of a transient socket error.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use sozu_command_lib::{
+    channel::ChannelError,
     config::Config,
     proto::command::{
         AggregatedMetrics, Event, ListListeners, ListOfCertificatesByAddress, ListenersList,
@@ -97,6 +106,15 @@ pub struct CertsSnapshot {
 /// side via `recv_deadline` not the channel itself; the bound just keeps
 /// memory bounded if the UI freezes momentarily.
 const EVENTS_CAP: usize = 64;
+
+/// Per-read deadline for the events loop. We do NOT want an unbounded
+/// blocking read here: the only signal that the UI is gone is the
+/// `shutdown` flag flipped by `run_top` after `render::run` returns,
+/// and dropping the crossbeam `Receiver<TopEvent>` does NOT propagate
+/// across the unix socket. A 1 s deadline keeps the shutdown latency
+/// bounded by a single round-trip without burning CPU on idle traffic
+/// (the master is event-pace; quiet seconds are the common case).
+const EVENTS_READ_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// `Snapshot` channel capacity. 1 with publish-or-skip on backpressure is
 /// intentional: while the UI is rendering a frame, a fresh snapshot is
@@ -450,16 +468,24 @@ fn content_type_name(ct: Option<&ContentType>) -> &'static str {
 }
 
 /// Spawn the events-stream thread. Returns the `TopEvent` receiver and
-/// a join handle. Thread exits when the receiver is dropped or the
-/// SubscribeEvents stream errors out.
+/// a join handle. Thread exits when `shutdown` is set, when the
+/// SubscribeEvents stream errors out, or when the master closes the
+/// subscription with a terminal Ok/Failure.
+///
+/// The `shutdown` flag is the canonical wake-up: dropping the
+/// `Receiver<TopEvent>` cannot propagate across the unix socket, so
+/// without an explicit flag the thread sleeps forever on the next read.
+/// `run_top` owns the `Arc<AtomicBool>` and flips it after the render
+/// loop returns.
 pub fn spawn_events(
     config: Config,
+    shutdown: Arc<AtomicBool>,
 ) -> Result<(Receiver<TopEvent>, std::thread::JoinHandle<()>), CtlError> {
     let mut channel = create_channel(&config)?;
     let (tx, rx) = bounded::<TopEvent>(EVENTS_CAP);
     let handle = std::thread::Builder::new()
         .name("sozu-top-events".into())
-        .spawn(move || events_loop(&mut channel, tx))
+        .spawn(move || events_loop(&mut channel, tx, shutdown))
         .expect("spawn sozu-top events");
     Ok((rx, handle))
 }
@@ -467,6 +493,7 @@ pub fn spawn_events(
 fn events_loop(
     channel: &mut sozu_command_lib::channel::Channel<Request, Response>,
     tx: Sender<TopEvent>,
+    shutdown: Arc<AtomicBool>,
 ) {
     let req = Request {
         request_type: Some(RequestType::SubscribeEvents(SubscribeEvents {})),
@@ -475,9 +502,13 @@ fn events_loop(
         eprintln!("sozu top: SubscribeEvents write error: {e}");
         return;
     }
-    loop {
-        let resp = match channel.read_message_blocking_timeout(None) {
+    while !shutdown.load(Ordering::Relaxed) {
+        let resp = match channel.read_message_blocking_timeout(Some(EVENTS_READ_TIMEOUT)) {
             Ok(r) => r,
+            // Bounded read timeout fired with no payload; loop back to
+            // re-check the shutdown flag. This is the steady-state path
+            // on a quiet master, not an error.
+            Err(ChannelError::TimeoutReached(_)) => continue,
             Err(e) => {
                 eprintln!("sozu top: events read error: {e}");
                 return;
