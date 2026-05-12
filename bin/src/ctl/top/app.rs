@@ -194,16 +194,6 @@ impl RateCalculator {
         self.history.insert(key.to_owned(), (value, sampled_at));
         result
     }
-
-    /// Drop history entries whose key the predicate rejects. Called from
-    /// `App::ingest_snapshot` with the set of keys present in the freshest
-    /// snapshot so a cluster / backend that disappears doesn't leave its
-    /// `(prev_value, prev_at)` lingering forever — the `HashMap` would
-    /// otherwise grow with fleet churn without ever shrinking back, since
-    /// `record` only `insert`s and never `remove`s.
-    pub fn retain<F: FnMut(&str) -> bool>(&mut self, mut keep: F) {
-        self.history.retain(|k, _| keep(k.as_str()));
-    }
 }
 
 /// What-changed pulse tracker. Snapshot-to-snapshot diffs surface as a
@@ -236,23 +226,15 @@ impl PulseTracker {
     /// Decrement every active pulse by one render frame. Drop entries that
     /// reach zero. Called once per render tick by `App::tick_pulses`.
     fn tick(&mut self) {
-        Self::tick_one(&mut self.cluster_disappeared);
-        Self::tick_one(&mut self.cluster_appeared);
-        // In-place retain drops the previous two-pass `Vec<K> + remove`
-        // shape: zero-aged entries are filtered out and the survivors
-        // decrement by one. Same semantics as before; no `String` clones
-        // for the keys in the dropped set.
-        self.backend_down.retain(|_, v| {
-            if *v == 0 {
-                false
-            } else {
-                *v -= 1;
-                true
-            }
-        });
+        Self::tick_map(&mut self.cluster_disappeared);
+        Self::tick_map(&mut self.cluster_appeared);
+        Self::tick_map(&mut self.backend_down);
     }
 
-    fn tick_one(map: &mut HashMap<String, u32>) {
+    /// In-place retain: zero-aged entries are filtered out and survivors
+    /// decrement by one. Same semantics for all three pulse maps; generic
+    /// over the key so `(String, String)` (backend_down) reuses it.
+    fn tick_map<K>(map: &mut HashMap<K, u32>) {
         map.retain(|_, v| {
             if *v == 0 {
                 false
@@ -314,24 +296,20 @@ impl PulseTracker {
     }
 
     pub fn cluster_pulse(&self, cluster_id: &str) -> Option<PulseKind> {
-        if self.cluster_disappeared.contains_key(cluster_id) {
-            Some(PulseKind::Disappeared)
-        } else if self.cluster_appeared.contains_key(cluster_id) {
-            Some(PulseKind::Appeared)
-        } else {
-            None
-        }
+        self.cluster_disappeared
+            .contains_key(cluster_id)
+            .then_some(PulseKind::Disappeared)
+            .or_else(|| {
+                self.cluster_appeared
+                    .contains_key(cluster_id)
+                    .then_some(PulseKind::Appeared)
+            })
     }
 
     pub fn backend_pulse(&self, cluster_id: &str, backend_id: &str) -> Option<PulseKind> {
-        if self
-            .backend_down
+        self.backend_down
             .contains_key(&(cluster_id.to_owned(), backend_id.to_owned()))
-        {
-            Some(PulseKind::WentDown)
-        } else {
-            None
-        }
+            .then_some(PulseKind::WentDown)
     }
 
     /// True when at least one pulse is still animating. The render loop
@@ -603,15 +581,12 @@ impl App {
         // pulse tracker can emit ClusterDisappeared / BackendWentDown
         // transitions against the previous set.
         self.pulse.diff(&snap.metrics);
-        // The rate calculator currently only carries the two overview-
-        // aggregate keys recorded by `fold_overview` below. The retain
-        // here is a defence-in-depth no-op while that invariant holds; if
-        // per-cluster series get added later (each (cluster_id, "requests")
-        // key plus the per-cluster 5xx series) this is the spot to widen
-        // `live_keys` so removed clusters / backends do not accumulate
-        // forever.
-        let live_keys: [&str; 2] = ["__overview.requests", "__overview.errors_5xx"];
-        self.rates.retain(|k| live_keys.contains(&k));
+        // The rate calculator's history is bounded to the two overview-
+        // aggregate keys recorded by `fold_overview` below, so no live-
+        // key sweep is needed. When per-cluster rates land, `record(...)`
+        // will start populating per-cluster keys and the matching `retain`
+        // belongs alongside that change so removed clusters / backends do
+        // not accumulate forever.
         // Keep the latest `AggregatedMetrics` for the CLUSTERS / BACKENDS
         // panes. Cloning isn't cheap for very-high-cardinality fleets
         // (>1000 clusters), but in practice the master already paid this

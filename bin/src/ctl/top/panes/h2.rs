@@ -155,53 +155,48 @@ fn render_flow(f: &mut Frame<'_>, area: Rect, skin: &Skin, m: &AggregatedMetrics
             .fg(skin.primary)
             .add_modifier(Modifier::BOLD),
     );
+    let gauge_at = |key: &str| gauge(m.proxying.get(key)).map(|v| v as i64);
+    let count_at = |key: &str| count(m.proxying.get(key));
     let rows = [
-        gauge_row(
+        metric_row(
             "connection.window_bytes",
-            names::h2::CONNECTION_WINDOW_BYTES,
-            m,
+            gauge_at(names::h2::CONNECTION_WINDOW_BYTES),
             skin,
             false,
         ),
-        gauge_row(
+        metric_row(
             "pending_window_updates",
-            names::h2::CONNECTION_PENDING_WINDOW_UPDATES,
-            m,
+            gauge_at(names::h2::CONNECTION_PENDING_WINDOW_UPDATES),
             skin,
             false,
         ),
-        count_row(
+        metric_row(
             "flow_control_stall",
-            names::h2::FLOW_CONTROL_STALL,
-            m,
+            count_at(names::h2::FLOW_CONTROL_STALL),
             skin,
             true,
         ),
-        count_row(
+        metric_row(
             "frames.tx.window_update",
-            names::h2::FRAMES_TX_WINDOW_UPDATE,
-            m,
+            count_at(names::h2::FRAMES_TX_WINDOW_UPDATE),
             skin,
             false,
         ),
-        count_row(
+        metric_row(
             "frames.tx.rst_stream",
-            names::h2::FRAMES_TX_RST_STREAM,
-            m,
+            count_at(names::h2::FRAMES_TX_RST_STREAM),
             skin,
             true,
         ),
-        count_row(
+        metric_row(
             "frames.tx.goaway",
-            names::h2::FRAMES_TX_GOAWAY,
-            m,
+            count_at(names::h2::FRAMES_TX_GOAWAY),
             skin,
             true,
         ),
-        count_row(
+        metric_row(
             "headers.rejected.budget_overrun",
-            names::h2::HEADERS_REJECTED_BUDGET_OVERRUN,
-            m,
+            count_at(names::h2::HEADERS_REJECTED_BUDGET_OVERRUN),
             skin,
             true,
         ),
@@ -267,34 +262,21 @@ fn render_floods(f: &mut Frame<'_>, area: Rect, skin: &Skin, m: &AggregatedMetri
     );
 }
 
-fn gauge_row<'a>(
+/// Render one numeric metric as a labelled table row. `value` is pre-
+/// extracted (`gauge(...)` for gauges, `count(...)` for counters) and
+/// widened to `i64` so the helper does not need to know the underlying
+/// variant. `warn_when_nonzero` flips the row to the critical tint when
+/// the value is a flood / error counter the operator should see.
+fn metric_row<'a>(
     label: &'a str,
-    key: &str,
-    m: &AggregatedMetrics,
+    value: Option<i64>,
     skin: &Skin,
     warn_when_nonzero: bool,
 ) -> Row<'a> {
-    let v = gauge(m.proxying.get(key));
-    let style = row_style(skin, v.unwrap_or(0) > 0 && warn_when_nonzero);
+    let style = row_style(skin, value.unwrap_or(0) > 0 && warn_when_nonzero);
     Row::new(vec![
         Cell::from(label),
-        Cell::from(v.map(|v| format!("{v}")).unwrap_or_else(|| "—".into())),
-    ])
-    .style(style)
-}
-
-fn count_row<'a>(
-    label: &'a str,
-    key: &str,
-    m: &AggregatedMetrics,
-    skin: &Skin,
-    warn_when_nonzero: bool,
-) -> Row<'a> {
-    let v = count(m.proxying.get(key));
-    let style = row_style(skin, v.unwrap_or(0) > 0 && warn_when_nonzero);
-    Row::new(vec![
-        Cell::from(label),
-        Cell::from(v.map(|v| format!("{v}")).unwrap_or_else(|| "—".into())),
+        Cell::from(value.map(|v| format!("{v}")).unwrap_or_else(|| "—".into())),
     ])
     .style(style)
 }
