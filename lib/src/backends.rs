@@ -409,6 +409,10 @@ impl BackendMap {
                         backend.borrow_mut().health = HealthState::default();
                     }
                 }
+                // Re-emit the rollup gauges so dashboards reflect the
+                // post-reset availability instead of holding the last
+                // health-check value indefinitely.
+                self.record_cluster_availability(cluster_id);
             }
         }
     }
@@ -424,6 +428,15 @@ impl BackendMap {
                     BackendList::import_configuration_state(backend_vec),
                 )
             }));
+        // Replay path inserts every cluster's backend list without
+        // touching the gauge emission sites used by add/remove/health.
+        // Latch `cluster.available_backends` and `.total_backends` here
+        // so a freshly-loaded worker reports correct values on the very
+        // first `QueryMetrics` instead of zero until something else
+        // mutates each cluster.
+        for cluster_id in backends.keys() {
+            self.record_cluster_availability(cluster_id);
+        }
     }
 
     pub fn add_backend(&mut self, cluster_id: &str, backend: Backend) {
@@ -1246,6 +1259,87 @@ mod backends_test {
         assert!(
             !map.backends.contains_key("c-absent"),
             "helper must not insert a BackendList for an unknown cluster_id"
+        );
+    }
+
+    #[test]
+    fn import_configuration_state_latches_cluster_rollup_gauges() {
+        use crate::metrics::METRICS;
+        use sozu_command_lib::proto::command::QueryMetricsOptions;
+        // Unique cluster id so the assertion is not perturbed by gauges
+        // left in the thread-local METRICS aggregator by sibling tests.
+        let cluster_id = "c-import-rollup-9701";
+        let mut map = BackendMap::new();
+        let mut input = HashMap::new();
+        input.insert(
+            cluster_id.to_owned(),
+            vec![sozu_command_lib::response::Backend {
+                cluster_id: cluster_id.to_owned(),
+                backend_id: "b1".to_owned(),
+                address: "127.0.0.1:9701".parse().unwrap(),
+                sticky_id: None,
+                load_balancing_parameters: None,
+                backup: None,
+            }],
+        );
+        map.import_configuration_state(&input);
+        let response = METRICS
+            .with(|m| {
+                m.borrow_mut().query(&QueryMetricsOptions {
+                    metric_names: vec![
+                        names::cluster::AVAILABLE_BACKENDS.to_owned(),
+                        names::cluster::TOTAL_BACKENDS.to_owned(),
+                    ],
+                    cluster_ids: vec![cluster_id.to_owned()],
+                    backend_ids: vec![],
+                    list: false,
+                    no_clusters: false,
+                    workers: false,
+                })
+            })
+            .expect("metrics query succeeds");
+        let cluster_metrics = match response.content_type {
+            Some(sozu_command_lib::proto::command::response_content::ContentType::WorkerMetrics(wm)) => wm,
+            other => panic!("expected WorkerMetrics, got {other:?}"),
+        };
+        let cm = cluster_metrics
+            .clusters
+            .get(cluster_id)
+            .expect("imported cluster must have a ClusterMetrics entry");
+        // Without the import-time `record_cluster_availability` call the
+        // two rollup gauges would be absent here. The fix guarantees the
+        // pair lands without waiting for any follow-up backend mutation.
+        assert!(
+            cm.cluster.contains_key(names::cluster::AVAILABLE_BACKENDS),
+            "cluster.available_backends gauge must be latched at import time"
+        );
+        assert!(
+            cm.cluster.contains_key(names::cluster::TOTAL_BACKENDS),
+            "cluster.total_backends gauge must be latched at import time"
+        );
+    }
+
+    #[test]
+    fn set_health_check_config_none_re_emits_rollup_after_reset() {
+        let mut map = BackendMap::new();
+        let cluster_id = "c-hc-reset";
+        // Seed the cluster with an unhealthy backend so `add_backend`
+        // drives the `availability` cell to AllDown.
+        map.add_backend(cluster_id, unhealthy_backend("b1", 9801));
+        assert_eq!(
+            ClusterAvailability::AllDown,
+            map.backends.get(cluster_id).unwrap().availability.get(),
+            "test setup: unhealthy backend must register the cell at AllDown"
+        );
+        // Disabling the health check resets backend health to the default
+        // pristine state AND must re-emit the rollup so the cell reflects
+        // the post-reset availability instead of the stale AllDown.
+        map.set_health_check_config(cluster_id, None);
+        assert_eq!(
+            ClusterAvailability::Available,
+            map.backends.get(cluster_id).unwrap().availability.get(),
+            "set_health_check_config(None) must re-emit the rollup after \
+             resetting backend health, otherwise dashboards stay stuck at AllDown"
         );
     }
 }
