@@ -1,34 +1,34 @@
 ---
 source: bin/src/ctl/top/snapshot_tests.rs
-assertion_line: 276
+assertion_line: 299
 expression: out
 ---
 ╭ H2 · streams · flow control · flood mitigations ─────────────────────────────────────────────────────────────────────╮
 │24 active H2 streams · 66.7 % of accepts on H2                                                                        │
 │metric                                             value            trend (60 s)                                      │
-│active streams                                     24               █                                                 │
-│H2 connections accepted                            1000             █                                                 │
-│HTTP/1.1 accepted                                  500              █                                                 │
-│client.connections (gauge)                         312              █                                                 │
+│active streams                                     24               ██                                                │
+│H2 connections accepted                            1100             ▇█                                                │
+│HTTP/1.1 accepted                                  550              ▇█                                                │
+│client.connections (gauge)                         312              ██                                                │
 │                                                                                                                      │
 │flow control                                       value            trend (60 s)                                      │
-│connection.window_bytes                            65535            █                                                 │
-│pending_window_updates                             0                ▁                                                 │
-│flow_control_stall                                 2                █                                                 │
-│frames.tx.window_update                            42               █                                                 │
-│frames.tx.rst_stream                               0                ▁                                                 │
-│frames.tx.goaway                                   0                ▁                                                 │
+│connection.window_bytes                            65535            ██                                                │
+│pending_window_updates                             0                ▁▁                                                │
+│flow_control_stall                                 2                ██                                                │
+│frames.tx.window_update                            42               ██                                                │
+│frames.tx.rst_stream                               0                ▁▁                                                │
+│frames.tx.goaway                                   0                ▁▁                                                │
 │╭ flood mitigations · CVE-2023-44487 / CVE-2024-27316 / CVE-2025-8671 ───────────────────────────────────────────────╮│
 ││counter                                           value            trend (60 s)                                     ││
-││glitch_window                                     0                ▁                                                ││
-││rapid_reset                                       0                ▁                                                ││
-││continuation_flood                                0                ▁                                                ││
-││made_you_reset                                    0                ▁                                                ││
-││ping_flood                                        0                ▁                                                ││
-││settings_flood                                    0                ▁                                                ││
-││priority_flood                                    0                ▁                                                ││
-││window_update_dropped                             0                ▁                                                ││
-││close_with_active_streams                         0                ▁                                                ││
+││glitch_window                                     0                ▁▁                                               ││
+││rapid_reset                                       0                ▁▁                                               ││
+││continuation_flood                                0                ▁▁                                               ││
+││made_you_reset                                    0                ▁▁                                               ││
+││ping_flood                                        0                ▁▁                                               ││
+││settings_flood                                    0                ▁▁                                               ││
+││priority_flood                                    0                ▁▁                                               ││
+││window_update_dropped                             0                ▁▁                                               ││
+││close_with_active_streams                         0                ▁▁                                               ││
 ││                                                                                                                    ││
 ││                                                                                                                    ││
 ││                                                                                                                    ││

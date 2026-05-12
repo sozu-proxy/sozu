@@ -88,7 +88,7 @@ pub fn render(f: &mut Frame<'_>, area: Rect, app: &App, skin: &Skin) {
             };
             Row::new(vec![
                 Cell::from(row.cluster_id.clone()),
-                Cell::from(format!("{} req/s", row.rps)),
+                Cell::from(format!("{} req/s", format_rate_count(row.rps))),
                 Cell::from(format!("{:.2}", row.error_rate_pct)),
                 Cell::from(format!("{}", row.p50_ms)),
                 Cell::from(format!("{}", row.p99_ms)),
@@ -100,7 +100,7 @@ pub fn render(f: &mut Frame<'_>, area: Rect, app: &App, skin: &Skin) {
 
     let widths = [
         Constraint::Min(20),
-        Constraint::Length(8),
+        Constraint::Length(14),
         Constraint::Length(8),
         Constraint::Length(6),
         Constraint::Length(6),
@@ -108,4 +108,20 @@ pub fn render(f: &mut Frame<'_>, area: Rect, app: &App, skin: &Skin) {
     ];
     let table = Table::new(body, widths).header(header).block(block);
     f.render_widget(table, area);
+}
+
+/// Compact representation of a per-second request rate. Auto-scales
+/// to K / M / G base-1000 so a high-traffic cluster's "1.2M req/s"
+/// stays in a single cell width.
+fn format_rate_count(rate: u64) -> String {
+    let n = rate as f64;
+    if n >= 1_000_000_000.0 {
+        format!("{:.2}G", n / 1_000_000_000.0)
+    } else if n >= 1_000_000.0 {
+        format!("{:.2}M", n / 1_000_000.0)
+    } else if n >= 1_000.0 {
+        format!("{:.1}K", n / 1_000.0)
+    } else {
+        format!("{rate}")
+    }
 }
