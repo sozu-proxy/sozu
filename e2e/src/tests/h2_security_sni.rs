@@ -667,3 +667,153 @@ fn e2e_h2_coalescing_multi_san_accepted() {
         State::Success
     );
 }
+
+// ============================================================================
+// Test 7: CN is NOT an authoritative coalescing identity (RFC 6125 §6.4.4)
+// ============================================================================
+
+/// Defence-in-depth: a certificate whose Common Name does NOT appear in the
+/// SubjectAlternativeName dNSName list must not let an attacker coalesce H2
+/// streams onto the CN. The cert fixture `cn-ne-san-cert.pem` is shaped
+/// CN=tenant-b.example with SAN=tenant-a.example; browsers (Firefox, Chrome)
+/// have ignored CN for hostname verification since 2017 and Sōzu must
+/// agree, otherwise an operator who configures only the SAN list could be
+/// surprised by traffic reaching a backend keyed off the CN. The check
+/// matters because [`command::certificate::get_cn_and_san_attributes`]
+/// (`command/src/certificate.rs`) returns the SAN dNSName list only when a
+/// dNSName entry is present; the routing layer then can never see the CN.
+///
+/// The test handshakes with SNI=`tenant-a.example` (the legitimate SAN),
+/// then attempts an H2 stream with `:authority=tenant-b.example` (the CN
+/// the attacker hopes will be honoured). Expected result: 421 Misdirected
+/// Request and `http.sni_authority_mismatch` bumped.
+fn try_h2_cn_not_coalesced_with_san() -> State {
+    let front_port = super::provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker =
+        Worker::start_new_worker_owned("H2-CN-NOT-COALESCED", config, listeners, state);
+
+    let mut https_listener = ListenerBuilder::new_https(front_address.clone())
+        .to_tls(None)
+        .expect("build https listener");
+    https_listener.strict_sni_binding = None;
+    worker.send_proxy_request_type(RequestType::AddHttpsListener(https_listener));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        address: front_address.clone(),
+        proxy: ListenerType::Https.into(),
+        from_scm: false,
+    }));
+
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "tenant-a-cluster",
+    )));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "tenant-b-cluster",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        hostname: String::from("tenant-a.example"),
+        ..Worker::default_http_frontend("tenant-a-cluster", front_address.clone().into())
+    }));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        hostname: String::from("tenant-b.example"),
+        ..Worker::default_http_frontend("tenant-b-cluster", front_address.clone().into())
+    }));
+
+    let certificate_and_key = CertificateAndKey {
+        certificate: String::from(include_str!("../../../lib/assets/cn-ne-san-cert.pem")),
+        key: String::from(include_str!("../../../lib/assets/cn-ne-san-key.pem")),
+        certificate_chain: vec![],
+        versions: vec![],
+        names: vec![],
+    };
+    worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+        address: front_address,
+        certificate: certificate_and_key,
+        expired_at: None,
+    }));
+
+    let tenant_a_addr = create_local_address();
+    let tenant_b_addr = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "tenant-a-cluster",
+        "tenant-a-0".to_owned(),
+        tenant_a_addr,
+        None,
+    )));
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "tenant-b-cluster",
+        "tenant-b-0".to_owned(),
+        tenant_b_addr,
+        None,
+    )));
+    let mut tenant_a = AsyncBackend::spawn_detached_backend(
+        "TENANT-A",
+        tenant_a_addr,
+        SimpleAggregator::default(),
+        AsyncBackend::http_handler("pong-a".to_owned()),
+    );
+    let mut tenant_b = AsyncBackend::spawn_detached_backend(
+        "TENANT-B",
+        tenant_b_addr,
+        SimpleAggregator::default(),
+        AsyncBackend::http_handler("pong-b".to_owned()),
+    );
+
+    worker.read_to_last();
+
+    let before = read_counter(&mut worker, "http.sni_authority_mismatch");
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection_with_sni(front_addr, "tenant-a.example");
+    h2_handshake(&mut tls);
+
+    let headers = build_request_headers(b"tenant-b.example");
+    let frame = H2Frame::headers(1, headers, true, true);
+    tls.write_all(&frame.encode()).expect("write HEADERS");
+    tls.flush().expect("flush HEADERS");
+
+    let frames = collect_response_frames(&mut tls, 500, 4, 500);
+    log_frames("H2 CN attack via :authority", &frames);
+
+    let got_421 = headers_status_matches(&frames, b"421");
+    let after = read_counter(&mut worker, "http.sni_authority_mismatch");
+    let delta = after - before;
+
+    drop(tls);
+    thread::sleep(Duration::from_millis(200));
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+
+    let tenant_a_agg = tenant_a.stop_and_get_aggregator().unwrap_or_default();
+    let tenant_b_agg = tenant_b.stop_and_get_aggregator().unwrap_or_default();
+
+    if stopped
+        && got_421
+        && delta >= 1
+        && tenant_a_agg.requests_received == 0
+        && tenant_b_agg.requests_received == 0
+    {
+        State::Success
+    } else {
+        println!(
+            "CN-attack FAIL: stopped={stopped} got_421={got_421} delta={delta} \
+             tenant_a_reqs={} tenant_b_reqs={}",
+            tenant_a_agg.requests_received, tenant_b_agg.requests_received
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn e2e_h2_cn_not_coalesced_with_san() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 RFC 6125 \u{a7}6.4.4: cert CN is NOT a coalescing identity when SAN dNSName is present",
+            try_h2_cn_not_coalesced_with_san
+        ),
+        State::Success
+    );
+}
