@@ -787,7 +787,7 @@ h2_max_rst_stream_emitted_lifetime = 500
 
 | Parameter            | Default | Description                                                                                                                                                                                                            |
 | -------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `strict_sni_binding` | true    | Every HTTP request must have its `:authority` / `Host` exact-match the TLS SNI negotiated at handshake (CWE-346 / CWE-444). Applies to HTTPS listeners only; plaintext listeners never have an SNI to compare against. |
+| `strict_sni_binding` | true    | Every HTTP request must have its `:authority` / `Host` covered by a SAN of the certificate served on this TLS session, with RFC 6125 §6.4.3 wildcard handling (CWE-346 / CWE-444). Applies to HTTPS listeners only; plaintext listeners never have an SNI to compare against. Misses are answered with 421 Misdirected Request (RFC 9110 §15.5.20). This matches Firefox / Chrome HTTP/2 connection-coalescing semantics (RFC 7540 §9.1.1 / RFC 9113 §9.1.1) — browsers reuse one H2 connection for any origin covered by the served cert. |
 | `disable_http11`     | false   | Only accept HTTP/2 connections; clients that do not negotiate `h2` via TLS ALPN (including those that omit ALPN entirely) are dropped at handshake instead of silently downgrading to HTTP/1.1.                        |
 
 _Configuration example:_
@@ -797,7 +797,7 @@ _Configuration example:_
 address = "0.0.0.0:443"
 protocol = "https"
 
-strict_sni_binding = true   # reject host/SNI mismatch (default)
+strict_sni_binding = true   # require :authority covered by served cert SANs (RFC 6125 wildcards, default)
 disable_http11 = false      # allow HTTP/1.1 fallback (default)
 sozu_id_header = "Sozu-Id"  # rename the per-request correlation header (default "Sozu-Id")
 ```
@@ -1325,7 +1325,7 @@ immediately after the patch is acknowledged.
 | Field                | Type       | Mutability class | Default             | Notes                                                                                                                                     |
 | -------------------- | ---------- | ---------------- | ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
 | `alpn_protocols`     | `string[]` | per-handshake    | `["h2","http/1.1"]` | Rebuilds the rustls `ServerConfig`. In-flight handshakes finish on the old config. Pass `--reset-alpn` on the CLI to restore the default. |
-| `strict_sni_binding` | `bool`     | per-handshake    | `true`              | Enforce `:authority`/`Host` == TLS SNI (CWE-346/CWE-444)                                                                                  |
+| `strict_sni_binding` | `bool`     | per-handshake    | `true`              | Require `:authority`/`Host` covered by served cert SANs (RFC 6125 wildcards, CWE-346/CWE-444). Miss → 421 (RFC 9110 §15.5.20).            |
 | `disable_http11`     | `bool`     | per-handshake    | `false`             | Drop clients that do not negotiate `h2` via ALPN                                                                                          |
 
 #### TCP listeners

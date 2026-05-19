@@ -10,6 +10,7 @@ use std::{
     io::Write as _,
     net::{IpAddr, SocketAddr},
     str::from_utf8,
+    sync::Arc,
 };
 
 use rusty_ulid::Ulid;
@@ -186,6 +187,17 @@ pub struct HttpContext {
     /// `None` when the listener is plaintext HTTP or the client omitted SNI.
     /// Stored pre-lowercased and without a port for direct exact-match comparison.
     pub tls_server_name: Option<String>,
+    /// Snapshot of the SAN set of the certificate Sōzu actually served at
+    /// the TLS handshake. Captured once in `https.rs::upgrade_handshake`
+    /// from the resolver and frozen for the connection lifetime so H2
+    /// stream coalescing (RFC 7540 §9.1.1 / RFC 9113 §9.1.1) accepts any
+    /// `:authority` covered by the certificate, with RFC 6125 §6.4.3
+    /// wildcard handling. `None` for plaintext listeners or when SNI was
+    /// absent (router falls back to the legacy exact-match predicate).
+    /// `Some(empty)` when the default cert was served — every
+    /// `:authority` is rejected. `Arc` so the snapshot is shared across
+    /// every per-stream `HttpContext` without re-allocation.
+    pub tls_cert_names: Option<Arc<Vec<String>>>,
     /// Whether the router must reject this request when `tls_server_name`
     /// does not exact-match its authority (CWE-346 / CWE-444). Mirrors
     /// `HttpsListenerConfig::strict_sni_binding`. Set from the mux
@@ -402,6 +414,7 @@ impl HttpContext {
 
             backend_address: None,
             tls_server_name: None,
+            tls_cert_names: None,
             strict_sni_binding: true,
             elide_x_real_ip,
             send_x_real_ip,
