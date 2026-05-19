@@ -587,8 +587,11 @@ impl Router {
         // behaviour on the pathological "no SNI" case.
         // Operators may opt out per-listener via
         // `HttpsListenerConfig::strict_sni_binding = false`.
-        if context.strict_sni_binding && context.tls_server_name.is_some() {
-            let sni = context.tls_server_name.as_deref().unwrap();
+        if let Some(sni) = context
+            .tls_server_name
+            .as_deref()
+            .filter(|_| context.strict_sni_binding)
+        {
             let matched: Option<&str> = match context.tls_cert_names.as_deref() {
                 Some(names) => authority_matched_cert_name(host, names),
                 None => {
@@ -605,16 +608,16 @@ impl Router {
                     // value after the matcher's port-strip + ASCII case
                     // folding. Same-name requests are the common
                     // non-coalesced path; do not pollute the counter or
-                    // logs with them. The metric / log is also gated to
-                    // ALPN=`h2` because the user-facing bug (Slack threads
-                    // C4RT92HLK / C6V040003, 2026-05) is specifically
-                    // about H2 multiplexing — browsers do not coalesce H1
-                    // keep-alive across origins (sequential reuse is not
-                    // multiplexing); counting H1 cross-Host requests as
-                    // "coalescing" would over-report the signal ops use
-                    // to detect the H2 multi-tenant pattern.
-                    if !host_matches_sni_ignoring_port(host, sni) && context.tls_alpn == Some("h2")
-                    {
+                    // logs with them. The ALPN=`h2` gate is a defensive
+                    // guard, not load-bearing under current invariants —
+                    // every request reaching `route_from_request` on an
+                    // HTTPS listener with `tls_cert_names` populated has
+                    // already gone through the H2 mux (ALPN=h2 by
+                    // construction). Kept explicit so a future routing
+                    // refactor that funnels H1 keep-alive through the
+                    // same predicate doesn't silently double-count
+                    // sequential `Host:` reuse as "coalescing".
+                    if !authority_matches_sni(host, sni) && context.tls_alpn == Some("h2") {
                         incr!("h2.coalescing.accepted");
                         debug!(
                             "{} accepted coalesced authority {:?} (SNI {:?}, matched SAN {:?})",
@@ -1221,20 +1224,6 @@ fn strip_authority_port(authority: &str) -> &str {
         Some((h, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => h,
         _ => authority,
     }
-}
-
-/// Case-insensitive equality between an authority host (port stripped) and
-/// an already-lowercased SNI. Used to decide whether a request is
-/// "same-name" or really coalesced.
-fn host_matches_sni_ignoring_port(authority: &str, sni_lowercased: &str) -> bool {
-    let host = strip_authority_port(authority);
-    if host.len() != sni_lowercased.len() {
-        return false;
-    }
-    host.as_bytes()
-        .iter()
-        .zip(sni_lowercased.as_bytes())
-        .all(|(a, b)| a.to_ascii_lowercase() == *b)
 }
 
 /// RFC 6125 §6.4.3 wildcard-aware match of `:authority` against a SAN set
