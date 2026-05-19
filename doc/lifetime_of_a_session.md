@@ -146,14 +146,25 @@ driven from `lib/src/protocol/rustls.rs`; the listener-level config
 (certificate stores, ALPN list, SNI binding policy) lives in
 `lib/src/https.rs` and `lib/src/tls.rs`.
 
-### 4.1 SNI binding
+### 4.1 SNI / `:authority` binding
 
 If `strict_sni_binding` is enabled on a listener
-(`command/src/config.rs:388`), Sōzu rejects handshakes whose SNI does
-not match a known frontend, even when a wildcard certificate would
-allow the negotiation. This protects multi-tenant HTTPS deployments
-from an attacker reaching cluster B via a TLS session keyed for
-cluster A.
+(`command/src/config.rs:388`), Sōzu rejects any HTTP request whose
+`:authority` (H2) or `Host` (H1) is not covered by a SAN of the
+certificate served on this TLS session, with RFC 6125 §6.4.3 wildcard
+handling. This matches Firefox / Chrome connection-coalescing
+semantics (RFC 7540 §9.1.1 / RFC 9113 §9.1.1) — browsers reuse a
+single H2 connection for any origin covered by the served certificate.
+Misses are answered with 421 Misdirected Request (RFC 9110 §15.5.20),
+which both browsers handle by opening a fresh connection on the right
+SNI. The SAN snapshot is captured once at handshake (mirroring browser
+cache semantics) and stored on the mux `Context` as `tls_cert_names`;
+it is frozen for the connection lifetime even if the operator swaps
+the underlying certificate mid-flight. Plaintext listeners have no
+SNI / cert to compare against and bypass the check. This protects
+multi-tenant HTTPS deployments from an attacker reaching tenant B via
+a TLS session keyed for tenant A while staying compatible with
+browser-driven coalescing on legitimate wildcard certs.
 
 ### 4.2 ALPN and `disable_http11`
 

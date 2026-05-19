@@ -97,9 +97,13 @@ authority and path from the Kawa stream and calls back into the listener
 (`L7ListenerHandler`) to resolve the request to a `cluster_id`. It is also the
 gate that:
 
-- enforces the SNI-vs-`:authority` strict binding when `tls_server_name` is
-  present (`HttpContext::strict_sni_binding`, see `editor.rs:189`) — mismatch
-  yields a default answer rather than a backend connection (CWE-346 / CWE-444);
+- enforces the served-cert-SAN-vs-`:authority` binding when `tls_server_name`
+  is present (`HttpContext::strict_sni_binding`, see `editor.rs:189`): the
+  routing layer matches the request authority against `HttpContext::tls_cert_names`
+  with RFC 6125 §6.4.3 wildcard handling, accepting H2/H1 connection coalescing
+  per RFC 7540 §9.1.1 / RFC 9113 §9.1.1 (the same behaviour Firefox / Chrome
+  implement). Misses yield a **421 Misdirected Request** default answer
+  (RFC 9110 §15.5.20) rather than a backend connection (CWE-346 / CWE-444);
 - turns route-not-found into `DefaultAnswer::Answer404`.
 
 ### 2.4 Backend connect — `connect_to_backend`
@@ -146,12 +150,21 @@ hand-rolling a struct literal (per repo `CLAUDE.md`).
 
 Notable security-relevant fields on `HttpContext`:
 
-- `tls_server_name` (`editor.rs:188`) — SNI captured at handshake; the routing
-  layer enforces an exact match against the HTTP authority when
-  `strict_sni_binding` is set.
+- `tls_server_name` (`editor.rs:188`) — SNI captured at handshake (lowercased,
+  trailing dot stripped). Used for logging and as a fallback exact-match check
+  when `tls_cert_names` is unavailable.
+- `tls_cert_names` (`editor.rs:200`) — `Option<Arc<Vec<String>>>` snapshot of
+  the SAN+CN set of the certificate Sōzu actually served on this TLS session,
+  captured once at handshake from the cert resolver. Frozen for the connection
+  lifetime, `Arc`-shared across every per-stream `HttpContext` so H2 fan-out
+  allocates once. The routing layer matches `:authority` against this set with
+  RFC 6125 wildcard handling, accepting browser connection coalescing while
+  preserving the CWE-346/CWE-444 trust boundary (operator-defined SAN scope).
+  `Some(Arc::new(vec![]))` when the default cert was served — every authority
+  is then rejected.
 - `strict_sni_binding` (`editor.rs:195`) — mirrors
-  `HttpsListenerConfig::strict_sni_binding`; defends against
-  cross-tenant authority spoofing (CWE-346 / CWE-444).
+  `HttpsListenerConfig::strict_sni_binding`; gates the `tls_cert_names` check
+  on/off. Defends against cross-tenant authority spoofing (CWE-346 / CWE-444).
 - `xff_chain` (`editor.rs:147`) — verbatim upstream `X-Forwarded-For` snapshot
   taken before Sōzu appends its own hop, so the access log records the
   attested chain even when Sōzu mutates the live header.

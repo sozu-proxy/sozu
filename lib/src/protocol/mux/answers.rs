@@ -381,6 +381,7 @@ mod tests {
             sticky_session: None,
             backend_address: None,
             tls_server_name: None,
+            tls_cert_names: None,
             strict_sni_binding: false,
             elide_x_real_ip: false,
             send_x_real_ip: false,

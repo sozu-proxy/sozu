@@ -22,6 +22,7 @@ use std::{
     io::ErrorKind,
     net::{Shutdown, SocketAddr},
     rc::{Rc, Weak},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -380,6 +381,16 @@ pub struct Context<L: ListenerHandler + L7ListenerHandler> {
     /// the client omitted the SNI extension. Stored pre-lowercased
     /// and without a port for cheap exact-match comparison.
     pub tls_server_name: Option<String>,
+    /// Snapshot of the SAN set of the certificate Sōzu actually served at
+    /// the TLS handshake. Captured once in `https.rs::upgrade_handshake`
+    /// from the resolver and frozen for the connection lifetime so H2
+    /// stream coalescing (RFC 7540 §9.1.1 / RFC 9113 §9.1.1) accepts any
+    /// `:authority` covered by the certificate, with RFC 6125 §6.4.3
+    /// wildcard handling. `None` for plaintext listeners or when SNI was
+    /// absent. `Some(empty)` when the default cert was served — every
+    /// `:authority` is rejected. `Arc` so the snapshot is shared across
+    /// every per-stream `HttpContext` without re-allocation.
+    pub tls_cert_names: Option<Arc<Vec<String>>>,
     /// Whether the routing layer must reject any request whose authority
     /// host does not exact-match `tls_server_name` (CWE-346 / CWE-444).
     /// Mirrors `HttpsListenerConfig::strict_sni_binding`; captured once
@@ -444,6 +455,7 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
             debug: DebugHistory::new(),
             h2_stream_shrink_ratio,
             tls_server_name: None,
+            tls_cert_names: None,
             strict_sni_binding,
             elide_x_real_ip,
             send_x_real_ip,
@@ -518,6 +530,10 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
             // HttpContext so `route_from_request` can enforce the SNI ↔
             // `:authority` binding for each H2 stream independently.
             http_context.tls_server_name = self.tls_server_name.clone();
+            // Mirror the frozen-at-handshake SAN snapshot. `Arc` clone is a
+            // refcount bump, not a deep copy — every per-stream
+            // `HttpContext` shares the same `Vec<String>`.
+            http_context.tls_cert_names = self.tls_cert_names.clone();
             // Mirror the listener's strict_sni_binding flag onto each
             // HttpContext so the routing layer can honor operator opt-outs
             // without reaching back into the listener on every request.

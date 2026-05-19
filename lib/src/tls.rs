@@ -434,6 +434,24 @@ impl CertificateResolver {
     ) -> Option<&KeyValue<Key, Fingerprint>> {
         self.domains.domain_lookup(domain, accept_wildcard)
     }
+
+    /// Resolve the SAN set Sōzu would serve for `domain` (the same trie
+    /// lookup rustls uses, wildcard-aware via `domain_lookup`). Returns the
+    /// certificate's `names` exactly as stored — wildcards retain their
+    /// leading `*.` so the caller can apply RFC 6125 §6.4.3 matching. `None`
+    /// when no cert covers `domain` (rustls would fall back to
+    /// `DEFAULT_CERTIFICATE`).
+    ///
+    /// Mirrors `MutexCertificateResolver::resolve` minus the rustls glue, so
+    /// the SAN snapshot taken at handshake matches the certificate the peer
+    /// actually validated (RFC 7540 §9.1.1 / RFC 9113 §9.1.1 connection
+    /// reuse).
+    pub fn names_for_sni(&self, domain: &[u8]) -> Option<Vec<String>> {
+        let (_, fingerprint) = self.domain_lookup(domain, true)?;
+        self.certificates
+            .get(fingerprint)
+            .map(|cert| cert.names.clone())
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -513,6 +531,27 @@ impl ResolvesServerCert for MutexCertificateResolver {
         );
         incr!("tls.default_cert_used");
         DEFAULT_CERTIFICATE.clone()
+    }
+}
+
+impl MutexCertificateResolver {
+    /// Snapshot of the SAN set Sōzu would serve for `domain`. Acquires the
+    /// resolver lock once. Returns `None` when the underlying mutex is
+    /// poisoned — the caller is expected to treat poison the same as
+    /// "default cert served" (legacy fallback), mirroring `resolve`'s
+    /// own poison handling at the rustls hot path.
+    pub fn names_for_sni(&self, domain: &[u8]) -> Option<Vec<String>> {
+        match self.0.lock() {
+            Ok(guard) => guard.names_for_sni(domain),
+            Err(poisoned) => {
+                error!(
+                    "{} cert resolver mutex poisoned, treating as no SAN match: {:?}",
+                    log_module_context!(),
+                    poisoned
+                );
+                None
+            }
+        }
     }
 }
 

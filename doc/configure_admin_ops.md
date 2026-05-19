@@ -35,7 +35,7 @@ reference, including defaults, mutability class, and metric impact:
 | `request_timeout`                      | http, https     | yes              |                                                              |
 | `disable_http11`                       | https          | yes               | Affects new handshakes only                                 |
 | `alpn_protocols`                       | https          | yes               | Use `--reset-alpn` to restore `["h2", "http/1.1"]` default  |
-| `strict_sni_binding`                   | https          | yes               | CWE-346 / CWE-444 protection                                |
+| `strict_sni_binding`                   | https          | yes               | `:authority` covered by served cert SANs (CWE-346 / CWE-444) |
 | `sozu_id_header`                       | http, https    | yes               | Rebranding the per-request correlation header               |
 | H2 flood thresholds (`h2_max_*`)       | https          | yes               | Per-connection setup; new connections only                  |
 | `h2_stream_idle_timeout_seconds`       | https          | yes               | Slow-multiplex Slowloris defence                            |

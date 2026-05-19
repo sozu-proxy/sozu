@@ -43,6 +43,29 @@ upgrade. See `doc/upgrade/1.x-to-2.0.md` for the full migration guide.
 
 ### ⛑️ Fixed
 
+- **H2 connection coalescing accepted on certificate SANs (RFC 7540 §9.1.1 /
+  RFC 9113 §9.1.1, RFC 6125 §6.4.3 wildcard handling)**: the strict
+  `:authority == TLS SNI` check at `lib/src/protocol/mux/router.rs` rejected
+  Firefox / Chrome coalesced H2 streams on wildcard certificates as **421
+  Misdirected Request**. Browsers reuse one H2 connection for any origin
+  covered by the served certificate's SAN set (Firefox
+  `nsHttpConnectionMgr::FindCoalescableConnection*` →
+  `Http2Session::RealJoinConnection`; Chrome
+  `SpdySession::VerifyDomainAuthentication` →
+  `X509Certificate::VerifyNameMatch`); both retry cleanly on 421. Sōzu now
+  matches each request's `:authority` (H2) / `Host` (H1) against the SAN+CN
+  set of the certificate it actually served on the TLS session — captured
+  once at handshake into `Context::tls_cert_names` and `Arc`-shared across
+  every per-stream `HttpContext`. The 421 path remains for genuine SAN
+  misses (RFC 9110 §15.5.20). The default-cert path serves an explicit
+  empty SAN set so every `:authority` is still rejected. Existing
+  `strict_sni_binding = false` opt-out is unchanged. A new
+  `h2.coalescing.accepted` counter records legitimate coalesced acceptances
+  (matched SAN ≠ initial SNI) for multi-tenant observability, alongside a
+  `debug!` log on the same path. Public-suffix wildcard blocking (e.g.
+  `*.com`) is intentionally not implemented — that is a browser-policy
+  concern, not a reverse-proxy responsibility.
+
 - **Response-side header edits no longer re-injected on every prepare
   cycle (`H2BlockConverter::finalize` "out buffer not empty" leak)**:
   `apply_response_header_edits` was called inconditionally before
