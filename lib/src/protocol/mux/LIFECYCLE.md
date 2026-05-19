@@ -65,6 +65,31 @@ index.
                └── state machine, flow window, HPACK, ...
 ```
 
+The `Context` also carries two connection-scoped TLS fields populated once at
+handshake and propagated to every per-stream `HttpContext` via
+`Context::create_stream`:
+
+- `tls_server_name: Option<String>` — the SNI the client sent (lowercased,
+  trailing dot stripped). `None` on plaintext listeners or when the client
+  omitted SNI.
+- `tls_cert_names: Option<Arc<Vec<String>>>` — snapshot of the SAN+CN set of
+  the certificate Sōzu actually served on this TLS session, captured in
+  `lib/src/https.rs::HttpsStateMachine::upgrade_handshake` from the resolver.
+  `Arc`-shared so fan-out across N H2 streams allocates once; frozen for the
+  connection lifetime even if the operator swaps the cert mid-flight (mirrors
+  browser cache semantics). `None` for plaintext or no-SNI handshakes;
+  `Some(Arc::new(vec![]))` when rustls fell back to the default cert (Sōzu is
+  not authoritative for any specific name, so every `:authority` is rejected).
+
+The routing layer (`lib/src/protocol/mux/router.rs::route_from_request`)
+matches each request's `:authority` (H2) or `Host` (H1) against
+`tls_cert_names` with RFC 6125 §6.4.3 wildcard handling — accepting H2
+connection coalescing per RFC 7540 §9.1.1 / RFC 9113 §9.1.1, the way Firefox
+and Chrome do. Misses are answered with **421 Misdirected Request** (RFC 9110
+§15.5.20), which both browsers retry on a fresh connection with the correct
+SNI. Coalesced acceptances (matched SAN != initial SNI) bump
+`h2.coalescing.accepted` and emit a `debug!` log for ops observability.
+
 ### 1.3 Key type declarations
 
 | Type                                 | Declaration                     | Purpose                                                              |

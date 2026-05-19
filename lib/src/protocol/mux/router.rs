@@ -564,28 +564,74 @@ impl Router {
         // holds on `context`.
         let captured_authority = host.to_owned();
 
-        // ── TLS SNI ↔ HTTP :authority binding ─────────────────────────────
-        // Reject any request whose authority hostname does not exact-match the
-        // SNI negotiated at TLS handshake. Without this check, an attacker
-        // holding a valid certificate for tenant A could open TLS with SNI=A
-        // (Sōzu serves cert A) then send an H2 stream with
-        // `:authority=tenantB.example.com` and reach tenant B's backend,
-        // crossing the TLS trust boundary (CWE-346 / CWE-444).
+        // ── TLS cert SAN ↔ HTTP :authority binding ────────────────────────
+        // Reject any request whose `:authority` is not covered by a SAN of
+        // the certificate Sōzu actually served at the TLS handshake, with
+        // RFC 6125 §6.4.3 wildcard handling. Without this binding, an
+        // attacker holding a valid certificate for tenant A could open TLS
+        // with SNI=A then send an H2 stream with `:authority=tenantB.…` and
+        // reach tenant B's backend, crossing the TLS trust boundary
+        // (CWE-346 / CWE-444). The H2 spec explicitly allows browsers to
+        // coalesce streams onto a connection whenever the server is
+        // authoritative for the new origin (RFC 7540 §9.1.1 / RFC 9113
+        // §9.1.1), which "authoritative" means "covered by a SAN of the
+        // served cert"; rejecting coalesced streams as 421 caused the
+        // user-visible bug this predicate fixes (RFC 9110 §15.5.20).
         //
         // Plaintext listeners bypass the check (SNI is always `None`).
+        // Connections where SNI was sent but no cert matched (rustls served
+        // the default cert) carry `Some(empty)` SAN snapshot, so every
+        // authority is rejected — Sōzu is not authoritative for any name.
+        // Connections with no SNI fall back to the legacy exact-SNI match
+        // predicate (`authority_matches_sni`) for parity with pre-fix
+        // behaviour on the pathological "no SNI" case.
         // Operators may opt out per-listener via
-        // `HttpsListenerConfig::strict_sni_binding = false`; the flag is
-        // captured on `HttpContext` at stream creation to avoid a
-        // per-request listener borrow.
-        if context.strict_sni_binding {
-            if let Some(sni) = context.tls_server_name.as_deref() {
-                if !authority_matches_sni(host, sni) {
+        // `HttpsListenerConfig::strict_sni_binding = false`.
+        if context.strict_sni_binding && context.tls_server_name.is_some() {
+            let sni = context.tls_server_name.as_deref().unwrap();
+            let matched: Option<&str> = match context.tls_cert_names.as_deref() {
+                Some(names) => authority_matched_cert_name(host, names),
+                None => {
+                    if authority_matches_sni(host, sni) {
+                        Some(sni)
+                    } else {
+                        None
+                    }
+                }
+            };
+            match matched {
+                Some(matched_name) => {
+                    // Real coalescing = matched SAN differs from the SNI's
+                    // value after the matcher's port-strip + ASCII case
+                    // folding. Same-name requests are the common
+                    // non-coalesced path; do not pollute the counter or
+                    // logs with them. The metric / log is also gated to
+                    // ALPN=`h2` because the user-facing bug (Slack threads
+                    // C4RT92HLK / C6V040003, 2026-05) is specifically
+                    // about H2 multiplexing — browsers do not coalesce H1
+                    // keep-alive across origins (sequential reuse is not
+                    // multiplexing); counting H1 cross-Host requests as
+                    // "coalescing" would over-report the signal ops use
+                    // to detect the H2 multi-tenant pattern.
+                    if !host_matches_sni_ignoring_port(host, sni) && context.tls_alpn == Some("h2")
+                    {
+                        incr!("h2.coalescing.accepted");
+                        debug!(
+                            "{} accepted coalesced authority {:?} (SNI {:?}, matched SAN {:?})",
+                            log_module_context!(context),
+                            host,
+                            sni,
+                            matched_name,
+                        );
+                    }
+                }
+                None => {
                     incr!("http.sni_authority_mismatch");
                     warn!(
-                        "{} rejecting request: TLS SNI {:?} does not match :authority {:?}",
+                        "{} rejecting request: TLS cert SANs do not cover :authority {:?} (SNI {:?})",
                         log_module_context!(context),
+                        host,
                         sni,
-                        host
                     );
                     return Err(RetrieveClusterError::SniAuthorityMismatch {
                         sni: sni.to_owned(),
@@ -1156,10 +1202,7 @@ fn build_redirect_location(
 /// entirely ASCII digits. This keeps bracketed IPv6 literals like `[::1]`
 /// intact: `rsplit_once(':')` would otherwise mis-split them.
 pub(crate) fn authority_matches_sni(authority: &str, sni_lowercased: &str) -> bool {
-    let host = match authority.rsplit_once(':') {
-        Some((h, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => h,
-        _ => authority,
-    };
+    let host = strip_authority_port(authority);
     if host.len() != sni_lowercased.len() {
         return false;
     }
@@ -1167,6 +1210,93 @@ pub(crate) fn authority_matches_sni(authority: &str, sni_lowercased: &str) -> bo
         .iter()
         .zip(sni_lowercased.as_bytes())
         .all(|(a, b)| a.to_ascii_lowercase() == *b)
+}
+
+/// Strip the optional `:port` suffix from an authority value. Bracketed
+/// IPv6 literals (`[::1]`, `[::1]:8443`) keep their inner colons intact:
+/// the suffix is only stripped when the tail after the last `:` is
+/// non-empty and entirely ASCII digits.
+fn strip_authority_port(authority: &str) -> &str {
+    match authority.rsplit_once(':') {
+        Some((h, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => h,
+        _ => authority,
+    }
+}
+
+/// Case-insensitive equality between an authority host (port stripped) and
+/// an already-lowercased SNI. Used to decide whether a request is
+/// "same-name" or really coalesced.
+fn host_matches_sni_ignoring_port(authority: &str, sni_lowercased: &str) -> bool {
+    let host = strip_authority_port(authority);
+    if host.len() != sni_lowercased.len() {
+        return false;
+    }
+    host.as_bytes()
+        .iter()
+        .zip(sni_lowercased.as_bytes())
+        .all(|(a, b)| a.to_ascii_lowercase() == *b)
+}
+
+/// RFC 6125 §6.4.3 wildcard-aware match of `:authority` against a SAN set
+/// snapshot taken at TLS handshake.
+///
+/// Returns the matched SAN entry on success so the caller can log it.
+///
+/// Matching rules:
+///   * Port suffix on the authority is stripped (same logic as
+///     [`authority_matches_sni`], IPv6-bracket safe).
+///   * Compare is ASCII case-insensitive (`:authority` is ASCII per
+///     RFC 9113 §8.3.1; SAN entries are stored pre-lowercased by
+///     `https.rs::upgrade_handshake`).
+///   * `*.suffix` matches exactly one DNS label at the leftmost position
+///     and only when that label is non-empty: it does NOT match the apex,
+///     does NOT cross dots, and embedded wildcards (`foo.*.example.com`,
+///     `*foo.example.com`) are forbidden.
+///   * Empty `names` ⇒ `None` (default-cert path — Sōzu is not
+///     authoritative for any name).
+pub(crate) fn authority_matched_cert_name<'a>(
+    authority: &str,
+    names: &'a [String],
+) -> Option<&'a str> {
+    let host = strip_authority_port(authority);
+    if host.is_empty() {
+        return None;
+    }
+    for entry in names {
+        if let Some(suffix) = entry.strip_prefix("*.") {
+            // RFC 6125 §6.4.3: the wildcard label is the *entire* left-most
+            // label. Embedded wildcards (`f*.example.com`, `*f.example.com`)
+            // are rejected because we reach this branch only when the entry
+            // starts with the exact two bytes `*.`. We still must reject
+            // wildcards anywhere else in the entry by requiring no further
+            // `*` in `suffix`.
+            if suffix.contains('*') {
+                continue;
+            }
+            // Authority has the form `<left-most-label>.<rest>`; the
+            // wildcard substitutes for exactly that left-most label, which
+            // must be non-empty and contain no dot.
+            let Some((leftmost, rest)) = host.split_once('.') else {
+                continue;
+            };
+            if leftmost.is_empty() {
+                continue;
+            }
+            if rest.eq_ignore_ascii_case(suffix) {
+                return Some(entry);
+            }
+            continue;
+        }
+        if entry.contains('*') {
+            // Internal wildcards (`foo.*.example.com`) are not RFC 6125-
+            // valid. Skip rather than mis-match.
+            continue;
+        }
+        if host.eq_ignore_ascii_case(entry) {
+            return Some(entry);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -1225,5 +1355,113 @@ mod tests {
         // port separator: the tail after the last `:` is `1]`, not all
         // digits, so it is NOT stripped and the whole string compares.
         assert!(authority_matches_sni("[::1]", "[::1]"));
+    }
+}
+
+#[cfg(test)]
+mod authority_matched_cert_name_tests {
+    use super::authority_matched_cert_name;
+
+    #[test]
+    fn cert_name_match_exact_single_san() {
+        let names = vec!["example.com".to_owned()];
+        assert_eq!(
+            authority_matched_cert_name("example.com", &names),
+            Some("example.com"),
+        );
+    }
+
+    #[test]
+    fn cert_name_match_wildcard_left_most() {
+        let names = vec!["*.cleverapps.io".to_owned()];
+        assert_eq!(
+            authority_matched_cert_name("staging-3.cleverapps.io", &names),
+            Some("*.cleverapps.io"),
+        );
+    }
+
+    #[test]
+    fn cert_name_reject_wildcard_apex() {
+        // RFC 6125 §6.4.3: `*.example.com` does NOT cover the apex
+        // `example.com` — the wildcard label must consume exactly one
+        // non-empty label.
+        let names = vec!["*.example.com".to_owned()];
+        assert_eq!(authority_matched_cert_name("example.com", &names), None);
+    }
+
+    #[test]
+    fn cert_name_reject_wildcard_two_labels() {
+        // `*.example.com` cannot cross dots: `a.b.example.com` has two
+        // labels before `example.com` and must be rejected.
+        let names = vec!["*.example.com".to_owned()];
+        assert_eq!(authority_matched_cert_name("a.b.example.com", &names), None,);
+    }
+
+    #[test]
+    fn cert_name_reject_wildcard_not_left_most() {
+        // Embedded wildcards (`foo.*.example.com`) are not RFC 6125-valid
+        // and must be skipped, not mis-matched.
+        let names = vec!["foo.*.example.com".to_owned()];
+        assert_eq!(
+            authority_matched_cert_name("foo.bar.example.com", &names),
+            None,
+        );
+    }
+
+    #[test]
+    fn cert_name_match_case_insensitive() {
+        // ASCII case folding only — `:authority` is ASCII per RFC 9113
+        // §8.3.1 and the snapshot is pre-lowercased at handshake.
+        let names = vec!["EXAMPLE.com".to_owned()];
+        assert!(authority_matched_cert_name("Example.COM", &names).is_some());
+    }
+
+    #[test]
+    fn cert_name_match_with_port() {
+        // The port suffix on `:authority` must be stripped before the
+        // SAN compare.
+        let names = vec!["example.com".to_owned()];
+        assert!(authority_matched_cert_name("example.com:8443", &names).is_some());
+    }
+
+    #[test]
+    fn cert_name_match_idn_a_label() {
+        // IDNA A-labels (xn--…) are ASCII and compare byte-for-byte once
+        // the snapshot is lowercased.
+        let names = vec!["xn--bcher-kva.example.com".to_owned()];
+        assert!(authority_matched_cert_name("xn--bcher-kva.example.com", &names).is_some());
+    }
+
+    #[test]
+    fn cert_name_reject_empty_names() {
+        // Empty snapshot = default cert served = Sōzu is not
+        // authoritative for any name; every authority must miss.
+        assert_eq!(authority_matched_cert_name("example.com", &[]), None);
+    }
+
+    #[test]
+    fn cert_name_match_multi_san_one_hit() {
+        let names = vec!["foo.com".to_owned(), "*.example.org".to_owned()];
+        assert_eq!(
+            authority_matched_cert_name("bar.example.org", &names),
+            Some("*.example.org"),
+        );
+    }
+
+    #[test]
+    fn cert_name_reject_substring_attack() {
+        // `*.example.com` must not match `example.commons` — the suffix
+        // after the first label is `commons`, not `example.com`.
+        let names = vec!["*.example.com".to_owned()];
+        assert_eq!(authority_matched_cert_name("example.commons", &names), None,);
+    }
+
+    #[test]
+    fn cert_name_ipv6_bracketed_literal_with_port() {
+        // The `:` characters inside the brackets must not be mistaken for
+        // a port separator: only the trailing `:8443` is stripped, and
+        // `[::1]` compares equal to `[::1]`.
+        let names = vec!["[::1]".to_owned()];
+        assert!(authority_matched_cert_name("[::1]:8443", &names).is_some());
     }
 }

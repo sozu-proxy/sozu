@@ -264,12 +264,16 @@ fn e2e_h2_sni_strict_match_happy_path() {
 }
 
 // ============================================================================
-// Test 2: SNI ≠ :authority — blocked with 421 and metric bump
+// Test 2: SNI ↔ :authority — off-SAN authority blocked with 421 and metric bump
 // ============================================================================
 
-/// CWE-346 / CWE-444: SNI=foo but `:authority=bar`. The router must reject
-/// the stream with 421 Misdirected Request, bump
-/// `http.sni_authority_mismatch`, and MUST NOT reach the bar backend.
+/// CWE-346 / CWE-444: SNI=foo but `:authority=evil.org`. `evil.org` is not in
+/// the served cert's SAN set (`foo|bar|baz.example.com`, `localhost`), so the
+/// router must reject the stream with 421 Misdirected Request (RFC 9110
+/// §15.5.20), bump `http.sni_authority_mismatch`, and MUST NOT reach any
+/// backend. This guards the post-coalescing semantics: legitimate
+/// browser-driven coalescing across SANs is accepted (test 6), but an
+/// authority outside the cert's coverage is still rejected.
 fn try_h2_sni_authority_mismatch_blocked() -> State {
     let (mut worker, mut foo, mut bar, front_port) =
         setup_sni_two_tenant_listener("H2-SNI-MISMATCH", None);
@@ -280,13 +284,13 @@ fn try_h2_sni_authority_mismatch_blocked() -> State {
     let mut tls = raw_h2_connection_with_sni(front_addr, "foo.example.com");
     h2_handshake(&mut tls);
 
-    let headers = build_request_headers(b"bar.example.com");
+    let headers = build_request_headers(b"evil.org");
     let frame = H2Frame::headers(1, headers, true, true);
     tls.write_all(&frame.encode()).expect("write HEADERS");
     tls.flush().expect("flush HEADERS");
 
     let frames = collect_response_frames(&mut tls, 500, 4, 500);
-    log_frames("H2 SNI mismatch", &frames);
+    log_frames("H2 SNI off-SAN", &frames);
 
     let got_421 = headers_status_matches(&frames, b"421");
 
@@ -313,7 +317,7 @@ fn try_h2_sni_authority_mismatch_blocked() -> State {
         State::Success
     } else {
         println!(
-            "mismatch FAIL: stopped={stopped} got_421={got_421} delta={delta} \
+            "off-SAN FAIL: stopped={stopped} got_421={got_421} delta={delta} \
              foo_reqs={} bar_reqs={}",
             foo_agg.requests_received, bar_agg.requests_received
         );
@@ -326,7 +330,7 @@ fn e2e_h2_sni_authority_mismatch_blocked() {
     assert_eq!(
         repeat_until_error_or(
             3,
-            "H2 SNI: mismatch blocked (SNI=foo, :authority=bar \u{2192} 421 + metric)",
+            "H2 SNI: off-SAN authority blocked (SNI=foo, :authority=evil.org \u{2192} 421 + metric)",
             try_h2_sni_authority_mismatch_blocked
         ),
         State::Success
@@ -572,6 +576,93 @@ fn e2e_h2_sni_authority_mismatch_allowed_when_strict_binding_disabled() {
             3,
             "H2 SNI: opt-out via strict_sni_binding=false forwards the mismatch",
             try_h2_sni_authority_mismatch_allowed_when_strict_binding_disabled
+        ),
+        State::Success
+    );
+}
+
+// ============================================================================
+// Test 6: H2 connection coalescing across cert SANs (RFC 7540 §9.1.1)
+// ============================================================================
+
+/// Browsers (Firefox / Chrome) reuse a single H2 connection for any origin
+/// covered by the SAN set of the certificate served at handshake (RFC 7540
+/// §9.1.1 / RFC 9113 §9.1.1, with RFC 6125 §6.4.3 wildcard handling). Sōzu
+/// must accept this: SNI=foo.example.com but `:authority=bar.example.com`
+/// where both names are SANs of the served cert → 200 from the `bar`
+/// backend, and the `h2.coalescing.accepted` counter must bump.
+///
+/// This is the regression test for the Clever Cloud console 421 storm
+/// reported on 2026-05-18 (Slack threads C4RT92HLK / p1779119756906459 and
+/// C6V040003 / p1776691535478149): legitimate browser coalescing on
+/// `*.cleverapps.io` was being rejected as 421.
+fn try_h2_coalescing_multi_san_accepted() -> State {
+    let (mut worker, mut foo, mut bar, front_port) =
+        setup_sni_two_tenant_listener("H2-COALESCING-ACCEPTED", None);
+
+    let coalesce_before = read_counter(&mut worker, "h2.coalescing.accepted");
+    let mismatch_before = read_counter(&mut worker, "http.sni_authority_mismatch");
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection_with_sni(front_addr, "foo.example.com");
+    h2_handshake(&mut tls);
+
+    // Same TLS session, but request the `bar` tenant — this is what a
+    // browser does when it coalesces a second origin onto a wildcard /
+    // multi-SAN cert.
+    let headers = build_request_headers(b"bar.example.com");
+    let frame = H2Frame::headers(1, headers, true, true);
+    tls.write_all(&frame.encode()).expect("write HEADERS");
+    tls.flush().expect("flush HEADERS");
+
+    let frames = collect_response_frames(&mut tls, 500, 4, 500);
+    log_frames("H2 SAN coalescing accepted", &frames);
+
+    let got_ok = headers_ok_response(&frames);
+
+    let coalesce_after = read_counter(&mut worker, "h2.coalescing.accepted");
+    let mismatch_after = read_counter(&mut worker, "http.sni_authority_mismatch");
+    let coalesce_delta = coalesce_after - coalesce_before;
+    let mismatch_delta = mismatch_after - mismatch_before;
+
+    drop(tls);
+    thread::sleep(Duration::from_millis(200));
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+
+    let foo_agg = foo.stop_and_get_aggregator().unwrap_or_default();
+    let bar_agg = bar.stop_and_get_aggregator().unwrap_or_default();
+
+    // `bar` backend MUST receive the request (coalescing accepted); `foo`
+    // backend MUST NOT (the request was routed by `:authority`, not SNI).
+    // `h2.coalescing.accepted` MUST bump; `http.sni_authority_mismatch`
+    // MUST NOT bump (it is reserved for real misses).
+    if stopped
+        && got_ok
+        && coalesce_delta >= 1
+        && mismatch_delta == 0
+        && bar_agg.requests_received == 1
+        && foo_agg.requests_received == 0
+    {
+        State::Success
+    } else {
+        println!(
+            "coalescing FAIL: stopped={stopped} got_ok={got_ok} \
+             coalesce_delta={coalesce_delta} mismatch_delta={mismatch_delta} \
+             foo_reqs={} bar_reqs={}",
+            foo_agg.requests_received, bar_agg.requests_received
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn e2e_h2_coalescing_multi_san_accepted() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 coalescing: SNI=foo, :authority=bar covered by cert SANs \u{2192} 200 + h2.coalescing.accepted",
+            try_h2_coalescing_multi_san_accepted
         ),
         State::Success
     );

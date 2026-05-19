@@ -408,10 +408,52 @@ impl HttpsSession {
             self.peer_address,
             self.public_address,
         );
+        // Snapshot the SAN set of the certificate this handshake actually
+        // served. Frozen at handshake to match browser behaviour (Firefox
+        // and Chrome cache the validated cert per connection — RFC 7540
+        // §9.1.1 / RFC 9113 §9.1.1) and so the H2 router can accept
+        // coalesced streams whose `:authority` is covered by any SAN
+        // (RFC 6125 §6.4.3 wildcards). Worker is single-threaded mio, so
+        // no concurrent `add_certificate` / `remove_certificate` can race
+        // between rustls's resolve callback and this lookup.
+        //
+        // Three cases:
+        //   * SNI absent → `None`; `strict_sni_binding` falls back to the
+        //     legacy exact-match predicate (no SNI ⇒ predicate no-ops).
+        //   * SNI present and matches a cert → snapshot its SAN list,
+        //     canonicalised (lowercase + trailing-dot strip + dedup).
+        //   * SNI present but no matching cert (rustls served the default
+        //     cert) → `Some(empty)`; every authority is rejected, since
+        //     Sōzu is not authoritative for any name on the default cert.
+        let tls_cert_names: Option<Arc<Vec<String>>> = match sni_owned.as_deref() {
+            Some(sni) => {
+                let names = self
+                    .listener
+                    .borrow()
+                    .resolver()
+                    .names_for_sni(sni.as_bytes());
+                let mut snapshot: Vec<String> = names
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|mut name| {
+                        name.make_ascii_lowercase();
+                        if name.ends_with('.') {
+                            name.pop();
+                        }
+                        name
+                    })
+                    .collect();
+                snapshot.sort();
+                snapshot.dedup();
+                Some(Arc::new(snapshot))
+            }
+            None => None,
+        };
         // Bind the TLS SNI to this session so the routing layer can reject any
         // H2 stream whose `:authority` crosses the TLS trust boundary (see
         // `route_from_request`).
         context.tls_server_name = sni_owned;
+        context.tls_cert_names = tls_cert_names;
         // Stamp the connection-scoped TLS metadata so every per-stream
         // HttpContext created by `Context::create_stream` inherits it for
         // the access log without re-querying rustls.
@@ -987,6 +1029,15 @@ impl HttpsListener {
     /// to HTTP/1.1.
     pub fn is_http11_disabled(&self) -> bool {
         self.config.disable_http11.unwrap_or(false)
+    }
+
+    /// Borrow the listener's certificate resolver. Used by the TLS handshake
+    /// path to snapshot the SAN set of the certificate Sōzu serves for a
+    /// given SNI, so the H2 router can accept connection coalescing
+    /// (RFC 7540 §9.1.1 / RFC 9113 §9.1.1) on every authority covered by
+    /// that cert (RFC 6125 §6.4.3 wildcard handling).
+    pub fn resolver(&self) -> &Arc<MutexCertificateResolver> {
+        &self.resolver
     }
 
     pub fn try_new(
