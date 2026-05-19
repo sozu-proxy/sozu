@@ -77,9 +77,11 @@ handshake and propagated to every per-stream `HttpContext` via
   `lib/src/https.rs::HttpsStateMachine::upgrade_handshake` from the resolver.
   `Arc`-shared so fan-out across N H2 streams allocates once; frozen for the
   connection lifetime even if the operator swaps the cert mid-flight (mirrors
-  browser cache semantics). `None` for plaintext or no-SNI handshakes;
-  `Some(Arc::new(vec![]))` when rustls fell back to the default cert (Sōzu is
-  not authoritative for any specific name, so every `:authority` is rejected).
+  browser cache semantics). `None` for plaintext or no-SNI handshakes, and
+  also when rustls fell back to the default cert (no SAN matched the SNI) —
+  routing then uses the legacy `authority_matches_sni` exact-match
+  predicate, preserving the pre-fix safety guarantee without blocking
+  intentionally-misconfigured listeners.
 
 The routing layer (`lib/src/protocol/mux/router.rs::route_from_request`)
 matches each request's `:authority` (H2) or `Host` (H1) against
