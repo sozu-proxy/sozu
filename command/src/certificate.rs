@@ -57,31 +57,93 @@ pub fn parse_x509(pem_bytes: &[u8]) -> Result<X509Certificate<'_>, CertificateEr
 // -----------------------------------------------------------------------------
 // get_cn_and_san_attributes
 
-/// Retrieve from the x509 the common name (a.k.a `CN`) and the
-/// subject alternate names (a.k.a `SAN`)
+/// Retrieve the certificate's authoritative DNS identities for routing.
+///
+/// Per RFC 6125 §6.4.4: when the SubjectAlternativeName extension contains
+/// at least one `dNSName` entry, the SAN entries are the sole authoritative
+/// identities and the Common Name is ignored. The CN is only honoured as a
+/// fallback when the certificate omits the SAN extension entirely or
+/// declares it without a `dNSName` (e.g. SAN with only `iPAddress` /
+/// `rfc822Name` / `directoryName` entries — uncommon, but legal).
+///
+/// Aligns Sōzu's coalescing trust boundary with browser implementations
+/// (Firefox / Chrome both stopped honouring CN for hostname verification
+/// circa 2017) so a cert with `CN=tenant-b.example` and `SAN=tenant-a.example`
+/// cannot smuggle `tenant-b.example` into the routing authority list.
 pub fn get_cn_and_san_attributes(x509: &X509Certificate) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
-    for name in x509.subject().iter_by_oid(&OID_X509_COMMON_NAME) {
-        names.push(
-            name.as_str()
-                .map(String::from)
-                .unwrap_or_else(|_| String::from_utf8_lossy(name.as_slice()).to_string()),
-        );
-    }
+    let mut san_dns_seen = false;
 
     for extension in x509.extensions() {
         if extension.oid == OID_X509_EXT_SUBJECT_ALT_NAME {
             if let ParsedExtension::SubjectAlternativeName(san) = extension.parsed_extension() {
                 for name in &san.general_names {
                     if let GeneralName::DNSName(name) = name {
+                        san_dns_seen = true;
                         names.push(name.to_string());
                     }
                 }
             }
         }
     }
+
+    if !san_dns_seen {
+        for name in x509.subject().iter_by_oid(&OID_X509_COMMON_NAME) {
+            names.push(
+                name.as_str()
+                    .map(String::from)
+                    .unwrap_or_else(|_| String::from_utf8_lossy(name.as_slice()).to_string()),
+            );
+        }
+    }
     names.dedup();
     names
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// RFC 6125 §6.4.4: when SAN contains at least one dNSName, the CN is
+    /// ignored. A cert with `CN=tenant-b.example` and SAN `tenant-a.example`
+    /// is authoritative for `tenant-a.example` only.
+    #[test]
+    fn san_dns_present_excludes_cn() {
+        let pem = parse_pem(include_str!("../../lib/assets/cn-ne-san-cert.pem").as_bytes())
+            .expect("parse PEM");
+        let x509 = parse_x509(&pem.contents).expect("parse x509");
+        let names = get_cn_and_san_attributes(&x509);
+        assert_eq!(names, vec![String::from("tenant-a.example")]);
+    }
+
+    /// Fallback: SAN extension absent (no dNSName entries) ⇒ CN is honoured.
+    /// `lib/assets/certificate.pem` (CN=lolcatho.st, no SAN extension) is the
+    /// canonical fixture for this branch.
+    #[test]
+    fn cn_used_when_san_absent() {
+        let pem = parse_pem(include_str!("../../lib/assets/certificate.pem").as_bytes())
+            .expect("parse PEM");
+        let x509 = parse_x509(&pem.contents).expect("parse x509");
+        let names = get_cn_and_san_attributes(&x509);
+        assert_eq!(names, vec![String::from("lolcatho.st")]);
+    }
+
+    /// SAN dNSName present and CN ∈ SAN ⇒ the resulting list is the SAN
+    /// dNSName set verbatim (dedup removes the duplicate CN entry from the
+    /// pre-fix code path; the post-fix code never inserts the CN at all,
+    /// so the same list is observed but via a tighter path).
+    #[test]
+    fn san_dns_present_cn_is_san_member() {
+        let pem = parse_pem(include_str!("../../lib/assets/multi-sni-cert.pem").as_bytes())
+            .expect("parse PEM");
+        let x509 = parse_x509(&pem.contents).expect("parse x509");
+        let names = get_cn_and_san_attributes(&x509);
+        assert!(names.contains(&String::from("foo.example.com")));
+        assert!(names.contains(&String::from("bar.example.com")));
+        assert!(names.contains(&String::from("baz.example.com")));
+        assert!(names.contains(&String::from("localhost")));
+        assert_eq!(names.len(), 4);
+    }
 }
 
 // -----------------------------------------------------------------------------

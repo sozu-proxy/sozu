@@ -154,14 +154,18 @@ Notable security-relevant fields on `HttpContext`:
   trailing dot stripped). Used for logging and as a fallback exact-match check
   when `tls_cert_names` is unavailable.
 - `tls_cert_names` (`editor.rs:200`) — `Option<Arc<Vec<String>>>` snapshot of
-  the SAN+CN set of the certificate Sōzu actually served on this TLS session,
-  captured once at handshake from the cert resolver. Frozen for the connection
-  lifetime, `Arc`-shared across every per-stream `HttpContext` so H2 fan-out
-  allocates once. The routing layer matches `:authority` against this set with
-  RFC 6125 wildcard handling, accepting browser connection coalescing while
-  preserving the CWE-346/CWE-444 trust boundary (operator-defined SAN scope).
-  `None` when the resolver fell back to the default cert — routing then
-  fall-backs to legacy SNI exact-match.
+  the SAN dNSName entries of the certificate Sōzu actually served on this TLS
+  session (RFC 6125 §6.4.4: when the SAN extension contains at least one
+  dNSName entry, those entries are authoritative and the Common Name is
+  ignored — Sōzu only honours CN as a fallback when SAN is absent or has no
+  dNSName entry). Captured once at handshake from the cert resolver, frozen
+  for the connection lifetime, `Arc`-shared across every per-stream
+  `HttpContext` so H2 fan-out allocates once. The routing layer matches
+  `:authority` against this set with RFC 6125 §6.4.3 wildcard handling,
+  accepting browser connection coalescing while preserving the
+  CWE-346 / CWE-444 trust boundary (operator-defined SAN scope). `None` when
+  the resolver fell back to the default cert — routing then fall-backs to
+  legacy SNI exact-match.
 - `strict_sni_binding` (`editor.rs:195`) — mirrors
   `HttpsListenerConfig::strict_sni_binding`; gates the `tls_cert_names` check
   on/off. Defends against cross-tenant authority spoofing (CWE-346 / CWE-444).
