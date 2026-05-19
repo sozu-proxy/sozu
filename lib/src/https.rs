@@ -413,11 +413,35 @@ impl HttpsSession {
         // and Chrome cache the validated cert per connection — RFC 7540
         // §9.1.1 / RFC 9113 §9.1.1) and so the H2 router can accept
         // coalesced streams whose `:authority` is covered by any SAN
-        // (RFC 6125 §6.4.3 wildcards). Worker is single-threaded mio, so
-        // no concurrent `add_certificate` / `remove_certificate` can race
-        // between rustls's resolve callback and this lookup.
+        // (RFC 6125 §6.4.3 wildcards).
         //
-        // Three cases:
+        // # Known race window (accepted risk)
+        //
+        // This is a SECOND lookup, separate from rustls's `resolve()`
+        // callback. Between rustls's `resolve()` (during ClientHello
+        // processing) and this block (post-`Finished`), the mio loop may
+        // dispatch the command-channel token — handlers there call
+        // `add_certificate` / `remove_certificate`, which mutate the same
+        // resolver trie. The single-threaded-worker invariant prevents
+        // simultaneous mutation, but not interleaving between mio
+        // iterations.
+        //
+        // Realistic threat model: internal misuse — a tenant operator
+        // with config-IPC privilege races a `remove_certificate(A)` plus
+        // `add_certificate(B covering same SNI)` inside the handshake
+        // window. The snapshot below then reflects B instead of A. The
+        // attacker already holds the trust boundary they would need to
+        // mint a malicious cert outright (config IPC == resolver write
+        // privilege), so the race grants no privilege the attacker did
+        // not already have. Closing it structurally would require either
+        // (a) rustls API support to recover the served cert chain
+        // post-handshake (`server_cert_chain` is `pub(crate)` in rustls
+        // 0.23.x) or (b) threading per-session state from `resolve()` to
+        // here through a side-channel that handles out-of-order handshake
+        // completion — both deferred. Keep the second lookup; document
+        // the window honestly.
+        //
+        // Cases handled:
         //   * SNI absent → `None`; routing falls back to the legacy
         //     `authority_matches_sni` predicate (no SNI ⇒ predicate no-ops).
         //   * SNI present and the resolver returned a SAN-bearing cert →
