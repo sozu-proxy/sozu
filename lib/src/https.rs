@@ -418,35 +418,51 @@ impl HttpsSession {
         // between rustls's resolve callback and this lookup.
         //
         // Three cases:
-        //   * SNI absent → `None`; `strict_sni_binding` falls back to the
-        //     legacy exact-match predicate (no SNI ⇒ predicate no-ops).
-        //   * SNI present and matches a cert → snapshot its SAN list,
-        //     canonicalised (lowercase + trailing-dot strip + dedup).
+        //   * SNI absent → `None`; routing falls back to the legacy
+        //     `authority_matches_sni` predicate (no SNI ⇒ predicate no-ops).
+        //   * SNI present and the resolver returned a SAN-bearing cert →
+        //     `Some(snapshot)` (lowercase + trailing-dot strip + dedup).
+        //     Routing accepts `:authority` covered by the SAN set with
+        //     RFC 6125 §6.4.3 wildcard handling — this is the H2
+        //     connection-coalescing fix (RFC 7540 §9.1.1 / RFC 9113
+        //     §9.1.1, Firefox + Chrome semantics).
         //   * SNI present but no matching cert (rustls served the default
-        //     cert) → `Some(empty)`; every authority is rejected, since
-        //     Sōzu is not authoritative for any name on the default cert.
+        //     cert) → `None`. The legacy exact-match fallback applies:
+        //     accept iff `:authority == SNI`, identical to the pre-fix
+        //     behaviour. Returning `Some(empty)` here would block every
+        //     authority — including configurations where the operator
+        //     intentionally keeps a frontend reachable on a different cert
+        //     (test fixtures, dev setups, misconfigured listeners). The
+        //     real defence stays on the client: a browser will refuse the
+        //     default cert when SNI doesn't validate against it; a
+        //     deliberate insecure client choosing to ignore that is
+        //     responsible for its own behaviour and is not a trust-boundary
+        //     concern for the proxy.
         let tls_cert_names: Option<Arc<Vec<String>>> = match sni_owned.as_deref() {
-            Some(sni) => {
-                let names = self
-                    .listener
-                    .borrow()
-                    .resolver()
-                    .names_for_sni(sni.as_bytes());
-                let mut snapshot: Vec<String> = names
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|mut name| {
-                        name.make_ascii_lowercase();
-                        if name.ends_with('.') {
-                            name.pop();
-                        }
-                        name
-                    })
-                    .collect();
-                snapshot.sort();
-                snapshot.dedup();
-                Some(Arc::new(snapshot))
-            }
+            Some(sni) => self
+                .listener
+                .borrow()
+                .resolver()
+                .names_for_sni(sni.as_bytes())
+                .and_then(|names| {
+                    let mut snapshot: Vec<String> = names
+                        .into_iter()
+                        .map(|mut name| {
+                            name.make_ascii_lowercase();
+                            if name.ends_with('.') {
+                                name.pop();
+                            }
+                            name
+                        })
+                        .collect();
+                    snapshot.sort();
+                    snapshot.dedup();
+                    if snapshot.is_empty() {
+                        None
+                    } else {
+                        Some(Arc::new(snapshot))
+                    }
+                }),
             None => None,
         };
         // Bind the TLS SNI to this session so the routing layer can reject any

@@ -160,8 +160,8 @@ Notable security-relevant fields on `HttpContext`:
   allocates once. The routing layer matches `:authority` against this set with
   RFC 6125 wildcard handling, accepting browser connection coalescing while
   preserving the CWE-346/CWE-444 trust boundary (operator-defined SAN scope).
-  `Some(Arc::new(vec![]))` when the default cert was served — every authority
-  is then rejected.
+  `None` when the resolver fell back to the default cert — routing then
+  fall-backs to legacy SNI exact-match.
 - `strict_sni_binding` (`editor.rs:195`) — mirrors
   `HttpsListenerConfig::strict_sni_binding`; gates the `tls_cert_names` check
   on/off. Defends against cross-tenant authority spoofing (CWE-346 / CWE-444).
