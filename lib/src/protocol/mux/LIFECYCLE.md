@@ -72,8 +72,12 @@ handshake and propagated to every per-stream `HttpContext` via
 - `tls_server_name: Option<String>` — the SNI the client sent (lowercased,
   trailing dot stripped). `None` on plaintext listeners or when the client
   omitted SNI.
-- `tls_cert_names: Option<Arc<Vec<String>>>` — snapshot of the SAN+CN set of
-  the certificate Sōzu actually served on this TLS session, captured in
+- `tls_cert_names: Option<Arc<Vec<String>>>` — snapshot of the SAN dNSName
+  entries of the certificate Sōzu actually served on this TLS session
+  (RFC 6125 §6.4.4: when the SAN extension contains at least one dNSName
+  entry, those entries are authoritative and the Common Name is ignored;
+  CN is honoured only as a fallback when SAN is absent or has no dNSName
+  entry). Captured in
   `lib/src/https.rs::HttpsStateMachine::upgrade_handshake` from the resolver.
   `Arc`-shared so fan-out across N H2 streams allocates once; frozen for the
   connection lifetime even if the operator swaps the cert mid-flight (mirrors

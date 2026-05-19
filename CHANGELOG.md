@@ -53,8 +53,11 @@ upgrade. See `doc/upgrade/1.x-to-2.0.md` for the full migration guide.
   `Http2Session::RealJoinConnection`; Chrome
   `SpdySession::VerifyDomainAuthentication` →
   `X509Certificate::VerifyNameMatch`); both retry cleanly on 421. Sōzu now
-  matches each request's `:authority` (H2) / `Host` (H1) against the SAN+CN
-  set of the certificate it actually served on the TLS session — captured
+  matches each request's `:authority` (H2) / `Host` (H1) against the SAN
+  dNSName entries of the certificate it actually served on the TLS session
+  (RFC 6125 §6.4.4: when SAN dNSName is present, the Common Name is
+  ignored; CN is only honoured as a fallback when SAN is absent or has
+  no dNSName entry) — captured
   once at handshake into `Context::tls_cert_names` and `Arc`-shared across
   every per-stream `HttpContext`. The 421 path remains for genuine SAN
   misses (RFC 9110 §15.5.20). The default-cert path serves an explicit
