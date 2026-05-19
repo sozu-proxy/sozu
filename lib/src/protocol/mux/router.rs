@@ -1258,7 +1258,17 @@ pub(crate) fn authority_matched_cert_name<'a>(
     authority: &str,
     names: &'a [String],
 ) -> Option<&'a str> {
-    let host = strip_authority_port(authority);
+    let mut host = strip_authority_port(authority);
+    // RFC 1034 §3.1 absolute-form: `example.com.` and `example.com` name
+    // the same host. The SAN snapshot already strips trailing dots at
+    // `https.rs::upgrade_handshake`, and the SNI side strips them at the
+    // same site; strip on the authority side so a client emitting
+    // absolute-form `:authority` (or H1 `Host`) does not get a false 421.
+    // Only one trailing dot is removed because RFC 1034 forbids multiple
+    // trailing dots on a domain literal.
+    if let Some(trimmed) = host.strip_suffix('.') {
+        host = trimmed;
+    }
     if host.is_empty() {
         return None;
     }
@@ -1422,6 +1432,23 @@ mod authority_matched_cert_name_tests {
         // SAN compare.
         let names = vec!["example.com".to_owned()];
         assert!(authority_matched_cert_name("example.com:8443", &names).is_some());
+    }
+
+    #[test]
+    fn cert_name_match_absolute_form_trailing_dot() {
+        // RFC 1034 §3.1: an absolute-form domain literal carries one
+        // trailing dot (`example.com.`) and resolves to the same host as
+        // the relative form. The SAN snapshot stores the relative form
+        // (https.rs strips the trailing dot at handshake), so the matcher
+        // must strip it on the authority side too — otherwise a client
+        // emitting an absolute-form `:authority` gets a false 421.
+        let names = vec!["example.com".to_owned()];
+        assert!(authority_matched_cert_name("example.com.", &names).is_some());
+        // And with both port and trailing dot.
+        assert!(authority_matched_cert_name("example.com.:8443", &names).is_some());
+        // The wildcard branch must also accept the absolute form.
+        let wildcard = vec!["*.example.com".to_owned()];
+        assert!(authority_matched_cert_name("foo.example.com.", &wildcard).is_some());
     }
 
     #[test]
