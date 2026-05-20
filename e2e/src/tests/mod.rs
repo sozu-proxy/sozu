@@ -24,6 +24,7 @@
 #![allow(clippy::useless_vec)]
 
 mod cluster_ip_limit_tests;
+mod command_channel_security_tests;
 mod eviction_tests;
 mod fuzz_tests;
 mod h1_security_tests;
