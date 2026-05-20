@@ -72,3 +72,8 @@ fips = ["sozu-lib/fips", "hyper-rustls/aws-lc-rs"]
 # not itself observe behaviour differences.
 opentelemetry = ["sozu-lib/opentelemetry"]
 simd = ["sozu-lib/simd"]
+# Pass-through for the tolerant H1 parser, so feature-gated e2e tests
+# (e.g. `test_h1_tolerant_high_byte_method_no_ub` in
+# `tests/h1_security_tests.rs`) can be selected with
+# `cargo test -p sozu-e2e --features tolerant-http1-parser`.
+tolerant-http1-parser = ["sozu-lib/tolerant-http1-parser"]
