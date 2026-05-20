@@ -145,8 +145,9 @@ mod shared;
 pub mod stream;
 
 use crate::{
-    BackendConnectionError, L7ListenerHandler, L7Proxy, ListenerHandler, ProxySession, Readiness,
-    RetrieveClusterError, SessionIsToBeClosed, SessionMetrics, SessionResult, StateResult,
+    BackendConnectionError, FrontendFromRequestError, L7ListenerHandler, L7Proxy, ListenerHandler,
+    ProxySession, Readiness, RetrieveClusterError, SessionIsToBeClosed, SessionMetrics,
+    SessionResult, StateResult,
     backends::{Backend, BackendError},
     http::HttpListener,
     https::HttpsListener,
@@ -1197,8 +1198,19 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                             BE::Backend(BackendError::NoBackendForCluster(_)) => {
                                 set_default_answer(stream, front_readiness, 503, &answers);
                             }
-                            BE::RetrieveClusterError(RetrieveClusterError::RetrieveFrontend(_)) => {
-                                set_default_answer(stream, front_readiness, 404, &answers);
+                            BE::RetrieveClusterError(RetrieveClusterError::RetrieveFrontend(
+                                ref err,
+                            )) => {
+                                // RFC 9110 §15.5.1: a malformed authority is a
+                                // 400. A syntactically valid authority that
+                                // simply has no matching frontend stays on the
+                                // historical 404 path.
+                                let code = match err {
+                                    FrontendFromRequestError::HostParse { .. }
+                                    | FrontendFromRequestError::InvalidCharsAfterHost(_) => 400,
+                                    FrontendFromRequestError::NoClusterFound(_) => 404,
+                                };
+                                set_default_answer(stream, front_readiness, code, &answers);
                             }
                             BE::RetrieveClusterError(RetrieveClusterError::UnauthorizedRoute) => {
                                 set_default_answer(stream, front_readiness, 401, &answers);

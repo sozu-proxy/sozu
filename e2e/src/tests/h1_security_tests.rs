@@ -14,7 +14,7 @@ use std::{
     io::{Read, Write},
     net::{SocketAddr, TcpStream},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -73,6 +73,33 @@ fn raw_read_all(stream: &mut TcpStream) -> String {
         }
     }
     String::from_utf8_lossy(&all_data).to_string()
+}
+
+// =========================================================================
+// Attack-test scaffolding
+// =========================================================================
+
+/// Polls the backend listener for incoming connections until `deadline`
+/// elapses. Returns `true` if no connection arrived (attack was rejected
+/// before reaching the backend), `false` if sozu forwarded the attack.
+///
+/// Each underlying `accept()` call already blocks up to 100 ms via the
+/// listener's `SO_RCVTIMEO`, so this loop replaces the legacy
+/// `thread::sleep(200 ms)` + single `accept(0)` pattern with a deadline-
+/// based wait (CLAUDE.md: "Prefer `repeat_until_error_or` / explicit
+/// deadlines over `sleep`"). The deadline is the upper bound on the wait;
+/// the helper returns immediately when an attack reaches the backend.
+fn assert_attack_not_forwarded(label: &str, backend: &mut SyncBackend, deadline: Duration) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < deadline {
+        if backend.accept(0) {
+            println!("{label}: attack reached the backend");
+            backend.receive(0);
+            backend.send(0);
+            return false;
+        }
+    }
+    true
 }
 
 // =========================================================================
@@ -704,74 +731,20 @@ fn test_h1_multiple_host_headers() {
 // =========================================================================
 // Test 6: Host authority with out-of-range port
 //
-// The H1 routing helper strips a syntactically valid :port suffix before
-// frontend lookup. A port outside u16 range is not a valid URI authority port
-// and must not be ignored, otherwise `Host: localhost:65536` routes as if it
-// were `Host: localhost`.
+// RFC 3986 §3.2.3 permits any `*DIGIT` in the port subcomponent, but
+// RFC 6335 §6 caps TCP/UDP ports at 16 bits. The H1 routing helper used
+// to strip a syntactically valid :port suffix before frontend lookup,
+// which let `Host: localhost:65536` route as if it were `Host: localhost`.
+// The parser now rejects out-of-range ports, and per RFC 9110 §15.5.1 the
+// reverse proxy answers 400 Bad Request rather than 404 Not Found.
 // =========================================================================
 
 fn try_h1_host_port_overflow_not_routed() -> State {
-    let front_address = create_local_address();
-
-    let (config, listeners, state) = Worker::empty_config();
-    let (mut worker, mut backends) = setup_sync_test(
+    try_h1_bad_authority_rejected(
         "HOST-PORT-OVERFLOW",
-        config,
-        listeners,
-        state,
-        front_address,
-        1,
-        false,
-    );
-    let mut backend = backends.pop().unwrap();
-    backend.connect();
-
-    let request = concat!(
-        "GET /api HTTP/1.1\r\n",
-        "Host: localhost:65536\r\n",
-        "Connection: close\r\n",
-        "\r\n",
-    );
-
-    let mut stream = raw_connect(front_address);
-    stream
-        .write_all(request.as_bytes())
-        .expect("write Host port overflow request");
-
-    thread::sleep(Duration::from_millis(200));
-
-    let forwarded = backend.accept(0);
-    if forwarded {
-        println!("HOST-PORT-OVERFLOW: invalid authority was forwarded to backend");
-        backend.receive(0);
-        backend.send(0);
-        worker.soft_stop();
-        worker.wait_for_server_stop();
-        return State::Fail;
-    }
-
-    match raw_read(&mut stream) {
-        Some(response) if response.contains("404") => {
-            println!("HOST-PORT-OVERFLOW: rejected before backend routing");
-        }
-        other => {
-            println!("HOST-PORT-OVERFLOW: expected 404, got {other:?}");
-            worker.soft_stop();
-            worker.wait_for_server_stop();
-            return State::Fail;
-        }
-    }
-    drop(stream);
-
-    if !verify_sozu_healthy(front_address, &mut backend, false) {
-        worker.soft_stop();
-        worker.wait_for_server_stop();
-        return State::Fail;
-    }
-
-    worker.soft_stop();
-    worker.wait_for_server_stop();
-    State::Success
+        b"GET /api HTTP/1.1\r\nHost: localhost:65536\r\nConnection: close\r\n\r\n",
+        "400",
+    )
 }
 
 #[test]
@@ -787,55 +760,173 @@ fn test_h1_host_port_overflow_not_routed() {
 }
 
 // =========================================================================
-// Test 7: Invalid UTF-8 in custom method does not crash the worker
+// Test 7: Host authority with reserved port 0
 //
-// Kawa should reject non-token method bytes. This also protects the
-// Method::new boundary from ever turning malformed network bytes into an
-// unchecked UTF-8 string.
+// RFC 6335 §6 reserves port 0; it cannot identify a TCP/UDP service. A
+// `Host: example.com:0` request must be rejected at the parser before
+// frontend lookup.
+// =========================================================================
+
+fn try_h1_host_port_zero_not_routed() -> State {
+    try_h1_bad_authority_rejected(
+        "HOST-PORT-ZERO",
+        b"GET /api HTTP/1.1\r\nHost: localhost:0\r\nConnection: close\r\n\r\n",
+        "400",
+    )
+}
+
+#[test]
+fn test_h1_host_port_zero_not_routed() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "H1 security: Host authority with reserved port 0 is not routed",
+            try_h1_host_port_zero_not_routed,
+        ),
+        State::Success,
+    );
+}
+
+// =========================================================================
+// Test 8: Invalid UTF-8 in custom method does not crash the worker
+//
+// kawa rejects non-token method bytes at request-line parsing under the
+// strict default. The defence at `Method::new` ensures that even under
+// `--features tolerant-http1-parser`, where kawa accepts bytes
+// `0xA0..=0xFF` as method-token characters, malformed network bytes never
+// reach `from_utf8_unchecked`. See `test_h1_tolerant_high_byte_method_no_ub`
+// below for the feature-gated end-to-end coverage of that path.
 // =========================================================================
 
 fn try_h1_invalid_utf8_method_no_crash() -> State {
+    try_h1_bad_authority_rejected(
+        "BAD-METHOD-UTF8",
+        b"\xFFBAD /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        "400",
+    )
+}
+
+#[test]
+fn test_h1_invalid_utf8_method_no_crash() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "H1 security: invalid UTF-8 method is rejected without crash",
+            try_h1_invalid_utf8_method_no_crash,
+        ),
+        State::Success,
+    );
+}
+
+// =========================================================================
+// Test 9: Tolerant-mode high-byte method does not trigger UB
+//
+// Under `--features tolerant-http1-parser` the kawa `tchar` stop set
+// shrinks to `0x7F..=0x9F`, so bytes `0xA0..=0xFF` slip through as valid
+// method-token characters and reach `Method::new`. Before this fix that
+// path called `from_utf8_unchecked` on the wire bytes — a lone
+// continuation byte such as `0xA5` is not valid UTF-8 and would produce
+// undefined behaviour. With `from_utf8_lossy`, the method is safely
+// represented as `U+FFFD…` and the worker remains healthy.
+// =========================================================================
+
+#[cfg(feature = "tolerant-http1-parser")]
+fn try_h1_tolerant_high_byte_method_no_ub() -> State {
+    let label = "TOLERANT-HIGH-BYTE-METHOD";
     let front_address = create_local_address();
 
     let (config, listeners, state) = Worker::empty_config();
-    let (mut worker, mut backends) = setup_sync_test(
-        "BAD-METHOD-UTF8",
-        config,
-        listeners,
-        state,
-        front_address,
-        1,
-        false,
+    let (mut worker, mut backends) =
+        setup_sync_test(label, config, listeners, state, front_address, 1, false);
+    let mut backend = backends.pop().unwrap();
+    backend.connect();
+    // Canned reply: under tolerant parsing the proxy may forward the
+    // request with a lossy method, so the backend must answer
+    // *without* calling `receive()`, which would panic on the raw
+    // 0xA5 byte that sozu re-emits on the wire.
+    backend.set_response("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+
+    let mut stream = raw_connect(front_address);
+    stream
+        .write_all(b"\xA5BAD /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .expect("write high-byte method attack");
+
+    // Drain whichever side reacts first within the deadline. Under
+    // tolerant-parsing the proxy is expected to forward to the
+    // backend; under strict parsing the byte is a stop char and the
+    // proxy answers 400 directly. Both outcomes are acceptable here —
+    // the assertion of interest is the post-attack health check, not
+    // the rejection code.
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_millis(300) {
+        if backend.accept(0) {
+            backend.send(0);
+            break;
+        }
+    }
+    let _ = raw_read(&mut stream);
+    drop(stream);
+
+    if !verify_sozu_healthy(front_address, &mut backend, false) {
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        return State::Fail;
+    }
+
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+    State::Success
+}
+
+#[cfg(feature = "tolerant-http1-parser")]
+#[test]
+fn test_h1_tolerant_high_byte_method_no_ub() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "H1 security: high-byte method under tolerant parser does not UB",
+            try_h1_tolerant_high_byte_method_no_ub,
+        ),
+        State::Success,
     );
+}
+
+/// Shared body for "malformed request must never reach the backend" tests.
+///
+/// Sets up a single-backend worker, writes the raw request bytes, polls
+/// the backend until a deadline (no fixed `sleep`), reads the proxy
+/// response, and finishes with a `verify_sozu_healthy` follow-up. Accepts
+/// `expected_status` as a substring such as `"400"` or `"404"`; an empty
+/// response (i.e. the proxy closed without writing) is treated as a
+/// terminal accept too, since some malformed inputs justifiably yield a
+/// silent close.
+fn try_h1_bad_authority_rejected(label: &str, request: &[u8], expected_status: &str) -> State {
+    let front_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, mut backends) =
+        setup_sync_test(label, config, listeners, state, front_address, 1, false);
     let mut backend = backends.pop().unwrap();
     backend.connect();
 
     let mut stream = raw_connect(front_address);
-    stream
-        .write_all(b"\xFFBAD /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-        .expect("write invalid UTF-8 method request");
+    stream.write_all(request).expect("write attack bytes");
 
-    thread::sleep(Duration::from_millis(200));
-
-    let forwarded = backend.accept(0);
-    if forwarded {
-        println!("BAD-METHOD-UTF8: malformed request was forwarded to backend");
-        backend.receive(0);
-        backend.send(0);
+    if !assert_attack_not_forwarded(label, &mut backend, Duration::from_millis(300)) {
         worker.soft_stop();
         worker.wait_for_server_stop();
         return State::Fail;
     }
 
     match raw_read(&mut stream) {
-        Some(response) if response.contains("400") => {
-            println!("BAD-METHOD-UTF8: rejected with 400");
+        Some(response) if response.contains(expected_status) => {
+            println!("{label}: rejected with {expected_status}");
         }
         None => {
-            println!("BAD-METHOD-UTF8: connection closed without forwarding");
+            println!("{label}: connection closed without forwarding");
         }
         other => {
-            println!("BAD-METHOD-UTF8: expected 400 or close, got {other:?}");
+            println!("{label}: expected {expected_status} or close, got {other:?}");
             worker.soft_stop();
             worker.wait_for_server_stop();
             return State::Fail;
@@ -854,20 +945,8 @@ fn try_h1_invalid_utf8_method_no_crash() -> State {
     State::Success
 }
 
-#[test]
-fn test_h1_invalid_utf8_method_no_crash() {
-    assert_eq!(
-        repeat_until_error_or(
-            5,
-            "H1 security: invalid UTF-8 method is rejected without crash",
-            try_h1_invalid_utf8_method_no_crash,
-        ),
-        State::Success,
-    );
-}
-
 // =========================================================================
-// Test 8: Chunked encoding edge cases
+// Test 10: Chunked encoding edge cases
 //
 // RFC 7230 §4.1: Chunk extensions and zero-length intermediate chunks
 // are valid per the HTTP specification. A compliant proxy must handle
@@ -1063,7 +1142,7 @@ fn test_h1_chunked_encoding_edge_cases() {
 }
 
 // =========================================================================
-// Test 7: HTTP/0.9 request rejection
+// Test 11: HTTP/0.9 request rejection
 //
 // RFC 7230 §2.6: HTTP/1.1 servers SHOULD respond to HTTP/0.9 requests
 // with a proper HTTP response indicating the version is not supported,
@@ -1147,7 +1226,7 @@ fn test_h1_http09_request_rejection() {
 }
 
 // =========================================================================
-// Test 8: Connection: close terminates the connection
+// Test 12: Connection: close terminates the connection
 //
 // RFC 7230 §6.1: A client that sends "Connection: close" signals that
 // it will not send further requests on this connection. The server
