@@ -702,7 +702,172 @@ fn test_h1_multiple_host_headers() {
 }
 
 // =========================================================================
-// Test 6: Chunked encoding edge cases
+// Test 6: Host authority with out-of-range port
+//
+// The H1 routing helper strips a syntactically valid :port suffix before
+// frontend lookup. A port outside u16 range is not a valid URI authority port
+// and must not be ignored, otherwise `Host: localhost:65536` routes as if it
+// were `Host: localhost`.
+// =========================================================================
+
+fn try_h1_host_port_overflow_not_routed() -> State {
+    let front_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, mut backends) = setup_sync_test(
+        "HOST-PORT-OVERFLOW",
+        config,
+        listeners,
+        state,
+        front_address,
+        1,
+        false,
+    );
+    let mut backend = backends.pop().unwrap();
+    backend.connect();
+
+    let request = concat!(
+        "GET /api HTTP/1.1\r\n",
+        "Host: localhost:65536\r\n",
+        "Connection: close\r\n",
+        "\r\n",
+    );
+
+    let mut stream = raw_connect(front_address);
+    stream
+        .write_all(request.as_bytes())
+        .expect("write Host port overflow request");
+
+    thread::sleep(Duration::from_millis(200));
+
+    let forwarded = backend.accept(0);
+    if forwarded {
+        println!("HOST-PORT-OVERFLOW: invalid authority was forwarded to backend");
+        backend.receive(0);
+        backend.send(0);
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        return State::Fail;
+    }
+
+    match raw_read(&mut stream) {
+        Some(response) if response.contains("404") => {
+            println!("HOST-PORT-OVERFLOW: rejected before backend routing");
+        }
+        other => {
+            println!("HOST-PORT-OVERFLOW: expected 404, got {other:?}");
+            worker.soft_stop();
+            worker.wait_for_server_stop();
+            return State::Fail;
+        }
+    }
+    drop(stream);
+
+    if !verify_sozu_healthy(front_address, &mut backend, false) {
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        return State::Fail;
+    }
+
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+    State::Success
+}
+
+#[test]
+fn test_h1_host_port_overflow_not_routed() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "H1 security: Host authority with out-of-range port is not routed",
+            try_h1_host_port_overflow_not_routed,
+        ),
+        State::Success,
+    );
+}
+
+// =========================================================================
+// Test 7: Invalid UTF-8 in custom method does not crash the worker
+//
+// Kawa should reject non-token method bytes. This also protects the
+// Method::new boundary from ever turning malformed network bytes into an
+// unchecked UTF-8 string.
+// =========================================================================
+
+fn try_h1_invalid_utf8_method_no_crash() -> State {
+    let front_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, mut backends) = setup_sync_test(
+        "BAD-METHOD-UTF8",
+        config,
+        listeners,
+        state,
+        front_address,
+        1,
+        false,
+    );
+    let mut backend = backends.pop().unwrap();
+    backend.connect();
+
+    let mut stream = raw_connect(front_address);
+    stream
+        .write_all(b"\xFFBAD /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .expect("write invalid UTF-8 method request");
+
+    thread::sleep(Duration::from_millis(200));
+
+    let forwarded = backend.accept(0);
+    if forwarded {
+        println!("BAD-METHOD-UTF8: malformed request was forwarded to backend");
+        backend.receive(0);
+        backend.send(0);
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        return State::Fail;
+    }
+
+    match raw_read(&mut stream) {
+        Some(response) if response.contains("400") => {
+            println!("BAD-METHOD-UTF8: rejected with 400");
+        }
+        None => {
+            println!("BAD-METHOD-UTF8: connection closed without forwarding");
+        }
+        other => {
+            println!("BAD-METHOD-UTF8: expected 400 or close, got {other:?}");
+            worker.soft_stop();
+            worker.wait_for_server_stop();
+            return State::Fail;
+        }
+    }
+    drop(stream);
+
+    if !verify_sozu_healthy(front_address, &mut backend, false) {
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        return State::Fail;
+    }
+
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+    State::Success
+}
+
+#[test]
+fn test_h1_invalid_utf8_method_no_crash() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "H1 security: invalid UTF-8 method is rejected without crash",
+            try_h1_invalid_utf8_method_no_crash,
+        ),
+        State::Success,
+    );
+}
+
+// =========================================================================
+// Test 8: Chunked encoding edge cases
 //
 // RFC 7230 §4.1: Chunk extensions and zero-length intermediate chunks
 // are valid per the HTTP specification. A compliant proxy must handle
