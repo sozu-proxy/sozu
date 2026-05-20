@@ -9,7 +9,6 @@ use std::{
     cmp::min,
     fmt::{self, Write},
     ops::Deref,
-    str::from_utf8_unchecked,
 };
 
 use nom::{
@@ -67,12 +66,7 @@ impl Method {
         } else if compare_no_case(s, b"CONNECT") {
             Method::Connect
         } else {
-            // SAFETY: every call site of `Method::new` (see
-            // `lib/src/router/mod.rs:607` and the in-file tests) passes
-            // either `String::as_bytes()` — guaranteed valid UTF-8 by the
-            // `String` invariant — or a static ASCII byte literal. The
-            // bytes are therefore well-formed UTF-8.
-            Method::Custom(String::from(unsafe { from_utf8_unchecked(s) }))
+            Method::Custom(String::from_utf8_lossy(s).into_owned())
         }
     }
 }
@@ -133,11 +127,22 @@ fn is_hostname_char(i: u8) -> bool {
   b"-.".contains(&i)
 }
 
-// FIXME: convert port to u16 here
 #[allow(clippy::type_complexity)]
 pub fn hostname_and_port(i: &[u8]) -> IResult<&[u8], (&[u8], Option<&[u8]>)> {
     let (i, host) = take_while(is_hostname_char)(i)?;
+    if host.is_empty() {
+        return Err(Err::Error(Error::new(i, ErrorKind::Alpha)));
+    }
     let (i, port) = opt(preceded(bytes::complete::tag(":"), digit1))(i)?;
+    if let Some(port) = port {
+        if std::str::from_utf8(port)
+            .ok()
+            .and_then(|port| port.parse::<u16>().ok())
+            .is_none()
+        {
+            return Err(Err::Error(Error::new(port, ErrorKind::Digit)));
+        }
+    }
 
     if !i.is_empty() {
         return Err(Err::Error(Error::new(i, ErrorKind::Eof)));
@@ -192,4 +197,30 @@ fn test_view_out_of_bound() {
             &[5, 5, 8, 9, 9, 13, 80]
         )
     );
+}
+
+#[test]
+fn custom_method_does_not_assume_utf8() {
+    let method = Method::new(b"\xFFBAD");
+
+    assert_eq!(method, Method::Custom("\u{FFFD}BAD".to_owned()));
+}
+
+#[test]
+fn hostname_and_port_rejects_empty_host() {
+    assert!(hostname_and_port(b":80").is_err());
+}
+
+#[test]
+fn hostname_and_port_rejects_out_of_range_port() {
+    assert!(hostname_and_port(b"example.com:65536").is_err());
+}
+
+#[test]
+fn hostname_and_port_accepts_u16_port() {
+    let (remaining, (host, port)) = hostname_and_port(b"example.com:65535").unwrap();
+
+    assert!(remaining.is_empty());
+    assert_eq!(host, b"example.com");
+    assert_eq!(port, Some(&b"65535"[..]));
 }
