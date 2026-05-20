@@ -36,6 +36,16 @@ tempfile = { workspace = true }
 # request consume the failure injection that FIX-18 just armed,
 # producing the wrong response code for both tests on CI.
 serial_test = { workspace = true }
+# Encode forged length-delimited protobuf payloads in
+# `tests/command_channel_security_tests.rs` to reproduce the
+# `ScmSocket::receive_listeners` slice-OOB pre-fix and prove the
+# `ListenersCountInconsistent` rejection path post-fix.
+prost = { workspace = true }
+# `sendmsg` syscall wrapper used by the same test to ship a
+# malformed `ListenersCount` over the SCM socket without going
+# through `ScmSocket::send_listeners` (which keeps addresses and
+# FDs in sync by construction).
+nix = { workspace = true, features = ["socket", "uio"] }
 
 [features]
 # Forward sozu-lib's `splice` feature so the dependency-tree compiles
