@@ -6,7 +6,8 @@
 use std::io::Write as _;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use std::hint::black_box;
 
 // ---------------------------------------------------------------------------
 // Helpers (optimized path from PR #1200)
