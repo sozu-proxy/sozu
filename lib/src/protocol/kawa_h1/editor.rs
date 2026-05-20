@@ -81,9 +81,17 @@ fn build_traceparent(trace_id: &[u8; 32], parent_id: &[u8; 16]) -> [u8; 55] {
 
 /// Write the ";for=..;by=.." portion of a Forwarded header into `buf`
 /// without heap-allocating a `String`.
+///
+/// RFC 7239 §6 requires IPv6 literals to be enclosed in square brackets
+/// inside a quoted string (the `IP-literal` production is `"[" IPv6address "]"`).
+/// Emitting a bare IPv6 like `for="2001:db8::1:8080"` is ambiguous: the
+/// trailing `:1:8080` could parse as `::1` + port `8080` or as the literal
+/// `:1:8080` with no port. Matches HAProxy's behaviour
+/// (`_7239_print_ip6` in `src/http_ext.c`), which is the de-facto reference
+/// implementation of RFC 7239 in the proxy world. See sozu issue #1254.
 fn write_forwarded_for_by(buf: &mut Vec<u8>, peer_ip: IpAddr, peer_port: u16, public_ip: IpAddr) {
     buf.extend_from_slice(b";for=\"");
-    let _ = write!(buf, "{peer_ip}");
+    write_ip_literal(buf, peer_ip);
     buf.push(b':');
     let mut port_buf = itoa::Buffer::new();
     buf.extend_from_slice(port_buf.format(peer_port).as_bytes());
@@ -94,8 +102,24 @@ fn write_forwarded_for_by(buf: &mut Vec<u8>, peer_ip: IpAddr, peer_port: u16, pu
         }
         IpAddr::V6(_) => {
             buf.push(b'"');
-            let _ = write!(buf, "{public_ip}");
+            write_ip_literal(buf, public_ip);
             buf.push(b'"');
+        }
+    }
+}
+
+/// Write an `IP-literal` per RFC 3986 §3.2.2 / RFC 7239 §6: IPv4 verbatim,
+/// IPv6 wrapped in `[...]`. Caller is responsible for any surrounding quotes
+/// required by the embedding syntax (RFC 7239 mandates them for IPv6).
+fn write_ip_literal(buf: &mut Vec<u8>, ip: IpAddr) {
+    match ip {
+        IpAddr::V4(_) => {
+            let _ = write!(buf, "{ip}");
+        }
+        IpAddr::V6(_) => {
+            buf.push(b'[');
+            let _ = write!(buf, "{ip}");
+            buf.push(b']');
         }
     }
 }
@@ -1111,6 +1135,86 @@ mod tests {
         assert_eq!(ctx.id, original_id);
         assert_eq!(ctx.protocol, original_protocol);
         assert_eq!(ctx.public_address, original_public_address);
+    }
+
+    // ── write_forwarded_for_by (RFC 7239 §6 IP-literal bracketing) ──────
+    //
+    // Locks in the IPv6 bracket+quote contract that matches HAProxy
+    // (`_7239_print_ip6` in `src/http_ext.c`) and prevents regression to
+    // the ambiguous `for="2001:db8::1:8080"` form flagged in issue #1254.
+
+    use std::net::Ipv6Addr;
+
+    fn render_for_by(peer: SocketAddr, public_ip: IpAddr) -> String {
+        let mut buf = Vec::new();
+        write_forwarded_for_by(&mut buf, peer.ip(), peer.port(), public_ip);
+        String::from_utf8(buf).expect("forwarded fragment must be ASCII")
+    }
+
+    fn render_suffix(proto: &str, peer: SocketAddr, public_ip: IpAddr) -> String {
+        let mut buf = Vec::new();
+        write_forwarded_suffix(&mut buf, proto, peer.ip(), peer.port(), public_ip);
+        String::from_utf8(buf).expect("forwarded fragment must be ASCII")
+    }
+
+    #[test]
+    fn test_forwarded_ipv4_peer_ipv4_by_unchanged() {
+        // IPv4 must keep the pre-fix wire format: unquoted `by=`, bare IPv4 in
+        // `for=`. Sōzu emits `for=` quoted unconditionally (HAProxy emits it
+        // quoted only when a port is attached; we always attach a port).
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)), 54321);
+        let public_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1));
+        assert_eq!(
+            render_for_by(peer, public_ip),
+            r#";for="203.0.113.7:54321";by=198.51.100.1"#,
+        );
+    }
+
+    #[test]
+    fn test_forwarded_ipv6_peer_brackets_disambiguate_port() {
+        // Regression for issue #1254: without brackets, `for="2001:db8::1:8080"`
+        // is ambiguous (could parse as `::1` + port `8080` or `:1:8080` literal).
+        let peer = SocketAddr::new(IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap()), 8080);
+        let public_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1));
+        assert_eq!(
+            render_for_by(peer, public_ip),
+            r#";for="[2001:db8::1]:8080";by=198.51.100.1"#,
+        );
+    }
+
+    #[test]
+    fn test_forwarded_ipv6_public_address_bracketed_and_quoted() {
+        // `by=` carries no port but RFC 7239 §6 still requires the IP-literal
+        // brackets for IPv6, and the value must be quoted because the literal
+        // contains `:`.
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)), 54321);
+        let public_ip = IpAddr::V6("2001:db8::2".parse::<Ipv6Addr>().unwrap());
+        assert_eq!(
+            render_for_by(peer, public_ip),
+            r#";for="203.0.113.7:54321";by="[2001:db8::2]""#,
+        );
+    }
+
+    #[test]
+    fn test_forwarded_ipv6_peer_and_public_both_bracketed() {
+        let peer = SocketAddr::new(IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap()), 8080);
+        let public_ip = IpAddr::V6("2001:db8::2".parse::<Ipv6Addr>().unwrap());
+        assert_eq!(
+            render_for_by(peer, public_ip),
+            r#";for="[2001:db8::1]:8080";by="[2001:db8::2]""#,
+        );
+    }
+
+    #[test]
+    fn test_forwarded_suffix_prepends_proto_and_brackets_ipv6() {
+        // The suffix form is what we append when an inbound `Forwarded`
+        // header already exists. Same bracketing contract must hold.
+        let peer = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 443);
+        let public_ip = IpAddr::V6("fe80::1".parse::<Ipv6Addr>().unwrap());
+        assert_eq!(
+            render_suffix("https", peer, public_ip),
+            r#", proto=https;for="[::1]:443";by="[fe80::1]""#,
+        );
     }
 
     // ── traceparent / opentelemetry helpers ─────────────────────────────

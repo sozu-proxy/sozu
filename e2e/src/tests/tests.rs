@@ -4464,6 +4464,122 @@ fn test_x_real_ip_send_and_elide() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// RFC 7239 IPv6 bracketing in the synthesised `Forwarded` header.
+//
+// Regression for sozu issue #1254. Prior to the fix Sōzu emitted
+// `Forwarded: ... for="2001:db8::1:9000"` which the RFC explicitly calls out
+// as ambiguous — the trailing `:9000` could be the port or part of the
+// address. The on-wire contract must be `for="[2001:db8::1]:9000"` and
+// `by="[<ipv6>]"` (RFC 7239 §6, mirrors HAProxy `_7239_print_ip6`).
+//
+// We drive PROXY-v2 with an IPv6 source AND destination so `HttpContext`
+// sees IPv6 for both `session_address` (→ `for=`) and `public_address`
+// (→ `by=`) without needing the e2e port_registry to grow IPv6 support.
+// ---------------------------------------------------------------------------
+
+/// PROXY-v2 with IPv6 src + dst → backend must observe a bracketed
+/// `Forwarded` header for both `for=` and `by=`.
+fn try_forwarded_ipv6_brackets_via_proxy_v2() -> State {
+    use std::io::Write;
+    use std::net::TcpStream;
+
+    let (mut worker, front_address, back_address) = setup_x_real_ip_test(
+        "FORWARDED-IPV6-BRACKETS",
+        /* elide_x_real_ip */ false,
+        /* send_x_real_ip */ false,
+        /* expect_proxy */ true,
+    );
+
+    let mut backend = SyncBackend::new("BACKEND_0", back_address, http_ok_response("pong"));
+    backend.connect();
+
+    // IPv6 source + destination in the PROXY-v2 header. Sōzu uses
+    // `addresses.destination()` as `public_address` (→ `by=`) and
+    // `addresses.source()` as `session_address` (→ `for=`).
+    let pp_src: SocketAddr = "[2001:db8::1]:9000".parse().unwrap();
+    let pp_dst: SocketAddr = "[2001:db8::2]:443".parse().unwrap();
+    let pp_header = sozu_lib::protocol::proxy_protocol::header::HeaderV2::new(
+        sozu_lib::protocol::proxy_protocol::header::Command::Proxy,
+        pp_src,
+        pp_dst,
+    );
+    let pp_bytes = pp_header.into_bytes();
+
+    let http_payload = "GET /api HTTP/1.1\r\n\
+        Host: localhost\r\n\
+        Connection: close\r\n\
+        Content-Length: 4\r\n\
+        \r\n\
+        ping";
+
+    let mut stream = TcpStream::connect(front_address).expect("could not connect to sozu");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set read timeout");
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .expect("set write timeout");
+    stream
+        .write_all(&pp_bytes)
+        .expect("write proxy-protocol header");
+    stream
+        .write_all(http_payload.as_bytes())
+        .expect("write HTTP request");
+
+    backend.accept(0);
+    let request = backend.receive(0);
+    println!("backend received request: {request:?}");
+
+    backend.send(0);
+    let mut buf = [0u8; 4096];
+    let _ = stream.read(&mut buf);
+
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+
+    let Some(req) = request else {
+        println!("backend received no request");
+        return State::Fail;
+    };
+
+    // Assert the exact RFC 7239 wire format for both nodes.
+    let expected_for = r#"for="[2001:db8::1]:9000""#;
+    let expected_by = r#"by="[2001:db8::2]""#;
+
+    if !req.contains(expected_for) {
+        println!(
+            "missing bracketed `for=` in Forwarded header:\nwant: {expected_for}\ngot:\n{req}"
+        );
+        return State::Fail;
+    }
+    if !req.contains(expected_by) {
+        println!("missing bracketed `by=` in Forwarded header:\nwant: {expected_by}\ngot:\n{req}");
+        return State::Fail;
+    }
+
+    // The pre-fix, ambiguous form must never appear on the wire.
+    let ambiguous_for = r#"for="2001:db8::1:9000""#;
+    if req.contains(ambiguous_for) {
+        println!("Forwarded header is back to the ambiguous form #1254 (no brackets):\n{req}");
+        return State::Fail;
+    }
+
+    State::Success
+}
+
+#[test]
+fn test_forwarded_ipv6_brackets_via_proxy_v2() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "Forwarded (RFC 7239) — IPv6 peer + public are bracketed in `for=` / `by=` (#1254)",
+            try_forwarded_ipv6_brackets_via_proxy_v2,
+        ),
+        State::Success
+    );
+}
+
 /// Codex cross-check finding: `pkawa::handle_trailer` bypasses the
 /// shared `HttpContext::on_request_headers` callback. Without dedicated
 /// trailer-side elision a naive H2 client could spoof `x-real-ip` as a
