@@ -7,6 +7,37 @@ Multiple Keep-a-Changelog blocks of the same kind appear in sequence — bullets
 stay where they were authored; they will be merged into a single block per
 category at tag time.
 
+### 🔐 Security
+
+- **`openssl 0.10.78 → 0.10.80`** closes two Dependabot security advisories.
+  Both were fixed in `openssl 0.10.79`; neither affected API is reached by
+  sozu's build (`lib/src/crypto.rs:84-98` / `:104-115`; `rustls-openssl 0.3.x`
+  wires only `aes_{128,256}_gcm` / `chacha20_poly1305`).
+  - `GHSA-xp3w-r5p5-63rr` / `CVE-2026-42327` (HIGH) — UB in
+    `X509Ref::ocsp_responders`.
+  - `GHSA-xv59-967r-8726` / `CVE-2026-44662` (MEDIUM) — heap overflow in
+    AES key-wrap-with-padding.
+- **`rustls-pemfile` removed** (clears `RUSTSEC-2025-0134` — unmaintained).
+  PEM key parsing migrated to `rustls_pki_types::PrivateKeyDer::from_pem_slice`
+  (already in the tree transitively via `rustls`).
+- **`paste` removed** (clears `RUSTSEC-2024-0436` — unmaintained). The
+  `protocol_pair_matrix!` helper now uses a `pub mod $name { … }` wrapper
+  for per-cell function names instead of `paste::paste!` identifier
+  concatenation; e2e-only.
+
+### 🔄 Changed
+
+- Refreshed workspace dependency floors to crates.io latest where they had
+  drifted: `libc 0.2.185 → 0.2.186`, `nix 0.31.2 → 0.31.3`, `rustls
+  0.23.38 → 0.23.40`, `rustls-openssl 0.3.0 → 0.3.1`, `tokio 1.52.1 → 1.52.3`,
+  `flate2 ^1.1 → ^1.1.9`, `criterion 0.5.1 → 0.8.2`, `libfuzzer-sys
+  0.4 → 0.4.12`. Other workspace deps were already pinned to the latest
+  crates.io patch.
+- Lockfile refreshed via `cargo update`: 32 transitive packages bumped, 2 new
+  transitive version slots (`itertools 0.13.0`, `wit-bindgen 0.57.1`), plus
+  criterion 0.8 dep fan-out. No MSRV impact — all movers declare
+  MSRV ≤ 1.88.0.
+
 ### 💥 Breaking changes (1.1.x → 2.0.0)
 
 The 2.0.0 release carries breaking changes that operators must address before
