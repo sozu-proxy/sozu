@@ -47,6 +47,18 @@ pub enum ScmSocketError {
     },
     #[error("error decoding the protobuf format of the listeners: {0}")]
     DecodeError(DecodeError),
+    #[error(
+        "listeners count manifest is inconsistent with the SCM payload: \
+         http={http}, tls={tls}, tcp={tcp} (sum={total}), fds_received={fds_received}, max_fds={max_fds}"
+    )]
+    ListenersCountInconsistent {
+        http: usize,
+        tls: usize,
+        tcp: usize,
+        total: usize,
+        fds_received: usize,
+        max_fds: usize,
+    },
 }
 
 /// A unix socket specialized for file descriptor passing
@@ -135,12 +147,43 @@ impl ScmSocket {
         let listeners_count = ListenersCount::decode_length_delimited(&buf[..size])
             .map_err(ScmSocketError::DecodeError)?;
 
+        // Validate the manifest before indexing into the fixed-size FD array.
+        // The peer-controlled `listeners_count.{http,tls,tcp}` lists are
+        // matched 1:1 with `received_fds` slots; without these bounds checks
+        // a peer that declared more entries than MAX_FDS_OUT or more entries
+        // than FDs actually arrived would panic the worker on
+        // `received_fds[index..index + len]`.
+        let http_len = listeners_count.http.len();
+        let tls_len = listeners_count.tls.len();
+        let tcp_len = listeners_count.tcp.len();
+        let total = http_len
+            .checked_add(tls_len)
+            .and_then(|s| s.checked_add(tcp_len))
+            .ok_or(ScmSocketError::ListenersCountInconsistent {
+                http: http_len,
+                tls: tls_len,
+                tcp: tcp_len,
+                total: usize::MAX,
+                fds_received: file_descriptor_length,
+                max_fds: MAX_FDS_OUT,
+            })?;
+        if total > MAX_FDS_OUT || total > file_descriptor_length {
+            return Err(ScmSocketError::ListenersCountInconsistent {
+                http: http_len,
+                tls: tls_len,
+                tcp: tcp_len,
+                total,
+                fds_received: file_descriptor_length,
+                max_fds: MAX_FDS_OUT,
+            });
+        }
+
         let mut http_addresses = parse_addresses(&listeners_count.http)?;
         let mut tls_addresses = parse_addresses(&listeners_count.tls)?;
         let mut tcp_addresses = parse_addresses(&listeners_count.tcp)?;
 
         let mut index = 0;
-        let len = listeners_count.http.len();
+        let len = http_len;
         let mut http = Vec::new();
         http.extend(
             http_addresses
@@ -149,7 +192,7 @@ impl ScmSocket {
         );
 
         index += len;
-        let len = listeners_count.tls.len();
+        let len = tls_len;
         let mut tls = Vec::new();
         tls.extend(
             tls_addresses
@@ -158,11 +201,12 @@ impl ScmSocket {
         );
 
         index += len;
+        let len = tcp_len;
         let mut tcp = Vec::new();
         tcp.extend(
             tcp_addresses
                 .drain(..)
-                .zip(received_fds[index..file_descriptor_length].iter().cloned()),
+                .zip(received_fds[index..index + len].iter().cloned()),
         );
 
         Ok(Listeners { http, tls, tcp })
@@ -426,5 +470,58 @@ mod tests {
             .expect("Could not receive listeners");
 
         assert_eq!(listeners.http[0].0, received_listeners.http[0].0);
+    }
+
+    /// Regression: a malformed `ListenersCount` whose entry counts do not
+    /// match the number of file descriptors received over SCM must be
+    /// rejected with `ListenersCountInconsistent`, never panic the worker
+    /// on `received_fds[index..index + len]`.
+    ///
+    /// Without the bounds check, a peer that declares more addresses than
+    /// `MAX_FDS_OUT` (or more than the FDs that actually arrived) crashes
+    /// the receiving worker on out-of-bounds array indexing.
+    #[test]
+    fn rejects_listeners_count_with_more_entries_than_fds() {
+        let (stream_1, stream_2) =
+            MioUnixStream::pair().expect("Could not create a pair of mio unix streams");
+        let sender = ScmSocket::new(stream_1.into_raw_fd()).expect("Could not create scm socket");
+        let receiver = ScmSocket::new(stream_2.into_raw_fd()).expect("Could not create scm socket");
+
+        // Declare three HTTP entries but ship zero file descriptors.
+        let bogus = ListenersCount {
+            http: vec![
+                "127.0.0.1:80".to_string(),
+                "127.0.0.2:80".to_string(),
+                "127.0.0.3:80".to_string(),
+            ],
+            tls: vec![],
+            tcp: vec![],
+        };
+        let payload = bogus.encode_length_delimited_to_vec();
+        sender
+            .send_msg_and_fds(&payload, &[])
+            .expect("manual send_msg_and_fds with zero fds must succeed at the syscall layer");
+
+        match receiver.receive_listeners() {
+            Err(ScmSocketError::ListenersCountInconsistent {
+                http,
+                tls,
+                tcp,
+                total,
+                fds_received,
+                max_fds,
+            }) => {
+                assert_eq!(http, 3);
+                assert_eq!(tls, 0);
+                assert_eq!(tcp, 0);
+                assert_eq!(total, 3);
+                assert_eq!(fds_received, 0);
+                assert_eq!(max_fds, MAX_FDS_OUT);
+            }
+            other => panic!(
+                "expected ListenersCountInconsistent, got {other:?}\n\
+                 NOTE: a panic / OOM here means the SCM bounds check was reverted",
+            ),
+        }
     }
 }
