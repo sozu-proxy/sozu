@@ -42,6 +42,13 @@ pub enum ChannelError {
         capacity: usize,
         max: usize,
     },
+    #[error(
+        "declared message length ({message_len} bytes) is shorter than the {delimiter_size}-byte length prefix"
+    )]
+    MessageLengthUnderDelimiter {
+        message_len: usize,
+        delimiter_size: usize,
+    },
     #[error("channel could not write on the back buffer")]
     Write(std::io::Error),
     #[error("channel buffer is full ({capacity} bytes, max {max} bytes), cannot grow more")]
@@ -469,6 +476,25 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
                     message_len,
                     capacity: self.front_buf.capacity(),
                     max: self.max_buffer_size,
+                });
+            }
+
+            // A length-delimited frame is `[delimiter][payload]`. The declared
+            // `message_len` is the total frame size and MUST therefore be at
+            // least `delimiter_size()`. A peer-controlled value below that
+            // ceiling makes `&buffer[delimiter_size()..message_len]` slice
+            // backwards and panic; reject it the same way as oversized frames.
+            //
+            // Drop the bogus delimiter bytes before returning so the channel
+            // can re-sync on the peer's next frame. Without this, every
+            // subsequent `read_message()` re-reads the same bad header from
+            // the front buffer and the worker burns CPU on the same error
+            // until the peer disconnects.
+            if message_len < delimiter_size() {
+                self.front_buf.consume(delimiter_size());
+                return Err(ChannelError::MessageLengthUnderDelimiter {
+                    message_len,
+                    delimiter_size: delimiter_size(),
                 });
             }
 
@@ -961,5 +987,44 @@ mod tests {
             grown.is_power_of_two() || grown == 10000,
             "expected doubling growth pattern, got {grown}"
         );
+    }
+
+    /// Regression: a peer that writes a length-delimited frame whose
+    /// declared length is *less than* the delimiter itself must be
+    /// rejected with `MessageLengthUnderDelimiter`, never panic the
+    /// reader with `slice index starts at N but ends at M`.
+    ///
+    /// Without the bounds check, `&buffer[delimiter_size()..message_len]`
+    /// at `try_read_delimited_message` panics for any peer-controlled
+    /// `message_len < delimiter_size()` (= 8 on 64-bit) — a one-packet
+    /// denial-of-service against the master command socket.
+    #[test]
+    fn rejects_declared_length_below_delimiter() {
+        let (mut reader, mut writer): (
+            Channel<ProtobufMessage, ProtobufMessage>,
+            Channel<ProtobufMessage, ProtobufMessage>,
+        ) = Channel::generate(1000, 10000).expect("could not generate channels");
+        writer.blocking().expect("writer to block");
+        reader.blocking().expect("reader to block");
+
+        // Craft a delimiter that lies: message_len = 5 (< delimiter_size() = 8).
+        // Send it as raw bytes, bypassing write_delimited_message.
+        let bogus: usize = 5;
+        let bytes = bogus.to_le_bytes();
+        std::io::Write::write_all(&mut writer.sock, &bytes).expect("raw write of bogus delimiter");
+
+        match reader.read_message() {
+            Err(ChannelError::MessageLengthUnderDelimiter {
+                message_len,
+                delimiter_size,
+            }) => {
+                assert_eq!(message_len, 5);
+                assert_eq!(delimiter_size, std::mem::size_of::<usize>());
+            }
+            other => panic!(
+                "expected MessageLengthUnderDelimiter, got {other:?}\n\
+                 NOTE: a panic here means the slice-OOB hardening was reverted",
+            ),
+        }
     }
 }
