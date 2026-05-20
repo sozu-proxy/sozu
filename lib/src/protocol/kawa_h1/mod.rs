@@ -31,8 +31,9 @@ use sozu_command::{
 use crate::metrics::names;
 use crate::{
     AcceptError, BackendConnectAction, BackendConnectionError, BackendConnectionStatus,
-    L7ListenerHandler, L7Proxy, ListenerHandler, Protocol, ProxySession, Readiness,
-    RetrieveClusterError, SessionIsToBeClosed, SessionMetrics, SessionResult, StateResult,
+    FrontendFromRequestError, L7ListenerHandler, L7Proxy, ListenerHandler, Protocol, ProxySession,
+    Readiness, RetrieveClusterError, SessionIsToBeClosed, SessionMetrics, SessionResult,
+    StateResult,
     backends::{Backend, BackendError},
     pool::{Checkout, Pool},
     protocol::{
@@ -1431,7 +1432,24 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         let route = match route_result {
             Ok(route) => route,
             Err(frontend_error) => {
-                self.set_answer(DefaultAnswer::Answer404 {});
+                // RFC 9110 §15.5.1: a malformed authority is a 400. A
+                // syntactically valid authority that simply has no matching
+                // frontend stays on the historical 404 path.
+                match &frontend_error {
+                    FrontendFromRequestError::HostParse { .. }
+                    | FrontendFromRequestError::InvalidCharsAfterHost(_) => {
+                        self.set_answer(DefaultAnswer::Answer400 {
+                            message: frontend_error.to_string(),
+                            phase: self.request_stream.parsing_phase.marker(),
+                            successfully_parsed: "null".into(),
+                            partially_parsed: "null".into(),
+                            invalid: "null".into(),
+                        });
+                    }
+                    FrontendFromRequestError::NoClusterFound(_) => {
+                        self.set_answer(DefaultAnswer::Answer404 {});
+                    }
+                }
                 return Err(RetrieveClusterError::RetrieveFrontend(frontend_error));
             }
         };

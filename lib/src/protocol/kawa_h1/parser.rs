@@ -127,22 +127,23 @@ fn is_hostname_char(i: u8) -> bool {
   b"-.".contains(&i)
 }
 
-#[allow(clippy::type_complexity)]
-pub fn hostname_and_port(i: &[u8]) -> IResult<&[u8], (&[u8], Option<&[u8]>)> {
+pub fn hostname_and_port(i: &[u8]) -> IResult<&[u8], (&[u8], Option<u16>)> {
     let (i, host) = take_while(is_hostname_char)(i)?;
     if host.is_empty() {
         return Err(Err::Error(Error::new(i, ErrorKind::Alpha)));
     }
-    let (i, port) = opt(preceded(bytes::complete::tag(":"), digit1))(i)?;
-    if let Some(port) = port {
-        if std::str::from_utf8(port)
-            .ok()
-            .and_then(|port| port.parse::<u16>().ok())
-            .is_none()
-        {
-            return Err(Err::Error(Error::new(port, ErrorKind::Digit)));
-        }
-    }
+    let (i, port_bytes) = opt(preceded(bytes::complete::tag(":"), digit1))(i)?;
+    let port = match port_bytes {
+        // `digit1` guarantees ASCII digits, so the slice is always valid UTF-8;
+        // `parse::<u16>()` rejects values that overflow the 16-bit port space
+        // (RFC 6335 §6) and `Ok(0)` is explicitly rejected because port 0 is
+        // reserved by the same RFC and not a routable authority.
+        Some(bytes) => match std::str::from_utf8(bytes).unwrap().parse::<u16>() {
+            Ok(p) if p != 0 => Some(p),
+            _ => return Err(Err::Error(Error::new(bytes, ErrorKind::Digit))),
+        },
+        None => None,
+    };
 
     if !i.is_empty() {
         return Err(Err::Error(Error::new(i, ErrorKind::Eof)));
@@ -217,10 +218,25 @@ fn hostname_and_port_rejects_out_of_range_port() {
 }
 
 #[test]
+fn hostname_and_port_rejects_port_zero() {
+    // RFC 6335 §6 reserves port 0; it cannot identify a TCP/UDP service.
+    assert!(hostname_and_port(b"example.com:0").is_err());
+}
+
+#[test]
 fn hostname_and_port_accepts_u16_port() {
     let (remaining, (host, port)) = hostname_and_port(b"example.com:65535").unwrap();
 
     assert!(remaining.is_empty());
     assert_eq!(host, b"example.com");
-    assert_eq!(port, Some(&b"65535"[..]));
+    assert_eq!(port, Some(65535));
+}
+
+#[test]
+fn hostname_and_port_returns_no_port_when_absent() {
+    let (remaining, (host, port)) = hostname_and_port(b"example.com").unwrap();
+
+    assert!(remaining.is_empty());
+    assert_eq!(host, b"example.com");
+    assert_eq!(port, None);
 }
