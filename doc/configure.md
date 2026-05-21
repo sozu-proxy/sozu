@@ -1529,6 +1529,16 @@ Each level is a SUPERSET of the previous one:
 | `cluster`  | Keeps `cluster_id`, drops `backend_id`. **Default** — preserves the historical pre-knob behaviour.                                                                                                                                 | The current shape of every existing dashboard.                                                             |
 | `backend`  | Keeps both labels. Highest cardinality.                                                                                                                                                                                            | Per-backend SLOs / hotspot debugging when the cluster has few backends.                                    |
 
+Memory note for `Time` histograms: per-bucket counters are `Histogram<u64>`
+(widened from `Histogram<u32>` to avoid saturation at sustained
+high-RPS — `u32` saturates a single popular bucket in ≈72 minutes at
+1 M samples/s in a 64-bit count). Memory footprint per Time histogram is
+bounded by `hdrhistogram`'s sigfig=3 shape, roughly 16–32 KB per
+histogram, doubled vs. the prior `u32` shape. With `cluster`-level
+cardinality this multiplies by the number of live clusters × Time-key
+distinct names; with `backend`-level, also by per-cluster backend count.
+Plan capacity accordingly.
+
 Filtering happens centrally in `Aggregator::receive_metric`
 (`lib/src/metrics/mod.rs`) via the pure helper `filter_labels_for_detail`,
 unit-tested exhaustively across all four levels. Workers receive the level over
