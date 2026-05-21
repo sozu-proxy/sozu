@@ -452,20 +452,31 @@ impl BackendMap {
     }
 
     // TODO: return <Result, BackendError>, log the error downstream
-    pub fn remove_backend(&mut self, cluster_id: &str, backend_address: &SocketAddr) {
-        if let Some(backends) = self.backends.get_mut(cluster_id) {
-            backends.remove_backend(backend_address);
+    /// Remove every backend at `backend_address` from `cluster_id` and
+    /// return the list of `backend_id`s that were dropped. Callers (e.g.
+    /// `Server::remove_backend`) iterate over the returned ids to tear
+    /// down per-backend metrics so the identity used by the runtime
+    /// (address-keyed) matches the identity used by the metrics layer
+    /// (id-keyed) — see PR #1252 follow-up review MEDIUM-3.
+    pub fn remove_backend(
+        &mut self,
+        cluster_id: &str,
+        backend_address: &SocketAddr,
+    ) -> Vec<String> {
+        let removed = if let Some(backends) = self.backends.get_mut(cluster_id) {
+            backends.remove_backend(backend_address)
         } else {
             error!(
                 "Backend was already removed: cluster id {}, address {:?}",
                 cluster_id, backend_address
             );
-            return;
-        }
+            return Vec::new();
+        };
         // Re-evaluate so removing the last backend logs an explicit
         // `AllDown` transition (or, with `total == 0`, drops back to
         // silent gauges).
         self.record_cluster_availability(cluster_id);
+        removed
     }
 
     // TODO: return <Result, BackendError>, log the error downstream
@@ -692,9 +703,25 @@ impl BackendList {
         }
     }
 
-    pub fn remove_backend(&mut self, backend_address: &SocketAddr) {
-        self.backends
-            .retain(|backend| &backend.borrow().address != backend_address);
+    /// Remove every backend at `backend_address` and return the list of
+    /// `backend_id`s that were dropped. Two backends with the same address
+    /// but distinct ids (A/B test, weighted variant, dedup race) are both
+    /// removed here; the caller relies on the returned ids to tear down
+    /// matching per-backend state (metrics, health-check). Returning the
+    /// ids closes the identity drift between runtime-removal-by-address
+    /// and metrics-removal-by-id.
+    pub fn remove_backend(&mut self, backend_address: &SocketAddr) -> Vec<String> {
+        let mut removed = Vec::new();
+        self.backends.retain(|backend| {
+            let b = backend.borrow();
+            if &b.address == backend_address {
+                removed.push(b.backend_id.clone());
+                false
+            } else {
+                true
+            }
+        });
+        removed
     }
 
     pub fn has_backend(&self, backend_address: &SocketAddr) -> bool {
