@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque, hash_map::Entry},
+    collections::{HashMap, HashSet, VecDeque, hash_map::Entry},
     io::{ErrorKind, Write},
     net::SocketAddr,
     str,
@@ -37,6 +37,15 @@ pub struct NetworkDrain {
     cluster_metrics: HashMap<(String, String), StoredMetricValue>,
     /// (cluster_id, backend_id, key) -> metric
     backend_metrics: HashMap<(String, String, String), StoredMetricValue>,
+    /// Cluster ids that received a `RemoveCluster` IPC and have not yet
+    /// been re-introduced by `AddCluster`. Mirrors `LocalDrain`'s
+    /// tombstone: in-flight sessions for a removed cluster keep emitting
+    /// access-log / response-time / gauge metrics, which without this
+    /// guard would re-enter `cluster_metrics` / `backend_metrics` /
+    /// `queue` (the IPC-time `retain` calls cleared the existing entries
+    /// but cannot prevent reinsertion). The wire side stays silent for
+    /// the cluster until `AddCluster` re-arms or an operator clear.
+    removed_clusters: HashSet<String>,
     pub use_tagged_metrics: bool,
     pub origin: String,
     created: Instant,
@@ -54,6 +63,7 @@ impl NetworkDrain {
             proxy_metrics: HashMap::new(),
             cluster_metrics: HashMap::new(),
             backend_metrics: HashMap::new(),
+            removed_clusters: HashSet::new(),
             use_tagged_metrics: false,
             origin: String::from("x"),
             created: Instant::now(),
@@ -64,27 +74,55 @@ impl NetworkDrain {
         self.is_writable = true;
     }
 
-    /// Drop all wire-side metric storage for a cluster: stored counters /
-    /// gauges in `cluster_metrics` + `backend_metrics`, and any queued
-    /// `MetricLine` carrying the cluster id. Called from
+    /// Drop all wire-side metric storage for a cluster, drain matching
+    /// queued lines, and mark the cluster id as tombstoned so subsequent
+    /// emissions for that cluster are dropped before they can re-enter
+    /// the maps or the queue. Called from
     /// [`super::Aggregator::remove_cluster`] on `RequestType::RemoveCluster`.
     /// Any unsent statsd interval for the cluster is **dropped**, not
-    /// emitted: there is no final flush. Operators that need per-removal
-    /// delta accuracy must trigger a flush before the IPC. In practice
-    /// cluster-removal events are rare and the loss is bounded by the
-    /// metrics send cadence (typically ≤1 second).
+    /// emitted: there is no final flush. The wire stays silent for the
+    /// cluster until [`Self::add_cluster`] re-arms it (called from the
+    /// `AddCluster` IPC) or [`Self::clear`] wipes the tombstone.
+    ///
+    /// The tombstone is the load-bearing guard against in-flight sessions
+    /// keeping a removed cluster on the wire: proxy `remove_cluster`
+    /// paths in `lib/src/http.rs` / `https.rs` / `tcp.rs` drop cluster
+    /// config but do NOT close in-flight sessions, so access-log
+    /// emissions continue to fire. Mirror of `LocalDrain::remove_cluster`.
     pub fn remove_cluster(&mut self, cluster_id: &str) {
         self.cluster_metrics.retain(|(c, _), _| c != cluster_id);
         self.backend_metrics.retain(|(c, _, _), _| c != cluster_id);
         self.queue
             .retain(|m| m.cluster_id.as_deref() != Some(cluster_id));
+        self.removed_clusters.insert(cluster_id.to_owned());
+    }
+
+    /// Re-arm a previously-removed cluster id so its metrics can flow on
+    /// the wire again. Called from [`super::Aggregator::add_cluster`] on
+    /// `RequestType::AddCluster`. Idempotent on ids that were never
+    /// removed.
+    pub fn add_cluster(&mut self, cluster_id: &str) {
+        self.removed_clusters.remove(cluster_id);
+    }
+
+    /// Operator-issued reset triggered by `MetricsConfiguration::Clear`.
+    /// Wipes every wire-side map AND clears the tombstone set so any
+    /// cluster id can resume emitting without going through `AddCluster`.
+    /// Mirror of `LocalDrain::clear`.
+    pub fn clear(&mut self) {
+        self.proxy_metrics.clear();
+        self.cluster_metrics.clear();
+        self.backend_metrics.clear();
+        self.queue.clear();
+        self.removed_clusters.clear();
     }
 
     /// Drop all wire-side metric storage for one backend: stored counters
     /// in `backend_metrics` and any queued `MetricLine` for that backend.
     /// Called from [`super::Aggregator::remove_backend`] on
     /// `RequestType::RemoveBackend`. Same final-delta-loss caveat as
-    /// [`Self::remove_cluster`].
+    /// [`Self::remove_cluster`]. Does NOT tombstone the cluster — only
+    /// `remove_cluster` does, since backends come and go independently.
     pub fn remove_backend(&mut self, cluster_id: &str, backend_id: &str) {
         self.backend_metrics
             .retain(|(c, b, _), _| !(c == cluster_id && b == backend_id));
@@ -461,6 +499,16 @@ impl Subscriber for NetworkDrain {
         backend_id: Option<&str>,
         metric: MetricValue,
     ) {
+        // Tombstone guard — see `Self::remove_cluster`. Long-lived sessions
+        // for a removed cluster would otherwise re-enter `cluster_metrics`
+        // / `backend_metrics` / `queue` after the IPC drained them, keeping
+        // the wire noisy for a cluster the operator just removed.
+        if let Some(cid) = cluster_id {
+            if self.removed_clusters.contains(cid) {
+                return;
+            }
+        }
+
         if metric.is_time() {
             if let MetricValue::Time(millis) = metric {
                 self.queue.push_back(MetricLine {
@@ -695,6 +743,65 @@ mod tests {
                 !(c.as_deref() == Some("cluster-a") && b.as_deref() == Some("backend-1"))
             }),
             "no (cluster-a, backend-1) line must remain"
+        );
+    }
+
+    #[test]
+    fn network_drain_tombstone_blocks_resurrection() {
+        // After `remove_cluster`, subsequent emissions for the cluster id
+        // must be dropped on the wire side too — without the tombstone a
+        // long-lived session would re-insert into `cluster_metrics` /
+        // `backend_metrics` / queue every time it ran.
+        use crate::metrics::Subscriber;
+        let mut drain = loopback_drain();
+
+        drain.remove_cluster("cluster-a");
+
+        drain.receive_metric("metric_a", Some("cluster-a"), None, MetricValue::Count(1));
+        drain.receive_metric(
+            "metric_b",
+            Some("cluster-a"),
+            Some("backend-1"),
+            MetricValue::Count(2),
+        );
+        drain.receive_metric(
+            "metric_c",
+            Some("cluster-a"),
+            Some("backend-2"),
+            MetricValue::Time(5),
+        );
+
+        assert!(
+            drain
+                .cluster_metrics
+                .keys()
+                .all(|(c, _)| c != "cluster-a"),
+            "cluster-level metric must be tombstoned"
+        );
+        assert!(
+            drain.backend_metrics.keys().all(|(c, _, _)| c != "cluster-a"),
+            "backend-level metric must be tombstoned"
+        );
+        assert!(
+            drain.queue.iter().all(|m| m.cluster_id.as_deref() != Some("cluster-a")),
+            "queued Time metric must be tombstoned"
+        );
+    }
+
+    #[test]
+    fn network_drain_add_cluster_clears_tombstone() {
+        use crate::metrics::Subscriber;
+        let mut drain = loopback_drain();
+
+        drain.remove_cluster("cluster-a");
+        drain.add_cluster("cluster-a");
+
+        drain.receive_metric("metric_a", Some("cluster-a"), None, MetricValue::Count(4));
+        assert!(
+            drain
+                .cluster_metrics
+                .contains_key(&("cluster-a".to_string(), "metric_a".to_string())),
+            "cluster row must record after add_cluster re-arms"
         );
     }
 }

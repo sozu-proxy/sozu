@@ -665,6 +665,9 @@ impl Aggregator {
     }
 
     pub fn clear_local(&mut self) {
+        if let Some(ref mut net) = self.network.as_mut() {
+            net.clear();
+        }
         self.local.clear();
     }
 
@@ -672,12 +675,18 @@ impl Aggregator {
         self.local.configure(config);
     }
 
-    /// Drop all metric storage for a cluster across BOTH drains. Called from
-    /// the worker IPC dispatch on [`RequestType::RemoveCluster`] so retired
-    /// clusters do not leak per-cluster keys after the wall-clock hourly
-    /// clear was removed. Network-side draining the queued `MetricLine`s
-    /// produces immediate silence on the wire (any unsent statsd interval
-    /// for the cluster is discarded).
+    /// Drop all metric storage for a cluster across BOTH drains and arm
+    /// the per-drain tombstone so subsequent emissions for the cluster are
+    /// dropped on the floor instead of resurrecting the row via
+    /// `entry().or_default()`. Called from the worker IPC dispatch on
+    /// [`RequestType::RemoveCluster`]. Network-side draining the queued
+    /// `MetricLine`s produces immediate silence on the wire (any unsent
+    /// statsd interval for the cluster is discarded).
+    ///
+    /// Worker-event-loop only — `METRICS` is a `thread_local!`, and the
+    /// mutable borrow taken here must not be re-entered from a session-
+    /// bound code path. Calling this from a metrics emission site would
+    /// deadlock the thread-local on `borrow_mut`.
     pub fn remove_cluster(&mut self, cluster_id: &str) {
         if let Some(ref mut net) = self.network.as_mut() {
             net.remove_cluster(cluster_id);
@@ -685,8 +694,21 @@ impl Aggregator {
         self.local.remove_cluster(cluster_id);
     }
 
+    /// Re-arm a previously-removed cluster id across BOTH drains. Called
+    /// from the worker IPC dispatch on [`RequestType::AddCluster`].
+    /// Idempotent on ids that were never removed. Without this hook a
+    /// cluster removed then re-added would stay tombstoned forever and
+    /// every fresh metric emission would be dropped.
+    pub fn add_cluster(&mut self, cluster_id: &str) {
+        if let Some(ref mut net) = self.network.as_mut() {
+            net.add_cluster(cluster_id);
+        }
+        self.local.add_cluster(cluster_id);
+    }
+
     /// Drop all metric storage for one backend across BOTH drains. Called
     /// from the worker IPC dispatch on [`RequestType::RemoveBackend`].
+    /// Does NOT tombstone the cluster (only `remove_cluster` does).
     pub fn remove_backend(&mut self, cluster_id: &str, backend_id: &str) {
         if let Some(ref mut net) = self.network.as_mut() {
             net.remove_backend(cluster_id, backend_id);

@@ -1781,6 +1781,13 @@ impl Server {
                     }
                 }
                 self.add_cluster(cluster);
+                // Re-arm the metric drain tombstone in case this cluster id
+                // was previously removed — without this the drain would
+                // continue dropping every emission for the resurrected
+                // cluster. Idempotent on a fresh id.
+                METRICS.with(|metrics| {
+                    (*metrics.borrow_mut()).add_cluster(&cluster.cluster_id);
+                });
                 //not returning because the message must still be handled by each proxy
             }
             Some(RequestType::RemoveCluster(ref cluster_id)) => {

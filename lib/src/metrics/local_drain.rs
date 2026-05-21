@@ -344,6 +344,14 @@ pub struct LocalDrain {
     pub proxy_metrics: MetricsMap,
     /// cluster_id -> cluster_metrics
     cluster_metrics: BTreeMap<String, LocalClusterMetrics>,
+    /// Cluster ids that received a `RemoveCluster` IPC and have not yet
+    /// been re-introduced by `AddCluster`. Late session emissions for
+    /// these ids are dropped on the floor by [`Self::receive_cluster_metric`]
+    /// / [`Self::receive_backend_metric`] so a long-lived H2 / WebSocket /
+    /// TCP session against a removed cluster cannot resurrect (and keep
+    /// growing) the cluster's metric row via `entry().or_default()`.
+    /// Cleared on [`Self::clear`] and on [`Self::add_cluster`].
+    removed_clusters: HashSet<String>,
     use_tagged_metrics: bool,
     origin: String,
     disable_cluster_metrics: bool,
@@ -356,6 +364,7 @@ impl LocalDrain {
             created: Instant::now(),
             proxy_metrics: MetricsMap::new(),
             cluster_metrics: BTreeMap::new(),
+            removed_clusters: HashSet::new(),
             use_tagged_metrics: false,
             origin: String::from("x"),
             disable_cluster_metrics: false,
@@ -371,14 +380,14 @@ impl LocalDrain {
     }
 
     /// Operator-issued reset (`sozu metrics clear`,
-    /// [`MetricsConfiguration::Clear`]). Wipes everything: counts, gauges,
-    /// and histograms, proxy-wide and per-cluster. Operators ask for this
-    /// explicitly via the CLI; gauge preservation across an explicit clear
-    /// is surprising. The wall-clock hourly clear (formerly in
-    /// `lib/src/server.rs`) has been removed; the local drain is now
-    /// cumulative since worker start, with explicit cluster-removal
-    /// lifecycle hooks ([`Self::remove_cluster`], [`Self::remove_backend`])
-    /// providing the memory bound the hourly clear used to provide.
+    /// [`MetricsConfiguration::Clear`]). Wipes every map: counts, gauges,
+    /// and histograms, proxy-wide and per-cluster, AND clears the
+    /// removed-cluster tombstone so previously-removed cluster ids can
+    /// receive metrics again without going through `AddCluster`. Operators
+    /// ask for this explicitly via the CLI; the prior gauge-preserving
+    /// shape was a workaround for the now-deleted hourly clear (long-lived
+    /// H2 sessions decrementing gauges past a fresh-zero baseline) and is
+    /// no longer needed.
     ///
     /// Caveat: issuing `clear()` during live traffic resets in-flight gauge
     /// accuracy. Sessions opened before the clear that decrement gauges on
@@ -389,23 +398,41 @@ impl LocalDrain {
     pub fn clear(&mut self) {
         self.proxy_metrics = MetricsMap::new();
         self.cluster_metrics.clear();
+        self.removed_clusters.clear();
     }
 
-    /// Drop all metrics for a cluster from the local drain. Called from the
-    /// worker IPC dispatch on [`RequestType::RemoveCluster`]. Ignores
-    /// `disable_cluster_metrics`: this method only deletes, never emits, so
-    /// it is safe to call regardless of the runtime metrics configuration.
+    /// Drop all metrics for a cluster from the local drain and mark the
+    /// cluster id as a tombstone so subsequent emissions are dropped on
+    /// the floor rather than resurrecting a row via `entry().or_default()`.
+    /// Called from the worker IPC dispatch on
+    /// [`RequestType::RemoveCluster`]. Ignores `disable_cluster_metrics`:
+    /// this method only deletes, never emits, so it is safe to call
+    /// regardless of the runtime metrics configuration.
     ///
-    /// Race note: late access-log / session metrics can fire from
-    /// `lib/src/lib.rs` and `lib/src/protocol/mux/stream.rs` after the IPC
-    /// removal. `LocalDrain::receive_cluster_metric` will reinsert a cluster
-    /// row via `entry().or_default()` for any such late emission. The ghost
-    /// row sits idle until the next `RemoveCluster`, the next `AddCluster`
-    /// for the same id, or the next operator clear. Single-threaded worker
-    /// makes this trivially correct (no actual race) — a "removed clusters"
-    /// denylist would be over-engineered for the resulting cosmetic noise.
+    /// Lifetime of the tombstone: cleared on [`Self::add_cluster`] (the
+    /// same cluster id comes back) and on [`Self::clear`] (operator-
+    /// initiated full reset). Otherwise it lives forever — fine, since the
+    /// tombstone is a small `String` per actually-removed cluster, the
+    /// cardinality of which is bounded by operator activity.
+    ///
+    /// Why this matters: `HttpProxy::remove_cluster` and the equivalent on
+    /// the HTTPS / TCP proxies remove cluster *config* but do NOT close
+    /// in-flight sessions. Long-lived H2 streams, WebSocket upgrades, and
+    /// TCP frontends with persistent backends continue to emit
+    /// access-log / response-time / gauge-decrement metrics for the
+    /// removed cluster, which without the tombstone would re-create the
+    /// cluster row and keep growing it until the last session closes.
     pub fn remove_cluster(&mut self, cluster_id: &str) {
         self.cluster_metrics.remove(cluster_id);
+        self.removed_clusters.insert(cluster_id.to_owned());
+    }
+
+    /// Re-arm a previously-removed cluster id so its metrics flow again.
+    /// Called from the worker IPC dispatch on
+    /// [`RequestType::AddCluster`]. Idempotent on ids that were never
+    /// removed.
+    pub fn add_cluster(&mut self, cluster_id: &str) {
+        self.removed_clusters.remove(cluster_id);
     }
 
     /// Drop all metrics for one backend within a cluster. Called from the
@@ -413,6 +440,10 @@ impl LocalDrain {
     /// entry in place if cluster-level metrics or other backends remain;
     /// otherwise drops the empty cluster row to avoid phantom keyspace.
     /// Ignores `disable_cluster_metrics`: deletes only, never emits.
+    ///
+    /// Note: this does NOT tombstone the cluster id — backends come and go
+    /// independently of the cluster. Only [`Self::remove_cluster`] sets
+    /// the tombstone.
     pub fn remove_backend(&mut self, cluster_id: &str, backend_id: &str) {
         let drop_cluster = if let Some(cluster) = self.cluster_metrics.get_mut(cluster_id) {
             cluster.backends.retain(|b| b.backend_id != backend_id);
@@ -625,6 +656,12 @@ impl LocalDrain {
         if self.disable_cluster_metrics {
             return Ok(());
         }
+        // Tombstone guard — see `Self::remove_cluster`. Without this, late
+        // session emissions for a removed cluster resurrect the row via
+        // `entry().or_default()` below.
+        if self.removed_clusters.contains(cluster_id) {
+            return Ok(());
+        }
 
         let local_cluster_metric = self
             .cluster_metrics
@@ -642,6 +679,10 @@ impl LocalDrain {
         metric: MetricValue,
     ) -> Result<(), MetricError> {
         if self.disable_cluster_metrics {
+            return Ok(());
+        }
+        // Same tombstone guard as `receive_cluster_metric`.
+        if self.removed_clusters.contains(cluster_id) {
             return Ok(());
         }
 
@@ -1123,6 +1164,108 @@ mod tests {
         {
             Some(Inner::Count(v)) => assert_eq!(*v, 7, "cluster-b counter intact"),
             other => panic!("expected Count for cluster-b, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn remove_cluster_tombstones_late_emissions() {
+        // After `remove_cluster`, late access-log / session metrics for the
+        // same cluster id must be dropped on the floor rather than
+        // resurrecting the row via `entry().or_default()`. This is the
+        // load-bearing guard against long-lived sessions (H2 / WS / TCP)
+        // keeping a removed cluster permanently growing — proxy
+        // `remove_cluster` paths drop config but do not close sessions.
+        let mut local_drain = LocalDrain::new("prefix".to_string());
+
+        local_drain.receive_metric(
+            "backend.connections.error",
+            Some("cluster-a"),
+            Some("backend-a"),
+            MetricValue::Count(3),
+        );
+        local_drain.remove_cluster("cluster-a");
+
+        // Late emission after the IPC.
+        local_drain.receive_metric(
+            "backend.connections.error",
+            Some("cluster-a"),
+            Some("backend-a"),
+            MetricValue::Count(7),
+        );
+
+        assert!(
+            local_drain
+                .metrics_of_one_cluster("cluster-a", &[])
+                .is_err(),
+            "tombstone must drop late emissions instead of resurrecting"
+        );
+    }
+
+    #[test]
+    fn add_cluster_clears_tombstone() {
+        // `AddCluster` for a previously-removed cluster id must re-arm the
+        // drain so fresh emissions are recorded again. Without this hook a
+        // cluster removed then re-added would stay silent forever.
+        let mut local_drain = LocalDrain::new("prefix".to_string());
+
+        local_drain.remove_cluster("cluster-a");
+        local_drain.add_cluster("cluster-a");
+
+        local_drain.receive_metric(
+            "backend.connections.error",
+            Some("cluster-a"),
+            Some("backend-a"),
+            MetricValue::Count(11),
+        );
+
+        let result = local_drain
+            .metrics_of_one_backend(
+                "backend-a",
+                ["backend.connections.error".to_string()].as_ref(),
+            )
+            .expect("cluster row must be reachable after add_cluster");
+        match result
+            .metrics
+            .get("backend.connections.error")
+            .and_then(|m| m.inner.as_ref())
+        {
+            Some(Inner::Count(v)) => {
+                assert_eq!(*v, 11, "post-add metric must record from zero")
+            }
+            other => panic!("expected Count, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clear_wipes_tombstones() {
+        // Operator-issued clear must wipe tombstones too so previously-
+        // removed cluster ids can resume emitting without going through
+        // `AddCluster`.
+        let mut local_drain = LocalDrain::new("prefix".to_string());
+
+        local_drain.remove_cluster("cluster-a");
+        local_drain.clear();
+
+        local_drain.receive_metric(
+            "backend.connections.error",
+            Some("cluster-a"),
+            Some("backend-a"),
+            MetricValue::Count(5),
+        );
+
+        let result = local_drain
+            .metrics_of_one_backend(
+                "backend-a",
+                ["backend.connections.error".to_string()].as_ref(),
+            )
+            .expect("tombstone must be cleared after `clear()`");
+        match result
+            .metrics
+            .get("backend.connections.error")
+            .and_then(|m| m.inner.as_ref())
+        {
+            Some(Inner::Count(v)) => assert_eq!(*v, 5),
+            other => panic!("expected Count, got {other:?}"),
         }
     }
 
