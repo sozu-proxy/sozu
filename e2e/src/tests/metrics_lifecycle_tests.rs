@@ -167,8 +167,13 @@ fn try_remove_cluster_drops_metric_row() -> State {
     let cluster_id = "lifecycle_cluster_remove";
     let backend_id = "lifecycle_back_remove";
 
-    let mut worker =
-        setup_worker_with_cluster("METRICS-LIFECYCLE-REMOVE", cluster_id, backend_id, front_address, back_address);
+    let mut worker = setup_worker_with_cluster(
+        "METRICS-LIFECYCLE-REMOVE",
+        cluster_id,
+        backend_id,
+        front_address,
+        back_address,
+    );
 
     prime_with_one_request(front_address, back_address);
 
@@ -219,8 +224,13 @@ fn try_remove_then_add_cluster_re_arms_metrics() -> State {
     let cluster_id = "lifecycle_cluster_readd";
     let backend_id = "lifecycle_back_readd";
 
-    let mut worker =
-        setup_worker_with_cluster("METRICS-LIFECYCLE-READD", cluster_id, backend_id, front_address, back_address);
+    let mut worker = setup_worker_with_cluster(
+        "METRICS-LIFECYCLE-READD",
+        cluster_id,
+        backend_id,
+        front_address,
+        back_address,
+    );
 
     prime_with_one_request(front_address, back_address);
 

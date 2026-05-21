@@ -772,18 +772,21 @@ mod tests {
         );
 
         assert!(
-            drain
-                .cluster_metrics
-                .keys()
-                .all(|(c, _)| c != "cluster-a"),
+            drain.cluster_metrics.keys().all(|(c, _)| c != "cluster-a"),
             "cluster-level metric must be tombstoned"
         );
         assert!(
-            drain.backend_metrics.keys().all(|(c, _, _)| c != "cluster-a"),
+            drain
+                .backend_metrics
+                .keys()
+                .all(|(c, _, _)| c != "cluster-a"),
             "backend-level metric must be tombstoned"
         );
         assert!(
-            drain.queue.iter().all(|m| m.cluster_id.as_deref() != Some("cluster-a")),
+            drain
+                .queue
+                .iter()
+                .all(|m| m.cluster_id.as_deref() != Some("cluster-a")),
             "queued Time metric must be tombstoned"
         );
     }
