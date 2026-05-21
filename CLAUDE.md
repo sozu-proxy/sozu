@@ -1,4 +1,4 @@
-Sōzu — a hot-reconfigurable HTTP/1.x + HTTP/2 reverse proxy (AGPL-3.0). Rust 2024 (MSRV 1.88.0, matching the `1.88.0` toolchain pinned in `rust-toolchain`). Upstream: `github.com/sozu-proxy/sozu`. The `feat/h2-mux` branch carries the H2 multiplexer rewrite; PR #1209 is open against `main`.
+Sōzu — a hot-reconfigurable HTTP/1.x + HTTP/2 reverse proxy (AGPL-3.0). Rust 2024 (MSRV 1.88.0, matching the `1.88.0` toolchain pinned in `rust-toolchain`). Upstream: `github.com/sozu-proxy/sozu`. The H2 multiplexer rewrite landed on `main` via PR #1209 (merged commit `98c56a4c`); subsequent hardening (parser, command IPC, metrics, audit fixes) builds on it.
 
 This file is the primary agent instruction for the repo. It is symlinked to `AGENTS.md` so OpenAI Codex picks up the same content. Anthropic's global `~/.claude/CLAUDE.md` conventions (worktree-first, GPG sign-off, commitizen style) still apply and are not duplicated here.
 
@@ -21,12 +21,12 @@ Dependency graph: `lib → command`; `bin → lib + command`; `e2e → lib + com
 
 ```bash
 cargo build --locked                            # debug, all workspace members
-cargo build --all-features --locked             # currently builds (verified 2026-04 on feat/h2-mux)
+cargo build --all-features --locked             # all features on main (verified 2026-05)
 cargo build -p sozu --release --locked          # production binary (release = lto + codegen-units=1)
 cargo +nightly fmt --all -- --check             # nightly REQUIRED: rustfmt.toml uses `ignore = [...]` which stable treats as nightly-only
-cargo clippy --all-targets --locked             # currently emits one `clippy::if_same_then_else` in e2e/src/tests/h2_correctness_tests.rs — `-D warnings` fails until fixed
+cargo clippy --all-targets --locked -- -D warnings  # clean on main; keep it that way
 cargo test --workspace --locked                 # unit + e2e
-cargo test -p sozu-e2e -- h2_                   # filter to H2 e2e tests (~149 tests)
+cargo test -p sozu-e2e -- h2_                   # filter to H2 e2e tests (~181 tests across h2_*.rs)
 cargo +nightly fuzz run fuzz_frame_parser       # from fuzz/, requires cargo-fuzz + nightly
 ```
 
@@ -68,9 +68,11 @@ Crypto-provider features live in `bin/Cargo.toml` + `lib/Cargo.toml`; CI exercis
 
 Unit tests live beside their modules (`#[cfg(test)] mod tests` in `lib/src/**`). Integration tests are in `e2e/src/tests/` and registered via `e2e/src/tests/mod.rs`:
 
-- `h2_tests.rs`, `h2_correctness_tests.rs`, `h2_security_tests.rs`, `h2_security_{parser,session,sni,header_injection}.rs` — H2 mux coverage (~130 tests on this branch).
+- `h2_tests.rs`, `h2_correctness_tests.rs`, `h2_security_tests.rs`, `h2_security_{parser,session,sni,header_injection}.rs`, `h2_priority_rearm_tests.rs` — H2 mux coverage (~181 tests on `main`).
 - `mux_tests.rs` — H1 + proxy-protocol + keepalive/hup edge cases.
-- `h1_security_tests.rs`, `tls_tests.rs`, `tcp_tests.rs`.
+- `h1_security_tests.rs`, `tls_tests.rs`, `tcp_tests.rs`, `hsts_tests.rs`.
+- `command_channel_security_tests.rs` — command-channel and SCM FD-passing hardening (panic-OOB, length-prefix validation).
+- `cluster_ip_limit_tests.rs`, `eviction_tests.rs`, `listener_update_tests.rs`, `protocol_pair_matrix.rs`, `redirect_rewrite_auth_tests.rs` — feature coverage for per-IP rate-limit, accept-queue eviction, listener hot-update, the H1↔H2 protocol matrix, and the answer/redirect/rewrite/auth pipeline.
 - `fuzz_tests.rs` — `#[ignore]` wrappers around the cargo-fuzz targets. Run with `cargo test -p sozu-e2e -- --ignored fuzz`.
 - `h2_utils.rs` — shared helpers, including `loop_read_*` (absorbs TCP segmentation in assertions).
 - `tests.rs` — `setup_sync_test`, `setup_async_test`, worker harness, port-registry integration.
@@ -114,7 +116,7 @@ Crypto-provider features (`crypto-ring`, `crypto-aws-lc-rs`, `crypto-openssl`, `
 - **Branch naming**: `feat/<scope>`, `fix/<scope>`, `refactor/<scope>`, `chore/<scope>`, `docs/<scope>`, `test/<scope>`, `perf/<scope>`, `style/<scope>`, `ci/<scope>`, `bench/<scope>`.
 - **Conventional commits** with scope: `feat(h2): ...`, `fix(mux): ...`, `test(e2e): ...`, etc. No commitizen config — follow the existing `git log` style manually.
 - **Sign + GPG**: `git commit -s -S` for new commits. History on this branch has a minority of unsigned/unsignedoff commits; keep new ones signed.
-- **PR base is `main`.** For sub-worktrees forked off `feat/h2-mux` (most in-flight work), manually target `feat/h2-mux` when merging back. `wt merge -y` defaults to the repo default (`main`) — confirm the target before using it.
+- **PR base is `main`.** Default-branch development now — `feat/h2-mux` was merged via PR #1209 and is no longer a long-lived integration branch. `wt merge -y` defaults to `main`; confirm the target before using it for the rare follow-up forked off another in-flight branch.
 - **After committing: push.** On this repo, `git push` is part of the commit task; don't stop at `git commit`. Post the resulting `github.com/sozu-proxy/sozu/actions` run URL.
 - **PRs** are reviewed by CODEOWNERS (`@FlorentinDUBOIS @Wonshtrum @llenotre`) and gated by the CLA in `CONTRIBUTING.md`. PR descriptions should call out protocol/security impact, commands run, tests added, and doc updates.
 
