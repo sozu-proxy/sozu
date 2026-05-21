@@ -196,13 +196,21 @@ upgrade. See `doc/upgrade/1.x-to-2.0.md` for the full migration guide.
   (`MetricsConfiguration::Clear`) now wipes everything (counts, gauges,
   histograms, proxy-wide and per-cluster, AND the master-process
   `main_metrics`) — formerly it preserved gauges and never touched
-  `proxy_metrics` or `main_metrics`. On cluster removal, the cluster is
-  dropped immediately from both the local drain and the StatsD
-  `network_drain` (`cluster_metrics`, `backend_metrics`, queued
-  `MetricLine`s); any unsent statsd interval for the cluster is discarded
-  rather than emitted. Formerly the cluster lingered for up to 10 minutes
-  via the idle GC. The StatsD wire format is unchanged (per-second deltas
-  as before). `Time` histograms are widened from `Histogram<u32>` to
+  `proxy_metrics` or `main_metrics`. The master-side wipe runs on the
+  scatter-completion path AFTER the operator audit row is emitted, so the
+  audit `count!(metrics_configured, 1)` increment driven by the clear
+  operation does not immediately repopulate the freshly-cleared
+  `main_metrics`. On cluster removal, the cluster is dropped immediately
+  from both the local drain and the StatsD `network_drain`
+  (`cluster_metrics`, `backend_metrics`, queued `MetricLine`s); any unsent
+  statsd interval for the cluster is discarded rather than emitted.
+  Formerly the cluster lingered for up to 10 minutes via the idle GC. A
+  per-drain `removed_clusters` tombstone now drops late session emissions
+  for the removed cluster id so long-lived H2 / WebSocket / TCP sessions
+  cannot resurrect the cluster row via `entry().or_default()` —
+  `AddCluster` for the same id and `sozu metrics clear` both clear the
+  tombstone. The StatsD wire format is unchanged (per-second deltas as
+  before). `Time` histograms are widened from `Histogram<u32>` to
   `Histogram<u64>` so per-bucket counters do not saturate under sustained
   high-RPS traffic; memory cost is roughly 2× per histogram, bounded.
 - **Removed the `proto_version` capability handshake**.

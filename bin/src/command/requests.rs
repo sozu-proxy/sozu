@@ -1930,7 +1930,24 @@ pub fn worker_request(
     // returned by `dump_local_proxy_metrics` would survive the operator
     // clear and `sozu metrics` would still report stale values).
     let metrics_configuration = if let RequestType::ConfigureMetrics(value) = &request_content {
-        Some(MetricsConfiguration::try_from(*value).unwrap_or(MetricsConfiguration::Disabled))
+        // `try_from` rejects any i32 outside the proto-known set. An
+        // unknown variant lands here only if the master has been deployed
+        // ahead of a worker schema bump (or a malformed IPC payload slips
+        // past the dispatch whitelist). Log loudly and fall back to
+        // `Disabled` — silently treating "unknown" as "disabled" would
+        // mask future enum drift, e.g. a `Clear` value the master no
+        // longer recognises would silently skip the master-side wipe.
+        match MetricsConfiguration::try_from(*value) {
+            Ok(cfg) => Some(cfg),
+            Err(err) => {
+                error!(
+                    "ConfigureMetrics IPC carries unknown enum value {} ({:?}), \
+                     falling back to MetricsConfiguration::Disabled",
+                    value, err
+                );
+                Some(MetricsConfiguration::Disabled)
+            }
+        }
     } else {
         None
     };

@@ -121,16 +121,22 @@ Per-cluster entries are also dropped on `RemoveCluster` /
 StatsD `network_drain` the same two events drop the cluster's
 `cluster_metrics`, `backend_metrics`, and queued `MetricLine`s, so the
 wire side goes silent immediately (any unsent statsd interval for the
-cluster is discarded — bounded by `metrics_send_interval`, typically
-≤1 second).
+cluster is discarded — bounded by the one-second network-drain cadence
+hard-coded in `NetworkDrain::send_metrics`).
 
-Late session emissions can briefly recreate ghost rows in
-`cluster_metrics` after a `RemoveCluster` — `LocalDrain::receive_cluster_metric`
-calls `entry().or_default()`, so a teardown that fires after the IPC
-inserts a stub cluster row. The single-threaded mio worker makes this
-trivially benign (no real race); the row sits idle until the next
-`RemoveCluster`, the next `AddCluster` for the same id, or the next
-operator clear.
+`RemoveCluster` also arms a per-drain tombstone (`removed_clusters:
+HashSet<String>`) so subsequent emissions for the same cluster id are
+dropped on the floor rather than resurrecting the row via
+`entry().or_default()`. This matters in production: the per-proxy
+`remove_cluster` paths in `lib/src/http.rs` / `https.rs` / `tcp.rs`
+drop cluster config but do NOT close in-flight sessions, so long-lived
+H2 / WebSocket / TCP sessions continue emitting access-log /
+response-time / gauge metrics for the removed cluster. Without the
+tombstone those emissions would keep growing the cluster row until the
+last session closed; with it, the wire and the local drain stay quiet.
+The tombstone is cleared on `AddCluster` for the same id (a cluster can
+come back after a remove) and on `sozu metrics clear` (operator-initiated
+full reset).
 
 Implication for dashboards: counters in `sozu metrics` output are
 monotonic; charts should compute `rate()` / `irate()` rather than
