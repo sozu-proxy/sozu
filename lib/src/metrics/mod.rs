@@ -161,9 +161,20 @@ impl MetricValue {
                 *v1 += v2;
                 changed
             }
-            (s, m) => panic!(
-                "tried to update metric {key} of value {s:?} with an incompatible metric: {m:?}"
-            ),
+            (s, m) => {
+                // Symmetric with `AggregatedMetric::update` in `local_drain.rs`:
+                // a type-mismatch is a coding bug (a `metric_name` was
+                // re-emitted with a different `MetricValue` variant), not a
+                // network-driven event, but log-and-continue is still the
+                // right policy — taking the worker process down on a metric
+                // bookkeeping mismatch is too aggressive for a single-bug
+                // recovery path. The log line names the offending key.
+                error!(
+                    "tried to update metric {} of value {:?} with an incompatible metric: {:?}",
+                    key, s, m
+                );
+                false
+            }
         }
     }
 }
@@ -177,18 +188,28 @@ pub struct StoredMetricValue {
 
 impl StoredMetricValue {
     pub fn new(last_sent: Instant, data: MetricValue) -> StoredMetricValue {
+        // Symmetric with `AggregatedMetric::new`: a first emission with a
+        // negative `GaugeAdd` is a coding bug (a `-1` ran with no paired
+        // `+1` earlier in the worker's lifetime); clamp to 0 and log so the
+        // offending pattern shows up in operator logs alongside the
+        // local-drain side.
+        let data = if let MetricValue::GaugeAdd(v) = data {
+            if v >= 0 {
+                MetricValue::Gauge(v as usize)
+            } else {
+                error!(
+                    "stored metric created with negative GaugeAdd({}), clamping to 0",
+                    v
+                );
+                MetricValue::Gauge(0)
+            }
+        } else {
+            data
+        };
         StoredMetricValue {
             last_sent,
             updated: true,
-            data: if let MetricValue::GaugeAdd(v) = data {
-                if v >= 0 {
-                    MetricValue::Gauge(v as usize)
-                } else {
-                    MetricValue::Gauge(0)
-                }
-            } else {
-                data
-            },
+            data,
         }
     }
 
