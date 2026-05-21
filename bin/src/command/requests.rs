@@ -1820,6 +1820,15 @@ struct WorkerTask {
     /// them through `target`. `None` for any verb that is not
     /// `SetMetricDetail`.
     metric_detail_audit: Option<MetricDetailAuditFields>,
+    /// `MetricsConfiguration::Clear` deferred-clear flag. When `true`, the
+    /// completion handler wipes the master-side `METRICS` aggregator AFTER
+    /// the audit row has been emitted. Done post-audit so the
+    /// `count!(metrics_configured, 1)` increment driven by the audit row
+    /// itself is not what the operator sees in `sozu metrics` immediately
+    /// after `sozu metrics clear` — otherwise the master would be wiped,
+    /// the audit would repopulate one counter, and the "wipes everything"
+    /// contract would silently drift by exactly one row per clear.
+    clear_master_metrics_on_finish: bool,
 }
 
 /// Carry the per-verb metadata needed to emit a completion-time audit
@@ -2077,16 +2086,14 @@ pub fn worker_request(
         );
     }
 
-    // Master-side clear: the main process keeps its own `main_metrics`
-    // aggregator (read by `dump_local_proxy_metrics` at this file's
-    // metrics-query handler) that is NOT reached by the worker scatter.
-    // Apply the clear locally before fanning out so master and workers
-    // are wiped consistently.
-    if metrics_configuration == Some(MetricsConfiguration::Clear) {
-        METRICS.with(|metrics| {
-            (*metrics.borrow_mut()).clear_local();
-        });
-    }
+    // Master-side clear: deferred to `WorkerTask::on_finish` AFTER the
+    // audit emission so the `count!(metrics_configured, 1)` driven by the
+    // completion-time audit row does not immediately repopulate the
+    // freshly-cleared `main_metrics`. Without this deferral, the documented
+    // "wipes everything" contract drifts by exactly one row per clear and
+    // `sozu metrics` snapshot taken right after `sozu metrics clear` would
+    // report `config.metrics_configured = 1`.
+    let clear_master_metrics_on_finish = metrics_configuration == Some(MetricsConfiguration::Clear);
 
     client.return_processing("Processing worker request...");
 
@@ -2099,6 +2106,7 @@ pub fn worker_request(
             audit: audit_for_task,
             inline_audit,
             metric_detail_audit: metric_detail_audit_completion,
+            clear_master_metrics_on_finish,
         }),
         Timeout::Default,
         None,
@@ -2216,6 +2224,17 @@ impl GatheringTask for WorkerTask {
                 result,
                 extras,
             );
+        }
+
+        // Deferred master-side `MetricsConfiguration::Clear`. Runs AFTER
+        // the audit emission above so the `count!(metrics_configured, 1)`
+        // increment driven by that audit row is wiped here. Operators
+        // running `sozu metrics clear; sozu metrics` see an empty master
+        // dump, matching the PR contract.
+        if self.clear_master_metrics_on_finish {
+            METRICS.with(|metrics| {
+                (*metrics.borrow_mut()).clear_local();
+            });
         }
 
         if errors > 0 || timed_out {
