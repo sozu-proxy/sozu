@@ -65,18 +65,29 @@ To get started check out our [documentation](./doc/README.md) !
 
 - **From source.** See [`doc/getting_started.md`](./doc/getting_started.md) for compilation prerequisites (`protoc`, Rust toolchain pinned via `rust-toolchain`).
 
+## Quickstart
+
+Once the prerequisites (`protoc`, Rust 1.88 via the pinned `rust-toolchain`) are installed, building and starting Sōzu takes two commands:
+
+```sh
+cargo build -p sozu --release --locked
+target/release/sozu start -c bin/config.toml
+```
+
+`bin/config.toml` is the in-tree sample config — copy it next to your TLS certs and edit listener/cluster blocks before going to production. The live operator dashboard is available with `cargo build -p sozu --release --locked --features tui` then `target/release/sozu top`. Configuration reference: [`doc/configure.md`](./doc/configure.md).
+
 ## Exploring the source
 
 The Cargo workspace ships four crates (Rust 2024 edition, MSRV 1.88):
 
-- `lib/`: the `sozu-lib` reverse proxy library hosts the single-threaded mio event loop, the HTTP/1.1, HTTP/2 multiplexer, TCP and TLS protocols, routing, sockets, metrics, and the buffer pool.
-- `bin/`: the `sozu` binary wraps the library in a master/worker supervisor, exposes the unix command socket, and orchestrates hot reconfiguration and zero-downtime upgrades.
-- `command/`: the `sozu-command-lib` ships the protobuf IPC schema, configuration parser, replicated state, channels, and FD-passing helpers used by both `lib` and `bin`.
-- `e2e/`: the `sozu-e2e` integration harness spawns real workers plus mock clients and backends to exercise the H1, H2, TLS, and PROXY-protocol paths.
+- `lib/`: the `sozu-lib` reverse proxy library hosts the single-threaded mio event loop, the HTTP/1.1 (Kawa) and HTTP/2 multiplexer, TCP and TLS protocols, routing, per-IP rate limiting, sockets, metrics, and the buffer pool.
+- `bin/`: the `sozu` binary wraps the library in a master/worker supervisor, exposes the unix command socket, orchestrates hot reconfiguration and zero-downtime upgrades, and ships the optional `sozu top` TUI behind the `tui` feature.
+- `command/`: the `sozu-command-lib` ships the protobuf IPC schema, configuration parser, replicated state, length-prefixed channels, and SCM FD-passing helpers used by both `lib` and `bin`.
+- `e2e/`: the `sozu-e2e` integration harness spawns real workers plus mock clients and backends to exercise the H1, H2, TLS, PROXY-protocol, command-channel hardening, and listener/upgrade hot-reconfig paths.
 
 The `fuzz/` crate (`fuzz_frame_parser`, `fuzz_hpack_decoder`) lives outside the Cargo workspace and is built with `cargo +nightly fuzz` from inside `fuzz/`.
 
-HTTP/2 support (frontend and backend) is driven through the multiplexer in `lib/src/protocol/mux/` and TLS ALPN negotiation in `lib/src/protocol/rustls.rs`.
+HTTP/2 support (frontend and backend) is driven through the multiplexer in `lib/src/protocol/mux/` and TLS ALPN negotiation in `lib/src/protocol/rustls.rs`; the multiplexer includes flood mitigations for CVE-2023-44487 (Rapid Reset), CVE-2024-27316 (CONTINUATION flood), and CVE-2025-8671 (MadeYouReset), plus PING/SETTINGS/priority floods.
 
 ## License
 
