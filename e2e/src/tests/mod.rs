@@ -39,6 +39,7 @@ mod h2_tests;
 pub(crate) mod h2_utils;
 mod hsts_tests;
 mod listener_update_tests;
+mod metrics_lifecycle_tests;
 mod mux_tests;
 mod protocol_pair_matrix;
 mod redirect_rewrite_auth_tests;
