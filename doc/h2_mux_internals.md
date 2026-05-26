@@ -405,8 +405,9 @@ Flushes control data before application frames, in order:
    eviction (which the per-stream error callers invoke synchronously after
    `reset_stream` returns). `finalize_write` retains `Ready::WRITABLE`
    whenever the queue is non-empty so a partial write that deferred the
-   flush (Phase 3 is gated on `expect_write.is_none()`) re-runs on the
-   next tick rather than stranding the queued RST.
+   flush (the RST_STREAM drain stage is gated on
+   `expect_write.is_none()`) re-runs on the next tick rather than
+   stranding the queued RST.
 
 Returns `Some(MuxResult)` if the caller should return early, `None` to proceed.
 

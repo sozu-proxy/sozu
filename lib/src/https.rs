@@ -1018,12 +1018,13 @@ impl L7ListenerHandler for HttpsListener {
     }
 
     fn get_strict_sni_binding(&self) -> bool {
-        // Phase 1D enforced SNI↔:authority binding unconditionally; this
-        // listener knob preserves that behavior by default and lets
-        // operators opt out when cross-SNI routing is intentional.
+        // SNI↔:authority binding is enforced by default (closes
+        // CWE-346 / CWE-444); this listener knob preserves that
+        // behavior by default and lets operators opt out when cross-SNI
+        // routing is intentional.
         //
-        // Codex G10 note: `strict_sni_binding = false` theoretically allows
-        // an attacker to present many distinct SNIs on the same TCP
+        // Note: `strict_sni_binding = false` theoretically allows an
+        // attacker to present many distinct SNIs on the same TCP
         // connection. rustls 0.23 **bans TLS renegotiation outright** (see
         // `rustls::server::ClientHello` which is consumed during the initial
         // handshake only), so a single TCP connection gets exactly one SNI

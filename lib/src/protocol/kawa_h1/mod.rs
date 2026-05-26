@@ -1454,10 +1454,11 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             }
         };
 
-        // Wave 2b carries the new RouteResult shape; the mux integration in
-        // Wave 3a will read every field. Until then, this legacy kawa_h1
-        // path collapses RouteResult down to its `cluster_id` and treats an
-        // absent cluster as the historical `Route::Deny`.
+        // `RouteResult` already carries the full routing decision, but the
+        // mux integration that consumes every field is not in place yet.
+        // Until it lands, this legacy kawa_h1 path collapses `RouteResult`
+        // down to its `cluster_id` and treats an absent cluster as the
+        // historical `Route::Deny`.
         let cluster_id = match route.cluster_id {
             Some(cluster_id) => cluster_id,
             None => {

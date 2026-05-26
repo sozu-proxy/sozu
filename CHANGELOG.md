@@ -37,6 +37,21 @@ category at tag time.
   transitive version slots (`itertools 0.13.0`, `wit-bindgen 0.57.1`), plus
   criterion 0.8 dep fan-out. No MSRV impact — all movers declare
   MSRV ≤ 1.88.0.
+- **Docs and comments consolidation**: refreshed code comments, rustdoc, and
+  `lib/src/protocol/mux/LIFECYCLE.md` / `doc/h2_mux_internals.md` so they
+  describe behavior directly instead of citing now-retired plan labels
+  (router "Wave 1c/2b/3a", security-audit "Phase 1D", Codex review markers
+  "G5/G7/G10/G11/G12", h2-priority-rearm "Fix A/B/C/D", "B3-h/B3-p/B3-z"
+  test plan entries, and the "Phase 1/2/3" stage labels inside
+  `flush_pending_control_frames` and `graceful_goaway`). One
+  operator-visible side effect — the `h2.rs:4089` debug log
+  `GOAWAY (graceful, phase 1)` now reads `GOAWAY (graceful, initial)`. The
+  final GOAWAY continues to log via the generic `GOAWAY: {error}` line at
+  `h2.rs:4032` (unchanged), so only the initial-GOAWAY substring shifts.
+  Deployments running with `--features logs-debug` that scrape sozu logs
+  for the literal `phase 1` substring need to update their filters. The
+  RFC 9113 §6.8 double-GOAWAY behavior itself is unchanged. No other
+  metrics, config keys, or wire behavior change.
 
 ### 💥 Breaking changes (1.1.x → 2.0.0)
 

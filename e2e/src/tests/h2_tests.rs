@@ -4312,7 +4312,7 @@ fn test_h2_to_h1_100_continue() {
 /// actually count the HEADERS frames sozu emits to the wire. The hyper-based
 /// counterpart only surfaces the final response, so it cannot prove that the
 /// intermediate `100 Continue` HEADERS frame made it to the client — it could
-/// just as well be swallowed. Codex B3-z / plan entry from 2026-04-21.
+/// just as well be swallowed.
 ///
 /// Scenario: the `ContinueBackend` (H1) replies `100 Continue` then `200 OK`.
 /// Sozu MUST translate the 1xx status into an H2 HEADERS frame without
@@ -4676,16 +4676,16 @@ fn test_h2_backend_disconnect_clean_error() {
     );
 }
 
-// ---- Backend disconnect: repeated fast-close does not leak stream state (B3-h / G4) ----
+// ---- Backend disconnect: repeated fast-close does not leak stream state ----
 
-/// Codex gap G4 / plan entry B3-h: "`Linked` stream whose backend dies
-/// mid-response may not be driven to `Unlinked` before buffer recycle;
-/// race window". Reviewer verified the cleanup path
-/// (`remove_dead_stream` → `rst_sent.remove` etc.), but only a single
-/// disconnect was previously covered by
-/// `test_h2_backend_disconnect_clean_error`. A one-shot leak of 1 slot is
-/// invisible; a leak-per-fast-close would show up only after dozens of
-/// rapid fast-closes through the same listener.
+/// Regression guard for the race window in which a `Linked` stream whose
+/// backend dies mid-response may not be driven to `Unlinked` before
+/// buffer recycle. The cleanup path (`remove_dead_stream` →
+/// `rst_sent.remove` etc.) was previously exercised only by
+/// `test_h2_backend_disconnect_clean_error`, which fires a single
+/// disconnect; a one-shot leak of 1 slot is invisible, while a
+/// leak-per-fast-close would show up only after dozens of rapid
+/// fast-closes through the same listener.
 ///
 /// This test fires 30 sequential H2 requests against the
 /// `DisconnectingBackend`. If sozu leaked any per-stream state between

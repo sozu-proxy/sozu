@@ -604,12 +604,13 @@ pub trait L7ListenerHandler {
     /// Whether requests must have their `:authority` / `Host` exact-match
     /// the TLS SNI negotiated at handshake (CWE-346 / CWE-444).
     ///
-    /// Defaults to `true` — the safe setting enforced by Phase 1D of the
-    /// security audit. Operators can opt out per-listener via
-    /// `HttpsListenerConfig::strict_sni_binding = false` when cross-SNI
-    /// routing is explicitly required. Plaintext HTTP listeners return the
-    /// default value; they never have an SNI to compare against, so the
-    /// routing-layer check short-circuits on `tls_server_name: None`.
+    /// Defaults to `true` — the safe setting that closes the
+    /// CWE-346 / CWE-444 cross-SNI smuggling vector. Operators can opt
+    /// out per-listener via `HttpsListenerConfig::strict_sni_binding =
+    /// false` when cross-SNI routing is explicitly required. Plaintext
+    /// HTTP listeners return the default value; they never have an SNI
+    /// to compare against, so the routing-layer check short-circuits on
+    /// `tls_server_name: None`.
     fn get_strict_sni_binding(&self) -> bool {
         true
     }
@@ -660,7 +661,7 @@ pub trait L7ListenerHandler {
     }
 
     /// Wall-clock budget granted to in-flight H2 streams after soft-stop sent
-    /// the phase-1 `GOAWAY(NO_ERROR)`. Once the deadline elapses the mux
+    /// the initial `GOAWAY(NO_ERROR)`. Once the deadline elapses the mux
     /// transitions to a forced close (final GOAWAY + session teardown).
     ///
     /// Returning `None` disables the forced close entirely — shutdown waits
