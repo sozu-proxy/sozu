@@ -1243,7 +1243,7 @@ pub struct H2DrainState {
     /// drains via `handle_goaway_frame` don't arm the forced-close timer —
     /// the caller in `Mux::shutting_down` is the only writer).
     pub started_at: Option<Instant>,
-    /// Wall-clock budget granted to in-flight streams after the phase-1
+    /// Wall-clock budget granted to in-flight streams after the initial
     /// `GOAWAY(NO_ERROR)`. `None` means "wait indefinitely" (knob value `0`).
     /// Default when unset upstream: 5 s (see `L7ListenerHandler`).
     pub graceful_shutdown_deadline: Option<std::time::Duration>,
@@ -1666,13 +1666,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         // RFC 9113 §6.8: after sending a GOAWAY, the proxy
                         // MUST NOT accept new streams.
                         // `graceful_goaway` sets `drain.draining = true`
-                        // and sends a phase-1 GOAWAY with last_stream_id =
+                        // and sends an initial GOAWAY with last_stream_id =
                         // STREAM_ID_MAX (so in-flight requests are still
                         // accepted), but the contract for *new* peer-
                         // initiated streams is that they must be refused.
                         // Without this check, a peer racing the drain
                         // window could open arbitrary new streams between
-                        // phase-1 and phase-2 GOAWAY emission.
+                        // the initial and final GOAWAY emission.
                         if self.drain.draining {
                             if stream_id > self.highest_peer_stream_id {
                                 self.highest_peer_stream_id = stream_id;
@@ -2858,9 +2858,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// MUST be emptied of `stream_id` here — they are the only three
     /// per-stream caches that are not stored in the slab-allocated
     /// `Context.streams[]`. Forgetting any of them causes unbounded memory
-    /// growth on long-lived connections with many cancelled streams (Codex
-    /// gap G11). The `debug_assert`s below fail loudly in test builds if
-    /// someone adds a new per-stream cache without updating this function.
+    /// growth on long-lived connections with many cancelled streams. The
+    /// `debug_assert`s below fail loudly in test builds if someone adds a
+    /// new per-stream cache without updating this function.
     fn remove_dead_stream(&mut self, stream_id: StreamId, global_stream_id: GlobalStreamId) {
         if self.streams.remove(&stream_id).is_none() {
             error!(
@@ -3054,9 +3054,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             }
         }
 
-        // Phase 1: Resume flushing the zero buffer if a previous write was partial.
-        // Don't reset the timeout for control frame writes (SETTINGS ACK, PING
-        // response, WINDOW_UPDATE). Only application data writes should reset it.
+        // Stage — resume zero-buffer flush.
+        // If a previous write was partial, finish it before serialising any
+        // new control frames. Don't reset the timeout for control frame
+        // writes (SETTINGS ACK, PING response, WINDOW_UPDATE) — only
+        // application-data writes should reset it.
         if let Some(H2StreamId::Zero) = self.expect_write {
             if self.flush_zero_to_socket() {
                 self.ensure_tls_flushed();
@@ -3068,9 +3070,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             self.expect_write = None;
         }
 
-        // Phase 2: Serialize and flush pending WINDOW_UPDATE frames.
-        // Write them inline to avoid extra event loop iterations that could
-        // cause response data to be sent before validating subsequent frames.
+        // Stage — drain pending WINDOW_UPDATE frames.
+        // Serialize and flush them inline to avoid extra event loop
+        // iterations that could cause response data to be sent before
+        // subsequent frames are validated.
         if !self.flow_control.pending_window_updates.is_empty() && self.expect_write.is_none() {
             let kawa = &mut self.zero;
             kawa.storage.clear();
@@ -3113,10 +3116,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             }
         }
 
-        // Phase 3: Cap check + flush pending RST_STREAM frames.
-        // Check lifetime total (not just pending queue length) because writable()
-        // drains the queue between readable() calls, so the pending count alone
-        // may never reach the cap even under sustained misbehavior.
+        // Stage — RST_STREAM cap check + drain.
+        // Check the lifetime total (not just pending queue length) because
+        // writable() drains the queue between readable() calls, so the
+        // pending count alone may never reach the cap even under sustained
+        // misbehavior.
         if !matches!(self.state, H2State::GoAway | H2State::Error)
             && self.total_rst_streams_queued >= MAX_PENDING_RST_STREAMS
         {
@@ -4082,18 +4086,19 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // tears the connection down instead of waiting forever.
         self.drain.started_at = Some(Instant::now());
         // Keep expect_read as-is: existing streams should continue reading
-        // data during phase 1. Only phase 2 (goaway()) removes READABLE.
+        // data during the drain window opened by the initial GOAWAY. Only
+        // the final GOAWAY (via `goaway()`) removes READABLE.
         let kawa = &mut self.zero;
         kawa.storage.clear();
         debug!(
-            "{} GOAWAY (graceful, phase 1): last_stream_id=0x7FFFFFFF",
+            "{} GOAWAY (graceful, initial): last_stream_id=0x7FFFFFFF",
             log_context!(self)
         );
-        // Phase 1 sends a NO_ERROR GOAWAY on the wire — count it under the
-        // same per-code key as phase 2. The downstream alert that wants to
-        // distinguish drain from termination compares against the
-        // `h2.goaway.sent.no_error` rate (drain) vs the other variants
-        // (termination on error).
+        // The initial GOAWAY sends NO_ERROR on the wire — count it under
+        // the same per-code key as the final GOAWAY. The downstream alert
+        // that wants to distinguish drain from termination compares
+        // against the `h2.goaway.sent.no_error` rate (drain) vs the other
+        // variants (termination on error).
         count!(metric_for_goaway_sent(H2Error::NoError), 1);
 
         match serializer::gen_goaway(kawa.storage.space(), STREAM_ID_MAX, H2Error::NoError) {
@@ -4101,9 +4106,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 kawa.storage.fill(size);
                 incr!(names::h2::FRAMES_TX_GOAWAY);
                 // Stay in the current state so the connection can continue processing
-                // existing streams. The second GOAWAY will transition to GoAway state.
+                // existing streams. The final GOAWAY will transition to GoAway state.
                 // Keep READABLE so in-flight request bodies can still be received
-                // during phase 1. Only remove READABLE in the second GOAWAY (goaway()).
+                // during the drain window. Only remove READABLE in the final GOAWAY
+                // (via `goaway()`).
                 self.expect_write = Some(H2StreamId::Zero);
                 self.readiness.arm_writable();
                 MuxResult::Continue
@@ -7640,7 +7646,7 @@ mod tests {
         assert!(any_stream_has_pending_back(&streams_map, &[stream]));
     }
 
-    // ── Fix D: ready_incremental_by_urgency mid-pass consistency ─────────
+    // ── ready_incremental_by_urgency mid-pass consistency ────────────────
     //
     // The full RED is in e2e and currently #[ignore]'d (timing-sensitive).
     // The scalar logic below pins the saturating_sub + bucket-scoped

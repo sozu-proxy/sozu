@@ -274,7 +274,7 @@ macro_rules! ensure_frame_size {
 
 // https://httpwg.org/specs/rfc7540.html#rfc.section.4.1
 //
-// Codex G12 invariant (production caller contract):
+// Production caller contract:
 // `max_frame_size` MUST be the *negotiated* `settings_max_frame_size` from
 // the peer's latest accepted SETTINGS frame (see `H2Settings` on
 // `ConnectionH2`). It MUST NOT be `DEFAULT_MAX_FRAME_SIZE` — that RFC

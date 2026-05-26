@@ -1,36 +1,35 @@
-//! End-to-end regression tests for the H2 "rearm + peer-signal" gaps
-//! identified by the `/ask --with-codex` follow-up on PR #1209.
+//! End-to-end regression guards for the H2 scheduler/readiness contract
+//! at the boundary between `signal_pending_write` and `Ready::WRITABLE`.
+//! Each test pins one previously-broken interaction so a regression
+//! manifests as a wall-clock stall the harness can catch. See
+//! `lib/src/protocol/mux/LIFECYCLE.md` invariants 15/16/17 for the
+//! underlying readiness invariants.
 //!
-//! Three production-grade `signal_pending_write`/`Ready::WRITABLE` pairing
-//! gaps plus one scheduler staleness bug are covered here. See the
-//! canonical plan at `~/.claude/plans/ask-h2-prio-truncation-plan.md` and
-//! `lib/src/protocol/mux/LIFECYCLE.md` invariants 15/16/17.
-//!
-//! * [`test_h2_backend_silent_triggers_504_within_back_timeout`]: Fix A —
+//! * [`test_h2_backend_silent_triggers_504_within_back_timeout`] —
 //!   defence-in-depth for invariant 15 on the `set_default_answer` path.
 //!   On HEAD the synchronous drain loop at `mux/mod.rs:1402-1423` already
 //!   flushes the 504 body before the session closes, so this test is a
-//!   lock-in regression guard rather than a RED-to-green flip. The actual
-//!   RED for Fix A is the unit test shipped alongside the patch in
+//!   lock-in regression guard rather than a RED-to-green flip. The
+//!   matching RED that exercises `set_default_answer` directly lives in
 //!   `mux/answers.rs::tests`.
-//! * [`test_h2_priority_update_rearms_writable`]: Fix B — two streams,
-//!   a mid-flight PRIORITY_UPDATE bumps the second to `u=0, i`. Asserts
+//! * [`test_h2_priority_update_rearms_writable`] — two streams, a
+//!   mid-flight PRIORITY_UPDATE bumps the second to `u=0, i`. Asserts
 //!   both streams drain full bodies + END_STREAM within the 5-second
 //!   post-PU budget. On HEAD the observed post-PU drain is O(100 µs),
 //!   well under the budget; on a regressed scheduler the rearm gap
 //!   strands the reprioritised stream past the deadline.
-//! * [`test_h2_backend_silent_headers_data_peer_signal`]: Fix C — exercises
+//! * [`test_h2_backend_silent_headers_data_peer_signal`] — exercises
 //!   the H2-backend → H2-frontend peer-rearm path using the
 //!   [`RawH2ResponseBackend::set_body_with_delay`] mode that emits
-//!   HEADERS, sleeps 50 ms, then streams DATA frames. Passes post-fix
-//!   (`fead8eb0`); a regression that drops the peer signal stalls the
-//!   client past the 1-second budget.
-//! * [`test_h2_mid_pass_rst_does_not_force_yield`]: Fix D — structural
+//!   HEADERS, sleeps 50 ms, then streams DATA frames. A regression
+//!   that drops the peer's `signal_pending_write` stalls the client
+//!   past the 1-second budget.
+//! * [`test_h2_mid_pass_rst_does_not_force_yield`] — structural
 //!   regression guard. Asserts that RST_STREAM'ing a middle peer
 //!   mid-flight does not corrupt the surviving `u=1, i` streams'
-//!   body delivery. The one-yield-saved delta from `1de3faad`'s
-//!   mid-pass bucket decrement is below CI timing noise and is not
-//!   asserted directly (see memory `project_sozu_h2_flood_family_flakes`).
+//!   body delivery. The one-yield-saved delta from the mid-pass
+//!   bucket decrement is below CI timing noise and is not asserted
+//!   directly (see memory `project_sozu_h2_flood_family_flakes`).
 
 use std::{
     io::{Read, Write},
@@ -165,7 +164,7 @@ fn teardown_simple<T>(tls: T, front_port: u16, mut worker: Worker) -> bool {
 }
 
 // ============================================================================
-// Test 1 — Fix A lock-in: backend silence yields a 504 within back_timeout
+// Test 1 — backend silence yields a 504 within back_timeout
 // ============================================================================
 
 /// Single H2 stream → backend that accepts the TCP connection and never
@@ -180,11 +179,11 @@ fn teardown_simple<T>(tls: T, front_port: u16, mut worker: Worker) -> bool {
 ///    the body.
 ///
 /// On HEAD, path (a) masks the missing `signal_pending_write` pairing
-/// in `set_default_answer` (the Fix A gap). This test therefore passes
-/// on HEAD and remains green after Fix A — it's a lock-in regression
-/// guard for the end-to-end 504 path, not a RED-to-green flip. The
-/// actual RED for invariant 15 compliance lives in the unit test
-/// alongside Fix A (`mux/answers.rs::tests`).
+/// in `set_default_answer`. This test therefore passes on HEAD and
+/// remains green once the pairing is in place — it's a lock-in
+/// regression guard for the end-to-end 504 path, not a RED-to-green
+/// flip. The matching RED that exercises invariant 15 directly on
+/// `set_default_answer` lives in `mux/answers.rs::tests`.
 fn try_h2_backend_silent_triggers_504() -> State {
     let (worker, front_port, back_address) =
         setup_listener_with_back_timeout("H2-PRIO-REARM-504", 2);
@@ -271,7 +270,7 @@ fn test_h2_backend_silent_triggers_504_within_back_timeout() {
 }
 
 // ============================================================================
-// Test 2 — Fix B: PRIORITY_UPDATE rearms WRITABLE after a scheduler yield
+// Test 2 — PRIORITY_UPDATE rearms WRITABLE after a scheduler yield
 // ============================================================================
 
 /// Two concurrent H2 streams on the same connection, both `u=3, i` at
@@ -282,8 +281,8 @@ fn test_h2_backend_silent_triggers_504_within_back_timeout() {
 /// Setup pins the sozu scheduler in a state where `finalize_write`
 /// stripped `Ready::WRITABLE` on a voluntary incremental yield. At that
 /// point the client sends a PRIORITY_UPDATE for the second stream,
-/// bumping it to `u=0, i`. Without Fix B the scheduler does not
-/// rearm — the reprioritised stream waits for an external event
+/// bumping it to `u=0, i`. Without the rearm-on-PRIORITY_UPDATE path
+/// the scheduler does not rearm — the reprioritised stream waits for an external event
 /// (ping, window update, timeout tick) before draining.
 ///
 /// Post-fix, both streams complete within 2 s of HEADERS being sent.
@@ -309,7 +308,8 @@ fn try_h2_priority_update_rearms_writable() -> State {
     // Both streams start as `u=3, i`. Once the first DATA frame of each
     // stream has been observed, kick the second stream via PRIORITY_UPDATE
     // to `u=0, i` — this forces sozu to mutate `self.prioriser` via
-    // `handle_priority_update_frame`, which is the Fix B code path.
+    // `handle_priority_update_frame`, which is the code path that must
+    // rearm WRITABLE for the reprioritised stream.
     let sid_a: u32 = 1;
     let sid_b: u32 = 3;
     tls.write_all(&H2Frame::headers(sid_a, build_get_with_priority(3, "i"), true, true).encode())
@@ -443,7 +443,7 @@ fn test_h2_priority_update_rearms_writable() {
 }
 
 // ============================================================================
-// Test 3 — Fix C: peer signal_pending_write on H2 backend DATA/HEADERS
+// Test 3 — peer signal_pending_write on H2 backend DATA/HEADERS
 // ============================================================================
 
 /// An H2 backend that emits HEADERS → 50 ms pause → DATA (END_STREAM)
@@ -451,17 +451,18 @@ fn test_h2_priority_update_rearms_writable() {
 /// `feedback_h2_repro_multi_data_frames` notes that single-DATA
 /// responses pass by coincidence of the natural writable window).
 ///
-/// Before Fix C, `handle_data_frame` / `handle_headers_frame` insert
+/// Without the peer-side rearm in `handle_data_frame` /
+/// `handle_headers_frame`, the H2-backend → H2-frontend handoff inserts
 /// `Ready::WRITABLE` on the peer readiness without pairing it with
 /// `signal_pending_write`. Under edge-triggered epoll the frontend
 /// never wakes to forward the bytes sozu just received from the H2
 /// backend — they sit in `stream.back` until an unrelated event
 /// arrives.
 ///
-/// Post-fix (`fead8eb0`), the peer uses `Readiness::arm_writable`
-/// which pairs insert + signal. The client sees the full body
-/// within the 1-second budget below. Budget is intentionally wide
-/// (≥ 20× the backend delay) so CI jitter does not flip this test.
+/// With the peer-side `Readiness::arm_writable` (which pairs insert +
+/// signal) in place, the client sees the full body within the
+/// 1-second budget below. Budget is intentionally wide (≥ 20× the
+/// backend delay) so CI jitter does not flip this test.
 fn try_h2_backend_silent_headers_data_peer_signal() -> State {
     // Body must produce ≥ 2 DATA frames on the backend → sozu hop and
     // enough data that the frontend cannot flush everything from the
@@ -583,7 +584,7 @@ fn test_h2_backend_silent_headers_data_peer_signal() {
 }
 
 // ============================================================================
-// Test 4 — Fix D: mid-pass RST_STREAM does not corrupt surviving streams
+// Test 4 — mid-pass RST_STREAM does not corrupt surviving streams
 // ============================================================================
 
 /// Three concurrent `u=1, i` streams share a connection. Mid-flight —
@@ -591,14 +592,13 @@ fn test_h2_backend_silent_headers_data_peer_signal() {
 /// client RST_STREAMs the middle one (stream B). The surviving
 /// streams (A, C) MUST complete their full bodies cleanly.
 ///
-/// This is a **structural** regression guard for Fix D (`1de3faad`)
-/// and its mid-pass mutation of `ready_incremental_by_urgency`. We do
-/// not attempt to observe the one-yield-saved delta directly — that
-/// would require an `e2e-hooks` probe on `incremental_peer_count`,
-/// and the wire delta (≤ 1 DATA frame) sits below CI timing noise.
-/// Instead, we verify that Fix D's `saturating_sub` on the bucket
-/// counter under RST / retirement paths does not break the surviving
-/// streams' body delivery.
+/// This is a **structural** regression guard for the mid-pass mutation
+/// of `ready_incremental_by_urgency`. We do not attempt to observe the
+/// one-yield-saved delta directly — that would require an `e2e-hooks`
+/// probe on `incremental_peer_count`, and the wire delta (≤ 1 DATA
+/// frame) sits below CI timing noise. Instead, we verify that the
+/// `saturating_sub` on the bucket counter under RST / retirement paths
+/// does not break the surviving streams' body delivery.
 ///
 /// A regression here (e.g. bucket underflow, stale read, borrow-check
 /// typo) would manifest as A or C stalling indefinitely, which the
@@ -668,8 +668,8 @@ fn try_h2_mid_pass_rst_does_not_force_yield() -> State {
         }
     }
 
-    // Phase 2: RST stream B. Fix D must decrement the bucket count
-    // on the `rst_sent` mid-pass path AND on the completion path
+    // Phase 2: RST stream B. The scheduler must decrement the per-bucket
+    // count on the `rst_sent` mid-pass path AND on the completion path
     // without perturbing A or C.
     tls.write_all(&H2Frame::rst_stream(sid_b, H2_ERROR_NO_ERROR).encode())
         .unwrap();

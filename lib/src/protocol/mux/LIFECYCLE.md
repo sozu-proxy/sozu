@@ -530,13 +530,13 @@ listener.
 
 ### 8.1 Graceful GOAWAY (double-GOAWAY per RFC 9113 §6.8)
 
-Two-phase in `ConnectionH2::graceful_goaway` (`h2.rs:3051`):
+Two GOAWAY frames in `ConnectionH2::graceful_goaway` (`h2.rs:3051`):
 
-1. **Phase 1** — send GOAWAY with `last_stream_id = 0x7FFFFFFF`
+1. **Initial GOAWAY** — send GOAWAY with `last_stream_id = 0x7FFFFFFF`
    (`STREAM_ID_MAX`, `h2.rs:178`); keep `READABLE` so in-flight request bodies
    can still arrive. Called first time from `Mux::shutting_down` at
    `mod.rs:1596`. Draining flag set.
-2. **Phase 2** — on the second invocation (draining already true), call
+2. **Final GOAWAY** — on the second invocation (draining already true), call
    `goaway(NoError)` (`h2.rs:3054`) with the actual `highest_peer_stream_id`,
    remove `READABLE` interest (`h2.rs:3026`), transition to `H2State::GoAway`.
    Caller is `finalize_write` when all streams drain (`h2.rs:2273`).
@@ -594,8 +594,9 @@ The three RST push sites retrofit to `enqueue_rst`:
   content-length mismatch, WINDOW_UPDATE zero-increment or overflow,
   unauthorised priority updates, self-dependent HEADERS).
 
-Serialisation happens in `flush_pending_control_frames` (`h2.rs:2867` → Phase 3
-at the pending-RST-streams check, which drains `self.pending_rst_streams` into
+Serialisation happens in `flush_pending_control_frames` (`h2.rs:2867` → the
+RST_STREAM cap-check-and-drain stage at the pending-RST-streams check, which
+drains `self.pending_rst_streams` into
 `self.zero` via `serializer::gen_rst_stream`). This path is independent of the
 owning `Stream` still being present in `self.streams`, so it survives the
 immediate `remove_dead_stream` call that every `reset_stream` caller performs
@@ -603,9 +604,10 @@ synchronously after return.
 
 `finalize_write` (`h2.rs:2795`) retains `Ready::WRITABLE` when the pass
 completes but `pending_rst_streams` or `flow_control.pending_window_updates` are
-still non-empty — otherwise a partial write that deferred the Phase-3 flush
-(gated on `expect_write.is_none()`) would strand a queued RST until an unrelated
-event re-raised the writable bit. This guard, together with the invariant-15 arm
+still non-empty — otherwise a partial write that deferred the RST_STREAM drain
+stage (gated on `expect_write.is_none()`) would strand a queued RST until an
+unrelated event re-raised the writable bit. This guard, together with the
+invariant-15 arm
 inside `enqueue_rst`, closes the 18-check h2spec 2.0 gap previously reported in
 RFC 9113 §§5.3, 6.9, 8.1.2.
 
@@ -687,10 +689,11 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
    frames (PING / WINDOW_UPDATE / SETTINGS) do **not** reset `timeout_container`
    — enforced in `readable()` by setting it only on DATA payload (`h2.rs:1646`)
    and HEADERS (inside `handle_frame`).
-10. **Single `graceful_goaway` per session outside phase 2.**
+10. **Single `graceful_goaway` per session outside the final GOAWAY.**
     `Mux::shutting_down` (`mod.rs:1595`) only calls it if
-    `!self.frontend.is_draining()`; a second unconditional call would collapse
-    phase 1 into phase 2 and disconnect in-flight streams.
+    `!self.frontend.is_draining()`; a second unconditional call would
+    collapse the initial GOAWAY into the final one and disconnect
+    in-flight streams.
 11. **Frontend HUP defers close when output is pending.**
     `delay_close_for_frontend_flush` (`mod.rs:538`) must be consulted before
     returning `SessionResult::Close` so that unflushed TLS/GOAWAY records are

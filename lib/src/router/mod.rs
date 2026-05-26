@@ -860,7 +860,8 @@ impl MethodRule {
 
 /// What to do with a request that matches a frontend.
 ///
-/// Three variants coexist during the Wave 2b → Wave 1c transition:
+/// Three variants coexist today; the legacy two will retire once
+/// `HttpFrontend` itself carries the rich routing fields:
 ///
 /// - [`Route::ClusterId`] is the legacy "forward to this cluster" variant
 ///   used by call sites that build routes directly from
@@ -868,9 +869,10 @@ impl MethodRule {
 /// - [`Route::Deny`] is the legacy "send 401" variant used when a frontend
 ///   has no `cluster_id`.
 /// - [`Route::Frontend`] carries a richer [`Frontend`] decision (redirect
-///   policy, rewrite templates, header edits, auth gating). Wave 1c will
-///   migrate `add_http_front` to build `Route::Frontend` once
-///   `HttpFrontend` carries the matching proto fields.
+///   policy, rewrite templates, header edits, auth gating). Once
+///   `HttpFrontend` carries the matching proto fields, `add_http_front`
+///   will build `Route::Frontend` directly and the two legacy variants
+///   above can retire.
 ///
 /// `Eq`/`PartialEq` compare `Frontend` variants by `Rc` pointer identity to
 /// stay consistent with `Hash`/`Ord` on [`Rc`]; this is sufficient for the
@@ -884,8 +886,9 @@ pub enum Route {
     /// the cluster to which the frontend belongs
     ClusterId(ClusterId),
     /// rich routing decision carrying redirect, rewrite, header, and auth
-    /// configuration; supersedes the legacy variants once Wave 1c migrates
-    /// the in-memory frontend wiring.
+    /// configuration; supersedes the two legacy variants once the
+    /// in-memory frontend wiring is migrated to build `Route::Frontend`
+    /// directly.
     Frontend(Rc<Frontend>),
 }
 
@@ -1280,11 +1283,11 @@ impl Frontend {
     /// [`HttpFrontend`] configuration.
     ///
     /// The richer proto-level fields (`redirect`, `redirect_scheme`,
-    /// `redirect_template`, `rewrite_*`, `headers`, `required_auth`) will
-    /// arrive via Wave 1c; until they do, this constructor takes them as
-    /// explicit arguments so the data flow is testable today and the call
-    /// sites in `add_http_front` only need a one-line update once Wave 1c
-    /// plumbs the fields through `HttpFrontend`.
+    /// `redirect_template`, `rewrite_*`, `headers`, `required_auth`) are
+    /// not yet carried on `HttpFrontend`; until they are, this constructor
+    /// takes them as explicit arguments so the data flow is testable
+    /// today and the call sites in `add_http_front` only need a one-line
+    /// update once the fields are plumbed through.
     ///
     /// Coercions:
     /// - `redirect == UNAUTHORIZED` zeroes out rewrite/headers/auth — the
@@ -1607,8 +1610,8 @@ impl Frontend {
 /// against the captures collected during routing. Legacy [`Route::ClusterId`]
 /// and [`Route::Deny`] entries synthesize a minimal `RouteResult` with the
 /// proto enums set to defaults (`FORWARD` / `UNAUTHORIZED`) so existing
-/// session code keeps working until Wave 3a wires the rich fields into the
-/// mux layer.
+/// session code keeps working until the mux layer is updated to read every
+/// `RouteResult` field directly.
 ///
 /// Implements `PartialEq` for test parity: existing router tests compare
 /// `router.lookup(...)` against an expected route. Equality compares every

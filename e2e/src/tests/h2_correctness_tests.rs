@@ -1574,8 +1574,8 @@ fn test_h2_incremental_round_robin_closes_every_stream() {
 ///   last DATA frame.
 ///
 /// MUST FAIL on `feat/h2-mux` HEAD (commit `fe528e75` landed the RFC 9218
-/// scheduling that introduced the strand); MUST PASS after Fix A (skip
-/// incremental yield when `incremental_peer_count <= 1`).
+/// scheduling that introduced the strand); MUST PASS once the scheduler
+/// skips its incremental yield when `incremental_peer_count <= 1`.
 fn try_h2_solo_incremental_drains_fully() -> State {
     const BODY_SIZE: usize = 80 * 1024;
 

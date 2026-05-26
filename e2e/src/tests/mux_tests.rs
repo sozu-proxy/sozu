@@ -2103,7 +2103,7 @@ fn test_h1_rejects_ambiguous_cl_te() {
 }
 
 // =========================================================================
-// H1 chunked-trailer end-to-end forwarding (B3-p / #899)
+// H1 chunked-trailer end-to-end forwarding (#899)
 // =========================================================================
 
 /// Issue #899 asked whether sozu forwards HTTP/1.1 chunked trailers through

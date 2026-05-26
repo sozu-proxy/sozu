@@ -1145,7 +1145,7 @@ pub fn handle_trailer(
         return Err((H2Error::ProtocolError, false));
     }
 
-    // Codex G7 / RFC 9110 §6.5: if the request/response was framed with a
+    // RFC 9110 §6.5: if the request/response was framed with a
     // fixed Content-Length (not chunked), the H1-side serializer cannot emit
     // trailers — HTTP/1.1 only carries trailers with chunked transfer-coding.
     // The trailer block stays in kawa but the downstream writer will never
@@ -1896,7 +1896,7 @@ mod tests {
 
     #[test]
     fn test_handle_header_rejects_empty_status() {
-        // Codex G5 concern: response pseudo-header emptiness could slip through
+        // Response pseudo-header emptiness could slip through
         // if the three-digit guard were removed. Locks in `v.len() != 3` as
         // the rejection gate for an empty :status (HPACK allows zero-length
         // field values, so this must be enforced explicitly). A server

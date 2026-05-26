@@ -409,7 +409,7 @@ mod tests {
     /// is the `signal_pending_write` side of the invariant-15 pair — under
     /// edge-triggered epoll, this is what causes the scheduler's next
     /// tick to re-enter `writable()` and flush the default answer without
-    /// waiting for an external epoll event. This is the RED for Fix A.
+    /// waiting for an external epoll event.
     #[test]
     fn set_default_answer_arms_writable_and_signals() {
         let (_pool, mut stream) = make_stream();

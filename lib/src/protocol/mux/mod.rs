@@ -1811,10 +1811,10 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
 
     fn shutting_down(&mut self) -> SessionIsToBeClosed {
         // RFC 9113 §6.8: initiate graceful shutdown with double-GOAWAY pattern.
-        // Only send the phase-1 GOAWAY once. Phase 2 (final GOAWAY with the real
+        // Only send the initial GOAWAY once. The final GOAWAY (with the real
         // last_stream_id) is handled by finalize_write() when all streams drain.
-        // Calling graceful_goaway() again would send phase 2 prematurely and
-        // force-disconnect before in-flight streams complete.
+        // Calling graceful_goaway() again would send the final GOAWAY
+        // prematurely and force-disconnect before in-flight streams complete.
         if !self.frontend.is_draining() {
             match self.frontend.graceful_goaway() {
                 MuxResult::CloseSession => return true,
