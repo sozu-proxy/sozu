@@ -24,6 +24,105 @@ category at tag time.
   `protocol_pair_matrix!` helper now uses a `pub mod $name { … }` wrapper
   for per-cell function names instead of `paste::paste!` identifier
   concatenation; e2e-only.
+- **`fix(h1)`: bracket IPv6 literals in `Forwarded` header**
+  ([#1254](https://github.com/sozu-proxy/sozu/pull/1254)). RFC 7239 §6
+  requires `for=`/`by=` IPv6 nodes to render as `IP-literal`
+  (`"[" IPv6 "]"`). Pre-fix output `for="2001:db8::1:8080"` was
+  ambiguous between `2001:db8::1` port `8080` and `2001:db8::1:8080`
+  port absent. The fix matches HAProxy's `_7239_print_ip6` contract on
+  both `for=` and `by=`. `X-Forwarded-For` stays bare (HAProxy / Apache
+  / nginx convention). Five unit tests in `editor::tests` plus one e2e
+  (`test_forwarded_ipv6_brackets_via_proxy_v2`).
+- **`fix(command)`: reject length-delimited IPC frames shorter than the
+  delimiter**. `Channel::try_read_delimited_message` trusted the
+  peer-supplied `usize` length prefix and could panic with
+  `slice index starts at 8 but ends at 5` on an 8-byte admin-socket
+  write — proxy-wide DoS reachable from the master ↔ CLI admin socket
+  (CWE-129 / CWE-248). The decoder now emits
+  `ChannelError::MessageLengthUnderDelimiter`, consumes the bogus
+  prefix bytes, and re-syncs on the next valid frame. Regression
+  `rejects_declared_length_below_delimiter` in
+  `command/src/channel.rs`.
+- **`fix(command)`: validate `ListenersCount` before slicing the SCM FD
+  table**. `ScmSocket::receive_listeners` indexed a fixed
+  `[RawFd; MAX_FDS_OUT]` (200) with peer-declared `http + tls + tcp`
+  counts; a manifest declaring more entries than `MAX_FDS_OUT` or more
+  than the FDs actually arrived panicked the worker on the slice. Same
+  class as the `channel.rs` slice-OOB (CWE-129 / CWE-248). The new
+  `ScmSocketError::ListenersCountInconsistent` carries every input
+  that contributed to the rejection; `checked_add` guards the sum.
+- **`fix(h1)`: harden HTTP/1 request-parser boundaries**.
+  `hostname_and_port` now returns `(&[u8], Option<u16>)` with the
+  port validated to fit `u16` and be non-zero (RFC 6335 §6 reserves
+  port 0). Parser-level frontend errors (`HostParse`,
+  `InvalidCharsAfterHost`) now surface as HTTP 400 in both the legacy
+  `kawa_h1::cluster_id_from_request` path and the mux router path
+  (`protocol/mux/mod.rs`) — RFC 9110 §15.5.1 reserves 400 for
+  malformed authorities. Router-miss (`NoClusterFound`) keeps the
+  historical 404. Adds `hostname_and_port_rejects_port_zero` and
+  `hostname_and_port_returns_no_port_when_absent`; `h1_security_tests.rs`
+  restructured around a shared fixture.
+- **`fix(server)`: enforce `LEASE_CLIENT_ID_MAX_BYTES` on the worker
+  `SetMetricDetail` clear branch**. The worker dispatcher enforced
+  the 64-byte `client_id` cap on apply only; the clear branch fed
+  `req.client_id` straight to `Aggregator::lease_clear`, walking an
+  unbounded operator-supplied string through the `HashMap` lookup.
+  Master-side validation was already in place; the worker now
+  mirrors it as defense-in-depth for fuzz harnesses and future
+  internal callers.
+- **`fix(metrics)`: authorise lease renewals against the apply-time
+  peer binding**. `Aggregator::lease_apply` previously overwrote the
+  recorded `PeerBinding` on every renewal, letting any same-UID
+  process that learned the victim's `client_id` (PID is enumerable
+  via `/proc`; the lease id leaks through the `lease_id=` audit
+  column and `sozu top --debug` stderr) steal a lease and lock the
+  legitimate owner out of their `Drop`-time `clear`. Renewals now
+  require the presented `(peer_pid, peer_session_ulid)` to match
+  when the apply-time binding is fully known
+  (`PeerBinding::is_known`). Unknown apply-time bindings (no
+  `SO_PEERCRED`, pre-binding callers, intermediate proxies) keep
+  "accept any renewer" behaviour per the proto contract on
+  `SetMetricDetail.peer_pid` / `peer_session_ulid`. Surfaces as
+  `LeaseApplyOutcome::Unauthorized` via `WorkerResponse::error`;
+  the error message intentionally does not echo `client_id`.
+- **`fix(audit)`: sanitise worker error reasons at both join sites**.
+  `WorkerTask::on_finish` and `SetMetricDetailTask::on_finish` joined
+  per-worker `response.message` strings into `extras.reason` via
+  `messages.join(", ")`; the weak `sanitize_for_audit` left `,` and
+  `=` untouched, so a worker message containing either could forge
+  adjacent KV columns when a SIEM splits on `, ` / `=`. Each worker
+  message now goes through `sanitize_for_audit_kv` before formatting.
+  Regression asserts the canonical
+  `x,actor_user=mallory,sozu_version=hijacked` payload cannot survive
+  the join.
+- **`fix(audit)`: cover the bidirectional override / isolate range in
+  `is_unsafe_line`**. `is_unsafe_line` already stripped C0 + DEL +
+  C1, BOM, and the line/paragraph separators, but missed
+  U+202A..U+202E (LRE/RLE/PDF/LRO/RLO) and U+2066..U+2069
+  (LRI/RLI/FSI/PDI) — the Trojan-Source class
+  ([CVE-2021-42574](https://www.cve.org/CVERecord?id=CVE-2021-42574))
+  applied to audit rows. An operator tailing the audit log in
+  `less` / `cat` under UTF-8 or `journalctl` could see a row visually
+  attributed to a different field than the one the rule actually
+  fired on. Four regression tests, including
+  `line_preserves_legitimate_bidi_text` asserting Hebrew / Arabic
+  content round-trips unchanged.
+- **`fix(audit)`: close SIEM column-smuggling at source and harden the
+  sanitiser**. Three convergent hardenings to the audit-log pipeline
+  introduced with `SetMetricDetail`: (1) worker error templates in
+  `lib/src/server.rs` no longer echo operator-supplied `client_id`
+  verbatim (the dedicated `lease_id=` column already carries it
+  through the strict sanitiser); (2) `sanitize_for_audit_kv`
+  extended; (3) free-form `extras.reason` always sanitised before
+  serde-json rendering. Follow-up to the initial INFO-1 pass already
+  documented further down in this section.
+- **`fix(top)`: the skin TOML loader uses `O_NOFOLLOW` on the leaf
+  open to close TOCTOU**. The loader claimed TOCTOU-closed but the
+  second open (`File::open(&resolved)` after canonicalize + anchor
+  check) re-resolved symlinks because `O_NOFOLLOW` was not set. A
+  writable skins-dir scenario (operator's own `$HOME`) could swap
+  the resolved file for a symlink between canonicalize and open,
+  defeating the anchor check.
 
 ### 🔄 Changed
 
@@ -86,6 +185,121 @@ upgrade. See `doc/upgrade/1.x-to-2.0.md` for the full migration guide.
   Dashboards scraping the old per-status name need updating; the new key is
   documented in `doc/configure.md` alongside the new `http.302.redirection` and
   `http.308.redirection` counters.
+- **Removed the `proto_version` capability handshake**.
+  `WorkerInfo.proto_version` (proto tag 4) and
+  `MetricDetailStatus.unsupported_workers` (proto tag 5) are now
+  `reserved`; `sozu_command_lib::SOZU_PROTO_VERSION`,
+  `WorkerSession.proto_version`, and
+  `MIN_PROTO_VERSION_FOR_SET_METRIC_DETAIL` are deleted. The handshake
+  was structurally inert — the master stamped its own
+  `SOZU_PROTO_VERSION` onto every `WorkerInfo` at fork time, so the
+  partition was always unconditional. External consumers reading
+  `WorkerInfo.proto_version` from the proto schema must drop the
+  reference; the additive proto contract surfaces unknown tags as
+  `WorkerResponse::error("unknown request type")` via the standard
+  fan-out tally (`extras.fanout.workers_err`).
+
+### 🌟 Added
+
+- **`feat(command,lib)`: per-worker `WorkerMetricDetailStatus` payload**.
+  `SetMetricDetail` responses now carry a `Copy`-friendly per-worker
+  status packet (four `i32` + one `u32`) so the master fan-out can
+  distinguish accept / unauthorised / capacity-exceeded / unsupported
+  outcomes individually instead of collapsing them into a generic
+  `workers_err` tally. Consumed by `sozu top`'s lease-lifecycle banner.
+
+### ⛑️ Fixed
+
+- **`fix(metrics)`: latch `cluster.available_backends` and
+  `cluster.total_backends` on state replay and health-check reset**.
+  `BackendMap::record_cluster_availability` is the sole emission site
+  for the rollup gauges, but two control-plane paths populated or
+  reset the backend map without calling it:
+  `import_configuration_state` (workers loading topology via SCM-fd
+  hot-restart or `LoadState`) extended the map via `HashMap::extend`
+  with no follow-up, and `set_health_check_config(None)` reset every
+  backend to `HealthState::default()` so the load balancer routed
+  again after the operator dropped the probe — but did not re-emit.
+  Both paths now call `record_cluster_availability(cluster_id)` for
+  each affected cluster. Unit tests assert the rollup gauges land in
+  the Aggregator immediately after `import_configuration_state`.
+- **`fix(command,metrics)`: drop the systemd `RELOADING` flap on
+  `SetMetricDetail`**. `SetMetricDetail` was in `is_mutating_verb`,
+  which brackets every dispatch with `sd_notify(STATE_RELOADING)` /
+  `READY=1`. The TUI auto-renews its cardinality lease every `ttl/2`
+  (~ 30 s default), so a long-lived `sozu top` flapped the unit
+  through `reloading` every 30 s in `systemctl status` and external
+  monitors. The verb does not change cluster / listener / certificate
+  state — it is now excluded from `is_mutating_verb`. The audit trail
+  (`EventKind::METRIC_DETAIL_CHANGED`, proto tag 30) still records
+  every apply / clear / TTL expiry.
+- **`fix(ctl)`: `cfg`-gate `CtlError::SpawnFailed` behind the `tui`
+  feature**. The variant is only constructed from
+  `bin/src/ctl/top/transport.rs`, which is itself gated behind the
+  `tui` Cargo feature. The lean default-features build
+  (`--no-default-features --features crypto-ring`) emitted
+  `warning: variant SpawnFailed is never constructed`, tripping the
+  `-D warnings` clippy gate.
+- **`fix(top)`: plumb transport-thread errors through `App.status`**.
+  Three `eprintln!` sites in `bin/src/ctl/top/transport.rs` wrote
+  transient errors to stderr after the alt-screen takeover had
+  redirected the terminal — the operator never saw them and recovery
+  required leaving the TUI to inspect the parent shell's stderr
+  buffer. Reuses the `StatusSlot` pattern already used by the
+  `DetailGuard` renewer.
+- **`fix(top)`: graceful spawn-failure on background threads**. The
+  four transport-thread spawn sites used
+  `.expect("spawn sozu-top <label>")`. `thread::Builder::spawn` can
+  fail under `RLIMIT_NPROC` pressure or transient OOM; the previous
+  behaviour panicked the binary with a backtrace. The `RawModeGuard`
+  Drop already restored the terminal on panic, but the operator
+  still lost the TUI session. Failures now surface through
+  `App.status` and the four spawn sites fall back gracefully.
+- **`fix(top)`: mark visible state mutations dirty so input redraws
+  immediately**. The render-loop dirty gate skipped `terminal.draw`
+  when `!app.take_dirty() && !app.pulse.has_active()`. Several
+  `handle_key` arms mutated visible state without setting the dirty
+  flag, so on a quiet system (1 s default snapshot tick) Tab, sort,
+  `:`, `?`, and F1 keys took up to one second to redraw.
+- **`fix(top)`: `RawModeGuard` install ordering + SIGTERM coverage**.
+  Two related terminal-lifecycle bugs: (1) raw mode was enabled
+  *before* the guard was constructed, leaking raw mode on
+  `EnterAlternateScreen` / `Hide` / `EnableMouseCapture` failure
+  (rare but real on `EBADF` stdout in `nspawn` / `systemd-run`, EOF
+  on a closed pty after session detach); (2) the signal handler only
+  caught SIGINT, so `systemctl stop` left the terminal in raw mode.
+  Both paths now drop through `Drop` with the terminal restored.
+- **`fix(top)`: plumb a shutdown flag + finite read timeout into the
+  events transport**. The events transport thread blocked
+  indefinitely on `read_message_blocking_timeout(None)`. The other
+  three transport threads use bounded intervals and exit on
+  `try_send::Disconnected`; the events thread had no wake path
+  because dropping the crossbeam receiver does not propagate to a
+  Unix socket. Adds a shared `Arc<AtomicBool>` shutdown flag plus a
+  finite read timeout.
+- **`fix(top)`: redraw every pane on terminal resize**. The resize
+  handler re-laid the chunks but only the focused pane was marked
+  dirty, so the other panes kept stale cell content until the next
+  snapshot tick.
+- **`fix(top)`: per-cluster counters read under backend-detail filing
+  too**. With `metrics.detail = Backend`, per-cluster counters land
+  under `(cluster, backend)` keys rather than bare cluster keys. The
+  CLUSTERS pane fallback path now rolls those up correctly when the
+  bare cluster keys are absent. Companion to the
+  `cluster.available_backends` rollup-gauge bullet in this section.
+- **`fix(top)`: certs pane decodes `CertificatesWithFingerprints`;
+  redacts unknown variants**. The certs poll only decoded one
+  response variant; the others rendered as `?`. Adds the
+  `WithFingerprints` decoder and falls back to a redacted
+  `<unsupported>` line on unknown variants so the pane never leaks
+  bytes from a future schema revision.
+
+### 🤖 CI
+
+- **`chore(deps)`: bump the actions group**.
+  `docker/setup-buildx-action 4.0.0 → 4.1.0`,
+  `docker/login-action 4.1.0 → 4.2.0`,
+  `docker/build-push-action 7.1.0 → 7.2.0`.
 
 ### ⛑️ Fixed
 
