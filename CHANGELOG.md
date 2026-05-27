@@ -1,11 +1,10 @@
 # Changelog
 
-## [Unreleased]
+## 2.0.0 - 2026-05-27
 
 The v1.1.1 → v2.0.0 entries below are grouped by Keep-a-Changelog category.
 Multiple Keep-a-Changelog blocks of the same kind appear in sequence — bullets
-stay where they were authored; they will be merged into a single block per
-category at tag time.
+stay where they were authored.
 
 ### 🔐 Security
 
@@ -8929,7 +8928,7 @@ Started implementation:
 - control with command line app sozuctl
 - command library
 
-[Unreleased]: https://github.com/sozu-proxy/sozu/compare/1.1.1...HEAD
+[2.0.0]: https://github.com/sozu-proxy/sozu/compare/1.1.1...2.0.0
 [0.10.0]: https://github.com/sozu-proxy/sozu/compare/0.9.0...0.10.0
 [0.9.0]: https://github.com/sozu-proxy/sozu/compare/0.8.0...0.9.0
 [0.8.0]: https://github.com/sozu-proxy/sozu/compare/0.7.0...0.8.0

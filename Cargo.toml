@@ -50,8 +50,8 @@ serial_test = "^3.4.0"
 sha2 = "^0.11.0"
 slab = "^0.4.12"
 socket2 = "^0.6.3"
-sozu-command-lib = { version = "^1.1.1", path = "command" }
-sozu-lib = { version = "^1.1.1", path = "lib", default-features = false }
+sozu-command-lib = { version = "^2.0.0", path = "command" }
+sozu-lib = { version = "^2.0.0", path = "lib", default-features = false }
 subtle = "^2.6.1"
 tempfile = "^3.27.0"
 termion = "^4.0.6"

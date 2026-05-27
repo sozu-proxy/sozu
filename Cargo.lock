@@ -3109,7 +3109,7 @@ dependencies = [
 
 [[package]]
 name = "sozu"
-version = "1.1.1"
+version = "2.0.0"
 dependencies = [
  "clap",
  "color-eyre",
@@ -3148,7 +3148,7 @@ dependencies = [
 
 [[package]]
 name = "sozu-command-lib"
-version = "1.1.1"
+version = "2.0.0"
 dependencies = [
  "hex",
  "libc",
@@ -3177,7 +3177,7 @@ dependencies = [
 
 [[package]]
 name = "sozu-e2e"
-version = "1.1.1"
+version = "2.0.0"
 dependencies = [
  "base64 0.22.1",
  "flate2",
@@ -3202,7 +3202,7 @@ dependencies = [
 
 [[package]]
 name = "sozu-lib"
-version = "1.1.1"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
