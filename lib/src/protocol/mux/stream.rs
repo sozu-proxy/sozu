@@ -322,6 +322,7 @@ impl Stream {
             service_time: self.metrics.service_time(),
             response_time: self.metrics.backend_response_time(),
             request_time: self.metrics.request_time(),
+            start_time_ns: self.metrics.start_wall_ns(),
             bytes_in: self.metrics.bin,
             bytes_out: self.metrics.bout,
             user_agent: context.user_agent.as_deref(),
