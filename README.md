@@ -18,16 +18,16 @@ To get started check out our [documentation](./doc/README.md) !
 
 ## Installation
 
-- **Pre-built binaries** for Linux are attached to every tagged release on the [GitHub Releases page](https://github.com/sozu-proxy/sozu/releases). 12 tarballs cover the cross-product of:
+- **Pre-built binaries** for Linux are attached to every tagged release on the [GitHub Releases page](https://github.com/sozu-proxy/sozu/releases). 10 tarballs cover the cross-product of:
 
-  - **target** (4): `x86_64-unknown-linux-{gnu,musl}` and `aarch64-unknown-linux-{gnu,musl}`
-  - **crypto provider feature** (3-4 per target):
-    - `crypto-ring` (default — ring backend, all 4 targets)
-    - `crypto-aws-lc-rs` (post-quantum capable, AWS-LC backend, all 4 targets)
+  - **target** (3 published, 4 supported from source): `x86_64-unknown-linux-{gnu,musl}` and `aarch64-unknown-linux-gnu`. `aarch64-unknown-linux-musl` builds from source but is **not** in the prebuilt matrix — `jemalloc-sys 0.5.4`'s cross-compile probe cannot link its atomics tests against the `musl-tools` wrapper on the arm64 runner; build from source against a real `aarch64-linux-musl-gcc` toolchain (Alpine, musl-cross-make, etc.) if you need that combination.
+  - **crypto provider feature** (2-4 per target):
+    - `crypto-ring` (default — ring backend, all 3 published targets)
+    - `crypto-aws-lc-rs` (post-quantum capable, AWS-LC backend, all 3 published targets)
     - `crypto-openssl` (system OpenSSL backend, gnu targets only)
     - `fips` (aws-lc-rs in FIPS-validated mode, no SLA per project policy, gnu targets only)
 
-  Tarball names follow `sozu-<VERSION>-<TARGET>-<PROVIDER>.tar.gz`. Each release also carries a `SHA256SUMS` file covering all 12 tarballs, a sigstore keyless signature pair (`SHA256SUMS.sig` + `SHA256SUMS.pem`), and SLSA build-provenance attestations.
+  Tarball names follow `sozu-<VERSION>-<TARGET>-<PROVIDER>.tar.gz`. Each release also carries a `SHA256SUMS` file covering all 10 tarballs, a sigstore keyless signature pair (`SHA256SUMS.sig` + `SHA256SUMS.pem`), and SLSA build-provenance attestations.
 
   ```sh
   # Pick the (target, provider) combination you need. The default for
