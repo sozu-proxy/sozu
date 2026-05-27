@@ -92,14 +92,23 @@ jobs:
       # release is structurally impossible.
       fail-fast: false
       matrix:
-        # 12 cells = 4 ring + 4 aws-lc-rs + 2 openssl-gnu + 2 fips-gnu.
+        # 10 cells = 3 ring + 3 aws-lc-rs + 2 openssl-gnu + 2 fips-gnu.
         # `crypto-openssl` is gnu-only because rustls-openssl pulls in
         # `openssl-sys`, which on musl needs `openssl/vendored` to link
         # cleanly — out of scope here. `fips` is gnu-only because the
         # aws-lc-fips-sys precompiled FIPS module assumes glibc; cmake
         # is required for the aws-lc-rs C bindings (incl. fips).
+        # `aarch64-unknown-linux-musl` is excluded across all providers:
+        # `jemalloc-sys 0.5.4+5.3.0-patched`'s autoconf cross-compile
+        # probe (host=aarch64-unknown-linux-musl, build=…-gnu) cannot
+        # link any of its three atomics test programs against the
+        # `musl-tools`-supplied `musl-gcc` wrapper on the arm64 runner,
+        # so jemalloc 5.3.0 falls through to `#error "Don't have atomics
+        # implemented on this platform."` — see release run 26499958009
+        # for the failure. Re-introduce when a real
+        # `aarch64-linux-musl-gcc` cross toolchain is wired into CI.
         include:
-          # crypto-ring (default, ring backend) — all 4 targets
+          # crypto-ring (default, ring backend) — all gnu + x86_64-musl
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             provider: crypto-ring
@@ -112,11 +121,7 @@ jobs:
             runner: ubuntu-24.04-arm
             provider: crypto-ring
             apt: protobuf-compiler
-          - target: aarch64-unknown-linux-musl
-            runner: ubuntu-24.04-arm
-            provider: crypto-ring
-            apt: protobuf-compiler musl-tools
-          # crypto-aws-lc-rs (post-quantum capable, AWS-LC backend) — all 4 targets
+          # crypto-aws-lc-rs (post-quantum capable, AWS-LC backend) — all gnu + x86_64-musl
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             provider: crypto-aws-lc-rs
@@ -129,10 +134,6 @@ jobs:
             runner: ubuntu-24.04-arm
             provider: crypto-aws-lc-rs
             apt: protobuf-compiler cmake
-          - target: aarch64-unknown-linux-musl
-            runner: ubuntu-24.04-arm
-            provider: crypto-aws-lc-rs
-            apt: protobuf-compiler cmake musl-tools
           # crypto-openssl (system OpenSSL backend) — gnu only
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
@@ -279,17 +280,18 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Verify all 12 tarballs landed
+      - name: Verify all 10 tarballs landed
         working-directory: dist
         run: |
           set -euo pipefail
           # Defensive count assertion — catches silent collisions if
           # `download-artifact merge-multiple: true` ever flattens two
-          # cells into the same name. 12 = 4 ring + 4 aws-lc-rs + 2
-          # openssl-gnu + 2 fips-gnu (matches the build matrix above).
+          # cells into the same name. 10 = 3 ring + 3 aws-lc-rs + 2
+          # openssl-gnu + 2 fips-gnu (matches the build matrix above;
+          # aarch64-musl excluded — see matrix comment for context).
           count=$(find . -maxdepth 1 -name 'sozu-*.tar.gz' | wc -l)
-          if [ "${count}" -ne 12 ]; then
-            echo "::error::expected 12 tarballs in dist/, found ${count}"
+          if [ "${count}" -ne 10 ]; then
+            echo "::error::expected 10 tarballs in dist/, found ${count}"
             ls -la
             exit 1
           fi
