@@ -1,5 +1,27 @@
 # Changelog
 
+## 2.0.1 - 2026-05-27
+
+Patch release with release-pipeline fixes uncovered by the 2.0.0 tag push. No runtime, protocol, API, configuration, metric, or log-format changes — only `Cargo.toml` `include` lists, the GitHub Actions release matrix, and `CHANGELOG.md` formatting were touched. `sozu-command-lib` consumers can bump from `^2.0.0` to `^2.0.1` without code changes.
+
+### 🐛 Fixed
+
+- **`fix(release)`: include `build.rs` in published tarballs** ([b4f85911](https://github.com/sozu-proxy/sozu/commit/b4f85911f24359c45d7f152aeaf0120eccd09a5)).
+`cargo publish` strips files outside each manifest's `include` list. The `bin/`, `command/`, and `lib/` member manifests all omitted `build.rs`, so the build script never ran inside `target/package/<crate>-2.0.0/` during the cargo verify step.
+`bin/` failed loudly: `env!("SOZU_BUILD_FEATURES")`, `env!("SOZU_BUILD_GIT")`, and `env!("SOZU_BUILD_GIT_SHA")` all errored at compile time because no build script existed to emit the matching `cargo:rustc-env=…` lines.
+`command/` and `lib/` failed silently: `command/`'s prost-generated `src/proto/command.rs` only made it into the tarball when a prior local build had already produced it (and `src/**/*` swept it up), and `lib/`'s log-layout scan (`lib/log_scanner.rs`, `include!`'d from `lib/build.rs`) never ran on the published source.
+Each member's `include` list now ships `build.rs` (plus `log_scanner.rs` for `lib/`) so the verify step runs the same build pipeline as a workspace build.
+- **`fix(ci/release)`: drop `aarch64-unknown-linux-musl` from the prebuilt matrix** ([72af57c9](https://github.com/sozu-proxy/sozu/commit/72af57c980d2deefc6967f2425eb3577ea1dc55d)).
+The 2.0.0 tag's Release run (26499958009) failed on both `aarch64-musl` cells; the other 10 cells succeeded, so `release` and `docker-release` were skipped — no draft release, no Docker push, hence this 2.0.1.
+Root cause: `jemalloc-sys 0.5.4+5.3.0-patched`'s autoconf cross-compile probe runs on the arm64 runner with `--host=aarch64-unknown-linux-musl --build=aarch64-unknown-linux-gnu` and `CC=aarch64-linux-musl-gcc` (the `musl-tools` wrapper); the three `JE_COMPILABLE` atomics tests (C11, GCC `__atomic`, GCC `__sync`) all fail at the link step because the wrapper cannot satisfy the cross-libc link, so jemalloc 5.3.0 falls through to `#error "Don't have atomics implemented on this platform."`. The same target works on `x86_64-unknown-linux-musl` and on the gnu arm64 cell — only `aarch64-musl` is affected.
+The aarch64-musl cells were introduced by commit `f61162cf` (`feat(ci): multi-provider crypto fan-out for release tarballs`, 2026-05-04); 2.0.0 was the first tag pushed against that matrix, so this is a never-worked configuration rather than a regression. The prebuilt matrix is now 10 cells (3 ring + 3 aws-lc-rs + 2 openssl-gnu + 2 fips-gnu); the workflow count assertion is updated `12 → 10`, and the exclusion is documented in the release matrix header comment, `README.md`, `RELEASE.md`, and the 2.0.0 `CHANGELOG.md` section.
+Operators who need `aarch64-unknown-linux-musl` can still build from source against a real `aarch64-linux-musl-gcc` cross toolchain (Alpine, musl-cross-make, etc.); the cell will be re-introduced once such a toolchain is wired into CI.
+
+### 🧹 Style
+
+- **`style`: reformat `CHANGELOG.md`** ([6dbc1645](https://github.com/sozu-proxy/sozu/commit/6dbc164500d09d9e52082e221514cc4ff946c25e)).
+Mechanical Markdown pass against the 2.0.0 history — no semantic changes.
+
 ## 2.0.0 - 2026-05-27
 
 The v1.1.1 → v2.0.0 entries below are grouped by Keep-a-Changelog category.

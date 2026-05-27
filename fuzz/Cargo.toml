@@ -1,6 +1,6 @@
 [package]
 name = "sozu-fuzz"
-version = "2.0.0"
+version = "2.0.1"
 publish = false
 edition = "2021"
 
