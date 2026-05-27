@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### 🐛 Fixed
+
+- **`fix(ci/release)`: switch cosign `sign-blob` to the Sigstore bundle format**. cosign 2.5 made `--new-bundle-format` the default and now rejects the legacy `--output-signature` / `--output-certificate` flag pair with `create bundle file: open : no such file or directory` (release run 26502888301 — the 2.0.1 tag's release job failed at the signing step, so the GitHub Release was published manually without the cosign side-files). The workflow now emits a single `SHA256SUMS.sigstore` bundle (signature + Fulcio cert + Rekor entry) via `cosign sign-blob --bundle SHA256SUMS.sigstore SHA256SUMS`. Operators verify with `cosign verify-blob --bundle SHA256SUMS.sigstore --new-bundle-format ... SHA256SUMS` (requires cosign >= 2.5). `README.md` and `RELEASE.md` are updated to point at the new bundle file and the new verification command.
+
 ## 2.0.1 - 2026-05-27
 
 Patch release with release-pipeline fixes uncovered by the 2.0.0 tag push. No runtime, protocol, API, configuration, metric, or log-format changes — only `Cargo.toml` `include` lists, the GitHub Actions release matrix, and `CHANGELOG.md` formatting were touched. `sozu-command-lib` consumers can bump from `^2.0.0` to `^2.0.1` without code changes.

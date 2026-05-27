@@ -27,7 +27,7 @@ To get started check out our [documentation](./doc/README.md) !
     - `crypto-openssl` (system OpenSSL backend, gnu targets only)
     - `fips` (aws-lc-rs in FIPS-validated mode, no SLA per project policy, gnu targets only)
 
-  Tarball names follow `sozu-<VERSION>-<TARGET>-<PROVIDER>.tar.gz`. Each release also carries a `SHA256SUMS` file covering all 10 tarballs, a sigstore keyless signature pair (`SHA256SUMS.sig` + `SHA256SUMS.pem`), and SLSA build-provenance attestations.
+  Tarball names follow `sozu-<VERSION>-<TARGET>-<PROVIDER>.tar.gz`. Each release also carries a `SHA256SUMS` file covering all 10 tarballs, a sigstore keyless signature bundle (`SHA256SUMS.sigstore` — single JSON file containing the signature, the Fulcio certificate, and the Rekor transparency-log entry), and SLSA build-provenance attestations.
 
   ```sh
   # Pick the (target, provider) combination you need. The default for
@@ -38,14 +38,14 @@ To get started check out our [documentation](./doc/README.md) !
 
   curl -LO https://github.com/sozu-proxy/sozu/releases/download/<VERSION>/sozu-<VERSION>-${TARGET}-${PROVIDER}.tar.gz
   curl -LO https://github.com/sozu-proxy/sozu/releases/download/<VERSION>/SHA256SUMS
-  curl -LO https://github.com/sozu-proxy/sozu/releases/download/<VERSION>/SHA256SUMS.sig
-  curl -LO https://github.com/sozu-proxy/sozu/releases/download/<VERSION>/SHA256SUMS.pem
+  curl -LO https://github.com/sozu-proxy/sozu/releases/download/<VERSION>/SHA256SUMS.sigstore
 
   # Verify the signature was produced by this repository's release workflow.
-  # Requires cosign >= 2.4.1 (GHSA-whqx-f9j3-ch6m).
+  # Requires cosign >= 2.5 (new bundle format is the default since 2.5;
+  # also satisfies GHSA-whqx-f9j3-ch6m, fixed in 2.4.1).
   cosign verify-blob \
-    --certificate SHA256SUMS.pem \
-    --signature SHA256SUMS.sig \
+    --bundle SHA256SUMS.sigstore \
+    --new-bundle-format \
     --certificate-identity-regexp '^https://github\.com/sozu-proxy/sozu/\.github/workflows/release\.yml@refs/tags/[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$' \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
     --certificate-github-workflow-repository sozu-proxy/sozu \

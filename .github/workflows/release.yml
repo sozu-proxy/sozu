@@ -316,12 +316,17 @@ jobs:
           set -euo pipefail
           # Keyless signing — no static secret. The OIDC token presented
           # by `id-token: write` is exchanged with sigstore's Fulcio for
-          # a short-lived signing certificate; the signature and
-          # certificate are recorded in Rekor and emitted as side files.
-          # Operators verify with cosign >= 2.4.1 (GHSA-whqx-f9j3-ch6m):
+          # a short-lived signing certificate; the signature, certificate,
+          # and Rekor transparency-log entry are packed into a single
+          # Sigstore bundle (`SHA256SUMS.sigstore`). cosign 2.5+ defaults
+          # to the new bundle format and rejects the legacy
+          # `--output-signature` / `--output-certificate` flag pair with
+          # `create bundle file: open : no such file or directory`
+          # (release run 26502888301).
+          # Operators verify with cosign >= 2.5:
           #   cosign verify-blob \
-          #     --certificate SHA256SUMS.pem \
-          #     --signature SHA256SUMS.sig \
+          #     --bundle SHA256SUMS.sigstore \
+          #     --new-bundle-format \
           #     --certificate-identity-regexp '^https://github\.com/sozu-proxy/sozu/\.github/workflows/release\.yml@refs/tags/[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$' \
           #     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
           #     --certificate-github-workflow-repository sozu-proxy/sozu \
@@ -331,8 +336,7 @@ jobs:
           # at a release-shaped tag, so a future helper workflow with
           # id-token:write cannot act as a signing oracle for SHA256SUMS.
           cosign sign-blob \
-            --output-signature SHA256SUMS.sig \
-            --output-certificate SHA256SUMS.pem \
+            --bundle SHA256SUMS.sigstore \
             SHA256SUMS
 
       - name: Generate SLSA build provenance
@@ -382,8 +386,7 @@ jobs:
           files: |
             dist/*.tar.gz
             dist/SHA256SUMS
-            dist/SHA256SUMS.sig
-            dist/SHA256SUMS.pem
+            dist/SHA256SUMS.sigstore
 
   docker-release:
     name: Docker Hub (tagged image)
