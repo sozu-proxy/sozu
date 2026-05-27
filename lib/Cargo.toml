@@ -20,6 +20,8 @@ rust-version = "1.88.0"
 include = [
   "./README.md",
   "Cargo.toml",
+  "build.rs",
+  "log_scanner.rs",
   "src/**/*",
   "/examples/*",
   "benches/**/*",
