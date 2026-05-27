@@ -1232,13 +1232,11 @@ impl SessionMetrics {
     }
 
     pub fn service_start(&mut self) {
-        let now = Instant::now();
-
         if self.start.is_none() {
-            self.start = Some(now);
-            self.start_wall = Some(SystemTime::now());
+            self.mark_request_start();
         }
 
+        let now = Instant::now();
         self.service_start = Some(now);
         self.wait_time += now - self.wait_start;
     }
@@ -1262,6 +1260,14 @@ impl SessionMetrics {
             }
             None => self.service_time,
         }
+    }
+
+    /// Arm both the monotonic and wall-clock start timestamps together.
+    /// This must be the single place that sets `start` + `start_wall` outside
+    /// of `new()`, so the two fields can never desynchronize.
+    pub fn mark_request_start(&mut self) {
+        self.start = Some(Instant::now());
+        self.start_wall = Some(SystemTime::now());
     }
 
     /// time elapsed since the beginning of the session

@@ -202,10 +202,11 @@ pub struct RequestRecord<'a> {
     /// time between first byte of the request and last byte of the response
     pub request_time: Duration,
     /// Wall-clock start time as nanoseconds since the Unix epoch. Captured
-    /// from the same `SystemTime::now()` call as the monotonic `start`
-    /// instant, so consumers can use it directly as the span start time
-    /// instead of computing `precise_time - request_time` (which mixes
-    /// CLOCK_REALTIME and CLOCK_MONOTONIC).
+    /// immediately alongside the monotonic `start` instant (via
+    /// `SessionMetrics::mark_request_start`), so consumers can use it
+    /// directly as the span start time instead of computing
+    /// `precise_time - request_time` (which mixes CLOCK_REALTIME and
+    /// CLOCK_MONOTONIC).
     pub start_time_ns: Option<i128>,
     pub bytes_in: usize,
     pub bytes_out: usize,
