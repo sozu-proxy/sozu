@@ -248,6 +248,12 @@ feature flag:
 - A new span ID is generated per Sōzu hop; the value is rewritten on the
   outgoing request and stored on `HttpContext.otel`.
 - Access logs surface `trace_id`, `span_id`, `parent_span_id`.
+- Access logs include `start_time` (proto field 30, `Uint128`, nanoseconds
+  since epoch) — a wall-clock timestamp captured at the start of the request
+  via `SessionMetrics::mark_request_start()`. Consumers reconstructing OTel
+  spans should prefer this field over `time - request_time`, which mixes
+  `CLOCK_REALTIME` and `CLOCK_MONOTONIC` and produces unreliable start
+  timestamps on short-lived requests.
 
 To go further (real spans, OTLP exporter, B3/Datadog propagation), see the
 "Out of scope" section in [`configure.md`](configure.md). It would land

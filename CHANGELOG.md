@@ -1,5 +1,12 @@
 # Changelog
 
+## [Unreleased]
+
+### ✨ Added
+
+- **`fix(otel)`: wall-clock `start_time` field in `ProtobufAccessLog`** (field 30, optional `Uint128`).
+  Access-log consumers reconstructing OpenTelemetry spans no longer need to compute `time - request_time` — a subtraction that mixed `CLOCK_REALTIME` and `CLOCK_MONOTONIC` and produced unreliable start timestamps on short-lived requests. The new field is captured at request start via `SessionMetrics::mark_request_start()` and should be preferred whenever present. Old consumers ignore the unknown field; new consumers with old producers see `None` and can fall back to the subtraction.
+
 ## 2.0.1 - 2026-05-27
 
 Patch release with release-pipeline fixes uncovered by the 2.0.0 tag push. No runtime, protocol, API, configuration, metric, or log-format changes — only `Cargo.toml` `include` lists, the GitHub Actions release matrix, and `CHANGELOG.md` formatting were touched. `sozu-command-lib` consumers can bump from `^2.0.0` to `^2.0.1` without code changes.

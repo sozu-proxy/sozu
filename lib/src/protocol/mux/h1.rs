@@ -5,7 +5,7 @@
 //! same routing / shutdown / readiness machinery applies across H1 and H2
 //! connections. Long-form lifecycle: `lib/src/protocol/mux/LIFECYCLE.md`.
 
-use std::{io::IoSlice, time::Instant};
+use std::io::IoSlice;
 
 use rusty_ulid::Ulid;
 use sozu_command::{logging::ansi_palette, ready::Ready};
@@ -214,7 +214,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         let answers_rc = context.listener.borrow().get_answers().clone();
         let stream = &mut context.streams[stream_id];
         if stream.metrics.start.is_none() {
-            stream.metrics.start = Some(Instant::now());
+            stream.metrics.mark_request_start();
         }
         let parts = stream.split(&self.position);
         let kawa = parts.rbuffer;

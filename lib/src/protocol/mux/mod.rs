@@ -571,8 +571,7 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
             stream.front.clear();
             stream.front.storage.clear();
             stream.metrics.reset();
-            stream.metrics.start = Some(Instant::now());
-            stream.metrics.start_wall = Some(std::time::SystemTime::now());
+            stream.metrics.mark_request_start();
             // After recycling a slot, check if the Vec has excessive trailing
             // Recycle entries (more than 2x active streams of total capacity).
             let active = self.active_len();
