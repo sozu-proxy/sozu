@@ -1806,6 +1806,14 @@ message ProtobufAccessLog {
     // proxy hops (e.g. `"203.0.113.5, 198.51.100.10"`). `None` if no
     // upstream proxy supplied the header.
     optional string xff_chain = 29;
+    // Wall-clock timestamp (POSIX nanoseconds since epoch) captured at the
+    // start of the request. Enables accurate OTel span reconstruction
+    // without subtracting a monotonic `request_time` duration from the
+    // wall-clock `time` field — a computation that mixes two unsynchronised
+    // clock sources (CLOCK_MONOTONIC vs CLOCK_REALTIME) and produces
+    // unreliable start timestamps, especially for short-lived requests or
+    // across NTP adjustments. Optional for backwards compatibility.
+    optional Uint128 start_time = 30;
 }
 
 message ProtobufEndpoint {

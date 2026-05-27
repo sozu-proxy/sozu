@@ -1049,6 +1049,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             service_time: metrics.service_time(),
             response_time: metrics.backend_response_time(),
             request_time: metrics.request_time(),
+            start_time_ns: metrics.start_wall_ns(),
             bytes_in: metrics.bin,
             bytes_out: metrics.bout,
             user_agent: self.context.user_agent.as_deref(),

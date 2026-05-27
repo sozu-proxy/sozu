@@ -343,7 +343,7 @@ use std::{
     net::SocketAddr,
     rc::Rc,
     str,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use backends::BackendError;
@@ -1170,6 +1170,11 @@ impl fmt::Debug for Readiness {
 pub struct SessionMetrics {
     /// date at which we started handling that request
     pub start: Option<Instant>,
+    /// wall-clock timestamp captured alongside `start`, for access-log
+    /// consumers that need an absolute start time (e.g. OTel span
+    /// reconstruction) without subtracting a monotonic duration from a
+    /// wall-clock end time — which mixes two unsynchronised clock sources.
+    pub start_wall: Option<SystemTime>,
     /// time actually spent handling the request
     pub service_time: Duration,
     /// time spent waiting for its turn
@@ -1195,6 +1200,7 @@ impl SessionMetrics {
     pub fn new(wait_time: Option<Duration>) -> SessionMetrics {
         SessionMetrics {
             start: Some(Instant::now()),
+            start_wall: Some(SystemTime::now()),
             service_time: Duration::from_secs(0),
             wait_time: wait_time.unwrap_or_else(|| Duration::from_secs(0)),
             bin: 0,
@@ -1212,6 +1218,7 @@ impl SessionMetrics {
 
     pub fn reset(&mut self) {
         self.start = None;
+        self.start_wall = None;
         self.service_time = Duration::from_secs(0);
         self.wait_time = Duration::from_secs(0);
         self.bin = 0;
@@ -1229,6 +1236,7 @@ impl SessionMetrics {
 
         if self.start.is_none() {
             self.start = Some(now);
+            self.start_wall = Some(SystemTime::now());
         }
 
         self.service_start = Some(now);
@@ -1262,6 +1270,16 @@ impl SessionMetrics {
             Some(start) => Instant::now() - start,
             None => Duration::from_secs(0),
         }
+    }
+
+    /// Wall-clock start time as nanoseconds since the Unix epoch, or `None`
+    /// if the monotonic start has not been set yet (post-`reset()`, pre-`service_start()`).
+    pub fn start_wall_ns(&self) -> Option<i128> {
+        self.start_wall.and_then(|t| {
+            t.duration_since(SystemTime::UNIX_EPOCH)
+                .ok()
+                .map(|d| d.as_nanos() as i128)
+        })
     }
 
     pub fn backend_start(&mut self) {
