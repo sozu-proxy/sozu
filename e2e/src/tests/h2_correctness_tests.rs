@@ -494,20 +494,31 @@ fn try_h2_window_stall_response_reaped() -> State {
     tls.write_all(&headers.encode()).unwrap();
     tls.flush().unwrap();
 
-    // Wait past the 2s deadline, then tickle the readable path (which runs
-    // cancel_timed_out_streams) with a PING.
-    thread::sleep(Duration::from_secs(4));
-    let ping = H2Frame::ping([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
-    let _ = tls.write_all(&ping.encode());
-    let _ = tls.flush();
-
-    let data = read_all_available(&mut tls, Duration::from_millis(1000));
-    let all_frames = parse_h2_frames(&data);
-    log_frames("Window-stall reaped", &all_frames);
-
-    let rst_cancel = extract_rst_streams(&all_frames)
-        .iter()
-        .any(|(sid, ec)| *sid == 1 && *ec == 0x8 /* CANCEL */);
+    // Poll past the 2s deadline, sending a PING each iteration to drive the
+    // readable path (which runs `cancel_timed_out_streams`) — a passive read
+    // never fires the read-path reaper, so the PING is REQUIRED. Polled deadline
+    // instead of a fixed `thread::sleep`, per the "prefer explicit deadlines over
+    // sleep" rule (matches the sibling window-stall tests).
+    let mut rst_cancel = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    while std::time::Instant::now() < deadline {
+        let ping = H2Frame::ping([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
+        let _ = tls.write_all(&ping.encode());
+        let _ = tls.flush();
+        thread::sleep(Duration::from_millis(500));
+        let data = read_all_available(&mut tls, Duration::from_millis(200));
+        let all_frames = parse_h2_frames(&data);
+        if !all_frames.is_empty() {
+            log_frames("Window-stall reaped", &all_frames);
+        }
+        if extract_rst_streams(&all_frames)
+            .iter()
+            .any(|(sid, ec)| *sid == 1 && *ec == 0x8 /* CANCEL */)
+        {
+            rst_cancel = true;
+            break;
+        }
+    }
     println!("Window-stall stream 1 RST_STREAM(CANCEL): {rst_cancel}");
 
     let infra_ok = teardown(tls, front_port, worker, vec![backend]);
@@ -657,9 +668,136 @@ fn test_h2_window_stall_inbound_drip_reaped() {
     );
 }
 
+/// M2 cumulative-stall budget: a `WINDOW_UPDATE(+1)` drip lets sozu drain ~1
+/// byte of the window-blocked response per grant (`consumed > 0`), which under
+/// the old clear-on-any-progress reset the deadline forever. The budget
+/// accumulates these toward a 16 KiB floor the drip never reaches, so the
+/// deadline still ages out and the stream is reaped. This is the test that fails
+/// if the cumulative-stall budget regresses to clear-on-`consumed>0`.
+fn try_h2_window_stall_wu_drip_reaped() -> State {
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker =
+        Worker::start_new_worker_owned("H2-COR-WINDOW-STALL-WU-DRIP", config, listeners, state);
+
+    let mut listener_config = ListenerBuilder::new_https(front_address.clone())
+        .to_tls(None)
+        .unwrap();
+    listener_config.h2_stream_idle_timeout_seconds = Some(2);
+
+    worker.send_proxy_request_type(RequestType::AddHttpsListener(listener_config));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        address: front_address.clone(),
+        proxy: ListenerType::Https.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        hostname: String::from("localhost"),
+        ..Worker::default_http_frontend("cluster_0", front_address.clone().into())
+    }));
+
+    let certificate_and_key = CertificateAndKey {
+        certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
+        key: String::from(include_str!("../../../lib/assets/local-key.pem")),
+        certificate_chain: vec![],
+        versions: vec![],
+        names: vec![],
+    };
+    worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+        address: front_address,
+        certificate: certificate_and_key,
+        expired_at: None,
+    }));
+
+    let back_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0".to_owned(),
+        back_address,
+        None,
+    )));
+    let backend = AsyncBackend::spawn_detached_backend(
+        "BACKEND_0".to_owned(),
+        back_address,
+        SimpleAggregator::default(),
+        AsyncBackend::http_handler("window-stall-body".to_owned()),
+    );
+    worker.read_to_last();
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    // Zero stream window: response HEADERS flow, response DATA stays blocked.
+    h2_handshake_with_initial_window(&mut tls, 0);
+
+    let header_block = vec![
+        0x82, // :method GET
+        0x84, // :path /
+        0x87, // :scheme https
+        0x41, 0x09, // :authority localhost
+        b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't',
+    ];
+    let headers = H2Frame::headers(1, header_block, true, true);
+    tls.write_all(&headers.encode()).unwrap();
+    tls.flush().unwrap();
+
+    // Drip a +1 stream-window grant every 700ms (< the 2s deadline). Each lets
+    // sozu drain ~1 byte (`consumed > 0`) but never enough to reach the 16 KiB
+    // cumulative floor, so the budget keeps aging the deadline -> reaped.
+    let mut rst_cancel = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(7);
+    while std::time::Instant::now() < deadline {
+        let wu = H2Frame::window_update(1, 1);
+        let _ = tls.write_all(&wu.encode());
+        let _ = tls.flush();
+        thread::sleep(Duration::from_millis(700));
+        let bytes = read_all_available(&mut tls, Duration::from_millis(200));
+        let frames = parse_h2_frames(&bytes);
+        if !frames.is_empty() {
+            log_frames("Window-stall WU-drip", &frames);
+        }
+        if extract_rst_streams(&frames)
+            .iter()
+            .any(|(sid, ec)| *sid == 1 && *ec == 0x8)
+        {
+            rst_cancel = true;
+            break;
+        }
+    }
+    println!("Window-stall (WU drip) stream 1 RST_STREAM(CANCEL): {rst_cancel}");
+
+    let infra_ok = teardown(tls, front_port, worker, vec![backend]);
+    if infra_ok && rst_cancel {
+        State::Success
+    } else {
+        println!("Window-stall WU-drip - FAIL: rst_cancel={rst_cancel} infra_ok={infra_ok}");
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_window_stall_wu_drip_reaped() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 correctness: window-stalled stream reaped despite WINDOW_UPDATE(+1) drip (cumulative-stall budget)",
+            try_h2_window_stall_wu_drip_reaped
+        ),
+        State::Success
+    );
+}
+
 /// Fully-silent window-stall: peer sends one zero-window GET then NO further
-/// frames. The connection-timeout path must run the reaper, else the stream
-/// lingers until the zombie checker. Reap observed as GOAWAY/RST(CANCEL) or EOF.
+/// frames. The connection-timeout path must run the reaper AND flush the queued
+/// `RST_STREAM(CANCEL)` (M3: via `has_pending_control_write`, since
+/// `has_pending_write` ignores `pending_rst_streams`). We assert the actual
+/// RST(CANCEL) reaches the wire — not merely EOF — so this fails if the
+/// silent-peer flush regresses (slot would still be freed, but the peer would
+/// only ever see EOF).
 fn try_h2_window_stall_silent_reaped() -> State {
     use std::io::Read as _;
     let front_port = provide_port();
@@ -730,16 +868,15 @@ fn try_h2_window_stall_silent_reaped() -> State {
     tls.write_all(&headers.encode()).unwrap();
     tls.flush().unwrap();
 
-    let mut reaped = false;
+    let mut rst_cancel = false;
     let mut acc: Vec<u8> = Vec::new();
     let mut buf = [0u8; 16384];
     let deadline = std::time::Instant::now() + Duration::from_secs(8);
     while std::time::Instant::now() < deadline {
         match tls.read(&mut buf) {
-            Ok(0) => {
-                reaped = true;
-                break;
-            }
+            // EOF: the connection closed. If we have NOT seen the RST(CANCEL) by
+            // now, the silent-peer flush (M3) regressed — the peer only saw EOF.
+            Ok(0) => break,
             Ok(n) => {
                 acc.extend_from_slice(&buf[..n]);
                 let frames = parse_h2_frames(&acc);
@@ -749,9 +886,8 @@ fn try_h2_window_stall_silent_reaped() -> State {
                 if extract_rst_streams(&frames)
                     .iter()
                     .any(|(sid, ec)| *sid == 1 && *ec == 0x8)
-                    || contains_goaway(&frames)
                 {
-                    reaped = true;
+                    rst_cancel = true;
                     break;
                 }
             }
@@ -761,19 +897,16 @@ fn try_h2_window_stall_silent_reaped() -> State {
             {
                 thread::sleep(Duration::from_millis(50));
             }
-            Err(_) => {
-                reaped = true;
-                break;
-            }
+            Err(_) => break,
         }
     }
-    println!("Window-stall (silent) reaped: {reaped}");
+    println!("Window-stall (silent) RST_STREAM(CANCEL) flushed: {rst_cancel}");
 
     let infra_ok = teardown(tls, front_port, worker, vec![backend]);
-    if infra_ok && reaped {
+    if infra_ok && rst_cancel {
         State::Success
     } else {
-        println!("Window-stall silent - FAIL: reaped={reaped} infra_ok={infra_ok}");
+        println!("Window-stall silent - FAIL: rst_cancel={rst_cancel} infra_ok={infra_ok}");
         State::Fail
     }
 }
