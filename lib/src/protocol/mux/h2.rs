@@ -299,6 +299,17 @@ const DEFAULT_MAX_HEADER_TABLE_SIZE: u32 = 65536;
 /// ~2048 fields for a 64 KB list; this explicit count cap is the tighter,
 /// upstream-matching defense (cf. nginx `max_headers`, Apache `LimitRequestFields`).
 const DEFAULT_MAX_HEADER_FIELDS: u32 = 128;
+/// Cumulative outbound progress (bytes) a window-stalled stream must drain to
+/// clear its flow-control-stall deadline (M2 cumulative-stall budget). Below
+/// this, a `WINDOW_UPDATE(+1)` drip that trickles a few bytes per idle period
+/// cannot keep the slot alive: the deadline ages out and the reaper
+/// RST(CANCEL)s the stream. Chosen as one max H2 DATA frame payload (16 KiB) —
+/// a legitimate slow-but-steady transfer drains at least one frame per idle
+/// period at any realistic bandwidth, while a drip attacker grants far less. A
+/// `const`, not a config knob: `h2_stream_idle_timeout_seconds` is already the
+/// operator dial for slow-link tolerance, and coupling a second knob invites
+/// misconfiguration (high floor + low deadline = mass false reaps).
+const FC_STALL_CLEAR_FLOOR: usize = 16 * 1024;
 /// RFC 9113 §6.5.2: the size accounted against `SETTINGS_MAX_HEADER_LIST_SIZE`
 /// is the uncompressed name + value octets PLUS a 32-octet overhead per field.
 /// The per-field overhead is what bounds the field count under a fixed byte
@@ -675,6 +686,15 @@ fn collect_timed_out_streams(
         }
     }
     out
+}
+
+/// True when a stream still has response/upload bytes that could be put on the
+/// wire — headers/body in flight, or a terminated-but-not-fully-flushed buffer.
+/// Deliberately EXCLUDES `is_error()`/`rst_sent`: that disjunct is specific to
+/// the priority-eligibility and write-loop gates (`write_streams`) and must stay
+/// inline there; this 2-clause helper backs ONLY the window-stall arm.
+fn has_sendable_response(kawa: &GenericHttpStream) -> bool {
+    kawa.is_main_phase() || (kawa.is_terminated() && !kawa.is_completed())
 }
 
 /// Core of [`ConnectionH2::enqueue_rst`], extracted so the RST-queueing
@@ -1421,6 +1441,14 @@ pub struct ConnectionH2<Front: SocketHandler> {
     /// liveness timer alone misses this because inbound drips refresh it). Reaped
     /// by [`Self::cancel_timed_out_streams`] after [`Self::stream_idle_timeout`].
     pub stream_fc_stalled_since: HashMap<StreamId, Instant>,
+    /// Cumulative outbound flow-control bytes drained on a window-stalled stream
+    /// SINCE its [`Self::stream_fc_stalled_since`] deadline was armed (M2
+    /// cumulative-stall budget). An entry exists IFF `stream_fc_stalled_since`
+    /// has one for the stream; the two maps are kept in lockstep at every
+    /// arm/clear/evict site. Closes the `WINDOW_UPDATE(+1)`-drip residual: a
+    /// 1-byte drain no longer clears the deadline — only cumulative progress
+    /// reaching [`FC_STALL_CLEAR_FLOOR`] does.
+    pub stream_fc_stalled_progress: HashMap<StreamId, usize>,
     /// Per-stream idle cap. Streams with no activity for longer than this are
     /// RST_STREAM(CANCEL)'d by [`Self::cancel_timed_out_streams`].
     pub stream_idle_timeout: std::time::Duration,
@@ -1581,6 +1609,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             last_gauge_snapshot: None,
             stream_last_activity_at: HashMap::new(),
             stream_fc_stalled_since: HashMap::new(),
+            stream_fc_stalled_progress: HashMap::new(),
             stream_idle_timeout,
             refuse_count_window: 0,
             refuse_window_start: Instant::now(),
@@ -2380,11 +2409,18 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 if let Some(t) = self.stream_last_activity_at.get_mut(&stream_id) {
                     *t = Instant::now();
                 }
-                // Outbound progress clears any flow-control-stall deadline. The
-                // resume path is socket-backpressure (normally a positive window,
-                // so window-stall is armed in the main write loop, not here), but
-                // clear defensively to keep the two write sites symmetric.
-                self.stream_fc_stalled_since.remove(&stream_id);
+                // Clear the flow-control-stall deadline ONLY when the effective
+                // send window is genuinely open — that alone is a real un-stall.
+                // A window-stalled stream can flush a `WINDOW_UPDATE(+1)`-drip
+                // byte HERE via socket-backpressure resume; clearing on that
+                // would reset the deadline at 1-byte granularity and re-open the
+                // drip the M2 cumulative-stall budget closes. While still blocked,
+                // leave the deadline (and its progress accumulator) for the main
+                // write loop's budget to govern — keeping the two maps in lockstep.
+                if min(*parts.window, self.flow_control.window) > 0 {
+                    self.stream_fc_stalled_since.remove(&stream_id);
+                    self.stream_fc_stalled_progress.remove(&stream_id);
+                }
             }
             if outcome == FlushOutcome::Stalled {
                 return MuxResult::Continue;
@@ -2725,26 +2761,49 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     *t = Instant::now();
                 }
             }
-            // Arm/clear the dedicated flow-control-stall deadline that catches
-            // a window-stalled response. It is set only when the stream holds
-            // buffered response
-            // data it cannot send because its effective send window is exhausted,
-            // and — unlike `stream_last_activity_at` — it is NEVER refreshed by
-            // inbound DATA/HEADERS, so a peer dribbling 1-byte DATA on a
-            // window-stalled stream cannot keep it warm. Any genuine outbound
-            // flow-control progress (`consumed > 0`) clears it; the reaper
-            // (`cancel_timed_out_streams`) RST(CANCEL)s a stream stalled longer
-            // than `stream_idle_timeout`.
-            let outbound_window_blocked = (kawa.is_main_phase()
-                || (kawa.is_terminated() && !kawa.is_completed()))
+            // Arm/age the dedicated flow-control-stall deadline that catches a
+            // window-stalled stream — a buffered RESPONSE to a slow frontend
+            // (`Position::Server`) OR a buffered request UPLOAD to a slow H2
+            // backend (`Position::Client`): window-stall reaping is bidirectional
+            // by design (M4), so there is no position gate here. Set only when the
+            // stream holds sendable buffered data it cannot send because its
+            // effective send window is exhausted; unlike `stream_last_activity_at`
+            // it is NEVER refreshed by inbound DATA/HEADERS, so a peer dribbling
+            // 1-byte DATA cannot keep it warm.
+            //
+            // M2 cumulative-stall budget: a genuinely OPEN window clears the
+            // deadline immediately (real un-stall). While the window stays
+            // blocked, accumulate this pass's outbound drain; only cumulative
+            // progress reaching `FC_STALL_CLEAR_FLOOR` (a full frame of real
+            // delivery) clears it. A `WINDOW_UPDATE(+1)` drip drains ~1 byte/pass
+            // straight back to a zero window, so it never reaches the floor — the
+            // deadline ages out and `cancel_timed_out_streams` RST(CANCEL)s the
+            // slot-pinning stream after `stream_idle_timeout`.
+            let outbound_window_blocked = has_sendable_response(kawa)
                 && min(*parts.window, self.flow_control.window) <= 0
                 && (!kawa.blocks.is_empty() || !kawa.out.is_empty());
-            if consumed > 0 || !outbound_window_blocked {
+            if !outbound_window_blocked {
                 self.stream_fc_stalled_since.remove(&stream_id);
+                self.stream_fc_stalled_progress.remove(&stream_id);
             } else {
-                self.stream_fc_stalled_since
-                    .entry(stream_id)
-                    .or_insert_with(Instant::now);
+                let progressed = self
+                    .stream_fc_stalled_progress
+                    .get(&stream_id)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(consumed.max(0) as usize);
+                if progressed >= FC_STALL_CLEAR_FLOOR {
+                    // A full frame of cumulative progress: not a drip. Clear and
+                    // let the next stalled pass re-arm with a fresh deadline.
+                    self.stream_fc_stalled_since.remove(&stream_id);
+                    self.stream_fc_stalled_progress.remove(&stream_id);
+                } else {
+                    self.stream_fc_stalled_since
+                        .entry(stream_id)
+                        .or_insert_with(Instant::now);
+                    self.stream_fc_stalled_progress
+                        .insert(stream_id, progressed);
+                }
             }
             total_bytes_written = total_bytes_written.saturating_add(stream_bytes);
             if outcome == FlushOutcome::Stalled {
@@ -2961,9 +3020,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// Evict every per-stream piece of state carried by this `ConnectionH2`.
     ///
     /// **Invariant**: `rst_sent`, `stream_last_activity_at`,
-    /// `stream_fc_stalled_since` and `prioriser` MUST be emptied of `stream_id`
-    /// here — they are the only four per-stream caches that are not stored in the
-    /// slab-allocated
+    /// `stream_fc_stalled_since`, `stream_fc_stalled_progress` and `prioriser`
+    /// MUST be emptied of `stream_id` here — they are the only five per-stream
+    /// caches that are not stored in the slab-allocated
     /// `Context.streams[]`. Forgetting any of them causes unbounded memory
     /// growth on long-lived connections with many cancelled streams. The
     /// `debug_assert`s below fail loudly in test builds if someone adds a
@@ -2979,6 +3038,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         self.rst_sent.remove(&stream_id);
         self.stream_last_activity_at.remove(&stream_id);
         self.stream_fc_stalled_since.remove(&stream_id);
+        self.stream_fc_stalled_progress.remove(&stream_id);
         self.prioriser.remove(&stream_id);
         debug_assert!(
             !self.rst_sent.contains(&stream_id),
@@ -2991,6 +3051,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         debug_assert!(
             !self.stream_fc_stalled_since.contains_key(&stream_id),
             "stream_fc_stalled_since still contains stream_id {stream_id} after eviction"
+        );
+        debug_assert!(
+            !self.stream_fc_stalled_progress.contains_key(&stream_id),
+            "stream_fc_stalled_progress still contains stream_id {stream_id} after eviction"
         );
         // Invariant: expect_write/expect_read must not reference a gid whose
         // context slot may be popped by shrink_trailing_recycle after eviction.
@@ -3786,6 +3850,23 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 deadline,
                 reason
             );
+            // M1: break reaps down by guard so a window-stall reap (a DoS
+            // mitigation) is distinguishable from an ordinary idle reap on a
+            // dashboard. M2: a window-stall reap whose stream dribbled some
+            // outbound progress (`acc > 0`) below the floor is specifically a
+            // stall-budget reap — the `WINDOW_UPDATE`-drip vector the budget
+            // closes — counted as a subset. Read the accumulator BEFORE
+            // `remove_dead_stream` evicts it below.
+            match reason {
+                "H2::WindowStall" => {
+                    count!(names::h2::STREAMS_REAPED_WINDOW_STALL, 1);
+                    if matches!(self.stream_fc_stalled_progress.get(&sid), Some(&acc) if acc > 0) {
+                        count!(names::h2::STREAMS_REAPED_STALL_BUDGET, 1);
+                    }
+                }
+                "H2::IdleTimeout" => count!(names::h2::STREAMS_REAPED_IDLE_TIMEOUT, 1),
+                other => debug!("{} unexpected reap reason {}", log_context!(self), other),
+            }
             // Route through the canonical chokepoint so dedupe (rst_sent),
             // queued-cap accounting (MAX_PENDING_RST_STREAMS via
             // total_rst_streams_queued), and edge-triggered-epoll arming
@@ -4281,6 +4362,17 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         self.expect_write.is_some()
             || !self.zero.storage.is_empty()
             || self.socket.socket_wants_write()
+    }
+
+    /// True when the reaper has queued control frames (`RST_STREAM`) into
+    /// `pending_rst_streams` that have not yet been serialized. Kept SEPARATE
+    /// from [`Self::has_pending_write`] because that probe gates connection close
+    /// (the `mod.rs` close-gating sites) and must NOT treat a queued RST as a
+    /// reason to keep the connection open; this probe is consulted ONLY by the
+    /// `MuxState::timeout` flush gate to push a silent-peer `RST_STREAM(CANCEL)`
+    /// onto the wire before the connection closes.
+    pub fn has_pending_control_write(&self) -> bool {
+        !self.pending_rst_streams.is_empty()
     }
 
     /// Connection-level [`Self::has_pending_write`] extended with a per-stream
