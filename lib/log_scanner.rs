@@ -37,6 +37,7 @@ const CONTEXT_MACROS: &[&str] = &[
     "log_context!",
     "log_context_lite!",
     "log_context_stream!",
+    "log_flow_context!",
     "log_module_context!",
     "log_socket_context!",
     "log_socket_module_prefix",

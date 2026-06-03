@@ -218,7 +218,20 @@ impl UdpHealthChecker {
             let offset = self.next_token_id % UDP_HEALTH_TOKEN_CAPACITY;
             self.next_token_id = self.next_token_id.wrapping_add(1);
             if !in_flight.contains(&offset) {
-                return Some(Token(UDP_HEALTH_TOKEN_BASE + offset));
+                let token = Token(UDP_HEALTH_TOKEN_BASE + offset);
+                // A freshly allocated probe token must fall in the reserved
+                // health namespace (so the proxy demuxes its readiness back to
+                // the health checker) and must not collide with an in-flight
+                // probe (which would alias two probes onto one socket slot).
+                debug_assert!(
+                    self.owns_token(token),
+                    "allocate_token returned a token outside the health namespace"
+                );
+                debug_assert!(
+                    !self.in_flight.iter().any(|p| p.token == token),
+                    "allocate_token returned a token already in flight"
+                );
+                return Some(token);
             }
         }
         error!(

@@ -81,28 +81,31 @@ fn splitmix64_finalize(mut z: u64) -> u64 {
 /// Runs once at construction (off the datapath); a trial-division check is more
 /// than fast enough for the small sizes Sōzu uses (default 65537).
 fn next_prime(n: usize) -> usize {
-    fn is_prime(x: usize) -> bool {
-        if x < 2 {
-            return false;
-        }
-        if x % 2 == 0 {
-            return x == 2;
-        }
-        let mut d = 3;
-        while d * d <= x {
-            if x % d == 0 {
-                return false;
-            }
-            d += 2;
-        }
-        true
-    }
-
     let mut candidate = n.max(2);
     while !is_prime(candidate) {
         candidate += 1;
     }
     candidate
+}
+
+/// Trial-division primality test. Module-level (not nested in `next_prime`) so
+/// the Maglev `rebuild` post-condition can re-assert that the table size stayed
+/// the prime it was constructed with.
+fn is_prime(x: usize) -> bool {
+    if x < 2 {
+        return false;
+    }
+    if x % 2 == 0 {
+        return x == 2;
+    }
+    let mut d = 3;
+    while d * d <= x {
+        if x % d == 0 {
+            return false;
+        }
+        d += 2;
+    }
+    true
 }
 
 /// Minimal FNV-1a 64-bit hasher with a seeded offset basis. Deterministic and
@@ -566,6 +569,44 @@ impl Maglev {
         }
 
         self.table = table;
+
+        // Post-conditions (TigerStyle). The table is either fully built or empty:
+        //   * `size` is the prime chosen at construction — rebuild never changes
+        //     it (the permutation math depends on a coprime stride over a prime).
+        //   * a populated table is exactly `size` slots, every entry a valid
+        //     index into `backend_addrs` (`< backend_addrs.len() <= size`), so a
+        //     later `table[slot]` lookup can never index out of `backend_addrs`.
+        //   * `backend_addrs` is non-empty whenever the table is non-empty (the
+        //     table maps slots to addresses; an empty address vector would make
+        //     every lookup resolve to nothing).
+        #[cfg(debug_assertions)]
+        {
+            debug_assert!(
+                is_prime(self.size),
+                "Maglev table size {} is not prime",
+                self.size
+            );
+            if self.table.is_empty() {
+                debug_assert!(
+                    self.backend_addrs.is_empty(),
+                    "Maglev: empty table but non-empty backend_addrs"
+                );
+            } else {
+                debug_assert_eq!(
+                    self.table.len(),
+                    self.size,
+                    "Maglev table must have exactly `size` slots"
+                );
+                debug_assert!(
+                    !self.backend_addrs.is_empty(),
+                    "Maglev: non-empty table but empty backend_addrs"
+                );
+                debug_assert!(
+                    self.table.iter().all(|&idx| idx < self.backend_addrs.len()),
+                    "Maglev table holds an index out of backend_addrs range"
+                );
+            }
+        }
     }
 }
 
@@ -606,6 +647,14 @@ impl LoadBalancingAlgorithm for Maglev {
         // is what keeps a partial outage off the hot path and keeps healthy
         // keys pinned to the same backend.
         let start = (key % self.size as u64) as usize;
+        // `key % size` is always a valid table slot, and the table is exactly
+        // `size` long here (non-empty checked above, rebuild post-condition).
+        debug_assert!(start < self.size, "Maglev start slot out of range");
+        debug_assert_eq!(
+            self.table.len(),
+            self.size,
+            "Maglev lookup on a table whose length != size"
+        );
         for i in 0..self.size {
             let slot = (start + i) % self.size;
             let idx = self.table[slot];
