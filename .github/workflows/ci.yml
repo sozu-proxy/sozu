@@ -210,8 +210,8 @@ jobs:
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
 
-      # 300s per target × 2 targets = ~10 min wall, fits inside the
-      # 30-min timeout with ~20 min slack for libFuzzer warm-up and
+      # 300s per target × 3 targets = ~15 min wall, fits inside the
+      # 30-min timeout with ~15 min slack for libFuzzer warm-up and
       # corpus replay. cargo-fuzz writes crash artefacts to
       # `fuzz/artifacts/<target>/`, picked up by the upload step.
       - name: Fuzz fuzz_frame_parser (300s)
@@ -221,6 +221,10 @@ jobs:
       - name: Fuzz fuzz_hpack_decoder (300s)
         working-directory: fuzz
         run: cargo +nightly fuzz run fuzz_hpack_decoder -- -max_total_time=300
+
+      - name: Fuzz fuzz_udp_flow (300s)
+        working-directory: fuzz
+        run: cargo +nightly fuzz run fuzz_udp_flow -- -max_total_time=300
 
       - name: Upload fuzz crashes
         if: failure()
@@ -274,6 +278,32 @@ jobs:
           # produces a consistent advisory set; the duplicate invocation
           # is kept symmetrical with the per-feature build matrix above.
           cargo audit --deny warnings
+
+  # ┌──────────────────────────────────────────────────────────────┐
+  # │ Group C″ — test hygiene: reject a bare `#[ignore]` (one with  │
+  # │   no reason string). Per CONTRIBUTING.md / doc/testing.md,    │
+  # │   `#[ignore]` must carry a reason and only gate an            │
+  # │   environment dependency or a tracked follow-up — never hide  │
+  # │   a failing test. Doc-comment mentions of `#[ignore]` (lines  │
+  # │   starting with `//`) are excluded.                          │
+  # └──────────────────────────────────────────────────────────────┘
+  test-hygiene:
+    name: Test hygiene
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+
+      - name: Reject bare #[ignore] (must carry a reason string)
+        run: |
+          matches=$(grep -rEn '#\[ignore\]' --include='*.rs' . | grep -vE ':[[:space:]]*//' || true)
+          if [ -n "$matches" ]; then
+            echo "::error::bare #[ignore] without a reason string — use #[ignore = \"...\"] (see CONTRIBUTING.md#testing / doc/testing.md):"
+            echo "$matches"
+            exit 1
+          fi
+          echo "OK: every #[ignore] carries a reason string."
 
   # ┌──────────────────────────────────────────────────────────────┐
   # │ Group D — Bombardier load benches (folded from benchmark.yml) │

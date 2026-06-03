@@ -1,0 +1,124 @@
+---
+name: Simulation sweep
+
+# Deterministic-simulation seed swarm + extended fuzzing, in the spirit of
+# FoundationDB's nightly simulation runs. Per-PR CI already exercises the
+# default seed sweep (via `cargo test -p sozu-lib`) and 300s/target fuzzing;
+# this workflow widens both far beyond what fits in a PR gate.
+#
+# Every `(commit, seed)` pair is bit-for-bit reproducible, so a failing seed
+# printed here replays locally with:
+#   SOZU_UDP_SIM_SEED=<seed> cargo test -p sozu-lib --test udp_simulation -- --nocapture
+# See doc/testing.md and doc/udp_simulation.md.
+
+on:
+  schedule:
+    # Daily at 03:17 UTC (quiet window; offset off the hour).
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      seeds:
+        description: 'Number of seeds to sweep (SOZU_UDP_SIM_SEEDS)'
+        required: false
+        default: '4096'
+      steps:
+        description: 'Steps per seed (SOZU_UDP_SIM_STEPS)'
+        required: false
+        default: '20000'
+      fuzz_seconds:
+        description: 'Seconds per fuzz target'
+        required: false
+        default: '900'
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Never cancel a sweep in flight; let scheduled runs complete.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ┌──────────────────────────────────────────────────────────────┐
+  # │ Deterministic simulation seed swarm over the sans-io UDP core │
+  # │   Debug build is REQUIRED: the TigerStyle `debug_assert!`     │
+  # │   invariants are compiled out in release.                    │
+  # └──────────────────────────────────────────────────────────────┘
+  udp-simulation-sweep:
+    name: UDP simulation seed sweep
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # Inputs are exposed as env vars (the safe pattern); the test parses them
+    # and falls back to its built-in defaults on anything non-numeric.
+    env:
+      SOZU_UDP_SIM_SEEDS: ${{ github.event.inputs.seeds || '4096' }}
+      SOZU_UDP_SIM_STEPS: ${{ github.event.inputs.steps || '20000' }}
+    steps:
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Checkout sources
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+
+      - name: Install rust 1.88.0
+        uses: dtolnay/rust-toolchain@1.88.0
+
+      - name: Cache cargo target
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        with:
+          cache-all-crates: true
+          prefix-key: sim-sweep
+          workspaces: . -> target/
+
+      # Debug profile on purpose: the simulator's power is the embedded
+      # `debug_assert!` invariant sweep inside the sans-io core, which a
+      # release build would strip. A failing seed is printed by the test.
+      - name: UDP simulation sweep (debug, asserts live)
+        run: cargo test -p sozu-lib --locked --test udp_simulation -- --nocapture
+
+  # ┌──────────────────────────────────────────────────────────────┐
+  # │ Extended fuzzing — longer than the per-PR 300s budget.        │
+  # └──────────────────────────────────────────────────────────────┘
+  extended-fuzz:
+    name: Extended fuzz
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [fuzz_frame_parser, fuzz_hpack_decoder, fuzz_udp_flow]
+    env:
+      FUZZ_SECONDS: ${{ github.event.inputs.fuzz_seconds || '900' }}
+    steps:
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler cmake
+
+      - name: Checkout sources
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+
+      - name: Install rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo target
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        with:
+          cache-all-crates: true
+          prefix-key: sim-sweep-fuzz
+          workspaces: . -> target/
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Fuzz ${{ matrix.target }}
+        working-directory: fuzz
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo +nightly fuzz run "$TARGET" -- -max_total_time="$FUZZ_SECONDS"
+
+      - name: Upload fuzz crashes
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        with:
+          name: fuzz-crashes-${{ matrix.target }}
+          path: fuzz/artifacts
+          retention-days: 14
