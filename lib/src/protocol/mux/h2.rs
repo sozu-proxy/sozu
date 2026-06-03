@@ -697,6 +697,51 @@ fn has_sendable_response(kawa: &GenericHttpStream) -> bool {
     kawa.is_main_phase() || (kawa.is_terminated() && !kawa.is_completed())
 }
 
+/// Outcome of the M2 cumulative-stall budget decision for one `write_streams`
+/// pass on a window-stalled stream. Extracted from the `write_streams` arm so
+/// the budget logic is unit-testable without a full `ConnectionH2` fixture
+/// (mirrors the [`collect_timed_out_streams`] extraction).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FcStallAction {
+    /// Clear both the deadline (`stream_fc_stalled_since`) and the progress
+    /// accumulator (`stream_fc_stalled_progress`) for this stream.
+    Clear,
+    /// Ensure the deadline is armed (WITHOUT refreshing an existing `Instant`)
+    /// and set the progress accumulator to `progress`.
+    Arm { progress: usize },
+}
+
+/// Decide what to do with a stream's flow-control-stall deadline + cumulative
+/// progress accumulator on one write pass (M2 cumulative-stall budget).
+///
+/// - A genuinely open send window (`!outbound_window_blocked`) is a real
+///   un-stall → [`FcStallAction::Clear`].
+/// - While the window stays blocked, accumulate this pass's outbound drain
+///   (`consumed`, clamped to `>= 0`) onto `prior_progress`. Once the cumulative
+///   total reaches [`FC_STALL_CLEAR_FLOOR`] (a full DATA frame of real delivery)
+///   → `Clear`; otherwise `Arm` with the running total. A `WINDOW_UPDATE(+1)`
+///   drip adds ~1 byte/pass and never reaches the floor, so the deadline keeps
+///   aging and the reaper eventually fires.
+fn fc_stall_budget_decision(
+    outbound_window_blocked: bool,
+    consumed: i32,
+    prior_progress: Option<usize>,
+) -> FcStallAction {
+    if !outbound_window_blocked {
+        return FcStallAction::Clear;
+    }
+    let progressed = prior_progress
+        .unwrap_or(0)
+        .saturating_add(consumed.max(0) as usize);
+    if progressed >= FC_STALL_CLEAR_FLOOR {
+        FcStallAction::Clear
+    } else {
+        FcStallAction::Arm {
+            progress: progressed,
+        }
+    }
+}
+
 /// Core of [`ConnectionH2::enqueue_rst`], extracted so the RST-queueing
 /// semantics (dedupe, queued-cap counter bump, invariant-15 readiness rearm)
 /// can be unit-tested without building a full `ConnectionH2<Front>` fixture.
@@ -2782,27 +2827,20 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             let outbound_window_blocked = has_sendable_response(kawa)
                 && min(*parts.window, self.flow_control.window) <= 0
                 && (!kawa.blocks.is_empty() || !kawa.out.is_empty());
-            if !outbound_window_blocked {
-                self.stream_fc_stalled_since.remove(&stream_id);
-                self.stream_fc_stalled_progress.remove(&stream_id);
-            } else {
-                let progressed = self
-                    .stream_fc_stalled_progress
-                    .get(&stream_id)
-                    .copied()
-                    .unwrap_or(0)
-                    .saturating_add(consumed.max(0) as usize);
-                if progressed >= FC_STALL_CLEAR_FLOOR {
-                    // A full frame of cumulative progress: not a drip. Clear and
-                    // let the next stalled pass re-arm with a fresh deadline.
+            match fc_stall_budget_decision(
+                outbound_window_blocked,
+                consumed,
+                self.stream_fc_stalled_progress.get(&stream_id).copied(),
+            ) {
+                FcStallAction::Clear => {
                     self.stream_fc_stalled_since.remove(&stream_id);
                     self.stream_fc_stalled_progress.remove(&stream_id);
-                } else {
+                }
+                FcStallAction::Arm { progress } => {
                     self.stream_fc_stalled_since
                         .entry(stream_id)
                         .or_insert_with(Instant::now);
-                    self.stream_fc_stalled_progress
-                        .insert(stream_id, progressed);
+                    self.stream_fc_stalled_progress.insert(stream_id, progress);
                 }
             }
             total_bytes_written = total_bytes_written.saturating_add(stream_bytes);
@@ -7730,6 +7768,93 @@ mod tests {
         // `Iterator::any` short-circuits on the first `true` — so the probe
         // must fire at most once in this construction.
         assert_eq!(calls, 1);
+    }
+
+    // ── cumulative-stall budget decision (fc_stall_budget_decision) ──
+
+    #[test]
+    fn test_fc_stall_budget_open_window_always_clears() {
+        // A genuinely open send window is a real un-stall, regardless of prior
+        // accumulated progress or this pass's drain.
+        assert_eq!(
+            fc_stall_budget_decision(false, 0, None),
+            FcStallAction::Clear
+        );
+        assert_eq!(
+            fc_stall_budget_decision(false, 1, Some(5)),
+            FcStallAction::Clear
+        );
+        assert_eq!(
+            fc_stall_budget_decision(false, i32::MAX, Some(FC_STALL_CLEAR_FLOOR)),
+            FcStallAction::Clear
+        );
+    }
+
+    #[test]
+    fn test_fc_stall_budget_blocked_arms_and_accumulates() {
+        // First blocked pass arms with this pass's drain.
+        assert_eq!(
+            fc_stall_budget_decision(true, 1, None),
+            FcStallAction::Arm { progress: 1 }
+        );
+        // A blocked pass with no drain keeps the accumulator unchanged, so the
+        // deadline keeps aging (a window-0 stall makes consumed == 0).
+        assert_eq!(
+            fc_stall_budget_decision(true, 0, Some(42)),
+            FcStallAction::Arm { progress: 42 }
+        );
+        // Negative `consumed` is clamped to 0 (defensive; converter.window only
+        // shrinks, so consumed is >= 0 in practice).
+        assert_eq!(
+            fc_stall_budget_decision(true, -10, Some(7)),
+            FcStallAction::Arm { progress: 7 }
+        );
+    }
+
+    #[test]
+    fn test_fc_stall_budget_floor_clears() {
+        // Reaching the floor in a single pass (a full DATA frame of real
+        // delivery) clears the deadline.
+        assert_eq!(
+            fc_stall_budget_decision(true, FC_STALL_CLEAR_FLOOR as i32, None),
+            FcStallAction::Clear
+        );
+        // Exactly one byte below the floor still arms.
+        assert_eq!(
+            fc_stall_budget_decision(true, (FC_STALL_CLEAR_FLOOR - 1) as i32, None),
+            FcStallAction::Arm {
+                progress: FC_STALL_CLEAR_FLOOR - 1
+            }
+        );
+        // Prior progress plus this pass crossing the floor clears.
+        assert_eq!(
+            fc_stall_budget_decision(true, 1, Some(FC_STALL_CLEAR_FLOOR - 1)),
+            FcStallAction::Clear
+        );
+    }
+
+    #[test]
+    fn test_fc_stall_budget_wu_drip_ages_until_floor() {
+        // The WINDOW_UPDATE(+1) closure: a 1-byte-per-pass drip must keep the
+        // deadline armed (aging) for the whole run up to the floor and only
+        // clear on the pass that reaches it — so a drip granting < floor bytes
+        // per idle period is reaped, never kept alive. This is the unit-level
+        // proof that the budget closes the WINDOW_UPDATE-drip vector.
+        let mut progress: Option<usize> = None;
+        for pass in 1..FC_STALL_CLEAR_FLOOR {
+            match fc_stall_budget_decision(true, 1, progress) {
+                FcStallAction::Arm { progress: p } => {
+                    assert_eq!(p, pass, "drip accumulator off at pass {pass}");
+                    progress = Some(p);
+                }
+                FcStallAction::Clear => panic!("drip cleared the deadline early at pass {pass}"),
+            }
+        }
+        // The pass that reaches the floor finally clears.
+        assert_eq!(
+            fc_stall_budget_decision(true, 1, progress),
+            FcStallAction::Clear
+        );
     }
 
     // ── flow-control-stall reaper union (collect_timed_out_streams) ──
