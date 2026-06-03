@@ -46,6 +46,7 @@ mod redirect_rewrite_auth_tests;
 mod tcp_tests;
 mod tests;
 mod tls_tests;
+mod udp_tests;
 
 use std::{io::stdin, net::SocketAddr};
 

@@ -229,6 +229,9 @@ impl Worker {
         for listener in upgrade_state.tcp_listeners.values_mut() {
             listener.active = false;
         }
+        for listener in upgrade_state.udp_listeners.values_mut() {
+            listener.active = false;
+        }
 
         let mut worker =
             Worker::start_new_worker(name, self.config.to_owned(), &listeners, upgrade_state);

@@ -24,3 +24,8 @@ doc = false
 name = "fuzz_hpack_decoder"
 path = "fuzz_targets/fuzz_hpack_decoder.rs"
 doc = false
+
+[[bin]]
+name = "fuzz_udp_flow"
+path = "fuzz_targets/fuzz_udp_flow.rs"
+doc = false

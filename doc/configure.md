@@ -112,7 +112,7 @@ _General parameters:_
 
 ```toml
 [[listeners]]
-# possible values are http, https or tcp
+# possible values are http, https, tcp or udp
 protocol = "http"
 # listening address
 address = "0.0.0.0:8080"
@@ -122,6 +122,7 @@ address = "0.0.0.0:8080"
 # public_address = "1.2.3.4:80
 
 # Configures the client socket to receive a PROXY protocol header
+# (TCP listeners only — not supported on UDP listeners)
 # expect_proxy = false
 ```
 
@@ -541,6 +542,67 @@ openssl req -new -key ecdsa.key -x509 -days 365 \
 > extension matching the frontend hostname. Certificates without SANs may cause
 > TLS handshake failures.
 
+#### Options specific to UDP listeners
+
+A `protocol = "udp"` listener load-balances datagram traffic (DNS, syslog, NTP,
+generic UDP) to a cluster's backends. UDP is **plaintext only** and is served by
+exactly one worker per listener (see [Limitations](#udp-limitations) below).
+
+```toml
+[[listeners]]
+protocol       = "udp"
+address        = "0.0.0.0:53"
+# public_address = "203.0.113.10:53"
+
+# client / upstream flow idle timeout, in seconds. A flow is reaped once it has
+# been idle for this long. Defaults to 30.
+front_timeout  = 30
+back_timeout   = 30
+
+# maximum received datagram size, in bytes. Defaults to 1500 (one Ethernet
+# frame). Capped at the global `buffer_size` (>= 16393): a value larger than
+# `buffer_size` is clamped to it at config-load with a warning. A datagram on
+# the wire that exceeds the effective read size is truncated (MSG_TRUNC) and
+# dropped (`udp.datagrams.dropped`, reason `truncated`) — never a panic. Raise
+# it for large EDNS0 / DNS responses; keep responses within PMTU where possible.
+max_rx_datagram_size = 1500
+
+# maximum number of concurrent flows on this listener. `0` (the default)
+# auto-derives a cap from ~70% of the soft RLIMIT_NOFILE, because every flow
+# owns one connected upstream socket (one fd). An explicit value above that
+# bound is accepted but warns at config-load. New flows beyond the cap are shed
+# (dropped + `udp.flows.shed`), never crashing the worker on EMFILE/ENFILE.
+max_flows      = 0
+```
+
+> **Note:** inbound UDP PROXY-protocol decode (`expect_proxy`) is **not
+> supported** on UDP listeners — the field is rejected. (Sōzu can still *send* a
+> PROXY v2 header to UDP backends; see the cluster `send_proxy_protocol` knob
+> below.) UDP listeners also have no `connect_timeout` (there is no connect
+> handshake) and no `request_timeout`.
+
+<a id="udp-limitations"></a>
+
+##### UDP limitations
+
+- **One worker per UDP listener.** A UDP listener is bound and served by exactly
+  one worker, so per-listener throughput is one core. Scale across cores by
+  running **multiple UDP listeners** (each owned by one worker) rather than
+  expecting a single listener to span workers.
+- **Flows reset on hot-upgrade.** On a zero-downtime upgrade the **listener
+  socket** is handed to the new worker over SCM_RIGHTS, but per-flow state (the
+  flow table and the per-flow connected upstream sockets) lives in the old
+  worker's heap and is **not migrated**. The old worker drains its in-flight
+  flows (bounded by the idle timeout) while the new worker serves new flows. For
+  short datagram flows (DNS = one request + reply) this is near-invisible; a
+  flow caught in-flight loses at most a datagram and the client retries.
+- **Plaintext only.** No DTLS termination, no QUIC/HTTP3 CID-aware routing, no
+  UDP-over-HTTP tunnelling.
+- **Other non-goals:** Direct Server Return (DSR), io_uring / XDP / eBPF
+  datapaths, eBPF `SK_REUSEPORT` single-listener multi-core, inbound UDP
+  PROXY-protocol decode, and transparent (`IP_TRANSPARENT`) return are all out
+  of scope.
+
 ### Clusters
 
 You can declare the list of your _clusters_ under the `[clusters]` section. They
@@ -623,6 +685,83 @@ The frontend and backend protocols are independent. All four combinations work:
 
 > **Note:** The `http2` option controls the backend protocol only. The frontend
 > protocol is determined by TLS ALPN negotiation between the client and Sōzu.
+
+#### UDP clusters
+
+A cluster fronting a UDP listener selects its load-balancing algorithm with the
+shared cluster-level `load_balancing` key, and carries its datagram-specific
+knobs (flow affinity, teardown counters, PROXY-protocol, health checks) under an
+optional `[clusters.<id>.udp]` block.
+
+Two source-hash algorithms are added for flow-affine UDP selection (both are
+also valid for the existing `load_balancing` field):
+
+| `load_balancing` | Affinity | Notes                                                                                                                                  |
+| ---------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `ROUND_ROBIN`    | none     | Rotate through backends. The existing default; no source affinity.                                                                     |
+| `HRW`            | yes      | Highest-Random-Weight / rendezvous hashing — the recommended UDP default. `O(N)` per selection, no precomputed table, so no rebuild stall on hot-reconfig and provably-minimal flow remapping when backends change. |
+| `MAGLEV`         | yes      | Maglev consistent hashing — `O(1)` per-packet table lookup, near-perfect balance, for large backend sets / high pps. The lookup table is rebuilt in the control-plane reconcile step on a backend-set change (not per-packet) and remaps ~2× more keys than HRW on churn. |
+
+> **Note:** the `load_balancing` enum is parsed in `SCREAMING_SNAKE_CASE`
+> (`"ROUND_ROBIN"`, `"HRW"`, `"MAGLEV"`, …) — the same casing as every other
+> proto-backed enum in this file (e.g. `tls_versions`).
+
+The `[clusters.<id>.udp]` block:
+
+| Key                             | Default      | Description                                                                                                                                   |
+| ------------------------------- | ------------ | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `affinity_key`                  | `SOURCE_IP`  | Flow affinity key for hash LBs. `SOURCE_IP` pins every port from one client to one backend; `SOURCE_IP_PORT` keys on the full source 2-tuple. |
+| `responses`                     | `0`          | Expected replies per flow. A DNS flow sets `responses = 1` so the flow closes immediately after its single reply; `0` = unlimited (syslog-style fire-and-forget). |
+| `requests`                      | `0`          | Maximum client datagrams per flow before teardown. `0` = unlimited.                                                                           |
+| `send_proxy_protocol`           | `false`      | Prepend a PROXY protocol **v2** header (carrying the real client `SocketAddr`) to the backend. By default it is sent on the **first** datagram of the flow only. Backend PPv2-over-UDP parse support is not guaranteed by the spec — verify per backend. |
+| `proxy_protocol_every_datagram` | `false`      | When `true`, prepend the PPv2 header to **every** datagram instead of the first only. Useful when a flow may be re-created after idle eviction and the backend needs the client context on each datagram. |
+
+The `[clusters.<id>.udp.health]` sub-block configures active backend health
+checks, bound to the endpoint:
+
+| Key                      | Default     | Description                                                                                                               |
+| ------------------------ | ----------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `mode`                   | `TCP_PROBE` | `HEALTH_OFF` disables health checking; `TCP_PROBE` opens a non-blocking TCP connection to a companion port (the industry-standard liveness hint — a hint, not proof of UDP reachability); `UDP_PROBE` sends an application datagram and expects any reply. Defaults to `TCP_PROBE` when a `[…udp.health]` block is present. |
+| `tcp_port`               | data port   | Companion TCP probe port. Unset = the backend's data port.                                                                |
+| `rise`                   | `2`         | Consecutive successes before a backend is marked up (hysteresis).                                                         |
+| `fall`                   | `3`         | Consecutive failures before a backend is marked down (hysteresis). A flapping probe never re-hashes live flows; flows on a now-unhealthy backend stay pinned via the flow table until idle-timeout. |
+| `fail_open`              | `true`      | When **all** backends read unhealthy, still run the normal LB over the full configured backend set (ignoring health) rather than black-holing traffic. |
+| `udp_probe_payload`      | —           | Literal payload sent for a `UDP_PROBE` (e.g. a DNS query).                                                                |
+| `probe_interval_seconds` | `5`         | Delay between probes, in seconds.                                                                                         |
+| `probe_timeout_seconds`  | `2`         | Per-probe response timeout, in seconds.                                                                                   |
+
+A complete DNS cluster, with HRW affinity, single-reply flows, PROXY v2 to the
+backend, and a TCP-probe health check:
+
+```toml
+[[listeners]]
+protocol = "udp"
+address  = "0.0.0.0:53"
+
+[clusters.dns]
+protocol       = "tcp"            # cluster transport family; UDP knobs live under [clusters.dns.udp]
+load_balancing = "HRW"            # ROUND_ROBIN | HRW (source-hash, recommended for UDP) | MAGLEV
+frontends = [
+  { address = "0.0.0.0:53" }
+]
+backends = [
+  { address = "10.0.0.10:53" },
+  { address = "10.0.0.11:53" }
+]
+
+[clusters.dns.udp]
+affinity_key        = "SOURCE_IP" # SOURCE_IP | SOURCE_IP_PORT
+responses           = 1           # DNS = one reply per query; closes the flow when reached
+requests            = 0           # 0 = unlimited client datagrams per flow
+send_proxy_protocol = true        # PROXY v2 to the backend, first datagram only
+
+[clusters.dns.udp.health]
+mode      = "TCP_PROBE"           # HEALTH_OFF | TCP_PROBE | UDP_PROBE
+tcp_port  = 53                    # companion probe port; default = the data port
+rise      = 2
+fall      = 3
+fail_open = true                  # all-unhealthy ⇒ LB over the full configured set
+```
 
 #### Buffer size for HTTP/2
 
@@ -1337,6 +1476,20 @@ immediately after the patch is acknowledged.
 | `front_timeout`   | `u32` (seconds) | session-at-accept | `60`    |       |
 | `back_timeout`    | `u32` (seconds) | session-at-accept | `30`    |       |
 | `connect_timeout` | `u32` (seconds) | session-at-accept | `3`     |       |
+
+#### UDP listeners
+
+Patched values apply to **new** flows; flows already in progress keep their
+captured value. `address` and `active` are bind-only — change them with
+`RemoveListener` + add.
+
+| Field                  | Type            | Mutability class | Default | Notes                                                                 |
+| ---------------------- | --------------- | ---------------- | ------- | --------------------------------------------------------------------- |
+| `public_address`       | `SocketAddr`    | flow-at-admit    | —       | Source address reported to backends / logs                            |
+| `front_timeout`        | `u32` (seconds) | flow-at-admit    | `30`    | Client flow idle timeout                                              |
+| `back_timeout`         | `u32` (seconds) | flow-at-admit    | `30`    | Upstream flow idle timeout                                            |
+| `max_rx_datagram_size` | `u32` (bytes)   | flow-at-admit    | `1500`  | Clamped to the effective `buffer_size`                                |
+| `max_flows`            | `u32`           | flow-at-admit    | `0`     | `0` = auto (~70% of soft RLIMIT_NOFILE)                               |
 
 ### Examples
 
@@ -2213,6 +2366,25 @@ Incremented when a session fails to transition between protocol phases:
 | `rustls.write.error`               | counter | proxy | TLS write error                                 |
 | `rustls.read.infinite_loop.error`  | counter | proxy | TLS read loop safety breaker triggered          |
 | `rustls.write.infinite_loop.error` | counter | proxy | TLS write loop safety breaker triggered         |
+
+#### UDP
+
+Emitted by `protocol = "udp"` listeners. `udp.active_flows` is a gauge and is
+guaranteed not to underflow on close / timeout / shed / error paths.
+
+| Metric                   | Type    | Scope            | Description                                                                                                                          |
+| ------------------------ | ------- | ---------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `udp.datagrams.in`       | counter | cluster, backend | Client datagrams received                                                                                                           |
+| `udp.datagrams.out`      | counter | cluster, backend | Datagrams forwarded (to backend) and returned (to client)                                                                          |
+| `udp.bytes.in`           | counter | cluster, backend | Bytes received from clients                                                                                                         |
+| `udp.bytes.out`          | counter | cluster, backend | Bytes sent (to backend and back to client)                                                                                         |
+| `udp.active_flows`       | gauge   | proxy            | Currently tracked flows (one connected upstream socket each). Never underflows                                                     |
+| `udp.flows.created`      | counter | cluster, backend | Flows admitted and tracked                                                                                                          |
+| `udp.flows.evicted`      | counter | cluster, backend | Flows torn down (idle timeout / `responses` reached / `requests` reached / drain)                                                  |
+| `udp.flows.shed`         | counter | proxy            | New flows dropped at the `max_flows` cap or on `EMFILE`/`ENFILE` (existing flows protected)                                        |
+| `udp.datagrams.dropped`  | counter | proxy            | Datagrams dropped, by reason: `invalid` / `truncated` / `no-backend` / `shed` / `wq-full` (write-queue full) / `unknown-flow` / `send-error` |
+| `udp.backend.health`     | gauge   | cluster, backend | `1` when the backend passes its UDP health check, `0` when down                                                                    |
+| `udp.flow.duration`      | time    | cluster, backend | Flow lifetime, from admission to teardown                                                                                          |
 
 #### Other
 

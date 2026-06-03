@@ -18,7 +18,9 @@ use sozu_command::{
 use crate::metrics::names;
 use crate::{
     PeakEWMA,
-    load_balancing::{LeastLoaded, LoadBalancingAlgorithm, PowerOfTwo, Random, RoundRobin},
+    load_balancing::{
+        LeastLoaded, LoadBalancingAlgorithm, Maglev, PowerOfTwo, Random, Rendezvous, RoundRobin,
+    },
     retry::{self, RetryPolicy},
     server::{self, push_event},
 };
@@ -563,6 +565,51 @@ impl BackendMap {
         Ok((next_backend.clone(), tcp_stream))
     }
 
+    /// Select a backend for `cluster_id`, optionally pinned by an affinity
+    /// `key`, and return its `(backend_id, address)` **without** opening any
+    /// connection.
+    ///
+    /// This is the UDP datapath's selection entry point. Unlike
+    /// [`backend_from_cluster_id`](Self::backend_from_cluster_id) — which is
+    /// TCP-specific because it calls `Backend::try_connect` and hands back a
+    /// `TcpStream` — UDP owns its own per-flow connected `UdpSocket` (created in
+    /// the shell via `socket::udp_connect`), so all the map needs to surface is
+    /// the chosen endpoint identity. `key` is `Some(flow_hash)` so HRW/Maglev
+    /// keep a client flow pinned to one backend; `None` behaves like the legacy
+    /// round-robin selection. Fail-open (all-unhealthy ⇒ LB over the full set)
+    /// is inherited from [`BackendList::next_available_backend_with_key`].
+    pub fn backend_from_cluster_id_with_key(
+        &mut self,
+        cluster_id: &str,
+        key: Option<u64>,
+    ) -> Result<(String, SocketAddr), BackendError> {
+        let cluster_backends = self
+            .backends
+            .get_mut(cluster_id)
+            .ok_or(BackendError::NoBackendForCluster(cluster_id.to_owned()))?;
+
+        if cluster_backends.backends.is_empty() {
+            let _ = cluster_backends;
+            self.record_cluster_availability(cluster_id);
+            return Err(BackendError::NoBackendForCluster(cluster_id.to_owned()));
+        }
+
+        let next_backend = match cluster_backends.next_available_backend_with_key(key) {
+            Some(nb) => nb,
+            None => {
+                let _ = cluster_backends;
+                self.record_cluster_availability(cluster_id);
+                return Err(BackendError::NoBackendForCluster(cluster_id.to_owned()));
+            }
+        };
+
+        let (backend_id, address) = {
+            let borrowed = next_backend.borrow();
+            (borrowed.backend_id.to_owned(), borrowed.address)
+        };
+        Ok((backend_id, address))
+    }
+
     pub fn backend_from_sticky_session(
         &mut self,
         cluster_id: &str,
@@ -701,6 +748,11 @@ impl BackendList {
                 b.backup = backend.backup;
             }
         }
+        // Refresh table-based policies (Maglev) off the datapath whenever the
+        // full backend set or a weight changes. This is the ONLY place the
+        // table is rebuilt on mutation; selection never rebuilds. The default
+        // `rebuild` is a no-op for the stateless policies.
+        self.load_balancing.rebuild(&self.backends);
     }
 
     /// Remove every backend at `backend_address` and return the list of
@@ -721,6 +773,12 @@ impl BackendList {
                 true
             }
         });
+        // Rebuild table-based policies (Maglev) off the datapath after the set
+        // shrinks, only when something was actually removed. No-op for the
+        // stateless policies.
+        if !removed.is_empty() {
+            self.load_balancing.rebuild(&self.backends);
+        }
         removed
     }
 
@@ -758,6 +816,19 @@ impl BackendList {
     }
 
     pub fn next_available_backend(&mut self) -> Option<Rc<RefCell<Backend>>> {
+        self.next_available_backend_with_key(None)
+    }
+
+    /// Pick the next available backend, optionally pinned by an affinity `key`.
+    ///
+    /// `key` is only consulted by consistent-hashing policies (HRW/Maglev);
+    /// every other policy ignores it, so `next_available_backend_with_key(None)`
+    /// is byte-for-byte the legacy behavior. The UDP datapath calls this with
+    /// `Some(flow_hash)` to keep a client flow pinned to one backend.
+    pub fn next_available_backend_with_key(
+        &mut self,
+        key: Option<u64>,
+    ) -> Option<Rc<RefCell<Backend>>> {
         let mut backends = self.available_backends(false);
 
         if backends.is_empty() {
@@ -773,7 +844,9 @@ impl BackendList {
                 );
                 self.fail_open_warned = false;
             }
-            return self.load_balancing.next_available_backend(&mut backends);
+            return self
+                .load_balancing
+                .next_available_backend(key, &mut backends);
         }
 
         // Fail-open: when no backend passes the full `can_open()` gate,
@@ -811,7 +884,8 @@ impl BackendList {
         }
         count!(names::backend::FAIL_OPEN, 1);
 
-        self.load_balancing.next_available_backend(&mut backends)
+        self.load_balancing
+            .next_available_backend(key, &mut backends)
     }
 
     pub fn set_load_balancing_policy(
@@ -833,6 +907,16 @@ impl BackendList {
                 self.load_balancing = Box::new(PowerOfTwo {
                     metric: metric.unwrap_or(LoadMetric::Connections),
                 })
+            }
+            // Affinity policies (used by the UDP datapath). They consult the
+            // optional hash key; with `None` they fall back to round-robin.
+            LoadBalancingAlgorithms::Hrw => self.load_balancing = Box::new(Rendezvous::new()),
+            LoadBalancingAlgorithms::Maglev => {
+                let mut maglev = Maglev::new();
+                // Seed the lookup table from the currently-known backends so
+                // selection is correct before the first control-plane rebuild.
+                maglev.rebuild(&self.backends);
+                self.load_balancing = Box::new(maglev);
             }
         }
     }

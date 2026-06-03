@@ -80,7 +80,7 @@ target/release/sozu start -c bin/config.toml
 
 The Cargo workspace ships four crates (Rust 2024 edition, MSRV 1.88):
 
-- `lib/`: the `sozu-lib` reverse proxy library hosts the single-threaded mio event loop, the HTTP/1.1 (Kawa) and HTTP/2 multiplexer, TCP and TLS protocols, routing, per-IP rate limiting, sockets, metrics, and the buffer pool.
+- `lib/`: the `sozu-lib` reverse proxy library hosts the single-threaded mio event loop, the HTTP/1.1 (Kawa) and HTTP/2 multiplexer, TCP, UDP, and TLS protocols, routing, per-IP rate limiting, sockets, metrics, and the buffer pool.
 - `bin/`: the `sozu` binary wraps the library in a master/worker supervisor, exposes the unix command socket, orchestrates hot reconfiguration and zero-downtime upgrades, and ships the optional `sozu top` TUI behind the `tui` feature.
 - `command/`: the `sozu-command-lib` ships the protobuf IPC schema, configuration parser, replicated state, length-prefixed channels, and SCM FD-passing helpers used by both `lib` and `bin`.
 - `e2e/`: the `sozu-e2e` integration harness spawns real workers plus mock clients and backends to exercise the H1, H2, TLS, PROXY-protocol, command-channel hardening, and listener/upgrade hot-reconfig paths.

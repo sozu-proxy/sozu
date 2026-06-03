@@ -4,8 +4,9 @@
 //! cadence (operator-paced; listener state changes flow through the EVENTS
 //! pane). This pane just renders the freshest snapshot as a flat table.
 //!
-//! Three columns per address: protocol (HTTP / HTTPS / TCP), address,
-//! status hint (active, scheme, ALPN summary for HTTPS).
+//! Three columns per address: protocol (HTTP / HTTPS / TCP / UDP), address,
+//! status hint (active, scheme, ALPN summary for HTTPS, datagram/flow caps
+//! for UDP).
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Rect};
@@ -73,6 +74,19 @@ pub fn render(f: &mut Frame<'_>, area: Rect, app: &App, skin: &Skin) {
                 Cell::from("TCP"),
                 Cell::from(addr.to_owned()),
                 Cell::from(format!("active={}", cfg.active)),
+            ])
+            .style(Style::default().fg(skin.secondary)),
+        );
+    }
+    for (addr, cfg) in &listeners.udp_listeners {
+        rows.push(
+            Row::new(vec![
+                Cell::from("UDP"),
+                Cell::from(addr.to_owned()),
+                Cell::from(format!(
+                    "active={} · max_rx={} · max_flows={}",
+                    cfg.active, cfg.max_rx_datagram_size, cfg.max_flows
+                )),
             ])
             .style(Style::default().fg(skin.secondary)),
         );

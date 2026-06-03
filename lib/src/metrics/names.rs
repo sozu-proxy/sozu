@@ -304,6 +304,59 @@ pub mod tcp {
     pub const WRITE_ERROR: &str = "tcp.write.error";
 }
 
+/// UDP datapath counters/gauges, fed by the UDP I/O shell in `lib/src/udp.rs`.
+///
+/// `IN`/`OUT` follow the client perspective: `IN` = client→backend
+/// (request), `OUT` = backend→client (reply). `ACTIVE_FLOWS` is a gauge that
+/// must never underflow — it is incremented exactly once per admitted flow
+/// (`FLOWS_CREATED`) and decremented exactly once per close.
+pub mod udp {
+    /// Client→backend datagrams forwarded.
+    pub const DATAGRAMS_IN: &str = "udp.datagrams.in";
+    /// Backend→client datagrams returned.
+    pub const DATAGRAMS_OUT: &str = "udp.datagrams.out";
+    /// Payload bytes forwarded client→backend (excludes PPv2 prefix).
+    pub const BYTES_IN: &str = "udp.bytes.in";
+    /// Payload bytes returned backend→client.
+    pub const BYTES_OUT: &str = "udp.bytes.out";
+    /// Gauge: currently admitted flows. Never underflows.
+    pub const ACTIVE_FLOWS: &str = "udp.active_flows";
+    /// Flows admitted since boot.
+    pub const FLOWS_CREATED: &str = "udp.flows.created";
+    /// Flows torn down (idle / teardown / drain).
+    pub const FLOWS_EVICTED: &str = "udp.flows.evicted";
+    /// New flows shed at the `max_flows` cap or under fd pressure.
+    pub const FLOWS_SHED: &str = "udp.flows.shed";
+    /// Datagrams dropped before allocation (aggregate). Reason-specific
+    /// counters below carry the dotted `.<reason>` suffix; both are emitted
+    /// so dashboards can chart the total or break it down. The `incr!` macro
+    /// needs `&'static str`, so the by-reason names are fixed constants
+    /// rather than a runtime-formatted suffix.
+    pub const DATAGRAMS_DROPPED: &str = "udp.datagrams.dropped";
+    /// Dropped: failed validation (empty / extractor rejected).
+    pub const DROPPED_INVALID: &str = "udp.datagrams.dropped.invalid";
+    /// Dropped: exceeded `max_rx_datagram_size` (truncation surrogate).
+    pub const DROPPED_TRUNCATED: &str = "udp.datagrams.dropped.truncated";
+    /// Dropped: no cluster/backend configured for the listener.
+    pub const DROPPED_NO_BACKEND: &str = "udp.datagrams.dropped.no_backend";
+    /// Dropped: flow-table cap reached (shed).
+    pub const DROPPED_SHED: &str = "udp.datagrams.dropped.shed";
+    /// Dropped: referenced an unknown / already-closed flow.
+    pub const DROPPED_UNKNOWN_FLOW: &str = "udp.datagrams.dropped.unknown_flow";
+    /// Dropped: the bounded per-flow / client-return write queue was at
+    /// capacity (genuine egress-queue overflow under sustained `WouldBlock`).
+    pub const DROPPED_WQ_FULL: &str = "udp.datagrams.dropped.wq_full";
+    /// Dropped: a hard `send`/`send_to` error (e.g. ECONNREFUSED) on the egress
+    /// path, distinct from a queue-full overflow. The egress "no resolved flow /
+    /// socket gone" case routes to [`DROPPED_UNKNOWN_FLOW`] instead, so
+    /// `wq_full` only counts genuine bounded-queue overflow.
+    pub const DROPPED_SEND_ERROR: &str = "udp.datagrams.dropped.send_error";
+    /// Backend health transitions observed by the UDP health prober.
+    pub const BACKEND_HEALTH: &str = "udp.backend.health";
+    /// `time!` of a flow's lifetime, recorded on close.
+    pub const FLOW_DURATION: &str = "udp.flow.duration";
+}
+
 /// TLS counters (certificate inventory, handshake timing).
 pub mod tls {
     pub const CERT_MIN_EXPIRES_AT_SECONDS: &str = "tls.cert.min_expires_at_seconds";

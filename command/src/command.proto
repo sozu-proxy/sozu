@@ -143,6 +143,14 @@ message Request {
     // server-side after `ttl_seconds` so a crashed client never permanently
     // elevates cardinality. See doc/configure.md for the full semantics.
     SetMetricDetail set_metric_detail = 55;
+    // add a UDP listener
+    UdpListenerConfig add_udp_listener = 56;
+    // patch a running UDP listener in place (no socket re-bind)
+    UpdateUdpListenerConfig update_udp_listener = 57;
+    // add a UDP frontend
+    RequestUdpFrontend add_udp_frontend = 58;
+    // remove a UDP frontend
+    RequestUdpFrontend remove_udp_frontend = 59;
   }
 }
 
@@ -365,6 +373,26 @@ message UpdateTcpListenerConfig {
     optional uint32 back_timeout = 5;
     // time to connect to the backend, in seconds
     optional uint32 connect_timeout = 6;
+}
+
+// Partial-update patch for a running UDP listener.
+// Only fields that are `Some` in the patch will be applied;
+// absent fields preserve their current value on the listener.
+// Bind-only fields (address, active) are intentionally absent — use
+// RemoveListener + AddUdpListener to change them.
+message UpdateUdpListenerConfig {
+    // identifies the listener to patch (required — used as key)
+    required SocketAddress address = 1;
+
+    optional SocketAddress public_address = 2;
+    // client flow idle time, in seconds
+    optional uint32 front_timeout = 3;
+    // upstream flow idle time, in seconds
+    optional uint32 back_timeout = 4;
+    // maximum received datagram size, in bytes (capped at buffer_size at runtime)
+    optional uint32 max_rx_datagram_size = 5;
+    // maximum number of concurrent flows; 0 = auto (~70% soft RLIMIT_NOFILE)
+    optional uint32 max_flows = 6;
 }
 
 // details of an HTTP listener
@@ -623,6 +651,22 @@ message TcpListenerConfig {
     required bool active = 7 [default = false];
 }
 
+// details of a UDP listener
+message UdpListenerConfig {
+    required SocketAddress address = 1;
+    optional SocketAddress public_address = 2;
+    // client flow idle time, in seconds
+    required uint32 front_timeout = 3 [default = 30];
+    // upstream flow idle time, in seconds
+    required uint32 back_timeout = 4 [default = 30];
+    // maximum received datagram size, in bytes (capped at buffer_size at runtime)
+    required uint32 max_rx_datagram_size = 5 [default = 1500];
+    // maximum number of concurrent flows; 0 = auto (~70% soft RLIMIT_NOFILE)
+    required uint32 max_flows = 6 [default = 0];
+    // wether the listener is actively listening on its socket
+    required bool active = 7 [default = false];
+}
+
 // HSTS (HTTP Strict Transport Security, RFC 6797) policy attached to
 // an HTTPS listener default or per-frontend. The materialised
 // `Strict-Transport-Security: max-age=N[; includeSubDomains][; preload]`
@@ -724,6 +768,7 @@ enum ListenerType {
     HTTP = 0;
     HTTPS = 1;
     TCP = 2;
+    UDP = 3;
 }
 
 // All listeners, listed
@@ -734,6 +779,8 @@ message ListenersList {
     map<string, HttpsListenerConfig> https_listeners = 2;
     // address -> tcp listener config
     map<string, TcpListenerConfig> tcp_listeners = 3;
+    // address -> udp listener config
+    map<string, UdpListenerConfig> udp_listeners = 4;
 }
 
 // Frontend-level redirect policy. Mirrors HAProxy's
@@ -841,6 +888,14 @@ message RequestHttpFrontend {
 message RequestTcpFrontend {
     required string cluster_id = 1;
     // the socket address on which to listen for incoming traffic
+    required SocketAddress address = 2;
+    // custom tags to identify the frontend in the access logs
+    map<string, string> tags = 3;
+}
+
+message RequestUdpFrontend {
+    required string cluster_id = 1;
+    // the socket address on which to listen for incoming datagrams
     required SocketAddress address = 2;
     // custom tags to identify the frontend in the access logs
     map<string, string> tags = 3;
@@ -955,6 +1010,59 @@ enum TlsVersion {
     TLS_V1_3 = 5;
 }
 
+// How a UDP flow is keyed for backend affinity. SOURCE_IP keys on the
+// client source IP only (all ports from one client pin to one backend);
+// SOURCE_IP_PORT keys on the full 2-tuple (per-socket affinity).
+enum UdpAffinityKey {
+    SOURCE_IP = 0;
+    SOURCE_IP_PORT = 1;
+}
+
+// UDP backend health probe mode. HEALTH_OFF disables health checking;
+// TCP_PROBE opens a non-blocking TCP connection to a companion port;
+// UDP_PROBE sends an application datagram and waits for any reply.
+enum UdpHealthMode {
+    HEALTH_OFF = 0;
+    TCP_PROBE = 1;
+    UDP_PROBE = 2;
+}
+
+// Optional health-check configuration for a UDP cluster's backends.
+message UdpHealthConfig {
+    // probe mode; defaults to TCP_PROBE when a udp block is present
+    optional UdpHealthMode mode = 1;
+    // companion TCP probe port; unset = the backend data port
+    optional uint32 tcp_port = 2;
+    // consecutive successes before a backend is marked up
+    optional uint32 rise = 3 [default = 2];
+    // consecutive failures before a backend is marked down
+    optional uint32 fall = 4 [default = 3];
+    // when all backends are down, still forward (don't drop the flow)
+    optional bool fail_open = 5 [default = true];
+    // payload sent for a UDP_PROBE
+    optional bytes udp_probe_payload = 6;
+    // delay between probes, in seconds
+    optional uint32 probe_interval_seconds = 7 [default = 5];
+    // per-probe response timeout, in seconds
+    optional uint32 probe_timeout_seconds = 8 [default = 2];
+}
+
+// UDP-specific cluster knobs. Attached to a `Cluster` via the `udp` field.
+message UdpClusterConfig {
+    // flow affinity key; defaults to SOURCE_IP
+    optional UdpAffinityKey affinity_key = 1;
+    // expected replies per flow; 0 = unlimited
+    optional uint32 responses = 2;
+    // max client datagrams per flow; 0 = unlimited
+    optional uint32 requests = 3;
+    // send a PROXY protocol v2 header to the backend
+    optional bool send_proxy_protocol = 4;
+    // prepend PPv2 to every datagram; false = first-datagram only
+    optional bool proxy_protocol_every_datagram = 5;
+    // optional backend health-check configuration
+    optional UdpHealthConfig health = 6;
+}
+
 // A cluster is what binds a frontend to backends with routing rules
 message Cluster {
     required string cluster_id = 1;
@@ -1004,6 +1112,9 @@ message Cluster {
     // tags 9-14 cover answers/redirect/auth/limits, so health-check
     // configuration occupies tag 15.
     optional HealthCheckConfig health_check = 15;
+    // Optional UDP-specific cluster configuration. Present only for clusters
+    // that front UDP backends; absent for HTTP/HTTPS/TCP clusters.
+    optional UdpClusterConfig udp = 16;
 }
 
 message HealthCheckConfig {
@@ -1027,6 +1138,13 @@ enum LoadBalancingAlgorithms {
     RANDOM = 1;
     LEAST_LOADED = 2;
     POWER_OF_TWO = 3;
+    // Highest-Random-Weight / rendezvous hashing — flow-affine backend
+    // selection for UDP. Maps a 4-tuple flow key to a backend that survives
+    // minimal disruption on backend add/remove.
+    HRW = 4;
+    // Maglev consistent hashing — precomputed lookup table for even, stable
+    // backend distribution across the flow keyspace.
+    MAGLEV = 5;
 }
 
 enum ProxyProtocolConfig {
@@ -1175,6 +1293,7 @@ message ListedFrontends {
     repeated RequestHttpFrontend http_frontends = 1;
     repeated RequestHttpFrontend https_frontends = 2;
     repeated RequestTcpFrontend tcp_frontends = 3;
+    repeated RequestUdpFrontend udp_frontends = 4;
 }
 
 message ClusterInformations {
@@ -1189,6 +1308,7 @@ message ClusterInformation {
     repeated RequestHttpFrontend https_frontends = 3;
     repeated RequestTcpFrontend tcp_frontends = 4;
     repeated AddBackend backends = 5;
+    repeated RequestUdpFrontend udp_frontends = 6;
 }
 
 // an event produced by a worker to notify about backends status
@@ -1718,6 +1838,8 @@ message ListenersCount {
     repeated string tls = 2;
     // socket addresses of TCP listeners
     repeated string tcp = 3;
+    // socket addresses of UDP listeners
+    repeated string udp = 4;
 }
 
 // the Sōzu state, passed to a new worker.

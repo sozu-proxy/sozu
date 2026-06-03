@@ -152,6 +152,7 @@ fn fixture_listeners() -> ListenersList {
         http_listeners: BTreeMap::new(),
         https_listeners: BTreeMap::new(),
         tcp_listeners: BTreeMap::new(),
+        udp_listeners: BTreeMap::new(),
     }
 }
 

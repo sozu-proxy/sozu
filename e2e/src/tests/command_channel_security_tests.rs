@@ -137,6 +137,7 @@ fn scm_inconsistent_listeners_count_does_not_panic_server_constructor() {
         ],
         tls: vec![],
         tcp: vec![],
+        udp: vec![],
     };
     let payload = forged.encode_length_delimited_to_vec();
     // Bypass `ScmSocket::send_listeners` (which keeps addresses + FDs

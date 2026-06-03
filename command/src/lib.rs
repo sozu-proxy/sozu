@@ -88,6 +88,8 @@ pub enum ObjectKind {
     TcpCluster,
     TcpListener,
     TcpFrontend,
+    UdpListener,
+    UdpFrontend,
 }
 
 pub trait AsString {

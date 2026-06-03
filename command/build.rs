@@ -6,6 +6,7 @@ pub fn main() {
         .message_attribute("Request", "#[derive(Eq)]")
         .message_attribute("RequestHttpFrontend", "#[derive(Hash, Eq)]")
         .message_attribute("RequestTcpFrontend", "#[derive(Hash, Eq)]")
+        .message_attribute("RequestUdpFrontend", "#[derive(Hash, Eq)]")
         .message_attribute("CertificatesByAddress", "#[derive(Hash, Eq)]")
         .message_attribute("ResponseContent", "#[derive(Hash, Eq)]")
         .message_attribute("WorkerInfos", "#[derive(Hash, Eq)]")
@@ -70,6 +71,7 @@ pub fn main() {
         .field_attribute("HttpsListenerConfig.alpn_protocols", "#[serde(default)]")
         .field_attribute("HttpsListenerConfig.answers", "#[serde(default)]")
         .field_attribute("TcpListenerConfig.answers", "#[serde(default)]")
+        .field_attribute("RequestUdpFrontend.tags", "#[serde(default)]")
         .enum_attribute(".", "#[serde(rename_all = \"SCREAMING_SNAKE_CASE\")]")
         .enum_attribute(
             "ResponseContent.content_type",

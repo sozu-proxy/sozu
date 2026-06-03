@@ -12,7 +12,7 @@ use std::{
     net::SocketAddr,
 };
 
-use mio::net::{TcpListener, TcpStream};
+use mio::net::{TcpListener, TcpStream, UdpSocket};
 use rustls::{ProtocolVersion, ServerConnection};
 use rusty_ulid::Ulid;
 use socket2::{Domain, Protocol, Socket, Type};
@@ -1036,6 +1036,72 @@ pub fn server_bind(addr: SocketAddr) -> Result<TcpListener, ServerBindError> {
     sock.listen(1024).map_err(ServerBindError::Listen)?;
 
     Ok(TcpListener::from_std(sock.into()))
+}
+
+/// Bind a non-blocking UDP listener socket on `addr`.
+///
+/// Mirrors [`server_bind`] but for DGRAM: `SO_REUSEADDR` (unix) + `SO_REUSEPORT`
+/// so the socket can be SCM-passed and re-bound across a hot-upgrade, then
+/// `bind` + non-blocking. Unlike TCP there is **no `listen()`** — a UDP socket
+/// receives datagrams directly. The returned `mio::net::UdpSocket` is the one
+/// listener socket the UDP datapath demuxes many flows over (one-socket-many-
+/// flows; per-flow return sockets are created by [`udp_connect`]).
+pub fn udp_bind(addr: SocketAddr) -> Result<UdpSocket, ServerBindError> {
+    let sock = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))
+        .map_err(ServerBindError::SocketCreationError)?;
+
+    // set so_reuseaddr, but only on unix (mirrors what libstd does)
+    if cfg!(unix) {
+        sock.set_reuse_address(true)
+            .map_err(ServerBindError::SetReuseAddress)?;
+    }
+
+    sock.set_reuse_port(true)
+        .map_err(ServerBindError::SetReusePort)?;
+
+    sock.bind(&addr.into())
+        .map_err(ServerBindError::BindError)?;
+
+    sock.set_nonblocking(true)
+        .map_err(ServerBindError::SetNonBlocking)?;
+
+    // No `listen()` for DGRAM sockets.
+    Ok(UdpSocket::from_std(sock.into()))
+}
+
+/// Create a non-blocking **connected** per-flow upstream UDP socket toward
+/// `backend`.
+///
+/// The socket is bound to an ephemeral local port (family matched to the
+/// backend) and `connect`-ed to the backend address. A connected UDP socket
+/// "only receives from the connected address" (`connect(2)`), so its fd is the
+/// symmetric-NAT return-demux key for one flow: the shell registers
+/// `upstream_token -> FlowId` and feeds anything that arrives on it back into
+/// the manager as a `BackendDatagram`. `send` (not `send_to`) is then used for
+/// the forward path. Errors (`EMFILE`/`ENFILE`/connect refusal) bubble up so
+/// the caller can shed the flow rather than panic.
+pub fn udp_connect(backend: SocketAddr) -> Result<UdpSocket, ServerBindError> {
+    let unspecified: SocketAddr = match backend {
+        SocketAddr::V4(_) => (std::net::Ipv4Addr::UNSPECIFIED, 0).into(),
+        SocketAddr::V6(_) => (std::net::Ipv6Addr::UNSPECIFIED, 0).into(),
+    };
+    let sock = Socket::new(
+        Domain::for_address(backend),
+        Type::DGRAM,
+        Some(Protocol::UDP),
+    )
+    .map_err(ServerBindError::SocketCreationError)?;
+
+    sock.bind(&unspecified.into())
+        .map_err(ServerBindError::BindError)?;
+    sock.set_nonblocking(true)
+        .map_err(ServerBindError::SetNonBlocking)?;
+    // `connect` on a DGRAM socket pins the return 4-tuple; a non-blocking
+    // connect on UDP completes immediately (no handshake).
+    sock.connect(&backend.into())
+        .map_err(ServerBindError::BindError)?;
+
+    Ok(UdpSocket::from_std(sock.into()))
 }
 
 /// Socket statistics

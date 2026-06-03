@@ -14,7 +14,7 @@ use std::{
 
 use mio::{
     Events, Interest, Poll, Token,
-    net::{TcpListener as MioTcpListener, TcpStream},
+    net::{TcpListener as MioTcpListener, TcpStream, UdpSocket as MioUdpSocket},
 };
 use slab::Slab;
 use sozu_command::{
@@ -27,8 +27,9 @@ use sozu_command::{
         HttpsListenerConfig, InitialState, ListenerType, LoadBalancingAlgorithms, LoadMetric,
         MetricDetail, MetricsConfiguration, RemoveBackend, Request, ResponseContent,
         ResponseStatus, ServerConfig, TcpListenerConfig as CommandTcpListener,
-        UpdateHttpListenerConfig, UpdateHttpsListenerConfig, UpdateTcpListenerConfig,
-        WorkerRequest, WorkerResponse, request::RequestType, response_content::ContentType,
+        UdpListenerConfig as CommandUdpListener, UpdateHttpListenerConfig,
+        UpdateHttpsListenerConfig, UpdateTcpListenerConfig, UpdateUdpListenerConfig, WorkerRequest,
+        WorkerResponse, request::RequestType, response_content::ContentType,
     },
     ready::Ready,
     scm_socket::{Listeners, ScmSocket, ScmSocketError},
@@ -46,6 +47,7 @@ use crate::{
     pool::Pool,
     tcp,
     timer::Timer,
+    udp,
 };
 
 // Number of retries to perform on a server after a connection failure
@@ -570,6 +572,7 @@ pub struct Server {
     should_poll_at: Option<Instant>,
     shutting_down: Option<String>,
     tcp: Rc<RefCell<tcp::TcpProxy>>,
+    udp: Rc<RefCell<udp::UdpProxy>>,
     zombie_check_interval: Duration,
 }
 
@@ -736,6 +739,25 @@ impl Server {
             }
         }));
 
+        // UDP proxy is constructed internally (no constructor parameter) so the
+        // public `Server::new` / `try_new_from_config` signatures stay
+        // unchanged — bin/ is not forced to change for construction.
+        let udp = Rc::new(RefCell::new({
+            let registry = poll
+                .registry()
+                .try_clone()
+                .map_err(ServerError::CloneRegistry)?;
+
+            udp::UdpProxy::new(
+                registry,
+                sessions.clone(),
+                pool.clone(),
+                backends.clone(),
+                server_config.max_connections as usize,
+                server_config.buffer_size as usize,
+            )
+        }));
+
         let mut server = Server {
             accept_queue_timeout: Duration::from_secs(u64::from(
                 server_config.accept_queue_timeout,
@@ -767,6 +789,7 @@ impl Server {
             should_poll_at: None,
             shutting_down: None,
             tcp,
+            udp,
             zombie_check_interval: Duration::from_secs(u64::from(
                 server_config.zombie_check_interval,
             )),
@@ -929,6 +952,9 @@ impl Server {
                     token if self.health_checker.owns_token(token) => {
                         self.health_checker.ready(token);
                     }
+                    token if self.udp.borrow().health_owns_token(token) => {
+                        self.udp.borrow_mut().health_ready(token);
+                    }
                     token => self.ready(token, Ready::from(event)),
                 }
             }
@@ -949,6 +975,10 @@ impl Server {
             self.zombie_check();
             self.health_checker
                 .poll(&self.backends, self.poll.registry());
+            // Drive the UDP endpoint health prober (TCP-probe + hysteresis +
+            // fail-open). Non-blocking; no-op when no UDP cluster has health
+            // configured.
+            self.udp.borrow_mut().health_poll();
 
             // Frontend session gauges. `client.connections` keeps the
             // per-event signal from `SessionManager::incr/decr`; the rest
@@ -1842,6 +1872,12 @@ impl Server {
                 notify_response = Some(tcp_proxy_response);
             }
         }
+        if proxy_destinations.to_udp_proxy {
+            let udp_proxy_response = self.udp.borrow_mut().notify(request.clone());
+            if udp_proxy_response.is_failure() || notify_response.is_none() {
+                notify_response = Some(udp_proxy_response);
+            }
+        }
         if let Some(response) = notify_response {
             push_queue(response);
         }
@@ -1857,6 +1893,9 @@ impl Server {
             Some(RequestType::AddTcpListener(listener)) => {
                 push_queue(self.notify_add_tcp_listener(&req_id, listener));
             }
+            Some(RequestType::AddUdpListener(listener)) => {
+                push_queue(self.notify_add_udp_listener(&req_id, listener));
+            }
             Some(RequestType::UpdateHttpListener(patch)) => {
                 push_queue(self.notify_update_http_listener(&req_id, patch));
             }
@@ -1866,6 +1905,9 @@ impl Server {
             Some(RequestType::UpdateTcpListener(patch)) => {
                 push_queue(self.notify_update_tcp_listener(&req_id, patch));
             }
+            Some(RequestType::UpdateUdpListener(patch)) => {
+                push_queue(self.notify_update_udp_listener(&req_id, patch));
+            }
             Some(RequestType::RemoveListener(ref remove)) => {
                 debug!("{} remove {:?} listener {:?}", req_id, remove.proxy, remove);
                 self.base_sessions_count -= 1;
@@ -1873,6 +1915,7 @@ impl Server {
                     Ok(ListenerType::Http) => self.http.borrow_mut().notify(request),
                     Ok(ListenerType::Https) => self.https.borrow_mut().notify(request),
                     Ok(ListenerType::Tcp) => self.tcp.borrow_mut().notify(request),
+                    Ok(ListenerType::Udp) => self.udp.borrow_mut().notify(request),
                     Err(_) => WorkerResponse::error(req_id, "Wrong variant ListenerType"),
                 };
                 push_queue(response);
@@ -2041,6 +2084,45 @@ impl Server {
         }
     }
 
+    fn notify_add_udp_listener(
+        &mut self,
+        req_id: &str,
+        listener: CommandUdpListener,
+    ) -> WorkerResponse {
+        debug!("{} add udp listener {:?}", req_id, listener);
+
+        if self.sessions.borrow().at_capacity() {
+            return worker_response_error(req_id, "session list is full, cannot add a listener");
+        }
+
+        let mut session_manager = self.sessions.borrow_mut();
+        let entry = session_manager.slab.vacant_entry();
+        let token = Token(entry.key());
+
+        match self.udp.borrow_mut().add_listener(listener, token) {
+            Ok(_token) => {
+                entry.insert(Rc::new(RefCell::new(ListenSession {
+                    protocol: Protocol::UDPListen,
+                })));
+                self.base_sessions_count += 1;
+                WorkerResponse::ok(req_id)
+            }
+            Err(e) => worker_response_error(req_id, format!("Could not add UDP listener: {e}")),
+        }
+    }
+
+    fn notify_update_udp_listener(
+        &mut self,
+        req_id: &str,
+        patch: UpdateUdpListenerConfig,
+    ) -> WorkerResponse {
+        debug!("{} update udp listener {:?}", req_id, patch.address);
+        match self.udp.borrow_mut().update_listener(patch) {
+            Ok(()) => WorkerResponse::ok(req_id),
+            Err(e) => worker_response_error(req_id, format!("Could not update UDP listener: {e}")),
+        }
+    }
+
     fn notify_update_http_listener(
         &mut self,
         req_id: &str,
@@ -2164,6 +2246,42 @@ impl Server {
                     ),
                 }
             }
+            Ok(ListenerType::Udp) => {
+                let socket = self
+                    .scm_listeners
+                    .as_mut()
+                    .and_then(|s| s.get_udp(&address))
+                    // SAFETY: `fd` was just received from the supervisor via
+                    // SCM_RIGHTS (see `command/src/scm_socket.rs`) and is not
+                    // owned elsewhere — `ScmListeners::get_udp` removes it from
+                    // the map. Ownership transfers to the mio `UdpSocket`
+                    // wrapper, whose `Drop` closes the descriptor. `O_NONBLOCK`
+                    // + `SO_REUSE*` are file-description flags preserved across
+                    // SCM + exec.
+                    .map(|fd| unsafe { MioUdpSocket::from_raw_fd(fd) });
+
+                let activated_token = self.udp.borrow_mut().activate_listener(&address, socket);
+                match activated_token {
+                    Ok(token) => {
+                        // UDP never uses accept()/create_session: replace the
+                        // `ListenSession` placeholder at the listener token with
+                        // the real `UdpListenerSession` so the READABLE
+                        // registration drives `Server::ready`'s generic path
+                        // into `UdpListenerSession::update_readiness`.
+                        if let Some(session) = self.udp.borrow_mut().build_session(token) {
+                            let mut sessions = self.sessions.borrow_mut();
+                            if sessions.slab.contains(token.0) {
+                                sessions.slab[token.0] = session;
+                            }
+                        }
+                        WorkerResponse::ok(req_id)
+                    }
+                    Err(activate_error) => worker_response_error(
+                        req_id,
+                        format!("Could not activate UDP listener: {activate_error}"),
+                    ),
+                }
+            }
             Err(_) => worker_response_error(req_id, "Wrong variant for ListenerType on request"),
         }
     }
@@ -2216,6 +2334,7 @@ impl Server {
                         http: vec![(address, listener.as_raw_fd())],
                         tls: vec![],
                         tcp: vec![],
+                        udp: vec![],
                     };
                     info!("sending HTTP listener: {:?}", listeners);
                     let res = self.scm.send_listeners(&listeners);
@@ -2259,6 +2378,7 @@ impl Server {
                         http: vec![],
                         tls: vec![(address, listener.as_raw_fd())],
                         tcp: vec![],
+                        udp: vec![],
                     };
                     info!("sending HTTPS listener: {:?}", listeners);
                     let res = self.scm.send_listeners(&listeners);
@@ -2300,6 +2420,7 @@ impl Server {
                         http: vec![],
                         tls: vec![],
                         tcp: vec![(address, listener.as_raw_fd())],
+                        udp: vec![],
                     };
                     info!("sending TCP listener: {:?}", listeners);
                     let res = self.scm.send_listeners(&listeners);
@@ -2307,6 +2428,48 @@ impl Server {
                     self.block_scm_socket();
 
                     info!("sent TCP listener: {:?}", res);
+                }
+                WorkerResponse::ok(req_id)
+            }
+            Ok(ListenerType::Udp) => {
+                let (token, mut listener) = match self.udp.borrow_mut().give_back_listener(address)
+                {
+                    Ok((token, listener)) => (token, listener),
+                    Err(e) => {
+                        return worker_response_error(
+                            req_id,
+                            format!(
+                                "Could not deactivate UDP listener at address {address:?}: {e}"
+                            ),
+                        );
+                    }
+                };
+
+                if let Err(e) = self.poll.registry().deregister(&mut listener) {
+                    error!(
+                        "error deregistering UDP listen socket({:?}): {:?}",
+                        deactivate, e
+                    );
+                }
+                if self.sessions.borrow().slab.contains(token.0) {
+                    self.sessions.borrow_mut().slab.remove(token.0);
+                    info!("removed listen token {:?}", token);
+                }
+
+                if deactivate.to_scm {
+                    self.unblock_scm_socket();
+                    let listeners = Listeners {
+                        http: vec![],
+                        tls: vec![],
+                        tcp: vec![],
+                        udp: vec![(address, listener.as_raw_fd())],
+                    };
+                    info!("sending UDP listener: {:?}", listeners);
+                    let res = self.scm.send_listeners(&listeners);
+
+                    self.block_scm_socket();
+
+                    info!("sent UDP listener: {:?}", res);
                 }
                 WorkerResponse::ok(req_id)
             }
@@ -2345,6 +2508,13 @@ impl Server {
             }
         }
 
+        let mut udp_listeners = self.udp.borrow_mut().give_back_listeners();
+        for &mut (_, ref mut sock) in udp_listeners.iter_mut() {
+            if let Err(e) = self.poll.registry().deregister(sock) {
+                error!("error deregistering UDP listen socket({:?}): {:?}", sock, e);
+            }
+        }
+
         // use as_raw_fd because the listeners should be dropped after sending them
         let listeners = Listeners {
             http: http_listeners
@@ -2356,6 +2526,10 @@ impl Server {
                 .map(|(addr, listener)| (*addr, listener.as_raw_fd()))
                 .collect(),
             tcp: tcp_listeners
+                .iter()
+                .map(|(addr, listener)| (*addr, listener.as_raw_fd()))
+                .collect(),
+            udp: udp_listeners
                 .iter()
                 .map(|(addr, listener)| (*addr, listener.as_raw_fd()))
                 .collect(),
@@ -2693,6 +2867,7 @@ impl Server {
                         Protocol::HTTPListen
                             | Protocol::HTTPSListen
                             | Protocol::TCPListen
+                            | Protocol::UDPListen
                             | Protocol::Channel
                             | Protocol::Metrics
                             | Protocol::Timer

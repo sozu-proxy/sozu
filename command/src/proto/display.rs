@@ -99,6 +99,10 @@ pub fn format_request_type(request_type: &RequestType) -> &str {
         RequestType::AddHttpListener(_) => "AddHttpListener",
         RequestType::AddHttpsListener(_) => "AddHttpsListener",
         RequestType::AddTcpListener(_) => "AddTcpListener",
+        RequestType::AddUdpListener(_) => "AddUdpListener",
+        RequestType::UpdateUdpListener(_) => "UpdateUdpListener",
+        RequestType::AddUdpFrontend(_) => "AddUdpFrontend",
+        RequestType::RemoveUdpFrontend(_) => "RemoveUdpFrontend",
         RequestType::RemoveListener(_) => "RemoveListener",
         RequestType::ActivateListener(_) => "ActivateListener",
         RequestType::DeactivateListener(_) => "DeactivateListener",
@@ -605,6 +609,22 @@ fn print_frontends(frontends: &ListedFrontends) -> Result<(), DisplayError> {
         }
         table.printstd();
     }
+
+    // UDP frontends
+    if !frontends.udp_frontends.is_empty() {
+        let mut table = Table::new();
+        table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
+        table.add_row(row!["UDP frontends  "]);
+        table.add_row(row!["Cluster ID", "address", "tags"]);
+        for udp_frontend in frontends.udp_frontends.iter() {
+            table.add_row(row!(
+                udp_frontend.cluster_id,
+                udp_frontend.address,
+                format_tags_to_string(&udp_frontend.tags)
+            ));
+        }
+        table.printstd();
+    }
     Ok(())
 }
 
@@ -649,6 +669,37 @@ pub fn print_listeners(listeners_list: &ListenersList) -> Result<(), DisplayErro
         }
         table.printstd();
     }
+
+    println!("\nUDP LISTENERS\n================");
+
+    if !listeners_list.udp_listeners.is_empty() {
+        let mut table = Table::new();
+        table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
+        table.add_row(row!["UDP listeners"]);
+        // UDP has no expect_proxy / connect_timeout (no connect handshake);
+        // it carries datagram-specific knobs instead.
+        table.add_row(row![
+            "socket address",
+            "public address",
+            "front timeout",
+            "back timeout",
+            "max rx datagram size",
+            "max flows",
+            "activated"
+        ]);
+        for (_, udp_listener) in listeners_list.udp_listeners.iter() {
+            table.add_row(row![
+                format!("{:?}", udp_listener.address),
+                format!("{:?}", udp_listener.public_address),
+                udp_listener.front_timeout,
+                udp_listener.back_timeout,
+                udp_listener.max_rx_datagram_size,
+                udp_listener.max_flows,
+                udp_listener.active,
+            ]);
+        }
+        table.printstd();
+    }
     Ok(())
 }
 
@@ -666,6 +717,8 @@ fn print_cluster_infos(worker_responses: &WorkerResponses) -> Result<(), Display
 
     let mut tcp_frontend_table = create_cluster_table(vec!["id", "address"], &worker_responses.map);
 
+    let mut udp_frontend_table = create_cluster_table(vec!["id", "address"], &worker_responses.map);
+
     let mut backend_table = create_cluster_table(
         vec!["backend id", "IP address", "Backup"],
         &worker_responses.map,
@@ -677,6 +730,7 @@ fn print_cluster_infos(worker_responses: &WorkerResponses) -> Result<(), Display
     let mut http_frontends = BTreeMap::new();
     let mut https_frontends = BTreeMap::new();
     let mut tcp_frontends = BTreeMap::new();
+    let mut udp_frontends = BTreeMap::new();
     let mut backends = BTreeMap::new();
 
     for (worker_id, response_content) in worker_responses.map.iter() {
@@ -699,6 +753,11 @@ fn print_cluster_infos(worker_responses: &WorkerResponses) -> Result<(), Display
 
                 for frontend in cluster.tcp_frontends.iter() {
                     let entry = tcp_frontends.entry(frontend).or_insert(Vec::new());
+                    entry.push(worker_id.to_owned());
+                }
+
+                for frontend in cluster.udp_frontends.iter() {
+                    let entry = udp_frontends.entry(frontend).or_insert(Vec::new());
                     entry.push(worker_id.to_owned());
                 }
 
@@ -819,6 +878,24 @@ fn print_cluster_infos(worker_responses: &WorkerResponses) -> Result<(), Display
     }
 
     tcp_frontend_table.printstd();
+
+    println!("\nUDP frontends configuration:\n");
+
+    for (key, values) in udp_frontends.iter() {
+        let mut row = vec![cell!(key.cluster_id), cell!(format!("{}", key.address))];
+
+        for val in values.iter() {
+            if worker_ids.contains(val) {
+                row.push(cell!(String::from("X")));
+            } else {
+                row.push(cell!(String::from("")));
+            }
+        }
+
+        udp_frontend_table.add_row(Row::new(row));
+    }
+
+    udp_frontend_table.printstd();
 
     println!("\nbackends configuration:\n");
 

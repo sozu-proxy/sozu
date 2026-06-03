@@ -7,3 +7,5 @@ pub mod https_client;
 pub mod raw_h2_response_backend;
 pub mod single_read_h1_backend;
 pub mod sync_backend;
+pub mod udp_backend;
+pub mod udp_client;

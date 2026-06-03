@@ -4,6 +4,14 @@
 
 ### ✨ Added
 
+- **`feat(udp)`: first-class UDP listeners with load balancing** ([#1273](https://github.com/sozu-proxy/sozu/pull/1273)).
+  A new `protocol = "udp"` listener type sits alongside `tcp`/`http`/`https`, with full hot-reconfig and CLI parity, fronting datagram services (DNS, syslog, NTP, generic UDP). The userland datapath runs in the existing single-threaded mio loop with **static per-listener worker ownership** (scale by running multiple listeners) and virtual 4-tuple flow sessions torn down by a three-knob policy (`responses` / idle timeout / `requests`). Highlights:
+  - **Load balancing:** two source-hash algorithms selectable per cluster via the shared `load_balancing` key — **`HRW`** (Highest-Random-Weight / rendezvous hashing, recommended UDP default, no rebuild stall on reconfig) and **`MAGLEV`** (opt-in `O(1)` lookup table for large backend sets), plus the existing `ROUND_ROBIN`. Flow affinity keys on the client source IP (`SOURCE_IP`) or full 2-tuple (`SOURCE_IP_PORT`).
+  - **PROXY protocol v2 to backend** (`send_proxy_protocol`, first datagram by default; `proxy_protocol_every_datagram` opt-in), carrying the real client address.
+  - **Active health checks** (`[clusters.<id>.udp.health]`): companion `TCP_PROBE` (primary) or app-level `UDP_PROBE`, with rise/fall hysteresis and **fail-open**.
+  - **Metrics:** `udp.datagrams.{in,out}`, `udp.bytes.{in,out}`, `udp.active_flows` (gauge), `udp.flows.{created,evicted,shed}`, `udp.datagrams.dropped` (by reason), `udp.backend.health`, `udp.flow.duration`.
+  - **Config:** `[[listeners]]` gains `max_rx_datagram_size` (capped at the global `buffer_size`; oversized datagrams truncate and drop) and `max_flows` (`0` = auto, ~70% of the soft `RLIMIT_NOFILE`). Inbound UDP PROXY-protocol decode (`expect_proxy`) is not supported. Plaintext only; in-flight flows reset on hot-upgrade (listener fd handed off, flow state not migrated). See [`doc/configure.md`](doc/configure.md) for the full schema.
+
 - **`fix(otel)`: wall-clock `start_time` field in `ProtobufAccessLog`** (field 30, optional `Uint128`).
   Access-log consumers reconstructing OpenTelemetry spans no longer need to compute `time - request_time` — a subtraction that mixed `CLOCK_REALTIME` and `CLOCK_MONOTONIC` and produced unreliable start timestamps on short-lived requests. The new field is captured at request start via `SessionMetrics::mark_request_start()` and should be preferred whenever present. Old consumers ignore the unknown field; new consumers with old producers see `None` and can fall back to the subtraction.
 
