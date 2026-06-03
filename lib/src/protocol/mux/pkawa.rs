@@ -548,21 +548,41 @@ fn decode_headers_with_budget<F>(
     decoder: &mut loona_hpack::Decoder<'static>,
     input: &[u8],
     max_decoded_bytes: usize,
+    max_header_fields: u32,
     mut per_header: F,
 ) -> Result<bool, (H2Error, bool)>
 where
-    F: FnMut(Cow<[u8]>, Cow<[u8]>, &mut bool),
+    F: FnMut(Cow<[u8]>, Cow<[u8]>, &mut bool, &mut usize),
 {
+    let max_header_fields = max_header_fields as usize;
     let mut invalid_headers = false;
     let mut budget_exceeded = false;
+    let mut field_limit_exceeded = false;
+    let mut field_count: usize = 0;
     let mut decoded_bytes: usize = 0;
     let decode_status = decoder.decode_with_cb(input, |k, v| {
-        if invalid_headers || budget_exceeded {
+        if invalid_headers || budget_exceeded || field_limit_exceeded {
             return;
         }
-        decoded_bytes = decoded_bytes.saturating_add(k.len() + v.len());
+        // RFC 9113 §6.5.2: the size accounted against SETTINGS_MAX_HEADER_LIST_SIZE
+        // is the name + value octets PLUS a 32-octet per-field overhead. The
+        // overhead is what bounds the field count under a fixed byte budget;
+        // omitting it lets an HPACK indexed-reference bomb (thousands of 1-byte
+        // indexed references) materialize ~33× more fields than the limit intends.
+        decoded_bytes = decoded_bytes
+            .saturating_add(k.len())
+            .saturating_add(v.len())
+            .saturating_add(crate::protocol::mux::h2::HEADER_FIELD_SIZE_OVERHEAD);
         if decoded_bytes > max_decoded_bytes {
             budget_exceeded = true;
+            return;
+        }
+        // Cap the COUNT of materialized header fields (cf. nginx `max_headers`,
+        // Apache `LimitRequestFields`): the bomb's real cost is one `Pair` of
+        // per-entry bookkeeping per field, not the decoded byte size.
+        field_count += 1;
+        if field_count > max_header_fields {
+            field_limit_exceeded = true;
             return;
         }
         if let Some(reason) = classify_invalid_h2_header(&k, &v) {
@@ -570,7 +590,13 @@ where
             invalid_headers = true;
             return;
         }
-        per_header(k, v, &mut invalid_headers);
+        per_header(k, v, &mut invalid_headers, &mut field_count);
+        // The cookie branch (RFC 9113 §8.2.3) expands one HPACK field into many
+        // jar crumbs and bumps `field_count` per crumb; re-check after each call
+        // so a single crumb-packed cookie header cannot blow past the cap.
+        if field_count > max_header_fields {
+            field_limit_exceeded = true;
+        }
     });
     if let Err(error) = decode_status {
         error!("{} INVALID FRAGMENT: {:?}", log_module_context!(), error);
@@ -582,6 +608,15 @@ where
             log_module_context!(),
             decoded_bytes,
             max_decoded_bytes
+        );
+        return Err((H2Error::EnhanceYourCalm, false));
+    }
+    if field_limit_exceeded {
+        error!(
+            "{} HPACK header field count {} exceeds max_header_fields {}",
+            log_module_context!(),
+            field_count,
+            max_header_fields
         );
         return Err((H2Error::EnhanceYourCalm, false));
     }
@@ -598,6 +633,7 @@ pub fn handle_header<C>(
     end_stream: bool,
     callbacks: &mut C,
     max_header_list_size: u32,
+    max_header_fields: u32,
     elide_x_real_ip: bool,
 ) -> Result<(), (H2Error, bool)>
 where
@@ -610,6 +646,7 @@ where
             end_stream,
             decoder,
             max_header_list_size,
+            max_header_fields,
             elide_x_real_ip,
         );
     }
@@ -634,7 +671,8 @@ where
                 decoder,
                 input,
                 max_decoded_bytes,
-                |k, v, invalid_headers| {
+                max_header_fields,
+                |k, v, invalid_headers, field_count| {
                     if compare_no_case(&k, b":method") {
                         // RFC 9110 §9: method = token. Validate every byte is
                         // a tchar — spaces, delimiters, and CTLs in the method
@@ -729,6 +767,16 @@ where
                                     len: val_len,
                                 }),
                             });
+                            // RFC 9113 §8.2.3 lets one HPACK cookie field expand
+                            // into many crumbs, each materialized as a jar Pair.
+                            // Count every crumb against the field cap and bail the
+                            // moment it is crossed, so a crumb-packed cookie cannot
+                            // amplify allocation (cf. Apache CVE-2026-49975 counting
+                            // crumbs against LimitRequestFields).
+                            *field_count += 1;
+                            if *field_count > max_header_fields as usize {
+                                return;
+                            }
                         }
                     } else if compare_no_case(&k, b"host") {
                         // RFC 9113 §8.3.1: a literal ``host`` header is tolerated
@@ -859,7 +907,8 @@ where
                 decoder,
                 input,
                 max_decoded_bytes,
-                |k, v, invalid_headers| {
+                max_header_fields,
+                |k, v, invalid_headers, _field_count| {
                     if compare_no_case(&k, b":status") {
                         // RFC 9113 §8.3.2 / RFC 9110 §15: :status is exactly
                         // three ASCII digits. `u16::from_str` would accept
@@ -1042,6 +1091,7 @@ pub fn handle_trailer(
     end_stream: bool,
     decoder: &mut loona_hpack::Decoder<'static>,
     max_header_list_size: u32,
+    max_header_fields: u32,
     elide_x_real_ip: bool,
 ) -> Result<(), (H2Error, bool)> {
     // Acknowledge the parameter; dropping it would force a callsite
@@ -1051,8 +1101,11 @@ pub fn handle_trailer(
     if !end_stream {
         return Err((H2Error::ProtocolError, false));
     }
+    let max_header_fields = max_header_fields as usize;
     let mut invalid_trailers = false;
     let mut budget_exceeded = false;
+    let mut field_limit_exceeded = false;
+    let mut field_count: usize = 0;
     let mut decoded_bytes: usize = 0;
     // HEADERS and trailers each tracked an independent `decoded_bytes`
     // counter against `max_header_list_size`, so the
@@ -1065,12 +1118,22 @@ pub fn handle_trailer(
     // tighter than the HEADERS cap.
     let max_decoded = (max_header_list_size as usize).min(MAX_TRAILER_BYTES);
     let decode_status = decoder.decode_with_cb(input, |k, v| {
-        if invalid_trailers || budget_exceeded {
+        if invalid_trailers || budget_exceeded || field_limit_exceeded {
             return;
         }
-        decoded_bytes = decoded_bytes.saturating_add(k.len() + v.len());
+        // RFC 9113 §6.5.2: count name + value octets plus the 32-octet
+        // per-field overhead, matching the HEADERS path.
+        decoded_bytes = decoded_bytes
+            .saturating_add(k.len())
+            .saturating_add(v.len())
+            .saturating_add(crate::protocol::mux::h2::HEADER_FIELD_SIZE_OVERHEAD);
         if decoded_bytes > max_decoded {
             budget_exceeded = true;
+            return;
+        }
+        field_count += 1;
+        if field_count > max_header_fields {
+            field_limit_exceeded = true;
             return;
         }
         // RFC 9113 §8.1: Trailers MUST NOT contain pseudo-header fields.
@@ -1137,6 +1200,15 @@ pub fn handle_trailer(
             log_module_context!(),
             decoded_bytes,
             max_decoded
+        );
+        return Err((H2Error::EnhanceYourCalm, false));
+    }
+    if field_limit_exceeded {
+        error!(
+            "{} HPACK trailer field count {} exceeds max_header_fields {}",
+            log_module_context!(),
+            field_count,
+            max_header_fields
         );
         return Err((H2Error::EnhanceYourCalm, false));
     }
@@ -1492,10 +1564,140 @@ mod tests {
             end_stream,
             &mut callbacks,
             crate::protocol::mux::h2::MAX_HEADER_LIST_SIZE as u32,
+            u32::MAX,
             false,
         );
         assert!(result.is_ok(), "handle_header failed: {:?}", result.err());
         kawa
+    }
+
+    // ── handle_header: HPACK "bomb" budget caps ──────────────────────────
+
+    fn base_request_pseudo() -> Vec<(Vec<u8>, Vec<u8>)> {
+        vec![
+            (b":method".to_vec(), b"GET".to_vec()),
+            (b":scheme".to_vec(), b"https".to_vec()),
+            (b":path".to_vec(), b"/".to_vec()),
+            (b":authority".to_vec(), b"example.com".to_vec()),
+        ]
+    }
+
+    /// HPACK-encode owned headers and run `handle_header` with explicit budget
+    /// caps, returning the raw result so limit enforcement can be asserted.
+    fn try_decode_request_capped(
+        pool: &mut crate::pool::Pool,
+        headers: &[(Vec<u8>, Vec<u8>)],
+        max_header_list_size: u32,
+        max_header_fields: u32,
+    ) -> Result<GenericHttpStream, (H2Error, bool)> {
+        let mut encoder = loona_hpack::Encoder::new();
+        let mut encoded = Vec::new();
+        for (name, value) in headers {
+            encoder
+                .encode_header_into((name.as_slice(), value.as_slice()), &mut encoded)
+                .unwrap();
+        }
+        let mut decoder = loona_hpack::Decoder::new();
+        let mut prioriser = Prioriser::default();
+        let mut kawa = make_generic_kawa(pool, Kind::Request);
+        struct NoOpCallbacks;
+        impl kawa::h1::ParserCallbacks<crate::pool::Checkout> for NoOpCallbacks {
+            fn on_headers(&mut self, _kawa: &mut GenericHttpStream) {}
+        }
+        let mut callbacks = NoOpCallbacks;
+        handle_header(
+            &mut decoder,
+            &mut prioriser,
+            1,
+            &mut kawa,
+            &encoded,
+            true,
+            &mut callbacks,
+            max_header_list_size,
+            max_header_fields,
+            false,
+        )
+        .map(|()| kawa)
+    }
+
+    #[test]
+    fn test_h2_header_field_count_cap_rejects_bomb() {
+        // HPACK indexed-reference bomb: thousands of 1-byte indexed references
+        // each materialize one Pair of per-entry bookkeeping. Cap the COUNT of
+        // header fields (nginx `max_headers` / Apache `LimitRequestFields`
+        // equivalent), independent of decoded byte size.
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 1 << 20);
+        let mut headers = base_request_pseudo();
+        for _ in 0..200 {
+            headers.push((b"x-bomb".to_vec(), b"".to_vec()));
+        }
+        let result = try_decode_request_capped(&mut pool, &headers, u32::MAX, 128);
+        assert!(
+            matches!(result, Err((H2Error::EnhanceYourCalm, _))),
+            "expected EnhanceYourCalm for >128 header fields, got {:?}",
+            result.map(|_| ())
+        );
+    }
+
+    #[test]
+    fn test_h2_header_list_size_includes_32_octet_overhead() {
+        // RFC 9113 §6.5.2: SETTINGS_MAX_HEADER_LIST_SIZE counts name + value
+        // octets PLUS a 32-octet overhead per field. These headers' raw bytes
+        // are far under the limit, but the per-field overhead pushes the
+        // accounted size over it — without the +32 the bomb slips through.
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 1 << 20);
+        let mut headers = base_request_pseudo();
+        for _ in 0..120 {
+            headers.push((b"a".to_vec(), b"".to_vec())); // 1 raw octet, 33 with overhead
+        }
+        let result = try_decode_request_capped(&mut pool, &headers, 4096, u32::MAX);
+        assert!(
+            matches!(result, Err((H2Error::EnhanceYourCalm, _))),
+            "expected EnhanceYourCalm once 32-octet/field overhead is counted, got {:?}",
+            result.map(|_| ())
+        );
+    }
+
+    #[test]
+    fn test_h2_cookie_crumb_count_cap_rejects_bomb() {
+        // RFC 9113 §8.2.3 cookie-crumb vector: one HPACK cookie field expands
+        // into many jar Pairs. Crumbs must count against the field cap
+        // (cf. Apache CVE-2026-49975 counting crumbs against LimitRequestFields).
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 1 << 20);
+        let mut headers = base_request_pseudo();
+        let mut cookie = Vec::new();
+        for i in 0..200 {
+            if i > 0 {
+                cookie.extend_from_slice(b"; ");
+            }
+            cookie.extend_from_slice(b"a=1");
+        }
+        headers.push((b"cookie".to_vec(), cookie));
+        let result = try_decode_request_capped(&mut pool, &headers, u32::MAX, 128);
+        assert!(
+            matches!(result, Err((H2Error::EnhanceYourCalm, _))),
+            "expected EnhanceYourCalm for >128 cookie crumbs, got {:?}",
+            result.map(|_| ())
+        );
+    }
+
+    #[test]
+    fn test_h2_legit_request_within_caps_accepted() {
+        // A normal request with a handful of headers and a 3-crumb cookie must
+        // pass cleanly under the default caps.
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        let mut headers = base_request_pseudo();
+        headers.push((b"user-agent".to_vec(), b"curl/8".to_vec()));
+        headers.push((b"accept".to_vec(), b"*/*".to_vec()));
+        headers.push((b"cookie".to_vec(), b"a=1; b=2; c=3".to_vec()));
+        let kawa = try_decode_request_capped(
+            &mut pool,
+            &headers,
+            crate::protocol::mux::h2::MAX_HEADER_LIST_SIZE as u32,
+            128,
+        )
+        .expect("legit request must be accepted");
+        assert_eq!(kawa.detached.jar.len(), 3);
     }
 
     #[test]
@@ -1709,6 +1911,7 @@ mod tests {
             end_stream,
             &mut callbacks,
             crate::protocol::mux::h2::MAX_HEADER_LIST_SIZE as u32,
+            u32::MAX,
             false,
         )
     }
@@ -1742,6 +1945,7 @@ mod tests {
             end_stream,
             &mut callbacks,
             crate::protocol::mux::h2::MAX_HEADER_LIST_SIZE as u32,
+            u32::MAX,
             false,
         )
     }
@@ -2075,6 +2279,7 @@ mod tests {
             true,
             &mut decoder,
             crate::protocol::mux::h2::MAX_HEADER_LIST_SIZE as u32,
+            u32::MAX,
             false,
         );
         assert!(err.is_err(), "LF in trailer value must be rejected");
@@ -2303,6 +2508,7 @@ mod tests {
             true, // end_stream
             &mut decoder,
             crate::protocol::mux::h2::MAX_HEADER_LIST_SIZE as u32,
+            u32::MAX,
             false, // elide_x_real_ip — listener flag, not the trailer-side gate
         );
         assert!(result.is_ok(), "handle_trailer failed: {:?}", result.err());

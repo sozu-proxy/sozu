@@ -3167,6 +3167,7 @@ fn format_patch_diff_http(
     diff_opt_copy!(h2_max_rst_stream_emitted_lifetime);
     diff_opt_copy!(h2_max_header_list_size);
     diff_opt_copy!(h2_max_header_table_size);
+    diff_opt_copy!(h2_max_header_fields);
     diff_opt_copy!(h2_stream_idle_timeout_seconds);
     diff_opt_copy!(h2_graceful_shutdown_deadline_seconds);
     diff_opt_copy!(h2_max_window_update_stream0_per_window);
@@ -3267,6 +3268,7 @@ fn format_patch_diff_https(
     diff_opt_copy!(h2_max_rst_stream_emitted_lifetime);
     diff_opt_copy!(h2_max_header_list_size);
     diff_opt_copy!(h2_max_header_table_size);
+    diff_opt_copy!(h2_max_header_fields);
     diff_opt_copy!(h2_stream_idle_timeout_seconds);
     diff_opt_copy!(h2_graceful_shutdown_deadline_seconds);
     diff_opt_copy!(h2_max_window_update_stream0_per_window);

@@ -1033,6 +1033,11 @@ pub enum HttpListenerCmd {
         h2_max_header_list_size: Option<u32>,
         #[clap(long, help = "Maximum HPACK dynamic table size accepted from the peer")]
         h2_max_header_table_size: Option<u32>,
+        #[clap(
+            long,
+            help = "Maximum materialized header fields per request, incl. cookie crumbs (HTTP/2 header-bomb mitigation)"
+        )]
+        h2_max_header_fields: Option<u32>,
         #[clap(long, help = "Per-stream idle timeout in seconds")]
         h2_stream_idle_timeout_seconds: Option<u32>,
         #[clap(
@@ -1300,6 +1305,11 @@ pub enum HttpsListenerCmd {
         h2_max_header_list_size: Option<u32>,
         #[clap(long, help = "Maximum HPACK dynamic table size accepted from the peer")]
         h2_max_header_table_size: Option<u32>,
+        #[clap(
+            long,
+            help = "Maximum materialized header fields per request, incl. cookie crumbs (HTTP/2 header-bomb mitigation)"
+        )]
+        h2_max_header_fields: Option<u32>,
         #[clap(long, help = "Per-stream idle timeout in seconds")]
         h2_stream_idle_timeout_seconds: Option<u32>,
         #[clap(

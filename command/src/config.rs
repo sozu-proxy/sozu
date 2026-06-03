@@ -450,6 +450,10 @@ pub struct ListenerBuilder {
     /// from the peer. Caps the value the peer advertises in SETTINGS frames to
     /// prevent unbounded HPACK encoder memory growth. Default: 65536.
     pub h2_max_header_table_size: Option<u32>,
+    /// Maximum number of materialized header fields per request — HPACK fields
+    /// plus expanded cookie crumbs (RFC 9113 §8.2.3). Bounds the HPACK
+    /// indexed-reference header bomb. Default: 128.
+    pub h2_max_header_fields: Option<u32>,
     /// Per-stream idle timeout, in seconds. An open H2 stream that makes no
     /// forward progress for this duration is cancelled (RST_STREAM / CANCEL)
     /// to defend against slow-multiplex Slowloris. Default: 30.
@@ -575,6 +579,7 @@ impl ListenerBuilder {
             h2_max_rst_stream_emitted_lifetime: None,
             h2_max_header_list_size: None,
             h2_max_header_table_size: None,
+            h2_max_header_fields: None,
             h2_stream_idle_timeout_seconds: None,
             h2_graceful_shutdown_deadline_seconds: None,
             strict_sni_binding: None,
@@ -847,6 +852,7 @@ impl ListenerBuilder {
             h2_max_rst_stream_emitted_lifetime: self.h2_max_rst_stream_emitted_lifetime,
             h2_max_header_list_size: self.h2_max_header_list_size,
             h2_max_header_table_size: self.h2_max_header_table_size,
+            h2_max_header_fields: self.h2_max_header_fields,
             h2_stream_idle_timeout_seconds: self.h2_stream_idle_timeout_seconds,
             h2_graceful_shutdown_deadline_seconds: self.h2_graceful_shutdown_deadline_seconds,
             sozu_id_header: self.sozu_id_header.clone(),
@@ -1015,6 +1021,7 @@ impl ListenerBuilder {
             h2_max_rst_stream_emitted_lifetime: self.h2_max_rst_stream_emitted_lifetime,
             h2_max_header_list_size: self.h2_max_header_list_size,
             h2_max_header_table_size: self.h2_max_header_table_size,
+            h2_max_header_fields: self.h2_max_header_fields,
             strict_sni_binding: self.strict_sni_binding,
             disable_http11: self.disable_http11,
             h2_stream_idle_timeout_seconds: self.h2_stream_idle_timeout_seconds,

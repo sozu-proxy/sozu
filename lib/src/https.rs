@@ -1006,6 +1006,10 @@ impl L7ListenerHandler for HttpsListener {
                 .config
                 .h2_max_header_table_size
                 .unwrap_or(defaults.max_header_table_size),
+            max_header_fields: self
+                .config
+                .h2_max_header_fields
+                .unwrap_or(defaults.max_header_fields),
         }
     }
 
@@ -1347,6 +1351,9 @@ impl HttpsListener {
         }
         if let Some(v) = patch.h2_max_header_table_size {
             self.config.h2_max_header_table_size = Some(v);
+        }
+        if let Some(v) = patch.h2_max_header_fields {
+            self.config.h2_max_header_fields = Some(v);
         }
         if let Some(v) = patch.h2_stream_idle_timeout_seconds {
             self.config.h2_stream_idle_timeout_seconds = Some(v);

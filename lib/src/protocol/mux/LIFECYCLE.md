@@ -480,20 +480,41 @@ listener.
   leaves `access_log_message = None`. See `doc/configure.md` § "Access log
   message field" for the full vocabulary.
 
-### 7.2 Per-stream idle timeout (slow-multiplex guard)
+### 7.2 Per-stream reap guards (slow-multiplex + window-stall)
 
-- Tracker: `ConnectionH2.stream_last_activity_at: HashMap<StreamId, Instant>` —
-  `h2.rs:1057`.
-- Cap: `ConnectionH2.stream_idle_timeout` — `h2.rs:1060`.
-- Fired by: `ConnectionH2::cancel_timed_out_streams` at `h2.rs:2823`, called at
-  the top of every `readable()` call (`h2.rs:1616`).
-- Action: queue `RST_STREAM(CANCEL)`, remove the wire-id mapping, mark the
-  stream `Recycle`, notify the backend endpoint.
-- Does **not** feed `total_rst_streams_queued` — it is proxy-initiated, not
-  peer-driven (`h2.rs:2854`).
-- Mitigates slow-multiplex Slowloris: connection-level timer resets on every
-  frame, so without this per-stream guard a peer could hold
-  `max_concurrent_streams` slots for the full session timeout.
+Two independent per-stream deadlines, both bounded by
+`ConnectionH2.stream_idle_timeout` and reaped by
+`ConnectionH2::cancel_timed_out_streams`, which unions them (deduped) via the
+unit-testable free function `collect_timed_out_streams`:
+
+- **Bidirectional-silence guard** — `ConnectionH2.stream_last_activity_at:
+  HashMap<StreamId, Instant>`. Refreshed on every non-empty inbound DATA frame,
+  on HEADERS for an existing stream (trailers), and on outbound bytes written.
+  Catches a stream making no forward progress in either direction
+  (slow-multiplex Slowloris: the connection-level timer resets on every frame,
+  so without this per-stream guard a peer could hold `max_concurrent_streams`
+  slots for the full session timeout).
+- **Outbound-flow-control-stall guard** — `ConnectionH2.stream_fc_stalled_since:
+  HashMap<StreamId, Instant>`. Armed (in `write_streams`) only when a stream
+  holds buffered response data it cannot send because its effective send window
+  `min(stream.window, connection.window)` is exhausted; cleared the instant the
+  response makes real outbound progress (`consumed > 0`). It is **never**
+  refreshed by inbound DATA/HEADERS, so a peer that keeps the silence guard warm
+  with an inbound 1-byte DATA drip while holding its receive window shut — the
+  HTTP/2 window-stall / `WINDOW_UPDATE`-drip vector — is still reaped.
+
+- Action (both): queue `RST_STREAM(CANCEL)` via `enqueue_rst`, remove the
+  wire-id mapping, mark the stream `Recycle`, notify the backend endpoint. The
+  access-log reason discriminates them — `"H2::IdleTimeout"` vs
+  `"H2::WindowStall"`.
+- Run from the top of every `readable()` call **and** from the connection-level
+  `MuxState::timeout`, so a fully-silent peer — which never triggers a read
+  event — still has its window-stalled stream reaped; the timeout path sets
+  `should_write` to flush the queued `RST_STREAM(CANCEL)`.
+- Does **not** feed `total_rst_streams_queued` — proxy-initiated, not
+  peer-driven.
+- Both per-stream maps are evicted in `remove_dead_stream` (with `debug_assert`s
+  guarding against a leaked entry on a new per-stream cache).
 
 ### 7.3 Backend timeout
 
