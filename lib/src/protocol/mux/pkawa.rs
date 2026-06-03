@@ -267,6 +267,15 @@ pub(super) enum RejectReason {
     /// A pseudo-header arrived with a zero-length value (RFC 9113 §8.3.1
     /// forbids empty `:path`/`:method`/`:authority`/`:scheme`/`:status`).
     EmptyPseudo,
+    /// The HPACK block's accounted size (name + value + the RFC 9113 §6.5.2
+    /// 32-octet/field overhead) exceeded `SETTINGS_MAX_HEADER_LIST_SIZE` — the
+    /// indexed-reference "header bomb" byte budget. Stream-level
+    /// `RST_STREAM(ENHANCE_YOUR_CALM)`.
+    HeaderListOverBudget,
+    /// The block's materialized header-field count (cookie crumbs counted
+    /// individually, RFC 9113 §8.2.3) exceeded `h2_max_header_fields` — the
+    /// per-block field-count cap. Stream-level `RST_STREAM(ENHANCE_YOUR_CALM)`.
+    TooManyHeaderFields,
 }
 
 /// Compile-time mapping from `(prefix, RejectReason)` to a static metric key.
@@ -298,6 +307,8 @@ macro_rules! reject_metric_key {
             RejectReason::PseudoAfterRegular => concat!($prefix, ".pseudo_after_regular"),
             RejectReason::UnknownPseudo => concat!($prefix, ".unknown_pseudo"),
             RejectReason::EmptyPseudo => concat!($prefix, ".empty_pseudo"),
+            RejectReason::HeaderListOverBudget => concat!($prefix, ".header_list_size"),
+            RejectReason::TooManyHeaderFields => concat!($prefix, ".header_fields"),
         }
     };
 }
@@ -592,8 +603,10 @@ where
         }
         per_header(k, v, &mut invalid_headers, &mut field_count);
         // The cookie branch (RFC 9113 §8.2.3) expands one HPACK field into many
-        // jar crumbs and bumps `field_count` per crumb; re-check after each call
-        // so a single crumb-packed cookie header cannot blow past the cap.
+        // jar crumbs and bumps `field_count` for each crumb beyond the first
+        // (the first crumb is already counted by the `field_count += 1` above,
+        // so a cookie costs exactly N); re-check after the call so a crumb-packed
+        // cookie header cannot blow past the cap.
         if field_count > max_header_fields {
             field_limit_exceeded = true;
         }
@@ -603,6 +616,7 @@ where
         return Err((H2Error::CompressionError, true));
     }
     if budget_exceeded {
+        metric_reject(RejectReason::HeaderListOverBudget);
         error!(
             "{} HPACK decoded header size {} exceeds MAX_HEADER_LIST_SIZE {}",
             log_module_context!(),
@@ -612,6 +626,7 @@ where
         return Err((H2Error::EnhanceYourCalm, false));
     }
     if field_limit_exceeded {
+        metric_reject(RejectReason::TooManyHeaderFields);
         error!(
             "{} HPACK header field count {} exceeds max_header_fields {}",
             log_module_context!(),
@@ -717,6 +732,7 @@ where
                         //  1. H1BlockConverter emits a single "Cookie: k1=v1; k2=v2" header
                         //  2. H2BlockConverter re-encodes each as a separate HPACK header
                         //  3. HttpContext::on_request_headers can find sticky session cookies
+                        let mut first_crumb = true;
                         for cookie_pair in v.split(|&b| b == b';') {
                             let trimmed = trim_ows(cookie_pair);
                             if trimmed.is_empty() {
@@ -731,13 +747,35 @@ where
                             // RFC 6265 §4.2.1 + RFC 9110 §5.5: cookie-name and
                             // cookie-value must not contain CTLs. Without this
                             // check, a crafted cookie can smuggle headers
-                            // through kawa's H1 serializer.
+                            // through kawa's H1 serializer. Validate BEFORE the
+                            // field-count gate so a malformed crumb is still
+                            // rejected as CrlfInValue/NulInValue rather than
+                            // masked by the count cap.
                             if let Some(reason) = classify_invalid_value_byte(cookie_key)
                                 .or_else(|| classify_invalid_value_byte(cookie_val))
                             {
                                 metric_reject(reason);
                                 *invalid_headers = true;
                                 return;
+                            }
+                            // RFC 9113 §8.2.3 lets one HPACK cookie field expand
+                            // into many crumbs, each materialized as a jar Pair.
+                            // Count every crumb against the field cap and bail the
+                            // moment it is crossed — BEFORE materializing the
+                            // over-cap crumb (storage + jar Pair), so a crumb-packed
+                            // cookie cannot amplify allocation (cf. Apache
+                            // CVE-2026-49975 counting crumbs against
+                            // LimitRequestFields). The outer `field_count += 1` in
+                            // `decode_headers_with_budget` already counted the first
+                            // crumb of this cookie HPACK field, so only crumbs 2..N
+                            // add here — a cookie costs exactly N, not N+1.
+                            if first_crumb {
+                                first_crumb = false;
+                            } else {
+                                *field_count += 1;
+                                if *field_count > max_header_fields as usize {
+                                    return;
+                                }
                             }
                             let key_start = kawa.storage.end as u32;
                             if kawa.storage.write_all(cookie_key).is_err() {
@@ -767,16 +805,6 @@ where
                                     len: val_len,
                                 }),
                             });
-                            // RFC 9113 §8.2.3 lets one HPACK cookie field expand
-                            // into many crumbs, each materialized as a jar Pair.
-                            // Count every crumb against the field cap and bail the
-                            // moment it is crossed, so a crumb-packed cookie cannot
-                            // amplify allocation (cf. Apache CVE-2026-49975 counting
-                            // crumbs against LimitRequestFields).
-                            *field_count += 1;
-                            if *field_count > max_header_fields as usize {
-                                return;
-                            }
                         }
                     } else if compare_no_case(&k, b"host") {
                         // RFC 9113 §8.3.1: a literal ``host`` header is tolerated
@@ -1195,6 +1223,7 @@ pub fn handle_trailer(
         return Err((H2Error::CompressionError, true));
     }
     if budget_exceeded {
+        metric_reject(RejectReason::HeaderListOverBudget);
         error!(
             "{} HPACK decoded trailer size {} exceeds MAX_HEADER_LIST_SIZE {}",
             log_module_context!(),
@@ -1204,6 +1233,7 @@ pub fn handle_trailer(
         return Err((H2Error::EnhanceYourCalm, false));
     }
     if field_limit_exceeded {
+        metric_reject(RejectReason::TooManyHeaderFields);
         error!(
             "{} HPACK trailer field count {} exceeds max_header_fields {}",
             log_module_context!(),
@@ -1677,6 +1707,51 @@ mod tests {
         assert!(
             matches!(result, Err((H2Error::EnhanceYourCalm, _))),
             "expected EnhanceYourCalm for >128 cookie crumbs, got {:?}",
+            result.map(|_| ())
+        );
+    }
+
+    #[test]
+    fn test_h2_cookie_crumb_count_exact_n_boundary() {
+        // L2 exact-N semantics: a cookie HPACK field costs exactly N (its crumb
+        // count), NOT N+1. With 4 pseudo-headers + a cap of 4 + 128 = 132, a lone
+        // cookie of 128 crumbs costs exactly 128 → total 132 → ACCEPTED; 129
+        // crumbs → total 133 → REJECTED. Under the old N+1 count the 128-crumb
+        // cookie would have cost 129 (total 133) and been wrongly rejected — so
+        // this pins the exact-N boundary and guards against a silent regression
+        // back to N+1 (or to an under-count below the materialized Pair count).
+        let cap: u32 = 4 + 128;
+
+        let build = |crumbs: usize| -> Vec<(Vec<u8>, Vec<u8>)> {
+            let mut headers = base_request_pseudo();
+            let mut cookie = Vec::new();
+            for i in 0..crumbs {
+                if i > 0 {
+                    cookie.extend_from_slice(b"; ");
+                }
+                cookie.extend_from_slice(b"a=1");
+            }
+            headers.push((b"cookie".to_vec(), cookie));
+            headers
+        };
+
+        // Exactly at the cap: 128 crumbs (total field count 132) → accepted.
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 1 << 20);
+        let at_cap = build(128);
+        let result = try_decode_request_capped(&mut pool, &at_cap, u32::MAX, cap);
+        assert!(
+            result.is_ok(),
+            "128-crumb cookie must pass under exact-N (cap {cap}), got {:?}",
+            result.err()
+        );
+
+        // One past the cap: 129 crumbs (total field count 133) → rejected.
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 1 << 20);
+        let over_cap = build(129);
+        let result = try_decode_request_capped(&mut pool, &over_cap, u32::MAX, cap);
+        assert!(
+            matches!(result, Err((H2Error::EnhanceYourCalm, _))),
+            "129-crumb cookie must reject under exact-N (cap {cap}), got {:?}",
             result.map(|_| ())
         );
     }
