@@ -107,7 +107,7 @@ fn sozu_version_reports_plus_tui() {
 /// cargo test -p sozu --features tui --tests -- --ignored sozu_top
 /// ```
 #[test]
-#[ignore]
+#[ignore = "manual: drives a real master process over a unix socket; run with --ignored (see module docs)"]
 fn sozu_top_tick_once_against_real_master() {
     let temp = tempfile::tempdir().expect("tempdir");
     let socket_path = temp.path().join("sozu.sock");

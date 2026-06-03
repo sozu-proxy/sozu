@@ -1,9 +1,10 @@
 # Deterministic simulation (UDP)
 
-`lib/tests/udp_simulation.rs` is a moonpool / VOPR-style **deterministic
+`lib/tests/udp_simulation.rs` is a FoundationDB/VOPR-style **deterministic
 simulation test** for the sans-io UDP load-balancing core
 (`sozu_lib::protocol::udp::UdpManager` + `UdpFlow`, issue #1273). It is built in
-the spirit of [TigerBeetle's VOPR][vopr] and the [FoundationDB simulator][fdb]:
+the spirit of [TigerBeetle's VOPR][vopr], the [FoundationDB simulator][fdb], and
+the [`moonpool-sim`][moonpool] deterministic-simulation engine for Rust:
 a single seeded RNG drives a randomized, adversarial workload against the pure
 core across many seeds, so that **same seed → bit-for-bit identical run**, and
 every failure reproduces exactly from its seed.
@@ -114,3 +115,4 @@ reproduces exactly via `SOZU_UDP_SIM_SEED=<seed>`.
 [vopr]: https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/internals/vopr.md
 [fdb]: https://apple.github.io/foundationdb/testing.html
 [fdb-buggify]: https://transactional.blog/simulation/buggify
+[moonpool]: https://crates.io/crates/moonpool-sim

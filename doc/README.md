@@ -60,9 +60,11 @@ Sōzu is a reverse proxy for load balancing, written in Rust. Its main job is to
 
 ## Testing
 
+* [Testing guide][tst] — the testing doctrine: assertion-first + deterministic simulation, categories, and what every change must land with
+
 * [Worker upgrade e2e tests][ue]
 
-* [Deterministic simulation (UDP)][uds] — moonpool/VOPR-style seeded fault injection for the sans-io UDP core
+* [Deterministic simulation (UDP)][uds] — FoundationDB/VOPR-style seeded fault injection for the sans-io UDP core
 
 * [Nightly CI notes][nci]
 
@@ -91,6 +93,7 @@ Sōzu is a reverse proxy for load balancing, written in Rust. Its main job is to
 [h2lc]: ../lib/src/protocol/mux/LIFECYCLE.md
 [hc]: ./health_checks.md
 [li]: ./lifetime_of_a_session.md
+[tst]: ./testing.md
 [ue]: ./upgrade_e2e_tests.md
 [uds]: ./udp_simulation.md
 [ob]: ./observability.md
