@@ -177,7 +177,7 @@ Declared at `h2.rs:920` (`pub enum H2State`):
 | `ConnectionH2::writable`                 | `h2.rs:3001` | `Mux::ready` when `WRITABLE` asserted |
 | `ConnectionH2::close`                    | `h2.rs:5117` | `Mux::close` and dead-backend cleanup |
 | `ConnectionH2::graceful_goaway`          | `h2.rs:3751` | `Mux::shutting_down` (`mod.rs:1669`)  |
-| `ConnectionH2::cancel_timed_out_streams` | `h2.rs:3392` | top of every `readable()` call        |
+| `ConnectionH2::cancel_timed_out_streams` | `h2.rs:2048` | top of every `readable()` call        |
 
 ### 2.4 Termination triggers
 
@@ -231,8 +231,8 @@ StreamState:     Idle  → Link → Linked(Token) → Unlinked → Recycle
 
 - **Stream creation.** `Context::create_stream` (`mod.rs:430`) either reuses a
   `Recycle` slot or pushes a new `Stream`. For H2, the per-stream wire-id
-  mapping is added by `ConnectionH2::create_stream` (`h2.rs:3153`) which also
-  records `stream_last_activity_at` (`h2.rs:3180`).
+  mapping is added by `ConnectionH2::create_stream` (`h2.rs:4433`) which also
+  records `stream_last_activity_at` (`h2.rs:4461`).
 - **Backend attach.** `Router::connect` (called from `mod.rs:1049` during the
   `pending_links` drain) eventually calls `Context::link_stream`
   (`router.rs:233` and `:358`) which sets `Linked(token)` and pushes to
@@ -389,7 +389,7 @@ going through `remove_dead_stream` must apply the same two invalidation checks
 (or be refactored to route through the helper):
 
 - `handle_continuation_header_state` CONTINUATION oversize — `h2.rs:1562`.
-- `cancel_timed_out_streams` slow-multiplex guard — `h2.rs:2863`.
+- `cancel_timed_out_streams` slow-multiplex guard — `h2.rs:2048`.
 - `handle_rst_stream_frame` peer RST — `h2.rs:3739`.
 - `handle_goaway_frame` retry loop — `h2.rs:4016`.
 - `end_stream` client-side retirement — `h2.rs:4420`.
@@ -495,26 +495,50 @@ unit-testable free function `collect_timed_out_streams`:
   so without this per-stream guard a peer could hold `max_concurrent_streams`
   slots for the full session timeout).
 - **Outbound-flow-control-stall guard** — `ConnectionH2.stream_fc_stalled_since:
-  HashMap<StreamId, Instant>`. Armed (in `write_streams`) only when a stream
-  holds buffered response data it cannot send because its effective send window
-  `min(stream.window, connection.window)` is exhausted; cleared the instant the
-  response makes real outbound progress (`consumed > 0`). It is **never**
-  refreshed by inbound DATA/HEADERS, so a peer that keeps the silence guard warm
-  with an inbound 1-byte DATA drip while holding its receive window shut — the
-  HTTP/2 window-stall / `WINDOW_UPDATE`-drip vector — is still reaped.
+  HashMap<StreamId, Instant>`, paired with
+  `ConnectionH2.stream_fc_stalled_progress: HashMap<StreamId, usize>` (the
+  cumulative-stall budget). Armed (in `write_streams`) whenever a stream holds
+  sendable buffered data it cannot send because its effective send window
+  `min(stream.window, connection.window)` is exhausted. This is
+  **bidirectional**: the buffered data is the **response** on a `Position::Server`
+  (frontend) connection and the **request upload** on a `Position::Client`
+  (backend) connection — so a slot pinned by a stalled upload to a slow H2 backend
+  is reaped too (a legitimately slow upload to a window-shut backend is then
+  cancelled and returned to the client as a `502` via `end_stream_decision`; size
+  `h2_stream_idle_timeout_seconds` accordingly). It is **never** refreshed by
+  inbound DATA/HEADERS, so a peer keeping the silence guard warm with an inbound
+  1-byte DATA drip cannot keep it alive. The deadline clears only on a genuinely
+  open window OR once `stream_fc_stalled_progress` reaches `FC_STALL_CLEAR_FLOOR`
+  (16 KiB = one max DATA frame). A `WINDOW_UPDATE(+1)` drip that trickles ~1 byte
+  per idle period — on the main write loop **and** on the socket-backpressure
+  resume path (`h2.rs:2387`) — therefore never reaches the floor, so the deadline
+  ages out and the stream is reaped (the HTTP/2 window-stall / `WINDOW_UPDATE`-drip
+  vector is closed). The progress accumulator is kept in lockstep with
+  `stream_fc_stalled_since` at every arm/clear/evict site.
 
-- Action (both): queue `RST_STREAM(CANCEL)` via `enqueue_rst`, remove the
-  wire-id mapping, mark the stream `Recycle`, notify the backend endpoint. The
-  access-log reason discriminates them — `"H2::IdleTimeout"` vs
-  `"H2::WindowStall"`.
+- Action (both): queue `RST_STREAM(CANCEL)` via `enqueue_rst`, remove the wire-id
+  mapping, mark the stream `Recycle` (on `Position::Server`; the `Position::Client`
+  reap is finalized through the linked frontend's `end_stream`), notify the linked
+  endpoint. The access-log reason discriminates them — `"H2::IdleTimeout"` vs
+  `"H2::WindowStall"` — and is emitted once, frontend-side.
 - Run from the top of every `readable()` call **and** from the connection-level
   `MuxState::timeout`, so a fully-silent peer — which never triggers a read
-  event — still has its window-stalled stream reaped; the timeout path sets
-  `should_write` to flush the queued `RST_STREAM(CANCEL)`.
-- Does **not** feed `total_rst_streams_queued` — proxy-initiated, not
-  peer-driven.
-- Both per-stream maps are evicted in `remove_dead_stream` (with `debug_assert`s
-  guarding against a leaked entry on a new per-stream cache).
+  event — still has its window-stalled stream reaped; the timeout path consults
+  `ConnectionH2::has_pending_control_write` and sets `should_write` so the queued
+  `RST_STREAM(CANCEL)` is flushed to the peer before close (`has_pending_write`
+  intentionally ignores `pending_rst_streams` because it gates connection close).
+- **Does** feed `total_rst_streams_queued` and the MadeYouReset emitted-lifetime
+  cap (via `enqueue_rst` → `account_emitted_rst`, since `Cancel != NoError`):
+  proxy-emitted reaps deliberately count against the caps so an attacker cannot
+  use proxy-forced resets to bypass the ceiling (security review LISA-001; see
+  §8.2).
+- All three per-stream maps (`stream_last_activity_at`, `stream_fc_stalled_since`,
+  `stream_fc_stalled_progress`) are evicted in `remove_dead_stream` (with
+  `debug_assert`s guarding against a leaked entry on a new per-stream cache).
+- Observability: `cancel_timed_out_streams` emits
+  `h2.streams.reaped.{idle_timeout,window_stall}` per guard, plus
+  `h2.streams.reaped.stall_budget` (a subset of `window_stall`) when the reaped
+  stream had dribbled progress below the floor.
 
 ### 7.3 Backend timeout
 
