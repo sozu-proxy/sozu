@@ -412,6 +412,385 @@ fn test_h2_idle_stream_timeout_frees_slot() {
 }
 
 // ============================================================================
+// Window-stalled response stream is reaped by the flow-control-stall guard
+// ============================================================================
+
+/// With `h2_stream_idle_timeout_seconds = 2` and the client advertising
+/// `SETTINGS_INITIAL_WINDOW_SIZE = 0`, a GET gets its response HEADERS (not
+/// flow-controlled) but the response DATA cannot egress and sits buffered in
+/// sozu's kawa with the send window exhausted. The dedicated flow-control-stall
+/// deadline must arm and RST_STREAM(CANCEL) the stream after the timeout,
+/// freeing its MAX_CONCURRENT_STREAMS slot. (End-to-end coverage that the write
+/// loop *arms* `stream_fc_stalled_since`; the reaper union itself is unit-tested
+/// in `collect_timed_out_streams`.)
+fn try_h2_window_stall_response_reaped() -> State {
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker =
+        Worker::start_new_worker_owned("H2-COR-WINDOW-STALL", config, listeners, state);
+
+    let mut listener_config = ListenerBuilder::new_https(front_address.clone())
+        .to_tls(None)
+        .unwrap();
+    listener_config.h2_stream_idle_timeout_seconds = Some(2);
+
+    worker.send_proxy_request_type(RequestType::AddHttpsListener(listener_config));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        address: front_address.clone(),
+        proxy: ListenerType::Https.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        hostname: String::from("localhost"),
+        ..Worker::default_http_frontend("cluster_0", front_address.clone().into())
+    }));
+
+    let certificate_and_key = CertificateAndKey {
+        certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
+        key: String::from(include_str!("../../../lib/assets/local-key.pem")),
+        certificate_chain: vec![],
+        versions: vec![],
+        names: vec![],
+    };
+    worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+        address: front_address,
+        certificate: certificate_and_key,
+        expired_at: None,
+    }));
+
+    let back_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0".to_owned(),
+        back_address,
+        None,
+    )));
+    let backend = AsyncBackend::spawn_detached_backend(
+        "BACKEND_0".to_owned(),
+        back_address,
+        SimpleAggregator::default(),
+        AsyncBackend::http_handler("window-stall-body".to_owned()),
+    );
+    worker.read_to_last();
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    // Zero stream window: HEADERS flow, response DATA stays window-blocked.
+    h2_handshake_with_initial_window(&mut tls, 0);
+
+    let header_block = vec![
+        0x82, // :method GET
+        0x84, // :path /
+        0x87, // :scheme https
+        0x41, 0x09, // :authority localhost
+        b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't',
+    ];
+    let headers = H2Frame::headers(1, header_block, true, true);
+    tls.write_all(&headers.encode()).unwrap();
+    tls.flush().unwrap();
+
+    // Wait past the 2s deadline, then tickle the readable path (which runs
+    // cancel_timed_out_streams) with a PING.
+    thread::sleep(Duration::from_secs(4));
+    let ping = H2Frame::ping([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
+    let _ = tls.write_all(&ping.encode());
+    let _ = tls.flush();
+
+    let data = read_all_available(&mut tls, Duration::from_millis(1000));
+    let all_frames = parse_h2_frames(&data);
+    log_frames("Window-stall reaped", &all_frames);
+
+    let rst_cancel = extract_rst_streams(&all_frames)
+        .iter()
+        .any(|(sid, ec)| *sid == 1 && *ec == 0x8 /* CANCEL */);
+    println!("Window-stall stream 1 RST_STREAM(CANCEL): {rst_cancel}");
+
+    let infra_ok = teardown(tls, front_port, worker, vec![backend]);
+    if infra_ok && rst_cancel {
+        State::Success
+    } else {
+        println!("Window-stall reaped - FAIL: rst_cancel={rst_cancel} infra_ok={infra_ok}");
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_window_stall_response_reaped() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 correctness: window-stalled response stream reaped (flow-control-stall guard)",
+            try_h2_window_stall_response_reaped
+        ),
+        State::Success
+    );
+}
+
+/// The distinguishing case for the flow-control-stall guard: a peer that
+/// keeps the bidirectional-liveness timer warm with an inbound 1-byte DATA drip
+/// while its response stays window-blocked. The idle guard cannot fire (each
+/// non-empty inbound DATA refreshes `stream_last_activity_at`), so ONLY the
+/// dedicated flow-control-stall deadline can produce the RST_STREAM(CANCEL).
+/// This is the test that fails if the write-loop arming of `stream_fc_stalled_since`
+/// is removed (the GET case above is reaped by the idle guard regardless).
+fn try_h2_window_stall_inbound_drip_reaped() -> State {
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker =
+        Worker::start_new_worker_owned("H2-COR-WINDOW-STALL-DRIP", config, listeners, state);
+
+    let mut listener_config = ListenerBuilder::new_https(front_address.clone())
+        .to_tls(None)
+        .unwrap();
+    listener_config.h2_stream_idle_timeout_seconds = Some(2);
+
+    worker.send_proxy_request_type(RequestType::AddHttpsListener(listener_config));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        address: front_address.clone(),
+        proxy: ListenerType::Https.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        hostname: String::from("localhost"),
+        ..Worker::default_http_frontend("cluster_0", front_address.clone().into())
+    }));
+
+    let certificate_and_key = CertificateAndKey {
+        certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
+        key: String::from(include_str!("../../../lib/assets/local-key.pem")),
+        certificate_chain: vec![],
+        versions: vec![],
+        names: vec![],
+    };
+    worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+        address: front_address,
+        certificate: certificate_and_key,
+        expired_at: None,
+    }));
+
+    let back_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0".to_owned(),
+        back_address,
+        None,
+    )));
+    let backend = AsyncBackend::spawn_detached_backend(
+        "BACKEND_0".to_owned(),
+        back_address,
+        SimpleAggregator::default(),
+        AsyncBackend::http_handler("window-stall-body".to_owned()),
+    );
+    worker.read_to_last();
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake_with_initial_window(&mut tls, 0);
+
+    // POST WITHOUT END_STREAM: the request body stays open so we can drip
+    // inbound DATA. The backend (one read + immediate response) buffers the
+    // response, which is window-blocked at the client's zero window.
+    let header_block = vec![
+        0x83, // :method POST
+        0x84, // :path /
+        0x87, // :scheme https
+        0x41, 0x09, // :authority localhost
+        b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't',
+    ];
+    let headers = H2Frame::headers(1, header_block, true, false);
+    tls.write_all(&headers.encode()).unwrap();
+    tls.flush().unwrap();
+
+    // Drip a 1-byte non-empty DATA frame every 700ms (< the 2s deadline). Each
+    // refreshes the idle timer (content_len > 0) but makes ZERO outbound
+    // progress, so only the flow-control-stall deadline can reap the stream.
+    let mut rst_cancel = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(7);
+    while std::time::Instant::now() < deadline {
+        let data = H2Frame::new(H2_FRAME_DATA, 0 /* no END_STREAM */, 1, vec![0x41]);
+        let _ = tls.write_all(&data.encode());
+        let _ = tls.flush();
+        thread::sleep(Duration::from_millis(700));
+        let bytes = read_all_available(&mut tls, Duration::from_millis(200));
+        let frames = parse_h2_frames(&bytes);
+        if !frames.is_empty() {
+            log_frames("Window-stall inbound-drip", &frames);
+        }
+        if extract_rst_streams(&frames)
+            .iter()
+            .any(|(sid, ec)| *sid == 1 && *ec == 0x8)
+        {
+            rst_cancel = true;
+            break;
+        }
+    }
+    println!("Window-stall (inbound drip) stream 1 RST_STREAM(CANCEL): {rst_cancel}");
+
+    let infra_ok = teardown(tls, front_port, worker, vec![backend]);
+    if infra_ok && rst_cancel {
+        State::Success
+    } else {
+        println!("Window-stall inbound-drip - FAIL: rst_cancel={rst_cancel} infra_ok={infra_ok}");
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_window_stall_inbound_drip_reaped() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 correctness: window-stalled stream reaped despite inbound DATA drip (flow-control-stall guard)",
+            try_h2_window_stall_inbound_drip_reaped
+        ),
+        State::Success
+    );
+}
+
+/// Fully-silent window-stall: peer sends one zero-window GET then NO further
+/// frames. The connection-timeout path must run the reaper, else the stream
+/// lingers until the zombie checker. Reap observed as GOAWAY/RST(CANCEL) or EOF.
+fn try_h2_window_stall_silent_reaped() -> State {
+    use std::io::Read as _;
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker =
+        Worker::start_new_worker_owned("H2-COR-WINDOW-STALL-SILENT", config, listeners, state);
+
+    let mut listener_config = ListenerBuilder::new_https(front_address.clone())
+        .to_tls(None)
+        .unwrap();
+    listener_config.h2_stream_idle_timeout_seconds = Some(2);
+    // Frontend timer is armed with `request_timeout` (https.rs:170).
+    listener_config.request_timeout = 3;
+    listener_config.front_timeout = 3;
+
+    worker.send_proxy_request_type(RequestType::AddHttpsListener(listener_config));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        address: front_address.clone(),
+        proxy: ListenerType::Https.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        hostname: String::from("localhost"),
+        ..Worker::default_http_frontend("cluster_0", front_address.clone().into())
+    }));
+
+    let certificate_and_key = CertificateAndKey {
+        certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
+        key: String::from(include_str!("../../../lib/assets/local-key.pem")),
+        certificate_chain: vec![],
+        versions: vec![],
+        names: vec![],
+    };
+    worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+        address: front_address,
+        certificate: certificate_and_key,
+        expired_at: None,
+    }));
+
+    let back_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0".to_owned(),
+        back_address,
+        None,
+    )));
+    let backend = AsyncBackend::spawn_detached_backend(
+        "BACKEND_0".to_owned(),
+        back_address,
+        SimpleAggregator::default(),
+        AsyncBackend::http_handler("window-stall-body".to_owned()),
+    );
+    worker.read_to_last();
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake_with_initial_window(&mut tls, 0);
+
+    let header_block = vec![
+        0x82, 0x84, 0x87, 0x41, 0x09, b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't',
+    ];
+    let headers = H2Frame::headers(1, header_block, true, true);
+    tls.write_all(&headers.encode()).unwrap();
+    tls.flush().unwrap();
+
+    let mut reaped = false;
+    let mut acc: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 16384];
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    while std::time::Instant::now() < deadline {
+        match tls.read(&mut buf) {
+            Ok(0) => {
+                reaped = true;
+                break;
+            }
+            Ok(n) => {
+                acc.extend_from_slice(&buf[..n]);
+                let frames = parse_h2_frames(&acc);
+                if !frames.is_empty() {
+                    log_frames("Window-stall silent", &frames);
+                }
+                if extract_rst_streams(&frames)
+                    .iter()
+                    .any(|(sid, ec)| *sid == 1 && *ec == 0x8)
+                    || contains_goaway(&frames)
+                {
+                    reaped = true;
+                    break;
+                }
+            }
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => {
+                reaped = true;
+                break;
+            }
+        }
+    }
+    println!("Window-stall (silent) reaped: {reaped}");
+
+    let infra_ok = teardown(tls, front_port, worker, vec![backend]);
+    if infra_ok && reaped {
+        State::Success
+    } else {
+        println!("Window-stall silent - FAIL: reaped={reaped} infra_ok={infra_ok}");
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_window_stall_silent_reaped() {
+    assert_eq!(
+        repeat_until_error_or(
+            2,
+            "H2 correctness: fully-silent window-stall reaped via connection-timeout reaper",
+            try_h2_window_stall_silent_reaped
+        ),
+        State::Success
+    );
+}
+
+// ============================================================================
 // Test 5: Active upload survives past idle timeout (trickled DATA resets timer)
 // ============================================================================
 

@@ -30,11 +30,11 @@
 use std::{io::Write, net::SocketAddr};
 
 use super::h2_utils::{
-    H2_ERROR_FRAME_SIZE_ERROR, H2_ERROR_PROTOCOL_ERROR, H2_FRAME_DATA, H2_FRAME_GOAWAY, H2Frame,
-    collect_response_frames, contains_goaway, contains_goaway_with_error,
-    contains_headers_response, contains_rst_stream, goaway_error_code, h2_handshake, log_frames,
-    parse_h2_frames, raw_h2_connection, read_all_available, rejected_with_goaway_or_rst,
-    setup_h2_test, teardown,
+    H2_ERROR_ENHANCE_YOUR_CALM, H2_ERROR_FRAME_SIZE_ERROR, H2_ERROR_PROTOCOL_ERROR, H2_FRAME_DATA,
+    H2_FRAME_GOAWAY, H2Frame, collect_response_frames, contains_goaway, contains_goaway_with_error,
+    contains_headers_response, contains_rst_stream, contains_rst_stream_with_error,
+    goaway_error_code, h2_handshake, log_frames, parse_h2_frames, raw_h2_connection,
+    read_all_available, rejected_with_goaway_or_rst, setup_h2_test, teardown,
 };
 use crate::tests::{State, repeat_until_error_or};
 
@@ -641,6 +641,74 @@ fn e2e_h2_parser_serializer_masks_reserved_bit() {
             3,
             "H2 serializer: reserved R-bit masked on every outbound stream-id (RFC 9113 \u{00a7}4.1)",
             try_h2_parser_serializer_masks_reserved_bit,
+        ),
+        State::Success,
+    );
+}
+
+// ============================================================================
+// Test: HPACK indexed-reference "header bomb" — per-request field-count cap
+// ============================================================================
+
+/// HTTP/2 "header bomb" (memory-amplification DoS, same class as the calif.io
+/// disclosure and Apache CVE-2026-49975): the attacker seeds the HPACK dynamic
+/// table with one header, then emits many 1-byte *indexed* references to it.
+/// Each reference costs ~1 wire byte but materializes a full header field
+/// (a `Pair` of per-entry bookkeeping) on the server, amplifying wire bytes
+/// into allocation. sozu caps the number of materialized fields per request
+/// (`h2_max_header_fields`, default 128) and must reject an over-cap block with
+/// ENHANCE_YOUR_CALM instead of materializing it.
+fn try_h2_parser_reject_header_field_bomb() -> State {
+    let (worker, backends, front_port) = setup_h2_test("H2-PARSER-HEADER-BOMB", 1);
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake(&mut tls);
+
+    // Valid GET pseudo-headers, then seed the dynamic table with one
+    // literal-with-incremental-indexing header ("x-bomb: x" → dynamic index 62),
+    // then 200 one-byte indexed references (0xBE == 0x80 | 62) to it. 205
+    // materialized fields far exceed the 128 default cap, while the decoded
+    // byte size stays trivially small — exactly the amplification the field
+    // cap exists to stop.
+    let mut block = minimal_get_headers_block();
+    block.push(0x40); // literal w/ incremental indexing, new name
+    block.push(0x06); // name length = 6
+    block.extend_from_slice(b"x-bomb");
+    block.push(0x01); // value length = 1
+    block.push(b'x');
+    block.extend(std::iter::repeat_n(0xBE_u8, 200)); // 200 × indexed ref to entry 62
+
+    let headers = H2Frame::headers(1, block, true, true);
+    let write_ok = tls.write_all(&headers.encode()).is_ok() && tls.flush().is_ok();
+
+    let frames = collect_response_frames(&mut tls, 500, 5, 500);
+    log_frames("Header field bomb", &frames);
+
+    let calmed = contains_goaway_with_error(&frames, H2_ERROR_ENHANCE_YOUR_CALM)
+        || contains_rst_stream_with_error(&frames, 1, H2_ERROR_ENHANCE_YOUR_CALM);
+    let got_ok_response = contains_headers_response(&frames);
+    println!("Header field bomb - ENHANCE_YOUR_CALM={calmed} ok_response={got_ok_response}");
+
+    let infra_ok = teardown(tls, front_port, worker, backends);
+    if infra_ok && calmed && !got_ok_response {
+        State::Success
+    } else {
+        println!(
+            "Header field bomb - FAIL: calmed={calmed} got_ok_response={got_ok_response} \
+             write_ok={write_ok} infra_ok={infra_ok}"
+        );
+        State::Fail
+    }
+}
+
+#[test]
+fn e2e_h2_parser_reject_header_field_bomb() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "H2 parser: HPACK indexed-reference header bomb rejected with ENHANCE_YOUR_CALM",
+            try_h2_parser_reject_header_field_bomb,
         ),
         State::Success,
     );

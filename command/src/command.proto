@@ -250,6 +250,8 @@ message UpdateHttpListenerConfig {
     // When true, a proxy-generated `X-Real-IP` header carrying the connection
     // peer IP is appended to every forwarded request. See HttpListenerConfig.
     optional bool send_x_real_ip                    = 40;
+    // Maximum materialized header fields per request — see HttpListenerConfig.
+    optional uint32 h2_max_header_fields            = 41;
 }
 
 // Partial-update patch for a running HTTPS listener.
@@ -347,6 +349,8 @@ message UpdateHttpsListenerConfig {
     // disable HSTS via partial update. Cites RFC 6797 §6.1 (single
     // header) and §7.2 (HTTPS-only).
     optional HstsConfig hsts                        = 41;
+    // Maximum materialized header fields per request — see HttpsListenerConfig.
+    optional uint32 h2_max_header_fields            = 42;
 }
 
 // Partial-update patch for a running TCP listener.
@@ -468,6 +472,11 @@ message HttpListenerConfig {
     // to every forwarded request. Independently combinable with
     // `elide_x_real_ip`. Default: false.
     optional bool send_x_real_ip = 33 [default = false];
+    // Maximum number of materialized header fields per request — HPACK fields
+    // plus expanded cookie crumbs (RFC 9113 §8.2.3). Bounds the HPACK
+    // indexed-reference header bomb, where 1-byte indexed references are
+    // amplified into per-entry bookkeeping. Default: 128.
+    optional uint32 h2_max_header_fields = 34;
 }
 
 // details of an HTTPS listener
@@ -606,6 +615,11 @@ message HttpsListenerConfig {
     // emission, §8.1 host scope, §11.4 max-age=0 kill-switch). A
     // per-frontend `RequestHttpFrontend.hsts` overrides this default.
     optional HstsConfig hsts = 46;
+    // Maximum number of materialized header fields per request — HPACK fields
+    // plus expanded cookie crumbs (RFC 9113 §8.2.3). Bounds the HPACK
+    // indexed-reference header bomb, where 1-byte indexed references are
+    // amplified into per-entry bookkeeping. Default: 128.
+    optional uint32 h2_max_header_fields = 47;
 }
 
 // details of an TCP listener

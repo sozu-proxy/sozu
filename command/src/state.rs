@@ -418,6 +418,9 @@ impl ConfigState {
         if let Some(v) = patch.h2_max_header_table_size {
             listener.h2_max_header_table_size = Some(v);
         }
+        if let Some(v) = patch.h2_max_header_fields {
+            listener.h2_max_header_fields = Some(v);
+        }
         if let Some(v) = patch.h2_stream_idle_timeout_seconds {
             listener.h2_stream_idle_timeout_seconds = Some(v);
         }
@@ -535,6 +538,9 @@ impl ConfigState {
         }
         if let Some(v) = patch.h2_max_header_table_size {
             listener.h2_max_header_table_size = Some(v);
+        }
+        if let Some(v) = patch.h2_max_header_fields {
+            listener.h2_max_header_fields = Some(v);
         }
         if let Some(v) = patch.h2_stream_idle_timeout_seconds {
             listener.h2_stream_idle_timeout_seconds = Some(v);
@@ -1792,6 +1798,7 @@ pub fn validate_h2_flood_knobs_http(patch: &UpdateHttpListenerConfig) -> Result<
     );
     require_ge1!(patch.h2_max_header_list_size, "h2_max_header_list_size");
     require_ge1!(patch.h2_max_header_table_size, "h2_max_header_table_size");
+    require_ge1!(patch.h2_max_header_fields, "h2_max_header_fields");
     Ok(())
 }
 
@@ -1852,6 +1859,7 @@ pub fn validate_h2_flood_knobs_https(patch: &UpdateHttpsListenerConfig) -> Resul
     );
     require_ge1!(patch.h2_max_header_list_size, "h2_max_header_list_size");
     require_ge1!(patch.h2_max_header_table_size, "h2_max_header_table_size");
+    require_ge1!(patch.h2_max_header_fields, "h2_max_header_fields");
     Ok(())
 }
 

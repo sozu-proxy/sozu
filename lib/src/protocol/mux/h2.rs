@@ -291,6 +291,19 @@ pub(super) const MAX_HEADER_LIST_SIZE: usize = 65536;
 /// accepted from the peer. 64 KB is well above the RFC default of 4 KB
 /// while preventing a malicious peer from advertising up to 4 GB.
 const DEFAULT_MAX_HEADER_TABLE_SIZE: u32 = 65536;
+/// Default maximum number of materialized header fields per request/response —
+/// HPACK fields plus expanded cookie crumbs (RFC 9113 §8.2.3). Bounds the HPACK
+/// indexed-reference "header bomb": each 1-byte indexed reference materializes a
+/// `Pair` of per-entry bookkeeping, so an attacker amplifies wire bytes into
+/// allocation. RFC 9113 §6.5.2's +32-octet/field accounting alone caps this at
+/// ~2048 fields for a 64 KB list; this explicit count cap is the tighter,
+/// upstream-matching defense (cf. nginx `max_headers`, Apache `LimitRequestFields`).
+const DEFAULT_MAX_HEADER_FIELDS: u32 = 128;
+/// RFC 9113 §6.5.2: the size accounted against `SETTINGS_MAX_HEADER_LIST_SIZE`
+/// is the uncompressed name + value octets PLUS a 32-octet overhead per field.
+/// The per-field overhead is what bounds the field count under a fixed byte
+/// budget — omitting it lets a peer materialize ~33× more fields than intended.
+pub(super) const HEADER_FIELD_SIZE_OVERHEAD: usize = 32;
 /// Duration of the sliding window for rate-based flood counters
 const FLOOD_WINDOW_DURATION: std::time::Duration = std::time::Duration::from_secs(1);
 /// Default maximum general anomaly count before triggering ENHANCE_YOUR_CALM
@@ -347,6 +360,12 @@ pub struct H2FloodConfig {
     /// from the peer. Caps the value the peer advertises in SETTINGS frames to
     /// prevent unbounded HPACK encoder memory growth.
     pub max_header_table_size: u32,
+    /// Maximum number of materialized header fields, enforced per HEADERS block
+    /// and (independently) per trailers block — HPACK fields plus expanded
+    /// cookie crumbs (RFC 9113 §8.2.3). Bounds the HPACK indexed-reference
+    /// header bomb, where many 1-byte indexed references each materialize a
+    /// `Pair` of per-entry bookkeeping.
+    pub max_header_fields: u32,
 }
 
 impl Default for H2FloodConfig {
@@ -364,6 +383,7 @@ impl Default for H2FloodConfig {
             max_rst_stream_emitted_lifetime: DEFAULT_MAX_RST_STREAM_EMITTED_LIFETIME,
             max_header_list_size: MAX_HEADER_LIST_SIZE as u32,
             max_header_table_size: DEFAULT_MAX_HEADER_TABLE_SIZE,
+            max_header_fields: DEFAULT_MAX_HEADER_FIELDS,
         }
     }
 }
@@ -385,6 +405,7 @@ impl H2FloodConfig {
         max_rst_stream_emitted_lifetime: u64,
         max_header_list_size: u32,
         max_header_table_size: u32,
+        max_header_fields: u32,
     ) -> Self {
         Self {
             max_rst_stream_per_window: max_rst_stream_per_window.max(1),
@@ -399,6 +420,7 @@ impl H2FloodConfig {
             max_rst_stream_emitted_lifetime: max_rst_stream_emitted_lifetime.max(1),
             max_header_list_size: max_header_list_size.max(1),
             max_header_table_size: max_header_table_size.max(1),
+            max_header_fields: max_header_fields.max(1),
         }
     }
 }
@@ -610,6 +632,49 @@ where
     F: FnMut(GlobalStreamId) -> bool,
 {
     streams.values().any(|gid| probe(*gid))
+}
+
+/// Collect the live streams that have exceeded `deadline` under either
+/// per-stream reap guard, deduped so a stream tripping both is reaped (and
+/// access-logged) exactly once. Split out from
+/// [`ConnectionH2::cancel_timed_out_streams`] so the two-guard union is
+/// unit-testable without a full `ConnectionH2` fixture (the existing test
+/// module only fixtures `H2FloodDetector` and `Stream`):
+///
+/// - `last_activity` — bidirectional-silence guard: no DATA/HEADERS in either
+///   direction (the slow-multiplex Slowloris timer).
+/// - `fc_stalled` — outbound-flow-control-starvation guard: a buffered response
+///   that cannot drain because the peer keeps its receive window shut (the
+///   HTTP/2 window-stall / WINDOW_UPDATE-drip vector). This guard is what the
+///   liveness timer misses: an inbound 1-byte DATA drip keeps `last_activity`
+///   warm, but never touches `fc_stalled`.
+///
+/// Streams not in `live_streams` or already in `rst_sent` are skipped. The
+/// returned reason string is the access-log tag for the guard that tripped
+/// first (idle takes precedence on a tie, purely for a stable label).
+fn collect_timed_out_streams(
+    last_activity: &HashMap<StreamId, Instant>,
+    fc_stalled: &HashMap<StreamId, Instant>,
+    live_streams: &HashMap<StreamId, GlobalStreamId>,
+    rst_sent: &HashSet<StreamId>,
+    now: Instant,
+    deadline: std::time::Duration,
+) -> Vec<(StreamId, &'static str)> {
+    let eligible = |sid: StreamId| live_streams.contains_key(&sid) && !rst_sent.contains(&sid);
+    let expired = |t: Instant| now.saturating_duration_since(t) > deadline;
+    let mut seen: HashSet<StreamId> = HashSet::new();
+    let mut out: Vec<(StreamId, &'static str)> = Vec::new();
+    for (&sid, &t) in last_activity {
+        if eligible(sid) && expired(t) && seen.insert(sid) {
+            out.push((sid, "H2::IdleTimeout"));
+        }
+    }
+    for (&sid, &t) in fc_stalled {
+        if eligible(sid) && expired(t) && seen.insert(sid) {
+            out.push((sid, "H2::WindowStall"));
+        }
+    }
+    out
 }
 
 /// Core of [`ConnectionH2::enqueue_rst`], extracted so the RST-queueing
@@ -1345,6 +1410,17 @@ pub struct ConnectionH2<Front: SocketHandler> {
     /// inbound DATA frame and on HEADERS for an existing stream (trailers).
     /// Empty DATA frames (CVE-2019-9518 vector) do NOT refresh the timer.
     pub stream_last_activity_at: HashMap<StreamId, Instant>,
+    /// Per-stream timestamp of when the stream first became flow-control-stalled
+    /// on the OUTBOUND (response) side — it holds buffered response data it
+    /// cannot drain because its effective send window `min(stream.window,
+    /// connection.window)` is exhausted (the HTTP/2 window-stall /
+    /// WINDOW_UPDATE-drip vector). Distinct from [`Self::stream_last_activity_at`]:
+    /// this map is armed/cleared ONLY by outbound flow-control progress and is
+    /// NEVER refreshed by inbound DATA/HEADERS or connection-level frames, so a
+    /// peer dribbling 1-byte DATA on a stalled stream cannot keep it warm (the
+    /// liveness timer alone misses this because inbound drips refresh it). Reaped
+    /// by [`Self::cancel_timed_out_streams`] after [`Self::stream_idle_timeout`].
+    pub stream_fc_stalled_since: HashMap<StreamId, Instant>,
     /// Per-stream idle cap. Streams with no activity for longer than this are
     /// RST_STREAM(CANCEL)'d by [`Self::cancel_timed_out_streams`].
     pub stream_idle_timeout: std::time::Duration,
@@ -1504,6 +1580,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             connection_config,
             last_gauge_snapshot: None,
             stream_last_activity_at: HashMap::new(),
+            stream_fc_stalled_since: HashMap::new(),
             stream_idle_timeout,
             refuse_count_window: 0,
             refuse_window_start: Instant::now(),
@@ -2303,6 +2380,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 if let Some(t) = self.stream_last_activity_at.get_mut(&stream_id) {
                     *t = Instant::now();
                 }
+                // Outbound progress clears any flow-control-stall deadline. The
+                // resume path is socket-backpressure (normally a positive window,
+                // so window-stall is armed in the main write loop, not here), but
+                // clear defensively to keep the two write sites symmetric.
+                self.stream_fc_stalled_since.remove(&stream_id);
             }
             if outcome == FlushOutcome::Stalled {
                 return MuxResult::Continue;
@@ -2484,6 +2566,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             let stream_state = stream.state;
             let parts = stream.split(&self.position);
             let kawa = parts.wbuffer;
+            // Hoisted out of the gate below so the post-flush flow-control-stall
+            // classification can see how many flow-control bytes this pass moved.
+            let mut consumed: i32 = 0;
             if kawa.is_main_phase()
                 || (kawa.is_terminated() && !kawa.is_completed())
                 || (kawa.is_error() && !self.rst_sent.contains(&stream_id))
@@ -2601,7 +2686,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         }
                     }
                 }
-                let consumed = window - converter.window;
+                consumed = window - converter.window;
                 *parts.window = parts.window.saturating_sub(consumed);
                 self.flow_control.window = self.flow_control.window.saturating_sub(consumed);
                 if is_incremental && consumed > 0 && first_incremental_fired.is_none() {
@@ -2639,6 +2724,27 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 if let Some(t) = self.stream_last_activity_at.get_mut(&stream_id) {
                     *t = Instant::now();
                 }
+            }
+            // Arm/clear the dedicated flow-control-stall deadline that catches
+            // a window-stalled response. It is set only when the stream holds
+            // buffered response
+            // data it cannot send because its effective send window is exhausted,
+            // and — unlike `stream_last_activity_at` — it is NEVER refreshed by
+            // inbound DATA/HEADERS, so a peer dribbling 1-byte DATA on a
+            // window-stalled stream cannot keep it warm. Any genuine outbound
+            // flow-control progress (`consumed > 0`) clears it; the reaper
+            // (`cancel_timed_out_streams`) RST(CANCEL)s a stream stalled longer
+            // than `stream_idle_timeout`.
+            let outbound_window_blocked = (kawa.is_main_phase()
+                || (kawa.is_terminated() && !kawa.is_completed()))
+                && min(*parts.window, self.flow_control.window) <= 0
+                && (!kawa.blocks.is_empty() || !kawa.out.is_empty());
+            if consumed > 0 || !outbound_window_blocked {
+                self.stream_fc_stalled_since.remove(&stream_id);
+            } else {
+                self.stream_fc_stalled_since
+                    .entry(stream_id)
+                    .or_insert_with(Instant::now);
             }
             total_bytes_written = total_bytes_written.saturating_add(stream_bytes);
             if outcome == FlushOutcome::Stalled {
@@ -2854,9 +2960,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
 
     /// Evict every per-stream piece of state carried by this `ConnectionH2`.
     ///
-    /// **Invariant**: `rst_sent`, `stream_last_activity_at` and `prioriser`
-    /// MUST be emptied of `stream_id` here — they are the only three
-    /// per-stream caches that are not stored in the slab-allocated
+    /// **Invariant**: `rst_sent`, `stream_last_activity_at`,
+    /// `stream_fc_stalled_since` and `prioriser` MUST be emptied of `stream_id`
+    /// here — they are the only four per-stream caches that are not stored in the
+    /// slab-allocated
     /// `Context.streams[]`. Forgetting any of them causes unbounded memory
     /// growth on long-lived connections with many cancelled streams. The
     /// `debug_assert`s below fail loudly in test builds if someone adds a
@@ -2871,6 +2978,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         }
         self.rst_sent.remove(&stream_id);
         self.stream_last_activity_at.remove(&stream_id);
+        self.stream_fc_stalled_since.remove(&stream_id);
         self.prioriser.remove(&stream_id);
         debug_assert!(
             !self.rst_sent.contains(&stream_id),
@@ -2879,6 +2987,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         debug_assert!(
             !self.stream_last_activity_at.contains_key(&stream_id),
             "stream_last_activity_at still contains stream_id {stream_id} after eviction"
+        );
+        debug_assert!(
+            !self.stream_fc_stalled_since.contains_key(&stream_id),
+            "stream_fc_stalled_since still contains stream_id {stream_id} after eviction"
         );
         // Invariant: expect_write/expect_read must not reference a gid whose
         // context slot may be popped by shrink_trailing_recycle after eviction.
@@ -3642,30 +3754,37 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             self.priorities_buf.shrink_to(SCRATCH_BUF_RETAIN);
         }
 
-        if self.streams.is_empty() || self.stream_last_activity_at.is_empty() {
+        if self.streams.is_empty()
+            || (self.stream_last_activity_at.is_empty() && self.stream_fc_stalled_since.is_empty())
+        {
             return;
         }
         let now = Instant::now();
         let deadline = self.stream_idle_timeout;
-        let timed_out: Vec<StreamId> = self
-            .stream_last_activity_at
-            .iter()
-            .filter_map(|(&sid, &t)| {
-                (self.streams.contains_key(&sid)
-                    && !self.rst_sent.contains(&sid)
-                    && now.saturating_duration_since(t) > deadline)
-                    .then_some(sid)
-            })
-            .collect();
+        // Two independent per-stream guards reap on the same deadline — see
+        // `collect_timed_out_streams`. The flow-control-stall guard
+        // (`stream_fc_stalled_since`) closes the HTTP/2 window-stall vector that
+        // the bidirectional liveness guard (`stream_last_activity_at`) misses,
+        // because an inbound DATA drip keeps the liveness timer warm while the
+        // response stays window-blocked.
+        let timed_out = collect_timed_out_streams(
+            &self.stream_last_activity_at,
+            &self.stream_fc_stalled_since,
+            &self.streams,
+            &self.rst_sent,
+            now,
+            deadline,
+        );
         if timed_out.is_empty() {
             return;
         }
-        for sid in timed_out {
+        for (sid, reason) in timed_out {
             info!(
-                "{} H2 stream {} idle > {:?}, cancelling (slow-multiplex guard)",
+                "{} H2 stream {} exceeded {:?} ({}), cancelling",
                 log_context!(self),
                 sid,
-                deadline
+                deadline,
+                reason
             );
             // Route through the canonical chokepoint so dedupe (rst_sent),
             // queued-cap accounting (MAX_PENDING_RST_STREAMS via
@@ -3722,7 +3841,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         stream.metrics.backend_stop();
                         stream.generate_access_log(
                             true,
-                            Some("H2::IdleTimeout"),
+                            Some(reason),
                             context.listener.clone(),
                             client_rtt,
                             server_rtt,
@@ -4656,6 +4775,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             headers.end_stream,
             parts.context,
             self.flood_detector.config.max_header_list_size,
+            self.flood_detector.config.max_header_fields,
             elide_x_real_ip,
         );
         kawa.storage.clear();
@@ -7518,6 +7638,74 @@ mod tests {
         // `Iterator::any` short-circuits on the first `true` — so the probe
         // must fire at most once in this construction.
         assert_eq!(calls, 1);
+    }
+
+    // ── flow-control-stall reaper union (collect_timed_out_streams) ──
+
+    #[test]
+    fn test_collect_timed_out_streams_reaps_fc_stall_despite_fresh_liveness() {
+        // A window-stalled stream MUST be reaped on the flow-control-stall
+        // deadline even if its bidirectional-liveness timer is fresh — an
+        // inbound 1-byte DATA drip keeps `last_activity` warm but never touches
+        // `fc_stalled`. Without the `fc_stalled` guard this stream is never
+        // reaped (the pre-fix window-stall hold).
+        let now = Instant::now();
+        let deadline = std::time::Duration::from_secs(2);
+        let mut live = HashMap::new();
+        live.insert(7u32, 0usize);
+        let rst_sent = HashSet::new();
+        let mut last_activity = HashMap::new();
+        last_activity.insert(7u32, now); // fresh: just received an inbound DATA drip
+        let mut fc_stalled = HashMap::new();
+        fc_stalled.insert(7u32, now - std::time::Duration::from_secs(5));
+        let out =
+            collect_timed_out_streams(&last_activity, &fc_stalled, &live, &rst_sent, now, deadline);
+        assert_eq!(out, vec![(7u32, "H2::WindowStall")]);
+    }
+
+    #[test]
+    fn test_collect_timed_out_streams_idle_dedup_and_filters() {
+        let now = Instant::now();
+        let deadline = std::time::Duration::from_secs(2);
+        let old = now - std::time::Duration::from_secs(5);
+        let mut live = HashMap::new();
+        for sid in [1u32, 3, 5, 9] {
+            live.insert(sid, 0usize);
+        }
+        let mut rst_sent = HashSet::new();
+        rst_sent.insert(9u32); // already resetting -> excluded
+        let mut last_activity = HashMap::new();
+        last_activity.insert(1u32, old); // idle past deadline
+        last_activity.insert(3u32, now); // fresh -> survives
+        last_activity.insert(5u32, old); // idle AND fc-stalled -> dedup to one entry
+        last_activity.insert(9u32, old); // idle but rst_sent -> excluded
+        last_activity.insert(11u32, old); // not a live stream -> excluded
+        let mut fc_stalled = HashMap::new();
+        fc_stalled.insert(5u32, old);
+        let mut out =
+            collect_timed_out_streams(&last_activity, &fc_stalled, &live, &rst_sent, now, deadline);
+        out.sort();
+        assert_eq!(
+            out,
+            vec![(1u32, "H2::IdleTimeout"), (5u32, "H2::IdleTimeout")]
+        );
+    }
+
+    #[test]
+    fn test_collect_timed_out_streams_empty_when_all_fresh() {
+        let now = Instant::now();
+        let deadline = std::time::Duration::from_secs(2);
+        let mut live = HashMap::new();
+        live.insert(1u32, 0usize);
+        let rst_sent = HashSet::new();
+        let mut last_activity = HashMap::new();
+        last_activity.insert(1u32, now);
+        let mut fc_stalled = HashMap::new();
+        fc_stalled.insert(1u32, now);
+        assert!(
+            collect_timed_out_streams(&last_activity, &fc_stalled, &live, &rst_sent, now, deadline)
+                .is_empty()
+        );
     }
 
     // ── LIFECYCLE §9 invariant 16: any_stream_has_pending_back ───────────

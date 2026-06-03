@@ -1364,6 +1364,25 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 self.frontend
             );
             self.frontend.timeout_container().triggered();
+            // The per-stream reaper (bidirectional-idle + outbound
+            // flow-control-stall guards) normally runs only from `readable()`,
+            // but a fully-silent peer never triggers a read event. Run it on the
+            // connection-timeout path too so a window-stalled stream — a buffered
+            // response the peer refuses to drain by holding its receive window
+            // shut — is reaped and its MAX_CONCURRENT_STREAMS slot freed, instead
+            // of lingering until the 30-minute zombie checker. The reaper queues
+            // an `RST_STREAM(CANCEL)`; `should_write` below flushes it so the peer
+            // is actually told (the reaper's `arm_writable` only sets interest —
+            // the edge-triggered writable signal needs an explicit flush here).
+            if let Connection::H2(h2) = &mut self.frontend {
+                h2.cancel_timed_out_streams(
+                    &mut self.context,
+                    &mut EndpointClient(&mut self.router),
+                );
+            }
+            if self.frontend.has_pending_write() {
+                should_write = true;
+            }
             let front_readiness = self.frontend.readiness_mut();
             for stream_id in 0..self.context.streams.len() {
                 match self.context.streams[stream_id].state {
