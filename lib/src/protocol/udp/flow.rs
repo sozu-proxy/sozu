@@ -117,7 +117,10 @@ impl UdpFlow {
         // cannot close a flow that has since seen traffic. Snapshot the old
         // value and pair-assert (positive: the new value is returned; negative:
         // it differs from the old, even across the wrapping boundary).
-        #[cfg(debug_assertions)]
+        // Not `#[cfg(debug_assertions)]`-gated: `debug_assert_ne!` compiles its
+        // arguments in every profile (it only gates *execution*), so a snapshot
+        // it reads must exist in release too. The read is dead code in release and
+        // the optimizer drops the binding — zero cost, but it must still compile.
         let old_gen = self.timer_gen;
         self.idle_deadline = now + timeout;
         self.timer_gen = self.timer_gen.wrapping_add(1);
@@ -148,7 +151,8 @@ impl UdpFlow {
         // `requests_seen` is monotonic non-decreasing (a forward only ever bumps
         // it) and saturates rather than wraps — so the count never silently
         // resets to a small value and re-arms an already-exhausted cap.
-        #[cfg(debug_assertions)]
+        // Always declared (not debug-gated): the `debug_assert!` below compiles
+        // this read in release too; dead there, dropped by the optimizer.
         let before = self.requests_seen;
         self.requests_seen = self.requests_seen.saturating_add(1);
         debug_assert!(
@@ -170,7 +174,8 @@ impl UdpFlow {
             "on_backend_datagram requires an Established flow"
         );
         // `responses_seen` is monotonic non-decreasing and saturating.
-        #[cfg(debug_assertions)]
+        // Always declared (not debug-gated): the `debug_assert!` below compiles
+        // this read in release too; dead there, dropped by the optimizer.
         let before = self.responses_seen;
         self.responses_seen = self.responses_seen.saturating_add(1);
         debug_assert!(

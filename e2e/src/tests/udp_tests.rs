@@ -391,9 +391,14 @@ fn try_udp_maglev_affinity_stable() -> State {
         .map(|(i, &addr)| UdpBackend::bind(format!("BK{i}"), addr, 1).spawn())
         .collect();
 
-    // Probe 6 fixed client ports twice each; each port's two probes must agree
-    // (deterministic table lookup), and every probe must be served.
-    let clients: Vec<UdpClient> = (0..6)
+    // Probe 20 fixed client ports twice each; each port's two probes must agree
+    // (deterministic table lookup), and every probe must be served. 20 keys (not
+    // a handful) keeps the distribution sanity check below robust: with a
+    // near-perfectly-balanced Maglev table over 3 backends, the chance all 20
+    // CI-allocated client-port keys land on a single backend's slots is ~2e-9 —
+    // versus the ~1-in-700 a 6-key sample hit in CI. Probes are serialised over
+    // loopback, so the larger key set adds no datagram-loss risk to determinism.
+    let clients: Vec<UdpClient> = (0..20)
         .map(|i| UdpClient::new(format!("M{i}"), front))
         .collect();
     let probe = |clients: &[UdpClient]| -> Vec<Option<String>> {
@@ -420,7 +425,7 @@ fn try_udp_maglev_affinity_stable() -> State {
         .zip(second.iter())
         .all(|(a, b)| a.is_some() && a == b);
     // Maglev should also spread load across the table — assert at least two
-    // distinct backends are hit across the 6 keys (not a single-backend table).
+    // distinct backends are hit across the 20 keys (not a single-backend table).
     let distinct: std::collections::HashSet<_> = first.iter().flatten().collect();
     if deterministic && distinct.len() >= 2 && stopped {
         State::Success

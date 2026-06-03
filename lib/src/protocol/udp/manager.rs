@@ -271,8 +271,9 @@ impl<E: FlowKeyExtractor> UdpManager<E> {
         // New flow. Draining or at cap → shed, allocate nothing.
         // Drop / shed paths ("silence is a virtue"): a reject must allocate
         // nothing, so `flows.len()` is unchanged across it. Snapshot the count
-        // to pair-assert that on every early return below.
-        #[cfg(debug_assertions)]
+        // to pair-assert that on every early return below. Not debug-gated: the
+        // `debug_assert_eq!`s that read it compile in release too (execution only
+        // is gated); the read is dead there and the optimizer drops the binding.
         let flows_before_admit = self.flows.len();
         if self.draining {
             self.drop_datagram(DropReason::Shed);
@@ -644,7 +645,8 @@ impl<E: FlowKeyExtractor> UdpManager<E> {
         // "Silence is a virtue": a drop allocates no flow and frees none — the
         // slab is untouched across the reject. Snapshot + pair-assert so a future
         // edit that accidentally mutates the slab on a drop path is caught loudly.
-        #[cfg(debug_assertions)]
+        // Not debug-gated: the `debug_assert_eq!` reads it in release too (only
+        // execution is gated); dead there, dropped by the optimizer.
         let flows_before_drop = self.flows.len();
         self.outputs
             .push_back(Output::Metric(MetricEvent::DatagramDropped(reason)));
