@@ -178,6 +178,14 @@ impl WriteQueue {
             return false;
         }
         self.queue.push_back((dst, payload));
+        // Invariant: the bounded FIFO never grows past its cap. The guard above
+        // is the only growth site, so depth <= cap holds after every push.
+        debug_assert!(
+            self.queue.len() <= self.cap,
+            "WriteQueue overran its cap: len {} > cap {}",
+            self.queue.len(),
+            self.cap,
+        );
         true
     }
 
@@ -1306,6 +1314,19 @@ impl UdpListenerSession {
         self.upstream_sockets.insert(upstream_token, socket);
         self.upstream_to_flow.insert(upstream_token, flow);
         self.flow_to_upstream.insert(flow, upstream_token);
+        // `flow_to_upstream` and `upstream_to_flow` are inverse maps: the token
+        // in one points back to the flow in the other. A broken inverse would let
+        // a backend reply demux to the wrong client (a NAT-return mismatch).
+        debug_assert_eq!(
+            self.upstream_to_flow.get(&upstream_token),
+            Some(&flow),
+            "upstream_to_flow must map the new token back to its flow"
+        );
+        debug_assert_eq!(
+            self.flow_to_upstream.get(&flow),
+            Some(&upstream_token),
+            "flow_to_upstream must map the flow back to its upstream token"
+        );
         self.flow_started.insert(flow, Instant::now());
         // The client source for this flow is the one currently in flight.
         let client = self.in_flight_client.unwrap_or(self.address);
@@ -1313,6 +1334,13 @@ impl UdpListenerSession {
         if let Some(src) = self.in_flight_client {
             let key = self.client_key(src);
             self.client_key_to_flow.insert(key, flow);
+            // The shadow flow-table only ever holds live flows: the flow we just
+            // mapped must have a live upstream token (it is the one we just
+            // opened). Pairs the on-close drop in `on_close_flow`.
+            debug_assert!(
+                self.flow_to_upstream.contains_key(&flow),
+                "client_key_to_flow points at flow {flow} with no live upstream token"
+            );
         }
         // This flow's first SendToBackend (if any) follows immediately.
         self.in_flight_flow = Some(flow);
@@ -1570,6 +1598,16 @@ impl UdpListenerSession {
             self.upstream_write_queues.remove(&token);
             self.upstream_to_flow.remove(&token);
             self.sessions.borrow_mut().slab.try_remove(token.0);
+            // On close, all per-flow maps drop the flow together: neither
+            // direction of the upstream-token map may still reference it.
+            debug_assert!(
+                !self.upstream_to_flow.values().any(|&f| f == flow),
+                "on_close_flow left upstream_to_flow referencing closed flow {flow}"
+            );
+            debug_assert!(
+                !self.flow_to_upstream.contains_key(&flow),
+                "on_close_flow left flow_to_upstream entry for closed flow {flow}"
+            );
         }
         if let Some(started) = self.flow_started.remove(&flow) {
             let duration = started.elapsed();
@@ -1584,6 +1622,13 @@ impl UdpListenerSession {
         if self.client_key_to_flow.get(&key) == Some(&flow) {
             self.client_key_to_flow.remove(&key);
         }
+        // The shadow flow-table must no longer map THIS flow id. A surviving
+        // entry would misroute a later established-flow `SendToBackend` onto a
+        // freed upstream token.
+        debug_assert!(
+            !self.client_key_to_flow.values().any(|&f| f == flow),
+            "on_close_flow left client_key_to_flow referencing closed flow {flow}"
+        );
         info!("{} flow closed", log_flow_context!(flow, client, backend));
     }
 

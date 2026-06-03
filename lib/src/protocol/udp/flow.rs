@@ -112,8 +112,19 @@ impl UdpFlow {
     /// token so any in-flight wheel expiry for the old deadline is invalidated.
     /// Returns the *new* generation so the manager can re-arm the wheel.
     pub fn touch(&mut self, timeout: std::time::Duration, now: Instant) -> u64 {
+        // Generation token: a `touch` MUST advance `timer_gen` so any in-flight
+        // wheel expiry captured against the old generation no longer matches and
+        // cannot close a flow that has since seen traffic. Snapshot the old
+        // value and pair-assert (positive: the new value is returned; negative:
+        // it differs from the old, even across the wrapping boundary).
+        #[cfg(debug_assertions)]
+        let old_gen = self.timer_gen;
         self.idle_deadline = now + timeout;
         self.timer_gen = self.timer_gen.wrapping_add(1);
+        debug_assert_ne!(
+            self.timer_gen, old_gen,
+            "touch must advance the generation token (stale expiry would still match)"
+        );
         self.timer_gen
     }
 
@@ -125,15 +136,79 @@ impl UdpFlow {
     /// could trip the `requests` cap having delivered fewer than `requests`
     /// datagrams. Use [`touch`](Self::touch) for the buffer-only idle refresh.
     pub fn on_client_datagram(&mut self, now: Instant) -> u64 {
+        // A real forward is only ever recorded on an Established flow (the buffer
+        // flush in `on_backend_resolved` transitions to Established first). A
+        // forward on an AwaitingBackend flow would mean we sent upstream before a
+        // backend was resolved — a routing bug.
+        debug_assert_eq!(
+            self.phase,
+            FlowPhase::Established,
+            "on_client_datagram (a real forward) requires an Established flow"
+        );
+        // `requests_seen` is monotonic non-decreasing (a forward only ever bumps
+        // it) and saturates rather than wraps — so the count never silently
+        // resets to a small value and re-arms an already-exhausted cap.
+        #[cfg(debug_assertions)]
+        let before = self.requests_seen;
         self.requests_seen = self.requests_seen.saturating_add(1);
+        debug_assert!(
+            self.requests_seen >= before,
+            "requests_seen must be monotonic non-decreasing"
+        );
         self.touch(self.config.front_timeout, now)
     }
 
     /// Record that one backend reply was returned; refresh the back idle
     /// deadline. Returns the new generation token.
     pub fn on_backend_datagram(&mut self, now: Instant) -> u64 {
+        // A backend reply can only arrive on an Established flow (the upstream
+        // socket is opened on establish). A reply for an AwaitingBackend flow
+        // would mean a datagram on a not-yet-connected upstream — impossible.
+        debug_assert_eq!(
+            self.phase,
+            FlowPhase::Established,
+            "on_backend_datagram requires an Established flow"
+        );
+        // `responses_seen` is monotonic non-decreasing and saturating.
+        #[cfg(debug_assertions)]
+        let before = self.responses_seen;
         self.responses_seen = self.responses_seen.saturating_add(1);
+        debug_assert!(
+            self.responses_seen >= before,
+            "responses_seen must be monotonic non-decreasing"
+        );
         self.touch(self.config.back_timeout, now)
+    }
+
+    /// Transition the flow to `next`, asserting the move is legal. The lifecycle
+    /// is strictly forward: `AwaitingBackend → Established → Closing`, with a
+    /// self-loop allowed only into `Closing` (idempotent close). A backward move
+    /// (`Established → AwaitingBackend`) or skipping straight from
+    /// `AwaitingBackend → Closing` is allowed *only* into `Closing` (a flow may
+    /// be aborted before it establishes); every other transition is a bug.
+    ///
+    /// Debug-only guard — the assignment itself is unconditional so release
+    /// behavior is identical.
+    pub fn set_phase(&mut self, next: FlowPhase) {
+        #[cfg(debug_assertions)]
+        {
+            let legal = match (self.phase, next) {
+                // Forward edges.
+                (FlowPhase::AwaitingBackend, FlowPhase::Established) => true,
+                // Either live phase may be torn down (normal close or abort).
+                (FlowPhase::AwaitingBackend, FlowPhase::Closing) => true,
+                (FlowPhase::Established, FlowPhase::Closing) => true,
+                // No legal backward or skipping edge, and no Awaiting/Established
+                // self-loop (callers set Established / Closing exactly once).
+                _ => false,
+            };
+            debug_assert!(
+                legal,
+                "illegal flow phase transition {:?} -> {next:?}",
+                self.phase,
+            );
+        }
+        self.phase = next;
     }
 
     /// Whether the `requests` knob has been exhausted (`0` = unlimited).
@@ -150,13 +225,34 @@ impl UdpFlow {
     /// The teardown reason if any knob is exhausted, else `None`. Idle is
     /// handled separately by the manager via the timer wheel.
     pub fn teardown_reason(&self) -> Option<CloseReason> {
-        if self.responses_exhausted() {
+        let reason = if self.responses_exhausted() {
             Some(CloseReason::ResponsesReached)
         } else if self.requests_exhausted() {
             Some(CloseReason::RequestsReached)
         } else {
             None
+        };
+        // Pair-assert the boundary (positive + negative space): a teardown reason
+        // is returned IFF at least one cap is truly exhausted, and `None` is
+        // returned IFF neither cap is. A reason without an exhausted cap (or an
+        // exhausted cap with no reason) is a silent correctness bug — the flow
+        // would close early or never close on its cap.
+        #[cfg(debug_assertions)]
+        {
+            let exhausted = self.responses_exhausted() || self.requests_exhausted();
+            debug_assert_eq!(
+                reason.is_some(),
+                exhausted,
+                "teardown_reason boundary: Some={} but exhausted={} (req {}/{}, resp {}/{})",
+                reason.is_some(),
+                exhausted,
+                self.requests_seen,
+                self.config.requests,
+                self.responses_seen,
+                self.config.responses,
+            );
         }
+        reason
     }
 
     /// Whether this upstream datagram should carry a PPv2 DGRAM prefix, given

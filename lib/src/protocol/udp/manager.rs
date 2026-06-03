@@ -82,6 +82,15 @@ pub struct UdpManager<E: FlowKeyExtractor = SourceTupleExtractor> {
     /// The single armed manager-wide deadline currently reflected to the shell
     /// via the last `ArmTimer`. `None` means no timer is armed.
     armed_deadline: Option<Instant>,
+
+    /// High-water mark of every `max_flows` cap ever set (construction +
+    /// `SetMaxFlows`). The live cap can be shrunk below `flows.len()` by a
+    /// `SetMaxFlows`, so `flows.len() <= max_flows` is NOT an invariant; but a
+    /// flow can only ever have been admitted under *some* cap that was in force
+    /// at admission, so `flows.len() <= max_flows_high_water` always holds.
+    /// Debug-only — only read by [`check_invariants`](Self::check_invariants).
+    #[cfg(debug_assertions)]
+    max_flows_high_water: usize,
 }
 
 impl UdpManager<SourceTupleExtractor> {
@@ -122,6 +131,8 @@ impl<E: FlowKeyExtractor> UdpManager<E> {
             draining: false,
             outputs: VecDeque::new(),
             armed_deadline: None,
+            #[cfg(debug_assertions)]
+            max_flows_high_water: max_flows,
         }
     }
 
@@ -172,6 +183,9 @@ impl<E: FlowKeyExtractor> UdpManager<E> {
                 addr,
             } => self.on_backend_resolved(flow, backend, addr, now),
         }
+        // Post-condition: the public method ran to completion under the caller's
+        // lock, so every structural invariant must hold again.
+        self.debug_assert_invariants();
     }
 
     /// Tear down a single flow on demand, emitting the same outputs a normal
@@ -190,6 +204,7 @@ impl<E: FlowKeyExtractor> UdpManager<E> {
     /// time-driven entry points (the teardown itself is time-independent).
     pub fn abort_flow(&mut self, flow: FlowId, _now: Instant, reason: CloseReason) {
         self.close_flow(flow, reason);
+        self.debug_assert_invariants();
     }
 
     /// Tear down EVERY live flow, emitting — for each — the same outputs a
@@ -211,6 +226,20 @@ impl<E: FlowKeyExtractor> UdpManager<E> {
         for flow_id in live {
             self.abort_flow(flow_id, now, CloseReason::Drain);
         }
+        // Post: the table and slab are drained to zero and no timer is armed.
+        #[cfg(debug_assertions)]
+        {
+            debug_assert_eq!(self.flow_count(), 0, "close_all must drain every flow");
+            debug_assert!(
+                self.table.is_empty(),
+                "close_all must clear every table entry"
+            );
+            debug_assert!(
+                self.armed_deadline.is_none(),
+                "close_all must leave no armed timer"
+            );
+        }
+        self.debug_assert_invariants();
     }
 
     fn on_client_datagram(&mut self, src: SocketAddr, payload: &[u8], now: Instant) {
@@ -240,16 +269,45 @@ impl<E: FlowKeyExtractor> UdpManager<E> {
         }
 
         // New flow. Draining or at cap → shed, allocate nothing.
+        // Drop / shed paths ("silence is a virtue"): a reject must allocate
+        // nothing, so `flows.len()` is unchanged across it. Snapshot the count
+        // to pair-assert that on every early return below.
+        #[cfg(debug_assertions)]
+        let flows_before_admit = self.flows.len();
         if self.draining {
             self.drop_datagram(DropReason::Shed);
+            debug_assert_eq!(
+                self.flows.len(),
+                flows_before_admit,
+                "drain shed must allocate no flow"
+            );
             return;
         }
         if self.flows.len() >= self.max_flows {
             self.outputs
                 .push_back(Output::Metric(MetricEvent::FlowShed));
             self.drop_datagram(DropReason::Shed);
+            debug_assert_eq!(
+                self.flows.len(),
+                flows_before_admit,
+                "cap shed must allocate no flow"
+            );
             return;
         }
+
+        // Admit. Pre-conditions (positive + negative space): we are on the admit
+        // path, so there is room under the live cap AND the key is NOT already
+        // tracked (a tracked key would have been served above without a new
+        // slot — a double-insert would orphan the previous flow and leak a slab
+        // slot).
+        debug_assert!(
+            self.flows.len() < self.max_flows,
+            "admit path entered while at/over the cap"
+        );
+        debug_assert!(
+            !self.table.contains_key(&key),
+            "admit path entered for a key already in the table (would orphan a flow)"
+        );
 
         // Admit: one slab slot + one copy of the payload (the design's single
         // admission copy). The flow is parked AwaitingBackend with the datagram
@@ -262,6 +320,19 @@ impl<E: FlowKeyExtractor> UdpManager<E> {
         let key_hash = self.affinity_hash(&flow);
         let flow_id = self.flows.insert(flow);
         self.table.insert(key, flow_id);
+
+        // Post (admission): exactly one slot was added and the key now maps to
+        // it. Pairs the pre-conditions above (grew by exactly 1, not 0 or 2).
+        debug_assert_eq!(
+            self.flows.len(),
+            flows_before_admit + 1,
+            "admission must add exactly one flow"
+        );
+        debug_assert_eq!(
+            self.table.get(&key),
+            Some(&flow_id),
+            "admission must map the key to the new flow"
+        );
 
         self.outputs
             .push_back(Output::Metric(MetricEvent::FlowCreated));
@@ -340,7 +411,7 @@ impl<E: FlowKeyExtractor> UdpManager<E> {
         }
         flow.backend_id = Some(backend);
         flow.backend_addr = Some(addr);
-        flow.phase = FlowPhase::Established;
+        flow.set_phase(FlowPhase::Established);
 
         // Open the connected upstream socket (the shell registers
         // upstream_token -> flow for NAT return).
@@ -418,7 +489,16 @@ impl<E: FlowKeyExtractor> UdpManager<E> {
     fn on_config(&mut self, event: ConfigEvent, _now: Instant) {
         match event {
             ConfigEvent::SetCluster(cfg) => self.cluster = cfg,
-            ConfigEvent::SetMaxFlows(n) => self.max_flows = n,
+            ConfigEvent::SetMaxFlows(n) => {
+                self.max_flows = n;
+                // Track the high-water mark: a `SetMaxFlows` may shrink the live
+                // cap below `flows.len()` (documented), so the only durable cap
+                // bound is the largest cap ever in force.
+                #[cfg(debug_assertions)]
+                {
+                    self.max_flows_high_water = self.max_flows_high_water.max(n);
+                }
+            }
             ConfigEvent::SetMaxRxDatagramSize(n) => self.max_rx_datagram_size = n,
             ConfigEvent::Drain => self.draining = true,
         }
@@ -462,6 +542,21 @@ impl<E: FlowKeyExtractor> UdpManager<E> {
                  armed {next:?} <= fired_at {now:?} (busy-loop)"
             );
         }
+
+        // Post: every flow due at `now` was reaped — no live flow may retain a
+        // deadline `<= now`. Pair with the strict-advance guard above: that one
+        // proves the next *armed* deadline advanced, this one proves no *flow*
+        // was left behind due (a leak the armed-deadline check alone misses,
+        // since min() over an empty set is None regardless of stragglers).
+        #[cfg(debug_assertions)]
+        for (id, flow) in self.flows.iter() {
+            debug_assert!(
+                flow.idle_deadline > now,
+                "FlowId {id} still due after handle_timeout: deadline {:?} <= now {now:?}",
+                flow.idle_deadline,
+            );
+        }
+        self.debug_assert_invariants();
     }
 
     /// The next manager-wide deadline, or `None` if no flow is armed. After a
@@ -506,7 +601,7 @@ impl<E: FlowKeyExtractor> UdpManager<E> {
         if flow.phase == FlowPhase::Closing {
             return;
         }
-        flow.phase = FlowPhase::Closing;
+        flow.set_phase(FlowPhase::Closing);
         let key = FlowKey::from_src(flow.client, self.cluster.affinity_with_port);
         // Remove the table entry only if it still points at this flow; a
         // recreated flow under the same key must not be unmapped.
@@ -525,14 +620,40 @@ impl<E: FlowKeyExtractor> UdpManager<E> {
             .push_back(Output::Metric(MetricEvent::FlowEvicted));
         self.outputs.push_back(Output::CloseFlow(flow_id));
         self.reschedule();
+
+        // Post: the slot is gone from the slab AND no table key still maps to it
+        // (a stale table key would dangle — caught by check_invariants (1), but
+        // assert it here too so the local failure points at close_flow). Pair:
+        // positive = removed from slab; negative = no key still references it.
+        #[cfg(debug_assertions)]
+        {
+            debug_assert!(
+                !self.flows.contains(flow_id),
+                "close_flow left FlowId {flow_id} in the slab"
+            );
+            debug_assert!(
+                self.table.values().all(|&id| id != flow_id),
+                "close_flow left a table entry mapping to the removed FlowId {flow_id}"
+            );
+        }
     }
 
     /// Emit a drop with its by-reason metric. Allocates nothing per the
     /// "silence is a virtue" posture.
     fn drop_datagram(&mut self, reason: DropReason) {
+        // "Silence is a virtue": a drop allocates no flow and frees none — the
+        // slab is untouched across the reject. Snapshot + pair-assert so a future
+        // edit that accidentally mutates the slab on a drop path is caught loudly.
+        #[cfg(debug_assertions)]
+        let flows_before_drop = self.flows.len();
         self.outputs
             .push_back(Output::Metric(MetricEvent::DatagramDropped(reason)));
         self.outputs.push_back(Output::Drop(reason));
+        debug_assert_eq!(
+            self.flows.len(),
+            flows_before_drop,
+            "a drop must allocate nothing and free nothing (flows.len() unchanged)"
+        );
     }
 
     /// Affinity hash for a flow: `hash(seed, affinity_key)`. The shell feeds
@@ -546,6 +667,150 @@ impl<E: FlowKeyExtractor> UdpManager<E> {
             flow.client.ip().hash(&mut hasher);
         }
         hasher.finish()
+    }
+
+    /// TigerStyle invariant sweep (TigerBeetle / FoundationDB style). A single
+    /// full check of every structural invariant the manager must preserve,
+    /// asserted at the END of every public mutating method via
+    /// [`debug_assert_invariants`](Self::debug_assert_invariants). Compiled out
+    /// entirely in release (`#[cfg(debug_assertions)]`); on in every test / e2e /
+    /// fuzz / dev build. It must NEVER change runtime behavior — it only reads.
+    ///
+    /// The right place for the sweep is a *post-condition*: these public methods
+    /// run to completion under the caller's lock, so the table/slab/timer state
+    /// is fully reconciled by the time the method returns.
+    #[cfg(debug_assertions)]
+    fn check_invariants(&self) {
+        use std::collections::HashSet;
+
+        // (3) flow_count() is exactly the slab population.
+        debug_assert_eq!(
+            self.flow_count(),
+            self.flows.len(),
+            "flow_count() must equal flows.len()"
+        );
+
+        // (1) Table -> slab consistency + (2) table injectivity: every FlowId in
+        // the table points at a live slab slot, and no two keys share a FlowId.
+        let mut seen_ids: HashSet<FlowId> = HashSet::with_capacity(self.table.len());
+        for (key, &id) in self.table.iter() {
+            debug_assert!(
+                self.flows.contains(id),
+                "table key {key:?} maps to FlowId {id} absent from the slab (dangling key)"
+            );
+            debug_assert!(
+                seen_ids.insert(id),
+                "table injectivity violated: FlowId {id} is the target of two distinct FlowKeys"
+            );
+        }
+        // Pair (negative space): a live flow that is reachable from the table is
+        // mapped exactly once — there is never a live flow with two table keys.
+        debug_assert!(
+            seen_ids.len() <= self.flows.len(),
+            "more distinct table targets than live flows"
+        );
+
+        // Per-flow invariants over the slab.
+        let mut min_live_deadline: Option<Instant> = None;
+        let mut live_count = 0usize;
+        for (id, flow) in self.flows.iter() {
+            // (4) No slab flow is Closing. close_flow sets Closing then removes
+            // the slot in the same call, so a Closing flow must never persist.
+            // Pair: positive space — every live flow is Awaiting or Established.
+            debug_assert_ne!(
+                flow.phase,
+                FlowPhase::Closing,
+                "FlowId {id} persists in the slab while Closing (close_flow must remove it)"
+            );
+            debug_assert!(
+                matches!(
+                    flow.phase,
+                    FlowPhase::AwaitingBackend | FlowPhase::Established
+                ),
+                "FlowId {id} has an unexpected live phase {:?}",
+                flow.phase
+            );
+
+            // (5) Established <=> backend_addr.is_some(); AwaitingBackend <=>
+            // backend_addr.is_none() (positive + negative space).
+            match flow.phase {
+                FlowPhase::Established => debug_assert!(
+                    flow.backend_addr.is_some(),
+                    "Established FlowId {id} has no backend address"
+                ),
+                FlowPhase::AwaitingBackend => debug_assert!(
+                    flow.backend_addr.is_none(),
+                    "AwaitingBackend FlowId {id} already carries a backend address"
+                ),
+                FlowPhase::Closing => {}
+            }
+
+            // (7) Counters within caps OR a teardown is due. A flow whose cap is
+            // exhausted must report a teardown reason; an exhausted flow that
+            // reports None would be an immortal flow (the cap silently lost).
+            if flow.requests_exhausted() || flow.responses_exhausted() {
+                debug_assert!(
+                    flow.teardown_reason().is_some(),
+                    "FlowId {id} exhausted a cap (req {}/{}, resp {}/{}) but reports no teardown",
+                    flow.requests_seen,
+                    flow.config.requests,
+                    flow.responses_seen,
+                    flow.config.responses,
+                );
+            } else {
+                // Pair (negative): a flow within both caps must NOT report a
+                // cap-driven teardown (idle teardown is handled by the timer,
+                // not teardown_reason()).
+                debug_assert!(
+                    flow.teardown_reason().is_none(),
+                    "FlowId {id} reports a teardown while within both caps"
+                );
+            }
+
+            live_count += 1;
+            min_live_deadline = Some(match min_live_deadline {
+                Some(d) => d.min(flow.idle_deadline),
+                None => flow.idle_deadline,
+            });
+        }
+
+        // The high-water cap bounds the live population at all times (the live
+        // cap itself can be shrunk below flows.len() by SetMaxFlows, so we assert
+        // against the largest cap ever in force, not max_flows).
+        debug_assert!(
+            self.flows.len() <= self.max_flows_high_water,
+            "live flows {} exceed the high-water cap {}",
+            self.flows.len(),
+            self.max_flows_high_water,
+        );
+
+        // (6) Timer coherence: armed_deadline is Some IFF at least one (non-
+        // Closing) live flow exists, and when Some it equals the minimum
+        // idle_deadline over live flows. Closing flows are never in the slab
+        // (invariant 4), so "live" == "slab" here.
+        debug_assert_eq!(
+            self.armed_deadline.is_some(),
+            live_count > 0,
+            "timer coherence: armed_deadline.is_some() ({}) must match having live flows ({})",
+            self.armed_deadline.is_some(),
+            live_count > 0,
+        );
+        if let Some(armed) = self.armed_deadline {
+            debug_assert_eq!(
+                Some(armed),
+                min_live_deadline,
+                "timer coherence: armed deadline {armed:?} must equal the minimum live idle deadline {min_live_deadline:?}"
+            );
+        }
+    }
+
+    /// Run the full [`check_invariants`](Self::check_invariants) sweep, but only
+    /// in debug builds. A thin wrapper so call sites read as one line and so the
+    /// whole sweep — and any read it performs — is dead-stripped in release.
+    #[inline]
+    fn debug_assert_invariants(&self) {
+        #[cfg(debug_assertions)]
+        self.check_invariants();
     }
 }
 
